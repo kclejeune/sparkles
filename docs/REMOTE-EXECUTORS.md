@@ -300,13 +300,17 @@ free, 85 by default, and ends with exit 4 rather than start with less. A Boat wo
 its disk cleanup first. An ssh host runs `mbx gc` with `gc.min_free_size` raised to the
 floor, which evicts cache objects and managed targets until that much is free, and removes
 nothing else, so a lane's build cannot fill a gate host's disk from a start with too little
-room. While the check runs, the job reads the free space every `REMOTE_CI_WATCH_SECONDS`, 30
-by default, and stops it with exit 5 when less than `REMOTE_CI_RUN_FLOOR_GIB` stays free, 4
-by default. The server's tests keep 1 GiB free and fail below it, so a disk that another job
-fills ends the run as a host problem rather than as test failures. Either refusal writes
-`disk-below-floor` to the job's `outcome` file, and `remote-ci.sh` then says that the host's
-disk was below its floor. The run's `TMPDIR` is `.artifacts/tmp` in its worktree, so its
-temporary files leave with the worktree and do not fill the host's `/tmp`. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
+room. On an ssh host the job also reads the free space every `REMOTE_CI_WATCH_SECONDS`
+while the check runs, 30 by default, and once more when a failed check ends. It stops the
+check with exit 5, or marks the failure as exit 5, when less than `REMOTE_CI_RUN_FLOOR_GIB`
+is free, 4 by default. The server's tests keep 1 GiB free and fail below it, so a disk that
+another job fills ends the run as a host problem rather than as test failures. A stopped
+check's processes that ignore the stop are killed before the job copies its results and
+removes its worktree. Either refusal writes `disk-below-floor` to the job's `outcome` file,
+and `remote-ci.sh` then says that the host's disk was below its floor. The check's `TMPDIR`
+on an ssh host is `.artifacts/tmp` in its worktree, so its temporary files leave with the
+worktree and do not fill the host's `/tmp`. A Boat worker keeps its disk timer's hard limit
+and its own temporary directory. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
 and the default adds 25% to that. The build cache does not help a second run on the large
 worker, because the test build stores about 48 GiB, more than the store's 40 GiB budget, so
 a rerun of the same commit measured 3 hits in 343 lookups and grew the disk by 65.7 GiB. The worker's disk timer stops any running job at 95% use, which is a recovery rather

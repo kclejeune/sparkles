@@ -34,7 +34,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 printf 'prop %s\n' "${props[@]}" >> "$FAKE_LOG"
-# systemd-run itself succeeds once the unit has started, whatever the unit's exit.
+# systemd-run itself succeeds once the unit has started, whatever the unit's exit. With
+# FAKE_ASYNC the unit runs on after the start returns, as a real unit does.
+if [ -n "${FAKE_ASYNC:-}" ]; then
+  env -i FAKE_LOG="$FAKE_LOG" FAKE_CI_EXIT="${FAKE_CI_EXIT:-0}" FAKE_CLEAN_EXIT="${FAKE_CLEAN_EXIT:-0}" "${envs[@]}" "$@" > /dev/null 2>&1 < /dev/null &
+  exit 0
+fi
 env -i FAKE_LOG="$FAKE_LOG" FAKE_CI_EXIT="${FAKE_CI_EXIT:-0}" FAKE_CLEAN_EXIT="${FAKE_CLEAN_EXIT:-0}" "${envs[@]}" "$@" || true
 '''
 
@@ -74,9 +79,14 @@ class RemoteCI(unittest.TestCase):
         shutil.copy(ROOT / 'scripts/gate/remote/ci-job.sh', src / 'scripts/gate/remote/ci-job.sh')
         shutil.copy(ROOT / 'scripts/gate/config.sh', src / 'scripts/gate/config.sh')
         (src / 'scripts/remote-executor.sh').write_text(FAKE_RX)
-        # With ~/ci-fills-disk the build leaves 1000 KiB free and keeps running.
-        (src / 'scripts/ci.sh').write_text('#!/usr/bin/env bash\necho "ci $*"; echo "tmpdir $TMPDIR"; mkdir -p .artifacts/ci/logs; echo log > .artifacts/ci/logs/test.log\n'
-                                           'if [ -f "$HOME/ci-fills-disk" ]; then echo 1000 > "$HOME/df-kib"; sleep 60; echo "survived the watch"; fi\nexit "${FAKE_CI_EXIT:-0}"\n')
+        # With ~/ci-fills-disk the build leaves 1000 KiB free and keeps running for the seconds
+        # that the file names, 60 by default. With ~/ci-leaves-child it also starts a
+        # descendant that ignores TERM, and with ~/ci-says-exit it writes an exit-like line
+        # into progress.log and runs on for 3 seconds.
+        (src / 'scripts/ci.sh').write_text('#!/usr/bin/env bash\necho "ci $*"; echo "tmpdir ${TMPDIR:-unset}"; mkdir -p .artifacts/ci/logs; echo log > .artifacts/ci/logs/test.log\n'
+                                           'if [ -f "$HOME/ci-leaves-child" ]; then (trap "" TERM; exec sleep 300) & echo $! > "$HOME/child.pid"; fi\n'
+                                           'if [ -f "$HOME/ci-says-exit" ]; then echo "mbx check || exit 7" >> "$HOME/gate/out/$NAME/progress.log"; sleep 3; fi\n'
+                                           'if [ -f "$HOME/ci-fills-disk" ]; then echo 1000 > "$HOME/df-kib"; sleep "$(cat "$HOME/ci-fills-disk" | grep . || echo 60)"; echo "survived the watch"; fi\nexit "${FAKE_CI_EXIT:-0}"\n')
         (src / '.gitignore').write_text('.artifacts/\n')
         (src / 'rust-toolchain.toml').write_text('[toolchain]\nchannel = "1.2.3"\n')
         (src / 'scripts/premerge.sh').write_text('#!/usr/bin/env bash\necho premerge; mkdir -p .artifacts/premerge; echo ok > .artifacts/premerge/doc-paths.log\n')
@@ -96,7 +106,10 @@ class RemoteCI(unittest.TestCase):
         self.home = home
         fake = t / 'bin'; fake.mkdir()
         (fake / 'systemd-run').write_text(FAKE_SYSTEMD_RUN)
-        (fake / 'systemctl').write_text('#!/bin/sh\necho "systemctl $*" >> "$FAKE_LOG"\n[ "$2" = is-active ] && { echo inactive; exit 3; }\n[ "$2" = show ] && echo "${FAKE_STATE-inactive}"\nexit 0\n')
+        # Every unit is inactive, except that with FAKE_ASYNC a unit is active until its job is done.
+        (fake / 'systemctl').write_text('#!/bin/sh\necho "systemctl $*" >> "$FAKE_LOG"\n'
+                                        'if [ "$2" = is-active ] && [ -n "${FAKE_ASYNC:-}" ] && [ ! -f "$HOME/gate/out/${3#gate-}/done_at" ]; then echo active; exit 0; fi\n'
+                                        '[ "$2" = is-active ] && { echo inactive; exit 3; }\n[ "$2" = show ] && echo "${FAKE_STATE-inactive}"\nexit 0\n')
         # mise exec runs its command, and every other mise command does nothing.
         (fake / 'mise').write_text('#!/bin/sh\nif [ "$1" = exec ]; then shift; [ "$1" != -- ] || shift; exec "$@"; fi\nexit 0\n')
         (fake / 'rustc').write_text('#!/bin/sh\necho "rustc ${RUSTUP_TOOLCHAIN:-default} (fake)"\n')
@@ -305,8 +318,38 @@ class RemoteCI(unittest.TestCase):
     def test_a_disk_that_fills_during_the_run_on_an_ssh_host_stops_it(self):
         self.check_the_disk_watch(self.run_ssh)
 
-    def test_a_disk_that_fills_during_the_run_on_a_boat_worker_stops_it(self):
-        self.check_the_disk_watch(self.run_ci)
+    def test_a_boat_worker_keeps_its_own_disk_limit_and_temporary_directory(self):
+        (self.home / 'ci-fills-disk').write_text('2')
+        r = self.run_ci(REMOTE_CI_WATCH_SECONDS='1')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        out = self.home / 'gate/out' / self.name()
+        self.assertFalse((out / 'outcome').exists())
+        log = (out / 'ci.log').read_text()
+        self.assertIn('survived the watch', log); self.assertNotIn('.artifacts/tmp', log)
+
+    def test_a_descendant_that_ignores_the_stop_is_ended_before_the_cleanup(self):
+        (self.home / 'ci-leaves-child').touch()
+        (self.home / 'ci-fills-disk').touch()
+        r = self.run_ssh(REMOTE_CI_WATCH_SECONDS='1')
+        self.assertEqual(r.returncode, 5, r.stdout + r.stderr)
+        pid = int((self.home / 'child.pid').read_text())
+        self.assertFalse(Path('/proc/%d' % pid).exists() and Path('/proc/%d/stat' % pid).read_text().split(') ', 1)[1][0] != 'Z')
+        self.assertIn('ended the processes the run left', (self.home / 'gate/out' / self.name() / 'progress.log').read_text())
+
+    def test_a_disk_that_fills_just_before_a_failed_run_ends_marks_it(self):
+        (self.home / 'ci-fills-disk').write_text('0')
+        r = self.run_ssh(FAKE_CI_EXIT='1', REMOTE_CI_WATCH_SECONDS='600')
+        self.assertEqual(r.returncode, 5, r.stdout + r.stderr)
+        self.assertIn('host disk below floor', r.stderr)
+
+    def test_the_wait_takes_only_the_exit_record_and_fetches_a_fresh_copy(self):
+        stale = self.src / '.artifacts/remote-ci' / self.name()
+        stale.mkdir(parents=True); (stale / 'outcome').write_text('disk-below-floor\n'); (stale / 'ci.exit').write_text('4\n')
+        (self.home / 'ci-says-exit').touch()
+        r = self.run_ssh(FAKE_ASYNC='1', REMOTE_CI_POLL_SECONDS='1')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn('host disk below floor', r.stderr)
+        self.assertEqual((stale / 'ci.exit').read_text().strip(), '0'); self.assertFalse((stale / 'outcome').exists())
 
     def run_cmd(self, cmd, *args, **env):
         return self.run_ssh('--cmd', cmd, *args, **env)
@@ -434,12 +477,55 @@ class GateDiskFloor(unittest.TestCase):
             shell_functions(ROOT / 'scripts/gate/gate.sh', 'free_gib', 'ensure_disk') + 'ensure_disk wally %d "ci half"\n' % need
         return subprocess.run(['bash', '-c', program], env=self.env, capture_output=True, text=True, timeout=60)
 
-    def test_the_driver_collects_to_the_floor_before_it_starts(self):
-        self.assertEqual(self.ensure(150, 150, 110).returncode, 0); self.assertFalse(self.log.exists())
-        r = self.ensure(60, 115, 110)
-        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('min_free=110GiB', self.log.read_text())
-        r = self.ensure(60, 90, 110)
-        self.assertEqual(r.returncode, 2); self.assertIn('90 GiB free after mbx gc', r.stderr)
+    def test_the_driver_only_reads_the_disk_and_warns_when_short(self):
+        r = self.ensure(150, 150, 110)
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertEqual(r.stderr, '')
+        r = self.ensure(60, 200, 110)
+        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('wally has 60 GiB free and the ci half needs 110 GiB', r.stderr)
+        # Another job may hold the host, so the driver never collects there.
+        self.assertFalse(self.log.exists())
+
+    def merge(self, ci, conf, ci_disk=False, conf_disk=False):
+        """Merge a split gate whose halves exited ci and conf, with fake hosts p and h."""
+        fake = self.t / 'hosts'
+        for host, code, disk in (('p', ci, ci_disk), ('h', conf, conf_disk)):
+            out = fake / host / 'gate/out' / ('n' if host == 'p' else 'n-conf')
+            shutil.rmtree(fake / host, ignore_errors=True); out.mkdir(parents=True)
+            (out / 'part.exit').write_text('%d\n' % code); (out / 'steps.txt').write_text('%s step\n' % host)
+            if disk:
+                (out / 'outcome').write_text('disk-below-floor\n')
+        dest = self.t / 'dest'; shutil.rmtree(dest, ignore_errors=True)
+        (self.t / '.artifacts/gates').mkdir(parents=True, exist_ok=True)
+        program = r'''
+rx_exec() { (cd "$FAKE_HOSTS/$1" && HOME=$FAKE_HOSTS/$1 bash -c "systemctl() { return 3; }; $2"); }
+rx_sync() {
+  local a=("$@") n=${#a[@]} del=0 x
+  for x in "$@"; do [ "$x" != --delete ] || del=1; done
+  local src=${a[n-2]} dst=${a[n-1]}
+  case $src in *:*) src=$FAKE_HOSTS/${src%%:*}/${src#*:} ;; esac
+  case $dst in *:*) dst=$FAKE_HOSTS/${dst%%:*}/${dst#*:} ;; esac
+  if [ -d "$src" ]; then mkdir -p "$dst"; [ "$del" = 0 ] || rm -rf "${dst:?}"/*; cp -a "$src/." "$dst/"; else cp -a "$src" "$dst"; fi
+}
+''' + shell_functions(ROOT / 'scripts/gate/gate.sh', 'wall', 'finished', 'fetch') + '''
+primary=p helper=h name=n hname=n-conf pout=gate/out/n hout=gate/out/n-conf
+fetch > /dev/null || exit 90
+cat "$dest/gate.exit"
+'''
+        r = subprocess.run(['bash', '-c', program], capture_output=True, text=True, timeout=60,
+                           env=dict(self.env, FAKE_HOSTS=str(fake), dest=str(dest), root=str(self.t)))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return int(r.stdout.strip()), dest
+
+    def test_a_split_gate_keeps_a_part_s_disk_refusal(self):
+        code, dest = self.merge(0, 4, conf_disk=True)
+        self.assertEqual(code, 4)
+        self.assertEqual((dest / 'outcome').read_text().strip(), 'disk-below-floor')
+        self.assertEqual((dest / 'outcome-host').read_text().strip(), 'conformance half on h')
+        code, dest = self.merge(4, 0, ci_disk=True)
+        self.assertEqual(code, 4); self.assertEqual((dest / 'outcome-host').read_text().strip(), 'ci half on p')
+        # A part that failed its tests still fails the merge, whatever the other part's disk.
+        self.assertEqual(self.merge(1, 4, conf_disk=True)[0], 1)
+        self.assertEqual(self.merge(0, 0)[0], 0); self.assertEqual(self.merge(0, 1)[0], 1)
 
     def test_hosts_reports_each_host_against_the_floors(self):
         src = self.t / 'src'; (src / 'scripts/gate').mkdir(parents=True)

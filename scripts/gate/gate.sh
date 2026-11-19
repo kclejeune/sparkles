@@ -77,12 +77,12 @@
 #
 # Disk floors. A gate needs GATE_NEED_CI_GB free for a ci half, a whole gate or the link
 # check and GATE_NEED_CONF_GB for a conformance half, 110 each by default, the floor a cold
-# workspace build needs on a Boat worker. Before it starts, the driver checks each chosen
-# host. A host that is short runs `mbx gc` with gc.min_free_size raised to the floor, which
-# evicts cache objects and managed targets until that much is free, and the driver refuses
-# to start when the host is still short. The gate then checks again under the host's heavy
-# lock, since another job may have used the space while the gate queued, and a gate still
-# short there ends with exit 4 and disk-below-floor in its outcome file. --auto and the
+# workspace build needs on a Boat worker. Before it starts, the driver reads each chosen
+# host's free disk and warns when it is short, without collecting, since another job may
+# hold the host. Under the host's heavy lock the gate checks again. An ssh host that is
+# short runs `mbx gc` with gc.min_free_size raised to the floor, which evicts cache objects
+# and managed targets until that much is free, and a gate still short ends with exit 4 and
+# disk-below-floor in its outcome file. A split gate whose part refused that way exits 4. --auto and the
 # default helper choice count a host as having the disk for a whole gate when
 # GATE_MIN_FREE_GB are free and for a conformance half when GATE_MIN_FREE_HALF_GB are free,
 # which default to the two floors.
@@ -453,9 +453,21 @@ fetch() {
     echo "split: ci on $primary (gate-$name), conformance on $helper (gate-$hname)"
     wall "$tmp" "$conf"
   } > "$tmp/wall.txt"
+  # A part refused for its host's disk keeps its outcome, and the merge exits 4 for it.
+  [ ! -f "$tmp/outcome" ] || cp -a "$tmp/outcome" "$tmp/outcome-ci"
+  if grep -qx disk-below-floor "$conf/outcome" 2> /dev/null; then
+    echo disk-below-floor > "$tmp/outcome"
+    echo "conformance half on $helper" > "$tmp/outcome-host"
+  elif grep -qx disk-below-floor "$tmp/outcome" 2> /dev/null; then
+    echo "ci half on $primary" > "$tmp/outcome-host"
+  fi
   if [ -f "$tmp/part.exit" ] && [ -f "$conf/part.exit" ]; then
+    # A failed part makes the merge 1, unless every failed part was refused for its disk.
     code=0
-    for f in "$tmp/part.exit" "$conf/part.exit"; do [ "$(cat "$f")" = 0 ] || code=1; done
+    for f in "$tmp/part.exit:$tmp/outcome-ci" "$conf/part.exit:$conf/outcome"; do
+      [ "$(cat "${f%%:*}")" != 0 ] || continue
+      if grep -qx disk-below-floor "${f#*:}" 2> /dev/null; then [ "$code" = 1 ] || code=4; else code=1; fi
+    done
   elif finished "$primary" "$name" && finished "$helper" "$hname"; then
     # Both units have stopped, but a half may have written its exit file after the copy
     # above. Look again before taking a missing file as a run that stopped without one.
@@ -653,22 +665,18 @@ free_gib() {
   rx_exec "$1" 'df -BG --output=avail "$HOME" | tail -n1 | tr -dc 0-9' 2> /dev/null
 }
 
-# ensure_disk HOST NEED_GIB WHAT: refuse to start WHAT on HOST unless the host has NEED_GIB
-# free. A host that is short first runs `mbx gc` with gc.min_free_size raised to NEED_GIB,
-# which collects idle managed targets and evicts cache objects until that much is free. A
-# build holds its target lease for the whole run, so space freed after the start comes too late.
+# ensure_disk HOST NEED_GIB WHAT: say when HOST has less than NEED_GIB free for WHAT. The
+# check only reads, since another job or a timing run may hold the host now. The gate itself
+# checks again under the host's heavy lock, where an ssh host runs `mbx gc` to free the
+# shortfall and a Boat worker its disk cleanup, and refuses there with exit 4 when the host
+# stays short. A Boat worker's floor is GATE_BOAT_MIN_FREE_GIB.
 ensure_disk() {
   local h=$1 need=$2 what=$3 d
+  case $h in boat:*) need=${GATE_BOAT_MIN_FREE_GIB:-110} ;; esac
   d=$(free_gib "$h")
   [ -n "$d" ] || return 0
   [ "$d" -ge "$need" ] && return 0
-  echo "gate.sh: $h has $d GiB free and the $what needs $need GiB, so mbx gc frees the shortfall there first" >&2
-  rx_exec "$h" "MBX_GC_MIN_FREE_SIZE=${need}GiB mbx gc" >&2 || echo "gate.sh: mbx gc on $h failed" >&2
-  d=$(free_gib "$h")
-  if [ -z "$d" ] || [ "$d" -lt "$need" ]; then
-    die "$h has ${d:-an unknown number of} GiB free after mbx gc and the $what needs $need GiB. Free space there, choose another host with --host or --helper, or lower GATE_NEED_CI_GB or GATE_NEED_CONF_GB."
-  fi
-  echo "gate.sh: $h has $d GiB free after mbx gc" >&2
+  echo "gate.sh: $h has $d GiB free and the $what needs $need GiB; the gate frees the shortfall under the host's heavy lock or ends with exit 4, so another host may be quicker (--host, --helper)" >&2
 }
 
 # A whole gate runs the suites in the ci half's worktree after it, so it needs what the ci
@@ -728,6 +736,6 @@ cat "$dest/wall.txt" 2> /dev/null || true
 code=$(cat "$dest/gate.exit" 2> /dev/null || echo 99)
 echo "gate exit $code"
 if grep -qx disk-below-floor "$dest/outcome" 2> /dev/null; then
-  echo "gate.sh: host disk below floor, so the gate did not run; its exit says nothing about $short" >&2
+  echo "gate.sh: host disk below floor${dest:+ for the $(cat "$dest/outcome-host" 2> /dev/null || echo "gate on $primary")}, so the gate did not run there; its exit says nothing about $short" >&2
 fi
 exit "$code"

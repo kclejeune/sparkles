@@ -20,11 +20,12 @@
 # 4 at admission and 5 during the run. Under the heavy lock the job needs NEED_GIB free. A
 # Boat worker frees finished work with scripts/boat/disk_clean.py first. An ssh host runs
 # `mbx gc` with gc.min_free_size raised to NEED_GIB, which evicts managed targets and
-# cache objects until that much is free, and removes nothing else. While ci.sh or
-# premerge.sh runs, a watch reads the free space every WATCH_SECONDS, 30 by default, and
-# stops the run when it falls under RUN_FLOOR_GIB, 4 by default, so tests do not fail
-# against the server's own free-disk reserve for a reason that is not theirs. The run's
-# TMPDIR is .artifacts/tmp in the job's worktree, so its temporary files go with it.
+# cache objects until that much is free, and removes nothing else. On an ssh host a watch
+# reads the free space every WATCH_SECONDS while the run goes, 30 by default, and once more
+# when a failed run ends, and stops or marks the run when it is under RUN_FLOOR_GIB, 4 by
+# default, so tests do not fail against the server's own free-disk reserve for a reason
+# that is not theirs. The run's TMPDIR there is .artifacts/tmp in the job's worktree, so
+# its temporary files go with it.
 set -uo pipefail
 umask 022
 G=$HOME/gate
@@ -116,7 +117,11 @@ if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = boat ]; then
 else
   w=$(until_end 600)
   [ "$w" -le 240 ] || w=240
-  if [ "$w" -le 0 ] || ! ssh_admit "$need" "$w"; then
+  if [ "$w" -le 0 ]; then
+    log "too little time is left before the job's end for the disk check and the run"
+    finish 3
+  fi
+  if ! ssh_admit "$need" "$w"; then
     echo disk-below-floor > "$out/outcome"
     finish 4
   fi
@@ -150,38 +155,67 @@ case $MODE in
     [ -z "$tc" ] || export RUSTUP_TOOLCHAIN=$tc
     # shellcheck disable=SC2016
     run=(mise exec -- bash -c 'echo "remote-ci: $1"; echo "remote-ci: RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-unset}"; echo "remote-ci: $(rustc --version 2>&1)"; echo "remote-ci: $(mbx --version 2>&1)"; exec bash -c "$1"' remote-ci "$cmd")
-    log "running $cmd with ${RUSTUP_TOOLCHAIN:-the default toolchain}"
+    log "running the command with ${RUSTUP_TOOLCHAIN:-the default toolchain}"
     ;;
   *) finish 2 ;;
 esac
-export TMPDIR=$wt/.artifacts/tmp
-mkdir -p "$TMPDIR"
-# timeout runs the command in its own process group and passes a TERM to the whole group,
-# so the disk watch stops the run by signalling timeout.
+# On an ssh host, where other lanes' jobs share the disk, the run's temporary files live in
+# its worktree and a watch stops the run when the disk falls under the run floor. A Boat
+# worker keeps its own timer's hard limit instead.
+watch=0
+if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = ssh ]; then
+  watch=1
+  export TMPDIR=$wt/.artifacts/tmp
+  mkdir -p "$TMPDIR"
+fi
+floor_kib=$((${RUN_FLOOR_GIB:-4} * 1048576))
+# below_floor NOTE: record the outcome and say so when the disk is under the run floor.
+below_floor() {
+  local f
+  f=$(free_kib)
+  [ "${f:-0}" -lt "$floor_kib" ] || return 1
+  echo disk-below-floor > "$out/outcome"
+  log "host disk below floor: $((${f:-0} / 1024)) MiB free $1, under the ${RUN_FLOOR_GIB:-4} GiB floor"
+}
+# timeout leads its own process group and passes a TERM it receives to the whole group, so
+# the disk watch stops the run by signalling timeout.
 timeout --signal=TERM --kill-after=30s "$left" "${run[@]}" > "$out/ci.log" 2>&1 &
 cpid=$!
-floor_kib=$((${RUN_FLOOR_GIB:-4} * 1048576))
-(
-  trap 'kill "$ds" 2> /dev/null; exit 0' TERM
-  ds=
-  while kill -0 "$cpid" 2> /dev/null; do
-    f=$(free_kib)
-    if [ "${f:-0}" -lt "$floor_kib" ]; then
-      echo disk-below-floor > "$out/outcome"
-      log "host disk below floor: $((${f:-0} / 1024)) MiB free during the run, under the ${RUN_FLOOR_GIB:-4} GiB floor; stopping it"
-      kill -TERM "$cpid" 2> /dev/null
-      exit 0
-    fi
-    sleep "${WATCH_SECONDS:-30}" &
-    ds=$!
-    wait "$ds"
-  done
-) &
-dw=$!
+if [ "$watch" = 1 ]; then
+  (
+    trap 'kill "$ds" 2> /dev/null; exit 0' TERM
+    ds=
+    while kill -0 "$cpid" 2> /dev/null; do
+      if below_floor "during the run"; then
+        log "stopping the run"
+        kill -TERM "$cpid" 2> /dev/null
+        exit 0
+      fi
+      sleep "${WATCH_SECONDS:-30}" &
+      ds=$!
+      wait "$ds"
+    done
+  ) &
+  dw=$!
+fi
 wait "$cpid"
 c=$?
-kill "$dw" 2> /dev/null
+[ -z "${dw:-}" ] || kill "$dw" 2> /dev/null
+[ -z "${dw:-}" ] || wait "$dw" 2> /dev/null
 dw=
+# timeout exits once its own child has, so a descendant that ignored the TERM can still be
+# in its group. The group is killed before the results are copied and the worktree removed.
+if kill -0 -- "-$cpid" 2> /dev/null; then
+  kill -TERM -- "-$cpid" 2> /dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 -- "-$cpid" 2> /dev/null || break
+    sleep 1
+  done
+  kill -KILL -- "-$cpid" 2> /dev/null
+  log "ended the processes the run left in its process group"
+fi
+# A disk that fell under the floor between the last sample and the run's end still marks it.
+[ "$watch" = 0 ] || [ -f "$out/outcome" ] || [ "$c" = 0 ] || below_floor "when the run ended" || true
 [ ! -f "$out/outcome" ] || c=5
 for d in ci premerge; do [ ! -d ".artifacts/$d" ] || cp -r ".artifacts/$d" "$out/$d"; done
 finish "$c"

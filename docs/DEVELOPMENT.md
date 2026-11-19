@@ -997,18 +997,18 @@ wally through the laptop and checks linger, mbx and free disk.
 A gate has a disk floor on every host, 110 GiB by default for a ci half, a whole gate, the
 link check and a conformance half alike. That is the floor of a Boat gate, which a cold
 workspace build needs. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change the floors of the
-ci and conformance parts, in the environment or in `~/.config/sparkles/gate.env`. The
-driver checks the free disk under the home directory of each chosen host before it starts
-anything there. When a host has less, the driver runs `mbx gc` on it with
-`gc.min_free_size` raised to the floor, which collects idle managed targets and evicts
-cache objects until that much is free, and checks again. A host that is still short makes
-the driver stop with a message that names the host, the free space and the space needed.
-The check runs before the start because a running build holds its target's lease, so the
-cache cannot give back that space until the gate ends. Another job can use the space while
-the gate waits for the host's heavy lock, so the gate checks again under the lock, with the
-same `mbx gc` on an ssh host and the disk cleanup on a Boat worker. A gate still short there
-ends with exit 4 and `disk-below-floor` in its `outcome` file, and the driver says that the
-host's disk was below its floor. `--auto` and the default helper choice count a host as
+ci and conformance parts, in the environment or in `~/.config/sparkles/gate.env`, and
+`GATE_BOAT_MIN_FREE_GIB` sets a Boat worker's. The driver reads the free disk under the
+home directory of each chosen host before it starts anything there and warns when a host
+is short. It collects nothing, since another job or a timing run may hold the host. The
+gate checks the floor under the host's heavy lock, before it builds, because a running
+build holds its target's lease and the cache cannot give back that space until the gate
+ends. An ssh host that is short runs `mbx gc` with `gc.min_free_size` raised to the floor,
+which collects idle managed targets and evicts cache objects until that much is free, and
+a Boat worker runs its disk cleanup. A gate still short ends with exit 4 and
+`disk-below-floor` in its `outcome` file, and the driver says that the host's disk was
+below its floor. A split gate whose failed parts were all refused for their disk exits 4
+and names the refusing half in `outcome-host`. `--auto` and the default helper choice count a host as
 having the disk for a whole gate at `GATE_MIN_FREE_GB` free and for a conformance half at
 `GATE_MIN_FREE_HALF_GB`, which default to the two floors.
 

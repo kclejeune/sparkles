@@ -20,8 +20,8 @@
 # included, exports RUSTUP_TOOLCHAIN from rust-toolchain.toml, runs the command under
 # `mise exec` so the tools that mise.toml pins apply, and writes the `rustc --version` and
 # `mbx --version` it used at the top of its log, so its result matches a local run. The
-# job's name is cmd-<rev>-<hash of the command>, and the script prints the command's log
-# and exits with its code. With --worktree the commit is a temporary one whose parent is
+# job's name is cmd-<rev>-<hash of the command>, and the script prints the command's whole
+# log, or its last REMOTE_CI_LOG_LINES lines, and exits with its code. With --worktree the commit is a temporary one whose parent is
 # HEAD, written from a private index, so neither the branch nor the index changes.
 #
 # The job runs in the systemd user unit gate-NAME on the host, NAME being ci-<rev>-<base> or
@@ -38,9 +38,10 @@
 # the disk by 67.8 GiB on the large Boat worker, about 60 GiB of it in the mbx cache, and 85
 # adds 25%. A Boat worker frees finished work with its disk cleanup first, and an ssh host
 # runs `mbx gc` with gc.min_free_size raised to the floor, which evicts cache objects and
-# managed targets until the floor is free. While the build and tests run, the job reads the
-# free space every REMOTE_CI_WATCH_SECONDS, 30 by default, and stops them with exit 5 when it
-# falls under REMOTE_CI_RUN_FLOOR_GIB, 4 by default, since the server's tests keep 1 GiB free.
+# managed targets until the floor is free. On an ssh host the job also reads the free space
+# every REMOTE_CI_WATCH_SECONDS while the build and tests run, 30 by default, and once more
+# when they end, and stops them with exit 5 when it falls under REMOTE_CI_RUN_FLOOR_GIB, 4
+# by default, since the server's tests keep 1 GiB free.
 # Either refusal writes disk-below-floor to the job's outcome file, and this script then
 # says that the host's disk was below its floor.
 # Results land in .artifacts/remote-ci/NAME, with ci.exit, ci.log and the ci or premerge logs.
@@ -120,10 +121,12 @@ cd "$root"
 
 status() {
   # shellcheck disable=SC2016
-  rx_exec "$host" "o=\$HOME/gate/out/$1; cat \"\$o/progress.log\" 2> /dev/null; [ ! -f \"\$o/ci.exit\" ] || echo \"exit \$(cat \"\$o/ci.exit\")\"; systemctl --user is-active gate-$1 || true"
+  rx_exec "$host" "o=\$HOME/gate/out/$1; cat \"\$o/progress.log\" 2> /dev/null; [ ! -f \"\$o/ci.exit\" ] || echo \"ci.exit=\$(cat \"\$o/ci.exit\")\"; systemctl --user is-active gate-$1 || true"
 }
 fetch() {
   local dest=$root/.artifacts/remote-ci/$1
+  # A fresh copy, so that an earlier run's exit and outcome never stand in for this one.
+  rm -rf "$dest"
   mkdir -p "$dest"
   rx_sync -- -a "$host:gate/out/$1/" "$dest/"
   echo "results in $dest"
@@ -236,9 +239,13 @@ echo \"started gate-$name, ending by \$(date -u -d @$end +%FT%TZ)\"" < "$here/ga
 start=$(date +%s)
 while :; do
   s=$(status "$name" 2> /dev/null || true)
-  case $s in *"exit "[0-9]*) break ;; esac
+  # The exit record is a line of its own, which no line of progress.log can be.
+  printf '%s\n' "$s" | grep -Eqx 'ci\.exit=[0-9]+' && break
   case $(printf '%s\n' "$s" | tail -n 1) in inactive | failed)
-    printf '%s\n' "$s" | grep -q '^exit ' || {
+    # The unit can stop between the read of the exit record and the read of its state, so
+    # a stopped unit's record is read once more before it counts as missing.
+    s=$(status "$name" 2> /dev/null || true)
+    printf '%s\n' "$s" | grep -Eqx 'ci\.exit=[0-9]+' || {
       echo "gate-$name ended without an exit status" >&2
       fetch "$name"
       exit 1
@@ -249,7 +256,7 @@ while :; do
     echo "gate-$name passed its end" >&2
     exit 1
   }
-  sleep 30
+  sleep "${REMOTE_CI_POLL_SECONDS:-30}"
 done
 fetch "$name"
 code=$(cat "$root/.artifacts/remote-ci/$name/ci.exit")
@@ -260,7 +267,12 @@ if [ "$(cat "$root/.artifacts/remote-ci/$name/outcome" 2> /dev/null)" = disk-bel
   exit "$code"
 fi
 if [ "$mode" = cmd ]; then
-  [ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n "${REMOTE_CI_LOG_LINES:-200}" "$root/.artifacts/remote-ci/$name/ci.log"
+  # The whole log, unless REMOTE_CI_LOG_LINES asks for its last lines.
+  if [ -n "${REMOTE_CI_LOG_LINES:-}" ]; then
+    tail -n "$REMOTE_CI_LOG_LINES" "$root/.artifacts/remote-ci/$name/ci.log" 2> /dev/null || true
+  else
+    cat "$root/.artifacts/remote-ci/$name/ci.log" 2> /dev/null || true
+  fi
 else
   [ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 30 "$root/.artifacts/remote-ci/$name/ci.log"
 fi
