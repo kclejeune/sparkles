@@ -388,15 +388,15 @@ impl Side {
             Side::Rows(held) => Ok((!started).then_some(held.table.len)),
             Side::File { reader, frame, .. } => {
                 ctx.check()?;
+                // The consumed frame goes before the next is decoded, so one decoded
+                // frame and its encoded payload are live at a time.
+                frame.clear();
                 match reader.as_mut().expect("a started run").next_frame()? {
                     Some((columns, n)) => {
                         *frame = columns;
                         Ok(Some(n))
                     }
-                    None => {
-                        frame.clear();
-                        Ok(None)
-                    }
+                    None => Ok(None),
                 }
             }
         }
@@ -440,9 +440,12 @@ impl SpooledPair {
         let mut right = Side::new(ctx, right, &inputs[1])?;
         left.restart()?;
         right.restart()?;
-        // A frame of each file, decoded and as read.
+        // A frame of each file, decoded and as read, with the decoded frame's column
+        // headers and the decoder's scratch for one column.
         let frame = |side: &Side, width: usize| match side {
-            Side::File { run, .. } => run.max_frame_rows() as u64 * width as u64 * 8 * 2,
+            Side::File { run, .. } => {
+                run.max_frame_rows() as u64 * (width as u64 * 8 * 2 + 8) + width as u64 * 24
+            }
             Side::Rows(_) => 0,
         };
         let charge =
@@ -627,7 +630,9 @@ fn positions(vars: &[VarId], of: &[VarId]) -> Vec<Option<usize>> {
 }
 
 impl Merge {
-    pub(super) fn new(ctx: &Ctx, node: &Node) -> Result<Self> {
+    /// The merge takes the condition of an OPTIONAL out of `node`, which the operator
+    /// does not keep, so building it copies no expression.
+    pub(super) fn new(ctx: &Ctx, node: &mut Node) -> Result<Self> {
         let keys = [key(ctx, node).expect("eligible merge key")];
         let charge =
             ctx.retained_charge(node.vars.len() as u64 * 64 + keys.len() as u64 * 32 + 1024)?;
@@ -637,8 +642,8 @@ impl Merge {
         );
         let mut columns: Vec<(Option<usize>, Option<usize>)> =
             left.into_iter().zip(right).collect();
-        let condition = match &node.kind {
-            Kind::LeftJoin { expr } => expr.clone().map(Arc::new),
+        let condition = match &mut node.kind {
+            Kind::LeftJoin { expr } => expr.take().map(Arc::new),
             _ => None,
         };
         let key_columns = |side: usize| {
@@ -1640,7 +1645,9 @@ mod tests {
                         && let Some(pair) = &merge.spooled
                     {
                         let frame_bytes = |side: &Side, width| match side {
-                            Side::File { run, .. } => run.max_frame_rows() as u64 * width * 16,
+                            Side::File { run, .. } => {
+                                run.max_frame_rows() as u64 * (width * 16 + 8) + width * 24
+                            }
                             Side::Rows(_) => 0,
                         };
                         let required = frame_bytes(&pair.left, widths[0])

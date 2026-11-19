@@ -3087,7 +3087,7 @@ impl Operator {
             },
         );
         let merge = incremental_merge
-            .then(|| merge::Merge::new(ctx, &node))
+            .then(|| merge::Merge::new(ctx, &mut node))
             .transpose()?;
         let group = incremental_group
             .then(|| group::Group::new(ctx, &node))
