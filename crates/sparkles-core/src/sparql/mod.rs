@@ -2510,6 +2510,8 @@ fn graph_triple_bytes(t: &Triple) -> u64 {
 #[cfg(test)]
 mod access_tests;
 #[cfg(test)]
+mod callback_guard_tests;
+#[cfg(test)]
 mod charsets_tests;
 #[cfg(test)]
 mod costcal_tests;

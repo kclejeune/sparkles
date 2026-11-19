@@ -1333,7 +1333,9 @@ fn stored_count(snap: &Snapshot, t: &TriplePattern) -> u64 {
 }
 
 /// The distinct values of `var` over the patterns `chosen`, read from the view with the
-/// facts derived so far, or `None` when there are more than [`MAX_SEEDS`].
+/// facts derived so far, or `None` when there are more than [`MAX_SEEDS`] or a chosen
+/// pattern calls a registered property function. Such a call runs only in the query
+/// itself, so the seeded pattern falls back to its demand with constants.
 fn seed_values(
     ctx: &Ctx,
     view: &Overlay,
@@ -1343,6 +1345,9 @@ fn seed_values(
     dataset: Option<&QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
 ) -> Result<Option<Vec<Id>>> {
+    if super::propertyext::has_calls(ctx, chosen) {
+        return Ok(None);
+    }
     let gp = GraphPattern::Slice {
         inner: Box::new(GraphPattern::Distinct {
             inner: Box::new(GraphPattern::Project {

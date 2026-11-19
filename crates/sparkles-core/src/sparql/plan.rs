@@ -1545,6 +1545,10 @@ impl<'a> Planner<'a> {
             }
             GP::Bgp { patterns } => {
                 if super::propertyext::has_calls(self.ctx, patterns) {
+                    // a context configured on a pattern without the call never runs it
+                    if !self.ctx.calls_extensions {
+                        return Err(super::extensions::unconfigured());
+                    }
                     let (calls, rest) = super::propertyext::take_calls(self.ctx, patterns)?;
                     self.collect(&GP::Bgp { patterns: rest }, g, items)?;
                     let input = self.plan_group(std::mem::take(items), Vec::new())?;

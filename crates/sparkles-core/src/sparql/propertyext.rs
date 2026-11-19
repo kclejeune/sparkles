@@ -52,7 +52,7 @@ impl<'q> PropertyContext<'q> {
     }
     fn guarded<T>(&self, f: impl FnOnce() -> Result<T>) -> std::result::Result<T, ScalarError> {
         let ctx = self.scope.ctx;
-        let _owner = CallbackGuard::enter(ctx);
+        let _owner = CallbackGuard::enter(ctx).map_err(|e| ScalarError::from_engine(&e))?;
         ctx.check().and_then(|()| f()).map_err(|e| {
             let error = ScalarError::from_engine(&e);
             ctx.fail_extension(error.clone());
@@ -633,7 +633,7 @@ fn dispatch<T>(
 ) -> Result<Option<T>> {
     ctx.check()
         .inspect_err(|e| ctx.fail_extension(ScalarError::from_engine(e)))?;
-    let _owner = CallbackGuard::enter(ctx);
+    let _owner = CallbackGuard::enter(ctx)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
         .unwrap_or_else(|_| Err(ScalarError::Execution("property callback panicked".into())));
     if let Err(e) = &result {
@@ -654,14 +654,11 @@ struct OwnedStream<'q> {
 }
 impl Drop for OwnedStream<'_> {
     fn drop(&mut self) {
-        let _owner = CallbackGuard::enter(self.ctx);
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.inner.take())))
-            .is_err()
-        {
-            self.ctx.fail_extension(ScalarError::Execution(
-                "property stream destructor panicked".into(),
-            ));
-        }
+        CallbackGuard::drop_owned(
+            self.ctx,
+            self.inner.take(),
+            "property stream destructor panicked",
+        );
     }
 }
 

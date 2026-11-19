@@ -1012,7 +1012,7 @@ fn registered(
         terms.push(term);
     }
     let context = ScalarContext { ctx };
-    let _owner = CallbackGuard::enter(ctx);
+    let _owner = CallbackGuard::enter(ctx).map_err(|e| fail(ScalarError::from_engine(&e)))?;
     let arguments = [terms];
     let results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         descriptor.implementation.call_batch(&context, &arguments)
