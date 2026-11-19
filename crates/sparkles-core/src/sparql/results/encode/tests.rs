@@ -1114,8 +1114,9 @@ fn json_keys_are_charged_before_they_are_allocated() {
         .map(|i| format!("v{i}{}", "\"".repeat(1_000)))
         .collect();
     // each key is its name with every quote escaped, two quotes and a colon, and the
-    // table holds one start per key and the end
-    let keys = 3 * (2 + 2 * 1_000 + 3) + 4 * std::mem::size_of::<usize>() as u64;
+    // table holds one pointer per key
+    let keys = 3 * (2 + 2 * 1_000 + 3 + std::mem::size_of::<Box<[u8]>>() as u64);
+    assert_eq!(Json::charged(&vars), keys);
     let writer = OUTPUT_BUFFER as u64 + FIRST_MARKS as u64 * MARK_BYTES;
     for (left, fits) in [(writer + keys - 1, false), (writer + keys, true)] {
         let r = small_answer();
@@ -1133,5 +1134,45 @@ fn json_keys_are_charged_before_they_are_allocated() {
         }
         drop(held);
         assert_eq!(room(&ctx), before, "{left}: the charge outlived the writer");
+    }
+}
+
+/// Json::new itself charges its keys before it allocates them: it is refused with one byte
+/// less than the keys need, admitted with exactly that room, and gives the room back when
+/// it is dropped, whatever the writer around it charges.
+#[test]
+fn json_new_charges_its_keys_itself() {
+    let vars: Vec<String> = (0..3)
+        .map(|i| format!("v{i}{}", "\n".repeat(100)))
+        .collect();
+    let keys = Json::charged(&vars);
+    // two quotes, the name with every newline escaped, a colon and the key's pointer
+    assert_eq!(
+        keys,
+        3 * (2 + 2 + 2 * 100 + 1 + std::mem::size_of::<Box<[u8]>>() as u64)
+    );
+    for (left, fits) in [(keys - 1, false), (keys, true)] {
+        let r = small_answer();
+        let ctx = r.test_context().clone();
+        let before = room(&ctx);
+        let held = crate::sparql::ctx::OwnedCharge::new(&ctx, before - left).unwrap();
+        match Json::new(Some(&*ctx), &vars) {
+            Ok(json) => {
+                assert!(fits, "{left}: the keys were not charged");
+                assert_eq!(
+                    room(&ctx),
+                    0,
+                    "{left}: the keys charged more than they need"
+                );
+                drop(json);
+            }
+            Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            })) => assert!(!fits, "{left}: refused with room for the keys"),
+            Err(e) => panic!("the refusal lost its type: {e:?}"),
+        }
+        drop(held);
+        assert_eq!(room(&ctx), before, "{left}: the charge outlived the keys");
     }
 }

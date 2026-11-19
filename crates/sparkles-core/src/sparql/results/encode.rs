@@ -113,41 +113,45 @@ impl Csv {
 /// `xml:lang` and `its:dir` or a `datatype` other than xsd:string, a triple term as an
 /// object of its three parts, and strings escaped as json-event-parser escapes them.
 pub(super) struct Json<'a> {
-    /// every variable's key, `"name":`, escaped once, one after another
-    keys: Vec<u8>,
-    /// where each key starts in `keys`, and where the last ends
-    starts: Vec<usize>,
+    /// each variable's key, `"name":`, escaped once, so that a cell copies its key with
+    /// one lookup
+    keys: Box<[Box<[u8]>]>,
     /// no row has been written, so the next one starts without a comma
     first: bool,
-    /// the reservation for `keys` and `starts`, declared after them so that they drop first
+    /// the reservation for `keys`, declared after them so that they drop first
     _charge: Option<Charge<'a>>,
 }
 
 impl<'a> Json<'a> {
-    /// The keys of `variables`, charged to `ctx` before they are allocated. Both vectors
-    /// are allocated once at their exact size and never grow.
+    /// The keys of `variables`, charged to `ctx` before they are allocated. Each key and
+    /// the table of keys are allocated once at their exact size and never grow.
     pub(super) fn new(ctx: Option<&'a Ctx>, variables: &[String]) -> crate::error::Result<Self> {
-        // each key is its escaped, quoted name and a colon
-        let len: usize = variables.iter().map(|v| json_escaped_len(v) + 1).sum();
-        let table = (variables.len() + 1) * std::mem::size_of::<usize>();
         let charge = ctx
-            .map(|ctx| ctx.charge((len + table) as u64))
+            .map(|ctx| ctx.charge(Self::charged(variables)))
             .transpose()?;
-        let mut keys = Vec::with_capacity(len);
-        let mut starts = Vec::with_capacity(variables.len() + 1);
-        for v in variables {
-            starts.push(keys.len());
-            json_escaped(&mut keys, v);
-            keys.push(b':');
-        }
-        starts.push(keys.len());
-        debug_assert_eq!(keys.len(), len);
+        let keys = variables
+            .iter()
+            .map(|v| {
+                // the escaped, quoted name and a colon
+                let mut key = Vec::with_capacity(json_escaped_len(v) + 1);
+                json_escaped(&mut key, v);
+                key.push(b':');
+                debug_assert_eq!(key.len(), key.capacity());
+                key.into_boxed_slice()
+            })
+            .collect();
         Ok(Json {
             keys,
-            starts,
             first: true,
             _charge: charge,
         })
+    }
+
+    /// The bytes [`Json::new`] charges for the keys of `variables`: each key's bytes and
+    /// the table of their pointers.
+    pub(super) fn charged(variables: &[String]) -> u64 {
+        let bytes: usize = variables.iter().map(|v| json_escaped_len(v) + 1).sum();
+        (bytes + variables.len() * std::mem::size_of::<Box<[u8]>>()) as u64
     }
 
     /// The document up to the opening of the bindings array, as one piece.
@@ -206,7 +210,7 @@ impl<'a> Json<'a> {
         if std::mem::replace(comma, true) {
             out.put(b",")?;
         }
-        out.put(&self.keys[self.starts[column]..self.starts[column + 1]])?;
+        out.put(&self.keys[column])?;
         json_term(out, term)
     }
 
