@@ -988,3 +988,56 @@ fn validation_beside_a_live_writer_reads_one_consistent_prefix() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// A compaction that retires the generation after its log is open must leave that
+/// generation out, as it did when the log was opened last, not read its vanished
+/// vocabulary as empty and the log's terms as damage.
+#[test]
+fn validation_skips_a_generation_retired_while_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = StoreOptions {
+        history_max_generations: 0,
+        ..StoreOptions::default()
+    };
+    let store = std::sync::Arc::new(Store::open(dir.path(), options).unwrap());
+    update(&store, "retired-0");
+    update(&store, "retired-1");
+    let first = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let compactor = store.clone();
+    let mut fired = false;
+    validation::INSPECTION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |at: &str| {
+            if at == "bound" && !fired {
+                fired = true;
+                compactor.compact().unwrap();
+            }
+        }))
+    });
+    let result = validate_copy(dir.path(), false, &preparation());
+    validation::INSPECTION_HOOK.with(|hook| hook.borrow_mut().take());
+    assert!(
+        !dir.path().join(first.trim()).exists(),
+        "the compaction retired {first}"
+    );
+    result.unwrap();
+}
+
+/// A closed copy whose generation lost its log still refuses a vocabulary of an
+/// unknown format, so the order of the reads hides no refusal.
+#[test]
+fn validation_without_a_log_still_refuses_an_unknown_vocabulary() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        update(&store, "closed");
+    }
+    let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let generation = dir.path().join(current.trim());
+    let vocabulary = generation.join("delta.vocab");
+    let mut bytes = std::fs::read(&vocabulary).unwrap();
+    assert!(bytes.len() > 12, "the update added delta terms");
+    bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&vocabulary, &bytes).unwrap();
+    std::fs::remove_file(generation.join("wal.log")).unwrap();
+    assert!(validate_copy(dir.path(), false, &preparation()).is_err());
+}

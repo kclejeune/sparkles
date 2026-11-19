@@ -314,18 +314,19 @@ fn inspect_generation(
         // `sparkles check` runs this beside a live writer, so the log is bounded
         // first and the vocabulary and annotations are counted after it, as the
         // writer writes a group's terms and annotations before the next group's
-        // records (see `committed_bound`).
+        // records (see `committed_bound`). A missing log still has its vocabulary
+        // and annotations read, so their refusals hold for a closed copy.
         let path = directory.join("wal.log");
-        let loaded = match budget.buffered(&path) {
-            Ok(loaded) => loaded,
-            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(());
+        let log = match budget.buffered(&path) {
+            Ok(loaded) => {
+                let mut reader = loaded.value;
+                let extent = reader.get_ref().metadata()?.len();
+                let extent = wal::probe::committed_bound(&mut reader, extent, budget)?;
+                Some((reader, extent))
             }
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let mut reader = loaded.value;
-        let extent = reader.get_ref().metadata()?.len();
-        let extent = wal::probe::committed_bound(&mut reader, extent, budget)?;
         inspection_point("bound");
         let vocabulary = cold::head_vocabulary_controlled(directory, root, budget)?;
         let terms = vocabulary.value.len_limited(&budget.owned_limit()?)?;
@@ -337,6 +338,19 @@ fn inspect_generation(
             },
             Some(branch) => crate::annotations::seqs_controlled(root, branch, budget)?,
         };
+        let Some((mut reader, extent)) = log else {
+            return Ok(());
+        };
+        // The open log outlives a compaction that retires the generation, but its
+        // vocabulary read by path does not, and a vanished one reads as empty. A
+        // generation is never recreated under its name, so a log path still present
+        // now was present when the vocabulary was read, and a retired generation is
+        // left out as it is when its log is already gone.
+        match std::fs::symlink_metadata(&path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        }
         let mut configuration_error = None;
         wal::probe::prove_prefix_with(
             &mut reader,
