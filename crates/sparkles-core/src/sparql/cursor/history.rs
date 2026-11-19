@@ -144,7 +144,8 @@ impl History {
             let page = pages.next(PAGE, limit, &mut |b| charge.resize(b))?;
             self.total = self.total.saturating_add(page.changes.len());
             ctx.check_rows(self.total)?;
-            // a page stops at its limit only with one change more than the budget
+            // a page reaches its limit only with one change more than the budget, and
+            // stops there, so the refusal comes before any later record is read
             debug_assert!(!page.truncated, "a truncated page passes the row budget");
             if page.changes.is_empty() {
                 self.release();
@@ -155,12 +156,13 @@ impl History {
         }
     }
 
-    /// Drop a page whose rows are all out, and its charge.
+    /// Drop a page whose rows are all out, and its charge. What the pages keep between
+    /// pages stays charged.
     fn drop_page(&mut self) -> Result<()> {
         self.page = Vec::new();
         self.at = 0;
         match &mut self.pages {
-            Some((_, charge)) => charge.resize(0),
+            Some((pages, charge)) => charge.resize(pages.kept_bytes()),
             None => Ok(()),
         }
     }

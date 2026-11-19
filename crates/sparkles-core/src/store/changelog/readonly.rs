@@ -1712,9 +1712,11 @@ impl ReadOnlyLog {
 
     /// One page of a paged history read of commits `from` through `to`: the records
     /// whose changes `visit` takes, resuming where `cur` stopped, until `visit` stops
-    /// or the page holds `budget` changes before a record. Returns whether the range
-    /// was read to its end. The prefix of each segment that is read follows the rules
-    /// of [`ReadOnlyLog::walk`]. Newest first, the offsets of one segment's records are
+    /// or the page holds `budget` changes before a record is read or a segment is
+    /// walked. A commit is one record (see `append_pending`), so stopping before a
+    /// record never splits a commit. Returns whether the range was read to its end.
+    /// The prefix of each segment that is read follows the rules of
+    /// [`ReadOnlyLog::walk`]. Newest first, the offsets of one segment's records are
     /// kept, admitted as they grow, and read back from the newest.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn page(
@@ -1739,6 +1741,10 @@ impl ReadOnlyLog {
             while cur.seg < self.segments.len() {
                 let mut offset = cur.offset.unwrap_or(SEG_HEADER as u64);
                 loop {
+                    if held.len.get() >= budget {
+                        cur.offset = Some(offset);
+                        return Ok(false);
+                    }
                     let Some(body) = self.read_admitted(cur.seg, offset, check, held)? else {
                         break;
                     };
@@ -1755,15 +1761,12 @@ impl ReadOnlyLog {
                     if record.first() > to {
                         return Ok(true);
                     }
-                    if record.last() >= from && matches!(record, RecordView::Changes { .. }) {
-                        if held.len.get() >= budget {
-                            cur.offset = Some(offset);
-                            return Ok(false);
-                        }
-                        if !record.emit(filter, check, visit)? {
-                            cur.offset = Some(offset);
-                            return Ok(false);
-                        }
+                    if record.last() >= from
+                        && matches!(record, RecordView::Changes { .. })
+                        && !record.emit(filter, check, visit)?
+                    {
+                        cur.offset = Some(offset);
+                        return Ok(false);
                     }
                     cur.previous = Some(record.last());
                     offset = offset
@@ -1805,6 +1808,10 @@ impl ReadOnlyLog {
             if next == 0 {
                 return Ok(true);
             }
+            // a full page stops before it walks the next segment
+            if held.len.get() >= budget {
+                return Ok(false);
+            }
             let segment = next - 1;
             cur.rev_seg = Some(segment);
             let mut offset = SEG_HEADER as u64;
@@ -1826,16 +1833,18 @@ impl ReadOnlyLog {
                     && matches!(record, RecordView::Changes { .. })
                 {
                     if cur.rev.len() == cur.rev.capacity() {
+                        // a reallocation holds the old offsets beside the new ones
+                        let size = std::mem::size_of::<RecordOffset>() as u64;
+                        let old = cur.rev.capacity() as u64 * size;
                         let more = cur.rev.capacity().max(16);
-                        held.kept(
-                            ((cur.rev.capacity() + more) * std::mem::size_of::<RecordOffset>())
-                                as u64,
-                        )?;
+                        let new = old + more as u64 * size;
+                        held.kept(old + new)?;
                         cur.rev.try_reserve_exact(more).map_err(|_| {
                             Error::HistoryUnsupported(
                                 "history offset allocation was refused".into(),
                             )
                         })?;
+                        held.kept(new)?;
                     }
                     cur.rev.push(RecordOffset { segment, offset });
                 }

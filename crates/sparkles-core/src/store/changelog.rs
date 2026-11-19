@@ -1603,9 +1603,11 @@ impl ChangeLog {
     /// Read the changes of commits `from` through `to` that match `filter`, in commit
     /// order (newest first with `descending`), calling `visit` for each until it
     /// returns `false`. Returns the commits in the range whose changes are not
-    /// recorded, and without `holes` only those found before `visit` stops. With
-    /// `admit`, each record is read by [`ChangeLog::read_admitted`] and released (an
-    /// admission of 0) once its changes are visited; a read-only log is not read so.
+    /// recorded, and without `holes_after_stop` only those found before the scan stops.
+    /// With `paged`, each record is read by [`ChangeLog::read_admitted`] and released
+    /// (an admission of 0) once its changes are visited, and the scan stops where the
+    /// page is full, before the index of a segment is loaded and before a record is
+    /// read; a read-only log is not read so.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
@@ -1615,7 +1617,7 @@ impl ChangeLog {
         descending: bool,
         holes_after_stop: bool,
         check: &mut dyn FnMut() -> Result<()>,
-        mut admit: Option<&mut Admit<'_>>,
+        mut paged: Option<&mut PageHooks<'_, '_>>,
         visit: &mut Visit<'_>,
     ) -> Result<Vec<Unrecorded>> {
         if let Some(reader) = &self.readonly {
@@ -1673,6 +1675,17 @@ impl ChangeLog {
                     });
                 }
             }
+            // a full page stops before it loads the next segment's index; a commit is
+            // one record, so the segment holds no part of the commit read last
+            if !stop
+                && let Some(p) = paged.as_deref_mut()
+                && (p.full)(if descending { sl.min(to) } else { sf.max(from) })
+            {
+                stop = true;
+            }
+            if stop && !holes_after_stop {
+                break;
+            }
             let ix = self.index(&mut inner, i)?;
             let lo = ix.recs.partition_point(|r| r.seq < from);
             let hi = ix.recs.partition_point(|r| r.seq <= to);
@@ -1695,9 +1708,6 @@ impl ChangeLog {
                 }
             }
             if stop {
-                if !holes_after_stop {
-                    break;
-                }
                 continue;
             }
             // the records that may match
@@ -1735,8 +1745,14 @@ impl ChangeLog {
                 if e.hole.is_some() {
                     continue;
                 }
-                let record = match admit.as_deref_mut() {
-                    Some(admit) => self.read_admitted(&inner, i, e.offset, admit)?,
+                if let Some(p) = paged.as_deref_mut()
+                    && (p.full)(e.seq)
+                {
+                    stop = true;
+                    break;
+                }
+                let record = match paged.as_deref_mut() {
+                    Some(p) => self.read_admitted(&inner, i, e.offset, p.admit)?,
                     None => self.read(&inner, i, e.offset)?,
                 };
                 if let Record::Changes(c, changes) = &record {
@@ -1748,8 +1764,8 @@ impl ChangeLog {
                     }
                 }
                 drop(record);
-                if let Some(admit) = admit.as_deref_mut() {
-                    admit(0)?;
+                if let Some(p) = paged.as_deref_mut() {
+                    (p.admit)(0)?;
                 }
                 if stop {
                     if descending {
@@ -1757,6 +1773,9 @@ impl ChangeLog {
                     }
                     break;
                 }
+            }
+            if stop && !holes_after_stop {
+                break;
             }
         }
         holes.sort_by_key(|h| h.from);
@@ -1892,6 +1911,15 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut at: u64) -> std::io::Result<(
 pub(crate) type Visit<'a> = dyn FnMut(&Arc<ChangeCommit>, bool, &QuadKey) -> Result<bool> + 'a;
 /// Told the bytes a record being read holds now, before each allocation (item 829).
 pub(crate) type Admit<'a> = dyn FnMut(u64) -> Result<()> + 'a;
+
+/// What a paged history read gives [`ChangeLog::scan`] (item 829).
+pub(crate) struct PageHooks<'a, 'b> {
+    /// told the bytes a record being read holds now, before each allocation
+    pub(crate) admit: &'a mut Admit<'b>,
+    /// whether the page is full before a record of commit `seq` is read, or before a
+    /// segment whose next commit is `seq` is opened: the scan stops there
+    pub(crate) full: &'a mut dyn FnMut(u64) -> bool,
+}
 
 /// Which changes a scan returns: for each of graph, subject, predicate and object, the
 /// keys it may have (`None`: any).

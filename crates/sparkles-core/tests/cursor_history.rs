@@ -255,3 +255,103 @@ fn refusals_are_eagers() {
     assert!(matches!(&c, Error::HistoryUnsupported(_)), "{c}");
     assert_eq!(c.to_string(), e.to_string());
 }
+
+/// A page that reaches the row budget stops there: a record after it that is larger
+/// than the memory budget is not read, and the query fails on its rows as eager does.
+#[test]
+fn the_row_budget_fails_before_a_later_record_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    for persistent in [false, true] {
+        let o = StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        };
+        let s = match persistent {
+            true => Store::open(dir.path(), o).unwrap(),
+            false => Store::in_memory(o),
+        };
+        upd(&s, "INSERT DATA { <urn:a> <urn:p> 1 }");
+        upd(&s, "INSERT DATA { <urn:b> <urn:p> 2 }");
+        let big: String = (0..2000)
+            .map(|j| format!("<urn:big> <urn:p> \"{}{j}\" . ", "v".repeat(1000)))
+            .collect();
+        upd(&s, &format!("INSERT DATA {{ {big} }}"));
+        s.flush_change_log().unwrap();
+        let snap = s.snapshot();
+        let o = QueryOptions {
+            max_rows: Some(1),
+            max_memory_bytes: Some(1 << 20),
+            ..opts()
+        };
+        let e = eager(&snap, ALL, &o).unwrap_err();
+        assert!(
+            matches!(&e, Error::BudgetExceeded(b) if b.kind == BudgetKind::Rows),
+            "{e}"
+        );
+        let c = streamed(&snap, ALL, &o, &strict(7)).unwrap_err();
+        assert!(
+            matches!(&c, Error::BudgetExceeded(b) if b.kind == BudgetKind::Rows && b.limit == 1 && b.requested == 2),
+            "persistent={persistent}: {c}"
+        );
+        drop(snap);
+        drop(s);
+    }
+}
+
+/// A branch deleted while a streamed history query reads its change log: the later
+/// pulls either fail or give eager's rows, never fewer rows without an error.
+#[test]
+fn deleting_the_branch_under_a_reading_cursor_fails_or_reads_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = Store::open(
+        dir.path(),
+        StoreOptions {
+            change_log_segment_bytes: 4096,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    upd(&main, "INSERT DATA { <urn:main> <urn:p> 1 }");
+    main.create_branch("b", &Default::default()).unwrap();
+    let (snap, expected) = {
+        let b = main.branch("b").unwrap();
+        for i in 0..100 {
+            let body: String = (0..150)
+                .map(|j| format!("<urn:s{i}x{j}> <urn:p{}> \"{i}-{j}\" . ", j % 3))
+                .collect();
+            upd(&b, &format!("INSERT DATA {{ {body} }}"));
+        }
+        b.flush_change_log().unwrap();
+        let snap = b.snapshot();
+        let expected = eager(&snap, ALL, &opts()).unwrap();
+        (snap, expected)
+    };
+    assert!(expected.len() > 3 * 4096, "{}", expected.len());
+    let mut cursor =
+        select_cursor(snap.clone(), &format!("{P}{ALL}"), &opts(), &strict(100)).unwrap();
+    let mut answer: Rows = Vec::new();
+    let b = cursor.next_batch().unwrap().unwrap();
+    for r in 0..b.len() {
+        answer.push(b.row(r).unwrap().values().to_vec());
+    }
+    drop(b);
+    let deleted = main.delete_branch("b", true);
+    let mut failed = None;
+    loop {
+        match cursor.next_batch() {
+            Ok(Some(b)) => {
+                for r in 0..b.len() {
+                    answer.push(b.row(r).unwrap().values().to_vec());
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    if deleted.is_ok() && failed.is_none() {
+        assert_eq!(answer, expected, "rows went missing without an error");
+    }
+}
