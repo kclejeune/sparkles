@@ -412,12 +412,18 @@ implementation and always apply. EXPLAIN shows which ones ran.
   warm store. EXPLAIN notes `[merge on ?p]`. Other OPTIONALs keep the hash join, which
   puts the unmatched left rows last.
 * **Pair conditions in the streamed merge** (`merge_pair_conditions`). A streamed merge
-  OPTIONAL with a condition, whose key is the only shared variable, tests the condition on
-  the pairs of the left rows that the loaded right batch decides before it copies an
-  output row, as the eager merge does over the whole input. With the switch off it copies
-  every pair and an extension for every left row into the batch, copies the pairs again
-  for the test and then compacts the batch. Runs that cross a batch of the right input
-  keep that second path in both settings.
+  OPTIONAL that has a condition, and whose merge key is the only variable its two sides
+  share, tests the condition on the pairs of the left rows that the loaded right batch
+  decides before it copies an output row, as the eager merge does over the whole input.
+  With the switch off it copies every pair and an extension for every left row into the
+  batch, copies the pairs again for the test and then compacts the batch. A run that
+  crosses a batch of the right input, a left row whose pairs do not fit a whole batch
+  and a run that was written to disk keep that second path in both settings. The merge
+  tests their rows before it decides a later left row, so the condition sees the pairs
+  in input order. Testing the pairs first holds them beside the table that the condition
+  reads, which takes more scratch memory for a row than the second path, so a batch
+  that the memory budget cannot hold together with that scratch is built on the second
+  path.
 * **Probed OPTIONAL** (`probed_optional`). An OPTIONAL whose right side is a triple
   pattern, with its FILTERs, sorted on a variable that every row of the evaluated left
   side binds reads the pattern only for the left side's distinct values. It uses the
