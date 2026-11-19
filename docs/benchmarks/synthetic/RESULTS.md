@@ -737,9 +737,11 @@ forge with its base, c0948014, with a probe build of the direct comparison of tw
 keys on that base, and with 174de1f8, an earlier build of the item that gave each worker
 a map of its own. The cells were interleaved A/Bs of release builds that forge made with
 the same compilers, at 1.05M triples in five A,B,B,A rounds of ten timed requests per
-query and server. The
-[run record](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g1-streaming/summary.md), whose
-first cell this links, keeps the samples, answers and summary of each of the six cells with their [commands](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/run.sh.txt). Every cell returned the same
+query and server. The run record keeps the samples, answers and summary of each of the six cells, in the
+table's order [one](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g1-streaming/summary.md), [two](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g2-vs-direct/summary.md),
+[three](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g3-t12-streaming/summary.md), [four](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g4-t12-eager/summary.md),
+[five](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g5-vs-maps-streaming/summary.md) and [six](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g6-vs-maps-eager/summary.md),
+with their [commands](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/run.sh.txt). Every cell returned the same
 answers from both builds, and steal was zero. The table gives server execution time as a
 ratio of 3a8b7adb to the other build.
 
@@ -760,9 +762,11 @@ in all five rounds. `bind-two` and `order-lcase` at 12 threads read 0.992 to 1.0
 rounds on both sides of 1 and spreads of 8% to 94%.
 
 The 37-query screens compared 174de1f8 with c0948014, and item 678's pair compared
-75a70587 with 7e272f4d. The earlier
-[run record](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f5-screen-streaming/summary.md),
-whose first screen this links, keeps both with their
+75a70587 with 7e272f4d. The earlier run record keeps the
+[streaming](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f5-screen-streaming/summary.md) and
+[automatic](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f6-screen-auto/summary.md) screens and the pair's
+[automatic](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f7-layout-auto/summary.md) and
+[streaming](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f8-layout-streaming/summary.md) cells with their
 [commands](runs/2026-11-18-floor-cache-ab-forge-174de1f8/run.sh.txt).
 The screens against the base ran three rounds and read a geometric mean of 0.980 in
 streaming and 0.970 in automatic execution, with no query 10% slower, and automatic

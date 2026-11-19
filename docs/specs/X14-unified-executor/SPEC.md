@@ -283,14 +283,18 @@ first table as large as the vocabulary's clamp closed that gap but made `str-pai
 whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
 
 `str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
-floors are nearly all computed once, and in streaming execution their reads of a key and
-its predecessor cost more than comparing the two keys. A switch that turns the floors off
+floors are nearly all computed once, and in streaming execution they cost more than
+comparing the two keys. A switch that turns the floors off
 when a prefix of the rows repeats few values was considered and not built, because in a
 shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
 `str-pair-colleague` while the whole query repeats many, so the switch would lose the
 names query's 2x. A profile of the per-worker maps put most of the floors' time in
 `Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
-predecessor, and item 1088 recovers the streaming cost.
+predecessor. The shared table has not been profiled, so that read is the suspected cause
+of its cost, and item 1088 recovers the streaming cost. Its first candidate allocates the
+checked walk's key buffer before the walk instead of growing it from empty and reads the
+predecessor without the copy that `PrevKey::keep` makes, keeping the checked envelope and
+its fallback.
 
 Queries that the floors do not reach also became slower in every round, and item 1089
 holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
