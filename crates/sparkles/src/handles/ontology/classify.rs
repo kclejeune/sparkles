@@ -769,25 +769,75 @@ fn bounded<T>(
 }
 
 /// What [`unsatisfiable_at`] found.
+#[derive(Debug, Default)]
 pub(crate) struct Unsatisfiable {
     /// the unsatisfiable named classes, sorted, without `owl:Nothing`
     pub classes: Vec<String>,
-    /// false when the ontology has no model, so that every class is unsatisfiable
+    /// false when the terminology has no model, so that every class is unsatisfiable
     pub consistent: bool,
-    /// how many axioms the classifier left out or used in part, since they are outside
-    /// what it reasons with
+    /// how many axioms the answer may depend on but the classifier left out, since they
+    /// are outside what it reasons with
     pub excluded: usize,
-    /// why some of the ontology could not be read, such as an `owl:imports` that resolves
-    /// to no graph of the snapshot
+    /// how many named individuals the terminology names, as in `owl:oneOf` or
+    /// `owl:hasValue`: the answer can depend on the assertions about them, which the check
+    /// does not read
+    pub nominals: usize,
+    /// why the ontology could not be read whole, such as an `owl:imports` that resolves to
+    /// no graph of the snapshot. When it is not empty, nothing was classified.
     pub unresolved: Vec<String>,
 }
 
-/// The unsatisfiable classes of the ontology that `graphs` of `snap` hold, with the
+/// The predicates whose triples are the roots of logical axioms of the terminology: a
+/// read that leaves such a triple unmapped has lost an axiom.
+const ROOT_PREDICATES: [&str; 12] = [
+    vocab::RDFS_SUB_CLASS_OF,
+    vocab::OWL_EQUIVALENT_CLASS,
+    vocab::OWL_DISJOINT_WITH,
+    vocab::OWL_DISJOINT_UNION_OF,
+    vocab::RDFS_SUB_PROPERTY_OF,
+    vocab::OWL_EQUIVALENT_PROPERTY,
+    vocab::OWL_PROPERTY_DISJOINT_WITH,
+    vocab::RDFS_DOMAIN,
+    vocab::RDFS_RANGE,
+    vocab::OWL_INVERSE_OF,
+    vocab::OWL_PROPERTY_CHAIN_AXIOM,
+    vocab::OWL_HAS_KEY,
+];
+
+/// The `rdf:type` objects whose class assertions are the roots of logical axioms.
+const ROOT_TYPES: [&str; 9] = [
+    vocab::OWL_ALL_DISJOINT_CLASSES,
+    vocab::OWL_ALL_DISJOINT_PROPERTIES,
+    vocab::OWL_FUNCTIONAL_PROPERTY,
+    vocab::OWL_INVERSE_FUNCTIONAL_PROPERTY,
+    vocab::OWL_TRANSITIVE_PROPERTY,
+    vocab::OWL_SYMMETRIC_PROPERTY,
+    vocab::OWL_ASYMMETRIC_PROPERTY,
+    vocab::OWL_REFLEXIVE_PROPERTY,
+    vocab::OWL_IRREFLEXIVE_PROPERTY,
+];
+
+/// Whether `t` is the root triple of a logical axiom of the terminology.
+fn axiom_root(t: &oxrdf::Triple) -> bool {
+    let p = t.predicate.as_str();
+    if p == vocab::RDF_TYPE {
+        return matches!(&t.object, Term::NamedNode(o) if ROOT_TYPES.contains(&o.as_str()));
+    }
+    ROOT_PREDICATES.contains(&p)
+}
+
+/// The unsatisfiable classes of the terminology that `graphs` of `snap` hold, with the
 /// imports that resolve to graphs of `snap` through `import_targets`, by one complete
 /// classification of its asserted logical axioms (spec C31, `chk:UnsatisfiableClassesCheck`).
 /// It reads the snapshot alone, with no dataset handle or kept classification, and runs
 /// under the deadline, cancellation and memory budget of `opts`. A run those stop fails,
 /// since a partial answer could miss an unsatisfiable class.
+///
+/// It reads the terminology and leaves out assertions about individuals, in whatever form
+/// the graphs hold them, so its cost does not grow with the data. It never reads the
+/// materialized inferences, also through an import, and it loses no input: an index
+/// error, a quad it cannot decode, an error of the OWL reader or a logical axiom the
+/// reader could not map is an error, not an axiom left out.
 pub(crate) fn unsatisfiable_at(
     snap: &Arc<Snapshot>,
     graphs: Vec<GraphRef>,
@@ -800,14 +850,96 @@ pub(crate) fn unsatisfiable_at(
         ..Default::default()
     };
     req.validate()?;
-    let (resolved, _) = req.resolve(snap, &|_| true);
-    let unresolved = resolved.warnings.clone();
-    let graph_ids: Vec<Option<crate::id::Id>> =
-        resolved.graphs.iter().map(|g| g.id(snap)).collect();
-    let (ontology, _) = super::read_store(snap, &graph_ids, req.graphs().len(), req.mode, opts)?;
+    // only asserted graphs: the materialized inferences and the gate's run records are
+    // never an ontology graph, also when an import names them
+    let unread: Vec<crate::id::Id> = [INFERRED_GRAPH, crate::gate::RUNS_GRAPH]
+        .iter()
+        .filter_map(|g| snap.lookup_iri(g))
+        .collect();
+    let inputs = sparkles_reasoner::inputs::Inputs {
+        data_graphs: req.graphs(),
+        ontology_graphs: Vec::new(),
+        imports: req.imports,
+        location_mapping: Default::default(),
+    };
+    let to_error = |e: anyhow::Error| match e.downcast::<Error>() {
+        Ok(e) => e,
+        Err(e) => Error::Corrupt(format!("{e:#}")),
+    };
+    let (resolved, _) = sparkles_reasoner::inputs::try_resolve_closure(
+        snap,
+        &inputs,
+        &|id| !unread.contains(&id),
+        &req.import_targets,
+        &|| check(opts).map_err(anyhow::Error::new),
+    )
+    .map_err(to_error)?;
+    if !resolved.warnings.is_empty() {
+        return Ok(Unsatisfiable {
+            unresolved: resolved.warnings,
+            ..Default::default()
+        });
+    }
+    let mut graph_ids = Vec::with_capacity(resolved.graphs.len());
+    for g in &resolved.graphs {
+        match g.try_id(snap)? {
+            Some(id) if !unread.contains(&id) => graph_ids.push(Some(id)),
+            _ => {
+                return Ok(Unsatisfiable {
+                    unresolved: vec![format!(
+                        "the graph <{}> is not an ontology graph",
+                        g.as_str()
+                    )],
+                    ..Default::default()
+                });
+            }
+        }
+    }
+    let (ontology, _) =
+        super::read_store_with(snap, &graph_ids, req.graphs().len(), req.mode, opts, true)?;
     check(opts)?;
-    let axioms = logical_axioms(&ontology);
-    let (out, excluded) = classify_once(&axioms, &ClassifyRequest::default(), opts)?;
+    if ontology.error_count > 0 {
+        let first = ontology
+            .diagnostics
+            .iter()
+            .find(|d| d.severity == sparkles_owl::read::Severity::Error)
+            .map_or_else(|| "an error".to_string(), |d| d.message.clone());
+        return Err(Error::invalid(format!(
+            "the OWL reader could not read the ontology whole ({} errors): {first}",
+            ontology.error_count
+        )));
+    }
+    if let Some(t) = ontology
+        .unmapped
+        .iter()
+        .map(|i| &ontology.triples[*i])
+        .find(|t| axiom_root(t))
+    {
+        return Err(Error::invalid(format!(
+            "the triple {t} of the ontology maps to no axiom, so an axiom would be left out"
+        )));
+    }
+    let mut tbox: Vec<&AxiomKind> = Vec::new();
+    let mut nominals: std::collections::BTreeSet<Entity> = Default::default();
+    for a in ontology.axioms.keys().filter(|a| logical(&a.kind)) {
+        if !a.kind.axiom_type().is_assertion() {
+            nominals.extend(
+                a.signature()
+                    .into_iter()
+                    .filter(|e| matches!(e, Entity::NamedIndividual(_))),
+            );
+            tbox.push(&a.kind);
+        }
+    }
+    if tbox.is_empty() {
+        return Ok(Unsatisfiable {
+            unresolved: vec![
+                "the ontology graphs hold no logical axioms of a terminology".to_string(),
+            ],
+            ..Default::default()
+        });
+    }
+    let (out, excluded) = classify_once(&tbox, &ClassifyRequest::default(), opts)?;
     if !out.complete {
         return Err(Error::Timeout);
     }
@@ -819,6 +951,7 @@ pub(crate) fn unsatisfiable_at(
             .collect(),
         consistent: out.consistent,
         excluded: excluded.len(),
-        unresolved,
+        nominals: nominals.len(),
+        unresolved: Vec::new(),
     })
 }

@@ -20,8 +20,9 @@
 //! The check types are `chk:ShaclCheck` (`chk:shapesGraph` or inline `chk:shapes` Turtle,
 //! `chk:dataGraph` and `chk:inferences`), `chk:ShexCheck` (`chk:schema` ShExC and
 //! `chk:shapeMap`), `chk:DiagnosticsCheck` (OWL RL diagnostics, `chk:diagnostic` ids, none
-//! for all), `chk:UnsatisfiableClassesCheck` (the OWL 2 EL classifier on the asserted axioms
-//! of the `chk:graph` graphs, the default graph without one, and their imports) and
+//! for all), `chk:UnsatisfiableClassesCheck` (the OWL 2 EL classifier on the asserted
+//! terminology of the `chk:graph` graphs, the default graph without one, and their imports,
+//! with `chk:requireComplete`) and
 //! `chk:QueryCheck`, a query that must return nothing (`chk:query` text, or
 //! `chk:storedQuery` with `chk:storedQueryVersion` and `chk:storedQueryDigest`, the
 //! `sha256:` digest of its text). A stored query without its digest parses, so that a store
@@ -36,13 +37,28 @@
 //! check type, an unknown term of the vocabulary, a missing or repeated value, or a check
 //! the suite does not link is refused, never ignored.
 //!
-//! A SHACL check selects its data graph as the SHACL write guard does. Without
-//! `chk:dataGraph` it reads the store's default graph, which is the union of all graphs only
-//! when the store uses a union default graph, so on another store it does not see data in
-//! named graphs. `chk:dataGraph chk:UnionGraph` reads every graph, and graph IRIs, with
-//! `chk:DefaultGraph` for the default graph, read those graphs, each of which must hold data
-//! in the candidate. The shapes graph, the run records and, unless `chk:inferences true`, the
-//! materialized inferences are never data.
+//! A SHACL check selects its data graph as the SHACL write guard does, so that a gate and
+//! the guard judge the same data. Without `chk:dataGraph` it reads the store's default
+//! graph, which is the union of all graphs only when the store uses a union default graph,
+//! so on another store it does not see data in named graphs. A check that must see every
+//! graph names `chk:dataGraph chk:UnionGraph` or runs on a store with a union default
+//! graph. Graph IRIs, with `chk:DefaultGraph` for the default graph, read those graphs, each
+//! of which must hold data in the candidate. The shapes graph, the run records and, unless
+//! `chk:inferences true`, the materialized inferences are never data. A shapes graph is an
+//! ordinary named graph: `chk:shapesGraph` refuses the ARQ aliases and the reserved graphs,
+//! and shapes that target nothing are refused rather than validating nothing.
+//!
+//! An unsatisfiable-classes check classifies the terminology and leaves out assertions
+//! about individuals in every form the graphs hold them, so its cost does not grow with the
+//! data. A contradiction among assertions, such as an individual of two disjoint classes,
+//! is found by a `chk:DiagnosticsCheck` or a SHACL check. The check never reads the
+//! materialized inferences, also through an import, and an index error, a quad it cannot
+//! decode, an error of the OWL reader, a logical axiom the reader cannot map, an import
+//! that resolves to no graph and graphs with no terminology are errors. What the answer
+//! may depend on but the check leaves out, the axioms outside what the classifier reasons
+//! with and the assertions about individuals that the terminology names, is a note of
+//! severity `sh:Warning` in the result, and `chk:requireComplete true` makes it keep the
+//! check from passing with the code `check-incomplete`.
 //!
 //! [`run`] reads the inputs of a check, a shapes graph or a stored query, from the state
 //! the merge starts from and never from the candidate, so a merge cannot weaken the checks
@@ -52,7 +68,7 @@ mod run;
 #[cfg(test)]
 mod tests;
 
-pub use run::{CheckResult, Inputs, Status, SuiteReport, run};
+pub use run::{CheckResult, Inputs, Note, Status, SuiteReport, run};
 
 use oxrdf::{NamedNode, Term, Triple};
 use std::collections::{BTreeMap, BTreeSet};
@@ -181,10 +197,14 @@ pub enum CheckKind {
         diagnostics: Vec<String>,
         inferences: bool,
     },
-    /// the classes the OWL 2 EL classifier finds unsatisfiable in the asserted axioms of
-    /// `graphs` (empty: the default graph) and their imports
+    /// the classes the OWL 2 EL classifier finds unsatisfiable in the asserted
+    /// terminology of `graphs` (empty: the default graph) and their imports. Axioms the
+    /// answer may depend on but the classifier leaves out are a `sh:Warning` note, and
+    /// with `require_complete` (`chk:requireComplete true`) they keep the check from
+    /// passing.
     UnsatisfiableClasses {
         graphs: Vec<NamedNode>,
+        require_complete: bool,
     },
     /// a query that must return no solutions, `false` or no triples
     Query(Query),
@@ -268,7 +288,7 @@ fn allowed(kind: &str) -> &'static [&'static str] {
         "ShaclCheck" => &["shapesGraph", "shapes", "dataGraph", "inferences"],
         "ShexCheck" => &["schema", "shapeMap"],
         "DiagnosticsCheck" => &["diagnostic", "inferences"],
-        "UnsatisfiableClassesCheck" => &["graph"],
+        "UnsatisfiableClassesCheck" => &["graph", "requireComplete"],
         "QueryCheck" => &[
             "query",
             "storedQuery",
@@ -310,20 +330,32 @@ impl Suite {
         ) {
             return Err(bad("a suite is Turtle or N-Triples"));
         }
-        let mut triples = Vec::new();
-        for q in oxrdfio::RdfParser::from_format(format).for_slice(text.as_bytes()) {
-            let q = q.map_err(|e| bad(format!("syntax error: {e}")))?;
-            triples.push(Triple::new(q.subject, q.predicate, q.object));
-        }
-        Suite::from_triples(triples)
+        Suite::accumulate(
+            oxrdfio::RdfParser::from_format(format)
+                .for_slice(text.as_bytes())
+                .map(|q| {
+                    q.map(|q| Triple::new(q.subject, q.predicate, q.object))
+                        .map_err(|e| bad(format!("syntax error: {e}")))
+                }),
+        )
     }
 
     /// Read a suite from its triples.
     pub fn from_triples(triples: impl IntoIterator<Item = Triple>) -> Result<Suite, SuiteError> {
+        Suite::accumulate(triples.into_iter().map(Ok))
+    }
+
+    /// Read a suite from triples as they arrive, so that no more than its canonical
+    /// N-Triples is held: the first unique triple past [`MAX_SUITE_BYTES`] ends the read
+    /// before the next is asked for.
+    fn accumulate(
+        triples: impl Iterator<Item = Result<Triple, SuiteError>>,
+    ) -> Result<Suite, SuiteError> {
         let mut subjects: BTreeMap<String, Props> = BTreeMap::new();
         let mut lines = BTreeSet::new();
         let mut canonical_bytes = 0usize;
         for t in triples {
+            let t = t?;
             let s = match &t.subject {
                 oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().to_string(),
                 _ => {
@@ -638,20 +670,28 @@ fn check(s: &str, kind: &str, props: &Props) -> Result<Check, SuiteError> {
             Some(_) => Err(bad(format!("<{s}>: chk:{local} takes an IRI"))),
         }
     };
-    let inferences = || -> Result<bool, SuiteError> {
-        match one(props, &ns("inferences"), s)? {
+    let boolean = |local: &str| -> Result<bool, SuiteError> {
+        match one(props, &ns(local), s)? {
             None => Ok(false),
             Some(Term::Literal(l)) if l.datatype().as_str() == XSD_BOOLEAN => match l.value() {
                 "true" | "1" => Ok(true),
                 "false" | "0" => Ok(false),
-                _ => Err(bad(format!("<{s}>: chk:inferences takes a boolean"))),
+                _ => Err(bad(format!("<{s}>: chk:{local} takes a boolean"))),
             },
-            Some(_) => Err(bad(format!("<{s}>: chk:inferences takes a boolean"))),
+            Some(_) => Err(bad(format!("<{s}>: chk:{local} takes a boolean"))),
         }
     };
+    let inferences = || boolean("inferences");
     let kind = match kind {
         "ShaclCheck" => {
             let shapes = match (iri("shapesGraph")?, string("shapes")?) {
+                (Some(g), None) if reserved_graph(g.as_str()) => {
+                    return Err(bad(format!(
+                        "<{s}>: chk:shapesGraph names a graph that holds the shapes, not <{}>; \
+                         the shapes come from a named graph or from chk:shapes",
+                        g.as_str()
+                    )));
+                }
                 (Some(g), None) => Shapes::Graph(g),
                 (None, Some(t)) => Shapes::Inline(t),
                 _ => {
@@ -719,7 +759,10 @@ fn check(s: &str, kind: &str, props: &Props) -> Result<Check, SuiteError> {
                 }
             }
             graphs.sort();
-            CheckKind::UnsatisfiableClasses { graphs }
+            CheckKind::UnsatisfiableClasses {
+                graphs,
+                require_complete: boolean("requireComplete")?,
+            }
         }
         "QueryCheck" => {
             let version = match one(props, &ns("storedQueryVersion"), s)? {

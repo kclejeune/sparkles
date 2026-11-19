@@ -42,12 +42,25 @@ pub struct CheckResult {
     pub status: Status,
     /// what it found: results, nonconformant nodes, findings or solutions
     pub findings: u64,
-    /// why it could not run: `check-unavailable`, `input-missing`, `input-invalid` or
-    /// `check-timeout`
+    /// why it could not run: `check-unavailable`, `input-missing`, `input-invalid`,
+    /// `check-timeout`, `budget-exceeded` or `check-incomplete`
     pub code: Option<&'static str>,
     /// at most [`MAX_MESSAGES`] messages
     pub messages: Vec<String>,
+    /// what the check reports beside its findings, each with its own severity, such as
+    /// the axioms an unsatisfiable-classes check left out. A note never fails the suite.
+    pub notes: Vec<Note>,
     pub millis: u64,
+}
+
+/// Something a check reports beside its findings, with its own severity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub severity: Severity,
+    /// a stable code, such as `axioms-left-out`
+    pub code: &'static str,
+    pub count: u64,
+    pub message: String,
 }
 
 impl CheckResult {
@@ -92,6 +105,12 @@ impl SuiteReport {
                 "findings": r.findings,
                 "code": r.code,
                 "messages": r.messages,
+                "notes": r.notes.iter().map(|n| serde_json::json!({
+                    "severity": n.severity.name(),
+                    "code": n.code,
+                    "count": n.count,
+                    "message": n.message,
+                })).collect::<Vec<_>>(),
                 "millis": r.millis,
             })).collect::<Vec<_>>(),
         })
@@ -126,8 +145,9 @@ pub fn run(suite: &Suite, inputs: &Inputs<'_>) -> SuiteReport {
     }
 }
 
-/// What a checker answers: the findings and their messages, or why it could not run.
-type Outcome = Result<(u64, Vec<String>), (&'static str, String)>;
+/// What a checker answers: the findings, their messages and its notes, or why it could
+/// not run.
+type Outcome = Result<(u64, Vec<String>, Vec<Note>), (&'static str, String)>;
 
 /// One check's bound: its deadline, and what remains of it for the checkers that take a
 /// relative timeout.
@@ -184,7 +204,10 @@ fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
                 diagnostics,
                 inferences,
             } => diagnostics_check(diagnostics.clone(), *inferences, inputs, bound),
-            CheckKind::UnsatisfiableClasses { graphs } => unsatisfiable(graphs, inputs, bound),
+            CheckKind::UnsatisfiableClasses {
+                graphs,
+                require_complete,
+            } => unsatisfiable(graphs, *require_complete, inputs, bound),
             CheckKind::Query(q) => query(q, inputs, bound),
         }
     } else {
@@ -197,17 +220,17 @@ fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
         ))
     };
     // a check that ends after its deadline never passes, and its error is the timeout
-    if bound.passed() && !matches!(outcome, Ok((n, _)) if n > 0) {
+    if bound.passed() && !matches!(outcome, Ok((n, _, _)) if n > 0) {
         return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
     }
     outcome
 }
 
 fn result(c: &Check, outcome: Outcome, t0: Instant) -> CheckResult {
-    let (status, findings, code, mut messages) = match outcome {
-        Ok((0, m)) => (Status::Passed, 0, None, m),
-        Ok((n, m)) => (Status::Failed, n, None, m),
-        Err((code, m)) => (Status::Error, 0, Some(code), vec![m]),
+    let (status, findings, code, mut messages, notes) = match outcome {
+        Ok((0, m, notes)) => (Status::Passed, 0, None, m, notes),
+        Ok((n, m, notes)) => (Status::Failed, n, None, m, notes),
+        Err((code, m)) => (Status::Error, 0, Some(code), vec![m], Vec::new()),
     };
     messages.truncate(MAX_MESSAGES);
     CheckResult {
@@ -218,6 +241,7 @@ fn result(c: &Check, outcome: Outcome, t0: Instant) -> CheckResult {
         findings,
         code,
         messages,
+        notes,
         millis: t0.elapsed().as_millis() as u64,
     }
 }
@@ -276,11 +300,16 @@ fn shacl(
                 .map_err(|e| failure(&e))?
         }
     };
+    if shapes.targeted().next().is_none() {
+        return Err((
+            "input-invalid",
+            "the shapes have no shape with a target, so the check would validate nothing"
+                .to_string(),
+        ));
+    }
     if let DataGraph::Graphs(gs) = data_graph {
         for g in gs {
-            if g != "urn:x-arq:DefaultGraph"
-                && !holds_data(inputs.after, g).map_err(|e| failure(&e.into()))?
-            {
+            if !holds_data(inputs.after, g).map_err(|e| failure(&e.into()))? {
                 return Err((
                     "input-missing",
                     format!("the data graph <{g}> holds no data in the candidate"),
@@ -310,7 +339,7 @@ fn shacl(
     };
     let report = sparkles_shacl::validate(inputs.after, &shapes, &opts).map_err(|e| failure(&e))?;
     if report.conforms {
-        return Ok((0, Vec::new()));
+        return Ok((0, Vec::new(), Vec::new()));
     }
     let messages = report
         .results
@@ -328,7 +357,7 @@ fn shacl(
             }
         })
         .collect();
-    Ok((report.results.len().max(1) as u64, messages))
+    Ok((report.results.len().max(1) as u64, messages, Vec::new()))
 }
 
 #[cfg(not(feature = "shacl"))]
@@ -355,7 +384,7 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
     let results =
         sparkles_shex::validate(inputs.after, &compiled, &map, &opts).map_err(|e| failure(&e))?;
     if results.conforms {
-        return Ok((0, Vec::new()));
+        return Ok((0, Vec::new(), Vec::new()));
     }
     let messages = results
         .results
@@ -371,7 +400,7 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
             )
         })
         .collect();
-    Ok((results.nonconformant.max(1) as u64, messages))
+    Ok((results.nonconformant.max(1) as u64, messages, Vec::new()))
 }
 
 #[cfg(not(feature = "shex"))]
@@ -409,7 +438,7 @@ fn diagnostics_check(
                     ),
                 ));
             }
-            _ => {}
+            CheckStatus::Violations | CheckStatus::None | CheckStatus::Truncated => {}
         }
     }
     let total: usize = report.checks.iter().map(|o| o.findings).sum();
@@ -423,7 +452,11 @@ fn diagnostics_check(
         .take(MAX_MESSAGES)
         .map(|f| format!("{}: {}", f.check, f.message))
         .collect();
-    Ok(((total.max(usize::from(truncated))) as u64, messages))
+    Ok((
+        (total.max(usize::from(truncated))) as u64,
+        messages,
+        Vec::new(),
+    ))
 }
 
 #[cfg(not(feature = "reasoning"))]
@@ -497,36 +530,51 @@ fn query(q: &Query, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
         (n, QueryKind::Select) => vec![format!("the query returned {n} solutions")],
         (n, _) => vec![format!("the query returned {n} triples")],
     };
-    Ok((n, messages))
+    Ok((n, messages, Vec::new()))
 }
 
-/// Whether the named graph `iri` holds a quad in `snap`.
+/// Whether the graph `iri` holds a quad in `snap`: the named graph of that IRI, or the
+/// default graph for `urn:x-arq:DefaultGraph`.
 #[cfg(any(feature = "shacl", feature = "ontology"))]
 fn holds_data(snap: &Arc<Snapshot>, iri: &str) -> sparkles_core::Result<bool> {
-    let Some(id) = snap.lookup_iri(iri) else {
-        return Ok(false);
+    let id = if iri == sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI {
+        crate::id::Id::DEFAULT_GRAPH
+    } else {
+        match snap.lookup_iri(iri) {
+            Some(id) => id,
+            None => return Ok(false),
+        }
     };
     Ok(snap.count(crate::index::Perm::Gspo, &[id.0])? > 0)
 }
 
 #[cfg(feature = "ontology")]
-fn unsatisfiable(graphs: &[oxrdf::NamedNode], inputs: &Inputs<'_>, bound: Bound) -> Outcome {
+fn unsatisfiable(
+    graphs: &[oxrdf::NamedNode],
+    require_complete: bool,
+    inputs: &Inputs<'_>,
+    bound: Bound,
+) -> Outcome {
     use sparkles_reasoner::inputs::GraphRef;
     let mut refs = Vec::new();
     for g in graphs {
-        if !holds_data(inputs.after, g.as_str()).map_err(|e| failure(&e.into()))? {
-            return Err((
-                "input-missing",
-                format!(
-                    "the ontology graph <{}> holds no data in the candidate",
-                    g.as_str()
-                ),
-            ));
-        }
         refs.push(GraphRef::Named(g.as_str().to_string()));
     }
     if refs.is_empty() {
         refs.push(GraphRef::Default);
+    }
+    let names: Vec<&str> = if graphs.is_empty() {
+        vec![sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI]
+    } else {
+        graphs.iter().map(|g| g.as_str()).collect()
+    };
+    for g in names {
+        if !holds_data(inputs.after, g).map_err(|e| failure(&e.into()))? {
+            return Err((
+                "input-missing",
+                format!("the ontology graph <{g}> holds no data in the candidate"),
+            ));
+        }
     }
     let opts = crate::sparql::QueryOptions {
         timeout: bound.remaining(),
@@ -545,7 +593,8 @@ fn unsatisfiable(graphs: &[oxrdf::NamedNode], inputs: &Inputs<'_>, bound: Bound)
     }
     let mut messages = Vec::new();
     if !u.consistent {
-        messages.push("the ontology is inconsistent, so every class is unsatisfiable".to_string());
+        messages
+            .push("the terminology is inconsistent, so every class is unsatisfiable".to_string());
     }
     messages.extend(
         u.classes
@@ -553,17 +602,39 @@ fn unsatisfiable(graphs: &[oxrdf::NamedNode], inputs: &Inputs<'_>, bound: Bound)
             .take(MAX_MESSAGES)
             .map(|c| format!("<{c}> is unsatisfiable")),
     );
-    if u.excluded > 0 {
-        messages.push(format!(
-            "{} axioms are outside what the classifier reasons with and were left out",
-            u.excluded
-        ));
-    }
     let findings = u.classes.len() as u64 + u64::from(!u.consistent);
-    Ok((findings, messages))
+    let mut notes = Vec::new();
+    if u.excluded + u.nominals > 0 {
+        let mut parts = Vec::new();
+        if u.excluded > 0 {
+            parts.push(format!(
+                "{} axioms are outside what the classifier reasons with and were left out",
+                u.excluded
+            ));
+        }
+        if u.nominals > 0 {
+            parts.push(format!(
+                "the terminology names {} individuals, and the assertions about them, which \
+                 the check does not read, can make a class unsatisfiable",
+                u.nominals
+            ));
+        }
+        let message = parts.join("; ");
+        // a positive finding stands, since the axioms read already prove it
+        if require_complete && findings == 0 {
+            return Err(("check-incomplete", message));
+        }
+        notes.push(Note {
+            severity: Severity::Warning,
+            code: "axioms-left-out",
+            count: (u.excluded + u.nominals) as u64,
+            message,
+        });
+    }
+    Ok((findings, messages, notes))
 }
 
 #[cfg(not(feature = "ontology"))]
-fn unsatisfiable(_: &[oxrdf::NamedNode], _: &Inputs<'_>, _: Bound) -> Outcome {
+fn unsatisfiable(_: &[oxrdf::NamedNode], _: bool, _: &Inputs<'_>, _: Bound) -> Outcome {
     unreachable!("an unavailable check does not run")
 }

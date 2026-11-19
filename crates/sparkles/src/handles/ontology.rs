@@ -1897,6 +1897,19 @@ fn read_store(
     mode: Mode,
     opts: &QueryOptions,
 ) -> Result<(read::Ontology, Inner)> {
+    read_store_with(snap, graph_ids, requested, mode, opts, false)
+}
+
+/// [`read_store`], where `strict` makes a selected quad whose terms cannot be decoded an
+/// error rather than a quad left out, for a reader that must not lose input.
+fn read_store_with(
+    snap: &Arc<Snapshot>,
+    graph_ids: &[Option<Id>],
+    requested: usize,
+    mode: Mode,
+    opts: &QueryOptions,
+    strict: bool,
+) -> Result<(read::Ontology, Inner)> {
     let graph_of_id: FxHashMap<Id, u32> = graph_ids
         .iter()
         .enumerate()
@@ -2002,6 +2015,7 @@ fn read_store(
         requested,
         mode,
         (terminological, mains),
+        strict,
     )
 }
 
@@ -2042,6 +2056,7 @@ impl Collect<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     snap: &Snapshot,
     quads: Vec<[Id; 4]>,
@@ -2050,15 +2065,24 @@ fn finish(
     requested: usize,
     mode: Mode,
     (terminological, mains): (FxHashSet<Id>, FxHashSet<[Id; 4]>),
+    strict: bool,
 ) -> Result<(read::Ontology, Inner)> {
     let mut triples = Vec::with_capacity(quads.len());
     let mut graph_of = Vec::with_capacity(quads.len());
     let mut kept = Vec::with_capacity(quads.len());
     for q in quads {
-        if let Some(t) = triple_of(snap, &q) {
-            triples.push(t);
-            graph_of.push(graph_of_id[&q[3]]);
-            kept.push(q);
+        match triple_of(snap, &q) {
+            Some(t) => {
+                triples.push(t);
+                graph_of.push(graph_of_id[&q[3]]);
+                kept.push(q);
+            }
+            None if strict => {
+                return Err(Error::Corrupt(format!(
+                    "a quad of the ontology graphs cannot be read as a triple: {q:?}"
+                )));
+            }
+            None => {}
         }
     }
     let primary: Vec<u32> = (0..requested.min(graphs) as u32).collect();

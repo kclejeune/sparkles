@@ -1279,6 +1279,41 @@ fn deep_nesting_stays_unmapped() {
 }
 
 #[test]
+fn an_error_past_the_diagnostics_limit_is_still_counted() {
+    // undeclared entities give warnings first, which fill a limit of one, and the
+    // expression nested too deeply then gives an error that the limit drops
+    let mut body = String::from(":X rdfs:subClassOf :Y .\n:A rdfs:subClassOf _:c0 .\n");
+    for i in 0..200 {
+        body.push_str(&format!(
+            "_:c{i} a owl:Class ; owl:complementOf _:c{} .\n",
+            i + 1
+        ));
+    }
+    body.push_str("_:c200 a owl:Class ; owl:complementOf :B .\n");
+    let o = read::read_graph(
+        ttl(&body),
+        ReadOptions {
+            mode: Mode::Lenient,
+            max_diagnostics: 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(o.diagnostics.len(), 1, "{:?}", o.diagnostics);
+    assert!(
+        o.diagnostics
+            .iter()
+            .all(|d| d.severity == Severity::Warning)
+    );
+    assert!(o.diagnostics_dropped > 0);
+    assert_eq!(o.error_count, 1, "the nesting error is counted");
+    // a read within the limit counts the same error
+    let full = lenient(&body);
+    assert_eq!(full.error_count, 1);
+    assert!(full.diagnostics.iter().any(|d| d.code == "nesting"));
+    assert_eq!(lenient(":X rdfs:subClassOf :Y .").error_count, 0);
+}
+
+#[test]
 fn mentions_reaches_annotation_values() {
     let see = "http://example.org/E";
     let o = strict(&decl(

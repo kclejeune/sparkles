@@ -240,6 +240,9 @@ pub struct Ontology {
     pub diagnostics: Vec<Diagnostic>,
     /// diagnostics past the limit, counted
     pub diagnostics_dropped: usize,
+    /// the error diagnostics of the read, counted before the limit applies, so that an
+    /// error past the limit is still known
+    pub error_count: usize,
     pub typing: Typing,
     pub mode: Mode,
     pub terminology_only: bool,
@@ -501,6 +504,7 @@ pub fn read(
         used,
         diags,
         dropped,
+        errors,
         typing,
         headers,
         rind,
@@ -531,6 +535,7 @@ pub fn read(
         unmapped,
         diagnostics: diags,
         diagnostics_dropped: dropped,
+        error_count: errors,
         typing,
         mode: opts.mode,
         terminology_only: opts.terminology_only,
@@ -600,6 +605,7 @@ struct Parser<'a> {
     axioms: BTreeMap<Axiom, Vec<Origin>>,
     diags: Vec<Diagnostic>,
     dropped: usize,
+    errors: usize,
     headers: Vec<(u32, Key, Header, bool)>,
     rind: FxHashSet<BlankNode>,
     onodes: FxHashSet<NamedOrBlankNode>,
@@ -653,6 +659,7 @@ impl<'a> Parser<'a> {
             axioms: BTreeMap::new(),
             diags: Vec::new(),
             dropped: 0,
+            errors: 0,
             headers: Vec::new(),
             rind: FxHashSet::default(),
             onodes: FxHashSet::default(),
@@ -674,6 +681,9 @@ impl<'a> Parser<'a> {
         } else {
             self.opts.max_diagnostics
         };
+        if severity == Severity::Error {
+            self.errors += 1;
+        }
         if self.diags.len() >= max {
             self.dropped += 1;
             return;

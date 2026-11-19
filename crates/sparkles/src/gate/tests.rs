@@ -526,7 +526,7 @@ fn a_shacl_check_selects_named_graphs_as_the_write_guard_does() {
     let (before, after) = states(
         &ds,
         &person_shapes(),
-        "INSERT DATA { GRAPH <urn:g> { <urn:bob> a <urn:Person> } }",
+        "INSERT DATA { <urn:x> <urn:p> <urn:y> . GRAPH <urn:g> { <urn:bob> a <urn:Person> } }",
     );
     let status = |s: &Suite| run_on(s, &before, &after).results[0].clone();
     // the named graph, and every graph, see the nameless person
@@ -685,4 +685,380 @@ fn the_unsatisfiable_classes_check_needs_the_ontology_feature() {
         assert_eq!(r.results[0].code, Some("check-unavailable"));
         assert!(!r.passed());
     }
+}
+
+// ---- round 2 of the slice 1 review ---------------------------------------------------
+
+#[test]
+fn a_shapes_graph_is_not_a_reserved_graph() {
+    for g in [
+        "<urn:x-arq:DefaultGraph>",
+        "<urn:x-arq:UnionGraph>",
+        "<urn:x-sparkles:inferred>",
+        "<urn:x-sparkles:checks:runs>",
+        "chk:DefaultGraph",
+    ] {
+        for data in ["", "; chk:dataGraph chk:DefaultGraph"] {
+            refused(
+                &format!(
+                    "<urn:s> a chk:Suite ; chk:check <urn:c> .
+                     <urn:c> a chk:ShaclCheck ; chk:shapesGraph {g} {data} ."
+                ),
+                "chk:shapesGraph names a graph that holds the shapes",
+            );
+        }
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn named_shapes_validate_the_default_graph() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        &person_shapes(),
+        "INSERT DATA { <urn:bob> a <urn:Person> }",
+    );
+    let s = shacl_suite("; chk:dataGraph chk:DefaultGraph").unwrap();
+    let r = run_on(&s, &before, &after).results[0].clone();
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+    // a selected default graph that holds nothing fails closed, as a named graph does
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        &person_shapes(),
+        "INSERT DATA { GRAPH <urn:g> { <urn:bob> a <urn:Person> } }",
+    );
+    let r = run_on(&s, &before, &after).results[0].clone();
+    assert_eq!(r.code, Some("input-missing"), "{r:?}");
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn shapes_that_target_nothing_are_refused() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:bob> a <urn:Person> }");
+    let s = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShaclCheck ; chk:shapes \"<urn:S> a <http://www.w3.org/ns/shacl#NodeShape> ; <http://www.w3.org/ns/shacl#closed> true .\" .",
+    )
+    .unwrap();
+    let r = run_on(&s, &before, &after).results[0].clone();
+    assert_eq!(r.code, Some("input-invalid"), "{r:?}");
+    assert!(r.blocks());
+}
+
+/// The suite of one unsatisfiable-classes check, with `extra` on the check.
+#[cfg(feature = "ontology")]
+fn unsat_suite(extra: &str) -> Suite {
+    suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:u> .
+         <urn:u> a chk:UnsatisfiableClassesCheck {extra} ."
+    ))
+    .unwrap()
+}
+
+/// The result of `s` on a dataset after the SPARQL update `u`.
+#[cfg(feature = "ontology")]
+fn unsat_after(s: &Suite, u: &str) -> CheckResult {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", u);
+    run_on(s, &before, &after).results[0].clone()
+}
+
+/// `A` and `B` disjoint, `C` under `A`, `B` the domain of `r`, and `C` under the existential
+/// `filler`, so that `C` is unsatisfiable once the existential is read.
+#[cfg(feature = "ontology")]
+fn domain_ontology(filler: &str) -> String {
+    format!(
+        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
+         INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A> .
+           <urn:r> a owl:ObjectProperty ; rdfs:domain <urn:B> .
+           <urn:C> rdfs:subClassOf _:e0 . {filler} }}"
+    )
+}
+
+/// A chain of `n` existential restrictions on `r` from `_:e0`, ending in `urn:D`.
+#[cfg(feature = "ontology")]
+fn existentials(n: usize) -> String {
+    let mut t = String::new();
+    for i in 0..n {
+        let next = if i + 1 == n {
+            "<urn:D>".to_string()
+        } else {
+            format!("_:e{}", i + 1)
+        };
+        t.push_str(&format!(
+            "_:e{i} a owl:Restriction ; owl:onProperty <urn:r> ; owl:someValuesFrom {next} .\n"
+        ));
+    }
+    t
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn an_owl_reader_error_is_not_an_axiom_left_out() {
+    let s = unsat_suite("");
+    // the readable control: membership in the existential puts C under B too
+    let r = unsat_after(&s, &domain_ontology(&existentials(1)));
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
+    // the same axiom nested past the reader's limit is an error, not a pass
+    let r = unsat_after(
+        &s,
+        &domain_ontology(&existentials(sparkles_owl::read::MAX_NESTING + 2)),
+    );
+    assert_eq!(r.status, Status::Error, "{r:?}");
+    assert_eq!(r.code, Some("input-invalid"), "{r:?}");
+    // a restriction without its filler leaves its subclass axiom unmapped
+    let r = unsat_after(
+        &s,
+        &domain_ontology("_:e0 a owl:Restriction ; owl:onProperty <urn:r> ."),
+    );
+    assert_eq!(r.code, Some("input-invalid"), "{r:?}");
+    assert!(r.messages[0].contains("maps to no axiom"), "{r:?}");
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn the_check_classifies_the_terminology_and_not_the_assertions() {
+    let s = unsat_suite("");
+    // one individual in two disjoint classes, as plain, annotated and class-expression
+    // assertions: the terminology alone is consistent, so each form gives the same verdict
+    for abox in [
+        "<urn:x> a <urn:A>, <urn:B> .",
+        "<urn:x> a <urn:A>, <urn:B> .
+         [] a owl:Axiom ; owl:annotatedSource <urn:x> ;
+            owl:annotatedProperty <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ;
+            owl:annotatedTarget <urn:B> ; rdfs:comment \"c\" .",
+        "<urn:x> a [ a owl:Class ; owl:intersectionOf ( <urn:A> <urn:B> ) ] .",
+    ] {
+        let u = format!(
+            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
+             INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . {abox} }}"
+        );
+        let r = unsat_after(&s, &u);
+        assert_eq!(r.status, Status::Passed, "{abox}: {r:?}");
+        assert!(r.notes.is_empty(), "{abox}: {r:?}");
+    }
+}
+
+#[cfg(all(feature = "ontology", feature = "reasoning"))]
+#[test]
+fn a_diagnostics_check_finds_an_individual_of_two_disjoint_classes() {
+    let s = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:d> .
+         <urn:d> a chk:DiagnosticsCheck .",
+    )
+    .unwrap();
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        "",
+        &format!(
+            "PREFIX owl: <{OWL}> INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> .
+               <urn:x> a <urn:A>, <urn:B> }}"
+        ),
+    );
+    let r = run_on(&s, &before, &after).results[0].clone();
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn axioms_left_out_are_a_warning_and_can_block() {
+    // a nominal: whether C is satisfiable can depend on the assertions about a
+    let u = format!(
+        "PREFIX owl: <{OWL}> INSERT DATA {{ <urn:C> owl:equivalentClass [ a owl:Class ;
+           owl:oneOf ( <urn:a> ) ] . <urn:D> owl:disjointWith <urn:C> . <urn:a> a <urn:D> }}"
+    );
+    let r = unsat_after(&unsat_suite(""), &u);
+    assert_eq!(r.status, Status::Passed, "{r:?}");
+    let note = r
+        .notes
+        .iter()
+        .find(|n| n.code == "axioms-left-out")
+        .expect("a note for the axioms left out");
+    assert_eq!(note.severity, Severity::Warning);
+    assert!(note.count >= 1);
+    let r = unsat_after(&unsat_suite("; chk:requireComplete true"), &u);
+    assert_eq!(r.code, Some("check-incomplete"), "{r:?}");
+    assert!(r.blocks());
+    // without nominals the assertions do not make the answer incomplete
+    let r = unsat_after(
+        &unsat_suite("; chk:requireComplete true"),
+        &format!(
+            "PREFIX owl: <{OWL}> INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . <urn:x> a <urn:A> }}"
+        ),
+    );
+    assert_eq!(r.status, Status::Passed, "{r:?}");
+    refused(
+        "<urn:s> a chk:Suite ; chk:check <urn:u> .
+         <urn:u> a chk:UnsatisfiableClassesCheck ; chk:requireComplete \"yes\" .",
+        "chk:requireComplete takes a boolean",
+    );
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn an_ontology_with_no_terminology_is_missing_input() {
+    let s = unsat_suite("");
+    // an empty default graph, and one with data but no axioms
+    let ds = Dataset::memory();
+    let snap = ds.store().snapshot();
+    let r = run_on(&s, &snap, &snap).results[0].clone();
+    assert_eq!(r.code, Some("input-missing"), "{r:?}");
+    let r = unsat_after(&s, "INSERT DATA { <urn:x> <urn:p> <urn:y> }");
+    assert_eq!(r.code, Some("input-missing"), "{r:?}");
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn imports_resolve_to_asserted_graphs_only() {
+    let s = unsat_suite("");
+    let inferred = sparkles_core::INFERRED_GRAPH;
+    let base = format!(
+        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> INSERT DATA {{
+           <urn:C> rdfs:subClassOf <urn:A>, <urn:B> ."
+    );
+    // a valid import supplies the disjointness that makes C unsatisfiable
+    let r = unsat_after(
+        &s,
+        &format!(
+            "{base} <urn:o> owl:imports <urn:dis> .
+               GRAPH <urn:dis> {{ <urn:A> owl:disjointWith <urn:B> }} }}"
+        ),
+    );
+    assert_eq!(r.status, Status::Failed, "{r:?}");
+    // the same axiom in the materialized inferences is not read through an import
+    let r = unsat_after(
+        &s,
+        &format!(
+            "{base} <urn:o> owl:imports <{inferred}> .
+               GRAPH <{inferred}> {{ <urn:A> owl:disjointWith <urn:B> }} }}"
+        ),
+    );
+    assert_eq!(r.code, Some("input-missing"), "{r:?}");
+    // an import that resolves to no graph
+    let r = unsat_after(&s, &format!("{base} <urn:o> owl:imports <urn:absent> }}"));
+    assert_eq!(r.code, Some("input-missing"), "{r:?}");
+    // more imports than the bound
+    let n = sparkles_reasoner::inputs::MAX_IMPORTS + 1;
+    let mut u = base.clone();
+    for i in 0..n {
+        u.push_str(&format!(
+            " <urn:o> owl:imports <urn:i{i}> . GRAPH <urn:i{i}> {{ <urn:X{i}> rdfs:subClassOf <urn:Y> }}"
+        ));
+    }
+    u.push_str(" <urn:A> owl:disjointWith <urn:B> }");
+    let r = unsat_after(&s, &u);
+    assert_eq!(r.code, Some("input-missing"), "{r:?}");
+    assert!(r.messages[0].contains("imports"), "{r:?}");
+}
+
+/// The candidate of `u` with one more quad whose object id decodes to no term.
+#[cfg(feature = "ontology")]
+fn with_undecodable_object(u: &str, s: &str, p: &str) -> Arc<Snapshot> {
+    use crate::id::Id;
+    use crate::index::Perm;
+    let ds = Dataset::memory();
+    ds.update(u).unwrap();
+    let mut snap = (*ds.store().snapshot()).clone();
+    let s = snap.lookup_iri(s).unwrap();
+    let p = snap.lookup_iri(p).unwrap();
+    let bad = [s, p, Id::vocab(1 << 40), Id::DEFAULT_GRAPH];
+    for perm in [Perm::Gspo, Perm::Pos] {
+        snap.delta.ins[perm.index()].insert(perm.to_key(&bad));
+    }
+    Arc::new(snap)
+}
+
+#[cfg(feature = "ontology")]
+#[test]
+fn an_undecodable_quad_is_an_error_not_a_quad_left_out() {
+    let s = unsat_suite("");
+    let ok = format!(
+        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> INSERT DATA {{
+           <urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A> .
+           GRAPH <urn:other> {{ <urn:z> owl:imports <urn:elsewhere> }} }}"
+    );
+    for p in [format!("{OWL}imports"), format!("{RDFS}subClassOf")] {
+        let snap = with_undecodable_object(&ok, "urn:C", &p);
+        let r = run_on(&s, &snap, &snap).results[0].clone();
+        assert_eq!(r.status, Status::Error, "{p}: {r:?}");
+        assert!(r.blocks());
+    }
+}
+
+#[test]
+fn the_canonical_limit_stops_the_parser_before_the_rest() {
+    // the expanded statements pass the limit before the malformed tail is reached
+    let mut big = long_iris(600);
+    big.push_str("<urn:broken> <urn:p> .\n");
+    assert!(big.len() < MAX_SUITE_BYTES);
+    let e = Suite::parse(&big, RdfFormat::Turtle).expect_err("too large once expanded");
+    assert!(e.0.contains("N-Triples"), "{e}");
+}
+
+#[test]
+fn the_accumulator_reads_no_triple_past_the_limit() {
+    let iri = |i: usize| NamedNode::new_unchecked(format!("urn:x:{i:06}:{}", "a".repeat(4096)));
+    let p = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#seeAlso");
+    let s = NamedNode::new_unchecked("urn:s");
+    let read = std::cell::Cell::new(0usize);
+    // each line has the same length, newline included, and the first line past the
+    // limit is the one that brings the total over it
+    let line = format!("{} .", Triple::new(s.clone(), p.clone(), iri(0))).len() + 1;
+    let last = MAX_SUITE_BYTES / line;
+    let items = (0..).map(|i: usize| {
+        read.set(read.get() + 1);
+        assert!(
+            i <= last,
+            "the accumulator asked for a triple past the limit"
+        );
+        Ok(Triple::new(s.clone(), p.clone(), iri(i)))
+    });
+    let e = Suite::accumulate(items).expect_err("too large");
+    assert!(e.0.contains("N-Triples"), "{e}");
+    assert_eq!(read.get(), last + 1);
+}
+
+#[test]
+fn the_canonical_limit_counts_every_byte() {
+    // a suite padded so that its canonical N-Triples, final newline included, is exactly
+    // the limit; a repeated triple adds nothing, and one more byte is refused
+    let doc = |pad: usize, repeat: bool| {
+        let mut d = format!(
+            "<urn:s> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:x-sparkles:checks#Suite> .\n\
+             <urn:s> <http://www.w3.org/2000/01/rdf-schema#comment> \"{}\" .\n",
+            "a".repeat(pad)
+        );
+        if repeat {
+            d.push_str("<urn:s> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <urn:x-sparkles:checks#Suite> .\n");
+        }
+        d
+    };
+    let base = Suite::parse(&doc(0, false), RdfFormat::NTriples).unwrap();
+    let pad = MAX_SUITE_BYTES - base.canonical().len();
+    let exact = Suite::parse(&doc(pad, false), RdfFormat::NTriples).unwrap();
+    assert_eq!(exact.canonical().len(), MAX_SUITE_BYTES);
+    let triples = || {
+        oxrdfio::RdfParser::from_format(RdfFormat::NTriples)
+            .for_slice(doc(pad, true).as_bytes())
+            .map(|q| q.unwrap())
+            .map(|q| Triple::new(q.subject, q.predicate, q.object))
+            .collect::<Vec<_>>()
+    };
+    assert!(Suite::from_triples(triples()).is_ok());
+    // one byte more, counted in the canonical form; the raw bound is not reached
+    let over = doc(pad + 1, false);
+    assert!(over.len() <= MAX_SUITE_BYTES + 200);
+    let e = Suite::from_triples(
+        oxrdfio::RdfParser::from_format(RdfFormat::NTriples)
+            .for_slice(over.as_bytes())
+            .map(|q| q.unwrap())
+            .map(|q| Triple::new(q.subject, q.predicate, q.object)),
+    )
+    .expect_err("one byte past the limit");
+    assert!(e.0.contains("N-Triples"), "{e}");
 }

@@ -52,11 +52,19 @@ impl GraphRef {
 
     /// The graph's id in a snapshot, if it has quads there.
     pub fn id(&self, snap: &Snapshot) -> Option<Id> {
+        self.try_id(snap).unwrap_or(None)
+    }
+
+    /// [`id`](Self::id), with an error when the index cannot say whether the graph has
+    /// quads, rather than counting it absent.
+    pub fn try_id(&self, snap: &Snapshot) -> sparkles_core::Result<Option<Id>> {
         match self {
-            GraphRef::Default => Some(Id::DEFAULT_GRAPH),
+            GraphRef::Default => Ok(Some(Id::DEFAULT_GRAPH)),
             GraphRef::Named(g) => {
-                let id = snap.lookup_iri(g)?;
-                (snap.count(Perm::Gspo, &[id.0]).unwrap_or(0) > 0).then_some(id)
+                let Some(id) = snap.lookup_iri(g) else {
+                    return Ok(None);
+                };
+                Ok((snap.count(Perm::Gspo, &[id.0])? > 0).then_some(id))
             }
         }
     }
@@ -356,13 +364,26 @@ impl Resolved {
     }
 }
 
-/// The `owl:imports` objects in graph `g` of `snap`.
-fn imports_in(snap: &Snapshot, g: Id, warnings: &mut Vec<String>) -> Vec<String> {
+/// The `owl:imports` objects in graph `g` of `snap`. A strict read fails on a scan
+/// error or an object it cannot decode, and a lenient one skips them.
+fn imports_in(
+    snap: &Snapshot,
+    g: Id,
+    warnings: &mut Vec<String>,
+    strict: bool,
+) -> anyhow::Result<Vec<String>> {
     let Some(p) = snap.lookup_iri(OWL_IMPORTS) else {
-        return Vec::new();
+        return Ok(Vec::new());
+    };
+    let keys = match snap.scan_keys(Perm::Pos, &[p.0]) {
+        Ok(keys) => keys,
+        Err(e) if strict => {
+            return Err(anyhow::Error::new(e).context("reading the owl:imports statements"));
+        }
+        Err(_) => Vec::new(),
     };
     let mut out = Vec::new();
-    for k in snap.scan_keys(Perm::Pos, &[p.0]).unwrap_or_default() {
+    for k in keys {
         let q = Perm::Pos.to_quad(&k);
         if q[3] != g {
             continue;
@@ -370,10 +391,15 @@ fn imports_in(snap: &Snapshot, g: Id, warnings: &mut Vec<String>) -> Vec<String>
         match snap.term(q[2]) {
             Some(Term::NamedNode(n)) => out.push(n.into_string()),
             Some(t) => warnings.push(format!("owl:imports {t} is not an IRI and was ignored")),
+            None if strict => {
+                anyhow::bail!(
+                    "the object of an owl:imports statement cannot be decoded: the index is damaged"
+                )
+            }
             None => {}
         }
     }
-    out
+    Ok(out)
 }
 
 /// The graphs `inputs` reads in `snap`, with the imports resolved.
@@ -483,35 +509,75 @@ pub fn resolve_closure(
     readable: &dyn Fn(Id) -> bool,
     targets: &ImportTargets,
 ) -> (Resolved, Vec<ImportEdge>) {
-    let id = |g: &GraphRef| g.id(snap).filter(|i| readable(*i));
+    match closure(snap, inputs, readable, targets, false, &|| Ok(())) {
+        Ok(r) => r,
+        Err(_) => unreachable!("a lenient resolution does not fail"),
+    }
+}
+
+/// [`resolve_closure`] for a caller that must not lose input: an index error while
+/// testing a graph for quads or scanning its `owl:imports`, or an import object that
+/// cannot be decoded, is an error rather than an absent graph or import. `check` runs
+/// before each graph is scanned, for a deadline or a cancellation.
+pub fn try_resolve_closure(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: &dyn Fn(Id) -> bool,
+    targets: &ImportTargets,
+    check: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<(Resolved, Vec<ImportEdge>)> {
+    closure(snap, inputs, readable, targets, true, check)
+}
+
+fn closure(
+    snap: &Snapshot,
+    inputs: &Inputs,
+    readable: &dyn Fn(Id) -> bool,
+    targets: &ImportTargets,
+    strict: bool,
+    check: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<(Resolved, Vec<ImportEdge>)> {
+    let present = |g: &GraphRef| -> anyhow::Result<Option<Id>> {
+        if strict {
+            g.try_id(snap)
+                .with_context(|| format!("testing the graph <{}> for quads", g.as_str()))
+        } else {
+            Ok(g.id(snap))
+        }
+    };
+    let id =
+        |g: &GraphRef| -> anyhow::Result<Option<Id>> { Ok(present(g)?.filter(|i| readable(*i))) };
     let mut r = Resolved {
         graphs: inputs.configured(),
         ..Default::default()
     };
     let mut edges: Vec<ImportEdge> = Vec::new();
     for g in &r.graphs {
-        if g.id(snap).is_none() {
+        if present(g)?.is_none() {
             r.warnings
                 .push(format!("the input graph <{}> is empty", g.as_str()));
         }
     }
     if inputs.imports == ImportMode::None {
-        return (r, edges);
+        return Ok((r, edges));
     }
-    let exists = |name: &str| id(&GraphRef::Named(name.to_string())).is_some();
+    let exists = |name: &str| -> anyhow::Result<bool> {
+        Ok(id(&GraphRef::Named(name.to_string()))?.is_some())
+    };
     // import IRI → what it resolved to, so a second importer gets the same edge
     let mut seen: BTreeMap<String, (Vec<String>, Option<Via>)> = BTreeMap::new();
     let mut stopped = false;
     let mut i = 0;
     while i < r.graphs.len() {
         let from = r.graphs[i].clone();
-        let Some(g) = id(&from) else {
+        let Some(g) = id(&from)? else {
             i += 1;
             continue;
         };
         i += 1;
+        check()?;
         let mut warnings = Vec::new();
-        for iri in imports_in(snap, g, &mut warnings) {
+        for iri in imports_in(snap, g, &mut warnings, strict)? {
             if let Some((graphs, via)) = seen.get(&iri) {
                 edges.push(ImportEdge {
                     from: from.clone(),
@@ -541,23 +607,27 @@ pub fn resolve_closure(
                 continue;
             }
             let location = inputs.location_mapping.map(&iri);
-            let (graphs, via): (Vec<String>, Option<Via>) = match targets.map.get(&iri) {
-                Some(g) if exists(g) => (vec![g.clone()], Some(Via::Map)),
-                _ if exists(&iri) => (vec![iri.clone()], Some(Via::Graph)),
-                _ if location != iri && exists(&location) => {
-                    (vec![location.clone()], Some(Via::Graph))
-                }
-                _ => {
-                    let found: Vec<String> = targets
-                        .resources
-                        .get(&iri)
-                        .map(|v| v.iter().filter(|g| exists(g)).cloned().collect())
-                        .unwrap_or_default();
-                    if found.is_empty() {
-                        (found, None)
-                    } else {
-                        (found, Some(Via::Resource))
+            let mapped = match targets.map.get(&iri) {
+                Some(g) if exists(g)? => Some(g.clone()),
+                _ => None,
+            };
+            let (graphs, via): (Vec<String>, Option<Via>) = if let Some(g) = mapped {
+                (vec![g], Some(Via::Map))
+            } else if exists(&iri)? {
+                (vec![iri.clone()], Some(Via::Graph))
+            } else if location != iri && exists(&location)? {
+                (vec![location.clone()], Some(Via::Graph))
+            } else {
+                let mut found: Vec<String> = Vec::new();
+                for g in targets.resources.get(&iri).into_iter().flatten() {
+                    if exists(g)? {
+                        found.push(g.clone());
                     }
+                }
+                if found.is_empty() {
+                    (found, None)
+                } else {
+                    (found, Some(Via::Resource))
                 }
             };
             if graphs.is_empty() {
@@ -586,7 +656,7 @@ pub fn resolve_closure(
         r.warnings.extend(warnings);
     }
     mark_cycles(&mut edges);
-    (r, edges)
+    Ok((r, edges))
 }
 
 /// Mark the edges whose target graphs reach their importing graph.
