@@ -27,10 +27,13 @@ fn axioms(body: &str) -> Vec<Axiom> {
 /// Classifies at one and at eight threads, checks that the answers are the same, and
 /// returns one with the axioms left out.
 fn run(body: &str) -> (Classification, Vec<sparkles_owl::classify::Excluded>) {
-    let ax = axioms(body);
+    run_axioms(&axioms(body))
+}
+
+fn run_axioms(ax: &[Axiom]) -> (Classification, Vec<sparkles_owl::classify::Excluded>) {
     let mut outs = Vec::new();
     for threads in [1, 8] {
-        let mut k = Classifier::of(&ax);
+        let mut k = Classifier::of(ax);
         let out = k
             .classify(&Limits {
                 threads,
@@ -644,4 +647,32 @@ fn a_link_that_r6_gives_beside_a_strict_subrole_of_the_inverse_still_clashes() {
          DisjointObjectProperties(ObjectInverseOf(:p) :s)
          ClassAssertion(:A :x)");
     assert_eq!(out.consistency, Consistency::Inconsistent);
+}
+
+#[test]
+fn a_covered_successor_preserves_the_classification_of_a_witness() {
+    // The inverse roles are equivalent and symmetric. a1 has at most one neighbor,
+    // a0, so every C3 instance is a0. Both ends of the asserted link are in its
+    // domain C5 and therefore in C4, so a0 is also in C1.
+    // On one and eight threads the covered-successor check changes a witness
+    // verdict for this fixture. Both paths select the world for C3.
+    let fixture = include_str!("fixtures/horn_individuals/covered_successor_witness.ofn");
+    let doc = ofn_read::parse(fixture).unwrap();
+    let (out, excluded) = run_axioms(&doc.axioms);
+    assert!(excluded.is_empty(), "left out: {excluded:#?}");
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert_eq!(out.consistency, Consistency::Consistent);
+
+    let class = |id| Class::new(format!("http://example.org/d#{id}"));
+    let neighbor_of_a1 = class("C3");
+    let role_domain = class("C5");
+    let domain_superclass = class("C4");
+    let neighbor_of_c4 = class("C1");
+    let t = &out.taxonomy;
+    assert!(t.is_subclass(&neighbor_of_a1, &role_domain));
+    assert!(t.is_subclass(&neighbor_of_a1, &domain_superclass));
+    assert!(t.is_subclass(&neighbor_of_a1, &neighbor_of_c4));
+    assert!(t.is_subclass(&role_domain, &domain_superclass));
+    assert!(!t.is_subclass(&domain_superclass, &role_domain));
+    assert!(!t.is_subclass(&role_domain, &neighbor_of_c4));
 }
