@@ -810,7 +810,7 @@ alive, and it decodes the block again at its row when the cache has dropped it. 
 batches that the cursor root hands out without copying share the block and one charge of
 its decoded columns through one handle. The root scan keeps that handle while it reads
 the block, so a writer that drops each batch before it pulls the next, as the result
-writers do with one Rayon worker, does not charge the block again for every batch. The
+writers do with one Rayon worker, does not charge the block again for every batch. While the root shares a block, the scan keeps no weak handle on it and reads it through the shared handle in place, and it takes the block back from that handle when it switches to owned rows inside the block or a batch declines the shared path, so a scan stopped inside a block always has a way back to it. The
 charge ends when the scan leaves the block, reads it as owned rows or ends, and when the
 last batch handed out from it drops, so a cursor stopped inside a block keeps it charged
 until the cursor closes. The root shares a
@@ -826,6 +826,20 @@ of a term larger than the room the block leaves, under a budget at which a copy 
 answer, and roadmap item 1051 holds that. A cursor over a read-through snapshot, which keeps no blocks,
 decodes its current block again for each batch of copied rows, and no cursor query reads such a
 snapshot.
+
+Roadmap item 1063 removed most of the cost that item 1039 left on root scans. The shared
+path no longer makes and drops a weak handle on the block for each batch, and it reads the
+block in place instead of taking it back at each read. On 100,000 people on atlas with one
+thread, `root-scan`, `export-500k` and `root-limit` became 1.6% to 3.5% faster in server
+time under streaming and automatic execution, and a cycle profile on stanley puts the scan
+back at its cost before item 1039. Against that build, streaming `root-scan` still takes
+2.4% longer, 1.98 µs, and `export-500k` 0.5% longer, a remainder of about 2 µs per request
+that does not grow with the blocks a scan enters and that the profile does not show. Item
+1063 stays open for that remainder. `distinct-obj` and `predicate-counts` read 0.3 µs
+slower under streaming and faster under automatic execution, and their plans do not reach
+the changed code. The
+[run record](../../benchmarks/engine/runs/2026-11-19-shared-scan-atlas/README.md) has the
+method and the numbers.
 
 ### One join-kernel library
 

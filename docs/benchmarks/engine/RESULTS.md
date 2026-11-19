@@ -163,6 +163,32 @@ Every query passes. Repeated runs of the same comparison differed by up to 4% on
 under 15 µs, and `path-plus` reads faster with the pool on, so ratios of these queries
 below 1.05 are within the run-to-run spread.
 
+### The cost of a root scan that shares its block
+
+A cursor whose root is a scan hands out an index block's rows without copying them, and
+the scan reads the block through the handle that those batches share. Two builds were
+compared on atlas with 100,000 people and one Rayon worker, in 12 rounds of A,B,B,A in both
+arm orders, combined to cancel the bias of the second position. The base is `9acd6d74`,
+the build before the scan stopped charging its block between reads, and the current build
+is `4e9185f1`.
+
+| Query | Mode | Base | Current against base | 95% interval | Added time |
+|---|---|--:|--:|---|--:|
+| `root-limit` | streaming | 3.6 µs | 1.039 | 1.004 to 1.075 | 0.14 µs |
+| `root-limit` | automatic | 11.5 µs | 1.040 | 1.011 to 1.088 | 0.46 µs |
+| `root-scan` | streaming | 82.4 µs | 1.024 | 1.021 to 1.027 | 1.98 µs |
+| `root-scan` | automatic | 83.9 µs | 1.011 | 1.007 to 1.014 | 0.89 µs |
+| `export-500k` | streaming | 391.3 µs | 1.005 | 1.003 to 1.008 | 1.95 µs |
+| `export-500k` | automatic | 409.0 µs | 1.003 | 0.999 to 1.006 | 1.07 µs |
+
+*Measured on atlas.*
+
+`root-scan` under streaming takes 2 µs longer than the base, and roadmap item 1063 holds
+that remainder. The other cells pass the Intel rule or stay within 1%. The current build is
+1.6% to 3.5% faster than the build before item 1063 on each of these cells. The
+[run record](runs/2026-11-19-shared-scan-atlas/README.md) has the method, the controls and
+a cycle profile of the scan.
+
 ### Planning large basic graph patterns
 
 The ignored test `large_bgp_planning_time` in `crates/sparkles/tests/nesting.rs` runs

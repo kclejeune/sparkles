@@ -25,6 +25,16 @@ with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which
 their advisories. The SvelteKit advisories that only 3.x fixes concern features the
 static UI does not use, and roadmap item 1049 covers the migration.
 
+### Root scans read a shared block in place
+
+A cursor scan that shares its block with the batches it hands out keeps no weak handle on
+the block and reads it in place, and it takes the block back from the shared batch only
+when it switches to owned rows inside the block. This removes most of the cost that the
+uncharged scan of item 1039 added. On 100,000 people on atlas with one thread, `root-scan`,
+`export-500k` and `root-limit` are 1.6% to 3.5% faster in server time. Against the build
+before item 1039, streaming `root-scan` still takes 2.4% longer, about 2 µs, and roadmap
+item 1063 stays open for that remainder.
+
 ### Keys and the universal property in rooted classification runs
 
 With `Limits::rooted`, the disjunctive rules take keys over object properties and the

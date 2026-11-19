@@ -1,0 +1,25 @@
+"""classify.py PERF_SCRIPT_OUTPUT MARK...: per sample, region = first MARK found in its call chain (or 'other').
+Prints samples per region, and the leaf symbols of each marked region."""
+import sys, collections
+path, marks = sys.argv[1], sys.argv[2:]
+reg = collections.Counter(); leaf = collections.defaultdict(collections.Counter); total = 0
+def flush(fr):
+    global total
+    if not fr: return
+    total += 1
+    r = next((m for m in marks if any(m in f for f in fr)), "other")
+    reg[r] += 1; leaf[r][fr[0][:150]] += 1
+fr = []
+for line in open(path, errors="replace"):
+    if not line.startswith("\t") and not line.startswith(" "):
+        flush(fr); fr = []; continue
+    s = line.strip()
+    if not s: flush(fr); fr = []; continue
+    parts = s.split(" ", 1)
+    if len(parts) == 2: fr.append(parts[1])
+flush(fr)
+print("total", total)
+for r, n in reg.most_common(): print(f"region {r}: {n}")
+for r in marks:
+    print(f"== leaves of {r}")
+    for k, n in leaf[r].most_common(25): print(f"{n:7d} {k}")
