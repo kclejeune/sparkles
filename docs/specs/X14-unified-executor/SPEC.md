@@ -1341,7 +1341,7 @@ with the base second, these streamed requests took 121 ms against 289 ms, 10.4 a
 eager requests of the same build, which took 220, 14.1, 42.7 and 4.89 ms. With one thread
 the four queries took 0.53, 0.65, 0.78 and 0.73 times the base's wall time, and the
 streamed `star-join` and `order-by-full` took about as long as the eager ones. The
-geometric mean of the streamed ratios was 0.935 with 12 threads and 0.932 with one. The
+geometric mean of the streamed ratios over the 31 queries was 0.935 with 12 threads. The
 eager requests of the two builds took 0.984 to 1.023 times each other's wall time with 12
 threads, in the order with the base second, since the other order's eager run may have
 overlapped a build, and 0.983 to 1.018 with one thread over both orders.
