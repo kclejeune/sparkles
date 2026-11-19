@@ -14,7 +14,13 @@
 //! allocates or frees, and memory from before the window, cannot move the reading in
 //! either direction. The counted threads are the one thread of the Rayon pool that runs
 //! each audited query, which also takes the query's parallel work, and the engine's
-//! block decoders, which a query waits for.
+//! block decoders, which a query waits for. The allocator holds its lock across the
+//! system call of each counted allocation, free and reallocation, so a second counted
+//! thread cannot free or allocate between a system call and its count, and the reading
+//! is exact whatever the counted threads do at once. A reallocated block counts its old
+//! and new sizes together, whether it moves or grows in place, as `Charged::grow`
+//! admits it, and `AUDIT_REALLOC=exact` counts one that stays in place at its larger
+//! size.
 //!
 //! While a cursor is audited, the allocator also compares the counted heap with the
 //! bytes the query has admitted, which [`MemoryMeter`] reads exactly from the query's
@@ -83,115 +89,213 @@ fn slot(address: usize) -> usize {
     (address >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - SLOTS.trailing_zeros())
 }
 
-/// Count a block that a counted thread allocated inside the window.
-fn insert(address: usize, size: usize) {
-    if OPEN.load(Ordering::Relaxed) && counted() {
-        place(address, size, 0);
+/// The meter's own test stops a counted thread at one site of the allocator, after
+/// the system call and before the count settles, to let another counted thread try
+/// the opposite call there. `HOOK` names the site, 1 for `alloc`, 2 for `dealloc` and
+/// 3 for `realloc`, and is cleared when the stop is taken. `REACHED` reports the stop,
+/// `DONE` is set by the other thread once its call returned, and `OVERLAPPED` reads
+/// `DONE` as the stop ends, which is whether the other call ran inside the site.
+pub static HOOK: AtomicUsize = AtomicUsize::new(0);
+pub static REACHED: AtomicBool = AtomicBool::new(false);
+pub static DONE: AtomicBool = AtomicBool::new(false);
+pub static OVERLAPPED: AtomicBool = AtomicBool::new(false);
+
+thread_local! {
+    /// Whether this thread takes the stop. Like `COUNTED`, it has no destructor.
+    static STOPS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Stop here, for at most a tenth of a second, if the meter's test asked for a stop at
+/// `site` on this thread. The other thread waits for the meter's lock, which this
+/// thread holds, so the stop ends at its bound and the other call runs after the site.
+fn pause(site: usize) {
+    if STOPS.try_with(Cell::get).unwrap_or(false)
+        && HOOK
+            .compare_exchange(site, 0, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    {
+        REACHED.store(true, Ordering::SeqCst);
+        let start = std::time::Instant::now();
+        while !DONE.load(Ordering::SeqCst)
+            && start.elapsed() < std::time::Duration::from_millis(100)
+        {
+            std::hint::spin_loop();
+        }
+        OVERLAPPED.store(DONE.load(Ordering::SeqCst), Ordering::SeqCst);
     }
 }
 
-/// Put a block in the table. The peak reads the live bytes with `beside`, the bytes of
-/// a block that left the table and was live while this one was filled.
-fn place(address: usize, size: usize, beside: usize) {
-    locked(|| {
-        if BLOCKS.load(Ordering::Relaxed) >= SLOTS / 2 {
-            FULL.store(true, Ordering::Relaxed);
-            return;
-        }
-        let mut at = slot(address);
-        while ADDRESS[at].load(Ordering::Relaxed) != 0 {
-            at = (at + 1) % SLOTS;
-        }
-        ADDRESS[at].store(address, Ordering::Relaxed);
-        SIZE[at].store(size, Ordering::Relaxed);
-        BLOCKS.fetch_add(1, Ordering::Relaxed);
-        let live = LIVE.fetch_add(size, Ordering::Relaxed) + size + beside;
-        PEAK.fetch_max(live, Ordering::Relaxed);
-        let m = METER.load(Ordering::Relaxed);
-        if !m.is_null() {
-            // SAFETY: `audit` keeps the meter alive for as long as the pointer is set,
-            // and the tests that set it hold the serial lock.
-            let admitted = unsafe { (*m).live_bytes() } as i64;
-            WITHIN.fetch_max(live as i64 - admitted, Ordering::Relaxed);
-        }
-    });
+/// Count this thread's allocations, for the meter's own tests.
+pub fn count_this_thread() {
+    COUNTED.set(true);
 }
 
-/// Stop counting a block, and give its size, if the window counted it. Later blocks of
-/// its probe run move back over the gap, so a search still ends at the first empty slot.
-fn remove(address: usize) -> Option<usize> {
+/// Let this thread take the stop at `HOOK`, for the meter's own tests.
+pub fn stop_here(stops: bool) {
+    STOPS.set(stops);
+}
+
+/// Whether a block that grows in place raises the peak by its larger size alone, as
+/// the allocator holds it, instead of by its old and new sizes together. `open` sets
+/// it from `AUDIT_REALLOC=exact`.
+static EXACT_REALLOC: AtomicBool = AtomicBool::new(false);
+
+/// Read `live` bytes as a peak, and against the bytes the audited query has admitted.
+/// The caller holds the lock.
+fn sample(live: usize) {
+    PEAK.fetch_max(live, Ordering::Relaxed);
+    let m = METER.load(Ordering::Relaxed);
+    if !m.is_null() {
+        // SAFETY: `audit` keeps the meter alive for as long as the pointer is set, and
+        // the tests that set it hold the serial lock.
+        let admitted = unsafe { (*m).live_bytes() } as i64;
+        WITHIN.fetch_max(live as i64 - admitted, Ordering::Relaxed);
+    }
+}
+
+/// Count a block of `size` bytes, under the lock. A full table does not take it,
+/// which voids the reading.
+fn count(address: usize, size: usize) {
+    let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+    sample(live);
+    if !remember(address, size) {
+        LIVE.fetch_sub(size, Ordering::Relaxed);
+    }
+}
+
+/// Put a block in the table, under the lock. A full table does not take it and sets
+/// `FULL`.
+fn remember(address: usize, size: usize) -> bool {
+    if BLOCKS.load(Ordering::Relaxed) >= SLOTS / 2 {
+        FULL.store(true, Ordering::Relaxed);
+        return false;
+    }
+    let mut at = slot(address);
+    while ADDRESS[at].load(Ordering::Relaxed) != 0 {
+        at = (at + 1) % SLOTS;
+    }
+    ADDRESS[at].store(address, Ordering::Relaxed);
+    SIZE[at].store(size, Ordering::Relaxed);
+    BLOCKS.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Take a block out of the table and its bytes out of the live bytes, under the lock,
+/// and give its size, if the window counted it. Later blocks of its probe run move
+/// back over the gap, so a search still ends at the first empty slot.
+fn forget(address: usize) -> Option<usize> {
     if BLOCKS.load(Ordering::Relaxed) == 0 {
         return None;
     }
-    locked(|| {
-        let mut at = slot(address);
-        loop {
-            match ADDRESS[at].load(Ordering::Relaxed) {
-                0 => return None,
-                a if a == address => break,
-                _ => at = (at + 1) % SLOTS,
-            }
+    let mut at = slot(address);
+    loop {
+        match ADDRESS[at].load(Ordering::Relaxed) {
+            0 => return None,
+            a if a == address => break,
+            _ => at = (at + 1) % SLOTS,
         }
-        let size = SIZE[at].load(Ordering::Relaxed);
-        LIVE.fetch_sub(size, Ordering::Relaxed);
-        BLOCKS.fetch_sub(1, Ordering::Relaxed);
-        let mut gap = at;
-        let mut next = (at + 1) % SLOTS;
-        loop {
-            let a = ADDRESS[next].load(Ordering::Relaxed);
-            if a == 0 {
-                break;
-            }
-            // The block stays if its home slot lies after the gap and up to its place.
-            let home = slot(a);
-            let stays = if gap <= next {
-                gap < home && home <= next
-            } else {
-                gap < home || home <= next
-            };
-            if !stays {
-                ADDRESS[gap].store(a, Ordering::Relaxed);
-                SIZE[gap].store(SIZE[next].load(Ordering::Relaxed), Ordering::Relaxed);
-                gap = next;
-            }
-            next = (next + 1) % SLOTS;
+    }
+    let size = SIZE[at].load(Ordering::Relaxed);
+    LIVE.fetch_sub(size, Ordering::Relaxed);
+    BLOCKS.fetch_sub(1, Ordering::Relaxed);
+    let mut gap = at;
+    let mut next = (at + 1) % SLOTS;
+    loop {
+        let a = ADDRESS[next].load(Ordering::Relaxed);
+        if a == 0 {
+            break;
         }
-        ADDRESS[gap].store(0, Ordering::Relaxed);
-        Some(size)
-    })
+        // The block stays if its home slot lies after the gap and up to its place.
+        let home = slot(a);
+        let stays = if gap <= next {
+            gap < home && home <= next
+        } else {
+            gap < home || home <= next
+        };
+        if !stays {
+            ADDRESS[gap].store(a, Ordering::Relaxed);
+            SIZE[gap].store(SIZE[next].load(Ordering::Relaxed), Ordering::Relaxed);
+            gap = next;
+        }
+        next = (next + 1) % SLOTS;
+    }
+    ADDRESS[gap].store(0, Ordering::Relaxed);
+    Some(size)
 }
 
+/// Whether a free or a reallocation must take the lock: while a window is open, or
+/// while the table holds a block that a window counted.
+fn watched() -> bool {
+    OPEN.load(Ordering::Relaxed) || BLOCKS.load(Ordering::Relaxed) > 0
+}
+
+// The meter holds `LOCK` across the system call of every counted allocation, and of
+// every free and reallocation while a block could be counted. A counted block's life
+// is then one ordered sequence of system calls and counts, so the live bytes are
+// exactly what the system holds of the counted blocks at each count, whatever another
+// counted thread does at the same time. Without it, a free on another thread between a
+// system call and its count hides the peak, and an allocation on another thread
+// between a count and the free it stands for is read without the block the system
+// still holds. The system allocator never calls back into `Counting`, so the lock is
+// never taken twice by one thread. Allocations on threads that do not count take no
+// lock. The lock serializes the counted threads' allocations while a window is open,
+// which the audit's fixtures accept.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        let p = unsafe { System.alloc(l) };
-        if !p.is_null() {
-            insert(p as usize, l.size());
+        if !(OPEN.load(Ordering::Relaxed) && counted()) {
+            return unsafe { System.alloc(l) };
         }
-        p
+        locked(|| {
+            let p = unsafe { System.alloc(l) };
+            pause(1);
+            // A window that closed while this thread waited for the lock counts no
+            // more blocks.
+            if !p.is_null() && OPEN.load(Ordering::Relaxed) {
+                count(p as usize, l.size());
+            }
+            p
+        })
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        remove(p as usize);
-        unsafe { System.dealloc(p, l) }
+        if !watched() {
+            return unsafe { System.dealloc(p, l) };
+        }
+        locked(|| {
+            unsafe { System.dealloc(p, l) };
+            pause(2);
+            forget(p as usize);
+        });
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        // The block leaves the table before the system can free its address, so a
-        // counted thread that is given the address meanwhile keeps its own block.
-        let old = remove(p as usize);
-        let q = unsafe { System.realloc(p, l, new) };
-        if q.is_null() {
-            // The block is still live at its address.
-            if let Some(size) = old {
-                place(p as usize, size, 0);
-            }
-        } else if OPEN.load(Ordering::Relaxed) && counted() {
-            // A block that moved was live beside its copy while the bytes moved. One that
-            // grew in place is counted the same, since whether it can depends on what
-            // the allocator holds beside it, which other tests and earlier queries set,
-            // and an operator that grows one must admit both sizes.
-            let beside = old.unwrap_or(0);
-            place(q as usize, new, beside);
+        if !watched() {
+            return unsafe { System.realloc(p, l, new) };
         }
-        q
+        locked(|| {
+            let q = unsafe { System.realloc(p, l, new) };
+            pause(3);
+            if q.is_null() {
+                // The block is still live at its address, with the bytes it had.
+                return q;
+            }
+            let old = forget(p as usize);
+            if OPEN.load(Ordering::Relaxed) && counted() {
+                // A block that moved was live beside its copy while the bytes moved.
+                // One that stayed in place reads the same, old and new together, which
+                // is what `Charged::grow` admits: whether a block can stay in place
+                // depends on what the allocator holds beside it, which earlier tests
+                // and queries set, so an operator must admit both sizes.
+                // `AUDIT_REALLOC=exact` reads such a block at its larger size.
+                let held = old.unwrap_or(0);
+                let rest = LIVE.load(Ordering::Relaxed);
+                if q == p && EXACT_REALLOC.load(Ordering::Relaxed) {
+                    sample(rest + held.max(new));
+                } else {
+                    sample(rest + held + new);
+                }
+                count(q as usize, new);
+            }
+            q
+        })
     }
 }
 
@@ -227,6 +331,9 @@ pub fn pool() -> &'static rayon::ThreadPool {
 }
 
 fn open() {
+    // Read before the window opens, since reading the variable allocates.
+    let exact = std::env::var("AUDIT_REALLOC").is_ok_and(|v| v == "exact");
+    EXACT_REALLOC.store(exact, Ordering::Relaxed);
     locked(|| {
         for address in &ADDRESS {
             address.store(0, Ordering::Relaxed);

@@ -61,6 +61,33 @@ counted heap with the bytes the query has admitted, read exactly through the hid
 both sides again. A pool grant's `used` grows in steps of 64 KiB and is given back only
 1 MiB late, so the audit never reads it.
 
+The meter holds its lock across the system call of every counted allocation, and of
+every free and reallocation while a counted block may be live. A counted block's life is
+then one ordered sequence of system calls and counts, so the live bytes are exactly what
+the system holds of the counted blocks, whatever a second counted thread does at the
+same moment. A meter that counts after the system call, or uncounts before it, reads
+low when another counted thread frees during an allocation or a reallocation, or
+allocates during a free. The meter's own test stops a counted thread at each of the
+three sites and has a second counted thread make the opposite call there, and it fails
+when the system calls move outside the lock. The lock serializes the counted threads'
+allocations while a window is open, which slows the audited fixtures and nothing else.
+
+A reallocated block counts its old and new sizes together, whether the allocator moves
+it or grows it in place. This is the rule `Charged::grow` admits by, since whether a
+block can grow in place depends on what the allocator holds beside it, which earlier
+tests and queries set. Under a rule that counted a block grown in place at its larger
+size, a `Charged` growth that stayed in place would read as an overcharge at its peak,
+and the two-column DISTINCT fixture's heap peak read 1.28 MB or 1.73 MB from one run to
+the next. `AUDIT_REALLOC=exact` selects the larger-size rule. An excess that shows only
+under the default rule comes from an operator that grows a block without admitting its
+old size beside the new one, and it belongs to item 1192. An excess that shows under
+both rules is an undercharge for the operator's own item.
+
+The streamed merge's audit in `crates/sparkles-core/tests/cursor_alloc_audit.rs` has
+its own copy of the meter, which counts a block grown in place at its larger size and
+counts outside the lock. It moves onto `tests/common/heap.rs` once both are on the
+main branch, and its fixtures then read old and new sizes for blocks that grow in place.
+
 The audit reports three excesses. The heap above the ledger inside or after a pull is
 an undercharge. The ledger above the heap after a pull is an overcharge. The ledger's
 peak above five quarters of the heap's peak is an overcharge inside a pull, which

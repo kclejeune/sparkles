@@ -13,6 +13,43 @@
 //! site. A mutator that adds entries asserts in debug builds that room was made for them
 //! first, and every growth checks in debug builds that the charge equals the size.
 //!
+//! # The growth rule
+//!
+//! Let a buffer charge `old` bytes, its collection's allocation, and let a growth aim for
+//! an allocation of `target` bytes. The rule has four parts.
+//!
+//! 1. Before the collection allocates, the account is resized to `old + target`. Both
+//!    blocks are live while the entries move, and a block that the allocator grows in
+//!    place is charged the same, since whether it can stay in place depends on what the
+//!    allocator holds beside it and not on the operator.
+//! 2. If that admission is refused with `BudgetExceeded`, a vector tries once more at
+//!    `old + need`, where `need` is the bytes of its exact need, its length plus the new
+//!    entries. A refusal of any other kind, a refusal of the exact need and any refusal
+//!    of a hash table's growth return the error, since a table has no smaller growth.
+//! 3. A refused admission changes nothing. The account, the charge and the collection
+//!    stay as they were, and the caller may freeze, spill or fail.
+//! 4. After the collection allocates, the account is resized to the size it reports,
+//!    `new`, which is at most the admitted target. The `old` bytes are released only
+//!    then, after their block is freed.
+//!
+//! So a growth from `old` to `new` needs `old + target` bytes of headroom at its
+//! admission and holds `new` afterwards. A vector's `target` is double its capacity, or
+//! the `toward` of [`Charged::reserve_toward`], with at least 16 entries. A hash table's
+//! is the bound of what hashbrown allocates for the larger of its need and one more
+//! entry than its capacity, which doubles its buckets. The `growth` methods give a
+//! buffer's `target` before it grows, so an operator can predict its size. The smallest budget at which a buffer reaches a given length is
+//! therefore set by its last growth, the old allocation plus the new one, and not by the
+//! length alone. Two buffers of one operator grow one after the other, so their
+//! transient peak is the larger of their growths. An operator that keeps several copies
+//! of its state, such as one that grows a held run while an earlier run is live, pays
+//! this rule for each buffer, and its budget parity against a formula that charged the
+//! final size alone moves by the old allocation at each growth.
+//!
+//! [`Charged::shrink`] is for storage that is freed and not moved. A shrink that copies
+//! into a smaller block, as `Vec::shrink_to` may, holds both blocks for the copy while
+//! `shrink` admits nothing beyond the old size, so it goes through `grow` with the
+//! smaller size instead.
+//!
 //! A query without a budget or a grant pays for the charge only when a collection
 //! grows, which a doubling vector does a logarithmic number of times. Operators reserve
 //! the room for a batch at once, so the per-row path is a plain insert.

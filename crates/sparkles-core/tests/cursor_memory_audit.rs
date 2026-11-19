@@ -20,7 +20,9 @@ use sparkles_core::sparql::update::update;
 use sparkles_core::sparql::{CursorOptions, QueryOptions, select_cursor};
 use sparkles_core::spill::{Spill, SpillOptions};
 use sparkles_core::store::{Store, StoreOptions};
+use std::alloc::Layout;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 #[global_allocator]
 static A: heap::Counting = heap::Counting;
@@ -432,10 +434,125 @@ fn the_meter_counts_the_window_of_the_counted_thread_alone() {
         drop(held);
     });
     assert!((MIB..2 * MIB).contains(&peak), "{peak}");
+    // A reallocated block counts its old and its new bytes together, whether it moves
+    // or stays where it is, which is the allocator's choice. `AUDIT_REALLOC=exact`
+    // counts one that stays at its larger size.
+    let exact = std::env::var("AUDIT_REALLOC").is_ok_and(|v| v == "exact");
+    for (from, to) in [(MIB, MIB), (64, 2 * MIB)] {
+        let (moved, peak) = heap::peak(|| unsafe {
+            let layout = Layout::from_size_align(from, 8).unwrap();
+            let p = std::alloc::alloc(layout);
+            let old = p as usize;
+            let q = std::alloc::realloc(p, layout, to);
+            assert!(!q.is_null());
+            std::alloc::dealloc(q, Layout::from_size_align(to, 8).unwrap());
+            q as usize != old
+        });
+        let expected = if moved || !exact {
+            from + to
+        } else {
+            from.max(to)
+        };
+        assert!(
+            (expected..expected + MIB / 4).contains(&peak),
+            "{from} to {to}: {peak}"
+        );
+    }
+    // A second counted thread that frees or allocates while the first is inside the
+    // allocator, between its system call and its count, cannot hide a peak, since the
+    // meter holds its lock across both. Each case stops the first thread there and has
+    // the other thread make the opposite call, which waits for the lock.
+    let mut found = Vec::new();
+    for site in [1, 2, 3] {
+        let (moved, peak) = heap::peak(|| meter_race(site));
+        let overlapped = heap::OVERLAPPED.load(Ordering::SeqCst);
+        let expected = match site {
+            // A 24 MiB block is live while the first thread allocates 16 MiB.
+            1 => 40 * MIB,
+            // The first thread frees 24 MiB and the other allocates 16 MiB, after the
+            // free or, if the call ran inside the site, beside the block the system
+            // still held.
+            2 if overlapped => 40 * MIB,
+            2 => 24 * MIB,
+            // A 24 MiB block is live while the first thread grows 4 MiB to 16 MiB.
+            _ if exact && !moved => 40 * MIB,
+            _ => 44 * MIB,
+        };
+        if overlapped {
+            found.push(format!("site {site}: the other call ran inside the site"));
+        }
+        if !(expected..expected + MIB / 4).contains(&peak) {
+            found.push(format!("site {site}: read {peak}, expected {expected}"));
+        }
+    }
+    assert!(found.is_empty(), "{found:#?}");
     let (_, peak) = heap::peak(|| {
         let block = Vec::<u8>::with_capacity(2 * MIB);
         std::thread::spawn(move || drop(block)).join().unwrap();
         drop(std::hint::black_box(Vec::<u8>::with_capacity(MIB)));
     });
     assert!((2 * MIB..3 * MIB).contains(&peak), "{peak}");
+}
+
+/// One case of the meter's race test, run on the counted thread. See its caller.
+fn meter_race(site: usize) -> bool {
+    const MIB: usize = 1 << 20;
+    for flag in [&heap::REACHED, &heap::DONE, &heap::OVERLAPPED] {
+        flag.store(false, Ordering::SeqCst);
+    }
+    let held = (site != 2).then(|| Vec::<u8>::with_capacity(24 * MIB));
+    let other = std::thread::spawn(move || {
+        heap::count_this_thread();
+        let start = std::time::Instant::now();
+        while !heap::REACHED.load(Ordering::SeqCst) {
+            assert!(start.elapsed().as_secs() < 10, "the stop was never reached");
+            std::hint::spin_loop();
+        }
+        // The opposite call: a free while the first thread allocates or grows, and an
+        // allocation while it frees.
+        let made = match held {
+            Some(block) => {
+                drop(block);
+                None
+            }
+            None => Some(std::hint::black_box(Vec::<u8>::with_capacity(16 * MIB))),
+        };
+        heap::DONE.store(true, Ordering::SeqCst);
+        drop(made);
+    });
+    heap::stop_here(true);
+    let moved = unsafe {
+        match site {
+            1 => {
+                let layout = Layout::from_size_align(16 * MIB, 8).unwrap();
+                heap::HOOK.store(1, Ordering::SeqCst);
+                let p = std::alloc::alloc(layout);
+                assert!(!p.is_null());
+                std::alloc::dealloc(p, layout);
+                false
+            }
+            2 => {
+                let layout = Layout::from_size_align(24 * MIB, 8).unwrap();
+                let p = std::alloc::alloc(layout);
+                assert!(!p.is_null());
+                heap::HOOK.store(2, Ordering::SeqCst);
+                std::alloc::dealloc(p, layout);
+                false
+            }
+            _ => {
+                let layout = Layout::from_size_align(4 * MIB, 8).unwrap();
+                let p = std::alloc::alloc(layout);
+                assert!(!p.is_null());
+                heap::HOOK.store(3, Ordering::SeqCst);
+                let q = std::alloc::realloc(p, layout, 16 * MIB);
+                assert!(!q.is_null());
+                std::alloc::dealloc(q, Layout::from_size_align(16 * MIB, 8).unwrap());
+                q != p
+            }
+        }
+    };
+    heap::stop_here(false);
+    heap::HOOK.store(0, Ordering::SeqCst);
+    other.join().unwrap();
+    moved
 }
