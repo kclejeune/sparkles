@@ -318,10 +318,11 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   literals, over a table or cursor batch of at least 4,096 rows, read the strings' order
   from their vocabulary ids and each string's floor in both modes, so neither column is
   decoded. The workers keep the floors they compute in one shared table of a cache that
-  lasts the query and grows when repeated strings evict each other, charged to its budget and capped at 64 MiB or a sixteenth of the budget, which
-  trades that memory for not computing a repeated string's floor again. Once the cache
-  is full, the floors it lacks are computed each time. Pairs whose strings rarely repeat
-  run up to 12% slower than a direct comparison of the keys, which
+  lasts the query and grows when repeated strings evict each other, charged to its
+  budget and capped at 64 MiB or a sixteenth of the budget, which trades that memory for
+  not computing a repeated string's floor again. Once the cache is full, the floors it
+  lacks are computed each time. In streaming execution, pairs whose strings rarely
+  repeat run up to about 7% slower than a direct comparison of the keys, which
   [roadmap item 1088](../ROADMAP.md) recovers.
 * Property path closures run within the query's memory budget and timeout in both
   executors. A closure counts its visited set, its frontier and the edge relation of a

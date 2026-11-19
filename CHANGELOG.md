@@ -163,9 +163,11 @@ the strings' order from their vocabulary ids and floors in streaming execution a
 in eager execution, which completes roadmap items 678 and 1069. The floors live in a cache
 that lasts the query, charged to its memory budget inside the spill threshold and capped
 at 64 MiB or a sixteenth of the budget, so a cursor's batches share them. On forge at 1.05M
-triples with one thread, streaming `str-pair-names` takes 0.488 of its earlier time and
-`str-pair-lt` 0.899, while `str-pair-colleague`, whose names rarely repeat, takes 1.087,
-which item 1088 follows.
+triples with one thread, streaming `str-pair-names` takes 0.517 of its earlier time and
+`str-pair-lt` 0.815, while `str-pair-colleague`, whose names rarely repeat, takes 1.042,
+and 1.065 with 12 threads, which item 1088 follows. Every worker of a comparison reads and
+writes one lock-free table of floors, which replaced an earlier map per worker that
+computed a repeated string's floor once per worker.
 
 ### Fewer rooted classification runs past their bound
 

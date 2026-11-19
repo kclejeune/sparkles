@@ -254,7 +254,7 @@ comparison on streaming `str-pair-lt` and `str-pair-names` on atlas, so item 106
 the context a charged floor cache that lasts the query and serves both modes. Cursor
 batches now compare through the floors, the exclusion in `string_order_mask` is gone and
 the bound is seven. The [Outcome](SPEC.md#outcome) records the forge measurements, and
-items 1088 and 1089 hold the costs that remain.
+items 1088, 1089 and 1140 hold the costs that remain.
 
 ## Stage 5: shared kernels
 
