@@ -244,9 +244,10 @@ plans name the merge, and `merge_left_join` selects it in both modes. On an Inte
 at 10.5M quads with one Rayon thread, the streamed `optional-filter` went from 46.6 to
 19.3 ms and `optional-cond` from 70.1 to 19.4 ms. At about 2.5 pairs per left row the cursor still takes 1.18 to 1.36 times
 the eager time, so an OPTIONAL whose condition holds an EXISTS stays eager under
-automatic execution, which item 570 keeps open. Items 1105, 1106 and 1137 follow the
-admission's merge order, the EXISTS counters of the cursor's plan and the charge of the
-merge's variable map.
+automatic execution, which item 570 keeps open. Item 1105 gives a future admission the
+build's merge order, and items 1106, 1137, 1140, 1141 and 1142 follow the EXISTS
+counters of the cursor's plan, the charge of the merge's variable map, a 0.9% cost of a
+hashed control, the reservation of a spooled frame and the eager memory retry.
 
 ### MCP tool profiles and semantic search
 

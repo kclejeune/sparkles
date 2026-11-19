@@ -1,0 +1,5 @@
+build-bc647108.log: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+build-ca1532ba.log: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+
+fa5dfcac483004a9c673af6e9e09348e9eb002de8c73db5aa5d633e234c7e74f  bin/bc647108
+8c43879e2f6100cfa22f08669bedae30f5fbe4c505efc414f9eeeadc676b1ad3  bin/ca1532ba

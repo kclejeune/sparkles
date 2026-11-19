@@ -218,10 +218,10 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   as IF or OR, an aggregate argument or an ORDER BY key, is answered from the same key
   set. Every row is probed before the expression is evaluated, also a row on which the
   expression does not reach the EXISTS. Automatic execution streams a plan with an
-  EXISTS in any of these positions unless the pattern calls a SERVICE, the EXISTS is
-  nested more than four levels deep or it is an OPTIONAL condition, because the cursor's
-  conditional merge is slower than the eager one at higher fan-out, which roadmap item
-  570 covers.
+  EXISTS in any of these positions unless the pattern calls a SERVICE or the EXISTS is
+  nested more than four levels deep. Automatic execution of a SELECT also keeps an
+  OPTIONAL whose condition holds an EXISTS eager, because the cursor's conditional merge
+  is slower than the eager one at higher fan-out, which roadmap item 570 covers.
 * An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
   every execution mode, so each operator reads its inputs a batch at a time and stops
   once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
@@ -276,13 +276,16 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   least a thousand rows, groupings of an estimated 20,000 input rows or more and every
   ASK without initial bindings. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice. Both modes join
-  through the same hash, keyed and merge kernels, so an OPTIONAL over two inputs sorted
-  on their shared variable merges in both when `merge_left_join` is on and hashes in both
-  when it is off, a hash join's OPTIONAL condition is tested once over each chunk of
-  candidate pairs rather than over the whole product, and EXPLAIN names the algorithm
-  that ran in either mode. A merge OPTIONAL's condition is tested over all of its matched
-  pairs at once in eager execution and over each batch's pairs in the cursor, which is
-  slower when a left row has several pairs.
+  through the same hash, keyed and merge primitives, so an OPTIONAL over two inputs
+  sorted on their one shared variable merges in both when `merge_left_join` is on and
+  hashes in both when it is off, a hash join's OPTIONAL condition is tested once over
+  each chunk of candidate pairs rather than over the whole product, and EXPLAIN names
+  the algorithm that ran in either mode. The cursor also merges on a leading variable
+  that is certainly bound when the inputs share further variables. The two modes test a
+  merge OPTIONAL's condition in separate implementations, eager execution over all of
+  the matched pairs at once and the cursor over each batch's pairs. In the measured
+  OPTIONALs over `foaf:knows`, with about 2.5 pairs per left row, the cursor took 1.18
+  to 1.36 times the eager time.
 * Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
   GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms
   keep one running state per group, on one key or several and with expression arguments,

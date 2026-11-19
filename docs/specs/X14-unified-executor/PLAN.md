@@ -291,17 +291,12 @@ modes and EXPLAIN names the algorithm the switch selected in both. An OPTIONAL c
 is evaluated once over the gathered candidates of a chunk in both modes, as
 `Binary::condition` already does for the cursor and `left_join` for the eager table, and
 the phase measures the conditional OPTIONAL of item 570's record,
-`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. Item
-570 closes when that measurement puts the streamed query within the gate of the eager
-one and the admission of an OPTIONAL whose condition is an EXISTS with a key set, whose
-earlier admission and revert
-[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records,
-passes the same measurement. The measurement is recorded in the
-[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19).
-The cursor now merges the conditional OPTIONAL and streams that query within the gate,
-but it streams the OPTIONALs over `foaf:knows`, with about 2.5 pairs per left row, in
-1.18 to 1.36 times the eager time, so item 570 stays open and the EXISTS admission
-waits for it. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
+`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. The
+[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
+records that measurement, in which the cursor merges the query and streams it within
+the gate. Item 570 states the remaining acceptance rule, which adds OPTIONALs with
+several pairs per left row and the admission of an OPTIONAL whose condition holds an
+EXISTS. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
 for keys the hash cannot take.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`

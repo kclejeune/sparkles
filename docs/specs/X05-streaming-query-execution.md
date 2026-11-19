@@ -1798,29 +1798,37 @@ extension only when none of its pairs passed, carrying that state across batches
 merge reports no count under a condition, holds the condition once for the operator,
 and charges its variable map, its candidate table and the pair and extension of a
 one-row batch before the test. A spooled run drops a consumed frame before it decodes
-the next. The variable map is sized before planning a nested EXISTS interns more
-variables, which item 1137 covers.
+the next, but its reservation of eight bytes per encoded cell can fall short for wide,
+poorly compressible frames, which item 1141 covers. The variable map is sized before
+planning a nested EXISTS interns more variables, which item 1137 covers.
 
 A quiet A/B on `atlas`, an Intel benchmark worker, compared bc647108, which hashed every
 conditional OPTIONAL in the cursor, as A with ca1532ba as B at 10.5M quads with one
 Rayon thread, over three A, B, B, A rounds of seven timed requests in each mode. Every
 build and mode returned the same answers, and the executed plans of B name the merge in
 both modes for the six merge shapes. Streamed, B took 0.28 to 0.78 times as long as A on
-each of them, while the two `class-*` controls, which hash in both modes, and every
-eager time stayed within their spread. On the shapes where a left row has about one
+each of them. The two `class-*` controls, which hash in both modes, and the eager times
+were within the spread of their server processes, except eager `optional-cond`, which
+was faster on B in every round. On the shapes where a left row has about one
 pair, `optional-filter`, `optional-cond` and `exists-optional`, B streamed in 0.71 to
 1.04 times its eager time. On `foaf:knows`, with about 2.5 pairs per left row, B streamed
 in 1.32 times its eager time with a plain FILTER and in 1.18 and 1.36 times with an
 EXISTS. Eager execution tests the condition over all of the matched pairs at once,
 while the cursor emits every pair and a candidate extension for each left row and then
-tests the batch. With `merge_left_join` off both modes hash and the two builds tied.
+tests the batch. With `merge_left_join` off both modes hash, and over two rounds the
+builds were within their spread on every query except streamed `knows-fail`, which took
+305.3 ms on B against 302.5 ms on A in code the change does not touch. Item 1140 holds
+that cost.
 
 B also streamed an OPTIONAL whose condition holds an EXISTS under automatic execution,
-which A kept eager. That raised the automatic times of `knows-exists` from 132 to 181 ms
-and of `knows-mixed` from 548 to 647 ms, so the change keeps such plans eager, and item
-570 admits them once the merge tests its condition on the runs of pairs. An OPTIONAL
-with a plain condition was already streamed, and its automatic times fell with the
-merge, `knows-fail` from 304 to 198 ms. The
+which A kept eager, as the plans that B's automatic execution chose show. The A/B timed
+the forced modes, so the cost of that admission is read from the paths each build's
+automatic execution takes, A eager against B streamed. That is 132 against 181 ms for
+`knows-exists` and 549 against 647 ms for `knows-mixed`, so the change keeps such plans
+eager, and item 570 admits them once the merge tests its condition on each key's pairs
+and item 1105 gives admission the build's merge order. An OPTIONAL with a plain
+condition was already streamed on both builds, and the streamed `knows-fail` went from
+304 to 198 ms. The
 [memory results](../benchmarks/memory/RESULTS.md#automatic-exists) give the table, and the
 [run record](../benchmarks/memory/records/exists-optional-2026-11-19/README.md) holds the
 samples and plans.
@@ -1833,9 +1841,10 @@ caps over long runs of failing pairs.
 eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
 per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the
 conditional OPTIONAL honours `merge_left_join` and names its algorithm in both plans.
-The cursor's EXPLAIN reports no EXISTS counters on the merge OPTIONAL, which item 1106
-covers, and automatic admission reads the planner's order of the inputs while the build
-derives it again, which item 1105 covers.
+The cursor's EXPLAIN reports EXISTS counters only on a FILTER, while eager plans report
+them on every operator that evaluates an EXISTS, which item 1106 covers. Without spill,
+the eager memory retry of automatic execution uses the admission check and so does not
+retry an OPTIONAL whose condition holds an EXISTS as a cursor, which item 1142 covers.
 
 ### Finite HTTP body limits
 

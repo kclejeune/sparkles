@@ -5,10 +5,12 @@ These are the records behind the table of conditional OPTIONALs in the
 [X05 outcome](../../../../specs/X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19).
 They are manual records, not bench-record files, so the [run catalog](../../RUNS.json)
 does not list them. Their files keep the bytes the runs wrote, except that the plan
-files keep only the timing line and the plan and drop the result rows. The `SHA256SUMS`
-file lists the hash of each original file, and each `samples.tsv.zst` compresses the
-`samples.tsv` that it lists. The timing script `ab.sh` and the driver `run.sh` are in
-`scripts.tar.zst`.
+files keep only the timing line and the plan and drop the result rows. `SHA256SUMS`
+lists the hashes of the three original TSV files of each timing directory and of the two
+scripts, and each `samples.tsv.zst` compresses the `samples.tsv` that it lists. The
+plans and queries have no listed hashes. The timing script `ab.sh` and the driver
+`run.sh` are in `scripts.tar.zst`. `builds.txt` holds the compiler line of each build
+log and `sha256sum` of the two binaries as taken on `atlas` after the run.
 
 Both builds are release builds made on `atlas` with `mbx build --release -p
 sparkles-server` and rustc 1.99.1. A is bc647108, which streams EXISTS inside larger
