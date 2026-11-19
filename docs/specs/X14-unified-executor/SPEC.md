@@ -291,8 +291,8 @@ shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
 names query's 2x. A profile of the per-worker maps put most of the floors' time in
 `Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
 predecessor. The shared table has not been profiled, so that read is the suspected cause
-of its cost, and item 1088 recovers the streaming cost. Its first candidate allocates the
-checked walk's key buffer before the walk instead of growing it from empty and reads the
+of its cost, and item 1088 recovers the streaming cost. Its first candidate admits and allocates
+the checked walk's key buffer before the walk instead of growing it from empty and reads the
 predecessor without the copy that `PrevKey::keep` makes, keeping the checked envelope and
 its fallback.
 
