@@ -12,6 +12,9 @@ use std::io::Result;
 /// The tabs between the cells of a TSV row, written a slice at a time.
 const TABS: &[u8; 32] = b"\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t\t";
 
+/// The commas between the cells of a CSV row.
+const COMMAS: &[u8; 32] = b",,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,,";
+
 /// SPARQL 1.1 Query Results TSV, as sparesults writes it with SPARQL 1.2 terms.
 pub(super) struct Tsv;
 
@@ -49,24 +52,117 @@ impl Tsv {
                 // less the tabs already written
                 let mut tabs = 0;
                 for (c, term) in terms {
-                    tabs_to(out, &mut tabs, *c)?;
+                    separators_to(out, TABS, &mut tabs, *c)?;
                     tsv_term(out, term.as_ref().as_ref())?;
                 }
-                tabs_to(out, &mut tabs, width.saturating_sub(1))?;
+                separators_to(out, TABS, &mut tabs, width.saturating_sub(1))?;
             }
         }
         out.put(b"\n")
     }
 }
 
+/// SPARQL 1.1 Query Results CSV, as sparesults writes it with SPARQL 1.2 terms: IRIs and
+/// lexical forms without their datatypes or languages, a lexical form quoted when it holds
+/// a quote, comma, line feed or carriage return, and lines ended by CRLF.
+pub(super) struct Csv;
+
+impl Csv {
+    /// The header line, the names separated by commas.
+    pub(super) fn header(out: &mut Explicit<'_, '_>, variables: &[String]) -> Result<()> {
+        out.begin_piece();
+        for (i, v) in variables.iter().enumerate() {
+            if i > 0 {
+                out.put(b",")?;
+            }
+            out.put(v.as_bytes())?;
+        }
+        out.put(b"\r\n")?;
+        out.end_piece()
+    }
+
+    /// One row of `width` cells, an unbound cell empty.
+    pub(super) fn row(out: &mut Explicit<'_, '_>, row: RowView<'_>, width: usize) -> Result<()> {
+        match row {
+            RowView::Dense(terms) => {
+                for (c, term) in terms.iter().enumerate() {
+                    if c > 0 {
+                        out.put(b",")?;
+                    }
+                    if let Some(term) = term {
+                        csv_term(out, term.as_ref())?;
+                    }
+                }
+            }
+            RowView::Sparse(terms) => {
+                let mut commas = 0;
+                for (c, term) in terms {
+                    separators_to(out, COMMAS, &mut commas, *c)?;
+                    csv_term(out, term.as_ref().as_ref())?;
+                }
+                separators_to(out, COMMAS, &mut commas, width.saturating_sub(1))?;
+            }
+        }
+        out.put(b"\r\n")
+    }
+}
+
+/// Write separators until `written` reaches `to`, which the entries of a sparse row give
+/// as the column of the next cell.
 #[inline]
-fn tabs_to(out: &mut Explicit<'_, '_>, written: &mut usize, to: usize) -> Result<()> {
+fn separators_to(
+    out: &mut Explicit<'_, '_>,
+    run: &[u8; 32],
+    written: &mut usize,
+    to: usize,
+) -> Result<()> {
     while *written < to {
-        let n = (to - *written).min(TABS.len());
-        out.put(&TABS[..n])?;
+        let n = (to - *written).min(run.len());
+        out.put(&run[..n])?;
         *written += n;
     }
     Ok(())
+}
+
+fn csv_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+    match term {
+        TermRef::NamedNode(node) => out.put(node.as_str().as_bytes()),
+        TermRef::BlankNode(node) => {
+            out.put(b"_:")?;
+            out.put(node.as_str().as_bytes())
+        }
+        TermRef::Literal(literal) => csv_string(out, literal.value()),
+        TermRef::Triple(triple) => {
+            csv_term(out, triple.subject.as_ref().into())?;
+            out.put(b" ")?;
+            csv_term(out, triple.predicate.as_ref().into())?;
+            out.put(b" ")?;
+            csv_term(out, triple.object.as_ref())
+        }
+    }
+}
+
+/// A lexical form, between double quotes with each quote doubled when it holds a quote,
+/// comma, line feed or carriage return.
+fn csv_string(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    if !bytes
+        .iter()
+        .any(|&b| matches!(b, b'"' | b',' | b'\n' | b'\r'))
+    {
+        return out.put(bytes);
+    }
+    out.put(b"\"")?;
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' {
+            // the quote ends this run, and the next run starts with it again
+            out.put(&bytes[start..=i])?;
+            start = i;
+        }
+    }
+    out.put(&bytes[start..])?;
+    out.put(b"\"")
 }
 
 fn tsv_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {

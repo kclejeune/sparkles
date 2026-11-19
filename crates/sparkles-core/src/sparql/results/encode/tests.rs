@@ -5,7 +5,7 @@
 use super::super::rowout::Explicit;
 use super::super::source::RowView;
 use super::super::{RowCount, io, write_buffered};
-use super::Tsv;
+use super::{Csv, Tsv};
 use crate::error::Result;
 use oxrdf::vocab::xsd;
 use oxrdf::{
@@ -22,18 +22,21 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug)]
 enum Enc {
     Tsv,
+    Csv,
 }
 
 impl Enc {
     fn oracle(self) -> QueryResultsFormat {
         match self {
             Enc::Tsv => QueryResultsFormat::Tsv,
+            Enc::Csv => QueryResultsFormat::Csv,
         }
     }
 
     fn header(self, out: &mut Explicit<'_, '_>, vars: &[String]) -> std::io::Result<()> {
         match self {
             Enc::Tsv => Tsv::header(out, vars),
+            Enc::Csv => Csv::header(out, vars),
         }
     }
 
@@ -45,6 +48,7 @@ impl Enc {
     ) -> std::io::Result<()> {
         match self {
             Enc::Tsv => Tsv::row(out, row, width),
+            Enc::Csv => Csv::row(out, row, width),
         }
     }
 }
@@ -414,6 +418,16 @@ proptest! {
     fn tsv_counts_the_rows_a_failed_writer_took((vars, rows) in solutions(), limit in 0usize..400) {
         check_failing(Enc::Tsv, &vars, &rows, limit)?;
     }
+
+    #[test]
+    fn csv_equals_sparesults((vars, rows) in solutions()) {
+        check(Enc::Csv, &vars, &rows)?;
+    }
+
+    #[test]
+    fn csv_counts_the_rows_a_failed_writer_took((vars, rows) in solutions(), limit in 0usize..400) {
+        check_failing(Enc::Csv, &vars, &rows, limit)?;
+    }
 }
 
 proptest! {
@@ -433,6 +447,20 @@ proptest! {
         let total = oracle(Enc::Tsv, &vars, &rows).0.len();
         check_failing(Enc::Tsv, &vars, &rows, (total as f64 * at) as usize)?;
     }
+
+    #[test]
+    fn csv_pieces_equal_sparesults_row_writes((vars, rows) in long_solutions()) {
+        check_pieces(Enc::Csv, &vars, &rows)?;
+    }
+
+    #[test]
+    fn csv_counts_the_rows_a_failed_writer_took_over_drains(
+        (vars, rows) in long_solutions(),
+        at in 0.0f64..=1.0,
+    ) {
+        let total = oracle(Enc::Csv, &vars, &rows).0.len();
+        check_failing(Enc::Csv, &vars, &rows, (total as f64 * at) as usize)?;
+    }
 }
 
 // ---- fixtures ----
@@ -441,14 +469,22 @@ fn lit(v: &str, d: NamedNode) -> Option<Term> {
     Some(Literal::new_typed_literal(v, d).into())
 }
 
-fn tsv(vars: &[&str], rows: &[Vec<Option<Term>>]) -> String {
+fn encoded(enc: Enc, vars: &[&str], rows: &[Vec<Option<Term>>]) -> String {
     let vars: Vec<String> = vars.iter().map(|v| v.to_string()).collect();
     let mut got = Vec::new();
-    let (r, _) = encode(Enc::Tsv, &vars, rows, false, &mut got);
+    let (r, _) = encode(enc, &vars, rows, false, &mut got);
     r.unwrap();
-    let (want, _) = oracle(Enc::Tsv, &vars, rows);
+    let (want, _) = oracle(enc, &vars, rows);
     assert_eq!(got, want, "the oracle disagrees");
     String::from_utf8(got).unwrap()
+}
+
+fn tsv(vars: &[&str], rows: &[Vec<Option<Term>>]) -> String {
+    encoded(Enc::Tsv, vars, rows)
+}
+
+fn csv(vars: &[&str], rows: &[Vec<Option<Term>>]) -> String {
+    encoded(Enc::Csv, vars, rows)
 }
 
 /// Valid lexical forms of the Turtle number and boolean rules are written bare, and any
@@ -608,4 +644,59 @@ fn tsv_writes_long_tab_runs_and_many_short_rows() {
     for limit in [8_191, 8_192, 20_000, 50_000] {
         check_failing(Enc::Tsv, &vars, &rows, limit).unwrap();
     }
+}
+
+/// CSV writes IRIs and lexical forms bare, quotes a lexical form with a quote, comma, line
+/// feed or carriage return and doubles its quotes, and writes a triple term's parts
+/// separated by spaces.
+#[test]
+fn csv_quotes_only_the_lexical_forms_that_need_it() {
+    let t = Term::Triple(Box::new(Triple::new(
+        BlankNode::new_unchecked("b0"),
+        NamedNode::new_unchecked("http://e/p,q"),
+        Literal::new_language_tagged_literal_unchecked("a\"b", "en"),
+    )));
+    let rows = vec![
+        vec![
+            simple("plain\ttab"),
+            Some(NamedNode::new_unchecked("http://e/a,b\"c").into()),
+            Some(t),
+        ],
+        vec![simple("\"\""), simple("a,b"), simple("cr\rlf\n")],
+        vec![lit("42", xsd::INTEGER.into_owned()), simple(""), None],
+    ];
+    assert_eq!(
+        csv(&["é", "b", "c"], &rows),
+        "é,b,c\r\n\
+         plain\ttab,http://e/a,b\"c,_:b0 http://e/p,q \"a\"\"b\"\r\n\
+         \"\"\"\"\"\",\"a,b\",\"cr\rlf\n\"\r\n\
+         42,,\r\n"
+    );
+    assert_eq!(csv(&[], &[vec![], vec![]]), "\r\n\r\n\r\n");
+}
+
+/// CSV rows past the buffer and runs of more than 32 empty cells, as for TSV.
+#[test]
+fn csv_handles_long_rows_and_long_comma_runs() {
+    let vars = vec!["v".to_string()];
+    let row = |n: usize| vec![simple(&"z".repeat(n - 2))];
+    let rows = vec![
+        vec![simple("a")],
+        row(8_191),
+        row(8_192),
+        row(8_193),
+        vec![simple(&"\",".repeat(30_000))],
+        vec![simple("b")],
+    ];
+    check_pieces(Enc::Csv, &vars, &rows).unwrap();
+    for limit in [0, 3, 8_000, 9_000, 40_000, 80_000] {
+        check_failing(Enc::Csv, &vars, &rows, limit).unwrap();
+    }
+    let vars: Vec<String> = (0..70).map(|i| format!("c{i}")).collect();
+    let mut sparse = vec![None; 70];
+    sparse[33] = simple("m");
+    sparse[69] = simple("n");
+    let rows = vec![sparse, vec![None; 70]];
+    check(Enc::Csv, &vars, &rows).unwrap();
+    check_pieces(Enc::Csv, &vars, &rows).unwrap();
 }

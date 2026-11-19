@@ -1,7 +1,7 @@
 //! One writer per result format family over the sources of [`super::source`], and the
 //! entry that every caller writes a result through.
 
-use super::encode::Tsv;
+use super::encode::{Csv, Tsv};
 use super::rowout::Explicit;
 use super::source::{
     BatchVisitor, CursorGraph, CursorSolutions, EagerGraph, EagerMode, EagerSolutions, GraphSource,
@@ -236,17 +236,10 @@ fn select<S: SolutionSource>(
         }
         return Ok(());
     }
-    if fmt == SolutionsFormat::Tsv {
-        let width = source.variables().len();
-        let mut out = Explicit::new(out);
-        Tsv::header(&mut out, source.variables()).map_err(io)?;
-        let mut rows = EncodedRows {
-            out,
-            width,
-            flush: S::FLUSH_FIRST,
-            row: Tsv::row,
-        };
-        return source.drive(send, &mut rows);
+    match fmt {
+        SolutionsFormat::Tsv => return encoded(source, out, send, Tsv::header, Tsv::row),
+        SolutionsFormat::Csv => return encoded(source, out, send, Csv::header, Csv::row),
+        _ => {}
     }
     let vars: Vec<Variable> = source
         .variables()
@@ -280,6 +273,31 @@ fn select<S: SolutionSource>(
         rows.serializer.finish().map_err(io)?;
     }
     Ok(())
+}
+
+/// A SELECT in a format the engine encodes, its header and then its rows, each marked in
+/// the explicit mode. The row encoder is a function item, so each format compiles its own
+/// loop.
+fn encoded<S: SolutionSource, R>(
+    source: &mut S,
+    out: &mut RowOut<'_>,
+    send: Option<usize>,
+    header: fn(&mut Explicit<'_, '_>, &[String]) -> std::io::Result<()>,
+    row: R,
+) -> Result<()>
+where
+    R: Fn(&mut Explicit<'_, '_>, RowView<'_>, usize) -> std::io::Result<()>,
+{
+    let width = source.variables().len();
+    let mut out = Explicit::new(out);
+    header(&mut out, source.variables()).map_err(io)?;
+    let mut rows = EncodedRows {
+        out,
+        width,
+        flush: S::FLUSH_FIRST,
+        row,
+    };
+    source.drive(send, &mut rows)
 }
 
 /// The rows of a format the engine encodes, each marked in the explicit mode.
