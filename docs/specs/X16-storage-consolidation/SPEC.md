@@ -763,15 +763,22 @@ log and the on-disk formats did not change.
 
 Phase 5 is built apart from the `imbl` maps. `index::encode_deltas` writes the zig-zag
 delta varints of an index column frame and of a run block's column, and
-`index::decode_varints_into`, the index's decoder with its eight-byte fast path, reads
-both. The run reader decodes a column into a scratch vector of up to 32,768 values and
-copies it into the keys, which costs each open run reader 256 KiB more memory beside the
-four 1 MiB blocks it already holds. Tests pin the varint bytes of a sample column in a column frame and in a
-run block, which the shared coder writes unchanged. An instruction count of the
-new `delta_coder_bench` harness on one P core of the laptop, over 2^20 sorted keys in
-three interleaved rounds, found the index's column encode and decode and the run encode
-unchanged to within 0.001%, and the run decode 4.4% fewer instructions. The timing on
-`atlas` is pending. `bench:insn` reaches neither coder, so the harness stands in for it. It ran with the
+`index::decode_varints_strided`, the index's decoder with its eight-byte fast path, reads
+both. It writes every `S`th element of its output, so the run reader decodes a column
+straight into every fourth word of the flattened keys and the index's frames use a stride
+of one. Tests pin the varint bytes of a sample column in a column frame and in a run block,
+which the shared coder writes unchanged, and check the strided decode against the
+contiguous one for every column, tail length and kind of damage. The new
+`delta_coder_bench` harness times the four cases over 2^20 sorted keys on one P core. The
+first shared version decoded a run column into a 256 KiB scratch vector and copied it into
+the keys. On `atlas`, in five interleaved A,B,B,A rounds, it left the run encode and the
+index's encode and decode within the spread of their rounds, and made the run decode 19%
+slower, 14.35 against 11.98 ns a key, in every round, although it ran 4.4% fewer
+instructions. A profile on the laptop put the extra cycles in that copy, whose stores
+stride 32 bytes through a megabyte of keys. Decoding in place removed the copy. On a
+laptop P core over two interleaved rounds the run decode then took 41.3 million cycles a
+pass against 45.1 million before the sharing, and the index's decode 38.8 million against
+41.4 million, with the encodes unchanged. The confirming timing on `atlas` is pending. `bench:insn` reaches neither coder, so the harness stands in for it. It ran with the
 default features, whose run blocks use LZ4, while the server's builder uses zstd.
 The ungated test hooks `set_clock`, `wal_direct_active`, `vocab_direct_active`, the
 vector pause and sequential-build hooks, the full-text failure, checkpoint and tick hooks,
