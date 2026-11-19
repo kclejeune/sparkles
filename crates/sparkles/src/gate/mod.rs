@@ -48,6 +48,16 @@
 //! ordinary named graph: `chk:shapesGraph` refuses the ARQ aliases and the reserved graphs,
 //! and shapes with no active shape that has a target are refused rather than validating
 //! nothing. A shape that `sh:deactivated true` turns off is not active.
+//! Embedded SHACL-SPARQL reads the selected candidate data as its default graph.
+//! The gate refuses `GRAPH`, `FROM` and `FROM NAMED` in these queries. It also refuses
+//! `sh:target` declarations and malformed targets, including malformed node expressions.
+//! A blank node in `sh:targetNode` remains a constant unless its predicates identify
+//! a node expression.
+//!
+//! Standalone query checks, ShEx SPARQL selectors and SHACL-SPARQL queries refuse
+//! `SERVICE`, including operations inside expressions. Gate ShEx schemas cannot
+//! contain semantic actions, and shape-map data selectors cannot contain fixed
+//! blank nodes. Blank-node shape labels and selectors that match nothing are supported.
 //!
 //! An unsatisfiable-classes check parses, has a revision and can be named in a suite, but
 //! no build runs it. Its result is an error with the code `check-unavailable`, so a

@@ -900,6 +900,303 @@ fn shapes_that_are_all_deactivated_are_refused() {
     assert_eq!(r.status, Status::Passed, "{r:?}");
 }
 
+fn profile_refusal(result: &CheckResult, reason: &str) {
+    assert_eq!(result.status, Status::Error, "{result:?}");
+    assert_eq!(result.code, Some("input-invalid"), "{result:?}");
+    assert!(result.blocks(), "{result:?}");
+    assert!(
+        result.messages[0].contains(reason),
+        "expected {reason:?}: {result:?}"
+    );
+}
+
+const NESTED_SERVICE: &str = "SELECT ?focus WHERE {
+    VALUES ?focus { <urn:x> }
+    BIND(EXISTS { SERVICE <urn:offline:unused> { ?a ?b ?c } } AS ?hit)
+    FILTER(?hit)
+}";
+
+#[test]
+fn gate_query_profile_refuses_service_before_evaluation() {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { GRAPH <urn:data> { <urn:x> <urn:p> <urn:y> } }")
+        .unwrap();
+    let snapshot = ds.store().snapshot();
+    let run_query = |query: &str| {
+        let literal = oxrdf::Literal::new_simple_literal(query);
+        let suite = suite(&format!(
+            "<urn:s> a chk:Suite ; chk:check <urn:c> .
+             <urn:c> a chk:QueryCheck ; chk:query {literal} ."
+        ))
+        .unwrap();
+        run_on(&suite, &snapshot, &snapshot).results.remove(0)
+    };
+    let queries = [
+        NESTED_SERVICE,
+        "ASK { SERVICE SILENT <urn:offline:unused> { ?s ?p ?o } }",
+        "SELECT ?s {
+            VALUES (?s ?endpoint) { (<urn:x> <urn:offline:unused>) }
+            OPTIONAL { ?s ?p ?o FILTER(EXISTS { SERVICE ?endpoint { ?a ?b ?c } }) }
+        }",
+        "SELECT ?count WHERE {
+            { SELECT (COUNT(IF(EXISTS { SERVICE <urn:offline:unused> { ?a ?b ?c } },
+                                1, 0)) AS ?count) WHERE {} }
+        }",
+        "SELECT ?s { ?s ?p ?o }
+         ORDER BY DESC(IF(EXISTS { SERVICE <urn:offline:unused> { ?a ?b ?c } }, 1, 0))",
+    ];
+    for query in queries {
+        sparkles_core::sparql::parse_query(query, None, &[]).expect(query);
+        profile_refusal(&run_query(query), "SERVICE");
+    }
+    assert_eq!(
+        run_query("ASK { FILTER(CONTAINS('SERVICE', 'SERVICE')) }").status,
+        Status::Failed
+    );
+    assert_eq!(
+        run_query("ASK FROM <urn:data> { <urn:x> <urn:p> <urn:y> }").status,
+        Status::Failed
+    );
+}
+
+#[cfg(feature = "shacl")]
+fn inline_shacl(shapes: &str, selection: &str) -> Suite {
+    let text = oxrdf::Literal::new_simple_literal(format!("@prefix sh: <{SH_NS}> .\n{shapes}"));
+    suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShaclCheck ; chk:shapes {text} {selection} ."
+    ))
+    .unwrap()
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_refuses_access_to_the_candidate_copy_of_pinned_shapes() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        &format!(
+            "PREFIX sh: <{SH_NS}>
+             INSERT DATA {{ GRAPH <urn:shapes> {{
+                 <urn:S> sh:targetNode <urn:x> ;
+                     sh:sparql [ sh:select
+                        'SELECT $this WHERE {{ GRAPH $shapesGraph {{ <urn:ref> <urn:flag> true }} }}'
+                     ] .
+                 <urn:ref> <urn:flag> true .
+             }} }}"
+        ),
+        "DELETE DATA { GRAPH <urn:shapes> { <urn:ref> <urn:flag> true } }",
+    );
+    let suite = shacl_suite("").unwrap();
+    profile_refusal(&run_on(&suite, &before, &after).results[0], "GRAPH");
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_checks_all_embedded_query_forms() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        "",
+        "INSERT DATA {
+            GRAPH <urn:data> { <urn:x> <urn:flag> true }
+            GRAPH <urn:other> { <urn:x> <urn:otherFlag> true }
+        }",
+    );
+    let run_shapes = |shapes: &str| {
+        let suite = inline_shacl(shapes, "; chk:dataGraph <urn:data>");
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    for graph in [
+        "<urn:other>",
+        "?g",
+        "<urn:x-arq:DefaultGraph>",
+        "<urn:x-arq:UnionGraph>",
+    ] {
+        let shapes = format!(
+            "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select
+              'SELECT $this WHERE {{ GRAPH {graph} {{ <urn:x> <urn:flag> true }} }}' ] ."
+        );
+        profile_refusal(&run_shapes(&shapes), "GRAPH");
+    }
+    let shapes = [
+        "<urn:S> sh:targetNode <urn:x>,
+             [ sh:select '''SELECT ?result WHERE {
+                 BIND(EXISTS { GRAPH <urn:other> { ?s ?p ?o } } AS ?result)
+             }''' ] .",
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+           sh:validator [ a sh:SPARQLAskValidator ;
+                           sh:ask 'ASK { GRAPH <urn:other> { ?s ?p ?o } }' ] .
+         <urn:S> sh:targetNode <urn:x> .",
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+           sh:propertyValidator [ a sh:SPARQLSelectValidator ;
+                   sh:select 'SELECT $this WHERE { GRAPH ?g { $this $PATH ?o } }' ] .
+         <urn:S> sh:targetNode <urn:x> ;
+             sh:property [ sh:path <urn:flag> ; <urn:param> true ] .",
+        "<urn:f> a sh:SPARQLFunction ;
+            sh:select 'SELECT ?o WHERE { GRAPH <urn:other> { ?s ?p ?o } }' .
+         <urn:S> sh:targetNode <urn:x> .",
+    ];
+    for shapes in shapes {
+        profile_refusal(&run_shapes(shapes), "GRAPH");
+    }
+    for from in ["FROM <urn:other>", "FROM NAMED <urn:other>"] {
+        for shapes in [
+            format!(
+                "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select
+                   'SELECT $this {from} WHERE {{ $this <urn:flag> true }}' ] ."
+            ),
+            format!(
+                "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+                    sh:nodeValidator [ sh:select 'SELECT $this {from} WHERE {{}}' ] .
+                 <urn:S> sh:targetNode <urn:x> ; <urn:param> true ."
+            ),
+            format!(
+                "<urn:S> sh:targetNode
+                    [ sh:select 'SELECT ?result {from} WHERE {{ ?result <urn:flag> true }}' ] ;
+                    sh:class <urn:Required> ."
+            ),
+        ] {
+            profile_refusal(&run_shapes(&shapes), "FROM");
+        }
+    }
+    let supported = [
+        "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select
+           'SELECT $this WHERE { $this <urn:flag> true }' ] .",
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+           sh:propertyValidator [ a sh:SPARQLSelectValidator ;
+                sh:select 'SELECT $this WHERE { $this $PATH $param }' ] .
+         <urn:S> sh:targetNode <urn:x> ;
+             sh:property [ sh:path <urn:flag> ; <urn:param> true ] .",
+        "<urn:S> sh:targetNode
+            [ sh:select 'SELECT ?result WHERE { ?result <urn:flag> true }' ] ;
+            sh:class <urn:Required> .",
+    ];
+    for shapes in supported {
+        let result = run_shapes(shapes);
+        assert_eq!(result.status, Status::Failed, "{shapes}: {result:?}");
+    }
+    for constraint in [
+        "sh:select 'SELECT $this WHERE { $this <urn:otherFlag> true }'",
+        "sh:deactivated true ; sh:select 'SELECT $this WHERE { GRAPH ?g { ?s ?p ?o } }'",
+    ] {
+        let result = run_shapes(&format!(
+            "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ {constraint} ] ."
+        ));
+        assert_eq!(result.status, Status::Passed, "{result:?}");
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_refuses_skipped_targets() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> a <urn:Observed> }");
+    let run_shapes = |shapes: &str| {
+        let suite = inline_shacl(shapes, "");
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    for (target, reason) in [
+        (
+            "sh:target [ a sh:SPARQLTarget ; sh:select 'SELECT $this { $this a <urn:Observed> }' ]",
+            "sh:target",
+        ),
+        (
+            "sh:targetNode [ sh:select <urn:not-a-string> ]",
+            "sh:targetNode",
+        ),
+        ("sh:targetClass 'not-an-iri'", "sh:targetClass"),
+        ("sh:targetSubjectsOf []", "sh:targetSubjectsOf"),
+        ("sh:targetObjectsOf 'not-an-iri'", "sh:targetObjectsOf"),
+        ("sh:targetWhere 'not-a-shape'", "sh:targetWhere"),
+    ] {
+        let mixed = format!("<urn:S> sh:targetNode <urn:valid> ; {target} .");
+        profile_refusal(&run_shapes(&mixed), reason);
+    }
+    for node in ["[]", "[ <urn:description> 'a regular blank node' ]"] {
+        let result = run_shapes(&format!(
+            "<urn:S> sh:targetNode {node} ; sh:nodeKind sh:IRI ."
+        ));
+        assert_eq!(result.status, Status::Failed, "{node}: {result:?}");
+    }
+}
+
+#[cfg(feature = "shex")]
+fn run_shex_profile(schema: &str, map: &str) -> CheckResult {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> <urn:link> <urn:y> }");
+    let schema = oxrdf::Literal::new_simple_literal(schema);
+    let map = oxrdf::Literal::new_simple_literal(map);
+    let suite = suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShexCheck ; chk:schema {schema} ; chk:shapeMap {map} ."
+    ))
+    .unwrap();
+    run_on(&suite, &before, &after).results.remove(0)
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_refuses_nonportable_blank_data_selectors() {
+    let label = sparkles_core::store::bnode_for(crate::id::Id::bnode(1));
+    let selectors = [
+        "_:x@<urn:S>".to_string(),
+        format!("_:{label}@<urn:S>", label = label.as_str()),
+        "{FOCUS <urn:link> _:x}@<urn:S>".to_string(),
+        "{_:x <urn:link> FOCUS}@<urn:S>".to_string(),
+    ];
+    for selector in selectors {
+        profile_refusal(&run_shex_profile("<urn:S> {}", &selector), "blank node");
+    }
+    assert_eq!(
+        run_shex_profile("_:shape {}", "<urn:x>@_:shape").status,
+        Status::Passed
+    );
+    assert_eq!(
+        run_shex_profile("<urn:S> { <urn:req> . }", "{FOCUS <urn:absent> _}@<urn:S>").status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_refuses_compiled_semantic_actions() {
+    for schema in [
+        "<urn:S> { <urn:link> @<urn:T> } <urn:T> {} %<urn:unknown>% ",
+        "%<urn:unknown>% <urn:S> {}",
+        "<urn:S> { ( <urn:link> . ; <urn:unused> .? ) %<urn:unknown>% }",
+    ] {
+        profile_refusal(
+            &run_shex_profile(schema, "<urn:x>@<urn:S>"),
+            "semantic action",
+        );
+    }
+    assert_eq!(
+        run_shex_profile(
+            "<urn:S> { <urn:link> @<urn:T> } <urn:T> {}",
+            "<urn:x>@<urn:S>",
+        )
+        .status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_refuses_service_in_selector_expressions() {
+    let schema = "<urn:S> { <urn:required> . }";
+    let selector = format!("SPARQL '''{NESTED_SERVICE}'''@<urn:S>");
+    profile_refusal(&run_shex_profile(schema, &selector), "SERVICE");
+    assert_eq!(
+        run_shex_profile(
+            schema,
+            "SPARQL 'SELECT ?focus WHERE { ?focus <urn:absent> ?o }'@<urn:S>",
+        )
+        .status,
+        Status::Passed
+    );
+}
+
 #[test]
 fn a_note_is_reported_with_its_severity_and_never_blocks() {
     let note = Note {

@@ -146,7 +146,7 @@ pub(crate) fn validate_typed_with_output(
     tracing::debug!(pairs = t.len(), waves = ?t.waves, "shex typing");
 
     // per result: the verdict, then the prints and the reasons
-    let acts = has_acts(schema);
+    let acts = schema.has_semantic_actions();
     let items: Vec<u32> = (0..entries.len() as u32).collect();
     let read = |n: Id, k: PairKind| t.read_with(n, k, fixed);
     let prefixes = schema.prefixes();
@@ -266,17 +266,21 @@ pub fn validate_node(
 }
 
 /// Does the schema have semantic actions anywhere?
-fn has_acts(schema: &CompiledSchema) -> bool {
-    let ir = schema.ir();
-    !ir.start_acts.is_empty()
-        || ir.shapes.iter().any(|s| {
-            !s.sem_acts.is_empty()
-                || s.tcs.iter().any(|t| !t.sem_acts.is_empty())
-                || s.te.iter().any(|t| match t {
-                    Te::Tc(_) => false,
-                    Te::EachOf { acts, .. } | Te::OneOf { acts, .. } => !acts.is_empty(),
-                })
-        })
+impl CompiledSchema {
+    /// Whether the compiled schema has semantic actions, including START actions,
+    /// referenced shapes, triple constraints and groups.
+    pub fn has_semantic_actions(&self) -> bool {
+        let ir = self.ir();
+        !ir.start_acts.is_empty()
+            || ir.shapes.iter().any(|s| {
+                !s.sem_acts.is_empty()
+                    || s.tcs.iter().any(|t| !t.sem_acts.is_empty())
+                    || s.te.iter().any(|t| match t {
+                        Te::Tc(_) => false,
+                        Te::EachOf { acts, .. } | Te::OneOf { acts, .. } => !acts.is_empty(),
+                    })
+            })
+    }
 }
 
 #[cfg(test)]

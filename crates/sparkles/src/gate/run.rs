@@ -299,13 +299,15 @@ fn shacl(
                 ));
             }
             exclude.push(g.as_str().to_string());
-            sparkles_shacl::Shapes::from_store(inputs.before, Some(g.as_str()))
+            sparkles_shacl::Shapes::from_store_for_gate(inputs.before, Some(g.as_str()))
                 .map_err(|e| failure(&e))?
         }
-        Shapes::Inline(text) => {
-            sparkles_shacl::Shapes::parse(text, ShapesSyntax::Rdf(oxrdfio::RdfFormat::Turtle), None)
-                .map_err(|e| failure(&e))?
-        }
+        Shapes::Inline(text) => sparkles_shacl::Shapes::parse_for_gate(
+            text,
+            ShapesSyntax::Rdf(oxrdfio::RdfFormat::Turtle),
+            None,
+        )
+        .map_err(|e| failure(&e))?,
     };
     // a shape that `sh:deactivated true` turns off selects no focus node
     if !shapes.targeted().any(|shape| !shape.deactivated) {
@@ -375,13 +377,38 @@ fn shacl(_: &Shapes, _: &DataGraph, _: bool, _: &Inputs<'_>, _: Bound) -> Outcom
 
 #[cfg(feature = "shex")]
 fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
+    use sparkles_shex::NodeSelector;
+
     let invalid = |what: &str, e: &dyn std::fmt::Display| ("input-invalid", format!("{what}: {e}"));
     let parsed =
         sparkles_shex::Schema::parse_shexc(schema, None).map_err(|e| invalid("the schema", &e))?;
     let compiled = sparkles_shex::compile(&parsed, &sparkles_shex::NoImports)
         .map_err(|e| invalid("the schema", &e))?;
+    if compiled.has_semantic_actions() {
+        return Err((
+            "input-invalid",
+            "the gate's ShEx profile does not support semantic actions".to_string(),
+        ));
+    }
     let map = sparkles_shex::ShapeMap::parse(map, compiled.prefixes(), compiled.base())
         .map_err(|e| invalid("the shape map", &e))?;
+    let is_blank = |term: &oxrdf::Term| matches!(term, oxrdf::Term::BlankNode(_));
+    for association in &map.0 {
+        let has_blank = match &association.node {
+            NodeSelector::Term(term) => is_blank(term),
+            NodeSelector::Focus {
+                subject, object, ..
+            } => subject.as_ref().is_some_and(is_blank) || object.as_ref().is_some_and(is_blank),
+            NodeSelector::Sparql(_) => false,
+        };
+        if has_blank {
+            return Err((
+                "input-invalid",
+                "the shape map names a blank node in a data selector, which requires a store-local identifier"
+                    .to_string(),
+            ));
+        }
+    }
     if bound.passed() {
         return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
     }
@@ -391,6 +418,12 @@ fn shex(schema: &str, map: &str, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
     };
     let results =
         sparkles_shex::validate(inputs.after, &compiled, &map, &opts).map_err(|e| failure(&e))?;
+    if let Some(warning) = results.warnings.first() {
+        return Err((
+            "input-invalid",
+            format!("the ShEx check skipped work: {warning}"),
+        ));
+    }
     if results.conforms {
         return Ok((0, Vec::new(), Vec::new()));
     }
@@ -523,9 +556,16 @@ fn query(q: &Query, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
     let opts = crate::sparql::QueryOptions {
         timeout: bound.remaining(),
         deadline: bound.deadline,
+        no_cache: true,
+        forbid_service: true,
         ..Default::default()
     };
-    let r = crate::sparql::query(inputs.after.clone(), &text, &opts)
+    let started = Instant::now();
+    let parsed = crate::sparql::parse_query(&text, None, &[])
+        .map_err(|e| failure(&anyhow::Error::new(e)))?;
+    crate::sparql::check_no_service(&parsed).map_err(|e| failure(&anyhow::Error::new(e)))?;
+    let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let r = crate::sparql::execute_query(inputs.after.clone(), &parsed, &opts, parse_ms)
         .map_err(|e| failure(&anyhow::Error::new(e)))?;
     use crate::sparql::QueryKind;
     let n = match r.kind {

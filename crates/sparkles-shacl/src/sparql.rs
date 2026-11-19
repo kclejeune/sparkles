@@ -6,15 +6,16 @@
 //! (`Planner::subst`), so blank node focus nodes work too. `$PATH` is replaced
 //! textually with the SPARQL form of the shape's path before parsing.
 
+use crate::nodeexpr::Expr;
 use crate::path::PropertyPath;
-use crate::shapes::{G, ShapeId};
+use crate::shapes::{Constraint, G, ShapeId, Shapes};
 use crate::validate::{Engine, Out, RPath};
 use crate::vocab::{owl, sh};
 use anyhow::{Context as _, Result, anyhow, bail};
 use oxrdf::{Literal, NamedNode, Term};
 use rustc_hash::FxHashSet;
 use spargebra::Query;
-use spargebra::algebra::{AggregateExpression, Expression, GraphPattern, OrderExpression};
+use spargebra::algebra::GraphPattern;
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::sparql::plan::{ActiveGraph, Planner};
 use sparkles_core::sparql::table::Table;
@@ -181,15 +182,8 @@ fn substitute_path(text: &str, path: Option<&PropertyPath>) -> String {
     out
 }
 
-/// Visit all graph and expression children. Node expressions share the no-SERVICE
-/// boundary without acquiring constraint-specific prebinding restrictions.
-fn check_pattern(gp: &GraphPattern, prebound: Option<&[String]>) -> Result<()> {
-    enum Work<'a> {
-        Pattern(&'a GraphPattern),
-        Expr(&'a Expression),
-        Aggregate(&'a AggregateExpression),
-    }
-    use Expression as E;
+/// SHACL-SPARQL's additional constraints on prebound variables and operations.
+fn check_pattern(root: &GraphPattern, prebound: Option<&[String]>) -> Result<()> {
     use GraphPattern as GP;
     let assigned = |v: &oxrdf::Variable| -> Result<()> {
         if prebound.is_some_and(|vars| vars.iter().any(|p| p == v.as_str())) {
@@ -200,145 +194,47 @@ fn check_pattern(gp: &GraphPattern, prebound: Option<&[String]>) -> Result<()> {
         }
         Ok(())
     };
-    let mut work = vec![Work::Pattern(gp)];
-    while let Some(next) = work.pop() {
-        match next {
-            Work::Pattern(gp) => match gp {
-                GP::Service { .. } => bail!("SERVICE is not allowed in SHACL-SPARQL queries"),
-                GP::Minus { .. } if prebound.is_some() => {
-                    bail!("MINUS is not allowed in SHACL-SPARQL queries")
+    sparkles_core::sparql::visit_graph_patterns(root, |pattern| {
+        match pattern {
+            GP::Service { .. } => bail!("SERVICE is not allowed in SHACL-SPARQL queries"),
+            GP::Minus { .. } if prebound.is_some() => {
+                bail!("MINUS is not allowed in SHACL-SPARQL queries")
+            }
+            GP::Values { variables, .. } => {
+                let Some(vars) = prebound else {
+                    return Ok(());
+                };
+                if let Some(v) = variables
+                    .iter()
+                    .find(|v| vars.iter().any(|p| p == v.as_str()))
+                {
+                    bail!(
+                        "VALUES must not mention the pre-bound variable ?{}",
+                        v.as_str()
+                    );
                 }
-                GP::Values { variables, .. } if prebound.is_some() => {
-                    if let Some(v) = variables
-                        .iter()
-                        .find(|v| prebound.is_some_and(|vars| vars.iter().any(|p| p == v.as_str())))
-                    {
-                        bail!(
-                            "VALUES must not mention the pre-bound variable ?{}",
-                            v.as_str()
-                        );
-                    }
-                    bail!("VALUES is not allowed in SHACL-SPARQL queries");
+                bail!("VALUES is not allowed in SHACL-SPARQL queries");
+            }
+            GP::Extend { variable, .. } | GP::Assign { variable, .. } => {
+                assigned(variable)?;
+            }
+            GP::Unfold {
+                variable, second, ..
+            } => {
+                assigned(variable)?;
+                if let Some(second) = second {
+                    assigned(second)?;
                 }
-                GP::Extend {
-                    inner,
-                    variable,
-                    expression,
-                }
-                | GP::Assign {
-                    inner,
-                    variable,
-                    expression,
-                } => {
+            }
+            GP::Group { aggregates, .. } => {
+                for (variable, _) in aggregates {
                     assigned(variable)?;
-                    work.extend([Work::Pattern(inner), Work::Expr(expression)]);
                 }
-                GP::Unfold {
-                    inner,
-                    variable,
-                    second,
-                    expression,
-                } => {
-                    assigned(variable)?;
-                    if let Some(second) = second {
-                        assigned(second)?;
-                    }
-                    work.extend([Work::Pattern(inner), Work::Expr(expression)]);
-                }
-                GP::Join { left, right }
-                | GP::Lateral { left, right }
-                | GP::Union { left, right }
-                | GP::Minus { left, right }
-                | GP::SemiJoin { left, right }
-                | GP::AntiJoin { left, right } => {
-                    work.extend([Work::Pattern(left), Work::Pattern(right)]);
-                }
-                GP::LeftJoin {
-                    left,
-                    right,
-                    expression,
-                } => {
-                    work.extend([Work::Pattern(left), Work::Pattern(right)]);
-                    if let Some(expr) = expression {
-                        work.push(Work::Expr(expr));
-                    }
-                }
-                GP::Filter { inner, expr } => {
-                    work.extend([Work::Pattern(inner), Work::Expr(expr)]);
-                }
-                GP::OrderBy { inner, expression } => {
-                    work.push(Work::Pattern(inner));
-                    for order in expression {
-                        let expr = match order {
-                            OrderExpression::Asc(expr) | OrderExpression::Desc(expr) => expr,
-                        };
-                        work.push(Work::Expr(expr));
-                    }
-                }
-                GP::Group {
-                    inner, aggregates, ..
-                } => {
-                    work.push(Work::Pattern(inner));
-                    for (variable, aggregate) in aggregates {
-                        assigned(variable)?;
-                        work.push(Work::Aggregate(aggregate));
-                    }
-                }
-                GP::Graph { inner, .. }
-                | GP::Project { inner, .. }
-                | GP::Distinct { inner }
-                | GP::Reduced { inner }
-                | GP::Slice { inner, .. } => work.push(Work::Pattern(inner)),
-                GP::Bgp { .. } | GP::Path { .. } | GP::Values { .. } => {}
-            },
-            Work::Expr(expr) => match expr {
-                E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => {}
-                E::Or(a, b)
-                | E::And(a, b)
-                | E::Equal(a, b)
-                | E::SameTerm(a, b)
-                | E::Greater(a, b)
-                | E::GreaterOrEqual(a, b)
-                | E::Less(a, b)
-                | E::LessOrEqual(a, b)
-                | E::Add(a, b)
-                | E::Subtract(a, b)
-                | E::Multiply(a, b)
-                | E::Divide(a, b) => {
-                    work.extend([Work::Expr(a), Work::Expr(b)]);
-                }
-                E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => work.push(Work::Expr(a)),
-                E::In(a, list) => {
-                    work.push(Work::Expr(a));
-                    work.extend(list.iter().map(Work::Expr));
-                }
-                E::If(a, b, c) => work.extend([Work::Expr(a), Work::Expr(b), Work::Expr(c)]),
-                E::Coalesce(list) | E::FunctionCall(_, list) => {
-                    work.extend(list.iter().map(Work::Expr))
-                }
-                E::Exists(pattern) => work.push(Work::Pattern(pattern)),
-            },
-            Work::Aggregate(aggregate) => match aggregate {
-                AggregateExpression::CountSolutions { .. } => {}
-                AggregateExpression::FunctionCall { expr, .. } => work.push(Work::Expr(expr)),
-                AggregateExpression::Fold {
-                    expr, value, order, ..
-                } => {
-                    work.push(Work::Expr(expr));
-                    if let Some(value) = value {
-                        work.push(Work::Expr(value));
-                    }
-                    for order in order {
-                        let expr = match order {
-                            OrderExpression::Asc(expr) | OrderExpression::Desc(expr) => expr,
-                        };
-                        work.push(Work::Expr(expr));
-                    }
-                }
-            },
+            }
+            _ => {}
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Node expressions use ordinary SPARQL forms, but never outbound SERVICE.
@@ -353,6 +249,96 @@ fn query_pattern(q: &Query) -> &GraphPattern {
         | Query::Construct { pattern, .. }
         | Query::Describe { pattern, .. } => pattern,
     }
+}
+
+fn check_gate_query(query: &Query) -> Result<()> {
+    let dataset = match query {
+        Query::Select { dataset, .. }
+        | Query::Ask { dataset, .. }
+        | Query::Construct { dataset, .. }
+        | Query::Describe { dataset, .. } => dataset,
+    };
+    if dataset.is_some() {
+        bail!("FROM and FROM NAMED are not allowed in the gate's SHACL profile");
+    }
+    sparkles_core::sparql::visit_graph_patterns(query_pattern(query), |pattern| match pattern {
+        GraphPattern::Graph { .. } => {
+            bail!("GRAPH is not allowed in the gate's SHACL profile");
+        }
+        GraphPattern::Service { .. } => {
+            bail!("SERVICE is not allowed in SHACL-SPARQL queries");
+        }
+        _ => Ok(()),
+    })
+}
+
+/// Check component validators even when no shape supplies their parameters, and
+/// SPARQL functions even when the shapes do not call them.
+pub(crate) fn check_gate_declarations(g: &G<'_>) -> Result<()> {
+    // A validator may be used by a property shape. Its path cannot introduce a
+    // graph or a dataset clause, so one placeholder suffices for this preflight.
+    let path = PropertyPath::Predicate(NamedNode::new_unchecked("urn:sparkles:shacl:path"));
+    for predicate in [sh::VALIDATOR, sh::NODE_VALIDATOR, sh::PROPERTY_VALIDATOR] {
+        for triple in g.g.triples_for_predicate(predicate) {
+            let component = Term::from(triple.subject.into_owned());
+            if !g.is_instance(&component, sh::CONSTRAINT_COMPONENT) {
+                continue;
+            }
+            let validator = triple.object.into_owned();
+            for query in [sh::ASK, sh::SELECT]
+                .into_iter()
+                .flat_map(|p| g.objects(&validator, p))
+            {
+                let text = literal_text(&query)
+                    .ok_or_else(|| anyhow!("the validator of {component} needs a query literal"))?;
+                let prefixes = prefixes(g, &validator);
+                check_gate_query(&parse_query(
+                    &substitute_path(text, Some(&path)),
+                    None,
+                    &prefixes,
+                )?)
+                .with_context(|| format!("validator of {component}"))?;
+            }
+        }
+    }
+    for predicate in [sh::ASK, sh::SELECT] {
+        for triple in g.g.triples_for_predicate(predicate) {
+            let function = Term::from(triple.subject.into_owned());
+            if !g.is_instance(&function, sh::SPARQL_FUNCTION) {
+                continue;
+            }
+            let query = triple.object.into_owned();
+            let text = literal_text(&query)
+                .ok_or_else(|| anyhow!("the SPARQL function {function} needs a query literal"))?;
+            check_gate_query(&parse_query(text, None, &prefixes(g, &function))?)
+                .with_context(|| format!("SPARQL function {function}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Check the actual queries after compilation, including substituted paths and
+/// expressions nested in targets, constraints or custom function bodies.
+pub(crate) fn check_gate_queries(shapes: &Shapes) -> Result<()> {
+    for shape in &shapes.shapes {
+        for constraint in &shape.constraints {
+            let query = match constraint {
+                Constraint::Sparql(c) => &c.parsed,
+                Constraint::Component(c) => &c.parsed,
+                _ => continue,
+            };
+            check_gate_query(query).with_context(|| format!("shape {}", shape.node))?;
+        }
+    }
+    for (expr, node) in shapes.exprs.iter().zip(&shapes.expr_nodes) {
+        let query = match expr {
+            Expr::Select(q) | Expr::SparqlExpr(q) => &q.query,
+            Expr::SparqlFn { query, .. } | Expr::SparqlCall { query, .. } => query.as_ref(),
+            _ => continue,
+        };
+        check_gate_query(query).with_context(|| format!("node expression {node}"))?;
+    }
+    Ok(())
 }
 
 pub(crate) fn parse(

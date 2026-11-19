@@ -515,6 +515,28 @@ impl Parser<'_> {
         matches!(node, Term::BlankNode(_)) && self.has_triples(node)
     }
 
+    /// An ordinary target blank node may have application predicates. Only list and
+    /// function syntax identifies it as an expression in a strict target.
+    pub(crate) fn has_expression_syntax(&self, node: &Term) -> bool {
+        matches!(node, Term::BlankNode(_))
+            && self.predicates(node).iter().any(|p| {
+                p.as_ref() == rdf::FIRST
+                    || p.as_ref() == rdf::REST
+                    || self.is_expression_key(p)
+                    || self.is_list_function(p)
+            })
+    }
+
+    fn is_expression_key(&self, predicate: &NamedNode) -> bool {
+        KEYS.contains(&predicate.as_ref()) || self.fns.keys.contains_key(predicate)
+    }
+
+    fn is_list_function(&self, predicate: &NamedNode) -> bool {
+        predicate.as_str() == shnex::CONFORMS_TO_SHAPE.as_str()
+            || predicate.as_str().starts_with(SPARQL_FN_NS)
+            || self.fns.lists.contains_key(predicate)
+    }
+
     fn has_triples(&self, node: &Term) -> bool {
         as_subject(node).is_some_and(|s| self.g.g.triples_for_subject(s).next().is_some())
     }
@@ -589,7 +611,7 @@ impl Parser<'_> {
         // predicate of a list parameter function
         let mut keys: Vec<NamedNode> = preds
             .iter()
-            .filter(|p| KEYS.iter().any(|k| k.as_str() == p.as_str()))
+            .filter(|p| KEYS.contains(&p.as_ref()))
             .cloned()
             .collect();
         keys.extend(
@@ -610,14 +632,7 @@ impl Parser<'_> {
         if let Some(k) = keys.pop() {
             return self.named_function(node, &k);
         }
-        let listy: Vec<&NamedNode> = preds
-            .iter()
-            .filter(|p| {
-                p.as_str() == shnex::CONFORMS_TO_SHAPE.as_str()
-                    || p.as_str().starts_with(SPARQL_FN_NS)
-                    || self.fns.lists.contains_key(*p)
-            })
-            .collect();
+        let listy: Vec<&NamedNode> = preds.iter().filter(|p| self.is_list_function(p)).collect();
         match listy.as_slice() {
             [p] => {
                 let p = (*p).clone();

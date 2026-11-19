@@ -360,6 +360,17 @@ impl Shapes {
         Shapes::from_graph(doc.graph)
     }
 
+    /// Compile inline shapes for candidate validation, with the gate's strict target
+    /// syntax and SPARQL restricted to the selected validation data.
+    pub fn parse_for_gate(
+        text: &str,
+        syntax: impl Into<ShapesSyntax>,
+        base: Option<&str>,
+    ) -> Result<Shapes> {
+        let doc = crate::syntax::read_document(text, syntax.into(), base)?;
+        Parser::new(&doc.graph).for_gate().parse(false)
+    }
+
     /// Read shapes text (RDF or SHACLC) into a graph for
     /// [`Shapes::from_store_graphs_with`]. Its blank nodes get fresh labels, so they
     /// never name a blank node of the store.
@@ -433,8 +444,27 @@ impl Shapes {
         snap: &sparkles_core::store::Snapshot,
         graph: Option<&str>,
     ) -> Result<Shapes> {
+        Self::from_store_with_profile(snap, graph, false)
+    }
+
+    /// Compile the pinned shapes graph for a gate. Stored blank nodes retain their
+    /// identity, as in [`Shapes::from_store`].
+    pub fn from_store_for_gate(
+        snap: &sparkles_core::store::Snapshot,
+        graph: Option<&str>,
+    ) -> Result<Shapes> {
+        Self::from_store_with_profile(snap, graph, true)
+    }
+
+    fn from_store_with_profile(
+        snap: &sparkles_core::store::Snapshot,
+        graph: Option<&str>,
+        gate: bool,
+    ) -> Result<Shapes> {
         let g = crate::data::read_graph(snap, graph)?;
-        let mut shapes = Parser::new(&g).parse(true)?;
+        let mut parser = Parser::new(&g);
+        parser.gate = gate;
+        let mut shapes = parser.parse(true)?;
         shapes.source_graph = graph
             .filter(|g| *g != sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI)
             .map(str::to_string);
@@ -771,6 +801,7 @@ const SHAPE_PARAMS: &[NamedNodeRef<'static>] = &[
 pub(crate) struct Parser<'g> {
     pub(crate) g: G<'g>,
     pub(crate) out: Shapes,
+    gate: bool,
     components: Vec<std::sync::Arc<SparqlComponent>>,
     pub(crate) fns: FnIndex,
     pub(crate) expr_memo: FxHashMap<Term, ExprId>,
@@ -784,12 +815,18 @@ impl<'g> Parser<'g> {
         Parser {
             g: G { g: graph },
             out: Shapes::default(),
+            gate: false,
             components: Vec::new(),
             fns: FnIndex::default(),
             expr_memo: FxHashMap::default(),
             af_memo: FxHashMap::default(),
             expr_stack: Vec::new(),
         }
+    }
+
+    fn for_gate(mut self) -> Self {
+        self.gate = true;
+        self
     }
 
     pub(crate) fn parse(self, bnodes_in_store: bool) -> Result<Shapes> {
@@ -805,6 +842,15 @@ impl<'g> Parser<'g> {
     ) -> Result<(Shapes, Option<ExprId>)> {
         self.out.bnodes_in_store = bnodes_in_store;
         self.out.binds_shapes_graph = bnodes_in_store;
+        if self.gate {
+            if let Some(t) = self.g.g.triples_for_predicate(sh::TARGET).next() {
+                bail!(
+                    "sh:target on {} is not supported by the gate's SHACL profile",
+                    t.subject
+                );
+            }
+            crate::sparql::check_gate_declarations(&self.g)?;
+        }
         self.components = crate::sparql::parse_components(&self.g)?;
         self.parse_functions()?;
         // candidate shapes, in a deterministic order
@@ -858,6 +904,9 @@ impl<'g> Parser<'g> {
             ),
             None => None,
         };
+        if self.gate {
+            crate::sparql::check_gate_queries(&self.out)?;
+        }
         Ok((self.out, expr))
     }
 
@@ -1010,7 +1059,15 @@ impl<'g> Parser<'g> {
         for t in self.g.objects(node, sh::TARGET_NODE) {
             // a blank node that is a node expression (SHACL 1.2); other blank nodes are
             // plain nodes, as in SHACL 1.0
-            if self.is_function_expr(&t)
+            if self.gate && self.has_expression_syntax(&t) {
+                let e = self
+                    .expr(&t)
+                    .with_context(|| format!("sh:targetNode of shape {node}"))?;
+                out.push(Target::Expr(e));
+                continue;
+            }
+            if !self.gate
+                && self.is_function_expr(&t)
                 && let Ok(e) = self.expr(&t)
             {
                 out.push(Target::Expr(e));
@@ -1019,7 +1076,7 @@ impl<'g> Parser<'g> {
             out.push(Target::Node(self.out.intern(t)));
         }
         for t in self.g.objects(node, sh::TARGET_CLASS) {
-            out.push(Target::Class(self.out.intern(t)));
+            out.push(Target::Class(self.target_iri(node, sh::TARGET_CLASS, t)?));
         }
         // implicit class target: the shape is also an rdfs:Class
         if matches!(node, Term::NamedNode(_))
@@ -1033,10 +1090,18 @@ impl<'g> Parser<'g> {
             }
         }
         for t in self.g.objects(node, sh::TARGET_SUBJECTS_OF) {
-            out.push(Target::SubjectsOf(self.out.intern(t)));
+            out.push(Target::SubjectsOf(self.target_iri(
+                node,
+                sh::TARGET_SUBJECTS_OF,
+                t,
+            )?));
         }
         for t in self.g.objects(node, sh::TARGET_OBJECTS_OF) {
-            out.push(Target::ObjectsOf(self.out.intern(t)));
+            out.push(Target::ObjectsOf(self.target_iri(
+                node,
+                sh::TARGET_OBJECTS_OF,
+                t,
+            )?));
         }
         for t in self.g.objects(node, sh::TARGET_WHERE) {
             let w = self
@@ -1045,6 +1110,14 @@ impl<'g> Parser<'g> {
             out.push(Target::Where(w));
         }
         Ok(out)
+    }
+
+    fn target_iri(&mut self, node: &Term, predicate: NamedNodeRef<'_>, term: Term) -> Result<Tid> {
+        if self.gate && !matches!(term, Term::NamedNode(_)) {
+            let name = predicate.as_str().rsplit('#').next().unwrap_or_default();
+            bail!("sh:{name} of shape {node} requires an IRI, found {term}");
+        }
+        Ok(self.out.intern(term))
     }
 
     fn shape_list(&mut self, head: &Term) -> Result<Vec<ShapeId>> {

@@ -818,6 +818,23 @@ Editing forms also edit declared nested blank-node children, SHACL 1.2 lists and
 commit. See the [nested form model](../visualization/README.md#nested-form-read-models)
 for its allowances and the editors.
 
+### Gate suite validation
+
+The Rust gate runner in `sparkles::gate` takes the state before a change and its
+candidate state. A SHACL check compiles its pinned shapes graph from the earlier state
+or reads inline shapes. Its embedded SPARQL queries use only the selected candidate data
+as their default graph. They refuse `GRAPH`, `FROM` and `FROM NAMED`. The gate refuses
+unsupported `sh:target` declarations and malformed targets even when a shape also has
+a valid target. A blank node in `sh:targetNode` is a constant unless its predicates
+identify a list or function expression.
+
+Standalone queries, SHACL-SPARQL and ShEx SPARQL selectors refuse `SERVICE` before
+evaluation, including in expressions and subqueries. Gate ShEx schemas refuse semantic
+actions, and fixed blank-node data selectors are refused because their identifiers
+belong to a store. A blank-node shape label is supported, and a supported selector
+that matches no node can pass. See [C31](../specs/C31-checks-and-protected-merges/SPEC.md#outcome)
+for the gate suite work.
+
 ### Schema discovery and drafted shapes
 
 * `GET /$/schema/{ds}`, `sparkles schema` and `sparkles::schema` list classes and

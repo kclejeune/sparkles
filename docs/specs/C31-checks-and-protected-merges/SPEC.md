@@ -83,6 +83,14 @@ SHACL-SPARQL literals. Gate results attach to the merge response, the task detai
 run record in the merge commit, and [item 1139](../../ROADMAP.md) adds a first-class merge
 request.
 
+The Rust gate runner evaluates standalone queries and supported SHACL and ShEx checks
+against the candidate. These checks refuse `SERVICE` even inside an expression. SHACL
+queries read the selected candidate data and refuse explicit `GRAPH`, `FROM` and
+`FROM NAMED` clauses. The SHACL profile also refuses unsupported and malformed targets.
+ShEx refuses semantic actions and fixed blank-node data selectors. The [reasoning and
+validation guide](../../reasoning/README.md#gate-suite-validation) describes the supported
+profiles.
+
 A suite can name a `chk:UnsatisfiableClassesCheck`, which parses and counts in the suite's
 revision, but no build runs it. Its result is an error with the code `check-unavailable`,
 so a required one fails the suite. The OWL reader cannot yet read a terminology with the

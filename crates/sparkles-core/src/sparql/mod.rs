@@ -62,6 +62,7 @@ pub mod value;
 mod valuespush;
 mod vectortopk;
 pub mod viewsvc;
+mod walk;
 
 use crate::error::{Error, Result};
 use crate::id::Id;
@@ -95,6 +96,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 pub use table::Table;
+pub use walk::visit_graph_patterns;
 
 #[derive(Clone, Debug, Default)]
 pub struct QueryOptions {
@@ -1180,6 +1182,17 @@ fn split(
             ..
         } => (pattern, dataset.as_ref(), base_iri.as_ref()),
     }
+}
+
+/// Refuse any SERVICE operation, including local, SILENT and variable
+/// endpoints, before the query can be evaluated.
+pub fn check_no_service(query: &Query) -> Result<()> {
+    visit_graph_patterns(split(query).0, |pattern| {
+        if matches!(pattern, GraphPattern::Service { .. }) {
+            return Err(Error::invalid("SERVICE is not allowed in this query"));
+        }
+        Ok(())
+    })
 }
 
 /// Execute a SPARQL query against a snapshot.

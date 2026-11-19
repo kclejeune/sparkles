@@ -704,9 +704,8 @@ pub fn selector_query(q: &str) -> Result<Query, String> {
     if projected(pattern).is_empty() {
         return Err("a SPARQL selector's query projects no variable".into());
     }
-    if has_service(pattern) {
-        return Err("SERVICE is not allowed in a SPARQL selector".into());
-    }
+    sparkles_core::sparql::check_no_service(&parsed)
+        .map_err(|_| "SERVICE is not allowed in a SPARQL selector".to_string())?;
     Ok(parsed)
 }
 
@@ -717,32 +716,6 @@ fn projected(p: &GraphPattern) -> &[Variable] {
         | GraphPattern::Reduced { inner }
         | GraphPattern::Slice { inner, .. } => projected(inner),
         _ => &[],
-    }
-}
-
-fn has_service(p: &GraphPattern) -> bool {
-    use GraphPattern as G;
-    match p {
-        G::Service { .. } => true,
-        G::Join { left, right }
-        | G::Lateral { left, right }
-        | G::LeftJoin { left, right, .. }
-        | G::Union { left, right }
-        | G::Minus { left, right }
-        | G::SemiJoin { left, right }
-        | G::AntiJoin { left, right } => has_service(left) || has_service(right),
-        G::Filter { inner, .. }
-        | G::Graph { inner, .. }
-        | G::Extend { inner, .. }
-        | G::Assign { inner, .. }
-        | G::Unfold { inner, .. }
-        | G::OrderBy { inner, .. }
-        | G::Project { inner, .. }
-        | G::Distinct { inner }
-        | G::Reduced { inner }
-        | G::Slice { inner, .. }
-        | G::Group { inner, .. } => has_service(inner),
-        _ => false,
     }
 }
 
