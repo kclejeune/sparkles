@@ -8839,6 +8839,62 @@ impl ServiceSolution<'_> {
     }
 }
 
+/// An in-process SERVICE call: the dataset it reads, the options it runs under and
+/// the callee's hold, which lasts as long as the call.
+pub(super) struct LocalCall {
+    pub(super) snap: std::sync::Arc<crate::store::Snapshot>,
+    pub(super) options: super::QueryOptions,
+    pub(super) hold: Option<Box<dyn std::any::Any + Send + Sync>>,
+}
+
+impl LocalCall {
+    /// The call to `target`, as the caller. It keeps the caller's cancellation, grant,
+    /// row count and outbound budget, and `deadline`, so it can neither wait for
+    /// admission behind its caller nor outlive it.
+    pub(super) fn new(
+        ctx: &Ctx,
+        target: Result<super::LocalTarget>,
+        deadline: Option<Instant>,
+    ) -> Result<Self> {
+        if ctx.service_depth >= super::MAX_SERVICE_DEPTH {
+            return Err(Error::Service(format!(
+                "SERVICE calls to this server nest more than {} deep",
+                super::MAX_SERVICE_DEPTH
+            )));
+        }
+        let super::LocalTarget {
+            snap,
+            options: mut opts,
+            hold,
+        } = target?;
+        // the call can never be given more than its caller has
+        opts.max_rows = Some(opts.max_rows.map_or(ctx.max_rows, |m| m.min(ctx.max_rows)));
+        opts.max_memory_bytes = Some(
+            opts.max_memory_bytes
+                .map_or(ctx.mem_limit, |m| m.min(ctx.mem_limit)),
+        );
+        opts.max_rows_produced = Some(
+            opts.max_rows_produced
+                .map_or(ctx.max_rows_produced, |m| m.min(ctx.max_rows_produced)),
+        );
+        opts.timeout = None;
+        opts.deadline = deadline;
+        opts.cancel = Some(ctx.cancel.clone());
+        opts.cancellation = ctx.cancellation.clone();
+        opts.grant = ctx.grant().cloned();
+        opts.work = Some(ctx.rows_produced.clone());
+        opts.outbound_budget = Some(ctx.outbound_budget.clone());
+        opts.service_depth = ctx.service_depth + 1;
+        // the call's plan is dropped below, so it names no patterns (item 180)
+        opts.no_plan_patterns = true;
+        Ok(Self {
+            snap,
+            options: opts,
+            hold,
+        })
+    }
+}
+
 /// Run `query` in process on the dataset `target` names, as the caller, and hand each
 /// solution to `on_solution`. The call keeps the caller's deadline, cancellation, grant,
 /// row count and outbound budget, so it can neither wait for admission behind its
@@ -8849,37 +8905,11 @@ fn fetch_local(
     query: &str,
     on_solution: &mut dyn FnMut(ServiceSolution<'_>) -> Result<()>,
 ) -> Result<()> {
-    if ctx.service_depth >= super::MAX_SERVICE_DEPTH {
-        return Err(Error::Service(format!(
-            "SERVICE calls to this server nest more than {} deep",
-            super::MAX_SERVICE_DEPTH
-        )));
-    }
-    let super::LocalTarget {
+    let LocalCall {
         snap,
-        options: mut opts,
+        options: opts,
         hold: _hold,
-    } = target?;
-    // the call can never be given more than its caller has
-    opts.max_rows = Some(opts.max_rows.map_or(ctx.max_rows, |m| m.min(ctx.max_rows)));
-    opts.max_memory_bytes = Some(
-        opts.max_memory_bytes
-            .map_or(ctx.mem_limit, |m| m.min(ctx.mem_limit)),
-    );
-    opts.max_rows_produced = Some(
-        opts.max_rows_produced
-            .map_or(ctx.max_rows_produced, |m| m.min(ctx.max_rows_produced)),
-    );
-    opts.timeout = None;
-    opts.deadline = ctx.current_deadline();
-    opts.cancel = Some(ctx.cancel.clone());
-    opts.cancellation = ctx.cancellation.clone();
-    opts.grant = ctx.grant().cloned();
-    opts.work = Some(ctx.rows_produced.clone());
-    opts.outbound_budget = Some(ctx.outbound_budget.clone());
-    opts.service_depth = ctx.service_depth + 1;
-    // the call's plan is dropped below, so it names no patterns (item 180)
-    opts.no_plan_patterns = true;
+    } = LocalCall::new(ctx, target, ctx.current_deadline())?;
     ctx.check()?;
     let r = super::query(snap, query, &opts)?;
     for i in 0..r.table().len() {
@@ -8911,95 +8941,143 @@ pub(super) fn fetch(
     {
         return fetch_local(ctx, target, query, on_solution);
     }
-    // the host of the endpoint (no user info, no port)
-    let host = oxiri::Iri::parse(url.as_str())
-        .ok()
-        .and_then(|i| {
-            let a = i.authority()?;
-            let a = a.rsplit('@').next().unwrap_or(a);
-            Some(match a.strip_prefix('[') {
-                Some(v6) => v6.split(']').next().unwrap_or(v6).to_string(),
-                None => a.split(':').next().unwrap_or(a).to_string(),
-            })
-        })
-        .unwrap_or_default();
-    // a client span: its context is what the outbound headers hook propagates
-    let span = tracing::info_span!(
-        target: "sparkles::sparql::exec",
-        "sparql.service",
-        otel.kind = "client",
-        http.request.method = "POST",
-        server.address = %host,
-        http.response.status_code = tracing::field::Empty,
-    );
-    let _entered = span.enter();
-    // within the query's deadline too
-    let timeout = ctx.current_deadline().map_or(ctx.outbound.timeout, |d| {
-        d.saturating_duration_since(Instant::now())
-    });
-    let resp = ctx
-        .outbound
-        .send(&ctx.outbound_budget, url.as_str(), timeout, |client, u| {
-            client
-                .post(u)
-                .header(
-                    "Accept",
-                    "application/sparql-results+json, application/sparql-results+xml;q=0.8",
-                )
-                .form(&[("query", query)])
-        })
-        .map_err(|f| {
-            f.into_error(&format!("SERVICE <{}>", url.as_str()), |m| {
-                Error::Service(format!("<{}>: {m}", url.as_str()))
-            })
-        })?;
-    span.record("http.response.status_code", i64::from(resp.status.as_u16()));
-    if !resp.status.is_success() {
-        return Err(Error::Service(format!(
-            "{} returned {}",
-            url.as_str(),
-            resp.status
-        )));
-    }
-    let (fmt, syntax) = if resp.content_type.contains("xml") {
-        (
-            sparesults::QueryResultsFormat::Xml,
-            crate::nesting::Syntax::Xml,
-        )
-    } else {
-        (
-            sparesults::QueryResultsFormat::Json,
-            crate::nesting::Syntax::Json,
-        )
-    };
-    // the results parsers read a nested triple term by recursion
-    let body = crate::nesting::Guarded::new(
-        resp.body,
-        syntax,
-        crate::nesting::MAX_ELEMENTS,
-        &format!("<{}>", url.as_str()),
-        Error::Service,
-    );
-    // parsed as it streams in, under the policy's byte ceiling and deadline
-    let parser = sparesults::QueryResultsParser::from_format(fmt);
-    let failed = |e: sparesults::QueryResultsParseError| match e {
-        // a spent budget, or the body's own words (timeout, size, connection)
-        sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
-            Error::Io(e) => Error::Service(format!("<{}>: {e}", url.as_str())),
-            e => e,
-        },
-        e => Error::Service(format!("<{}>: {e}", url.as_str())),
-    };
-    match parser.for_reader(body).map_err(failed)? {
-        sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => {
-            for sol in sols {
-                let solution = sol.map_err(failed)?;
-                on_solution(ServiceSolution::Remote(&solution))?;
-            }
-        }
-        sparesults::ReaderQueryResultsParserOutput::Boolean(_) => {}
+    let mut answer = RemoteAnswer::open(ctx, url, query)?;
+    let _entered = answer.span.clone().entered();
+    while let Some(solution) = answer.next_solution() {
+        on_solution(ServiceSolution::Remote(&solution?))?;
     }
     Ok(())
+}
+
+/// The response of a remote endpoint to one SERVICE request, whose solutions are parsed
+/// as they are read. Dropping it closes the response, and the request's time charge in
+/// the outbound budget ends then.
+pub(super) struct RemoteAnswer {
+    /// The client span of the request, which each read enters.
+    pub(super) span: tracing::Span,
+    url: String,
+    solutions:
+        Option<sparesults::ReaderSolutionsParser<crate::nesting::Guarded<crate::outbound::Body>>>,
+}
+
+impl RemoteAnswer {
+    /// Send `query` to `url` through the outbound policy and read the head of its
+    /// response. The transfer's timeout is the outbound policy's, cut to the query's
+    /// deadline as it stands now, and it counts from the start of the request.
+    pub(super) fn open(ctx: &Ctx, url: &oxrdf::NamedNode, query: &str) -> Result<Self> {
+        // the host of the endpoint (no user info, no port)
+        let host = oxiri::Iri::parse(url.as_str())
+            .ok()
+            .and_then(|i| {
+                let a = i.authority()?;
+                let a = a.rsplit('@').next().unwrap_or(a);
+                Some(match a.strip_prefix('[') {
+                    Some(v6) => v6.split(']').next().unwrap_or(v6).to_string(),
+                    None => a.split(':').next().unwrap_or(a).to_string(),
+                })
+            })
+            .unwrap_or_default();
+        // a client span: its context is what the outbound headers hook propagates
+        let span = tracing::info_span!(
+            target: "sparkles::sparql::exec",
+            "sparql.service",
+            otel.kind = "client",
+            http.request.method = "POST",
+            server.address = %host,
+            http.response.status_code = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        // within the query's deadline too
+        let timeout = ctx.current_deadline().map_or(ctx.outbound.timeout, |d| {
+            d.saturating_duration_since(Instant::now())
+        });
+        let resp = ctx
+            .outbound
+            .send(&ctx.outbound_budget, url.as_str(), timeout, |client, u| {
+                client
+                    .post(u)
+                    .header(
+                        "Accept",
+                        "application/sparql-results+json, application/sparql-results+xml;q=0.8",
+                    )
+                    .form(&[("query", query)])
+            })
+            .map_err(|f| {
+                f.into_error(&format!("SERVICE <{}>", url.as_str()), |m| {
+                    Error::Service(format!("<{}>: {m}", url.as_str()))
+                })
+            })?;
+        span.record("http.response.status_code", i64::from(resp.status.as_u16()));
+        if !resp.status.is_success() {
+            return Err(Error::Service(format!(
+                "{} returned {}",
+                url.as_str(),
+                resp.status
+            )));
+        }
+        let (fmt, syntax) = if resp.content_type.contains("xml") {
+            (
+                sparesults::QueryResultsFormat::Xml,
+                crate::nesting::Syntax::Xml,
+            )
+        } else {
+            (
+                sparesults::QueryResultsFormat::Json,
+                crate::nesting::Syntax::Json,
+            )
+        };
+        // the results parsers read a nested triple term by recursion
+        let body = crate::nesting::Guarded::new(
+            resp.body,
+            syntax,
+            crate::nesting::MAX_ELEMENTS,
+            &format!("<{}>", url.as_str()),
+            Error::Service,
+        );
+        // parsed as it streams in, under the policy's byte ceiling and deadline
+        let parser = sparesults::QueryResultsParser::from_format(fmt);
+        let solutions = match parser
+            .for_reader(body)
+            .map_err(|e| Self::failed(url.as_str(), e))?
+        {
+            sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => Some(sols),
+            sparesults::ReaderQueryResultsParserOutput::Boolean(_) => None,
+        };
+        drop(_entered);
+        Ok(Self {
+            span,
+            url: url.as_str().to_string(),
+            solutions,
+        })
+    }
+
+    /// The next solution of the response, or `None` once it has ended. A failure ends
+    /// the answer, and the response is closed then.
+    pub(super) fn next_solution(&mut self) -> Option<Result<sparesults::QuerySolution>> {
+        let next = self.solutions.as_mut()?.next();
+        match next {
+            Some(Ok(solution)) => Some(Ok(solution)),
+            Some(Err(e)) => {
+                self.solutions = None;
+                Some(Err(Self::failed(&self.url, e)))
+            }
+            None => {
+                self.solutions = None;
+                None
+            }
+        }
+    }
+
+    fn failed(url: &str, e: sparesults::QueryResultsParseError) -> Error {
+        match e {
+            // a spent budget, or the body's own words (timeout, size, connection)
+            sparesults::QueryResultsParseError::Io(e) => match crate::codec::io_error(e) {
+                Error::Io(e) => Error::Service(format!("<{url}>: {e}")),
+                e => e,
+            },
+            e => Error::Service(format!("<{url}>: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
