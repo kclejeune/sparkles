@@ -746,14 +746,22 @@ impl BlockMeta {
     }
 }
 
-pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
-    scratch.clear();
+/// Append the differences of `values`, from 0, to `out` as zig-zag varints. The column
+/// frames of the index and the run blocks of the builder share this step and
+/// [`decode_varints_into`], and each adds its own compression framing.
+#[inline]
+pub(crate) fn encode_deltas(values: impl IntoIterator<Item = u64>, out: &mut Vec<u8>) {
     let mut prev = 0u64;
-    for &v in col {
+    for v in values {
         let d = v.wrapping_sub(prev) as i64;
-        write_varint(scratch, ((d << 1) ^ (d >> 63)) as u64);
+        write_varint(out, ((d << 1) ^ (d >> 63)) as u64);
         prev = v;
     }
+}
+
+pub(crate) fn encode_column(col: &[u64], scratch: &mut Vec<u8>) -> Vec<u8> {
+    scratch.clear();
+    encode_deltas(col.iter().copied(), scratch);
     lz4_flex::compress_prepend_size(scratch)
 }
 
@@ -885,8 +893,9 @@ fn decode_point_column_limited(
     Ok(Col::from(values))
 }
 
-/// The `out.len()` zigzag-delta varints that make up all of `raw`, written to `out`.
-fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
+/// The `out.len()` zigzag-delta varints that make up all of `raw`, written to `out`, as
+/// [`encode_deltas`] writes them.
+pub(crate) fn decode_varints_into(raw: &[u8], out: &mut [u64]) -> Result<()> {
     let rows = out.len();
     let bad = |m: &str| Error::Corrupt(format!("block column: {m}"));
     let mut pos = 0;
