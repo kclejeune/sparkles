@@ -364,6 +364,7 @@ impl RowBatch for CursorRows<'_> {
         self.len
     }
 
+    #[inline]
     fn row(&mut self, i: usize) -> Result<RowView<'_>> {
         if i.is_multiple_of(1024) {
             self.cursor.check()?;

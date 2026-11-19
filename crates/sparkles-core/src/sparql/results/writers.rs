@@ -207,9 +207,10 @@ fn select<S: SolutionSource>(
     if S::FLUSH_FIRST {
         // the serializer holds the writer, and the first batch's flush goes past it
         let shared = RefCell::new(out);
+        let mut writer = Shared(&shared);
         let mut rows = SelectRows {
             serializer: serializer
-                .serialize_solutions_to_writer(Shared(&shared), vars.clone())
+                .serialize_solutions_to_writer(&mut writer, vars.clone())
                 .map_err(io)?,
             vars: &vars,
             staged,
