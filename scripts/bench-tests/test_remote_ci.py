@@ -438,8 +438,11 @@ class RemoteCI(unittest.TestCase):
         before = res.resolve()
         r = subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'wally', '--fetch', self.name()],
                            cwd=self.src, env=self.env, capture_output=True, text=True, timeout=60)
-        self.assertEqual(r.returncode, 0, r.stderr); self.assertIn('could not point to them', r.stderr)
+        self.assertEqual(r.returncode, 1, r.stderr); self.assertIn('could not point to the new copy', r.stderr)
         self.assertEqual(res.resolve(), before)
+        # Both copies are there, and the new one is named in the output.
+        new = [p for p in (self.src / '.artifacts/remote-ci').glob(self.name() + '.fetch-*')]
+        self.assertEqual(len(new), 1); self.assertIn('results in %s' % new[0], r.stdout)
         # Without the fault a fetch by name gets a copy of its own, and the name follows it.
         (fake / 'mv').unlink()
         r = subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'wally', '--fetch', self.name()],

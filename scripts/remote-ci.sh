@@ -157,21 +157,32 @@ fetch() {
     return 1
   fi
   res=$base/$1.$id
+  # One publication of a name at a time, so two fetches never both migrate an older copy.
+  local fd linked=0
+  exec {fd}>> "$base/.lock-$1"
+  flock -w 60 "$fd" || echo "remote-ci.sh: another fetch of $1 held its lock for 60 s" >&2
   link=$(mktemp -u "$base/.link-$1.XXXXXX")
   if ! ln -s "$1.$id" "$link"; then
-    echo "remote-ci.sh: results in $res, but $base/$1 could not point to them" >&2
+    :
   elif [ -d "$base/$1" ] && [ ! -L "$base/$1" ]; then
     if mv --exchange -T "$link" "$base/$1" 2> /dev/null; then
-      mv -T "$link" "$base/$1.kept-$(date +%s)" 2> /dev/null || echo "remote-ci.sh: the older copy of $1 is at $link" >&2
+      linked=1
+      mv -T "$link" "$base/$1.kept-$(date +%s)-$$" 2> /dev/null || echo "remote-ci.sh: the older copy of $1 is at $link" >&2
     else
       rm -f "$link"
-      echo "remote-ci.sh: results in $res; the older directory $base/$1 stays in place" >&2
     fi
-  elif ! mv -Tf "$link" "$base/$1"; then
+  elif mv -Tf "$link" "$base/$1"; then
+    linked=1
+  else
     rm -f "$link"
-    echo "remote-ci.sh: results in $res, but $base/$1 could not point to them" >&2
   fi
+  exec {fd}>&-
   echo "results in $res"
+  if [ "$linked" = 0 ]; then
+    echo "remote-ci.sh: $base/$1 could not point to the new copy and still holds the earlier one" >&2
+    # A fetch by name exists to update the name, so it fails. The waiter reads its own copy.
+    [ -n "${2:-}" ] || return 1
+  fi
 }
 case $name in '' | *[!A-Za-z0-9._-]*) [ "$action" = start ] || {
   echo "remote-ci.sh: bad job name" >&2
