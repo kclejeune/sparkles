@@ -162,7 +162,7 @@ impl History {
         self.page = Vec::new();
         self.at = 0;
         match &mut self.pages {
-            Some((pages, charge)) => charge.resize(pages.kept_bytes()),
+            Some((pages, charge)) => pages.page_dropped(&mut |b| charge.resize(b)),
             None => Ok(()),
         }
     }

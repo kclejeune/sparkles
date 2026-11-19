@@ -185,9 +185,15 @@ impl HistoryPages {
     }
 
     /// What the reader keeps allocated between pages: for a read-only log read newest
-    /// first, the offsets of a segment's records. The caller keeps it charged.
-    pub(crate) fn kept_bytes(&self) -> u64 {
+    /// first, the offsets of a segment's records.
+    fn kept_bytes(&self) -> u64 {
         self.ro.kept_bytes()
+    }
+
+    /// The caller has dropped the last page: `resize` is told the bytes that stay
+    /// charged, those the pages keep until the next page.
+    pub(crate) fn page_dropped(&self, resize: &mut Admit<'_>) -> Result<()> {
+        resize(self.kept_bytes())
     }
 
     /// The next page, of at least `budget` changes unless the range ends, and at most
@@ -857,9 +863,19 @@ mod tests {
                         "ro={ro} descending={descending}"
                     );
                     if ro && descending {
-                        // the offsets of a segment's records stay with the reader
+                        // the offsets of a segment's records stay with the reader, and
+                        // charged once the page is dropped
                         let kept = pages.kept_bytes();
                         assert!(kept > 0 && kept <= last, "{kept} {last}");
+                        drop(page);
+                        let mut charged = None;
+                        pages
+                            .page_dropped(&mut |b| {
+                                charged = Some(b);
+                                Ok(())
+                            })
+                            .unwrap();
+                        assert_eq!(charged, Some(kept));
                     }
                     let mut pages = log.pages(q, 36).unwrap();
                     let refused = pages.next(64, usize::MAX, &mut |b| {
