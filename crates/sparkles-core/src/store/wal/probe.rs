@@ -240,6 +240,80 @@ mod tests {
     }
 
     #[test]
+    fn the_committed_bound_ends_at_the_last_commit_record_and_hides_no_damage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wal.log");
+        let options = HistoryOptions::default();
+        let budget = || {
+            ColdBudget::new(ReadLimit {
+                options: &options,
+                memory: Some(4096),
+                held: 0,
+            })
+            .unwrap()
+        };
+        let bound = |wire: &[u8]| {
+            std::fs::write(&path, wire).unwrap();
+            let mut budget = budget();
+            let mut reader = budget.buffered(&path).unwrap().value;
+            committed_bound(&mut reader, wire.len() as u64, &budget).unwrap()
+        };
+        let rec = WAL_REC as u64;
+        let d = data(0);
+        let zeros = [0; WAL_REC];
+        // preallocated zeros and an in-flight record after the last commit are outside
+        let wire: Vec<_> = [
+            header_record(),
+            d,
+            commit_record(11, &d, 0),
+            d,
+            zeros,
+            zeros,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        assert_eq!(bound(&wire), 3 * rec);
+        // a log with only its header, and an empty one
+        assert_eq!(bound(&[header_record(), zeros].concat()), rec);
+        assert_eq!(bound(&[]), 0);
+        // a torn or missing header keeps the whole extent for the open's refusals
+        let torn: Vec<_> = [zeros, d, commit_record(11, &d, 0), zeros].concat();
+        assert_eq!(bound(&torn), torn.len() as u64);
+        let headerless: Vec<_> = [d, commit_record(11, &d, 0)].concat();
+        assert_eq!(bound(&headerless), headerless.len() as u64);
+        // damage that a later durable commit proves is still inside the bound and refused
+        let mut damaged = commit_record(11, &d, 0);
+        damaged[30] ^= 0xff;
+        let wire: Vec<_> = [
+            header_record(),
+            d,
+            damaged,
+            d,
+            commit_record(12, &d, 0),
+            zeros,
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        let end = bound(&wire);
+        assert_eq!(end, 5 * rec);
+        let mut budget = budget();
+        let mut reader = budget.buffered(&path).unwrap().value;
+        let refused = prove_prefix(
+            &mut reader,
+            end,
+            10,
+            u64::MAX,
+            u64::MAX,
+            None,
+            &path,
+            &budget,
+        );
+        assert!(matches!(refused, Err(Error::Corrupt(_))), "{refused:?}");
+    }
+
+    #[test]
     fn committed_prefix_refuses_durable_damage_but_keeps_exact_unsynced_boundary() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("wal.log");
@@ -537,6 +611,56 @@ mod tests {
 pub(crate) struct ProvenWal {
     pub(crate) head: WalPoint,
     pub(crate) selected: Option<WalPoint>,
+}
+
+/// The end of the last commit record among the first `extent` bytes, as a bound for a
+/// later [`prove_prefix_with`] of a log that a live writer may still append to.
+///
+/// A reader beside a live writer calls this before it counts the vocabulary and the
+/// annotations, and proves only up to the bound. A writer starts a group's records only
+/// after every earlier group's terms, annotations and records are written, and a group's
+/// commit records never claim its own commits durable. Every commit that a record below
+/// the bound proves durable therefore had its terms written before this pass, so before
+/// the count. Records beyond the bound, or zeros a buffer read before the writer reached
+/// them, cannot then turn the writer's in-flight group into damage. A closed log loses
+/// nothing to the bound, since only a commit record proves an earlier commit durable. A
+/// log whose first record is not a header keeps its whole extent, so the refusals of a
+/// headerless or torn-header log still see every byte. A log that a compaction trims
+/// while this reads it ends the bound at the trimmed end.
+pub(crate) fn committed_bound<R: Read + Seek>(
+    reader: &mut BufReader<R>,
+    extent: u64,
+    budget: &ColdBudget<'_>,
+) -> Result<u64> {
+    let records = (extent / WAL_REC as u64) as usize;
+    if records == 0 {
+        budget.check()?;
+        return Ok(extent);
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    let mut record = [0; WAL_REC];
+    reader.read_exact(&mut record)?;
+    if record[0] != WAL_HEADER {
+        budget.check()?;
+        return Ok(extent);
+    }
+    let mut end = WAL_REC as u64;
+    for index in 1..records {
+        budget.key_step("WAL bound record", index)?;
+        match reader.read_exact(&mut record) {
+            Ok(()) => {}
+            // A compaction that switched away from this log trims its preallocated
+            // zeros to the last commit (`trim_wal`), so a log shorter than its length
+            // was taken ends after every commit record it still holds.
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(error) => return Err(error.into()),
+        }
+        if record[0] == WAL_COMMIT {
+            end = (index as u64 + 1) * WAL_REC as u64;
+        }
+    }
+    budget.check()?;
+    Ok(end)
 }
 
 /// Provisional metadata of one physically decoded commit. Observations may be

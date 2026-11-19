@@ -953,3 +953,134 @@ fn a_clone_racing_memory_activation_refuses_under_the_writer() {
     assert_eq!(error.code(), "unsupported", "{error}");
     update(&store, "after");
 }
+
+/// `sparkles check` runs this validation on a live root. Commits that land while it
+/// reads, after it counts the vocabulary or after it has buffered the log, must not
+/// read as a damaged committed prefix.
+#[test]
+fn validation_beside_a_live_writer_reads_one_consistent_prefix() {
+    let mut failures = Vec::new();
+    for point in ["bound", "vocabulary", "observation"] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(Store::open(dir.path(), StoreOptions::default()).unwrap());
+        update(&store, "seed");
+        let seeded = store.head_commit().seq;
+        let writer = store.clone();
+        let mut fired = false;
+        validation::INSPECTION_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |at: &str| {
+                if at == point && !fired {
+                    fired = true;
+                    for i in 0..3 {
+                        update(&writer, &format!("live-{point}-{i}"));
+                    }
+                }
+            }))
+        });
+        let result = validate_copy(dir.path(), false, &preparation());
+        validation::INSPECTION_HOOK.with(|hook| hook.borrow_mut().take());
+        if let Err(error) = result {
+            failures.push(format!("commits after {point}: {error}"));
+        }
+        // the commits landed and a later validation still proves all of them
+        assert_eq!(store.head_commit().seq, seeded + 3, "{point}");
+        validate_copy(dir.path(), false, &preparation()).unwrap();
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// A compaction that retires the generation after its log is open must leave that
+/// generation out, as it did when the log was opened last, not read its vanished
+/// vocabulary as empty and the log's terms as damage.
+#[test]
+fn validation_skips_a_generation_retired_while_it_reads() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = StoreOptions {
+        history_max_generations: 0,
+        ..StoreOptions::default()
+    };
+    let store = std::sync::Arc::new(Store::open(dir.path(), options).unwrap());
+    update(&store, "retired-0");
+    update(&store, "retired-1");
+    let first = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let compactor = store.clone();
+    let mut fired = false;
+    validation::INSPECTION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |at: &str| {
+            if at == "bound" && !fired {
+                fired = true;
+                compactor.compact().unwrap();
+            }
+        }))
+    });
+    let result = validate_copy(dir.path(), false, &preparation());
+    validation::INSPECTION_HOOK.with(|hook| hook.borrow_mut().take());
+    assert!(
+        !dir.path().join(first.trim()).exists(),
+        "the compaction retired {first}"
+    );
+    result.unwrap();
+}
+
+/// A closed copy whose generation lost its log still refuses a vocabulary of an
+/// unknown format, so the order of the reads hides no refusal.
+#[test]
+fn validation_without_a_log_still_refuses_an_unknown_vocabulary() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        update(&store, "closed");
+    }
+    let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let generation = dir.path().join(current.trim());
+    let vocabulary = generation.join("delta.vocab");
+    let mut bytes = std::fs::read(&vocabulary).unwrap();
+    assert!(bytes.len() > 12, "the update added delta terms");
+    bytes[8..12].copy_from_slice(&u32::MAX.to_le_bytes());
+    std::fs::write(&vocabulary, &bytes).unwrap();
+    std::fs::remove_file(generation.join("wal.log")).unwrap();
+    assert!(validate_copy(dir.path(), false, &preparation()).is_err());
+}
+
+/// A compaction trims the old log's preallocated tail to its last commit once it
+/// switches `CURRENT` (`trim_wal`). A trim after the validation took the log's length
+/// ends the bound at the trimmed end, which still holds every commit record.
+#[test]
+fn validation_reads_a_log_trimmed_after_its_length_was_taken() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        update(&store, "trimmed-0");
+        update(&store, "trimmed-1");
+    }
+    let current = std::fs::read_to_string(dir.path().join("CURRENT")).unwrap();
+    let log = dir.path().join(current.trim()).join("wal.log");
+    let bytes = std::fs::read(&log).unwrap();
+    let records = bytes.len() / crate::store::WAL_REC;
+    let end = (0..records)
+        .rev()
+        .find(|&i| bytes[i * crate::store::WAL_REC] == crate::store::WAL_COMMIT)
+        .map(|i| (i + 1) * crate::store::WAL_REC)
+        .unwrap();
+    // grow the preallocated zeros, as an open writer's log has them
+    let file = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+    file.set_len((end + 64 * crate::store::WAL_REC) as u64)
+        .unwrap();
+    let mut fired = false;
+    validation::INSPECTION_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |at: &str| {
+            if at == "extent" && !fired {
+                fired = true;
+                file.set_len(end as u64).unwrap();
+            }
+        }))
+    });
+    let result = validate_copy(dir.path(), false, &preparation());
+    validation::INSPECTION_HOOK.with(|hook| hook.borrow_mut().take());
+    assert_eq!(
+        std::fs::metadata(&log).unwrap().len(),
+        end as u64,
+        "{result:?}"
+    );
+    result.unwrap();
+}
