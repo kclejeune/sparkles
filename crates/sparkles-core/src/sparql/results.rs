@@ -4,7 +4,7 @@ use super::{QueryKind, QueryResult};
 use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::{Id, Tag};
 use oxrdf::Term;
-use oxrdfio::{RdfFormat, RdfSerializer};
+use oxrdfio::RdfFormat;
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use serde_json::{Value as J, json};
@@ -971,37 +971,6 @@ pub fn write_graph(
     write(Source::Result(r), options, &mut w).map(drop)
 }
 
-/// [`write_graph`] into the buffer of [`write_buffered`].
-fn graph_to(
-    r: &QueryResult,
-    fmt: RdfFormat,
-    prefixes: &[(String, String)],
-    w: &mut RowOut<'_>,
-    sent: &Cell<u64>,
-) -> Result<()> {
-    let mut ser = RdfSerializer::from_format(fmt);
-    if matches!(fmt, RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml) {
-        for (p, ns) in prefixes {
-            ser = ser
-                .with_prefix(p.clone(), ns.clone())
-                .map_err(|e| Error::invalid(e.to_string()))?;
-        }
-    }
-    let mut s = ser.for_writer(w);
-    for t in &r.inner.triples {
-        s.serialize_triple(t).map_err(io)?;
-        sent.set(sent.get() + 1);
-    }
-    if fmt.supports_datasets() {
-        for q in &r.inner.quads {
-            s.serialize_quad(q).map_err(io)?;
-            sent.set(sent.get() + 1);
-        }
-    }
-    s.finish().map_err(io)?;
-    Ok(())
-}
-
 /// Serialize CONSTRUCT / DESCRIBE results in one of Jena's syntaxes, by the policy of
 /// [`write_graph`]: TriX, RDF Thrift and RDF Protobuf also get the quads of a CONSTRUCT
 /// with `GRAPH` blocks, and RDF/JSON, which holds one graph, the default graph only.
@@ -1017,36 +986,6 @@ pub fn write_jena_graph(
         &mut w,
     )
     .map(drop)
-}
-
-/// [`write_jena_graph`] into the buffer of [`write_buffered`].
-fn jena_graph_to(
-    r: &QueryResult,
-    fmt: crate::jena_formats::JenaFormat,
-    w: &mut RowOut<'_>,
-    sent: &Cell<u64>,
-) -> Result<()> {
-    // RDF/JSON groups the triples by subject and writes them all at the end, so they
-    // count by subject as `finish_counted` writes them
-    let deferred = fmt == crate::jena_formats::JenaFormat::RdfJson;
-    let mut out = crate::jena_formats::RdfWriter::new(fmt, w);
-    for t in &r.inner.triples {
-        out.triple(t).map_err(io)?;
-        if !deferred {
-            sent.set(sent.get() + 1);
-        }
-    }
-    if fmt.quads() {
-        for q in &r.inner.quads {
-            out.quad(q).map_err(io)?;
-            if !deferred {
-                sent.set(sent.get() + 1);
-            }
-        }
-    }
-    out.finish_counted(|n| sent.set(sent.get() + n))
-        .map_err(io)?;
-    Ok(())
 }
 
 /// Extra metadata for an HTTP native response. Its timing includes serialization
@@ -1078,38 +1017,6 @@ pub fn write_native_json(
         ..WriteOptions::new(Format::Solutions(SolutionsFormat::Sparkles), &rows)
     };
     write(Source::Result(r), options, &mut w).map(drop)
-}
-
-/// The native document of a complete graph result, into the buffer of
-/// [`write_buffered`].
-fn native_graph_to(
-    r: &QueryResult,
-    w: &mut RowOut<'_>,
-    send: Option<usize>,
-    metadata: Option<NativeJsonMetadata<'_>>,
-    sent: &Cell<u64>,
-) -> Result<()> {
-    r.inner.ctx.check_memory_failure()?;
-    let n = send.map_or(r.len(), |s| s.min(r.len()));
-    // Serde's error type cannot carry the engine's typed refusal. Keep the exact
-    // first decode error at this one boundary instead of converting it into I/O.
-    let failure = RefCell::new(None);
-    let result = serde_json::to_writer(
-        w,
-        &NativeJson {
-            r,
-            n,
-            commit: None,
-            metadata,
-            started: Instant::now(),
-            sent,
-            failure: &failure,
-        },
-    );
-    if let Some(error) = failure.into_inner() {
-        return Err(error);
-    }
-    result.map_err(|e| Error::Io(e.into()))
 }
 
 /// Consume native SELECT rows without collecting them. Metadata is written only
@@ -1146,112 +1053,6 @@ pub fn write_cursor_graph_native_json(
     write(Source::Graph(cursor), options, &mut writer).map(|s| s.expect("cursor statistics"))
 }
 
-/// [`write_cursor_graph_native_json`] counting in `sent`.
-fn cursor_graph_native_json(
-    cursor: &mut super::GraphCursor,
-    output: &mut dyn Write,
-    send: Option<usize>,
-    metadata: Option<NativeJsonMetadata<'_>>,
-    sent: &RowCount,
-) -> Result<super::CursorStats> {
-    let mut metadata = metadata;
-    let mut stats = None;
-    let result = write_buffered(
-        output,
-        sent,
-        Some(cursor.output_ctx()),
-        &mut |mut writer, staged| {
-            let metadata = metadata.take();
-            stats = Some(super::depth::with_stack(cursor.stack_depth(), || {
-                cursor.check()?;
-                let _charge = cursor.charge(4096)?;
-                write!(writer, "{{\"queryType\":")?;
-                serde_json::to_writer(&mut writer, &cursor.kind())
-                    .map_err(|e| Error::Io(e.into()))?;
-                writer.write_all(b",\"triples\":[],\"quads\":[")?;
-                let mut sent = 0usize;
-                let mut first = true;
-                while send.is_none_or(|max| sent < max) {
-                    let Some(batch) =
-                        cursor.next_at_most(send.map_or(usize::MAX, |max| max - sent))?
-                    else {
-                        break;
-                    };
-                    for quad in batch.quads() {
-                        if sent.is_multiple_of(1024) {
-                            cursor.check()?;
-                        }
-                        if sent > 0 {
-                            writer.write_all(b",")?;
-                        }
-                        // Reuse the borrowed native term serializer, without a JSON tree.
-                        serde_json::to_writer(&mut writer, &NativeQuad(quad))
-                            .map_err(|e| Error::Io(e.into()))?;
-                        staged.set(staged.get() + 1);
-                        sent += 1;
-                    }
-                    // the first batch's quads reach a writer that commits on a flush
-                    if std::mem::take(&mut first) {
-                        writer.flush()?;
-                    }
-                }
-                if send.is_some_and(|max| sent >= max) {
-                    cursor.close();
-                }
-                let stats = cursor.stats();
-                writer.write_all(b"],\"meta\":{")?;
-                write!(
-                    writer,
-                    "\"totalRows\":{},\"sentRows\":{sent},\"status\":",
-                    if stats.status == super::CursorStatus::Complete {
-                        sent.to_string()
-                    } else {
-                        "null".into()
-                    }
-                )?;
-                serde_json::to_writer(&mut writer, &stats.status)
-                    .map_err(|e| Error::Io(e.into()))?;
-                writer.write_all(b",\"timing\":")?;
-                serde_json::to_writer(&mut writer, &stats.timing)
-                    .map_err(|e| Error::Io(e.into()))?;
-                writer.write_all(b",\"plan\":")?;
-                serde_json::to_writer(&mut writer, cursor.plan())
-                    .map_err(|e| Error::Io(e.into()))?;
-                let granted = stats
-                    .granted_bytes
-                    .map_or(String::new(), |g| format!(",\"grantedBytes\":{g}"));
-                write!(
-                    writer,
-                    ",\"memory\":{{\"peakBytes\":{}{granted}}},\"rowsProduced\":{},\"describeTruncated\":{}",
-                    stats.mem_peak_bytes,
-                    stats.rows_produced,
-                    cursor.describe_truncated()
-                )?;
-                if let Some(meta) = metadata {
-                    write!(writer, ",\"commit\":{},\"datasetId\":", meta.commit)?;
-                    serde_json::to_writer(&mut writer, meta.dataset_id)
-                        .map_err(|e| Error::Io(e.into()))?;
-                    if let Some(p) = meta.io {
-                        writer.write_all(b",\"io\":")?;
-                        serde_json::to_writer(&mut writer, &p.report())
-                            .map_err(|e| Error::Io(e.into()))?;
-                    }
-                }
-                writer.write_all(b"}}")?;
-                Ok::<_, Error>(stats)
-            })?);
-            Ok(())
-        },
-    );
-    match result {
-        Ok(()) => Ok(stats.expect("the writer ran")),
-        Err(error) => {
-            cursor.fail_output(&error);
-            Err(error)
-        }
-    }
-}
-
 /// Jena's wire formats stream one statement at a time. RDF/JSON groups objects
 /// by subject and predicate; reserve its retained representation before insertion.
 pub fn write_cursor_jena_graph(
@@ -1266,98 +1067,6 @@ pub fn write_cursor_jena_graph(
         ..WriteOptions::new(Format::Jena(format), &rows)
     };
     write(Source::Graph(cursor), options, &mut output).map(|s| s.expect("cursor statistics"))
-}
-
-/// [`write_cursor_jena_graph`] counting in `sent`.
-fn cursor_jena_graph(
-    cursor: &mut super::GraphCursor,
-    format: crate::jena_formats::JenaFormat,
-    output: &mut dyn Write,
-    send: Option<usize>,
-    sent: &RowCount,
-) -> Result<super::CursorStats> {
-    let mut stats = None;
-    let result = write_buffered(
-        output,
-        sent,
-        Some(cursor.output_ctx()),
-        &mut |output, staged| {
-            stats = Some(cursor_jena_graph_to(cursor, format, output, send, staged)?);
-            Ok(())
-        },
-    );
-    match result {
-        Ok(()) => Ok(stats.expect("the writer ran")),
-        Err(error) => {
-            cursor.fail_output(&error);
-            Err(error)
-        }
-    }
-}
-
-/// [`cursor_jena_graph`] into the buffer of [`write_buffered`].
-fn cursor_jena_graph_to(
-    cursor: &mut super::GraphCursor,
-    format: crate::jena_formats::JenaFormat,
-    output: &mut RowOut<'_>,
-    send: Option<usize>,
-    staged: &Cell<u64>,
-) -> Result<super::CursorStats> {
-    // RDF/JSON groups the triples by subject and writes them all at the end, so they
-    // count by subject as `finish_counted` writes them
-    let deferred = format == crate::jena_formats::JenaFormat::RdfJson;
-    super::depth::with_stack(cursor.stack_depth(), || {
-        let mut charge = cursor.charge(128 << 10)?;
-        let mut bytes = 128 << 10;
-        let shared = std::cell::RefCell::new(output);
-        let mut writer = crate::jena_formats::RdfWriter::new(format, Shared(&shared));
-        let mut sent = 0usize;
-        let mut first = true;
-        while send.is_none_or(|max| sent < max) {
-            let Some(batch) = cursor.next_at_most(send.map_or(usize::MAX, |max| max - sent))?
-            else {
-                break;
-            };
-            for quad in batch.quads() {
-                if sent.is_multiple_of(1024) {
-                    cursor.check()?;
-                }
-                if format == crate::jena_formats::JenaFormat::RdfJson {
-                    bytes += super::graph_quad_bytes(quad).saturating_mul(4) + 1024;
-                    charge.resize(bytes)?;
-                }
-                if format.quads() {
-                    writer.quad(quad).map_err(io)?;
-                    if !deferred {
-                        staged.set(staged.get() + 1);
-                    }
-                } else if quad.graph_name == oxrdf::GraphName::DefaultGraph {
-                    writer
-                        .triple(&oxrdf::Triple::new(
-                            quad.subject.clone(),
-                            quad.predicate.clone(),
-                            quad.object.clone(),
-                        ))
-                        .map_err(io)?;
-                    if !deferred {
-                        staged.set(staged.get() + 1);
-                    }
-                }
-                sent += 1;
-            }
-            // what the first batch wrote reaches a writer that commits on a flush
-            if std::mem::take(&mut first) {
-                shared.borrow_mut().flush()?;
-            }
-        }
-        if send.is_some_and(|max| sent >= max) {
-            cursor.close();
-        }
-        writer
-            .finish_counted(|n| staged.set(staged.get() + n))
-            .map_err(io)?;
-        Ok(cursor.stats())
-    })
 }
 
 struct NativeJson<'a> {
@@ -1525,25 +1234,6 @@ fn native_refusal<E: serde::ser::Error>(failure: &RefCell<Option<Error>>, error:
 }
 
 mod output;
-
-struct NativeQuad<'a>(&'a oxrdf::Quad);
-impl Serialize for NativeQuad<'_> {
-    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        let q = self.0.as_ref();
-        let graph = match q.graph_name {
-            oxrdf::GraphNameRef::NamedNode(n) => Some(NativeTerm(n.into())),
-            oxrdf::GraphNameRef::BlankNode(b) => Some(NativeTerm(b.into())),
-            oxrdf::GraphNameRef::DefaultGraph => None,
-        };
-        [
-            Some(NativeTerm(q.subject.into())),
-            Some(NativeTerm(q.predicate.into())),
-            Some(NativeTerm(q.object)),
-            graph,
-        ]
-        .serialize(s)
-    }
-}
 
 enum GraphRows<'a> {
     Triples(&'a [oxrdf::Triple]),

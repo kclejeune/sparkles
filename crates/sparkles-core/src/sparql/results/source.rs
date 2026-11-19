@@ -302,35 +302,7 @@ impl SolutionSource for EagerSolutions<'_> {
         started: Instant,
         _initial_exec: f64,
     ) -> Result<()> {
-        let r = self.r;
-        // what `send` selects, which is what a whole output holds
-        let n = send.map_or(r.len(), |s| s.min(r.len()));
-        r.inner.ctx.check_memory_failure()?;
-        let mut timing = r.timing.clone();
-        if metadata.is_some() {
-            timing.serialize_ms = started.elapsed().as_secs_f64() * 1000.0;
-            timing.total_ms += timing.serialize_ms;
-        }
-        out.write_all(b",\"meta\":")?;
-        json(
-            out,
-            &NativeMeta {
-                total_rows: r.len(),
-                sent_rows: n,
-                timing: &timing,
-                plan: &r.inner.plan,
-                memory: NativeMemory {
-                    peak_bytes: r.mem_peak_bytes,
-                    granted_bytes: r.inner.ctx.grant().map(|g| g.peak()),
-                },
-                rows_produced: r.rows_produced,
-                commit: metadata.as_ref().map(|m| m.commit),
-                dataset_id: metadata.as_ref().map(|m| m.dataset_id),
-                io: metadata.as_ref().and_then(|m| m.io).map(|p| p.report()),
-            },
-        )?;
-        out.write_all(b"}")?;
-        Ok(())
+        eager_native_trailer(self.r, out, send, metadata, started)
     }
 
     fn stats(&self) -> Option<CursorStats> {
@@ -338,6 +310,44 @@ impl SolutionSource for EagerSolutions<'_> {
     }
 
     fn fail_output(&mut self, _error: &Error) {}
+}
+
+/// The `meta` member of an eager result's native document and its closing brace.
+fn eager_native_trailer(
+    r: &QueryResult,
+    out: &mut RowOut<'_>,
+    send: Option<usize>,
+    metadata: Option<NativeJsonMetadata<'_>>,
+    started: Instant,
+) -> Result<()> {
+    // what `send` selects, which is what a whole output holds
+    let n = send.map_or(r.len(), |s| s.min(r.len()));
+    r.inner.ctx.check_memory_failure()?;
+    let mut timing = r.timing.clone();
+    if metadata.is_some() {
+        timing.serialize_ms = started.elapsed().as_secs_f64() * 1000.0;
+        timing.total_ms += timing.serialize_ms;
+    }
+    out.write_all(b",\"meta\":")?;
+    json(
+        out,
+        &NativeMeta {
+            total_rows: r.len(),
+            sent_rows: n,
+            timing: &timing,
+            plan: &r.inner.plan,
+            memory: NativeMemory {
+                peak_bytes: r.mem_peak_bytes,
+                granted_bytes: r.inner.ctx.grant().map(|g| g.peak()),
+            },
+            rows_produced: r.rows_produced,
+            commit: metadata.as_ref().map(|m| m.commit),
+            dataset_id: metadata.as_ref().map(|m| m.dataset_id),
+            io: metadata.as_ref().and_then(|m| m.io).map(|p| p.report()),
+        },
+    )?;
+    out.write_all(b"}")?;
+    Ok(())
 }
 
 /// A SELECT cursor. Its batches come from [`crate::sparql::QueryCursor::for_each_decoded`],
@@ -495,6 +505,319 @@ impl SolutionSource for CursorSolutions<'_> {
             )
         })?;
         out.write_all(b"}")?;
+        Ok(())
+    }
+
+    fn stats(&self) -> Option<CursorStats> {
+        Some(self.cursor.stats())
+    }
+
+    fn fail_output(&mut self, error: &Error) {
+        self.cursor.fail_output(error);
+    }
+}
+
+/// One statement of a graph result, a triple or a quad as its source produced it. The
+/// Jena binary formats write the message of the statement's own kind.
+#[derive(Clone, Copy)]
+pub(super) enum Statement<'s> {
+    Triple(&'s oxrdf::Triple),
+    Quad(&'s oxrdf::Quad),
+}
+
+/// The writer's side of [`GraphSource::drive`].
+pub(super) trait StatementVisitor {
+    fn statement(&mut self, statement: Statement<'_>) -> Result<()>;
+    /// The source's first batch has been handed over, for a source whose
+    /// [`GraphSource::FLUSH_FIRST`] is set.
+    fn first_batch(&mut self) -> Result<()>;
+}
+
+/// How the native document holds a graph result's statements.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum NativeGraphLayout {
+    /// The triples in `triples`, then the quads in `quads` when the result has any.
+    Split { quads: bool },
+    /// An empty `triples` and every statement in `quads`, with a null default graph.
+    Quads,
+}
+
+/// The statements of a CONSTRUCT or DESCRIBE, with the checks, the accounting, the
+/// prefix rule and the native layout and trailer of the source they come from.
+pub(super) trait GraphSource {
+    /// The writer flushes its output after the first batch.
+    const FLUSH_FIRST: bool;
+    /// The charge that a writer takes for its serializer's state.
+    type Charge;
+    fn kind(&self) -> QueryKind;
+    /// The context that the output buffer is charged to.
+    fn ctx(&self) -> Arc<Ctx>;
+    /// The stack that the whole writer runs on, when the source sets one.
+    fn stack_depth(&self) -> Option<usize>;
+    /// The check before the native document's first byte.
+    fn native_start(&mut self) -> Result<()>;
+    /// Charge `bytes` for the writer's serializer.
+    fn charge(&self, bytes: u64) -> Result<Self::Charge>;
+    /// Grow the writer's charge by what an RDF/JSON writer keeps of `statement` until
+    /// its end, where it groups the statements by subject.
+    fn keep(charge: &mut Self::Charge, statement: Statement<'_>) -> Result<()>;
+    /// An oxrdfio serializer for `format` with the source's prefix rule.
+    fn serializer(
+        &self,
+        format: oxrdfio::RdfFormat,
+        prefixes: &[(String, String)],
+    ) -> Result<oxrdfio::RdfSerializer>;
+    /// Hand the statements, `send` at most, to `visitor`. A statement that the format
+    /// leaves out still counts towards `send`.
+    fn drive<V: StatementVisitor>(&mut self, send: Option<usize>, visitor: &mut V) -> Result<()>;
+    fn native_layout(&self) -> NativeGraphLayout;
+    /// The native document's `meta` member and its closing brace, after `sent`
+    /// statements.
+    fn native_trailer(
+        &mut self,
+        out: &mut RowOut<'_>,
+        sent: u64,
+        send: Option<usize>,
+        metadata: Option<NativeJsonMetadata<'_>>,
+        started: Instant,
+    ) -> Result<()>;
+    /// The cursor's statistics after a whole output.
+    fn stats(&self) -> Option<CursorStats>;
+    /// The output failed with `error`.
+    fn fail_output(&mut self, error: &Error);
+}
+
+/// A complete graph result: its default-graph triples, then its named-graph quads.
+pub(super) struct EagerGraph<'r> {
+    pub(super) r: &'r QueryResult,
+}
+
+impl GraphSource for EagerGraph<'_> {
+    const FLUSH_FIRST: bool = false;
+    type Charge = ();
+
+    fn kind(&self) -> QueryKind {
+        self.r.kind
+    }
+
+    fn ctx(&self) -> Arc<Ctx> {
+        self.r.inner.ctx.clone()
+    }
+
+    fn stack_depth(&self) -> Option<usize> {
+        None
+    }
+
+    fn native_start(&mut self) -> Result<()> {
+        self.r.inner.ctx.check_memory_failure()
+    }
+
+    fn charge(&self, _bytes: u64) -> Result<()> {
+        Ok(())
+    }
+
+    fn keep(_charge: &mut (), _statement: Statement<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn serializer(
+        &self,
+        format: oxrdfio::RdfFormat,
+        prefixes: &[(String, String)],
+    ) -> Result<oxrdfio::RdfSerializer> {
+        use oxrdfio::RdfFormat;
+        let mut ser = oxrdfio::RdfSerializer::from_format(format);
+        // a prefix that the serializer refuses fails the output
+        if matches!(
+            format,
+            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml
+        ) {
+            for (p, ns) in prefixes {
+                ser = ser
+                    .with_prefix(p.clone(), ns.clone())
+                    .map_err(|e| Error::invalid(e.to_string()))?;
+            }
+        }
+        Ok(ser)
+    }
+
+    fn drive<V: StatementVisitor>(&mut self, send: Option<usize>, visitor: &mut V) -> Result<()> {
+        let (triples, quads) = (&self.r.inner.triples, &self.r.inner.quads);
+        let n = send.unwrap_or(usize::MAX);
+        for t in &triples[..n.min(triples.len())] {
+            visitor.statement(Statement::Triple(t))?;
+        }
+        for q in &quads[..n.saturating_sub(triples.len()).min(quads.len())] {
+            visitor.statement(Statement::Quad(q))?;
+        }
+        Ok(())
+    }
+
+    fn native_layout(&self) -> NativeGraphLayout {
+        NativeGraphLayout::Split {
+            quads: !self.r.inner.quads.is_empty(),
+        }
+    }
+
+    fn native_trailer(
+        &mut self,
+        out: &mut RowOut<'_>,
+        _sent: u64,
+        send: Option<usize>,
+        metadata: Option<NativeJsonMetadata<'_>>,
+        started: Instant,
+    ) -> Result<()> {
+        eager_native_trailer(self.r, out, send, metadata, started)
+    }
+
+    fn stats(&self) -> Option<CursorStats> {
+        None
+    }
+
+    fn fail_output(&mut self, _error: &Error) {}
+}
+
+/// A cursor writer's charge and the bytes it covers.
+pub(super) struct CursorCharge {
+    charge: crate::sparql::ctx::OwnedCharge,
+    bytes: u64,
+}
+
+/// A CONSTRUCT or DESCRIBE cursor. Its statements are quads in production order, with
+/// the cancellation and deadline check every 1,024 statements and a cursor closed once
+/// `send` statements have been handed over.
+pub(super) struct CursorGraph<'c> {
+    pub(super) cursor: &'c mut crate::sparql::GraphCursor,
+}
+
+impl GraphSource for CursorGraph<'_> {
+    const FLUSH_FIRST: bool = true;
+    type Charge = CursorCharge;
+
+    fn kind(&self) -> QueryKind {
+        self.cursor.kind()
+    }
+
+    fn ctx(&self) -> Arc<Ctx> {
+        self.cursor.output_ctx()
+    }
+
+    fn stack_depth(&self) -> Option<usize> {
+        Some(self.cursor.stack_depth())
+    }
+
+    fn native_start(&mut self) -> Result<()> {
+        self.cursor.check()
+    }
+
+    fn charge(&self, bytes: u64) -> Result<Self::Charge> {
+        Ok(CursorCharge {
+            charge: self.cursor.charge(bytes)?,
+            bytes,
+        })
+    }
+
+    fn keep(charge: &mut Self::Charge, statement: Statement<'_>) -> Result<()> {
+        let kept = match statement {
+            Statement::Triple(t) => crate::sparql::graph_triple_bytes(t),
+            Statement::Quad(q) => crate::sparql::graph_quad_bytes(q),
+        };
+        charge.bytes += kept.saturating_mul(4) + 1024;
+        charge.charge.resize(charge.bytes)
+    }
+
+    fn serializer(
+        &self,
+        format: oxrdfio::RdfFormat,
+        prefixes: &[(String, String)],
+    ) -> Result<oxrdfio::RdfSerializer> {
+        // a prefix that is not valid is left out, so a long-running output is not refused
+        Ok(crate::io::with_prefixes(
+            oxrdfio::RdfSerializer::from_format(format),
+            prefixes.iter().cloned(),
+        ))
+    }
+
+    fn drive<V: StatementVisitor>(&mut self, send: Option<usize>, visitor: &mut V) -> Result<()> {
+        let cursor = &mut *self.cursor;
+        let mut sent = 0usize;
+        let mut first = true;
+        while send.is_none_or(|max| sent < max) {
+            let Some(batch) =
+                cursor.next_at_most(send.map_or(usize::MAX, |max| max.saturating_sub(sent)))?
+            else {
+                break;
+            };
+            for quad in batch.quads() {
+                if send.is_some_and(|max| sent == max) {
+                    break;
+                }
+                if sent.is_multiple_of(1024) {
+                    cursor.check()?;
+                }
+                visitor.statement(Statement::Quad(quad))?;
+                sent += 1;
+            }
+            // what the first batch wrote reaches a writer that commits on a flush; a
+            // serializer that groups triples by subject may still hold the last ones
+            if std::mem::take(&mut first) {
+                visitor.first_batch()?;
+            }
+        }
+        if send.is_some_and(|max| sent >= max) {
+            cursor.close();
+        }
+        Ok(())
+    }
+
+    fn native_layout(&self) -> NativeGraphLayout {
+        NativeGraphLayout::Quads
+    }
+
+    fn native_trailer(
+        &mut self,
+        out: &mut RowOut<'_>,
+        sent: u64,
+        _send: Option<usize>,
+        metadata: Option<NativeJsonMetadata<'_>>,
+        _started: Instant,
+    ) -> Result<()> {
+        let cursor = &*self.cursor;
+        let stats = cursor.stats();
+        out.write_all(b",\"meta\":{")?;
+        write!(
+            out,
+            "\"totalRows\":{},\"sentRows\":{sent},\"status\":",
+            if stats.status == crate::sparql::CursorStatus::Complete {
+                sent.to_string()
+            } else {
+                "null".into()
+            }
+        )?;
+        json(&mut *out, &stats.status)?;
+        out.write_all(b",\"timing\":")?;
+        json(&mut *out, &stats.timing)?;
+        out.write_all(b",\"plan\":")?;
+        json(&mut *out, cursor.plan())?;
+        let granted = stats
+            .granted_bytes
+            .map_or(String::new(), |g| format!(",\"grantedBytes\":{g}"));
+        write!(
+            out,
+            ",\"memory\":{{\"peakBytes\":{}{granted}}},\"rowsProduced\":{},\"describeTruncated\":{}",
+            stats.mem_peak_bytes,
+            stats.rows_produced,
+            cursor.describe_truncated()
+        )?;
+        if let Some(meta) = metadata {
+            write!(out, ",\"commit\":{},\"datasetId\":", meta.commit)?;
+            json(&mut *out, &meta.dataset_id)?;
+            if let Some(p) = meta.io {
+                out.write_all(b",\"io\":")?;
+                json(&mut *out, &p.report())?;
+            }
+        }
+        out.write_all(b"}}")?;
         Ok(())
     }
 

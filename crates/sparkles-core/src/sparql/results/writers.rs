@@ -2,13 +2,15 @@
 //! entry that every caller writes a result through.
 
 use super::source::{
-    BatchVisitor, CursorSolutions, EagerSolutions, RowBatch, RowView, SolutionSource,
+    BatchVisitor, CursorGraph, CursorSolutions, EagerGraph, EagerSolutions, GraphSource,
+    NativeGraphLayout, RowBatch, RowView, SolutionSource, Statement, StatementVisitor,
 };
 use super::{
     NativeJsonMetadata, NativeTerm, RowCount, RowOut, Shared, SolutionsFormat, io, json,
     write_buffered,
 };
 use crate::error::{Error, Result};
+use crate::jena_formats::JenaFormat;
 use crate::sparql::{CursorStats, GraphCursor, QueryCursor, QueryKind, QueryResult};
 use oxrdf::Variable;
 use oxrdfio::RdfFormat;
@@ -93,10 +95,9 @@ pub fn write(
             })
         }
         (Source::Result(r), Format::Solutions(SolutionsFormat::Sparkles)) => {
-            write_buffered(writer, rows, Some(r.inner.ctx.clone()), &mut |w, sent| {
-                super::native_graph_to(r, w, send, metadata, sent)
+            graphs(&mut EagerGraph { r }, writer, rows, |s, out, staged| {
+                native_graph(s, out, staged, send, metadata)
             })
-            .map(|()| None)
         }
         (Source::Result(r), Format::Solutions(fmt)) => {
             let mut source = EagerSolutions { r, scratch: false };
@@ -104,17 +105,16 @@ pub fn write(
                 select(s, fmt, out, staged, send)
             })
         }
+        // a complete graph result is written whole in the RDF and Jena formats
         (Source::Result(r), Format::Rdf(fmt)) => {
-            write_buffered(writer, rows, Some(r.inner.ctx.clone()), &mut |w, sent| {
-                super::graph_to(r, fmt, prefixes, w, sent)
+            graphs(&mut EagerGraph { r }, writer, rows, |s, out, staged| {
+                rdf(s, fmt, prefixes, out, staged, None)
             })
-            .map(|()| None)
         }
         (Source::Result(r), Format::Jena(fmt)) => {
-            write_buffered(writer, rows, Some(r.inner.ctx.clone()), &mut |w, sent| {
-                super::jena_graph_to(r, fmt, w, sent)
+            graphs(&mut EagerGraph { r }, writer, rows, |s, out, staged| {
+                jena(s, fmt, out, staged, None)
             })
-            .map(|()| None)
         }
         (Source::Select(cursor), Format::Solutions(fmt)) => {
             let mut source = CursorSolutions { cursor };
@@ -128,18 +128,24 @@ pub fn write(
                 })
             }
         }
-        (Source::Graph(cursor), Format::Solutions(SolutionsFormat::Sparkles)) => {
-            super::cursor_graph_native_json(cursor, writer, send, metadata, rows).map(Some)
-        }
-        (Source::Graph(cursor), Format::Rdf(fmt)) => {
-            crate::sparql::cursor::graph::write_cursor_graph_rows(
-                cursor, fmt, writer, send, prefixes, rows,
-            )
-            .map(Some)
-        }
-        (Source::Graph(cursor), Format::Jena(fmt)) => {
-            super::cursor_jena_graph(cursor, fmt, writer, send, rows).map(Some)
-        }
+        (Source::Graph(cursor), Format::Solutions(SolutionsFormat::Sparkles)) => graphs(
+            &mut CursorGraph { cursor },
+            writer,
+            rows,
+            |s, out, staged| native_graph(s, out, staged, send, metadata),
+        ),
+        (Source::Graph(cursor), Format::Rdf(fmt)) => graphs(
+            &mut CursorGraph { cursor },
+            writer,
+            rows,
+            |s, out, staged| rdf(s, fmt, prefixes, out, staged, send),
+        ),
+        (Source::Graph(cursor), Format::Jena(fmt)) => graphs(
+            &mut CursorGraph { cursor },
+            writer,
+            rows,
+            |s, out, staged| jena(s, fmt, out, staged, send),
+        ),
         (Source::Select(_), _) => Err(Error::invalid(
             "a SELECT cursor is written in a result format",
         )),
@@ -348,6 +354,313 @@ impl BatchVisitor for NativeRows<'_, '_> {
         // the first batch's rows reach a writer that commits on a flush
         if std::mem::take(&mut self.flush) {
             out.flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// Run `write` on a graph source into the writers' buffer, on the source's stack, failing
+/// the source with its error.
+fn graphs<S: GraphSource>(
+    source: &mut S,
+    writer: &mut dyn Write,
+    rows: &RowCount,
+    mut write: impl FnMut(&mut S, &mut RowOut<'_>, &Cell<u64>) -> Result<()>,
+) -> Result<Option<CursorStats>> {
+    let ctx = source.ctx();
+    let depth = source.stack_depth();
+    let result = write_buffered(writer, rows, Some(ctx), &mut |out, staged| match depth {
+        Some(depth) => crate::sparql::depth::with_stack(depth, || write(source, out, staged)),
+        None => write(source, out, staged),
+    });
+    match result {
+        Ok(()) => Ok(source.stats()),
+        Err(error) => {
+            source.fail_output(&error);
+            Err(error)
+        }
+    }
+}
+
+/// The oxrdfio formats from either source. A format without datasets leaves out the
+/// named-graph quads, as Fuseki writes it.
+fn rdf<S: GraphSource>(
+    source: &mut S,
+    format: RdfFormat,
+    prefixes: &[(String, String)],
+    out: &mut RowOut<'_>,
+    staged: &Cell<u64>,
+    send: Option<usize>,
+) -> Result<()> {
+    let _charge = source.charge(
+        (128 << 10)
+            + prefixes
+                .iter()
+                .map(|(a, b)| (a.len() + b.len()) as u64 * 4 + 128)
+                .sum::<u64>(),
+    )?;
+    let serializer = source.serializer(format, prefixes)?;
+    let datasets = format.supports_datasets();
+    if S::FLUSH_FIRST {
+        // the serializer holds the writer, and the first batch's flush goes past it
+        let shared = RefCell::new(out);
+        let mut rows = RdfRows {
+            writer: serializer.for_writer(Shared(&shared)),
+            datasets,
+            staged,
+            flush: Some(|| shared.borrow_mut().flush()),
+        };
+        source.drive(send, &mut rows)?;
+        rows.writer.finish().map_err(io)?;
+    } else {
+        let mut rows = RdfRows {
+            writer: serializer.for_writer(out),
+            datasets,
+            staged,
+            flush: None::<fn() -> std::io::Result<()>>,
+        };
+        source.drive(send, &mut rows)?;
+        rows.writer.finish().map_err(io)?;
+    }
+    Ok(())
+}
+
+struct RdfRows<'v, W: Write, F> {
+    writer: oxrdfio::WriterQuadSerializer<W>,
+    datasets: bool,
+    staged: &'v Cell<u64>,
+    /// the flush after the first batch
+    flush: Option<F>,
+}
+
+impl<W: Write, F: FnOnce() -> std::io::Result<()>> StatementVisitor for RdfRows<'_, W, F> {
+    #[inline]
+    fn statement(&mut self, statement: Statement<'_>) -> Result<()> {
+        match statement {
+            Statement::Triple(t) => self.writer.serialize_triple(t),
+            Statement::Quad(q) if self.datasets || q.graph_name.is_default_graph() => {
+                self.writer.serialize_quad(q)
+            }
+            Statement::Quad(_) => return Ok(()),
+        }
+        .map_err(io)?;
+        self.staged.set(self.staged.get() + 1);
+        Ok(())
+    }
+
+    fn first_batch(&mut self) -> Result<()> {
+        match self.flush.take() {
+            Some(flush) => flush().map_err(io),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Jena's syntaxes from either source. TriX, RDF Thrift and RDF Protobuf also hold the
+/// quads, each statement in the message of its own kind, and RDF/JSON, which holds one
+/// graph, the default graph only.
+fn jena<S: GraphSource>(
+    source: &mut S,
+    format: JenaFormat,
+    out: &mut RowOut<'_>,
+    staged: &Cell<u64>,
+    send: Option<usize>,
+) -> Result<()> {
+    let charge = source.charge(128 << 10)?;
+    // RDF/JSON groups the triples by subject and writes them all at the end, so they
+    // count by subject as `finish_counted` writes them
+    let deferred = format == JenaFormat::RdfJson;
+    if S::FLUSH_FIRST {
+        // the writer holds the output, and the first batch's flush goes past it
+        let shared = RefCell::new(out);
+        let mut rows = JenaRows::<S, _, _> {
+            writer: crate::jena_formats::RdfWriter::new(format, Shared(&shared)),
+            format,
+            deferred,
+            charge,
+            staged,
+            flush: Some(|| shared.borrow_mut().flush()),
+        };
+        source.drive(send, &mut rows)?;
+        rows.writer
+            .finish_counted(|n| staged.set(staged.get() + n))
+            .map_err(io)?;
+    } else {
+        let mut rows = JenaRows::<S, _, _> {
+            writer: crate::jena_formats::RdfWriter::new(format, out),
+            format,
+            deferred,
+            charge,
+            staged,
+            flush: None::<fn() -> std::io::Result<()>>,
+        };
+        source.drive(send, &mut rows)?;
+        rows.writer
+            .finish_counted(|n| staged.set(staged.get() + n))
+            .map_err(io)?;
+    }
+    Ok(())
+}
+
+struct JenaRows<'v, S: GraphSource, W: Write, F> {
+    writer: crate::jena_formats::RdfWriter<W>,
+    format: JenaFormat,
+    deferred: bool,
+    charge: S::Charge,
+    staged: &'v Cell<u64>,
+    /// the flush after the first batch
+    flush: Option<F>,
+}
+
+impl<S: GraphSource, W: Write, F: FnOnce() -> std::io::Result<()>> StatementVisitor
+    for JenaRows<'_, S, W, F>
+{
+    #[inline]
+    fn statement(&mut self, statement: Statement<'_>) -> Result<()> {
+        if self.format == JenaFormat::RdfJson {
+            S::keep(&mut self.charge, statement)?;
+        }
+        match statement {
+            Statement::Triple(t) => self.writer.triple(t).map_err(io)?,
+            Statement::Quad(q) if self.format.quads() => self.writer.quad(q).map_err(io)?,
+            Statement::Quad(q) if q.graph_name.is_default_graph() => self
+                .writer
+                .triple(&oxrdf::Triple::new(
+                    q.subject.clone(),
+                    q.predicate.clone(),
+                    q.object.clone(),
+                ))
+                .map_err(io)?,
+            Statement::Quad(_) => return Ok(()),
+        }
+        if !self.deferred {
+            self.staged.set(self.staged.get() + 1);
+        }
+        Ok(())
+    }
+
+    fn first_batch(&mut self) -> Result<()> {
+        match self.flush.take() {
+            Some(flush) => flush().map_err(io),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The native document of a CONSTRUCT or DESCRIBE from either source, in the source's
+/// layout. Its statements are written by hand, cell by cell.
+fn native_graph<S: GraphSource>(
+    source: &mut S,
+    out: &mut RowOut<'_>,
+    staged: &Cell<u64>,
+    send: Option<usize>,
+    metadata: Option<NativeJsonMetadata<'_>>,
+) -> Result<()> {
+    let started = Instant::now();
+    source.native_start()?;
+    let _charge = source.charge(4096)?;
+    let layout = source.native_layout();
+    out.write_all(b"{\"queryType\":")?;
+    json(&mut *out, &source.kind())?;
+    out.write_all(match layout {
+        NativeGraphLayout::Split { .. } => b",\"triples\":[",
+        NativeGraphLayout::Quads => b",\"triples\":[],\"quads\":[",
+    })?;
+    let mut rows = NativeGraphRows {
+        out: &mut *out,
+        staged,
+        in_triples: matches!(layout, NativeGraphLayout::Split { .. }),
+        section: 0,
+        sent: 0,
+        flush: S::FLUSH_FIRST,
+    };
+    source.drive(send, &mut rows)?;
+    let (sent, in_triples) = (rows.sent, rows.in_triples);
+    out.write_all(b"]")?;
+    if in_triples && layout == (NativeGraphLayout::Split { quads: true }) {
+        out.write_all(b",\"quads\":[]")?;
+    }
+    source.native_trailer(out, sent, send, metadata, started)
+}
+
+struct NativeGraphRows<'o, 'w> {
+    out: &'o mut RowOut<'w>,
+    staged: &'o Cell<u64>,
+    /// the statements go into `triples`, until the first quad of a split layout
+    in_triples: bool,
+    /// the statements written into the open array
+    section: u64,
+    sent: u64,
+    /// flush after the first batch
+    flush: bool,
+}
+
+impl StatementVisitor for NativeGraphRows<'_, '_> {
+    #[inline]
+    fn statement(&mut self, statement: Statement<'_>) -> Result<()> {
+        let out = &mut *self.out;
+        match statement {
+            Statement::Triple(t) => {
+                if self.section > 0 {
+                    out.write_all(b",")?;
+                }
+                let t = t.as_ref();
+                if self.in_triples {
+                    json(
+                        &mut *out,
+                        &[
+                            NativeTerm(t.subject.into()),
+                            NativeTerm(t.predicate.into()),
+                            NativeTerm(t.object),
+                        ],
+                    )?;
+                } else {
+                    json(
+                        &mut *out,
+                        &[
+                            Some(NativeTerm(t.subject.into())),
+                            Some(NativeTerm(t.predicate.into())),
+                            Some(NativeTerm(t.object)),
+                            None,
+                        ],
+                    )?;
+                }
+            }
+            Statement::Quad(q) => {
+                if std::mem::take(&mut self.in_triples) {
+                    out.write_all(b"],\"quads\":[")?;
+                    self.section = 0;
+                }
+                if self.section > 0 {
+                    out.write_all(b",")?;
+                }
+                let q = q.as_ref();
+                let graph = match q.graph_name {
+                    oxrdf::GraphNameRef::NamedNode(n) => Some(NativeTerm(n.into())),
+                    oxrdf::GraphNameRef::BlankNode(b) => Some(NativeTerm(b.into())),
+                    oxrdf::GraphNameRef::DefaultGraph => None,
+                };
+                json(
+                    &mut *out,
+                    &[
+                        Some(NativeTerm(q.subject.into())),
+                        Some(NativeTerm(q.predicate.into())),
+                        Some(NativeTerm(q.object)),
+                        graph,
+                    ],
+                )?;
+            }
+        }
+        self.staged.set(self.staged.get() + 1);
+        self.section += 1;
+        self.sent += 1;
+        Ok(())
+    }
+
+    fn first_batch(&mut self) -> Result<()> {
+        // the first batch's statements reach a writer that commits on a flush
+        if std::mem::take(&mut self.flush) {
+            self.out.flush()?;
         }
         Ok(())
     }

@@ -16,7 +16,6 @@ use oxrdf::{GraphName, Quad};
 use rustc_hash::FxHashSet;
 use spargebra::GraphTemplate;
 use spargebra::term::TriplePattern;
-use std::cell::Cell;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -483,93 +482,4 @@ pub fn write_cursor_graph(
         output,
     )
     .map(|s| s.expect("cursor statistics"))
-}
-
-/// [`write_cursor_graph`], counting in `sent` the triples and quads that reached `output`
-/// whole, as the eager graph writers count them. The statements go out through the
-/// buffer of the eager writers.
-pub(in crate::sparql) fn write_cursor_graph_rows(
-    cursor: &mut GraphCursor,
-    format: oxrdfio::RdfFormat,
-    output: &mut dyn std::io::Write,
-    send: Option<usize>,
-    prefixes: &[(String, String)],
-    sent: &crate::sparql::results::RowCount,
-) -> Result<CursorStats> {
-    let result = crate::sparql::results::write_buffered(
-        output,
-        sent,
-        Some(cursor.output_ctx()),
-        &mut |w, staged| graph_to(cursor, format, w, send, prefixes, staged),
-    );
-    if let Err(error) = result {
-        cursor.failure = Some(error.to_string());
-        cursor.finish(CursorStatus::Failed);
-        return Err(error);
-    }
-    Ok(cursor.stats())
-}
-
-/// [`write_cursor_graph_rows`] into the buffer of the eager writers.
-fn graph_to(
-    cursor: &mut GraphCursor,
-    format: oxrdfio::RdfFormat,
-    output: &mut crate::sparql::results::RowOut<'_>,
-    send: Option<usize>,
-    prefixes: &[(String, String)],
-    staged: &Cell<u64>,
-) -> Result<()> {
-    use std::io::Write as _;
-    depth::with_stack(cursor.where_cursor.depth, || {
-        let _serializer_charge = OwnedCharge::new(
-            &cursor.where_cursor.ctx,
-            (128 << 10)
-                + prefixes
-                    .iter()
-                    .map(|(a, b)| (a.len() + b.len()) as u64 * 4 + 128)
-                    .sum::<u64>(),
-        )?;
-        let serializer = crate::io::with_prefixes(
-            oxrdfio::RdfSerializer::from_format(format),
-            prefixes.iter().cloned(),
-        );
-        let shared = std::cell::RefCell::new(output);
-        let mut writer = serializer.for_writer(crate::sparql::results::Shared(&shared));
-        let mut sent = 0usize;
-        let mut first = true;
-        while send.is_none_or(|max| sent < max) {
-            let Some(batch) =
-                cursor.next_at_most(send.map_or(usize::MAX, |max| max.saturating_sub(sent)))?
-            else {
-                break;
-            };
-            for quad in batch.quads() {
-                if send.is_some_and(|max| sent == max) {
-                    break;
-                }
-                if sent.is_multiple_of(1024) {
-                    cursor.where_cursor.ctx.check()?;
-                }
-                if format.supports_datasets() || quad.graph_name == GraphName::DefaultGraph {
-                    writer
-                        .serialize_quad(quad)
-                        .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-                    staged.set(staged.get() + 1);
-                }
-                sent += 1;
-            }
-            // what the first batch wrote reaches a writer that commits on a flush; a
-            // serializer that groups triples by subject may still hold the last ones
-            if std::mem::take(&mut first) {
-                shared.borrow_mut().flush()?;
-            }
-        }
-        if send.is_some_and(|max| sent >= max) {
-            cursor.close();
-        }
-        writer
-            .finish()
-            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        Ok(())
-    })
 }

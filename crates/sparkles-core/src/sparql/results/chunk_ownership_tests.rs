@@ -925,3 +925,88 @@ fn packet_credit_survives_caller_unwind_blocked_prefetch() {
 fn packet_credit_survives_caller_unwind_completed_prefetch() {
     caller_unwind_packet(true);
 }
+
+/// A prefetch worker that fails while the current chunk is being written stops that
+/// chunk at its next row, and the worker's error is the one returned, not the stand-in
+/// error of the row that saw the failure.
+#[test]
+fn a_prefetch_error_mid_chunk_is_returned_over_the_row_that_saw_it() {
+    use std::sync::{Barrier, atomic::Ordering};
+    struct Sink {
+        writes: usize,
+        bytes: usize,
+        rendezvous: Arc<Barrier>,
+    }
+    impl Write for Sink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            if self.writes == 1 {
+                // hold the first chunk's output here while the worker fails
+                self.rendezvous.wait();
+                self.rendezvous.wait();
+            }
+            self.bytes += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let (result, pool, _directory) = large_answer();
+    let rendezvous = Arc::new(Barrier::new(2));
+    let (worker, ctx) = (rendezvous.clone(), Arc::downgrade(&result.inner.ctx));
+    *result.inner.ctx.chunk_hook.lock() = Some(Arc::new(move |stage, _| {
+        let Some(ctx) = ctx.upgrade() else { return };
+        if stage == "prefetch-start" {
+            // the writer is blocked in its first write; cancel only for the worker
+            worker.wait();
+            ctx.cancel.store(true, Ordering::SeqCst);
+        }
+        if stage == "prefetch-end" {
+            ctx.cancel.store(false, Ordering::SeqCst);
+            worker.wait();
+        }
+    }));
+    let sent = RowCount::new();
+    let mut sink = Sink {
+        writes: 0,
+        bytes: 0,
+        rendezvous,
+    };
+    let error =
+        write_solutions_rows(&result, SolutionsFormat::Tsv, &mut sink, None, &sent).unwrap_err();
+    assert!(matches!(error, Error::Cancelled), "{error:?}");
+    assert!(sink.writes >= 1);
+    assert!(sent.get() < DECODE_ROWS as u64, "{}", sent.get());
+    let hook = result.inner.ctx.chunk_hook.lock().take();
+    drop(hook);
+    drop(result);
+    assert_eq!(pool.granted(), 0);
+}
+
+/// `send` just below, at and above one chunk picks the scratch row or the chunked path,
+/// and both write exactly the rows it selects, count them and return every charge.
+#[test]
+fn send_around_one_chunk_writes_and_counts_exactly_its_rows() {
+    let (result, pool, _directory) = large_answer();
+    for fmt in [SolutionsFormat::Tsv, SolutionsFormat::Json] {
+        let mut whole = Vec::new();
+        write_solutions_rows(&result, fmt, &mut whole, None, &RowCount::new()).unwrap();
+        for send in [DECODE_ROWS - 1, DECODE_ROWS, DECODE_ROWS + 1] {
+            let sent = RowCount::new();
+            let mut out = Vec::new();
+            write_solutions_rows(&result, fmt, &mut out, Some(send), &sent).unwrap();
+            assert_eq!(sent.get(), send as u64, "{fmt:?} {send}");
+            if fmt == SolutionsFormat::Tsv {
+                let lines = |b: &[u8]| b.split(|c| *c == b'\n').count();
+                assert_eq!(lines(&out), send + 2, "{fmt:?} {send}");
+                assert!(whole.starts_with(&out[..out.len() - 1]), "{send}");
+            } else {
+                let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+                assert_eq!(v["results"]["bindings"].as_array().unwrap().len(), send);
+            }
+        }
+    }
+    drop(result);
+    assert_eq!(pool.granted(), 0);
+}
