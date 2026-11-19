@@ -102,8 +102,10 @@ pub(super) struct Merge {
     /// two apart. [`Merge::next`] tests the condition on the pairs of each batch and
     /// keeps a left row's extension only when none of its pairs passed.
     condition: Option<Arc<Expr>>,
-    /// Whether the condition holds a call whose order or grouping can be observed
-    /// ([`crate::sparql::exprcache::observable`]). Such a condition is always tested
+    /// Whether the order or the grouping of the pairs that the condition is tested on
+    /// can be observed ([`crate::sparql::exprcache::observable`]): the query references
+    /// a registered extension anywhere, or the condition holds a call with side effects
+    /// or a value that differs from call to call. Such a condition is always tested
     /// after the batch, on the same pairs in the same order and batches as with
     /// `merge_pair_conditions` off.
     observable: bool,
@@ -782,7 +784,7 @@ impl Merge {
             narrowed: false,
             observable: condition
                 .as_deref()
-                .is_some_and(|e| crate::sparql::exprcache::observable(e).is_some()),
+                .is_some_and(|e| crate::sparql::exprcache::observable(ctx, e).is_some()),
             condition,
             staged: Vec::new(),
             passed: false,
@@ -1392,9 +1394,10 @@ impl Merge {
         // this batch. Holding the pairs with the table that the condition reads takes
         // more scratch for a row than the test after the batch, so a budget that does
         // not hold the whole batch with that scratch gets the batch that the switch-off
-        // path builds. A condition with a call that can be observed keeps that path at
-        // every budget, since deciding tests other pairs together and, beside staged
-        // pairs, in another order.
+        // path builds. A condition whose evaluation can be observed, which includes
+        // every condition of a query that references a registered extension, keeps
+        // that path at every budget, since deciding tests other pairs together and,
+        // beside staged pairs, in another order.
         let decide =
             extend && ctx.opt.merge_pair_conditions && !self.observable && self.key_only() && {
                 let width = vars.len() - 1;
@@ -1657,6 +1660,16 @@ mod tests {
     /// A context whose merge tests an OPTIONAL condition on the pairs before it copies
     /// output rows when `pairs` is set, and on each batch after it otherwise.
     fn context_with(limit: u64, spill: Option<&Arc<crate::spill::Spill>>, pairs: bool) -> Arc<Ctx> {
+        context_set(limit, spill, pairs, |_| ())
+    }
+
+    /// [`context_with`] after `set` has changed the context.
+    fn context_set(
+        limit: u64,
+        spill: Option<&Arc<crate::spill::Spill>>,
+        pairs: bool,
+        set: impl FnOnce(&mut Ctx),
+    ) -> Arc<Ctx> {
         let store = Store::in_memory(StoreOptions::default());
         let mut ctx = Ctx::new(store.snapshot());
         ctx.opt.merge_pair_conditions = pairs;
@@ -1667,6 +1680,7 @@ mod tests {
         ctx.spill = spill.map(|s| Arc::new(s.query(None)));
         // Where a registered scalar that a condition calls reports a failure.
         ctx.extension_failure = Some(Default::default());
+        set(&mut ctx);
         ctx.enable_cursor_accounting().unwrap();
         let ctx = Arc::new(ctx);
         ctx.attach_owner();
@@ -2409,8 +2423,16 @@ mod tests {
         pairs: bool,
         spill: Option<&Arc<crate::spill::Spill>>,
     ) -> Result<(Vec<Vec<Id>>, u64, Vec<usize>)> {
-        let ctx = context_with(limit, spill, pairs);
-        let mut op = Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)?;
+        conditional_on(&context_with(limit, spill, pairs), node, cap)
+    }
+
+    /// [`conditional_batches`] on a context.
+    fn conditional_on(
+        ctx: &Arc<Ctx>,
+        node: &Node,
+        cap: usize,
+    ) -> Result<(Vec<Vec<Id>>, u64, Vec<usize>)> {
+        let mut op = Operator::build(ctx, node.clone(), FallbackPolicy::RejectMaterialization)?;
         assert!(matches!(op.state, super::super::State::Merge(_)));
         let options = CursorOptions {
             batch_rows: cap,
@@ -2418,7 +2440,7 @@ mod tests {
         };
         let mut result = Vec::new();
         let mut sizes = Vec::new();
-        while let Some(batch) = op.next(&ctx, &options, cap)? {
+        while let Some(batch) = op.next(ctx, &options, cap)? {
             assert!(batch.table.len <= cap && batch.table.len > 0);
             sizes.push(batch.table.len);
             result.extend(rows(&batch.table));
@@ -2640,6 +2662,16 @@ mod tests {
             Box::new(Expr::Const(Id::from_i64(2).unwrap())),
             crate::sparql::expr::CmpOp::Lt,
         );
+        // A query that references a registration keeps the test after the batch for a
+        // condition that calls nothing, since the flag is the registry's answer for the
+        // whole query pattern.
+        let flagged = |pairs: bool| {
+            let ctx = context_set(8 << 20, None, pairs, |ctx| ctx.calls_extensions = true);
+            let (mut bag, _, sizes) = conditional_on(&ctx, &node(above.clone()), 64).unwrap();
+            bag.sort();
+            (bag, sizes)
+        };
+        assert_eq!(flagged(false), flagged(true));
         for (name, condition, decides) in [("pure", above, true), ("RAND", always, false)] {
             let node = node(condition);
             let batches = |pairs: bool| {
@@ -2665,7 +2697,9 @@ mod tests {
     /// input batch loaded beside different buffers, and the same budget does not
     /// always fit both. The fit is not monotone in the budget either, because the merge
     /// derives each batch's size from the room it finds, so the budgets are swept and
-    /// not bisected.
+    /// not bisected. The bound is on the merge's own buffers: the condition here charges
+    /// nothing for its evaluation, and one that charges by the pairs in a call is
+    /// outside it, since a call holds up to twice the pairs with the switch on.
     #[test]
     fn pair_conditions_fit_within_a_batch_of_every_budget_that_the_staged_test_fits() {
         let (left, right) = (2, 3);

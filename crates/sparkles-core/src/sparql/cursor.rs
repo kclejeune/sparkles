@@ -1569,14 +1569,16 @@ pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool 
 
 /// Whether evaluating `pattern` can be observed from outside the query or differs from
 /// one evaluation to the next: it holds a SERVICE or, in any expression, a call of
-/// RAND, UUID, STRUUID or BNODE or of a function named by an IRI other than an XSD
-/// cast. The pattern is not planned, so an application function cannot be told from
-/// an extension function here, and every such name counts.
+/// RAND, UUID, STRUUID or BNODE or of a function named by an IRI other than a supported
+/// XSD cast ([`super::expr::is_cast`]). The pattern is not planned, so every such name
+/// counts, whether it is a built-in extension function or a registration. A registered
+/// aggregate or property function is not a call in an expression, and
+/// [`super::exprcache::observable`] asks the registry for those.
 pub(super) fn pattern_observable(pattern: &spargebra::algebra::GraphPattern) -> bool {
     use spargebra::algebra::Function as F;
     pattern_has(pattern, &|function| match function {
         F::Rand | F::Uuid | F::StrUuid | F::BNode => true,
-        F::Custom(name) => !name.as_str().starts_with(super::expr::XSD),
+        F::Custom(name) => !super::expr::is_cast(name.as_str()),
         _ => false,
     })
 }
