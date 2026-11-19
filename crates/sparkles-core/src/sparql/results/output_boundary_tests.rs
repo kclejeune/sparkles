@@ -600,10 +600,12 @@ struct CancelAfter {
     bytes: Vec<u8>,
     cancel: Arc<AtomicBool>,
     after: usize,
+    flushes: usize,
 }
 
 impl Write for CancelAfter {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        assert!(!bytes.is_empty());
         self.bytes.extend_from_slice(bytes);
         if self.bytes.len() >= self.after {
             self.cancel.store(true, Ordering::Relaxed);
@@ -612,6 +614,7 @@ impl Write for CancelAfter {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.flushes += 1;
         Ok(())
     }
 }
@@ -627,6 +630,7 @@ fn cancelling_during_a_grown_native_row_counts_it_and_stops_the_trailer() {
         bytes: Vec::new(),
         cancel: cancel.clone(),
         after: CANCEL_CHECK_BYTES as usize,
+        flushes: 0,
     };
     let mut out = LimitedWriter::new(sink, None, Some(cancel));
     let sent = RowCount::new();
@@ -639,6 +643,61 @@ fn cancelling_during_a_grown_native_row_counts_it_and_stops_the_trailer() {
     let result = result.map_err(|error| out.classify(error));
     assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
     assert!(out.get_ref().bytes.ends_with(b"}]"));
+}
+
+#[test]
+fn cancelling_during_the_last_grown_csv_or_tsv_row_fails_on_completion() {
+    use crate::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+
+    let store = Store::in_memory(StoreOptions::default());
+    let literal = "x".repeat(70 << 10);
+    let text = format!("SELECT ?o WHERE {{ VALUES ?o {{ \"first\" \"{literal}\" }} }}");
+    let options = QueryOptions::default();
+    let r = query(store.snapshot(), &text, &options).unwrap();
+    let mut outcomes = Vec::new();
+    for format in [SolutionsFormat::Csv, SolutionsFormat::Tsv] {
+        let mut cursor = select_cursor(
+            store.snapshot(),
+            &text,
+            &options,
+            &CursorOptions {
+                batch_rows: 1,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for (mode, source, flushes) in [
+            ("eager", Source::Result(&r), 0),
+            ("cursor", Source::Select(&mut cursor), 1),
+        ] {
+            // Keep the sink's flag independent of the query and cursor controls.
+            let cancel = Arc::new(AtomicBool::new(false));
+            let sink = CancelAfter {
+                bytes: Vec::new(),
+                cancel: cancel.clone(),
+                after: CANCEL_CHECK_BYTES as usize,
+                flushes: 0,
+            };
+            let mut out = LimitedWriter::new(sink, None, Some(cancel.clone()));
+            let sent = RowCount::new();
+            let result = write(
+                source,
+                WriteOptions::new(super::Format::Solutions(format), &sent),
+                &mut out,
+            );
+            assert!(cancel.load(Ordering::Relaxed), "{format:?}, {mode}");
+            assert_eq!(sent.get(), 2, "{format:?}, {mode}");
+            assert_eq!(out.get_ref().flushes, flushes, "{format:?}, {mode}");
+            outcomes.push((format, mode, result.map_err(|e| out.classify(e))));
+        }
+    }
+    assert!(
+        outcomes
+            .iter()
+            .all(|(_, _, result)| matches!(result, Err(Error::Cancelled))),
+        "{outcomes:?}"
+    );
 }
 
 #[test]
@@ -694,6 +753,7 @@ fn an_eager_thrift_answer_checks_its_controls_before_each_row() {
         bytes: Vec::new(),
         cancel: r.test_context().cancel.clone(),
         after: LONG,
+        flushes: 0,
     };
     let sent = RowCount::new();
     let error = write(
