@@ -57,4 +57,4 @@ pub mod vocab;
 pub mod write;
 
 pub use model::*;
-pub use read::{Mode, Ontology, ReadOptions, Scope, is_terminological};
+pub use read::{Mode, Ontology, ReadOptions, is_terminological};

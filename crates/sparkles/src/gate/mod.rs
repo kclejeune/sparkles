@@ -20,7 +20,7 @@
 //! The check types are `chk:ShaclCheck` (`chk:shapesGraph` or inline `chk:shapes` Turtle,
 //! `chk:dataGraph` and `chk:inferences`), `chk:ShexCheck` (`chk:schema` ShExC and
 //! `chk:shapeMap`), `chk:DiagnosticsCheck` (OWL RL diagnostics, `chk:diagnostic` ids, none
-//! for all), `chk:UnsatisfiableClassesCheck` (the OWL 2 EL classifier on the asserted
+//! for all), `chk:UnsatisfiableClassesCheck` (the unsatisfiable classes of the asserted
 //! terminology of the `chk:graph` graphs, the default graph without one, and their imports,
 //! with `chk:requireComplete`) and
 //! `chk:QueryCheck`, a query that must return nothing (`chk:query` text, or
@@ -49,24 +49,15 @@
 //! and shapes with no active shape that has a target are refused rather than validating
 //! nothing. A shape that `sh:deactivated true` turns off is not active.
 //!
-//! An unsatisfiable-classes check classifies the terminology and leaves out assertions
-//! about individuals in every form the graphs hold them, so an assertion can neither fail
-//! the check nor change its answer, and the check avoids a full assertion scan. The
-//! structural triples it reads can still include those of assertion-only structures, whose
-//! number grows with the data. A contradiction among assertions, such as an individual of
-//! two disjoint classes, is found by a `chk:DiagnosticsCheck` when it matches a
-//! contradiction pattern the diagnostics support, or by a SHACL check whose shapes describe
-//! it. The check never reads the materialized inferences, also through an import. An index
-//! error, a quad it cannot decode, an error of the OWL reader, a terminology statement the
-//! reader cannot map to its axiom, an import that resolves to no graph and graphs with no
-//! terminology are errors. A terminology statement is the main triple of a terminology
-//! axiom, such as an `rdfs:subClassOf` triple or a named class's `owl:intersectionOf`, and
-//! one whose list is malformed, whose predicate is typed as an annotation property or whose
-//! operands collapse, as in `owl:members ( A A )`, is refused rather than left out. What the answer
-//! may depend on but the check leaves out, the axioms outside what the classifier reasons
-//! with and the assertions about individuals that the terminology names, is a note of
-//! severity `sh:Warning` in the result, and `chk:requireComplete true` makes it keep the
-//! check from passing with the code `check-incomplete`.
+//! An unsatisfiable-classes check parses, has a revision and can be named in a suite, but
+//! no build runs it. Its result is an error with the code `check-unavailable`, so a
+//! required one blocks the suite and an advisory one reports the error. The check is
+//! deferred because the OWL reader cannot yet read a terminology with the guarantee that no
+//! axiom is lost, and a check that dropped an axiom could pass on a terminology with an
+//! unsatisfiable class (roadmap item 1207). A contradiction among assertions, such as an
+//! individual of two disjoint classes, is found by a `chk:DiagnosticsCheck` when it matches
+//! a contradiction pattern the diagnostics support, or by a SHACL check whose shapes
+//! describe it.
 //!
 //! [`run`] reads the inputs of a check, a shapes graph or a stored query, from the state
 //! the merge starts from and never from the candidate, so a merge cannot weaken the checks
@@ -205,11 +196,9 @@ pub enum CheckKind {
         diagnostics: Vec<String>,
         inferences: bool,
     },
-    /// the classes the OWL 2 EL classifier finds unsatisfiable in the asserted
-    /// terminology of `graphs` (empty: the default graph) and their imports. Axioms the
-    /// answer may depend on but the classifier leaves out are a `sh:Warning` note, and
-    /// with `require_complete` (`chk:requireComplete true`) they keep the check from
-    /// passing.
+    /// the unsatisfiable classes of the asserted terminology of `graphs` (empty: the
+    /// default graph) and their imports, with `require_complete`
+    /// (`chk:requireComplete true`). No build runs it (see [`CheckKind::available`]).
     UnsatisfiableClasses {
         graphs: Vec<NamedNode>,
         require_complete: bool,
@@ -231,12 +220,14 @@ impl CheckKind {
     }
 
     /// Whether this build can run the check: the cargo feature it needs is compiled in.
+    /// An unsatisfiable-classes check is unavailable in every build until the OWL reader
+    /// can read a terminology without losing an axiom (roadmap item 1207).
     pub fn available(&self) -> bool {
         match self {
             CheckKind::Shacl { .. } => cfg!(feature = "shacl"),
             CheckKind::Shex { .. } => cfg!(feature = "shex"),
             CheckKind::Diagnostics { .. } => cfg!(feature = "reasoning"),
-            CheckKind::UnsatisfiableClasses { .. } => cfg!(feature = "ontology"),
+            CheckKind::UnsatisfiableClasses { .. } => false,
             CheckKind::Query(_) => true,
         }
     }

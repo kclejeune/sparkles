@@ -43,12 +43,12 @@ pub struct CheckResult {
     /// what it found: results, nonconformant nodes, findings or solutions
     pub findings: u64,
     /// why it could not run: `check-unavailable`, `input-missing`, `input-invalid`,
-    /// `check-timeout`, `budget-exceeded` or `check-incomplete`
+    /// `check-timeout` or `budget-exceeded`
     pub code: Option<&'static str>,
     /// at most [`MAX_MESSAGES`] messages
     pub messages: Vec<String>,
-    /// what the check reports beside its findings, each with its own severity, such as
-    /// the axioms an unsatisfiable-classes check left out. A note never fails the suite.
+    /// what the check reports beside its findings, each with its own severity. A note
+    /// never fails the suite. No check of this build reports one.
     pub notes: Vec<Note>,
     pub millis: u64,
 }
@@ -57,7 +57,7 @@ pub struct CheckResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Note {
     pub severity: Severity,
-    /// a stable code, such as `axioms-left-out`
+    /// a stable code
     pub code: &'static str,
     pub count: u64,
     pub message: String,
@@ -167,6 +167,11 @@ impl Bound {
     }
 }
 
+/// Why `chk:UnsatisfiableClassesCheck` does not run in any build (roadmap item 1207).
+pub(super) const UNSATISFIABLE_DEFERRED: &str = "chk:UnsatisfiableClassesCheck is deferred, \
+     so no build runs it: the OWL reader cannot yet read a terminology with the guarantee \
+     that no axiom is lost";
+
 const TIMED_OUT: (&str, &str) = ("check-timeout", "the check did not finish within its bound");
 
 fn run_check(c: &Check, inputs: &Inputs<'_>) -> CheckResult {
@@ -192,32 +197,28 @@ fn dispatch(c: &Check, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
     if bound.passed() {
         return Err((TIMED_OUT.0, TIMED_OUT.1.to_string()));
     }
-    let outcome = if c.kind.available() {
-        match &c.kind {
-            CheckKind::Shacl {
-                shapes,
-                data_graph,
-                inferences,
-            } => shacl(shapes, data_graph, *inferences, inputs, bound),
-            CheckKind::Shex { schema, shape_map } => shex(schema, shape_map, inputs, bound),
-            CheckKind::Diagnostics {
-                diagnostics,
-                inferences,
-            } => diagnostics_check(diagnostics.clone(), *inferences, inputs, bound),
-            CheckKind::UnsatisfiableClasses {
-                graphs,
-                require_complete,
-            } => unsatisfiable(graphs, *require_complete, inputs, bound),
-            CheckKind::Query(q) => query(q, inputs, bound),
+    let outcome = match &c.kind {
+        CheckKind::UnsatisfiableClasses { .. } => {
+            Err(("check-unavailable", UNSATISFIABLE_DEFERRED.to_string()))
         }
-    } else {
-        Err((
+        kind if !kind.available() => Err((
             "check-unavailable",
             format!(
                 "this build cannot run chk:{}: its cargo feature is not compiled in",
-                c.kind.type_name()
+                kind.type_name()
             ),
-        ))
+        )),
+        CheckKind::Shacl {
+            shapes,
+            data_graph,
+            inferences,
+        } => shacl(shapes, data_graph, *inferences, inputs, bound),
+        CheckKind::Shex { schema, shape_map } => shex(schema, shape_map, inputs, bound),
+        CheckKind::Diagnostics {
+            diagnostics,
+            inferences,
+        } => diagnostics_check(diagnostics.clone(), *inferences, inputs, bound),
+        CheckKind::Query(q) => query(q, inputs, bound),
     };
     // a check that ends after its deadline never passes, and its error is the timeout
     if bound.passed() && !matches!(outcome, Ok((n, _, _)) if n > 0) {
@@ -536,7 +537,7 @@ fn query(q: &Query, inputs: &Inputs<'_>, bound: Bound) -> Outcome {
 
 /// Whether the graph `iri` holds a quad in `snap`: the named graph of that IRI, or the
 /// default graph for `urn:x-arq:DefaultGraph`.
-#[cfg(any(feature = "shacl", feature = "ontology"))]
+#[cfg(feature = "shacl")]
 fn holds_data(snap: &Arc<Snapshot>, iri: &str) -> sparkles_core::Result<bool> {
     let id = if iri == sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI {
         crate::id::Id::DEFAULT_GRAPH
@@ -547,95 +548,4 @@ fn holds_data(snap: &Arc<Snapshot>, iri: &str) -> sparkles_core::Result<bool> {
         }
     };
     Ok(snap.count(crate::index::Perm::Gspo, &[id.0])? > 0)
-}
-
-#[cfg(feature = "ontology")]
-fn unsatisfiable(
-    graphs: &[oxrdf::NamedNode],
-    require_complete: bool,
-    inputs: &Inputs<'_>,
-    bound: Bound,
-) -> Outcome {
-    use sparkles_reasoner::inputs::GraphRef;
-    let mut refs = Vec::new();
-    for g in graphs {
-        refs.push(GraphRef::Named(g.as_str().to_string()));
-    }
-    if refs.is_empty() {
-        refs.push(GraphRef::Default);
-    }
-    let names: Vec<&str> = if graphs.is_empty() {
-        vec![sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI]
-    } else {
-        graphs.iter().map(|g| g.as_str()).collect()
-    };
-    for g in names {
-        if !holds_data(inputs.after, g).map_err(|e| failure(&e.into()))? {
-            return Err((
-                "input-missing",
-                format!("the ontology graph <{g}> holds no data in the candidate"),
-            ));
-        }
-    }
-    let opts = crate::sparql::QueryOptions {
-        timeout: bound.remaining(),
-        deadline: bound.deadline,
-        ..Default::default()
-    };
-    let u = crate::handles::ontology::classify::unsatisfiable_at(
-        inputs.after,
-        refs,
-        Default::default(),
-        &opts,
-    )
-    .map_err(|e| failure(&anyhow::Error::new(e)))?;
-    if let Some(w) = u.unresolved.first() {
-        return Err(("input-missing", w.clone()));
-    }
-    let mut messages = Vec::new();
-    if !u.consistent {
-        messages
-            .push("the terminology is inconsistent, so every class is unsatisfiable".to_string());
-    }
-    messages.extend(
-        u.classes
-            .iter()
-            .take(MAX_MESSAGES)
-            .map(|c| format!("<{c}> is unsatisfiable")),
-    );
-    let findings = u.classes.len() as u64 + u64::from(!u.consistent);
-    let mut notes = Vec::new();
-    if u.excluded + u.nominals > 0 {
-        let mut parts = Vec::new();
-        if u.excluded > 0 {
-            parts.push(format!(
-                "{} axioms are outside what the classifier reasons with and were left out",
-                u.excluded
-            ));
-        }
-        if u.nominals > 0 {
-            parts.push(format!(
-                "the terminology names {} individuals, and the assertions about them, which \
-                 the check does not read, can make a class unsatisfiable",
-                u.nominals
-            ));
-        }
-        let message = parts.join("; ");
-        // a positive finding stands, since the axioms read already prove it
-        if require_complete && findings == 0 {
-            return Err(("check-incomplete", message));
-        }
-        notes.push(Note {
-            severity: Severity::Warning,
-            code: "axioms-left-out",
-            count: (u.excluded + u.nominals) as u64,
-            message,
-        });
-    }
-    Ok((findings, messages, notes))
-}
-
-#[cfg(not(feature = "ontology"))]
-fn unsatisfiable(_: &[oxrdf::NamedNode], _: bool, _: &Inputs<'_>, _: Bound) -> Outcome {
-    unreachable!("an unavailable check does not run")
 }

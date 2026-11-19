@@ -83,6 +83,14 @@ SHACL-SPARQL literals. Gate results attach to the merge response, the task detai
 run record in the merge commit, and [item 1139](../../ROADMAP.md) adds a first-class merge
 request.
 
+A suite can name a `chk:UnsatisfiableClassesCheck`, which parses and counts in the suite's
+revision, but no build runs it. Its result is an error with the code `check-unavailable`,
+so a required one fails the suite. The OWL reader cannot yet read a terminology with the
+guarantee that no axiom is lost, and a check that dropped an axiom could pass on a
+terminology with an unsatisfiable class. [Item 1207](../../ROADMAP.md) makes the reader
+fail closed and enables the check, and [item 1163](../../ROADMAP.md) then adds an
+assertion-aware mode.
+
 The storage format of the comments phase is chosen, and the ontology editor's
 discussions of item 618 use it, as the
 [U12 Outcome](../U12-ontology-workbench/SPEC.md#discussions) describes. A thread is a

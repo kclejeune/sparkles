@@ -1897,33 +1897,6 @@ fn read_store(
     mode: Mode,
     opts: &QueryOptions,
 ) -> Result<(read::Ontology, Inner)> {
-    read_store_with(
-        snap,
-        graph_ids,
-        requested,
-        mode,
-        opts,
-        false,
-        read::Scope::All,
-    )
-}
-
-/// [`read_store`], where `strict` makes a selected quad whose terms cannot be decoded an
-/// error rather than a quad left out, for a reader that must not lose input. With
-/// [`read::Scope::Terminology`] it reads no assertion: it does not look for class
-/// assertions with a class expression or for the main triples of annotated assertions,
-/// and the OWL reader accounts for every axiom of the terminology.
-#[allow(clippy::too_many_arguments)]
-fn read_store_with(
-    snap: &Arc<Snapshot>,
-    graph_ids: &[Option<Id>],
-    requested: usize,
-    mode: Mode,
-    opts: &QueryOptions,
-    strict: bool,
-    scope: read::Scope,
-) -> Result<(read::Ontology, Inner)> {
-    let terminology = scope == read::Scope::Terminology;
     let graph_of_id: FxHashMap<Id, u32> = graph_ids
         .iter()
         .enumerate()
@@ -1972,15 +1945,12 @@ fn read_store_with(
         }
         // class assertions whose class is a class expression: `x rdf:type _:c` for each
         // blank node subject read so far
-        let bnodes: BTreeSet<Id> = if terminology {
-            BTreeSet::new()
-        } else {
-            c.quads
-                .iter()
-                .filter(|q| q[0].tag() == crate::id::Tag::BNode)
-                .map(|q| q[0])
-                .collect()
-        };
+        let bnodes: BTreeSet<Id> = c
+            .quads
+            .iter()
+            .filter(|q| q[0].tag() == crate::id::Tag::BNode)
+            .map(|q| q[0])
+            .collect();
         for b in bnodes {
             check(opts)?;
             c.prefix(&[rdf_type.0, b.0])?;
@@ -1990,15 +1960,11 @@ fn read_store_with(
     // assertion keeps its main triple outside the terminology's predicates
     let mut mains: FxHashSet<[Id; 4]> = FxHashSet::default();
     let ids = |p: &str| snap.lookup_iri(p);
-    // (a terminology read needs none: the main triple of every terminology axiom has a
-    // predicate or a type read above)
-    if !terminology
-        && let (Some(src), Some(prop), Some(tgt)) = (
-            ids(vocab::OWL_ANNOTATED_SOURCE),
-            ids(vocab::OWL_ANNOTATED_PROPERTY),
-            ids(vocab::OWL_ANNOTATED_TARGET),
-        )
-    {
+    if let (Some(src), Some(prop), Some(tgt)) = (
+        ids(vocab::OWL_ANNOTATED_SOURCE),
+        ids(vocab::OWL_ANNOTATED_PROPERTY),
+        ids(vocab::OWL_ANNOTATED_TARGET),
+    ) {
         let mut parts: FxHashMap<(Id, Id), [Option<Id>; 3]> = FxHashMap::default();
         for q in &c.quads {
             let slot = if q[1] == src {
@@ -2036,8 +2002,6 @@ fn read_store_with(
         requested,
         mode,
         (terminological, mains),
-        strict,
-        scope,
     )
 }
 
@@ -2078,7 +2042,6 @@ impl Collect<'_> {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn finish(
     snap: &Snapshot,
     quads: Vec<[Id; 4]>,
@@ -2087,25 +2050,15 @@ fn finish(
     requested: usize,
     mode: Mode,
     (terminological, mains): (FxHashSet<Id>, FxHashSet<[Id; 4]>),
-    strict: bool,
-    scope: read::Scope,
 ) -> Result<(read::Ontology, Inner)> {
     let mut triples = Vec::with_capacity(quads.len());
     let mut graph_of = Vec::with_capacity(quads.len());
     let mut kept = Vec::with_capacity(quads.len());
     for q in quads {
-        match triple_of(snap, &q) {
-            Some(t) => {
-                triples.push(t);
-                graph_of.push(graph_of_id[&q[3]]);
-                kept.push(q);
-            }
-            None if strict => {
-                return Err(Error::Corrupt(format!(
-                    "a quad of the ontology graphs cannot be read as a triple: {q:?}"
-                )));
-            }
-            None => {}
+        if let Some(t) = triple_of(snap, &q) {
+            triples.push(t);
+            graph_of.push(graph_of_id[&q[3]]);
+            kept.push(q);
         }
     }
     let primary: Vec<u32> = (0..requested.min(graphs) as u32).collect();
@@ -2117,7 +2070,6 @@ fn finish(
             mode,
             terminology_only: true,
             max_diagnostics: 0,
-            scope,
         },
     );
     let graph_ids = {

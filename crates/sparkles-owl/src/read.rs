@@ -48,8 +48,12 @@ impl Mode {
 }
 
 /// Which axioms a read maps.
+///
+/// The terminology scope is experimental and crate-private: it is not yet a fail-closed
+/// reader (roadmap item 1207), so only this crate's tests construct it, and [`read`]
+/// always reads with [`Scope::All`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum Scope {
+pub(crate) enum Scope {
     /// Every axiom the mapping defines.
     #[default]
     All,
@@ -80,13 +84,15 @@ pub enum Scope {
     /// It composes with [`ReadOptions::terminology_only`], which says what the input
     /// holds, and with either [`Mode`]: a strict read also reports the unmapped triples of
     /// the structures the roots reach.
+    // constructed only by the tests until the reader is fail-closed (item 1207)
+    #[cfg_attr(not(test), allow(dead_code))]
     Terminology,
 }
 
 /// What a triple is to a read of the terminology, from its predicate or, for an
 /// `rdf:type` triple, its object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Role {
+pub(crate) enum Role {
     /// the main triple of a terminology axiom, whatever its subject
     Root,
     /// the main triple of a terminology axiom when its subject is an IRI (an OWL 1 class
@@ -104,7 +110,7 @@ pub enum Role {
 /// The [`Role`] of a triple with predicate `p` (not `rdf:type`), for each predicate of
 /// [`STRUCTURAL_PREDICATES`](v::STRUCTURAL_PREDICATES) and [`FACETS`](v::FACETS); `None`
 /// for another predicate, whose triples are assertions or annotations.
-pub fn predicate_role(p: &str) -> Option<Role> {
+pub(crate) fn predicate_role(p: &str) -> Option<Role> {
     use Role::*;
     Some(match p {
         v::RDFS_SUB_CLASS_OF
@@ -160,7 +166,7 @@ pub fn predicate_role(p: &str) -> Option<Role> {
 /// The [`Role`] of an `rdf:type` triple with the class `ty`, for each class of
 /// [`STRUCTURAL_TYPES`](v::STRUCTURAL_TYPES); `None` for another class, whose triples are
 /// class assertions.
-pub fn type_role(ty: &str) -> Option<Role> {
+pub(crate) fn type_role(ty: &str) -> Option<Role> {
     use Role::*;
     Some(match ty {
         v::OWL_ALL_DISJOINT_CLASSES
@@ -207,7 +213,7 @@ fn role_of(t: &Triple) -> Option<Role> {
 }
 
 /// Whether `t` is a root of a terminology read (see [`Scope::Terminology`]).
-pub fn is_terminology_root(t: &Triple) -> bool {
+pub(crate) fn is_terminology_root(t: &Triple) -> bool {
     match role_of(t) {
         Some(Role::Root) => true,
         Some(Role::RootIfNamed) => matches!(t.subject, NamedOrBlankNode::NamedNode(_)),
@@ -242,8 +248,6 @@ pub struct ReadOptions {
     pub terminology_only: bool,
     /// The most diagnostics kept; later ones are counted only (0: 1,000).
     pub max_diagnostics: usize,
-    /// Which axioms the read maps.
-    pub scope: Scope,
 }
 
 /// A note about the read: a repair made in lenient mode, or an error of a strict read.
@@ -683,8 +687,19 @@ pub fn read(
     primary: &[u32],
     opts: ReadOptions,
 ) -> Ontology {
+    read_scoped(triples, graph_of, primary, opts, Scope::All)
+}
+
+/// [`read`] with the axioms that `scope` selects.
+pub(crate) fn read_scoped(
+    triples: Vec<Triple>,
+    graph_of: Vec<u32>,
+    primary: &[u32],
+    opts: ReadOptions,
+    scope: Scope,
+) -> Ontology {
     assert_eq!(triples.len(), graph_of.len());
-    let (triples, graph_of) = if opts.scope == Scope::Terminology {
+    let (triples, graph_of) = if scope == Scope::Terminology {
         // a triple and its copy in another graph are one statement of the terminology,
         // and two copies of a structure's triple would make it unreadable
         let mut seen: FxHashSet<Triple> = FxHashSet::default();
@@ -696,7 +711,7 @@ pub fn read(
     } else {
         (triples, graph_of)
     };
-    let mut p = Parser::new(&triples, &graph_of, opts);
+    let mut p = Parser::new(&triples, &graph_of, opts, scope);
     p.run(primary);
     let Parser {
         axioms,
@@ -748,6 +763,18 @@ pub fn read_graph(triples: impl IntoIterator<Item = Triple>, opts: ReadOptions) 
     let triples: Vec<Triple> = triples.into_iter().collect();
     let n = triples.len();
     read(triples, vec![0; n], &[0], opts)
+}
+
+/// [`read_graph`] with the axioms that `scope` selects.
+#[cfg(test)]
+pub(crate) fn read_graph_scoped(
+    triples: impl IntoIterator<Item = Triple>,
+    opts: ReadOptions,
+    scope: Scope,
+) -> Ontology {
+    let triples: Vec<Triple> = triples.into_iter().collect();
+    let n = triples.len();
+    read_scoped(triples, vec![0; n], &[0], opts, scope)
 }
 
 /// A parsed structure and the triples it consumes.
@@ -824,7 +851,7 @@ struct Parser<'a> {
 }
 
 impl<'a> Parser<'a> {
-    fn new(t: &'a [Triple], g: &'a [u32], opts: ReadOptions) -> Parser<'a> {
+    fn new(t: &'a [Triple], g: &'a [u32], opts: ReadOptions, scope: Scope) -> Parser<'a> {
         let mut by_s: FxHashMap<Key, Vec<usize>> = FxHashMap::default();
         let mut by_p: FxHashMap<&'a str, Vec<usize>> = FxHashMap::default();
         let mut refs: FxHashMap<BlankNode, Vec<usize>> = FxHashMap::default();
@@ -872,7 +899,7 @@ impl<'a> Parser<'a> {
             ann_triples: FxHashMap::default(),
             ann_nodes: FxHashMap::default(),
             ann_taken: FxHashSet::default(),
-            terms: opts.scope == Scope::Terminology,
+            terms: scope == Scope::Terminology,
             roots: Vec::new(),
             reach: Vec::new(),
             accounted: Vec::new(),
@@ -3082,3 +3109,6 @@ fn mentions(t: &Triple, iri: &str) -> bool {
         || n(&t.predicate)
         || matches!(&t.object, Term::NamedNode(o) if n(o))
 }
+
+#[cfg(test)]
+mod terminology_tests;

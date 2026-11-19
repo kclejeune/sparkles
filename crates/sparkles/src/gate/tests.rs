@@ -623,68 +623,61 @@ fn a_check_past_its_bound_never_passes() {
     assert!(!r.passed());
 }
 
-#[cfg(feature = "ontology")]
-const OWL: &str = "http://www.w3.org/2002/07/owl#";
-#[cfg(feature = "ontology")]
-const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
-
-#[cfg(feature = "ontology")]
 #[test]
-fn the_el_classifier_finds_a_class_under_two_disjoint_classes() {
+fn the_unsatisfiable_classes_check_is_unavailable_in_every_build() {
+    // a valid, consistent terminology with no exclusions or imports, which a classifier
+    // would pass
     let ds = Dataset::memory();
-    // no asserted path leads to owl:Nothing, so the OWL RL diagnostic does not see it
     let (before, after) = states(
         &ds,
-        &format!("INSERT DATA {{ <urn:A> <{OWL}disjointWith> <urn:B> }}"),
-        &format!(
-            "INSERT DATA {{ <urn:C> <{RDFS}subClassOf> <urn:A>, <urn:B> .
-               GRAPH <urn:onto> {{ <urn:D> <{RDFS}subClassOf> <urn:E> }} }}"
-        ),
+        "",
+        "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+         PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+         INSERT DATA { <urn:A> a owl:Class . <urn:B> a owl:Class .
+           <urn:A> rdfs:subClassOf <urn:B> }",
     );
-    let s = suite(
-        "<urn:s> a chk:Suite ; chk:check <urn:u>, <urn:v>, <urn:w> .
-         <urn:u> a chk:UnsatisfiableClassesCheck .
-         <urn:v> a chk:UnsatisfiableClassesCheck ; chk:graph <urn:onto> .
-         <urn:w> a chk:UnsatisfiableClassesCheck ; chk:graph <urn:absent> .",
-    )
-    .unwrap();
-    let r = run_on(&s, &before, &after);
-    assert_eq!(r.results[0].status, Status::Failed, "{:?}", r.results[0]);
-    assert_eq!(r.results[0].findings, 1);
-    assert!(
-        r.results[0].messages[0].contains("urn:C"),
-        "{:?}",
-        r.results[0]
-    );
-    assert_eq!(r.results[1].status, Status::Passed, "{:?}", r.results[1]);
-    assert_eq!(
-        r.results[2].code,
-        Some("input-missing"),
-        "{:?}",
-        r.results[2]
-    );
-    assert!(run_on(&s, &before, &before).results[0].status == Status::Passed);
-}
-
-#[test]
-fn the_unsatisfiable_classes_check_needs_the_ontology_feature() {
-    let s = suite(
-        "<urn:s> a chk:Suite ; chk:check <urn:u> . <urn:u> a chk:UnsatisfiableClassesCheck .",
-    )
-    .unwrap();
-    assert_eq!(s.unavailable().is_empty(), cfg!(feature = "ontology"));
+    for complete in [
+        "",
+        "; chk:requireComplete true",
+        "; chk:requireComplete false",
+    ] {
+        for (severity, blocks) in [("sh:Violation", true), ("sh:Warning", false)] {
+            let s = suite(&format!(
+                "<urn:s> a chk:Suite ; chk:check <urn:u>, <urn:v> .
+                 <urn:u> a chk:UnsatisfiableClassesCheck ; chk:severity {severity} {complete} .
+                 <urn:v> a chk:QueryCheck ; chk:query \"ASK {{ <urn:x> ?p ?o }}\" ."
+            ))
+            .unwrap();
+            let case = format!("{severity} {complete:?}");
+            // the suite parses and names the check, and a store of suites refuses it
+            let unavailable: Vec<&str> = s.unavailable().iter().map(|c| c.iri.as_str()).collect();
+            assert_eq!(unavailable, ["urn:u"], "{case}");
+            let r = run_on(&s, &before, &after);
+            assert_eq!(r.revision, s.revision(), "{case}");
+            let u = &r.results[0];
+            assert_eq!(u.check.as_str(), "urn:u", "{case}");
+            assert_eq!(u.status, Status::Error, "{case}: {u:?}");
+            assert_eq!(u.code, Some("check-unavailable"), "{case}: {u:?}");
+            assert_eq!(u.findings, 0, "{case}: {u:?}");
+            assert!(u.notes.is_empty(), "{case}: {u:?}");
+            assert!(u.messages[0].contains("deferred"), "{case}: {u:?}");
+            assert!(!u.messages[0].contains("cargo feature"), "{case}: {u:?}");
+            assert_eq!(u.blocks(), blocks, "{case}: {u:?}");
+            assert_eq!(r.passed(), !blocks, "{case}");
+            // the ordinary check beside it still runs
+            assert_eq!(
+                r.results[1].status,
+                Status::Passed,
+                "{case}: {:?}",
+                r.results[1]
+            );
+        }
+    }
     refused(
         "<urn:s> a chk:Suite ; chk:check <urn:u> .
          <urn:u> a chk:UnsatisfiableClassesCheck ; chk:inferences true .",
         "does not take chk:inferences",
     );
-    if !cfg!(feature = "ontology") {
-        let ds = Dataset::memory();
-        let snap = ds.store().snapshot();
-        let r = run_on(&s, &snap, &snap);
-        assert_eq!(r.results[0].code, Some("check-unavailable"));
-        assert!(!r.passed());
-    }
 }
 
 // ---- round 2 of the slice 1 review ---------------------------------------------------
@@ -748,102 +741,7 @@ fn shapes_that_target_nothing_are_refused() {
     assert!(r.blocks());
 }
 
-/// The suite of one unsatisfiable-classes check, with `extra` on the check.
-#[cfg(feature = "ontology")]
-fn unsat_suite(extra: &str) -> Suite {
-    suite(&format!(
-        "<urn:s> a chk:Suite ; chk:check <urn:u> .
-         <urn:u> a chk:UnsatisfiableClassesCheck {extra} ."
-    ))
-    .unwrap()
-}
-
-/// The result of `s` on a dataset after the SPARQL update `u`.
-#[cfg(feature = "ontology")]
-fn unsat_after(s: &Suite, u: &str) -> CheckResult {
-    let ds = Dataset::memory();
-    let (before, after) = states(&ds, "", u);
-    run_on(s, &before, &after).results[0].clone()
-}
-
-/// `A` and `B` disjoint, `C` under `A`, `B` the domain of `r`, and `C` under the existential
-/// `filler`, so that `C` is unsatisfiable once the existential is read.
-#[cfg(feature = "ontology")]
-fn domain_ontology(filler: &str) -> String {
-    format!(
-        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
-         INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A> .
-           <urn:r> a owl:ObjectProperty ; rdfs:domain <urn:B> .
-           <urn:C> rdfs:subClassOf _:e0 . {filler} }}"
-    )
-}
-
-/// A chain of `n` existential restrictions on `r` from `_:e0`, ending in `urn:D`.
-#[cfg(feature = "ontology")]
-fn existentials(n: usize) -> String {
-    let mut t = String::new();
-    for i in 0..n {
-        let next = if i + 1 == n {
-            "<urn:D>".to_string()
-        } else {
-            format!("_:e{}", i + 1)
-        };
-        t.push_str(&format!(
-            "_:e{i} a owl:Restriction ; owl:onProperty <urn:r> ; owl:someValuesFrom {next} .\n"
-        ));
-    }
-    t
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn an_owl_reader_error_is_not_an_axiom_left_out() {
-    let s = unsat_suite("");
-    // the readable control: membership in the existential puts C under B too
-    let r = unsat_after(&s, &domain_ontology(&existentials(1)));
-    assert_eq!(r.status, Status::Failed, "{r:?}");
-    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
-    // the same axiom nested past the reader's limit is an error, not a pass
-    let r = unsat_after(
-        &s,
-        &domain_ontology(&existentials(sparkles_owl::read::MAX_NESTING + 2)),
-    );
-    assert_eq!(r.status, Status::Error, "{r:?}");
-    assert_eq!(r.code, Some("input-invalid"), "{r:?}");
-    // a restriction without its filler leaves its subclass axiom unmapped
-    let r = unsat_after(
-        &s,
-        &domain_ontology("_:e0 a owl:Restriction ; owl:onProperty <urn:r> ."),
-    );
-    assert_eq!(r.code, Some("input-invalid"), "{r:?}");
-    assert!(r.messages[0].contains("maps to no axiom"), "{r:?}");
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn the_check_classifies_the_terminology_and_not_the_assertions() {
-    let s = unsat_suite("");
-    // one individual in two disjoint classes, as plain, annotated and class-expression
-    // assertions: the terminology alone is consistent, so each form gives the same verdict
-    for abox in [
-        "<urn:x> a <urn:A>, <urn:B> .",
-        "<urn:x> a <urn:A>, <urn:B> .
-         [] a owl:Axiom ; owl:annotatedSource <urn:x> ;
-            owl:annotatedProperty <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> ;
-            owl:annotatedTarget <urn:B> ; rdfs:comment \"c\" .",
-        "<urn:x> a [ a owl:Class ; owl:intersectionOf ( <urn:A> <urn:B> ) ] .",
-    ] {
-        let u = format!(
-            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
-             INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . {abox} }}"
-        );
-        let r = unsat_after(&s, &u);
-        assert_eq!(r.status, Status::Passed, "{abox}: {r:?}");
-        assert!(r.notes.is_empty(), "{abox}: {r:?}");
-    }
-}
-
-#[cfg(all(feature = "ontology", feature = "reasoning"))]
+#[cfg(feature = "reasoning")]
 #[test]
 fn a_diagnostics_check_finds_an_individual_of_two_disjoint_classes() {
     let s = suite(
@@ -855,139 +753,11 @@ fn a_diagnostics_check_finds_an_individual_of_two_disjoint_classes() {
     let (before, after) = states(
         &ds,
         "",
-        &format!(
-            "PREFIX owl: <{OWL}> INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> .
-               <urn:x> a <urn:A>, <urn:B> }}"
-        ),
+        "PREFIX owl: <http://www.w3.org/2002/07/owl#> INSERT DATA { <urn:A> owl:disjointWith <urn:B> .
+           <urn:x> a <urn:A>, <urn:B> }",
     );
     let r = run_on(&s, &before, &after).results[0].clone();
     assert_eq!(r.status, Status::Failed, "{r:?}");
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn axioms_left_out_are_a_warning_and_can_block() {
-    // a nominal: whether C is satisfiable can depend on the assertions about a
-    let u = format!(
-        "PREFIX owl: <{OWL}> INSERT DATA {{ <urn:C> owl:equivalentClass [ a owl:Class ;
-           owl:oneOf ( <urn:a> ) ] . <urn:D> owl:disjointWith <urn:C> . <urn:a> a <urn:D> }}"
-    );
-    let r = unsat_after(&unsat_suite(""), &u);
-    assert_eq!(r.status, Status::Passed, "{r:?}");
-    let note = r
-        .notes
-        .iter()
-        .find(|n| n.code == "axioms-left-out")
-        .expect("a note for the axioms left out");
-    assert_eq!(note.severity, Severity::Warning);
-    assert!(note.count >= 1);
-    let r = unsat_after(&unsat_suite("; chk:requireComplete true"), &u);
-    assert_eq!(r.code, Some("check-incomplete"), "{r:?}");
-    assert!(r.blocks());
-    // without nominals the assertions do not make the answer incomplete
-    let r = unsat_after(
-        &unsat_suite("; chk:requireComplete true"),
-        &format!(
-            "PREFIX owl: <{OWL}> INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . <urn:x> a <urn:A> }}"
-        ),
-    );
-    assert_eq!(r.status, Status::Passed, "{r:?}");
-    refused(
-        "<urn:s> a chk:Suite ; chk:check <urn:u> .
-         <urn:u> a chk:UnsatisfiableClassesCheck ; chk:requireComplete \"yes\" .",
-        "chk:requireComplete takes a boolean",
-    );
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn an_ontology_with_no_terminology_is_missing_input() {
-    let s = unsat_suite("");
-    // an empty default graph, and one with data but no axioms
-    let ds = Dataset::memory();
-    let snap = ds.store().snapshot();
-    let r = run_on(&s, &snap, &snap).results[0].clone();
-    assert_eq!(r.code, Some("input-missing"), "{r:?}");
-    let r = unsat_after(&s, "INSERT DATA { <urn:x> <urn:p> <urn:y> }");
-    assert_eq!(r.code, Some("input-missing"), "{r:?}");
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn imports_resolve_to_asserted_graphs_only() {
-    let s = unsat_suite("");
-    let inferred = sparkles_core::INFERRED_GRAPH;
-    let base = format!(
-        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> INSERT DATA {{
-           <urn:C> rdfs:subClassOf <urn:A>, <urn:B> ."
-    );
-    // a valid import supplies the disjointness that makes C unsatisfiable
-    let r = unsat_after(
-        &s,
-        &format!(
-            "{base} <urn:o> owl:imports <urn:dis> .
-               GRAPH <urn:dis> {{ <urn:A> owl:disjointWith <urn:B> }} }}"
-        ),
-    );
-    assert_eq!(r.status, Status::Failed, "{r:?}");
-    // the same axiom in the materialized inferences is not read through an import
-    let r = unsat_after(
-        &s,
-        &format!(
-            "{base} <urn:o> owl:imports <{inferred}> .
-               GRAPH <{inferred}> {{ <urn:A> owl:disjointWith <urn:B> }} }}"
-        ),
-    );
-    assert_eq!(r.code, Some("input-missing"), "{r:?}");
-    // an import that resolves to no graph
-    let r = unsat_after(&s, &format!("{base} <urn:o> owl:imports <urn:absent> }}"));
-    assert_eq!(r.code, Some("input-missing"), "{r:?}");
-    // more imports than the bound
-    let n = sparkles_reasoner::inputs::MAX_IMPORTS + 1;
-    let mut u = base.clone();
-    for i in 0..n {
-        u.push_str(&format!(
-            " <urn:o> owl:imports <urn:i{i}> . GRAPH <urn:i{i}> {{ <urn:X{i}> rdfs:subClassOf <urn:Y> }}"
-        ));
-    }
-    u.push_str(" <urn:A> owl:disjointWith <urn:B> }");
-    let r = unsat_after(&s, &u);
-    assert_eq!(r.code, Some("input-missing"), "{r:?}");
-    assert!(r.messages[0].contains("imports"), "{r:?}");
-}
-
-/// The candidate of `u` with one more quad whose object id decodes to no term.
-#[cfg(feature = "ontology")]
-fn with_undecodable_object(u: &str, s: &str, p: &str) -> Arc<Snapshot> {
-    use crate::id::Id;
-    use crate::index::Perm;
-    let ds = Dataset::memory();
-    ds.update(u).unwrap();
-    let mut snap = (*ds.store().snapshot()).clone();
-    let s = snap.lookup_iri(s).unwrap();
-    let p = snap.lookup_iri(p).unwrap();
-    let bad = [s, p, Id::vocab(1 << 40), Id::DEFAULT_GRAPH];
-    for perm in [Perm::Gspo, Perm::Pos] {
-        snap.delta.ins[perm.index()].insert(perm.to_key(&bad));
-    }
-    Arc::new(snap)
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn an_undecodable_quad_is_an_error_not_a_quad_left_out() {
-    let s = unsat_suite("");
-    let ok = format!(
-        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> INSERT DATA {{
-           <urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A> .
-           GRAPH <urn:other> {{ <urn:z> owl:imports <urn:elsewhere> }} }}"
-    );
-    for p in [format!("{OWL}imports"), format!("{RDFS}subClassOf")] {
-        let snap = with_undecodable_object(&ok, "urn:C", &p);
-        let r = run_on(&s, &snap, &snap).results[0].clone();
-        assert_eq!(r.status, Status::Error, "{p}: {r:?}");
-        assert!(r.blocks());
-    }
 }
 
 #[test]
@@ -1065,293 +835,6 @@ fn the_canonical_limit_counts_every_byte() {
 
 // ---- round 3 of the slice 1 review ---------------------------------------------------
 
-#[cfg(feature = "ontology")]
-const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
-
-/// `A` and `B` declared disjoint classes and `C` a declared class, with `body`.
-#[cfg(feature = "ontology")]
-fn disjoint_ontology(body: &str) -> String {
-    format!(
-        "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> PREFIX rdf: <{RDF}>
-         INSERT DATA {{ <urn:A> a owl:Class . <urn:B> a owl:Class . <urn:C> a owl:Class .
-           <urn:A> owl:disjointWith <urn:B> . {body} }}"
-    )
-}
-
-#[cfg(feature = "ontology")]
-fn assert_invalid(r: &CheckResult, what: &str) {
-    assert_eq!(r.status, Status::Error, "{what}: {r:?}");
-    assert_eq!(r.code, Some("input-invalid"), "{what}: {r:?}");
-    assert!(r.blocks(), "{what}: {r:?}");
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn a_named_class_definition_is_read_or_refused() {
-    let suites = [unsat_suite(""), unsat_suite("; chk:requireComplete true")];
-    // the well-formed definition makes C the intersection of two disjoint classes
-    let ok = disjoint_ontology("<urn:C> owl:intersectionOf ( <urn:A> <urn:B> ) .");
-    let r = unsat_after(&suites[0], &ok);
-    assert_eq!(r.status, Status::Failed, "{r:?}");
-    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
-    // the same list with its last rdf:rest missing loses the definition
-    let broken = |p: &str| {
-        disjoint_ontology(&format!(
-            "<urn:C> owl:{p} _:l1 . _:l1 rdf:first <urn:A> ; rdf:rest _:l2 .
-             _:l2 rdf:first <urn:B> ."
-        ))
-    };
-    for s in &suites {
-        for p in ["intersectionOf", "unionOf"] {
-            assert_invalid(&unsat_after(s, &broken(p)), p);
-        }
-        let r = unsat_after(
-            s,
-            &disjoint_ontology(
-                "<urn:C> owl:oneOf _:l1 . _:l1 rdf:first <urn:a> ; rdf:rest _:l2 .
-                 _:l2 rdf:first <urn:b> .",
-            ),
-        );
-        assert_invalid(&r, "oneOf");
-        // a complement of a restriction without its filler
-        let r = unsat_after(
-            s,
-            &disjoint_ontology(
-                "<urn:r> a owl:ObjectProperty .
-                 <urn:C> owl:complementOf [ a owl:Restriction ; owl:onProperty <urn:r> ] .",
-            ),
-        );
-        assert_invalid(&r, "complementOf");
-    }
-    // the well-formed forms of the other three are read
-    for body in [
-        "<urn:C> owl:unionOf ( <urn:A> <urn:B> ) .",
-        "<urn:C> owl:oneOf ( <urn:a> <urn:b> ) .",
-        "<urn:C> owl:complementOf <urn:A> .",
-    ] {
-        let r = unsat_after(&suites[0], &disjoint_ontology(body));
-        assert_ne!(r.status, Status::Error, "{body}: {r:?}");
-    }
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn a_structural_predicate_typed_as_an_annotation_property_is_refused() {
-    let s = unsat_suite("");
-    let axioms = "<urn:C> rdfs:subClassOf <urn:A>, <urn:B> .";
-    let r = unsat_after(&s, &disjoint_ontology(axioms));
-    assert_eq!(r.status, Status::Failed, "{r:?}");
-    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
-    // the subclass triples would become annotations and the disjointness alone would pass
-    let r = unsat_after(
-        &s,
-        &disjoint_ontology(&format!(
-            "rdfs:subClassOf a owl:AnnotationProperty . {axioms}"
-        )),
-    );
-    assert_invalid(&r, "rdfs:subClassOf typed as an annotation property");
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn a_class_disjoint_with_itself_is_not_dropped() {
-    let s = unsat_suite("");
-    for body in [
-        "<urn:C> owl:disjointWith <urn:C> .",
-        "[] a owl:AllDisjointClasses ; owl:members ( <urn:C> <urn:C> ) .",
-    ] {
-        let r = unsat_after(&s, &disjoint_ontology(body));
-        // C is unsatisfiable: the check either finds it or refuses the input
-        if r.status != Status::Failed {
-            assert_invalid(&r, body);
-        } else {
-            assert!(
-                r.messages.iter().any(|m| m.contains("urn:C")),
-                "{body}: {r:?}"
-            );
-        }
-    }
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn a_structure_read_in_part_is_not_an_axiom() {
-    // the restriction's node also states the intersection that makes C unsatisfiable
-    let r = unsat_after(
-        &unsat_suite(""),
-        &disjoint_ontology(
-            "<urn:r> a owl:ObjectProperty .
-             <urn:C> rdfs:subClassOf [ a owl:Restriction ; owl:onProperty <urn:r> ;
-               owl:someValuesFrom owl:Thing ; owl:intersectionOf ( <urn:A> <urn:B> ) ] .",
-        ),
-    );
-    if r.status != Status::Failed {
-        assert_invalid(&r, "a restriction with an intersection beside it");
-    }
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn a_terminology_repeated_in_two_graphs_reads_once() {
-    let s = unsat_suite("; chk:graph <urn:g1>, <urn:g2>");
-    // one request, so _:e0 is the same blank node in both graphs, as a graph copy leaves it
-    let t = "<urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A>, _:e0 .
-             <urn:r> a owl:ObjectProperty .
-             _:e0 a owl:Restriction ; owl:onProperty <urn:r> ; owl:someValuesFrom <urn:B> .
-             <urn:r> rdfs:domain <urn:B> .";
-    let r = unsat_after(
-        &s,
-        &format!(
-            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
-             INSERT DATA {{ GRAPH <urn:g1> {{ {t} }} GRAPH <urn:g2> {{ {t} }} }}"
-        ),
-    );
-    assert_eq!(r.status, Status::Failed, "{r:?}");
-    assert!(r.messages.iter().any(|m| m.contains("urn:C")), "{r:?}");
-}
-
-/// The result of the check on the consistent terminology `A owl:disjointWith B` with a
-/// declared object property, and `abox` beside it.
-#[cfg(feature = "ontology")]
-fn with_abox(s: &Suite, abox: &str) -> CheckResult {
-    unsat_after(
-        s,
-        &format!(
-            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> PREFIX rdf: <{RDF}>
-             INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . <urn:r> a owl:ObjectProperty .
-               {abox} }}"
-        ),
-    )
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn an_assertion_outside_the_terminology_cannot_refuse_it() {
-    let s = unsat_suite("");
-    let alone = with_abox(&s, "");
-    assert_eq!(alone.status, Status::Passed, "{alone:?}");
-    let deep = existentials(sparkles_owl::read::MAX_NESTING + 2);
-    for abox in [
-        // a class assertion whose expression is past the reader's nesting limit
-        format!("<urn:x> a _:e0 . {deep}"),
-        // the same assertion annotated
-        format!(
-            "<urn:x> a _:e0 . {deep}
-             [] a owl:Axiom ; owl:annotatedSource <urn:x> ; owl:annotatedProperty rdf:type ;
-                owl:annotatedTarget _:e0 ; rdfs:comment \"c\" ."
-        ),
-    ] {
-        let r = with_abox(&s, &abox);
-        assert_eq!(r.status, alone.status, "{r:?}");
-        assert_eq!(r.findings, alone.findings, "{r:?}");
-        assert_eq!(r.notes, alone.notes, "{r:?}");
-    }
-    // a terminology axiom that shares the expression reads it, and so meets the error
-    for s in [unsat_suite(""), unsat_suite("; chk:requireComplete true")] {
-        let r = with_abox(
-            &s,
-            &format!("<urn:x> a _:e0 . <urn:C> rdfs:subClassOf _:e0 . {deep}"),
-        );
-        assert_invalid(&r, "shared expression");
-    }
-    // the readable control: a shared expression within the limit is read
-    let r = with_abox(
-        &s,
-        &format!(
-            "<urn:x> a _:e0 . <urn:C> rdfs:subClassOf _:e0 . {}",
-            existentials(1)
-        ),
-    );
-    assert_eq!(r.status, Status::Passed, "{r:?}");
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn assertions_do_not_type_the_terminology() {
-    let s = unsat_suite("");
-    // r and D are undeclared, so the range axiom maps only if something types them
-    let base = "<urn:r> rdfs:range <urn:D> .";
-    let alone = with_abox_untyped(&s, base);
-    for abox in [
-        "<urn:x> a <urn:D> .",
-        "<urn:x> a <urn:D> .
-         [] a owl:Axiom ; owl:annotatedSource <urn:x> ; owl:annotatedProperty rdf:type ;
-            owl:annotatedTarget <urn:D> ; rdfs:comment \"c\" .",
-        "<urn:x> a [ a owl:Restriction ; owl:onProperty <urn:r> ;
-            owl:someValuesFrom <urn:E> ] .",
-        "[] a owl:NegativePropertyAssertion ; owl:sourceIndividual <urn:x> ;
-            owl:assertionProperty <urn:r> ; owl:targetIndividual <urn:y> .",
-    ] {
-        let r = with_abox_untyped(&s, &format!("{base} {abox}"));
-        assert!(
-            r.status == alone.status && r.code == alone.code && r.findings == alone.findings,
-            "{abox}: {r:?} against {alone:?}"
-        );
-    }
-}
-
-/// [`with_abox`] without the declared object property.
-#[cfg(feature = "ontology")]
-fn with_abox_untyped(s: &Suite, abox: &str) -> CheckResult {
-    unsat_after(
-        s,
-        &format!(
-            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}> PREFIX rdf: <{RDF}>
-             INSERT DATA {{ <urn:A> owl:disjointWith <urn:B> . {abox} }}"
-        ),
-    )
-}
-
-#[cfg(feature = "ontology")]
-#[test]
-fn an_axiom_the_classifier_leaves_out_is_a_warning_note() {
-    // a has-value restriction with a literal of a datatype outside the classifier's map
-    let left_out = "<urn:d> a owl:DatatypeProperty .
-         <urn:A> rdfs:subClassOf [ a owl:Restriction ; owl:onProperty <urn:d> ;
-            owl:hasValue \"x\"^^<urn:unknown-datatype> ] .";
-    let u = |body: &str| {
-        format!(
-            "PREFIX owl: <{OWL}> PREFIX rdfs: <{RDFS}>
-             INSERT DATA {{ <urn:A> a owl:Class . <urn:B> a owl:Class . {left_out} {body} }}"
-        )
-    };
-    let report = |s: &Suite, body: &str| {
-        let ds = Dataset::memory();
-        let (before, after) = states(&ds, "", &u(body));
-        run_on(s, &before, &after).to_json()
-    };
-    let result = |j: &serde_json::Value| j["results"][0].clone();
-    // no finding, completeness not required: a pass with the warning note
-    let j = report(&unsat_suite(""), "<urn:A> rdfs:subClassOf <urn:B> .");
-    let r = result(&j);
-    assert_eq!(r["status"], "passed", "{j}");
-    assert_eq!(j["passed"], true, "{j}");
-    assert_eq!(r["notes"][0]["code"], "axioms-left-out", "{j}");
-    assert_eq!(r["notes"][0]["severity"], "warning", "{j}");
-    assert_eq!(r["notes"][0]["count"], 1, "{j}");
-    // completeness required and no finding: the gap blocks
-    let j = report(
-        &unsat_suite("; chk:requireComplete true"),
-        "<urn:A> rdfs:subClassOf <urn:B> .",
-    );
-    let r = result(&j);
-    assert_eq!(r["status"], "error", "{j}");
-    assert_eq!(r["code"], "check-incomplete", "{j}");
-    assert_eq!(r["findings"], 0, "{j}");
-    assert_eq!(r["blocks"], true, "{j}");
-    // a known violation stands as a failure, with the same note
-    let j = report(
-        &unsat_suite("; chk:requireComplete true"),
-        "<urn:A> owl:disjointWith <urn:B> . <urn:C> rdfs:subClassOf <urn:A>, <urn:B> .",
-    );
-    let r = result(&j);
-    assert_eq!(r["status"], "failed", "{j}");
-    assert_eq!(r["findings"], 1, "{j}");
-    assert_eq!(r["notes"][0]["code"], "axioms-left-out", "{j}");
-    assert_eq!(r["notes"][0]["severity"], "warning", "{j}");
-    assert_eq!(r["notes"][0]["count"], 1, "{j}");
-}
-
 #[cfg(feature = "shacl")]
 #[test]
 fn shapes_that_are_all_deactivated_are_refused() {
@@ -1397,4 +880,49 @@ fn shapes_that_are_all_deactivated_are_refused() {
         shapes("true")
     ));
     assert_eq!(r.status, Status::Passed, "{r:?}");
+}
+
+#[test]
+fn a_note_is_reported_with_its_severity_and_never_blocks() {
+    let note = Note {
+        severity: Severity::Warning,
+        code: "a-note",
+        count: 2,
+        message: "two things the check left out".to_string(),
+    };
+    let check = |status: Status, severity: Severity| CheckResult {
+        check: oxrdf::NamedNode::new_unchecked("urn:c"),
+        kind: "QueryCheck",
+        severity,
+        status,
+        findings: u64::from(status == Status::Failed),
+        code: None,
+        messages: Vec::new(),
+        notes: vec![note.clone()],
+        millis: 0,
+    };
+    let report = |r: CheckResult| SuiteReport {
+        suite: oxrdf::NamedNode::new_unchecked("urn:s"),
+        revision: "sha256:0".to_string(),
+        results: vec![r],
+    };
+    // a passing required check with a warning note passes, and the note is in the JSON
+    let j = report(check(Status::Passed, Severity::Violation)).to_json();
+    assert_eq!(j["passed"], true, "{j}");
+    let r = &j["results"][0];
+    assert_eq!(r["blocks"], false, "{j}");
+    assert_eq!(r["notes"][0]["code"], "a-note", "{j}");
+    assert_eq!(r["notes"][0]["severity"], "warning", "{j}");
+    assert_eq!(r["notes"][0]["count"], 2, "{j}");
+    assert_eq!(
+        r["notes"][0]["message"], "two things the check left out",
+        "{j}"
+    );
+    // a failure blocks for its own status, with the same note beside it
+    let j = report(check(Status::Failed, Severity::Violation)).to_json();
+    assert_eq!(j["passed"], false, "{j}");
+    assert_eq!(j["results"][0]["notes"][0]["code"], "a-note", "{j}");
+    // a note on an advisory check does not fail the suite either
+    let j = report(check(Status::Failed, Severity::Info)).to_json();
+    assert_eq!(j["passed"], true, "{j}");
 }
