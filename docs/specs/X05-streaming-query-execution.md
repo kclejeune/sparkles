@@ -1363,9 +1363,14 @@ the pairs against the block grid.
 The cursor's memory for the operator is about one morsel's working set per worker
 thread plus the k rows it keeps, whatever the size of the range. The test
 `ordered_top_k_memory_does_not_grow_with_its_unordered_pieces` reads 300,000 and 900,000
-dictionary values on two threads and requires the second peak to stay within a quarter
-of the first. The peak grows with the number of threads instead, since each holds a
-morsel at once, so the test fixes its pool. Running the morsels in waves of one per
+dictionary values on one thread and on two. On one thread the second peak must stay
+within an eighth of the first. On two threads both peaks must stay within twice the
+one-thread peak of the smaller store, plus an eighth. The peak grows with the number of
+threads instead, since each holds a morsel at once, so the test fixes its pools. A
+two-thread peak depends on how far two morsels overlap in time, so the bound comes from
+the one-thread peaks, which do not. The test does not prove that at most one morsel per
+thread is live, because a third morsel's first charge is smaller than the margin.
+Running the morsels in waves of one per
 thread keeps a waiting worker from starting further morsels by work stealing.
 
 Reading the morsels one after another was 1.72 times slower than eager execution at eight
