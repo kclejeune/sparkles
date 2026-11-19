@@ -189,6 +189,14 @@ impl ChangeLog {
     /// `(from, to, upto)`, with `upto` clipped to what a read-only log holds. It flushes
     /// the queued commits, so the log covers the state the caller reads.
     pub(crate) fn range(&self, q: &HistoryQuery, upto: u64) -> Result<(u64, u64, u64)> {
+        let upto = self.prepare(q, upto)?;
+        let (from, to) = self.bounds(q, upto)?;
+        Ok((from, to, upto))
+    }
+
+    /// The checks of [`ChangeLog::range`] and its flush, which can run retention.
+    /// Returns `upto` clipped to what a read-only log holds.
+    pub(crate) fn prepare(&self, q: &HistoryQuery, upto: u64) -> Result<u64> {
         let upto = self
             .read_only_through()
             .map_or(upto, |through| upto.min(through));
@@ -203,6 +211,12 @@ impl ChangeLog {
         check_history_access(q.access.as_ref())?;
         // what the commits up to now queued
         self.flush(false)?;
+        Ok(upto)
+    }
+
+    /// The range of commits of [`ChangeLog::range`], once [`ChangeLog::prepare`] has
+    /// run: `(from, to)`.
+    pub(crate) fn bounds(&self, q: &HistoryQuery, upto: u64) -> Result<(u64, u64)> {
         let from = match &q.from {
             None => 1,
             Some(HistoryBound::Commit(n)) => (*n).max(1),
@@ -228,7 +242,7 @@ impl ChangeLog {
                 )));
             }
         };
-        Ok((from, to, upto))
+        Ok((from, to))
     }
 
     /// Run a history query against the commits up to `upto` (the state the caller

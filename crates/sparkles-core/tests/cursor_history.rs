@@ -299,7 +299,8 @@ fn the_row_budget_fails_before_a_later_record_is_read() {
 }
 
 /// A branch deleted while a streamed history query reads its change log: the later
-/// pulls either fail or give eager's rows, never fewer rows without an error.
+/// pulls either fail because its files are gone or give eager's rows, never fewer rows
+/// without an error (row 1173).
 #[test]
 fn deleting_the_branch_under_a_reading_cursor_fails_or_reads_all() {
     let dir = tempfile::tempdir().unwrap();
@@ -335,7 +336,7 @@ fn deleting_the_branch_under_a_reading_cursor_fails_or_reads_all() {
         answer.push(b.row(r).unwrap().values().to_vec());
     }
     drop(b);
-    let deleted = main.delete_branch("b", true);
+    main.delete_branch("b", true).unwrap();
     let mut failed = None;
     loop {
         match cursor.next_batch() {
@@ -351,7 +352,10 @@ fn deleting_the_branch_under_a_reading_cursor_fails_or_reads_all() {
             }
         }
     }
-    if deleted.is_ok() && failed.is_none() {
-        assert_eq!(answer, expected, "rows went missing without an error");
+    match failed {
+        // the deleted segment files are gone
+        Some(Error::Io(e)) => assert_eq!(e.kind(), std::io::ErrorKind::NotFound, "{e}"),
+        Some(e) => panic!("{e}"),
+        None => assert_eq!(answer, expected, "rows went missing without an error"),
     }
 }

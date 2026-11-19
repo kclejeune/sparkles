@@ -63,16 +63,19 @@ impl ChangeLog {
         upto: u64,
         after_range: &mut dyn FnMut() -> Result<()>,
     ) -> Result<HistoryPages> {
-        // Every commit is pinned while the range is resolved, so retention cannot drop
-        // a commit of the range between its resolution and its pin. The pin is taken
-        // under `inner` (before `pins`, the lock order), which retention holds while it
-        // reads the pins and drops segments: a retention pass that read them before
-        // has finished, and every later one sees the pin.
+        // The checks and the flush come first, unpinned, so the retention that the
+        // flush runs drops what it drops for an eager query. Then every commit is
+        // pinned while the range is resolved, so retention cannot drop a commit of the
+        // range between its resolution and its pin. The pin is taken under `inner`
+        // (before `pins`, the lock order), which retention holds while it reads the
+        // pins and drops segments: a retention pass that read them before has
+        // finished, and every later one sees the pin.
+        let upto = self.prepare(&q, upto)?;
         let hold = {
             let _inner = self.inner.lock();
             self.pin(0)
         };
-        let (from, to, _) = self.range(&q, upto)?;
+        let (from, to) = self.bounds(&q, upto)?;
         after_range()?;
         // an empty range reads nothing and holds no pin
         let pin = (from <= to).then(|| self.pin(from)).flatten();
@@ -204,6 +207,15 @@ impl HistoryPages {
                 truncated: false,
             });
         }
+        if limit == 0 {
+            // the page has reached its limit before it reads anything
+            self.done = true;
+            self.pin = None;
+            return Ok(Page {
+                changes: Vec::new(),
+                truncated: true,
+            });
+        }
         let held = Held {
             page: Cell::new(0),
             record: Cell::new(0),
@@ -275,22 +287,22 @@ impl HistoryPages {
                         .map(|s| arc_slice_bytes(s.len()))
                         .sum::<u64>();
             }
-            let page = held.page.get() + add_bytes;
             if changes.len() == changes.capacity() {
-                // a reallocation holds the old vector beside the new one
+                // a reallocation holds the old vector beside the new one, until it is
+                // done and before the change is decoded
                 let size = std::mem::size_of::<HistoryChange>() as u64;
                 let old = changes.capacity() as u64 * size;
                 let more = changes.capacity().max(64);
-                let page = page + more as u64 * size;
-                held.page.set(page + old);
+                let grown = held.page.get() + more as u64 * size;
+                held.page.set(grown + old);
                 held.admit()?;
                 changes.try_reserve_exact(more).map_err(|_| {
                     Error::HistoryUnsupported("history page allocation was refused".into())
                 })?;
-                held.page.set(page);
-            } else {
-                held.page.set(page);
+                held.page.set(grown);
+                held.admit()?;
             }
+            held.page.set(held.page.get() + add_bytes);
             held.admit()?;
             if let Some(quad) = key_quad(k) {
                 changes.push(HistoryChange {
@@ -675,6 +687,98 @@ mod tests {
         }
     }
 
+    /// The flush a reader makes before it pins runs retention as an eager query's flush
+    /// does, so both read the same commits.
+    #[test]
+    fn the_opening_flush_runs_retention_as_an_eager_query_does() {
+        for persistent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            // a commit that fills its segment, flushed, and one more queued: the flush
+            // of the second seals its segment and drops the first
+            let fixture = |name: &str| {
+                let s = match persistent {
+                    true => Store::open(&dir.path().join(name), options()).unwrap(),
+                    false => Store::in_memory(options()),
+                };
+                s.change_log().unwrap().set_background(false);
+                s.set_change_log_settings(ChangeLogSettings {
+                    keep_commits: Some(1),
+                    ..Default::default()
+                })
+                .unwrap();
+                for i in 0..2 {
+                    let body: String = (0..20)
+                        .map(|j| format!("<urn:s{i}> <urn:p> \"{}{j}\" . ", "v".repeat(300)))
+                        .collect();
+                    upd(&s, &format!("INSERT DATA {{ {body} }}"));
+                    if i == 0 {
+                        s.flush_change_log().unwrap();
+                    }
+                }
+                s
+            };
+            let all = HistoryQuery::default();
+            let eager = fixture("eager");
+            let head = eager.head_commit().seq;
+            let want: Vec<Key> = eager
+                .change_log()
+                .unwrap()
+                .query(&all, head)
+                .unwrap()
+                .changes
+                .iter()
+                .map(key)
+                .collect();
+            assert!(
+                !want.is_empty() && want.iter().all(|k| k.0 == head),
+                "the flush keeps only the last commit: {want:?}"
+            );
+            let paging = fixture("paged");
+            let got = paged(paging.change_log().unwrap(), &all, head, 3).concat();
+            assert_eq!(got, want, "persistent={persistent}");
+        }
+    }
+
+    /// A full page stops before it loads the index of the next segment: the page reads
+    /// though that index is missing.
+    #[test]
+    fn a_full_page_loads_no_index_of_the_next_segment() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), options()).unwrap();
+        fill(&s);
+        let log = s.change_log().unwrap().clone();
+        let (last, next, idx) = {
+            let inner = log.inner.lock();
+            assert!(inner.segs.len() > 2 && inner.segs[1].sealed);
+            (
+                inner.segs[0].last,
+                inner.segs[1].first,
+                inner.segs[1].idx_path().unwrap(),
+            )
+        };
+        let q = HistoryQuery {
+            from: Some(HistoryBound::Commit(last)),
+            ..Default::default()
+        };
+        let want: Vec<Key> = log.query(&q, 36).unwrap().changes.iter().map(key).collect();
+        let aside = idx.with_extension("aside");
+        std::fs::rename(&idx, &aside).unwrap();
+        log.inner.lock().cache.retain(|c| c.0 != next);
+        let mut pages = log.pages(q, 36).unwrap();
+        let first = pages.next(1, usize::MAX, &mut |_| Ok(())).unwrap();
+        std::fs::rename(&aside, &idx).unwrap();
+        let mut got: Vec<Key> = first.changes.iter().map(key).collect();
+        assert!(got.iter().all(|k| k.0 == last), "{got:?}");
+        loop {
+            let page = pages.next(1, usize::MAX, &mut |_| Ok(())).unwrap();
+            if page.changes.is_empty() {
+                break;
+            }
+            got.extend(page.changes.iter().map(key));
+        }
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn a_read_only_log_pages_as_its_scan_in_both_orders() {
         let dir = tempfile::tempdir().unwrap();
@@ -844,6 +948,15 @@ mod tests {
                 .changes
                 .is_empty()
         );
+        turn_off(&s).unwrap();
+        drop(pages);
+        // a limit of zero is reached before anything is read
+        let s = Store::in_memory(options());
+        fill(&s);
+        let log = s.change_log().unwrap().clone();
+        let mut pages = log.pages(HistoryQuery::default(), 36).unwrap();
+        let page = pages.next(10_000, 0, &mut |_| Ok(())).unwrap();
+        assert!(page.truncated && page.changes.is_empty() && pages.done());
         turn_off(&s).unwrap();
         drop(pages);
     }
