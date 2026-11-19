@@ -4515,7 +4515,7 @@ fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
     }
     // one worker: the same morsel peak however many morsels there are
     assert!(peaks[1][0] < peaks[0][0] * 9 / 8, "{peaks:?}");
-    // two workers: at most a morsel per worker, which a third live morsel exceeds
+    // two workers: at most twice one worker's peak, with a margin for per-worker state
     let bound = peaks[0][0] * 2 * 9 / 8;
     assert!(
         peaks.iter().all(|p| p[1] < bound),
