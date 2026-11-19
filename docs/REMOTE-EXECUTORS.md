@@ -304,9 +304,14 @@ room. On an ssh host the job also reads the free space every `REMOTE_CI_WATCH_SE
 while the check runs, 30 by default, and once more when a failed check ends. It stops the
 check with exit 5, or marks the failure as exit 5, when less than `REMOTE_CI_RUN_FLOOR_GIB`
 is free, 4 by default. The server's tests keep 1 GiB free and fail below it, so a disk that
-another job fills ends the run as a host problem rather than as test failures. A stopped
-check's processes that ignore the stop are killed before the job copies its results and
-removes its worktree. Either refusal writes `disk-below-floor` to the job's `outcome` file,
+another job fills ends the run as a host problem rather than as test failures. On an ssh host
+the unit is delegated and the check runs in a child cgroup, so a stopped check's processes,
+those that ignore the stop or left its process group included, are killed and gone before
+the job copies its results and removes its worktree. The job sets aside a MiB before the
+check and gives it back before it writes its outcome and exit records, so they fit on a
+disk the check filled. Each start has its own id, which the job records first, so the
+waiting `remote-ci.sh` takes only that start's results and says so when another start of
+the same name replaced them. Either refusal writes `disk-below-floor` to the job's `outcome` file,
 and `remote-ci.sh` then says that the host's disk was below its floor. The check's `TMPDIR`
 on an ssh host is `.artifacts/tmp` in its worktree, so its temporary files leave with the
 worktree and do not fill the host's `/tmp`. A Boat worker keeps its disk timer's hard limit

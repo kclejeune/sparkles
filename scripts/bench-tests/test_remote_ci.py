@@ -85,6 +85,7 @@ class RemoteCI(unittest.TestCase):
         # into progress.log and runs on for 3 seconds.
         (src / 'scripts/ci.sh').write_text('#!/usr/bin/env bash\necho "ci $*"; echo "tmpdir ${TMPDIR:-unset}"; mkdir -p .artifacts/ci/logs; echo log > .artifacts/ci/logs/test.log\n'
                                            'if [ -f "$HOME/ci-leaves-child" ]; then (trap "" TERM; exec sleep 300) & echo $! > "$HOME/child.pid"; fi\n'
+                                           'if [ -f "$HOME/ci-replaces" ]; then echo another-start > "$HOME/gate/out/$NAME/run-id"; fi\n'
                                            'if [ -f "$HOME/ci-says-exit" ]; then echo "mbx check || exit 7" >> "$HOME/gate/out/$NAME/progress.log"; sleep 3; fi\n'
                                            'if [ -f "$HOME/ci-fills-disk" ]; then echo 1000 > "$HOME/df-kib"; sleep "$(cat "$HOME/ci-fills-disk" | grep . || echo 60)"; echo "survived the watch"; fi\nexit "${FAKE_CI_EXIT:-0}"\n')
         (src / '.gitignore').write_text('.artifacts/\n')
@@ -388,6 +389,20 @@ class RemoteCI(unittest.TestCase):
         r = self.run_cmd('true')
         self.assertEqual(r.returncode, 4, r.stdout + r.stderr); self.assertIn('host disk below floor', r.stderr)
 
+    def test_the_wait_refuses_results_that_another_start_replaced(self):
+        (self.home / 'ci-replaces').touch(); (self.home / 'ci-says-exit').touch()
+        r = self.run_ssh(FAKE_ASYNC='1', REMOTE_CI_POLL_SECONDS='1')
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn('another start of gate-%s replaced this one' % self.name(), r.stderr)
+        self.assertFalse((self.src / '.artifacts/remote-ci' / self.name()).exists())
+
+    def test_the_results_carry_their_start_and_no_reserve(self):
+        r = self.run_ssh()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        res = self.src / '.artifacts/remote-ci' / self.name()
+        self.assertRegex((res / 'run-id').read_text().strip(), r'^[0-9]+-[0-9]+$')
+        self.assertFalse((res / '.reserve').exists())
+
     def test_the_disk_settings_must_be_positive_numbers(self):
         for n in ['REMOTE_CI_MIN_FREE_GIB', 'REMOTE_CI_RUN_FLOOR_GIB', 'REMOTE_CI_WATCH_SECONDS']:
             for v in ['x', '0', '-1', '08']:
@@ -485,10 +500,10 @@ class GateDiskFloor(unittest.TestCase):
         # Another job may hold the host, so the driver never collects there.
         self.assertFalse(self.log.exists())
 
-    def merge(self, ci, conf, ci_disk=False, conf_disk=False):
+    def merge(self, ci, conf, ci_disk=False, conf_disk=False, fresh=True):
         """Merge a split gate whose halves exited ci and conf, with fake hosts p and h."""
         fake = self.t / 'hosts'
-        for host, code, disk in (('p', ci, ci_disk), ('h', conf, conf_disk)):
+        for host, code, disk in (('p', ci, ci_disk), ('h', conf, conf_disk)) if fresh else ():
             out = fake / host / 'gate/out' / ('n' if host == 'p' else 'n-conf')
             shutil.rmtree(fake / host, ignore_errors=True); out.mkdir(parents=True)
             (out / 'part.exit').write_text('%d\n' % code); (out / 'steps.txt').write_text('%s step\n' % host)
@@ -519,13 +534,31 @@ cat "$dest/gate.exit"
     def test_a_split_gate_keeps_a_part_s_disk_refusal(self):
         code, dest = self.merge(0, 4, conf_disk=True)
         self.assertEqual(code, 4)
-        self.assertEqual((dest / 'outcome').read_text().strip(), 'disk-below-floor')
+        self.assertEqual((dest / 'gate-outcome').read_text().strip(), 'disk-below-floor')
+        self.assertFalse((dest / 'outcome').exists())
         self.assertEqual((dest / 'outcome-host').read_text().strip(), 'conformance half on h')
         code, dest = self.merge(4, 0, ci_disk=True)
         self.assertEqual(code, 4); self.assertEqual((dest / 'outcome-host').read_text().strip(), 'ci half on p')
-        # A part that failed its tests still fails the merge, whatever the other part's disk.
+        code, dest = self.merge(4, 4, ci_disk=True, conf_disk=True)
+        self.assertEqual(code, 4); self.assertEqual((dest / 'outcome-host').read_text().strip(), 'ci half on p, conformance half on h')
+        # A part that failed its tests still fails the merge, whatever the other part's disk,
+        # and a disk marker without exit 4 is not a refusal.
         self.assertEqual(self.merge(1, 4, conf_disk=True)[0], 1)
+        self.assertEqual(self.merge(1, 0, ci_disk=True)[0], 1)
         self.assertEqual(self.merge(0, 0)[0], 0); self.assertEqual(self.merge(0, 1)[0], 1)
+
+    def test_a_retried_merge_never_reads_an_earlier_merge_s_record_as_a_part_s(self):
+        # A copy back that stopped before gate.exit left the merge's records on the primary.
+        code, dest = self.merge(1, 4, conf_disk=True)
+        self.assertEqual(code, 1)
+        p = self.t / 'hosts/p/gate/out/n'
+        for f in ['gate-outcome', 'outcome-host', 'outcome-conf']:
+            (p / f).write_text('disk-below-floor\n')
+        (p / 'gate.exit').unlink(missing_ok=True)
+        code, dest = self.merge(1, 4, fresh=False)
+        self.assertEqual(code, 1)
+        self.assertFalse((dest / 'outcome').exists())
+        self.assertEqual((dest / 'outcome-host').read_text().strip(), 'conformance half on h')
 
     def test_hosts_reports_each_host_against_the_floors(self):
         src = self.t / 'src'; (src / 'scripts/gate').mkdir(parents=True)

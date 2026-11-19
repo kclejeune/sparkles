@@ -121,14 +121,26 @@ cd "$root"
 
 status() {
   # shellcheck disable=SC2016
-  rx_exec "$host" "o=\$HOME/gate/out/$1; cat \"\$o/progress.log\" 2> /dev/null; [ ! -f \"\$o/ci.exit\" ] || echo \"ci.exit=\$(cat \"\$o/ci.exit\")\"; systemctl --user is-active gate-$1 || true"
+  rx_exec "$host" "o=\$HOME/gate/out/$1; cat \"\$o/progress.log\" 2> /dev/null; [ ! -f \"\$o/run-id\" ] || echo \"run-id=\$(cat \"\$o/run-id\")\"; [ ! -f \"\$o/ci.exit\" ] || echo \"ci.exit=\$(cat \"\$o/ci.exit\")\"; systemctl --user is-active gate-$1 || true"
 }
+# fetch NAME [RUN_ID]: copy the job's results into a staging directory and, once the copy is
+# whole and, with RUN_ID, is that start's own, put it in place of the earlier copy.
 fetch() {
-  local dest=$root/.artifacts/remote-ci/$1
-  # A fresh copy, so that an earlier run's exit and outcome never stand in for this one.
+  local dest=$root/.artifacts/remote-ci/$1 stage
+  mkdir -p "$root/.artifacts/remote-ci"
+  stage=$(mktemp -d "$root/.artifacts/remote-ci/.fetch-$1.XXXXXX")
+  if ! rx_sync -- -a "$host:gate/out/$1/" "$stage/"; then
+    rm -rf "$stage"
+    echo "remote-ci.sh: could not copy the results of gate-$1" >&2
+    return 1
+  fi
+  if [ -n "${2:-}" ] && [ "$(cat "$stage/run-id" 2> /dev/null)" != "$2" ]; then
+    rm -rf "$stage"
+    echo "remote-ci.sh: another start of gate-$1 replaced this one's results on $host" >&2
+    return 1
+  fi
   rm -rf "$dest"
-  mkdir -p "$dest"
-  rx_sync -- -a "$host:gate/out/$1/" "$dest/"
+  mv "$stage" "$dest"
   echo "results in $dest"
 }
 case $name in '' | *[!A-Za-z0-9._-]*) [ "$action" = start ] || {
@@ -182,6 +194,7 @@ case $host in
     # scripts/boat/metadata-probe.py, so the job's cap is that figure.
     memory_max=12G
     cargo_jobs=6
+    delegate=
     ;;
   *)
     git push -q "ssh://$host/home/$USER/gate/repo.git" "$full:refs/heads/ci-${full:0:8}" "$bfull:refs/heads/ci-base-${bfull:0:8}"
@@ -191,9 +204,14 @@ case $host in
     # shellcheck disable=SC2016
     memory_max='${GATE_MEMORY_MAX:-13G}'
     cargo_jobs=6
+    # The job runs its check in a child cgroup, so that a stop ends every process of it.
+    delegate='-p Delegate=yes'
     ;;
 esac
 min=${REMOTE_CI_MIN_SECONDS:-600}
+# Each start has its own id, which the job records first, so the wait and the fetch take only
+# this start's results even when a later start of the same name replaces them.
+run_id=$(date +%s%N)-$$
 for n in REMOTE_CI_MIN_FREE_GIB REMOTE_CI_RUN_FLOOR_GIB REMOTE_CI_WATCH_SECONDS; do
   case ${!n:-1} in '' | *[!0-9]* | 0 | 0*)
     echo "remote-ci.sh: $n must be a positive whole number" >&2
@@ -225,11 +243,11 @@ for n in MBX_REMOTE_URL MBX_CACHE_DIR MBX_GC_MAX_TOTAL_SIZE MBX_GC_MIN_FREE_SIZE
 done
 p=\$PATH; [ ! -d \"\$G/py-venv/bin\" ] || p=\$G/py-venv/bin:\$p
 systemd-run --user --unit gate-$name --collect -q \"\${forward[@]}\" \\
-  -p MemoryMax=$memory_max -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p TimeoutStopSec=60 -p UMask=0022 \\
+  -p MemoryMax=$memory_max -p MemorySwapMax=2G -p OOMPolicy=continue -p RuntimeMaxSec=\$rt -p TimeoutStopSec=60 -p UMask=0022 $delegate \\
   --setenv=HOME=\"\$HOME\" --setenv=USER=\"\$USER\" --setenv=PATH=\"\$p\" --setenv=SPARKLES_REMOTE_EXECUTOR=$executor \\
   --setenv=CARGO_BUILD_JOBS=$cargo_jobs --setenv=CARGO_INCREMENTAL=0 \\
   --setenv=NEED_GIB=${REMOTE_CI_MIN_FREE_GIB:-85} --setenv=RUN_FLOOR_GIB=${REMOTE_CI_RUN_FLOOR_GIB:-4} --setenv=WATCH_SECONDS=${REMOTE_CI_WATCH_SECONDS:-30} \\
-  --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end --setenv=CMD_B64=$(printf '%s' "$cmd" | base64 -w0) \\
+  --setenv=NAME=$name --setenv=FULL=$full --setenv=BASE=$bfull --setenv=MODE=$mode --setenv=END=$end --setenv=RUN_ID=$run_id --setenv=CMD_B64=$(printf '%s' "$cmd" | base64 -w0) \\
   /bin/bash \"\$o/ci-job.sh\"
 echo \"started gate-$name, ending by \$(date -u -d @$end +%FT%TZ)\"" < "$here/gate/remote/ci-job.sh"
 [ "$wait" = 1 ] || {
@@ -237,19 +255,29 @@ echo \"started gate-$name, ending by \$(date -u -d @$end +%FT%TZ)\"" < "$here/ga
   exit 0
 }
 start=$(date +%s)
+# done_here STATUS: 0 when STATUS holds this start's id and an exit record, which are lines
+# of their own that no line of progress.log can be; 2 when another start's id is there.
+done_here() {
+  local id
+  id=$(printf '%s\n' "$1" | sed -n 's/^run-id=//p' | tail -n 1)
+  [ -z "$id" ] || [ "$id" = "$run_id" ] || return 2
+  [ "$id" = "$run_id" ] && printf '%s\n' "$1" | grep -Eqx 'ci\.exit=[0-9]+'
+}
 while :; do
   s=$(status "$name" 2> /dev/null || true)
-  # The exit record is a line of its own, which no line of progress.log can be.
-  printf '%s\n' "$s" | grep -Eqx 'ci\.exit=[0-9]+' && break
+  done_here "$s" && break
+  [ $? != 2 ] || {
+    echo "remote-ci.sh: another start of gate-$name replaced this one on $host" >&2
+    exit 1
+  }
   case $(printf '%s\n' "$s" | tail -n 1) in inactive | failed)
     # The unit can stop between the read of the exit record and the read of its state, so
     # a stopped unit's record is read once more before it counts as missing.
     s=$(status "$name" 2> /dev/null || true)
-    printf '%s\n' "$s" | grep -Eqx 'ci\.exit=[0-9]+' || {
-      echo "gate-$name ended without an exit status" >&2
-      fetch "$name"
-      exit 1
-    }
+    done_here "$s" && break
+    echo "gate-$name ended without an exit status" >&2
+    fetch "$name" "$run_id" || true
+    exit 1
     ;;
   esac
   [ "$(date +%s)" -lt $((end + 120)) ] || {
@@ -258,13 +286,12 @@ while :; do
   }
   sleep "${REMOTE_CI_POLL_SECONDS:-30}"
 done
-fetch "$name"
+fetch "$name" "$run_id" || exit 1
 code=$(cat "$root/.artifacts/remote-ci/$name/ci.exit")
 echo "gate-$name exit $code in $(($(date +%s) - start)) s"
 if [ "$(cat "$root/.artifacts/remote-ci/$name/outcome" 2> /dev/null)" = disk-below-floor ]; then
   echo "remote-ci.sh: host disk below floor on $host, so the job did not finish; its result says nothing about $full" >&2
   grep 'host disk below floor' "$root/.artifacts/remote-ci/$name/progress.log" >&2 || true
-  exit "$code"
 fi
 if [ "$mode" = cmd ]; then
   # The whole log, unless REMOTE_CI_LOG_LINES asks for its last lines.

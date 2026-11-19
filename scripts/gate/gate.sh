@@ -453,21 +453,31 @@ fetch() {
     echo "split: ci on $primary (gate-$name), conformance on $helper (gate-$hname)"
     wall "$tmp" "$conf"
   } > "$tmp/wall.txt"
-  # A part refused for its host's disk keeps its outcome, and the merge exits 4 for it.
-  [ ! -f "$tmp/outcome" ] || cp -a "$tmp/outcome" "$tmp/outcome-ci"
-  if grep -qx disk-below-floor "$conf/outcome" 2> /dev/null; then
-    echo disk-below-floor > "$tmp/outcome"
-    echo "conformance half on $helper" > "$tmp/outcome-host"
-  elif grep -qx disk-below-floor "$tmp/outcome" 2> /dev/null; then
-    echo "ci half on $primary" > "$tmp/outcome-host"
-  fi
+  # Each part keeps its own disk marker, the ci half's as outcome and the conformance half's
+  # as outcome-conf, and the merge writes its own as gate-outcome, so a merge retried after a
+  # partial copy back never reads an earlier merge's record as a part's.
+  rm -f "$tmp/gate-outcome" "$tmp/outcome-host" "$tmp/outcome-conf"
+  [ ! -f "$conf/outcome" ] || cp -a "$conf/outcome" "$tmp/outcome-conf"
   if [ -f "$tmp/part.exit" ] && [ -f "$conf/part.exit" ]; then
-    # A failed part makes the merge 1, unless every failed part was refused for its disk.
+    # A failed part makes the merge 1, unless every failed part exited 4 with its own disk
+    # marker, which makes it 4 and names each refusing half.
+    local i e refused=
+    local exits=("$tmp/part.exit" "$conf/part.exit") marks=("$tmp/outcome" "$conf/outcome") who=("ci half on $primary" "conformance half on $helper")
     code=0
-    for f in "$tmp/part.exit:$tmp/outcome-ci" "$conf/part.exit:$conf/outcome"; do
-      [ "$(cat "${f%%:*}")" != 0 ] || continue
-      if grep -qx disk-below-floor "${f#*:}" 2> /dev/null; then [ "$code" = 1 ] || code=4; else code=1; fi
+    for i in 0 1; do
+      e=$(cat "${exits[$i]}")
+      [ "$e" != 0 ] || continue
+      if [ "$e" = 4 ] && grep -qx disk-below-floor "${marks[$i]}" 2> /dev/null; then
+        [ "$code" = 1 ] || code=4
+        refused+="${refused:+, }${who[$i]}"
+      else
+        code=1
+      fi
     done
+    if [ -n "$refused" ]; then
+      echo disk-below-floor > "$tmp/gate-outcome"
+      echo "$refused" > "$tmp/outcome-host"
+    fi
   elif finished "$primary" "$name" && finished "$helper" "$hname"; then
     # Both units have stopped, but a half may have written its exit file after the copy
     # above. Look again before taking a missing file as a run that stopped without one.
@@ -735,7 +745,7 @@ cat "$dest/steps.txt" 2> /dev/null || true
 cat "$dest/wall.txt" 2> /dev/null || true
 code=$(cat "$dest/gate.exit" 2> /dev/null || echo 99)
 echo "gate exit $code"
-if grep -qx disk-below-floor "$dest/outcome" 2> /dev/null; then
-  echo "gate.sh: host disk below floor${dest:+ for the $(cat "$dest/outcome-host" 2> /dev/null || echo "gate on $primary")}, so the gate did not run there; its exit says nothing about $short" >&2
+if grep -qx disk-below-floor "$dest/gate-outcome" 2> /dev/null || { [ "$helper" = none ] && grep -qx disk-below-floor "$dest/outcome" 2> /dev/null; }; then
+  echo "gate.sh: host disk below floor for the $(cat "$dest/outcome-host" 2> /dev/null || echo "gate on $primary"), so the gate did not run there; its exit says nothing about $short" >&2
 fi
 exit "$code"

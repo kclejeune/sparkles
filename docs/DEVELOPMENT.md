@@ -1007,8 +1007,11 @@ ends. An ssh host that is short runs `mbx gc` with `gc.min_free_size` raised to 
 which collects idle managed targets and evicts cache objects until that much is free, and
 a Boat worker runs its disk cleanup. A gate still short ends with exit 4 and
 `disk-below-floor` in its `outcome` file, and the driver says that the host's disk was
-below its floor. A split gate whose failed parts were all refused for their disk exits 4
-and names the refusing half in `outcome-host`. `--auto` and the default helper choice count a host as
+below its floor. A split gate keeps each half's own record, the ci half's as `outcome` and
+the conformance half's as `outcome-conf`. When every failed half exited 4 with its own
+disk record, the merge exits 4, writes `gate-outcome` and names the refusing halves in
+`outcome-host`. Any other failure makes the merge exit 1. An ssh gate still creates its
+worktree before it takes the heavy lock, which roadmap item 1136 tracks. `--auto` and the default helper choice count a host as
 having the disk for a whole gate at `GATE_MIN_FREE_GB` free and for a conformance half at
 `GATE_MIN_FREE_HALF_GB`, which default to the two floors.
 
