@@ -388,9 +388,10 @@ impl Side {
             Side::Rows(held) => Ok((!started).then_some(held.table.len)),
             Side::File { reader, frame, .. } => {
                 ctx.check()?;
-                // The consumed frame goes before the next is decoded, so one decoded
-                // frame and its encoded payload are live at a time.
-                frame.clear();
+                // The consumed frame and its column headers go before the next is
+                // decoded, so one decoded frame and its encoded payload are live at a
+                // time.
+                drop(std::mem::take(frame));
                 match reader.as_mut().expect("a started run").next_frame()? {
                     Some((columns, n)) => {
                         *frame = columns;
