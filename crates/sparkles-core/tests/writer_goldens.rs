@@ -280,6 +280,15 @@ impl Goldens {
         }
     }
 
+    /// Record a mismatch when `got`, the body `what` wrote, differs from the body that the
+    /// golden `name` checked.
+    fn same(&mut self, name: &str, what: &str, expected: &[u8], got: &[u8]) {
+        if expected != got {
+            self.failures
+                .push(format!("{name}: the {what} body differs from the golden's"));
+        }
+    }
+
     fn pair(&mut self, name: &str, eager: &[u8], cursor: &[u8]) {
         self.pairs.insert(name.to_string(), eager == cursor);
     }
@@ -332,6 +341,21 @@ fn eager_thrift(r: &sparkles_core::sparql::QueryResult, send: Option<usize>) -> 
         out.finish()?;
         Ok(())
     })
+}
+
+/// SPARQL Results Thrift through the library's writer, from a complete result or a cursor.
+/// The rows counted must be the rows written.
+fn thrift_body(source: results::Source<'_>, send: Option<usize>, expect_rows: usize) -> Vec<u8> {
+    let rows = results::RowCount::new();
+    let bytes = body(|w| {
+        let options = results::WriteOptions {
+            send,
+            ..results::WriteOptions::new(results::Format::ResultsThrift, &rows)
+        };
+        results::write(source, options, w).map(drop)
+    });
+    assert_eq!(rows.get(), expect_rows as u64, "Thrift rows counted");
+    bytes
 }
 
 /// The cursor body of `write`, asserted equal at every batch size and with and without
@@ -394,7 +418,22 @@ fn every_writer_matches_its_golden() {
                 g.pair(&name, &e, &c);
             }
             let name = format!("{qname}{suffix}.thrift");
-            g.check(&format!("{name}.eager"), &eager_thrift(&eager, send));
+            let n = send.map_or(eager.len(), |s| s.min(eager.len()));
+            let e = eager_thrift(&eager, send);
+            g.check(&format!("{name}.eager"), &e);
+            // the library's writer, from the result and from a cursor at every batch size,
+            // writes the bytes the server wrote before it
+            let lib = thrift_body(results::Source::Result(&eager), send, n);
+            g.same(&name, "library eager", &e, &lib);
+            let c = cursor_body(
+                &name,
+                |o, c| {
+                    let mut cursor = select_cursor(s.snapshot(), q, o, c).unwrap();
+                    thrift_body(results::Source::Select(&mut cursor), send, n)
+                },
+                false,
+            );
+            g.same(&name, "cursor", &e, &c);
         }
     }
     for &(qname, q) in ASKS {
@@ -509,10 +548,16 @@ fn large_answers_match_their_golden() {
             g.check(&format!("{name}.cursor"), &c);
             g.pair(&name, &e, &c);
         }
-        g.check(
-            &format!("large{suffix}.thrift.eager"),
-            &eager_thrift(&eager, send),
-        );
+        let n = send.map_or(eager.len(), |s| s.min(eager.len()));
+        let name = format!("large{suffix}.thrift");
+        let e = eager_thrift(&eager, send);
+        g.check(&format!("{name}.eager"), &e);
+        let lib = thrift_body(results::Source::Result(&eager), send, n);
+        g.same(&name, "library eager", &e, &lib);
+        let mut cursor =
+            select_cursor(s.snapshot(), q, &options(true), &cursor_options(4096)).unwrap();
+        let c = thrift_body(results::Source::Select(&mut cursor), send, n);
+        g.same(&name, "cursor", &e, &c);
     }
     g.finish("manifest-large.txt");
 }

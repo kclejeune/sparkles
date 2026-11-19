@@ -10,7 +10,7 @@ use super::{
     write_buffered,
 };
 use crate::error::{Error, Result};
-use crate::jena_formats::JenaFormat;
+use crate::jena_formats::{JenaFormat, ThriftResults};
 use crate::sparql::{CursorStats, GraphCursor, QueryCursor, QueryKind, QueryResult};
 use oxrdf::Variable;
 use oxrdfio::RdfFormat;
@@ -34,6 +34,9 @@ pub enum Source<'a> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Format {
     Solutions(SolutionsFormat),
+    /// Jena's SPARQL Results Thrift (`application/sparql-results+thrift`), which holds
+    /// SELECT results only. An ASK result is written in another format by the caller.
+    ResultsThrift,
     Rdf(RdfFormat),
     Jena(crate::jena_formats::JenaFormat),
 }
@@ -116,6 +119,22 @@ pub fn write(
                 jena(s, fmt, out, staged, None)
             })
         }
+        (Source::Result(r), Format::ResultsThrift) if r.kind == QueryKind::Select => {
+            // row by row into one scratch row, as the server wrote it before
+            let mut source = EagerSolutions { r, scratch: true };
+            solutions(&mut source, writer, rows, |s, out, staged| {
+                thrift(s, out, staged, send)
+            })
+        }
+        (Source::Select(cursor), Format::ResultsThrift) => {
+            let mut source = CursorSolutions { cursor };
+            solutions(&mut source, writer, rows, |s, out, staged| {
+                thrift(s, out, staged, send)
+            })
+        }
+        (_, Format::ResultsThrift) => Err(Error::invalid(
+            "SPARQL Results Thrift holds SELECT results only",
+        )),
         (Source::Select(cursor), Format::Solutions(fmt)) => {
             let mut source = CursorSolutions { cursor };
             if fmt == SolutionsFormat::Sparkles {
@@ -269,6 +288,59 @@ impl<W: Write, F: FnOnce() -> std::io::Result<()>> BatchVisitor for SelectRows<'
         }
         if let Some(flush) = self.flush.take() {
             flush().map_err(io)?;
+        }
+        Ok(())
+    }
+}
+
+/// SPARQL Results Thrift of a SELECT, from either source: the variables, then a data
+/// tuple per row.
+fn thrift<S: SolutionSource>(
+    source: &mut S,
+    out: &mut RowOut<'_>,
+    staged: &Cell<u64>,
+    send: Option<usize>,
+) -> Result<()> {
+    source.start()?;
+    let mut rows = ThriftRows {
+        width: source.variables().len(),
+        out: ThriftResults::new(&mut *out, source.variables()).map_err(io)?,
+        staged,
+        flush: S::FLUSH_FIRST,
+    };
+    source.drive(send, &mut rows)?;
+    rows.out.finish().map_err(io)?;
+    Ok(())
+}
+
+struct ThriftRows<'o, W: Write> {
+    out: ThriftResults<W>,
+    staged: &'o Cell<u64>,
+    width: usize,
+    /// flush after the first batch
+    flush: bool,
+}
+
+impl<W: Write> BatchVisitor for ThriftRows<'_, W> {
+    fn batch<B: RowBatch>(&mut self, batch: &mut B) -> Result<()> {
+        for i in 0..batch.len() {
+            match batch.row(i)? {
+                RowView::Dense(terms) => self.out.row(terms),
+                RowView::Sparse(terms) => {
+                    let mut bound = terms.iter().peekable();
+                    self.out.row_cells(
+                        self.width,
+                        (0..self.width)
+                            .map(|c| bound.next_if(|(col, _)| *col == c).map(|(_, t)| t.as_ref())),
+                    )
+                }
+            }
+            .map_err(io)?;
+            self.staged.set(self.staged.get() + 1);
+        }
+        // the first batch's rows reach a writer that commits on a flush
+        if std::mem::take(&mut self.flush) {
+            self.out.get_mut().flush().map_err(io)?;
         }
         Ok(())
     }

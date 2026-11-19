@@ -1288,10 +1288,6 @@ async fn cursor_rejects_unsupported_modes_and_preserves_early_errors() {
             StatusCode::BAD_REQUEST,
         ),
         (
-            format!("{ALL}&execution=streaming&format=application%2Fsparql-results%2Bthrift"),
-            StatusCode::NOT_IMPLEMENTED,
-        ),
-        (
             "/ds/sparql?execution=streaming&format=json&query=SELEKT".into(),
             StatusCode::BAD_REQUEST,
         ),
@@ -1686,11 +1682,31 @@ fn late_streamed_byte_budget_aborts_and_reports_the_rows_sent() {
 fn a_failed_budget_flush_reports_only_the_rows_sent() {
     let chunk = super::stream::CHUNK;
     for (rows, len) in [(5000, 512), (120, 20 << 10), (40, chunk + chunk / 8)] {
-        failed_budget_flush_case(rows, len);
+        for format in ["tsv", "thrift"] {
+            failed_budget_flush_case(rows, len, format);
+        }
     }
 }
 
-fn failed_budget_flush_case(rows: usize, len: usize) {
+/// The end offset of every row of a whole SPARQL Results Thrift body of `?s ?o`, whose rows
+/// the TSV body `tsv` holds in the same order, from the library's encoder.
+fn thrift_row_ends(tsv: &[u8], thrift: &[u8]) -> Vec<usize> {
+    let vars = ["s".to_string(), "o".to_string()];
+    let mut out = sparkles::jena_formats::ThriftResults::new(Vec::new(), &vars).unwrap();
+    let mut ends = Vec::new();
+    for line in std::str::from_utf8(tsv).unwrap().lines().skip(1) {
+        let (s, o) = line.split_once('\t').unwrap();
+        let s = oxrdf::NamedNode::new(s.trim_start_matches('<').trim_end_matches('>')).unwrap();
+        let o = oxrdf::Literal::new_simple_literal(o.trim_matches('"'));
+        out.row(&[Some(s.into()), Some(o.into())]).unwrap();
+        ends.push(out.get_mut().len());
+    }
+    let whole = out.finish().unwrap();
+    assert_eq!(whole, thrift, "the test's encoding is the server's");
+    ends
+}
+
+fn failed_budget_flush_case(rows: usize, len: usize, format: &str) {
     let data = (0..rows)
         .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(len)))
         .collect::<String>();
@@ -1707,25 +1723,29 @@ fn failed_budget_flush_case(rows: usize, len: usize) {
             .unwrap();
     };
     for execution in ["eager", "streaming"] {
-        let uri = format!(
-            "/ds/sparql?execution={execution}&format=tsv&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
-        );
-        // the whole body, from a server without the budget
-        let mut whole = Vec::new();
-        let full_uri = uri.clone();
+        let uri_in = |format: &str| {
+            format!(
+                "/ds/sparql?execution={execution}&format={format}&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
+            )
+        };
+        let uri = uri_in(format);
+        // the whole body, and the whole TSV body, from a server without the budget
+        let (mut whole, mut tsv) = (Vec::new(), Vec::new());
         access_lines_of(|| async {
             let s = server_with(|st| st.limits.max_result_bytes = None);
             load(&s);
-            let res = s
-                .app
-                .clone()
-                .oneshot(Request::get(full_uri).body(Body::empty()).unwrap())
-                .await
-                .unwrap();
-            whole = axum::body::to_bytes(res.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec();
+            for (format, out) in [(format, &mut whole), ("tsv", &mut tsv)] {
+                let res = s
+                    .app
+                    .clone()
+                    .oneshot(Request::get(uri_in(format)).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                *out = axum::body::to_bytes(res.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .to_vec();
+            }
         });
         let lines = access_lines_of(|| async {
             let s = server_with(|st| {
@@ -1757,18 +1777,25 @@ fn failed_budget_flush_case(rows: usize, len: usize) {
         .into_iter()
         .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
         .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 1, "{execution} {len}: {lines:#?}");
+        assert_eq!(lines.len(), 1, "{execution} {format} {len}: {lines:#?}");
         let j: J = serde_json::from_str(&lines[0]).unwrap();
         let f = &j["fields"];
-        assert_eq!(f["outcome"], "budget", "{execution} {len}: {f}");
+        assert_eq!(f["outcome"], "budget", "{execution} {format} {len}: {f}");
         let bytes = f["response_bytes"].as_u64().unwrap() as usize;
-        assert!(bytes < whole.len(), "{execution} {len}: {f}");
-        // every whole line after the header within the bytes the transport accepted
-        let lines = whole[..bytes].iter().filter(|&&b| b == b'\n').count() as u64;
+        assert!(bytes < whole.len(), "{execution} {format} {len}: {f}");
+        // every whole row within the bytes the transport accepted
+        let sent = if format == "thrift" {
+            thrift_row_ends(&tsv, &whole)
+                .iter()
+                .filter(|&&end| end <= bytes)
+                .count() as u64
+        } else {
+            whole[..bytes].iter().filter(|&&b| b == b'\n').count() as u64 - 1
+        };
         assert_eq!(
             f["rows"].as_u64(),
-            Some(lines - 1),
-            "{execution} {len}: the rows logged are the rows in the {bytes} bytes sent: {f}"
+            Some(sent),
+            "{execution} {format} {len}: the rows logged are the rows in the {bytes} bytes sent: {f}"
         );
     }
 }
@@ -2015,19 +2042,44 @@ async fn the_default_streams_a_large_scan_and_eager_opts_out() {
     );
 }
 
-#[tokio::test]
-async fn the_default_runs_thrift_eagerly() {
-    let s = server();
-    million(&s);
-    // the cursor writer has no Thrift encoding, so a streamed answer would be an error
-    let r = get(&s.app, &format!("{BIG_SCAN}&format=thrift")).await;
-    assert_eq!(
-        r.status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
-    );
-    assert!(r.header("content-type").contains("thrift"));
+/// SPARQL Results Thrift has a cursor writer, so the default, automatic execution streams a
+/// large scan in it from the cursor, with the bytes of the eager answer.
+#[test]
+fn the_default_streams_thrift_with_the_eager_bytes() {
+    let mut bodies = Vec::new();
+    let lines = access_lines_of(|| async {
+        let s = server_with(|st| st.access_log = true);
+        million(&s);
+        for execution in ["", "&execution=eager", "&execution=streaming"] {
+            let r = get(&s.app, &format!("{BIG_SCAN}&format=thrift{execution}")).await;
+            assert_eq!(
+                r.status,
+                StatusCode::OK,
+                "{execution}: {}",
+                String::from_utf8_lossy(&r.body[..r.body.len().min(200)])
+            );
+            assert_eq!(
+                r.header("content-type"),
+                "application/sparql-results+thrift",
+                "{execution}"
+            );
+            bodies.push(r.body);
+        }
+    })
+    .into_iter()
+    .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
+    .collect::<Vec<_>>();
+    assert_eq!(bodies[0], bodies[1], "the automatic body is the eager one");
+    assert_eq!(bodies[2], bodies[1], "the streamed body is the eager one");
+    assert_eq!(lines.len(), 3, "{lines:#?}");
+    let status = |l: &str| {
+        let j: J = serde_json::from_str(l).unwrap();
+        j["fields"]["cursor_status"].clone()
+    };
+    // the automatic and streamed requests ran a cursor to its end, the eager one none
+    assert_eq!(status(&lines[0]), "complete", "{}", lines[0]);
+    assert_eq!(status(&lines[1]), J::Null, "{}", lines[1]);
+    assert_eq!(status(&lines[2]), "complete", "{}", lines[2]);
 }
 
 #[tokio::test]

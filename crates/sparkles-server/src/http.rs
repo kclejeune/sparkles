@@ -1890,13 +1890,11 @@ pub(crate) async fn run_query(
     // otherwise name for nobody (item 180).
     opts.no_plan_patterns = sfmt != SolutionsFormat::Sparkles && !params_wants_sparkles(&headers);
     // Automatic execution decides once the query is planned, and a plan it keeps eager
-    // continues below exactly as an eager request does. The policy runs some requests
-    // eagerly without asking, since SPARQL Results Thrift has no cursor writer and
-    // initial bindings rule out every automatic plan.
+    // continues below exactly as an eager request does. The policy runs a request with
+    // initial bindings eagerly without asking, since they rule out every automatic plan.
     let execution = sparkles::sparql::choose_execution(&sparkles::sparql::Consumer {
         requested,
         default: st.default_execution,
-        cursor_format: !thrift,
         initial_bindings: !bindings.is_empty(),
         ..Default::default()
     })
@@ -2132,6 +2130,11 @@ pub(crate) async fn run_query(
     }
     // SPARQL Results Thrift is written for SELECT; ASK falls back to the negotiated format
     let thrift = thrift && r.kind == QueryKind::Select && !sparkles_doc;
+    let solutions_format = if thrift {
+        results::Format::ResultsThrift
+    } else {
+        results::Format::Solutions(sfmt)
+    };
     let ct: String = if sparkles_doc {
         SolutionsFormat::Sparkles.media_type().into()
     } else if is_graph {
@@ -2170,29 +2173,21 @@ pub(crate) async fn run_query(
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
         let sent = results::RowCount::with_ledger(w.get_ref().ledger());
-        let thrift_sent = std::cell::Cell::new(0);
-        let written = if thrift {
-            write_thrift_results(&r, w, send, &thrift_sent)
-        } else {
-            serialize_result(
-                &r,
-                w,
-                sparkles_doc,
-                is_graph,
-                sfmt,
-                rfmt,
-                send,
-                &prefixes,
-                seq,
-                &dataset_id,
-                io.as_deref(),
-                &sent,
-            )
-        };
-        rows_written.store(
-            sent.get() + thrift_sent.get(),
-            std::sync::atomic::Ordering::Relaxed,
+        let written = serialize_result(
+            &r,
+            w,
+            sparkles_doc,
+            is_graph,
+            solutions_format,
+            rfmt,
+            send,
+            &prefixes,
+            seq,
+            &dataset_id,
+            io.as_deref(),
+            &sent,
         );
+        rows_written.store(sent.get(), std::sync::atomic::Ordering::Relaxed);
         // phase spans once serialization has ended (the request span is current here)
         attempted_ms.set(attempted_ms.get() + ts.elapsed().as_secs_f64() * 1000.0);
         if !w.get_ref().deferred() {
@@ -2329,14 +2324,15 @@ pub(crate) fn io_profile(
 static QUICK: std::sync::LazyLock<inline::QuickQueries> =
     std::sync::LazyLock::new(Default::default);
 
-/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions.
+/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions in
+/// `solutions`, a SPARQL result format or SPARQL Results Thrift.
 #[allow(clippy::too_many_arguments)]
 fn serialize_result(
     r: &sparkles::sparql::QueryResult,
     w: &mut LimitedWriter<stream::SwitchWriter>,
     sparkles_doc: bool,
     is_graph: bool,
-    sfmt: SolutionsFormat,
+    solutions: results::Format,
     rfmt: OutFormat,
     send: Option<usize>,
     prefixes: &std::collections::BTreeMap<String, String>,
@@ -2371,29 +2367,10 @@ fn serialize_result(
     } else {
         results::WriteOptions {
             send,
-            ..results::WriteOptions::new(results::Format::Solutions(sfmt), sent)
+            ..results::WriteOptions::new(solutions, sent)
         }
     };
     results::write(results::Source::Result(r), options, w).map(drop)
-}
-
-/// SELECT results in SPARQL Results Thrift, `send` rows at most, counting in `sent` the
-/// rows written whole.
-fn write_thrift_results(
-    r: &sparkles::sparql::QueryResult,
-    w: &mut LimitedWriter<stream::SwitchWriter>,
-    send: Option<usize>,
-    sent: &std::cell::Cell<u64>,
-) -> sparkles::Result<()> {
-    let mut out = jena_formats::ThriftResults::new(w, r.variables())?;
-    let n = send.map_or(r.len(), |s| s.min(r.len()));
-    for i in 0..n {
-        let row = r.row(i)?;
-        out.row(row.values())?;
-        sent.set(sent.get() + 1);
-    }
-    out.finish()?;
-    Ok(())
 }
 
 /// Log how a streamed response ended (its bytes are counted in the metrics).

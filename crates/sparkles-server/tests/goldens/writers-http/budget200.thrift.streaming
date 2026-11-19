@@ -1,2 +1,2 @@
-501 application/json
-{"error":"streaming SELECT does not support Thrift; choose JSON, XML, CSV, TSV or native JSON"}
+507 application/json
+{"budget":"result-bytes","error":"response exceeds the result size budget of 200 B","limit":200}

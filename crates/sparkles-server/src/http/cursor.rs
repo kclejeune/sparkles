@@ -143,23 +143,23 @@ pub(super) async fn serve(
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     // what query-time reasoning derived, for the response header
     let derived = cursor.reasoning();
-    if thrift && cursor.kind() == QueryKind::Select && !matches!(cursor, QueryExecution::Eager(_)) {
-        return Err(Error::Unsupported(
-            "streaming SELECT does not support Thrift; choose JSON, XML, CSV, TSV or native JSON"
-                .into(),
-        )
-        .into());
-    }
     let graph = matches!(cursor.kind(), QueryKind::Construct | QueryKind::Describe);
     let kind = cursor.kind();
-    let content_type =
-        if thrift && cursor.kind() == QueryKind::Select && format != SolutionsFormat::Sparkles {
-            jena_formats::RESULTS_THRIFT
-        } else if graph && !native_graph {
-            rdf_format.media_type()
-        } else {
-            format.media_type()
-        };
+    // SPARQL Results Thrift holds SELECT results; ASK and the Sparkles document keep the
+    // negotiated format
+    let thrift = thrift && kind == QueryKind::Select && format != SolutionsFormat::Sparkles;
+    let solutions_format = if thrift {
+        results::Format::ResultsThrift
+    } else {
+        results::Format::Solutions(format)
+    };
+    let content_type = if thrift {
+        jena_formats::RESULTS_THRIFT
+    } else if graph && !native_graph {
+        rdf_format.media_type()
+    } else {
+        format.media_type()
+    };
     let prefixes = prefix_map
         .iter()
         .map(|(a, b)| (a.clone(), b.clone()))
@@ -201,16 +201,6 @@ pub(super) async fn serve(
                 io: io.as_deref(),
             });
             let result = match &mut cursor {
-                QueryExecution::Eager(result)
-                    if thrift
-                        && result.result().kind == QueryKind::Select
-                        && format != SolutionsFormat::Sparkles =>
-                {
-                    let sent = std::cell::Cell::new(0);
-                    let written = write_thrift_results(result.result(), writer, send, &sent);
-                    *sent_slot.lock() = Some(sent.get());
-                    written
-                }
                 QueryExecution::Eager(result) => {
                     let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
                     let written = serialize_result(
@@ -218,7 +208,7 @@ pub(super) async fn serve(
                         writer,
                         (!graph && format == SolutionsFormat::Sparkles) || native_graph,
                         graph,
-                        format,
+                        solutions_format,
                         rdf_format,
                         send,
                         &prefix_map,
@@ -235,7 +225,7 @@ pub(super) async fn serve(
                     let options = results::WriteOptions {
                         send,
                         metadata,
-                        ..results::WriteOptions::new(results::Format::Solutions(format), &sent)
+                        ..results::WriteOptions::new(solutions_format, &sent)
                     };
                     let written =
                         results::write(results::Source::Select(cursor), options, &mut *writer);

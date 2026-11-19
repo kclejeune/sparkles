@@ -2684,8 +2684,7 @@ Query parameters beyond the standard protocol:
   LIMIT, a grouping, a DISTINCT and a join write what does not fit to disk and finish
   within the budget (see [Disk spill](#disk-spill)). A query that exceeds the budget
   otherwise fails, so streaming does not keep every query in constant memory. SELECT in SPARQL
-  Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
-  returns `400`.
+  Results Thrift streams in the same bytes as the eager answer. An invalid mode returns `400`.
 
   `auto` streams a plain SELECT of scans and projections when it expects at least a
   thousand rows and the data comes from immutable blocks with no pending changes. Any graph
@@ -2705,8 +2704,7 @@ Query parameters beyond the standard protocol:
   budget fails it with a status before any output. Every other plan runs eagerly, with the
   same response as `execution=eager`. A query that ran in under 10 ms the last time also
   runs eagerly without being planned for the decision, also when its last run streamed and
-  its answer fit in one 1 MiB body. A request for SPARQL
-  Results Thrift runs eagerly because that encoding has no streaming writer. A stored-query run with
+  its answer fit in one 1 MiB body. A stored-query run with
   parameter values also runs eagerly, because initial bindings rule out every automatic
   plan. A streamed answer that passes a lowered `max-result-mb` within its first
   1 MiB is refused with a status before any output, as an eager one is. The policy is
