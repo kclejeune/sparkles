@@ -422,10 +422,15 @@ change. An error replaces the panic in `CallbackGuard::enter`, the planner refus
 call that its context was not configured for, and the destructors of property streams
 and aggregate accumulators drop their value without a guard when none can be entered and
 leak the payload of a panic from it, whose own destructor could otherwise unwind.
+When an evaluated `EXISTS` or a registered scalar call encounters this refusal, query
+execution preserves the original error even if an expression such as `COALESCE`
+handles the evaluation error.
 `tests/rdfs_extension_calls.rs` covers eager and streamed shapes, an update's `WHERE`
 clause, inputs from rewritten patterns, list arguments, a registered `rdf:type` and the
-reasoning seeds, and `callback_guard_tests.rs` covers the guard and the
-planner on an unconfigured context.
+reasoning seeds. Unit tests cover the guard, the planner, eager execution and cursor
+execution on unconfigured contexts. The eager query fails and a strict cursor fails
+on its first pull without publishing a row. An untaken `IF` arm and ordinary
+expression fallback still succeed in both modes.
 
 ### Callback context during thread destruction
 

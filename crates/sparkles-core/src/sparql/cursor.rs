@@ -2685,6 +2685,12 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
     }
     for spec in specs {
         let planned = super::plan::Planner::new(ctx).plan(&spec.pattern, &spec.graph, Vec::new());
+        if let Err(error) = &planned
+            && super::extensions::is_unconfigured(error)
+        {
+            // This pattern needs no materialization. Its refusal matters only if it is evaluated.
+            continue;
+        }
         let built = planned
             .and_then(|node| Operator::build(ctx, node, FallbackPolicy::RejectMaterialization));
         match built {
@@ -4742,6 +4748,89 @@ fn successor(mut key: Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unconfigured_cursor(query: &str) -> (Result<QueryCursor>, Arc<AtomicUsize>) {
+        let parsed = super::super::parse_query(query, None, &[]).unwrap();
+        let (prepared, opens) = super::super::callback_guard_tests::prepared(&parsed, true);
+        let levels = prepared.plan_depth;
+        let cursor = from_prepared(
+            prepared,
+            &parsed,
+            query,
+            &QueryOptions::default(),
+            &CursorOptions {
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+            Instant::now(),
+            0.0,
+            0.0,
+            levels,
+            QueryKind::Select,
+        )
+        .map(|(cursor, _, _)| cursor);
+        (cursor, opens)
+    }
+
+    #[test]
+    fn callback_guard_exists_fails_before_a_cursor_emits_rows() {
+        use super::super::callback_guard_tests::{EXISTS_QUERY, assert_unconfigured};
+        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY);
+        let mut cursor = cursor.unwrap();
+        let result = cursor.next_batch();
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        let error = match result {
+            Err(error) => error,
+            Ok(Some(batch)) => panic!(
+                "unexpected batch of {} rows starting with {:?}",
+                batch.len(),
+                batch
+                    .term(0, 0)
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.as_term())
+            ),
+            Ok(None) => panic!("the cursor finished without an error"),
+        };
+        assert_unconfigured(error);
+        assert_eq!(cursor.status(), CursorStatus::Failed);
+        assert_eq!(cursor.stats().emitted_rows, 0);
+    }
+
+    #[test]
+    fn callback_guard_cursor_allows_untaken_exists_and_expression_fallback() {
+        use super::super::callback_guard_tests::FALLBACK_QUERY;
+        let (cursor, opens) = unconfigured_cursor(FALLBACK_QUERY);
+        let mut cursor = cursor.unwrap();
+        let batch = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(batch.len(), 1);
+        for (column, expected) in [true, false].into_iter().enumerate() {
+            let term = batch.term(0, column).unwrap().unwrap();
+            assert_eq!(
+                term.as_term(),
+                &Term::Literal(oxrdf::Literal::from(expected))
+            );
+        }
+        assert!(cursor.next_batch().unwrap().is_none());
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn callback_guard_cursor_still_checks_other_exists_patterns_for_materialization() {
+        let (cursor, opens) = unconfigured_cursor(
+            "SELECT ?b WHERE {
+                BIND(COALESCE(
+                    EXISTS { <urn:s> <urn:callback> ?x },
+                    EXISTS { SERVICE <urn:remote> { ?s <urn:p> ?o } }
+                ) AS ?b)
+            }",
+        );
+        assert!(
+            matches!(cursor, Err(Error::Unsupported(message)) if message.starts_with("cursor requires materialization at Bind"))
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+    }
 
     fn collected_values(
         width: usize,

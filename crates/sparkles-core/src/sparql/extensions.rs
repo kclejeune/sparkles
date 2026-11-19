@@ -235,10 +235,17 @@ impl CallbackGuard {
     }
 }
 
+const UNCONFIGURED_CALLBACK: &str =
+    "a registered extension was reached outside the calls its query configured";
+
 /// The error of a registered extension reached from a query context that was not
 /// configured to call it.
 pub(crate) fn unconfigured() -> Error {
-    Error::invalid("a registered extension was reached outside the calls its query configured")
+    Error::invalid(UNCONFIGURED_CALLBACK)
+}
+
+pub(super) fn is_unconfigured(error: &Error) -> bool {
+    matches!(error, Error::Invalid(message) if message == UNCONFIGURED_CALLBACK)
 }
 
 impl Drop for CallbackGuard {
