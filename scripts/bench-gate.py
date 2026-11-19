@@ -295,6 +295,13 @@ def executors(args):
         # a run of other arms than eager and streaming has a digest of every timed answer,
         # and so does any run whose digests name their repetition
         per_request = (not legacy) or any(len(row) >= 5 for row in warm_rows)
+        if per_request:
+            # every digest names its repetition, and its query is one of the run's
+            short = sum(1 for row in warm_rows if len(row) < 5)
+            stray = sorted({row[2] for row in warm_rows} - set(order))
+            if short or stray:
+                checks.append({"name": f"{cell}/warm-answers", "ok": False,
+                               "detail": {"digests without a repetition": short, "queries of no sample": stray}})
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the
@@ -318,8 +325,7 @@ def executors(args):
                 detail = sorted(digests)
                 if per_request:
                     # one digest for each timed request of every arm, and none of another
-                    want = timed[q] if all(len(k) == 3 for k in covered[q]) or not covered[q] \
-                        else {k[:2] for k in timed[q]}
+                    want = timed[q]
                     missing, extra = want - covered[q], covered[q] - want
                     lacking = sorted(arms[v] for v in arms if not any(k[1] == v for k in covered[q]))
                     if missing or extra or twice[q] or lacking:
@@ -616,8 +622,10 @@ VOLATILE_SETTINGS = {"threshold", "short_below", "short_threshold", "load", "hos
 TOOLCHAIN = ("compilers", "build_config")
 
 
-def incompatibilities(base, cand):
-    """Why two records do not measure the same workload, as a list of reasons."""
+def incompatibilities(base, cand, toolchain=True):
+    """Why two records do not measure the same workload, as a list of reasons. Without
+    `toolchain`, the records' own compilers and build configurations are left to the caller,
+    as `compare --best-of` checks those of the binaries behind the arms it scores."""
     out = []
     for k in ("gate", "suite", "scale"):
         if base.get(k) != cand.get(k):
@@ -631,7 +639,7 @@ def incompatibilities(base, cand):
         if base["host"].get("name") != cand["host"].get("name"):
             out.append(f"host: {base['host'].get('name')!r} against {cand['host'].get('name')!r}")
         bm, cmf = base.get("manifest", {}), cand.get("manifest", {})
-        for k in TOOLCHAIN:
+        for k in (TOOLCHAIN if toolchain else ()):
             unknown = [n for n, m in (("the baseline", bm), ("the candidate", cmf)) if not m.get(k)]
             if unknown:
                 out.append(f"manifest {k}: unknown in " + " and ".join(unknown))
@@ -759,7 +767,7 @@ def compare(args):
         fail("--arms needs --best-of")
     if best_of:
         arms = resolve_arms(base, cand, best_of, arms, within)
-    reasons = [] if within else incompatibilities(base, cand)
+    reasons = [] if within else incompatibilities(base, cand, toolchain=not best_of)
     if best_of:
         # every arm that takes part ran a binary of one known toolchain; the arms of one
         # binary share its toolchain

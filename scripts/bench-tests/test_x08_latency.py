@@ -32,6 +32,46 @@ def combine(*args):
                           capture_output=True, text=True)
 
 
+def answers(*args):
+    return subprocess.run([sys.executable, str(GATES / "answers.py"), *map(str, args)], capture_output=True, text=True)
+
+
+class AnswersTests(unittest.TestCase):
+    def run_dir(self, root, name, query, rows):
+        d = Path(root) / name
+        (d / "results").mkdir(parents=True)
+        (d / "queries").mkdir()
+        (d / "queries" / "q.rq").write_text(query)
+        samples = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+        warm, untimed = [], []
+        for e, v in ((1, "A"), (2, "B")):
+            samples.append(f"1\t{e}\t{v}\tq\t1\t0.1\t1")
+            untimed.append(f"{v}\tq\t1\t{rows[v]}\tdistinct:1 schema:ab")
+            warm.append(f"{e}\t{v}\tq\t1\t1 rows, schema ab, distinct 1, {rows[v]}")
+        (d / "results" / "samples.tsv").write_text("\n".join(samples) + "\n")
+        (d / "results" / "answers.tsv").write_text("\n".join(untimed) + "\n")
+        (d / "results" / "warm-answers.tsv").write_text("\n".join(warm) + "\n")
+        return d
+
+    def test_an_unordered_limit_may_return_other_rows(self):
+        with tempfile.TemporaryDirectory() as d:
+            q = "SELECT ?s WHERE { ?s <urn:p> <urn:o> } LIMIT 1"
+            run = self.run_dir(d, "r", q, {"A": "x", "B": "y"})
+            r = answers("--queries", "q", run)
+            self.assertEqual(r.returncode, 0, r.stdout)
+            run = self.run_dir(d, "s", "SELECT ?s WHERE { ?s <urn:p> <urn:o> }", {"A": "x", "B": "y"})
+            r = answers("--queries", "q", run)
+            self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_a_staged_query_missing_from_every_run_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = self.run_dir(d, "r", "ASK {}", {"A": "x", "B": "x"})
+            self.assertEqual(answers("--queries", "q", run).returncode, 0)
+            r = answers("--queries", "q other", run)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("other queries than those staged", r.stdout)
+
+
 class CombineTests(unittest.TestCase):
     def test_base_and_tip_labels_estimate_the_tip_over_the_base(self):
         with tempfile.TemporaryDirectory() as d:
@@ -60,7 +100,8 @@ class CombineTests(unittest.TestCase):
                      "needs taskset, chrt, zstd, curl and five CPUs")
 class LatencyTests(unittest.TestCase):
     def work(self, d):
-        w = Path(d) / "work"
+        # a space in the path, which the digest commands must survive
+        w = Path(d) / "work dir"
         (w / "queries").mkdir(parents=True)
         (w / "queries" / "count-all.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
         (w / "data.nt.zst").write_bytes(subprocess.run(["zstd", "-q", "-c"], input=b"", capture_output=True).stdout)
@@ -97,6 +138,7 @@ class LatencyTests(unittest.TestCase):
             self.assertEqual(seen["same"], {("stores/A", "tip", "tip", "-"), ("stores/B", "tip", "tip", "-")})
             self.assertIn("execution eager", (w / "runs-manifest.txt").read_text())
             self.assertIn("the answers agree", r.stdout)
+            self.assertIn("diagnostic run (--force)", r.stdout)
             # each binary loaded its own store, and the run against itself one
             for run, stores in (("tip-second", ["A", "B"]), ("tip-first", ["A", "B"]), ("same", ["A"])):
                 loads = (w / "runs" / run / "results" / "load.tsv").read_text().splitlines()
@@ -130,15 +172,22 @@ class LatencyTests(unittest.TestCase):
             r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", "/bin/true", d],
                                capture_output=True, text=True)
             self.assertIn("needs --base and --tip", r.stderr)
-            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", "/bin/true", "--tip", "/bin/true",
-                                "--rounds", "4", d], capture_output=True, text=True)
+            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--force", "--base", "/bin/true", "--tip",
+                                "/bin/true", "--rounds", "4", d], capture_output=True, text=True)
             self.assertIn("at least 10 rounds", r.stderr)
             w, bins = self.work(d)
             r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", bins["base"], "--tip", bins["tip"], w],
                                capture_output=True, text=True)
             self.assertIn("names no compilers", r.stderr)
+            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", "/bin/true", "--tip", "/bin/true", w],
+                               capture_output=True, text=True)
+            self.assertIn("needs --base-build-config and --tip-build-config", r.stderr)
+            (Path(d) / "count-all.rq").write_text("ASK {}")
+            hidden = Path(d) / ".hidden.rq"
+            hidden.write_text("ASK {}")
             for q, message in (("/no/such.rq", "no query file"), (f"{bins['tip']}", "must end in .rq"),
-                               (f"count-all {w}/queries/count-all.rq", "two queries are named count-all")):
+                               (str(hidden), "must start with a letter or digit"),
+                               (f"count-all {d}/count-all.rq", "two queries are named count-all")):
                 r = subprocess.run(["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"],
                                     "--queries", q, w], capture_output=True, text=True)
                 self.assertIn(message, r.stderr)

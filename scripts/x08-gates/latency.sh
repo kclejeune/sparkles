@@ -31,7 +31,8 @@
 #   --port P            the server port (default 4171)
 #   --base-build-config J, --tip-build-config J   the output of `scripts/bench-gate.py
 #                       build-config` in each binary's build environment
-#   --force             run two binaries of different compilers or build configurations
+#   --force             a diagnostic run of binaries whose compilers or build
+#                       configurations differ or are unknown, which decides nothing
 #
 # Run it on a quiet host while holding the host's benchmark lock. It pins the servers to
 # CPU 2 and the client to CPU 4, with one Rayon thread.
@@ -83,7 +84,9 @@ if [[ ${1:-} == --* ]]; then
       die "a binary names no compilers in its .comment section; pass --force to run anyway"
     [ "$BASE_COMPILERS" = "$TIP_COMPILERS" ] ||
       die "the base was built by $BASE_COMPILERS and the tip by $TIP_COMPILERS; pass --force to run anyway"
-    [ -z "$BASE_CONFIG" ] || [ -z "$TIP_CONFIG" ] || [ "$BASE_CONFIG" = "$TIP_CONFIG" ] ||
+    [ -n "$BASE_CONFIG" ] && [ -n "$TIP_CONFIG" ] ||
+      die "a decisive run needs --base-build-config and --tip-build-config; pass --force for a diagnostic run"
+    [ "$BASE_CONFIG" = "$TIP_CONFIG" ] ||
       die "the base and the tip have different build configurations; pass --force to run anyway"
   fi
 else
@@ -109,6 +112,7 @@ for q in "${QUERIES[@]}"; do
     [ -f "$src" ] || die "no query $q in $W/queries"
   fi
   n=$(basename "$src")
+  [[ $n =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*\.rq$ ]] || die "a query file name must start with a letter or digit: $n"
   [[ $names != *" $n "* ]] || die "two queries are named ${n%.rq}"
   names+="$n "
   SOURCES+=("$src")
@@ -120,6 +124,9 @@ run() { # <name> <binary A> <binary B> <env lines>
   mkdir -p "$d/queries"
   for src in "${SOURCES[@]}"; do cp "$src" "$d/queries/"; done
   [ "$(find "$d/queries" -name '*.rq' | wc -l)" = ${#SOURCES[@]} ] || die "$1: the staged queries do not match"
+  # the answer digests run from the run's directory, so no path of the checkout is split
+  mkdir -p "$d/tools"
+  cp "$ROOT/scripts/bench-gate.py" "$ROOT/scripts/bench-answers.py" "$d/tools/"
   zstd -q -1 -f "$2" -o "$d/bin-A.zst"
   zstd -q -1 -f "$3" -o "$d/bin-B.zst"
   ln -s "$W/data.nt.zst" "$d/data.nt.zst"
@@ -167,9 +174,10 @@ else
     [ -z "$BASE_CONFIG" ] || echo "base build config: $BASE_CONFIG"
     [ -z "$TIP_CONFIG" ] || echo "tip build config: $TIP_CONFIG"
     echo "host: $(hostname), $ROUNDS rounds, $REPS timed requests, queries ${SOURCES[*]}"
+    [ -z "$FORCE" ] || echo "diagnostic: --force, so the result decides nothing"
   } | tee "$W/runs-manifest.txt"
-  digests="ORDER_DIGEST=\"python3 $ROOT/scripts/bench-gate.py order-digest --data data.nt\"
-WARM_DIGEST=\"python3 $ROOT/scripts/bench-gate.py native-digest --data data.nt\""
+  digests="ORDER_DIGEST=\"python3 tools/bench-gate.py order-digest --data data.nt\"
+WARM_DIGEST=\"python3 tools/bench-gate.py native-digest --data data.nt\""
   run tip-second "$BASE" "$TIP" "EXECUTION=$BASE_EXEC,$TIP_EXEC
 $digests"
   run tip-first "$TIP" "$BASE" "EXECUTION=$TIP_EXEC,$BASE_EXEC
@@ -178,8 +186,11 @@ $digests"
 SHARE_STORE=1
 $digests"
   status=0
-  python3 "$HERE/answers.py" "$W/runs/tip-second" "$W/runs/tip-first" "$W/runs/same" || status=1
+  expected=""
+  for src in "${SOURCES[@]}"; do expected+="${expected:+ }$(basename "$src" .rq)"; done
+  python3 "$HERE/answers.py" --queries "$expected" "$W/runs/tip-second" "$W/runs/tip-first" "$W/runs/same" || status=1
   python3 "$HERE/combine.py" --labels base,tip "$W/runs/tip-second/results/samples.tsv" \
     "$W/runs/tip-first/results/samples.tsv" "$W/runs/same/results/samples.tsv" || status=1
+  [ -z "$FORCE" ] || echo "diagnostic run (--force): the binaries' toolchains were not checked, so this decides nothing"
   exit $status
 fi

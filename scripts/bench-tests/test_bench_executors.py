@@ -201,6 +201,41 @@ class RemoteRunnerTests(unittest.TestCase):
         self.assertEqual(loads, ["A", "B", "C"])
 
 
+class TimedDigestTests(unittest.TestCase):
+    def run_dir(self, d, warm):
+        root = Path(d) / "run"
+        res = root / "people-100000-threads-1" / "results"
+        res.mkdir(parents=True)
+        (root / "manifest.txt").write_text("host: atlas\narms: A=base-eager B=tip-default\n")
+        lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+        for e, v in ((1, "A"), (2, "B")):
+            for rep in (1, 2):
+                lines.append(f"1\t{e}\t{v}\tq\t{rep}\t1\t2")
+        res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+        res.joinpath("answers.tsv").write_text("A\tq\t1\tx\nB\tq\t1\tx\n")
+        res.joinpath("warm-answers.tsv").write_text("".join("\t".join(r) + "\n" for r in warm))
+        out = Path(d) / "record.json"
+        r = gate("executors", root, "--out", out)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        return {c["name"]: c["ok"] for c in json.loads(out.read_text())["checks"]}
+
+    def test_every_timed_request_needs_its_own_digest(self):
+        with tempfile.TemporaryDirectory() as d:
+            full = [(str(e), v, "q", str(rep), "1 rows, h") for e, v in ((1, "A"), (2, "B")) for rep in (1, 2)]
+            self.assertTrue(self.run_dir(d, full)["1.05m-1t/q/timed-answers"])
+        with tempfile.TemporaryDirectory() as d:
+            # one digest per server process does not cover its requests
+            checks = self.run_dir(d, [("1", "A", "q", "1 rows, h"), ("2", "B", "q", "1 rows, h")])
+            self.assertFalse(checks["1.05m-1t/q/timed-answers"])
+            self.assertFalse(checks["1.05m-1t/warm-answers"])
+        with tempfile.TemporaryDirectory() as d:
+            checks = self.run_dir(d, full[:3])
+            self.assertFalse(checks["1.05m-1t/q/timed-answers"])
+        with tempfile.TemporaryDirectory() as d:
+            checks = self.run_dir(d, full + [("1", "A", "other", "1", "1 rows, h")])
+            self.assertFalse(checks["1.05m-1t/warm-answers"])
+
+
 class BestOfTests(unittest.TestCase):
     def record(self, d, name, metrics, manifest=None):
         manifest = dict(manifest or {"compilers": "rustc 1", "build_config": "{}", "base_compilers": "rustc 1",
@@ -325,6 +360,16 @@ class BestOfTests(unittest.TestCase):
             self.assertIn("| c/eager/q/exec | 4 | 4.1 | 1.025 |  | streaming |", r.stdout)
             new = self.record(d, "new", {"c/eager/q/exec": 4.3, "c/streaming/q/exec": 4.0}, m)
             self.assertEqual(gate("compare", old, new, "--best-of", "eager,streaming").returncode, 1)
+
+    def test_across_records_only_the_scored_arms_toolchains_count(self):
+        with tempfile.TemporaryDirectory() as d:
+            four = self.record(d, "four", {"c/base-eager/q/exec": 1.0, "c/base-streaming/q/exec": 1.0},
+                               {"compilers": "rustc 2", "build_config": "{}", "base_compilers": "rustc 1",
+                                "base_build_config": "{}", "base_binary": "b",
+                                "arms": ["base-eager", "base-streaming", "tip-default"]})
+            later = self.record(d, "later", {"c/eager/q/exec": 1.0}, {"compilers": "rustc 1", "build_config": "{}"})
+            r = gate("compare", four, later, "--best-of", "base-eager,base-streaming", "--arms", "eager")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_compare_without_a_candidate_needs_best_of(self):
         with tempfile.TemporaryDirectory() as d:

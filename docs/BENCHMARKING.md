@@ -1090,9 +1090,12 @@ server by default. `--base-execution` and `--tip-execution` set each binary's ex
 field, and `--queries` takes names from `WORK/queries` or paths to other query files,
 such as ASK shapes, whose file names must differ. Each run checks the untimed TSV answer
 of each binary and a digest of every timed native answer, and `answers.py` fails the gate
-when they disagree. The script refuses two binaries of different compilers or build
-configurations, given with `--base-build-config` and `--tip-build-config`, unless
-`--force` is given, and each run starts the servers from a cleared environment.
+when they disagree. For a LIMIT without ORDER BY only the row count, the schema and the
+number of distinct rows must agree. A decisive run needs both binaries' build
+configurations, given with `--base-build-config` and `--tip-build-config`, and refuses
+binaries of different or unknown compilers or configurations. `--force` makes the run a
+diagnostic one that says it decides nothing. Each run starts the servers from a cleared
+environment.
 `combine.py --labels base,tip` estimates the tip's time over the
 base's with the position bias cancelled. A query passes when the upper end of the ratio's
 95% interval is at most 1.02 or its median added time is at most 0.5 µs.

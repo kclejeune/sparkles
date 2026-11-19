@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """The answer checks of latency.sh's base-and-tip form over its runs.
 
-usage: answers.py RUN_DIR...
+usage: answers.py --queries "q ..." RUN_DIR...
 
 Each RUN_DIR holds the results of one scripts/nsc-bench-remote.sh run with ORDER_DIGEST
 and WARM_DIGEST set. Every variant of every run must give each query one untimed TSV
 answer, the same rows and order digest as every other, and every timed request of every
 variant must have exactly one native digest, the same for all of a query's requests,
-whose row count matches the TSV answer. The check fails when a run holds other queries
-than the first, or when any file is missing.
+whose row count matches the TSV answer. A LIMIT without ORDER BY may return other rows in
+each answer, so for it only the row count, the schema and the number of distinct rows must
+agree. The check fails when a run holds other queries than --queries names, or when any
+file is missing.
 """
 
 import re
@@ -25,21 +27,26 @@ def tsv(path, problems):
 
 
 def main():
-    runs = [Path(a) for a in sys.argv[1:]]
-    if not runs:
+    args = sys.argv[1:]
+    if args[:1] != ["--queries"] or len(args) < 3:
         sys.exit(__doc__)
+    inventory = set(args[1].split())
+    runs = [Path(a) for a in args[2:]]
     problems = []
     untimed = defaultdict(set)
     timed = defaultdict(set)
-    inventory = None
+    unordered = set()
+    for q in inventory:
+        f = runs[0] / "queries" / f"{q}.rq"
+        text = f.read_text().upper() if f.exists() else ""
+        if re.search(r"\bLIMIT\b", text) and not re.search(r"\bORDER\s+BY\b", text):
+            unordered.add(q)
     for run in runs:
         res = run / "results"
         samples = tsv(res / "samples.tsv", problems)[1:]
         queries = {r[3] for r in samples}
-        if inventory is None:
-            inventory = queries
-        elif queries != inventory:
-            problems.append(f"{run.name} holds other queries: {sorted(queries ^ inventory)}")
+        if queries != inventory:
+            problems.append(f"{run.name} holds other queries than those staged: {sorted(queries ^ inventory)}")
         variants = {r[2] for r in samples}
         seen = defaultdict(set)
         for r in tsv(res / "answers.tsv", problems):
@@ -49,7 +56,11 @@ def main():
             seen[q].add(v)
             if "error" in r[2:4]:
                 problems.append(f"{run.name}: {q} failed in {v}")
-            untimed[q].add(tuple(r[2:]))
+            if re.search(r"missing:(?!0\b)\d+", "\t".join(r[4:])):
+                problems.append(f"{run.name}: {q} returned rows of {v} that are not triples of the input")
+            # the rows and the order digest, or for an unordered LIMIT the row count and the
+            # distinct rows and schema of the order digest
+            untimed[q].add((r[2],) + tuple(r[4:5]) if q in unordered else tuple(r[2:]))
         for q in queries:
             if seen[q] != variants:
                 problems.append(f"{run.name}: {q} lacks an untimed answer of {sorted(variants - seen[q])}")
@@ -60,14 +71,14 @@ def main():
                 problems.append(f"{run.name}: a timed digest names no repetition")
                 continue
             got[(r[0], r[1], r[2], r[3])] += 1
-            timed[r[2]].add(r[4])
+            timed[r[2]].add(",".join(r[4].split(",")[:3]) if r[2] in unordered else r[4])
         lacking = want - set(got)
         if lacking:
             problems.append(f"{run.name}: {len(lacking)} timed requests have no digest")
         extra = set(got) - want
         if extra or any(n > 1 for n in got.values()):
             problems.append(f"{run.name}: timed digests of no timed request or repeated")
-    for q in sorted(inventory or ()):
+    for q in sorted(inventory):
         if len(untimed[q]) != 1:
             problems.append(f"{q}: the untimed answers differ: {sorted(untimed[q])}")
         digests = timed[q]
