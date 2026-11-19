@@ -197,7 +197,7 @@ results separately from conversation events.
 | Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
 | Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
 | Easy, nearly trivial tasks and the execution of a plan that fixes every step | GPT-6.1 Terra or Claude Sonnet 5.5 |
-| Code review and finding validation | Prefer GPT-6.1 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
+| Code review and finding validation | Prefer GPT-6.2 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
 | Mechanical tasks with an exact rule | A plain script. |
 | Easy tasks that need a lot of context, such as exploration, broad file scans, searches across many files and log triage | Claude Haiku 5.5 or GPT-6 Luna. |
 
@@ -280,7 +280,7 @@ No lane lands without review, and each step picks its model from the table above
 1. **An independent agent reviews.** `scripts/codex-review.sh NAME TIP BASE "CONTEXT"`
    runs `codex exec review` on `BASE..TIP` in a scratch worktree and writes `review.md`
    under `$AUDIT_DIR/NAME` (default `.artifacts/audits`). CONTEXT names the roadmap item,
-   the specs and what the work was meant to do. The script defaults to Sol at high effort,
+   the specs and what the work was meant to do. The script defaults to GPT-6.2 Sol at high effort,
    and `CODEX_REVIEW_MODEL` and `CODEX_REVIEW_REASONING_EFFORT` select another choice.
 2. **A capable agent validates and plans.** The validating agent checks every finding
    independently and reproduces it where it can. It marks each one confirmed, refuted or
