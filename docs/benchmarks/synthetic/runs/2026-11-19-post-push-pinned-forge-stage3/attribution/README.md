@@ -2,9 +2,11 @@
 
 These files were made on the laptop, an Intel Core Ultra X7 358H whose performance cores are
 CPUs 0 to 3, while it carried other work. They locate and name costs and do not size them.
-For each rerun, create a fresh scratch directory and set `L` in copies of the
-archived scripts to its absolute path. Each profile replaces its output directory, and
-the count ladders write new logs under `L`. Stage the recorded dataset and query files
+For each rerun, use `mktemp -d /tmp/sparkles-forge-attribution.XXXXXXXX` to create a
+fresh scratch directory. Set `L` in copies of the archived scripts to the path it
+prints, and quote path expansions in those copies, including the profile's
+`rm -rf -- "$d"`. Each profile replaces its output directory, and the count ladders
+write new logs under `L`. Stage the recorded dataset and query files
 under `$L/insn` and the matrix binaries under `$L/bin`. The two screen ladders use
 `~/.cache/sparkles-nsc/bin/<full-revision>/sparkles`. In all three ladders, set `W` to the
 absolute path of the source worktree containing `scripts/request-insn.py`. Set the perf
