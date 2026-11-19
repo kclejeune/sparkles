@@ -521,6 +521,7 @@ pub(super) struct SparqlQueryArgs {
     reasoning: Option<ReasoningArg>,
     reasoning_profile: Option<String>,
     max_derived: Option<u64>,
+    aggregate_errors: Option<sparkles::sparql::AggregateErrors>,
     at_commit: Option<u64>,
     at: Option<Value>,
 }
@@ -1358,6 +1359,9 @@ impl Tools<'_> {
             a.max_derived,
             &mut opts,
         )?;
+        if let Some(m) = a.aggregate_errors {
+            opts.aggregate_errors = Some(m);
+        }
         opts.initial_bindings = bindings;
         let request = self
             .call

@@ -631,6 +631,7 @@ impl viewsvc::ViewSource for PolicyView {
             columns: vec!["x".into()],
             rows: vec![(vec![Some(oxrdf::Literal::from(7).into())], 1)],
             commit: read.at,
+            evaluated_under: None,
         })
     }
 }

@@ -133,8 +133,9 @@ was measured and not adopted, and item 939 orders rule bodies from sampled bindi
 instead. The reasoner also records witnesses for F18 under item 416.
 The columnar derived tier, the first phase of the core, is built under item 835. The
 SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its maintenance in
-item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core, the first
-phase of item 839, is built, and the engine does not evaluate it. The other core and
+item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core is built under
+item 839, with its evaluation by strata, maintenance, explanations, witnesses, demand and
+the rule frontend, and its restricted chase and planner over relations remain. The other core and
 convergence phases remain under [item 456](../../ROADMAP.md).
 
 ### Columnar derived tier
@@ -352,8 +353,7 @@ stratum, and one with a negation by strata, each to its fixpoint before the next
 limits of inferred facts and iterations counted across the strata and a warning for each
 Jena rule whose `noValue` is read by strata. Rules that read lists are replayed when list
 cells arrive, so a list cell can be an instance's only new premise. No frontend produces
-relations yet, so only the reasoner's tests reach this path and the ones below, and demand,
-why-not answers and explanations over the demand engine follow in a later step. On about 800 random programs
+relations yet, so only the reasoner's tests reach this path and the ones below. On about 800 random programs
 that stratify, over relations of arities zero to five, triple atoms, recursion and negated
 atoms with wildcards, the runs equal a naive stratified evaluator, and the decoded facts of
 a recursive program over tails are the same at 1, 4 and 16 threads. Full runs of the
@@ -384,6 +384,47 @@ pass through relation facts as through derived triples and count only triples, a
 negated atom makes a rule's supports unknown, as `noValue` does. On 300 random
 programs over relations of arities zero to five, histories of six insertions and
 deletions each give a full run's closure at every step, kept in memory and read back.
+
+Query-time demand reads a lowered program as it reads Jena rules, with a relation atom as a
+triple atom over its key. A key never unifies with a predicate that is not a constant, so a
+rule whose head has a variable predicate never answers a demand on a relation, and an atom
+with a variable predicate never asks for one. A negated atom is staged below its rule as
+`noValue` is, and a lower stage completes the negated relation or triple pattern with its
+constants bound, apart from the constants of a tail, which narrow nothing. Magic rules leave
+out the builtin that interns a head's tail, and a program with relations or negated atoms
+reads a list again when its cells arrive, in every stage, as its full run does. A demand
+binds only the first column of a relation of arity three or more, so a demand whose bound
+values are in the tail asks for every fact of the relation until roadmap item 1004 orders
+the tail columns. On about 390 random programs over
+relations of arities zero to five with negated atoms, sessions for random patterns give
+facts of the full run and every fact of the full run that the pattern matches, and the demand
+programs of the built-in profiles are unchanged rule for rule. Demand explanations show
+relation nodes as explanations of a closure do. Why-not answers never offer a relation fact
+as a missing fact, since none can be asserted. They unfold a missing relation fact from its
+whole tuple once the instance binds its columns, and name a negated relation that blocks an
+instance as the rule wrote it, with no fact.
+
+The rule frontend reads C24 §6.2's subset in rule texts. `parser.rs` gives `.decl`,
+relation atoms, `not` and `head :- body.` clauses their own clause kinds, and
+`engine/frontend.rs` compiles a text that uses them into one program, its included rule
+sets and vocabularies with it. Its Jena rules compile exactly as the Jena compiler
+compiles them, with the same warnings and skips, and its rules keep their names, lines
+and variable names for explanations. Materialization, incremental maintenance, witnesses,
+explanations, query-time sessions and why-not answers take the program whenever the text
+uses relations or `not`, and every other text takes the paths it took before, so the
+demand programs and closures of the built-in profiles do not change. A program's
+sessions keep demand tables in the cache under the digest of the rule text, and a negated
+triple makes the changes to its pattern relevant to their reuse. A program with an
+existential head is refused until the chase exists, and one that includes the OWL rule
+sets is refused until roadmap item 1109 shows that the program path agrees with the Jena
+path on them.
+
+The cost probe of Phase 4 decided the column order. Over 40 disjoint paths of six
+properties, a demand on the chain's triple derives 7 facts with its subject bound and 481
+with its object bound when the relation is `chain(x, list, i, y)`, 481 for both when the
+list comes first, and 1 for both with one rule of that length. Rule programs therefore
+write the subject first, and `owl-rl` keeps its chain and key rules per length until a
+demand can bind a later column (roadmap items 1102 and 517).
 
 ### SHACL rules and SPIN
 

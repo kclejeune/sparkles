@@ -60,8 +60,8 @@ pub use schema::{
     schema_error_of,
 };
 pub use settings::{
-    ChangeLogSetting, CompactionSetting, DescribeSetting, HistorySettings, HistoryUpdate,
-    QuotaSetting, RetentionSetting, Settings,
+    AggregateErrorsSetting, AggregateErrorsStatus, ChangeLogSetting, CompactionSetting,
+    DescribeSetting, HistorySettings, HistoryUpdate, QuotaSetting, RetentionSetting, Settings,
 };
 pub use settings::{
     CompactionReadings, CompactionState, CompactionStatus, DescribeStatus, SettingSource,

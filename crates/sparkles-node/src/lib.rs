@@ -222,6 +222,11 @@ fn query_options(v: &Value, flag: Arc<AtomicBool>) -> sparkles::Result<QueryOpti
         o.describe = serde_json::from_value(v["describe"].clone())
             .map_err(|e| EngineError::invalid(e.to_string()))?;
     }
+    if let Some(m) = v["aggregateErrors"].as_str() {
+        o.aggregate_errors = Some(m.parse()?);
+    } else if !v["aggregateErrors"].is_null() {
+        return Err(EngineError::invalid("aggregateErrors must be a string"));
+    }
     if let Some(p) = v["prefixes"].as_object() {
         for (k, val) in p {
             o.prefixes.push((

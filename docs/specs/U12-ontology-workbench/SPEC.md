@@ -1073,7 +1073,14 @@ or OWL RL producer. The hierarchy reduces transitive closure edges between equiv
 groups. Regions at one displayed revision share a producer pin and refuse replacement,
 while source and entity changes abort and discard prior reads. Missing or stale sources
 remain visible failures and never start implicit computation. Actual inferred-graph
-provenance and duplicate asserted facts are shown. Profile completeness, consistency and
+provenance and duplicate asserted facts are shown. Item 622 groups the rows of the separate
+read-only materialized region under the frame's clause keywords in Manchester syntax, with
+an Inferred badge per row and
+linked names whose labels come from the same pinned read, and characteristics in a
+Characteristics clause. Self-subsumptions, types and superclasses of `owl:Thing` or
+`rdfs:Resource` and subproperty relations to the top property of the same kind are counted
+instead of listed. Annotations, declarations and other rows that no clause takes keep their
+functional-style form. Profile completeness, consistency and
 arbitrary-axiom explanations remain unknown or unavailable. General classifier-backed
 entailments and matching F24 justifications remain in items 588, 622 and 609. The existing
 mapper and exact-total scans can cost more than a page's output size, and this phase

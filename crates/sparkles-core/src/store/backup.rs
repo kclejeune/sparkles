@@ -1386,8 +1386,10 @@ const APPEND_FILES: [&str; 2] = ["wal.log", "delta.vocab"];
 
 /// Meta files at the root, besides `CURRENT`, `dataset.json` and `prefixes.json`, that a
 /// backup holds when present.
-const OPTIONAL_META: [&str; 14] = [
+const OPTIONAL_META: [&str; 16] = [
     crate::annotations::FILE,
+    super::describe::DESCRIBE_FILE,
+    super::aggregates::AGGREGATE_ERRORS_FILE,
     super::REMOVED_PREFIXES_FILE,
     "text.json",
     "geo.json",
@@ -1798,6 +1800,22 @@ impl Store {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => return Err(e.into()),
                 }
+            }
+        } else {
+            // an in-memory store keeps these settings in memory: the capture holds the
+            // files a persistent store would write for them
+            let describe = self.describe_settings();
+            if !describe.is_default() {
+                files.push(meta_file(
+                    super::describe::DESCRIBE_FILE,
+                    super::describe::settings_bytes(&describe),
+                ));
+            }
+            if let Some(m) = self.aggregate_errors_setting() {
+                files.push(meta_file(
+                    super::aggregates::AGGREGATE_ERRORS_FILE,
+                    super::aggregates::setting_bytes(m),
+                ));
             }
         }
         report(1.0, "built");

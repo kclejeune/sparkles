@@ -1051,6 +1051,21 @@ python = "Dataset.schema.report"
 jvm = "DatasetGraphSparkles.schema().report"
 node = "Dataset.schema.report"
 
+["settings.aggregate_errors.get"]
+python = "Dataset.settings.aggregate_errors.get"
+jvm = "DatasetGraphSparkles.settings().aggregateErrors().get"
+node = "Dataset.settings.aggregateErrors.get"
+
+["settings.aggregate_errors.reset"]
+python = "Dataset.settings.aggregate_errors.reset"
+jvm = "DatasetGraphSparkles.settings().aggregateErrors().reset"
+node = "Dataset.settings.aggregateErrors.reset"
+
+["settings.aggregate_errors.set"]
+python = "Dataset.settings.aggregate_errors.set"
+jvm = "DatasetGraphSparkles.settings().aggregateErrors().set"
+node = "Dataset.settings.aggregateErrors.set"
+
 ["settings.compaction.get"]
 python = "Dataset.settings.compaction.get"
 jvm = "DatasetGraphSparkles.settings().compaction().get"

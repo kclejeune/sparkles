@@ -155,7 +155,7 @@ fn p4_prev_is_a_precondition_within_the_dataset() {
 
 #[test]
 fn leading_prev_dry_run_preserves_precondition_preview() {
-    for bulk_threshold in [1, u64::MAX] {
+    for bulk_threshold in [0, u64::MAX] {
         let opts = StoreOptions {
             bulk_threshold,
             ..Default::default()

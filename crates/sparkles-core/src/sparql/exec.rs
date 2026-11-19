@@ -1380,6 +1380,18 @@ fn run_node<'ctx>(
             let t = child(0, infos)?;
             let (t, pre) = order_by(ctx, t, keys, *limit, &mut expr_report)?;
             note = pre;
+            let exprs: Vec<Expr> = keys
+                .iter()
+                .filter(|(e, _)| e.has_exists())
+                .map(|(e, _)| e.clone())
+                .collect();
+            if !exprs.is_empty() {
+                let (exists, c) = super::exists::explain(ctx, &exprs);
+                if let Some(x) = exists {
+                    note = Some(note.map_or(x.clone(), |n| format!("{n} {x}")));
+                }
+                counters = merge_counters(counters, c);
+            }
             t
         }
         Kind::Project(vars) => {
@@ -1446,7 +1458,21 @@ fn run_node<'ctx>(
         }
         Kind::Group { keys, aggs } => {
             let t = child(0, infos)?;
-            group_or_spill(ctx, n, t, keys, aggs, &mut expr_report, &mut note)?
+            let out = group_or_spill(ctx, n, t, keys, aggs, &mut expr_report, &mut note)?;
+            let exprs: Vec<Expr> = aggs
+                .iter()
+                .filter_map(|(_, agg)| agg.expr.as_ref())
+                .filter(|e| e.has_exists())
+                .cloned()
+                .collect();
+            if !exprs.is_empty() {
+                let (exists, c) = super::exists::explain(ctx, &exprs);
+                if let Some(x) = exists {
+                    note = Some(note.map_or(x.clone(), |n| format!("{n} {x}")));
+                }
+                counters = merge_counters(counters, c);
+            }
+            out
         }
         Kind::Path {
             spec,
@@ -5334,12 +5360,18 @@ fn decode_for(ctx: &Ctx, t: &Table, exprs: &[&Expr]) -> Result<Option<Decoded>> 
     if t.len() < 2 || !exprs.iter().any(|e| super::expr::needs_values(e)) {
         return Ok(None);
     }
+    // Only the variables whose values the rows read. A column that the expressions
+    // answer from ids, such as `?p = ex:a` or an EXISTS pattern's key, costs a decode of
+    // every distinct term and gains nothing.
     let mut vars = Vec::new();
     for e in exprs {
-        e.vars(&mut vars);
+        super::expr::value_vars(e, ctx, &mut vars);
     }
     vars.sort_unstable();
     vars.dedup();
+    if vars.is_empty() {
+        return Ok(None);
+    }
     if t.len() < 4096 {
         // The rows are evaluated one at a time, each reading the terms it needs. On a
         // cold vocabulary every term is a page fault that waits for the one before it.
@@ -5530,6 +5562,8 @@ fn evaluate_mask(
     dec: Option<&super::expr::DecodedCols>,
 ) -> Result<Vec<bool>> {
     let t0 = Instant::now();
+    let nested = super::exists::nested(ctx, t, &exprs.iter().collect::<Vec<_>>())?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let test = |i: usize| {
         let row = Row {
@@ -5537,6 +5571,7 @@ fn evaluate_mask(
             i,
             map: &map,
             dec,
+            exists,
         };
         exprs.iter().all(|e| ebv(e, &row, ctx).unwrap_or(false))
     };
@@ -5618,6 +5653,7 @@ fn string_order_mask(
             i,
             map: &map,
             dec: None,
+            exists: None,
         };
         ebv(expr, &row, ctx).unwrap_or(false)
     };
@@ -5691,6 +5727,8 @@ pub(super) fn compute_column(
 }
 
 fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let dec = decode_for(ctx, t, &[e])?;
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| match eval(
@@ -5700,6 +5738,7 @@ fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
             i,
             map: &map,
             dec: Decoded::cols(&dec),
+            exists,
         },
         ctx,
     ) {
@@ -5983,6 +6022,9 @@ pub(super) fn offer_rows<P>(
             _ => HeapKey::Expr(e),
         });
     }
+    let later: Vec<&Expr> = keys.iter().skip(1).map(|(e, _)| e).collect();
+    let nested = super::exists::nested(ctx, t, &later)?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let key_of = |i: usize, k: usize| -> SortKey {
         match &sources[k] {
@@ -5997,6 +6039,7 @@ pub(super) fn offer_rows<P>(
                         i,
                         map: &map,
                         dec: None,
+                        exists,
                     },
                     ctx,
                 )
@@ -6140,6 +6183,8 @@ fn key_rows(
     e: &Expr,
     dec: Option<&super::expr::DecodedCols>,
 ) -> Result<Vec<Option<Value>>> {
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let f = |i: usize| {
         eval(
@@ -6149,6 +6194,7 @@ fn key_rows(
                 i,
                 map: &map,
                 dec,
+                exists,
             },
             ctx,
         )
@@ -6214,6 +6260,8 @@ fn key_rows_charged(
     e: &Expr,
 ) -> Result<super::exprcache::Column<Option<Value>>> {
     let _map_charge = ctx.charge(ctx.nvars() as u64 * 16 + 128)?;
+    let nested = super::exists::nested(ctx, t, &[e])?;
+    let exists = nested.as_ref().map(|n| &n.answers);
     let map = t.var_map(ctx.nvars());
     let mut bytes = t.len() as u64 * std::mem::size_of::<Option<Value>>() as u64 + 128;
     let mut charge = ctx.retained_charge(bytes)?;
@@ -6232,6 +6280,7 @@ fn key_rows_charged(
                 i,
                 map: &map,
                 dec: None,
+                exists,
             },
             ctx,
         )
@@ -6494,17 +6543,22 @@ pub(super) enum AggState {
     /// COUNT(*) / COUNT(?v): rows / bound values
     Count(u64),
     /// SUM / AVG: an exact integer sum while every value is an inline integer, then the
-    /// generic numeric sum; `None` once a value was unbound or not numeric. The integer
-    /// sum is held in an `i128`, so that a sum whose result fits an `xsd:integer` is found
-    /// whatever the order of its rows, and only the result is checked
+    /// generic numeric sum; `ok` is false once a value was unbound or not numeric. The
+    /// integer sum is held in an `i128`, so that a sum whose result fits an
+    /// `xsd:integer` is found whatever the order of its rows, and only the result is
+    /// checked. `errs` counts the rows whose argument was an error, apart from values
+    /// that are not numbers, for the reading in which AVG over only errors is zero.
     Sum {
         int: i128,
         generic: Option<Value>,
         ok: bool,
         rows: u64,
+        errs: u64,
     },
-    /// MIN / MAX: the best id and its value
-    Best(Option<Id>, Option<Value>),
+    /// MIN / MAX: the best id and its value, and the count of arguments that were
+    /// errors, which some readings make the result unbound (see
+    /// [`super::AggregateErrors`])
+    Best(Option<Id>, Option<Value>, u64),
     Sample(Option<Id>),
     /// ARQ's variance and deviation aggregates
     Stat(super::aggext::Arq, super::aggext::StatAcc),
@@ -6521,8 +6575,9 @@ impl AggState {
                 generic: None,
                 ok: true,
                 rows: 0,
+                errs: 0,
             },
-            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None),
+            AggregateFunction::Min | AggregateFunction::Max => AggState::Best(None, None, 0),
             AggregateFunction::Sample => AggState::Sample(None),
             _ => AggState::Count(0),
         }
@@ -6538,9 +6593,11 @@ impl AggState {
                 generic,
                 ok,
                 rows,
+                errs,
             } => {
                 *rows += 1;
                 let id = id.unwrap_or(Id::UNDEF);
+                *errs += u64::from(id.is_undef());
                 if !*ok {
                     return;
                 }
@@ -6572,8 +6629,9 @@ impl AggState {
                     None => *ok = false,
                 }
             }
-            AggState::Best(best, best_v) => {
+            AggState::Best(best, best_v, errs) => {
                 let Some(id) = id.filter(|id| !id.is_undef()) else {
+                    *errs += 1;
                     return;
                 };
                 let v = ctx.value(id);
@@ -6616,15 +6674,18 @@ impl AggState {
                     generic,
                     ok,
                     rows,
+                    errs,
                 },
                 AggState::Sum {
                     int: oint,
                     generic: ogeneric,
                     ok: ook,
                     rows: orows,
+                    errs: oerrs,
                 },
             ) => {
                 *rows += orows;
+                *errs += oerrs;
                 if !*ok {
                     return true;
                 }
@@ -6649,7 +6710,8 @@ impl AggState {
                     _ => *ok = false,
                 }
             }
-            (AggState::Best(best, best_v), AggState::Best(Some(id), v)) => {
+            (AggState::Best(best, best_v, errs), AggState::Best(Some(id), v, oerrs)) => {
+                *errs += oerrs;
                 let better = match best_v.as_ref() {
                     None => best.is_none(),
                     Some(b) => {
@@ -6666,7 +6728,7 @@ impl AggState {
                     *best_v = v;
                 }
             }
-            (AggState::Best(..), AggState::Best(None, _)) => {}
+            (AggState::Best(_, _, errs), AggState::Best(None, _, oerrs)) => *errs += oerrs,
             (AggState::Sample(x), AggState::Sample(y)) => {
                 if x.is_none() {
                     *x = y;
@@ -6698,6 +6760,7 @@ impl AggState {
                 generic: None,
                 ok: true,
                 rows,
+                ..
             } => {
                 let Some(id) = id.filter(|id| id.tag() == crate::id::Tag::Int) else {
                     return false;
@@ -6721,7 +6784,16 @@ impl AggState {
                 generic,
                 ok,
                 rows,
+                errs,
             } => {
+                // AVG is Sum over Count, and Count leaves the errors out
+                if rows > 0
+                    && errs == rows
+                    && matches!(agg.func, AggregateFunction::Avg)
+                    && ctx.aggregate_errors.avg_of_errors_zero()
+                {
+                    return ctx.intern_value(&Value::Integer(0.into()));
+                }
                 if !ok {
                     return Id::UNDEF;
                 }
@@ -6743,7 +6815,14 @@ impl AggState {
                 };
                 v.map_or(Id::UNDEF, |v| ctx.intern_value(&v))
             }
-            AggState::Best(best, _) => best.unwrap_or(Id::UNDEF),
+            AggState::Best(best, _, errs) => {
+                let min = matches!(agg.func, AggregateFunction::Min);
+                if errs > 0 && ctx.aggregate_errors.best_errs(min) {
+                    Id::UNDEF
+                } else {
+                    best.unwrap_or(Id::UNDEF)
+                }
+            }
             AggState::Sample(x) => x.unwrap_or(Id::UNDEF),
             AggState::Stat(arq, acc) => acc.finish(ctx, arq),
         }
@@ -6759,9 +6838,10 @@ pub(super) fn aggregate(
     rows: &[u32],
     agg: &Agg,
     arg: Option<&[Id]>,
+    exists: Option<&super::exists::Answers<'_>>,
 ) -> Id {
     if let (Some(spec), Some(e)) = (&agg.fold, &agg.expr) {
-        return fold(ctx, t, map, rows, e, agg.distinct, spec);
+        return fold(ctx, t, map, rows, (e, spec, agg.distinct), exists);
     }
     let Some(e) = &agg.expr else {
         // COUNT(*)
@@ -6789,6 +6869,7 @@ pub(super) fn aggregate(
                     i: i as usize,
                     map,
                     dec: None,
+                    exists,
                 },
                 ctx,
             )
@@ -6823,6 +6904,9 @@ pub(super) fn aggregate(
         }
         AggregateFunction::Min | AggregateFunction::Max => {
             let is_min = matches!(agg.func, AggregateFunction::Min);
+            if vals.iter().any(|v| v.is_err()) && ctx.aggregate_errors.best_errs(is_min) {
+                return Id::UNDEF;
+            }
             let mut best: Option<Id> = None;
             let mut best_v: Option<Value> = None;
             for id in vals.iter().filter_map(|v| v.ok()) {
@@ -6847,9 +6931,20 @@ pub(super) fn aggregate(
         }
         AggregateFunction::Sample => return vals.iter().find_map(|v| v.ok()).unwrap_or(Id::UNDEF),
         AggregateFunction::GroupConcat { separator } => {
+            if agg.distinct
+                && rows.is_empty()
+                && ctx.aggregate_errors.distinct_concat_of_nothing_unbound()
+            {
+                return Id::UNDEF;
+            }
             let sep = separator.as_deref().unwrap_or(" ");
             let mut parts = Vec::new();
+            let strings = ctx.aggregate_errors.concat_strings_only();
             for v in values() {
+                // CONCAT takes only strings
+                if strings && !v.is_string() {
+                    return Id::UNDEF;
+                }
                 let Ok(s) = v.lexical() else { return Id::UNDEF };
                 parts.push(s.to_string());
             }
@@ -6871,14 +6966,14 @@ pub(super) fn aggregate(
 /// is a null, and DISTINCT keeps the first of equal terms and one null), or the `e`
 /// keys with the `value` values as a `cdt:Map` literal (a row whose key is an error or a
 /// blank node is skipped, a later row replaces an earlier one's value).
+/// The fold is given as its argument, its spec and its DISTINCT flag.
 fn fold(
     ctx: &Ctx,
     t: &Table,
     map: &[Option<usize>],
     rows: &[u32],
-    e: &Expr,
-    distinct: bool,
-    fold: &super::plan::Fold,
+    (e, fold, distinct): (&Expr, &super::plan::Fold, bool),
+    exists: Option<&super::exists::Answers<'_>>,
 ) -> Id {
     use super::cdt::{Elem, Map, map_put};
     let row = |i: u32| Row {
@@ -6886,6 +6981,7 @@ fn fold(
         i: i as usize,
         map,
         dec: None,
+        exists,
     };
     let mut order: Vec<u32> = rows.to_vec();
     if !fold.order.is_empty() {
@@ -10027,6 +10123,88 @@ mod string_order_tests {
                     assert!(ctx.check().is_ok(), "{what}");
                 }
             }
+        }
+    }
+
+    /// The pre-decode leaves alone a column that the expressions answer from ids: one
+    /// compared with a constant IRI by `=`, `!=` or `IN`, one tested by `isIRI`, and an
+    /// EXISTS pattern's key, alone or under `IF`, as in `SUM(IF(?p = ex:a, 1, 0))`. That
+    /// decode cost an eager grouping over 300,000 IRIs four times its time (item 1098). A
+    /// comparison with a constant string reads values and still decodes the column.
+    #[test]
+    fn the_pre_decode_skips_columns_answered_from_ids() {
+        use super::super::expr::{ExistsSpec, Func};
+        use spargebra::algebra::{Function, GraphPattern};
+        let (s, strings) = unique_store();
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 256 << 20;
+        let ctx = std::sync::Arc::new(ctx);
+        ctx.attach_owner();
+        let (t, x) = wide(&ctx, &strings, usize::MAX);
+        let iri = s
+            .snapshot()
+            .lookup_term(&oxrdf::NamedNode::new("urn:s:0").unwrap().into())
+            .expect("a stored IRI");
+        let var = || Box::new(Expr::Var(x));
+        let int = |i: i64| Box::new(Expr::Const(Id::from_i64(i).unwrap()));
+        let eq = Expr::Eq(var(), Box::new(Expr::Const(iri)));
+        let exists = Expr::Exists(std::sync::Arc::new(ExistsSpec::new(
+            GraphPattern::Bgp {
+                patterns: Vec::new(),
+            },
+            super::super::plan::ActiveGraph::Default,
+            vec![x],
+            Vec::new(),
+        )));
+        let skipped = [
+            ("if-eq", Expr::If(Box::new(eq.clone()), int(1), int(0))),
+            ("not-eq", Expr::Not(Box::new(eq.clone()))),
+            (
+                "in",
+                Expr::In(var(), vec![Expr::Const(iri), Expr::Const(iri)]),
+            ),
+            (
+                "is-iri",
+                Expr::Call(Func::Builtin(Function::IsIri), vec![Expr::Var(x)]),
+            ),
+            ("if-exists", Expr::If(Box::new(exists), int(1), int(0))),
+        ];
+        for (what, e) in &skipped {
+            let decoded = decode_for(&ctx, &t, &[e]).unwrap();
+            assert!(
+                decoded.is_none_or(|d| d.cols.iter().all(Option::is_none)),
+                "{what}: the column is decoded"
+            );
+        }
+        // Each skipped expression gives on every row what it gives over the decoded column.
+        let full = decode_for(&ctx, &t, &[&str_of(x)])
+            .unwrap()
+            .expect("decoded");
+        let map = t.var_map(ctx.nvars());
+        for (what, e) in skipped.iter().filter(|(what, _)| *what != "if-exists") {
+            for i in 0..t.len() {
+                let at = |dec| {
+                    let row = Row {
+                        table: &t,
+                        i,
+                        map: &map,
+                        dec,
+                        exists: None,
+                    };
+                    eval(e, &row, &ctx).ok().map(|v| v.into_id(&ctx))
+                };
+                assert_eq!(at(None), at(Some(&full.cols)), "{what}: row {i}");
+            }
+        }
+        let string = Expr::Eq(var(), Box::new(Expr::Const(strings[1])));
+        let read = [
+            ("eq-string", Expr::If(Box::new(string), int(1), int(0))),
+            ("str", str_of(x)),
+        ];
+        for (what, e) in &read {
+            let decoded = decode_for(&ctx, &t, &[e]).unwrap().expect("decoded");
+            let col = decoded.cols[0].as_ref().expect("the column is decoded");
+            assert_rows(&ctx, &t, col, what);
         }
     }
 

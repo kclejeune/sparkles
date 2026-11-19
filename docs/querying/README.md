@@ -29,6 +29,11 @@ also pass with `execution=streaming`, through the cursors that a streamed query 
 `mise run test:w3c:streaming` runs that pass alone and reports, for each suite, the
 queries that fall back to eager execution for an operator the cursors do not stream.
 
+A test-only reference evaluator that follows the SPARQL algebra literally, with no part
+of the engine but the parser, answers every SPARQL 1.0, 1.1 and 1.2 query evaluation
+test. The seeded differential queries and the optimizer tests compare the engine's
+answers with it, in eager and streaming execution.
+
 The SPARQL parser is a vendored, patched `spargebra`
 ([`vendor/spargebra/PATCHED.md`](../../vendor/spargebra/PATCHED.md)).
 
@@ -71,6 +76,63 @@ check them against the W3C suites and Jena's own answers.
 * Results come as JSON, XML, CSV, TSV and `x-sparkles+json`, which includes the executed
   plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and as
   Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
+
+### Aggregate errors
+
+SPARQL leaves room for more than one answer when an argument of MIN, MAX, AVG or
+GROUP_CONCAT is an error, such as a variable that OPTIONAL leaves unbound. Each query
+runs under one of three readings, and `jena` is the default on every surface.
+
+| Reading | `MIN(?v)` and `MAX(?v)` with an unbound `?v` | AVG when every argument is an error | `GROUP_CONCAT` over an IRI or a number |
+|---|---|---|---|
+| `jena` | Unbound, as in Apache Jena. | Unbound. | The lexical form. |
+| `sparkles` | The bound values decide. | Unbound. | The lexical form. |
+| `spec` | MIN is unbound and the bound values decide MAX. | `0`. | Unbound. |
+
+The `jena` reading matches ARQ on every aggregate over unbound values, type errors,
+groups of errors alone and empty groups, which a fixture of ARQ's own answers checks. It
+also makes `GROUP_CONCAT(DISTINCT …)` over no rows unbound, as ARQ does, where the other
+readings give `""`. The `sparkles` reading is how the engine answered before the setting
+existed. The `spec` reading takes the text of SPARQL 1.1 and 1.2 literally. MIN and MAX
+order the values as ORDER BY does, which puts errors first. AVG divides Sum by Count, and
+Count leaves errors out. GROUP_CONCAT applies CONCAT, which takes only strings. Under
+every reading an error makes SUM, AVG and GROUP_CONCAT unbound, while COUNT and SAMPLE
+pass over it.
+
+```sparql
+SELECT ?person (MAX(?age) AS ?oldest)
+WHERE { ?person :child ?c . OPTIONAL { ?c :age ?age } }
+GROUP BY ?person
+```
+
+For a parent with one child of unknown age, `?oldest` is unbound under `jena`, while
+`sparkles` and `spec` give the greatest age present. `MIN(?age)` would be unbound under
+`spec` too. A query that wants the values present can ask for the `sparkles` reading,
+or compute the aggregate in a subquery that matches `:age` outside OPTIONAL and join
+that subquery with OPTIONAL, which gives the same answer under every reading.
+
+A query chooses its reading with the `aggregate-errors` request parameter, the library's
+`QueryOptions::aggregate_errors`, the Python keyword `aggregate_errors`, the Node.js
+option `aggregateErrors`, the JVM context symbol `Sparkles.AGGREGATE_ERRORS`, the MCP
+argument `aggregateErrors` or the command line's `--aggregate-errors`. Without one it takes
+the dataset's setting at `/$/aggregate-errors/{ds}`, and a dataset without a setting
+takes the server's default, which `sparkles serve --aggregate-errors` sets. A Fuseki
+configuration sets both with the context symbol `aggregateErrors`
+(`urn:x-sparkles:symbol#aggregateErrors`), in the server's context or a dataset's, and
+the JVM assembler sets a dataset's with `sparkles:aggregateErrors`. Materialized
+views and live queries follow the dataset's reading and evaluate again when it changes. A
+query that names another reading evaluates a view's query from the data and does not
+read the view's maintained state, and its plan says so. [Aggregate
+errors](../API.md#aggregate-errors) in the API reference gives the routes.
+
+The engine's own queries choose the `sparkles` reading where a group mixes rows with and
+without a value, so their answers do not change with the dataset's setting. These are the
+MCP memory tools' queries, the GraphRAG build's choice of a fact's reifier, and the web
+UI's list of memory agents and its nearby-features panel.
+
+Fuseki users get the answers they had from Jena. Users of earlier Sparkles releases see
+MIN and MAX become unbound where an argument was unbound or an error, and can set
+`sparkles` on a dataset or on the server to keep the earlier answers.
 
 ### Jena ARQ extensions
 
@@ -153,7 +215,11 @@ check them against the W3C suites and Jena's own answers.
   pattern costs less than evaluating it for each distinct outer key. A row is evaluated
   on its own when it binds a variable that a FILTER inside the pattern reads and the
   pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
-  as IF or OR, is evaluated once per distinct outer key.
+  as IF or OR, an aggregate argument or an ORDER BY key, is answered from the same key
+  set. Every row is probed before the expression is evaluated, also a row on which the
+  expression does not reach the EXISTS. Automatic execution streams a plan with an
+  EXISTS in any of these positions unless the pattern calls a SERVICE, the EXISTS is
+  nested more than four levels deep or it is an OPTIONAL condition.
 * An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
   every execution mode, so each operator reads its inputs a batch at a time and stops
   once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
@@ -319,6 +385,12 @@ check them against the W3C suites and Jena's own answers.
   Expiry aborts the transfer and requests cancellation. Actual producer owners remain
   until work stops, and only a successful transfer is a complete answer. The settings
   also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
+* A response that the result-size budget stops after its first bytes, eager or streamed,
+  first sends what its writer had buffered and then aborts the transfer. The access log
+  and the metrics count the rows whose bytes the response writer accepted, which are the
+  rows a client that keeps reading receives. When the client has stopped reading, that
+  last send waits only as long as the idle limit, and if it fails the report leaves out
+  its bytes but still counts the rows of that last chunk.
 * A query that a budget or its timeout stopped keeps its plan in the error body of the
   `application/x-sparkles+json` format.
 * `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the
@@ -450,6 +522,20 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   some of them. It skips an embedded query whose holder is ambiguous, such as the
   same query text on two blank nodes, rather than risk another node's findings. Roadmap
   item 444.
+* An `xsd:integer` or `xsd:decimal` with more digits than the engine's decimal type
+  holds, about 20 before the point, is not read as a number, so comparisons, arithmetic
+  and range filters treat it as an unknown literal. XSD allows a limit of 16 digits, while
+  Jena reads any length. Roadmap item 1065.
+* STRSTARTS, STRENDS, CONTAINS, STRBEFORE and STRAFTER compare only the language tags of
+  two language-tagged arguments, so a directional string and a string of the same language
+  without that direction are compatible arguments. SPARQL 1.2 and Jena also require the
+  same base direction. Roadmap item 1071.
+* `isNumeric("inf"^^xsd:double)` is true, though XSD spells infinity `INF`, and a cast of a
+  double to `xsd:string` gives `"1000000"` for `1e6`, where XPath gives `"1.0E6"`. In
+  REGEX, `.` matches a carriage return, which XPath excludes without the `s` flag. Roadmap
+  item 1077.
+* AVG over decimals divides to 18 digits where Jena divides to 24, so the last digits
+  of such an average can differ from ARQ's. Roadmap item 1084.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
@@ -513,10 +599,11 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 * Read [ARQ syntax extensions](../API.md#arq-syntax-extensions).
 * Read [ARQ's property functions](../API.md#arqs-property-functions).
 * Read [DESCRIBE](../API.md#describe).
+* Read [Aggregate errors](../API.md#aggregate-errors).
 
 ## Roadmap
 
-The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
+The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md), [item 1084](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -4,6 +4,7 @@ round trip of encoded terms, the split of an N-Quads dump, and the differ's verd
 must match those of a comparison of two in-memory sets."""
 
 import contextlib
+import gc
 import importlib.util
 import io
 import json
@@ -11,6 +12,7 @@ import random
 import re
 import tempfile
 import unittest
+import warnings
 from collections import Counter
 from pathlib import Path
 
@@ -253,7 +255,12 @@ class DiffMatchesSets(unittest.TestCase):
                     (d / "b.nt").write_text(b, encoding="utf-8")
                     (d / "known.tsv").write_text(known, encoding="utf-8")
                     err = io.StringIO()
-                    with contextlib.redirect_stderr(err):
+                    # A process object that an earlier test left unwaited can be collected
+                    # here and print its ResourceWarning into the captured stderr, so it is
+                    # collected first and warnings stay out of the comparison.
+                    gc.collect()
+                    with warnings.catch_warnings(), contextlib.redirect_stderr(err):
+                        warnings.simplefilter("ignore", ResourceWarning)
                         rc = rl.diff(str(d / "a.nt"), str(d / "b.nt"), str(d / "r.json"), str(d / "known.tsv"), subset)
                     want, want_err = set_diff(str(d / "a.nt"), str(d / "b.nt"), known_rows, subset)
                     # the text, so that the order of every count and example counts too

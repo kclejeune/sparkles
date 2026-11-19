@@ -102,6 +102,11 @@ impl ExistsSpec {
         }
     }
 
+    /// Whether the pattern calls a SERVICE.
+    pub fn calls_service(&self) -> bool {
+        self.calls_service
+    }
+
     /// The same EXISTS with `v` substituted by `c` as well.
     pub fn with_bound(&self, v: VarId, c: Id) -> ExistsSpec {
         let mut bound = self.bound.clone();
@@ -130,7 +135,7 @@ impl ExistsSpec {
 }
 
 /// The most entries the memo of one EXISTS keeps.
-const EXISTS_MEMO_ENTRIES: usize = 100_000;
+pub(super) const EXISTS_MEMO_ENTRIES: usize = 100_000;
 
 /// The deepest expression evaluated on rayon's threads (see [`Expr::parallel`]): their
 /// stack is 2 MiB unless the application sets another, and a debug build's evaluator
@@ -446,6 +451,8 @@ pub struct Row<'a> {
     pub map: &'a [Option<usize>],
     /// values decoded up front for this operator, per table column and row
     pub dec: Option<&'a DecodedCols>,
+    /// the answers of EXISTS patterns from their key sets, for this row's table
+    pub exists: Option<&'a super::exists::Answers<'a>>,
 }
 
 /// Row-aligned decoded values for some columns of a table (`None` = not decoded).
@@ -694,6 +701,9 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
             Err(TypeError)
         }
         Expr::Exists(spec) => {
+            if let Some(found) = row.exists.and_then(|a| a.get(spec, row.table, row.i)) {
+                return Ok(b(found));
+            }
             let key: Vec<Id> = spec.vars.iter().map(|&v| spec.value(row, v)).collect();
             // nothing to substitute: one answer for every such row
             let unbound = !ctx.calls_extensions && key.iter().all(|id| id.is_undef());
@@ -739,6 +749,42 @@ pub fn needs_values(e: &Expr) -> bool {
             args,
         ) => !args.iter().all(simple),
         _ => true,
+    }
+}
+
+/// The variables of `e` whose decoded values its evaluation reads. A variable compared
+/// with a constant IRI or blank node, by `=`, `!=` or `IN`, is answered from term ids and
+/// kinds, and so is one under `sameTerm`, `isIRI`, `isBlank`, `isLiteral` or `BOUND`. An
+/// EXISTS pattern takes its variables' ids. A variable elsewhere is listed, and so is a
+/// bare variable, whose decoded value some callers sort or hash on. Leaving a variable
+/// out never changes an answer, since its rows then read their values one at a time.
+pub fn value_vars(e: &Expr, ctx: &Ctx, out: &mut Vec<VarId>) {
+    let simple = |x: &Expr| matches!(x, Expr::Var(_) | Expr::Const(_) | Expr::Lit(..));
+    let atomic = |x: &Expr| {
+        x.const_id()
+            .is_some_and(|id| matches!(ctx.kind(id), TermKind::Iri | TermKind::BNode))
+    };
+    match e {
+        Expr::Const(_) | Expr::Lit(..) | Expr::Bound(_) | Expr::Exists(_) => {}
+        Expr::SameTerm(a, b) if simple(a) && simple(b) => {}
+        Expr::Eq(a, b) if (atomic(a) && simple(b)) || (simple(a) && atomic(b)) => {}
+        Expr::In(a, l) if simple(a) && l.iter().all(atomic) => {}
+        Expr::Call(
+            Func::Builtin(Function::IsIri | Function::IsBlank | Function::IsLiteral),
+            args,
+        ) if args.iter().all(simple) => {}
+        Expr::Not(a) => value_vars(a, ctx, out),
+        Expr::And(a, b) | Expr::Or(a, b) => {
+            value_vars(a, ctx, out);
+            value_vars(b, ctx, out);
+        }
+        Expr::If(a, b, c) => {
+            value_vars(a, ctx, out);
+            value_vars(b, ctx, out);
+            value_vars(c, ctx, out);
+        }
+        Expr::Coalesce(l) => l.iter().for_each(|x| value_vars(x, ctx, out)),
+        _ => e.vars(out),
     }
 }
 

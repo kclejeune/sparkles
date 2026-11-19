@@ -464,3 +464,61 @@ async fn fs_backups_restore() {
     assert_eq!(expected.0, 6);
     assert_eq!(expected.1.len(), 4, "{:?}", expected.1);
 }
+
+/// The dataset's DESCRIBE setting and its reading of errors in aggregates are part of a
+/// backup, from a live store and from a closed directory alike, and a restore keeps them.
+#[tokio::test]
+async fn describe_and_aggregate_errors_settings_round_trip() {
+    use sparkles_core::sparql::AggregateErrors;
+    use sparkles_core::sparql::describe::{DescribeMode, DescribeOptions};
+    let tmp = tempfile::tempdir().unwrap();
+    let db = tmp.path().join("ds");
+    make_db(&db);
+    let describe = DescribeOptions {
+        mode: DescribeMode::Scbd,
+        max_depth: Some(3),
+        ..Default::default()
+    };
+    {
+        let s = Store::open(&db, StoreOptions::default()).unwrap();
+        s.set_describe_settings(Some(describe.clone())).unwrap();
+        s.set_aggregate_errors_setting(Some(AggregateErrors::Spec))
+            .unwrap();
+    }
+    let (repo, _) = memory_repo().await;
+    let live = Store::open(&db, StoreOptions::default()).unwrap();
+    repo.create(
+        live.backup_capture("live").unwrap().into(),
+        &opts("live", "ds"),
+    )
+    .await
+    .unwrap();
+    drop(live);
+    repo.create(closed_source(&db), &opts("closed", "ds"))
+        .await
+        .unwrap();
+    for name in ["live", "closed"] {
+        let paths: Vec<String> = repo
+            .manifest(name)
+            .await
+            .unwrap()
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect();
+        for p in ["describe.json", "aggregate-errors.json"] {
+            assert!(paths.iter().any(|x| x == p), "{name}: {p} in {paths:?}");
+        }
+        let dest = tmp.path().join(format!("restored-{name}"));
+        repo.restore(name, &dest, &RestoreOptions::default())
+            .await
+            .unwrap();
+        let r = Store::open(&dest, StoreOptions::default()).unwrap();
+        assert_eq!(
+            r.aggregate_errors_setting(),
+            Some(AggregateErrors::Spec),
+            "{name}"
+        );
+        assert_eq!(r.describe_settings(), describe, "{name}");
+    }
+}

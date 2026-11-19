@@ -190,7 +190,7 @@ cd "$dir/src"
 # The copied scripts come first, so the build uses the caller's nsc-build.sh and finds the
 # cargo subcommand behind `mbx sparkles-task`.
 export PATH="$dir/bin:$PATH"
-for t in mbx rustc cargo flock systemd-run systemctl setsid nohup sha256sum; do command -v "$t" > /dev/null || fail "$t is not on PATH"; done
+for t in mbx rustc cargo flock systemd-run systemctl setsid nohup sha256sum zstd; do command -v "$t" > /dev/null || fail "$t is not on PATH"; done
 have=$(mbx --version | awk '{print $2}')
 systemd-run --user --scope -q --collect true 2> /dev/null || fail "systemd-run --user --scope does not work"
 

@@ -93,8 +93,11 @@ open(
       await expect(data.getByRole('button', { name: 'urn:dp', exact: true })).toHaveCount(0);
       await page.goto(`/ui/browse?ds=${ds}&iri=urn%3Ai`);
       const frame = page.getByRole('region', { name: 'Materialized inferred axioms', exact: true });
-      await expect(frame).toContainText('ClassAssertion');
-      await expect(frame).toContainText('urn:C');
+      const types = frame.locator('[data-section="materialized-types"]');
+      await expect(types).toContainText('Types:');
+      await expect(types).toContainText('urn:C');
+      await expect(types).toContainText('Inferred');
+      await expect(frame).not.toContainText('ClassAssertion(');
       await expect(frame).toContainText('Completeness and consistency are unknown');
       await expect(
         frame.getByRole('button', { name: /Edit|Explain|Classify|Materialize/ }),
@@ -112,7 +115,7 @@ open(
       expect(cleared.ok(), await cleared.text()).toBe(true);
       await frame.getByRole('button', { name: 'Read again', exact: true }).click();
       await expect(frame.getByRole('alert')).toContainText('Could not read materialized facts');
-      await expect(frame.locator('li code')).toHaveCount(0);
+      await expect(frame.locator('li')).toHaveCount(0);
       expect(posts).toEqual([]);
     } finally {
       const removed = await request.delete(`/$/datasets/${ds}`);

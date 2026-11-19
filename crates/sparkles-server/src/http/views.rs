@@ -75,6 +75,13 @@ impl Host for ServerHost {
         sparkles::handles::views::inference(&*self.state.upgrade()?)
     }
 
+    fn aggregate_errors(&self) -> sparkles::sparql::AggregateErrors {
+        self.state
+            .upgrade()
+            .map(|s| s.store.aggregate_errors())
+            .unwrap_or_default()
+    }
+
     fn stored_query(&self, name: &str) -> sparkles::Result<String> {
         let s = self
             .state

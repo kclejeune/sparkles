@@ -15,6 +15,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+pub(crate) mod frontend;
 #[cfg(feature = "plan-probe")]
 pub(crate) mod planprobe;
 pub(crate) mod sampled;
@@ -149,6 +150,7 @@ impl CompiledRules {
     pub fn as_slice(&self) -> &[CRule] {
         &self.rules
     }
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn iter(&self) -> std::slice::Iter<'_, CRule> {
         self.rules.iter()
     }
@@ -225,6 +227,12 @@ fn compile_with(
     warnings: &mut WorkingWarnings,
     backward: bool,
 ) -> Result<CompiledInfo, BudgetFailure> {
+    // a rule text with relations or `not` is a rule program, which every path compiles
+    // through `frontend::compile`; here its rules would be skipped
+    debug_assert!(
+        !crate::parser::uses_program(rules),
+        "a rule program compiled as Jena rules"
+    );
     let budget = terms.budget();
     let (bytes, emitted) = compile_credit::prewalk(rules, backward)?;
     let mut working = Held::try_new_exact(&budget, bytes)?;
@@ -388,89 +396,21 @@ fn compile_one<'a>(
                 atoms.push(a);
             }
             Clause::Builtin(b) => {
-                let Some(kind) = BuiltinKind::from_name(&b.name) else {
-                    if let Some(always) = static_bound_test(b, &bound) {
-                        if !always {
-                            // e.g. `unbound(?x)` after ?x was bound: the rule can never fire
-                            return Ok(None);
-                        }
-                        continue;
+                let mut slot_of = |n: &'a Node| slot(n, &mut var);
+                match compile_builtin(b, &mut bound, &mut slot_of, budget)? {
+                    BuiltinOut::Call(call) => {
+                        builtins.push(call);
+                        builtin_names.push(b.name.clone());
                     }
-                    return Err(unsupported(
-                        budget,
-                        format_args!("unknown or unsupported builtin '{}'", b.name),
-                    ));
-                };
-                if !kind.accepts_arity(b.args.len()) {
-                    return Err(unsupported(
-                        budget,
-                        format_args!("{}: wrong number of arguments ({})", b.name, b.args.len()),
-                    ));
+                    BuiltinOut::Holds => {}
+                    BuiltinOut::Never => return Ok(None),
                 }
-                let mut args = Vec::with_capacity(b.args.len());
-                for (i, a) in b.args.iter().enumerate() {
-                    // noValue: variables not bound at this position act as wildcards
-                    if kind == BuiltinKind::NoValue
-                        && let Node::Var(v) = a
-                        && !bound.contains(v.as_str())
-                    {
-                        args.push(Slot::Any);
-                        continue;
-                    }
-                    let s = slot(a, &mut var)?;
-                    if s == Slot::Any
-                        && kind.input_positions(b.args.len()).contains(&i)
-                        && kind != BuiltinKind::NoValue
-                    {
-                        return Err(unsupported(
-                            budget,
-                            format_args!("wildcard as input of builtin '{}'", b.name),
-                        ));
-                    }
-                    args.push(s);
-                }
-                let mut inputs = Vec::with_capacity(args.len());
-                for i in kind.input_positions(args.len()) {
-                    if let Slot::Var(v) = args[i] {
-                        inputs.push(v);
-                    }
-                }
-                let mut outputs = Vec::with_capacity(args.len());
-                for i in kind.output_positions(args.len()) {
-                    if let Slot::Var(v) = args[i] {
-                        outputs.push(v);
-                    }
-                }
-                for (i, a) in b.args.iter().enumerate() {
-                    if kind.output_positions(b.args.len()).contains(&i)
-                        && let Node::Var(v) = a
-                    {
-                        bound.insert(v.as_str());
-                    }
-                }
-                let regex = match (kind, b.args.get(1)) {
-                    (BuiltinKind::Regex, Some(Node::Const(Term::Literal(l)))) => {
-                        Some(match BudgetRegex::compile(l.value(), budget)? {
-                            Some(regex) => regex,
-                            None => {
-                                return Err(unsupported(
-                                    budget,
-                                    format_args!("invalid regex '{}'", l.value()),
-                                ));
-                            }
-                        })
-                    }
-                    _ => None,
-                };
-                builtins.push(CBuiltin {
-                    origin: 0,
-                    kind,
-                    args,
-                    inputs,
-                    outputs,
-                    regex,
-                });
-                builtin_names.push(b.name.clone());
+            }
+            Clause::Relation(_) | Clause::Not(_) => {
+                return Err(unsupported(
+                    budget,
+                    format_args!("a relation atom or 'not' needs the rule program frontend"),
+                ));
             }
             Clause::Rule(_) => unreachable!("flattened"),
         }
@@ -519,6 +459,12 @@ fn compile_one<'a>(
                     ))?;
                 }
             },
+            Clause::Relation(_) | Clause::Not(_) => {
+                return Err(unsupported(
+                    budget,
+                    format_args!("a relation atom or 'not' needs the rule program frontend"),
+                ));
+            }
             Clause::Rule(_) => unreachable!("flattened"),
         }
     }
@@ -592,6 +538,107 @@ fn compile_one<'a>(
         parsed: f.parsed,
     };
     Ok(Some((rule, info)))
+}
+
+/// A body builtin as [`compile_builtin`] compiles it.
+enum BuiltinOut {
+    Call(CBuiltin),
+    /// a test that the textual position decides and that always holds, which is left out
+    Holds,
+    /// a test that never holds, so the rule never fires
+    Never,
+}
+
+/// Compile the body builtin `b`, with `bound` the variables bound at its textual
+/// position, which it extends by its outputs. `slot` gives the slot of an argument.
+fn compile_builtin<'a>(
+    b: &'a BuiltinCall,
+    bound: &mut HashSet<&'a str>,
+    slot: &mut dyn FnMut(&'a Node) -> Result<Slot, CompileFailure>,
+    budget: &Arc<Budget>,
+) -> Result<BuiltinOut, CompileFailure> {
+    let Some(kind) = BuiltinKind::from_name(&b.name) else {
+        if let Some(always) = static_bound_test(b, bound) {
+            if !always {
+                // e.g. `unbound(?x)` after ?x was bound: the rule can never fire
+                return Ok(BuiltinOut::Never);
+            }
+            return Ok(BuiltinOut::Holds);
+        }
+        return Err(unsupported(
+            budget,
+            format_args!("unknown or unsupported builtin '{}'", b.name),
+        ));
+    };
+    if !kind.accepts_arity(b.args.len()) {
+        return Err(unsupported(
+            budget,
+            format_args!("{}: wrong number of arguments ({})", b.name, b.args.len()),
+        ));
+    }
+    let mut args = Vec::with_capacity(b.args.len());
+    for (i, a) in b.args.iter().enumerate() {
+        // noValue: variables not bound at this position act as wildcards
+        if kind == BuiltinKind::NoValue
+            && let Node::Var(v) = a
+            && !bound.contains(v.as_str())
+        {
+            args.push(Slot::Any);
+            continue;
+        }
+        let s = slot(a)?;
+        if s == Slot::Any
+            && kind.input_positions(b.args.len()).contains(&i)
+            && kind != BuiltinKind::NoValue
+        {
+            return Err(unsupported(
+                budget,
+                format_args!("wildcard as input of builtin '{}'", b.name),
+            ));
+        }
+        args.push(s);
+    }
+    let mut inputs = Vec::with_capacity(args.len());
+    for i in kind.input_positions(args.len()) {
+        if let Slot::Var(v) = args[i] {
+            inputs.push(v);
+        }
+    }
+    let mut outputs = Vec::with_capacity(args.len());
+    for i in kind.output_positions(args.len()) {
+        if let Slot::Var(v) = args[i] {
+            outputs.push(v);
+        }
+    }
+    for (i, a) in b.args.iter().enumerate() {
+        if kind.output_positions(b.args.len()).contains(&i)
+            && let Node::Var(v) = a
+        {
+            bound.insert(v.as_str());
+        }
+    }
+    let regex = match (kind, b.args.get(1)) {
+        (BuiltinKind::Regex, Some(Node::Const(Term::Literal(l)))) => {
+            Some(match BudgetRegex::compile(l.value(), budget)? {
+                Some(regex) => regex,
+                None => {
+                    return Err(unsupported(
+                        budget,
+                        format_args!("invalid regex '{}'", l.value()),
+                    ));
+                }
+            })
+        }
+        _ => None,
+    };
+    Ok(BuiltinOut::Call(CBuiltin {
+        origin: 0,
+        kind,
+        args,
+        inputs,
+        outputs,
+        regex,
+    }))
 }
 
 /// `bound(?x…)` / `unbound(?x…)` are resolved statically from the textual position.
@@ -2346,10 +2393,16 @@ pub(crate) fn run_program(
         g.set_relations();
     }
     for &ri in &lowered.stratified_novalue {
-        warnings.push_fmt(format_args!(
-            "the noValue of rule '{}' reads complete lower strata, since the program has relations or negated atoms and runs by strata",
-            program.rules[ri].name
-        ))?;
+        match program.include(ri) {
+            Some(set) => warnings.push_fmt(format_args!(
+                "the noValue of rule '{}' of the included rule set <{set}> reads complete lower strata, since the program has relations or negated atoms and runs by strata",
+                program.rules[ri].name
+            ))?,
+            None => warnings.push_fmt(format_args!(
+                "the noValue of rule '{}' reads complete lower strata, since the program has relations or negated atoms and runs by strata",
+                program.rules[ri].name
+            ))?,
+        }
     }
     let lists = Some((terms.rdf_first, terms.rdf_rest));
     match lowered.shape {

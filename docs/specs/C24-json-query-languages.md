@@ -321,6 +321,10 @@ cousin(?x, ?y, ?g) :- (?x ex:parent ?p), (?y ex:parent ?q), (?p ex:parent ?g),
 - `?- body.` is the query. A program has at most one, and its answer has one column per
   named variable of the body, in order of first appearance.
 - Rules in Jena's bracket form are kept as they are, forward or backward.
+- A reasoner rule file (`Profile::Rules`) takes `.decl`, relation atoms, `not` and `:-`
+  clauses, and reads a `:-` clause as a forward rule, since a materialization writes its
+  triple heads. A rule file refuses `?-` and does not parse comparisons, which stay with
+  the query language.
 
 ### 6.3 Semantics
 

@@ -1,0 +1,1 @@
+PREFIX ex: <http://example.org/> SELECT (COUNT(*) AS ?c) WHERE { ?p a ex:Researcher FILTER(?p = ex:nobody || EXISTS { ?p ex:authorOf ?d }) }

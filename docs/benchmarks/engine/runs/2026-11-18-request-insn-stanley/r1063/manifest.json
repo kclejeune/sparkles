@@ -1,0 +1,690 @@
+{
+ "host": "stanley",
+ "kernel": "7.3.3",
+ "cpu": "Intel(R) Core(TM) Ultra X7 358H",
+ "A": {
+  "path": "~/.cache/sparkles-nsc/bin/9acd6d742115a10249e89e752dcb8444c3266832-stanley/sparkles",
+  "sha256": "4dfe940fd836d1415377b59afeca2825057338e294eaa59f6b4cbc213ae05107",
+  "compilers": "GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 21.1.8; rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+  "label": "9acd6d74-stanley"
+ },
+ "B": {
+  "path": "~/.cache/sparkles-nsc/bin/9e3d7954c5289c29b34a4492dbb1e4784d7d1431/sparkles",
+  "sha256": "603a9bf3af1c1b7d8dffbbca3380c730d0d54121768b8423b6c80e344e2144b1",
+  "compilers": "GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 21.1.8; rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+  "label": "9e3d7954"
+ },
+ "store": {
+  "A": ".artifacts/worktrees/insn-harness/.artifacts/lanes/insn-harness/stores/s100k-9acd",
+  "B": ".artifacts/worktrees/insn-harness/.artifacts/lanes/insn-harness/stores/s100k-9acd"
+ },
+ "data": null,
+ "queries": [
+  "bind-two",
+  "class-predicate-list",
+  "class-predicates",
+  "contains",
+  "count-all",
+  "distinct-join",
+  "distinct-obj",
+  "employee-docs",
+  "exists-join",
+  "export-500k",
+  "expr-agg-arg",
+  "expr-bind-group",
+  "expr-order-key",
+  "group-avg",
+  "knows-reach",
+  "lang-filter",
+  "minus",
+  "not-exists",
+  "optional-chain",
+  "optional-count",
+  "order-by-full",
+  "order-lcase",
+  "path-plus",
+  "predicate-counts",
+  "predicate-subjects",
+  "range-topk",
+  "regex-iri",
+  "root-limit",
+  "root-scan",
+  "star-join",
+  "star-lookup",
+  "str-filter-two",
+  "str-pair-lt",
+  "str-pair-names",
+  "subquery-agg",
+  "two-hop-count",
+  "types-grouped",
+  "values-star"
+ ],
+ "modes": [
+  "streaming",
+  "auto"
+ ],
+ "rounds": 8,
+ "reps": 50,
+ "warmup": 5,
+ "server_cpu": 2,
+ "client_cpu": 3,
+ "rayon_threads": 1,
+ "spinners": true,
+ "kernel_instructions": false,
+ "perf_event_paranoid": "2",
+ "load_before": "16.26 18.02 18.27 11/2358 2505205",
+ "started": "2026-11-18T05:57:28Z",
+ "answers": {
+  "A/bind-two/streaming": [
+   1,
+   "cf79f74ca124fdcf"
+  ],
+  "A/bind-two/auto": [
+   1,
+   "cf79f74ca124fdcf"
+  ],
+  "A/class-predicate-list/streaming": [
+   8,
+   "e7ecf1b04dc69026"
+  ],
+  "A/class-predicate-list/auto": [
+   8,
+   "e7ecf1b04dc69026"
+  ],
+  "A/class-predicates/streaming": [
+   8,
+   "0c6f4fdd13c8ab7c"
+  ],
+  "A/class-predicates/auto": [
+   8,
+   "0c6f4fdd13c8ab7c"
+  ],
+  "A/contains/streaming": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "A/contains/auto": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "A/count-all/streaming": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "A/count-all/auto": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "A/distinct-join/streaming": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "A/distinct-join/auto": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "A/distinct-obj/streaming": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "A/distinct-obj/auto": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "A/employee-docs/streaming": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "A/employee-docs/auto": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "A/exists-join/streaming": [
+   1,
+   "a4f0566772f9f103"
+  ],
+  "A/exists-join/auto": [
+   1,
+   "a4f0566772f9f103"
+  ],
+  "A/export-500k/streaming": [
+   500000,
+   "c8963b63351fa320"
+  ],
+  "A/export-500k/auto": [
+   500000,
+   "c8963b63351fa320"
+  ],
+  "A/expr-agg-arg/streaming": [
+   10,
+   "1975e2c913fef1eb"
+  ],
+  "A/expr-agg-arg/auto": [
+   10,
+   "1975e2c913fef1eb"
+  ],
+  "A/expr-bind-group/streaming": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "A/expr-bind-group/auto": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "A/expr-order-key/streaming": [
+   10,
+   "50aa7e633d204881"
+  ],
+  "A/expr-order-key/auto": [
+   10,
+   "50aa7e633d204881"
+  ],
+  "A/group-avg/streaming": [
+   10,
+   "9685d11bbf7fddca"
+  ],
+  "A/group-avg/auto": [
+   10,
+   "9685d11bbf7fddca"
+  ],
+  "A/knows-reach/streaming": [
+   1,
+   "c01a22c6055aa918"
+  ],
+  "A/knows-reach/auto": [
+   1,
+   "c01a22c6055aa918"
+  ],
+  "A/lang-filter/streaming": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "A/lang-filter/auto": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "A/minus/streaming": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "A/minus/auto": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "A/not-exists/streaming": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "A/not-exists/auto": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "A/optional-chain/streaming": [
+   29977,
+   "33db47cfd8ee7ed8"
+  ],
+  "A/optional-chain/auto": [
+   29977,
+   "33db47cfd8ee7ed8"
+  ],
+  "A/optional-count/streaming": [
+   1,
+   "d7bb4cbcc53b6d11"
+  ],
+  "A/optional-count/auto": [
+   1,
+   "d7bb4cbcc53b6d11"
+  ],
+  "A/order-by-full/streaming": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "A/order-by-full/auto": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "A/order-lcase/streaming": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "A/order-lcase/auto": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "A/path-plus/streaming": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "A/path-plus/auto": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "A/predicate-counts/streaming": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "A/predicate-counts/auto": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "A/predicate-subjects/streaming": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "A/predicate-subjects/auto": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "A/range-topk/streaming": [
+   10,
+   "4853e782cf8c7a5f"
+  ],
+  "A/range-topk/auto": [
+   10,
+   "4853e782cf8c7a5f"
+  ],
+  "A/regex-iri/streaming": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "A/regex-iri/auto": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "A/root-limit/streaming": [
+   1000,
+   "b378edf115aeda75"
+  ],
+  "A/root-limit/auto": [
+   1000,
+   "b378edf115aeda75"
+  ],
+  "A/root-scan/streaming": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "A/root-scan/auto": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "A/star-join/streaming": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "A/star-join/auto": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "A/star-lookup/streaming": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "A/star-lookup/auto": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "A/str-filter-two/streaming": [
+   1,
+   "59af21c0122f00b2"
+  ],
+  "A/str-filter-two/auto": [
+   1,
+   "59af21c0122f00b2"
+  ],
+  "A/str-pair-lt/streaming": [
+   1,
+   "f49fe4c8335192f4"
+  ],
+  "A/str-pair-lt/auto": [
+   1,
+   "f49fe4c8335192f4"
+  ],
+  "A/str-pair-names/streaming": [
+   1,
+   "7af0f020afee8931"
+  ],
+  "A/str-pair-names/auto": [
+   1,
+   "7af0f020afee8931"
+  ],
+  "A/subquery-agg/streaming": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "A/subquery-agg/auto": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "A/two-hop-count/streaming": [
+   1,
+   "7513311add30b75e"
+  ],
+  "A/two-hop-count/auto": [
+   1,
+   "7513311add30b75e"
+  ],
+  "A/types-grouped/streaming": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "A/types-grouped/auto": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "A/values-star/streaming": [
+   16,
+   "340fa3c1c352861f"
+  ],
+  "A/values-star/auto": [
+   16,
+   "340fa3c1c352861f"
+  ],
+  "B/bind-two/streaming": [
+   1,
+   "cf79f74ca124fdcf"
+  ],
+  "B/bind-two/auto": [
+   1,
+   "cf79f74ca124fdcf"
+  ],
+  "B/class-predicate-list/streaming": [
+   8,
+   "e7ecf1b04dc69026"
+  ],
+  "B/class-predicate-list/auto": [
+   8,
+   "e7ecf1b04dc69026"
+  ],
+  "B/class-predicates/streaming": [
+   8,
+   "0c6f4fdd13c8ab7c"
+  ],
+  "B/class-predicates/auto": [
+   8,
+   "0c6f4fdd13c8ab7c"
+  ],
+  "B/contains/streaming": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "B/contains/auto": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "B/count-all/streaming": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "B/count-all/auto": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "B/distinct-join/streaming": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "B/distinct-join/auto": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "B/distinct-obj/streaming": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "B/distinct-obj/auto": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "B/employee-docs/streaming": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "B/employee-docs/auto": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "B/exists-join/streaming": [
+   1,
+   "a4f0566772f9f103"
+  ],
+  "B/exists-join/auto": [
+   1,
+   "a4f0566772f9f103"
+  ],
+  "B/export-500k/streaming": [
+   500000,
+   "c8963b63351fa320"
+  ],
+  "B/export-500k/auto": [
+   500000,
+   "c8963b63351fa320"
+  ],
+  "B/expr-agg-arg/streaming": [
+   10,
+   "1975e2c913fef1eb"
+  ],
+  "B/expr-agg-arg/auto": [
+   10,
+   "1975e2c913fef1eb"
+  ],
+  "B/expr-bind-group/streaming": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "B/expr-bind-group/auto": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "B/expr-order-key/streaming": [
+   10,
+   "50aa7e633d204881"
+  ],
+  "B/expr-order-key/auto": [
+   10,
+   "50aa7e633d204881"
+  ],
+  "B/group-avg/streaming": [
+   10,
+   "9685d11bbf7fddca"
+  ],
+  "B/group-avg/auto": [
+   10,
+   "9685d11bbf7fddca"
+  ],
+  "B/knows-reach/streaming": [
+   1,
+   "c01a22c6055aa918"
+  ],
+  "B/knows-reach/auto": [
+   1,
+   "c01a22c6055aa918"
+  ],
+  "B/lang-filter/streaming": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "B/lang-filter/auto": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "B/minus/streaming": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "B/minus/auto": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "B/not-exists/streaming": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "B/not-exists/auto": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "B/optional-chain/streaming": [
+   29977,
+   "33db47cfd8ee7ed8"
+  ],
+  "B/optional-chain/auto": [
+   29977,
+   "33db47cfd8ee7ed8"
+  ],
+  "B/optional-count/streaming": [
+   1,
+   "d7bb4cbcc53b6d11"
+  ],
+  "B/optional-count/auto": [
+   1,
+   "d7bb4cbcc53b6d11"
+  ],
+  "B/order-by-full/streaming": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "B/order-by-full/auto": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "B/order-lcase/streaming": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "B/order-lcase/auto": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "B/path-plus/streaming": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "B/path-plus/auto": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "B/predicate-counts/streaming": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "B/predicate-counts/auto": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "B/predicate-subjects/streaming": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "B/predicate-subjects/auto": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "B/range-topk/streaming": [
+   10,
+   "4853e782cf8c7a5f"
+  ],
+  "B/range-topk/auto": [
+   10,
+   "4853e782cf8c7a5f"
+  ],
+  "B/regex-iri/streaming": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "B/regex-iri/auto": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "B/root-limit/streaming": [
+   1000,
+   "b378edf115aeda75"
+  ],
+  "B/root-limit/auto": [
+   1000,
+   "b378edf115aeda75"
+  ],
+  "B/root-scan/streaming": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "B/root-scan/auto": [
+   102000,
+   "76a4b77dedd2d26f"
+  ],
+  "B/star-join/streaming": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "B/star-join/auto": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "B/star-lookup/streaming": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "B/star-lookup/auto": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "B/str-filter-two/streaming": [
+   1,
+   "59af21c0122f00b2"
+  ],
+  "B/str-filter-two/auto": [
+   1,
+   "59af21c0122f00b2"
+  ],
+  "B/str-pair-lt/streaming": [
+   1,
+   "f49fe4c8335192f4"
+  ],
+  "B/str-pair-lt/auto": [
+   1,
+   "f49fe4c8335192f4"
+  ],
+  "B/str-pair-names/streaming": [
+   1,
+   "7af0f020afee8931"
+  ],
+  "B/str-pair-names/auto": [
+   1,
+   "7af0f020afee8931"
+  ],
+  "B/subquery-agg/streaming": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "B/subquery-agg/auto": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "B/two-hop-count/streaming": [
+   1,
+   "7513311add30b75e"
+  ],
+  "B/two-hop-count/auto": [
+   1,
+   "7513311add30b75e"
+  ],
+  "B/types-grouped/streaming": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "B/types-grouped/auto": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "B/values-star/streaming": [
+   16,
+   "340fa3c1c352861f"
+  ],
+  "B/values-star/auto": [
+   16,
+   "340fa3c1c352861f"
+  ]
+ },
+ "load_after": "13.68 15.22 17.25 5/2404 3957479",
+ "ended": "2026-11-18T06:40:53Z",
+ "problems": []
+}

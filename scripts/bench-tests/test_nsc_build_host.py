@@ -8,6 +8,7 @@ systemctl stop kills."""
 
 import json
 import ctypes
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -127,7 +128,15 @@ pathlib.Path('target/release/sparkles').chmod(0o755)
     "c++": "#!/bin/sh\necho 'c++ test'\n",
     "zstd": """#!/usr/bin/env python3
 import shutil,sys
-a=sys.argv[1:];shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a.index('-o')+1]][0],a[a.index('-o')+1])
+# A stream without -o, as the source copy's compression and decompression, passes unchanged.
+# With FAKE_ZSTD_CUT=N a decompression writes the first N bytes and fails, as zstd does on
+# a cut-off stream.
+import os
+a=sys.argv[1:]
+cut=os.environ.get('FAKE_ZSTD_CUT')
+if cut and any(x.startswith('-d') for x in a):sys.stdout.buffer.write(sys.stdin.buffer.read(int(cut)));raise SystemExit(1)
+if '-o' not in a:shutil.copyfileobj(sys.stdin.buffer,sys.stdout.buffer);raise SystemExit(0)
+shutil.copyfile([x for x in a if not x.startswith('-') and x!=a[a.index('-o')+1]][0],a[a.index('-o')+1])
 """,
 }
 
@@ -416,13 +425,26 @@ class BuildHost(unittest.TestCase):
                 self.assertEqual(self.scratch("h1"), [])
 
     def test_a_dropped_source_copy_is_retried_into_a_fresh_tree(self):
-        env = dict(self.env, FAKE_SSH_DROP="tar -x -m:1")
+        env = dict(self.env, FAKE_SSH_DROP="tar --zstd -x -m:1")
         result, out = self.bench("--build-host", "h1", env=env)
+        self.assertEqual((self.hosts / "drops").read_text(), "1")
         [build] = self.builds()
         self.assertTrue(build["cwd"].endswith("/src"), build["cwd"])
         log = (out / "logs" / "build-A.log").read_text()
         self.assertIn("copying the source of", log)
         self.assertIn("retrying", log)
+        self.assertEqual(self.scratch("h1"), [])
+
+    def test_a_cut_off_compressed_source_is_never_published(self):
+        """tar extracts a valid prefix of the archive and would succeed alone, so the failure
+        of the decompression must fail the copy."""
+        env = dict(self.env, FAKE_ZSTD_CUT="2048")
+        result, out = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        self.assertIn("tar --zstd -x -m -C", self.ssh_log.read_text())
+        log = (out / "logs" / "build-A.log").read_text()
+        self.assertIn("copying the source of", log)
+        self.assertIn("failed 8 times", log)
+        self.assertEqual(self.builds(), [])
         self.assertEqual(self.scratch("h1"), [])
 
     def test_lost_contact_fails_after_bounded_retries_and_stops_the_build(self):
@@ -466,6 +488,71 @@ class BuildHost(unittest.TestCase):
         record.unlink()
         self.assertFalse(ok("boat:bx_worker"))
         self.assertIn("bh_entry_host_ok", (self.repo / "scripts/nsc-bench.sh").read_text())
+
+    def test_a_boat_build_gets_the_cap_and_a_bounded_jobs_count(self):
+        """A Boat build takes the admitted 12G cap by default, and a dedicated screen worker sets 13G."""
+        # bh_rx is stubbed, so the test sees the exact command that would reach the host.
+        program = ('. "$1/scripts/nsc-build-host.sh"; die() { echo "die: $*" >&2; exit 9; }; '
+                   'bh_rx() { echo "$3"; }; bh_start "$2" /scratch unit-x --locked')
+        def start(host, jobs=None, mem=None):
+            env = dict(self.env)
+            env.pop("SPARKLES_BOAT_BUILD_JOBS", None)
+            env.pop("SPARKLES_BOAT_BUILD_MEMORY_MAX", None)
+            if jobs is not None:
+                env["SPARKLES_BOAT_BUILD_JOBS"] = jobs
+            if mem is not None:
+                env["SPARKLES_BOAT_BUILD_MEMORY_MAX"] = mem
+            return subprocess.run(["bash", "-c", program, "bash", str(self.repo), host],
+                                  env=env, capture_output=True, text=True)
+        tail = "bash /scratch/bin/nsc-build-remote.sh /scratch unit-x "
+        default = start("boat:bx_worker")
+        self.assertEqual(default.returncode, 0, default.stderr)
+        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=12G CARGO_BUILD_JOBS=6 " + tail, default.stdout)
+        override = start("boat:bx_worker", "3", "13G")
+        self.assertIn("\nSPARKLES_NSC_BUILD_MEMORY_MAX=13G CARGO_BUILD_JOBS=3 " + tail, override.stdout)
+        # An ssh host derives its own cap and jobs, and the caller's override does not reach it.
+        ssh = start("h1", "3", "13G")
+        self.assertEqual(ssh.returncode, 0, ssh.stderr)
+        self.assertIn("\n" + tail, ssh.stdout)
+        self.assertNotIn("CARGO_BUILD_JOBS", ssh.stdout)
+        self.assertNotIn("SPARKLES_NSC_BUILD_MEMORY_MAX", ssh.stdout)
+        # A bad value is refused by the argument check, before the Boat admission is validated
+        # and before either entry point admits its executor.
+        spy = self.root / "admission-calls"
+        check = ('. "$1/scripts/nsc-build-host.sh"; die() { echo "die: $*" >&2; exit 9; }; '
+                 'SPY=$3; python3() { echo "$*" >> "$SPY"; }; BH_ARG=$2; bh_check_arg')
+        for bad in ("1", "9", "5x", "03"):
+            env = dict(self.env, SPARKLES_BOAT_BUILD_JOBS=bad)
+            refused = subprocess.run(["bash", "-c", check, "bash", str(self.repo), "boat:bx_worker", str(spy)],
+                                     env=env, capture_output=True, text=True)
+            self.assertEqual(refused.returncode, 9, bad)
+            self.assertIn("not a whole number from 2 to 8", refused.stderr)
+            self.assertFalse(spy.exists(), bad)
+        for bad in ("14G", "7G", "12", "12g", "013G", "12.5G"):
+            env = dict(self.env, SPARKLES_BOAT_BUILD_JOBS="2", SPARKLES_BOAT_BUILD_MEMORY_MAX=bad)
+            refused = subprocess.run(["bash", "-c", check, "bash", str(self.repo), "boat:bx_worker", str(spy)],
+                                     env=env, capture_output=True, text=True)
+            self.assertEqual(refused.returncode, 9, bad)
+            self.assertIn("not a whole number of G from 8G to 13G", refused.stderr)
+            self.assertFalse(spy.exists(), bad)
+        accepted = subprocess.run(["bash", "-c", check, "bash", str(self.repo), "boat:bx_worker", str(spy)],
+                                  env=dict(self.env, SPARKLES_BOAT_BUILD_JOBS="2"), capture_output=True, text=True)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("validate boat:bx_worker", spy.read_text())
+        for script in ("nsc-bench.sh", "nsc-writes.sh"):
+            text = (self.repo / "scripts" / script).read_text()
+            self.assertLess(text.index("\nbh_check_arg\n"), text.index("\nscreen_check"), script)
+        result, out = self.bench("--build-host", "boat:bx_worker",
+                                 env=dict(self.env, SPARKLES_BOAT_BUILD_JOBS="9"), ok_stop=False)
+        self.assertIn("not a whole number from 2 to 8", result.stderr)
+        self.assertEqual(self.builds(), [])
+        # The remote build takes the forwarded jobs over the count its cap implies.
+        d = self.remote_dir()
+        env = dict(self.env, SPARKLES_NSC_BUILD_MEMORY_MAX="12G", CARGO_BUILD_JOBS="2")
+        started = self.remote(str(d), "nsc-build-test-jobs", self.expiry(), env=env)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertIn("MemoryMax=12G, CARGO_BUILD_JOBS=2,", started.stdout)
+        self.assertEqual(self.remote("--cancel", str(d), "nsc-build-test-jobs").returncode, 0)
 
     def remote_dir(self):
         """A scratch directory on h1 with the scripts and a source tree, as bh_build leaves it."""
@@ -669,6 +756,124 @@ class BuildHost(unittest.TestCase):
         self.assertEqual(len(got), lines)
         self.assertEqual(got[-1], f"log line {lines - 1:07d}")
         self.assertIn("built on h1, sha256", log)
+
+    def test_only_a_boat_build_host_that_runs_the_screen_keeps_its_binaries(self):
+        program = '. "$1/scripts/nsc-build-host.sh"; BH_ARG=$2; EXECUTOR=$3; bh_keep_on_worker'
+        for arg, executor, keep in (("boat:bx_worker", "boat:bx_worker", True),
+                                    ("boat:bx_worker", "boat:bx_other", False),
+                                    ("boat:bx_worker", "nsc", False), ("h1", "h1", False),
+                                    ("local", "nsc", False), ("", "nsc", False)):
+            result = subprocess.run(["bash", "-c", program, "bash", str(self.repo), arg, executor],
+                                    env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode == 0, keep, (arg, executor))
+
+    def keep_on(self, host):
+        """Make the fixture's predicate keep binaries on HOST, an ssh host the fakes can reach."""
+        path = self.repo / "scripts/nsc-build-host.sh"
+        text = path.read_text()
+        old = 'case $BH_ARG in boat:bx_*) [ "${EXECUTOR:-}" = "$BH_ARG" ] ;; *) return 1 ;; esac'
+        self.assertIn(old, text)
+        path.write_text(text.replace(old, f'[ "$BH_ARG" = {host} ]'))
+
+    def kept_entry(self):
+        return self.cache / "bin" / f"{self.sha}-kept"
+
+    def test_a_kept_binary_stays_on_its_build_host_and_is_checked_before_reuse(self):
+        self.keep_on("h1")
+        result, out = self.bench("--build-host", "h1")
+        self.assertEqual(len(self.builds()), 1)
+        record = (self.kept_entry() / "build.txt").read_text()
+        kept = next(line[6:] for line in record.splitlines() if line.startswith("kept: "))
+        remote = Path(kept)
+        self.assertTrue(remote.is_relative_to(self.hosts / "h1" / "lanes" / "nsc-build"), kept)
+        self.assertEqual(remote.read_text(), f"built in {self.hosts / 'h1'} with ")
+        digest = hashlib.sha256(remote.read_bytes()).hexdigest()
+        self.assertIn(f"kept sha256: {digest}\n", record)
+        self.assertIn("kept compilers: \n", record)
+        self.assertIn("kept dynamic: 0\n", record)
+        self.assertIn("build host: h1\n", record)
+        # Nothing but the records crossed back: no binary in the entry, the private tree or the stage.
+        self.assertFalse((self.kept_entry() / "sparkles").exists())
+        self.assertFalse(self.entry().exists())
+        self.assertEqual(list((self.cache / "src").iterdir()), [])
+        self.assertEqual(list((out / "stage").glob("bin-*")), [])
+        manifest = (out / "manifest.txt").read_text()
+        self.assertIn(f"A sha256: {digest}\n", manifest)
+        self.assertIn(f"A kept on h1 at {kept}\n", manifest)
+        self.assertIn("DYNAMIC_A=0\n", (out / "stage" / "run.env").read_text())
+        # A second run checks the kept binary on the host and builds nothing.
+        self.bench("--build-host", "h1")
+        self.assertEqual(len(self.builds()), 1)
+        # A changed or missing binary is built again.
+        remote.write_text("tampered")
+        self.bench("--build-host", "h1")
+        self.assertEqual(len(self.builds()), 2)
+        kept = next(line[6:] for line in (self.kept_entry() / "build.txt").read_text().splitlines()
+                    if line.startswith("kept: "))
+        Path(kept).unlink()
+        self.bench("--build-host", "h1")
+        self.assertEqual(len(self.builds()), 3)
+        # A host that cannot be asked stops the run instead of building again.
+        (self.hosts / "h1" / "unreachable").touch()
+        env = dict(self.env, SPARKLES_NSC_BUILD_RETRIES="2")
+        result, _ = self.bench("--build-host", "h1", env=env, ok_stop=False)
+        self.assertIn("could not check the binary kept on h1", result.stderr)
+        self.assertEqual(len(self.builds()), 3)
+
+    def test_kept_checks_refuse_paths_and_hashes_of_another_shape(self):
+        program = '. "$1/scripts/nsc-build-host.sh"; bh_rx() { echo "rx: $*" >&2; }; bh_kept_check h1 "$2" "$3"'
+        good_path = f"/home/user/lanes/nsc-build/{self.sha}.AbC123/out/sparkles"
+        good_sha = "a" * 64
+        for path, digest in ((good_path + "; rm -rf ~", good_sha), ("/tmp/sparkles", good_sha),
+                             (good_path, "a" * 63), (good_path, "$(true)" + "a" * 57), ("", "")):
+            result = subprocess.run(["bash", "-c", program, "bash", str(self.repo), path, digest],
+                                    env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1, (path, digest))
+            self.assertEqual(result.stdout.strip(), "invalid")
+            self.assertNotIn("rx:", result.stderr)
+
+    def test_a_kept_build_needs_the_tools_that_read_the_binary_on_the_host(self):
+        # bh_rx runs the host's command under a PATH with only the named tools.
+        program = ('. "$1/scripts/nsc-build-host.sh"; bh_rx() { env PATH="$TOOLS" "$BASH" -c "$3"; }; '
+                   'bh_tools_kept h1')
+        bash = shutil.which("bash")
+        for missing in ("readelf", "ldd", "sha256sum", None):
+            tools = self.root / f"tools-{missing}"
+            tools.mkdir()
+            for name in ("readelf", "ldd", "sha256sum"):
+                if name != missing:
+                    (tools / name).write_text("#!/bin/sh\n")
+                    (tools / name).chmod(0o755)
+            result = subprocess.run([bash, "-c", program, "bash", str(self.repo)],
+                                    env=dict(self.env, TOOLS=str(tools)), capture_output=True, text=True)
+            if missing:
+                self.assertEqual(result.returncode, 3, missing)
+                self.assertIn(f"{missing} is not on the build host PATH", result.stderr)
+            else:
+                self.assertEqual(result.returncode, 0, result.stderr)
+        # The check runs before the scratch directory, the source copy and the build.
+        text = (self.repo / "scripts/nsc-build-host.sh").read_text()
+        steps = text[text.index("\nbh_build_steps() {"):]
+        self.assertLess(steps.index("bh_tools_kept"), steps.index("bh_scratch"))
+
+    def test_the_remote_run_takes_a_kept_binary_and_records_what_it_runs(self):
+        d = self.root / "screen"
+        (d / "queries").mkdir(parents=True)
+        shutil.copy(ROOT / "scripts/nsc-bench-remote.sh", d)
+        (d / "run.env").write_text("SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\n")
+        (d / "bin-A").write_text("kept A\n")
+        (d / "bin-B.zst").write_text("uploaded B\n")
+        (d / "data.nt.zst").write_text("")
+        subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual((d / "A" / "sparkles").read_text(), "kept A\n")
+        self.assertEqual((d / "B" / "sparkles").read_text(), "uploaded B\n")
+        recorded = dict(reversed(line.split()) for line in (d / "results/binaries.sha256").read_text().splitlines())
+        self.assertEqual(recorded, {"A/sparkles": hashlib.sha256(b"kept A\n").hexdigest(),
+                                    "B/sparkles": hashlib.sha256(b"uploaded B\n").hexdigest()})
+        # The bench compares that record with its manifest after the run and the rerun.
+        text = (self.repo / "scripts/nsc-bench.sh").read_text()
+        self.assertEqual(text.count('check_ran "$OUT"\n'), 1)
+        self.assertEqual(text.count('check_ran "$OUT/rerun"\n'), 1)
 
     def test_a_boat_write_screen_keeps_entries_of_its_own_worker(self):
         program = '. "$1/scripts/nsc-build-host.sh"; BH_ARG=$2; echo "[$(bh_entry_key_suffix)]"'

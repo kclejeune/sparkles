@@ -35,6 +35,7 @@ pub(crate) mod configuration_history;
 pub use bound_read_source::BoundReadSource;
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
+mod aggregates;
 pub mod definitions;
 mod deltas;
 mod describe;
@@ -68,6 +69,7 @@ pub use holds::{Acquired, HoldPublication};
 pub use managed::ManagedSnapshot;
 #[cfg(test)]
 mod control_tests;
+mod load_plan;
 #[cfg(test)]
 mod managed_tests;
 mod mem_history;
@@ -100,9 +102,13 @@ mod vector;
 pub(crate) use diff::QuadKey;
 pub(crate) use embed::embed_query_text;
 pub use embed::embed_texts;
+use load_plan::LoadPlan;
+#[cfg(test)]
+use load_plan::SMALL_STREAM_BYTES;
 use publish::{Committed, Publication};
 use snapshot::{Shared, SnapshotBuilder};
 pub(crate) mod wal;
+pub use aggregates::AGGREGATE_ERRORS_FILE;
 pub use backup::{
     BackupBranch, BackupCapture, CapturedFile, FileKind, FileSource, LeaseGuard,
     MEMORY_CAPTURE_PREFIX, MemoryCaptureOptions,
@@ -616,6 +622,9 @@ pub struct Snapshot {
     /// the spatial index as of this commit (datasets with a spatial index)
     pub geo: Option<Arc<crate::geo::GeoView>>,
     pub union_default_graph: bool,
+    /// How aggregates treat errors for queries on this snapshot that do not choose
+    /// ([`StoreOptions::aggregate_errors`])
+    pub aggregate_errors: crate::sparql::AggregateErrors,
     /// largest sum of input vertices of one geometry operation in queries on this
     /// snapshot ([`StoreOptions::geo_op_vertices`])
     pub geo_op_vertices: u64,
@@ -1403,9 +1412,14 @@ pub struct StoreOptions {
     /// that cache.
     pub service_cache_bytes: u64,
     pub union_default_graph: bool,
+    /// How aggregates treat errors and values that are not strings in queries that do
+    /// not choose, the server's default (see [`crate::sparql::AggregateErrors`]). A
+    /// dataset's own setting, which the library applies as a query default, comes first.
+    pub aggregate_errors: crate::sparql::AggregateErrors,
     pub build: BuildOptions,
-    /// Loads smaller than this many quads go through the transactional delta; larger
-    /// loads trigger a rebuild (bulk path).
+    /// Writes of more than this many quads rebuild the index generation (the bulk path),
+    /// and smaller ones go through the transactional delta. `store/load_plan.rs` holds
+    /// the rule for loads, replaces, bulk inserts and patches.
     pub bulk_threshold: u64,
     /// In-memory stores keep the metadata of this many most recent commits.
     pub memory_commit_ring: usize,
@@ -1534,6 +1548,7 @@ impl Default for StoreOptions {
             result_cache_min_ms: 1.0,
             service_cache_bytes: 64 << 20,
             union_default_graph: false,
+            aggregate_errors: Default::default(),
             build: BuildOptions::default(),
             bulk_threshold: 250_000,
             memory_commit_ring: 65_536,
@@ -1652,6 +1667,8 @@ struct BuiltGeneration {
     sourced: Option<Vec<QuadKey>>,
     /// the quads of the dropped graphs, unless there were more than the change cap
     dropped: Option<Vec<[Id; 4]>>,
+    /// the quads the sources gave, duplicates included
+    parsed: u64,
 }
 
 /// A failed switch of `CURRENT` (see [`Store::switch_generation`]).
@@ -1771,6 +1788,9 @@ pub struct Store {
     compaction: compaction::Track,
     /// the dataset's DESCRIBE setting (`describe.json` of a persistent store)
     describe: parking_lot::RwLock<crate::sparql::describe::DescribeOptions>,
+    /// the dataset's own reading of errors in aggregates (`aggregate-errors.json` of a
+    /// persistent store)
+    aggregate_errors: parking_lot::RwLock<Option<crate::sparql::AggregateErrors>>,
     /// the branch this store is, and the dataset's branches
     branching: branching::Branching,
     /// who keeps the dataset-managed definitions that captures record
@@ -2074,6 +2094,7 @@ impl Store {
                         cache: &cache,
                         results: &results,
                         union_default_graph: opts.union_default_graph,
+                        aggregate_errors: opts.aggregate_errors,
                         geo_op_vertices: opts.geo_op_vertices,
                         change_log: changelog.clone(),
                     },
@@ -2131,6 +2152,7 @@ impl Store {
             branching: Default::default(),
             compaction: compaction::Track::new(0, None, Some(root.timestamp_ms)),
             describe: Default::default(),
+            aggregate_errors: Default::default(),
             definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
@@ -2622,6 +2644,7 @@ impl Store {
                         cache: &cache,
                         results: &results,
                         union_default_graph: opts.union_default_graph,
+                        aggregate_errors: opts.aggregate_errors,
                         geo_op_vertices: opts.geo_op_vertices,
                         change_log: changelog.clone(),
                     },
@@ -2692,6 +2715,7 @@ impl Store {
                 Some(head.timestamp_ms),
             ),
             describe: parking_lot::RwLock::new(describe::read_settings(root)?),
+            aggregate_errors: parking_lot::RwLock::new(aggregates::read_setting(root)?),
             definitions: Default::default(),
             #[cfg(any(test, feature = "failpoints"))]
             failpoints: Default::default(),
@@ -5061,21 +5085,46 @@ impl Store {
 
     /// Before `quads` parsed quads are encoded into a transaction of an in-memory store
     /// (which adds their terms to its vocabulary even if the commit is refused later):
-    /// `StorageFull` when their delta alone would pass the limit.
-    fn check_memory_before(&self, quads: usize) -> Result<()> {
-        if self.root.is_some() || self.opts.max_memory_bytes.is_none() {
+    /// `StorageFull` when their delta alone would pass the limit. A dry run writes
+    /// nothing and rolls its terms back, so it is not refused here: the check that first
+    /// refuses it, which runs at `stage` among the write's checks, is kept in `early`, and
+    /// `with_early_refusal` puts it in the preview, which then reports the refusal and the
+    /// sizes the write itself would get.
+    fn check_memory_before(
+        &self,
+        quads: usize,
+        o: &crate::guard::WriteOptions,
+        stage: crate::preview::RefusalStage,
+        early: &mut Option<crate::preview::StorageCheck>,
+    ) -> Result<()> {
+        if self.root.is_some() || self.opts.max_memory_bytes.is_none() || early.is_some() {
             return Ok(());
         }
         let snap = self.snapshot();
         let now = snap.generation.disk_bytes()
             + delta_bytes(&snap.delta)
             + snap.generation.dvocab.with(|v| v.bytes()) as u64;
-        self.check_memory(now + quads as u64 * DELTA_QUAD_BYTES)
+        let size = now.saturating_add((quads as u64).saturating_mul(DELTA_QUAD_BYTES));
+        // one reading of the configuration's history serves the check and the preview
+        let total = self.memory_with_configuration(size)?;
+        match self.check_memory_total(total) {
+            Err(e) if o.dry_run.is_some() => {
+                *early = Some(crate::preview::StorageCheck {
+                    refused: Some(e),
+                    limit: self.opts.max_memory_bytes,
+                    used: None,
+                    projected: Some(total),
+                    stage,
+                });
+                Ok(())
+            }
+            r => r,
+        }
     }
 
-    /// In-memory stores stay within [`StoreOptions::max_memory_bytes`]: `StorageFull`
-    /// when a commit would make the data about `size` bytes.
-    fn check_memory(&self, size: u64) -> Result<()> {
+    /// `size` bytes of data with the retained history of the managed configuration, which
+    /// an in-memory store's limit also counts.
+    fn memory_with_configuration(&self, size: u64) -> Result<u64> {
         let history = self.family.managed.load();
         let configuration = match history.as_deref() {
             Some(crate::managed::ManagedState::Installed(i)) => {
@@ -5083,9 +5132,19 @@ impl Store {
             }
             _ => 0,
         };
-        let size = size
-            .checked_add(configuration)
-            .ok_or_else(|| Error::invalid("dataset memory size overflow"))?;
+        size.checked_add(configuration)
+            .ok_or_else(|| Error::invalid("dataset memory size overflow"))
+    }
+
+    /// In-memory stores stay within [`StoreOptions::max_memory_bytes`]: `StorageFull`
+    /// when a commit would make the data about `size` bytes.
+    fn check_memory(&self, size: u64) -> Result<()> {
+        self.check_memory_total(self.memory_with_configuration(size)?)
+    }
+
+    /// `StorageFull` when an in-memory store's data with its configuration's history,
+    /// `size` bytes, would pass its limit.
+    fn check_memory_total(&self, size: u64) -> Result<()> {
         match self.opts.max_memory_bytes {
             Some(max) if self.root.is_none() && size > max => {
                 let h = crate::error::human_bytes;
@@ -5288,21 +5347,8 @@ impl Store {
         kind: CommitKind,
         o: &crate::guard::WriteOptions,
     ) -> Result<Receipt> {
-        let snap = self.snapshot();
-        // A stream that ends within a few thousand quads goes into an empty store by a
-        // transaction, which costs less than the fixed cost of a rebuild. Its bytes are
-        // read ahead to tell, as only a read can.
-        let small_streams = snap.is_empty()
-            && !sources.is_empty()
-            && sources
-                .iter()
-                .all(|s| matches!(s.data, crate::io::SourceData::Reader(_)))
-            && !streams_exceed(sources, SMALL_STREAM_BYTES, o)?;
-        // a write limited to some graphs checks each quad, which a rebuild does not
-        if o.graphs.is_none()
-            && !small_streams
-            && (snap.is_empty() || estimated_quads(sources) > self.opts.bulk_threshold)
-        {
+        let plan = self.source_plan(load_plan::Entry::Load, sources, o)?;
+        if plan == LoadPlan::Bulk {
             let mut w = self.lock_writer(o)?;
             if w.poisoned {
                 return Err(Error::Poisoned);
@@ -5323,6 +5369,7 @@ impl Store {
             let mut txn = self.try_write_with(kind, o.clone())?;
             let mut prefixes = BTreeMap::new();
             let mut parsed = 0;
+            let mut early = None;
             let prepared = (|| -> Result<()> {
                 for s in sources {
                     o.check()?;
@@ -5332,7 +5379,12 @@ impl Store {
                         if parsed % 65_536 == 1 {
                             o.check()?;
                         }
-                        self.check_memory_before(parsed)?;
+                        self.check_memory_before(
+                            parsed,
+                            o,
+                            crate::preview::RefusalStage::Parse,
+                            &mut early,
+                        )?;
                         let ids = txn.encode_quad(&q, &mut labels)?;
                         txn.insert(ids)?;
                         Ok(())
@@ -5354,7 +5406,7 @@ impl Store {
                 txn.guard.next_bnode = txn.start_bnode;
                 return Err(error);
             }
-            let r = txn.commit()?;
+            let r = with_early_refusal(txn.commit(), early)?;
             self.add_prefixes(prefixes)?;
             Ok(r)
         }
@@ -5419,9 +5471,8 @@ impl Store {
                 }
                 _ => {}
             }
-        } else if estimated_quads(sources) > self.opts.bulk_threshold
-            || streams_exceed(sources, self.opts.bulk_threshold.saturating_mul(80), o)?
-        {
+        }
+        if self.source_plan(load_plan::Entry::Replace, sources, o)? == LoadPlan::Bulk {
             return self.replace_bulk(target, sources, kind, o);
         }
         let mut parsed = Vec::with_capacity(sources.len());
@@ -5432,7 +5483,14 @@ impl Store {
             prefixes.extend(p);
             parsed.push(quads);
         }
-        self.check_memory_before(parsed.iter().map(Vec::len).sum())?;
+        // the transaction checks the precondition when it opens, after this check
+        let mut early = None;
+        self.check_memory_before(
+            parsed.iter().map(Vec::len).sum(),
+            o,
+            crate::preview::RefusalStage::Prepare,
+            &mut early,
+        )?;
         let mut txn = self.try_write_with(kind, o.clone())?;
         let view = txn.view();
         let graphs: Vec<Id> = match &target {
@@ -5482,9 +5540,41 @@ impl Store {
         drop(keep);
         let n = ids.len() as u64;
         txn.insert_bulk(ids)?;
-        let r = txn.commit()?;
+        let r = with_early_refusal(txn.commit(), early)?;
         self.add_prefixes(prefixes)?;
         Ok((n, r))
+    }
+
+    /// The [`LoadPlan`] of a load or a replace of `sources` under `o`.
+    fn source_plan(
+        &self,
+        entry: load_plan::Entry,
+        sources: &[Source],
+        o: &crate::guard::WriteOptions,
+    ) -> Result<LoadPlan> {
+        // Every stream checks the write's controls beneath its decoder whichever plan
+        // runs, including one whose size the plan never reads.
+        control_streams(sources, o)?;
+        let inputs = load_plan::LoadInputs {
+            empty_head: self.snapshot().is_empty(),
+            sources: sources.len(),
+            streams: sources
+                .iter()
+                .filter(|s| matches!(s.data, crate::io::SourceData::Reader(_)))
+                .count(),
+            restricted: o.graphs.is_some(),
+            ..load_plan::LoadInputs::new(entry, self.opts.bulk_threshold)
+        };
+        struct SourceSizes<'a>(&'a [Source], &'a crate::guard::WriteOptions);
+        impl load_plan::Sizes for SourceSizes<'_> {
+            fn estimate(&mut self) -> u64 {
+                estimated_quads(self.0)
+            }
+            fn exceeds(&mut self, limit: u64) -> Result<bool> {
+                streams_exceed(self.0, limit, self.1)
+            }
+        }
+        LoadPlan::choose(&inputs, &mut SourceSizes(sources, o))
     }
 
     /// A large replace: one rebuild that leaves out the target graphs and adds the
@@ -5532,9 +5622,8 @@ impl Store {
             admission: None,
         };
         let check = (crate::guard::Changes::Unknown, o);
-        let (_, r) = self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, bulk, check)?;
-        // the quads the replacement holds: what is left, less what was kept
-        Ok(((r.commit.quads + dropped).saturating_sub(start_len), r))
+        // the quads parsed, as a transactional replace counts them
+        self.rebuild_locked(&mut w, &snap, sources, &[], &graphs, bulk, check)
     }
 
     /// Compact: merge base ⊕ delta into a new generation. The data does not change, so
@@ -5550,7 +5639,7 @@ impl Store {
     /// transaction), less the graphs in `drop_graphs`. A compaction keeps the head and
     /// builds and catches up on its own (see [`compact_with`](Self::compact_with)); both
     /// publish through [`switch_generation`](Self::switch_generation).
-    /// Returns the number of new quads and the receipt.
+    /// Returns the number of quads its sources parsed, duplicates included, and the receipt.
     #[allow(clippy::too_many_arguments)]
     fn rebuild_locked(
         &self,
@@ -5578,7 +5667,6 @@ impl Store {
             admitted.fence()?
         };
         let started = std::time::Instant::now();
-        let before = snap.len();
         // the head state before the bulk commit, whose changes the change log records
         let prior = self.snapshot();
         // a running compaction gives up: this rebuild makes a new generation itself
@@ -5627,6 +5715,7 @@ impl Store {
             storage,
             sourced,
             dropped,
+            parsed,
         } = self.build_generation(
             w,
             snap,
@@ -5864,7 +5953,7 @@ impl Store {
             validation,
             annotation,
         };
-        Ok((meta.quads.saturating_sub(before), receipt))
+        Ok((parsed, receipt))
     }
 
     /// Build the generation of a bulk commit next to the current one: the quads of
@@ -5916,6 +6005,7 @@ impl Store {
         let mut sourced: Option<Vec<QuadKey>> = None;
         let mut dropped: Vec<[Id; 4]> = Vec::new();
         let mut dropped_over = false;
+        let mut parsed = 0;
         let built = (|| {
             let mut builder = Builder::new(&dir, bopts)?;
             if let Some(i) = interrupt.clone() {
@@ -5946,9 +6036,11 @@ impl Store {
                 },
                 extra_quads,
             )?;
+            let before = builder.input_quads();
             for s in extra {
                 builder.add_source(s)?;
             }
+            parsed = builder.input_quads() - before;
             sourced = builder.take_tapped();
             builder.add_prefixes(self.prefixes());
             let meta = builder.finish()?;
@@ -5979,6 +6071,7 @@ impl Store {
                 storage,
                 sourced,
                 dropped: (!dropped_over).then_some(dropped),
+                parsed,
             }),
             Err(e) => {
                 // the unfinished generation's space is freed now, not at the next rebuild
@@ -6544,6 +6637,12 @@ impl WriteTxn<'_> {
         Ok((head.seq + 1, ts))
     }
 
+    /// The reading of errors in aggregates the store's queries use unless they choose
+    /// one: the dataset's own setting, else the store's option.
+    pub fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
+        self.store.aggregate_errors()
+    }
+
     /// The graph view of this transaction's writes, if it does not cover every graph.
     pub fn graphs(&self) -> Option<&Arc<crate::access::GraphAccess>> {
         self.opts.graphs.as_ref()
@@ -6933,7 +7032,7 @@ impl WriteTxn<'_> {
         !self.log.is_empty() || !self.bulk.is_empty()
     }
 
-    /// Insert many quads. Batches at or above the store's `bulk_threshold` are not
+    /// Insert many quads. Batches above the store's `bulk_threshold` are not
     /// applied to the delta; on commit they are merged into a freshly built generation
     /// (QLever-style rebuild), which is much faster than per-quad delta inserts. Staged
     /// bulk quads are not visible through [`view`](Self::view) / [`contains`](Self::contains)
@@ -6944,12 +7043,8 @@ impl WriteTxn<'_> {
                 self.check_graph(q[3])?;
             }
         }
-        // a write whose quads protections check goes through the delta, so that the
-        // state it leaves can be checked before the commit
-        if (quads.len() as u64) < self.store.opts.bulk_threshold
-            || self.requested.is_some()
-            || self.managed.is_some()
-            || self.control.is_some()
+        if self.bulk_plan(load_plan::Entry::InsertBulk, quads.len(), false)
+            == LoadPlan::Transactional
         {
             for q in quads {
                 self.insert(q)?;
@@ -6965,6 +7060,22 @@ impl WriteTxn<'_> {
         }
         self.bulk.extend(quads);
         Ok(())
+    }
+
+    /// The [`LoadPlan`] of a batch of `len` quads staged by `entry`, a bulk insert or a
+    /// patch that has met a delete row when `deleted`.
+    pub(crate) fn bulk_plan(&self, entry: load_plan::Entry, len: usize, deleted: bool) -> LoadPlan {
+        let inputs = load_plan::LoadInputs {
+            quads: len as u64,
+            restricted: self.opts.graphs.is_some(),
+            triple_checks: self.requested.is_some(),
+            managed: self.managed.is_some(),
+            control: self.control.is_some(),
+            deleted,
+            ..load_plan::LoadInputs::new(entry, self.store.opts.bulk_threshold)
+        };
+        // a batch has no sources to read, so its plan cannot fail
+        LoadPlan::choose(&inputs, &mut load_plan::NoSources).unwrap_or(LoadPlan::Transactional)
     }
 
     /// Durably commit and publish a new snapshot. A transaction without net effect (and
@@ -7532,42 +7643,64 @@ fn guard_required_by(root: &Path) -> bool {
     }
 }
 
+/// A dry run's preview with `early`, the memory check that refused its sources before
+/// they were encoded, which the write itself meets before its commit checks the storage,
+/// so that the preview reports that refusal and its sizes, with or without a net change.
+fn with_early_refusal<T>(r: Result<T>, early: Option<crate::preview::StorageCheck>) -> Result<T> {
+    match (r, early) {
+        (Err(Error::DryRun(mut p)), Some(s)) => {
+            p.storage = s;
+            Err(Error::DryRun(p))
+        }
+        (r, _) => r,
+    }
+}
+
 /// A rough quad count of RDF sources from their size (~80 bytes per quad in text
 /// formats; compressed sizes scaled by [`Codec::expansion`](crate::codec::Codec::expansion)).
 fn estimated_quads(sources: &[Source]) -> u64 {
     let mut bytes = 0u64;
     for s in sources {
-        bytes += match &s.data {
+        let b = match &s.data {
             crate::io::SourceData::Bytes(b) => b.len() as u64,
             crate::io::SourceData::File(p) => std::fs::metadata(p).map(|m| m.len()).unwrap_or(0),
             // a stream's length is unknown until it is read
             crate::io::SourceData::Reader(_) => continue,
-        } * s.codec().map_or(1, |c| c.expansion());
+        }
+        .saturating_mul(s.codec().map_or(1, |c| c.expansion()));
+        bytes = bytes.saturating_add(b);
     }
-    bytes / 80
+    bytes / load_plan::BYTES_PER_QUAD
 }
 
-/// Decompressed bytes of streams, about 100,000 quads, below which a load into an empty store
-/// takes a transaction instead of a rebuild. A rebuild has a fixed cost of about 20 ms,
-/// and it parses a stream shorter than one parallel chunk of 8 MiB on one thread, so a
-/// transaction is faster up to about that size.
-const SMALL_STREAM_BYTES: u64 = 8 << 20;
+/// Give each stream among `sources` its decompressing reader (see
+/// [`ReaderSource::decode`](crate::io::ReaderSource)), beneath which every read of the raw
+/// stream, the decoder's own included, checks `o`. The magic bytes that tell the codec are
+/// read ahead under the same checks, so a slow stream or a gzip header that never ends
+/// stops at the write's deadline before any quad reaches the parser's callback.
+fn control_streams(sources: &[Source], o: &crate::guard::WriteOptions) -> Result<()> {
+    for s in sources {
+        if let crate::io::SourceData::Reader(r) = &s.data {
+            r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
+            r.decode(s.codec()?, s.max_decompressed, o)?;
+        }
+    }
+    Ok(())
+}
 
 /// Whether the streams among `sources`, whose length is unknown, hold more than `limit`
-/// decompressed bytes. Each stream gets its decompressing reader (see
-/// [`ReaderSource::decode`](crate::io::ReaderSource)) and is read ahead until it ends or
-/// passes its share of `limit`, and the bytes read ahead are parsed later. `o` is checked
-/// before each read, so a slow stream stops at the write's deadline.
+/// decompressed bytes. Each stream is given its decompressing reader by
+/// [`control_streams`] and read ahead until it ends or passes its share of `limit`, and
+/// the bytes read ahead are parsed later. `o` is checked before each read, so a slow
+/// stream stops at the write's deadline.
 fn streams_exceed(sources: &[Source], limit: u64, o: &crate::guard::WriteOptions) -> Result<bool> {
+    control_streams(sources, o)?;
     let mut bytes = 0u64;
     for s in sources {
         let crate::io::SourceData::Reader(r) = &s.data else {
             continue;
         };
-        // the magic bytes that tell the codec, read under the same checks
-        r.read_ahead(crate::codec::Codec::MAGIC_LEN, &|| o.check())?;
-        r.decode(s.codec()?, s.max_decompressed, o)?;
-        let want = (limit + 1).saturating_sub(bytes);
+        let want = limit.saturating_add(1).saturating_sub(bytes);
         let held = r.read_ahead(usize::try_from(want).unwrap_or(usize::MAX), &|| o.check())?;
         bytes += held as u64;
         if bytes > limit {
@@ -8199,6 +8332,7 @@ pub(crate) fn replay_wal(
             cache,
             results: from.results,
             union_default_graph: false,
+            aggregate_errors: Default::default(),
             geo_op_vertices: StoreOptions::default().geo_op_vertices,
             change_log: None,
         },
@@ -8435,30 +8569,51 @@ mod tests {
                 Ok(1)
             }
         }
-        let store = Store::in_memory(StoreOptions::default());
-        store
-            .load(&[Source::from_bytes(
-                b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
-                RdfFormat::NTriples,
-                None,
-            )])
-            .unwrap();
-        let o = crate::guard::WriteOptions {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)),
-            ..Default::default()
-        };
-        let t = std::time::Instant::now();
-        let src = Source::from_reader(Slow, RdfFormat::NTriples, None);
-        let e = store
-            .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
-            .unwrap_err();
-        assert!(matches!(e, Error::Timeout), "{e}");
-        assert!(
-            t.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            t.elapsed()
-        );
-        assert_eq!(store.snapshot().len(), 1);
+        stops_at_the_deadline(|| Source::from_reader(Slow, RdfFormat::NTriples, None));
+    }
+
+    /// A load and a replace of the stream `src` into a store that holds a quad stop at a
+    /// near deadline, at the default threshold, where the plan reads the stream's size,
+    /// and at the largest, where it reads none.
+    fn stops_at_the_deadline(src: impl Fn() -> Source) {
+        for threshold in [StoreOptions::default().bulk_threshold, u64::MAX] {
+            for load in [false, true] {
+                let store = Store::in_memory(StoreOptions {
+                    bulk_threshold: threshold,
+                    ..Default::default()
+                });
+                store
+                    .load(&[Source::from_bytes(
+                        b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
+                        RdfFormat::NTriples,
+                        None,
+                    )])
+                    .unwrap();
+                let o = crate::guard::WriteOptions {
+                    deadline: Some(
+                        std::time::Instant::now() + std::time::Duration::from_millis(30),
+                    ),
+                    ..Default::default()
+                };
+                let t = std::time::Instant::now();
+                let e = if load {
+                    store.load_with(&[src()], CommitKind::Load, &o).map(|_| ())
+                } else {
+                    store
+                        .replace_with(ReplaceTarget::All, &[src()], CommitKind::Transaction, &o)
+                        .map(|_| ())
+                }
+                .unwrap_err();
+                let case = format!("threshold {threshold}, load {load}");
+                assert!(matches!(e, Error::Timeout), "{case}: {e}");
+                assert!(
+                    t.elapsed() < std::time::Duration::from_millis(500),
+                    "{case}: {:?}",
+                    t.elapsed()
+                );
+                assert_eq!(store.snapshot().len(), 1, "{case}");
+            }
+        }
     }
 
     #[test]
@@ -8515,30 +8670,7 @@ mod tests {
                 Ok(1)
             }
         }
-        let store = Store::in_memory(StoreOptions::default());
-        store
-            .load(&[Source::from_bytes(
-                b"<http://e/a> <http://e/b> <http://e/c> .".to_vec(),
-                RdfFormat::NTriples,
-                None,
-            )])
-            .unwrap();
-        let o = crate::guard::WriteOptions {
-            deadline: Some(std::time::Instant::now() + std::time::Duration::from_millis(30)),
-            ..Default::default()
-        };
-        let t = std::time::Instant::now();
-        let src = Source::from_reader(Header(0), RdfFormat::NTriples, None);
-        let e = store
-            .replace_with(ReplaceTarget::All, &[src], CommitKind::Transaction, &o)
-            .unwrap_err();
-        assert!(matches!(e, Error::Timeout), "{e}");
-        assert!(
-            t.elapsed() < std::time::Duration::from_millis(500),
-            "{:?}",
-            t.elapsed()
-        );
-        assert_eq!(store.snapshot().len(), 1);
+        stops_at_the_deadline(|| Source::from_reader(Header(0), RdfFormat::NTriples, None));
     }
 
     #[test]

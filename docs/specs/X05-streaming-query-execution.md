@@ -1007,7 +1007,7 @@ entry point that picks a mode and what it does now.
 | A query that ran in under 10 ms last time | eager, in place | The decision would cost more than any stream can save, and the in-place path stays as it was. |
 | Stored queries, `/{ds}/queries/{name}` | as `/{ds}/sparql` | A run with parameter values has initial bindings, which rule out every automatic plan, so it runs eagerly. |
 | Graph algorithms over HTTP | as `/{ds}/sparql` | Their plans never qualify, so they run eagerly. |
-| UI result table | eager, asked for explicitly | The table shows the full row count and the time slider compares totals, which a streamed answer stopped after `send` rows does not know. |
+| UI result table | the server's default, but eager in a comparison | A streamed answer that the row limit stopped shows its rows with an unknown total. A comparison on the time slider reads both states eagerly, because it compares whole results or their exact counts. |
 | UI downloads | the server's default | A download reads the whole answer. |
 | CLI `sparkles query`, local | `auto`, but eager for the `text` table and `--explain` | The table measures every row before printing one. A plan that stays eager prints exactly what an eager query prints. |
 | CLI `sparkles query --server` | the server's default | It sends `execution` only when `--execution` is given. |
@@ -1711,6 +1711,81 @@ to 26 µs were 7 to 14% slower in server time with spreads of 18 to 80%, and ite
 571 rechecks them on a quiet Intel host.
 
 
+### EXISTS inside larger expressions (2026-11-18)
+
+Both executors now answer an EXISTS inside a larger expression from the key set of its
+pattern, as they answer a FILTER EXISTS. This covers an EXISTS under IF, OR or another
+function, in an aggregate argument and in an ORDER BY key. Before the expression is
+evaluated over a table, every row of the table is probed once for each such EXISTS, and
+the evaluator reads the row's answer. A row that the key set cannot answer, and a pattern
+without a key set, are evaluated by substitution with the memo per distinct key as
+before. The probe answers and the key sets stay charged to the query while the
+expression reads them, and a row evaluated by substitution is counted when the
+expression reaches it. EXPLAIN reports the probes and the rows evaluated per row on the
+filter, extension, grouping and ordering that hold the EXISTS.
+
+Automatic execution now streams every FILTER, BIND, ORDER BY and grouping whose EXISTS
+patterns have cursor plans, whether the pattern is answered from a key set or per key.
+Three shapes stay eager. A pattern that calls a SERVICE stays eager because a cursor
+could repeat its effects, an EXISTS nested deeper than four levels stays eager under the
+admission's depth cap, which item 1081 covers, and an OPTIONAL whose condition holds an
+EXISTS stays eager until item 570 gives the cursor's merge OPTIONAL a condition.
+
+Probing every row costs a hash lookup per row and EXISTS, also for rows on which the
+expression never reaches the EXISTS. An IF branch that is rarely taken therefore builds
+a key set that it barely uses. On the laptop at 10.5M quads, `exists-rare` took 76 ms
+eagerly against 69 ms before, and 26 ms streamed against 12 ms before. The cost is
+bounded by one evaluation of the pattern, and item 1080 covers it.
+
+A quiet A/B on `atlas`, an Intel benchmark worker, compared the base with this change
+at 10.5M quads with one Rayon thread, over three A, B, B, A rounds of seven timed
+requests in each mode. Both builds returned the same answers in both modes. The
+aggregate `exists-agg` went from 885 to 16 ms eagerly and from 913 to 15 ms streamed. The
+keyed `not-exists`, `exists-bind` and `exists-bind-join` shapes, whose probe path the
+change rewrote, took 0.70 to 0.98 times as long as the base streamed, and the per-key shapes
+`exists-union` and `exists-union-bind`, whose UNION has no key set, took 1.00 and 1.015
+times as long streamed as eagerly. The [memory results](../benchmarks/memory/RESULTS.md#automatic-exists)
+give the table, and the [run record](../benchmarks/memory/records/exists-nested-2026-11-18/README.md)
+holds the samples.
+
+`tests/exists_auto.rs` compares automatic and eager answers for EXISTS under OR, IF and
+COALESCE, in SUM and in an ORDER BY key, with and without a key set, checks that each one
+streams and runs them under the budget loop from 512 KiB to 64 MiB. `exists_tests`
+compares the key-set answers with evaluation per key for the same positions and checks
+the nested counters of EXPLAIN, and the decision tables in `cursor.rs` admit the shapes.
+
+### The UI's table under automatic execution (2026-11-18)
+
+The query page's result table no longer asks for eager execution. It sends no
+`execution`, so the server's default applies, and automatic execution streams the plans
+that measured faster as cursors, such as a plain scan of a thousand rows or more and a
+grouping over 20,000 or more input rows, over a dataset whose updates are compacted. A
+streamed answer that reaches the row limit stops with `status: "stopped"` and a null
+`totalRows`, and the cursor writers stop without looking for another row. The Table tab
+then shows the rows sent with a plus sign, such as `1,000+`, and the notice above the
+table says that there may be more rows and that the total is unknown. A streamed answer
+that ends within the limit reports `complete` and its exact total, as an eager one does.
+
+A comparison on the time slider still asks for eager execution on both reads, because it
+compares two results as bags, or their exact counts when the row limit cut one of them.
+The comparison helper treats a stopped stream as cut, with its count unknown, so a
+caller that compares streamed answers compares counts and marks no row.
+
+A streamed CONSTRUCT or DESCRIBE answer sends an empty `triples` array and every
+statement in `quads`, with a null graph for the default graph. The UI moves those
+statements into `triples`, as an eager answer sends them, so the graph and table views
+draw a streamed graph answer as they draw an eager one. The other pages of the UI, such
+as paths, vector search, the shape editor and the ontology and thesaurus workbenches,
+still ask for eager execution, because they read exact totals or need a whole result.
+
+A streamed answer skips the full-result cache, so running the same streamed query again
+from the table is not served from the cache. Vitest covers the request's mode, the
+stopped metadata, the quads and the comparison of a stopped stream. A mock browser test
+rewrites the mock's answers into the stopped and quads shapes and checks the badge, the
+notice, the graph and a comparison's eager reads, and a browser test against a real
+server streams a grouping over 30,000 rows with a row limit of 1,000 and with a limit
+above the total, and a plain scan of the same rows with a limit of 1,000.
+
 ### Finite HTTP body limits
 
 Finite streamed query, Graph Store export, diff and changes responses use a separate
@@ -1748,3 +1823,17 @@ timer join. Configuration tests isolate environment/CLI precedence in child proc
 A capped response's body-side admission uses a take-once shared lease, adding one small
 shared allocation per response under concurrency caps. No measured negligible-cost
 claim follows from these correctness checks.
+
+### Buffered cursor writers
+
+The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
+through the engine's 8 KiB `Buffered` writer, as the eager writers do, and count the rows
+whose bytes reached the response, so a streamed body that stopped partway reports the
+rows the response writer accepted, as an eager body does. A streamed body that the result-size budget stops after the
+response committed sends what it had buffered before it aborts the transfer, which only
+eager bodies did before. That send waits under the body's idle limit, and when it fails
+the report leaves out its bytes but still counts its rows. On the large answers at 1.05M
+triples a streamed request runs 0.46 to 0.69 times the instructions it ran before, within
+2% of the eager request's count in native JSON or below it, and the
+[X14 Outcome](X14-unified-executor/SPEC.md#the-streamed-response-cost) gives the counts
+and where the short queries' remaining cost lies.

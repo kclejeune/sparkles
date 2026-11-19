@@ -358,6 +358,7 @@ fn internal_circuits_are_invisible_to_callers() {
         allow_stale: false,
         caller: None,
         deadline: None,
+        aggregate_errors: None,
     });
     assert_eq!(code(read.err().expect("refused")), "view-not-found");
     assert!(!rt.readable_by("secret", None));

@@ -117,6 +117,8 @@ command line win over the converted ones.
 | `arq:queryTimeout "N,M"` (first result, overall) | `--timeout M/1000` | approximated: Sparkles has no time limit for the first result |
 | `arq:updateTimeout` | `--update-timeout` | converted |
 | `tdb:unionDefaultGraph`, `tdb2:unionDefaultGraph` in a context | `--union-default-graph` | converted when it holds for every dataset |
+| `aggregateErrors` (`urn:x-sparkles:symbol#aggregateErrors`) in the server's context | `--aggregate-errors` | converted, and a value other than `jena`, `sparkles` or `spec` is unsupported |
+| `aggregateErrors` in a dataset's or an endpoint's context | the dataset's reading of errors in aggregates, set at the start unless the dataset has one | converted, approximated for an endpoint, and reported with the `PUT /$/aggregate-errors/{ds}` to run for a converted directory |
 | `fuseki:contextPath "/ABC"` | none | unsupported: datasets are served at the root, so a reverse proxy has to strip the prefix |
 | `fuseki:pingEP`, `fuseki:statsEP`, `fuseki:metricsEP`, `fuseki:compactEP` | always served; `metricsEP true` adds `--metrics-fuseki-names` | converted |
 | `fuseki:passwd`, `fuseki:realm`, `fuseki:auth "basic"` | §6 | converted |

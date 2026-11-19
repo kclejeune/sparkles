@@ -897,8 +897,8 @@ impl Dataset {
     /// The options a query of this dataset runs with by default. They hold RDFS on read
     /// when the dataset has it set, the graph of materialized inferences
     /// ([`INFERRED_GRAPH`](crate::reasoning::INFERRED_GRAPH)) as part of the default
-    /// graph while the dataset has a reasoning record, and the dataset's DESCRIBE
-    /// setting. Their `defaults_applied` is set, so the dataset uses them as given: a
+    /// graph while the dataset has a reasoning record, the dataset's DESCRIBE
+    /// setting and its reading of errors in aggregates. Their `defaults_applied` is set, so the dataset uses them as given: a
     /// caller changes a field to override a default, such as clearing
     /// `default_graph_extra` to leave the inferences out or setting `rdfs` to `None` to
     /// turn RDFS on read off for one query.
@@ -909,6 +909,7 @@ impl Dataset {
             rdfs,
             default_graph_extra,
             describe: state.store.describe_settings(),
+            aggregate_errors: Some(state.store.aggregate_errors()),
             pool: state.pool.clone(),
             algo_projections: Some(state.algo.clone()),
             views: Some(Arc::new(crate::handles::views::Source {
@@ -951,6 +952,9 @@ impl Dataset {
         }
         if o.describe == crate::sparql::describe::DescribeOptions::default() {
             o.describe = defaults.describe;
+        }
+        if o.aggregate_errors.is_none() {
+            o.aggregate_errors = defaults.aggregate_errors;
         }
         if o.pool.is_none() && o.grant.is_none() {
             o.pool = defaults.pool;

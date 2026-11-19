@@ -30,7 +30,15 @@ export type Derivation = {
   read?: ReadContext;
   /** A repeat of the node with this id given earlier, without its premises. */
   shared?: boolean;
+  /**
+   * A fact of a relation that a rule program declares. Its `triple` holds the
+   * relation's reserved IRI and is no fact of the data.
+   */
+  relation?: RelationAtom;
 };
+
+/** A relation fact of a rule program, `name(args)`. */
+export type RelationAtom = { name: string; args: Term[] };
 
 export type Explanation = {
   mode: 'why';
@@ -121,6 +129,8 @@ export function premiseTriples(d: Derivation): WhyTriple[] {
   const seen = new Set<string>([tripleKey(d.triple)]);
   const out: WhyTriple[] = [];
   for (const n of walk(d).slice(1)) {
+    // a relation fact is no triple of the data, so the canvas has no edge for it
+    if (n.relation) continue;
     const k = tripleKey(n.triple);
     if (seen.has(k)) continue;
     seen.add(k);
@@ -189,6 +199,16 @@ export function how(d: Derivation, graphLabel: (g: string) => string = (g) => g)
       return `derived by ${ruleText(d)}${gloss ? ` (${gloss})` : ''}${d.shared ? ' · as above' : ''}`;
     }
   }
+}
+
+/** The most depth an explanation request may ask for, which the server allows. */
+export const MAX_DEPTH = 64;
+
+/** The depth a request asks for to expand a cut relation node at `depth`, or `null`. */
+export function deeper(current: number | undefined, depth: number): number | null {
+  const want = Math.max(current ?? 32, depth) + 32;
+  const at = Math.min(MAX_DEPTH, want);
+  return at > (current ?? 32) ? at : null;
 }
 
 /** The largest id of the given trees, which ids given out later must pass. */

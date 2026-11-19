@@ -524,6 +524,11 @@ impl Builder {
         Ok(())
     }
 
+    /// The quads parsed so far, duplicates included.
+    pub(crate) fn input_quads(&self) -> u64 {
+        self.input_quads.load(Ordering::Relaxed)
+    }
+
     pub fn new_scope(&self) -> Arc<LabelScope> {
         Arc::new(LabelScope::new())
     }

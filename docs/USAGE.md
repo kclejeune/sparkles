@@ -735,6 +735,7 @@ sparkles query   --data file.ttl --query q.rq # query files in memory (arq --dat
 sparkles query   --loc db --rdfs schema.ttl 'SELECT ...'   # RDFS on read (--rdfs-graph IRI|default)
 sparkles query   --loc db --reasoning demand --profile owl-rl 'SELECT ...'   # derive on demand (--rules FILE, --max-derived N)
 sparkles query   --loc db --describe scbd 'DESCRIBE <http://ex.org/a>'   # cbd|scbd|outgoing, --describe-labels
+sparkles query   --loc db --aggregate-errors spec 'SELECT (MIN(?v) AS ?m) ...'   # jena (default)|sparkles|spec
 sparkles update  --loc db 'INSERT DATA {...}' # also LOAD <http…>
 sparkles patch   --loc db changes.rdfp        # apply RDF Patch files, one commit per file
 sparkles compact --loc db                     # merge updates into a new generation
@@ -1446,6 +1447,19 @@ as `--describe MODE`, `--describe-labels`, `--describe-reifiers`, `--describe-ma
 N` and `--describe-max-depth N`. They apply to a local query, and with `--server` they
 travel to the server as the request parameters. [API.md](API.md#describe) describes the
 modes and options.
+
+### Aggregate errors
+
+`--aggregate-errors jena|sparkles|spec` chooses how MIN, MAX, AVG and GROUP_CONCAT treat
+errors such as unbound values. `jena` is the default and gives Apache Jena's answers.
+`sparkles query` and `sparkles update` run their request under the reading, locally or
+with `--server` as the request parameter `aggregate-errors`. `sparkles serve` uses it for the datasets that have
+no setting of their own, and the NixOS module's `services.sparkles.aggregateErrors`
+passes it on. [API.md](API.md#aggregate-errors) describes the readings, the per-dataset
+setting at `/$/aggregate-errors/{ds}` and the parameter, and the Python, Node.js and JVM
+bindings take them as `aggregate_errors`, `aggregateErrors` and
+`Sparkles.AGGREGATE_ERRORS`, with the setting under `settings.aggregate_errors`,
+`settings.aggregateErrors` and `settings().aggregateErrors()`.
 
 ### GraphQL
 
@@ -5724,8 +5738,11 @@ curl --fail --get http://localhost:3030/ds/sparql \
 ```
 
 `sparkles serve --default-execution eager` makes eager execution the default for every
-request that does not name a mode. The UI's result table asks for eager execution,
-because it shows the full row count, and its downloads use the server's default.
+request that does not name a mode. The UI's result table and its downloads use the
+server's default. When the server streams an answer and the row limit stops it, the
+table shows the rows it received with an unknown total, since there may be more. A
+comparison on the time slider asks for eager execution, because it compares whole results
+or their exact counts.
 
 When a client reads a streamed answer slowly, the query pauses once the bounded output
 buffers are full. A disconnect stops the query even while it waits. The query's
@@ -6849,6 +6866,7 @@ in the dataset's `getContext()` or on one execution.
 | `Sparkles.INCLUDE_INFERRED` | The reasoner's `urn:x-sparkles:inferred` graph is part of the default graph. |
 | `Sparkles.MAX_ROWS`, `MAX_MEMORY_BYTES`, `MAX_ROWS_PRODUCED` | The request's budgets. |
 | `Sparkles.NO_CACHE` | The request neither reads nor fills the result cache. |
+| `Sparkles.AGGREGATE_ERRORS` | How the query's aggregates treat errors, as an `AggregateErrors` or its name. Under a reading other than `JENA`, a query with MIN, MAX, AVG or GROUP_CONCAT that would fall back to ARQ fails, since ARQ answers as Jena. The fallback mode `ALWAYS` runs it in ARQ. |
 | `Sparkles.AT` | A historical reference such as `snapshot:before-edit` or `commit:42`. |
 | `ARQ.httpServiceAllowed` | `false` refuses SERVICE. |
 
@@ -6927,8 +6945,11 @@ With the bundle on Fuseki's classpath, a dataset can be opened from an assembler
 ```
 
 Use `sparkles:memory true` instead of `location` for an in-memory dataset. The assembler
-also accepts `readOnly`, `autocommit`, `unionDefaultGraph`, `fallback` and
-`blankNodeLabels`, and merges Jena context settings.
+also accepts `readOnly`, `autocommit`, `unionDefaultGraph`, `fallback`,
+`blankNodeLabels` and `aggregateErrors`, and merges Jena context settings.
+`sparkles:aggregateErrors "sparkles"` sets the dataset's reading of errors in aggregates
+when the dataset has no setting of its own, and a query whose context sets
+`Sparkles.AGGREGATE_ERRORS` keeps its own reading.
 
 ### Blank node labels
 

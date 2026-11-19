@@ -746,6 +746,9 @@ per-dataset form and no concurrency caps. `preauth=off` turns it off.
 | GET    | `/$/describe/{ds}`           | *Extension.* The dataset's DESCRIBE setting. See [DESCRIBE](#describe). |
 | PUT    | `/$/describe/{ds}`           | *Extension.* Replaces the DESCRIBE setting with the JSON object's options: `mode`, `labels`, `reifiers`, `maxTriples` and `maxDepth`. Needs `admin`. `400` for a malformed body, `403` on a read-only server. |
 | DELETE | `/$/describe/{ds}`           | *Extension.* Restores the DESCRIBE defaults. Needs `admin`. |
+| GET    | `/$/aggregate-errors/{ds}`   | *Extension.* How the dataset's aggregates read errors. See [Aggregate errors](#aggregate-errors). |
+| PUT    | `/$/aggregate-errors/{ds}`   | *Extension.* Sets the dataset's reading from the JSON object's `mode`, which is `jena`, `sparkles` or `spec`. Needs `admin`. `400` for a malformed body, `403` on a read-only server. |
+| DELETE | `/$/aggregate-errors/{ds}`   | *Extension.* Removes the dataset's reading, so that it follows the server's default. Needs `admin`. |
 | GET    | `/$/tasks`                   | `[Task]` |
 | GET    | `/$/tasks/{id}`              | `Task` |
 | DELETE | `/$/tasks/{id}`              | *Extension.* Cancels a task that accepts cancellation: a queued task, a clone until it is in place, an N-Quads backup, a reasoning run or a vector projection. Returns `202` with the `Task`, which ends `cancelled`. Other tasks and finished ones get `409 {code: "not-cancellable"}`. Needs `admin` on the task's dataset, `read` on the whole dataset for a `vector-projection`, or `server-admin` for a server-wide task. The caller that started a background view-only algorithm run (`algo-view`) may also cancel it. |
@@ -2734,7 +2737,9 @@ Query parameters beyond the standard protocol:
   diffs and `/{ds}/explain` always run eagerly, because each of them returns one
   document built from the whole result.
 * `send=<n>` caps the number of rows serialized. The UI uses it so that a huge result does
-  not hang the browser, and asks for eager execution, because it shows the full count.
+  not hang the browser. Its result table leaves the mode to the server's default and
+  shows an unknown total for a streamed answer that `send` stopped, and its comparisons
+  ask for eager execution, because they compare exact counts.
   With eager execution, the native metadata reports the full count. With streaming,
   including a scan that `auto` streams, the query stops after the first n rows. `meta.status` is then
   `stopped`, and `meta.totalRows` is `null` unless the cursor had already reached the
@@ -2755,6 +2760,9 @@ Query parameters beyond the standard protocol:
 * `describe`, `describe-labels`, `describe-reifiers`, `describe-max-triples` and
   `describe-max-depth` choose how a DESCRIBE query describes a resource. See
   [DESCRIBE](#describe).
+* `aggregate-errors=jena|sparkles|spec` chooses how the query's MIN, MAX, AVG and
+  GROUP_CONCAT treat errors, over the dataset's setting. Any other value is a `400`. See
+  [Aggregate errors](#aggregate-errors).
 
 ### CSV and TSV uploads
 
@@ -3355,6 +3363,52 @@ and the bulk requests sent again.
 Jena's slice-aware cache, which serves overlapping LIMIT and OFFSET ranges from stored
 pages, and its management functions `se:cacheRm` and `se:cacheLs` are not supported.
 
+### Aggregate errors
+
+SPARQL leaves room for more than one reading of what MIN, MAX, AVG and GROUP_CONCAT give
+when an argument is an error, such as an unbound variable, and engines differ. Each
+query runs under one of three readings, and `jena` is the default.
+
+| Reading | MIN and MAX over an error | AVG over only errors | GROUP_CONCAT of an IRI or a number |
+|---|---|---|---|
+| `jena` (default) | Unbound. | Unbound. | Its lexical form. |
+| `sparkles` | The other values decide. | Unbound. | Its lexical form. |
+| `spec` | MIN is unbound, and the other values decide MAX. | `0`. | Unbound. |
+
+The `jena` reading gives Apache Jena's answers. It also makes `GROUP_CONCAT(DISTINCT …)`
+over no rows unbound, as Jena does, where the other readings give `""`. The `sparkles`
+reading is the engine's earlier behaviour. The `spec` reading follows the text of SPARQL
+1.1 and 1.2. Its MIN and MAX order values as ORDER BY does, with errors first, its AVG
+is Sum over Count after Count leaves out the errors, and its GROUP_CONCAT is CONCAT over
+the values, which takes only strings. In every reading an error makes SUM, AVG and
+GROUP_CONCAT unbound, and COUNT and SAMPLE pass over errors. The
+[querying guide](querying/README.md#aggregate-errors) gives examples.
+
+A request's `aggregate-errors` parameter sets the reading of one query, or of the WHERE
+clauses of one update at `/{ds}/update`. Without it the request takes the dataset's
+setting, and a dataset without a setting takes the server's
+default, which `sparkles serve --aggregate-errors` sets. The setting lives at
+`/$/aggregate-errors/{ds}`. `GET` needs read access and returns `mode`, `source`
+(`dataset` or `default`) and the list of `modes`. `PUT` with `{"mode": "spec"}` sets the
+dataset's reading, and `DELETE` removes it. Both need admin, and a read-only server
+refuses them with `403`. A persistent dataset keeps its setting in
+`aggregate-errors.json`. Branches copy the setting when they are created, and backups
+hold it, including backups of in-memory datasets.
+
+Materialized views and live queries follow the dataset's reading and evaluate again when
+it changes. A query that names another reading does not read a view's maintained state.
+It evaluates the view's query from the data instead, and its plan and its EXPLAIN output
+carry the `view-evaluated` warning. A plan's
+Group operator names the reading when it is not `jena`.
+
+```sh
+curl -X PUT localhost:3030/$/aggregate-errors/ds -H 'Content-Type: application/json' \
+  -d '{"mode": "spec"}'
+curl 'localhost:3030/ds/sparql?aggregate-errors=sparkles' \
+  --data-urlencode 'query=SELECT (MIN(?v) AS ?m) WHERE { OPTIONAL { ?s <http://example.org/p> ?v } }'
+sparkles query --loc db --aggregate-errors spec 'SELECT (AVG(?v) AS ?a) WHERE { ?s ?p ?v }'
+```
+
 ### DESCRIBE
 
 A DESCRIBE query returns a description of each IRI and blank node that it names or that
@@ -3545,7 +3599,7 @@ refuses it like any write.
 | `changes` | With `changes=N`. `total` counts every changed quad, and `quads` lists the first `N`, removals first, in the form of [diffs](#diffs-between-commits). |
 | `validation` | The write-time validation summary the write would get, in the guard's mode, including grandfather mode. Absent when no guard runs. |
 | `precondition` | With `If-Match` or `If-None-Match`, whether the condition holds, with the `error` the write would get when it does not. |
-| `storage` | Whether the write fits. With a [storage quota](#storage-quotas), `limit`, `used` and `projected` give the bytes before and after the write. A refusal has the `error` and its `budget` or `code`. |
+| `storage` | Whether the write fits. With a [storage quota](#storage-quotas), `limit`, `used` and `projected` give the bytes before and after the write, and an in-memory dataset gives `limit` and `projected`. A refusal has the `error` and its `budget` or `code`, with the sizes of the check that refused it. |
 
 The status is the one the write would get. A write that would succeed answers `200`. A
 write that a failed precondition would stop answers `412`, one the guard would reject
@@ -3553,7 +3607,11 @@ answers `422`, and one the quota would refuse answers `507`. Each of these still
 the whole preview, with every check evaluated, plus the `error`, `code`, `budget` and
 `validation` members of the real error. When several apply, the status is the one the
 write would meet first: the precondition, then the validation, then the storage, except
-that a bulk write measures its new generation before it validates it. Any other failure,
+that a bulk write measures its new generation before it validates it. A load or a
+replacement through a transaction checks an in-memory dataset's size limit while it
+parses its body, before the validation, and a PUT does so before its precondition too. A
+dry run builds the whole state the write would leave, so that limit does not bound the
+memory a preview takes, while its deadline and cancellation still apply. Any other failure,
 such as a syntax error, a missing permission or a timeout, is the write's own error.
 Responses carry `Sparkles-Dry-Run: true` and `Sparkles-Dry-Run-Outcome` with the
 outcome, and `Sparkles-Validation` when a guard ran.
@@ -3687,9 +3745,9 @@ successfully checked a pending head waits for its fence and propagates a failure
 | A body over `--max-upload-mb` | 413 | |
 | Write-time validation rejects the result | 422 | as for other writes |
 
-A failed patch applies nothing. A patch of adds alone with at least as many rows as the
-store's bulk threshold takes the bulk path of a large load, which rebuilds the index
-instead of growing the write-ahead log.
+A failed patch applies nothing. A patch of adds alone with more rows than the store's
+bulk threshold takes the bulk path of a large load, which rebuilds the index instead of
+growing the write-ahead log.
 
 ## Stored queries
 
@@ -10817,8 +10875,9 @@ describes when that happens, and `execution=eager` avoids it.
 **Large request bodies.** Graph Store PUT/POST bodies over 16 MiB, and upload files, are
 written to a temporary file as they arrive rather than held in memory. A large PUT,
 estimated above the bulk threshold, replaces its graphs in one index rebuild that parses
-the body as a stream. Like every write it is atomic, so a parse error leaves the data as
-it was.
+the body as a stream. A POST into an empty dataset also builds the index in one
+rebuild, whatever the size of its body, unless the caller may write only some graphs.
+Like every write it is atomic, so a parse error leaves the data as it was.
 
 ### Storage quotas
 

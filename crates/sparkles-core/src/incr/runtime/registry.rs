@@ -21,6 +21,8 @@ pub(super) struct Registry {
     pub(super) cells: FxHashMap<u64, Arc<Cell>>,
     /// the dataset's inference that every circuit is compiled for
     pub(super) inference: Option<Arc<Inference>>,
+    /// the dataset's reading of errors in aggregates, which every circuit runs with
+    pub(super) aggregate_errors: crate::sparql::AggregateErrors,
     pub(super) views: BTreeMap<String, ViewEntry>,
     /// the internal circuits by id (spec F13 §3.6), which no view or live query shares
     pub(super) internal: BTreeMap<String, Arc<InternalCell>>,

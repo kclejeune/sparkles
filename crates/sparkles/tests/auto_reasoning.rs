@@ -410,6 +410,10 @@ fn auto_does_not_mix_fresh_witnesses() {
         "[f: (?x ex:seed ?v), makeTemp(?n) -> (?x ex:node ?n)]",
         "[f: (?x ex:seed ?v), makeSkolem(?n, ?x, ?v) -> (?x ex:node ?n)]",
         "[f: (?x ex:seed ?v) -> (?x ex:node _:w)]",
+        // a relation fact of a rule program (item 839) with a blank node in its head
+        ".decl r(x, n)
+         [f: (?x ex:seed ?v) -> r(?x, _:w)]
+         [out: r(?x, ?n) -> (?x ex:node ?n)]",
     ] {
         let rules = format!(
             "@prefix ex: <http://ex.org/>.

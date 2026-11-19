@@ -195,10 +195,40 @@ pub(crate) fn head_slots(h: &CHead) -> (Slot, Slot, Slot) {
     }
 }
 
-/// Whether a fact that the head gives can match the pattern.
+/// Whether `s` is the key of a declared relation (item 839), the predicate of a lowered
+/// relation atom.
+fn is_key(s: Slot) -> bool {
+    matches!(s, Slot::Const(c) if crate::ir::lower::is_key(c))
+}
+
+/// Whether a fact that the head gives can match the pattern. A relation's key never
+/// unifies with a predicate that is not a constant, either way: an atom with a variable
+/// predicate does not read relation facts ([`crate::graph::Graph::is_hidden`]), so a head
+/// with a variable predicate, whose instances come from such atoms, never gives one.
 fn unifies(a: (Slot, Slot, Slot), h: (Slot, Slot, Slot)) -> bool {
     let one = |x: Slot, y: Slot| !matches!((x, y), (Slot::Const(c), Slot::Const(d)) if c != d);
+    let constant = |s: Slot| matches!(s, Slot::Const(_));
+    if (is_key(a.1) && !constant(h.1)) || (is_key(h.1) && !constant(a.1)) {
+        return false;
+    }
     one(a.0, h.0) && one(a.1, h.1) && one(a.2, h.2)
+}
+
+/// Whether builtin `kind` is a negation that reads facts which must be complete before
+/// its rule runs: `noValue`, and the negated atom of a lowered program (`RelAbsent`).
+pub(crate) fn negates(kind: BuiltinKind) -> bool {
+    matches!(kind, BuiltinKind::NoValue | BuiltinKind::RelAbsent)
+}
+
+/// The pattern a negation reads (see [`negates`]): a `noValue`'s first three arguments,
+/// and for a `RelAbsent` its lowered atom, whose object is the handle of its tail when it
+/// has more than three arguments, which no constant names.
+pub(crate) fn negated_pattern(b: &CBuiltin) -> (Slot, Slot, Slot) {
+    let arg = |k: usize| b.args.get(k).copied().unwrap_or(Slot::Any);
+    match b.kind {
+        BuiltinKind::RelAbsent if b.args.len() > 3 => (arg(0), arg(1), Slot::Any),
+        _ => (arg(0), arg(1), arg(2)),
+    }
 }
 
 /// Whether rules can give facts that match the pattern `a`.
@@ -225,9 +255,8 @@ pub(crate) fn cone_indices(rules: &[CRule], terms: &Terms, a: (Slot, Slot, Slot)
                 out.push(i);
                 todo.extend(r.atoms.iter().map(|b| (b.s, b.p, b.o)));
                 for b in &r.builtins {
-                    if b.kind == BuiltinKind::NoValue {
-                        let arg = |k: usize| b.args.get(k).copied().unwrap_or(Slot::Any);
-                        todo.push((arg(0), arg(1), arg(2)));
+                    if negates(b.kind) {
+                        todo.push(negated_pattern(b));
                     }
                     for read in list_reads(b.kind, &b.args, None) {
                         if let Read::Facts(s, p) = read {
@@ -609,11 +638,12 @@ fn magic_atom(k: &Key, m: u64, dummy: u64, (s, p, o): (Slot, Slot, Slot)) -> Ato
 /// class is split by the class, as [`key_of`] splits a positive one (Codex review F17-P1
 /// #7), so the stage below asks for that class alone.
 fn no_value_demand(b: &CBuiltin, rdf_type: u64) -> (Key, [u64; 3]) {
-    let c = |s: Option<&Slot>| match s {
-        Some(Slot::Const(c)) => Some(*c),
+    let c = |s: Slot| match s {
+        Slot::Const(c) => Some(c),
         _ => None,
     };
-    let (s, p, o) = (c(b.args.first()), c(b.args.get(1)), c(b.args.get(2)));
+    let (s, p, o) = negated_pattern(b);
+    let (s, p, o) = (c(s), c(p), c(o));
     let mut key = Key::new(s.is_some(), p.map_or(KeyP::Free, KeyP::Const), o.is_some());
     if let (Some(t), Some(c)) = (p, o)
         && t == rdf_type
@@ -679,6 +709,19 @@ fn reads_lists(r: &CRule) -> bool {
 /// An estimate of the facts an atom matches with the variables `bound` bound: from the
 /// stored facts, and for a pattern of unknown predicate (what rules may derive).
 pub(crate) type Estimate<'a> = &'a dyn Fn(&Atom, &[bool]) -> (f64, f64);
+
+/// The builtins `before` of `body` in a magic rule. A `RelTuple` is left out: its output
+/// is the handle of a relation head's tail, which no magic head reads, and in a new
+/// derivation it would intern a tail for every partial match. Leaving it out can only
+/// widen a demand.
+fn magic_builtins(body: &CRule, before: &[usize]) -> Vec<CBuiltin> {
+    before
+        .iter()
+        .map(|&j| &body.builtins[j])
+        .filter(|b| b.kind != BuiltinKind::RelTuple)
+        .map(clone_builtin)
+        .collect()
+}
 
 /// The order in which a rule copy's body is walked to pass bindings sideways: builtins as
 /// soon as their inputs are bound, then the atom with the fewest estimated matches. An
@@ -859,6 +902,10 @@ struct StageBuilder<'a> {
     derived_lists: bool,
     /// whether linear recursion is rewritten (see [`transform`])
     rewrite_linear: bool,
+    /// the rules are a lowered program's with an IR feature (item 839), which runs as
+    /// `engine::run_program` runs it and reads a list again when its cells arrive, so a
+    /// stage whose lists are not completed below asks for the cells it reads
+    replay: bool,
 }
 
 impl StageBuilder<'_> {
@@ -952,10 +999,7 @@ impl StageBuilder<'_> {
                                 name: format!("{} (demand)", r.name),
                                 nvars,
                                 atoms,
-                                builtins: before_builtins
-                                    .iter()
-                                    .map(|&j| clone_builtin(&body.builtins[j]))
-                                    .collect(),
+                                builtins: magic_builtins(&body, &before_builtins),
                                 head: vec![CHead::Triple(mh.s, mh.p, mh.o)],
                             });
                         }
@@ -1030,7 +1074,7 @@ impl StageBuilder<'_> {
             );
         }
         for b in &body.builtins {
-            if b.kind == BuiltinKind::NoValue {
+            if negates(b.kind) {
                 let (nk, vals) = no_value_demand(b, self.rdf_type);
                 if self.below_seen.insert((nk, vals)) {
                     self.below.push((nk, Some(vals)));
@@ -1060,8 +1104,9 @@ impl StageBuilder<'_> {
         before_builtins: &[usize],
         bound: &[bool],
     ) -> Result<(), TransformError> {
+        let mut asked: Vec<Atom> = Vec::new();
         for read in reads {
-            let (k, at) = match *read {
+            match *read {
                 Read::List => {
                     // a list read through a builtin is not read again when its facts
                     // grow, so the lists the rules give are complete in a stage below
@@ -1073,17 +1118,26 @@ impl StageBuilder<'_> {
                                 self.below.push((k, Some([0; 3])));
                             }
                         }
+                    } else if self.replay {
+                        // a lowered program's run reads a list again when its cells
+                        // arrive (item 839), so the stage itself asks for the cells
+                        for p in [self.terms.rdf_first, self.terms.rdf_rest] {
+                            asked.push(Atom {
+                                s: Slot::Any,
+                                p: Slot::Const(p),
+                                o: Slot::Any,
+                            });
+                        }
                     }
-                    continue;
                 }
-                Read::Facts(s, p) => {
-                    let at = Atom { s, p, o: Slot::Any };
-                    if !self.intensional(&at) {
-                        continue;
-                    }
-                    (key_of(&at, bound, self.rdf_type), at)
-                }
-            };
+                Read::Facts(s, p) => asked.push(Atom { s, p, o: Slot::Any }),
+            }
+        }
+        for at in asked {
+            if !self.intensional(&at) {
+                continue;
+            }
+            let k = key_of(&at, bound, self.rdf_type);
             let m = self.magic_of(k)?;
             let mh = magic_atom(&k, m, self.dummy, (at.s, at.p, at.o));
             let mut atoms = vec![guard.clone()];
@@ -1092,10 +1146,7 @@ impl StageBuilder<'_> {
                 name: format!("{} (demand of lists)", body.name),
                 nvars: body.nvars,
                 atoms,
-                builtins: before_builtins
-                    .iter()
-                    .map(|&j| clone_builtin(&body.builtins[j]))
-                    .collect(),
+                builtins: magic_builtins(body, before_builtins),
                 head: vec![CHead::Triple(mh.s, mh.p, mh.o)],
             });
         }
@@ -1112,6 +1163,10 @@ impl StageBuilder<'_> {
         let mut made: FxHashSet<(usize, usize)> = FxHashSet::default();
         // the rules whose heads can give the key's predicate
         let candidates: Vec<usize> = match k.p {
+            // a head with a variable predicate gives no relation fact (see `unifies`)
+            KeyP::Const(p) if crate::ir::lower::is_key(p) => {
+                self.by_pred.get(&p).cloned().unwrap_or_default()
+            }
             KeyP::Const(p) => {
                 let mut c: Vec<usize> = self.by_pred.get(&p).cloned().unwrap_or_default();
                 c.extend(self.var_heads.iter().copied());
@@ -1128,7 +1183,11 @@ impl StageBuilder<'_> {
                 if k.neq && reflexive_head(hs) {
                     continue;
                 }
-                // a constant predicate asked for: the head must give it
+                // a constant predicate asked for: the head must give it. A relation's key
+                // and a predicate that is not a constant never meet (see `unifies`).
+                if is_key(hs.1) != matches!(k.p, KeyP::Const(c) if crate::ir::lower::is_key(c)) {
+                    continue;
+                }
                 let spec = match (k.p, hs.1) {
                     (KeyP::Const(c), Slot::Const(d)) if c != d => continue,
                     (KeyP::Const(c), Slot::Var(v)) => Some((v, c)),
@@ -1214,6 +1273,8 @@ impl StageBuilder<'_> {
                 let hs = head_slots(h);
                 let spec = match hs.1 {
                     Slot::Const(d) if d != p => continue,
+                    // a head with a variable predicate gives no relation fact
+                    Slot::Var(_) if crate::ir::lower::is_key(p) => continue,
                     Slot::Var(v) => Some(v),
                     Slot::Const(_) => None,
                     Slot::Any => return Ok(false),
@@ -1243,7 +1304,9 @@ impl StageBuilder<'_> {
                 let recs: Vec<usize> = (0..r.atoms.len())
                     .filter(|&i| {
                         let a = &r.atoms[i];
-                        a.p == Slot::Const(p) || matches!(a.p, Slot::Var(_) | Slot::Any)
+                        a.p == Slot::Const(p)
+                            || (matches!(a.p, Slot::Var(_) | Slot::Any)
+                                && !crate::ir::lower::is_key(p))
                     })
                     .collect();
                 let rec =
@@ -2107,6 +2170,10 @@ pub(crate) fn schema_roots(vocab: &Vocab, rdf_type: u64) -> Vec<(Key, [u64; 3])>
 /// With `linear` unset, linear recursion is not rewritten. Then every fact the program derives for a key has, among the facts derived, the
 /// premises of an instance of the original rule (spec F18 §3.1), since the rewriting
 /// derives the answers for the value asked for and not for the nodes it passes.
+///
+/// With `replay` set, the rules are a lowered program's with an IR feature (item 839),
+/// which runs as `engine::run_program` runs it and reads a list again when its cells
+/// arrive: a stage whose lists are not completed below asks for the list cells it reads.
 pub(crate) fn transform(
     rules: &[CRule],
     terms: &Terms,
@@ -2114,15 +2181,16 @@ pub(crate) fn transform(
     est: Estimate<'_>,
     pass: Pass<'_>,
     linear: bool,
+    replay: bool,
 ) -> Result<Program, TransformError> {
     // A lower stage of every derived list can depend on itself when a rule reads one
     // list to build another, which the keys cannot tell apart. The program is then made
     // again with lists read as the stage holds them (Codex re-review F17-P1 #3).
     // A program whose noValue lies on a cycle stays refused (second Codex re-review of
     // F17-P1, #2).
-    match transform_in(rules, terms, roots, est, pass, true, linear) {
+    match transform_in(rules, terms, roots, est, pass, true, linear, replay) {
         Err(TransformError::NotStratified) if !negation_on_a_cycle(rules, terms) => {
-            transform_in(rules, terms, roots, est, pass, false, linear)
+            transform_in(rules, terms, roots, est, pass, false, linear, replay)
         }
         r => r,
     }
@@ -2186,9 +2254,8 @@ pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
             .map(|a| (node(a.p, a.o, false), false))
             .collect();
         for b in &r.builtins {
-            if b.kind == BuiltinKind::NoValue {
-                let p = b.args.get(1).copied().unwrap_or(Slot::Any);
-                let o = b.args.get(2).copied().unwrap_or(Slot::Any);
+            if negates(b.kind) {
+                let (_, p, o) = negated_pattern(b);
                 deps.push((node(p, o, false), true));
             }
         }
@@ -2222,10 +2289,18 @@ pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
     // every constant depends on what a head of a variable predicate reads, and an atom
     // of a variable predicate reads every constant; a class likewise for heads and atoms
     // of `rdf:type` with a variable class
-    for a in adj.iter_mut().skip(SPECIAL) {
-        a.push(GIVES_ALL);
+    // relations take no part, since no pattern with a variable predicate reaches them
+    // (see `unifies`), as in `ir::strata`
+    let mut keys = vec![false; n];
+    for (&(p, _), &id) in &ids {
+        keys[id] = crate::ir::lower::is_key(p);
     }
-    adj[READS_ALL].extend(SPECIAL..n);
+    for (i, a) in adj.iter_mut().enumerate().skip(SPECIAL) {
+        if !keys[i] {
+            a.push(GIVES_ALL);
+        }
+    }
+    adj[READS_ALL].extend((SPECIAL..n).filter(|&i| !keys[i]));
     adj[READS_ALL].push(READS_TYPES);
     for &c in &classes {
         adj[c].push(GIVES_TYPES);
@@ -2249,6 +2324,7 @@ pub(crate) fn negation_on_a_cycle(rules: &[CRule], terms: &Terms) -> bool {
     negative.iter().any(|&(h, d)| reaches(d, h))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn transform_in(
     rules: &[CRule],
     terms: &Terms,
@@ -2257,6 +2333,7 @@ fn transform_in(
     pass: Pass<'_>,
     list_stages: bool,
     linear: bool,
+    replay: bool,
 ) -> Result<Program, TransformError> {
     let closed = match pass {
         Pass::Closed(c) => Some(c),
@@ -2334,12 +2411,7 @@ fn transform_in(
     // the noValue builtins of the program, for the stratification check
     let no_values: usize = rules
         .iter()
-        .map(|r| {
-            r.builtins
-                .iter()
-                .filter(|b| b.kind == BuiltinKind::NoValue)
-                .count()
-        })
+        .map(|r| r.builtins.iter().filter(|b| negates(b.kind)).count())
         .sum::<usize>()
         + if list_stages && list_heads(rules, terms) {
             rules.iter().filter(|r| reads_lists(r)).count()
@@ -2411,6 +2483,7 @@ fn transform_in(
             below_seen: FxHashSet::default(),
             derived_lists: list_stages && phase == 0 && list_heads(stage_rules, terms),
             rewrite_linear: linear,
+            replay,
         };
         let mut seeds: Vec<(Key, [u64; 3])> = Vec::new();
         for (k, vals) in &level {

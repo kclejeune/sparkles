@@ -11,6 +11,7 @@ from ._sparkles import (
     QuerySolutions,
     UpdateStats,
     Variable,
+    _AggregateErrors,
     _Describe,
     _Path,
     _QueryResult,
@@ -50,6 +51,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> _QueryResult: ...
     async def select(
         self,
@@ -68,6 +70,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> QuerySolutions: ...
     async def ask(
         self,
@@ -86,6 +89,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> bool: ...
     async def update(
         self,
@@ -98,6 +102,7 @@ class Dataset:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...
     async def select_cursor(
         self,
@@ -116,6 +121,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
         batch_rows: int = 4096,
         batch_bytes: int = 1048576,
         allow_materialization: bool = True,
@@ -137,6 +143,7 @@ class Dataset:
         cancel: CancelToken | None = None,
         at: int | str | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
         batch_rows: int = 4096,
         batch_bytes: int = 1048576,
         allow_materialization: bool = True,
@@ -203,6 +210,7 @@ class Transaction:
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
         describe: _Describe | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> _QueryResult: ...
     async def update(
         self,
@@ -215,4 +223,5 @@ class Transaction:
         max_memory_bytes: int | None = None,
         max_rows_produced: int | None = None,
         cancel: CancelToken | None = None,
+        aggregate_errors: _AggregateErrors | None = None,
     ) -> UpdateStats: ...

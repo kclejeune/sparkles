@@ -220,9 +220,10 @@ fn control_records_are_refused_without_a_keyspace_in_a_dry_run_and_with_bulk_qua
     assert_eq!(get(&s, "jobs/x"), Some("1".into()));
 }
 
+/// A threshold below every batch, so that a batch of one quad takes the bulk plan.
 fn bulk_options() -> StoreOptions {
     StoreOptions {
-        bulk_threshold: 1,
+        bulk_threshold: 0,
         ..Default::default()
     }
 }

@@ -5,6 +5,11 @@ use super::*;
 use crate::io::{RdfFormat, Source};
 use crate::store::{Store, StoreOptions};
 
+// The test-only reference evaluator (roadmap item 512), which follows the algebra
+// literally and shares nothing with the engine but the parser.
+#[path = "../../tests/support/reference/mod.rs"]
+mod reference;
+
 pub(super) const PREFIXES: &str = "PREFIX ex: <http://ex.org/> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
 pub(super) fn load(s: &Store, text: &str, format: RdfFormat) {
@@ -60,13 +65,110 @@ pub(super) fn has_desc(p: &PlanInfo, needle: &str) -> bool {
     p.description.contains(needle) || p.children.iter().any(|c| has_desc(c, needle))
 }
 
+/// Compare `r`, an engine answer to `text`, with the reference evaluator's answer over
+/// the store's quads, through the comparison that allows every answer the specification
+/// allows. The reference reads no text, spatial or extension indexes, so a query that
+/// uses them is one it does not evaluate, and neither is a query whose nested loops pass
+/// the work limit. A query that reads a number of more than 16 digits is not compared,
+/// since XSD lets the engine limit those (roadmap item 1065). Where the query meets a
+/// question that the engine reads otherwise than the specification's text, such as an
+/// error in MIN or MAX under the default of item 1064's setting or string arguments that
+/// differ only in base direction (item 1071), it is compared exactly under the engine's
+/// reading.
+pub(super) fn same_as_reference(s: &Store, text: &str, r: &QueryResult) {
+    same_as_reference_on(&s.snapshot(), &format!("{PREFIXES}{text}"), r);
+}
+
+/// The reference evaluator over the quads of `snapshot`, kept for the last snapshot a
+/// thread compared, since a test compares many queries over one snapshot and decoding
+/// and indexing its quads cost more than most evaluations. The cache holds a weak
+/// reference, which keeps the snapshot's allocation from being reused without keeping the
+/// snapshot alive, so a test that drops a snapshot still releases it.
+fn reference_of(snapshot: &Arc<crate::store::Snapshot>) -> std::rc::Rc<reference::Reference> {
+    thread_local! {
+        static LAST: std::cell::RefCell<
+            Option<(std::sync::Weak<crate::store::Snapshot>, std::rc::Rc<reference::Reference>)>,
+        > = const { std::cell::RefCell::new(None) };
+    }
+    if let Some(r) = LAST.with(|l| {
+        l.borrow()
+            .as_ref()
+            .filter(|(s, _)| std::ptr::eq(s.as_ptr(), Arc::as_ptr(snapshot)))
+            .map(|(_, r)| r.clone())
+    }) {
+        return r;
+    }
+    let mut quads = Vec::new();
+    snapshot
+        .for_each_quad(|q| {
+            quads.push(snapshot.quad_to_terms(q).expect("a stored quad decodes"));
+            Ok(())
+        })
+        .unwrap();
+    let r = std::rc::Rc::new(
+        reference::Reference::new(quads)
+            .with_union_default(snapshot.union_default_graph)
+            .with_work_limit(20_000_000),
+    );
+    LAST.with(|l| *l.borrow_mut() = Some((Arc::downgrade(snapshot), r.clone())));
+    r
+}
+
+/// [`same_as_reference`] over a snapshot, for `text` with its prefixes.
+pub(super) fn same_as_reference_on(
+    snapshot: &Arc<crate::store::Snapshot>,
+    text: &str,
+    r: &QueryResult,
+) {
+    let oracle = reference_of(snapshot);
+    let skip = |why: String| {
+        if std::env::var_os("SPARKLES_REFERENCE_SKIPS").is_some() {
+            eprintln!("reference skips ({why}): {text}");
+        }
+    };
+    let expected = match reference::check::under_engine_readings(&oracle, text) {
+        Err(reference::Error::Parse(e)) => {
+            panic!("the reference does not parse a query the engine ran ({e}): {text}")
+        }
+        Err(e) => return skip(e.to_string()),
+        Ok((expected, _)) => expected,
+    };
+    match expected {
+        reference::check::Expected::Ask(b, notes) => {
+            assert_eq!(r.kind, QueryKind::Ask, "an ASK answer: {text}");
+            if notes.chose {
+                return skip("an open value decides the answer".into());
+            }
+            assert_eq!(r.boolean, b, "ASK against the reference: {text}");
+        }
+        reference::check::Expected::Select(selected) => {
+            match reference::check::check_select(
+                &selected,
+                r.variables(),
+                &r.test_application_rows(),
+            ) {
+                Ok(reference::check::Outcome::Compared) => {}
+                Ok(
+                    reference::check::Outcome::Skipped(why)
+                    | reference::check::Outcome::OrderUnchecked(why)
+                    | reference::check::Outcome::Partial(why),
+                ) => skip(why),
+                Err(m) => panic!("against the reference: {m}: {text}"),
+            }
+        }
+        reference::check::Expected::Other => skip("not a SELECT or ASK".into()),
+    }
+}
+
 /// Run `text` with every optimization and with none; the answers must be equal and the
 /// optimized plan must contain `op` (an operator name, or `desc:` + description text).
+/// Both answers must also be the reference evaluator's where it evaluates the query.
 pub(super) fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
     let fast = run(s, text, Optimizations::ALL);
     let slow = run(s, text, Optimizations::NONE);
     let (a, b) = (solutions(&fast), solutions(&slow));
     assert_eq!(a, b, "{text}");
+    same_as_reference(s, text, &fast);
     let taken = match op.strip_prefix("desc:") {
         Some(d) => has_desc(fast.plan(), d),
         None => has_op(fast.plan(), op),
@@ -84,10 +186,13 @@ pub(super) fn same_answer(s: &Store, text: &str, op: &str) -> Vec<String> {
     a
 }
 
-/// Rows of `text` with every optimization and with none, without checking the plan.
+/// Rows of `text` with every optimization and with none, without checking the plan, and
+/// the reference evaluator's where it evaluates the query.
 pub(super) fn same_rows(s: &Store, text: &str) -> Vec<String> {
-    let a = solutions(&run(s, text, Optimizations::ALL));
+    let fast = run(s, text, Optimizations::ALL);
+    let a = solutions(&fast);
     assert_eq!(a, solutions(&run(s, text, Optimizations::NONE)), "{text}");
+    same_as_reference(s, text, &fast);
     a
 }
 
@@ -500,6 +605,15 @@ fn count_joins_from_key_runs() {
         "CountJoinFromRuns"
     ));
     same_rows(&s, q);
+    // an ASK answer, true and false, compares with the reference's
+    for (q, expected) in [
+        ("ASK { ?a ex:knows ?b }", true),
+        ("ASK { ?a ex:knows ex:nobody }", false),
+    ] {
+        let r = run(&s, q, Optimizations::ALL);
+        assert_eq!(r.boolean, expected, "{q}");
+        same_as_reference(&s, q, &r);
+    }
     // updates are visible
     update(
         &s,

@@ -2,6 +2,137 @@
 
 ## Unreleased
 
+### Streamed answers through the engine buffer
+
+The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
+through the engine's 8 KiB buffer, as eager answers do, which completes roadmap item 240.
+A streamed request on the large answers of the synthetic benchmark at 1.05M triples runs
+0.46 to 0.69 times the instructions it ran before, and on atlas with 12 threads it takes 0.42 to 0.77 times its former wall time, which puts it ahead of the eager request on those answers. The access log and the metrics report
+the rows whose bytes the response writer accepted for a streamed body that stopped
+partway, as they do for an eager one. A streamed body
+that the result-size budget stops after its first bytes now sends what it had buffered
+before it aborts the transfer, as an eager body did, so a client receives up to one more
+chunk of complete rows before the abort.
+
+### The UI's result table under automatic execution
+
+The query page's result table now runs a query in the server's default execution mode
+instead of asking for eager execution, so plans that are faster as cursors, such as plain
+scans of a thousand rows or more and large groupings, stream there too. When a streamed answer reaches the row limit, the Table tab
+reads the count with a plus sign, such as `1,000+`, and a notice says that there may be
+more rows and that the total is unknown. A streamed graph answer, whose statements arrive
+as quads, draws as an eager one does. A comparison on the history slider still reads both
+states eagerly. A streamed answer skips the full-result cache, so rerunning it is not
+served from the cache. This is part of roadmap item 7.
+
+### Instruction counts per request before timing
+
+`mise run bench:request-insn` counts the user-space instructions, cycles and CPU time per
+request of two server builds, query by query, in rounds of A,B,B,A on one pinned core,
+and reports each query's ratio with a 95% interval and the spread over processes. Lanes
+now count before they book an Intel host. An A-against-A run on `stanley` set the noise
+floor at 1% for queries under 2 million instructions per request and 0.25% above. Back
+tests showed that the counts flag item 678's slower string floors, at +13% and +29%
+against +25% and +33% in time, and miss item 1039's per-block charge, which added
+execution time without adding instructions. Counts measure the whole request,
+so they cannot resolve the 0.5 µs bound of the Intel rule on queries under 0.3 ms, which
+are still timed, as are changes to charging, allocation, atomics, locks, thread
+hand-offs, system calls, the response path, layout and concurrency. Instructions do not
+bound cycles either, so a change cleared by its counts leaves any cost in cycles alone to
+the batch screen and the forge checks after the push.
+
+### Materialized inferences under the clause keywords of entity frames
+
+The read-only materialized region of a property or individual frame in Browse and the
+ontology editor groups its rows under the frame's clause keywords, such as Types, Facts and
+SubPropertyOf, in Manchester syntax with an Inferred badge on each row, in place of a list
+of functional-style axioms. The rows stay in their own region below the asserted frame. Names link to their pages in Browse and select the entity in
+the editor, and their labels come from the same pinned read as the rows. Entailments that
+every entity of the profile has, such as a property's subproperty relation to itself or a
+type of `owl:Thing` or `rdfs:Resource`, are counted instead of listed. This is part of
+roadmap item 622. Classifier-backed inferred axioms beyond named-class parents and
+equivalents, and explanation links from F24's justifications, remain open.
+
+### Aggregate errors follow Jena by default
+
+MIN and MAX are now unbound when one of their arguments is an error, such as a value
+that OPTIONAL leaves unbound, as in Apache Jena, and `GROUP_CONCAT(DISTINCT …)` over no
+rows is unbound as Jena makes it. Earlier releases let MIN and MAX pass over such
+arguments, so queries that relied on that answer differently. The setting
+`aggregate-errors` chooses among three readings, `jena` (the default), `sparkles` (the
+earlier answers) and `spec` (the text of SPARQL 1.1 and 1.2, in which MIN is unbound, MAX
+passes over errors, AVG over only errors is `0` and GROUP_CONCAT takes only strings),
+which completes roadmap item 1064. A query sets it with the `aggregate-errors` request
+parameter, the library's `QueryOptions::aggregate_errors`, the Python, Node.js and JVM
+query options, the MCP argument `aggregateErrors` or `--aggregate-errors`. A dataset keeps
+its own at `/$/aggregate-errors/{ds}` in `aggregate-errors.json`, and `sparkles serve
+--aggregate-errors` and the NixOS option `aggregateErrors` set the server's default.
+Materialized views and live queries follow the dataset's reading and evaluate again when
+it changes, and a query under another reading evaluates a view's query from the data.
+The incremental group state now keeps error counts, so view checkpoints of earlier
+releases are refused and rebuilt from the data on the first start, and a deployment with
+views should expect that rebuild. The memory tools, GraphRAG's fact reader and the UI's
+agent and nearby lists ask for the `sparkles` reading, since they want the values
+present. Backups now hold `aggregate-errors.json` and `describe.json`, which earlier
+backups left out, so a restore kept the data but lost a dataset's DESCRIBE setting.
+
+### Eager aggregates over IRI comparisons and EXISTS
+
+An eager aggregate whose argument compares a variable with a constant IRI or holds an
+EXISTS, such as `SUM(IF(?p = ex:nobody, 1, 0))`, no longer decodes that variable's terms
+before it runs. The grouping operator of item 826 evaluates such arguments as BIND does,
+and that path decoded every vocabulary column an expression named once the table passed
+16,384 rows, although these columns are answered from term ids. The decode now covers
+only the columns whose values the expression reads, which also spares eager BIND and
+ORDER BY keys of the same shape. On forge with one thread over 1,000,000 people, the query
+takes 15.1 ms against 60.1 ms on the previous main and 16.1 ms before item 826, and its BIND
+form 15.2 ms against 60.9 ms. Its EXISTS form takes 867 ms against 918 ms, since the EXISTS
+evaluation itself sets most of its time. Arguments that read values, such as
+`STRLEN(?name)`, still decode their columns first, since that was faster on one thread
+than reading them row by row. This is roadmap item 1098.
+
+### Rule programs with relations and negation
+
+A reasoner rule text can declare relations with `.decl name(col, …)`, write relation atoms
+in rule bodies and heads, negate a triple pattern or a relation atom with `not`, and write
+forward rules as `head :- body.` clauses, the rule-file subset of the Datalog syntax of
+spec C24 §6.2. Such a text is one stratified program, which materialization, incremental
+maintenance, witnesses, explanations, query-time reasoning and why-not answers all read,
+and relation facts never reach the dataset. A program with `not` runs in full on every
+update, and one with an existential head or an include of the OWL rule sets is refused. A text without the new syntax is
+parsed and evaluated as before. `Clause` gains the `Relation` and `Not` variants and
+`Rule` the `include` field, `parser::rules_text` writes a parsed program back as text, and
+the web UI shows a relation fact in an explanation as `name(args)` and leaves it out of
+**Show on graph**. The `owl-rl` profile keeps its property chain and key rules per length
+until roadmap item 1102 lets a query-time demand bind a later column of a relation.
+
+### One load plan
+
+`LoadPlan::choose` in `store/load_plan.rs` now picks the bulk path or a transaction for
+`Store::load_with`, `Store::replace_with`, `WriteTxn::insert_bulk` and RDF Patch, which
+each had a rule of their own, and a table test records the plan of each entry point at
+the boundaries. The threshold test is strict everywhere, so a batch or a patch of exactly
+the bulk threshold now commits in a transaction. A load into an empty store still takes
+the bulk path unless all its inputs are streams that end within 8 MiB, and a graph
+replacement still takes a transaction unless its estimate or its streams are above the
+threshold, whatever the store holds. A stream load into a store that holds data reads its
+stream ahead up to 80 bytes per threshold quad, as a replacement did, and takes the bulk
+path past that bound. A bulk replacement returns the quads it parsed, duplicates
+included, as the transactional path and the documentation already did, where it used to
+return the quads the store held afterwards. Every stream of a load or a replacement now
+checks the write's deadline and cancellation beneath its decoder whichever plan runs,
+which a load into a store with data and a write limited to some graphs did not do before.
+A write limited to some graphs still parses its sources in a transaction, and a bulk
+insert or a patch under such a limit, whose graphs are checked as it is staged, may still
+take the bulk path. A dry run of a load or a replacement through a transaction is no
+longer refused by an in-memory dataset's memory limit while its sources are parsed. It
+returns a preview that reports the refusal the write itself gets, as a dry run on the
+bulk path does, with the sizes of the check that refused it. The refusal comes before a
+rejection by the guard, and for a replacement before a failed precondition too, since the
+write meets them in that order. This corrects the dry run of a large first PUT into an empty in-memory
+dataset and of a large POST into one with data. Durability, the write-ahead log and the
+on-disk formats are unchanged.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes
@@ -73,6 +204,37 @@ execution answers some queries under small budgets that it refused before. The d
 of a large term beside a shared batch can still be refused under a budget at which a
 copy would answer, which roadmap item 1051 holds. A cursor that reads a snapshot without filling the block cache, as an
 export does, decodes its current block again for each batch of copied rows.
+
+### Reference evaluator for the differential tests
+
+A test-only evaluator in `crates/sparkles-core/tests/support/reference` follows the
+SPARQL 1.1 and 1.2 algebra literally and shares only the parser with the engine, which
+completes roadmap item 512. It answers all 508 SPARQL 1.0 and 1.1 and all 63 SPARQL 1.2
+query evaluation tests under an exact comparison. It is the oracle of the seeded cursor
+differential in place of the eager executor, and the optimizer, index-join and
+string-filter tests compare the engine with it as well as with `Optimizations::NONE`. It
+notes the values and rows that the specification leaves open and the sort key of each
+row, and one comparison in `check.rs` passes no answer that the specification forbids
+and reports a partial, unordered or skipped comparison where it cannot decide. Where Jena's reading differs from the specification's
+text and the engine follows Jena, as for the default graph of several FROM clauses, the
+evaluator follows Jena, and the W3C suites run under the text. It found four groups of
+engine disagreements. MIN and MAX pass over errors, AVG over errors only is an error and
+GROUP_CONCAT reads IRIs and numbers, roadmap item 1064, integers and decimals beyond the
+engine's decimal range are not numbers, roadmap item 1065, the string functions ignore the
+base direction of their arguments, roadmap item 1071, and three XSD and XPath readings
+differ, roadmap item 1077.
+
+### EXISTS inside larger expressions
+
+Both executors answer an EXISTS inside a larger expression, such as IF, OR, an aggregate
+argument or an ORDER BY key, from the key set of its pattern, as they answer a FILTER
+EXISTS, and automatic execution streams such plans. On an Intel host at 10.5M quads with
+one Rayon thread, a SUM over IF(EXISTS …) went from 885 to 16 ms eagerly and from 913 to
+15 ms streamed. Every row is probed, also one on which the expression does not reach the
+EXISTS, so an IF branch that is never taken still builds the key set, which roadmap item
+1080 covers. An EXISTS pattern evaluated per key now streams too, and the plans that stay
+eager are an EXISTS over a SERVICE, an EXISTS nested more than four levels deep, which item
+1081 covers, and an OPTIONAL whose condition holds an EXISTS, which item 570 covers.
 
 ### MCP tool profiles and semantic search
 

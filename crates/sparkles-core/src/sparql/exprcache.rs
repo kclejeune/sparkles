@@ -934,6 +934,7 @@ fn numeric_filter(ctx: &Ctx, t: &Table, exprs: &[Expr]) -> Result<Option<Vec<boo
                 i,
                 map: &map,
                 dec: Some(&cols),
+                exists: None,
             };
             exprs
                 .iter()

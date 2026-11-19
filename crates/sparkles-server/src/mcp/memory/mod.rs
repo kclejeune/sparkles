@@ -84,6 +84,10 @@ impl Reader {
         let mut opts = self.opts.clone();
         opts.timeout = Some(remaining(self.deadline)?);
         opts.initial_bindings = bindings;
+        // the memory tools' aggregates take the values present, such as the latest time
+        // of a source some of whose records have none, whatever reading the dataset
+        // sets (roadmap item 1064)
+        opts.aggregate_errors = Some(sparkles::sparql::AggregateErrors::Sparkles);
         // An application copy, as before the retained row owners. Retaining these
         // MCP consumer rows under their query credit is a separate migration.
         Ok(sparql::query(self.snap.clone(), q, &opts)?

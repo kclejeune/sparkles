@@ -129,6 +129,13 @@ The SvelteKit UI is embedded in the server binary.
 
   ![The query page's Options menu with Demand reasoning and the RDFS profile, over a result whose badge reports 322 derived facts](../images/query-reasoning.png)
 
+* The result table runs a query in the server's default execution mode, so a plan that is
+  faster as a cursor streams. When a streamed answer reaches the row limit, the table
+  shows the rows it received, the **Table** tab reads the count with a plus sign, such as
+  `1,000+`, and a notice says that there may be more rows and that the total is unknown.
+  Raising the row limit or downloading the result from **Raw** reads the rest. A
+  comparison on the history slider reads both states eagerly, so it can compare whole
+  results or their exact counts ([USAGE.md](../USAGE.md#incremental-query-execution)).
 * The **Saved** menu lists the dataset's stored queries, shows a form for a query's
   parameters and runs it. An admin can save the editor's query with parameters picked from
   its variables, or delete one.
@@ -796,7 +803,12 @@ useful authorized clauses for restricted views. Such isolated output has no impl
 reclassification continuation. Property and individual pages also read materialized frames and hierarchies from an
 existing fresh RDFS or OWL RL producer. These views require complete readable inputs
 matching the producer scope. They retain an exact source/revision pin, label actual
-inferred-graph provenance and distinguish facts also asserted. Disabled or incomplete
+inferred-graph provenance and distinguish facts also asserted. The read-only materialized
+region below the asserted frame groups its rows under the frame's clause keywords, such as
+Types, Facts and SubPropertyOf, in Manchester syntax with an Inferred badge on each row and
+the names linked to their pages. Entailments that every entity of the profile has, such as a property's
+subproperty relation to itself or a type of `owl:Thing`, are counted instead of listed.
+Disabled or incomplete
 change logs and reverted input changes are conservatively refused when freshness cannot
 be proved. Counts and direct-edge reduction can inspect more facts than the bounded
 output, and no new latency guarantee follows from the page size. The

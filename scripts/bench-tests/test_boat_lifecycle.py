@@ -297,7 +297,7 @@ class BoatJobMemory(unittest.TestCase):
         gate=(scripts/'gate/remote/gate-start.sh').read_text()
         self.assertEqual(re.findall(r'^boat_mem_g=(\S+)$',gate,re.M),[str(g)])
         build=(scripts/'nsc-build-host.sh').read_text()
-        self.assertEqual(re.findall(r'SPARKLES_NSC_BUILD_MEMORY_MAX=(\S+?)\s',build),[f'{g}G'])
+        self.assertEqual(re.findall(r'^BH_BOAT_BUILD_MEMORY_MAX=(\S+)$',build,re.M),[f'{g}G'])
 
     def test_the_admission_edge(self):
         mp=metadata_probe();total=16768798720

@@ -61,6 +61,13 @@ impl Host for LibraryHost {
         inference(&*self.state.upgrade()?)
     }
 
+    fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
+        self.state
+            .upgrade()
+            .map(|s| s.store.aggregate_errors())
+            .unwrap_or_default()
+    }
+
     fn stored_query(&self, name: &str) -> Result<String> {
         let state = self
             .state
@@ -100,6 +107,17 @@ impl ViewSource for Source {
         let rt = state.views.clone();
         drop(state);
         rt.read(r)
+    }
+    fn view_reading(
+        &self,
+        name: &str,
+        deadline: Option<std::time::Instant>,
+    ) -> Option<crate::sparql::AggregateErrors> {
+        let state = self.state.try_upgrade().ok()??;
+        start(&state, None);
+        let rt = state.views.clone();
+        drop(state);
+        rt.view_reading(name, deadline)
     }
 }
 
@@ -252,6 +270,7 @@ impl Views {
             allow_stale: false,
             caller: None,
             deadline: None,
+            aggregate_errors: None,
         })
     }
 
@@ -533,6 +552,10 @@ mod tests {
             self.release("epoch");
             0
         }
+        fn aggregate_errors(&self) -> crate::sparql::AggregateErrors {
+            self.release("aggregate-errors");
+            crate::sparql::AggregateErrors::default()
+        }
     }
 
     /// Every synchronous operation that invokes a Host must defer its final close,
@@ -549,6 +572,9 @@ mod tests {
             ("put", "inference", 1),
             ("round", "inference", 1),
             ("round", "epoch", 1),
+            ("list", "aggregate-errors", 1),
+            ("read", "aggregate-errors", 1),
+            ("view-reading", "aggregate-errors", 1),
         ];
         for method in ["access", "prefixes", "stored-query"] {
             cases.push(("put", method, 1));
@@ -585,6 +611,7 @@ mod tests {
                             allow_stale: false,
                             caller: None,
                             deadline: None,
+                            aggregate_errors: None,
                         });
                     }
                     "live" => {
@@ -610,6 +637,9 @@ mod tests {
                     }
                     "round" => {
                         state.views.round(&state.store);
+                    }
+                    "view-reading" => {
+                        state.views.view_reading("v", None);
                     }
                     _ => unreachable!(),
                 }
@@ -740,27 +770,33 @@ mod tests {
     /// Panic unwinding drops registry guards before draining the owned close action.
     #[test]
     fn synchronous_host_panic_finishes_its_deferred_close() {
-        let ds = Dataset::memory();
-        let state = ds.inner.clone();
-        state.views.set_host(Arc::new(ClosingHost {
-            ds: parking_lot::Mutex::new(Some(ds)),
-            method: "inference",
-            call: 1,
-            calls: std::sync::atomic::AtomicUsize::new(0),
-            panic: true,
-        }));
-        let (done_tx, done) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                state.views.list(&state.store)
+        for method in ["inference", "aggregate-errors"] {
+            let ds = Dataset::memory();
+            let state = ds.inner.clone();
+            state.views.set_host(Arc::new(ClosingHost {
+                ds: parking_lot::Mutex::new(Some(ds)),
+                method,
+                call: 1,
+                calls: std::sync::atomic::AtomicUsize::new(0),
+                panic: true,
             }));
-            assert!(panic.is_err());
-            assert!(state.views.is_closed());
-            done_tx.send(()).unwrap();
-        });
-        done.recv_timeout(Duration::from_secs(2))
-            .expect("panic cleanup deadlocked");
-        reader.join().unwrap();
+            let (done_tx, done) = std::sync::mpsc::channel();
+            let reader = std::thread::spawn(move || {
+                let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if method == "inference" {
+                        state.views.list(&state.store);
+                    } else {
+                        state.views.view_reading("v", None);
+                    }
+                }));
+                assert!(panic.is_err());
+                assert!(state.views.is_closed());
+                done_tx.send(()).unwrap();
+            });
+            done.recv_timeout(Duration::from_secs(2))
+                .unwrap_or_else(|e| panic!("{method}: panic cleanup deadlocked: {e}"));
+            reader.join().unwrap();
+        }
     }
 
     /// An owner initialized before operation tracking can use views from its TLS
