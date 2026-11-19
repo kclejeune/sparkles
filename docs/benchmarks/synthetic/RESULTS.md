@@ -914,7 +914,7 @@ wall time, streamed `export-500k` is 7% to 9% slower than cc94ac7f in all four c
 Forge ran eleven interleaved pairs alone under its benchmark and build locks, in rounds of
 A,B,B,A, with release builds of the matrix recipe that the laptop made with the compilers
 and build configuration of the cc94ac7f build. The
-[run record](runs/2026-11-19-post-push-pinned-forge-stage3/validation.json) holds the
+[run record](runs/2026-11-19-post-push-pinned-forge-stage3/README.md) holds the
 scripts, samples, answer checksums, binary hashes and verdicts. For every pair, the sorted
 TSV answers of both builds have the same checksums, and the timed responses were not
 compared. A query whose arm medians are both under 0.3 ms is judged by the D4 rule of the
@@ -968,10 +968,12 @@ and others is not measured. The separate matrix runs of 8baa5686 and bccc5f7b re
 1.03 here. Their instruction counts are nearly flat from 8baa5686 to 71c277b0, so the gap
 between the two methods is not explained. The 10.5M and 12-thread cells of these four
 queries have no interleaved pair. In wall time this pair reads 0.650 for `optional-chain`
-and 0.543 for `export-500k`, over every change from cc94ac7f to 71c277b0. The
-[comparison of the streamed response](../../specs/X14-unified-executor/SPEC.md#the-streamed-response-cost)
-gives the share of item 534's writer. Server execution time covers the cursor's batches and
-leaves out the writer and its term cache.
+and 0.543 for `export-500k`, over every change from cc94ac7f to 71c277b0. The atlas
+comparison of 8baa5686 and a016b7bd in the
+[streamed response section](../../specs/X14-unified-executor/SPEC.md#the-streamed-response-cost)
+measures item 240's buffered cursor writer on its own and does not divide this difference.
+Server execution time covers the cursor's batches and leaves out the writer and its term
+cache.
 
 The [attribution files](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/README.md)
 count instructions per request on the laptop, streamed with one Rayon thread at 1.05M
