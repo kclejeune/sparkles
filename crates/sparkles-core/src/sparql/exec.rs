@@ -5656,9 +5656,36 @@ fn string_order_mask(
     let (xs, ys) = (&t.cols[cx], &t.cols[cy]);
     let sample = n.min(STRING_ORDER_SAMPLE);
     ctx.grow_floor_cache();
+    let order = |a: Id, b: Id, fa: u64, fb: u64| -> bool {
+        let (pa, pb) = (a.payload(), b.payload());
+        let order = match pa.cmp(&pb) {
+            Ordering::Equal => Ordering::Equal,
+            Ordering::Less if pa < fb => Ordering::Less,
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater if pb < fa => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+        };
+        match op {
+            CmpOp::Lt => order == Ordering::Less,
+            CmpOp::Le => order != Ordering::Greater,
+            CmpOp::Gt => order == Ordering::Greater,
+            CmpOp::Ge => order != Ordering::Less,
+        }
+    };
+    // The sample's rows keep the order their floors give, so that no row's floors are
+    // looked up twice, which would mark them as read again without a repeat and grow the
+    // cache for strings that do not recur.
+    let mut keep = Vec::with_capacity(n);
     let strings = {
         let mut floors = ctx.floor_map();
-        (0..sample).all(|i| floors.floor(xs[i]).is_some() && floors.floor(ys[i]).is_some())
+        (0..sample).all(|i| {
+            let (a, b) = (xs[i], ys[i]);
+            let (Some(fa), Some(fb)) = (floors.floor(a), floors.floor(b)) else {
+                return false;
+            };
+            keep.push(order(a, b, fa, fb));
+            true
+        })
     };
     if !strings {
         // a refused floor is not another kind of value
@@ -5682,20 +5709,7 @@ fn string_order_mask(
         let (Some(fa), Some(fb)) = (floors.floor(a), floors.floor(b)) else {
             return generic(i);
         };
-        let (pa, pb) = (a.payload(), b.payload());
-        let order = match pa.cmp(&pb) {
-            Ordering::Equal => Ordering::Equal,
-            Ordering::Less if pa < fb => Ordering::Less,
-            Ordering::Less => Ordering::Greater,
-            Ordering::Greater if pb < fa => Ordering::Greater,
-            Ordering::Greater => Ordering::Less,
-        };
-        match op {
-            CmpOp::Lt => order == Ordering::Less,
-            CmpOp::Le => order != Ordering::Greater,
-            CmpOp::Gt => order == Ordering::Greater,
-            CmpOp::Ge => order != Ordering::Less,
-        }
+        order(a, b, fa, fb)
     };
     let test = |floors: &mut super::ctx::FloorMap<'_>, i: usize| -> Result<bool> {
         if i.is_multiple_of(1024) {
@@ -5703,20 +5717,26 @@ fn string_order_mask(
         }
         Ok(order_of(floors, i))
     };
-    let keep = if n <= PAR_THRESHOLD && threads > 1 {
+    if n <= PAR_THRESHOLD && threads > 1 {
         // A table of at most `PAR_THRESHOLD` rows, such as a cursor's batch, spreads over
         // the pool as the generic filter's batch does, so that a cursor's comparison is
         // not left on one thread where the generic filter would use them all. The batch
         // checks the deadline itself and collects the rows' booleans.
-        map_batch_with(ctx, n, true, || ctx.floor_map(), order_of)?
+        let rest = map_batch_with(
+            ctx,
+            n - sample,
+            true,
+            || ctx.floor_map(),
+            |floors, i| order_of(floors, sample + i),
+        )?;
+        keep.extend_from_slice(&rest);
     } else {
         // A larger table is compared in parts of `PAR_THRESHOLD` rows and then of the
         // rows before them, so that the floor cache can grow after the first parts as it
         // does between a cursor's batches.
-        let mut keep = Vec::with_capacity(n);
-        let mut lo = 0;
+        let mut lo = sample;
         while lo < n {
-            if lo > 0 {
+            if lo > sample {
                 ctx.grow_floor_cache();
             }
             let hi = n.min(lo + lo.max(PAR_THRESHOLD));
@@ -5735,8 +5755,8 @@ fn string_order_mask(
             }
             lo = hi;
         }
-        keep
-    };
+    }
+    debug_assert_eq!(keep.len(), n);
     // A refused floor took its row to the generic test, so the mask must not stand.
     ctx.check_memory_failure()?;
     #[cfg(test)]
@@ -10697,16 +10717,18 @@ mod string_order_tests {
     }
 
     /// Strings that rarely repeat keep the first table: masks over pairs of words that no
-    /// other row holds evict floors that were never read again, which does not grow it.
-    /// Only the rows of a mask's sample are read twice, which stays under the threshold.
+    /// other row holds evict floors that were never read again, which does not grow it,
+    /// however many masks there are, since no row's floors are looked up twice.
     #[test]
     fn floors_read_once_do_not_grow_the_table() {
         use super::super::expr::CmpOp;
         let rows = STRING_ORDER_ROWS;
-        let (s, ids) = word_store(3 * 2 * rows);
+        let masks = 40;
+        let (s, ids) = word_store(masks * 2 * rows);
         let mut ctx = Ctx::new(s.snapshot());
         ctx.mem_limit = 256 << 20;
-        let first = 1 << 14;
+        // 2^10 slots hold the threshold at 32, under the 128 floors of one sample
+        let first = 1 << 10;
         ctx.floor_cache().set_first_slots(first);
         for part in ids.chunks(2 * rows) {
             let (x, y) = (ctx.var("x"), ctx.var("y"));
