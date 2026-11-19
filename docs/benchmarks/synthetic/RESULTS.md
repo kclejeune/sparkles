@@ -826,6 +826,75 @@ cc94ac7f. The e52937ca record took 28.5 ms there, but its compilers differ, so t
 not a measurement of the code. In wall time, streamed `export-500k` is 5% to 6% slower in all four cells and
 `lang-filter` and `regex-iri` 10% to 12% slower at 10.5M triples with one thread.
 
+### Forge record at batch 33 against cc94ac7f
+
+The matrix ran on forge alone for bccc5f7b, the main branch after batches 32 and 33, and
+then for eda22fce, the main branch before batch 32. Both runs used the scripts and data of
+the batch-30 runs and release builds made on the laptop whose build configuration and
+compiler notes equal those of the cc94ac7f build. The engine of eda22fce differs from that
+of 8baa5686 only in the OWL classifier, which no synthetic query runs, so the ratios of
+eda22fce to 8baa5686 show how far two forge runs of the same query code differ on
+different days. The run records of
+[bccc5f7b](runs/2026-11-19-executor-matrix-forge-bccc5f7b/summary.md) and
+[eda22fce](runs/2026-11-19-executor-matrix-forge-eda22fce/summary.md) hold the records,
+summaries, commands and compare outputs. Both modes returned the same answers in every
+cell of both runs, and every answer fingerprint equals that of cc94ac7f.
+
+Between the two runs of the same query code, every one-thread execution time above 0.3 ms
+read 0.98 to 1.02, apart from eager `export-500k`, whose 2 ms of execution inside a 230 ms
+request read 0.94 and 1.10. With 12 threads, eight of the 85 cell times above 0.3 ms read
+1.05 or more, up to 1.17 for `order-by-full` at 10.5M triples. Streamed wall times of the
+eda22fce run were 2% to 6% lower than those of 8baa5686 in every cell.
+
+Against eda22fce, batches 32 and 33 made eager grouping faster with one thread. Eager
+`expr-bind-group` reads 0.84 and 0.85, eager `optional-count` 0.86, `group-avg` 0.89 and
+0.93, `expr-agg-arg` 0.89 and 0.90 and eager `minus` 0.89 at both sizes. No one-thread
+execution time above 0.3 ms is slower by more than the floor. The times that read slower
+than the floor of their metric are these.
+
+| query | mode | cell | eda22fce | bccc5f7b | ratio | process medians |
+|---|---|---|--:|--:|--:|---|
+| `order-by-full` | eager | 1.05M, 12 threads | 8.75 ms | 9.42 ms | 1.076 | 9.13 to 9.81 ms against 8.49 to 8.82 ms |
+| `order-by-full` | streaming | 1.05M, 12 threads | 9.17 ms | 9.68 ms | 1.055 | overlapping |
+| `class-predicates` | streaming | 1.05M, 12 threads | 1.006 ms | 1.052 ms | 1.046 | 1.044 to 1.062 ms against 0.975 to 1.031 ms |
+| `export-500k` | streaming | wall, three of four cells | 267 to 342 ms | 290 to 363 ms | 1.061 to 1.085 | separate in every cell |
+
+The streamed `export-500k` wall times of bccc5f7b are 1.7% to 2.1% above those of
+8baa5686, so most of their ratio to eda22fce is the difference between the runs. Row 1063
+puts the cost of item 1039 at about 3% of streamed execution time, with wall time
+unchanged. The 12-thread `order-by-full` cells at 10.5M triples, 1.20 and 1.32 against
+eda22fce, and `range-topk` at 1.13 are within the 12-thread floor. An interleaved forge
+A/B of the two builds in the flagged modes decides whether the four lines of the table are
+costs.
+
+Against cc94ac7f, `bench-gate.py compare` flagged 76 of 248 execution times
+([execution times](runs/2026-11-19-executor-matrix-forge-bccc5f7b/compare-cc94ac7f-exec.md),
+[wall times](runs/2026-11-19-executor-matrix-forge-bccc5f7b/compare-cc94ac7f-wall.md)), 51
+of them under 0.3 ms. The drift above 0.3 ms is this.
+
+| query | mode | cells | ratio to cc94ac7f | cc94ac7f ms | bccc5f7b ms |
+|---|---|---|--:|--:|--:|
+| `minus` | eager | all four | 1.16 to 1.28 | 0.31 to 3.30 | 0.37 to 3.91 |
+| `lang-filter` | both | one thread | 1.09 to 1.10 | 1.64 and 16.0 | 1.79 and 17.6 |
+| `lang-filter` | streaming | 1.05M, 12 threads | 1.12 | 0.73 | 0.82 |
+| `regex-iri` | both | one thread | 1.08 to 1.10 | 3.48 and 34.5 | 3.75 and 37.8 |
+| `optional-chain` | streaming | three of four | 1.06 to 1.12 | 1.95 to 25.5 | 2.06 to 27.6 |
+| `optional-count` | streaming | all four | 1.05 to 1.08 | 0.52 to 5.18 | 0.54 to 5.52 |
+| `class-predicates` and `class-predicate-list` | streaming | 1.05M, 12 threads | 1.07 and 1.05 | 0.99 and 0.98 | 1.05 and 1.03 |
+| `order-by-full` | eager | 1.05M, 12 threads | 1.06 | 8.92 | 9.42 |
+
+Batches 32 and 33 removed part of the eager `minus` cost of item 825 and left
+`lang-filter`, `regex-iri` and streamed `optional-chain` and `optional-count` where batch 30
+had them. With one thread, every server process of a cell agrees on these four queries,
+and the [batch-30 record](#forge-record-at-batch-30-against-cc94ac7f) shows the same costs
+against cc94ac7f. Row 1072 records `lang-filter` at about 2.5% after item 678, which batch
+32 merged, and no row records a cost on `regex-iri`, streamed `optional-chain` or
+`optional-count`, so the drift of these queries is larger than the costs that
+[row 1074](../../ROADMAP.md) allows. Interleaved forge A/Bs of cc94ac7f against the current
+main decide which of them are costs of the code before the range is bisected. In wall time,
+streamed `export-500k` is 7% to 9% slower than cc94ac7f in all four cells, and
+`lang-filter` and `regex-iri` 9% slower at 10.5M triples with one thread.
+
 ### Execution mode of quick texts in fresh servers
 
 The Namespace screen of cf033f12, the batch that merged items 679 and 454, against 125edd41

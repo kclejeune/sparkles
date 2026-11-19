@@ -1,0 +1,6 @@
+[2m2026-11-19T00:08:08.125258Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m memory profile default: block cache 1024 MiB, result cache 0 MiB, derived table cache 256 MiB, SERVICE cache 64 MiB, history cache 512 MiB, query budget 8192 MiB, query pool 6882 MiB
+[2m2026-11-19T00:08:08.127280Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m spill directory /home/kclejeune/lanes/forge-backlog/matrix-bccc5f7b/people-100000-threads-12/srv/.spill/890faff8382545f29098db509101231a-123085-9e4b22ea64f594ca, 15229 MiB for all queries
+[2m2026-11-19T00:08:08.133923Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m Sparkles 0.1.0 listening on http://127.0.0.1:4181/ (UI at /ui/), opening 0 datasets
+[2m2026-11-19T00:08:08.138146Z[0m [31mERROR[0m [1mrequest[0m[1m{[0m[3mrequest_id[0m[2m=[0mfb5f018e-000000000001 [3mmethod[0m[2m=[0mGET [3mroute[0m[2m=[0m"/$/ready"[1m}[0m[2m:[0m [2mtower_http::trace::on_failure[0m[2m:[0m response failed [3mclassification[0m[2m=[0mStatus code: 503 Service Unavailable [3mlatency[0m[2m=[0m0 ms
+[2m2026-11-19T00:08:08.138299Z[0m [32m INFO[0m [2msparkles::startup[0m[2m:[0m datasets opened in 3.9ms: status ready, ready true
+[2m2026-11-19T00:11:02.136180Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m shutting down: finishing requests in flight (up to 20s)
