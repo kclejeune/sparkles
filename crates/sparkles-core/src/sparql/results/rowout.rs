@@ -27,6 +27,10 @@ pub(in crate::sparql) const FIRST_MARKS: usize = 64;
 
 pub(in crate::sparql) const MARK_BYTES: u64 = std::mem::size_of::<(usize, u64)>() as u64;
 
+/// A slot of a [`RowLedger`]'s queue of marks not yet copied, which a writer with a
+/// ledger charges for each of its own mark slots.
+pub(in crate::sparql) const LEDGER_MARK_BYTES: u64 = std::mem::size_of::<(u64, u64)>() as u64;
+
 /// The rows of a result writer's output that reached the caller's writer whole, and
 /// optionally the transport's [`RowLedger`].
 #[derive(Default)]
@@ -85,8 +89,9 @@ struct LedgerState {
     /// rows whose ends were handed over
     delivered: u64,
     /// marks past the bytes copied when they were registered, in stream order. They are
-    /// at most those of one piece of the writer and the late marks before it, since each
-    /// registration and each send collapses the ones that the copies have reached.
+    /// at most those of one piece of the writer, since each registration first collapses
+    /// the ones before the piece's start, so the writer reserves room for as many as it
+    /// has mark slots, under its charge, and frees it when it drops.
     pending: VecDeque<(u64, u64)>,
     /// a writer registered with this ledger
     used: bool,
@@ -131,13 +136,17 @@ impl RowLedger {
         self.0.copied.load(Ordering::Relaxed)
     }
 
-    /// Register row ends, `(stream offset, rows)` in stream order. Each counts by where
-    /// its offset lies: handed over, copied, or not yet copied.
-    fn register(&self, marks: impl Iterator<Item = (u64, u64)>) {
+    /// Register the row ends of a piece that starts at stream offset `start`,
+    /// `(stream offset, rows)` in stream order. Each counts by where its offset lies:
+    /// handed over, copied, or not yet copied. The marks of earlier pieces, whose bytes
+    /// the transport has accepted, count as copied, so the queue holds at most this
+    /// piece's marks.
+    fn register(&self, start: u64, marks: impl Iterator<Item = (u64, u64)>) {
         let copied = self.0.copied.load(Ordering::Relaxed);
         let mut s = self.0.state.lock();
+        let reached = copied.max(start);
         while let Some(&(offset, n)) = s.pending.front()
-            && offset <= copied
+            && offset <= reached
         {
             s.pending.pop_front();
             s.in_buffer += n;
@@ -148,9 +157,34 @@ impl RowLedger {
             } else if offset <= copied {
                 s.in_buffer += n;
             } else {
+                debug_assert!(
+                    s.pending.len() < s.pending.capacity(),
+                    "a mark past the reserved queue"
+                );
                 s.pending.push_back((offset, n));
             }
         }
+    }
+
+    /// Make room in the queue for `marks` marks, after the writer has charged it.
+    fn reserve_pending(&self, marks: usize) {
+        let mut s = self.0.state.lock();
+        let more = marks.saturating_sub(s.pending.len());
+        s.pending.reserve_exact(more);
+    }
+
+    /// The writer stops: marks the copies have reached count as copied, and the rest,
+    /// whose bytes no transport accepted and nothing will write, are dropped with the
+    /// queue's storage.
+    fn settle(&self) {
+        let copied = self.0.copied.load(Ordering::Relaxed);
+        let mut s = self.0.state.lock();
+        let pending = std::mem::take(&mut s.pending);
+        s.in_buffer += pending
+            .iter()
+            .take_while(|&&(offset, _)| offset <= copied)
+            .map(|&(_, n)| n)
+            .sum::<u64>();
     }
 }
 
@@ -232,8 +266,22 @@ impl<'a> RowOut<'a> {
         }
     }
 
+    /// The bytes of a buffer of `buf` bytes and `marks` mark slots, with as many slots of
+    /// the ledger's queue when the count has a ledger.
     fn held(&self, buf: usize, marks: usize) -> u64 {
-        buf as u64 + marks as u64 * MARK_BYTES
+        let slot = if self.count.ledger.is_some() {
+            MARK_BYTES + LEDGER_MARK_BYTES
+        } else {
+            MARK_BYTES
+        };
+        buf as u64 + marks as u64 * slot
+    }
+
+    /// Give the ledger's queue as many slots as the marks have, under the same charge.
+    fn reserve_pending(&self, marks: usize) {
+        if let Some(ledger) = &self.count.ledger {
+            ledger.reserve_pending(marks);
+        }
     }
 
     /// Keep a refusal to return in place of the I/O error a [`Write`] call can give.
@@ -254,6 +302,7 @@ impl<'a> RowOut<'a> {
         }
         self.buf.reserve_exact(OUTPUT_BUFFER);
         self.marks.reserve_exact(marks - self.marks.len());
+        self.reserve_pending(marks);
         Ok(())
     }
 
@@ -275,6 +324,7 @@ impl<'a> RowOut<'a> {
             return Err(self.refuse(e));
         }
         self.marks.reserve_exact(marks - self.marks.len());
+        self.reserve_pending(marks);
         Ok(())
     }
 
@@ -373,6 +423,7 @@ impl<'a> RowOut<'a> {
         {
             let start = self.base + self.taken;
             ledger.register(
+                start,
                 self.marks
                     .iter()
                     .map(|&(offset, n)| (start + offset as u64, n)),
@@ -422,6 +473,15 @@ impl<'a> RowOut<'a> {
         self.buf.clear();
         self.marks.clear();
         Ok(())
+    }
+}
+
+impl Drop for RowOut<'_> {
+    /// Free the ledger's queue, which runs before the charge that covers it drops.
+    fn drop(&mut self) {
+        if let Some(ledger) = &self.count.ledger {
+            ledger.settle();
+        }
     }
 }
 

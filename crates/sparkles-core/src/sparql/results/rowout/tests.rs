@@ -181,19 +181,20 @@ fn a_ledger_without_a_writer_reports_nothing() {
 fn late_marks_count_by_where_their_bytes_are() {
     let ledger = RowLedger::new();
     assert_eq!(ledger.start(), 0);
+    ledger.reserve_pending(2);
     // a mark not yet copied waits, one copied waits for the send, one sent counts at once
-    ledger.register([(10, 1)].into_iter());
+    ledger.register(0, [(10, 1)].into_iter());
     ledger.copied(20);
-    ledger.register([(15, 2), (25, 1)].into_iter());
+    ledger.register(0, [(15, 2), (25, 1)].into_iter());
     assert_eq!(ledger.delivered(), Some(0));
     ledger.handed_over(20);
     assert_eq!(ledger.delivered(), Some(3));
-    ledger.register([(18, 4)].into_iter());
+    ledger.register(0, [(18, 4)].into_iter());
     assert_eq!(ledger.delivered(), Some(7));
     // a copy that reaches a pending mark moves it to the buffer, and a lost buffer never
     // counts it
     ledger.copied(30);
-    ledger.register(std::iter::empty());
+    ledger.register(0, std::iter::empty());
     assert_eq!(ledger.delivered(), Some(7));
     ledger.handed_over(30);
     assert_eq!(ledger.delivered(), Some(8));
@@ -389,5 +390,91 @@ fn the_charge_is_released_with_the_writer() {
     )
     .unwrap();
     assert_eq!(count.get(), 1000);
+    assert_eq!(room(&ctx), before);
+}
+
+/// The capacity of the ledger's queue of marks not yet copied.
+fn pending_capacity(ledger: &RowLedger) -> usize {
+    ledger.0.state.lock().pending.capacity()
+}
+
+/// Under a ledger, the writer's charge covers the ledger's queue of marks as well as its
+/// own marks, at every growth, and the queue never outgrows what is charged.
+#[test]
+fn the_ledger_queue_is_charged_with_the_marks() {
+    let ledger_slot = std::mem::size_of::<(u64, u64)>() as u64;
+    for explicit in [false, true] {
+        let r = small_answer();
+        let ctx = r.test_context().clone();
+        let ledger = RowLedger::new();
+        let count = RowCount::with_ledger(ledger.clone());
+        let mut t = Transport::new(&ledger, 64 << 10, usize::MAX);
+        let mut write = rows(2000, 10, 3, explicit);
+        write_buffered(&mut t, &count, Some(ctx.clone()), &mut |w, staged| {
+            write(w, staged)?;
+            // rows of 10 bytes grow the marks from the first 64 past 512
+            let marks = w.marks.capacity() as u64;
+            assert!(marks >= 4 * FIRST_MARKS as u64, "{explicit} {marks}");
+            let charged = w.charge.as_ref().map(|c| c.bytes());
+            assert_eq!(
+                charged,
+                Some(OUTPUT_BUFFER as u64 + marks * (MARK_BYTES + ledger_slot)),
+                "{explicit}"
+            );
+            assert!(pending_capacity(&ledger) as u64 <= marks, "{explicit}");
+            Ok(())
+        })
+        .unwrap();
+        t.finish().unwrap();
+        assert_eq!(ledger.delivered(), Some(2000), "{explicit}");
+    }
+}
+
+/// The ledger's queue is freed with the writer, before its charge is released, also when
+/// the transport fails partway through a piece and the ledger outlives the writer.
+#[test]
+fn the_ledger_queue_is_freed_with_the_writer() {
+    for fail in [None, Some(1)] {
+        let r = small_answer();
+        let ctx = r.test_context().clone();
+        let before = room(&ctx);
+        let ledger = RowLedger::new();
+        let count = RowCount::with_ledger(ledger.clone());
+        // a transport that copies 333 bytes a call, so a piece's marks wait in the queue
+        let mut t = Transport::new(&ledger, 1000, 333);
+        t.fail_send = fail;
+        let result = write_buffered(
+            &mut t,
+            &count,
+            Some(ctx.clone()),
+            &mut rows(2000, 10, 3, false),
+        );
+        assert_eq!(result.is_ok(), fail.is_none());
+        assert_eq!(pending_capacity(&ledger), 0, "{fail:?}");
+        assert_eq!(room(&ctx), before, "{fail:?}");
+        let _ = t.finish();
+        assert_eq!(ledger.delivered(), Some(whole_rows(t.sent, 10)), "{fail:?}");
+    }
+}
+
+/// A serializer that panics still frees the ledger's queue and releases the charge.
+#[test]
+fn the_ledger_queue_is_freed_on_unwind() {
+    let r = small_answer();
+    let ctx = r.test_context().clone();
+    let before = room(&ctx);
+    let ledger = RowLedger::new();
+    let count = RowCount::with_ledger(ledger.clone());
+    let mut t = Transport::new(&ledger, 1000, 333);
+    let mut write = rows(2000, 10, 3, false);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        write_buffered(&mut t, &count, Some(ctx.clone()), &mut |w, staged| {
+            write(w, staged)?;
+            assert!(pending_capacity(&ledger) > 0);
+            panic!("the serializer panics");
+        })
+    }));
+    assert!(unwound.is_err());
+    assert_eq!(pending_capacity(&ledger), 0);
     assert_eq!(room(&ctx), before);
 }
