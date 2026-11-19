@@ -14,6 +14,17 @@ that the result-size budget stops after its first bytes now sends what it had bu
 before it aborts the transfer, as an eager body did, so a client receives up to one more
 chunk of complete rows before the abort.
 
+### The UI's result table under automatic execution
+
+The query page's result table now runs a query in the server's default execution mode
+instead of asking for eager execution, so plans that are faster as cursors, such as plain
+scans of a thousand rows or more and large groupings, stream there too. When a streamed answer reaches the row limit, the Table tab
+reads the count with a plus sign, such as `1,000+`, and a notice says that there may be
+more rows and that the total is unknown. A streamed graph answer, whose statements arrive
+as quads, draws as an eager one does. A comparison on the history slider still reads both
+states eagerly. A streamed answer skips the full-result cache, so rerunning it is not
+served from the cache. This is part of roadmap item 7.
+
 ### Instruction counts per request before timing
 
 `mise run bench:request-insn` counts the user-space instructions, cycles and CPU time per

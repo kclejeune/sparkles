@@ -1007,7 +1007,7 @@ entry point that picks a mode and what it does now.
 | A query that ran in under 10 ms last time | eager, in place | The decision would cost more than any stream can save, and the in-place path stays as it was. |
 | Stored queries, `/{ds}/queries/{name}` | as `/{ds}/sparql` | A run with parameter values has initial bindings, which rule out every automatic plan, so it runs eagerly. |
 | Graph algorithms over HTTP | as `/{ds}/sparql` | Their plans never qualify, so they run eagerly. |
-| UI result table | eager, asked for explicitly | The table shows the full row count and the time slider compares totals, which a streamed answer stopped after `send` rows does not know. |
+| UI result table | the server's default, but eager in a comparison | A streamed answer that the row limit stopped shows its rows with an unknown total. A comparison on the time slider reads both states eagerly, because it compares whole results or their exact counts. |
 | UI downloads | the server's default | A download reads the whole answer. |
 | CLI `sparkles query`, local | `auto`, but eager for the `text` table and `--explain` | The table measures every row before printing one. A plan that stays eager prints exactly what an eager query prints. |
 | CLI `sparkles query --server` | the server's default | It sends `execution` only when `--execution` is given. |
@@ -1753,6 +1753,38 @@ COALESCE, in SUM and in an ORDER BY key, with and without a key set, checks that
 streams and runs them under the budget loop from 512 KiB to 64 MiB. `exists_tests`
 compares the key-set answers with evaluation per key for the same positions and checks
 the nested counters of EXPLAIN, and the decision tables in `cursor.rs` admit the shapes.
+
+### The UI's table under automatic execution (2026-11-18)
+
+The query page's result table no longer asks for eager execution. It sends no
+`execution`, so the server's default applies, and automatic execution streams the plans
+that measured faster as cursors, such as a plain scan of a thousand rows or more and a
+grouping over 20,000 or more input rows, over a dataset whose updates are compacted. A
+streamed answer that reaches the row limit stops with `status: "stopped"` and a null
+`totalRows`, and the cursor writers stop without looking for another row. The Table tab
+then shows the rows sent with a plus sign, such as `1,000+`, and the notice above the
+table says that there may be more rows and that the total is unknown. A streamed answer
+that ends within the limit reports `complete` and its exact total, as an eager one does.
+
+A comparison on the time slider still asks for eager execution on both reads, because it
+compares two results as bags, or their exact counts when the row limit cut one of them.
+The comparison helper treats a stopped stream as cut, with its count unknown, so a
+caller that compares streamed answers compares counts and marks no row.
+
+A streamed CONSTRUCT or DESCRIBE answer sends an empty `triples` array and every
+statement in `quads`, with a null graph for the default graph. The UI moves those
+statements into `triples`, as an eager answer sends them, so the graph and table views
+draw a streamed graph answer as they draw an eager one. The other pages of the UI, such
+as paths, vector search, the shape editor and the ontology and thesaurus workbenches,
+still ask for eager execution, because they read exact totals or need a whole result.
+
+A streamed answer skips the full-result cache, so running the same streamed query again
+from the table is not served from the cache. Vitest covers the request's mode, the
+stopped metadata, the quads and the comparison of a stopped stream. A mock browser test
+rewrites the mock's answers into the stopped and quads shapes and checks the badge, the
+notice, the graph and a comparison's eager reads, and a browser test against a real
+server streams a grouping over 30,000 rows with a row limit of 1,000 and with a limit
+above the total, and a plain scan of the same rows with a limit of 1,000.
 
 ### Finite HTTP body limits
 

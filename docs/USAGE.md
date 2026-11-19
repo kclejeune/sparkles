@@ -5738,8 +5738,11 @@ curl --fail --get http://localhost:3030/ds/sparql \
 ```
 
 `sparkles serve --default-execution eager` makes eager execution the default for every
-request that does not name a mode. The UI's result table asks for eager execution,
-because it shows the full row count, and its downloads use the server's default.
+request that does not name a mode. The UI's result table and its downloads use the
+server's default. When the server streams an answer and the row limit stops it, the
+table shows the rows it received with an unknown total, since there may be more. A
+comparison on the time slider asks for eager execution, because it compares whole results
+or their exact counts.
 
 When a client reads a streamed answer slowly, the query pauses once the bounded output
 buffers are full. A disconnect stops the query even while it waits. The query's

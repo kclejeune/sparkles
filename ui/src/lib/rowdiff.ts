@@ -35,7 +35,13 @@ export type RowDiff = {
  * The rows cannot be compared in the browser: they are too many, or (`cut`) a read sent only
  * a prefix of them. `left` and `right` count the rows each side has in all.
  */
-export type TooLarge = { tooLarge: true; left: number; right: number; cut?: boolean };
+/** `left` and `right` are row counts, null for a streamed read whose total is unknown. */
+export type TooLarge = {
+  tooLarge: true;
+  left: number | null;
+  right: number | null;
+  cut?: boolean;
+};
 
 /** Compare `left` (the earlier state) with `right` as bags. */
 export function diffRows(left: readonly Row[], right: readonly Row[]): RowDiff {
@@ -97,7 +103,7 @@ export function compareRows(
 
 /**
  * Compare two results as bags, or say that the browser cannot: a read that cut its rows
- * (`sentRows` below `totalRows`) compares as a prefix, and a prefix says nothing about what
+ * (`sentRows` below `totalRows`, or a streamed read stopped with no total) compares as a prefix, and a prefix says nothing about what
  * the rows beyond it were, so only the counts are known (docs/specs/U01-time-slider.md §2.3).
  * `null` when the results are not both tables or both graphs.
  */
@@ -109,7 +115,9 @@ export function compareResults(
   const rows = result.rows && base.rows;
   const triples = result.triples && base.triples;
   if (!rows && !triples) return null;
-  const cut = (r: Pick<SparklesResult, 'meta'>) => r.meta.sentRows < r.meta.totalRows;
+  // a streamed read that stopped at the row limit has no total and may have more rows
+  const cut = (r: Pick<SparklesResult, 'meta'>) =>
+    r.meta.totalRows == null || r.meta.status === 'stopped' || r.meta.sentRows < r.meta.totalRows;
   if (cut(base) || cut(result))
     return {
       tooLarge: true,
