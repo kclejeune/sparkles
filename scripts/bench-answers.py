@@ -456,13 +456,49 @@ def _blank(m):
     return " " * len(t)
 
 
+def blank_tokens(query):
+    """The query with every comment, IRI and string literal, long or short, blanked to the
+    same length as `_blank` blanks one, so that words inside them are not read as syntax and
+    positions in the blanked text are positions in the query. A backslash escape outside a
+    string, such as a prefixed name's `\\#`, is kept, so its hash opens no comment."""
+    out, i, n = [], 0, len(query)
+    while i < n:
+        c = query[i]
+        if c == "\\":
+            out.append(query[i:i + 2])
+            i += 2
+            continue
+        if c == "#":
+            j = query.find("\n", i)
+            j = n if j < 0 else j
+            out.append(" " * (j - i))
+        elif c == "<" and (m := re.match(r"<[^<>\"{}|^`\\\s]*>", query[i:])):
+            j = i + m.end()
+            out.append("<" + " " * (j - i - 2) + ">")
+        elif query.startswith(c * 3, i) and c in "\"'":
+            j = i + 3
+            while j < n and not query.startswith(c * 3, j):
+                j += 2 if query[j] == "\\" else 1
+            j = min(n, j + 3)
+            out.append(c + " " * max(0, j - i - 2) + c if j - i >= 2 else " " * (j - i))
+        elif c in "\"'":
+            j = i + 1
+            while j < n and query[j] != c and query[j] != "\n":
+                j += 2 if query[j] == "\\" else 1
+            j = min(n, j + 1)
+            out.append(c + " " * max(0, j - i - 2) + c if j - i >= 2 else " " * (j - i))
+        else:
+            out.append(c)
+            j = i + 1
+        i = j
+    return "".join(out)[:n]
+
+
 def _order_by_tail(query):
     """(start, tail) of the query's last top-level ORDER BY, where start is the index in `query`
     after the ORDER BY keywords and tail is the text from there with IRIs, strings and comments
     blanked to the same length, or None. Only an ORDER BY outside every group counts."""
-    q = re.sub(r"<[^<>\s]*>", _blank, query)
-    q = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', _blank, q)
-    q = re.sub(r"#[^\n]*", _blank, q)
+    q = blank_tokens(query)
     depth, start = 0, None
     for m in re.finditer(r"[{}]|\border\s+by\b", q, re.I):
         if m.group() == "{":

@@ -86,6 +86,26 @@ class AnswersTests(unittest.TestCase):
                 run = self.run_dir(d, f"r{i}", query, {"A": "x", "B": "y"})
                 self.assertEqual(answers("--queries", "q", run).returncode, 0 if ok else 1, query)
 
+    def test_the_order_digests_lex_queries_as_the_checker_does(self):
+        gate = SCRIPTS / "bench-gate.py"
+        with tempfile.TemporaryDirectory() as d:
+            def digest(query, rows):
+                (Path(d) / "q.rq").write_text(query)
+                (Path(d) / "a.tsv").write_text("?x\n" + "".join(f"{r}\n" for r in rows))
+                r = subprocess.run([sys.executable, str(gate), "order-digest", Path(d) / "q.rq", Path(d) / "a.tsv"],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                return r.stdout.strip()
+            # ORDER BY inside a long literal: an unordered slice, so only counts are digested
+            q = 'SELECT ?x ("""alpha " ORDER BY " omega""" AS ?v) WHERE { VALUES ?x { "a" "b" } } LIMIT 1'
+            self.assertTrue(digest(q, ['"a"']).startswith("distinct:"))
+            self.assertEqual(digest(q, ['"a"']), digest(q, ['"b"']))
+            # a real ORDER BY after an escaped hash or a hash in a long literal keeps its order
+            for q in ('PREFIX ex: <urn:ex:> SELECT ?x (ex:a\\#b AS ?v) WHERE { VALUES ?x { "a" "b" } } ORDER BY ?x\nLIMIT 2',
+                      'SELECT ?x ("""alpha " # text " omega""" AS ?v) WHERE { VALUES ?x { "a" "b" } } ORDER BY ?x LIMIT 2'):
+                self.assertTrue(digest(q, ['"a"', '"b"']).startswith("keys:"), q)
+                self.assertNotEqual(digest(q, ['"a"', '"b"']), digest(q, ['"b"', '"a"']), q)
+
     def test_a_staged_query_missing_from_every_run_fails(self):
         with tempfile.TemporaryDirectory() as d:
             run = self.run_dir(d, "r", "ASK {}", {"A": "x", "B": "x"})

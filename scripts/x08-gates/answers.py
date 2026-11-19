@@ -13,49 +13,22 @@ agree. The check fails when a run holds other queries than --queries names, or w
 file is missing.
 """
 
+import importlib.util
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-def blank_tokens(query):
-    """The query with every comment, IRI and string literal, long or short, replaced by
-    spaces of the same length, so that words inside them are not read as syntax."""
-    out, i, n = [], 0, len(query)
-    while i < n:
-        c = query[i]
-        if c == "\\":
-            # an escape outside a string, such as a prefixed name's \#, is no comment
-            out.append(query[i:i + 2])
-            i += 2
-            continue
-        if c == "#":
-            j = query.find("\n", i)
-            j = n if j < 0 else j
-        elif c == "<" and (m := re.match(r"<[^<>\"{}|^`\\\s]*>", query[i:])):
-            j = i + m.end()
-        elif query.startswith('"""', i) or query.startswith("'''", i):
-            q3, j = query[i:i + 3], i + 3
-            while j < n and not query.startswith(q3, j):
-                j += 2 if query[j] == "\\" else 1
-            j = min(n, j + 3)
-        elif c in "\"'":
-            j = i + 1
-            while j < n and query[j] != c and query[j] != "\n":
-                j += 2 if query[j] == "\\" else 1
-            j = min(n, j + 1)
-        else:
-            out.append(c)
-            i += 1
-            continue
-        out.append(" " * (j - i))
-        i = j
-    return "".join(out)
+_spec = importlib.util.spec_from_file_location(
+    "bench_answers", Path(__file__).resolve().parent.parent / "bench-answers.py")
+ba = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ba)
 
 
 def unordered_slice(query):
-    """Whether the query has a top-level LIMIT and no top-level ORDER BY."""
-    q = blank_tokens(query)
+    """Whether the query has a top-level LIMIT and no top-level ORDER BY, with the lexing
+    that bench-answers.py's order digests use."""
+    q = ba.blank_tokens(query)
     depth, limit, ordered = 0, False, False
     for m in re.finditer(r"[{}]|\border\s+by\b|\blimit\s+\d+", q, re.I):
         t = m.group()
