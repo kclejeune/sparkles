@@ -226,37 +226,94 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped. The
-hierarchical budget of item 675 remains, and so does the cursor exclusion of the string
-floors, which item 1069 removes. Stage 5's
+479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
+shipped, and the hierarchical budget of item 675 remains. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
-Item 678 has shipped in part. The string floors of `string_order_mask` read their keys
+Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
-read fails the comparison with its refusal. Cursor batches still compare two string
-columns key by key and do not use the floors. On atlas with 1.05M triples and one
-thread, comparing through floors cached per batch made streaming `str-pair-lt` 24.8%
-slower and `str-pair-names` 33.4% slower than the direct comparison, in every round. The
-names of `str-pair-names` repeat across batches, with 83,226 and 91,694 distinct values in
-its two columns over 249,868 rows, so each batch computes again floors that an earlier batch had. Every name of
-`str-pair-lt` is distinct, 70,023 in 70,023 rows, and the cause of its loss is not
-established. Item 1069 takes up a floor cache that lasts the query and the exclusion.
-The row-aligned
-pre-decode of `decode_for` decodes its columns through the same sorted pre-decode as the
-dictionary values of top k and the numeric FILTER, which admits each value's storage
-before it builds it, and moves or clones the distinct values to their rows. Indexing the
-rows through the distinct values' slots was considered and not built, because the row
-evaluator reads the decoded column on its hot path and that change would need its own
-Intel measurement. The bounded-reads test counts every read of the mode, eight in all.
+read fails the comparison with its refusal. The row-aligned pre-decode of `decode_for`
+decodes its columns through the same sorted pre-decode as the dictionary values of top k
+and the numeric FILTER, which admits each value's storage before it builds it, and moves
+or clones the distinct values to their rows. Indexing the rows through the distinct
+values' slots was considered and not built, because the row evaluator reads the decoded
+column on its hot path and that change would need its own Intel measurement. Forge
+measured item 678 against the build before it on 36 queries at 1.05M triples with one
+thread, in three A,B,B,A rounds of ten requests, with the same answers and geometric means
+of 1.002 in streaming and 0.993 in automatic execution.
 
-Forge measured the item against the build before it on 36 queries at 1.05M triples with
-one thread, in three A,B,B,A rounds of ten requests, and every answer was the same. The
-geometric mean was 1.002 in streaming execution and 0.993 in automatic execution. A few
-filters that decode values became slower in every round. `str-filter-two` took 2.4% longer
-in streaming and 4.4% longer in automatic execution, `lang-filter` 2.4% and 2.6% longer,
-and streaming `str-pair-lt` 2.1% longer. With 12 threads `str-pair-lt` and `str-pair-names`
-were 2% faster.
+The query's context keeps the floors in a cache that lasts the query, so cursor batches
+compare two string columns through the floors as eager tables do. A floor cache that
+each batch built again had measured 24.8% slower on streaming `str-pair-lt` and 33.4% on
+`str-pair-names` on atlas, since names that repeat across batches had their floors
+computed in every batch. Every worker of a mask reads and writes one direct-mapped table
+of atomic words without a lock, since maps of their own made each worker compute a
+recurring string's floor again. A word holds the id's slot tag, the distance down to its
+floor and a bit set when the floor is read again. The first table has up to 2^16 slots,
+fewer when the vocabulary's strings or the cap need fewer. Before a mask or a part of a
+large eager table it grows up to eightfold, within the same limits, once its estimate of
+the floors it evicted that had been read again reaches a thirty-second of its slots, so
+inputs whose strings rarely repeat keep it. Each table is charged to the query before it is allocated, inside
+the spill threshold, and the cache holds at most 64 MiB or a sixteenth of the query's
+memory budget. This memory buys the speed below, and a table that the budget refuses
+leaves the floors the cache lacks to be computed each time. A cursor reads a key and the key before it in one walk of their block when
+that walk admits at most 4 KiB and the envelope grants it, and otherwise reads the key
+alone. A cursor batch spreads its floor comparison over the pool as the generic filter
+does. The bounded-reads test counts every read of the mode, seven in all.
+
+Forge measured 3a8b7adb, the build with the shared table, against c0948014, the build
+before item 1069, with 1.05M triples in five A,B,B,A rounds of ten requests per cell, and
+every answer was the same. With one thread in streaming execution, `str-pair-names` took
+0.517 of the base's time, 29.8 against 57.7 ms, `str-pair-lt` 0.815 and
+`str-pair-colleague` 1.042. Against the direct comparison of the two keys in eager
+execution, a probe build on the same base that the run record names, they read 0.512,
+0.778 and 0.991. With 12 threads, streaming `str-pair-lt` read 0.935, `str-pair-names`
+0.777 and `str-pair-colleague` 1.065, and eager execution read 0.843, 0.636 and 0.802.
+Every round of these cells agreed in direction with its median.
+
+An earlier build of the item, 174de1f8, gave each worker a map of its own, so a repeated
+name's floor was computed once for each worker that met it, and with 12 threads its
+streaming `str-pair-names` read 1.000 of the base and `str-pair-colleague` 1.118. Against
+that build with one thread, the shared table reads 0.952 on `str-pair-colleague` and
+0.907 on `str-pair-lt` in streaming execution and 0.931 and 0.908 in eager execution,
+while `str-pair-names` takes 5.3% longer in streaming and 9.7% longer in eager execution.
+The names query's table grows from its first 2^16 slots during the query. On wally, a
+first table as large as the vocabulary's clamp closed that gap but made `str-pair-lt`,
+whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
+
+`str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
+floors are nearly all computed once, and in streaming execution they cost more than
+comparing the two keys. A switch that turns the floors off
+when a prefix of the rows repeats few values was considered and not built, because in a
+shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
+`str-pair-colleague` while the whole query repeats many, so the switch would lose the
+names query's 2x. A profile of the per-worker maps put most of the floors' time in
+`Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
+predecessor. The shared table has not been profiled, so that read is the suspected cause
+of its cost, and item 1088 recovers the streaming cost. Its first candidate admits and allocates
+the checked walk's key buffer before the walk instead of growing it from empty and reads the
+predecessor without the copy that `PrevKey::keep` makes, keeping the checked envelope and
+its fallback.
+
+Queries that the floors do not reach also became slower in every round, and item 1089
+holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
+c0948014, and these lines have not been measured on 3a8b7adb. Over three rounds the screens
+had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no query
+was 10% slower. With one thread, 174de1f8 made streaming `str-filter-two` 2.8% slower over
+five rounds, which 3a8b7adb reads at 1.000 with rounds on both sides, and with 12 threads
+3a8b7adb makes streaming `str-filter-two` 1.4% slower in all five rounds. The screens
+found streaming `distinct-join` 2.5% slower, `star-join` 1.7% in streaming and 2.0% in
+automatic execution, automatic `employee-docs` 2.8% at 0.036 ms and automatic
+`star-lookup` 2.5% at 0.062 ms. `range-topk`, `order-lcase`, automatic `two-hop-count`
+and automatic `minus` read 0.8% to 1.3% slower, and streaming `lang-filter`, streaming
+`optional-count` and automatic `order-by-full` 0.2% to 0.4%. With both builds made on
+forge, item 678, 75a70587 against 7e272f4d, made `lang-filter` 2.9% slower in automatic
+and 2.7% in streaming execution, `str-filter-two` 2.1% and 1.8%, and streaming
+`distinct-join` 1.9%, in all five rounds, while `employee-docs` showed no cost. Profiles
+of item 678's costs on the laptop found no function the item changed above 0.14% of the
+samples and the same instruction counts for `lang-filter`. Automatic `str-filter-two`
+changes mode between server processes, which item 1087 holds.
 
 The test-only reference evaluator of item 512 has shipped in
 `crates/sparkles-core/tests/support/reference`. It reads a list of quads and a parsed
@@ -872,22 +929,20 @@ row of the table before it starts, which is more than the 12 bytes and one value
 decoded row that the separate large-input pre-decode admitted. Under a budget with little room left,
 a large column can therefore fall back to its rows where it was decoded before, which
 costs time but no correctness. The comparison of two string columns through cached
-lexicographic floors serves eager tables of at least 4,096 rows. A floor reads its
+lexicographic floors serves eager tables and cursor batches of at least 4,096 rows. A floor reads its
 string's key, the key before it and, for a string that other strings extend, the search
 for the first of them inside the decoding envelope, and a refused read fails the
-comparison with the refusal it recorded. Cursor batches compare the two keys directly
-instead, because the floors with a cache that lasts one batch measured slower than that
-comparison. Item 1069 takes up a cache that lasts the query.
+comparison with the refusal it recorded. The floors last the query in a charged cache,
+which the batches of a cursor share.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 reads of the accounting mode outside tests and fails above its bound. A read is a call of
 `streams()` or `accounting()`, a use of either `Accounting` variant or a direct read of
-the `streams` field outside its accessors. The bound is 8. The first read is the routing
+the `streams` field outside its accessors. The bound is 7. The first read is the routing
 of `query_execution_with_plan` in `cursor.rs`. The second accumulates an EXISTS key set
 across a cursor's batches, which an eager table builds in one batch. The third lets a
 cursor's decoding envelope refuse on the ledger, because eager callers of `term` and
-`value` cannot report a refusal and decode without the envelope instead. The fourth
-keeps cursor batches from the string floors until item 1069. The other four read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
+`value` cannot report a refusal and decode without the envelope instead. The other four read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
 without an owner may keep retained state uncharged, whether an empty release trims the
 ledger and whether a finished query's pool contribution shrinks. `CursorMemory` is gone, and a context in cursor accounting differs
 from an eager one only by its `streams` flag, its ledger retention and its deadline. The

@@ -156,6 +156,19 @@ with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which
 their advisories. The SvelteKit advisories that only 3.x fixes concern features the
 static UI does not use, and roadmap item 1049 covers the migration.
 
+### String comparisons through a per-query floor cache
+
+`FILTER(?x < ?y)` and the other order comparisons of two columns of stored strings read
+the strings' order from their vocabulary ids and floors in streaming execution as well as
+in eager execution, which completes roadmap items 678 and 1069. The floors live in a cache
+that lasts the query, charged to its memory budget inside the spill threshold and capped
+at 64 MiB or a sixteenth of the budget, so a cursor's batches share them. On forge at 1.05M
+triples with one thread, streaming `str-pair-names` takes 0.517 of its earlier time and
+`str-pair-lt` 0.815, while `str-pair-colleague`, whose names rarely repeat, takes 1.042,
+and 1.065 with 12 threads, which item 1088 follows. Every worker of a comparison reads and
+writes the slots of one table of floors without a lock, which replaced an earlier map per worker that
+computed a repeated string's floor once per worker.
+
 ### Fewer rooted classification runs past their bound
 
 With `Limits::rooted`, an existential restriction into a singleton, or into a class below
