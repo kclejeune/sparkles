@@ -909,6 +909,80 @@ main decides how much of that drift is a cost of the code before the range is bi
 wall time, streamed `export-500k` is 7% to 9% slower than cc94ac7f in all four cells, and
 `lang-filter` and `regex-iri` 9% slower at 10.5M triples with one thread.
 
+### Pinned checks and drift at batch 37
+
+Forge ran eleven interleaved pairs alone under its benchmark and build locks, in rounds of
+A,B,B,A, with release builds of the matrix recipe that the laptop made with the compilers
+and build configuration of the cc94ac7f build. The
+[run record](runs/2026-11-19-post-push-pinned-forge-stage3/validation.json) holds the
+scripts, samples, answers, binary hashes and verdicts. Both builds of every pair returned
+the same answers to every query. A query under 0.3 ms is judged by the D4 rule of the
+pinned checks above. A query above 0.3 ms passes when its ratio is below 1.05 and it is not
+slower in every round.
+
+The screen flags of batches 33 and 35 are noise. Against bccc5f7b's base eda22fce,
+`types-grouped` reads 0.984 eager, 0.969 streamed and 1.030 under automatic execution, where
+the added time is 0.22 µs. Against ffb18866, the main before batch 35, `subquery-agg`
+reads 0.997 under automatic execution and 1.001 streamed, with intervals that reach 1.0.
+
+The interleaved pairs of eda22fce and bccc5f7b test the candidates above 0.3 ms that the
+[batch-33 record](#forge-record-at-batch-33-against-cc94ac7f) listed. Every ratio is below
+1.05, and two of them are slower in every round.
+
+| query | mode | cell | ratio | rounds slower |
+|---|---|---|--:|--:|
+| `export-500k` | streaming | 1.05M, one thread | 1.032 | 12 of 12 |
+| `group-avg` | streaming | 10.5M, 12 threads | 1.022 | 8 of 8 |
+| `expr-order-key` | streaming | 10.5M, 12 threads | 1.022 | 7 of 8 |
+| `order-by-full` | streaming | 10.5M, 12 threads | 1.009 | 7 of 8 |
+| `order-by-full` | eager | 1.05M and 10.5M, 12 threads | 1.003 and 1.001 | 6 of 12 and 4 of 8 |
+| `class-predicates` | streaming | 1.05M, 12 threads | 1.006 | 9 of 12 |
+
+Row 1063 holds the `export-500k` cost of item 1039, and row 1067 holds the `group-avg`
+cost, whose cause batch 32's items 826, 678 and 1039 leave open. The 1.20 that the matrix
+read for eager `order-by-full` at 10.5M triples was a difference between runs. The pair of
+cc94ac7f and 71c277b0, the main at batch 37, measures the drift of streamed queries since
+the fixed baseline with one thread at 1.05M triples.
+
+| query | cc94ac7f ms | 71c277b0 ms | ratio | 95% interval | rounds slower | row |
+|---|--:|--:|--:|---|--:|---|
+| `optional-chain` | 1.940 | 2.096 | 1.081 | 1.076 to 1.085 | 12 of 12 | 1202 |
+| `optional-count` | 0.517 | 0.545 | 1.056 | 1.052 to 1.059 | 12 of 12 | 1203 |
+| `regex-iri` | 3.476 | 3.593 | 1.034 | 1.031 to 1.038 | 12 of 12 | 1204 |
+| `lang-filter` | 1.632 | 1.679 | 1.029 | 1.027 to 1.031 | 12 of 12 | 1204 and 1072 |
+| `export-500k` | 0.417 | 0.398 | 0.956 | 0.952 to 0.959 | 0 of 12 | none |
+
+The interleaved pair reads `lang-filter` and `regex-iri` at 1.03, while the separate
+matrix runs of 8baa5686 and bccc5f7b read them at 1.08 to 1.13 against the cc94ac7f run.
+Their instruction counts do not change from 8baa5686 to 71c277b0, so the gap between the
+two methods is not explained, and the 10.5M and 12-thread cells of all four queries have
+no interleaved pair. Item 534's writer took the wall time of `optional-chain` to 0.65 of
+cc94ac7f's and that of `export-500k` to 0.54. Server execution time stops at each batch the
+cursor returns and leaves out the writer, and the writer's term cache does not run inside
+it.
+
+The [attribution files](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/request-insn/)
+locate the drift by instructions per request, counted on the laptop with one Rayon thread
+in rounds of A,B,B,A. They compare the matrix builds from cc94ac7f to 71c277b0 and, inside
+cc94ac7f to 8baa5686, the cached screen builds of another toolchain. Counts locate a cost,
+and only the forge pair sizes it. On `optional-count`, 321508fe to 06ca04ef adds 4.4% and
+every other step adds less than 0.3%. That range holds item 825 and an OWL test change. On
+`optional-chain` the same range adds 0.5% while `export-500k` stays flat, so the added
+instructions are in the query and not in the writer. On `lang-filter` and `regex-iri`,
+adbe757c to 65c570db, which is batch 21, adds 1.8% and 1.6%, and the steps on either side
+add at most 0.06%. Item 948 changed the checked vocabulary decode in that batch.
+
+[Profiles](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/perf/) of the laptop's
+performance cores, sampled on user-space instructions, name the code. In cc94ac7f the
+cursor joined `optional-chain` through its own hash index in `cursor::binary`, and in
+71c277b0 it joins through the shared `join::hash` kernels that item 825 added, which build
+a partitioned index. The join takes about 8.9 million instructions per request against 6.9
+million. The count of `optional-count` moved from the cursor's grouping count over
+`zipper::lower_bounds` to `join::merge::count` and `join::merge::bounds`, which take about
+4.1 million instructions per request against 3.8 million. The merge keeps both kernel
+families, so both costs are on the kept path. The laptop carried other work during the
+profiles, so their cycle counts are not measurements.
+
 ### Execution mode of quick texts in fresh servers
 
 The Namespace screen of cf033f12, the batch that merged items 679 and 454, against 125edd41

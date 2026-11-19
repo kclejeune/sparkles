@@ -1,0 +1,108 @@
+{
+  "format_version": 1,
+  "kind": "pinned_internal_regression_check",
+  "host": "forge",
+  "cpu": "Intel Core i5-13500",
+  "kernel": "7.2.9",
+  "candidate": {
+    "commit": "71c277b0",
+    "role": "origin/main at batch 37; the pinned checks owed by the screens of batches 33 and 35, interleaved A/Bs of the batch 32 and 33 matrix candidates above 0.3 ms, and the drift from cc94ac7f"
+  },
+  "pairs": {
+    "sqa-b35-auto": {
+      "A": "ffb18866",
+      "B": "1cbc23cd",
+      "designated_queries": "subquery-agg",
+      "purpose": "batch 35 screen flag, automatic execution, one thread"
+    },
+    "sqa-b35-stream": {
+      "A": "ffb18866",
+      "B": "1cbc23cd",
+      "designated_queries": "subquery-agg",
+      "purpose": "batch 35 screen flag, streaming, one thread"
+    },
+    "tg-b33-auto": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "types-grouped",
+      "purpose": "batch 33 screen flag, automatic execution, one thread"
+    },
+    "tg-b33-eager": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "types-grouped",
+      "purpose": "batch 33 screen flag, eager, one thread"
+    },
+    "tg-b33-stream": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "types-grouped",
+      "purpose": "batch 33 screen flag, streaming, one thread"
+    },
+    "big-b32-12t-stream": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "order-by-full, class-predicates, optional-count, optional-chain, export-500k, not-exists",
+      "purpose": "batch 32 and 33 matrix candidates, 1.05M, 12 threads, streaming"
+    },
+    "big-b32-12t-eager": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "order-by-full",
+      "purpose": "batch 32 and 33 matrix candidate, 1.05M, 12 threads, eager"
+    },
+    "big-b32-1t-stream": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "export-500k, optional-chain",
+      "purpose": "batch 32 and 33 matrix candidates, 1.05M, one thread, streaming"
+    },
+    "big-b32-10m-12t-stream": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "order-by-full, group-avg, expr-order-key, optional-chain",
+      "purpose": "batch 32 and 33 matrix candidates, 10.5M, 12 threads, streaming"
+    },
+    "big-b32-10m-12t-eager": {
+      "A": "eda22fce",
+      "B": "bccc5f7b",
+      "designated_queries": "order-by-full",
+      "purpose": "batch 32 and 33 matrix candidate, 10.5M, 12 threads, eager"
+    },
+    "drift-cc94-1t-stream": {
+      "A": "cc94ac7f",
+      "B": "71c277b0",
+      "designated_queries": "lang-filter, regex-iri, optional-chain, optional-count, export-500k",
+      "purpose": "drift of main since cc94ac7f, the fixed X14 baseline, 1.05M, one thread, streaming"
+    }
+  },
+  "binary_sha256": {
+    "ffb18866": "c829b36f4cbe97c87231c65b7ced1ca61057c24657712a1e211b0b4970208851",
+    "1cbc23cd": "dd3ae65a8b980bd80326caf20bf16c2a049376028a6acc6718d50ccf837352f9",
+    "eda22fce": "915ba62e2bade5551f25d5b0c7acca90aa8578e21f180dfb7ccdbf6290fc023c",
+    "bccc5f7b": "27cf6f507e4ad5ad12f65605fe4f6c4961d95c43dcf4affb7aa4ca90d5703cd6",
+    "cc94ac7f": "9efa1cd4655ff0d75af758bf0bb0f54ff5950f152b61b3e0afb765ff63e0fcba",
+    "71c277b0": "4fde46bc9f96cbb459cc1ca37cc284c1f8b220f6970f5cc2222110f373d6de69"
+  },
+  "compiler_provenance": "Every binary is a release build of the matrix recipe made on stanley with GCC 15.3.0, clang 23.1.0git, LLD 23.1.1 and rustc 1.99.1, and every build-config.json equals build-config.json here. The binaries were copied to forge as zstd files whose sha256 matched on both hosts, and forge built nothing.",
+  "data": {
+    "1.05M": {
+      "generator": "scripts/gen-data.py 100000",
+      "triples": 1052807,
+      "nt_sha256": "c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8",
+      "zst_sha256": "befe6b2d417c379b1abf871abe95b8e8712637ad02f479c2aeffa735b188f4d3"
+    },
+    "10.5M": {
+      "generator": "scripts/gen-data.py 1000000",
+      "lines": 10527323,
+      "nt_sha256": "10daf6486c20f8dd4579d819ea73bb5e7836e054cd6d2d1b73f99f35233635f8",
+      "zst_sha256": "3f51783448371dd0f57391e7d3fdadae66442f0c32ae260c93a3a96b43b1cbd4"
+    }
+  },
+  "settings": "Each pair directory's run.env holds its rounds, requests per round, warm-up, Rayon threads, server and client CPUs, idle spinners and execution mode. Pairs at one thread pin the server to CPU 2 and the client to CPU 4 with idle spinners. Pairs at 12 threads give the server CPUs 0 to 11 and the client CPU 12 without spinners.",
+  "lock": "forge-backlog-stage3.service held ~/lanes/.bench.lock and ~/lanes/.heavy.lock for all eleven pairs, from 08:25 to 15:26 UTC on 2026-11-19, and refused to start while rustc, cargo, sparkles or another engine ran.",
+  "verdict_rule": "X14 SPEC D4 for a query under 0.3 ms: it passes when the upper end of the 95% t interval of the mean log round ratio is at most 1.02, or its median added server time is at most 0.5 us. A query above 0.3 ms passes when its ratio is below 1.05 and it is not slower in every round. analyze.py prints only the ratio test above 0.3 ms, so the rounds_slower field decides the second clause.",
+  "statistics": "ratio is the median of all B exec samples over the median of all A exec samples, computed by analyze.py, whose output is pinned-summary.json and pinned-summary.txt.",
+  "answer_equality": true,
+  "attribution": "attribution/ holds per-request instruction counts on stanley (scripts/request-insn.py, streaming, one thread, 1.05M) across the matrix builds and across cached screen builds of another toolchain, and user-space perf profiles of the matrix builds on stanley's performance cores. Counts locate a cost and profiles name the code, and neither sizes it. Stanley carried other work during both, so its cycle and time ratios are not measurements."
+}

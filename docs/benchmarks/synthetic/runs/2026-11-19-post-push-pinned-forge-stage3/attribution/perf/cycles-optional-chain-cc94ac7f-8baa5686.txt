@@ -1,0 +1,41 @@
+total cycles/request A 64903.1k B 63993.6k ratio 0.986
+   1514.2k       2.3k   -1511.9k  cpu_core <sparkles_core::sparql::cursor::binary::Binary>::pairs
+      0.0k    1308.4k   +1308.4k  cpu_core <sparkles_core::sparql::join::hash::HashIndex>::keyed
+      0.0k    1130.7k   +1130.7k  cpu_core sparkles_core::sparql::join::hash::gather
+   1103.6k       0.0k   -1103.6k  cpu_core sparkles_core::sparql::cursor::binary::gather
+      0.0k     825.1k    +825.1k  cpu_core <sparkles_core::sparql::join::hash::Part>::build
+   4130.5k    3388.1k    -742.4k  cpu_core sparkles_core::sparql::results::write_cursor_native_json::<&mut sparkles_core::sparql::results::LimitedWriter<s
+    728.0k       0.0k    -728.0k  cpu_core <sparkles_core::sparql::cursor::binary::HashIndex>::new
+   2751.9k    3475.0k    +723.1k  cpu_core <sparkles_core::vocab::Vocab>::get_sorted_checked::<sparkles_core::error::Error, <sparkles_core::sparql::cursor
+      0.0k     500.5k    +500.5k  cpu_core <sparkles_core::sparql::join::hash::Join>::pairs
+   5078.6k    4601.9k    -476.7k  cpu_core serde_json::ser::format_escaped_str::<&mut &mut sparkles_core::sparql::results::LimitedWriter<sparkles::http::s
+   9138.5k    8714.4k    -424.1k  cpu_core <sparkles_core::sparql::results::LimitedWriter<sparkles::http::stream::SwitchWriter> as core::io::write::Write>
+    415.5k       0.0k    -415.5k  cpu_core sparkles_core::sparql::zipper::lower_bounds
+      0.0k     409.9k    +409.9k  cpu_core sparkles_core::sparql::join::merge::bounds
+    348.4k       0.0k    -348.4k  cpu_core sparkles_core::sparql::zipper::zip_lower_bounds
+      0.0k     338.8k    +338.8k  cpu_core sparkles_core::sparql::join::zipper::zip_lower_bounds
+    230.5k       0.0k    -230.5k  cpu_core sparkles_core::sparql::results::write_cursor_native_json::json::<&mut sparkles_core::sparql::results::LimitedWr
+    882.8k     732.5k    -150.3k  cpu_core <sparkles_core::sparql::cursor::TermCache>::new::{closure#3}
+    249.7k     347.9k     +98.1k  cpu_core __memcmp_avx2_movbe
+   4771.7k    4693.3k     -78.4k  cpu_core __memmove_avx_unaligned_erms
+      0.0k      74.7k     +74.7k  cpu_core <sparkles_core::sparql::join::hash::HashIndex>::from_keys
+      0.0k      66.7k     +66.7k  cpu_core <sparkles_core::sparql::ctx::Ctx>::reserved_batch_term
+   1055.2k     994.7k     -60.5k  cpu_core <sparkles_core::sparql::cursor::QueryBatch>::id
+   1319.8k    1373.8k     +54.0k  cpu_core <sparkles_core::sparql::cursor::QueryBatch>::term_cache
+     56.5k     107.9k     +51.3k  cpu_core <sparkles_core::sparql::ctx::Ctx>::decoded_bytes
+     98.9k      53.3k     -45.6k  cpu_core <sparkles_core::vocab::Ahead>::at
+   1025.6k     983.7k     -41.9k  cpu_core core::slice::sort::shared::smallsort::small_sort_general_with_scratch::<(u64, u32), <(u64, u32) as core::cmp::P
+    946.9k     905.1k     -41.9k  cpu_core _mi_theap_malloc_zero
+     71.7k     108.1k     +36.4k  cpu_core [unknown]
+   1005.2k     970.3k     -34.9k  cpu_core <sparkles_core::sparql::results::NativeTerm as serde_core::ser::Serialize>::serialize::<&mut serde_json::ser::S
+   1945.6k    1910.8k     -34.8k  cpu_core <sparkles_core::sparql::results::RowCharge>::term
+   1247.1k    1212.6k     -34.5k  cpu_core core::slice::sort::stable::quicksort::quicksort::<(u64, u32), <(u64, u32) as core::cmp::PartialOrd>::lt>
+   1298.7k    1323.9k     +25.2k  cpu_core <core::str::lossy::Utf8Chunks as core::iter::traits::iterator::Iterator>::next
+    358.0k     336.7k     -21.3k  cpu_core <alloc::string::String>::from_utf8_lossy
+   1248.0k    1269.1k     +21.1k  cpu_core <sparkles_core::sparql::cursor::Operator>::next_inner
+   1597.1k    1616.0k     +18.9k  cpu_core <serde_json::ser::Compound<&mut &mut sparkles_core::sparql::results::LimitedWriter<sparkles::http::stream::Swit
+      0.0k      16.9k     +16.9k  cpu_core <sparkles_core::sparql::query_memory::Release>::finish
+      0.0k      15.6k     +15.6k  cpu_core <sparkles_core::sparql::query_memory::QueryMemoryLedger>::new_owner
+     15.3k       0.0k     -15.3k  cpu_core <sparkles_core::sparql::query_memory::QueryMemoryLedger>::owner
+     90.1k      77.1k     -13.1k  cpu_core mi_malloc
+    323.3k     310.4k     -12.9k  cpu_core core::slice::sort::shared::smallsort::sort8_stable::<(sparkles_core::id::Id, u32), <(sparkles_core::id::Id, u32

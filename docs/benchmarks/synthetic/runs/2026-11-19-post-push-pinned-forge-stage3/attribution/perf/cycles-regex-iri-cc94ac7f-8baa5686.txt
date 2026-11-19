@@ -1,0 +1,41 @@
+total cycles/request A 12605.0k B 10486.4k ratio 0.832
+   1661.5k    1086.0k    -575.5k  cpu_core <sparkles_core::sparql::query_regex::RegexState>::search
+   2403.5k    1978.7k    -424.8k  cpu_core sparkles_core::sparql::exec::par_count_on_keys::{closure#0}
+   3299.6k    2934.8k    -364.8k  cpu_core regex_automata::hybrid::search::find_rev
+   1390.2k    1116.3k    -273.9k  cpu_core <regex_automata::meta::strategy::ReverseAnchored as regex_automata::meta::strategy::Strategy>::is_match
+    335.3k     224.5k    -110.8k  cpu_core __memmove_avx_unaligned_erms
+   1209.2k    1104.4k    -104.8k  cpu_core core::str::converts::from_utf8
+    894.4k     853.3k     -41.1k  cpu_core <sparkles_core::sparql::keyfilter::KeyFilter>::test_with::<<sparkles_core::sparql::keyfilter::BoundKeyFilter>::
+     65.7k      24.9k     -40.8k  cpu_core <sparkles_core::vocab::Ahead>::at
+     23.1k      14.8k      -8.3k  cpu_core sparkles_core::index::will_need
+     71.2k      64.3k      -6.9k  cpu_core _mi_theap_malloc_zero
+      0.0k       6.8k      +6.8k  cpu_core <sparkles_core::sparql::query_memory::QueryMemoryLedger>::new_owner
+      6.8k       0.0k      -6.8k  cpu_core <sparkles_core::sparql::query_memory::QueryMemoryLedger>::owner
+    190.4k     185.5k      -4.9k  cpu_core sparkles_core::sparql::exec::block_passes
+     16.7k      12.7k      -4.0k  cpu_core __vdso_clock_gettime
+      3.9k       0.0k      -3.9k  cpu_core core::ptr::drop_glue::<axum::middleware::from_fn::FromFn<sparkles::http::global_restoring_guard, alloc::sync::A
+      9.1k       5.2k      -3.9k  cpu_core <sparkles_core::sparql::plan::Planner>::plan_group
+     15.5k      11.6k      -3.9k  cpu_core mi_theap_umalloc
+     19.3k      16.0k      -3.3k  cpu_core _mi_page_retire
+      7.3k      10.7k      +3.3k  cpu_core _mi_theap_realloc_zero
+     15.3k      12.3k      -3.1k  cpu_core spargebra::parser::parser::__parse_i
+      8.1k       5.2k      -2.9k  cpu_core <sparkles_core::sparql::cursor::Operator>::build_for
+      6.8k       4.1k      -2.7k  cpu_core <sparkles_core::sparql::query_memory::QueryMemoryLedger>::release
+     27.1k      24.4k      -2.7k  cpu_core mi_free
+      8.1k       5.9k      -2.3k  cpu_core serde_json::ser::format_escaped_str::<&mut &mut sparkles_core::sparql::results::LimitedWriter<sparkles::http::s
+      4.8k       2.5k      -2.3k  cpu_core spargebra::parser::parser::__parse_PN_CHARS_BASE
+      5.2k       3.2k      -2.0k  cpu_core <sparkles_core::sparql::cursor::Operator>::next_inner
+      0.0k       2.0k      +2.0k  cpu_core <sparkles_core::sparql::query_memory::Release>::finish
+      0.0k       2.0k      +2.0k  cpu_core core::ptr::drop_glue::<axum::middleware::from_fn::FromFn<sparkles::server_memory::admit, alloc::sync::Arc<spark
+      2.0k       0.1k      -1.9k  cpu_core <http_body_util::combinators::map_err::MapErr<tower_http::compression::body::CompressionBody<axum_core::body::B
+      2.1k       0.3k      -1.9k  cpu_core <sparkles_core::sparql::cursor::QueryCursor>::for_each_decoded::<sparkles_core::sparql::results::write_cursor_n
+      5.5k       3.6k      -1.9k  cpu_core <sparkles_core::vocab::Vocab>::find
+      6.9k       5.1k      -1.9k  cpu_core <alloc::raw_vec::RawVecInner>::finish_grow
+     10.0k       8.1k      -1.9k  cpu_core mi_find_page
+      3.3k       1.6k      -1.7k  cpu_core <sparkles_core::sparql::plan::Planner>::plan
+      1.7k       0.0k      -1.7k  cpu_core sparkles_core::sparql::prepare_query
+      4.5k       2.8k      -1.7k  cpu_core http::header::map::hash_elem_using::<http::header::name::HeaderName>
+      2.4k       0.7k      -1.7k  cpu_core <tower::util::map_future::MapFuture<axum::util::MapIntoResponse<axum::handler::service::HandlerService<sparkles
+      4.7k       2.9k      -1.7k  cpu_core _mi_malloc_generic
+      3.6k       1.9k      -1.7k  cpu_core form_urlencoded::decode
+      8.3k       6.5k      -1.7k  cpu_core mi_malloc
