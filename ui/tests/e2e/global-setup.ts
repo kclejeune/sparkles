@@ -70,23 +70,29 @@ function binary(): string {
 }
 
 /**
- * The debug server serves ui/build from disk. The Pattern pane, the plan's pattern and the
- * facets of a query have no server fallback for the formatter's WebAssembly module, so
- * without it in that build their tests fail on a pane that reports "unavailable", far from
- * the cause. Another binary embeds its own UI, which this check cannot see.
- * `SPARKLES_E2E_NO_WASM=1` runs the suite without the module anyway.
+ * The Pattern pane, the plan's pattern and Apply to query in the facets of a query have no
+ * server fallback for the formatter's WebAssembly module, so without it in the UI the server
+ * reads, their tests fail on a pane that reports "unavailable", far from the cause. The
+ * server reads the UI from `SPARKLES_UI_DIR` when that is set, and the debug build reads
+ * ui/build from disk. Another binary embeds its own UI or names one in a wrapper, which this
+ * check cannot see. It looks for the module's asset only, so a build with
+ * `VITE_PATTERN_WASM=off` passes it. `SPARKLES_E2E_NO_WASM=1` skips the check, and the tests
+ * that need the module then fail.
  */
-function checkModule() {
-  if (process.env.SPARKLES_BIN || process.env.SPARKLES_E2E_NO_WASM === '1') return;
-  const assets = join(UI_DIR, 'build', '_app', 'immutable', 'assets');
+function checkModule(bin: string) {
+  if (process.env.SPARKLES_E2E_NO_WASM === '1') return;
+  const debug = resolve(bin) === resolve(UI_DIR, '../target/debug/sparkles');
+  const ui = process.env.SPARKLES_UI_DIR || (debug ? join(UI_DIR, 'build') : null);
+  if (!ui) return;
+  const assets = join(ui, '_app', 'immutable', 'assets');
   const built =
     existsSync(assets) &&
     readdirSync(assets).some((f) => /^sparkles_fmt_wasm_bg\..*\.wasm$/.test(f));
   if (!built)
     throw new Error(
-      `The UI build in ${join(UI_DIR, 'build')} has no browser module of the formatter, which ` +
-        'the Pattern pane and the facets tests need. Run `mise run ui:e2e`, which builds it ' +
-        'with `mise run ui:wasm` before the UI, or set SPARKLES_E2E_NO_WASM=1.',
+      `The UI build in ${ui} has no browser module of the formatter, which the Pattern pane ` +
+        'and the facets tests need. Run `mise run ui:e2e`, which builds it with ' +
+        '`mise run ui:wasm` before the UI, or set SPARKLES_E2E_NO_WASM=1.',
     );
 }
 
@@ -176,7 +182,7 @@ async function serve(bin: string, data: string, log: string, extra: string[], of
 
 export default async function globalSetup(_config: FullConfig) {
   const bin = binary();
-  checkModule();
+  checkModule(bin);
   const dir = mkdtempSync(join(tmpdir(), 'sparkles-e2e-'));
   const log = join(dir, 'server.log');
 

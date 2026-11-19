@@ -230,13 +230,14 @@ cache = { enabled = false }
 description = "Rebuild the browser formatter if it was built before (`mise run ui:wasm`) and the formatter changed since"
 hide = true
 run = "if [ -e ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm ]; then mise run ui:wasm; fi"
-# after ui:wasm when a task such as ui:e2e runs both, so that two builds never write the module
+# after ui:wasm when one task graph, such as ui:e2e's, runs both, so that the graph builds the
+# module once (separate mise runs in one checkout are not serialized)
 wait_for = ["ui:wasm"]
 
 [tasks."ui:build"]
 description = "Build the SvelteKit UI (embedded into the server binary)"
 depends = ["ui:install", "ui:wasm:refresh"]
-# a task that also depends on ui:wasm gets the module in this build
+# in a task graph that also runs ui:wasm, this build has the module
 wait_for = ["ui:wasm"]
 dir = "ui"
 run = "pnpm build"
