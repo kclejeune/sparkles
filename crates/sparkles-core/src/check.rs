@@ -410,39 +410,8 @@ pub fn check(root: &Path, opts: &CheckOptions) -> Result<CheckReport> {
     c.reasoning();
     c.branches();
     let mut configuration = Run::new("configuration-history");
-    // The validation reads the generations by path, and a compaction that switches
-    // a `CURRENT` of the dataset or of a branch meanwhile trims the old log and may
-    // retire the generation under it, which reads as damage. A failure while one of
-    // them changed is read once more on the new layout, and one that races a
-    // compaction again is a warning.
-    let current = || {
-        let mut roots = vec![root.to_path_buf()];
-        if let Ok(entries) = std::fs::read_dir(root.join("branches")) {
-            roots.extend(entries.flatten().map(|entry| entry.path()));
-        }
-        roots.sort();
-        roots
-            .into_iter()
-            .map(|dir| std::fs::read_to_string(dir.join("CURRENT")).ok())
-            .collect::<Vec<_>>()
-    };
-    let mut before = current();
-    let mut validated = configuration_history(root, false, &crate::task::Control::none());
-    if validated.is_err() && current() != before {
-        before = current();
-        validated = configuration_history(root, false, &crate::task::Control::none());
-    }
-    if let Err(error) = validated {
-        if current() != before {
-            configuration.add(
-                Issue::warning(format!(
-                    "{error}, while a compaction switched CURRENT: check again"
-                ))
-                .file("CURRENT"),
-            );
-        } else {
-            configuration.add(Issue::error(error.to_string()));
-        }
+    if let Err(error) = configuration_history(root, false, &crate::task::Control::none()) {
+        configuration.add(Issue::error(error.to_string()));
     }
     c.checks.push(
         configuration.done("published configuration closure and accepted primary references"),

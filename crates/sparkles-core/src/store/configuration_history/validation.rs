@@ -321,7 +321,6 @@ fn inspect_generation(
             Ok(loaded) => {
                 let mut reader = loaded.value;
                 let extent = reader.get_ref().metadata()?.len();
-                inspection_point("extent");
                 let extent = wal::probe::committed_bound(&mut reader, extent, budget)?;
                 Some((reader, extent))
             }
