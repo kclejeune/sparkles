@@ -1708,7 +1708,7 @@ SPARKLES_TASK
 '''
 
 [tasks."bench:jena-remote"]
-description = "Jena comparison on an explicit executor; pass --executor nsc or boat:bx_ID and jena.py options after --"
+description = "Jena comparison on an explicit executor; pass --executor boat:bx_ID (the nsc fallback is retired) and jena.py options after --"
 run = "mbx sparkles-task -- scripts/jena-remote.sh"
 
 [tasks."boat:qualify"]

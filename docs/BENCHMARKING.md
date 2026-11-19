@@ -1140,8 +1140,9 @@ ranges over processes. The screen takes about half a minute on forge after its b
 Their [admission and transport contract](REMOTE-EXECUTORS.md) keeps lifecycle ownership
 separate from workloads. Both arms and all flagged-query reruns stay on one isolated
 worker with matching binaries, compiler and runtime configuration. Always name the
-worker with `--executor`, because the tasks still default to the retired Namespace
-executor. Small smoke workloads establish transport and correctness only. Published
+worker with `--executor`. `bench:remote` and `bench:remote-writes` refuse to start
+without it, and `bench:jena-remote` still falls back to the retired Namespace executor
+of the shared screen script. Small smoke workloads establish transport and correctness only. Published
 numbers still come from the benchmark host.
 
 The batch query screen runs through `bench:remote` on a Boat worker, and it is the only
