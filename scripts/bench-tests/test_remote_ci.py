@@ -69,6 +69,25 @@ for x in "$@"; do case $x in ssh://*/gate/repo.git) a+=("$FAKE_HOME/gate/repo.gi
 exec REAL_GIT "${a[@]}"
 '''
 
+# Isolate the test from the machine's startup files. When requested by fake mise,
+# emulate Bash builds that source a system profile even in a noninteractive shell.
+FAKE_BASH = r'''#!/bin/sh
+profile_path=${FAKE_BASH_PROFILE_PATH:-}
+for arg; do
+  case "$arg" in
+    --noprofile) profile_path=; break ;;
+    -c | --) break ;;
+    -*) ;;
+    *) break ;;
+  esac
+done
+[ -z "$profile_path" ] || export PATH="$profile_path"
+exec REAL_BASH --noprofile --norc "$@"
+'''
+
+FIXTURE_IDENTITY = dict(GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t',
+                        GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
+
 GIB = 1048576
 
 
@@ -97,11 +116,13 @@ class RemoteCI(unittest.TestCase):
         for f in ['ci.sh', 'premerge.sh', 'remote-ci.sh']:
             (src / 'scripts' / f).chmod(0o755)
         g = ['git', '-C', str(src)]
+        self.git_env = dict(os.environ, **FIXTURE_IDENTITY)
         subprocess.run(['git', 'init', '-q', str(src)], check=True)
-        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--no-gpg-sign', '-q', '--allow-empty', '-m', 'base'], check=True)
+        subprocess.run(g + ['commit', '--no-gpg-sign', '-q', '--allow-empty', '-m', 'base'],
+                       env=self.git_env, check=True)
         subprocess.run(g + ['update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
         subprocess.run(g + ['add', '-A'], check=True)
-        subprocess.run(g + ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '--no-gpg-sign', '-q', '-m', 'tip'], check=True)
+        subprocess.run(g + ['commit', '--no-gpg-sign', '-q', '-m', 'tip'], env=self.git_env, check=True)
         self.src = src
         home = t / 'home'; (home / 'gate/bin').mkdir(parents=True); (home / 'gate/out').mkdir()
         subprocess.run(['git', 'init', '-q', '--bare', str(home / 'gate/repo.git')], check=True)
@@ -116,8 +137,7 @@ class RemoteCI(unittest.TestCase):
                                         '[ "$2" = is-active ] && { echo inactive; exit 3; }\n[ "$2" = show ] && echo "${FAKE_STATE-inactive}"\nexit 0\n')
         # mise exec runs its command, and every other mise command does nothing.
         (fake / 'mise').write_text('#!/bin/sh\nif [ "$1" = exec ]; then shift; [ "$1" != -- ] || shift; exec "$@"; fi\nexit 0\n')
-        # Some Bash builds load system profiles for noninteractive shells and reset PATH.
-        (fake / 'bash').write_text('#!/bin/sh\nexec %s --noprofile --norc "$@"\n' % shlex.quote(shutil.which('bash')))
+        (fake / 'bash').write_text(FAKE_BASH.replace('REAL_BASH', shlex.quote(shutil.which('bash'))))
         (fake / 'rustc').write_text('#!/bin/sh\necho "rustc ${RUSTUP_TOOLCHAIN:-default} (fake)"\n')
         (fake / 'df').write_text(FAKE_DF); (fake / 'mbx').write_text(FAKE_MBX)
         (fake / 'git').write_text(FAKE_GIT.replace('REAL_GIT', shutil.which('git')))
@@ -128,6 +148,7 @@ class RemoteCI(unittest.TestCase):
         self.env = dict(os.environ, FAKE_HOME=str(home), FAKE_BIN=str(fake), FAKE_SRC=str(src), FAKE_LOG=str(self.log),
                         PATH=str(fake) + ':' + os.environ['PATH'],
                         SPARKLES_GATE_CONFIG=str(t / 'no-gate.env'), SPARKLES_BENCH_HOST='forge')
+        self.env.pop('BASH_ENV', None)
 
     def run_ci(self, *args, **env):
         return subprocess.run(['bash', str(self.src / 'scripts/remote-ci.sh'), '--host', 'boat:bx_test', *args],
@@ -188,10 +209,11 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual((self.home / 'gate/out' / name / 'ci.exit').read_text().strip(), '0')
 
     def test_a_base_that_moved_on_uses_the_merge_base_the_tip_carries(self):
-        g = ['git', '-C', str(self.src), '-c', 'user.name=t', '-c', 'user.email=t@t']
+        g = ['git', '-C', str(self.src)]
         mb = self.rev('origin/main')
         subprocess.run(g + ['checkout', '-q', '-b', 'side', 'origin/main'], check=True)
-        subprocess.run(g + ['commit', '--no-gpg-sign', '-q', '--allow-empty', '-m', 'main moved'], check=True)
+        subprocess.run(g + ['commit', '--no-gpg-sign', '-q', '--allow-empty', '-m', 'main moved'],
+                       env=self.git_env, check=True)
         subprocess.run(g + ['update-ref', 'refs/remotes/origin/main', 'HEAD'], check=True)
         subprocess.run(g + ['checkout', '-q', '-'], check=True)
         r = self.run_ci('--base', 'origin/main')
@@ -407,6 +429,29 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual((earlier / 'ci.exit').read_text(), '0\n')
         self.assertEqual((earlier / 'ci.log').read_text(), 'earlier result\n')
 
+    def test_a_legacy_result_is_archived_when_mv_can_exchange_it(self):
+        name = self.name()
+        base = self.src / '.artifacts/remote-ci'
+        earlier = base / name
+        earlier.mkdir(parents=True)
+        (earlier / 'ci.exit').write_text('4\n')
+        (earlier / 'ci.log').write_text('earlier result\n')
+        # Probe on the result filesystem with the same directory and symlink types.
+        directory = base / 'probe-dir'; directory.mkdir()
+        link = base / 'probe-link'; link.symlink_to(earlier.name)
+        probe = subprocess.run(['mv', '--exchange', '-T', str(link), str(directory)],
+                               env=self.env, capture_output=True, timeout=10)
+        if probe.returncode != 0:
+            self.skipTest('mv cannot atomically exchange a symlink and a directory here')
+
+        r = self.run_ssh()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(earlier.is_symlink(), r.stderr)
+        self.assertEqual((earlier / 'ci.exit').read_text().strip(), '0')
+        archived, = base.glob(name + '.kept-*')
+        self.assertEqual((archived / 'ci.exit').read_text(), '4\n')
+        self.assertEqual((archived / 'ci.log').read_text(), 'earlier result\n')
+
     def run_cmd(self, cmd, *args, **env):
         return self.run_ssh('--cmd', cmd, *args, **env)
 
@@ -427,14 +472,30 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(len(list((self.home / 'gate/out').glob(name + '*'))), 2)
 
+    def test_a_command_keeps_the_mise_path_during_bash_startup(self):
+        tools = self.home / 'mise-bin'; tools.mkdir()
+        mbx = tools / 'mbx'
+        mbx.write_text('#!/bin/sh\necho mbx from mise\n')
+        mbx.chmod(0o755)
+        (self.home / 'bash-env').write_text('export PATH=%s\n' % shlex.quote(self.env['PATH']))
+        mise = self.t / 'bin/mise'
+        command = 'printf "shell %s with %s arguments\\n" "${0##*/}" "$#"; mbx --version; exit 7'
+        for startup in ('export FAKE_BASH_PROFILE_PATH="$PATH"', 'export BASH_ENV="$HOME/bash-env"'):
+            with self.subTest(startup=startup):
+                mise.write_text('#!/bin/sh\n[ "$1" = exec ] || exit 0\nshift 2\n'
+                                + startup + '\nexport PATH="$HOME/mise-bin:$PATH"\nexec "$@"\n')
+                r = self.run_cmd(command)
+                self.assertEqual(r.returncode, 7, r.stdout + r.stderr)
+                self.assertIn('remote-ci: mbx from mise', r.stdout.splitlines())
+                self.assertIn('mbx from mise', r.stdout.splitlines())
+                self.assertIn('shell bash with 0 arguments', r.stdout.splitlines())
+
     def test_a_command_on_the_working_tree_sees_uncommitted_files_and_changes_nothing(self):
         (self.src / 'scripts/ci.sh').write_text('#!/bin/sh\necho edited\n')
         (self.src / 'new-file.txt').write_text('untracked\n')
         before = subprocess.run(['git', '-C', str(self.src), 'status', '--porcelain'], capture_output=True, text=True).stdout
         head = self.rev('HEAD')
-        r = self.run_cmd('cat new-file.txt scripts/ci.sh', '--worktree',
-                         GIT_AUTHOR_NAME='t', GIT_AUTHOR_EMAIL='t@t',
-                         GIT_COMMITTER_NAME='t', GIT_COMMITTER_EMAIL='t@t')
+        r = self.run_cmd('cat new-file.txt scripts/ci.sh', '--worktree', **FIXTURE_IDENTITY)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn('untracked', r.stdout.splitlines()); self.assertIn('echo edited', r.stdout.splitlines())
         self.assertEqual(self.rev('HEAD'), head)
@@ -565,6 +626,7 @@ class GateDiskFloor(unittest.TestCase):
             f.chmod(0o755)
         self.log = t / 'log'
         self.env = dict(os.environ, HOME=str(self.home), FAKE_LOG=str(self.log), PATH=str(fake) + ':' + os.environ['PATH'])
+        self.env.pop('BASH_ENV', None)
 
     def test_the_admission_check_is_the_same_in_lane_ci_and_the_gate(self):
         names = ('free_kib', 'ssh_admit')

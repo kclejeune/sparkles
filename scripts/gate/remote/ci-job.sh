@@ -169,8 +169,15 @@ case $MODE in
     [ -n "$cmd" ] || finish 2
     tc=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' rust-toolchain.toml 2> /dev/null | head -n 1)
     [ -z "$tc" ] || export RUSTUP_TOOLCHAIN=$tc
+    # Startup files can reset the PATH that mise selected, in either shell.
     # shellcheck disable=SC2016
-    run=(mise exec -- bash -c 'echo "remote-ci: $1"; echo "remote-ci: RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-unset}"; echo "remote-ci: $(rustc --version 2>&1)"; echo "remote-ci: $(mbx --version 2>&1)"; exec bash -c "$1"' remote-ci "$cmd")
+    run=(mise exec -- env -u BASH_ENV bash --noprofile --norc -c '
+      echo "remote-ci: $1"
+      echo "remote-ci: RUSTUP_TOOLCHAIN=${RUSTUP_TOOLCHAIN:-unset}"
+      echo "remote-ci: $(rustc --version 2>&1)"
+      echo "remote-ci: $(mbx --version 2>&1)"
+      exec bash --noprofile --norc -c "$1"
+    ' remote-ci "$cmd")
     log "running the command with ${RUSTUP_TOOLCHAIN:-the default toolchain}"
     ;;
   *) finish 2 ;;
