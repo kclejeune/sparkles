@@ -106,6 +106,7 @@ fn io(e: std::io::Error) -> Error {
 
 /// `io::Write` adapter for the result-size budget: the first write that would take the
 /// output past `limit` bytes fails, and the cancellation flag is checked every 64 KiB.
+/// After a write of at least 64 KiB, the next write or flush also checks the flag.
 /// [`LimitedWriter::classify`] turns the resulting I/O error back into the reason.
 pub struct LimitedWriter<W> {
     inner: W,
@@ -180,15 +181,28 @@ impl<W: Write> LimitedWriter<W> {
             return Err(std::io::Error::other("result size budget exceeded"));
         }
         if end >= self.next_check {
-            self.next_check = end.saturating_add(CANCEL_CHECK_BYTES);
-            if self
-                .cancel
-                .as_ref()
-                .is_some_and(|c| c.load(Ordering::Relaxed))
-            {
-                self.cancelled = true;
-                return Err(std::io::Error::other("query cancelled"));
-            }
+            // The sink can accept less than requested, so schedule from bytes it has
+            // already taken. After a long piece, leave the check due on the next call
+            // so the caller can count a whole row before the check refuses output.
+            self.next_check = match &self.cancel {
+                Some(_) if len as u64 >= CANCEL_CHECK_BYTES => self.written,
+                Some(_) => self.written.saturating_add(CANCEL_CHECK_BYTES),
+                None => end.saturating_add(CANCEL_CHECK_BYTES),
+            };
+            self.check_cancel()?;
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn check_cancel(&mut self) -> std::io::Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            self.cancelled = true;
+            return Err(std::io::Error::other("query cancelled"));
         }
         Ok(())
     }
@@ -224,7 +238,11 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
+        self.inner.flush()?;
+        if self.written >= self.next_check {
+            self.check_cancel()?;
+        }
+        Ok(())
     }
 }
 

@@ -617,6 +617,75 @@ impl Write for CancelAfter {
 }
 
 #[test]
+fn cancelling_during_a_grown_native_row_counts_it_and_stops_the_trailer() {
+    let store = Store::in_memory(StoreOptions::default());
+    let literal = serde_json::to_string(&"\n".repeat(40_000)).unwrap();
+    let text = format!("SELECT ?o WHERE {{ VALUES ?o {{ {literal} }} }}");
+    let r = query(store.snapshot(), &text, &QueryOptions::default()).unwrap();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let sink = CancelAfter {
+        bytes: Vec::new(),
+        cancel: cancel.clone(),
+        after: CANCEL_CHECK_BYTES as usize,
+    };
+    let mut out = LimitedWriter::new(sink, None, Some(cancel));
+    let sent = RowCount::new();
+    let result = write(
+        Source::Result(&r),
+        WriteOptions::new(super::Format::Solutions(SolutionsFormat::Sparkles), &sent),
+        &mut out,
+    );
+    assert_eq!(sent.get(), 1, "the sink took the whole row");
+    let result = result.map_err(|error| out.classify(error));
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    assert!(out.get_ref().bytes.ends_with(b"}]"));
+}
+
+#[test]
+fn a_flush_after_a_partial_long_write_preserves_io_errors() {
+    use std::io;
+
+    struct ShortSink {
+        cancel: Arc<AtomicBool>,
+        flush_error: Option<io::ErrorKind>,
+    }
+
+    impl Write for ShortSink {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if bytes.len() as u64 >= CANCEL_CHECK_BYTES {
+                self.cancel.store(true, Ordering::Relaxed);
+            }
+            Ok(bytes.len().min(1))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.flush_error.map_or(Ok(()), |kind| Err(kind.into()))
+        }
+    }
+
+    let bytes = vec![b'x'; CANCEL_CHECK_BYTES as usize];
+    for flush_error in [None, Some(io::ErrorKind::BrokenPipe)] {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let sink = ShortSink {
+            cancel: cancel.clone(),
+            flush_error,
+        };
+        let mut out = LimitedWriter::new(sink, None, Some(cancel));
+        out.write_all(&bytes[..bytes.len() - 1]).unwrap();
+        // A small partial write crosses the poll boundary before the long piece.
+        assert_eq!(out.write(b"xx").unwrap(), 1);
+        assert_eq!(out.write(&bytes).unwrap(), 1);
+        assert_eq!(out.written(), CANCEL_CHECK_BYTES + 1);
+        let error = out.flush().unwrap_err();
+        let error = out.classify(Error::Io(error));
+        match flush_error {
+            None => assert!(matches!(error, Error::Cancelled), "{error:?}"),
+            Some(kind) => assert!(matches!(error, Error::Io(e) if e.kind() == kind)),
+        }
+    }
+}
+
+#[test]
 fn an_eager_thrift_answer_checks_its_controls_before_each_row() {
     let r = answer(false);
     // The first row's literal is longer than the output buffer, so it reaches the
