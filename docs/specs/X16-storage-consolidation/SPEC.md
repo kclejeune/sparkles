@@ -780,7 +780,10 @@ instruction count on the laptop had found that version's run decode 4.4% shorter
 stride 32 bytes through a megabyte of keys. Decoding in place removed the copy. On a
 laptop P core over two interleaved rounds the run decode then took 41.3 million cycles a
 pass against 45.1 million before the sharing, and the index's decode 38.8 million against
-41.4 million, with the encodes unchanged. The confirming timing on `atlas` is pending. `bench:insn` reaches neither coder, so the harness stands in for it. It ran with the
+41.4 million, with the encodes unchanged. On `atlas`, in five interleaved A,C,C,A rounds against the
+version before the sharing, the run decode took 11.55 against 11.99 ns a key, 4% faster in
+every round, and the index's decode 11.06 against 11.90 ns, faster in every round, while
+both encodes stayed within 1%. `bench:insn` reaches neither coder, so the harness stands in for it. It ran with the
 default features, whose run blocks use LZ4, while the server's builder uses zstd.
 The ungated test hooks `set_clock`, `wal_direct_active`, `vocab_direct_active`, the
 vector pause and sequential-build hooks, the full-text failure, checkpoint and tick hooks,
