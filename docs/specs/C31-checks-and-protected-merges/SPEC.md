@@ -77,6 +77,12 @@ The gate-suite and required-check phases are in progress under
 [item 1136](../../ROADMAP.md). The other checks, workflow and badge phases are not built,
 and [item 459](../../ROADMAP.md) tracks them.
 
+Item 1136 leaves lint out of the gate suites, since lint reads document text and not a
+dataset state, and [item 1138](../../ROADMAP.md) adds a lint check for stored queries and
+SHACL-SPARQL literals. Gate results attach to the merge response, the task detail and the
+run record in the merge commit, and [item 1139](../../ROADMAP.md) adds a first-class merge
+request.
+
 The storage format of the comments phase is chosen, and the ontology editor's
 discussions of item 618 use it, as the
 [U12 Outcome](../U12-ontology-workbench/SPEC.md#discussions) describes. A thread is a
