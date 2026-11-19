@@ -97,7 +97,11 @@ pub fn search_in(
                 ctx.check()?;
                 let complete = hits.len() < fetch;
                 ctx.check_output(hits.len().min(n), vars.len())?;
-                let t = out.rows(ctx, resolved, &hits, n)?;
+                let mut t = Table::new(vars.to_vec());
+                let terms = out.terms(ctx, resolved, &hits)?;
+                let mut st = RowState::default();
+                out.rows(ctx, resolved, &hits, &terms, 0, n, &mut t, &mut st)?;
+                st.finish();
                 if t.len() >= n || complete {
                     break t;
                 }
@@ -120,50 +124,72 @@ pub fn search_in(
             }
             ctx.check_output(hits.len(), vars.len())?;
             // best first, as Tantivy's top-k orders them
-            hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-            out.rows(ctx, resolved, &hits, usize::MAX)?
+            sort_hits(&mut hits);
+            let mut t = Table::new(vars.to_vec());
+            let terms = out.terms(ctx, resolved, &hits)?;
+            let mut st = RowState::default();
+            out.rows(ctx, resolved, &hits, &terms, 0, usize::MAX, &mut t, &mut st)?;
+            st.finish();
+            t
         }
     };
     if let (Some(opts), Some(c)) = (&spec.highlight, out.clit) {
-        // Jena's highlight: the literal output becomes its highlighted fragments
-        let mut analyzer = resolved
-            .searcher
-            .index()
-            .tokenizer_for_field(field)
-            .map_err(text_err)?;
-        let mut done: FxHashMap<Id, Id> = Default::default();
-        for (i, id) in t.cols[c].iter_mut().enumerate() {
-            if i % 4096 == 4095 {
-                ctx.check()?;
-            }
-            if let Some(&h) = done.get(id) {
-                *id = h;
-                continue;
-            }
-            let h = match snap.term(*id) {
-                Some(oxrdf::Term::Literal(l)) => {
-                    match super::highlight::highlight(l.value(), opts, &matchers, &mut analyzer) {
-                        Some(text) => {
-                            let lit = match l.language() {
-                                Some(lang) => {
-                                    oxrdf::Literal::new_language_tagged_literal_unchecked(
-                                        text, lang,
-                                    )
-                                }
-                                None => oxrdf::Literal::new_typed_literal(text, l.datatype()),
-                            };
-                            ctx.intern_term(&oxrdf::Term::Literal(lit))
-                        }
-                        None => *id,
-                    }
-                }
-                _ => *id,
-            };
-            done.insert(*id, h);
-            *id = h;
-        }
+        highlight(ctx, resolved, field, opts, &matchers, &mut t.cols[c])?;
     }
     Ok(t)
+}
+
+/// Order hits best first, as Tantivy's top-k orders them.
+fn sort_hits(hits: &mut [(Score, DocAddress)]) {
+    hits.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+}
+
+/// Jena's highlight: each literal of `col` becomes its highlighted fragments. A literal
+/// is highlighted once per call, and a literal interns to the same id at every call.
+fn highlight(
+    ctx: &Ctx,
+    resolved: &Resolved,
+    field: Field,
+    opts: &super::HighlightOpts,
+    matchers: &super::lucene::Matchers,
+    col: &mut [Id],
+) -> Result<()> {
+    let snap = &ctx.snap;
+    let mut analyzer = resolved
+        .searcher
+        .index()
+        .tokenizer_for_field(field)
+        .map_err(text_err)?;
+    let mut done: FxHashMap<Id, Id> = Default::default();
+    for (i, id) in col.iter_mut().enumerate() {
+        if i % 4096 == 4095 {
+            ctx.check()?;
+        }
+        if let Some(&h) = done.get(id) {
+            *id = h;
+            continue;
+        }
+        let h = match snap.term(*id) {
+            Some(oxrdf::Term::Literal(l)) => {
+                match super::highlight::highlight(l.value(), opts, matchers, &mut analyzer) {
+                    Some(text) => {
+                        let lit = match l.language() {
+                            Some(lang) => {
+                                oxrdf::Literal::new_language_tagged_literal_unchecked(text, lang)
+                            }
+                            None => oxrdf::Literal::new_typed_literal(text, l.datatype()),
+                        };
+                        ctx.intern_term(&oxrdf::Term::Literal(lit))
+                    }
+                    None => *id,
+                }
+            }
+            _ => *id,
+        };
+        done.insert(*id, h);
+        *id = h;
+    }
+    Ok(())
 }
 
 /// The parsed query restricted to the call's predicates, language, subject, the given
@@ -408,42 +434,58 @@ impl<'a> Outputs<'a> {
         }
     }
 
-    /// The output rows of `hits` (best first), at most `want` of them.
+    /// The terms of `hits` that the outputs need.
+    fn terms(
+        &self,
+        ctx: &Ctx,
+        resolved: &Resolved,
+        hits: &[(Score, DocAddress)],
+    ) -> Result<HitTerms> {
+        hit_terms(ctx, resolved, self.ids, hits, self.need)
+    }
+
+    /// Append the output rows of `hits[from..]` (best first) to `t`, at most `want` of
+    /// them, and return the position of the first hit not read. `terms` are the terms of
+    /// `hits`, and `st` carries what a row depends on from the hits before `from`.
+    #[allow(clippy::too_many_arguments)]
     fn rows(
         &self,
         ctx: &Ctx,
         resolved: &Resolved,
         hits: &[(Score, DocAddress)],
+        terms: &HitTerms,
+        from: usize,
         want: usize,
-    ) -> Result<Table> {
+        t: &mut Table,
+        st: &mut RowState,
+    ) -> Result<usize> {
         let snap = &ctx.snap;
         let need = self.need;
-        let terms = hit_terms(ctx, resolved, self.ids, hits, need)?;
-        let mut t = Table::new(self.vars.to_vec());
-        let mut seen: FxHashSet<(Id, Id, Id)> = Default::default();
+        // a score interns to the same id at every call
         let mut scores: FxHashMap<u32, Id> = Default::default();
-        let mut default_graph = None;
-        let mut stale_hits = 0usize;
         let mut row = vec![Id::UNDEF; self.vars.len()];
-        // the rank of the rows with the last score: tied rows share the first one's
-        let mut rank: Option<(u32, usize)> = None;
-        for (i, (score, _)) in hits.iter().enumerate() {
-            if i % 4096 == 4095 {
+        let mut added = 0;
+        let mut i = from;
+        while i < hits.len() {
+            if (i - from) % 4096 == 4095 {
                 ctx.check()?;
             }
-            if t.len >= want {
+            if added >= want {
                 break;
             }
+            let score = hits[i].0;
             let (s, p, o, g) = (terms.s[i], terms.p[i], terms.o[i], terms.g[i]);
+            let hash = if need.hash { terms.hash[i] } else { 0 };
+            i += 1;
             // a document the searcher may hold for a quad this snapshot does not have
             // (whose terms it may not have either)
-            let uncertain = need.hash && resolved.uncertain.contains(&terms.hash[i]);
+            let uncertain = need.hash && resolved.uncertain.contains(&hash);
             let missing = (need.s && s == Id::UNDEF)
                 || (need.p && p == Id::UNDEF)
                 || (need.o && o == Id::UNDEF)
                 || (need.g && g == Id::UNDEF);
             if missing {
-                stale_hits += usize::from(!uncertain);
+                st.stale_hits += usize::from(!uncertain);
                 continue;
             }
             if uncertain && !snap.contains(&[s, p, o, g])? {
@@ -456,7 +498,7 @@ impl<'a> Outputs<'a> {
             {
                 continue;
             }
-            if self.spec.dedup && !seen.insert((s, p, o)) {
+            if self.spec.dedup && !st.dedup(s, p, o)? {
                 continue;
             }
             row.fill(Id::UNDEF);
@@ -465,14 +507,14 @@ impl<'a> Outputs<'a> {
             }
             if let Some(c) = self.cscore {
                 row[c] = *scores.entry(score.to_bits()).or_insert_with(|| {
-                    ctx.intern_value(&crate::sparql::value::Value::Float((*score).into()))
+                    ctx.intern_value(&crate::sparql::value::Value::Float(score.into()))
                 });
             }
             if let Some(c) = self.clit {
                 row[c] = o;
             }
             if let Some(c) = self.cg_out {
-                row[c] = graph_term(ctx, g, &mut default_graph);
+                row[c] = graph_term(ctx, g, &mut st.default_graph);
             }
             if let Some(c) = self.cgv {
                 if row[c] != Id::UNDEF && row[c] != g {
@@ -484,22 +526,59 @@ impl<'a> Outputs<'a> {
                 row[c] = p;
             }
             if let Some(c) = self.crank {
-                let r = match rank {
+                let r = match st.rank {
                     Some((bits, r)) if bits == score.to_bits() => r,
-                    _ => t.len + 1,
+                    _ => st.emitted + 1,
                 };
-                rank = Some((score.to_bits(), r));
+                st.rank = Some((score.to_bits(), r));
                 row[c] = Id::from_i64(r as i64).expect("a rank fits an inline integer");
             }
             t.push_row(&row);
+            added += 1;
+            st.emitted += 1;
         }
+        Ok(i)
+    }
+}
+
+/// What a row depends on from the hits before it, kept across the calls that decode one
+/// hit list: the triples seen (with a merged default graph), the rank of the last score,
+/// and the rows emitted so far.
+#[derive(Default)]
+struct RowState {
+    seen: FxHashSet<(Id, Id, Id)>,
+    /// admits the growth of `seen` before it grows, when set
+    grow: Option<Box<dyn FnMut(usize) -> Result<()> + Send>>,
+    default_graph: Option<Id>,
+    stale_hits: usize,
+    /// the rank of the rows with the last score: tied rows share the first one's
+    rank: Option<(u32, usize)>,
+    emitted: usize,
+}
+
+impl RowState {
+    /// Whether the triple is new.
+    fn dedup(&mut self, s: Id, p: Id, o: Id) -> Result<bool> {
+        if self.seen.len() == self.seen.capacity()
+            && let Some(grow) = &mut self.grow
+        {
+            // a rehash holds the old table and the new one at once
+            let next = (self.seen.capacity() * 2).max(4);
+            grow(next)?;
+            self.seen.reserve(next - self.seen.len());
+        }
+        Ok(self.seen.insert((s, p, o)))
+    }
+
+    /// Report the hits skipped because their terms are not in the snapshot.
+    fn finish(&mut self) {
+        let stale_hits = std::mem::take(&mut self.stale_hits);
         if stale_hits > 0 {
             tracing::warn!(
                 target: "sparkles::text::search",
                 "text:query skipped {stale_hits} hits whose terms are not in the snapshot"
             );
         }
-        Ok(t)
     }
 }
 
