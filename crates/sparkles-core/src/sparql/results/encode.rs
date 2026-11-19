@@ -107,6 +107,192 @@ impl Csv {
     }
 }
 
+/// SPARQL 1.1 Query Results JSON, as sparesults writes it with SPARQL 1.2 terms through
+/// json-event-parser: no whitespace, each bound cell an object of `type` and `value` with
+/// `xml:lang` and `its:dir` or a `datatype` other than xsd:string, a triple term as an
+/// object of its three parts, and strings escaped as json-event-parser escapes them.
+pub(super) struct Json {
+    /// each variable's key, `"name":`, escaped once
+    keys: Vec<Box<[u8]>>,
+    /// no row has been written, so the next one starts without a comma
+    first: bool,
+}
+
+impl Json {
+    pub(super) fn new(variables: &[String]) -> Json {
+        let keys = variables
+            .iter()
+            .map(|v| {
+                let mut key = Vec::with_capacity(v.len() + 3);
+                json_escaped(&mut key, v);
+                key.push(b':');
+                key.into_boxed_slice()
+            })
+            .collect();
+        Json { keys, first: true }
+    }
+
+    /// The document up to the opening of the bindings array, as one piece.
+    pub(super) fn header(out: &mut Explicit<'_, '_>, variables: &[String]) -> Result<()> {
+        out.begin_piece();
+        out.put(b"{\"head\":{\"vars\":[")?;
+        for (i, v) in variables.iter().enumerate() {
+            if i > 0 {
+                out.put(b",")?;
+            }
+            json_string(out, v)?;
+        }
+        out.put(b"]},\"results\":{\"bindings\":[")?;
+        out.end_piece()
+    }
+
+    /// One solution, the bound cells in column order, with the comma before it when it is
+    /// not the first, as json-event-parser writes the comma with the value it precedes.
+    pub(super) fn row(
+        &mut self,
+        out: &mut Explicit<'_, '_>,
+        row: RowView<'_>,
+        _width: usize,
+    ) -> Result<()> {
+        out.put(if std::mem::take(&mut self.first) {
+            b"{"
+        } else {
+            b",{"
+        })?;
+        let mut comma = false;
+        match row {
+            RowView::Dense(terms) => {
+                for (c, term) in terms.iter().enumerate() {
+                    if let Some(term) = term {
+                        self.cell(out, &mut comma, c, term.as_ref())?;
+                    }
+                }
+            }
+            RowView::Sparse(terms) => {
+                for (c, term) in terms {
+                    self.cell(out, &mut comma, *c, term.as_ref().as_ref())?;
+                }
+            }
+        }
+        out.put(b"}")
+    }
+
+    #[inline]
+    fn cell(
+        &self,
+        out: &mut Explicit<'_, '_>,
+        comma: &mut bool,
+        column: usize,
+        term: TermRef<'_>,
+    ) -> Result<()> {
+        if std::mem::replace(comma, true) {
+            out.put(b",")?;
+        }
+        out.put(&self.keys[column])?;
+        json_term(out, term)
+    }
+
+    /// The end of the bindings array and of the document.
+    pub(super) fn footer(out: &mut Explicit<'_, '_>) -> Result<()> {
+        out.put(b"]}}")
+    }
+}
+
+fn json_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+    match term {
+        TermRef::NamedNode(node) => {
+            out.put(b"{\"type\":\"uri\",\"value\":")?;
+            json_string(out, node.as_str())?;
+            out.put(b"}")
+        }
+        TermRef::BlankNode(node) => {
+            out.put(b"{\"type\":\"bnode\",\"value\":")?;
+            json_string(out, node.as_str())?;
+            out.put(b"}")
+        }
+        TermRef::Literal(literal) => {
+            out.put(b"{\"type\":\"literal\",\"value\":")?;
+            json_string(out, literal.value())?;
+            if let Some(language) = literal.language() {
+                out.put(b",\"xml:lang\":")?;
+                json_string(out, language)?;
+                match literal.direction() {
+                    Some(BaseDirection::Ltr) => out.put(b",\"its:dir\":\"ltr\"")?,
+                    Some(BaseDirection::Rtl) => out.put(b",\"its:dir\":\"rtl\"")?,
+                    None => {}
+                }
+            } else if literal.datatype() != xsd::STRING {
+                out.put(b",\"datatype\":")?;
+                json_string(out, literal.datatype().as_str())?;
+            }
+            out.put(b"}")
+        }
+        TermRef::Triple(triple) => {
+            out.put(b"{\"type\":\"triple\",\"value\":{\"subject\":")?;
+            json_term(out, triple.subject.as_ref().into())?;
+            out.put(b",\"predicate\":")?;
+            json_term(out, triple.predicate.as_ref().into())?;
+            out.put(b",\"object\":")?;
+            json_term(out, triple.object.as_ref())?;
+            out.put(b"}}")
+        }
+    }
+}
+
+/// The escape json-event-parser writes for `b`, a byte below 0x20, a quote or a
+/// backslash, with the bytes of `\u00XX` in lowercase hex for a control byte that has no
+/// short form.
+#[inline]
+fn json_escape(b: u8, long: &mut [u8; 6]) -> Option<&[u8]> {
+    Some(match b {
+        b'\\' => b"\\\\",
+        b'"' => b"\\\"",
+        0x08 => b"\\b",
+        0x0c => b"\\f",
+        b'\n' => b"\\n",
+        b'\r' => b"\\r",
+        b'\t' => b"\\t",
+        0..0x20 => {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            long[4] = HEX[usize::from(b >> 4)];
+            long[5] = HEX[usize::from(b & 15)];
+            &long[..]
+        }
+        _ => return None,
+    })
+}
+
+/// A string between double quotes, escaped, the runs between escapes copied whole. Only
+/// ASCII bytes are escaped, so a run never splits a character.
+fn json_string(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+    out.put(b"\"")?;
+    let bytes = s.as_bytes();
+    let mut long = *b"\\u0000";
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(escaped) = json_escape(b, &mut long) {
+            out.put(&bytes[start..i])?;
+            out.put(escaped)?;
+            start = i + 1;
+        }
+    }
+    out.put(&bytes[start..])?;
+    out.put(b"\"")
+}
+
+/// [`json_string`] into a vector, for the keys escaped once per answer.
+fn json_escaped(to: &mut Vec<u8>, s: &str) {
+    to.push(b'"');
+    let mut long = *b"\\u0000";
+    for &b in s.as_bytes() {
+        match json_escape(b, &mut long) {
+            Some(escaped) => to.extend_from_slice(escaped),
+            None => to.push(b),
+        }
+    }
+    to.push(b'"');
+}
+
 /// Write separators until `written` reaches `to`, which the entries of a sparse row give
 /// as the column of the next cell.
 #[inline]

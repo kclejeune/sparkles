@@ -1,7 +1,7 @@
 //! One writer per result format family over the sources of [`super::source`], and the
 //! entry that every caller writes a result through.
 
-use super::encode::{Csv, Tsv};
+use super::encode::{Csv, Json, Tsv};
 use super::rowout::Explicit;
 use super::source::{
     BatchVisitor, CursorGraph, CursorSolutions, EagerGraph, EagerMode, EagerSolutions, GraphSource,
@@ -237,8 +237,19 @@ fn select<S: SolutionSource>(
         return Ok(());
     }
     match fmt {
-        SolutionsFormat::Tsv => return encoded(source, out, send, Tsv::header, Tsv::row),
-        SolutionsFormat::Csv => return encoded(source, out, send, Csv::header, Csv::row),
+        SolutionsFormat::Tsv => return encoded(source, out, send, Tsv::header, Tsv::row, None),
+        SolutionsFormat::Csv => return encoded(source, out, send, Csv::header, Csv::row, None),
+        SolutionsFormat::Json => {
+            let mut json = Json::new(source.variables());
+            return encoded(
+                source,
+                out,
+                send,
+                Json::header,
+                |out: &mut Explicit<'_, '_>, row: RowView<'_>, width| json.row(out, row, width),
+                Some(Json::footer),
+            );
+        }
         _ => {}
     }
     let vars: Vec<Variable> = source
@@ -275,18 +286,19 @@ fn select<S: SolutionSource>(
     Ok(())
 }
 
-/// A SELECT in a format the engine encodes, its header and then its rows, each marked in
-/// the explicit mode. The row encoder is a function item, so each format compiles its own
-/// loop.
+/// A SELECT in a format the engine encodes, its header, its rows, each marked in the
+/// explicit mode, and its footer. The row encoder is a function item or a closure, so each
+/// format compiles its own loop.
 fn encoded<S: SolutionSource, R>(
     source: &mut S,
     out: &mut RowOut<'_>,
     send: Option<usize>,
     header: fn(&mut Explicit<'_, '_>, &[String]) -> std::io::Result<()>,
     row: R,
+    footer: Option<fn(&mut Explicit<'_, '_>) -> std::io::Result<()>>,
 ) -> Result<()>
 where
-    R: Fn(&mut Explicit<'_, '_>, RowView<'_>, usize) -> std::io::Result<()>,
+    R: FnMut(&mut Explicit<'_, '_>, RowView<'_>, usize) -> std::io::Result<()>,
 {
     let width = source.variables().len();
     let mut out = Explicit::new(out);
@@ -297,7 +309,11 @@ where
         flush: S::FLUSH_FIRST,
         row,
     };
-    source.drive(send, &mut rows)
+    source.drive(send, &mut rows)?;
+    if let Some(footer) = footer {
+        footer(&mut rows.out).map_err(io)?;
+    }
+    Ok(())
 }
 
 /// The rows of a format the engine encodes, each marked in the explicit mode.
@@ -311,7 +327,7 @@ struct EncodedRows<'o, 'a, R> {
 
 impl<R> BatchVisitor for EncodedRows<'_, '_, R>
 where
-    R: Fn(&mut Explicit<'_, '_>, RowView<'_>, usize) -> std::io::Result<()>,
+    R: FnMut(&mut Explicit<'_, '_>, RowView<'_>, usize) -> std::io::Result<()>,
 {
     fn batch<B: RowBatch>(&mut self, batch: &mut B) -> Result<()> {
         for i in 0..batch.len() {

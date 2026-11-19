@@ -5,7 +5,7 @@
 use super::super::rowout::Explicit;
 use super::super::source::RowView;
 use super::super::{RowCount, io, write_buffered};
-use super::{Csv, Tsv};
+use super::{Csv, Json, Tsv};
 use crate::error::Result;
 use oxrdf::vocab::xsd;
 use oxrdf::{
@@ -23,6 +23,14 @@ use std::rc::Rc;
 enum Enc {
     Tsv,
     Csv,
+    Json,
+}
+
+/// An encoder writing one answer, with the state a format keeps across its rows.
+enum Running {
+    Tsv,
+    Csv,
+    Json(Json),
 }
 
 impl Enc {
@@ -30,25 +38,47 @@ impl Enc {
         match self {
             Enc::Tsv => QueryResultsFormat::Tsv,
             Enc::Csv => QueryResultsFormat::Csv,
+            Enc::Json => QueryResultsFormat::Json,
         }
     }
 
-    fn header(self, out: &mut Explicit<'_, '_>, vars: &[String]) -> std::io::Result<()> {
-        match self {
-            Enc::Tsv => Tsv::header(out, vars),
-            Enc::Csv => Csv::header(out, vars),
-        }
+    /// Write the header and return the encoder for the rows.
+    fn start(self, out: &mut Explicit<'_, '_>, vars: &[String]) -> std::io::Result<Running> {
+        Ok(match self {
+            Enc::Tsv => {
+                Tsv::header(out, vars)?;
+                Running::Tsv
+            }
+            Enc::Csv => {
+                Csv::header(out, vars)?;
+                Running::Csv
+            }
+            Enc::Json => {
+                Json::header(out, vars)?;
+                Running::Json(Json::new(vars))
+            }
+        })
     }
+}
 
+impl Running {
     fn row(
-        self,
+        &mut self,
         out: &mut Explicit<'_, '_>,
         row: RowView<'_>,
         width: usize,
     ) -> std::io::Result<()> {
         match self {
-            Enc::Tsv => Tsv::row(out, row, width),
-            Enc::Csv => Csv::row(out, row, width),
+            Running::Tsv => Tsv::row(out, row, width),
+            Running::Csv => Csv::row(out, row, width),
+            Running::Json(json) => json.row(out, row, width),
+        }
+    }
+
+    fn footer(&self, out: &mut Explicit<'_, '_>) -> std::io::Result<()> {
+        match self {
+            Running::Tsv | Running::Csv => Ok(()),
+            Running::Json(_) => Json::footer(out),
         }
     }
 }
@@ -101,7 +131,7 @@ fn encode(
     let count = RowCount::new();
     let result = write_buffered(w, &count, None, &mut |out, _| {
         let mut out = Explicit::new(out);
-        enc.header(&mut out, vars).map_err(io)?;
+        let mut enc = enc.start(&mut out, vars).map_err(io)?;
         for row in rows {
             out.begin_row()?;
             let written = if sparse {
@@ -117,7 +147,7 @@ fn encode(
             written.map_err(io)?;
             out.end_row(1).map_err(io)?;
         }
-        Ok(())
+        enc.footer(&mut out).map_err(io)
     });
     (result, count.get())
 }
@@ -247,6 +277,49 @@ fn check_pieces(
         prop_assert!(r.is_ok(), "{enc:?} sparse {sparse}: {r:?}");
         prop_assert_eq!(n, rows.len() as u64);
         prop_assert_eq!(&w.0, &want, "{:?} sparse {}: write lengths", enc, sparse);
+    }
+    Ok(())
+}
+
+/// The length of the header sparesults writes, the bytes before the first row.
+fn header_len(enc: Enc, vars: &[String]) -> usize {
+    let footer = match enc {
+        Enc::Tsv | Enc::Csv => 0,
+        Enc::Json => b"]}}".len(),
+    };
+    oracle(enc, vars, &[]).0.len() - footer
+}
+
+/// Every piece the caller's writer takes ends where the header or a row ends, or at the
+/// end of the document, so a row's pieces never reach it before the row is whole and a
+/// row longer than the buffer goes in one write. sparesults' JSON writes each character
+/// on its own, so its staged pieces drain mid-row and are no oracle for the pieces.
+fn check_row_pieces(
+    enc: Enc,
+    vars: &[String],
+    rows: &[Vec<Option<Term>>],
+) -> std::result::Result<(), TestCaseError> {
+    let (want, ends) = oracle(enc, vars, rows);
+    let mut allowed: std::collections::BTreeSet<usize> = ends.into_iter().collect();
+    allowed.insert(header_len(enc, vars));
+    allowed.insert(want.len());
+    for sparse in [false, true] {
+        let mut w = Pieces::default();
+        let (r, n) = encode(enc, vars, rows, sparse, &mut w);
+        prop_assert!(r.is_ok(), "{enc:?} sparse {sparse}: {r:?}");
+        prop_assert_eq!(n, rows.len() as u64);
+        let mut at = 0;
+        for &len in &w.0 {
+            at += len;
+            prop_assert!(
+                allowed.contains(&at),
+                "{:?} sparse {}: a piece ends at {}, inside a row",
+                enc,
+                sparse,
+                at
+            );
+        }
+        prop_assert_eq!(at, want.len());
     }
     Ok(())
 }
@@ -428,6 +501,16 @@ proptest! {
     fn csv_counts_the_rows_a_failed_writer_took((vars, rows) in solutions(), limit in 0usize..400) {
         check_failing(Enc::Csv, &vars, &rows, limit)?;
     }
+
+    #[test]
+    fn json_equals_sparesults((vars, rows) in solutions()) {
+        check(Enc::Json, &vars, &rows)?;
+    }
+
+    #[test]
+    fn json_counts_the_rows_a_failed_writer_took((vars, rows) in solutions(), limit in 0usize..400) {
+        check_failing(Enc::Json, &vars, &rows, limit)?;
+    }
 }
 
 proptest! {
@@ -460,6 +543,20 @@ proptest! {
     ) {
         let total = oracle(Enc::Csv, &vars, &rows).0.len();
         check_failing(Enc::Csv, &vars, &rows, (total as f64 * at) as usize)?;
+    }
+
+    #[test]
+    fn json_pieces_end_where_rows_end((vars, rows) in long_solutions()) {
+        check_row_pieces(Enc::Json, &vars, &rows)?;
+    }
+
+    #[test]
+    fn json_counts_the_rows_a_failed_writer_took_over_drains(
+        (vars, rows) in long_solutions(),
+        at in 0.0f64..=1.0,
+    ) {
+        let total = oracle(Enc::Json, &vars, &rows).0.len();
+        check_failing(Enc::Json, &vars, &rows, (total as f64 * at) as usize)?;
     }
 }
 
@@ -651,7 +748,7 @@ fn errors_after(
         None,
         &mut |out, _| {
             let mut out = Explicit::new(out);
-            enc.header(&mut out, vars).map_err(io)?;
+            let mut enc = enc.start(&mut out, vars).map_err(io)?;
             for row in rows {
                 out.begin_row()?;
                 enc.row(&mut out, RowView::Dense(row), vars.len())
@@ -695,6 +792,7 @@ fn a_refused_piece_of_the_buffer_size_fails_before_a_later_error() {
         let (quotes, eol) = match enc {
             Enc::Tsv => (2, 1),
             Enc::Csv => (0, 2),
+            Enc::Json => unreachable!("the JSON case has its own test"),
         };
         let vars = vec!["v".to_string()];
         let rows = vec![vec![simple(&"z".repeat(8_192 - quotes - eol))]];
@@ -814,4 +912,145 @@ fn wide_gaps_in_both_views() {
         check(enc, &vars, &rows).unwrap();
         check_pieces(enc, &vars, &rows).unwrap();
     }
+}
+
+fn json(vars: &[&str], rows: &[Vec<Option<Term>>]) -> String {
+    encoded(Enc::Json, vars, rows)
+}
+
+/// The escapes json-event-parser spells: the short forms, `\u00XX` in lowercase hex for
+/// the other control characters, and DEL, U+2028 and other characters as they are.
+#[test]
+fn json_escapes_strings_as_json_event_parser_does() {
+    let all: String = (0u8..0x20).map(char::from).collect();
+    let got = json(
+        &["v"],
+        &[
+            vec![simple(&all)],
+            vec![simple("q\"b\\s\u{7f}\u{2028}\u{feff}é中𝄞")],
+            vec![simple("")],
+        ],
+    );
+    assert!(
+        got.contains(r#""\u0000\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e"#)
+    );
+    assert!(got.contains(r#"\u001e\u001f""#));
+    assert!(got.contains("q\\\"b\\\\s\u{7f}\u{2028}\u{feff}é中𝄞"));
+}
+
+/// Literals with languages, directions and datatypes, xsd:string without its datatype,
+/// IRIs and blank nodes, triple terms, Unicode names, unbound cells and an answer without
+/// variables.
+#[test]
+fn json_writes_every_term_form() {
+    let s = NamedNode::new_unchecked("http://e/s\"q");
+    let p = NamedNode::new_unchecked("http://e/p");
+    let triple = Term::Triple(Box::new(Triple::new(
+        NamedOrBlankNode::from(BlankNode::new_unchecked("b0")),
+        p.clone(),
+        Term::from(Literal::new_directional_language_tagged_literal_unchecked(
+            "x",
+            "ar",
+            BaseDirection::Rtl,
+        )),
+    )));
+    let got = json(
+        &["a", "é中", "c"],
+        &[
+            vec![
+                Some(s.clone().into()),
+                Some(BlankNode::new_unchecked("n1").into()),
+                lit("1", xsd::INTEGER.into()),
+            ],
+            vec![
+                None,
+                Some(Literal::new_language_tagged_literal_unchecked("hi", "en-GB").into()),
+                Some(
+                    Literal::new_directional_language_tagged_literal_unchecked(
+                        "x",
+                        "en",
+                        BaseDirection::Ltr,
+                    )
+                    .into(),
+                ),
+            ],
+            vec![lit("s", xsd::STRING.into()), Some(triple), None],
+            vec![None, None, None],
+        ],
+    );
+    assert_eq!(
+        got,
+        concat!(
+            r#"{"head":{"vars":["a","é中","c"]},"results":{"bindings":["#,
+            r#"{"a":{"type":"uri","value":"http://e/s\"q"},"é中":{"type":"bnode","value":"n1"},"#,
+            r#""c":{"type":"literal","value":"1","datatype":"http://www.w3.org/2001/XMLSchema#integer"}},"#,
+            r#"{"é中":{"type":"literal","value":"hi","xml:lang":"en-GB"},"#,
+            r#""c":{"type":"literal","value":"x","xml:lang":"en","its:dir":"ltr"}},"#,
+            r#"{"a":{"type":"literal","value":"s"},"é中":{"type":"triple","value":{"#,
+            r#""subject":{"type":"bnode","value":"b0"},"predicate":{"type":"uri","value":"http://e/p"},"#,
+            r#""object":{"type":"literal","value":"x","xml:lang":"ar","its:dir":"rtl"}}}},"#,
+            r#"{}]}}"#
+        )
+    );
+    assert_eq!(
+        json(&[], &[vec![], vec![]]),
+        r#"{"head":{"vars":[]},"results":{"bindings":[{},{}]}}"#
+    );
+    assert_eq!(
+        json(&["x"], &[]),
+        r#"{"head":{"vars":["x"]},"results":{"bindings":[]}}"#
+    );
+}
+
+/// Values and rows around and past the buffer's size, a row of quotes past it whose
+/// escapes double it, and deeply nested triple terms.
+#[test]
+fn json_handles_values_longer_than_the_buffer() {
+    let vars = vec!["v".to_string()];
+    let mut rows = vec![vec![simple("a")]];
+    for n in [8_150, 8_160, 8_170, 8_180, 8_190, 8_200, 20_000] {
+        rows.push(vec![simple(&"z".repeat(n))]);
+    }
+    rows.push(vec![simple(&"\"".repeat(9_000))]);
+    rows.push(vec![simple(&"\u{1}".repeat(3_000))]);
+    check(Enc::Json, &vars, &rows).unwrap();
+    check_row_pieces(Enc::Json, &vars, &rows).unwrap();
+    for limit in [0, 3, 100, 8_000, 9_000, 40_000, 60_000, 90_000] {
+        check_failing(Enc::Json, &vars, &rows, limit).unwrap();
+    }
+    let mut t: Term = NamedNode::new_unchecked("http://e/o").into();
+    for _ in 0..64 {
+        t = Term::Triple(Box::new(Triple::new(
+            NamedNode::new_unchecked("http://e/s"),
+            NamedNode::new_unchecked("http://e/p"),
+            t,
+        )));
+    }
+    json(&["t"], &[vec![Some(t)]]);
+}
+
+/// A JSON row or header of exactly the buffer's size that did not fit where it started
+/// goes on at once, so a writer that refuses it fails the output before the source's next
+/// error. sparesults' JSON reaches the staged buffer a character at a time, so its staged
+/// path is no oracle here.
+#[test]
+fn a_refused_json_piece_of_the_buffer_size_fails_before_a_later_error() {
+    let vars = vec!["v".to_string()];
+    let header = header_len(Enc::Json, &vars);
+    // a row of an empty value, less the header and the footer
+    let empty = oracle(Enc::Json, &vars, &[vec![simple("")]]).0.len() - header - 3;
+    let rows = vec![vec![simple(&"z".repeat(8_192 - empty))]];
+    let (e, _) = errors_after(Enc::Json, &vars, &rows, header + 8_191);
+    assert!(
+        matches!(e, crate::error::Error::Io(_)),
+        "row: the refusal was hidden by {e:?}"
+    );
+    let one = header_len(Enc::Json, &["h".to_string()]);
+    let long = vec!["h".repeat(8_192 - (one - 1))];
+    assert_eq!(header_len(Enc::Json, &long), 8_192);
+    let (e, _) = errors_after(Enc::Json, &long, &[], 8_191);
+    assert!(
+        matches!(e, crate::error::Error::Io(_)),
+        "header: the refusal was hidden by {e:?}"
+    );
 }
