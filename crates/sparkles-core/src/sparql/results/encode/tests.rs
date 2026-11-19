@@ -27,10 +27,10 @@ enum Enc {
 }
 
 /// An encoder writing one answer, with the state a format keeps across its rows.
-enum Running {
+enum Running<'a> {
     Tsv,
     Csv,
-    Json(Json),
+    Json(Json<'a>),
 }
 
 impl Enc {
@@ -42,26 +42,28 @@ impl Enc {
         }
     }
 
-    /// Write the header and return the encoder for the rows.
-    fn start(self, out: &mut Explicit<'_, '_>, vars: &[String]) -> std::io::Result<Running> {
+    /// Write the header and return the encoder for the rows, its state charged first as
+    /// select() charges it.
+    fn start<'a>(self, out: &mut Explicit<'_, 'a>, vars: &[String]) -> Result<Running<'a>> {
         Ok(match self {
             Enc::Tsv => {
-                Tsv::header(out, vars)?;
+                Tsv::header(out, vars).map_err(io)?;
                 Running::Tsv
             }
             Enc::Csv => {
-                Csv::header(out, vars)?;
+                Csv::header(out, vars).map_err(io)?;
                 Running::Csv
             }
             Enc::Json => {
-                Json::header(out, vars)?;
-                Running::Json(Json::new(vars))
+                let json = Json::new(out.ctx(), vars)?;
+                Json::header(out, vars).map_err(io)?;
+                Running::Json(json)
             }
         })
     }
 }
 
-impl Running {
+impl Running<'_> {
     fn row(
         &mut self,
         out: &mut Explicit<'_, '_>,
@@ -131,7 +133,7 @@ fn encode(
     let count = RowCount::new();
     let result = write_buffered(w, &count, None, &mut |out, _| {
         let mut out = Explicit::new(out);
-        let mut enc = enc.start(&mut out, vars).map_err(io)?;
+        let mut enc = enc.start(&mut out, vars)?;
         for row in rows {
             out.begin_row()?;
             let written = if sparse {
@@ -748,7 +750,7 @@ fn errors_after(
         None,
         &mut |out, _| {
             let mut out = Explicit::new(out);
-            let mut enc = enc.start(&mut out, vars).map_err(io)?;
+            let mut enc = enc.start(&mut out, vars)?;
             for row in rows {
                 out.begin_row()?;
                 enc.row(&mut out, RowView::Dense(row), vars.len())
@@ -1053,4 +1055,83 @@ fn a_refused_json_piece_of_the_buffer_size_fails_before_a_later_error() {
         matches!(e, crate::error::Error::Io(_)),
         "header: the refusal was hidden by {e:?}"
     );
+}
+
+fn small_answer() -> crate::sparql::QueryResult {
+    let store = crate::store::Store::in_memory(crate::store::StoreOptions::default());
+    let options = crate::sparql::QueryOptions {
+        max_memory_bytes: Some(1 << 20),
+        no_cache: true,
+        ..Default::default()
+    };
+    crate::sparql::query(
+        store.snapshot(),
+        "SELECT ?o WHERE { VALUES ?o { 1 } }",
+        &options,
+    )
+    .unwrap()
+}
+
+/// The most the query can still charge.
+fn room(ctx: &std::sync::Arc<crate::sparql::ctx::Ctx>) -> u64 {
+    let (mut lo, mut hi) = (0u64, 1 << 21);
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        if crate::sparql::ctx::OwnedCharge::new(ctx, mid).is_ok() {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// SPARQL JSON through a writer charged to `ctx`, one short row.
+fn json_charged(ctx: &std::sync::Arc<crate::sparql::ctx::Ctx>, vars: &[String]) -> Result<()> {
+    let row: Vec<Option<Term>> = vars.iter().map(|_| simple("x")).collect();
+    write_buffered(
+        &mut Vec::new(),
+        &RowCount::new(),
+        Some(ctx.clone()),
+        &mut |out, _| {
+            let mut out = Explicit::new(out);
+            let mut enc = Enc::Json.start(&mut out, vars)?;
+            out.begin_row()?;
+            enc.row(&mut out, RowView::Dense(&row), vars.len())
+                .map_err(io)?;
+            out.end_row(1).map_err(io)?;
+            enc.footer(&mut out).map_err(io)
+        },
+    )
+}
+
+/// The escaped keys of SPARQL JSON are charged to the query before they are allocated,
+/// beside the writer's buffer and marks, and released with the writer.
+#[test]
+fn json_keys_are_charged_before_they_are_allocated() {
+    use super::super::rowout::{FIRST_MARKS, MARK_BYTES, OUTPUT_BUFFER};
+    let vars: Vec<String> = (0..3)
+        .map(|i| format!("v{i}{}", "\"".repeat(1_000)))
+        .collect();
+    // each key is its name with every quote escaped, two quotes and a colon, and the
+    // table holds one start per key and the end
+    let keys = 3 * (2 + 2 * 1_000 + 3) + 4 * std::mem::size_of::<usize>() as u64;
+    let writer = OUTPUT_BUFFER as u64 + FIRST_MARKS as u64 * MARK_BYTES;
+    for (left, fits) in [(writer + keys - 1, false), (writer + keys, true)] {
+        let r = small_answer();
+        let ctx = r.test_context().clone();
+        let before = room(&ctx);
+        let held = crate::sparql::ctx::OwnedCharge::new(&ctx, before - left).unwrap();
+        let got = json_charged(&ctx, &vars);
+        match got {
+            Ok(()) => assert!(fits, "{left}: the keys were not charged"),
+            Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            })) => assert!(!fits, "{left}: refused with room for the keys"),
+            Err(e) => panic!("the refusal lost its type: {e:?}"),
+        }
+        drop(held);
+        assert_eq!(room(&ctx), before, "{left}: the charge outlived the writer");
+    }
 }

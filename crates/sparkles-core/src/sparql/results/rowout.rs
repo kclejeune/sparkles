@@ -274,6 +274,11 @@ impl<'a> RowOut<'a> {
         }
     }
 
+    /// The query whose memory this writer is charged to, when there is one.
+    pub(crate) fn ctx(&self) -> Option<&'a Ctx> {
+        self.ctx
+    }
+
     /// Cover `bytes` of buffer and marks before they are allocated.
     fn cover(&mut self, bytes: u64) -> Result<()> {
         let Some(ctx) = self.ctx else {
@@ -722,6 +727,12 @@ pub(crate) struct Explicit<'o, 'a>(&'o mut RowOut<'a>);
 impl<'o, 'a> Explicit<'o, 'a> {
     pub(crate) fn new(out: &'o mut RowOut<'a>) -> Self {
         Explicit(out)
+    }
+
+    /// The query whose memory an encoder's own state is charged to, when there is one.
+    #[cfg(test)]
+    pub(crate) fn ctx(&self) -> Option<&'a Ctx> {
+        self.0.ctx()
     }
 
     /// See [`RowOut::begin_row`].

@@ -240,7 +240,7 @@ fn select<S: SolutionSource>(
         SolutionsFormat::Tsv => return encoded(source, out, send, Tsv::header, Tsv::row, None),
         SolutionsFormat::Csv => return encoded(source, out, send, Csv::header, Csv::row, None),
         SolutionsFormat::Json => {
-            let mut json = Json::new(source.variables());
+            let mut json = Json::new(out.ctx(), source.variables())?;
             return encoded(
                 source,
                 out,
