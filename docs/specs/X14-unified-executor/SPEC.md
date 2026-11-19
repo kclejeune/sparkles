@@ -831,8 +831,8 @@ Roadmap item 1063 removed most of the cost that item 1039 left on root scans. Th
 path no longer makes and drops a weak handle on the block for each batch, and it reads the
 block in place instead of taking it back at each read. On 100,000 people on atlas with one
 thread, `root-scan`, `export-500k` and `root-limit` became 1.6% to 3.5% faster in server
-time under streaming and automatic execution, and in a cycle profile on stanley the scan's
-cost is within the spread of the passes around its cost before item 1039. Against that
+time under streaming and automatic execution, and in a cycle profile on stanley the range
+of the scan's cost over four passes overlaps its range before item 1039. Against that
 build, `root-scan` still takes 2.4% longer under streaming, 1.98 µs, and 1.1% under
 automatic execution, 0.89 µs, and streaming `export-500k` 0.5% longer, 1.95 µs. The
 remainder is about the same on both queries although the export reads more blocks, and the

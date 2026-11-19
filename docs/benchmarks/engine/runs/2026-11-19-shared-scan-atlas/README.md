@@ -68,9 +68,10 @@ The change is faster than `main` on every named query in both modes. Against `pr
 `export-500k` stays within 1%, but `root-scan` under streaming fails the rule at 1.024.
 Under the rule's own noise test, a 95% interval that reaches 1.0 or an added time of at
 most 0.5 µs, the costs that remain are `root-scan` under both modes and `export-500k` under
-streaming. The remainder is about 2 µs under streaming and 1 µs under automatic execution
-on both `root-scan` and `export-500k`, although the export reads more blocks. That reads
-like a cost per request rather than per block, but two queries do not settle it.
+streaming. The remainder is about 2 µs under streaming on both `root-scan` and
+`export-500k`, although the export reads more blocks, and the point estimates under
+automatic execution are about 1 µs on both, although the export's interval reaches 1.0.
+That reads like a cost per request rather than per block, but two queries do not settle it.
 
 Among the controls, `distinct-obj` and `predicate-counts` read 1.062 and 1.050 against
 `main` under streaming, 0.30 and 0.31 µs, and 0.976 and 0.986 under automatic execution.
@@ -78,10 +79,11 @@ Their plans run an eager subplan under the cursor, and a profile of `distinct-ob
 stanley shows no sample in the scan code that the change touches, so the difference is
 not attributed to it. Against `pre`, `path-plus` under automatic execution reads 1.145,
 1.43 µs, and `subquery-agg` 1.013, 2.41 µs, and 1.006, 1.14 µs, under streaming. All three
-are flat against `main`. Item 1039's own comparison on atlas, of `9acd6d74` with the tip of
-that item, read `path-plus` 0.944 and `subquery-agg` 1.007 under automatic execution and
-`subquery-agg` 1.000 under streaming. Most of these costs therefore come from the other
-merges of batches 30 to 32. The `distinct-obj` classifications are in `profile/`.
+are flat against `main`, so item 1063 does not cause them. Item 1039's own comparison on
+atlas, of `9acd6d74` with the tip of that item in six rounds of one arm order, read
+`path-plus` 0.944 and `subquery-agg` 1.007 under automatic execution and `subquery-agg`
+1.000 under streaming. That suggests most of these costs come from the other merges of
+batches 30 to 32, but it does not isolate them. The `distinct-obj` classifications are in `profile/`.
 
 ## Profile of the scan
 
@@ -103,8 +105,8 @@ share.
 | `fix` | 0.558 | 0.550 | 0.369 | 0.439 | 3,409 |
 
 `main` is above `pre` in every pass, and `fix` is above `pre` in two passes and below it
-in two. The leaves that item 1039 added, such as `Block::downgrade`, the drop of the weak
+in two, so the ranges of `fix` and `pre` overlap. The leaves that item 1039 added, such as `Block::downgrade`, the drop of the weak
 handle and the extra work of the shared batch, are gone or smaller in `fix`. On stanley, the
-scan's cost in `fix` is within the spread of the passes around its cost in `pre`, and the
-profile does not resolve a smaller difference. The profile does not reproduce the
+scan's cost in `fix` overlaps its cost in `pre` across the passes, and the profile does
+not resolve a smaller difference. The profile does not reproduce the
 remainder that atlas measures, and the cause of that remainder is open.
