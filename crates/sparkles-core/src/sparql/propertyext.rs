@@ -397,14 +397,14 @@ fn take_list(
     renamed: bool,
 ) -> Result<(Vec<TermPattern>, Vec<usize>)> {
     use oxrdf::vocab::rdf;
-    let node = |t: &TermPattern| -> Option<String> {
+    fn list_node(t: &TermPattern, renamed: bool) -> Option<&str> {
         match t {
-            TermPattern::BlankNode(b) => Some(b.as_str().to_owned()),
-            TermPattern::Variable(_) if renamed => super::rdfs::list_node(t).map(str::to_owned),
+            TermPattern::BlankNode(b) => Some(b.as_str()),
+            TermPattern::Variable(_) if renamed => super::rdfs::list_node(t),
             _ => None,
         }
-    };
-    let Some(mut cell) = node(head) else {
+    }
+    let Some(mut cell) = list_node(head, renamed) else {
         return Err(Error::invalid(
             "property argument must be a query-written RDF list",
         ));
@@ -414,8 +414,8 @@ fn take_list(
     loop {
         let link = |predicate: oxrdf::NamedNodeRef<'_>| -> Result<usize> {
             let mut matches = patterns.iter().enumerate().filter(|(_, t)| {
-                node(&t.subject).as_ref() == Some(&cell)
-                    && matches!(&t.predicate, NamedNodePattern::NamedNode(n) if *n == predicate)
+                matches!(&t.predicate, NamedNodePattern::NamedNode(n) if *n == predicate)
+                    && list_node(&t.subject, renamed) == Some(cell)
             });
             let (Some((i, _)), None) = (matches.next(), matches.next()) else {
                 return Err(Error::invalid("malformed property argument list"));
@@ -433,7 +433,7 @@ fn take_list(
         elements.push(patterns[first].object.clone());
         match &patterns[rest].object {
             TermPattern::NamedNode(n) if *n == rdf::NIL => break,
-            next => match node(next) {
+            next => match list_node(next, renamed) {
                 Some(next) => cell = next,
                 None => return Err(Error::invalid("malformed property argument list")),
             },

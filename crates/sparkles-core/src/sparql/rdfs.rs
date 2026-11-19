@@ -1337,7 +1337,8 @@ fn blank_to_var(gp: &mut GraphPattern) {
 }
 
 /// The prefix of the variables that stand for the query's blank nodes after the rewrite.
-const BLANK_PREFIX: &str = "__rdfsb_";
+/// SPARQL variable names cannot contain `-`, so no query can write one.
+const BLANK_PREFIX: &str = "__rdfs-b_";
 
 /// The label of a blank node of the query, written or renamed by the rewrite, so that a
 /// registered call's list argument is still read as the list the query wrote.
@@ -1381,18 +1382,22 @@ fn call_group(
     if heads.is_empty() {
         return group;
     }
+    // A cell may itself be a call when `rdf:first` or `rdf:rest` is registered, so the
+    // walk tracks the cells it has visited apart from the group.
+    let mut visited = vec![false; patterns.len()];
     loop {
         let mut grew = false;
-        for (t, g) in patterns.iter().zip(group.iter_mut()) {
+        for (i, t) in patterns.iter().enumerate() {
             let NamedNodePattern::NamedNode(p) = &t.predicate else {
                 continue;
             };
             let (first, rest) = (p.as_ref() == rdf::FIRST, p.as_ref() == rdf::REST);
-            if *g || !(first || rest) {
+            if visited[i] || !(first || rest) {
                 continue;
             }
             if list_node(&t.subject).is_some_and(|b| heads.contains(&b)) {
-                *g = true;
+                visited[i] = true;
+                group[i] = true;
                 grew = true;
                 if rest && let Some(next) = list_node(&t.object) {
                     heads.push(next);

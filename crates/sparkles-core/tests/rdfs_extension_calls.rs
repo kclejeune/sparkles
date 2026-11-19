@@ -494,3 +494,81 @@ fn blank_nodes_and_list_cells_under_the_rewrite() {
         assert_eq!(streamed(&s, &q, &make(&opens)).unwrap(), got, "{q}");
     }
 }
+
+/// A query variable named like the rewrite's blank-node variables is not a list cell,
+/// and a list keeps its cells when `rdf:rest` is registered as well.
+#[test]
+fn renamed_blank_nodes_cannot_meet_query_variables() {
+    let s = store();
+    update(
+        &s,
+        "INSERT DATA { <urn:l> <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <urn:b> .
+                       <urn:s:1> a <urn:C> }",
+        &Default::default(),
+    )
+    .unwrap();
+    let n = |x: &str| NamedNode::new(x).unwrap();
+    let schema = |t: Vec<Triple>| Some(Arc::new(RdfsOnRead::fixed(RdfsSchema::from_triples(&t))));
+    let sub_class = vec![Triple::new(
+        n("urn:C"),
+        n(&format!("{RDFS}subClassOf")),
+        n("urn:D"),
+    )];
+    let q = "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+        SELECT ?x { _:args rdf:first <urn:a> ; rdf:rest rdf:nil ; <urn:callback> ?x .
+                    ?__rdfsb_args rdf:first <urn:b> }";
+    for rdfs in [None, schema(Vec::new()), schema(sub_class.clone())] {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let o = QueryOptions {
+            extensions: Some(registry_of(CALLBACK, ArgumentShape::List(1..=4), &opens)),
+            rdfs,
+            ..options(&opens, false)
+        };
+        let rows = eager(&s, q, &o).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(rows.len(), 1);
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+    }
+    // `rdf:rest` registered as a pass-through call beside a list-shaped call
+    let opens = Arc::new(AtomicUsize::new(0));
+    let mut r = ExtensionRegistry::builder();
+    for (iri, subject, required, produces) in [
+        (
+            CALLBACK,
+            ArgumentShape::List(1..=4),
+            vec![PropertyPosition::Subject(0)],
+            vec![PropertyPosition::Object(0)],
+        ),
+        (
+            "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest",
+            ArgumentShape::Term,
+            vec![],
+            vec![],
+        ),
+    ] {
+        let mut d = PropertyDescriptor::new(
+            iri,
+            subject,
+            ArgumentShape::Term,
+            required,
+            produces,
+            Echo(opens.clone()),
+        )
+        .unwrap();
+        d.prefix_output = true;
+        r.register_property(d).unwrap();
+    }
+    let q = "SELECT ?x { <urn:s:1> a <urn:C> . (<urn:a> <urn:b>) <urn:callback> ?x }";
+    let registry = r.build();
+    let run = |rdfs| {
+        let o = QueryOptions {
+            extensions: Some(registry.clone()),
+            rdfs,
+            no_cache: true,
+            ..Default::default()
+        };
+        eager(&s, q, &o).map(|rows| rows.len())
+    };
+    // the outcome without RDFS, an answer or a refusal, is the outcome with the schema
+    let without = run(None).map_err(|e| e.to_string());
+    assert_eq!(run(schema(sub_class)).map_err(|e| e.to_string()), without);
+}
