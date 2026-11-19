@@ -120,34 +120,43 @@ impl Tee {
         })
     }
 
-    /// Copy one solution, or give up the copy once it is larger than the cache keeps.
-    /// What the copy will hold is charged before it grows.
+    /// Copy one solution, or give up the copy once it is larger than the cache keeps or
+    /// the budget can hold. What the copy will hold, names and row included, is sized
+    /// from the borrowed solution and charged before anything is copied.
     fn push(mut self, solution: &sparesults::QuerySolution) -> Result<Option<Self>> {
         // the variables of the first solution that binds any, as `fetch_rows` takes them
         if self.rows.vars.is_empty() && !solution.variables().is_empty() {
-            let vars: Vec<String> = solution
-                .variables()
+            let names = solution.variables();
+            self.bytes += names
                 .iter()
-                .map(|v| v.as_str().to_owned())
-                .collect();
-            self.bytes += Rows::vars_bytes(&vars);
-            let names = vars.capacity() * std::mem::size_of::<String>()
-                + vars.iter().map(String::capacity).sum::<usize>();
-            self.retained += names as u64;
+                .map(|v| v.as_str().len() as u64 + 24)
+                .sum::<u64>();
+            if self.over_limit() {
+                return Ok(None);
+            }
+            let kept = names.len() * std::mem::size_of::<String>()
+                + names.iter().map(|v| v.as_str().len()).sum::<usize>();
+            self.retained += kept as u64;
+            if !self.charge_for(self.rows.rows.capacity()) {
+                return Ok(None);
+            }
+            #[cfg(test)]
+            COPIES.with(|c| c.set(c.get() + 1));
+            let mut vars = Vec::with_capacity(names.len());
+            vars.extend(names.iter().map(|v| v.as_str().to_owned()));
             self.rows.vars = vars;
         }
-        let row: Vec<_> = self
-            .rows
-            .vars
-            .iter()
-            .map(|v| solution.get(v.as_str()).cloned())
-            .collect();
-        self.bytes += Rows::row_bytes(&row);
-        if self.bytes.saturating_add(self.key.len() as u64) > self.limit {
+        // the names are moved out while the row is sized and charged; a dropped copy
+        // never puts them back
+        let vars = std::mem::take(&mut self.rows.vars);
+        let terms = || vars.iter().map(|v| solution.get(v.as_str()));
+        self.bytes += Rows::row_bytes_of(terms());
+        if self.over_limit() {
             return Ok(None);
         }
-        self.retained += Rows::retained_row_bytes(&row);
-        let slot = std::mem::size_of::<Vec<Option<oxrdf::Term>>>();
+        let width = vars.len();
+        let row_bytes = Rows::retained_slots_bytes(width, terms().flatten());
+        self.retained += row_bytes;
         let (len, capacity) = (self.rows.rows.len(), self.rows.rows.capacity());
         let grown = if len == capacity {
             (capacity * 2).max(4)
@@ -156,21 +165,43 @@ impl Tee {
         };
         // The cache is an optimisation: a copy the budget cannot hold is dropped, and
         // the answer streams on uncached, as it does without the cache.
-        if self
-            .charge
-            .resize(
-                self.retained
-                    .saturating_add((grown * slot) as u64)
-                    .saturating_add(self.key.capacity() as u64),
-            )
-            .is_err()
-        {
+        if !self.charge_for(grown) {
             return Ok(None);
         }
+        #[cfg(test)]
+        COPIES.with(|c| c.set(c.get() + 1));
+        let mut row = Vec::with_capacity(width);
+        row.extend(terms().map(|t| t.cloned()));
+        debug_assert_eq!(Rows::retained_row_bytes(&row), row_bytes);
+        self.rows.vars = vars;
         self.rows.rows.reserve_exact(grown - len);
         self.rows.rows.push(row);
         Ok(Some(self))
     }
+
+    /// Whether the copy outgrew the largest entry the cache keeps.
+    fn over_limit(&self) -> bool {
+        self.bytes.saturating_add(self.key.len() as u64) > self.limit
+    }
+
+    /// Charge what the copy keeps with its rows vector at `slots` capacity, or say that
+    /// the budget cannot hold it.
+    fn charge_for(&mut self, slots: usize) -> bool {
+        let slot = std::mem::size_of::<Vec<Option<oxrdf::Term>>>();
+        self.charge
+            .resize(
+                self.retained
+                    .saturating_add((slots * slot) as u64)
+                    .saturating_add(self.key.capacity() as u64),
+            )
+            .is_ok()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// names and rows the tee copied on this thread (for tests of admission before copying)
+    static COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Service {
@@ -405,5 +436,57 @@ impl Service {
         }
         b.reconcile()?;
         Ok((b.table.len > 0).then_some(b))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+    use oxrdf::{Literal, Term, Variable};
+
+    fn ctx(limit: u64) -> Arc<Ctx> {
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = limit;
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        ctx
+    }
+
+    /// A wide solution of mostly unbound slots that the budget cannot hold.
+    fn wide(width: usize) -> sparesults::QuerySolution {
+        let vars: Arc<[Variable]> = (0..width)
+            .map(|i| Variable::new(format!("v{i}")).unwrap())
+            .collect();
+        let mut values = vec![None; width];
+        values[0] = Some(Term::Literal(Literal::from(1)));
+        (vars, values).into()
+    }
+
+    /// The tee charges a copy before it makes it: names and row the budget cannot hold
+    /// are not copied at all, not copied and then dropped.
+    #[test]
+    fn a_copy_is_charged_before_it_is_made() {
+        let width = 8_192;
+        // the names fit and the row of slots does not
+        let names = (width * (std::mem::size_of::<String>() + 6)) as u64;
+        let slots = (width * std::mem::size_of::<Option<Term>>()) as u64;
+        for (limit, copies) in [(names / 2, 0), (names + slots / 2, 1)] {
+            let ctx = ctx(limit);
+            let tee = Tee::new(&ctx, "key".into(), u64::MAX).unwrap();
+            COPIES.with(|c| c.set(0));
+            assert!(tee.push(&wide(width)).unwrap().is_none(), "{limit}");
+            assert_eq!(COPIES.with(std::cell::Cell::get), copies, "{limit}");
+        }
+        // with room for both, both are copied
+        let ctx = ctx(16 << 20);
+        let tee = Tee::new(&ctx, "key".into(), u64::MAX).unwrap();
+        COPIES.with(|c| c.set(0));
+        let tee = tee.push(&wide(width)).unwrap().unwrap();
+        assert_eq!(COPIES.with(std::cell::Cell::get), 2);
+        assert_eq!(tee.rows.rows.len(), 1);
+        assert_eq!(tee.rows.vars.len(), width);
     }
 }

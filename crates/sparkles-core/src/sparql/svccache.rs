@@ -31,10 +31,13 @@ impl Rows {
 
     /// What one row adds to [`Rows::bytes`].
     pub(crate) fn row_bytes(row: &[Option<Term>]) -> u64 {
-        let terms: usize = row
-            .iter()
-            .map(|t| t.as_ref().map_or(0, term_bytes) + 16)
-            .sum();
+        Self::row_bytes_of(row.iter().map(Option::as_ref))
+    }
+
+    /// [`Rows::row_bytes`] of a row's borrowed slots, which weighs a row before it is
+    /// built.
+    pub(crate) fn row_bytes_of<'a>(row: impl IntoIterator<Item = Option<&'a Term>>) -> u64 {
+        let terms: usize = row.into_iter().map(|t| t.map_or(0, term_bytes) + 16).sum();
         (terms + 24) as u64
     }
 
