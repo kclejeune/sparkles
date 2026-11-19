@@ -5,7 +5,7 @@
 >
 > **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
 > hold the phases that are ready to start, and each is named in its phase. Items 484 and 832 are
-> complete, and item 1136 takes the last `imbl` maps of Phase 5. The later candidate phases get their numbers when their prerequisites land.
+> complete, and item 1152 takes the last `imbl` maps of Phase 5. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -787,7 +787,7 @@ codec and kind of data. The `imbl` maps stay. A `BTreeMap` behind an `Arc` would
 whole map at the first change after a snapshot, which measured 38 µs a commit at 10,000
 predicates and 8.4 ms at a million, against about a microsecond for `imbl`, and 30 ms a
 frame for a control state of a million entries, as
-[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. Item 1136
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. Item 1152
 takes a persistent ordered map shared with the B+ tree of `KeySet`, after which the
 dependency can leave. No on-disk format changed.
 
