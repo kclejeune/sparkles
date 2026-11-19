@@ -4,10 +4,13 @@ use super::*;
 use crate::store::cold::ColdBudget;
 
 #[cfg(test)]
+pub(super) type InspectionHook = Option<Box<dyn FnMut(&str)>>;
+
+#[cfg(test)]
 thread_local! {
     /// Runs at a named point of a generation's inspection, so a test can commit
     /// beside it at the moment a live writer could.
-    pub(super) static INSPECTION_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> =
+    pub(super) static INSPECTION_HOOK: std::cell::RefCell<InspectionHook> =
         const { std::cell::RefCell::new(None) };
 }
 
