@@ -39,12 +39,22 @@ impl Rows {
     }
 
     /// The bytes one row keeps allocated: its slots at their capacity, its vector's
-    /// header and its terms' text. [`Rows::bytes`] is the cache's weight, an estimate
-    /// that this exceeds for wide rows of mostly unbound slots.
+    /// header and what its terms keep outside their slots (see [`term_alloc_bytes`]).
+    /// [`Rows::bytes`] is the cache's weight, an estimate that this exceeds for wide
+    /// rows of mostly unbound slots and for triple terms.
     #[allow(clippy::ptr_arg, reason = "the capacity of the row is what it keeps")]
     pub(crate) fn retained_row_bytes(row: &Vec<Option<Term>>) -> u64 {
-        let slots = row.capacity() * std::mem::size_of::<Option<Term>>();
-        let terms: usize = row.iter().flatten().map(term_bytes).sum();
+        Self::retained_slots_bytes(row.capacity(), row.iter().flatten())
+    }
+
+    /// [`Rows::retained_row_bytes`] of a row of `capacity` slots holding `terms`, which
+    /// sizes a row from borrowed terms before it is built.
+    pub(crate) fn retained_slots_bytes<'a>(
+        capacity: usize,
+        terms: impl IntoIterator<Item = &'a Term>,
+    ) -> u64 {
+        let slots = capacity * std::mem::size_of::<Option<Term>>();
+        let terms: usize = terms.into_iter().map(term_alloc_bytes).sum();
         (slots + std::mem::size_of::<Vec<Option<Term>>>() + terms) as u64
     }
 
@@ -73,11 +83,33 @@ fn term_bytes(t: &Term) -> usize {
             l.value().len() + l.language().map_or(0, str::len) + l.datatype().as_str().len() + 48
         }
         Term::Triple(t) => {
-            term_bytes(&t.subject.clone().into())
-                + t.predicate.as_str().len()
-                + term_bytes(&t.object)
-                + 24
+            subject_text(&t.subject) + 24 + t.predicate.as_str().len() + term_bytes(&t.object) + 24
         }
+    }
+}
+
+fn subject_text(s: &oxrdf::NamedOrBlankNode) -> usize {
+    match s {
+        oxrdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        oxrdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    }
+}
+
+/// The bytes a term keeps allocated outside the slot that holds it: its text with an
+/// allowance of 24 bytes for each string, as [`term_bytes`] counts it, and for a
+/// triple term the boxed triple and what its parts keep, at every level of nesting.
+/// [`term_bytes`] is the cache's weight and leaves the boxes out.
+fn term_alloc_bytes(t: &Term) -> usize {
+    match t {
+        Term::Triple(t) => {
+            std::mem::size_of::<oxrdf::Triple>()
+                + subject_text(&t.subject)
+                + 24
+                + t.predicate.as_str().len()
+                + 24
+                + term_alloc_bytes(&t.object)
+        }
+        t => term_bytes(t),
     }
 }
 
@@ -419,6 +451,29 @@ mod tests {
         assert_eq!(
             key("", "u", "p", &[("a", &a), ("b", &b)]),
             key("", "u", "p", &[("b", &b), ("a", &a)])
+        );
+    }
+
+    /// The bytes a row keeps count the box of every triple term, at every level of
+    /// nesting, beside the terms' text.
+    #[test]
+    fn retained_bytes_count_every_boxed_triple() {
+        let n = |s: &str| NamedNode::new(s).unwrap();
+        let depth = 8;
+        let mut t: Term = n("urn:o").into();
+        for _ in 0..depth {
+            t = Term::Triple(Box::new(oxrdf::Triple::new(n("urn:s"), n("urn:p"), t)));
+        }
+        let row = vec![Some(t)];
+        let text = depth * ("urn:s".len() + "urn:p".len()) + "urn:o".len();
+        let at_least = std::mem::size_of::<Option<Term>>()
+            + std::mem::size_of::<Vec<Option<Term>>>()
+            + depth * std::mem::size_of::<oxrdf::Triple>()
+            + text;
+        assert!(
+            Rows::retained_row_bytes(&row) >= at_least as u64,
+            "{} < {at_least}",
+            Rows::retained_row_bytes(&row)
         );
     }
 }

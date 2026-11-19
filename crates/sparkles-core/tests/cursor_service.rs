@@ -996,6 +996,63 @@ fn an_in_process_call_charges_its_callers_query() {
     assert!(peak >= alone / 2, "caller {peak}, callee alone {alone}");
 }
 
+/// A cache hit of nested triple terms is charged the box of every triple at every level,
+/// which the cache's own weight of the entry leaves out. A budget between the two
+/// refuses the streamed hit.
+#[test]
+fn a_cache_hit_of_nested_triple_terms_is_charged_every_box() {
+    let s = store();
+    let snap = s.snapshot();
+    let depth = 8;
+    let iri = |v: &str| format!(r#"{{"type":"uri","value":"{v}"}}"#);
+    let term = |i: usize| {
+        let mut t = iri(&format!("urn:o:{i}"));
+        for _ in 0..depth {
+            t = format!(
+                r#"{{"type":"triple","value":{{"subject":{},"predicate":{},"object":{t}}}}}"#,
+                iri("urn:s"),
+                iri("urn:p")
+            );
+        }
+        t
+    };
+    let n = 4_000;
+    let body = format!(
+        r#"{{"head":{{"vars":["t"]}},"results":{{"bindings":[{}{TAIL}"#,
+        (0..n)
+            .map(|i| format!(r#"{{"t":{}}}"#, term(i)))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let ep = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(body.clone().into_bytes())])
+    }));
+    let q = format!("SELECT ?t {{ SERVICE <cache:{}> {{ ?t ?p ?o }} }}", ep.url);
+    let cached = QueryOptions {
+        no_cache: false,
+        ..opts()
+    };
+    let answer = streamed(&snap, &q, &cached, &strict(256)).unwrap().0;
+    assert_eq!(answer.len(), n);
+    assert!(matches!(&answer[0][0], Some(Term::Triple(_))));
+    assert_eq!(s.result_cache().service.entries(), 1);
+    let calls = ep.calls();
+    let weight = s.result_cache().service.bytes();
+    let slot = std::mem::size_of::<Option<Term>>() as u64;
+    let boxes = n as u64 * depth as u64 * std::mem::size_of::<oxrdf::Triple>() as u64;
+    let tight = QueryOptions {
+        max_memory_bytes: Some(weight + n as u64 * slot + boxes / 2),
+        ..cached.clone()
+    };
+    let r = streamed(&snap, &q, &tight, &strict(256));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{:?}",
+        r.map(|r| r.0.len())
+    );
+    assert_eq!(ep.calls(), calls, "the cache answered");
+}
+
 /// A cached SERVICE whose copy of the answer the budget cannot hold drops the copy and
 /// streams the answer on uncached, as the same query does without the cache.
 #[test]
