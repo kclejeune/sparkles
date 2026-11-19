@@ -1347,6 +1347,86 @@ mod tests {
         assert!(matches!(seen[0].error, Some(Error::Cancelled)));
     }
 
+    /// A cursor graph written in Turtle or N-Triples keeps the kind of the I/O error that
+    /// stops it, so a deadline that passes mid-stream is reported as a timeout and a
+    /// cancellation as a cancellation, as in the other graph writers.
+    #[tokio::test]
+    async fn a_cursor_graph_stream_is_classified_by_the_error_that_stops_it() {
+        use sparkles::sparql::results as res;
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let data = (0..5000)
+            .map(|i| format!("<urn:s:{i}> <urn:p> \"value {i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[sparkles::io::Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        for format in [oxrdfio::RdfFormat::Turtle, oxrdfio::RdfFormat::NTriples] {
+            for timeout in [true, false] {
+                let (seen, on_end) = ends();
+                let cancel = Arc::new(AtomicBool::new(false));
+                let deadline = Instant::now() + Duration::from_millis(30);
+                let control = StreamControl::new(
+                    cancel.clone(),
+                    timeout.then_some(deadline),
+                    Default::default(),
+                    None,
+                );
+                let mut cursor = sparkles::sparql::graph_cursor(
+                    store.snapshot(),
+                    "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }",
+                    &Default::default(),
+                    &sparkles::sparql::CursorOptions {
+                        batch_rows: 100,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let write = move |w: &mut LimitedWriter<SwitchWriter>| {
+                    // the response switches to streaming, and then the deadline passes or
+                    // the query is cancelled before the graph is written
+                    w.write_all(&[b'#'; 200])?;
+                    w.write_all(b"\n")?;
+                    if timeout {
+                        std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+                    } else {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    let rows = res::RowCount::with_ledger(w.get_ref().ledger());
+                    res::write(
+                        res::Source::Graph(&mut cursor),
+                        res::WriteOptions::new(res::Format::Rdf(format), &rows),
+                        w,
+                    )
+                    .map(|_| ())
+                };
+                let Ok(Serialized::Streamed(body)) =
+                    serialize_inner(100, false, None, Some(control), write, on_end).await
+                else {
+                    panic!("expected a stream");
+                };
+                assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 1);
+                let error = &seen[0].error;
+                if timeout {
+                    assert!(
+                        matches!(error, Some(Error::Timeout)),
+                        "{format:?}: {error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, Some(Error::Cancelled)),
+                        "{format:?}: {error:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn controlled_early_errors_preserve_budget_status_and_report() {
         let (seen, on_end) = ends();
