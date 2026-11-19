@@ -710,15 +710,6 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     let format = src.rdf_format()?;
     let parser = source_parser(src)?;
     let codec = src.codec()?;
-    if rung == Rung::Buffered {
-        return parse_slice(
-            src,
-            parser,
-            load_bytes(src)?.as_ref(),
-            parallelism,
-            make_sink,
-        );
-    }
     let buffer_limit = src.buffer_limit();
     let line_based = matches!(format, RdfFormat::NTriples | RdfFormat::NQuads);
     if src.parse_mode == ParseMode::Streaming {
@@ -749,6 +740,16 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
         SourceData::File(p) if codec == Codec::None => Some(std::fs::metadata(p)?.len()),
         _ => None,
     };
+    // a buffered source is parsed from the whole document, after the checks above
+    if rung == Rung::Buffered {
+        return parse_slice(
+            src,
+            parser,
+            load_bytes(src)?.as_ref(),
+            parallelism,
+            make_sink,
+        );
+    }
     let bytes = if (codec == Codec::None
         && !reader
         && (splittable || matches!(src.data, SourceData::Bytes(_))))

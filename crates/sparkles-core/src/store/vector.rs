@@ -494,6 +494,7 @@ impl Store {
     /// Test hook: build the HNSW graphs of later builds one node at a time. A parallel
     /// build's graph depends on the order in which its threads insert nodes, and so on
     /// the machine's load; a sequential one is the same every time.
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn sequential_vector_builds(&self, on: bool) {
         self.vector.sequential.store(on, Ordering::SeqCst);

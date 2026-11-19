@@ -511,13 +511,49 @@ mod tests {
         assert_eq!(keys, rows);
     }
 
+    #[test]
+    fn damaged_run_columns_are_errors() {
+        let rows: Vec<Key> = PINNED.iter().map(|&v| [v, v, v, v]).collect();
+        let column = |raw: &[u8]| {
+            let mut out = (raw.len() as u32).to_le_bytes().to_vec();
+            out.extend(codec::compress(raw).unwrap());
+            out
+        };
+        let decode = |bytes: &[u8]| {
+            let mut keys = vec![[0u64; 4]; rows.len()];
+            let (mut raw, mut col) = (Vec::new(), Vec::new());
+            decode_column(bytes, 0, &mut keys, &mut raw, &mut col).map(|()| keys)
+        };
+        let whole = decode(&column(&PINNED_VARINTS)).unwrap();
+        assert!(whole.iter().zip(&rows).all(|(k, r)| k[0] == r[0]));
+        let mut long = PINNED_VARINTS.to_vec();
+        long.push(0);
+        let mut open = PINNED_VARINTS.to_vec();
+        *open.last_mut().unwrap() |= 0x80;
+        let mut overlong = PINNED_VARINTS[..5].to_vec();
+        overlong.extend([0xff; 11]);
+        for (what, raw) in [
+            ("too few values", &PINNED_VARINTS[..7]),
+            ("a value left over", &long[..]),
+            ("an unterminated varint", &open[..]),
+            ("a varint past 64 bits", &overlong[..]),
+        ] {
+            let err = decode(&column(raw)).unwrap_err().to_string();
+            assert!(err.contains("run block column"), "{what}: {err}");
+        }
+        // a length prefix larger than the rows' varints can take
+        let mut big = column(&PINNED_VARINTS);
+        big[..4].copy_from_slice(&1000u32.to_le_bytes());
+        assert!(decode(&big).is_err());
+    }
+
     /// A measurement of the delta coding of run blocks and index columns, not a check.
     /// `DELTA_BENCH_CASE` picks `run-encode`, `run-decode`, `index-encode` or
     /// `index-decode`, and `DELTA_BENCH_REPS` (default 20) the counted passes over 2^20
     /// sorted keys. Each pass's time goes to stdout. Instruction counts come from
     /// `perf stat -e instructions:u` on runs with the default and with 0 passes, whose
     /// difference is the passes alone. Run with `cargo test --release -p sparkles-core
-    /// --lib delta_coder_bench -- --ignored --nocapture --exact`.
+    /// --lib builder::runs::tests::delta_coder_bench -- --ignored --nocapture --exact`.
     #[test]
     #[ignore]
     fn delta_coder_bench() {
