@@ -33,13 +33,14 @@ Each kind of claim needs a host that can resolve it.
 
 Use available local resources for builds and validation first, with Boat for overflow
 and isolation, as described under [remote executors](DEVELOPMENT.md#remote-executors).
-Keep benchmark workers free for measurements. The quick query screen runs on an admitted Boat
-worker, and the Namespace harness remains its fallback. Keep each A/B comparison on one host with matching tools and configuration,
-and retain the actual host identity with its results.
+Keep benchmark workers free for measurements. The quick query screen runs on an admitted
+Boat worker. Keep each A/B comparison on one host with matching tools and configuration,
+retain the actual host identity with its results, and never compare timings from
+different providers.
 
 | Host | Use | Why |
 |---|---|---|
-| Boat worker, `mise run bench:remote --executor boat:bx_ID A B`, or a Namespace instance, `mise run bench:nsc A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | Both are shared virtual machines, so they cannot confirm a change of a few percent. Boat workers showed no CPU steal and fewer false first-pass flags than Namespace instances on the same pair of revisions. |
+| Boat worker, `mise run bench:remote --executor boat:bx_ID A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | A Boat worker is a shared virtual machine, so it cannot confirm a change of a few percent. |
 | `atlas` or `forge`, Intel Core i5-13500 | Effects under about 5%, queries under 0.3 ms and changes sensitive to code generation | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
 | `forge` | Published reference numbers | The main comparison tables use this host and preserve each run's environment. |
 | `wally`, Intel Core i7-12800H with 32 GiB RAM | Separately qualified memory-heavy query recovery | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
@@ -66,7 +67,7 @@ comparison.
 Build timed binaries with `MBX_LEARNED_INCREMENTAL=false`. Boxington's learned incremental
 reuse once compiled one side of an A/B pair with a `.text` section about 2% smaller, and
 that binary ran up to 12% to 19% slower on the same source. `scripts/nsc-build.sh` sets it
-for every binary the Namespace screen builds.
+for every binary the query screen builds.
 
 Unrelated source changes can still move linked query code. Compare both variant
 orders, include a same-binary control, and count user instructions and cycles
@@ -985,8 +986,9 @@ A comparison against a baseline recorded on another day carries the host's run-t
 noise. A metric that a timing gate flags is therefore measured again in an interleaved
 A/B of the baseline build and the candidate on the same host, and it counts as a
 regression only if the A/B confirms it. For the matrix, `scripts/nsc-bench-remote.sh`
-runs that A/B with `EXECUTION` set to the flagged mode, and `scripts/nsc-bench.sh` with
-`--execution` does the same on Namespace for a first screen. A confirmed slowdown that a
+runs that A/B with `EXECUTION` set to the flagged mode, and
+`bench:remote --executor boat:bx_ID` with `--execution` does the same on a Boat worker
+for a first screen. A confirmed slowdown that a
 change accepts gets its own roadmap item, as for every gate. The W3C counts do not depend
 on the host, and the instruction counts are compared by their ranges over five
 processes, so their comparisons stand without an A/B.
@@ -1137,27 +1139,30 @@ ranges over processes. The screen takes about half a minute on forge after its b
 `bench:remote-writes` and `bench:jena-remote` expose the matching write and Jena commands.
 Their [admission and transport contract](REMOTE-EXECUTORS.md) keeps lifecycle ownership
 separate from workloads. Both arms and all flagged-query reruns stay on one isolated
-worker with matching binaries, compiler and runtime configuration. The query defaults,
-answer checks and 1.10 regression threshold match the Namespace command.
+worker with matching binaries, compiler and runtime configuration. Always name the
+worker with `--executor`. `bench:remote` and `bench:remote-writes` refuse to start
+without it, and `bench:jena-remote` still falls back to the retired Namespace executor
+of the shared screen script. Small smoke workloads establish transport and correctness only. Published
+numbers still come from the benchmark host.
 
-The batch query screen runs through `bench:remote` on a Boat worker. A full-denominator
-comparison against the Namespace screen on the same revisions found no CPU steal on the
-Boat worker and 2 false first-pass flags out of 30 queries against Namespace's 3, which
-qualifies it for the screen's 10% rule. The Namespace screen remains the fallback, and
-`bench:nsc-writes` remains the write screen until a Boat write screen is qualified under
-item 762. Small smoke workloads establish transport and correctness only. Published numbers still come from the benchmark host.
+The batch query screen runs through `bench:remote` on a Boat worker, and it is the only
+screen of record. A small or contested effect is checked on an Intel host. The Boat and
+Namespace screens of the same two batches disagreed by about 10% in their geometric means,
+and item 1133 settles the difference on an Intel host.
 
-### Namespace query screens
+<a id="namespace-query-screens"></a>
 
-`scripts/nsc-bench.sh A B` (`mise run bench:nsc A B`) compares the query times of two
-Sparkles builds on an ephemeral [Namespace](https://namespace.so) instance, so a
-relative A/B comparison does not have to wait for a quiet local machine. It needs the
-`nsc` CLI, logged in to the workspace. A and B are git revisions or paths to `sparkles`
-binaries. The script builds each revision before it creates the instance, from a
-`git archive` of the revision, either on this machine or on a build host, and caches the
-binary in `~/.cache/sparkles-nsc` (`SPARKLES_NSC_CACHE`). A local build uses whatever
-compilers the shell provides, so run it inside `nix develop`. The dataset comes
-from `scripts/gen-data.py` and is cached there as zstd. The queries are those of
+### Query screens
+
+`bench:remote` runs `scripts/bench-remote.sh`, which hands its arguments to
+`scripts/nsc-bench.sh`. The script keeps its old name, and it compares the query times of
+two Sparkles builds on a Boat worker, so a relative A/B comparison does not have to wait
+for a quiet local machine. A and B are git revisions or paths to `sparkles` binaries. The
+script builds each revision before the timed run, from a `git archive` of the revision,
+either on this machine or on a build host, and caches the binary in
+`~/.cache/sparkles-nsc` (`SPARKLES_NSC_CACHE`). A local build uses whatever compilers the
+shell provides, so run it inside `nix develop`. The dataset comes from
+`scripts/gen-data.py` and is cached there as zstd. The queries are those of
 `scripts/bench.sh` except `export-500k`.
 
 Revision builds use Boxington's shared immutable cache and a separate managed target
@@ -1218,22 +1223,19 @@ with B. `build.txt` and `manifest.txt` name the host that built each binary, and
 is reused wherever it was built.
 
 ```sh
-mise run bench:nsc main my-branch                                   # 1.05M triples, every query
-mise run bench:nsc ba547b89 c2fe4b92 --queries "optional-count minus regex-iri"
-scripts/nsc-bench.sh --people 1000000 --rounds 4 old/sparkles new/sparkles   # 10.5M triples
+worker=boat:bx_ID   # an admitted warm Boat worker
+mise run bench:remote --executor "$worker" --build-host "$worker" main my-branch      # 1.05M triples, every query
+mise run bench:remote --executor "$worker" --build-host "$worker" ba547b89 c2fe4b92 --queries "optional-count minus regex-iri"
+scripts/bench-remote.sh --executor "$worker" --build-host "$worker" --people 1000000 --rounds 4 main my-branch   # 10.5M triples
 ```
 
-The script creates one `linux/amd64:8x16` instance with a lifetime cap of two hours
-(`--duration`) and destroys it when it exits, also after an error or Ctrl-C. It uploads
-the compressed binaries, the data, the queries and `scripts/nsc-bench-remote.sh`, which
-runs detached on the instance and needs only bash, busybox, curl and zstd. The binaries
-are dynamically linked against the build host's glibc and run under the instance's
-glibc loader. Each binary loads its own store from the same data. The remote script
-then runs four rounds of A, B, B, A (`--rounds`). Each of these runs a fresh server
+The script runs `scripts/nsc-bench-remote.sh` on the worker in a capped workload unit,
+and that script needs only bash, busybox, curl and zstd. Each binary loads its own store
+from the same data. The remote script then runs four rounds of A, B, B, A (`--rounds`). Each of these runs a fresh server
 process pinned to CPU 2 with `RAYON_NUM_THREADS=1`, and the client and curl are pinned
-to CPU 4, a different physical core. A busy loop at the lowest scheduling priority runs
+to CPU 4. A busy loop at the lowest scheduling priority runs
 on both CPUs, so that their vCPUs do not halt between requests (`--no-spin` turns it
-off), which halves the variation of the timings. In each server process every query gets
+off), which reduces the variation of the timings. In each server process every query gets
 3 untimed and 20 timed requests (`--warmup`, `--reps`). A timed request records the
 server's execution time (`execMs` of `application/x-sparkles+json`) and curl's wall time.
 Before the first timed run, each binary's sorted TSV answer to every query is checksummed.
@@ -1242,11 +1244,11 @@ The results go to `.artifacts/nsc-bench/<time>` (`--out`). `summary.md` has, for
 query and for both measures, the medians of A and B, the ratio B/A, the ratio within
 each round and the spread of each binary between its server processes, followed by the
 geometric mean of the ratios. It also reports differing answers and both load times.
-`manifest.txt` records each binary's commit and SHA-256, the instance, the time of each
-phase and the billed vCPU-minutes. `results/samples.tsv` has every timed request.
+`manifest.txt` records each binary's commit and SHA-256, the worker and the time of each
+phase. `results/samples.tsv` has every timed request.
 
-A query whose execution-time ratio B/A is 1.10 or more is flagged (`--flag-ratio`). Before
-the instance is destroyed, it runs the flagged queries again in 8 rounds with 40 timed
+A query whose execution-time ratio B/A is 1.10 or more is flagged (`--flag-ratio`). On
+the same worker, the script then runs the flagged queries again in 8 rounds with 40 timed
 requests per query and server process (`--rerun-rounds`, `--rerun-reps`), after loading
 fresh stores. `summary.md` then ends with the rerun's tables and names the queries that
 stay flagged, and `rerun/` holds the rerun's own results and summary. `--no-rerun` reports
@@ -1263,25 +1265,20 @@ read, unless `--allow-mixed-compilers` is given. A revision it builds also gets 
 and the cargo flags. A cache entry that a build outside the shell left behind has to be
 removed before the revision is built again in the shell.
 
-A run of all 27 queries at 1.05M triples takes about five minutes from creation to
-destruction, of which the instance spends about 10 seconds receiving 224 MB of
-binaries and data. Namespace bills it as 40 to 48 vCPU-minutes, about 7 cents at the
-overage rate. Building the two revisions usually takes longer than the run.
+A Boat worker is a shared virtual machine. The screen is therefore suited to changes of
+about 10% or more and to checking that a change leaves the other queries alone. It cannot
+confirm a change of a few percent, and [Choosing a host](#choosing-a-host) says where to
+measure those. Queries under 0.1 ms vary widely between server processes and say little
+on their own.
 
-The instances are AMD EPYC (Zen 4) virtual machines with 4 cores and 8 threads, and
-they are noisier than a dedicated host. Within one server process, the interquartile
-range of a query's execution time is about 10 to 15% of its median. Medians of the
-same binary in different server processes differ by 10 to 30%. In a control run that
-compared one binary with itself, each ratio for a query of 0.3 ms or more was within
-6% of 1, and the geometric mean was 0.986. Queries under 0.1 ms vary by 20% or more
-and say nothing. The script is therefore suited to changes of about 10% or more and
-to checking that a change leaves the other queries alone. It cannot confirm a change
-of a few percent, and [Choosing a host](#choosing-a-host) says where to measure those.
+<a id="namespace-write-screens"></a>
 
-### Namespace write screens
+### Write screens
 
-`scripts/nsc-writes.sh` stages write workloads before creating a capped Namespace
-instance. Its revision builds use `SPARKLES_NSC_CACHE/writes-v2`, separately from the
+`bench:remote-writes` runs `scripts/writes-remote.sh`, which hands its arguments to
+`scripts/nsc-writes.sh`. No write screen on Boat or a local host has been qualified to
+replace the retired Namespace one, and item 1134 tracks it. The script stages write workloads before it starts its timed
+runs. Its revision builds use `SPARKLES_NSC_CACHE/writes-v2`, separately from the
 query harness. Each source commit and exact `--cargo-args` string has its own build key,
 target directory and cross-process lock. The lock covers publication, verification and
 compressed staging. Each staged revision binary has a `bin-<id>.build.json` recording its
@@ -1299,7 +1296,7 @@ supplied path and staged hash. The launcher gives each default run a unique resu
 directory. `--out` requires a new destination and refuses any existing file, directory or
 symlink before opening evidence files. `--index text`, `geo` or `embed` builds a
 full-text, spatial or embedding index on each store after loading it, and with `embed` the
-servers run with `--no-embedding`, so nothing leaves the instance. Each run's
+servers run with `--no-embedding`, so nothing leaves the worker. Each run's
 `metrics-<run>.txt` also records the server's peak resident memory.
 
 `--views async:N` defines N table views on each store after loading it, with
@@ -1310,10 +1307,10 @@ F13 compare `--views none` with `async:N` to measure what views add to a commit.
 `commit:Q` and `graph:N` are reserved for commit-time and graph views and are refused
 until the server has them.
 
-The instances synchronize in about 0.2 ms, which hides the cost of a slow device.
-`delay-us=4000` adds 4 ms to every synchronization and write-through write, which
-brings the ordinary writer down to the 230 transactions/s it reached on forge. Reader tails do not settle on
-these instances, so measure them on forge.
+`delay-us=4000` adds 4 ms to every synchronization and write-through write, so that a
+machine whose synchronization takes a fraction of a millisecond shows the cost of a slow
+device. Item 1134 calibrates the delay on the write screen's host. Measure reader tails on
+forge.
 
 `scripts/write-bench.rs` is the client of `scripts/nsc-writes.sh`. It sends each update
 as one request on a kept-alive connection and requires distinct, contiguous receipts.
@@ -1322,7 +1319,7 @@ had closed the idle connection before it was sent. A request whose answer cannot
 is an error that fails the run, because the server may have committed it. With
 `--write-rate N`, the writers of the `writers` and `mixed` scenarios send N requests per
 second in total, each client on its own schedule, so two variants can be compared at the
-same commit rate. `nsc-writes.sh --write-rate N` passes the rate to those scenarios, and
+same commit rate. `--write-rate N` passes the rate to those scenarios, and
 variant names must be shell identifiers.
 
 ### Other scripts

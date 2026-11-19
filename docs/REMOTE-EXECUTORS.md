@@ -16,11 +16,11 @@ account-wide total.
 ## Qualification boundary
 
 The Boat transport and workload adapters are separate from provider qualification.
-Namespace remains the mandatory query-screen fallback until Boat has real lifecycle,
-build, transport, correctness and full-screen acceptance evidence. Local contract tests
-exercise quoting, exact source identities, result bounds and cleanup. They do not
-establish provider behavior or performance equivalence. Roadmap item 762 tracks the
-remaining qualification.
+The batch query screen runs on Boat and is the only screen of record. Namespace is not
+used. Local contract tests exercise quoting, exact source identities, result bounds and
+cleanup. They do not establish provider behavior or performance equivalence. Roadmap
+item 762 tracks the remaining qualification of the other commands, and item 1134 tracks
+a write screen.
 
 A lifecycle owner must establish startup quiescence, actual tool and source identities,
 cache authentication, available memory and disk, worker exclusivity and a finite
@@ -198,8 +198,8 @@ so a late activation still ends in time. `gate.sh` computes the runtime before i
 start, so a slow dispatch can still carry a gate past the lead, and roadmap item 803 keeps
 the absolute expiry open. Partitions request
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
-original qualification deadline. The legacy `--duration` screen option controls
-Namespace instance lifetime.
+original qualification deadline. The `--duration` screen option applies only to the
+retired Namespace executor and has no effect on a Boat worker.
 
 A worker kept warm past its jobs runs `boat:closure-watch`, which checks the jobs'
 closure shortly before the guard's present end and finishes the operation, so the
@@ -246,9 +246,10 @@ from 8G to 13G and `SPARKLES_BOAT_BUILD_JOBS` a count from 2 to 8, and a value o
 range is refused before the worker is admitted. A cold build of both revisions takes most of an hour, so the worker's
 admitted lifetime must cover both builds, the screen and its reruns.
 
-A Boat screen and a Namespace screen of the same revisions therefore run different
-binaries, and the Boat screen is judged by its ratios and noise against Namespace rather
-than by identical binaries.
+Binaries that a Boat screen builds therefore differ from those built for another host,
+and timings from different providers or hosts are never compared. The Boat and Namespace
+screens of the same two batches disagreed by about 10% in their geometric means, and item
+1133 settles the difference on an Intel host.
 
 The operator establishes actual native/cgroup/lease closure before supplying the fresh
 job-closure receipt. `boat:finish` validates that evidence and observes the guard's
@@ -368,7 +369,9 @@ worker directories and local receipt paths. Cleanup never stops another job or t
 warm sandbox. The lifecycle owner decides retention and verified stop after evidence
 and leases are closed.
 
-Existing `bench:nsc`, `bench:nsc-writes`, `bench:jena-nsc`, `nsc:MACHINE` test shares and
-SSH build hosts remain explicit compatibility paths. A failed Boat operation never
-silently retries on Namespace or a local host. Historical benchmark records retain
-their actual provider and host attribution.
+The `bench:nsc`, `bench:nsc-writes` and `bench:jena-nsc` tasks, the `nsc` executor and the
+`nsc` and `nsc:MACHINE` test shares are retired and unsupported, and item 1135 removes
+them. The `nsc-*` scripts that `bench:remote`, `bench:remote-writes` and the build hosts
+run keep their names and stay in use, and SSH build hosts remain a local build path. A
+failed Boat operation never silently retries on another provider or a local host.
+Historical benchmark records retain their actual provider and host attribution.

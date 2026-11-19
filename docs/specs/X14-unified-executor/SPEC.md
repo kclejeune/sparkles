@@ -183,7 +183,7 @@ The maintainer settled these questions for stage 4.
   views share, `mise run bench:reasoning-latency` guards changes to value decoding and
   the query path that query-time reasoning runs through, and `mise run bench:insn` guards
   changes to vocabulary readers and WAL replay.
-* The guards are `scripts/bench.sh` and `mise run bench:nsc` for queries, with forge runs
+* The guards are `scripts/bench.sh` and the Boat query screen (`mise run bench:remote --executor boat:bx_ID`) for queries, with forge runs
   of BSBM Explore and BI, SP²Bench `q4`, `q6` and `q12b`, WatDiv, LUBM and DBpedia at 50M,
   the memory benchmarks in `docs/benchmarks/memory`, `query_cursor.rs`,
   `plan_fidelity_tests.rs` and the W3C suites. Bindings use `bench:bindings`.
