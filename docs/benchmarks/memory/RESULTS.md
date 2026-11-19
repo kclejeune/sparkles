@@ -239,7 +239,7 @@ returned the same answers.
 *Measured on 8-vCPU AMD EPYC Namespace instances on 2026-11-01.*
 
 The cursor's conditional OPTIONAL hashed when these were measured. It now merges, and
-the last table of this section measures it.
+the table of conditional OPTIONALs below measures it.
 
 Both executors also answer an EXISTS inside a larger expression, such as IF, OR, an
 aggregate argument or an ORDER BY key, from the key set of its pattern, and automatic
