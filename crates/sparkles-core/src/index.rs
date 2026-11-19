@@ -4494,6 +4494,19 @@ mod tests {
     }
 
     #[test]
+    fn column_frame_bytes_are_pinned() {
+        // the column and its varints that the run blocks of the builder pin as well
+        const PINNED: [u64; 6] = [5, 3, 3, 200, 0, u64::MAX];
+        const PINNED_VARINTS: [u8; 8] = [0x0a, 0x03, 0x00, 0x8a, 0x03, 0x8f, 0x03, 0x01];
+        let mut scratch = Vec::new();
+        let frame = encode_column(&PINNED, &mut scratch);
+        assert_eq!(&frame[..4], &(PINNED_VARINTS.len() as u32).to_le_bytes());
+        let raw = lz4_flex::block::decompress(&frame[4..], PINNED_VARINTS.len()).unwrap();
+        assert_eq!(raw, PINNED_VARINTS);
+        assert_eq!(&decode_column(&frame, PINNED.len()).unwrap()[..], &PINNED);
+    }
+
+    #[test]
     fn damaged_blocks_are_errors_not_panics() {
         let col: Vec<u64> = (0..1000u64).map(|i| i * 7).collect();
         let mut scratch = Vec::new();
