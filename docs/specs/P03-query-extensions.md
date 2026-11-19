@@ -394,6 +394,30 @@ function marked pure runs natively with the same answer as its ARQ fallback; `fn
 with a variable IRI that names a registered function calls it and the query is not
 cached.
 
+### Calls added by query rewrites
+
+Roadmap item 1198. A query decided whether it calls registered extensions from its
+pattern as written, before RDFS on read rewrote it. A schema that declared a registered
+property function a subproperty of a queried predicate made the rewrite add the call to
+a query that had no callback state. `CallbackGuard::enter` panicked, the property
+stream's destructor entered the guard again while unwinding, and the process aborted. A
+plain join on the parent predicate was refused with a planning error instead, and the
+seed queries of query-time reasoning planned a written call without the callback state
+in the same way.
+
+The RDFS rewrite now treats a registered property as a call without stored triples. It
+leaves a triple pattern that names one as written and adds none as a subproperty
+branch, a domain or range branch, or a superproperty pair, and it keeps a path link of
+one as a stored read. A reasoning seed set that would read through a call falls back to
+the pattern's demand with constants. The configuration is still decided on the pattern
+as written, which the rewrite no longer extends, so the order of the two steps did not
+change. An error replaces the panic in `CallbackGuard::enter`, the planner refuses a
+call that its context was not configured for, and the destructors of property streams
+and aggregate accumulators drop their value without a guard when none can be entered.
+`tests/rdfs_extension_calls.rs` covers eager and streamed shapes, an update's `WHERE`
+clause and the reasoning seeds, and `callback_guard_tests.rs` covers the guard and the
+planner on an unconfigured context.
+
 ### Callback context during thread destruction
 
 Callback and writer bookkeeping remains available through thread destruction. The
