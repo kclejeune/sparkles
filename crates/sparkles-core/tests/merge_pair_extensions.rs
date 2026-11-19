@@ -3,8 +3,11 @@
 //! Deciding tests other pairs together, and in another order beside held rows, which a
 //! callback could observe. A query that references a registration anywhere therefore
 //! gives the same batches with the switch on and off, wherever the reference stands: a
-//! scalar under a name in the XSD namespace, a property function in a triple pattern, an
-//! aggregate that a HAVING tests, and each of them in the pattern of a nested EXISTS.
+//! scalar under a name in the XSD namespace and an aggregate that a HAVING tests, in the
+//! condition's EXISTS or in an EXISTS nested in it, and a property function in another
+//! branch of the query. An EXISTS whose pattern holds a property function has no cursor
+//! implementation, so its OPTIONAL is evaluated eagerly under the cursor and never
+//! reaches the switch, which the test states for those two cases.
 use oxrdf::{Literal, Term};
 use oxrdfio::RdfFormat;
 use sparkles_core::io::Source;
@@ -137,12 +140,16 @@ fn store(subjects: usize) -> Store {
     s
 }
 
-/// The rows of each batch of `exists` as the condition of a streamed merge OPTIONAL,
-/// and the bag of the rows.
-fn batches(s: &Store, exists: &str, pairs: bool) -> (Vec<usize>, Vec<String>) {
-    let q = format!(
-        "SELECT ?s ?v ?o {{ ?s <urn:p> ?v OPTIONAL {{ ?s <urn:q> ?o FILTER EXISTS {{ {exists} }} }} }}"
-    );
+/// The OPTIONAL of the test, with `exists` as its condition.
+fn optional(exists: &str) -> String {
+    format!("?s <urn:p> ?v OPTIONAL {{ ?s <urn:q> ?o FILTER EXISTS {{ {exists} }} }}")
+}
+
+/// The rows of each batch of the query over `pattern`, which holds a merge OPTIONAL
+/// with a condition, the bag of the rows, and whether the cursor streamed the merge
+/// instead of evaluating the OPTIONAL eagerly.
+fn batches(s: &Store, pattern: &str, pairs: bool) -> (Vec<usize>, Vec<String>, bool) {
+    let q = format!("SELECT ?s ?v ?o {{ {pattern} }}");
     let opts = QueryOptions {
         extensions: Some(registry()),
         no_cache: true,
@@ -178,8 +185,11 @@ fn batches(s: &Store, exists: &str, pairs: bool) -> (Vec<usize>, Vec<String>) {
             || plan.contains(r#""operator":"MergeJoin","description":"on ?s""#),
         "{q}: {plan}"
     );
+    let node = &plan[plan.find(r#""operator":"OptionalJoin""#).expect(&plan)..];
+    let streamed = node[node.find(r#""materializes":"#).expect(&plan)..]
+        .starts_with(r#""materializes":false"#);
     bag.sort();
-    (sizes, bag)
+    (sizes, bag, streamed)
 }
 
 #[test]
@@ -187,53 +197,87 @@ fn a_query_that_references_a_registration_gives_the_same_batches_with_the_switch
     let s = store(6000);
     // The registry is set and the query references nothing in it, so the merge decides:
     // it fills its batches, where the test after the batch leaves them short.
-    let (off, on) = (
-        batches(&s, "?o <urn:r> ?k", false),
-        batches(&s, "?o <urn:r> ?k", true),
-    );
-    assert_eq!(off.1, on.1);
-    assert!(
-        on.0.len() < off.0.len(),
-        "{} and {}",
-        on.0.len(),
-        off.0.len()
-    );
+    let plain = optional("?o <urn:r> ?k");
+    // The same OPTIONAL beside a UNION branch. Its predicate is a property function in
+    // one query and a predicate that no triple has in the other.
+    let beside = |predicate: &str| format!("{{ {plain} }} UNION {{ <urn:s:1> <{predicate}> ?o }}");
+    for control in [plain.clone(), beside("urn:test:unregistered")] {
+        let (off, on) = (batches(&s, &control, false), batches(&s, &control, true));
+        assert_eq!(off.1, on.1, "{control}");
+        assert!(off.2 && on.2, "{control}");
+        assert!(
+            on.0.len() < off.0.len(),
+            "{control}: {} and {}",
+            on.0.len(),
+            off.0.len()
+        );
+    }
+    // The name, the callback, the pattern and whether the cursor streams the merge.
     let cases = [
-        ("scalar", 0, format!("?o <urn:r> ?k FILTER(<{SCALAR}>(?k))")),
         (
-            "property function",
-            1,
-            format!("?o <urn:r> ?k . ?o <{PROPERTY}> ?x"),
+            "scalar",
+            0,
+            optional(&format!("?o <urn:r> ?k FILTER(<{SCALAR}>(?k))")),
+            true,
         ),
         (
             "aggregate in HAVING",
             2,
-            format!("SELECT ?o {{ ?o <urn:r> ?k }} GROUP BY ?o HAVING(AGG <{AGGREGATE}>(?k) > 0)"),
+            optional(&format!(
+                "SELECT ?o {{ ?o <urn:r> ?k }} GROUP BY ?o HAVING(AGG <{AGGREGATE}>(?k) > 0)"
+            )),
+            true,
         ),
         (
             "nested scalar",
             0,
-            format!("?o <urn:r> ?k FILTER EXISTS {{ ?o <urn:r> ?x FILTER(<{SCALAR}>(?x)) }}"),
-        ),
-        (
-            "nested property function",
-            1,
-            format!("?o <urn:r> ?k FILTER EXISTS {{ ?o <{PROPERTY}> ?x }}"),
+            optional(&format!(
+                "?o <urn:r> ?k FILTER EXISTS {{ ?o <urn:r> ?x FILTER(<{SCALAR}>(?x)) }}"
+            )),
+            true,
         ),
         (
             "nested aggregate",
             2,
-            format!(
+            optional(&format!(
                 "?o <urn:r> ?k FILTER EXISTS {{ SELECT ?o {{ ?o <urn:r> ?j }} GROUP BY ?o \
                  HAVING(AGG <{AGGREGATE}>(?j) > 0) }}"
-            ),
+            )),
+            true,
+        ),
+        (
+            "property function in a UNION branch",
+            1,
+            beside(PROPERTY),
+            true,
+        ),
+        // The cursor evaluates these two OPTIONALs eagerly, so the switch is not reached.
+        (
+            "property function",
+            1,
+            optional(&format!("?o <urn:r> ?k . ?o <{PROPERTY}> ?x")),
+            false,
+        ),
+        (
+            "nested property function",
+            1,
+            optional(&format!(
+                "?o <urn:r> ?k FILTER EXISTS {{ ?o <{PROPERTY}> ?x }}"
+            )),
+            false,
         ),
     ];
     let mut differing = Vec::new();
-    for (name, callback, exists) in cases {
-        let before = CALLS[callback].load(Ordering::Relaxed);
-        let (off, on) = (batches(&s, &exists, false), batches(&s, &exists, true));
+    for (name, callback, pattern, streams) in cases {
+        // Each setting calls the registration, and does not only name it.
+        let calls = || CALLS[callback].load(Ordering::Relaxed);
+        let before = calls();
+        let off = batches(&s, &pattern, false);
+        let between = calls();
+        let on = batches(&s, &pattern, true);
+        assert!(before < between && between < calls(), "{name}");
         assert_eq!(off.1, on.1, "{name}");
+        assert_eq!((off.2, on.2), (streams, streams), "{name}");
         if off.0 != on.0 {
             differing.push(format!(
                 "{name}: {} and {} batches",
@@ -244,8 +288,6 @@ fn a_query_that_references_a_registration_gives_the_same_batches_with_the_switch
         // The condition holds for some pairs and fails for others.
         let bound = off.1.iter().filter(|row| !row.ends_with("None]")).count();
         assert!(bound > 0 && bound < off.1.len(), "{name}: {bound}");
-        // The registration was called, and not only named.
-        assert!(CALLS[callback].load(Ordering::Relaxed) > before, "{name}");
     }
     assert!(differing.is_empty(), "{differing:#?}");
 }
