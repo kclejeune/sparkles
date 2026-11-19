@@ -309,9 +309,12 @@ the unit is delegated and the check runs in a child cgroup, so a stopped check's
 those that ignore the stop or left its process group included, are killed and gone before
 the job copies its results and removes its worktree. The job sets aside a MiB before the
 check and gives it back before it writes its outcome and exit records, so they fit on a
-disk the check filled. Each start has its own id, which the job records first, so the
-waiting `remote-ci.sh` takes only that start's results and says so when another start of
-the same name replaced them. Either refusal writes `disk-below-floor` to the job's `outcome` file,
+disk the check filled. A stopped check whose processes cannot be shown gone ends with exit
+6 and leaves its worktree for a later cleanup. Each start has its own id, which the job
+records first, so the waiting `remote-ci.sh` takes only that start's results and says so
+when another start of the same name replaced them on the host. Its local copy goes to
+`.artifacts/remote-ci/NAME.ID`, which no later fetch replaces, and `NAME` links to the
+newest. Either refusal writes `disk-below-floor` to the job's `outcome` file,
 and `remote-ci.sh` then says that the host's disk was below its floor. The check's `TMPDIR`
 on an ssh host is `.artifacts/tmp` in its worktree, so its temporary files leave with the
 worktree and do not fill the host's `/tmp`. A Boat worker keeps its disk timer's hard limit

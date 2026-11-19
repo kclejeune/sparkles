@@ -401,7 +401,10 @@ class RemoteCI(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         res = self.src / '.artifacts/remote-ci' / self.name()
         self.assertRegex((res / 'run-id').read_text().strip(), r'^[0-9]+-[0-9]+$')
-        self.assertFalse((res / '.reserve').exists())
+        self.assertEqual(sorted(p.name for p in res.glob('.reserve*')), [])
+        # The name is a link to the start's own copy, which no later fetch replaces.
+        self.assertTrue(res.is_symlink())
+        self.assertEqual(res.resolve().name, '%s.%s' % (self.name(), (res / 'run-id').read_text().strip()))
 
     def test_the_disk_settings_must_be_positive_numbers(self):
         for n in ['REMOTE_CI_MIN_FREE_GIB', 'REMOTE_CI_RUN_FLOOR_GIB', 'REMOTE_CI_WATCH_SECONDS']:

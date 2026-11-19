@@ -34,18 +34,26 @@ wt=$G/wt-$NAME
 log() { echo "$(date -u +%FT%TZ) $*" >> "$out/progress.log"; }
 # The watchdog stays up through the cleanup, which is bounded too, and finish() ends it last.
 finish() {
-  # The reserve goes first, so the records below fit on a disk the run filled.
-  rm -f "$out/.reserve"
-  echo "$1" > "$out/ci.exit"
+  local code=$1 keep=0
+  # A run still alive, as after a stop of the unit, is ended first. When its processes
+  # cannot be shown gone, the worktree stays for a later cleanup and the job exits 6.
+  if [ -n "${cpid:-}" ] && ! settle_run; then
+    log "the run's processes could not be shown ended; the worktree stays for a later cleanup" 2> /dev/null || true
+    keep=1
+    [ "$code" != 0 ] || code=6
+  fi
+  # The exit's reserve goes first, so the records below fit on a disk the run filled.
+  rm -f "$out/.reserve-exit"
+  echo "$code" > "$out/ci.exit"
   date +%s > "$out/done_at"
-  log "end exit=$1"
-  if cd "$G"; then
+  log "end exit=$code"
+  if [ "$keep" = 0 ] && cd "$G"; then
     timeout --kill-after=10s 120 rm -rf "$wt"
     timeout --kill-after=10s 60 git -C "$G/repo.git" worktree prune
   fi
   [ -z "${dw:-}" ] || kill "$dw" 2> /dev/null
   [ -z "${wd:-}" ] || kill "$wd" 2> /dev/null
-  exit "$1"
+  exit "$code"
 }
 until_end() { echo $((END - $(date +%s) - $1)); }
 # free_kib prints the KiB free on the filesystem of the home, or nothing when df fails.
@@ -178,16 +186,15 @@ is_below() {
   free_now=$(free_kib)
   [ "${free_now:-0}" -lt "$floor_kib" ]
 }
-# mark_below NOTE: free the reserve and record the outcome. A write that fails on a full
-# disk changes nothing else, and the job's own final check records it again.
-mark_below() {
-  rm -f "$out/.reserve"
-  echo disk-below-floor 2> /dev/null > "$out/outcome" || true
+# note_below NOTE: say that the disk is under the floor. A write that a full disk refuses
+# changes nothing, since the watch reports a breach by its exit status.
+note_below() {
   log "host disk below floor: $((${free_now:-0} / 1024)) MiB free $1, under the ${RUN_FLOOR_GIB:-4} GiB floor" 2> /dev/null || true
 }
-# A MiB set aside before the run, which finish() and mark_below give back so that the
-# outcome and exit records fit on a disk the run filled.
-head -c 1048576 /dev/zero > "$out/.reserve" 2> /dev/null || rm -f "$out/.reserve"
+# Two reserves of a MiB each are set aside before the run. The job gives back the first just
+# before it writes the outcome and finish() the second just before the exit record, so both
+# fit on a disk the run filled and the copy of the run's logs between them uses neither.
+for r in outcome exit; do head -c 1048576 /dev/zero > "$out/.reserve-$r" 2> /dev/null || rm -f "$out/.reserve-$r"; done
 # On an ssh host the unit is delegated, and the run goes into the child cgroup run, so that
 # a stop ends every process the run started, those in other process groups or sessions and
 # those reparented away included. A unit without a writable cgroup of its own, as in a
@@ -198,6 +205,16 @@ case $cg in */gate-"$NAME".service)
   if [ "$watch" = 1 ] && mkdir -p "$cg/run" 2> /dev/null && [ -w "$cg/run/cgroup.procs" ] && [ -e "$cg/run/cgroup.kill" ]; then runcg=$cg/run; fi
   ;;
 esac
+# settle_run: succeed when no process of the run is left, ending any that are.
+settle_run() {
+  if [ -n "$runcg" ]; then
+    grep -qx 'populated 0' "$runcg/cgroup.events" 2> /dev/null && return 0
+  else
+    kill -0 -- "-$cpid" 2> /dev/null || return 0
+  fi
+  stop_run || return 1
+  log "ended the processes the run left in its ${runcg:+cgroup}${runcg:-process group}" 2> /dev/null || true
+}
 # stop_run: end every process of the run and wait, up to 30 s, until none is left.
 stop_run() {
   local _
@@ -239,13 +256,13 @@ if [ "$watch" = 1 ]; then
     ds=
     while kill -0 "$cpid" 2> /dev/null; do
       if is_below; then
-        # The stop comes before any write, which a full disk can refuse, and the job's own
-        # stop of this watch, once the run ends, waits for the record.
+        # The stop comes before any write, which a full disk can refuse, and the watch
+        # reports the breach by its exit status 7, which the job reads when the run ends.
         trap '' TERM
         kill -TERM "$cpid" 2> /dev/null
-        mark_below "during the run"
+        note_below "during the run"
         log "stopped the run" 2> /dev/null || true
-        exit 0
+        exit 7
       fi
       sleep "${WATCH_SECONDS:-30}" &
       ds=$!
@@ -256,23 +273,29 @@ if [ "$watch" = 1 ]; then
 fi
 wait "$cpid"
 c=$?
-[ -z "${dw:-}" ] || kill "$dw" 2> /dev/null
-[ -z "${dw:-}" ] || wait "$dw" 2> /dev/null
-dw=
-rm -f "$out/.reserve"
-# timeout exits once its own child has, so a process that ignored the stop, or that left
-# the group, can still run. It is ended before the results are copied and the worktree goes.
-if [ -n "$runcg" ] && ! grep -qx 'populated 0' "$runcg/cgroup.events" 2> /dev/null; then
-  stop_run
-  log "ended the processes the run left in its cgroup"
-elif [ -z "$runcg" ] && kill -0 -- "-$cpid" 2> /dev/null; then
-  stop_run
-  log "ended the processes the run left in its process group"
+breach=0
+if [ -n "${dw:-}" ]; then
+  kill "$dw" 2> /dev/null
+  wait "$dw"
+  [ $? != 7 ] || breach=1
 fi
+dw=
+# timeout exits once its own child has, so a process that ignored the stop, or that left
+# the group, can still run. It is ended before the results are copied and the worktree goes,
+# and when it cannot be, finish() keeps the worktree and exits 6.
+settle_run || finish 6
 [ -z "$runcg" ] || rmdir "$runcg" 2> /dev/null || true
-# A disk that fell under the floor between the last sample and the run's end still marks it,
-# as does a stop whose outcome the full disk refused.
-if [ "$watch" = 1 ] && [ ! -f "$out/outcome" ] && [ "$c" != 0 ] && is_below; then mark_below "when the run ended"; fi
-[ ! -f "$out/outcome" ] || c=5
+# A disk that fell under the floor between the last sample and the run's end still marks a
+# failed run.
+if [ "$watch" = 1 ] && [ "$breach" = 0 ] && [ "$c" != 0 ] && is_below; then
+  note_below "when the run ended"
+  breach=1
+fi
+if [ "$breach" = 1 ]; then
+  rm -f "$out/.reserve-outcome"
+  echo disk-below-floor > "$out/outcome" || log "could not write the outcome record"
+  c=5
+fi
+rm -f "$out/.reserve-outcome"
 for d in ci premerge; do [ ! -d ".artifacts/$d" ] || cp -r ".artifacts/$d" "$out/$d"; done
 finish "$c"

@@ -44,7 +44,9 @@
 # by default, since the server's tests keep 1 GiB free.
 # Either refusal writes disk-below-floor to the job's outcome file, and this script then
 # says that the host's disk was below its floor.
-# Results land in .artifacts/remote-ci/NAME, with ci.exit, ci.log and the ci or premerge logs.
+# Results land in .artifacts/remote-ci/NAME.ID, ID being the start's id, with ci.exit, ci.log
+# and the ci or premerge logs, and .artifacts/remote-ci/NAME links to the newest. A job whose
+# run's processes cannot be shown ended exits 6 and leaves its worktree on the host.
 # A Boat worker needs SPARKLES_BOAT_PROFILE and SPARKLES_BOAT_ADMISSION, as every Boat
 # command does. The host needs ~/gate from scripts/gate/setup-host.sh.
 set -euo pipefail
@@ -123,12 +125,21 @@ status() {
   # shellcheck disable=SC2016
   rx_exec "$host" "o=\$HOME/gate/out/$1; cat \"\$o/progress.log\" 2> /dev/null; [ ! -f \"\$o/run-id\" ] || echo \"run-id=\$(cat \"\$o/run-id\")\"; [ ! -f \"\$o/ci.exit\" ] || echo \"ci.exit=\$(cat \"\$o/ci.exit\")\"; systemctl --user is-active gate-$1 || true"
 }
-# fetch NAME [RUN_ID]: copy the job's results into a staging directory and, once the copy is
-# whole and, with RUN_ID, is that start's own, put it in place of the earlier copy.
+# fetch NAME [RUN_ID]: copy the job's results into a staging directory, check the copy and,
+# with RUN_ID, that it is that start's own, and publish it, setting res to its path. With
+# RUN_ID the copy goes to NAME.RUN_ID, which nothing replaces, and NAME becomes a link to it.
+# Without one it replaces NAME. Every step checks its own result, since a caller may run fetch
+# where errexit is off, and a failure keeps the earlier copy.
 fetch() {
-  local dest=$root/.artifacts/remote-ci/$1 stage
-  mkdir -p "$root/.artifacts/remote-ci"
-  stage=$(mktemp -d "$root/.artifacts/remote-ci/.fetch-$1.XXXXXX")
+  local base=$root/.artifacts/remote-ci stage link
+  res=
+  mkdir -p "$base" || return 1
+  stage=$(mktemp -d "$base/.fetch-$1.XXXXXX") || return 1
+  case $stage in "$base"/.fetch-*) ;; *)
+    echo "remote-ci.sh: bad staging directory" >&2
+    return 1
+    ;;
+  esac
   if ! rx_sync -- -a "$host:gate/out/$1/" "$stage/"; then
     rm -rf "$stage"
     echo "remote-ci.sh: could not copy the results of gate-$1" >&2
@@ -139,9 +150,26 @@ fetch() {
     echo "remote-ci.sh: another start of gate-$1 replaced this one's results on $host" >&2
     return 1
   fi
-  rm -rf "$dest"
-  mv "$stage" "$dest"
-  echo "results in $dest"
+  if [ -n "${2:-}" ]; then
+    res=$base/$1.$2
+    if ! mv -T "$stage" "$res"; then
+      rm -rf "$stage"
+      res=
+      return 1
+    fi
+    link=$(mktemp -u "$base/.link-$1.XXXXXX")
+    if ! { ln -s "$1.$2" "$link" && { [ ! -d "$base/$1" ] || [ -L "$base/$1" ] || rm -rf "${base:?}/$1"; } && mv -Tf "$link" "$base/$1"; }; then
+      rm -f "$link"
+      echo "remote-ci.sh: results in $res, but $base/$1 could not point to them" >&2
+    fi
+  else
+    if ! { rm -rf "${base:?}/$1" && mv -T "$stage" "$base/$1"; }; then
+      rm -rf "$stage"
+      return 1
+    fi
+    res=$base/$1
+  fi
+  echo "results in $res"
 }
 case $name in '' | *[!A-Za-z0-9._-]*) [ "$action" = start ] || {
   echo "remote-ci.sh: bad job name" >&2
@@ -287,21 +315,21 @@ while :; do
   sleep "${REMOTE_CI_POLL_SECONDS:-30}"
 done
 fetch "$name" "$run_id" || exit 1
-code=$(cat "$root/.artifacts/remote-ci/$name/ci.exit")
+code=$(cat "$res/ci.exit")
 echo "gate-$name exit $code in $(($(date +%s) - start)) s"
-if [ "$(cat "$root/.artifacts/remote-ci/$name/outcome" 2> /dev/null)" = disk-below-floor ]; then
+if [ "$(cat "$res/outcome" 2> /dev/null)" = disk-below-floor ]; then
   echo "remote-ci.sh: host disk below floor on $host, so the job did not finish; its result says nothing about $full" >&2
-  grep 'host disk below floor' "$root/.artifacts/remote-ci/$name/progress.log" >&2 || true
+  grep 'host disk below floor' "$res/progress.log" >&2 || true
 fi
 if [ "$mode" = cmd ]; then
   # The whole log, unless REMOTE_CI_LOG_LINES asks for its last lines.
   if [ -n "${REMOTE_CI_LOG_LINES:-}" ]; then
-    tail -n "$REMOTE_CI_LOG_LINES" "$root/.artifacts/remote-ci/$name/ci.log" 2> /dev/null || true
+    tail -n "$REMOTE_CI_LOG_LINES" "$res/ci.log" 2> /dev/null || true
   else
-    cat "$root/.artifacts/remote-ci/$name/ci.log" 2> /dev/null || true
+    cat "$res/ci.log" 2> /dev/null || true
   fi
 else
-  [ ! -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 30 "$root/.artifacts/remote-ci/$name/ci.log"
+  [ ! -f "$res/ci.log" ] || tail -n 30 "$res/ci.log"
 fi
-[ -f "$root/.artifacts/remote-ci/$name/ci.log" ] || tail -n 5 "$root/.artifacts/remote-ci/$name/progress.log"
+[ -f "$res/ci.log" ] || tail -n 5 "$res/progress.log"
 exit "$code"
