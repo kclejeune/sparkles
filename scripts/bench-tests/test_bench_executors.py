@@ -7,6 +7,7 @@ with a stub server in place of sparkles, and of `bench-gate.py compare --best-of
 import json
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,13 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent.parent
 STUB = Path(__file__).resolve().parent / "fixtures" / "stub-sparkles.py"
+
+
+def free_port():
+    """A port no other test or run holds, so that suites can run side by side."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 GATE = SCRIPTS / "bench-gate.py"
 NEEDS = ("taskset", "zstd", "curl")
 
@@ -58,7 +66,7 @@ class ExecutorsTests(unittest.TestCase):
             out = Path(d) / "out"
             r = executors(d, "--out", out, "--rounds", "2", "--commit", "t1", "--build-config", "{}",
                           "--base", base, "--base-commit", "b1", "--base-build-config", "{}", tip,
-                          port=4291)
+                          port=free_port())
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             cell = out / "people-10-threads-2"
             # the binaries alternate, and the second round starts with the tip
@@ -100,7 +108,7 @@ class ExecutorsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             tip = stub(d, "tip")
             out = Path(d) / "out"
-            r = executors(d, "--out", out, "--rounds", "2", "--build-config", "{}", tip, port=4293)
+            r = executors(d, "--out", out, "--rounds", "2", "--build-config", "{}", tip, port=free_port())
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             cell = out / "people-10-threads-2"
             self.assertEqual(epochs(cell), list("ABBA") * 2)
@@ -121,7 +129,7 @@ class ExecutorsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             tip = stub(d, "tip")
             out = Path(d) / "out"
-            r = executors(d, "--out", out, "--rounds", "1", "--modes", "eager streaming collect", tip, port=4295)
+            r = executors(d, "--out", out, "--rounds", "1", "--modes", "eager streaming collect", tip, port=free_port())
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             cell = out / "people-10-threads-2"
             self.assertEqual(epochs(cell), list("ABCCBA"))
@@ -136,7 +144,7 @@ class ExecutorsTests(unittest.TestCase):
             base, tip = stub(d, "base"), stub(d, "tip")
             out = Path(d) / "out"
             r = executors(d, "--out", out, "--rounds", "2", "--base-modes", "default streaming", "--base", base, tip,
-                          port=4299)
+                          port=free_port())
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             cell = out / "people-10-threads-2"
             self.assertIn("EXECUTION=,,streaming,streaming\n", (cell / "run.env").read_text())
@@ -144,7 +152,7 @@ class ExecutorsTests(unittest.TestCase):
             self.assertEqual(modes, {("stores/A", "-"), ("stores/B", "-"), ("stores/C", "streaming"),
                                      ("stores/D", "streaming")})
             out = Path(d) / "out2"
-            r = executors(d, "--out", out, "--rounds", "1", "--modes", "default streaming", tip, port=4299)
+            r = executors(d, "--out", out, "--rounds", "1", "--modes", "default streaming", tip, port=free_port())
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             cell = out / "people-10-threads-2"
             modes = {(l.split("\t")[2], l.split("\t")[3]) for l in (cell / "requests.tsv").read_text().splitlines()}
@@ -153,14 +161,14 @@ class ExecutorsTests(unittest.TestCase):
     def test_refusals(self):
         with tempfile.TemporaryDirectory() as d:
             base, tip = stub(d, "base"), stub(d, "tip")
-            r = executors(d, "--out", Path(d) / "o0", "--base-modes", "eager", "--base", base, tip, port=4297)
+            r = executors(d, "--out", Path(d) / "o0", "--base-modes", "eager", "--base", base, tip, port=free_port())
             self.assertIn("as many modes", r.stderr)
-            r = executors(d, "--out", Path(d) / "o1", "--rounds", "1", "--base", base, tip, port=4297)
+            r = executors(d, "--out", Path(d) / "o1", "--rounds", "1", "--base", base, tip, port=free_port())
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("must be even", r.stderr)
-            r = executors(d, "--out", Path(d) / "o2", "--modes", "eager eager", tip, port=4297)
+            r = executors(d, "--out", Path(d) / "o2", "--modes", "eager eager", tip, port=free_port())
             self.assertIn("named twice", r.stderr)
-            r = executors(d, "--out", Path(d) / "o3", "--base-commit", "x", tip, port=4297)
+            r = executors(d, "--out", Path(d) / "o3", "--base-commit", "x", tip, port=free_port())
             self.assertIn("need --base", r.stderr)
 
 
@@ -191,7 +199,7 @@ class RemoteRunnerTests(unittest.TestCase):
         (d / "queries").mkdir()
         (d / "queries" / "q.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }")
         (d / "run.env").write_text('SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\nDYNAMIC_C=0\n'
-                                   'VARIANTS="A B C"\nORDERS="A B C C B A"\nROUNDS=1\nREPS=1\nWARMUP=0\nPORT=4307\n')
+                                   'VARIANTS="A B C"\nORDERS="A B C C B A"\nROUNDS=1\nREPS=1\nWARMUP=0\nPORT=' + str(free_port()) + '\n')
         for v in "ABC":
             (d / f"bin-{v}").write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{v}"'))
         subprocess.run(["zstd", "-q", "-o", str(d / "data.nt.zst")], input=b"", check=True)
@@ -233,6 +241,11 @@ class TimedDigestTests(unittest.TestCase):
             self.assertFalse(checks["1.05m-1t/q/timed-answers"])
         with tempfile.TemporaryDirectory() as d:
             checks = self.run_dir(d, full + [("1", "A", "other", "1", "1 rows, h")])
+            self.assertFalse(checks["1.05m-1t/warm-answers"])
+        with tempfile.TemporaryDirectory() as d:
+            # a sixth field cannot stand in for the digest
+            checks = self.run_dir(d, [(e, v, q, rep, "no digest", "1 rows, h") for e, v, q, rep, _ in full])
+            self.assertFalse(checks["1.05m-1t/q/timed-answers"])
             self.assertFalse(checks["1.05m-1t/warm-answers"])
 
 

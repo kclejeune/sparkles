@@ -6,6 +6,7 @@ base-and-tip form, with a stub server in place of sparkles.
 
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,13 @@ from pathlib import Path
 SCRIPTS = Path(__file__).resolve().parent.parent
 GATES = SCRIPTS / "x08-gates"
 STUB = Path(__file__).resolve().parent / "fixtures" / "stub-sparkles.py"
+
+
+def free_port():
+    """A port no other test or run holds, so that suites can run side by side."""
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def samples(path, ratio, rounds=12, a_ms=0.1, query="q"):
@@ -62,6 +70,16 @@ class AnswersTests(unittest.TestCase):
             run = self.run_dir(d, "s", "SELECT ?s WHERE { ?s <urn:p> <urn:o> }", {"A": "x", "B": "y"})
             r = answers("--queries", "q", run)
             self.assertEqual(r.returncode, 1, r.stdout)
+
+    def test_only_a_top_level_limit_without_order_by_is_an_unordered_slice(self):
+        with tempfile.TemporaryDirectory() as d:
+            for i, (query, ok) in enumerate((
+                    ('SELECT ("LIMIT" AS ?x) WHERE {}', False),
+                    ("SELECT ?s WHERE { ?s ?p ?o } LIMIT 1 # ORDER BY ?s", True),
+                    ("SELECT ?s WHERE { ?s ?p ?o } ORDER BY ?s LIMIT 1", False),
+                    ("SELECT ?s WHERE { ?s <urn:limit> ?o }", False))):
+                run = self.run_dir(d, f"r{i}", query, {"A": "x", "B": "y"})
+                self.assertEqual(answers("--queries", "q", run).returncode, 0 if ok else 1, query)
 
     def test_a_staged_query_missing_from_every_run_fails(self):
         with tempfile.TemporaryDirectory() as d:
@@ -123,7 +141,7 @@ class LatencyTests(unittest.TestCase):
             r = subprocess.run(
                 ["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"],
                  "--base-execution", "eager", "--queries", f"count-all {extra}", "--rounds", "10", "--reps", "2",
-                 "--port", "4301", w], capture_output=True, text=True, timeout=600)
+                 "--port", str(free_port()), w], capture_output=True, text=True, timeout=600)
             # the stub answers in a fixed time, so the gate passes
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             self.assertIn("| query | base ms | tip/base |", r.stdout)
@@ -150,7 +168,7 @@ class LatencyTests(unittest.TestCase):
             env = dict(os.environ, BINARY_OF_B="A", SHARE_STORE="1", EXECUTION="streaming")
             r = subprocess.run(
                 ["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"], "--queries",
-                 "count-all", "--rounds", "10", "--reps", "1", "--port", "4303", w],
+                 "count-all", "--rounds", "10", "--reps", "1", "--port", str(free_port()), w],
                 capture_output=True, text=True, timeout=600, env=env)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
             ids = {tuple(l.split("\t")[:2]) for l in (w / "runs" / "tip-second" / "requests.tsv").read_text().splitlines()}
@@ -162,7 +180,7 @@ class LatencyTests(unittest.TestCase):
             bins["tip"].write_text(bins["tip"].read_text().replace('b"?c\\n1\\n"', 'b"?c\\n2\\n"'))
             r = subprocess.run(
                 ["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip", bins["tip"], "--queries",
-                 "count-all", "--rounds", "10", "--reps", "1", "--port", "4305", w],
+                 "count-all", "--rounds", "10", "--reps", "1", "--port", str(free_port()), w],
                 capture_output=True, text=True, timeout=600)
             self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
             self.assertIn("the untimed answers differ", r.stdout)

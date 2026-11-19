@@ -13,10 +13,35 @@ agree. The check fails when a run holds other queries than --queries names, or w
 file is missing.
 """
 
+import importlib.util
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
+
+_spec = importlib.util.spec_from_file_location(
+    "bench_answers", Path(__file__).resolve().parent.parent / "bench-answers.py")
+ba = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ba)
+
+
+def unordered_slice(query):
+    """Whether the query has a top-level LIMIT and no top-level ORDER BY, with IRIs, strings
+    and comments blanked first, as bench-answers.py finds the ORDER BY."""
+    if ba._after_order_by(query) is not None:
+        return False
+    q = re.sub(r"<[^<>\s]*>", ba._blank, query)
+    q = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', ba._blank, q)
+    q = re.sub(r"#[^\n]*", ba._blank, q)
+    depth = 0
+    for m in re.finditer(r"[{}]|\blimit\s+\d+", q, re.I):
+        if m.group() == "{":
+            depth += 1
+        elif m.group() == "}":
+            depth -= 1
+        elif depth == 0:
+            return True
+    return False
 
 
 def tsv(path, problems):
@@ -38,8 +63,7 @@ def main():
     unordered = set()
     for q in inventory:
         f = runs[0] / "queries" / f"{q}.rq"
-        text = f.read_text().upper() if f.exists() else ""
-        if re.search(r"\bLIMIT\b", text) and not re.search(r"\bORDER\s+BY\b", text):
+        if f.exists() and unordered_slice(f.read_text()):
             unordered.add(q)
     for run in runs:
         res = run / "results"
@@ -67,8 +91,8 @@ def main():
         want = {(r[1], r[2], r[3], r[4]) for r in samples}
         got = defaultdict(int)
         for r in tsv(res / "warm-answers.tsv", problems):
-            if len(r) < 5:
-                problems.append(f"{run.name}: a timed digest names no repetition")
+            if len(r) != 5:
+                problems.append(f"{run.name}: a timed digest row has {len(r)} fields, not 5")
                 continue
             got[(r[0], r[1], r[2], r[3])] += 1
             timed[r[2]].add(",".join(r[4].split(",")[:3]) if r[2] in unordered else r[4])

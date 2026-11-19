@@ -286,6 +286,8 @@ def executors(args):
         warm_rows = read_tsv(d / "results" / "warm-answers.tsv")
         for row in warm_rows:
             # epoch, variant, query, [timed repetition,] digest
+            if len(row) not in (4, 5):
+                continue
             v, q, digest = row[1], row[2], row[-1]
             # unordered LIMIT answers may hold other rows, but not another count, schema or
             # number of distinct rows
@@ -297,11 +299,12 @@ def executors(args):
         per_request = (not legacy) or any(len(row) >= 5 for row in warm_rows)
         if per_request:
             # every digest names its repetition, and its query is one of the run's
-            short = sum(1 for row in warm_rows if len(row) < 5)
+            short = sum(1 for row in warm_rows if len(row) != 5)
             stray = sorted({row[2] for row in warm_rows} - set(order))
             if short or stray:
                 checks.append({"name": f"{cell}/warm-answers", "ok": False,
-                               "detail": {"digests without a repetition": short, "queries of no sample": stray}})
+                               "detail": {"digest rows without exactly five fields": short,
+                                          "queries of no sample": stray}})
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the
