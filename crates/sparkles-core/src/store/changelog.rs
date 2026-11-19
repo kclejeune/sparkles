@@ -56,6 +56,7 @@
 //!
 //! In-memory stores keep the same records in memory.
 
+mod pager;
 mod readonly;
 
 use super::diff::{Keys, QuadKey};
@@ -440,6 +441,78 @@ fn decode_meta(c: &mut Cur<'_>, seq: u64) -> Option<ChangeCommit> {
 
 /// Decode a record body (its CRC already checked).
 fn decode(body: &[u8]) -> Option<Record> {
+    decode_with(body, false)
+}
+
+/// The bytes an `Arc<[u8]>` or `Arc<str>` of `len` bytes allocates.
+fn arc_slice_bytes(len: usize) -> u64 {
+    (16 + len as u64).next_multiple_of(8)
+}
+
+/// What decoding a record body allocates, read from its length prefixes before
+/// anything is allocated (item 829): the commit's metadata with its author and message,
+/// the term table with its terms, and the vector of changes. `None` at damage, and
+/// when a count is larger than the bytes left could hold, so a damaged count is never
+/// admitted.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Footprint {
+    pub(super) meta: u64,
+    pub(super) terms: u64,
+    pub(super) changes: u64,
+}
+
+pub(super) fn footprint(body: &[u8]) -> Option<Footprint> {
+    let mut c = Cur { b: body, i: 0 };
+    let ty = c.u8()?;
+    c.u64()?;
+    let mut f = Footprint::default();
+    if ty == REC_GAP {
+        return Some(f);
+    }
+    if ty != REC_SUMMARY && ty != REC_CHANGES {
+        return None;
+    }
+    c.u64()?;
+    c.u8()?;
+    c.u8()?;
+    c.varint()?;
+    c.varint()?;
+    f.meta = arc_slice_bytes(std::mem::size_of::<ChangeCommit>());
+    for _ in 0..2 {
+        let n = usize::try_from(c.varint()?).ok()?;
+        c.bytes(n)?;
+        if n > 0 {
+            f.meta += arc_slice_bytes(n);
+        }
+    }
+    if ty == REC_SUMMARY {
+        return Some(f);
+    }
+    let n = usize::try_from(c.varint()?).ok()?;
+    // each term takes at least its one-byte length
+    if n > body.len() - c.i {
+        return None;
+    }
+    f.terms = n as u64 * std::mem::size_of::<Arc<[u8]>>() as u64;
+    for _ in 0..n {
+        let len = usize::try_from(c.varint()?).ok()?;
+        c.bytes(len)?;
+        f.terms += arc_slice_bytes(len);
+    }
+    let m = usize::try_from(c.varint()?).ok()?;
+    // each change takes at least five bytes
+    if m > (body.len() - c.i) / 5 {
+        return None;
+    }
+    f.changes = m as u64 * std::mem::size_of::<(bool, QuadKey)>() as u64;
+    Some(f)
+}
+
+/// Decode a record body. `exact` reserves the term table and the changes at their
+/// counts, which the caller has admitted from [`footprint`]; otherwise each reservation
+/// is capped, since a damaged count must not allocate before the bytes run out.
+fn decode_with(body: &[u8], exact: bool) -> Option<Record> {
+    let cap = |n: usize| if exact { n } else { n.min(1 << 16) };
     let mut c = Cur { b: body, i: 0 };
     let ty = c.u8()?;
     let seq = c.u64()?;
@@ -455,13 +528,13 @@ fn decode(body: &[u8]) -> Option<Record> {
         REC_CHANGES => {
             let meta = Arc::new(decode_meta(&mut c, seq)?);
             let n = c.varint()? as usize;
-            let mut terms: Vec<Arc<[u8]>> = Vec::with_capacity(n.min(1 << 16));
+            let mut terms: Vec<Arc<[u8]>> = Vec::with_capacity(cap(n));
             for _ in 0..n {
                 let len = c.varint()? as usize;
                 terms.push(Arc::from(c.bytes(len)?));
             }
             let m = c.varint()? as usize;
-            let mut changes = Vec::with_capacity(m.min(1 << 16));
+            let mut changes = Vec::with_capacity(cap(m));
             for _ in 0..m {
                 let add = c.u8()? == 1;
                 let mut k: [Option<Arc<[u8]>>; 4] = Default::default();
@@ -755,6 +828,11 @@ pub struct ChangeLog {
     settings: Mutex<ChangeLogSettings>,
     enabled: AtomicBool,
     inner: Mutex<Inner>,
+    /// The first commits that history readers still need, with the number of readers
+    /// pinning each (see [`LogPin`]). Retention keeps every segment at or after the
+    /// oldest, and the log cannot be turned off while any is held. Lock order: `inner`
+    /// before `pins`, and nothing is locked while `pins` is held.
+    pins: Mutex<std::collections::BTreeMap<u64, usize>>,
     pending: Mutex<VecDeque<Pending>>,
     /// the background writer has been told about the queue
     scheduled: AtomicBool,
@@ -818,6 +896,7 @@ impl ChangeLog {
             settings: Mutex::new(settings),
             enabled: AtomicBool::new(enabled),
             inner: Mutex::new(inner),
+            pins: Mutex::new(std::collections::BTreeMap::new()),
             pending: Mutex::new(VecDeque::new()),
             scheduled: AtomicBool::new(false),
             background: AtomicBool::new(true),
@@ -1288,6 +1367,52 @@ impl ChangeLog {
         decode(body).ok_or_else(damaged)
     }
 
+    /// Read the record of segment `i` at `offset` as [`ChangeLog::read`] does, admitting
+    /// each allocation before it is made (item 829): the frame of a file-backed segment
+    /// before it is read, then the decoded record from its [`footprint`] before it is
+    /// decoded. `admit` is told the bytes the record holds at each step, the frame
+    /// included until decoding ends.
+    fn read_admitted(
+        &self,
+        inner: &Inner,
+        i: usize,
+        offset: u64,
+        admit: &mut Admit<'_>,
+    ) -> Result<Record> {
+        let seg = &inner.segs[i];
+        let damaged = || {
+            Error::Corrupt(format!(
+                "change log segment {}: damaged record at byte {offset}",
+                seg.first
+            ))
+        };
+        let decode_admitted = |body: &[u8], frame: u64, admit: &mut Admit<'_>| {
+            let f = footprint(body).ok_or_else(damaged)?;
+            let held = f.meta + f.terms + f.changes;
+            admit(frame + held)?;
+            let r = decode_with(body, true).ok_or_else(damaged)?;
+            Ok::<_, Error>((r, held))
+        };
+        if seg.path.is_none() {
+            let (body, _) = frame(&seg.mem, offset as usize).ok_or_else(damaged)?;
+            return Ok(decode_admitted(body, 0, admit)?.0);
+        }
+        let path = seg.path.as_ref().expect("checked");
+        let f = File::open(path)?;
+        let mut h = [0u8; 8];
+        read_exact_at(&f, &mut h, offset)?;
+        let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+        admit(8 + len as u64)?;
+        let mut buf = vec![0u8; 8 + len];
+        buf[..8].copy_from_slice(&h);
+        read_exact_at(&f, &mut buf[8..], offset + 8)?;
+        let (body, _) = frame(&buf, 0).ok_or_else(damaged)?;
+        let (r, held) = decode_admitted(body, buf.len() as u64, admit)?;
+        drop(buf);
+        admit(held)?;
+        Ok(r)
+    }
+
     /// Drop sealed segments that retention no longer keeps. `now_ms` applies the age
     /// limit (none without it).
     pub(crate) fn enforce(&self, now_ms: Option<i64>) -> Result<usize> {
@@ -1302,8 +1427,13 @@ impl ChangeLog {
         let head = inner.last.unwrap_or(0);
         let mut total: u64 = inner.segs.iter().map(|s| s.bytes).sum();
         let mut dropped = 0;
+        // a history reader's pin keeps its commits, past the size limit too
+        let pinned = self.pins.lock().first_key_value().map(|(c, _)| *c);
         while inner.segs.len() > 1 && inner.segs[0].sealed {
             let seg = &inner.segs[0];
+            if pinned.is_some_and(|c| seg.last >= c) {
+                break;
+            }
             // a segment some limit keeps stays, unless the size limit needs the room
             let kept_by_count = s
                 .keep_commits
@@ -1365,12 +1495,22 @@ impl ChangeLog {
     /// at the next commit (`head` is the current one).
     pub(crate) fn set_settings(&self, s: ChangeLogSettings, head: u64) -> Result<()> {
         self.require_writable()?;
+        let on = s.enabled.unwrap_or(self.limits.default_on);
+        // Turning the log off waits for no reader: it is refused while a history
+        // reader pins the log, before the settings are written. The pins stay locked
+        // until the log is off, so a reader pinning later sees it off.
+        let pins = (!on).then(|| self.pins.lock());
+        if pins.as_ref().is_some_and(|p| !p.is_empty()) {
+            return Err(Error::Conflict(
+                "the change log cannot be turned off while a history query reads it".into(),
+            ));
+        }
         if let Some(root) = &self.root {
             write_settings(root, &s)?;
         }
-        let on = s.enabled.unwrap_or(self.limits.default_on);
         let was = self.enabled.swap(on, Ordering::AcqRel);
         *self.settings.lock() = s;
+        drop(pins);
         if was && !on {
             self.remove_all()?;
         } else if !was && on {
@@ -1460,14 +1600,19 @@ impl ChangeLog {
     /// Read the changes of commits `from` through `to` that match `filter`, in commit
     /// order (newest first with `descending`), calling `visit` for each until it
     /// returns `false`. Returns the commits in the range whose changes are not
-    /// recorded.
+    /// recorded, and without `holes` only those found before `visit` stops. With
+    /// `admit`, each record is read by [`ChangeLog::read_admitted`] and released (an
+    /// admission of 0) once its changes are visited; a read-only log is not read so.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
         from: u64,
         to: u64,
         filter: &LogFilter,
         descending: bool,
+        holes_after_stop: bool,
         check: &mut dyn FnMut() -> Result<()>,
+        mut admit: Option<&mut Admit<'_>>,
         visit: &mut Visit<'_>,
     ) -> Result<Vec<Unrecorded>> {
         if let Some(reader) = &self.readonly {
@@ -1547,6 +1692,9 @@ impl ChangeLog {
                 }
             }
             if stop {
+                if !holes_after_stop {
+                    break;
+                }
                 continue;
             }
             // the records that may match
@@ -1584,19 +1732,26 @@ impl ChangeLog {
                 if e.hole.is_some() {
                     continue;
                 }
-                let Record::Changes(c, changes) = self.read(&inner, i, e.offset)? else {
-                    continue;
+                let record = match admit.as_deref_mut() {
+                    Some(admit) => self.read_admitted(&inner, i, e.offset, admit)?,
+                    None => self.read(&inner, i, e.offset)?,
                 };
-                for (add, k) in &changes {
-                    if filter.matches(k) && !visit(&c, *add, k)? {
-                        stop = true;
-                        if descending {
-                            break 'segs;
+                if let Record::Changes(c, changes) = &record {
+                    for (add, k) in changes {
+                        if filter.matches(k) && !visit(c, *add, k)? {
+                            stop = true;
+                            break;
                         }
-                        break;
                     }
                 }
+                drop(record);
+                if let Some(admit) = admit.as_deref_mut() {
+                    admit(0)?;
+                }
                 if stop {
+                    if descending {
+                        break 'segs;
+                    }
                     break;
                 }
             }
@@ -1732,6 +1887,8 @@ fn read_exact_at(f: &File, mut buf: &mut [u8], mut at: u64) -> std::io::Result<(
 /// What a scan calls for each change: its commit, `true` for an addition, and its quad.
 /// Returning `false` stops the scan.
 pub(crate) type Visit<'a> = dyn FnMut(&Arc<ChangeCommit>, bool, &QuadKey) -> Result<bool> + 'a;
+/// Told the bytes a record being read holds now, before each allocation (item 829).
+pub(crate) type Admit<'a> = dyn FnMut(u64) -> Result<()> + 'a;
 
 /// Which changes a scan returns: for each of graph, subject, predicate and object, the
 /// keys it may have (`None`: any).

@@ -176,6 +176,17 @@ impl CapturedSegment {
         offset: u64,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<Vec<u8>>> {
+        self.body_at_admitted(offset, check, None)
+    }
+
+    /// [`CapturedSegment::body_at`], telling `admit` the body's length before the body
+    /// is allocated (item 829).
+    fn body_at_admitted(
+        &self,
+        offset: u64,
+        check: &mut dyn FnMut() -> Result<()>,
+        admit: Option<&mut dyn FnMut(u64) -> Result<()>>,
+    ) -> Result<Option<Vec<u8>>> {
         check()?;
         if offset.checked_add(8).is_none_or(|end| end > self.extent) {
             return Ok(None);
@@ -192,6 +203,9 @@ impl CapturedSegment {
             return Ok(None);
         }
         check()?;
+        if let Some(admit) = admit {
+            admit(length as u64)?;
+        }
         let mut body = Vec::new();
         body.try_reserve_exact(length).map_err(|_| {
             Error::HistoryUnsupported("history-log record allocation was refused".into())
@@ -362,7 +376,9 @@ mod tests {
                                     to.min(through),
                                     &filter,
                                     descending,
+                                    true,
                                     &mut || Ok(()),
+                                    None,
                                     &mut |meta, add, quad| {
                                         expected.push((
                                             meta.seq,
@@ -1020,6 +1036,16 @@ fn decode_checked<'a>(
     body: &'a [u8],
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<RecordView<'a>>> {
+    decode_checked_with(body, check, false)
+}
+
+/// [`decode_checked`]; `exact` reserves the term table at its count, which the caller
+/// has admitted from [`footprint`] (item 829).
+fn decode_checked_with<'a>(
+    body: &'a [u8],
+    check: &mut dyn FnMut() -> Result<()>,
+    exact: bool,
+) -> Result<Option<RecordView<'a>>> {
     check()?;
     let mut c = Cur { b: body, i: 0 };
     let Some((ty, seq)) = c.u8().zip(c.u64()) else {
@@ -1049,6 +1075,11 @@ fn decode_checked<'a>(
                 return Ok(None);
             };
             let mut terms = Vec::new();
+            if exact {
+                terms.try_reserve_exact(n).map_err(|_| {
+                    Error::HistoryUnsupported("history term-table allocation was refused".into())
+                })?;
+            }
             for _ in 0..n {
                 check()?;
                 let Some(length) = c.varint().and_then(|n| usize::try_from(n).ok()) else {
@@ -1630,5 +1661,193 @@ impl ChangeLog {
             budget.check()?;
             Ok(value)
         })
+    }
+}
+
+/// Where a read-only log's paged history read resumes (item 829).
+#[derive(Default)]
+pub(super) struct RoCursor {
+    /// oldest first: the segment, the offset of the next record and the last commit
+    /// read in that segment
+    seg: usize,
+    offset: Option<u64>,
+    previous: Option<u64>,
+    /// newest first: the offsets of the records left in the segment being read, and
+    /// the segment read before it (`None` before the first)
+    rev: Vec<RecordOffset>,
+    rev_seg: Option<usize>,
+}
+
+impl RoCursor {
+    /// What the cursor keeps allocated between pages.
+    pub(super) fn kept_bytes(&self) -> u64 {
+        (self.rev.capacity() * std::mem::size_of::<RecordOffset>()) as u64
+    }
+}
+
+impl ReadOnlyLog {
+    /// Read and decode the record at `offset` of `segment`, admitting its body and its
+    /// decoded form before each is allocated.
+    fn read_admitted(
+        &self,
+        segment: usize,
+        offset: u64,
+        check: &mut dyn FnMut() -> Result<()>,
+        held: &super::pager::Held<'_, '_>,
+    ) -> Result<Option<Vec<u8>>> {
+        let Some(body) = self.segments[segment].body_at_admitted(
+            offset,
+            check,
+            Some(&mut |b| held.record(b)),
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(f) = footprint(&body) else {
+            return Ok(None);
+        };
+        held.record(body.capacity() as u64 + f.meta + f.terms)?;
+        Ok(Some(body))
+    }
+
+    /// One page of a paged history read of commits `from` through `to`: the records
+    /// whose changes `visit` takes, resuming where `cur` stopped, until `visit` stops
+    /// or the page holds `budget` changes before a record. Returns whether the range
+    /// was read to its end. The prefix of each segment that is read follows the rules
+    /// of [`ReadOnlyLog::walk`]. Newest first, the offsets of one segment's records are
+    /// kept, admitted as they grow, and read back from the newest.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn page(
+        &self,
+        cur: &mut RoCursor,
+        from: u64,
+        to: u64,
+        filter: &LogFilter,
+        descending: bool,
+        budget: usize,
+        check: &mut dyn FnMut() -> Result<()>,
+        held: &super::pager::Held<'_, '_>,
+        visit: &mut Visit<'_>,
+    ) -> Result<bool> {
+        check()?;
+        let to = to.min(self.through);
+        if from > to {
+            return Ok(true);
+        }
+        let damaged = || Error::Corrupt("captured history record is no longer valid".into());
+        if !descending {
+            while cur.seg < self.segments.len() {
+                let mut offset = cur.offset.unwrap_or(SEG_HEADER as u64);
+                loop {
+                    let Some(body) = self.read_admitted(cur.seg, offset, check, held)? else {
+                        break;
+                    };
+                    let Some(record) = decode_checked_with(&body, check, true)? else {
+                        break;
+                    };
+                    if cur
+                        .previous
+                        .is_some_and(|last: u64| last.checked_add(1) != Some(record.first()))
+                        || record.first() > self.through
+                    {
+                        break;
+                    }
+                    if record.first() > to {
+                        return Ok(true);
+                    }
+                    if record.last() >= from && matches!(record, RecordView::Changes { .. }) {
+                        if held.len.get() >= budget {
+                            cur.offset = Some(offset);
+                            return Ok(false);
+                        }
+                        if !record.emit(filter, check, visit)? {
+                            cur.offset = Some(offset);
+                            return Ok(false);
+                        }
+                    }
+                    cur.previous = Some(record.last());
+                    offset = offset
+                        .checked_add(8 + body.len() as u64)
+                        .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+                    drop(record);
+                    drop(body);
+                    held.record(0)?;
+                }
+                held.record(0)?;
+                cur.seg += 1;
+                cur.offset = None;
+                cur.previous = None;
+            }
+            return Ok(true);
+        }
+        loop {
+            if let Some(item) = cur.rev.pop() {
+                if held.len.get() >= budget {
+                    cur.rev.push(item);
+                    return Ok(false);
+                }
+                let body = self
+                    .read_admitted(item.segment, item.offset, check, held)?
+                    .ok_or_else(damaged)?;
+                let record = decode_checked_with(&body, check, true)?.ok_or_else(damaged)?;
+                let more = record.emit(filter, check, visit)?;
+                drop(record);
+                drop(body);
+                held.record(0)?;
+                if !more {
+                    // a change of this record may be left: read it again next time
+                    cur.rev.push(item);
+                    return Ok(false);
+                }
+                continue;
+            }
+            let next = cur.rev_seg.unwrap_or(self.segments.len());
+            if next == 0 {
+                return Ok(true);
+            }
+            let segment = next - 1;
+            cur.rev_seg = Some(segment);
+            let mut offset = SEG_HEADER as u64;
+            let mut previous = None;
+            loop {
+                let Some(body) = self.read_admitted(segment, offset, check, held)? else {
+                    break;
+                };
+                let Some(record) = decode_checked_with(&body, check, true)? else {
+                    break;
+                };
+                if previous.is_some_and(|last: u64| last.checked_add(1) != Some(record.first()))
+                    || record.first() > self.through
+                {
+                    break;
+                }
+                if record.last() >= from
+                    && record.first() <= to
+                    && matches!(record, RecordView::Changes { .. })
+                {
+                    if cur.rev.len() == cur.rev.capacity() {
+                        let more = cur.rev.capacity().max(16);
+                        held.kept(
+                            ((cur.rev.capacity() + more) * std::mem::size_of::<RecordOffset>())
+                                as u64,
+                        )?;
+                        cur.rev.try_reserve_exact(more).map_err(|_| {
+                            Error::HistoryUnsupported(
+                                "history offset allocation was refused".into(),
+                            )
+                        })?;
+                    }
+                    cur.rev.push(RecordOffset { segment, offset });
+                }
+                previous = Some(record.last());
+                offset = offset
+                    .checked_add(8 + body.len() as u64)
+                    .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+                drop(record);
+                drop(body);
+                held.record(0)?;
+            }
+            held.record(0)?;
+        }
     }
 }

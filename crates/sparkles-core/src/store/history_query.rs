@@ -133,7 +133,7 @@ fn graph_filter_key(g: &GraphName) -> Vec<u8> {
 }
 
 impl HistoryQuery {
-    fn filter(&self) -> LogFilter {
+    pub(super) fn filter(&self) -> LogFilter {
         let list = |v: Vec<Vec<u8>>| (!v.is_empty()).then_some(v);
         LogFilter {
             keys: [
@@ -150,7 +150,7 @@ impl HistoryQuery {
         }
     }
 
-    fn check(&self) -> Result<()> {
+    pub(super) fn check(&self) -> Result<()> {
         if self
             .cancel
             .as_ref()
@@ -185,9 +185,10 @@ pub(crate) fn check_history_access(a: Option<&Arc<crate::access::GraphAccess>>) 
 }
 
 impl ChangeLog {
-    /// Run a history query against the commits up to `upto` (the state the caller
-    /// reads). Bounds given as [`HistoryBound::At`] must already be resolved.
-    pub fn query(&self, q: &HistoryQuery, upto: u64) -> Result<HistoryResult> {
+    /// The checks a history query makes before it reads, and its range of commits:
+    /// `(from, to, upto)`, with `upto` clipped to what a read-only log holds. It flushes
+    /// the queued commits, so the log covers the state the caller reads.
+    pub(crate) fn range(&self, q: &HistoryQuery, upto: u64) -> Result<(u64, u64, u64)> {
         let upto = self
             .read_only_through()
             .map_or(upto, |through| upto.min(through));
@@ -227,6 +228,13 @@ impl ChangeLog {
                 )));
             }
         };
+        Ok((from, to, upto))
+    }
+
+    /// Run a history query against the commits up to `upto` (the state the caller
+    /// reads). Bounds given as [`HistoryBound::At`] must already be resolved.
+    pub fn query(&self, q: &HistoryQuery, upto: u64) -> Result<HistoryResult> {
+        let (from, to, upto) = self.range(q, upto)?;
         let filter = q.filter();
         let access = q.access.as_ref().filter(|a| !a.reads_everything());
         let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
@@ -262,7 +270,9 @@ impl ChangeLog {
             to,
             &filter,
             q.descending,
+            true,
             &mut check,
+            None,
             &mut |c, add, k: &QuadKey| {
                 let op = if add { DiffOp::Add } else { DiffOp::Remove };
                 if q.op.is_some_and(|o| o != op) {
