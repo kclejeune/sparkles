@@ -258,7 +258,9 @@ impl Reader {
         // searcher's statistics, and only the documents that are alive. The list grows
         // under a charge taken before each growth, for the old list and the new one
         // while the hits move. Past `maxHits`, or once a charge is refused, the pass
-        // keeps no hit and only counts, so the errors come in eager's order.
+        // drops the list and its charge and only counts, so the errors come in eager's
+        // order. Cancellation is checked between segments, as an eager search checks it
+        // after its whole search.
         let weight = query
             .weight(EnableScoring::enabled_from_searcher(searcher))
             .map_err(text_err)?;
@@ -276,7 +278,10 @@ impl Reader {
                     total += 1;
                     if refused.is_some() || total > max as u64 {
                         if hits.capacity() > 0 {
+                            // the list is dropped and its charge with it; a smaller
+                            // charge is never refused
                             hits = Vec::new();
+                            let _ = charge(0);
                         }
                         return;
                     }
@@ -292,6 +297,7 @@ impl Reader {
                         {
                             refused = Some(e);
                             hits = Vec::new();
+                            let _ = charge(0);
                             return;
                         }
                     }

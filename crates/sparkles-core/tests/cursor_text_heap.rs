@@ -2,8 +2,7 @@
 //! counting allocator measures the peak heap of a streamed text search without a limit
 //! above what was live before the query. A budget too small for the hit list refuses the
 //! search while the list grows, so the peak stays near the budget rather than reaching
-//! the whole list. The allocator counts every thread, so each test holds a lock for its
-//! whole body.
+//! the whole list. The allocator counts every thread, so this file holds one test.
 #![cfg(feature = "text")]
 
 use oxrdfio::RdfFormat;
@@ -49,7 +48,7 @@ const ALLOWANCE: usize = (1 << 20) + (256 << 10);
 
 /// A budget too small for 100,000 hits of 12 bytes refuses the search with a memory
 /// error, and the heap the query held at its peak stays within the budget and the
-/// allowance, which an uncharged list of every hit, 1.5 MiB, would pass.
+/// allowance, which an uncharged list of every hit, 1.5 MiB, would exceed.
 #[test]
 fn a_refused_hit_list_stops_growing() {
     let s = Store::in_memory(StoreOptions::default());
