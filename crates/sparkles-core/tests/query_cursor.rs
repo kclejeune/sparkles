@@ -1218,8 +1218,7 @@ fn standard_writers_match_eager_and_stop_at_send_without_draining() {
 #[test]
 fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
     use sparkles_core::sparql::results::{
-        LimitedWriter, RowCount, SolutionsFormat, write_cursor_native_json_counted,
-        write_cursor_solutions_counted, write_solutions_counted,
+        Format, LimitedWriter, RowCount, SolutionsFormat, Source, WriteOptions, write,
     };
     let s = store(3000);
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
@@ -1229,7 +1228,11 @@ fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
             let mut cut = LimitedWriter::new(Vec::new(), Some(limit), None);
             let sent = RowCount::new();
             let mut c = open(&s, q, 1024);
-            let result = write_cursor_solutions_counted(&mut c, fmt, &mut cut, None, &sent);
+            let result = write(
+                Source::Select(&mut c),
+                WriteOptions::new(Format::Solutions(fmt), &sent),
+                &mut cut,
+            );
             assert!(result.is_err(), "{fmt:?} {limit}");
             let out = cut.get_ref();
             let lines = out.iter().filter(|&&b| b == b'\n').count() as u64;
@@ -1238,7 +1241,12 @@ fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
             let mut eager_cut = LimitedWriter::new(Vec::new(), Some(limit), None);
             let eager_sent = RowCount::new();
             assert!(
-                write_solutions_counted(&eager, fmt, &mut eager_cut, None, &eager_sent).is_err()
+                write(
+                    Source::Result(&eager),
+                    WriteOptions::new(Format::Solutions(fmt), &eager_sent),
+                    &mut eager_cut,
+                )
+                .is_err()
             );
             // the cursor's flush after its first batch moves where the buffer's pieces
             // end, so the bytes may differ, but the rule that counts them is the same
@@ -1252,13 +1260,25 @@ fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
         let sent = RowCount::new();
         let mut whole = Vec::new();
         let mut c = open(&s, q, 1024);
-        write_cursor_solutions_counted(&mut c, fmt, &mut whole, None, &sent).unwrap();
+        write(
+            Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(fmt), &sent),
+            &mut whole,
+        )
+        .unwrap();
         assert_eq!(sent.get(), 3000);
     }
     let mut cut = LimitedWriter::new(Vec::new(), Some(40_000), None);
     let sent = RowCount::new();
     let mut c = open(&s, q, 1024);
-    assert!(write_cursor_native_json_counted(&mut c, &mut cut, None, None, &sent).is_err());
+    assert!(
+        write(
+            Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(SolutionsFormat::Sparkles), &sent),
+            &mut cut,
+        )
+        .is_err()
+    );
     // every cell is bound and an object, so each whole row ends with `}]`
     let rows = cut.get_ref().windows(2).filter(|w| w == b"}]").count() as u64;
     assert_eq!(sent.get(), rows);

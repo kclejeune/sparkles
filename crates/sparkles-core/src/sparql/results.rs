@@ -3,12 +3,11 @@
 use super::{QueryKind, QueryResult};
 use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::{Id, Tag};
-use oxrdf::{Term, Variable};
+use oxrdf::Term;
 use oxrdfio::{RdfFormat, RdfSerializer};
 use serde::ser::{SerializeMap, SerializeSeq};
 use serde::{Serialize, Serializer};
 use serde_json::{Value as J, json};
-use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
@@ -230,10 +229,13 @@ impl<W: Write> Write for LimitedWriter<W> {
 }
 
 mod rowout;
+mod source;
+mod writers;
 #[cfg(test)]
 use rowout::{MARK_BYTES, OUTPUT_BUFFER};
 pub use rowout::{RowCount, RowLedger};
 pub(in crate::sparql) use rowout::{RowOut, write_buffered};
+pub use writers::{Format, Source, WriteOptions, write};
 
 /// The reservation for the cells of a streamed row that the batch's term cache does not
 /// hold, which are decoded or built for the row and dropped after it. It grows to the
@@ -318,304 +320,67 @@ impl<W: Write> Write for Shared<'_, W> {
 pub fn write_cursor_solutions(
     cursor: &mut super::QueryCursor,
     fmt: SolutionsFormat,
-    writer: impl Write,
-    send: Option<usize>,
-) -> Result<super::CursorStats> {
-    write_cursor_solutions_counted(cursor, fmt, writer, send, &RowCount::new())
-}
-
-/// [`write_cursor_solutions`], counting in `sent` the rows that reached `writer` whole.
-/// The rows go out through the buffer of the eager writers, so a writer that stops the
-/// output partway, such as at the result-size budget, has `sent` hold the rows of the
-/// output it took, as [`write_solutions_counted`] does.
-pub fn write_cursor_solutions_counted(
-    cursor: &mut super::QueryCursor,
-    fmt: SolutionsFormat,
     mut writer: impl Write,
     send: Option<usize>,
-    sent: &RowCount,
 ) -> Result<super::CursorStats> {
-    let format = match fmt {
-        SolutionsFormat::Json => QueryResultsFormat::Json,
-        SolutionsFormat::Xml => QueryResultsFormat::Xml,
-        SolutionsFormat::Csv => QueryResultsFormat::Csv,
-        SolutionsFormat::Tsv => QueryResultsFormat::Tsv,
-        SolutionsFormat::Sparkles => {
-            return write_cursor_native_json_counted(cursor, writer, send, None, sent);
-        }
+    let rows = RowCount::new();
+    let options = WriteOptions {
+        send,
+        ..WriteOptions::new(Format::Solutions(fmt), &rows)
     };
-    let result = write_buffered(
-        &mut writer,
-        sent,
-        Some(cursor.output_ctx()),
-        &mut |w, staged| cursor_solutions_to(cursor, format, w, send, staged),
-    );
-    match result {
-        Ok(()) => Ok(cursor.stats()),
-        Err(error) => {
-            cursor.fail_output(&error);
-            Err(error)
-        }
-    }
-}
-
-/// [`write_cursor_solutions_counted`] into the buffer of [`write_buffered`].
-fn cursor_solutions_to(
-    cursor: &mut super::QueryCursor,
-    format: QueryResultsFormat,
-    w: &mut RowOut<'_>,
-    send: Option<usize>,
-    staged: &Cell<u64>,
-) -> Result<()> {
-    let variables: Vec<Variable> = cursor
-        .variables()
-        .iter()
-        .map(Variable::new_unchecked)
-        .collect();
-    // the serializer holds the writer, and the first batch's flush goes past it
-    let shared = std::cell::RefCell::new(w);
-    let mut out = Shared(&shared);
-    cursor.check()?;
-    let mut serializer = QueryResultsSerializer::from_format(format)
-        .serialize_solutions_to_writer(&mut out, variables.clone())
-        .map_err(io)?;
-    let mut left = send.unwrap_or(usize::MAX);
-    let mut row_charge = RowCharge::default();
-    let mut first = true;
-    let remaining = cursor.for_each_decoded(send, |cursor, batch, decoded| {
-        let _row_storage = cursor.charge(
-            batch.width() as u64 * std::mem::size_of::<(usize, Cow<'_, Term>)>() as u64 + 128,
-        )?;
-        let mut terms = Vec::with_capacity(batch.width());
-        for row in 0..batch.len().min(left) {
-            if row.is_multiple_of(1024) {
-                cursor.check()?;
-            }
-            row_charge.start_row();
-            if let Some(d) = decoded {
-                row_charge.cover(cursor, d.row_bytes(row)?)?;
-            }
-            for col in 0..batch.width() {
-                if let Some(term) = row_charge.term(cursor, batch, decoded, row, col)? {
-                    terms.push((col, term));
-                }
-            }
-            serializer
-                .serialize(
-                    terms
-                        .iter()
-                        .map(|(col, term)| (variables[*col].as_ref(), term.as_ref().as_ref())),
-                )
-                .map_err(io)?;
-            staged.set(staged.get() + 1);
-            // Release owned fallbacks before their row reservation drops;
-            // keep only the adapter capacity for the next row.
-            terms.clear();
-            left -= 1;
-        }
-        if std::mem::take(&mut first) {
-            shared.borrow_mut().flush().map_err(io)?;
-        }
-        Ok(())
-    })?;
-    if remaining == 0 {
-        cursor.close();
-    }
-    cursor.check()?;
-    serializer.finish().map_err(io)?;
-    Ok(())
+    write(Source::Select(cursor), options, &mut writer).map(|s| s.expect("cursor statistics"))
 }
 
 /// Serialize SELECT / ASK results.
 pub fn write_solutions(
     r: &QueryResult,
     fmt: SolutionsFormat,
-    w: impl Write,
+    mut w: impl Write,
     send: Option<usize>,
 ) -> Result<()> {
-    write_solutions_counted(r, fmt, w, send, &RowCount::new())
+    let rows = RowCount::new();
+    let options = WriteOptions {
+        send,
+        ..WriteOptions::new(Format::Solutions(fmt), &rows)
+    };
+    write(Source::Result(r), options, &mut w).map(drop)
 }
 
-/// [`write_solutions`], counting in `sent` the rows written whole. A caller whose writer
-/// stops the output partway, such as at the result-size budget, learns from it how many
-/// rows the output holds.
-pub fn write_solutions_counted(
+/// [`write_solutions`] counting its rows in `rows`.
+#[cfg(test)]
+fn write_solutions_rows(
     r: &QueryResult,
     fmt: SolutionsFormat,
     mut w: impl Write,
     send: Option<usize>,
-    sent: &RowCount,
+    rows: &RowCount,
 ) -> Result<()> {
-    if fmt == SolutionsFormat::Sparkles {
-        return write_native_json_counted(r, w, send, None, sent);
-    }
-    write_buffered(&mut w, sent, Some(r.inner.ctx.clone()), &mut |w, sent| {
-        solutions_to(r, fmt, w, send, sent)
-    })
+    let options = WriteOptions {
+        send,
+        ..WriteOptions::new(Format::Solutions(fmt), rows)
+    };
+    write(Source::Result(r), options, &mut w).map(drop)
 }
 
-/// [`write_solutions_counted`] into the buffer of [`write_buffered`].
-fn solutions_to(
+/// [`write_jena_graph`] counting its statements in `rows`.
+#[cfg(test)]
+fn write_jena_rows(
     r: &QueryResult,
-    fmt: SolutionsFormat,
-    w: &mut RowOut<'_>,
-    send: Option<usize>,
-    sent: &Cell<u64>,
+    fmt: crate::jena_formats::JenaFormat,
+    mut w: impl Write,
+    rows: &RowCount,
 ) -> Result<()> {
-    r.inner.ctx.check_memory_failure()?;
-    let f = match fmt {
-        SolutionsFormat::Json => QueryResultsFormat::Json,
-        SolutionsFormat::Xml => QueryResultsFormat::Xml,
-        SolutionsFormat::Csv => QueryResultsFormat::Csv,
-        SolutionsFormat::Tsv => QueryResultsFormat::Tsv,
-        SolutionsFormat::Sparkles => unreachable!(),
-    };
-    let ser = QueryResultsSerializer::from_format(f);
-    if r.kind == QueryKind::Ask {
-        // CSV and TSV have no boolean form: Jena writes a column `_askResult`, and its
-        // clients read nothing else
-        match fmt {
-            SolutionsFormat::Csv => write!(w, "_askResult\r\n{}\r\n", r.boolean).map_err(io)?,
-            SolutionsFormat::Tsv => write!(w, "?_askResult\n{}\n", r.boolean).map_err(io)?,
-            _ => {
-                ser.serialize_boolean_to_writer(w, r.boolean).map_err(io)?;
-            }
-        }
-        return Ok(());
-    }
-    let vars: Vec<Variable> = r
-        .variables()
-        .iter()
-        .map(|v| Variable::new_unchecked(v.clone()))
-        .collect();
-    let mut s = ser
-        .serialize_solutions_to_writer(w, vars.clone())
-        .map_err(io)?;
-    let n = send.map_or(r.inner.table.len(), |s| s.min(r.inner.table.len()));
-    if n <= DECODE_ROWS {
-        // a result of one chunk is decoded row by row: under concurrent load that keeps
-        // less memory live per request than a chunk's table of terms, and in the 10.5M
-        // benchmark it served 25% more requests a second
-        // Even a small answer's terms lie on scattered vocabulary pages. Keep
-        // row-by-row decoding's small working set, but overlap those cold reads.
-        if n >= 2 && crate::index::io_hints() {
-            prefetch_answer(r, n)?;
-        }
-        let mut row = output::ScratchRow::new(r)?;
-        for i in 0..n {
-            let terms = row.load(i)?;
-            s.serialize(
-                terms
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(c, term)| term.as_ref().map(|t| (vars[c].as_ref(), t.as_ref()))),
-            )
-            .map_err(io)?;
-            sent.set(sent.get() + 1);
-        }
-        r.inner.ctx.check_memory_failure()?;
-        s.finish().map_err(io)?;
-        return Ok(());
-    }
-    let chunk = |start: usize| start..n.min(start + DECODE_ROWS);
-    // Scope and one live prefetch packet have fixed runtime headers. Stacks are
-    // process runtime memory, as documented by depth::with_stack, not heap DTOs.
-    let scope_header = r.inner.ctx.charge(4096)?;
-    // This guard must outlive the scope closure: caller unwinding drops that
-    // closure's locals before scope automatically joins its real workers.
-    let mut packet = None;
-    let failure = ChunkFailure::default();
-    std::thread::scope(|sc| -> Result<()> {
-        #[cfg(test)]
-        let _unwind_observer = ChunkCallerUnwindTrace(&r.inner.ctx);
-        let mut cells = Some(Decoded::try_cells(r, chunk(0), true)?);
-        let mut start = 0;
-        while start < n {
-            let end = n.min(start + DECODE_ROWS);
-            let d = Decoded::try_new(r, cells.take().expect("owned next chunk"))?;
-            packet = if end < n {
-                Some(r.inner.ctx.charge(4096)?)
-            } else {
-                None
-            };
-            let failure_ref = &failure;
-            let next = (end < n).then(|| {
-                sc.spawn(move || {
-                    #[cfg(test)]
-                    let _trace = ChunkWorkerTrace {
-                        ctx: &r.inner.ctx,
-                        stage: "prefetch-end",
-                        count: end,
-                    };
-                    #[cfg(test)]
-                    r.inner.ctx.chunk_event("prefetch-start", end);
-                    #[cfg(test)]
-                    {
-                        use crate::algo::memory::probe;
-                        probe::at(probe::Point::Allocation("chunk-prefetch-worker", end));
-                        if probe::fails("chunk-prefetch-worker") {
-                            panic!("injected chunk prefetch worker panic");
-                        }
-                    }
-                    match Decoded::try_cells(r, chunk(end), true) {
-                        Ok(cells) => Some(cells),
-                        Err(error) => {
-                            failure_ref.record(error);
-                            None
-                        }
-                    }
-                })
-            });
-            for i in start..end {
-                if failure.failed() {
-                    break;
-                }
-                let row = match ChunkRow::decode(r, &d, i) {
-                    Ok(row) => row,
-                    Err(error) => {
-                        failure.record(error);
-                        break;
-                    }
-                };
-                if let Err(error) = s.serialize(
-                    row.terms
-                        .iter()
-                        .map(|(c, term)| (vars[*c].as_ref(), term.as_ref().as_ref())),
-                ) {
-                    failure.record(io(error));
-                    #[cfg(test)]
-                    r.inner.ctx.chunk_event("io-failure-recorded", i);
-                    break;
-                }
-                sent.set(sent.get() + 1);
-            }
-            let completed = next.and_then(|handle| match handle.join() {
-                Ok(cells) => cells,
-                Err(panic) => {
-                    tracing::warn!(target: "sparkles::sparql::results", "query output prefetch worker panicked");
-                    failure.record(Error::invalid("query output prefetch worker panicked"));
-                    // Do not destroy an arbitrary panic payload under a failure lock.
-                    drop(panic);
-                    None
-                }
-            });
-            drop(packet.take());
-            if let Some(error) = failure.take() {
-                return Err(error);
-            }
-            if end < n {
-                cells = Some(
-                    completed.ok_or_else(|| Error::invalid("missing completed prefetch chunk"))?,
-                );
-            }
-            start = end;
-        }
-        r.inner.ctx.check()?;
-        Ok(())
-    })?;
-    drop(scope_header);
-    s.finish().map_err(io)?;
-    Ok(())
+    write(
+        Source::Result(r),
+        WriteOptions::new(Format::Jena(fmt), rows),
+        &mut w,
+    )
+    .map(drop)
+}
+
+/// Write `v` as JSON.
+fn json(w: &mut impl Write, v: &impl Serialize) -> Result<()> {
+    serde_json::to_writer(w, v).map_err(|e| Error::Io(e.into()))
 }
 
 // Keep prefetch preparation out of the generic serializer's row loop and stack frame.
@@ -1192,29 +957,25 @@ pub fn write_graph(
     r: &QueryResult,
     fmt: RdfFormat,
     prefixes: &BTreeMap<String, String>,
-    w: impl Write,
-) -> Result<()> {
-    write_graph_counted(r, fmt, prefixes, w, &RowCount::new())
-}
-
-/// [`write_graph`], counting in `sent` the triples and quads written whole.
-pub fn write_graph_counted(
-    r: &QueryResult,
-    fmt: RdfFormat,
-    prefixes: &BTreeMap<String, String>,
     mut w: impl Write,
-    sent: &RowCount,
 ) -> Result<()> {
-    write_buffered(&mut w, sent, Some(r.inner.ctx.clone()), &mut |w, sent| {
-        graph_to(r, fmt, prefixes, w, sent)
-    })
+    let prefixes: Vec<(String, String)> = prefixes
+        .iter()
+        .map(|(p, ns)| (p.clone(), ns.clone()))
+        .collect();
+    let rows = RowCount::new();
+    let options = WriteOptions {
+        prefixes: &prefixes,
+        ..WriteOptions::new(Format::Rdf(fmt), &rows)
+    };
+    write(Source::Result(r), options, &mut w).map(drop)
 }
 
-/// [`write_graph_counted`] into the buffer of [`write_buffered`].
+/// [`write_graph`] into the buffer of [`write_buffered`].
 fn graph_to(
     r: &QueryResult,
     fmt: RdfFormat,
-    prefixes: &BTreeMap<String, String>,
+    prefixes: &[(String, String)],
     w: &mut RowOut<'_>,
     sent: &Cell<u64>,
 ) -> Result<()> {
@@ -1247,24 +1008,18 @@ fn graph_to(
 pub fn write_jena_graph(
     r: &QueryResult,
     fmt: crate::jena_formats::JenaFormat,
-    w: impl Write,
-) -> Result<()> {
-    write_jena_graph_counted(r, fmt, w, &RowCount::new())
-}
-
-/// [`write_jena_graph`], counting in `sent` the triples and quads written whole.
-pub fn write_jena_graph_counted(
-    r: &QueryResult,
-    fmt: crate::jena_formats::JenaFormat,
     mut w: impl Write,
-    sent: &RowCount,
 ) -> Result<()> {
-    write_buffered(&mut w, sent, Some(r.inner.ctx.clone()), &mut |w, sent| {
-        jena_graph_to(r, fmt, w, sent)
-    })
+    let rows = RowCount::new();
+    write(
+        Source::Result(r),
+        WriteOptions::new(Format::Jena(fmt), &rows),
+        &mut w,
+    )
+    .map(drop)
 }
 
-/// [`write_jena_graph_counted`] into the buffer of [`write_buffered`].
+/// [`write_jena_graph`] into the buffer of [`write_buffered`].
 fn jena_graph_to(
     r: &QueryResult,
     fmt: crate::jena_formats::JenaFormat,
@@ -1297,6 +1052,7 @@ fn jena_graph_to(
 /// Extra metadata for an HTTP native response. Its timing includes serialization
 /// through the result rows; metadata is written last so that no document must be
 /// retained just to patch the timing.
+#[derive(Clone, Copy)]
 pub struct NativeJsonMetadata<'a> {
     pub commit: u64,
     pub dataset_id: &'a str,
@@ -1311,29 +1067,22 @@ pub struct NativeJsonMetadata<'a> {
 /// The query's underlying result tables/graphs are already materialized.
 pub fn write_native_json(
     r: &QueryResult,
-    w: impl Write,
-    send: Option<usize>,
-    metadata: Option<NativeJsonMetadata<'_>>,
-) -> Result<()> {
-    write_native_json_counted(r, w, send, metadata, &RowCount::new())
-}
-
-/// [`write_native_json`], counting in `sent` the rows written whole.
-pub fn write_native_json_counted(
-    r: &QueryResult,
     mut w: impl Write,
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
-    sent: &RowCount,
 ) -> Result<()> {
-    let mut metadata = metadata;
-    write_buffered(&mut w, sent, Some(r.inner.ctx.clone()), &mut |w, sent| {
-        native_json_to(r, w, send, metadata.take(), sent)
-    })
+    let rows = RowCount::new();
+    let options = WriteOptions {
+        send,
+        metadata,
+        ..WriteOptions::new(Format::Solutions(SolutionsFormat::Sparkles), &rows)
+    };
+    write(Source::Result(r), options, &mut w).map(drop)
 }
 
-/// [`write_native_json_counted`] into the buffer of [`write_buffered`].
-fn native_json_to(
+/// The native document of a complete graph result, into the buffer of
+/// [`write_buffered`].
+fn native_graph_to(
     r: &QueryResult,
     w: &mut RowOut<'_>,
     send: Option<usize>,
@@ -1367,171 +1116,40 @@ fn native_json_to(
 /// after successful production; a consumer cap leaves `totalRows` unknown.
 pub fn write_cursor_native_json(
     cursor: &mut super::QueryCursor,
-    writer: impl Write,
-    send: Option<usize>,
-    metadata: Option<NativeJsonMetadata<'_>>,
-) -> Result<super::CursorStats> {
-    write_cursor_native_json_counted(cursor, writer, send, metadata, &RowCount::new())
-}
-
-/// [`write_cursor_native_json`], counting in `sent` the rows that reached `writer` whole,
-/// as [`write_cursor_solutions_counted`] does.
-pub fn write_cursor_native_json_counted(
-    cursor: &mut super::QueryCursor,
     mut writer: impl Write,
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
-    sent: &RowCount,
 ) -> Result<super::CursorStats> {
-    let mut metadata = metadata;
-    let mut stats = None;
-    let result = write_buffered(
-        &mut writer,
-        sent,
-        Some(cursor.output_ctx()),
-        &mut |w, staged| {
-            stats = Some(cursor_native_json_to(
-                cursor,
-                w,
-                send,
-                metadata.take(),
-                staged,
-            )?);
-            Ok(())
-        },
-    );
-    match result {
-        Ok(()) => Ok(stats.expect("the writer ran")),
-        Err(error) => {
-            cursor.fail_output(&error);
-            Err(error)
-        }
-    }
-}
-
-/// [`write_cursor_native_json_counted`] into the buffer of [`write_buffered`].
-fn cursor_native_json_to(
-    cursor: &mut super::QueryCursor,
-    mut writer: &mut RowOut<'_>,
-    send: Option<usize>,
-    metadata: Option<NativeJsonMetadata<'_>>,
-    staged: &Cell<u64>,
-) -> Result<super::CursorStats> {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct Meta<'a> {
-        total_rows: Option<u64>,
-        sent_rows: u64,
-        status: super::CursorStatus,
-        timing: &'a super::Timing,
-        plan: &'a super::CursorPlan,
-        memory: NativeMemory,
-        rows_produced: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        commit: Option<u64>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        dataset_id: Option<&'a str>,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        io: Option<crate::ioacct::IoReport>,
-    }
-    fn json(w: &mut impl Write, v: &impl Serialize) -> Result<()> {
-        serde_json::to_writer(w, v).map_err(|e| Error::Io(e.into()))
-    }
-    let started = Instant::now();
-    let initial_exec = cursor.stats().timing.exec_ms;
-    cursor.check()?;
-    writer.write_all(b"{\"queryType\":\"SELECT\",\"vars\":")?;
-    json(&mut writer, &cursor.variables())?;
-    writer.write_all(b",\"rows\":[")?;
-    let mut left = send.unwrap_or(usize::MAX);
-    let mut sent = 0u64;
-    let mut row_charge = RowCharge::default();
-    let mut first = true;
-    let remaining = cursor.for_each_decoded(send, |cursor, batch, decoded| {
-        for row in 0..batch.len().min(left) {
-            if row.is_multiple_of(1024) {
-                cursor.check()?;
-            }
-            if sent > 0 {
-                writer.write_all(b",")?;
-            }
-            writer.write_all(b"[")?;
-            // One reservation covers the row's uncached cells through their
-            // serialization, as in the other result formats.
-            row_charge.start_row();
-            if let Some(d) = decoded {
-                row_charge.cover(cursor, d.row_bytes(row)?)?;
-            }
-            for col in 0..batch.width() {
-                if col > 0 {
-                    writer.write_all(b",")?;
-                }
-                let term = row_charge.term(cursor, batch, decoded, row, col)?;
-                json(
-                    &mut writer,
-                    &term.as_ref().map(|t| NativeTerm(t.as_ref().as_ref())),
-                )?;
-            }
-            writer.write_all(b"]")?;
-            staged.set(staged.get() + 1);
-            sent += 1;
-            left -= 1;
-        }
-        // the first batch's rows reach a writer that commits on a flush
-        if std::mem::take(&mut first) {
-            writer.flush()?;
-        }
-        Ok(())
-    })?;
-    if remaining == 0 {
-        cursor.close();
-    }
-    cursor.check()?;
-    let stats = cursor.stats();
-    let mut timing = stats.timing.clone();
-    timing.serialize_ms =
-        (started.elapsed().as_secs_f64() * 1000.0 - (timing.exec_ms - initial_exec)).max(0.0);
-    writer.write_all(b"],\"meta\":")?;
-    super::depth::with_stack(cursor.stack_depth(), || {
-        json(
-            &mut writer,
-            &Meta {
-                total_rows: (stats.status == super::CursorStatus::Complete).then_some(sent),
-                sent_rows: sent,
-                status: stats.status,
-                timing: &timing,
-                plan: cursor.plan(),
-                memory: NativeMemory {
-                    peak_bytes: stats.mem_peak_bytes,
-                    granted_bytes: stats.granted_bytes,
-                },
-                rows_produced: stats.rows_produced,
-                commit: metadata.as_ref().map(|m| m.commit),
-                dataset_id: metadata.as_ref().map(|m| m.dataset_id),
-                io: metadata.as_ref().and_then(|m| m.io).map(|p| p.report()),
-            },
-        )
-    })?;
-    writer.write_all(b"}")?;
-    Ok(stats)
+    let rows = RowCount::new();
+    let options = WriteOptions {
+        send,
+        metadata,
+        ..WriteOptions::new(Format::Solutions(SolutionsFormat::Sparkles), &rows)
+    };
+    write(Source::Select(cursor), options, &mut writer).map(|s| s.expect("cursor statistics"))
 }
 
 /// Stream graph rows in the native document. Default graph rows are represented
 /// as quads with a null graph, so mixed graph output needs no partition buffer.
 pub fn write_cursor_graph_native_json(
     cursor: &mut super::GraphCursor,
-    writer: impl Write,
+    mut writer: impl Write,
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
 ) -> Result<super::CursorStats> {
-    write_cursor_graph_native_json_counted(cursor, writer, send, metadata, &RowCount::new())
+    let rows = RowCount::new();
+    let options = WriteOptions {
+        send,
+        metadata,
+        ..WriteOptions::new(Format::Solutions(SolutionsFormat::Sparkles), &rows)
+    };
+    write(Source::Graph(cursor), options, &mut writer).map(|s| s.expect("cursor statistics"))
 }
 
-/// [`write_cursor_graph_native_json`], counting in `sent` the quads that reached `writer`
-/// whole, as [`write_cursor_solutions_counted`] counts rows.
-pub fn write_cursor_graph_native_json_counted(
+/// [`write_cursor_graph_native_json`] counting in `sent`.
+fn cursor_graph_native_json(
     cursor: &mut super::GraphCursor,
-    mut output: impl Write,
+    output: &mut dyn Write,
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
     sent: &RowCount,
@@ -1539,7 +1157,7 @@ pub fn write_cursor_graph_native_json_counted(
     let mut metadata = metadata;
     let mut stats = None;
     let result = write_buffered(
-        &mut output,
+        output,
         sent,
         Some(cursor.output_ctx()),
         &mut |mut writer, staged| {
@@ -1639,24 +1257,28 @@ pub fn write_cursor_graph_native_json_counted(
 pub fn write_cursor_jena_graph(
     cursor: &mut super::GraphCursor,
     format: crate::jena_formats::JenaFormat,
-    output: impl Write,
+    mut output: impl Write,
     send: Option<usize>,
 ) -> Result<super::CursorStats> {
-    write_cursor_jena_graph_counted(cursor, format, output, send, &RowCount::new())
+    let rows = RowCount::new();
+    let options = WriteOptions {
+        send,
+        ..WriteOptions::new(Format::Jena(format), &rows)
+    };
+    write(Source::Graph(cursor), options, &mut output).map(|s| s.expect("cursor statistics"))
 }
 
-/// [`write_cursor_jena_graph`], counting in `sent` the triples and quads that reached
-/// `output` whole, as [`write_jena_graph_counted`] does.
-pub fn write_cursor_jena_graph_counted(
+/// [`write_cursor_jena_graph`] counting in `sent`.
+fn cursor_jena_graph(
     cursor: &mut super::GraphCursor,
     format: crate::jena_formats::JenaFormat,
-    mut output: impl Write,
+    output: &mut dyn Write,
     send: Option<usize>,
     sent: &RowCount,
 ) -> Result<super::CursorStats> {
     let mut stats = None;
     let result = write_buffered(
-        &mut output,
+        output,
         sent,
         Some(cursor.output_ctx()),
         &mut |output, staged| {
@@ -1673,7 +1295,7 @@ pub fn write_cursor_jena_graph_counted(
     }
 }
 
-/// [`write_cursor_jena_graph_counted`] into the buffer of [`write_buffered`].
+/// [`cursor_jena_graph`] into the buffer of [`write_buffered`].
 fn cursor_jena_graph_to(
     cursor: &mut super::GraphCursor,
     format: crate::jena_formats::JenaFormat,
@@ -2372,11 +1994,11 @@ mod buffered_tests {
             room: 1,
         };
         let sent = RowCount::new();
-        assert!(write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut short, &sent).is_err());
+        assert!(write_jena_rows(&r, JenaFormat::RdfJson, &mut short, &sent).is_err());
         assert_eq!(short.out, b"{");
         assert_eq!(sent.get(), 0);
         let sent = RowCount::new();
-        write_jena_graph_counted(&r, JenaFormat::RdfJson, Vec::new(), &sent).unwrap();
+        write_jena_rows(&r, JenaFormat::RdfJson, Vec::new(), &sent).unwrap();
         assert_eq!(sent.get(), 1);
     }
 
@@ -2419,7 +2041,7 @@ mod buffered_tests {
         // the document is the one `finish` writes from the whole map
         let mut whole = Vec::new();
         let sent = RowCount::new();
-        write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut whole, &sent).unwrap();
+        write_jena_rows(&r, JenaFormat::RdfJson, &mut whole, &sent).unwrap();
         assert_eq!(sent.get(), 4);
         let mut plain = RdfWriter::new(JenaFormat::RdfJson, Vec::new());
         for t in &r.inner.triples {
@@ -2431,7 +2053,7 @@ mod buffered_tests {
         // a flush that fails after the whole document leaves every triple counted
         let mut late = FailFlush(Vec::new());
         let sent = RowCount::new();
-        assert!(write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut late, &sent).is_err());
+        assert!(write_jena_rows(&r, JenaFormat::RdfJson, &mut late, &sent).is_err());
         assert_eq!(late.0, whole);
         assert_eq!(sent.get(), 4);
         // a writer that stops partway counts the subjects whose bytes it took: the blank
@@ -2446,7 +2068,7 @@ mod buffered_tests {
                 room,
             };
             let sent = RowCount::new();
-            assert!(write_jena_graph_counted(&r, JenaFormat::RdfJson, &mut w, &sent).is_err());
+            assert!(write_jena_rows(&r, JenaFormat::RdfJson, &mut w, &sent).is_err());
             assert_eq!(w.out, whole[..room]);
             assert_eq!(sent.get(), counted, "{room}");
         }

@@ -952,12 +952,11 @@ mod tests {
         .unwrap();
         let mut sw = SwitchWriter::new(1 << 20, None);
         let rows = sparkles::sparql::results::RowCount::with_ledger(sw.ledger());
-        sparkles::sparql::results::write_solutions_counted(
-            &r,
-            sparkles::sparql::results::SolutionsFormat::Tsv,
+        use sparkles::sparql::results as res;
+        res::write(
+            res::Source::Result(&r),
+            res::WriteOptions::new(res::Format::Solutions(res::SolutionsFormat::Tsv), &rows),
             &mut sw,
-            None,
-            &rows,
         )
         .unwrap();
         assert_eq!(rows.get(), 3);

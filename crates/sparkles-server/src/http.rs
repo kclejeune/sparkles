@@ -1290,6 +1290,13 @@ enum OutFormat {
 }
 
 impl OutFormat {
+    fn format(self) -> results::Format {
+        match self {
+            OutFormat::Rdf(f) => results::Format::Rdf(f),
+            OutFormat::Jena(j) => results::Format::Jena(j),
+        }
+    }
+
     fn file_extension(self) -> &'static str {
         match self {
             OutFormat::Rdf(f) => f.file_extension(),
@@ -2338,26 +2345,36 @@ fn serialize_result(
     io: Option<&sparkles::ioacct::Profile>,
     sent: &results::RowCount,
 ) -> sparkles::Result<()> {
-    if sparkles_doc {
-        results::write_native_json_counted(
-            r,
-            w,
+    let prefix_list: Vec<(String, String)>;
+    let options = if sparkles_doc {
+        results::WriteOptions {
             send,
-            Some(results::NativeJsonMetadata {
+            metadata: Some(results::NativeJsonMetadata {
                 commit: seq,
                 dataset_id,
                 io,
             }),
-            sent,
-        )
+            ..results::WriteOptions::new(
+                results::Format::Solutions(SolutionsFormat::Sparkles),
+                sent,
+            )
+        }
     } else if is_graph {
-        match rfmt {
-            OutFormat::Rdf(f) => results::write_graph_counted(r, f, prefixes, w, sent),
-            OutFormat::Jena(j) => results::write_jena_graph_counted(r, j, w, sent),
+        prefix_list = prefixes
+            .iter()
+            .map(|(p, ns)| (p.clone(), ns.clone()))
+            .collect();
+        results::WriteOptions {
+            prefixes: &prefix_list,
+            ..results::WriteOptions::new(rfmt.format(), sent)
         }
     } else {
-        results::write_solutions_counted(r, sfmt, w, send, sent)
-    }
+        results::WriteOptions {
+            send,
+            ..results::WriteOptions::new(results::Format::Solutions(sfmt), sent)
+        }
+    };
+    results::write(results::Source::Result(r), options, w).map(drop)
 }
 
 /// SELECT results in SPARQL Results Thrift, `send` rows at most, counting in `sent` the

@@ -468,20 +468,27 @@ pub fn write_cursor_graph(
     send: Option<usize>,
     prefixes: &[(String, String)],
 ) -> Result<CursorStats> {
-    write_cursor_graph_counted(
-        cursor,
-        format,
-        output,
+    let rows = crate::sparql::results::RowCount::new();
+    let options = crate::sparql::results::WriteOptions {
         send,
         prefixes,
-        &crate::sparql::results::RowCount::new(),
+        ..crate::sparql::results::WriteOptions::new(
+            crate::sparql::results::Format::Rdf(format),
+            &rows,
+        )
+    };
+    crate::sparql::results::write(
+        crate::sparql::results::Source::Graph(cursor),
+        options,
+        output,
     )
+    .map(|s| s.expect("cursor statistics"))
 }
 
 /// [`write_cursor_graph`], counting in `sent` the triples and quads that reached `output`
 /// whole, as the eager graph writers count them. The statements go out through the
 /// buffer of the eager writers.
-pub fn write_cursor_graph_counted(
+pub(in crate::sparql) fn write_cursor_graph_rows(
     cursor: &mut GraphCursor,
     format: oxrdfio::RdfFormat,
     output: &mut dyn std::io::Write,
@@ -503,7 +510,7 @@ pub fn write_cursor_graph_counted(
     Ok(cursor.stats())
 }
 
-/// [`write_cursor_graph_counted`] into the buffer of the eager writers.
+/// [`write_cursor_graph_rows`] into the buffer of the eager writers.
 fn graph_to(
     cursor: &mut GraphCursor,
     format: oxrdfio::RdfFormat,

@@ -295,7 +295,7 @@ fn public_large_writer_keeps_threshold_values_counts_and_joins_prefetch() {
         prefix: Vec::new(),
     };
     let sent = RowCount::new();
-    write_solutions_counted(&result, SolutionsFormat::Tsv, &mut sink, None, &sent).unwrap();
+    write_solutions_rows(&result, SolutionsFormat::Tsv, &mut sink, None, &sent).unwrap();
     assert_eq!(sent.get(), (DECODE_ROWS + 1) as u64);
     assert!(sink.prefix.starts_with(b"?o\n\"small\"\n"));
     assert_eq!(sink.bytes, 3 + 8 * (DECODE_ROWS + 1));
@@ -419,9 +419,8 @@ fn scoped_prefetch_panic_is_an_error_without_unchecked_redo() {
         }
     }));
     let sent = RowCount::new();
-    let error =
-        write_solutions_counted(&result, SolutionsFormat::Tsv, std::io::sink(), None, &sent)
-            .unwrap_err();
+    let error = write_solutions_rows(&result, SolutionsFormat::Tsv, std::io::sink(), None, &sent)
+        .unwrap_err();
     assert!(
         matches!(error, Error::Invalid(message) if message == "query output prefetch worker panicked")
     );
@@ -492,7 +491,7 @@ fn observed_io_error_stays_first_while_later_prefetch_panic_is_joined() {
         }
     }));
     let sent = RowCount::new();
-    let error = write_solutions_counted(
+    let error = write_solutions_rows(
         &result,
         SolutionsFormat::Tsv,
         Broken { header: 0 },
@@ -862,7 +861,7 @@ fn caller_unwind_packet(completed_cells: bool) {
     }));
     let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let sent = RowCount::new();
-        write_solutions_counted(
+        write_solutions_rows(
             &result,
             SolutionsFormat::Tsv,
             CallerPanic {

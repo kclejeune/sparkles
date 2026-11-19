@@ -15,8 +15,8 @@ enum Format {
 impl Format {
     fn write(self, r: &QueryResult, out: impl Write, sent: &RowCount) -> Result<()> {
         match self {
-            Self::Native => write_native_json_counted(r, out, None, None, sent),
-            Self::Tsv => write_solutions_counted(r, SolutionsFormat::Tsv, out, None, sent),
+            Self::Native => write_solutions_rows(r, SolutionsFormat::Sparkles, out, None, sent),
+            Self::Tsv => write_solutions_rows(r, SolutionsFormat::Tsv, out, None, sent),
         }
     }
 }

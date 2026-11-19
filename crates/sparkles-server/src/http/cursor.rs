@@ -230,63 +230,33 @@ pub(super) async fn serve(
                     *sent_slot.lock() = Some(sent.get());
                     written
                 }
-                QueryExecution::Select(cursor) if format == SolutionsFormat::Sparkles => {
-                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
-                    let written = results::write_cursor_native_json_counted(
-                        cursor,
-                        &mut *writer,
-                        send,
-                        metadata,
-                        &sent,
-                    );
-                    *sent_slot.lock() = Some(sent.get());
-                    written.map(|_| ())
-                }
                 QueryExecution::Select(cursor) => {
                     let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
-                    let written = results::write_cursor_solutions_counted(
-                        cursor,
-                        format,
-                        &mut *writer,
-                        send,
-                        &sent,
-                    );
-                    *sent_slot.lock() = Some(sent.get());
-                    written.map(|_| ())
-                }
-                QueryExecution::Graph(cursor) if native_graph => {
-                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
-                    let written = results::write_cursor_graph_native_json_counted(
-                        cursor,
-                        &mut *writer,
+                    let options = results::WriteOptions {
                         send,
                         metadata,
-                        &sent,
-                    );
+                        ..results::WriteOptions::new(results::Format::Solutions(format), &sent)
+                    };
+                    let written =
+                        results::write(results::Source::Select(cursor), options, &mut *writer);
                     *sent_slot.lock() = Some(sent.get());
                     written.map(|_| ())
                 }
                 QueryExecution::Graph(cursor) => {
                     let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
-                    let written = match rdf_format {
-                        OutFormat::Rdf(format) => {
-                            sparkles::sparql::cursor::graph::write_cursor_graph_counted(
-                                cursor,
-                                format,
-                                &mut *writer,
-                                send,
-                                &prefixes,
-                                &sent,
-                            )
-                        }
-                        OutFormat::Jena(format) => results::write_cursor_jena_graph_counted(
-                            cursor,
-                            format,
-                            &mut *writer,
-                            send,
-                            &sent,
-                        ),
+                    let format = if native_graph {
+                        results::Format::Solutions(SolutionsFormat::Sparkles)
+                    } else {
+                        rdf_format.format()
                     };
+                    let options = results::WriteOptions {
+                        send,
+                        prefixes: &prefixes,
+                        metadata,
+                        ..results::WriteOptions::new(format, &sent)
+                    };
+                    let written =
+                        results::write(results::Source::Graph(cursor), options, &mut *writer);
                     *sent_slot.lock() = Some(sent.get());
                     written.map(|_| ())
                 }
