@@ -1688,6 +1688,63 @@ fn a_failed_budget_flush_reports_only_the_rows_sent() {
     }
 }
 
+/// A body that the result-size budget stops before the response is committed is answered
+/// with 507, and none of its rows reached the client, so the access log reports no rows,
+/// even though whole rows had already been copied into the buffer that the error
+/// discards.
+#[test]
+fn a_budget_error_before_the_commit_reports_no_rows() {
+    // The budget lets several of the writer's 8 KiB pieces through and refuses a later
+    // one, below both the eager switch and a stream's first bytes.
+    let budget = 40 << 10;
+    assert!(budget < super::stream::FIRST_BYTES_AFTER);
+    let data = (0..5000)
+        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(512)))
+        .collect::<String>();
+    for execution in ["eager", "streaming"] {
+        for format in ["tsv", "thrift"] {
+            let lines = access_lines_of(|| async {
+                let s = server_with(|st| {
+                    st.access_log = true;
+                    st.limits.max_result_bytes = Some(budget as u64);
+                });
+                s.state
+                    .get("ds")
+                    .unwrap()
+                    .store
+                    .load(&[Source::from_bytes(
+                        data.clone().into_bytes(),
+                        oxrdfio::RdfFormat::NTriples,
+                        None,
+                    )])
+                    .unwrap();
+                let uri = format!(
+                    "/ds/sparql?execution={execution}&format={format}&query=SELECT%20%3Fs%20%3Fo%20%7B%3Fs%20%3Curn:big%3E%20%3Fo%7D"
+                );
+                let r = get(&s.app, &uri).await;
+                assert_eq!(
+                    r.status,
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "{execution} {format}: {}",
+                    r.text()
+                );
+            })
+            .into_iter()
+            .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
+            .collect::<Vec<_>>();
+            assert_eq!(lines.len(), 1, "{execution} {format}: {lines:#?}");
+            let j: J = serde_json::from_str(&lines[0]).unwrap();
+            let f = &j["fields"];
+            assert_eq!(f["outcome"], "budget", "{execution} {format}: {f}");
+            assert_eq!(f["status"], 507, "{execution} {format}: {f}");
+            assert!(
+                f.get("rows").is_none_or(J::is_null),
+                "{execution} {format}: an error response sent no rows: {f}"
+            );
+        }
+    }
+}
+
 /// The end offset of every row of a whole SPARQL Results Thrift body of `?s ?o`, whose rows
 /// the TSV body `tsv` holds in the same order, from the library's encoder.
 fn thrift_row_ends(tsv: &[u8], thrift: &[u8]) -> Vec<usize> {
@@ -2218,7 +2275,7 @@ async fn a_late_failure_of_a_default_stream_aborts_the_transfer() {
 #[tokio::test]
 async fn explicit_streaming_commits_after_the_first_batch() {
     let s = server();
-    for format in ["json", "xml", "csv", "tsv", "sparkles"] {
+    for format in ["json", "xml", "csv", "tsv", "sparkles", "thrift"] {
         let streamed = get(
             &s.app,
             &format!("{ALL}&format={format}&execution=streaming"),

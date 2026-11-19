@@ -725,6 +725,7 @@ mod tests {
                             error: Some(error),
                             disconnected: false,
                             rows: None,
+                            committed: true,
                         },
                     )
                 }),

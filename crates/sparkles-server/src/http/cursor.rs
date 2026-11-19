@@ -281,8 +281,11 @@ pub(super) async fn serve(
             // The statistics count all the rows an answer produced, so a body that stopped
             // partway reports the rows that reached the response writer whole.
             // The rows of a streamed body are the ones whose ends the transport handed over,
-            // and a writer that records none there reports the rows it wrote whole.
+            // and a writer that records none there reports the rows it wrote whole. A body
+            // that failed before it was committed is an error response, which sent none of
+            // its rows.
             let rows = match (end.rows, *sent_rows.lock()) {
+                _ if !end.committed => None,
                 (Some(delivered), _) if end.error.is_some() => Some(delivered),
                 (None, Some(sent)) if end.error.is_some() => Some(sent),
                 _ => stats.as_ref().map(|s| s.emitted_rows),

@@ -70,6 +70,10 @@ pub struct StreamEnd {
     /// `None` when the writer recorded no rows there or the body failed before it was
     /// committed. A row counts once the send that holds its end has enqueued.
     pub rows: Option<u64>,
+    /// The response was committed: it switched to streaming, or its whole body went
+    /// out. A body that failed before then is answered with an error status, and no
+    /// row of it reached the client.
+    pub committed: bool,
 }
 
 impl StreamEnd {
@@ -685,6 +689,7 @@ where
                 error: result.err(),
                 disconnected,
                 rows: sw.ledger.delivered(),
+                committed: true,
             });
             drop(span);
             producer.publish();
@@ -702,6 +707,7 @@ where
                         error: None,
                         disconnected: false,
                         rows: sw.ledger.delivered(),
+                        committed: true,
                     });
                 }
                 drop(span);
@@ -719,8 +725,9 @@ where
                         serialize_ms,
                         error: Some(copy_error(&e)),
                         disconnected: false,
-                        // the response is an error, and the rows are reported as before
+                        // the response is an error status, and none of its rows was sent
                         rows: None,
+                        committed: false,
                     });
                     drop(span);
                     drop(sw.held.take());
@@ -749,6 +756,7 @@ where
                     error,
                     disconnected,
                     rows: sw.ledger.delivered(),
+                    committed: true,
                 });
                 drop(span);
                 if let Some(msg) = abort {

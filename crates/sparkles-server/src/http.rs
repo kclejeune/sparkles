@@ -2205,8 +2205,11 @@ pub(crate) async fn run_query(
         stream_end_log("query", &end);
         let (outcome, budget) = end.outcome();
         // the rows whose ends the transport handed over, or for a writer that records
-        // none there, the rows it wrote whole
-        let rows = if end.error.is_some() {
+        // none there, the rows it wrote whole. A body that failed before it was committed
+        // is an error response, which sent none of its rows.
+        let rows = if !end.committed {
+            None
+        } else if end.error.is_some() {
             Some(
                 end.rows
                     .unwrap_or_else(|| sent_rows.load(std::sync::atomic::Ordering::Relaxed)),
