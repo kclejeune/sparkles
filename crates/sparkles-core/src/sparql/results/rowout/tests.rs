@@ -327,6 +327,35 @@ fn a_refused_growth_keeps_the_rows_written() {
     }
 }
 
+/// A serializer's own error is reported even when the mark of its last row, noted after
+/// it returned, needs a growth of the marks that the budget refuses, and every row it
+/// wrote is still written on and counted.
+#[test]
+fn a_source_error_is_kept_over_a_later_refused_mark() {
+    let first = OUTPUT_BUFFER as u64 + FIRST_MARKS as u64 * MARK_BYTES;
+    let r = small_answer();
+    let _held = leave(&r, first + 500);
+    let count = RowCount::new();
+    let mut out = Vec::new();
+    // the last row's mark fills the first marks and is noted after the error
+    let mut write = rows(FIRST_MARKS as u64, 10, 3, false);
+    let result = write_buffered(
+        &mut out,
+        &count,
+        Some(r.test_context().clone()),
+        &mut |w, staged| {
+            write(w, staged)?;
+            Err(Error::invalid("the source's own error"))
+        },
+    );
+    match result {
+        Err(Error::Invalid(message)) => assert_eq!(message, "the source's own error"),
+        other => panic!("the source's error was replaced: {other:?}"),
+    }
+    assert_eq!(out.len(), FIRST_MARKS * 10);
+    assert_eq!(count.get(), FIRST_MARKS as u64);
+}
+
 #[test]
 fn the_charge_is_released_with_the_writer() {
     let r = small_answer();

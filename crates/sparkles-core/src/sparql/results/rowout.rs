@@ -461,24 +461,29 @@ pub(in crate::sparql) fn write_buffered(
     let staged = Cell::new(0);
     let mut out = RowOut::new(w, &staged, count, ctx.as_deref());
     let result = f(&mut out, &staged);
-    // the rows counted after the last write end where the output ends
-    let noted = out.note();
-    let result = result.and_then(|()| noted.map_err(Error::Io));
-    let result = match result {
-        Ok(()) => out.drain().map_err(Error::Io),
+    // A refused charge reached the serializer only as an I/O error, so that error is
+    // replaced by the refusal. An error of the serializer's own, such as a decode
+    // refusal or a cancellation, is the one reported, even when a charge made after it,
+    // for the last row's mark or in the drain below, is refused.
+    let result = match (result, out.refused.take()) {
+        (Err(Error::Io(_)), Some(refused)) => Err(refused),
+        (result, _) => result,
+    };
+    match result {
+        Ok(()) => {
+            // the rows counted after the last write end where the output ends
+            let written = out.note().and_then(|()| out.drain());
+            written.map_err(|e| out.refused.take().unwrap_or(Error::Io(e)))
+        }
         Err(e) => {
-            // the error is the one to report, and the output stops here either way, with
-            // the bytes before it written on
+            // the output stops here, with the bytes before the error written on and the
+            // rows that ended in them counted
+            let _ = out.note();
             if !out.failed {
                 let _ = out.drain();
             }
             Err(e)
         }
-    };
-    // a refused charge, which the serializer saw only as an I/O error
-    match out.refused.take() {
-        Some(refused) if result.is_err() => Err(refused),
-        _ => result,
     }
 }
 
