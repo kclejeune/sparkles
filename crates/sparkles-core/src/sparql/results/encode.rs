@@ -499,5 +499,235 @@ fn is_turtle_double(value: &str) -> bool {
     (before > 0 || after > 0) && !exponent.is_empty() && exponent.iter().all(u8::is_ascii_digit)
 }
 
+/// SPARQL Query Results XML, as sparesults writes it with SPARQL 1.2 terms through
+/// quick-xml: no whitespace between elements, attributes in double quotes, text and
+/// attribute values with `<`, `>`, `&`, `'` and `"` escaped, a literal's leading and
+/// trailing tabs, line feeds, carriage returns and spaces as character references, and the
+/// ITS namespace and version on each literal with a direction.
+pub(super) struct Xml<'a> {
+    /// each variable's opening binding tag, `<binding name="name">`, escaped once, so that
+    /// a cell copies its tag with one lookup
+    tags: Box<[Box<[u8]>]>,
+    /// the reservation for `tags`, declared after them so that they drop first
+    _charge: Option<Charge<'a>>,
+}
+
+const BINDING_OPEN: &[u8] = b"<binding name=\"";
+const BINDING_CLOSE: &[u8] = b"\">";
+
+impl<'a> Xml<'a> {
+    /// The binding tags of `variables`, charged to `ctx` before they are allocated. Each
+    /// tag and the table of tags are allocated once at their exact size and never grow.
+    pub(super) fn new(ctx: Option<&'a Ctx>, variables: &[String]) -> crate::error::Result<Self> {
+        let charge = ctx
+            .map(|ctx| ctx.charge(Self::charged(variables)))
+            .transpose()?;
+        let tags = variables
+            .iter()
+            .map(|v| {
+                let mut tag = Vec::with_capacity(Self::tag_len(v));
+                tag.extend_from_slice(BINDING_OPEN);
+                xml_escaped(&mut tag, v);
+                tag.extend_from_slice(BINDING_CLOSE);
+                debug_assert_eq!(tag.len(), tag.capacity());
+                tag.into_boxed_slice()
+            })
+            .collect();
+        Ok(Xml {
+            tags,
+            _charge: charge,
+        })
+    }
+
+    fn tag_len(name: &str) -> usize {
+        BINDING_OPEN.len() + xml_escaped_len(name) + BINDING_CLOSE.len()
+    }
+
+    /// The bytes [`Xml::new`] charges for the tags of `variables`: each tag's bytes and
+    /// the table of their pointers.
+    pub(super) fn charged(variables: &[String]) -> u64 {
+        let bytes: usize = variables.iter().map(|v| Self::tag_len(v)).sum();
+        (bytes + variables.len() * std::mem::size_of::<Box<[u8]>>()) as u64
+    }
+
+    /// The document up to the opening of the results element, as one piece.
+    pub(super) fn header(out: &mut Explicit<'_, '_>, variables: &[String]) -> Result<()> {
+        out.begin_piece();
+        out.put(b"<?xml version=\"1.0\"?><sparql xmlns=\"http://www.w3.org/2005/sparql-results#\"><head>")?;
+        for v in variables {
+            out.put(b"<variable name=\"")?;
+            xml_text(out, v)?;
+            out.put(b"\"/>")?;
+        }
+        out.put(b"</head><results>")?;
+        out.end_piece()
+    }
+
+    /// One solution, the bound cells in column order.
+    pub(super) fn row(
+        &mut self,
+        out: &mut Explicit<'_, '_>,
+        row: RowView<'_>,
+        _width: usize,
+    ) -> Result<()> {
+        out.put(b"<result>")?;
+        match row {
+            RowView::Dense(terms) => {
+                for (c, term) in terms.iter().enumerate() {
+                    if let Some(term) = term {
+                        self.cell(out, c, term.as_ref())?;
+                    }
+                }
+            }
+            RowView::Sparse(terms) => {
+                for (c, term) in terms {
+                    self.cell(out, *c, term.as_ref().as_ref())?;
+                }
+            }
+        }
+        out.put(b"</result>")
+    }
+
+    #[inline]
+    fn cell(&self, out: &mut Explicit<'_, '_>, column: usize, term: TermRef<'_>) -> Result<()> {
+        out.put(&self.tags[column])?;
+        xml_term(out, term)?;
+        out.put(b"</binding>")
+    }
+
+    /// The end of the results element and of the document.
+    pub(super) fn footer(out: &mut Explicit<'_, '_>) -> Result<()> {
+        out.put(b"</results></sparql>")
+    }
+}
+
+fn xml_term(out: &mut Explicit<'_, '_>, term: TermRef<'_>) -> Result<()> {
+    match term {
+        TermRef::NamedNode(node) => {
+            out.put(b"<uri>")?;
+            xml_text(out, node.as_str())?;
+            out.put(b"</uri>")
+        }
+        TermRef::BlankNode(node) => {
+            out.put(b"<bnode>")?;
+            xml_text(out, node.as_str())?;
+            out.put(b"</bnode>")
+        }
+        TermRef::Literal(literal) => {
+            out.put(b"<literal")?;
+            if let Some(language) = literal.language() {
+                out.put(b" xml:lang=\"")?;
+                xml_text(out, language)?;
+                out.put(b"\"")?;
+                if let Some(direction) = literal.direction() {
+                    out.put(match direction {
+                        BaseDirection::Ltr => b" its:dir=\"ltr\"",
+                        BaseDirection::Rtl => b" its:dir=\"rtl\"",
+                    })?;
+                    out.put(b" xmlns:its=\"http://www.w3.org/2005/11/its\" its:version=\"2.0\"")?;
+                }
+            } else if literal.datatype() != xsd::STRING {
+                out.put(b" datatype=\"")?;
+                xml_text(out, literal.datatype().as_str())?;
+                out.put(b"\"")?;
+            }
+            out.put(b">")?;
+            xml_literal_value(out, literal.value())?;
+            out.put(b"</literal>")
+        }
+        TermRef::Triple(triple) => {
+            out.put(b"<triple><subject>")?;
+            xml_term(out, triple.subject.as_ref().into())?;
+            out.put(b"</subject><predicate>")?;
+            xml_term(out, triple.predicate.as_ref().into())?;
+            out.put(b"</predicate><object>")?;
+            xml_term(out, triple.object.as_ref())?;
+            out.put(b"</object></triple>")
+        }
+    }
+}
+
+/// The escape quick-xml writes for `b` in text and attribute values.
+#[inline]
+fn xml_escape(b: u8) -> Option<&'static [u8]> {
+    Some(match b {
+        b'<' => b"&lt;",
+        b'>' => b"&gt;",
+        b'&' => b"&amp;",
+        b'\'' => b"&apos;",
+        b'"' => b"&quot;",
+        _ => return None,
+    })
+}
+
+/// Text or an attribute value, escaped, the runs between escapes copied whole. Only ASCII
+/// bytes are escaped, so a run never splits a character.
+fn xml_text(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(escaped) = xml_escape(b) {
+            out.put(&bytes[start..i])?;
+            out.put(escaped)?;
+            start = i + 1;
+        }
+    }
+    out.put(&bytes[start..])
+}
+
+/// The character reference sparesults writes for a tab, line feed, carriage return or
+/// space at either end of a literal's value.
+#[inline]
+fn xml_bound_space(b: u8) -> Option<&'static [u8]> {
+    Some(match b {
+        b'\t' => b"&#9;",
+        b'\n' => b"&#10;",
+        b'\r' => b"&#13;",
+        b' ' => b"&#32;",
+        _ => return None,
+    })
+}
+
+/// A literal's value, its leading and trailing whitespace as character references so that
+/// a reader keeps it, and the rest escaped as text. A value of only whitespace is all
+/// references.
+fn xml_literal_value(out: &mut Explicit<'_, '_>, s: &str) -> Result<()> {
+    let bytes = s.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|&b| xml_bound_space(b).is_none())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|&b| xml_bound_space(b).is_none())
+        .map_or(start, |i| i + 1);
+    for &b in &bytes[..start] {
+        out.put(xml_bound_space(b).unwrap_or_default())?;
+    }
+    // both ends are ASCII bytes or the ends of the value, so the middle is a whole str
+    xml_text(out, &s[start..end])?;
+    for &b in &bytes[end..] {
+        out.put(xml_bound_space(b).unwrap_or_default())?;
+    }
+    Ok(())
+}
+
+/// The length of `s` escaped by [`xml_escaped`].
+fn xml_escaped_len(s: &str) -> usize {
+    s.bytes()
+        .map(|b| xml_escape(b).map_or(1, <[u8]>::len))
+        .sum()
+}
+
+/// [`xml_text`] into a vector, for the binding tags escaped once per answer.
+fn xml_escaped(to: &mut Vec<u8>, s: &str) {
+    for &b in s.as_bytes() {
+        match xml_escape(b) {
+            Some(escaped) => to.extend_from_slice(escaped),
+            None => to.push(b),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests;

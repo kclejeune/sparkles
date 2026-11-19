@@ -1,7 +1,7 @@
 //! One writer per result format family over the sources of [`super::source`], and the
 //! entry that every caller writes a result through.
 
-use super::encode::{Csv, Json, Tsv};
+use super::encode::{Csv, Json, Tsv, Xml};
 use super::rowout::Explicit;
 use super::source::{
     BatchVisitor, CursorGraph, CursorSolutions, EagerGraph, EagerMode, EagerSolutions, GraphSource,
@@ -248,6 +248,17 @@ fn select<S: SolutionSource>(
                 Json::header,
                 |out: &mut Explicit<'_, '_>, row: RowView<'_>, width| json.row(out, row, width),
                 Some(Json::footer),
+            );
+        }
+        SolutionsFormat::Xml => {
+            let mut xml = Xml::new(out.ctx(), source.variables())?;
+            return encoded(
+                source,
+                out,
+                send,
+                Xml::header,
+                |out: &mut Explicit<'_, '_>, row: RowView<'_>, width| xml.row(out, row, width),
+                Some(Xml::footer),
             );
         }
         _ => {}

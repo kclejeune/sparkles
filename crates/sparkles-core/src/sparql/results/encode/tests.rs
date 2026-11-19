@@ -5,7 +5,7 @@
 use super::super::rowout::Explicit;
 use super::super::source::RowView;
 use super::super::{RowCount, io, write_buffered};
-use super::{Csv, Json, Tsv};
+use super::{Csv, Json, Tsv, Xml};
 use crate::error::Result;
 use oxrdf::vocab::xsd;
 use oxrdf::{
@@ -24,6 +24,7 @@ enum Enc {
     Tsv,
     Csv,
     Json,
+    Xml,
 }
 
 /// An encoder writing one answer, with the state a format keeps across its rows.
@@ -31,6 +32,7 @@ enum Running<'a> {
     Tsv,
     Csv,
     Json(Json<'a>),
+    Xml(Xml<'a>),
 }
 
 impl Enc {
@@ -39,6 +41,7 @@ impl Enc {
             Enc::Tsv => QueryResultsFormat::Tsv,
             Enc::Csv => QueryResultsFormat::Csv,
             Enc::Json => QueryResultsFormat::Json,
+            Enc::Xml => QueryResultsFormat::Xml,
         }
     }
 
@@ -59,6 +62,11 @@ impl Enc {
                 Json::header(out, vars).map_err(io)?;
                 Running::Json(json)
             }
+            Enc::Xml => {
+                let xml = Xml::new(out.ctx(), vars)?;
+                Xml::header(out, vars).map_err(io)?;
+                Running::Xml(xml)
+            }
         })
     }
 }
@@ -74,6 +82,7 @@ impl Running<'_> {
             Running::Tsv => Tsv::row(out, row, width),
             Running::Csv => Csv::row(out, row, width),
             Running::Json(json) => json.row(out, row, width),
+            Running::Xml(xml) => xml.row(out, row, width),
         }
     }
 
@@ -81,6 +90,7 @@ impl Running<'_> {
         match self {
             Running::Tsv | Running::Csv => Ok(()),
             Running::Json(_) => Json::footer(out),
+            Running::Xml(_) => Xml::footer(out),
         }
     }
 }
@@ -288,6 +298,7 @@ fn header_len(enc: Enc, vars: &[String]) -> usize {
     let footer = match enc {
         Enc::Tsv | Enc::Csv => 0,
         Enc::Json => b"]}}".len(),
+        Enc::Xml => b"</results></sparql>".len(),
     };
     oracle(enc, vars, &[]).0.len() - footer
 }
@@ -295,7 +306,8 @@ fn header_len(enc: Enc, vars: &[String]) -> usize {
 /// Every piece the caller's writer takes ends where the header or a row ends, or at the
 /// end of the document, so a row's pieces never reach it before the row is whole and a
 /// row longer than the buffer goes in one write. sparesults' JSON writes each character
-/// on its own, so its staged pieces drain mid-row and are no oracle for the pieces.
+/// on its own and quick-xml writes a tag in several writes, so their staged pieces drain
+/// mid-row and are no oracle for the pieces.
 fn check_row_pieces(
     enc: Enc,
     vars: &[String],
@@ -513,6 +525,16 @@ proptest! {
     fn json_counts_the_rows_a_failed_writer_took((vars, rows) in solutions(), limit in 0usize..400) {
         check_failing(Enc::Json, &vars, &rows, limit)?;
     }
+
+    #[test]
+    fn xml_equals_sparesults((vars, rows) in solutions()) {
+        check(Enc::Xml, &vars, &rows)?;
+    }
+
+    #[test]
+    fn xml_counts_the_rows_a_failed_writer_took((vars, rows) in solutions(), limit in 0usize..600) {
+        check_failing(Enc::Xml, &vars, &rows, limit)?;
+    }
 }
 
 proptest! {
@@ -559,6 +581,20 @@ proptest! {
     ) {
         let total = oracle(Enc::Json, &vars, &rows).0.len();
         check_failing(Enc::Json, &vars, &rows, (total as f64 * at) as usize)?;
+    }
+
+    #[test]
+    fn xml_pieces_end_where_rows_end((vars, rows) in long_solutions()) {
+        check_row_pieces(Enc::Xml, &vars, &rows)?;
+    }
+
+    #[test]
+    fn xml_counts_the_rows_a_failed_writer_took_over_drains(
+        (vars, rows) in long_solutions(),
+        at in 0.0f64..=1.0,
+    ) {
+        let total = oracle(Enc::Xml, &vars, &rows).0.len();
+        check_failing(Enc::Xml, &vars, &rows, (total as f64 * at) as usize)?;
     }
 }
 
@@ -794,7 +830,7 @@ fn a_refused_piece_of_the_buffer_size_fails_before_a_later_error() {
         let (quotes, eol) = match enc {
             Enc::Tsv => (2, 1),
             Enc::Csv => (0, 2),
-            Enc::Json => unreachable!("the JSON case has its own test"),
+            Enc::Json | Enc::Xml => unreachable!("JSON and XML have their own test"),
         };
         let vars = vec!["v".to_string()];
         let rows = vec![vec![simple(&"z".repeat(8_192 - quotes - eol))]];
@@ -1174,5 +1210,205 @@ fn json_new_charges_its_keys_itself() {
         }
         drop(held);
         assert_eq!(room(&ctx), before, "{left}: the charge outlived the keys");
+    }
+}
+
+fn xml(vars: &[&str], rows: &[Vec<Option<Term>>]) -> String {
+    encoded(Enc::Xml, vars, rows)
+}
+
+/// quick-xml's five escapes in text and attribute values, and a literal's whitespace as
+/// character references only at its ends, including values of only whitespace.
+#[test]
+fn xml_escapes_text_and_keeps_bound_whitespace() {
+    let got = xml(
+        &["v"],
+        &[
+            vec![simple("<a&b>'\"c\u{0}\u{7f}é中𝄞")],
+            vec![simple(" \t\r\n")],
+            vec![simple("  mid  dle\t")],
+            vec![simple("\n<&>\n")],
+            vec![simple("")],
+            vec![Some(NamedNode::new_unchecked("http://e/a&b<'\">").into())],
+            vec![lit(" 1 ", NamedNode::new_unchecked("http://e/d?a&b"))],
+        ],
+    );
+    let want = concat!(
+        r#"<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#">"#,
+        r#"<head><variable name="v"/></head><results>"#,
+        "<result><binding name=\"v\"><literal>&lt;a&amp;b&gt;&apos;&quot;c\u{0}\u{7f}é中𝄞</literal></binding></result>",
+        r#"<result><binding name="v"><literal>&#32;&#9;&#13;&#10;</literal></binding></result>"#,
+        r#"<result><binding name="v"><literal>&#32;&#32;mid  dle&#9;</literal></binding></result>"#,
+        r#"<result><binding name="v"><literal>&#10;&lt;&amp;&gt;&#10;</literal></binding></result>"#,
+        r#"<result><binding name="v"><literal></literal></binding></result>"#,
+        r#"<result><binding name="v"><uri>http://e/a&amp;b&lt;&apos;&quot;&gt;</uri></binding></result>"#,
+        r#"<result><binding name="v"><literal datatype="http://e/d?a&amp;b">&#32;1&#32;</literal></binding></result>"#,
+        r#"</results></sparql>"#
+    );
+    assert_eq!(got, want);
+}
+
+/// Literals with languages, directions and datatypes in sparesults' attribute order,
+/// xsd:string without its datatype, blank nodes, triple terms, Unicode names, unbound cells
+/// and answers without variables or rows.
+#[test]
+fn xml_writes_every_term_form() {
+    let triple = Term::Triple(Box::new(Triple::new(
+        NamedOrBlankNode::from(BlankNode::new_unchecked("b0")),
+        NamedNode::new_unchecked("http://e/p"),
+        Term::from(Literal::new_directional_language_tagged_literal_unchecked(
+            "x",
+            "ar",
+            BaseDirection::Rtl,
+        )),
+    )));
+    let got = xml(
+        &["a", "é中"],
+        &[
+            vec![
+                Some(BlankNode::new_unchecked("n1").into()),
+                Some(Literal::new_language_tagged_literal_unchecked("hi", "en-GB").into()),
+            ],
+            vec![
+                lit("s", xsd::STRING.into()),
+                Some(
+                    Literal::new_directional_language_tagged_literal_unchecked(
+                        "x",
+                        "en",
+                        BaseDirection::Ltr,
+                    )
+                    .into(),
+                ),
+            ],
+            vec![None, Some(triple)],
+            vec![None, None],
+        ],
+    );
+    let its = r#" xmlns:its="http://www.w3.org/2005/11/its" its:version="2.0""#;
+    let want = [
+        r#"<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#">"#,
+        r#"<head><variable name="a"/><variable name="é中"/></head><results>"#,
+        r#"<result><binding name="a"><bnode>n1</bnode></binding>"#,
+        r#"<binding name="é中"><literal xml:lang="en-GB">hi</literal></binding></result>"#,
+        r#"<result><binding name="a"><literal>s</literal></binding>"#,
+        &format!(r#"<binding name="é中"><literal xml:lang="en" its:dir="ltr"{its}>x</literal></binding></result>"#),
+        r#"<result><binding name="é中"><triple><subject><bnode>b0</bnode></subject>"#,
+        r#"<predicate><uri>http://e/p</uri></predicate><object>"#,
+        &format!(r#"<literal xml:lang="ar" its:dir="rtl"{its}>x</literal></object></triple></binding></result>"#),
+        r#"<result></result></results></sparql>"#,
+    ]
+    .concat();
+    assert_eq!(got, want);
+    assert_eq!(
+        xml(&[], &[vec![], vec![]]),
+        concat!(
+            r#"<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#">"#,
+            r#"<head></head><results><result></result><result></result></results></sparql>"#
+        )
+    );
+    assert_eq!(
+        xml(&["x"], &[]),
+        concat!(
+            r#"<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#">"#,
+            r#"<head><variable name="x"/></head><results></results></sparql>"#
+        )
+    );
+}
+
+/// Values and rows around and past the buffer's size, rows whose escapes and references
+/// outgrow it, wide sparse rows and deeply nested triple terms.
+#[test]
+fn xml_handles_values_longer_than_the_buffer() {
+    let vars = vec!["v".to_string()];
+    let mut rows = vec![vec![simple("a")]];
+    for n in [8_120, 8_130, 8_140, 8_150, 8_160, 8_200, 20_000] {
+        rows.push(vec![simple(&"z".repeat(n))]);
+    }
+    rows.push(vec![simple(&"&".repeat(3_000))]);
+    rows.push(vec![simple(&" ".repeat(3_000))]);
+    rows.push(vec![simple(&format!("{0}x{0}", "\t".repeat(2_000)))]);
+    check(Enc::Xml, &vars, &rows).unwrap();
+    check_row_pieces(Enc::Xml, &vars, &rows).unwrap();
+    for limit in [0, 3, 100, 8_000, 9_000, 40_000, 60_000, 90_000] {
+        check_failing(Enc::Xml, &vars, &rows, limit).unwrap();
+    }
+    let wide: Vec<String> = (0..120).map(|i| format!("c{i}")).collect();
+    let mut row = vec![None; 120];
+    row[40] = simple("a");
+    row[119] = simple("b");
+    check(Enc::Xml, &wide, &[row, vec![None; 120]]).unwrap();
+    let mut t: Term = NamedNode::new_unchecked("http://e/o").into();
+    for _ in 0..64 {
+        t = Term::Triple(Box::new(Triple::new(
+            NamedNode::new_unchecked("http://e/s"),
+            NamedNode::new_unchecked("http://e/p"),
+            t,
+        )));
+    }
+    xml(&["t"], &[vec![Some(t)]]);
+}
+
+/// An XML row or header of exactly the buffer's size that did not fit where it started
+/// goes on at once, so a writer that refuses it fails the output before the source's next
+/// error. quick-xml writes a tag in several writes, so the staged path is no oracle here.
+#[test]
+fn a_refused_xml_piece_of_the_buffer_size_fails_before_a_later_error() {
+    let vars = vec!["v".to_string()];
+    let header = header_len(Enc::Xml, &vars);
+    let footer = b"</results></sparql>".len();
+    // a row of an empty value, less the header and the footer
+    let empty = oracle(Enc::Xml, &vars, &[vec![simple("")]]).0.len() - header - footer;
+    let rows = vec![vec![simple(&"z".repeat(8_192 - empty))]];
+    let (e, _) = errors_after(Enc::Xml, &vars, &rows, header + 8_191);
+    assert!(
+        matches!(e, crate::error::Error::Io(_)),
+        "row: the refusal was hidden by {e:?}"
+    );
+    let one = header_len(Enc::Xml, &["h".to_string()]);
+    let long = vec!["h".repeat(8_192 - (one - 1))];
+    assert_eq!(header_len(Enc::Xml, &long), 8_192);
+    let (e, _) = errors_after(Enc::Xml, &long, &[], 8_191);
+    assert!(
+        matches!(e, crate::error::Error::Io(_)),
+        "header: the refusal was hidden by {e:?}"
+    );
+}
+
+/// Xml::new charges its binding tags before it allocates them, as Json::new charges its
+/// keys: refused with one byte less than they need, admitted with exactly that room, and
+/// the room given back when it is dropped.
+#[test]
+fn xml_new_charges_its_tags_itself() {
+    let vars: Vec<String> = (0..3).map(|i| format!("v{i}{}", "&".repeat(100))).collect();
+    let tags = Xml::charged(&vars);
+    // the opening and closing of the tag, the name with every ampersand escaped and the
+    // tag's pointer
+    assert_eq!(
+        tags,
+        3 * (15 + 2 + 5 * 100 + 2 + std::mem::size_of::<Box<[u8]>>() as u64)
+    );
+    for (left, fits) in [(tags - 1, false), (tags, true)] {
+        let r = small_answer();
+        let ctx = r.test_context().clone();
+        let before = room(&ctx);
+        let held = crate::sparql::ctx::OwnedCharge::new(&ctx, before - left).unwrap();
+        match Xml::new(Some(&*ctx), &vars) {
+            Ok(xml) => {
+                assert!(fits, "{left}: the tags were not charged");
+                assert_eq!(
+                    room(&ctx),
+                    0,
+                    "{left}: the tags charged more than they need"
+                );
+                drop(xml);
+            }
+            Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            })) => assert!(!fits, "{left}: refused with room for the tags"),
+            Err(e) => panic!("the refusal lost its type: {e:?}"),
+        }
+        drop(held);
+        assert_eq!(room(&ctx), before, "{left}: the charge outlived the tags");
     }
 }
