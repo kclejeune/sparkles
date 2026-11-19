@@ -356,6 +356,25 @@ fn a_source_error_is_kept_over_a_later_refused_mark() {
     assert_eq!(count.get(), FIRST_MARKS as u64);
 }
 
+/// A serializer that finishes whole, whose last row's mark needs a refused growth of the
+/// marks, fails with the refusal and still has every row written on and counted.
+#[test]
+fn a_refused_last_mark_after_a_whole_output_keeps_its_rows() {
+    let first = OUTPUT_BUFFER as u64 + FIRST_MARKS as u64 * MARK_BYTES;
+    let r = small_answer();
+    let _held = leave(&r, first + 500);
+    let count = RowCount::new();
+    let mut out = Vec::new();
+    memory_refusal(write_buffered(
+        &mut out,
+        &count,
+        Some(r.test_context().clone()),
+        &mut rows(FIRST_MARKS as u64, 10, 3, false),
+    ));
+    assert_eq!(out.len(), FIRST_MARKS * 10);
+    assert_eq!(count.get(), FIRST_MARKS as u64);
+}
+
 #[test]
 fn the_charge_is_released_with_the_writer() {
     let r = small_answer();

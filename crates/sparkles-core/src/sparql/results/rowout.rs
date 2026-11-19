@@ -471,8 +471,17 @@ pub(in crate::sparql) fn write_buffered(
     };
     match result {
         Ok(()) => {
-            // the rows counted after the last write end where the output ends
-            let written = out.note().and_then(|()| out.drain());
+            // the rows counted after the last write end where the output ends, and a
+            // refused mark for them still has the bytes before it written on
+            let written = match out.note() {
+                Ok(()) => out.drain(),
+                Err(e) => {
+                    if !out.failed {
+                        let _ = out.drain();
+                    }
+                    Err(e)
+                }
+            };
             written.map_err(|e| out.refused.take().unwrap_or(Error::Io(e)))
         }
         Err(e) => {
