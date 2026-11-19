@@ -207,9 +207,102 @@ fn the_produced_row_limit_refuses_alike() {
     );
 }
 
-/// The hit list is charged before it is collected: a budget below it refuses the
-/// search with a memory error. A budget that holds it gives a peak of at least each
-/// part the reader charges, and bounds it by the hits, not by a table of the rows.
+/// A budget too small for the hit list still gives eager's error when the hits are more
+/// than `maxHits` or than the produced-row limit, since the search counts every hit
+/// before it reports a refused charge.
+#[test]
+fn a_refused_charge_comes_after_the_row_limits() {
+    let budget = |e: Error| match e {
+        Error::BudgetExceeded(b) => (b.kind, b.limit, b.requested),
+        e => panic!("{e}"),
+    };
+    let q = "SELECT ?s ?sc ?lit { (?s ?sc ?lit) text:query (rdfs:label \"fox\") }";
+    let tight = QueryOptions {
+        max_memory_bytes: Some(64 << 10),
+        ..opts()
+    };
+    let s = store(
+        2500,
+        TextConfig {
+            max_hits: 4000,
+            ..Default::default()
+        },
+    );
+    let snap = s.snapshot();
+    let eager_refusal = budget(eager(&snap, q, &tight).unwrap_err());
+    assert_eq!(eager_refusal, (BudgetKind::Rows, 4000, 5000));
+    assert_eq!(
+        budget(streamed(&snap, q, &tight, &strict(16)).unwrap_err()),
+        eager_refusal
+    );
+    let s = store(2500, TextConfig::default());
+    let snap = s.snapshot();
+    let rows = QueryOptions {
+        max_rows_produced: Some(3000),
+        ..tight.clone()
+    };
+    let eager_refusal = budget(eager(&snap, q, &rows).unwrap_err());
+    assert_eq!(eager_refusal.0, BudgetKind::RowsProduced);
+    assert_eq!(eager_refusal.1, 3000);
+    assert_eq!(
+        budget(streamed(&snap, q, &rows, &strict(16)).unwrap_err()),
+        eager_refusal
+    );
+    // without the row limit, the same budget refuses the hit list
+    assert_eq!(
+        budget(streamed(&snap, q, &tight, &strict(16)).unwrap_err()).0,
+        BudgetKind::Memory
+    );
+}
+
+/// Hits in several segments, some of whose documents are deleted, are eager's rows and
+/// scores, in eager's order.
+#[test]
+fn hits_across_segments_with_deleted_documents_are_eagers() {
+    use sparkles_core::sparql::update::update;
+    // 600 triples in each graph, 67 of g1's deleted and 150 added to g2 by each update
+    let live = 2 * 600 - 4 * 67 + 4 * 150;
+    let s = store(600, TextConfig::default());
+    for i in 0..4 {
+        let mut data = String::new();
+        for j in 0..150 {
+            data.push_str(&format!(
+                "ex:t{i}_{j} rdfs:label \"{} fox {j}\" . ",
+                "brown ".repeat(j % 5)
+            ));
+        }
+        update(
+            &s,
+            &format!("{P}INSERT DATA {{ GRAPH ex:g2 {{ {data} }} }}"),
+            &opts(),
+        )
+        .unwrap();
+        let mut gone = String::new();
+        for j in (i..600).step_by(9) {
+            let words = "quick brown ".repeat(j % 7);
+            gone.push_str(&format!(
+                "GRAPH ex:g1 {{ ex:s{j} rdfs:label \"{words}fox {}\"@en }} ",
+                j % 7
+            ));
+        }
+        update(&s, &format!("{P}DELETE DATA {{ {gone} }}"), &opts()).unwrap();
+    }
+    let status = s.text_status().unwrap();
+    assert!(status.segments > 1, "{} segments", status.segments);
+    let snap = s.snapshot();
+    let q = "SELECT ?s ?sc ?lit ?g { (?s ?sc ?lit ?g) text:query (rdfs:label \"fox\") }";
+    let expected = eager(&snap, q, &opts()).unwrap();
+    assert_eq!(expected.len(), live);
+    for rows in [1, 7, 4096] {
+        let (answer, _, plan) = streamed(&snap, q, &opts(), &strict(rows)).unwrap();
+        assert!(!materializes(&plan), "{plan:#?}");
+        assert_eq!(answer, expected, "batch {rows}");
+    }
+}
+
+/// The hit list is charged before each growth: a budget below it refuses the search
+/// with a memory error. A budget that holds it gives a peak of at least each part the
+/// reader charges, and bounds it by the hits, not by a table of the rows.
 #[test]
 fn the_hit_list_is_charged() {
     let s = store(2500, TextConfig::default());
@@ -233,22 +326,23 @@ fn the_hit_list_is_charged() {
     let none = "SELECT ?s ?sc ?lit { (?s ?sc ?lit) text:query (rdfs:label \"wolf\") }";
     // what the query holds besides the reader's charge
     let base = peak(&snap, none);
-    // 5000 hits of 12 bytes twice while merging, a page of 4096 decoded hits at 192
-    // bytes, and the set of 2500 triples reserved at once in 4096 buckets of 25 bytes
-    let charged = 2 * 5000 * 12 + 4096 * 192 + (4096 * 25 + 16);
+    // 5000 hits in a list grown from 1024 to 8192 hits of 12 bytes, a page of 4096
+    // decoded hits at 192 bytes, and the set of 2500 triples reserved at once in 4096
+    // buckets of 25 bytes
+    let charged = 8192 * 12 + 4096 * 192 + (4096 * 25 + 16);
     let merged = peak(&snap, q);
     // the baseline holds a few bytes that need not be live at the peak
     assert!(
         merged + 4096 >= base + charged,
         "{merged} < {base} + {charged}"
     );
-    // With 50,000 hits, the two lists of the merge are the largest charge: 50,000 hits
-    // of 12 bytes twice, and the page.
+    // With 50,000 hits, the list grown to 65,536 hits of 12 bytes and the page are the
+    // largest charge, above the 32,768 and 65,536 hits that the last growth holds.
     let s = store(25_000, TextConfig::default());
     let snap = s.snapshot();
     let ranked = "SELECT ?s ?sc ?g { (?s ?sc ?lit ?g) text:query (rdfs:label \"fox\") }";
     let base = peak(&snap, none);
-    let charged = 2 * 50_000 * 12 + 4096 * 192;
+    let charged = 65_536 * 12 + 4096 * 192;
     let peak = peak(&snap, ranked);
     assert!(peak + 4096 >= base + charged, "{peak} < {base} + {charged}");
     assert!(

@@ -19,7 +19,9 @@ use crate::store::Snapshot;
 use rustc_hash::{FxHashMap, FxHashSet};
 use tantivy::collector::{Collector, SegmentCollector, TopDocs};
 use tantivy::columnar::BytesColumn;
-use tantivy::query::{BooleanQuery, ConstScoreQuery, Occur, Query, TermQuery, TermSetQuery};
+use tantivy::query::{
+    BooleanQuery, ConstScoreQuery, EnableScoring, Occur, Query, TermQuery, TermSetQuery,
+};
 use tantivy::schema::{Field, IndexRecordOption};
 use tantivy::{DocAddress, DocId, Score, SegmentOrdinal, SegmentReader, Term};
 
@@ -79,15 +81,9 @@ pub fn search_in(
             }
         }
         None => {
-            let (total, mut hits, _) = resolved
+            let (total, mut hits) = resolved
                 .searcher
-                .search(
-                    &query,
-                    &AllHits {
-                        cap: max,
-                        reserve: None,
-                    },
-                )
+                .search(&query, &AllHits { cap: max })
                 .map_err(text_err)?;
             ctx.check()?;
             if total > max as u64 {
@@ -200,17 +196,20 @@ const PAGE: usize = 4096;
 /// a term's key is decoded into is Tantivy's, outside this count (row 1156).
 const PAGE_HIT_BYTES: u64 = 192;
 
+/// The hits a reader's list first holds, and the least it grows by.
+const GROW: usize = 1024;
+
 /// The bytes a hit list keeps per hit, a score and a document address.
 const HIT_BYTES: u64 = std::mem::size_of::<(Score, DocAddress)>() as u64;
 
 /// A text search without a limit, read a page of hits at a time (item 829).
 ///
 /// Its hits are bounded by the index's `maxHits`, as an eager search's are, so it is a
-/// leaf under decision 2 of the X14 plan. The reader counts the hits first, without
-/// scoring them, and refuses more than `maxHits` before it collects any, with the
-/// error an eager search gives. It then holds the scored hit list, best first, under a
-/// charge, and decodes the terms of one page of hits at a time into rows, so what it
-/// holds between pulls does not grow with the width of a row. The triples a merged
+/// leaf under decision 2 of the X14 plan. The reader collects the scored hits in one
+/// pass, as an eager search does, into a list charged before each growth, and refuses
+/// more than `maxHits` with the error an eager search gives. It then holds the hit
+/// list, best first, and decodes the terms of one page of hits at a time into rows, so
+/// what it holds between pulls does not grow with the width of a row. The triples a merged
 /// default graph has seen are kept across pages, in a set reserved and charged for the
 /// whole hit list at the start.
 pub(crate) struct Reader {
@@ -253,12 +252,54 @@ impl Reader {
             return Ok(None);
         };
         let max = sh.config.max_hits;
-        let counts = resolved
-            .searcher
-            .search(&query, &SegmentCounts)
+        let searcher = &resolved.searcher;
+        // One scored pass over the segments in order, as `Searcher::search` runs it on
+        // the index's single-thread executor: the same weight, scoring from the
+        // searcher's statistics, and only the documents that are alive. The list grows
+        // under a charge taken before each growth, for the old list and the new one
+        // while the hits move. Past `maxHits`, or once a charge is refused, the pass
+        // keeps no hit and only counts, so the errors come in eager's order.
+        let weight = query
+            .weight(EnableScoring::enabled_from_searcher(searcher))
             .map_err(text_err)?;
-        ctx.check()?;
-        let total: u64 = counts.iter().sum();
+        let mut hits: Vec<(Score, DocAddress)> = Vec::new();
+        let mut total = 0u64;
+        let mut refused = None;
+        for (seg, reader) in searcher.segment_readers().iter().enumerate() {
+            let seg = seg as SegmentOrdinal;
+            let alive = reader.alive_bitset();
+            weight
+                .for_each(reader, &mut |doc, score| {
+                    if alive.is_some_and(|a| !a.is_alive(doc)) {
+                        return;
+                    }
+                    total += 1;
+                    if refused.is_some() || total > max as u64 {
+                        if hits.capacity() > 0 {
+                            hits = Vec::new();
+                        }
+                        return;
+                    }
+                    if hits.len() == hits.capacity() {
+                        // the list holds fewer than `maxHits` hits, so it can grow
+                        let old = hits.capacity();
+                        let new = old.saturating_mul(2).max(GROW).min(max);
+                        let grown = charge((old + new) as u64 * HIT_BYTES).map(|()| {
+                            hits.reserve_exact(new - old);
+                        });
+                        if let Err(e) =
+                            grown.and_then(|()| charge(hits.capacity() as u64 * HIT_BYTES))
+                        {
+                            refused = Some(e);
+                            hits = Vec::new();
+                            return;
+                        }
+                    }
+                    hits.push((score, DocAddress::new(seg, doc)));
+                })
+                .map_err(text_err)?;
+            ctx.check()?;
+        }
         if total > max as u64 {
             return Err(Error::BudgetExceeded(crate::Budget {
                 kind: crate::BudgetKind::Rows,
@@ -268,34 +309,15 @@ impl Reader {
         }
         // the row limits an eager search checks; the reader holds no table of the rows
         ctx.check_output_rows(total as usize)?;
+        if let Some(e) = refused {
+            return Err(e);
+        }
         let page = (total as usize).min(PAGE) as u64 * PAGE_HIT_BYTES;
         let seen = if spec.dedup {
             map_bytes(total as usize, std::mem::size_of::<(Id, Id, Id)>())
         } else {
             0
         };
-        // the segments' lists and the merged one, until the merge ends
-        charge(
-            (2 * total * HIT_BYTES)
-                .saturating_add(page)
-                .saturating_add(seen),
-        )?;
-        let (collected, mut hits, agreed) = resolved
-            .searcher
-            .search(
-                &query,
-                &AllHits {
-                    cap: max,
-                    reserve: Some(counts),
-                },
-            )
-            .map_err(text_err)?;
-        ctx.check()?;
-        if !agreed || collected != total {
-            return Err(text_err(format!(
-                "text:query counted {total} hits and collected {collected}"
-            )));
-        }
         charge(
             (hits.capacity() as u64 * HIT_BYTES)
                 .saturating_add(page)
@@ -406,53 +428,6 @@ fn map_bytes(n: usize, entry: usize) -> u64 {
         (n.saturating_mul(8) / 7).next_power_of_two()
     };
     (buckets * (entry + 1) + 16) as u64
-}
-
-/// Counts the hits of each segment, without scoring them.
-struct SegmentCounts;
-
-struct SegmentCount {
-    seg: SegmentOrdinal,
-    n: u64,
-}
-
-impl Collector for SegmentCounts {
-    /// the hits of each segment, by segment ordinal
-    type Fruit = Vec<u64>;
-    type Child = SegmentCount;
-
-    fn for_segment(&self, seg: SegmentOrdinal, _: &SegmentReader) -> tantivy::Result<SegmentCount> {
-        Ok(SegmentCount { seg, n: 0 })
-    }
-
-    fn requires_scoring(&self) -> bool {
-        false
-    }
-
-    fn merge_fruits(&self, fruits: Vec<(SegmentOrdinal, u64)>) -> tantivy::Result<Vec<u64>> {
-        let len = fruits
-            .iter()
-            .map(|(s, _)| *s as usize + 1)
-            .max()
-            .unwrap_or(0);
-        let mut counts = vec![0; len];
-        for (s, n) in fruits {
-            counts[s as usize] += n;
-        }
-        Ok(counts)
-    }
-}
-
-impl SegmentCollector for SegmentCount {
-    type Fruit = (SegmentOrdinal, u64);
-
-    fn collect(&mut self, _: DocId, _: Score) {
-        self.n += 1;
-    }
-
-    fn harvest(self) -> Self::Fruit {
-        (self.seg, self.n)
-    }
 }
 
 /// Order hits best first, as Tantivy's top-k orders them.
@@ -617,9 +592,6 @@ fn scoped(
 /// each hit is one push.
 struct AllHits {
     cap: usize,
-    /// the hits of each segment, when they were counted first: a segment's list is
-    /// allocated at its count and never holds more
-    reserve: Option<Vec<u64>>,
 }
 
 struct SegmentHits {
@@ -630,32 +602,16 @@ struct SegmentHits {
 }
 
 impl Collector for AllHits {
-    /// the hits counted, those kept, and whether each segment's count is the one
-    /// reserved for it (always, without a reservation)
-    type Fruit = (u64, Vec<(Score, DocAddress)>, bool);
+    /// the hits counted, and those kept
+    type Fruit = (u64, Vec<(Score, DocAddress)>);
     type Child = SegmentHits;
 
     fn for_segment(&self, seg: SegmentOrdinal, _: &SegmentReader) -> tantivy::Result<SegmentHits> {
-        let keep = self.cap.saturating_add(1);
-        Ok(match &self.reserve {
-            Some(counts) => {
-                let n = counts
-                    .get(seg as usize)
-                    .map_or(0, |&n| n as usize)
-                    .min(keep);
-                SegmentHits {
-                    seg,
-                    keep: n,
-                    total: 0,
-                    hits: Vec::with_capacity(n),
-                }
-            }
-            None => SegmentHits {
-                seg,
-                keep,
-                total: 0,
-                hits: Vec::new(),
-            },
+        Ok(SegmentHits {
+            seg,
+            keep: self.cap.saturating_add(1),
+            total: 0,
+            hits: Vec::new(),
         })
     }
 
@@ -667,22 +623,6 @@ impl Collector for AllHits {
         &self,
         fruits: Vec<(SegmentOrdinal, u64, Vec<(Score, DocAddress)>)>,
     ) -> tantivy::Result<Self::Fruit> {
-        // a segment that one pass reports and the other does not has no hits
-        let agreed = self.reserve.as_ref().is_none_or(|counts| {
-            let len = fruits
-                .iter()
-                .map(|(seg, _, _)| *seg as usize + 1)
-                .max()
-                .unwrap_or(0)
-                .max(counts.len());
-            let mut seen = vec![0u64; len];
-            for (seg, n, _) in &fruits {
-                seen[*seg as usize] += n;
-            }
-            seen.iter()
-                .enumerate()
-                .all(|(i, &n)| n == counts.get(i).copied().unwrap_or(0))
-        });
         let total = fruits.iter().map(|(_, n, _)| n).sum();
         let mut hits = Vec::with_capacity(fruits.iter().map(|(_, _, h)| h.len()).sum());
         for (_, _, h) in fruits {
@@ -690,7 +630,7 @@ impl Collector for AllHits {
                 hits.extend(h);
             }
         }
-        Ok((total, hits, agreed))
+        Ok((total, hits))
     }
 }
 
@@ -1237,51 +1177,5 @@ fn graph_id(snap: &Snapshot, g: &str) -> Option<Id> {
         crate::store::parse_bnode_label(label)
     } else {
         snap.lookup_iri(g)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn fruit(seg: SegmentOrdinal, n: u64) -> (SegmentOrdinal, u64, Vec<(Score, DocAddress)>) {
-        let hits = (0..n as u32)
-            .map(|d| (1.0, DocAddress::new(seg, d)))
-            .collect();
-        (seg, n, hits)
-    }
-
-    /// A segment whose collected hits differ from its count is reported, so a reader
-    /// fails rather than answer a different set of hits.
-    #[test]
-    fn a_collect_that_disagrees_with_the_count_is_reported() {
-        let counted = AllHits {
-            cap: 10,
-            reserve: Some(vec![2, 1]),
-        };
-        let agreed = |fruits| counted.merge_fruits(fruits).unwrap().2;
-        assert!(agreed(vec![fruit(0, 2), fruit(1, 1)]));
-        assert!(!agreed(vec![fruit(0, 2), fruit(1, 2)]));
-        assert!(!agreed(vec![fruit(0, 1), fruit(1, 1)]));
-        assert!(!agreed(vec![fruit(0, 2)]));
-        assert!(!agreed(vec![fruit(0, 2), fruit(1, 1), fruit(2, 1)]));
-        // segments in any order, and an empty segment only one pass reports
-        assert!(agreed(vec![fruit(1, 1), fruit(0, 2)]));
-        assert!(agreed(vec![fruit(0, 2), fruit(1, 1), fruit(2, 0)]));
-        let short = AllHits {
-            cap: 10,
-            reserve: Some(vec![2]),
-        };
-        assert!(
-            short
-                .merge_fruits(vec![fruit(1, 0), fruit(0, 2)])
-                .unwrap()
-                .2
-        );
-        let plain = AllHits {
-            cap: 10,
-            reserve: None,
-        };
-        assert!(plain.merge_fruits(vec![fruit(0, 3)]).unwrap().2);
     }
 }
