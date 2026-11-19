@@ -288,8 +288,7 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   over each batch's pairs. With the `merge_pair_conditions` switch on, the merge's own
   buffers can need more memory than with it off, by at most one output batch and the
   scratch for testing its pairs. What evaluating the condition charges is outside that
-  bound and grows with the pairs in one test, which can be twice as many with the
-  switch on. A budget that the query only just fits with the switch off can therefore
+  bound and grows with the pairs in one test, which can be more with the switch on. A budget that the query only just fits with the switch off can therefore
   refuse it. In the measured OPTIONALs over `foaf:knows`, with about 2.5
   pairs per left row, the cursor took 1.18 to 1.36 times the eager time.
 * Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,

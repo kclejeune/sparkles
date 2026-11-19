@@ -18,12 +18,16 @@ use sparkles_core::sparql::{
 };
 use sparkles_core::store::{Store, StoreOptions};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// A name in the XSD namespace that is not a cast, which a scalar may be registered
 /// under.
 const SCALAR: &str = "http://www.w3.org/2001/XMLSchema#myCallback";
 const PROPERTY: &str = "urn:test:property";
 const AGGREGATE: &str = "urn:test:aggregate";
+
+/// The calls of the scalar, the property function and the aggregate.
+static CALLS: [AtomicUsize; 3] = [const { AtomicUsize::new(0) }; 3];
 
 /// One row for every input, with the subject as its object.
 struct Echo;
@@ -42,6 +46,7 @@ impl PropertyFunction for Echo {
         _: PropertyContext<'q>,
         input: PropertyInput,
     ) -> Result<Box<dyn PropertyStream + 'q>, ScalarError> {
+        CALLS[1].fetch_add(1, Ordering::Relaxed);
         Ok(Box::new(Once(Some(PropertyRow {
             subject: vec![None],
             object: vec![input.subject[0].clone()],
@@ -54,6 +59,7 @@ struct Count(i64);
 
 impl AggregateAccumulator for Count {
     fn add(&mut self, _: &AggregateContext<'_>, _: &Term) -> Result<(), ScalarError> {
+        CALLS[2].fetch_add(1, Ordering::Relaxed);
         self.0 += 1;
         Ok(())
     }
@@ -71,6 +77,7 @@ fn registry() -> Arc<ExtensionRegistry> {
                 SCALAR,
                 1..=1,
                 |_: &ScalarContext<'_>, _: &[Term]| -> ScalarResult {
+                    CALLS[0].fetch_add(1, Ordering::Relaxed);
                     Ok(Literal::from(true).into())
                 },
             )
@@ -192,25 +199,30 @@ fn a_query_that_references_a_registration_gives_the_same_batches_with_the_switch
         off.0.len()
     );
     let cases = [
-        ("scalar", format!("?o <urn:r> ?k FILTER(<{SCALAR}>(?k))")),
+        ("scalar", 0, format!("?o <urn:r> ?k FILTER(<{SCALAR}>(?k))")),
         (
             "property function",
+            1,
             format!("?o <urn:r> ?k . ?o <{PROPERTY}> ?x"),
         ),
         (
             "aggregate in HAVING",
+            2,
             format!("SELECT ?o {{ ?o <urn:r> ?k }} GROUP BY ?o HAVING(AGG <{AGGREGATE}>(?k) > 0)"),
         ),
         (
             "nested scalar",
-            format!("?o <urn:r> ?k FILTER NOT EXISTS {{ ?o <urn:q> ?x FILTER(<{SCALAR}>(?x)) }}"),
+            0,
+            format!("?o <urn:r> ?k FILTER EXISTS {{ ?o <urn:r> ?x FILTER(<{SCALAR}>(?x)) }}"),
         ),
         (
             "nested property function",
+            1,
             format!("?o <urn:r> ?k FILTER EXISTS {{ ?o <{PROPERTY}> ?x }}"),
         ),
         (
             "nested aggregate",
+            2,
             format!(
                 "?o <urn:r> ?k FILTER EXISTS {{ SELECT ?o {{ ?o <urn:r> ?j }} GROUP BY ?o \
                  HAVING(AGG <{AGGREGATE}>(?j) > 0) }}"
@@ -218,7 +230,8 @@ fn a_query_that_references_a_registration_gives_the_same_batches_with_the_switch
         ),
     ];
     let mut differing = Vec::new();
-    for (name, exists) in cases {
+    for (name, callback, exists) in cases {
+        let before = CALLS[callback].load(Ordering::Relaxed);
         let (off, on) = (batches(&s, &exists, false), batches(&s, &exists, true));
         assert_eq!(off.1, on.1, "{name}");
         if off.0 != on.0 {
@@ -231,6 +244,8 @@ fn a_query_that_references_a_registration_gives_the_same_batches_with_the_switch
         // The condition holds for some pairs and fails for others.
         let bound = off.1.iter().filter(|row| !row.ends_with("None]")).count();
         assert!(bound > 0 && bound < off.1.len(), "{name}: {bound}");
+        // The registration was called, and not only named.
+        assert!(CALLS[callback].load(Ordering::Relaxed) > before, "{name}");
     }
     assert!(differing.is_empty(), "{differing:#?}");
 }

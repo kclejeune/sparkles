@@ -2699,7 +2699,7 @@ mod tests {
     /// derives each batch's size from the room it finds, so the budgets are swept and
     /// not bisected. The bound is on the merge's own buffers: the condition here charges
     /// nothing for its evaluation, and one that charges by the pairs in a call is
-    /// outside it, since a call holds up to twice the pairs with the switch on.
+    /// outside it, since a call can hold more pairs with the switch on.
     #[test]
     fn pair_conditions_fit_within_a_batch_of_every_budget_that_the_staged_test_fits() {
         let (left, right) = (2, 3);

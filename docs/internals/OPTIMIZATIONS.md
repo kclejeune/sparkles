@@ -433,7 +433,7 @@ implementation and always apply. EXPLAIN shows which ones ran.
   switch on. The merge's own buffers can therefore need more of a tight memory budget
   with the switch on, by at most one output batch and the scratch for testing its
   pairs. That bound does not cover what evaluating the condition charges. One test with
-  the switch on holds up to twice the pairs of a test with it off, so a condition whose
+  the switch on can hold more pairs than a test with it off, so a condition whose
   charge grows with the pairs in one call, such as one that decodes long strings, can
   need more than the bound adds.
 * **Probed OPTIONAL** (`probed_optional`). An OPTIONAL whose right side is a triple
