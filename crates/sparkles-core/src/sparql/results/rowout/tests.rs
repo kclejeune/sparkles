@@ -1,5 +1,6 @@
 use super::*;
 use crate::error::{Budget, BudgetKind};
+use crate::sparql::ctx::OwnedCharge;
 use crate::sparql::{QueryOptions, QueryResult, query};
 use crate::store::{Store, StoreOptions};
 
@@ -301,12 +302,15 @@ fn the_buffer_is_charged_before_its_first_byte() {
 #[test]
 fn a_refused_growth_keeps_the_rows_written() {
     for explicit in [false, true] {
-        for left in [600, 1200, 3000] {
+        // the buffer and the first marks are charged at the first byte, and these
+        // budgets refuse the second, third and fifth growth of the marks
+        let first = OUTPUT_BUFFER as u64 + FIRST_MARKS as u64 * MARK_BYTES;
+        for left in [first + 500, first + 3000, first + 10_000] {
             let r = small_answer();
             let _held = leave(&r, left);
             let count = RowCount::new();
             let mut out = Vec::new();
-            // rows of 10 bytes, so the buffer and the marks both grow
+            // rows of 10 bytes, so the marks grow
             memory_refusal(write_buffered(
                 &mut out,
                 &count,
@@ -317,6 +321,8 @@ fn a_refused_growth_keeps_the_rows_written() {
             let lines = out.iter().filter(|&&b| b == b'\n').count() as u64;
             assert!(lines > 0, "{explicit} {left}");
             assert_eq!(count.get(), lines, "{explicit} {left}");
+            // the refusal comes before any byte of the row it stops, in both modes
+            assert_eq!(out.len() as u64, lines * 10, "{explicit} {left}");
         }
     }
 }

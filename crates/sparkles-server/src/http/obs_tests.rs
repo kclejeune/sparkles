@@ -680,11 +680,13 @@ async fn updates_have_their_own_timeout() {
 #[tokio::test]
 async fn memory_budget_fails_with_507() {
     // A one-row answer charges its result backing, variables and table, which
-    // need more than 1 KiB, so the budget is 4 KiB.
-    let s = server_with(|st| st.limits.query_memory_bytes = Some(4096));
+    // need more than 1 KiB, and its writer charges its 8 KiB output buffer and first
+    // row marks (9 KiB) at its first byte, so the budget is 16 KiB, which a cross
+    // product of three patterns over the test data exceeds.
+    let s = server_with(|st| st.limits.query_memory_bytes = Some(16 << 10));
     let r = get(
         &s.app,
-        "/ds/sparql?query=SELECT%20*%20WHERE%20%7B%3Fa%20%3Fb%20%3Fc%20.%20%3Fd%20%3Fe%20%3Ff%7D",
+        "/ds/sparql?query=SELECT%20*%20WHERE%20%7B%3Fa%20%3Fb%20%3Fc%20.%20%3Fd%20%3Fe%20%3Ff%20.%20%3Fg%20%3Fh%20%3Fi%7D",
     )
     .await;
     assert_eq!(r.status, StatusCode::INSUFFICIENT_STORAGE, "{}", r.text());
@@ -697,8 +699,8 @@ async fn memory_budget_fails_with_507() {
         "{j}"
     );
     assert_eq!(j["budget"], "memory");
-    assert_eq!(j["limit"], 4096);
-    assert!(j["requested"].as_u64().unwrap() > 4096);
+    assert_eq!(j["limit"], 16 << 10);
+    assert!(j["requested"].as_u64().unwrap() > 16 << 10);
     let m = metrics(&s.app).await;
     assert_eq!(
         sample(
@@ -725,7 +727,7 @@ async fn memory_budget_fails_with_507() {
     let upd = Request::post("/ds/update")
         .header(header::CONTENT_TYPE, "application/sparql-update")
         .body(Body::from(
-            "INSERT { ?a <urn:x> ?d } WHERE { ?a ?b ?c . ?d ?e ?f }",
+            "INSERT { ?a <urn:x> ?d } WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }",
         ))
         .unwrap();
     let r = send(&s.app, upd).await;

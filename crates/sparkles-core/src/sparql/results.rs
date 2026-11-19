@@ -2219,6 +2219,31 @@ mod buffered_tests {
         assert!(matches!(prefetch_answer(&r, 2), Err(Error::Cancelled)));
     }
 
+    /// Writing an eager answer charges the writer's buffer on the query's fast memory
+    /// account, so a plain query still never creates the query ledger, whose charges
+    /// cost a lock each.
+    #[test]
+    fn an_eager_writer_keeps_the_fast_memory_account() {
+        let store = crate::store::Store::in_memory(Default::default());
+        let r = crate::sparql::query(
+            store.snapshot(),
+            "SELECT ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
+            &Default::default(),
+        )
+        .unwrap();
+        assert!(!r.inner.ctx.has_ledger());
+        for fmt in [
+            SolutionsFormat::Json,
+            SolutionsFormat::Tsv,
+            SolutionsFormat::Sparkles,
+        ] {
+            let mut out = Vec::new();
+            write_solutions(&r, fmt, &mut out, None).unwrap();
+            assert!(!out.is_empty());
+            assert!(!r.inner.ctx.has_ledger(), "{fmt:?}");
+        }
+    }
+
     /// A writer that takes `room` bytes and refuses the write that would pass them, as
     /// the response writer does at the result-size budget.
     struct Capped {

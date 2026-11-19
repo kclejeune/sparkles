@@ -8,7 +8,7 @@
 //! bytes up to its end, so a body that stops partway reports the rows it delivered.
 
 use crate::error::{Error, Result};
-use crate::sparql::ctx::{Ctx, OwnedCharge};
+use crate::sparql::ctx::{Charge, Ctx};
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::io::Write;
@@ -20,12 +20,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// limit, cancellation check and channel buffer.
 pub(in crate::sparql) const OUTPUT_BUFFER: usize = 8 << 10;
 
-/// The marks a [`RowOut`] makes room for first. The vector grows by doubling, and it holds
-/// at most one mark per distinct offset in the buffer, so at most `OUTPUT_BUFFER + 1`.
-const FIRST_MARKS: usize = 8;
-
-/// The buffer a [`RowOut`] allocates first. It doubles up to [`OUTPUT_BUFFER`].
-const FIRST_BUFFER: usize = 256;
+/// The marks a [`RowOut`] makes room for first, with its buffer. The vector grows by
+/// doubling, and it holds at most one mark per distinct offset in the buffer, so at most
+/// `OUTPUT_BUFFER + 1`.
+pub(in crate::sparql) const FIRST_MARKS: usize = 64;
 
 pub(in crate::sparql) const MARK_BYTES: u64 = std::mem::size_of::<(usize, u64)>() as u64;
 
@@ -169,7 +167,9 @@ impl RowLedger {
 /// says that `rows` rows end at `offset` in the buffer.
 ///
 /// The buffer and the marks are charged to the query before they are allocated, when the
-/// writer has a query context.
+/// writer has a query context: the whole buffer and the first marks at the first byte, in
+/// one charge, and each growth of the marks after. The charge borrows the context, so an
+/// eager query charges its fast memory account and does not create the query ledger.
 pub(crate) struct RowOut<'a> {
     inner: &'a mut dyn Write,
     buf: Vec<u8>,
@@ -188,9 +188,9 @@ pub(crate) struct RowOut<'a> {
     /// an error that a [`Write`] call could report only as an I/O error, such as a
     /// refused memory charge, returned in its place
     refused: Option<Error>,
-    ctx: Option<Arc<Ctx>>,
+    ctx: Option<&'a Ctx>,
     /// the reservation for `buf` and `marks`, declared after them so that they drop first
-    charge: Option<OwnedCharge>,
+    charge: Option<Charge<'a>>,
 }
 
 impl<'a> RowOut<'a> {
@@ -198,7 +198,7 @@ impl<'a> RowOut<'a> {
         inner: &'a mut dyn Write,
         staged: &'a Cell<u64>,
         count: &'a RowCount,
-        ctx: Option<Arc<Ctx>>,
+        ctx: Option<&'a Ctx>,
     ) -> Self {
         let base = count.ledger.as_ref().map_or(0, RowLedger::start);
         RowOut {
@@ -219,14 +219,14 @@ impl<'a> RowOut<'a> {
 
     /// Cover `bytes` of buffer and marks before they are allocated.
     fn cover(&mut self, bytes: u64) -> Result<()> {
-        let Some(ctx) = &self.ctx else {
+        let Some(ctx) = self.ctx else {
             return Ok(());
         };
-        match &mut self.charge {
+        match &self.charge {
             Some(charge) if charge.bytes() >= bytes => Ok(()),
             Some(charge) => charge.resize(bytes),
             None => {
-                self.charge = Some(OwnedCharge::new(ctx, bytes)?);
+                self.charge = Some(ctx.charge(bytes)?);
                 Ok(())
             }
         }
@@ -244,17 +244,16 @@ impl<'a> RowOut<'a> {
         io
     }
 
-    /// Grow the buffer, under its charge, to hold `len` bytes, at most
-    /// [`OUTPUT_BUFFER`]. It starts small and doubles, so a short answer charges a short
-    /// buffer.
+    /// Allocate the buffer and the first marks, under one charge, before the first byte.
     #[cold]
     #[inline(never)]
-    fn grow_buf(&mut self, len: usize) -> std::io::Result<()> {
-        let cap = len.next_power_of_two().clamp(FIRST_BUFFER, OUTPUT_BUFFER);
-        if let Err(e) = self.cover(self.held(cap, self.marks.capacity())) {
+    fn start(&mut self) -> std::io::Result<()> {
+        let marks = self.marks.capacity().max(FIRST_MARKS);
+        if let Err(e) = self.cover(self.held(OUTPUT_BUFFER, marks)) {
             return Err(self.refuse(e));
         }
-        self.buf.reserve_exact(cap - self.buf.len());
+        self.buf.reserve_exact(OUTPUT_BUFFER);
+        self.marks.reserve_exact(marks - self.marks.len());
         Ok(())
     }
 
@@ -344,16 +343,14 @@ impl<'a> RowOut<'a> {
     /// [`Write::write`] of `b` when it does not fit in what is left of `buf`.
     #[inline(never)]
     fn write_full(&mut self, b: &[u8]) -> std::io::Result<usize> {
-        // the row these bytes belong to has a slot for its mark before they go anywhere
-        if self.marks.capacity() == 0 {
-            self.grow_marks()?;
-        }
-        let len = self.buf.len() + b.len();
-        if len <= OUTPUT_BUFFER {
-            // it fits in a buffer of full size, which this one grows towards
-            self.grow_buf(len)?;
-            self.buf.extend_from_slice(b);
-            return Ok(b.len());
+        // the buffer and the slot for the mark of the row these bytes belong to exist
+        // before the bytes go anywhere
+        if self.buf.capacity() == 0 {
+            self.start()?;
+            if b.len() < OUTPUT_BUFFER {
+                self.buf.extend_from_slice(b);
+                return Ok(b.len());
+            }
         }
         self.drain()?;
         if b.len() >= OUTPUT_BUFFER {
@@ -363,9 +360,6 @@ impl<'a> RowOut<'a> {
             r?;
             self.taken += b.len() as u64;
         } else {
-            if b.len() > self.buf.capacity() {
-                self.grow_buf(b.len())?;
-            }
             self.buf.extend_from_slice(b);
         }
         Ok(b.len())
@@ -465,7 +459,7 @@ pub(in crate::sparql) fn write_buffered(
     f: &mut dyn FnMut(&mut RowOut<'_>, &Cell<u64>) -> Result<()>,
 ) -> Result<()> {
     let staged = Cell::new(0);
-    let mut out = RowOut::new(w, &staged, count, ctx);
+    let mut out = RowOut::new(w, &staged, count, ctx.as_deref());
     let result = f(&mut out, &staged);
     // the rows counted after the last write end where the output ends
     let noted = out.note();
