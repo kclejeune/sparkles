@@ -41,10 +41,10 @@ def pct(xs, p):
 
 def verdict(lo, hi, added_us):
     if lo > 1.0 and added_us > 0.5:
-        return "cost"
+        return "interval above 1"
     if hi < 1.0 and added_us < -0.5:
-        return "gain"
-    return "noise"
+        return "interval below 1"
+    return "none"
 
 
 def matrix(cell):
@@ -65,7 +65,7 @@ def matrix(cell):
             allv[q][v].append(x)
     rng = random.Random(829)
     print(f"\n### {cell.name}\n")
-    print("| query | A ms | B ms | B/A | 95% interval | added µs | A spread | B spread | verdict |")
+    print("| query | A ms | B ms | B/A | 95% interval | added µs | A spread | B spread | first-pass flag |")
     print("|---|--:|--:|--:|---|--:|--:|--:|---|")
     out = {}
     for q in sorted(rnd):
@@ -113,7 +113,7 @@ def ab(root):
                 arms = {a: ab_times(root / f"{script}-{a}-{mode}-{threads}", script)
                         for a in ("base", "tip", "tip2", "base2")}
                 print(f"\n### {script} {mode} {threads}\n")
-                print("| query | base ms | tip ms | tip/base | 95% interval | added µs | pair 1 | pair 2 | base2/base | tip2/tip | verdict |")
+                print("| query | base ms | tip ms | tip/base | 95% interval | added µs | pair 1 | pair 2 | base2/base | tip2/tip | first-pass flag |")
                 print("|---|--:|--:|--:|---|--:|--:|--:|--:|--:|---|")
                 common = set.intersection(*(set(v) for v in arms.values()))
                 for q in sorted(arms["base"]):
@@ -138,11 +138,11 @@ def ab(root):
                     # the plan's rule for these scripts: 5% on wall time, and a difference
                     # not above 1 in both A,B,B,A pairs is noise
                     if p1 > 1 and p2 > 1:
-                        vd = "gate fail" if min(p1, p2) >= 1.05 else "slower in both pairs"
+                        vd = "5% or more in both pairs" if min(p1, p2) >= 1.05 else "slower in both pairs"
                     elif p1 < 1 and p2 < 1:
                         vd = "faster in both pairs"
                     else:
-                        vd = "noise"
+                        vd = "none"
                     out[f"{script}/{mode}/{threads}/{q}"] = dict(
                         base_ms=st.median(base) * 1e3, tip_ms=st.median(tip) * 1e3, ratio=r,
                         lo=lo, hi=hi, added_us=added, base2_over_base=sb, tip2_over_tip=stt,

@@ -5,7 +5,9 @@ each comparison alone under the host's heavy lock. A is main at bccc5f7b and B i
 9df856f3, whose engine code is the part-1 tip. Both are release builds of
 `mbx build --release -p sparkles-server --bin sparkles` made on stanley with GCC 16.2.0,
 Clang 21.1.8, rustc 1.99.1 and LLD 23.1.1, as `readelf -p .comment` shows for both. The
-builds did not set `MBX_LEARNED_INCREMENTAL=false`. Their SHA-256 sums are
+build commands did not set `MBX_LEARNED_INCREMENTAL=false`, so whether Boxington's learned
+incremental reuse took part is not recorded. Their `.text` sections are 112,734,445 and
+112,706,605 bytes. Their SHA-256 sums are
 `af1f600cafe20755e0dbc6db5d677a39be0fc82a164453d1957725f7a028ba24` for A and
 `5e384d0f108d17bc2fd0f2d4cdae8cdc8abbfdcd520f084f63af3e7ffd3bec14` for B.
 
@@ -41,4 +43,6 @@ For each matrix query it gives the median of the per-round ratios of median exec
 times, a 95% percentile bootstrap over the rounds, the median added time and the spread of
 each build between its server processes. For each script query it gives the ratio of the
 pooled medians, the ratio of each A,B,B,A pair and the same-binary ratios of the two
-servers of each build.
+servers of each build. Its last column is a first-pass flag from the interval or from the
+two pairs alone, before the same-binary spread and the confirmation runs are weighed, and
+the verdicts are in the synthetic results.
