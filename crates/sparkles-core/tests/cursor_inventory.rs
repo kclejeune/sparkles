@@ -364,6 +364,18 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             "SELECT ?x { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x } }",
             Refused(Why::Row(1121)),
         ),
+        form(
+            "view read with its commit",
+            "ViewRead",
+            "SELECT ?x ?c { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#commit> ?c ; <urn:x-sparkles:view#bind> ?x } }",
+            Refused(Why::Row(1121)),
+        ),
+        form(
+            "view read that allows a stale result",
+            "ViewRead",
+            "SELECT ?x { SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#allowStale> true ; <urn:x-sparkles:view#bind> ?x } }",
+            Refused(Why::Row(1121)),
+        ),
         // history
         form(
             "history changes with a limit",

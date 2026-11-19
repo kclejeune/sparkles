@@ -308,6 +308,12 @@ If pruning removes the metadata needed to resolve its own state, the read return
   write-ahead log after a crash, and trimmed by commit count, age or size. Diffs and the
   change feed read it where the retained generations no longer can. Graph views and
   protections of triples apply.
+* A streamed history query without `hist:limit` or input reads the change log a page of
+  whole commits at a time and charges each page to the query's memory budget, so it
+  never holds a table of every change. It holds the commits from the start of its range
+  until it has read them or is closed, so retention keeps them past the size limit and
+  the log cannot be turned off meanwhile. A history query with a limit reads its changes
+  in one bounded step.
 
 ### Branches and merges
 
