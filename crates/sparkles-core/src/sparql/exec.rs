@@ -5680,7 +5680,12 @@ fn string_order_mask(
         let mut floors = ctx.floor_map();
         (0..sample).all(|i| {
             let (a, b) = (xs[i], ys[i]);
-            let (Some(fa), Some(fb)) = (floors.floor(a), floors.floor(b)) else {
+            // the second floor is read only when the first is a string's, as the generic
+            // comparison reads the second value only when the first has one
+            let Some(fa) = floors.floor(a) else {
+                return false;
+            };
+            let Some(fb) = floors.floor(b) else {
                 return false;
             };
             keep.push(order(a, b, fa, fb));
@@ -10619,7 +10624,8 @@ mod string_order_tests {
 
     /// The strings of the growth tests: `n` distinct words, each the object of one subject.
     fn word_store(n: usize) -> (Store, Vec<Id>) {
-        let word = |i: usize| format!("w{}", i * 7919 % 100_003);
+        // distinct for every i, in an order that spreads neighbours apart
+        let word = |i: usize| format!("w{}-{i}", i * 7919 % 100_003);
         let mut nt = String::new();
         for i in 0..n {
             nt.push_str(&format!("<urn:s:{i}> <urn:p> \"{}\" .\n", word(i)));
@@ -10716,6 +10722,43 @@ mod string_order_tests {
         });
     }
 
+    /// A sample row whose first value has no floor does not read the second one's, as
+    /// the generic comparison does not, so a long second string that a cursor's budget
+    /// refuses leaves the mask to the generic filter without a failure.
+    #[test]
+    fn a_sample_row_without_a_first_string_reads_no_second_floor() {
+        use super::super::expr::CmpOp;
+        let long = "a".repeat(1 << 20);
+        let s = Store::in_memory(StoreOptions::default());
+        s.load(&[Source::from_bytes(
+            format!("<urn:s:0> <urn:p> \"{long}\" .\n").into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        let snap = s.snapshot();
+        let y_id = snap
+            .lookup_term(&oxrdf::Literal::new_simple_literal(&long).into())
+            .unwrap();
+        drop(snap);
+        let mut ctx = Ctx::new(s.snapshot());
+        ctx.mem_limit = 4 << 20;
+        ctx.enable_cursor_accounting().unwrap();
+        let (x, y) = (ctx.var("x"), ctx.var("y"));
+        let mut t = Table::new(vec![x, y]);
+        for _ in 0..STRING_ORDER_ROWS {
+            t.push_row(&[Id::UNDEF, y_id]);
+        }
+        let held = ctx.charge(ctx.mem_limit - ctx.live_bytes() - 1024).unwrap();
+        let e = cmp(x, y, CmpOp::Lt);
+        let outcome = string_order_mask(&ctx, &t, (x, y), CmpOp::Lt, &e);
+        assert!(matches!(outcome, Ok(None)), "{outcome:?}");
+        assert!(ctx.check().is_ok(), "no floor of the long string was read");
+        let generic = evaluate_mask(&ctx, &t, std::slice::from_ref(&e), None).unwrap();
+        assert!(generic.iter().all(|&k| !k));
+        drop(held);
+    }
+
     /// Strings that rarely repeat keep the first table: masks over pairs of words that no
     /// other row holds evict floors that were never read again, which does not grow it,
     /// however many masks there are, since no row's floors are looked up twice.
@@ -10725,6 +10768,8 @@ mod string_order_tests {
         let rows = STRING_ORDER_ROWS;
         let masks = 40;
         let (s, ids) = word_store(masks * 2 * rows);
+        let distinct: std::collections::HashSet<Id> = ids.iter().copied().collect();
+        assert_eq!(distinct.len(), ids.len(), "no word recurs");
         let mut ctx = Ctx::new(s.snapshot());
         ctx.mem_limit = 256 << 20;
         // 2^10 slots hold the threshold at 32, under the 128 floors of one sample

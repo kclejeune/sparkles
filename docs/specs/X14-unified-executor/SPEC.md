@@ -250,10 +250,11 @@ each batch built again had measured 24.8% slower on streaming `str-pair-lt` and 
 computed in every batch. Every worker of a mask reads and writes one direct-mapped table
 of atomic words without a lock, since maps of their own made each worker compute a
 recurring string's floor again. A word holds the id's slot tag, the distance down to its
-floor and a bit set when the floor is read again. The first table has 2^16 slots, and it
-grows eightfold before a mask or a part of a large eager table once the floors it evicted
-that had been read again reach a thirty-second of its slots, so inputs whose strings
-rarely repeat keep it. Each table is charged to the query before it is allocated, inside
+floor and a bit set when the floor is read again. The first table has up to 2^16 slots,
+fewer when the vocabulary's strings or the cap need fewer. Before a mask or a part of a
+large eager table it grows up to eightfold, within the same limits, once its estimate of
+the floors it evicted that had been read again reaches a thirty-second of its slots, so
+inputs whose strings rarely repeat keep it. Each table is charged to the query before it is allocated, inside
 the spill threshold, and the cache holds at most 64 MiB or a sixteenth of the query's
 memory budget. This memory buys the speed below, and a table that the budget refuses
 leaves the floors the cache lacks to be computed each time. A cursor reads a key and the key before it in one walk of their block when
@@ -270,9 +271,9 @@ that the run record names, they read 0.460, 0.852 and
 1.030. With 12 threads, streaming `str-pair-lt` read 0.939, `str-pair-names` 1.000 and
 `str-pair-colleague` 1.118, and in eager execution `str-pair-lt` read 0.846,
 `str-pair-names` 0.833 and `str-pair-colleague` 0.880. Streaming
-`str-pair-names` takes 31.1 ms with 12 threads against 28.1 ms with one. Each worker
-keeps its own map, so the floors of a repeated name may be computed once per worker, but
-the cause of the lost gain has not been measured. The 37-query screens over three
+`str-pair-names` takes 31.1 ms with 12 threads against 28.1 ms with one. In that build
+each worker kept its own map, so the floors of a repeated name were computed once per
+worker, which the shared table replaces. The 37-query screens over three
 rounds had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no
 query was 10% slower.
 
