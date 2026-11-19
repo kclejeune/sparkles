@@ -24,7 +24,7 @@
 # reads the free space every WATCH_SECONDS while the run goes, 30 by default, and once more
 # when a failed run ends, and stops or marks the run when it is under RUN_FLOOR_GIB, 4 by
 # default, so tests do not fail against the server's own free-disk reserve for a reason
-# that is not theirs. The run's TMPDIR there is .artifacts/tmp in the job's worktree, so
+# that is not theirs. The run's TMPDIR there is ~/gate/tmp-NAME beside the job's worktree, so
 # its temporary files go with it.
 set -uo pipefail
 umask 022
@@ -48,7 +48,7 @@ finish() {
   date +%s > "$out/done_at"
   log "end exit=$code"
   if [ "$keep" = 0 ] && cd "$G"; then
-    timeout --kill-after=10s 120 rm -rf "$wt"
+    timeout --kill-after=10s 120 rm -rf "$wt" "$G/tmp-$NAME"
     timeout --kill-after=10s 60 git -C "$G/repo.git" worktree prune
   fi
   [ -z "${dw:-}" ] || kill "$dw" 2> /dev/null
@@ -177,7 +177,8 @@ esac
 watch=0
 if [ "${SPARKLES_REMOTE_EXECUTOR:-ssh}" = ssh ]; then
   watch=1
-  export TMPDIR=$wt/.artifacts/tmp
+  export TMPDIR=$G/tmp-$NAME
+  rm -rf "$TMPDIR"
   mkdir -p "$TMPDIR"
 fi
 floor_kib=$((${RUN_FLOOR_GIB:-4} * 1048576))

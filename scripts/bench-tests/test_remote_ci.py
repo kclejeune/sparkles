@@ -278,8 +278,9 @@ class RemoteCI(unittest.TestCase):
         self.assertNotIn('admit', log); self.assertNotIn('mbx gc', log)
         self.assertIn('prop MemoryMax=13G', log); self.assertIn('sync wally:gate/out/', log)
         self.assertFalse((out / 'outcome').exists())
-        # The run's temporary files live in its worktree, which the job removes.
-        self.assertIn('tmpdir %s/gate/wt-%s/.artifacts/tmp' % (self.home, self.name()), (out / 'ci.log').read_text())
+        # The run's temporary files live beside its worktree, and the job removes both.
+        self.assertIn('tmpdir %s/gate/tmp-%s' % (self.home, self.name()), (out / 'ci.log').read_text())
+        self.assertFalse((self.home / 'gate' / ('tmp-' + self.name())).exists())
 
     def test_an_ssh_host_short_of_the_floor_collects_the_shortfall_and_runs(self):
         (self.home / 'df-kib').write_text(str(40 * GIB)); (self.home / 'df-after-gc').write_text(str(90 * GIB))
@@ -327,7 +328,7 @@ class RemoteCI(unittest.TestCase):
         out = self.home / 'gate/out' / self.name()
         self.assertFalse((out / 'outcome').exists())
         log = (out / 'ci.log').read_text()
-        self.assertIn('survived the watch', log); self.assertNotIn('.artifacts/tmp', log)
+        self.assertIn('survived the watch', log); self.assertIn('tmpdir unset', log)
 
     def test_a_descendant_that_ignores_the_stop_is_ended_before_the_cleanup(self):
         (self.home / 'ci-leaves-child').touch()
@@ -620,9 +621,9 @@ cat "$dest/gate.exit"
                                     GATE_NEED_CONF_GB='40', FAKE_PROBE_h1='free 0 150', FAKE_PROBE_h2='held 1 60', FAKE_PROBE_h3='free 0 20'))
         self.assertEqual(r.returncode, 0, r.stderr)
         lines = r.stdout.splitlines()
-        self.assertIn('disk floors: 110 GiB for a whole gate, 40 GiB for a conformance half', lines)
-        self.assertIn('h1     free 0 150 room-for-whole', lines); self.assertIn('h2     held 1 60 room-for-half', lines)
-        self.assertIn('h3     free 0 20 below-floor', lines); self.assertIn('h4     unreachable', lines)
+        self.assertIn('disk floors: 110 GiB for a ci half or a whole gate and 40 GiB for a conformance half, met under the heavy lock; selection from 40 and 20 GiB free', lines)
+        self.assertIn('h1     free 0 150 room-for-whole', lines); self.assertIn('h2     held 1 60 whole-after-gc', lines)
+        self.assertIn('h3     free 0 20 half-after-gc', lines); self.assertIn('h4     unreachable', lines)
         r = subprocess.run(['bash', str(src / 'scripts/gate/gate.sh'), '--hosts'], cwd=src, capture_output=True, text=True, timeout=60,
                            env=dict(self.env, SPARKLES_GATE_CONFIG=str(self.t / 'none'), GATE_NEED_CI_GB='x'))
         self.assertEqual(r.returncode, 2); self.assertIn('bad GATE_NEED_CI_GB', r.stderr)

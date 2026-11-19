@@ -85,7 +85,7 @@
 # disk-below-floor in its outcome file. A split gate whose part refused that way exits 4. --auto and the
 # default helper choice count a host as having the disk for a whole gate when
 # GATE_MIN_FREE_GB are free and for a conformance half when GATE_MIN_FREE_HALF_GB are free,
-# which default to the two floors.
+# 40 and 20 by default, since they read the disk without collecting.
 #
 # Before it starts, the driver also prints the newest finished run of each GitHub workflow
 # on main (scripts/gate/github-runs.py) and warns when one failed, since those workflows
@@ -195,8 +195,11 @@ if [ $helper_set = 0 ] && [ -z "${GATE_HELPER+x}" ]; then pick_helper=1; fi
 
 need_ci=${GATE_NEED_CI_GB:-110}
 need_conf=${GATE_NEED_CONF_GB:-110}
-min_whole=${GATE_MIN_FREE_GB:-$need_ci}
-min_half=${GATE_MIN_FREE_HALF_GB:-$need_conf}
+# The selection reads the disk without collecting, and a host's cache keeps it near its own
+# gc.min_free_size, so a host counts as having room at what it holds without a collection.
+# The floor itself is met under the heavy lock, where an ssh host collects up to it.
+min_whole=${GATE_MIN_FREE_GB:-40}
+min_half=${GATE_MIN_FREE_HALF_GB:-20}
 for v in "GATE_NEED_CI_GB $need_ci" "GATE_NEED_CONF_GB $need_conf" "GATE_MIN_FREE_GB $min_whole" "GATE_MIN_FREE_HALF_GB $min_half"; do
   case ${v#* } in '' | *[!0-9]* | 0 | 0?*) die "bad $v" ;; esac
 done
@@ -217,14 +220,16 @@ probe() {
 
 if [ $mode = hosts ]; then
   echo "benchmark host: $bench (never runs gates)"
-  echo "disk floors: $min_whole GiB for a whole gate, $min_half GiB for a conformance half"
+  echo "disk floors: $need_ci GiB for a ci half or a whole gate and $need_conf GiB for a conformance half, met under the heavy lock; selection from $min_whole and $min_half GiB free"
   for h in "${gate_hosts[@]}"; do
     p=$(probe "$h")
     read -r l u d <<< "$p" || true
     room=
     if [ "$l" != unreachable ]; then
       case $d in '' | *[!0-9]*) room='unknown-disk' ;; *)
-        if [ "$d" -ge "$min_whole" ]; then room='room-for-whole'; elif [ "$d" -ge "$min_half" ]; then room='room-for-half'; else room='below-floor'; fi
+        if [ "$d" -ge "$need_ci" ]; then
+          room='room-for-whole'
+        elif [ "$d" -ge "$min_whole" ]; then room='whole-after-gc'; elif [ "$d" -ge "$min_half" ]; then room='half-after-gc'; else room='below-selection'; fi
         ;;
       esac
     fi

@@ -1011,9 +1011,13 @@ below its floor. A split gate keeps each half's own record, the ci half's as `ou
 the conformance half's as `outcome-conf`. When every failed half exited 4 with its own
 disk record, the merge exits 4, writes `gate-outcome` and names the refusing halves in
 `outcome-host`. Any other failure makes the merge exit 1. An ssh gate still creates its
-worktree before it takes the heavy lock, which roadmap item 1136 tracks. `--auto` and the default helper choice count a host as
-having the disk for a whole gate at `GATE_MIN_FREE_GB` free and for a conformance half at
-`GATE_MIN_FREE_HALF_GB`, which default to the two floors.
+worktree before it takes the heavy lock, which roadmap item 1136 tracks. `--auto` and the default helper choice read the disk without collecting, and a host's cache
+keeps it near its own `gc.min_free_size`, so they count a host as having the disk for a
+whole gate at `GATE_MIN_FREE_GB` free, 40 by default, and for a conformance half at
+`GATE_MIN_FREE_HALF_GB`, 20 by default. `gate.sh --hosts` marks a host that needs a
+collection before the floor as `whole-after-gc` or `half-after-gc`. Each ssh gate start on
+such a host evicts cache down to the floor, so a host whose cache budget and other data
+leave less than the floor free rebuilds more of the cache on each gate.
 
 Each run sets `CARGO_BUILD_JOBS` from its host's gate memory cap, the cap in GiB less one,
 halved, between 2 and 8. That gives 5 jobs at a Boat worker's 12 GiB cap, 6 jobs on a host
