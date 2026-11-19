@@ -4,8 +4,8 @@
 > phase 2 has shipped.
 >
 > **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
-> hold the phases that are ready to start, and each is named in its phase. Item 484 is
-> complete. The later candidate phases get their numbers when their prerequisites land.
+> hold the phases that are ready to start, and each is named in its phase. Items 484 and 832 are
+> complete, and item 1136 takes the last `imbl` maps of Phase 5. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -760,6 +760,35 @@ took 1.01, 1.00 and 0.94 times the base's time persistent and 1.02, 0.99 and 0.9
 memory. The gates were the table test, the entry-point tests, the deadline tests at the
 default and the saturated threshold, lane CI and eight review rounds. Durability, the write-ahead
 log and the on-disk formats did not change.
+
+Phase 5 is built apart from the `imbl` maps. `index::encode_deltas` writes the zig-zag
+delta varints of an index column frame and of a run block's column, and
+`index::decode_varints_into`, the index's decoder with its eight-byte fast path, reads
+both. The run reader decodes a column into a scratch vector of up to 32,768 values and
+copies it into the keys, which costs each open run reader 256 KiB more memory beside the
+four 1 MiB blocks it already holds. Tests pin the varint bytes of a column frame and of
+a run block, so the change provably writes the same bytes. An instruction count of the
+new `delta_coder_bench` harness on one P core of the laptop, over 2^20 sorted keys in
+three interleaved rounds, found the index's column encode and decode and the run encode
+unchanged to within 0.001%, and the run decode 4.4% fewer instructions. The timing on
+`atlas` is pending. `bench:insn` reaches neither coder, so the harness stands in for it.
+The ungated test hooks `set_clock`, `wal_direct_active`, `vocab_direct_active`, the
+vector pause and sequential-build hooks, the full-text failure, checkpoint and tick hooks,
+`Spill::inject_fault` and `io::parse_lines_in_blocks` build only for tests or with the
+`failpoints` feature, and `sparkles-core` and `sparkles` turn the feature on for their own
+tests through a dev-dependency on themselves, so a run of one package keeps every test a
+workspace run has. The `ordinary_sync_probe` points of `publish_log` call empty inline
+functions outside tests in place of their `cfg` blocks. `parse_source` and
+`parse_source_into` choose their first rung, Jena's syntaxes, the functional-style syntax
+or a buffered document, through one `Rung`, and a buffered document of either is parsed by
+one whole-slice parser, with a test that both entry points agree for every parse mode,
+codec and kind of data. The `imbl` maps stay. A `BTreeMap` behind an `Arc` would copy the
+whole map at the first change after a snapshot, which measured 38 µs a commit at 10,000
+predicates and 8.4 ms at a million, against about a microsecond for `imbl`, and 30 ms a
+frame for a control state of a million entries, as
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. Item 1136
+takes a persistent ordered map shared with the B+ tree of `KeySet`, after which the
+dependency can leave. No on-disk format changed.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
