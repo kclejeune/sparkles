@@ -1327,3 +1327,26 @@ the streamed requests ran 0.44 to 0.50 times the base's instructions on `export-
 `optional-chain` and `star-join`, 7.64 billion against 7.69 billion eager on
 `export-500k` and 78.8 million against 73.3 million eager on `star-join`. The laptop ran
 other builds at the time, so only the instruction counts are reported here.
+
+The wall times of the same two builds come from atlas, an Intel host with forge's
+hardware, which ran nothing else during the runs. The server ran on CPUs 0 to 11 and the
+client on CPU 12, at 1.05M triples in native JSON, in rounds of A,B,B,A in both orders
+with 10 requests per variant in each position, and the two orders were combined by their
+geometric mean. Over the 31 queries of the matrix with eight rounds in each order and 12
+Rayon threads, a streamed request took 0.42 times the base's wall time on `export-500k`,
+121 ms against 289 ms, 0.56 times on `optional-chain`, 10.4 against 18.4 ms, 0.63 times
+on `order-by-full`, 31.7 against 50.6 ms, and 0.77 times on `star-join`, 4.55 against
+5.90 ms. These streamed answers now finish before the eager ones, which took 220, 14.1,
+42.7 and 4.89 ms. With one thread the four queries took 0.53, 0.65, 0.78 and 0.73 times
+the base's wall time. The geometric mean of the streamed ratios was 0.935 with 12 threads
+and 0.932 with one. The eager requests of the two builds stayed within 2.3% of each other
+on every query in both cells.
+
+The seven queries under 1 ms ran again on atlas with 12 rounds in each order and 12
+threads, as a pinned check of the streamed `count-all` and `distinct-obj`, which one
+order of the matrix had shown about 7% slower. The streamed wall-time ratios of the two
+builds were 0.96 to 1.02 on all seven queries, and the 95% interval of every ratio
+included 1.0, as did the eager control's. A streamed answer still took 0.21 to 0.29 ms
+more wall time than an eager one on those queries, against 0.23 to 0.31 ms in the base,
+because the hand-off between threads that the phase trace measured lies outside the
+writer.

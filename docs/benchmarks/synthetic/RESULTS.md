@@ -589,7 +589,8 @@ of the time goes to writing the rows. It is faster on the grouped aggregates
 `expr-agg-arg` and `group-avg` in every cell, on `expr-bind-group` in every cell with 12
 threads and at 10.5M triples on `minus` and `not-exists`. Item 534 covers the
 streamed response's fixed cost and its losses on large answers, which the merged executor
-must not inherit.
+must not inherit. Item 240 has since removed the losses on large answers, as the
+[engine results](../engine/RESULTS.md) record for atlas.
 
 ### Forge record after stages 1 and 3
 

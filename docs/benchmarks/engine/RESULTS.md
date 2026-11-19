@@ -139,6 +139,28 @@ beside them. The eager counts of the two builds agree within 0.5%.
 performance cores, for release builds of 8baa5686 and a016b7bd made on the same host. The
 laptop ran other builds at the time, so cycles and wall times are not reported.*
 
+The wall times of the same two builds come from atlas, which has forge's hardware and ran
+nothing else during the runs. The table gives the median wall time of a native JSON request
+at 1.05M triples with 12 Rayon threads, the server on CPUs 0 to 11 and the client on CPU
+12, over eight rounds of A,B,B,A in each order with 10 requests per variant in each
+position.
+
+| Query | Streamed, writing to the response writer | Streamed, writing to the buffer | Eager |
+|---|--:|--:|--:|
+| `star-join` | 5.90 ms | 4.55 ms | 4.89 ms |
+| `optional-chain` | 18.4 ms | 10.4 ms | 14.1 ms |
+| `order-by-full` | 50.6 ms | 31.7 ms | 42.7 ms |
+| `export-500k` | 289 ms | 121 ms | 220 ms |
+
+*Wall times were measured on atlas for release builds of 8baa5686 and a016b7bd made on
+wally. They are not comparable with forge's figures.*
+
+A streamed request with one thread took 0.53 to 0.78 times the earlier build's wall time on
+these four queries. On the seven queries under 1 ms, a pinned atlas check with 12 rounds in
+each order found the two builds' streamed wall times within 4% of each other, with every
+95% interval including 1.0. A streamed answer there still takes 0.21 to 0.29 ms more wall
+time than an eager one, which roadmap item 534 follows up.
+
 A pinned forge comparison of the combined feature changes, with 16 A,B,B,A rounds and
 100 requests per server process, found `count-all` server time 12.5% higher at 6.0 µs
 against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Every round was slower for both
