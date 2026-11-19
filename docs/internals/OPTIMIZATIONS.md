@@ -418,12 +418,19 @@ implementation and always apply. EXPLAIN shows which ones ran.
   With the switch off it copies every pair and an extension for every left row into the
   batch, copies the pairs again for the test and then compacts the batch. A run that
   crosses a batch of the right input, a left row whose pairs do not fit a whole batch
-  and a run that was written to disk keep that second path in both settings. The merge
-  tests their rows before it decides a later left row, so the condition sees the pairs
-  in input order. Testing the pairs first holds them beside the table that the condition
-  reads, which takes more scratch memory for a row than the second path, so a batch
-  that the memory budget cannot hold together with that scratch is built on the second
-  path.
+  and a run that was written to disk keep that second path in both settings. So does
+  every pair of a condition whose evaluation can be observed, which is one that calls
+  an application function, a function with side effects, RAND, UUID, STRUUID or BNODE,
+  or that holds an EXISTS whose pattern calls a SERVICE, one of those functions or any
+  function named by an IRI other than an XSD cast. Such a condition is evaluated on the
+  same pairs, in the same batches, with the switch on and off. Testing the pairs first
+  holds them beside the table that the condition reads, which takes more scratch memory
+  for a row than the second path, so a batch that the memory budget cannot hold together
+  with that scratch is built on the second path. The two paths end their batches at
+  different left rows, so a run of equal keys can be held beside a fuller batch with the
+  switch on. A query that fits a tight memory budget with the switch off can therefore
+  need more with it on, by at most one output batch and the scratch for testing its
+  pairs.
 * **Probed OPTIONAL** (`probed_optional`). An OPTIONAL whose right side is a triple
   pattern, with its FILTERs, sorted on a variable that every row of the evaluated left
   side binds reads the pattern only for the left side's distinct values. It uses the

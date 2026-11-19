@@ -159,8 +159,27 @@ impl Report {
 
 /// Why `e` may differ between two evaluations on the same input, if it may.
 pub fn impurity(e: &Expr) -> Option<&'static str> {
+    impurity_with(e, &|_| Some("EXISTS"))
+}
+
+/// Why the order or the grouping of the rows that `e` is evaluated on can be observed,
+/// if it can: `e` calls an application function, a function with side effects or one
+/// whose value differs from call to call. An EXISTS is passed over unless its pattern
+/// holds such a call or a SERVICE, and the calls beside it are still found.
+pub fn observable(e: &Expr) -> Option<&'static str> {
+    impurity_with(e, &|spec| {
+        super::cursor::pattern_observable(&spec.pattern).then_some("a call in an EXISTS")
+    })
+}
+
+/// [`impurity`] with the reason, if any, that `exists` gives for an EXISTS.
+fn impurity_with(
+    e: &Expr,
+    exists: &dyn Fn(&super::expr::ExistsSpec) -> Option<&'static str>,
+) -> Option<&'static str> {
+    let impurity = |e: &Expr| impurity_with(e, exists);
     match e {
-        Expr::Exists(_) => Some("EXISTS"),
+        Expr::Exists(spec) => exists(spec),
         Expr::Call(Func::Registered(_), _) => Some("application function"),
         Expr::Call(Func::Ext(iri), args) => {
             let afn = iri.strip_prefix(super::expr::AFN);
@@ -2159,6 +2178,73 @@ mod tests {
         // NOW is fixed for a query
         assert_eq!(impurity(&call(Function::Now, vec![])), None);
         assert_eq!(impurity(&call(Function::UCase, vec![Expr::Var(1)])), None);
+    }
+
+    /// An EXISTS does not hide the calls beside it, and counts itself only when its
+    /// pattern holds a call or a SERVICE that can be observed.
+    #[test]
+    fn observable_calls_are_found_beside_and_inside_an_exists() {
+        use super::super::expr::ExistsSpec;
+        use spargebra::algebra::{Expression, GraphPattern};
+        let exists = |filter: Option<Expression>| {
+            let bgp = GraphPattern::Bgp {
+                patterns: Vec::new(),
+            };
+            let pattern = match filter {
+                Some(expr) => GraphPattern::Filter {
+                    expr,
+                    inner: Box::new(bgp),
+                },
+                None => bgp,
+            };
+            Expr::Exists(std::sync::Arc::new(ExistsSpec::new(
+                pattern,
+                super::super::plan::ActiveGraph::Default,
+                vec![0],
+                Vec::new(),
+            )))
+        };
+        let custom = |iri: &str| {
+            Expression::FunctionCall(
+                Function::Custom(oxrdf::NamedNode::new(iri).unwrap()),
+                vec![Expression::Variable(oxrdf::Variable::new("x").unwrap())],
+            )
+        };
+        let plain = exists(None);
+        assert_eq!(impurity(&plain), Some("EXISTS"));
+        assert_eq!(observable(&plain), None);
+        let rand = Expr::Call(Func::Builtin(Function::Rand), vec![]);
+        let beside = Expr::Or(Box::new(plain.clone()), Box::new(rand.clone()));
+        // The first impurity is the EXISTS, which hides the call from `impurity`.
+        assert_eq!(impurity(&beside), Some("EXISTS"));
+        assert_eq!(observable(&beside), Some("RAND"));
+        let apply = Expr::Call(
+            Func::Ext(format!("{}wait", super::super::expr::AFN)),
+            vec![],
+        );
+        let nested = Expr::If(
+            Box::new(plain.clone()),
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Not(Box::new(apply))),
+        );
+        assert_eq!(observable(&nested), Some("side effects"));
+        let inside = "a call in an EXISTS";
+        assert_eq!(observable(&exists(Some(custom("urn:f")))), Some(inside));
+        let rand_inside = Expression::FunctionCall(Function::Rand, Vec::new());
+        assert_eq!(observable(&exists(Some(rand_inside))), Some(inside));
+        // An EXISTS in the pattern of an EXISTS is searched too.
+        let deep = Expression::Exists(Box::new(GraphPattern::Filter {
+            expr: custom("urn:f"),
+            inner: Box::new(GraphPattern::Bgp {
+                patterns: Vec::new(),
+            }),
+        }));
+        assert_eq!(observable(&exists(Some(deep))), Some(inside));
+        let cast = custom("http://www.w3.org/2001/XMLSchema#integer");
+        assert_eq!(observable(&exists(Some(cast))), None);
+        let ucase = Expression::FunctionCall(Function::UCase, Vec::new());
+        assert_eq!(observable(&exists(Some(ucase))), None);
+        assert_eq!(observable(&Expr::Var(0)), None);
     }
 
     #[test]

@@ -102,6 +102,11 @@ pub(super) struct Merge {
     /// two apart. [`Merge::next`] tests the condition on the pairs of each batch and
     /// keeps a left row's extension only when none of its pairs passed.
     condition: Option<Arc<Expr>>,
+    /// Whether the condition holds a call whose order or grouping can be observed
+    /// ([`crate::sparql::exprcache::observable`]). Such a condition is always tested
+    /// after the batch, on the same pairs in the same order and batches as with
+    /// `merge_pair_conditions` off.
+    observable: bool,
     /// The output variables with the marker column, which every pull under a condition
     /// asks [`Merge::merged`] for. It is built on the first pull.
     staged: Vec<VarId>,
@@ -775,6 +780,9 @@ impl Merge {
                 _ => None,
             },
             narrowed: false,
+            observable: condition
+                .as_deref()
+                .is_some_and(|e| crate::sparql::exprcache::observable(e).is_some()),
             condition,
             staged: Vec::new(),
             passed: false,
@@ -1254,7 +1262,7 @@ impl Merge {
     /// with its extension, so a left row whose pairs fill one batch is decided in a
     /// later one.
     fn test(&mut self, ctx: &Ctx, out: &mut Buffer, condition: &Expr) -> Result<()> {
-        self.settle(ctx, &mut out.table, condition, true)?;
+        self.settle(ctx, &mut out.table, condition)?;
         // The marker is freed before the batch's charge falls to the columns it keeps.
         drop(out.table.cols.pop());
         out.table.vars.pop();
@@ -1262,10 +1270,8 @@ impl Merge {
     }
 
     /// Test the condition on the pairs that `table` stages, which its last column, the
-    /// marker, binds, and keep the rows as [`Merge::test`] describes. Unless this is
-    /// the `last` test of the batch, the marker stays and marks every row kept as
-    /// decided, so the merge can go on filling the batch.
-    fn settle(&mut self, ctx: &Ctx, table: &mut Table, condition: &Expr, last: bool) -> Result<()> {
+    /// marker, binds, and keep the rows as [`Merge::test`] describes.
+    fn settle(&mut self, ctx: &Ctx, table: &mut Table, condition: &Expr) -> Result<()> {
         let rows = table.len;
         let width = table.width() - 1;
         let (marker, cols) = table.cols.split_last_mut().expect("a marker column");
@@ -1319,12 +1325,7 @@ impl Merge {
             }
             column.truncate(w);
         }
-        let kept = keep.iter().filter(|k| **k).count();
-        if !last {
-            marker.clear();
-            marker.resize(kept, Id::UNDEF);
-        }
-        table.len = kept;
+        table.len = keep.iter().filter(|k| **k).count();
         Ok(())
     }
 
@@ -1391,11 +1392,14 @@ impl Merge {
         // this batch. Holding the pairs with the table that the condition reads takes
         // more scratch for a row than the test after the batch, so a budget that does
         // not hold the whole batch with that scratch gets the batch that the switch-off
-        // path builds.
-        let decide = extend && ctx.opt.merge_pair_conditions && self.key_only() && {
-            let width = vars.len() - 1;
-            fits(decide_row(width), decide_fixed(ctx, width)) >= cap
-        };
+        // path builds. A condition with a call that can be observed keeps that path at
+        // every budget, since deciding tests other pairs together and, beside staged
+        // pairs, in another order.
+        let decide =
+            extend && ctx.opt.merge_pair_conditions && !self.observable && self.key_only() && {
+                let width = vars.len() - 1;
+                fits(decide_row(width), decide_fixed(ctx, width)) >= cap
+            };
         let (scratch_row, scratch_fixed) = if self.filter.is_some() {
             (5, 64)
         } else if self.key_only() {
@@ -1421,9 +1425,6 @@ impl Merge {
             return Ok((!out.table.is_empty()).then_some(out));
         }
         let mut steps = 0usize;
-        // Whether the batch holds pairs that a path other than the deciding
-        // [`Merge::interior`] staged for the test.
-        let mut staged = false;
         while out.table.len < cap {
             if steps.is_multiple_of(1024) {
                 ctx.check()?;
@@ -1431,7 +1432,6 @@ impl Merge {
             steps += 1;
             if let Some(spooled) = &mut self.spooled {
                 spooled.fill(ctx, &self.columns, self.optional, extend, &mut out, cap)?;
-                staged = true;
                 if spooled.done {
                     self.spooled = None;
                 }
@@ -1450,17 +1450,6 @@ impl Merge {
                     continue;
                 }
                 if self.key_only() {
-                    if let Some(condition) = condition
-                        && decide
-                        && staged
-                    {
-                        // The staged pairs come before the pairs decided next, so the
-                        // condition is tested on them first and sees the pairs in input
-                        // order. Their runs have ended, so no left row is open.
-                        self.settle(ctx, &mut out.table, condition, false)?;
-                        debug_assert!(!self.passed);
-                        staged = false;
-                    }
                     match self.interior(ctx, &mut out, cap, children[1].done, decide)? {
                         Step::Advanced => continue,
                         Step::Full => break,
@@ -1529,7 +1518,6 @@ impl Merge {
                             });
                         }
                         out.table.len += 1;
-                        staged = true;
                     }
                     if compatible || self.optional {
                         for (col, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
@@ -1586,7 +1574,6 @@ impl Merge {
             // the two runs is compatible, so a left row joins a slice of right rows.
             let key_only = self.key_only();
             let pair = self.pair.as_mut().expect("matched runs");
-            staged = true;
             let left = pair.left.table(&self.inputs[0]);
             let right = pair.right.table(&self.inputs[1]);
             while pair.li < pair.left.rows.end && out.table.len < cap {
@@ -2411,6 +2398,17 @@ mod tests {
         pairs: bool,
         spill: Option<&Arc<crate::spill::Spill>>,
     ) -> Result<(Vec<Vec<Id>>, u64)> {
+        conditional_batches(node, cap, limit, pairs, spill).map(|(rows, runs, _)| (rows, runs))
+    }
+
+    /// [`conditional`] with the number of rows in each batch.
+    fn conditional_batches(
+        node: &Node,
+        cap: usize,
+        limit: u64,
+        pairs: bool,
+        spill: Option<&Arc<crate::spill::Spill>>,
+    ) -> Result<(Vec<Vec<Id>>, u64, Vec<usize>)> {
         let ctx = context_with(limit, spill, pairs);
         let mut op = Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)?;
         assert!(matches!(op.state, super::super::State::Merge(_)));
@@ -2419,23 +2417,25 @@ mod tests {
             ..Default::default()
         };
         let mut result = Vec::new();
+        let mut sizes = Vec::new();
         while let Some(batch) = op.next(&ctx, &options, cap)? {
             assert!(batch.table.len <= cap && batch.table.len > 0);
+            sizes.push(batch.table.len);
             result.extend(rows(&batch.table));
         }
         let super::super::State::Merge(merge) = &op.state else {
             unreachable!()
         };
-        Ok((result, merge.spooled_runs))
+        Ok((result, merge.spooled_runs, sizes))
     }
 
-    /// A registered scalar is called for the pairs in input order within a batch (P03),
-    /// so a condition that calls one sees the same sequence of pairs whether the merge
-    /// tests the pairs before it copies rows or the batch after it. Rows of held runs,
-    /// single-row runs at the end of a right batch and spooled runs are staged for the
-    /// later test, and the merge tests them before it decides a later left row.
+    /// A condition that calls a registered scalar is tested after the batch whether
+    /// `merge_pair_conditions` is on or off, so the scalar is called for the same pairs
+    /// in the same batches, and where one thread evaluates a batch in the same sequence.
+    /// The data has left rows that a merge with the switch on would decide beside held,
+    /// single-row and spooled runs.
     #[test]
-    fn a_condition_that_calls_a_registered_scalar_sees_the_pairs_in_input_order() {
+    fn a_condition_that_calls_a_registered_scalar_keeps_the_test_after_the_batch() {
         use crate::sparql::expr::Func;
         use crate::sparql::extensions::{ScalarContext, ScalarDescriptor, ScalarResult};
         use std::sync::Mutex;
@@ -2510,24 +2510,27 @@ mod tests {
         }
         let mut spooled = 0;
         for (lr, rr, long) in [(crossing.0, crossing.1, false), (l, r, true)] {
-            // Left rows in order, and for each the right rows of its key in order.
-            let mut order = Vec::new();
+            // One call for each pair of a left row and a right row of its key.
+            let mut every = Vec::new();
             for row in &lr {
-                order.extend(rr.iter().filter(|x| x[0] == row[0]).map(|x| (row[1], x[1])));
+                every.extend(rr.iter().filter(|x| x[0] == row[0]).map(|x| (row[1], x[1])));
             }
-            assert!(!order.is_empty());
+            assert!(!every.is_empty());
+            every.sort();
             let mut node = join(values(vec![0, left], &lr), values(vec![0, right], &rr));
             node.kind = Kind::LeftJoin {
                 expr: Some(condition.clone()),
             };
             for spills in [false, true] {
-                // A batch of these sizes is evaluated on one thread. A larger one may go
-                // to the pool, where the calls of a batch have no order.
-                for cap in [1, 2, 3, 4, 5, 7, 64] {
-                    if spills && !long {
+                // A batch of up to 64 rows is evaluated on one thread. A larger one may
+                // go to the pool, where the calls of a batch have no order. With the
+                // switch on, a merge that decided pairs would test up to 1024 of them
+                // in one call where the test after the batch has 512.
+                for cap in [1, 2, 3, 4, 5, 7, 64, 1024] {
+                    if spills && (!long || cap > 64) {
                         continue;
                     }
-                    let mut bags = Vec::new();
+                    let mut runs_of = Vec::new();
                     for pairs in [false, true] {
                         seen.lock().unwrap().clear();
                         let (limit, spill) = if spills {
@@ -2535,34 +2538,136 @@ mod tests {
                         } else {
                             (8 << 20, None)
                         };
-                        let (mut bag, runs) = conditional(&node, cap, limit, pairs, spill).unwrap();
+                        let (mut bag, runs, sizes) =
+                            conditional_batches(&node, cap, limit, pairs, spill).unwrap();
                         spooled += runs;
-                        let case = format!("long {long} spills {spills} cap {cap} pairs {pairs}");
-                        let calls = seen.lock().unwrap();
-                        assert_eq!(calls.len(), order.len(), "{case}");
-                        if let Some(at) = (0..order.len()).find(|&i| calls[i] != order[i]) {
-                            panic!(
-                                "{case}: call {at} was for {:?}, not {:?}",
-                                calls[at], order[at]
-                            );
+                        let mut calls = seen.lock().unwrap().clone();
+                        if cap > 64 {
+                            calls.sort();
                         }
                         bag.sort();
-                        bags.push(bag);
+                        runs_of.push((calls, sizes, bag));
                     }
-                    assert_eq!(bags[0], bags[1], "long {long} spills {spills} cap {cap}");
+                    let case = format!("long {long} spills {spills} cap {cap}");
+                    let (off, on) = (&runs_of[0], &runs_of[1]);
+                    let mut called = off.0.clone();
+                    called.sort();
+                    assert_eq!(called, every, "{case}");
+                    if let Some(at) =
+                        (0..off.0.len().max(on.0.len())).find(|&i| off.0.get(i) != on.0.get(i))
+                    {
+                        panic!(
+                            "{case}: call {at} was for {:?} with the switch off and {:?} with it on",
+                            off.0.get(at),
+                            on.0.get(at)
+                        );
+                    }
+                    assert_eq!(off.1, on.1, "{case}: rows in each batch");
+                    assert_eq!(off.2, on.2, "{case}");
                 }
             }
         }
         assert!(spooled > 0, "{spooled} runs spooled");
     }
 
-    /// A conditional merge OPTIONAL that fits a memory budget with the condition tested
-    /// after the batch also fits it with the condition tested on the pairs, at every
-    /// budget and batch size, and returns the same bag. The fit is not monotone in the
-    /// budget, because the merge derives each batch's size from the room it finds, so
-    /// the budgets are swept and not bisected.
+    /// The merge decides pairs for a condition without an observable call, an EXISTS
+    /// included, and not for one that holds such a call beside or inside an EXISTS. At
+    /// three pairs for a left row, deciding fits more left rows in a batch.
     #[test]
-    fn pair_conditions_fit_every_budget_that_the_staged_test_fits() {
+    fn pair_conditions_decide_only_without_an_observable_call() {
+        use crate::sparql::expr::{ExistsSpec, Func};
+        use spargebra::algebra::{Expression, Function, GraphPattern};
+        let (left, right) = (2, 3);
+        let above = Expr::Cmp(
+            Box::new(Expr::Var(right)),
+            Box::new(Expr::Var(left)),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        let exists = |filter: Option<Expression>| {
+            let bgp = GraphPattern::Bgp {
+                patterns: Vec::new(),
+            };
+            let pattern = match filter {
+                Some(expr) => GraphPattern::Filter {
+                    expr,
+                    inner: Box::new(bgp),
+                },
+                None => bgp,
+            };
+            Expr::Exists(Arc::new(ExistsSpec::new(
+                pattern,
+                crate::sparql::plan::ActiveGraph::Default,
+                vec![left],
+                Vec::new(),
+            )))
+        };
+        let rand = Expr::Call(Func::Builtin(Function::Rand), vec![]);
+        let l: Vec<Vec<i64>> = (0..400).map(|k| vec![k, 5]).collect();
+        let r: Vec<Vec<i64>> = (0..1200).map(|j| vec![j / 3, j % 9]).collect();
+        let node = |condition: Expr| {
+            let mut node = join(values(vec![0, left], &l), values(vec![0, right], &r));
+            node.kind = Kind::LeftJoin {
+                expr: Some(condition),
+            };
+            node
+        };
+        let observable = |condition: Expr| {
+            let ctx = context(8 << 20);
+            let op = Operator::build(&ctx, node(condition), FallbackPolicy::RejectMaterialization)
+                .unwrap();
+            let super::super::State::Merge(merge) = &op.state else {
+                unreachable!()
+            };
+            merge.observable
+        };
+        assert!(!observable(above.clone()));
+        assert!(!observable(exists(None)));
+        assert!(!observable(Expr::And(
+            Box::new(exists(None)),
+            Box::new(above.clone())
+        )));
+        assert!(observable(Expr::Or(
+            Box::new(exists(None)),
+            Box::new(rand.clone())
+        )));
+        assert!(observable(exists(Some(Expression::FunctionCall(
+            Function::Rand,
+            Vec::new()
+        )))));
+        // RAND() < 2 holds for every pair, so the bag is the same on every path.
+        let always = Expr::Cmp(
+            Box::new(rand),
+            Box::new(Expr::Const(Id::from_i64(2).unwrap())),
+            crate::sparql::expr::CmpOp::Lt,
+        );
+        for (name, condition, decides) in [("pure", above, true), ("RAND", always, false)] {
+            let node = node(condition);
+            let batches = |pairs: bool| {
+                let (mut bag, _, sizes) =
+                    conditional_batches(&node, 64, 8 << 20, pairs, None).unwrap();
+                bag.sort();
+                (bag, sizes)
+            };
+            let (off, on) = (batches(false), batches(true));
+            assert_eq!(off.0, on.0, "{name}");
+            if decides {
+                assert!(on.1.len() < off.1.len(), "{name}: {:?}", on.1);
+            } else {
+                assert_eq!(off.1, on.1, "{name}");
+            }
+        }
+    }
+
+    /// A conditional merge OPTIONAL that fits a memory budget with the condition tested
+    /// after the batch fits with the condition tested on the pairs too, with at most
+    /// one more output batch and the scratch for deciding it, and returns the same bag.
+    /// The two paths end their batches at different left rows, so a run is held or an
+    /// input batch loaded beside different buffers, and the same budget does not
+    /// always fit both. The fit is not monotone in the budget either, because the merge
+    /// derives each batch's size from the room it finds, so the budgets are swept and
+    /// not bisected.
+    #[test]
+    fn pair_conditions_fit_within_a_batch_of_every_budget_that_the_staged_test_fits() {
         let (left, right) = (2, 3);
         let condition = Expr::Cmp(
             Box::new(Expr::Var(right)),
@@ -2597,7 +2702,19 @@ mod tests {
                     .chain((4..12).map(|k| vec![k, 9]))
                     .collect(),
             ),
+            // The last left row meets a run that crosses the right input's batches of
+            // 64 rows. With pair conditions the batch before it holds more rows when
+            // the run is held.
+            (
+                "long last run",
+                (1..=32).chain([64]).map(|k| vec![k, 1]).collect(),
+                (1..=63)
+                    .map(|k| vec![k, 2])
+                    .chain((0..129).map(|j| vec![64, 2 + j]))
+                    .collect(),
+            ),
         ];
+        let mut worst = 0;
         for (name, l, r) in &shapes {
             let mut node = join(values(vec![0, left], l), values(vec![0, right], r));
             node.kind = Kind::LeftJoin {
@@ -2606,6 +2723,18 @@ mod tests {
             let mut expected = conditional(&node, 4096, u64::MAX, false, None).unwrap().0;
             expected.sort();
             for cap in [1, 2, 4, 64] {
+                // An output batch with its marker column, as [`Merge::merged`] admits
+                // it, and the scratch that [`Merge::interior`] charges to decide it.
+                let bound = {
+                    let ctx = context(u64::MAX);
+                    let (vars, rows) = (node.vars.len() as u64 + 1, cap.max(2) as u64);
+                    let width = node.vars.len();
+                    crate::sparql::ctx::table_bytes(rows as usize, vars as usize)
+                        + vars * 40
+                        + 128
+                        + rows * decide_row(width)
+                        + decide_fixed(&ctx, width)
+                };
                 let (mut fits, mut fails) = (0, 0);
                 for limit in (1024..40_000u64).step_by(16) {
                     let budget = |e: &Error| matches!(e, Error::BudgetExceeded(_));
@@ -2614,15 +2743,31 @@ mod tests {
                             fits += 1;
                             bag.sort();
                             assert_eq!(bag, expected, "{name}, cap {cap}, {limit} bytes");
-                            let pairs = conditional(&node, cap, limit, true, None);
-                            let (mut bag, _) = pairs.unwrap_or_else(|e| {
+                            let more = (0..=bound).step_by(16).find(|more| {
+                                match conditional(&node, cap, limit + more, true, None) {
+                                    Ok((mut bag, _)) => {
+                                        bag.sort();
+                                        assert_eq!(bag, expected, "{name}, cap {cap}, {limit}");
+                                        true
+                                    }
+                                    Err(e) => {
+                                        assert!(budget(&e), "{name}, cap {cap}, {limit}: {e}");
+                                        false
+                                    }
+                                }
+                            });
+                            let more = more.unwrap_or_else(|| {
                                 panic!(
                                     "{name}, cap {cap}: fits {limit} bytes with the staged test, \
-                                     not with pair conditions: {e}"
+                                     and with pair conditions not within {bound} bytes more"
                                 )
                             });
-                            bag.sort();
-                            assert_eq!(bag, expected, "{name}, cap {cap}, {limit} bytes");
+                            if more > worst {
+                                worst = more;
+                                println!(
+                                    "{name}, cap {cap}, {limit} bytes: {more} of {bound} more"
+                                );
+                            }
                         }
                         Err(e) => {
                             assert!(budget(&e), "{name}, cap {cap}, {limit} bytes: {e}");
@@ -2637,6 +2782,9 @@ mod tests {
                 );
             }
         }
+        // The long last run needs more with pair conditions at some budgets, so the
+        // sweep exercises the bound and not only equal budgets.
+        assert!(worst > 0);
     }
 
     /// With the switch off, the test after the batch reserves its scratch, which holds

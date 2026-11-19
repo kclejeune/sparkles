@@ -285,7 +285,10 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   also merges on a leading variable that is certainly bound when the inputs share
   further variables. The two modes test a merge OPTIONAL's condition in separate
   implementations, eager execution over all of the matched pairs at once and the cursor
-  over each batch's pairs. In the measured OPTIONALs over `foaf:knows`, with about 2.5
+  over each batch's pairs. With the `merge_pair_conditions` switch on, the cursor can
+  need more memory than with it off, by at most one output batch and the scratch for
+  testing its pairs, so a budget that the query only just fits with the switch off can
+  refuse it. In the measured OPTIONALs over `foaf:knows`, with about 2.5
   pairs per left row, the cursor took 1.18 to 1.36 times the eager time.
 * Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
   GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms

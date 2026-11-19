@@ -1564,10 +1564,33 @@ fn retryable(node: &Node) -> bool {
 /// keeps an EXISTS that it evaluates per row as a pattern, so [`retryable`] does not
 /// see a SERVICE there.
 pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    pattern_has(pattern, &|_| false)
+}
+
+/// Whether evaluating `pattern` can be observed from outside the query or differs from
+/// one evaluation to the next: it holds a SERVICE or, in any expression, a call of
+/// RAND, UUID, STRUUID or BNODE or of a function named by an IRI other than an XSD
+/// cast. The pattern is not planned, so an application function cannot be told from
+/// an extension function here, and every such name counts.
+pub(super) fn pattern_observable(pattern: &spargebra::algebra::GraphPattern) -> bool {
+    use spargebra::algebra::Function as F;
+    pattern_has(pattern, &|function| match function {
+        F::Rand | F::Uuid | F::StrUuid | F::BNode => true,
+        F::Custom(name) => !name.as_str().starts_with(super::expr::XSD),
+        _ => false,
+    })
+}
+
+/// Whether `pattern` holds a SERVICE or a call of a function that `call` accepts,
+/// anywhere.
+fn pattern_has(
+    pattern: &spargebra::algebra::GraphPattern,
+    call: &dyn Fn(&spargebra::algebra::Function) -> bool,
+) -> bool {
     use spargebra::algebra::{AggregateExpression, GraphPattern as P, OrderExpression};
     let order = |keys: &[OrderExpression]| {
         keys.iter().any(|k| match k {
-            OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_calls_service(e),
+            OrderExpression::Asc(e) | OrderExpression::Desc(e) => expr_has(e, call),
         })
     };
     match pattern {
@@ -1578,17 +1601,17 @@ pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool 
         | P::Minus { left, right }
         | P::SemiJoin { left, right }
         | P::AntiJoin { left, right }
-        | P::Lateral { left, right } => calls_service(left) || calls_service(right),
+        | P::Lateral { left, right } => pattern_has(left, call) || pattern_has(right, call),
         P::LeftJoin {
             left,
             right,
             expression,
         } => {
-            calls_service(left)
-                || calls_service(right)
-                || expression.as_ref().is_some_and(expr_calls_service)
+            pattern_has(left, call)
+                || pattern_has(right, call)
+                || expression.as_ref().is_some_and(|e| expr_has(e, call))
         }
-        P::Filter { expr, inner } => expr_calls_service(expr) || calls_service(inner),
+        P::Filter { expr, inner } => expr_has(expr, call) || pattern_has(inner, call),
         P::Extend {
             inner, expression, ..
         }
@@ -1597,23 +1620,23 @@ pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool 
         }
         | P::Unfold {
             inner, expression, ..
-        } => expr_calls_service(expression) || calls_service(inner),
-        P::OrderBy { inner, expression } => order(expression) || calls_service(inner),
+        } => expr_has(expression, call) || pattern_has(inner, call),
+        P::OrderBy { inner, expression } => order(expression) || pattern_has(inner, call),
         P::Group {
             inner, aggregates, ..
         } => {
-            calls_service(inner)
+            pattern_has(inner, call)
                 || aggregates.iter().any(|(_, agg)| match agg {
                     AggregateExpression::CountSolutions { .. } => false,
-                    AggregateExpression::FunctionCall { expr, .. } => expr_calls_service(expr),
+                    AggregateExpression::FunctionCall { expr, .. } => expr_has(expr, call),
                     AggregateExpression::Fold {
                         expr,
                         value,
                         order: keys,
                         ..
                     } => {
-                        expr_calls_service(expr)
-                            || value.as_ref().is_some_and(expr_calls_service)
+                        expr_has(expr, call)
+                            || value.as_ref().is_some_and(|e| expr_has(e, call))
                             || order(keys)
                     }
                 })
@@ -1622,15 +1645,19 @@ pub(super) fn calls_service(pattern: &spargebra::algebra::GraphPattern) -> bool 
         | P::Project { inner, .. }
         | P::Distinct { inner }
         | P::Reduced { inner }
-        | P::Slice { inner, .. } => calls_service(inner),
+        | P::Slice { inner, .. } => pattern_has(inner, call),
     }
 }
 
-/// Whether `expr` holds an EXISTS whose pattern holds a SERVICE.
-fn expr_calls_service(expr: &spargebra::algebra::Expression) -> bool {
+/// Whether `expr` calls a function that `call` accepts, or holds an EXISTS whose pattern
+/// holds a SERVICE or such a call.
+fn expr_has(
+    expr: &spargebra::algebra::Expression,
+    call: &dyn Fn(&spargebra::algebra::Function) -> bool,
+) -> bool {
     use spargebra::algebra::Expression as E;
     match expr {
-        E::Exists(pattern) => calls_service(pattern),
+        E::Exists(pattern) => pattern_has(pattern, call),
         E::NamedNode(_) | E::Literal(_) | E::Variable(_) | E::Bound(_) => false,
         E::Or(a, b)
         | E::And(a, b)
@@ -1643,11 +1670,12 @@ fn expr_calls_service(expr: &spargebra::algebra::Expression) -> bool {
         | E::Add(a, b)
         | E::Subtract(a, b)
         | E::Multiply(a, b)
-        | E::Divide(a, b) => expr_calls_service(a) || expr_calls_service(b),
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_calls_service(a),
-        E::In(a, list) => expr_calls_service(a) || list.iter().any(expr_calls_service),
-        E::If(a, b, c) => expr_calls_service(a) || expr_calls_service(b) || expr_calls_service(c),
-        E::Coalesce(list) | E::FunctionCall(_, list) => list.iter().any(expr_calls_service),
+        | E::Divide(a, b) => expr_has(a, call) || expr_has(b, call),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_has(a, call),
+        E::In(a, list) => expr_has(a, call) || list.iter().any(|e| expr_has(e, call)),
+        E::If(a, b, c) => expr_has(a, call) || expr_has(b, call) || expr_has(c, call),
+        E::Coalesce(list) => list.iter().any(|e| expr_has(e, call)),
+        E::FunctionCall(function, list) => call(function) || list.iter().any(|e| expr_has(e, call)),
     }
 }
 
