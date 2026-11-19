@@ -1412,3 +1412,22 @@ fn xml_new_charges_its_tags_itself() {
         assert_eq!(room(&ctx), before, "{left}: the charge outlived the tags");
     }
 }
+
+/// A writer cut exactly where the last row ends, or inside the footer, has taken every
+/// row and fails the output, in each encoded format, so the footer counts no row.
+#[test]
+fn a_cut_at_the_last_row_or_in_the_footer_counts_every_row() {
+    let vars = vec!["a".to_string(), "b".to_string()];
+    let rows = vec![
+        vec![simple("x"), None],
+        vec![None, Some(NamedNode::new_unchecked("http://e/y").into())],
+    ];
+    for enc in [Enc::Json, Enc::Xml] {
+        let (want, ends) = oracle(enc, &vars, &rows);
+        let last = *ends.last().unwrap();
+        assert!(last < want.len(), "{enc:?}: no footer");
+        for limit in [last, last + 1, want.len() - 1] {
+            check_failing(enc, &vars, &rows, limit).unwrap();
+        }
+    }
+}
