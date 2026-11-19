@@ -73,7 +73,7 @@ it checks nothing.
 
 `crates/sparkles-core/tests/cursor_memory_audit.rs` runs one fixture for each cursor
 operator, under the query's own account and a pool grant, with batches of 256 and 4,096
-rows. An operator whose charges follow its allocations is held to the exact allowance of
+rows, and a spilled fixture for each operator that spills. An operator whose charges follow its allocations is held to the exact allowance of
 16 KiB on each side, which covers its plan and cursor, and 64 KiB at its peak. A fixture
 with a known finding is held to its measured excess rounded up, under the item that owns
 it, so a change that makes it worse fails.
@@ -81,6 +81,8 @@ it, so a change that makes it worse fails.
 ## Findings
 
 These readings come from the first run of the audit over the operators as they were.
+The spilled fixtures run each spilling operator under a budget its state outgrows, so
+that the sort writes and merges runs and DISTINCT passes rows on to later passes.
 
 | Fixture | Reading | Item |
 |---|---|---|
@@ -88,14 +90,33 @@ These readings come from the first run of the audit over the operators as they w
 | group count, ordered group | The heap passes the ledger by up to 108 KiB and 750 KiB inside a pull. | 1185 |
 | group concat | The ledger stands about 1 MiB above the heap after its pull. | 1185 |
 | top k | The ledger stands about 62 KiB above the heap after its pull. | 1186 |
-| sort | The ledger peaks at 11.1 MB for a heap peak of 2.9 MB. | 1187 |
+| sort | The ledger peaks at 11.1 MB for a heap peak of 2.9 MB, from the decode of the sort's keys. | 1187 |
 | transitive path | The heap passes the ledger by up to 45 KiB inside a pull. | 1188 |
 | path search | The heap passes the ledger by up to 340 KiB inside a pull. | 1189 |
+| spilled sort | The heap passes the ledger by up to 88 KiB inside a pull, and the merge keeps up to 269 KiB charged above the heap. | 1193 |
+| spilled DISTINCT | The heap passes the ledger by up to 56 KiB inside a pull in the spill passes. | 1194 |
 | history | The heap passes the ledger by up to 410 KiB inside a pull. | 1190 |
 | text | The heap passes the ledger by up to 450 KiB inside a pull. | 1191 |
 
 The scans, filters, BIND, the merge and hash joins, UNION, MINUS, EXISTS, DISTINCT, GRAPH,
 sequence paths and slices are within the exact allowance.
+
+### DISTINCT
+
+DISTINCT keeps the rows of unordered and segmented input in a set of `Charged` buffers
+on the query's retained account. A single column is a hash set of its IDs. Wider rows
+are a hash table of row numbers and an arena of their IDs, which grows toward the
+table's room so that the two stay in step. A query that may spill stops growing the
+set before a growth that would take the predicted size of its buffers to the pass's
+threshold, or when a growth is refused. The prediction is the bound each buffer would
+grow to, so a one-column set is predicted as its table alone and no longer with the
+bytes of rows it does not keep, and it freezes later than it did.
+
+`crates/sparkles-core/tests/charged_parity.rs` pins the smallest budget at which each
+of six DISTINCT fixtures fitted before the move, single and wider rows, segmented,
+numbered below an ORDER BY and spilled. Every budget of each sweep at or above it fits
+with the same answer and no slack. The wider-row fixture fits from 1,769,472 bytes,
+where it needed 1,933,312.
 
 ## Acceptance criteria
 
@@ -112,8 +133,10 @@ sequence paths and slices are within the exact allowance.
 ## Outcome
 
 The `Charged` type, the shared audit and a fixture for each cursor operator are in
-place. The first run's findings are recorded above with their items. Moving DISTINCT and
-the external sort onto `Charged` buffers remains under item 1183, and the operators that
+place, with spilled fixtures for the sort and DISTINCT. The first run's findings are
+recorded above with their items. DISTINCT is on `Charged` buffers. Removing the charge
+of its arena or of its one-column set, or admitting a growth only after it allocates,
+fails its fixtures. The external sort moves under item 1193, and the operators that
 other work is rewriting move under item 1192.
 
 ## Provenance

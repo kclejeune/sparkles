@@ -747,4 +747,66 @@ mod tests {
             growth(1 << 20, numbered, true, Expect::Freezes);
         }
     }
+
+    /// A one-column set of a query that may spill stops growing once the table it would
+    /// grow to reaches the pass's threshold, which is predicted from the table's own
+    /// bound and not from row bytes the set does not keep. The rows it passes on come
+    /// back from later passes, each once.
+    #[test]
+    fn a_one_column_set_freezes_at_its_predicted_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.var("value");
+        ctx.mem_limit = 1 << 20;
+        ctx.spill = Some(Arc::new(spill.query(None)));
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let baseline = ctx.live_bytes();
+        let mut distinct = Distinct::new(&ctx, &[0], &[], false, false).unwrap();
+        let (rows, batch) = (100_000i64, 1000i64);
+        let mut output = Vec::new();
+        let mut largest = 0;
+        for first in (0..rows).step_by(batch as usize) {
+            let mut buffer = Buffer::new(&ctx, &[0], batch as usize).unwrap();
+            // every value twice, half the input apart
+            for i in first..first + batch {
+                buffer.table.cols[0].push(Id::from_i64(i % (rows / 2)).unwrap());
+            }
+            buffer.table.len = batch as usize;
+            buffer.reconcile().unwrap();
+            distinct.apply(&ctx, &mut buffer).unwrap();
+            output.extend(buffer.table.cols[0].iter().copied());
+            if let Some(Seen::One(ids)) = &distinct.seen {
+                largest = largest.max(ids.bytes());
+                assert_eq!(ids.bytes(), ids.allocation_size() as u64);
+            }
+        }
+        assert!(distinct.frozen, "the set must stop growing");
+        // the threshold is half the room the query had, at least 256 KiB
+        assert!(
+            largest < distinct.threshold,
+            "{largest} {}",
+            distinct.threshold
+        );
+        while let Some(buffer) = distinct.drain(&ctx, &[0]).unwrap() {
+            output.extend(buffer.table.cols[0].iter().copied());
+        }
+        assert!(distinct.passes > 0 && distinct.spilled > 0);
+        output.sort_unstable();
+        let expected: Vec<Id> = (0..rows / 2).map(|i| Id::from_i64(i).unwrap()).collect();
+        assert_eq!(output, expected);
+        drop(distinct);
+        assert_eq!(ctx.live_bytes(), baseline);
+        assert_eq!(spill.reserved_bytes(), 0);
+    }
 }

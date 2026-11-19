@@ -184,9 +184,11 @@ unsafe impl GlobalAlloc for Counting {
                 place(p as usize, size, 0);
             }
         } else if OPEN.load(Ordering::Relaxed) && counted() {
-            // A block that moved was live beside its copy while the bytes moved, and one
-            // that stayed never held more than its larger size.
-            let beside = if q == p { 0 } else { old.unwrap_or(0) };
+            // A block that moved was live beside its copy while the bytes moved. One that
+            // grew in place is counted the same, since whether it can depends on what
+            // the allocator holds beside it, which other tests and earlier queries set,
+            // and an operator that grows one must admit both sizes.
+            let beside = old.unwrap_or(0);
             place(q as usize, new, beside);
         }
         q

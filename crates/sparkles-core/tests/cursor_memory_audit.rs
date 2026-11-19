@@ -18,6 +18,7 @@ use sparkles_core::io::Source;
 use sparkles_core::sparql::pool::QueryPool;
 use sparkles_core::sparql::update::update;
 use sparkles_core::sparql::{CursorOptions, QueryOptions, select_cursor};
+use sparkles_core::spill::{Spill, SpillOptions};
 use sparkles_core::store::{Store, StoreOptions};
 use std::sync::Arc;
 
@@ -181,8 +182,9 @@ fn allowance(name: &str) -> Allowance {
             over: 72 * K,
             ..exact
         },
-        // item 1187: the in-memory sort charges a formula of 160 bytes for each key of
-        // each row, several times what it allocates for these keys
+        // item 1187: the in-memory sort's decode of its keys charges each distinct value
+        // 128 bytes and its term eight times the key's length and 128 bytes more,
+        // several times what it allocates for these keys
         "sort" => Allowance {
             peak: 8000 * K,
             ..exact
@@ -209,17 +211,43 @@ fn allowance(name: &str) -> Allowance {
             over: 72 * K,
             ..exact
         },
+        // item 1193: the external sort holds its pieces' sorts outside its ledger inside a
+        // pull and charges its merge a formula above what it holds, and its runs are
+        // written under the in-memory sort's charge of item 1187
+        "sort spilled" => Allowance {
+            under: 100 * K,
+            over: 300 * K,
+            peak: 1300 * K,
+        },
+        // item 1194: DISTINCT's passes hold their spill frames outside its ledger
+        "distinct spilled" => Allowance {
+            under: 64 * K,
+            ..exact
+        },
         _ => exact,
     }
 }
 
 fn run(s: &Store, q: &str, granted: bool, batch: usize) -> Audit {
+    run_under(s, q, granted, batch, 256 << 20, None)
+}
+
+/// [`run`] under a budget of `budget` bytes, spilling to `spill` when it is given.
+fn run_under(
+    s: &Store,
+    q: &str,
+    granted: bool,
+    batch: usize,
+    budget: u64,
+    spill: Option<Arc<Spill>>,
+) -> Audit {
     heap::audit(|| {
         let pool = QueryPool::new(1 << 40);
         let opts = QueryOptions {
             no_cache: true,
-            max_memory_bytes: Some(256 << 20),
+            max_memory_bytes: Some(budget),
             grant: granted.then(|| Arc::new(pool.try_grant(0).unwrap())),
+            spill,
             ..Default::default()
         };
         let cursor = CursorOptions {
@@ -236,6 +264,9 @@ fn print(name: &str, mode: &str, a: &Audit) {
             "AUDIT {name:24} {mode:7} rows={:7} batches={:4} within={:9} after={:9} over={:9} peak={:9} ledger={:9}",
             a.rows, a.batches, a.within, a.after, a.over, a.peak, a.ledger
         );
+        if std::env::var_os("AUDIT_PLAN").is_some() {
+            println!("PLAN {name} {}", a.plan);
+        }
     }
 }
 
@@ -256,6 +287,60 @@ fn every_cursor_operator_holds_its_ledger_and_no_more() {
                 }
                 print(name, &format!("{mode}/{batch}"), &a);
                 assert!(a.rows > 0, "{name}: no rows");
+                found.extend(a.check(&format!("{name} ({mode}, batch {batch})"), &allowance(name)));
+            }
+        }
+    }
+    assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// The operators that spill, each under a budget that its state outgrows, so that the
+/// sort writes and merges runs and DISTINCT passes rows on to later passes. Their
+/// spill files are outside the heap and outside the ledger.
+const SPILLED: &[(&str, &str, u64)] = &[
+    (
+        "sort spilled",
+        "SELECT ?s ?n { ?s <urn:name> ?n } ORDER BY DESC(?n)",
+        2 << 20,
+    ),
+    (
+        "distinct spilled",
+        "SELECT DISTINCT ?v ?o { ?s <urn:p> ?v . ?s <urn:q> ?o }",
+        512 << 10,
+    ),
+];
+
+/// Every spilling fixture holds its ledger while it spills, under both accounts and at
+/// both batch sizes.
+#[test]
+fn every_spilling_operator_holds_its_ledger_and_no_more() {
+    let _serial = heap::serial();
+    let s = store(20_000);
+    let tmp = tempfile::tempdir().unwrap();
+    let spill = Spill::open(&SpillOptions {
+        dir: tmp.path().to_path_buf(),
+        max_bytes: 1 << 30,
+        query_bytes: 1 << 30,
+        min_free_bytes: 0,
+        encrypted: false,
+    })
+    .unwrap();
+    let mut found = Vec::new();
+    for &(name, q, budget) in SPILLED {
+        for (granted, mode) in [(false, "local"), (true, "granted")] {
+            for batch in [256, 4096] {
+                let go = || run_under(&s, q, granted, batch, budget, Some(spill.clone()));
+                let mut a = go();
+                for _ in 0..2 {
+                    a = go();
+                }
+                print(name, &format!("{mode}/{batch}"), &a);
+                assert!(a.rows > 0, "{name}: no rows");
+                assert!(
+                    a.plan.contains("spilledBytes"),
+                    "{name}: no spill in {}",
+                    a.plan
+                );
                 found.extend(a.check(&format!("{name} ({mode}, batch {batch})"), &allowance(name)));
             }
         }

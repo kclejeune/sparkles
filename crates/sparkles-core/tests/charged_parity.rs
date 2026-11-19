@@ -79,6 +79,9 @@ const FIXTURES: &[Fixture] = &[
         query: "SELECT DISTINCT ?s ?v { ?s <urn:q> ?o . ?s <urn:p> ?v }",
         spill: false,
         range: (16 * K, 512 * K, 4 * K),
+        // The operator as it was fitted 57,344 bytes and missed 61,440, since a budget
+        // that sizes the batches from the room it finds is not monotone, so the pin is
+        // its smallest fit above its last miss.
         before: 65536,
         slack: 0,
     },
