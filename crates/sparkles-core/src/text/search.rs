@@ -79,7 +79,7 @@ pub fn search_in(
             }
         }
         None => {
-            let (total, mut hits) = resolved
+            let (total, mut hits, _) = resolved
                 .searcher
                 .search(
                     &query,
@@ -110,7 +110,15 @@ pub fn search_in(
         }
     };
     if let (Some(opts), Some(c)) = (&spec.highlight, out.clit) {
-        highlight(ctx, resolved, field, opts, &matchers, &mut t.cols[c])?;
+        highlight(
+            ctx,
+            resolved,
+            field,
+            opts,
+            &matchers,
+            &mut t.cols[c],
+            usize::MAX,
+        )?;
     }
     Ok(t)
 }
@@ -184,9 +192,18 @@ fn prepare<'a>(
 /// The hits a reader decodes at a time.
 const PAGE: usize = 4096;
 
-/// What decoding a page holds per hit: its terms and hash, the order of the page's
-/// hits by document, and the ordinals of a column.
-const PAGE_HIT_BYTES: u64 = 96;
+/// What decoding a page holds per hit at most at once: its four terms and hash (40
+/// bytes), its position in document order and its document (12, with growth), a
+/// column's ordinal per document and the distinct ordinals collected with growth (32),
+/// the values of those ordinals (16), and the id cache's lookup of the missing ones,
+/// their positions, ordinals, ids and the cached ids (48, with growth). The buffer that
+/// a term's key is decoded into is Tantivy's, outside this count (row 1156).
+const PAGE_HIT_BYTES: u64 = 192;
+
+/// The literals a reader's highlighting remembers at most, and what that map holds.
+const HIGHLIGHT_DONE: usize = PAGE;
+const HIGHLIGHT_DONE_BYTES: u64 = (HIGHLIGHT_DONE * 8 / 7).next_power_of_two() as u64
+    * (std::mem::size_of::<(Id, Id)>() as u64 + 1);
 
 /// The bytes a hit list keeps per hit, a score and a document address.
 const HIT_BYTES: u64 = std::mem::size_of::<(Score, DocAddress)>() as u64;
@@ -256,7 +273,10 @@ impl Reader {
         }
         // the row limits an eager search checks; the reader holds no table of the rows
         ctx.check_output_rows(total as usize)?;
-        let page = (total as usize).min(PAGE) as u64 * PAGE_HIT_BYTES;
+        let mut page = (total as usize).min(PAGE) as u64 * PAGE_HIT_BYTES;
+        if spec.highlight.is_some() {
+            page += HIGHLIGHT_DONE_BYTES;
+        }
         let seen = if spec.dedup {
             seen_bytes(total as usize)
         } else {
@@ -268,7 +288,7 @@ impl Reader {
                 .saturating_add(page)
                 .saturating_add(seen),
         )?;
-        let (_, mut hits) = resolved
+        let (collected, mut hits, agreed) = resolved
             .searcher
             .search(
                 &query,
@@ -279,6 +299,11 @@ impl Reader {
             )
             .map_err(text_err)?;
         ctx.check()?;
+        if !agreed || collected != total {
+            return Err(text_err(format!(
+                "text:query counted {total} hits and collected {collected}"
+            )));
+        }
         charge(
             (hits.capacity() as u64 * HIT_BYTES)
                 .saturating_add(page)
@@ -303,6 +328,11 @@ impl Reader {
         }))
     }
 
+    /// The hits not read yet, which bound the rows still to come.
+    pub(crate) fn remaining(&self) -> usize {
+        self.hits.len() - self.at
+    }
+
     /// Append the next rows to `t` until it holds `cap` of them, and return whether the
     /// hits have ended.
     pub(crate) fn next(&mut self, ctx: &Ctx, cap: usize, t: &mut Table) -> Result<bool> {
@@ -314,12 +344,9 @@ impl Reader {
             ctx.snap.mask.is_some(),
         );
         let first = t.len();
-        let ended = loop {
-            if t.len() >= cap {
-                break false;
-            }
-            if self.at >= self.hits.len() {
-                break true;
+        loop {
+            if t.len() >= cap || self.at >= self.hits.len() {
+                break;
             }
             let start = match &self.page {
                 Some((start, terms)) if self.at < start + terms.len() => *start,
@@ -344,7 +371,8 @@ impl Reader {
                 &mut self.st,
             )?;
             self.at = start + next;
-        };
+        }
+        let ended = self.at >= self.hits.len();
         if let (Some(opts), Some(c)) = (&self.spec.highlight, out.clit) {
             highlight(
                 ctx,
@@ -353,6 +381,7 @@ impl Reader {
                 opts,
                 &self.matchers,
                 &mut t.cols[c][first..],
+                HIGHLIGHT_DONE,
             )?;
         }
         if ended {
@@ -360,6 +389,13 @@ impl Reader {
             self.page = None;
         }
         Ok(ended)
+    }
+}
+
+impl Drop for Reader {
+    fn drop(&mut self) {
+        // the hits skipped before a consumer stopped early
+        self.st.finish();
     }
 }
 
@@ -440,6 +476,7 @@ fn highlight(
     opts: &super::HighlightOpts,
     matchers: &super::lucene::Matchers,
     col: &mut [Id],
+    remember: usize,
 ) -> Result<()> {
     let snap = &ctx.snap;
     let mut analyzer = resolved
@@ -473,6 +510,10 @@ fn highlight(
             }
             _ => *id,
         };
+        if done.len() >= remember {
+            // a literal highlighted again interns to the same id
+            done.clear();
+        }
         done.insert(*id, h);
         *id = h;
     }
@@ -594,7 +635,9 @@ struct SegmentHits {
 }
 
 impl Collector for AllHits {
-    type Fruit = (u64, Vec<(Score, DocAddress)>);
+    /// the hits counted, those kept, and whether each segment's count is the one
+    /// reserved for it (always, without a reservation)
+    type Fruit = (u64, Vec<(Score, DocAddress)>, bool);
     type Child = SegmentHits;
 
     fn for_segment(&self, seg: SegmentOrdinal, _: &SegmentReader) -> tantivy::Result<SegmentHits> {
@@ -627,21 +670,31 @@ impl Collector for AllHits {
 
     fn merge_fruits(
         &self,
-        fruits: Vec<(u64, Vec<(Score, DocAddress)>)>,
+        fruits: Vec<(SegmentOrdinal, u64, Vec<(Score, DocAddress)>)>,
     ) -> tantivy::Result<Self::Fruit> {
-        let total = fruits.iter().map(|(n, _)| n).sum();
-        let mut hits = Vec::with_capacity(fruits.iter().map(|(_, h)| h.len()).sum());
-        for (_, h) in fruits {
+        let agreed = self.reserve.as_ref().is_none_or(|counts| {
+            let mut seen = vec![0u64; counts.len()];
+            fruits.iter().all(|(seg, n, _)| {
+                let at = *seg as usize;
+                at < counts.len() && {
+                    seen[at] += n;
+                    true
+                }
+            }) && seen == *counts
+        });
+        let total = fruits.iter().map(|(_, n, _)| n).sum();
+        let mut hits = Vec::with_capacity(fruits.iter().map(|(_, _, h)| h.len()).sum());
+        for (_, _, h) in fruits {
             if total <= self.cap as u64 {
                 hits.extend(h);
             }
         }
-        Ok((total, hits))
+        Ok((total, hits, agreed))
     }
 }
 
 impl SegmentCollector for SegmentHits {
-    type Fruit = (u64, Vec<(Score, DocAddress)>);
+    type Fruit = (SegmentOrdinal, u64, Vec<(Score, DocAddress)>);
 
     fn collect(&mut self, doc: DocId, score: Score) {
         self.total += 1;
@@ -651,7 +704,7 @@ impl SegmentCollector for SegmentHits {
     }
 
     fn harvest(self) -> Self::Fruit {
-        (self.total, self.hits)
+        (self.seg, self.total, self.hits)
     }
 }
 
@@ -1183,5 +1236,38 @@ fn graph_id(snap: &Snapshot, g: &str) -> Option<Id> {
         crate::store::parse_bnode_label(label)
     } else {
         snap.lookup_iri(g)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fruit(seg: SegmentOrdinal, n: u64) -> (SegmentOrdinal, u64, Vec<(Score, DocAddress)>) {
+        let hits = (0..n as u32)
+            .map(|d| (1.0, DocAddress::new(seg, d)))
+            .collect();
+        (seg, n, hits)
+    }
+
+    /// A segment whose collected hits differ from its count is reported, so a reader
+    /// fails rather than answer a different set of hits.
+    #[test]
+    fn a_collect_that_disagrees_with_the_count_is_reported() {
+        let counted = AllHits {
+            cap: 10,
+            reserve: Some(vec![2, 1]),
+        };
+        let agreed = |fruits| counted.merge_fruits(fruits).unwrap().2;
+        assert!(agreed(vec![fruit(0, 2), fruit(1, 1)]));
+        assert!(!agreed(vec![fruit(0, 2), fruit(1, 2)]));
+        assert!(!agreed(vec![fruit(0, 1), fruit(1, 1)]));
+        assert!(!agreed(vec![fruit(0, 2)]));
+        assert!(!agreed(vec![fruit(0, 2), fruit(1, 1), fruit(2, 1)]));
+        let plain = AllHits {
+            cap: 10,
+            reserve: None,
+        };
+        assert!(plain.merge_fruits(vec![fruit(0, 3)]).unwrap().2);
     }
 }

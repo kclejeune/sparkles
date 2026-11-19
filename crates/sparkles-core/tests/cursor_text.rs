@@ -177,7 +177,7 @@ fn more_hits_than_max_hits_is_eagers_error() {
     assert_eq!(streamed, eager);
 }
 
-/// The produced-row limit refuses the same search in both modes.
+/// The produced-row limit refuses the same search in both modes, with the same count.
 #[test]
 fn the_produced_row_limit_refuses_alike() {
     let s = store(40, TextConfig::default());
@@ -187,9 +187,16 @@ fn the_produced_row_limit_refuses_alike() {
         ..opts()
     };
     let q = "SELECT ?s { ?s text:query (rdfs:label \"fox\") }";
-    let refused = |e: Error| matches!(e, Error::BudgetExceeded(_));
-    assert!(refused(eager(&snap, q, &o).unwrap_err()));
-    assert!(refused(streamed(&snap, q, &o, &strict(4)).unwrap_err()));
+    let budget = |e: Error| match e {
+        Error::BudgetExceeded(b) => (b.kind, b.limit, b.requested),
+        e => panic!("{e}"),
+    };
+    let eager_refusal = budget(eager(&snap, q, &o).unwrap_err());
+    assert_eq!(eager_refusal.1, 30);
+    assert_eq!(
+        budget(streamed(&snap, q, &o, &strict(4)).unwrap_err()),
+        eager_refusal
+    );
     let fits = QueryOptions {
         max_rows_produced: Some(1000),
         ..opts()
@@ -201,13 +208,14 @@ fn the_produced_row_limit_refuses_alike() {
 }
 
 /// The hit list is charged before it is collected: a budget below it refuses the
-/// search with a memory error, and a budget that holds it bounds the cursor's peak by
-/// the hits, not by a table of the rows.
+/// search with a memory error. A budget that holds it gives a peak of at least each
+/// part the reader charges, and bounds it by the hits, not by a table of the rows.
 #[test]
 fn the_hit_list_is_charged() {
     let s = store(2500, TextConfig::default());
     let snap = s.snapshot();
-    let q = "SELECT ?s ?sc ?lit ?p ?r { (?s ?sc ?lit [] ?p ?r) text:query (rdfs:label \"fox\") }";
+    // a merged default graph keeps the set of the triples seen
+    let q = "SELECT ?s ?sc ?lit { (?s ?sc ?lit) text:query (rdfs:label \"fox\") }";
     let tight = QueryOptions {
         max_memory_bytes: Some(64 << 10),
         ..opts()
@@ -216,13 +224,90 @@ fn the_hit_list_is_charged() {
         Err(Error::BudgetExceeded(b)) => assert_eq!(b.kind, BudgetKind::Memory),
         other => panic!("{:?}", other.map(|r| r.0.len())),
     }
-    let mut cursor = select_cursor(snap.clone(), &format!("{P}{q}"), &opts(), &strict(16)).unwrap();
-    while cursor.next_batch().unwrap().is_some() {}
-    let peak = cursor.stats().mem_peak_bytes;
-    // 5000 hits of 12 bytes twice while merging, a page of 4096 decoded hits, and the
-    // set of the 2500 triples seen, reserved at once: about 0.8 MB
-    assert!(peak > 5000 * 12, "{peak}");
-    assert!(peak < 2 << 20, "{peak}");
+    let peak = |snap: &Arc<Snapshot>, q: &str| {
+        let mut cursor =
+            select_cursor(snap.clone(), &format!("{P}{q}"), &opts(), &strict(16)).unwrap();
+        while cursor.next_batch().unwrap().is_some() {}
+        cursor.stats().mem_peak_bytes
+    };
+    let none = "SELECT ?s ?sc ?lit { (?s ?sc ?lit) text:query (rdfs:label \"wolf\") }";
+    // what the query holds besides the reader's charge
+    let base = peak(&snap, none);
+    // 5000 hits of 12 bytes twice while merging, a page of 4096 decoded hits at 192
+    // bytes, and the set of 2500 triples reserved at once in 4096 buckets of 25 bytes
+    let charged = 2 * 5000 * 12 + 4096 * 192 + (4096 * 25 + 16);
+    let merged = peak(&snap, q);
+    // the baseline holds a few bytes that need not be live at the peak
+    assert!(
+        merged + 4096 >= base + charged,
+        "{merged} < {base} + {charged}"
+    );
+    // With 50,000 hits, the two lists of the merge are the largest charge: 50,000 hits
+    // of 12 bytes twice, and the page.
+    let s = store(25_000, TextConfig::default());
+    let snap = s.snapshot();
+    let ranked = "SELECT ?s ?sc ?g { (?s ?sc ?lit ?g) text:query (rdfs:label \"fox\") }";
+    let base = peak(&snap, none);
+    let charged = 2 * 50_000 * 12 + 4096 * 192;
+    let peak = peak(&snap, ranked);
+    assert!(peak + 4096 >= base + charged, "{peak} < {base} + {charged}");
+    assert!(
+        peak < base + charged + (256 << 10),
+        "{peak} - {base} > {charged}"
+    );
+}
+
+/// A triple in more named graphs than a page holds gives a merged default graph a page
+/// whose every hit is a duplicate. The pull that reaches it reads on to the next page
+/// and hands out a full batch, at every batch size.
+#[test]
+fn a_page_of_skipped_hits_is_read_through() {
+    let s = Store::in_memory(StoreOptions {
+        union_default_graph: true,
+        ..Default::default()
+    });
+    let mut data = String::new();
+    for g in 0..9000 {
+        data.push_str(&format!(
+            "<http://example.org/g{g}> {{ <http://example.org/top> <http://www.w3.org/2000/01/rdf-schema#label> \"fox\" }}\n"
+        ));
+    }
+    data.push_str("<http://example.org/g0> {\n");
+    for i in 0..20 {
+        data.push_str(&format!(
+            "<http://example.org/s{i}> <http://www.w3.org/2000/01/rdf-schema#label> \"a much longer label about one fox {i}\" .\n"
+        ));
+    }
+    data.push_str("}\n");
+    s.load(&[Source::from_bytes(data.into_bytes(), RdfFormat::TriG, None)])
+        .unwrap();
+    s.enable_text(TextConfig::default()).unwrap();
+    let snap = s.snapshot();
+    let q = "SELECT ?s ?sc { (?s ?sc) text:query (rdfs:label \"fox\") }";
+    let expected = eager(&snap, q, &opts()).unwrap();
+    assert_eq!(expected.len(), 21);
+    for rows in [1, 2, 4096] {
+        let (answer, sizes, _) = streamed(&snap, q, &opts(), &strict(rows)).unwrap();
+        assert_eq!(answer, expected, "batch {rows}");
+        let (_, full) = sizes.split_last().unwrap();
+        assert!(full.iter().all(|&n| n == rows), "batch {rows}: {sizes:?}");
+    }
+}
+
+/// A search with no hits ends without a batch, so a budget too small for a batch of
+/// the default size does not refuse it.
+#[test]
+fn a_search_without_hits_needs_no_batch() {
+    let s = store(10, TextConfig::default());
+    let snap = s.snapshot();
+    let q = "SELECT ?s { ?s text:query (rdfs:label \"wolf* AND fox\") }";
+    let small = QueryOptions {
+        max_memory_bytes: Some(24 << 10),
+        ..opts()
+    };
+    assert!(eager(&snap, q, &small).unwrap().is_empty());
+    let (answer, sizes, _) = streamed(&snap, q, &small, &strict(4096)).unwrap();
+    assert!(answer.is_empty() && sizes.is_empty());
 }
 
 /// A search inside EXISTS streams under the strict policy and answers as eager does.

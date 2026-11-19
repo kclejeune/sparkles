@@ -80,8 +80,14 @@ impl Text {
         let Some((reader, _)) = &mut self.reader else {
             return Ok(None);
         };
-        let mut b = Buffer::new(ctx, &self.node.vars, cap)?;
-        let ended = match reader.next(ctx, cap, &mut b.table) {
+        // the hits left bound the batch, and none left ends the answer before a batch
+        let rows = cap.min(reader.remaining());
+        if rows == 0 {
+            self.reader = None;
+            return Ok(None);
+        }
+        let mut b = Buffer::new(ctx, &self.node.vars, rows)?;
+        let ended = match reader.next(ctx, rows, &mut b.table) {
             Ok(ended) => ended,
             Err(e) => {
                 self.reader = None;
