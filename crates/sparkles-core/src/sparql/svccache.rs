@@ -25,14 +25,22 @@ pub struct Rows {
 impl Rows {
     /// The estimated bytes the entry holds.
     pub fn bytes(&self) -> u64 {
-        let terms: usize = self
-            .rows
+        let rows: u64 = self.rows.iter().map(|r| Self::row_bytes(r)).sum();
+        Self::vars_bytes(&self.vars) + rows + 64
+    }
+
+    /// What one row adds to [`Rows::bytes`].
+    pub fn row_bytes(row: &[Option<Term>]) -> u64 {
+        let terms: usize = row
             .iter()
-            .flatten()
             .map(|t| t.as_ref().map_or(0, term_bytes) + 16)
             .sum();
-        let vars: usize = self.vars.iter().map(|v| v.len() + 24).sum();
-        (terms + vars + self.rows.len() * 24 + 64) as u64
+        (terms + 24) as u64
+    }
+
+    /// What the variable names add to [`Rows::bytes`].
+    pub fn vars_bytes(vars: &[String]) -> u64 {
+        vars.iter().map(|v| v.len() as u64 + 24).sum()
     }
 }
 
@@ -226,6 +234,11 @@ impl ServiceCache {
             return;
         }
         c.insert(NsKey { ns: self.ns, key }, rows);
+    }
+
+    /// The largest entry, with its key, that [`ServiceCache::put`] keeps.
+    pub fn max_entry_bytes(&self) -> u64 {
+        self.store.max_entry_bytes
     }
 
     pub fn remove(&self, key: &str) {

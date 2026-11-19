@@ -33,6 +33,7 @@ pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 pub(super) use joinspill::row_hash;
 mod merge;
 mod ripple;
+mod service;
 mod topk;
 mod walk;
 mod whole;
@@ -2527,6 +2528,8 @@ enum State {
     },
     TopK(Box<topk::TopK>),
     IndexTopK(Box<topk::IndexTopK>),
+    /// A SERVICE without SILENT, read from its endpoint a batch at a time.
+    Service(Box<service::Service>),
 }
 
 /// An eager kernel's node, its answer once it has run, and how far its consumer has
@@ -2573,6 +2576,7 @@ fn load_eager(
     mut info: PlanInfo,
     current: &mut PlanInfo,
     rows: usize,
+    vars: &[VarId],
     order: &[VarId],
 ) -> Result<Buffer> {
     if ctx.graphs.is_some() {
@@ -2591,12 +2595,24 @@ fn load_eager(
             capacity_bytes(&output.table) as usize,
         ));
     }
-    let mut charge = if output.lease.is_some() {
+    let charge = if output.lease.is_some() {
         OwnedCharge::adopt(ctx, &mut output.lease)?
     } else {
         OwnedCharge::new(ctx, capacity_bytes(&output.table))?
     };
-    let mut table = output.table;
+    let mut buffer = Buffer {
+        table: output.table,
+        charge,
+    };
+    // A kernel may answer without some of the node's variables, as a failed SILENT
+    // SERVICE answers one solution of none, and the parents read the node's columns.
+    if buffer.table.vars != vars {
+        buffer.project(vars)?;
+    }
+    let Buffer {
+        mut table,
+        mut charge,
+    } = buffer;
     // Parents rely on the planner's order, which the eager result reports only when its
     // rows hold it.
     if !table.sorted.starts_with(order) {
@@ -2950,6 +2966,8 @@ impl Operator {
         let pattern_counts = matches!(node.kind, Kind::PatternCount(_)) && node.children.is_empty();
         // An ordered top-k keeps a heap of its best rows, as a streaming top-k does.
         let index_topk = matches!(node.kind, Kind::OrderedTopK(_)) && exec::heap_eligible(ctx);
+        // A SERVICE without SILENT reads its endpoint's answer as it arrives.
+        let service_reader = service::eligible(&node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -2960,6 +2978,7 @@ impl Operator {
             && !walking
             && !whole_input
             && !index_topk
+            && !service_reader
             && !pattern_counts
             && (!native_blocking || !exists_streams);
         // A kernel that answers whole tables runs as a native operator when its form is
@@ -3253,6 +3272,8 @@ impl Operator {
             State::RunGroup(Box::new(group::RunGroup::new(&node, &children[0].vars)))
         } else if filter::eligible(&node, &children) {
             State::Filter(Box::new(filter::Filter::new(node)))
+        } else if service_reader {
+            State::Service(Box::new(service::Service::new(ctx, &node, fallback)))
         } else if index_topk {
             State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
@@ -4012,6 +4033,11 @@ impl Operator {
                     b.reconcile()?;
                     Some(b)
                 }
+                State::Service(service) => {
+                    let b = service.next(ctx, options, cap)?;
+                    self.done = service.done();
+                    b
+                }
                 State::TopK(topk) => {
                     let b = topk.next(ctx, &mut self.children[0], options, cap)?;
                     self.done = topk.done();
@@ -4122,8 +4148,15 @@ impl Operator {
                             exec::execute_with_inputs(ctx, &eager.node, &mut collect)?;
                         // The child operators describe themselves.
                         info.children.clear();
-                        let buffer =
-                            load_eager(ctx, output, info, &mut self.info, self.rows, &self.order)?;
+                        let buffer = load_eager(
+                            ctx,
+                            output,
+                            info,
+                            &mut self.info,
+                            self.rows,
+                            &self.vars,
+                            &self.order,
+                        )?;
                         eager.loaded = Some(buffer);
                     }
                     let batch = eager.serve(ctx, cap)?;
@@ -4133,8 +4166,15 @@ impl Operator {
                 State::Leaf(eager) | State::EagerSubtree(eager) => {
                     if eager.loaded.is_none() {
                         let (output, info) = exec::execute_owned(ctx, &eager.node)?;
-                        let buffer =
-                            load_eager(ctx, output, info, &mut self.info, self.rows, &self.order)?;
+                        let buffer = load_eager(
+                            ctx,
+                            output,
+                            info,
+                            &mut self.info,
+                            self.rows,
+                            &self.vars,
+                            &self.order,
+                        )?;
                         eager.loaded = Some(buffer);
                     }
                     let batch = eager.serve(ctx, cap)?;

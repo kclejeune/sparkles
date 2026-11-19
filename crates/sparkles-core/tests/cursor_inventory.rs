@@ -349,7 +349,7 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             "SERVICE",
             "Service",
             "SELECT ?s ?o { SERVICE <http://local/sparql> { ?s <urn:p> ?o } }",
-            Refused(Why::Pending("group 1")),
+            Native,
         ),
         form(
             "SILENT SERVICE",
