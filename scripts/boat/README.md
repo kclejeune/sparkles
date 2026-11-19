@@ -367,8 +367,7 @@ deadline on both the wall clock and `CLOCK_BOOTTIME`, keeps the 30-second closur
 reserve and refuses inadequate remaining time. The qualification receipt and local
 guard stay bound to the same operation throughout. The transport's actual Boat quoting,
 workload correctness, cache reuse and interruption behavior still require real
-acceptance under roadmap item 762. The batch query screen runs on Boat, and Namespace is not
-used.
+acceptance under roadmap item 762. Namespace remains the required screen fallback.
 
 ## Lifetime extension
 
