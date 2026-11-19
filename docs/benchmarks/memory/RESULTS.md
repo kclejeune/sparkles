@@ -238,9 +238,8 @@ returned the same answers.
 
 *Measured on 8-vCPU AMD EPYC Namespace instances on 2026-11-01.*
 
-An OPTIONAL whose condition is an EXISTS stays eager, because the cursor's conditional
-OPTIONAL takes several times as long as the eager one with any condition. Automatic
-execution already streams `optional-filter` at this size, which item 570 covers.
+The cursor's conditional OPTIONAL hashed when these were measured. It now merges, and
+the last table of this section measures it.
 
 Both executors also answer an EXISTS inside a larger expression, such as IF, OR, an
 aggregate argument or an ORDER BY key, from the key set of its pattern, and automatic
@@ -272,6 +271,38 @@ busy, gave `exists-if` 5,025 ms eagerly and 4,243 ms streamed before against 230
 `exists-rare`, went from 69 to 76 ms eagerly and from 12 to 26 ms streamed, because
 every row is probed and the key set is built whether or not the expression reaches the
 EXISTS. Item 1080 covers that cost.
+
+The cursor merges an OPTIONAL with a condition over two inputs sorted on their shared
+variable and tests the condition on each batch's pairs. The next table compares
+bc647108 as A, which hashed every conditional OPTIONAL in the cursor, with ca1532ba as
+B on `atlas` at 10.5M quads with one Rayon thread, three A, B, B, A rounds and seven
+timed requests in each mode. It gives median server execution times, and both builds
+returned the same answers in both modes. The
+[run record](records/exists-optional-2026-11-19/README.md) holds the samples and the
+plans.
+
+| 10.5M, ms | Eager, A | Eager, B | Streamed, A | Streamed, B |
+|---|---:|---:|---:|---:|
+| `optional-filter`, students with an OPTIONAL advisor that is not `ex:nobody`, counted | 27.9 | 27.2 | 46.6 | **19.3** |
+| `optional-cond`, the advisors of students other than `ex:x`, listed | 20.5 | **18.6** | 70.1 | 19.4 |
+| `exists-optional`, students with an OPTIONAL advisor who wrote a paper, counted | **19.4** | 21.7 | 49.1 | 19.7 |
+| `knows-fail`, an OPTIONAL `foaf:knows` whose FILTER fails every pair | **148** | 150 | 304 | 198 |
+| `knows-exists`, the same OPTIONAL with FILTER EXISTS on the friend | **132** | 133 | 319 | 181 |
+| `knows-mixed`, the same OPTIONAL with a FILTER that ORs a comparison and a NOT EXISTS | 549 | **547** | 829 | 647 |
+| `class-fail`, a conditional OPTIONAL that hashes in both modes | 82.4 | 83.0 | 78.1 | **77.7** |
+| `class-exists`, the same with FILTER EXISTS | 36.2 | 38.5 | 36.7 | **32.5** |
+
+*Measured on `atlas` on 2026-11-19.*
+
+Where a left row has about one pair, B streams in 0.71 to 1.04 times its eager time. A
+person knows about 2.5 others, and over those pairs B streams in 1.18 to 1.36 times its
+eager time. Eager execution tests the condition over all of the matched pairs at once,
+while the cursor emits every pair and a candidate extension for each left row and then
+tests the batch. Automatic execution therefore keeps an
+OPTIONAL whose condition holds an EXISTS eager, which item 570 covers. The eager
+differences between the builds are within the spread of their server processes, from
+18.9 to 24.0 ms for `exists-optional` and from 31.5 to 45.2 ms for `class-exists`. With
+`merge_left_join` off both modes hash, and the two builds took the same time.
 
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M, with the spill directory on the instance's local disk.

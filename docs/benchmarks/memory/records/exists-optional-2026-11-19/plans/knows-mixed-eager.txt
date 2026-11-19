@@ -1,0 +1,8 @@
+parse 0.15 ms · plan 0.20 ms · exec 586.75 ms · total 587.11 ms
+Project ?c ?w  [1 rows (est 1), 586.74 ms]
+  Bind ?w := ?72c5df0ab98a1d954a531b370528fed0  [1 rows (est 1), 586.74 ms]
+    Bind ?c := ?8a07ef53e7cb6d2b7da7cca5bf58b689  [1 rows (est 1), 586.73 ms]
+      GroupBy by  aggs ?8a07ef53e7cb6d2b7da7cca5bf58b689=Count ?72c5df0ab98a1d954a531b370528fed0=Count [incremental]  [1 rows (est 1), 586.73 ms]
+        OptionalJoin filter ((?n = "nobody") || !EXISTS{…}) [merge on ?p] [EXISTS decorrelated on ?f: 699809 keys from 699809 solutions, 2497620 rows probed, 0 per row]  [1259655 rows (est 1748334), 583.08 ms]
+          IndexScan PSO ?p <http://xmlns.com/foaf/0.1/name> ?n [decodes SOG]  [1020000 rows (est 1020000), 10.21 ms]
+          IndexScan PSO ?p <http://xmlns.com/foaf/0.1/knows> ?f [decodes SOG]  [2497620 rows (est 2497620), 24.06 ms]

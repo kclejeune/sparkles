@@ -219,7 +219,9 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   set. Every row is probed before the expression is evaluated, also a row on which the
   expression does not reach the EXISTS. Automatic execution streams a plan with an
   EXISTS in any of these positions unless the pattern calls a SERVICE, the EXISTS is
-  nested more than four levels deep or it is an OPTIONAL condition.
+  nested more than four levels deep or it is an OPTIONAL condition, because the cursor's
+  conditional merge is slower than the eager one at higher fan-out, which roadmap item
+  570 covers.
 * An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
   every execution mode, so each operator reads its inputs a batch at a time and stops
   once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
@@ -274,11 +276,13 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   least a thousand rows, groupings of an estimated 20,000 input rows or more and every
   ASK without initial bindings. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice. Both modes join
-  through the same hash, keyed and merge kernels, so an OPTIONAL without a condition over
-  two inputs sorted on their shared variable merges in both when `merge_left_join` is on
-  and hashes in both when it is off, a hash join's OPTIONAL condition is tested once over
-  each chunk of candidate pairs rather than over the whole product, and EXPLAIN names
-  the algorithm that ran in either mode.
+  through the same hash, keyed and merge kernels, so an OPTIONAL over two inputs sorted
+  on their shared variable merges in both when `merge_left_join` is on and hashes in both
+  when it is off, a hash join's OPTIONAL condition is tested once over each chunk of
+  candidate pairs rather than over the whole product, and EXPLAIN names the algorithm
+  that ran in either mode. A merge OPTIONAL's condition is tested over all of its matched
+  pairs at once in eager execution and over each batch's pairs in the cursor, which is
+  slower when a left row has several pairs.
 * Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
   GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms
   keep one running state per group, on one key or several and with expression arguments,

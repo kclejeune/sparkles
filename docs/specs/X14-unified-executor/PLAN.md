@@ -296,8 +296,12 @@ the phase measures the conditional OPTIONAL of item 570's record,
 one and the admission of an OPTIONAL whose condition is an EXISTS with a key set, whose
 earlier admission and revert
 [PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records,
-passes the same measurement. Until then item 570 stays open with the measurement
-recorded. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
+passes the same measurement. The measurement is recorded in the
+[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19).
+The cursor now merges the conditional OPTIONAL and streams that query within the gate,
+but it streams the OPTIONALs over `foaf:knows`, with about 2.5 pairs per left row, in
+1.18 to 1.36 times the eager time, so item 570 stays open and the EXISTS admission
+waits for it. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
 for keys the hash cannot take.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
@@ -609,7 +613,8 @@ merge removes it with the eager executor. In both cases
 `mise run test:w3c:streaming` records no eager fallback for the W3C query suites, which
 hold no such shape. The EXISTS shapes that automatic execution keeps eager through
 `streams_natively` are an admission choice rather than a fallback, and the merge removes
-the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, an
+the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, since
+the cursor merges it but is slower than eager execution at higher fan-out, an
 EXISTS deeper than four levels is item 1081 and an EXISTS pattern that calls a SERVICE
 stays eager because a cursor cannot repeat its effects.
 

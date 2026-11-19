@@ -1729,7 +1729,7 @@ patterns have cursor plans, whether the pattern is answered from a key set or pe
 Three shapes stay eager. A pattern that calls a SERVICE stays eager because a cursor
 could repeat its effects, an EXISTS nested deeper than four levels stays eager under the
 admission's depth cap, which item 1081 covers, and an OPTIONAL whose condition holds an
-EXISTS stays eager until item 570 gives the cursor's merge OPTIONAL a condition.
+EXISTS stays eager, for the reasons the next section measures.
 
 Probing every row costs a hash lookup per row and EXISTS, also for rows on which the
 expression never reaches the EXISTS. An IF branch that is rarely taken therefore builds
@@ -1785,6 +1785,57 @@ rewrites the mock's answers into the stopped and quads shapes and checks the bad
 notice, the graph and a comparison's eager reads, and a browser test against a real
 server streams a grouping over 30,000 rows with a row limit of 1,000 and with a limit
 above the total, and a plain scan of the same rows with a limit of 1,000.
+
+### The cursor's conditional merge OPTIONAL (2026-11-19)
+
+The cursor now merges an OPTIONAL whose condition joins two inputs sorted on their
+shared variable, as eager execution does, and both plans name the merge. Before, the
+cursor merged only an OPTIONAL without a condition and hashed the others. Under a
+condition the merge emits each matched pair and then the left row's unmatched
+extension, with a marker column that only pairs bind. A test step evaluates the
+condition on the pairs of each batch, keeps the passing pairs and keeps a left row's
+extension only when none of its pairs passed, carrying that state across batches. The
+merge reports no count under a condition, holds the condition once for the operator,
+and charges its variable map, its candidate table and the pair and extension of a
+one-row batch before the test. A spooled run drops a consumed frame before it decodes
+the next. The variable map is sized before planning a nested EXISTS interns more
+variables, which item 1137 covers.
+
+A quiet A/B on `atlas`, an Intel benchmark worker, compared bc647108, which hashed every
+conditional OPTIONAL in the cursor, as A with ca1532ba as B at 10.5M quads with one
+Rayon thread, over three A, B, B, A rounds of seven timed requests in each mode. Every
+build and mode returned the same answers, and the executed plans of B name the merge in
+both modes for the six merge shapes. Streamed, B took 0.28 to 0.78 times as long as A on
+each of them, while the two `class-*` controls, which hash in both modes, and every
+eager time stayed within their spread. On the shapes where a left row has about one
+pair, `optional-filter`, `optional-cond` and `exists-optional`, B streamed in 0.71 to
+1.04 times its eager time. On `foaf:knows`, with about 2.5 pairs per left row, B streamed
+in 1.32 times its eager time with a plain FILTER and in 1.18 and 1.36 times with an
+EXISTS. Eager execution tests the condition over all of the matched pairs at once,
+while the cursor emits every pair and a candidate extension for each left row and then
+tests the batch. With `merge_left_join` off both modes hash and the two builds tied.
+
+B also streamed an OPTIONAL whose condition holds an EXISTS under automatic execution,
+which A kept eager. That raised the automatic times of `knows-exists` from 132 to 181 ms
+and of `knows-mixed` from 548 to 647 ms, so the change keeps such plans eager, and item
+570 admits them once the merge tests its condition on the runs of pairs. An OPTIONAL
+with a plain condition was already streamed, and its automatic times fell with the
+merge, `knows-fail` from 304 to 198 ms. The
+[memory results](../benchmarks/memory/RESULTS.md#automatic-exists) give the table, and the
+[run record](../benchmarks/memory/records/exists-optional-2026-11-19/README.md) holds the
+samples and plans.
+
+Unit tests in `cursor/merge.rs` compare the conditional merge with eager execution at
+batch caps from one row up, with left rows whose failing pairs span batches, unmatched
+rows and a second shared variable, and hold its peak within the budget at small batch
+caps over long runs of failing pairs.
+`tests/exists_auto.rs` checks that automatic execution keeps the EXISTS conditions
+eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
+per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the
+conditional OPTIONAL honours `merge_left_join` and names its algorithm in both plans.
+The cursor's EXPLAIN reports no EXISTS counters on the merge OPTIONAL, which item 1106
+covers, and automatic admission reads the planner's order of the inputs while the build
+derives it again, which item 1105 covers.
 
 ### Finite HTTP body limits
 

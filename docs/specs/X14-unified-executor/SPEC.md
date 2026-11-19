@@ -964,8 +964,9 @@ hash form, the kernel's scratch for one chunk of candidates, which together are 
 what decoding the 20,000 terms charges. The `merge_left_join` switch selects the
 merge OPTIONAL without a condition in both modes, and EXPLAIN names the algorithm that
 ran, `[merge on ?k]` or `[hash join]`, in both. An OPTIONAL with a condition over two
-sorted inputs still merges only in eager execution, where its condition is tested over
-all of the matched pairs at once, and hashes in the cursor, which item 854 follows. An
+sorted inputs merged only in eager execution, where its condition is tested over all of
+the matched pairs at once, and hashed in the cursor until item 570 gave the cursor its
+own conditional merge. Item 854 follows one conditional merge for both modes. An
 eager hash join, OPTIONAL, semi join, anti join or MINUS whose hash table does not fit
 the memory budget of a query that may spill runs again as the cursor's partitioned hash
 join over its two input tables, whose Grace partitioning wraps the same kernel, and its
@@ -982,8 +983,10 @@ builds on its right side as the cursor does rather than on the smaller side. An 
 MINUS, semi join or anti join on one bound key now builds the kernel's table with its
 grouped rows, about twice the memory of the id set it used, which item 852 follows. The
 measurement of item 570's conditional OPTIONAL in both modes on the benchmark worker,
-which the plan asks of this phase, is outstanding, and item 570 records it when it is
-taken.
+which the plan asks of this phase, was taken after the cursor gained a conditional
+merge, and the
+[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
+records it.
 
 ### One grouping operator
 
