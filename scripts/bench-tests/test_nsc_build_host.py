@@ -889,6 +889,15 @@ class BuildHost(unittest.TestCase):
             ["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out), "--build-host", "h1",
              self.sha, self.sha], env=dict(self.env, FAKE_BUILD_DELAY="60"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        # A failed wait below still ends and reaps the run, so no process outlives the test.
+        def reap():
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            process.communicate()
+        self.addCleanup(reap)
         deadline = time.monotonic() + 20
         while not (self.hosts / "build-started").exists():
             self.assertLess(time.monotonic(), deadline, "the build did not start")
