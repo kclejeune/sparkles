@@ -8941,7 +8941,7 @@ pub(super) fn fetch(
     {
         return fetch_local(ctx, target, query, on_solution);
     }
-    let mut answer = RemoteAnswer::open(ctx, url, query)?;
+    let mut answer = RemoteAnswer::open(ctx, url, query, None)?;
     let _entered = answer.span.clone().entered();
     while let Some(solution) = answer.next_solution() {
         on_solution(ServiceSolution::Remote(&solution?))?;
@@ -8956,15 +8956,29 @@ pub(super) struct RemoteAnswer {
     /// The client span of the request, which each read enters.
     pub(super) span: tracing::Span,
     url: String,
-    solutions:
-        Option<sparesults::ReaderSolutionsParser<crate::nesting::Guarded<crate::outbound::Body>>>,
+    solutions: Option<sparesults::ReaderSolutionsParser<Box<dyn std::io::Read + Send>>>,
+    /// what the reader under the parser charges by, for a streamed answer
+    window: Option<std::sync::Arc<super::svcread::Window>>,
+}
+
+/// How a streamed SERVICE answer is charged to its query (see [`super::svcread`]). An
+/// eager call reads without one.
+pub(super) struct Meter<'a> {
+    pub(super) ctx: &'a std::sync::Arc<Ctx>,
+    /// whether a response that sparesults would buffer whole is refused
+    pub(super) strict: bool,
 }
 
 impl RemoteAnswer {
     /// Send `query` to `url` through the outbound policy and read the head of its
     /// response. The transfer's timeout is the outbound policy's, cut to the query's
     /// deadline as it stands now, and it counts from the start of the request.
-    pub(super) fn open(ctx: &Ctx, url: &oxrdf::NamedNode, query: &str) -> Result<Self> {
+    pub(super) fn open(
+        ctx: &Ctx,
+        url: &oxrdf::NamedNode,
+        query: &str,
+        meter: Option<Meter<'_>>,
+    ) -> Result<Self> {
         // the host of the endpoint (no user info, no port)
         let host = oxiri::Iri::parse(url.as_str())
             .ok()
@@ -9034,6 +9048,46 @@ impl RemoteAnswer {
             &format!("<{}>", url.as_str()),
             Error::Service,
         );
+        // A streamed answer reads the start of a JSON response first to see whether
+        // sparesults would buffer it, and charges what the parser holds as it reads.
+        let (body, window): (Box<dyn std::io::Read + Send>, _) = match meter {
+            None => (Box::new(body), None),
+            Some(meter) => {
+                let mut body = body;
+                let mut charge = super::svcread::charge(meter.ctx)?;
+                let window = std::sync::Arc::new(super::svcread::Window::default());
+                let reader: Box<dyn std::io::Read + Send> = if syntax
+                    == crate::nesting::Syntax::Json
+                {
+                    let start = super::svcread::json_start(&mut body, &mut charge)
+                        .map_err(|e| Self::failed(url.as_str(), e.into()))?;
+                    if start.late && meter.strict {
+                        return Err(Error::Service(format!(
+                            "<{}>: the response gives its results before the variables of its head, which a strict cursor cannot stream",
+                            url.as_str()
+                        )));
+                    }
+                    let base = (start.decided as u64).saturating_mul(super::svcread::head_factor());
+                    let bytes = std::io::Cursor::new(start.bytes);
+                    Box::new(super::svcread::Metered::new(
+                        std::io::Read::chain(bytes, body),
+                        charge,
+                        base,
+                        start.late,
+                        window.clone(),
+                    ))
+                } else {
+                    Box::new(super::svcread::Metered::new(
+                        body,
+                        charge,
+                        0,
+                        false,
+                        window.clone(),
+                    ))
+                };
+                (reader, Some(window))
+            }
+        };
         // parsed as it streams in, under the policy's byte ceiling and deadline
         let parser = sparesults::QueryResultsParser::from_format(fmt);
         let solutions = match parser
@@ -9048,6 +9102,7 @@ impl RemoteAnswer {
             span,
             url: url.as_str().to_string(),
             solutions,
+            window,
         })
     }
 
@@ -9056,7 +9111,12 @@ impl RemoteAnswer {
     pub(super) fn next_solution(&mut self) -> Option<Result<sparesults::QuerySolution>> {
         let next = self.solutions.as_mut()?.next();
         match next {
-            Some(Ok(solution)) => Some(Ok(solution)),
+            Some(Ok(solution)) => {
+                if let Some(window) = &self.window {
+                    window.solution();
+                }
+                Some(Ok(solution))
+            }
             Some(Err(e)) => {
                 self.solutions = None;
                 Some(Err(Self::failed(&self.url, e)))

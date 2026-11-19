@@ -53,6 +53,7 @@ mod sample;
 mod sortkey;
 pub mod stats;
 pub mod svccache;
+mod svcread;
 pub mod table;
 pub mod textpf;
 mod unionpush;

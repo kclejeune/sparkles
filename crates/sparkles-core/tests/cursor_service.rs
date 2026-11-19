@@ -834,3 +834,127 @@ fn auto(snap: &Arc<Snapshot>, q: &str, o: &QueryOptions) -> Vec<Vec<Option<Term>
         _ => unreachable!("a SELECT"),
     }
 }
+
+/// A JSON response that gives its results before the variables of its head, which
+/// sparesults buffers whole. A strict cursor refuses it by name as soon as it has read
+/// the start of the results, while the endpoint still holds the rest back. A permissive
+/// one answers it as eager does, under a charge for the buffered answer, so a budget the
+/// whole answer outgrows refuses it.
+#[test]
+fn a_response_whose_head_comes_late_is_refused_or_charged() {
+    let s = store();
+    let snap = s.snapshot();
+    let gate = Arc::new(Gate::default());
+    let held = gate.clone();
+    let late = Endpoint::start(Arc::new(move || {
+        (
+            200,
+            vec![
+                Part::Bytes(format!(r#"{{"results":{{"bindings":[{}"#, rows(10)).into_bytes()),
+                Part::Wait(held.clone()),
+                Part::Bytes(br#"]},"head":{"vars":["s","o"]}}"#.to_vec()),
+            ],
+        )
+    }));
+    let q = format!("SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }}", late.url);
+    let started = Instant::now();
+    let mut cursor = select_cursor(snap.clone(), &q, &opts(), &strict(4)).unwrap();
+    let r = cursor.next_batch().map(|b| b.map(|b| b.len()));
+    assert!(
+        matches!(&r, Err(Error::Service(m)) if m.contains("before the variables of its head")),
+        "{r:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "refused before the gate"
+    );
+    gate.open();
+    let allow = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(4)
+    };
+    let (answer, _) = streamed(&snap, &q, &opts(), &allow).unwrap();
+    assert_eq!(answer, eager(&snap, &q, &opts()).unwrap());
+    assert_eq!(answer.len(), 10);
+    // Empty bindings, which a buffered answer keeps at many times their bytes: the
+    // budget holds the bytes many times over, but not what sparesults keeps of them.
+    let body = format!(
+        r#"{{"results":{{"bindings":[{}]}},"head":{{"vars":["s","o"]}}}}"#,
+        vec!["{}"; 70_000].join(",")
+    );
+    let big = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(body.clone().into_bytes())])
+    }));
+    let q = format!("SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }}", big.url);
+    let roomy = QueryOptions {
+        max_memory_bytes: Some(64 << 20),
+        ..opts()
+    };
+    assert_eq!(streamed(&snap, &q, &roomy, &allow).unwrap().0.len(), 70_000);
+    let tight = QueryOptions {
+        max_memory_bytes: Some(4 << 20),
+        ..opts()
+    };
+    let r = streamed(&snap, &q, &tight, &allow).map(|(rows, _)| rows.len());
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+}
+
+/// The head of a response is charged before the parser keeps it, so a head of many
+/// variables that the budget cannot hold refuses the query, at the head-first order a
+/// strict cursor streams.
+#[test]
+fn an_oversized_head_is_refused_under_a_tight_budget() {
+    let s = store();
+    let snap = s.snapshot();
+    let vars: Vec<String> = (0..40_000).map(|i| format!(r#""v{i}""#)).collect();
+    let body = format!(
+        r#"{{"head":{{"vars":["s","o",{}]}},"results":{{"bindings":[{}]}}}}"#,
+        vars.join(","),
+        rows(3)
+    );
+    let ep = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(body.clone().into_bytes())])
+    }));
+    let q = format!("SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
+    assert_eq!(streamed(&snap, &q, &opts(), &strict(4)).unwrap().0.len(), 3);
+    let tight = QueryOptions {
+        max_memory_bytes: Some(1 << 20),
+        ..opts()
+    };
+    let r = streamed(&snap, &q, &tight, &strict(4)).map(|(rows, _)| rows.len());
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+}
+
+/// A literal far larger than the rest of the answer grows the parser's buffer while it
+/// arrives. The buffer is charged by the bytes read between two solutions, so a budget
+/// that holds the rest of the answer refuses the literal.
+#[test]
+fn a_large_literal_is_charged_while_the_parser_reads_it() {
+    let s = store();
+    let snap = s.snapshot();
+    let big = "x".repeat(1 << 20);
+    let body = format!(
+        r#"{HEAD}{},{{"s":{{"type":"uri","value":"urn:s"}},"o":{{"type":"literal","value":"{big}"}}}}{TAIL}"#,
+        rows(3)
+    );
+    let ep = Endpoint::start(Arc::new(move || {
+        (200, vec![Part::Bytes(body.clone().into_bytes())])
+    }));
+    let q = format!("SELECT ?s {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
+    assert_eq!(streamed(&snap, &q, &opts(), &strict(1)).unwrap().0.len(), 4);
+    let tight = QueryOptions {
+        max_memory_bytes: Some(5 << 20),
+        ..opts()
+    };
+    let r = streamed(&snap, &q, &tight, &strict(1)).map(|(rows, _)| rows.len());
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+}

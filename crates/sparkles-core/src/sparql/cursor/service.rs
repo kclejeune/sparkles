@@ -22,6 +22,10 @@
 //! leaves out the time a consumer keeps the cursor waiting, so a slow consumer can expire
 //! a remote transfer that an eager run would finish.
 //!
+//! The parser buffers a JSON response whose results come before its head's variables,
+//! so the strict policy refuses one by name and a permissive cursor reads it under a
+//! charge for the buffered answer (see `svcread`).
+//!
 //! A SILENT SERVICE answers one empty solution when the call fails, after any number of
 //! rows, so it needs the whole answer before its first row and stays an eager leaf that
 //! the strict policy refuses (decision Q-SVC1).
@@ -268,7 +272,11 @@ impl Service {
             }
             tee = Some(Tee::new(ctx, key, store.max_entry_bytes())?);
         }
-        let answer = RemoteAnswer::open(ctx, &url, &self.query)?;
+        let meter = crate::sparql::exec::Meter {
+            ctx,
+            strict: self.fallback.at_pull(ctx) == FallbackPolicy::RejectMaterialization,
+        };
+        let answer = RemoteAnswer::open(ctx, &url, &self.query, Some(meter))?;
         self.source = Some(Source::Remote {
             answer: Box::new(answer),
             tee,

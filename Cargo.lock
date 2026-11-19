@@ -5928,6 +5928,7 @@ dependencies = [
  "icu_normalizer",
  "imbl",
  "ipnet",
+ "json-event-parser",
  "levenshtein_automata",
  "libc",
  "liblzma",
