@@ -1,0 +1,34 @@
+[2m2026-11-18T07:04:24.594442Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase parse: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:24.594465Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m merging 0 partial vocabularies (0 input quads, 0 hot keys)
+[2m2026-11-18T07:04:24.598021Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase vocabulary merge: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:24.598029Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m vocabulary: 0 terms
+[2m2026-11-18T07:04:24.599024Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations spo, sop, gspo
+[2m2026-11-18T07:04:24.602900Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations osp, ops
+[2m2026-11-18T07:04:24.606266Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations pso, pos
+[2m2026-11-18T07:04:24.609417Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase sort and permutations: 0.01s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:24.609448Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m counting node sets
+[2m2026-11-18T07:04:24.609747Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase node sets: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:24.609755Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m writing predicate patterns
+[2m2026-11-18T07:04:24.610787Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase predicate patterns: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:24.613092Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase statistics: 0.00s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:24.613117Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase total: 0.02s, storage written 0.1 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:24.613184Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index files: 0.0 MB
+[2m2026-11-18T07:04:24.613188Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index complete: 0 quads, 0 terms
+[2m2026-11-18T07:04:24.617854Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m parsing data.nt
+[2m2026-11-18T07:04:24.789269Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase parse: 0.17s, storage written 4.7 MB (cancelled 0.0 MB), read 0.0 MB, temporary files written: quads 3.5 MB, partial vocabularies 1.2 MB
+[2m2026-11-18T07:04:24.789281Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m merging 13 partial vocabularies (1052807 input quads, 0 hot keys)
+[2m2026-11-18T07:04:24.829417Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase vocabulary merge: 0.04s, storage written 3.6 MB (cancelled 1.3 MB), read 0.0 MB, temporary files written: maps 0.7 MB
+[2m2026-11-18T07:04:24.829427Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m vocabulary: 313952 terms
+[2m2026-11-18T07:04:24.842966Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations spo, sop, gspo
+[2m2026-11-18T07:04:24.913141Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations osp, ops
+[2m2026-11-18T07:04:24.962125Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m building permutations pso, pos
+[2m2026-11-18T07:04:25.026349Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase sort and permutations: 0.20s, storage written 26.7 MB (cancelled 4.2 MB), read 0.0 MB
+[2m2026-11-18T07:04:25.026370Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m counting node sets
+[2m2026-11-18T07:04:25.042599Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase node sets: 0.02s, storage written 0.0 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:25.042616Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m writing predicate patterns
+[2m2026-11-18T07:04:25.050948Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase predicate patterns: 0.01s, storage written 0.8 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:25.053744Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase statistics: 0.00s, storage written 0.1 MB (cancelled 0.0 MB), read 0.0 MB
+[2m2026-11-18T07:04:25.053758Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m build phase total: 0.44s, storage written 35.9 MB (cancelled 5.4 MB), read 0.0 MB, temporary files written: quads 3.5 MB, partial vocabularies 1.2 MB, maps 0.7 MB
+[2m2026-11-18T07:04:25.053796Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index files: 29.9 MB
+[2m2026-11-18T07:04:25.053799Z[0m [32m INFO[0m [2msparkles::builder[0m[2m:[0m index complete: 1052801 quads, 313952 terms
+loaded 1052801 quads in 0.44s (2388948 quads/s); database now has 1052801 quads; commit 1
