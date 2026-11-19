@@ -1644,7 +1644,7 @@ mod tests {
                     if let super::super::State::Merge(merge) = &op.state
                         && let Some(pair) = &merge.spooled
                     {
-                        let frame_bytes = |side: &Side, width| match side {
+                        let frame_bytes = |side: &Side, width: u64| match side {
                             Side::File { run, .. } => {
                                 run.max_frame_rows() as u64 * (width * 16 + 8) + width * 24
                             }
