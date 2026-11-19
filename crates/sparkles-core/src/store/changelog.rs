@@ -831,7 +831,8 @@ pub struct ChangeLog {
     /// The first commits that history readers still need, with the number of readers
     /// pinning each (see [`LogPin`]). Retention keeps every segment at or after the
     /// oldest, and the log cannot be turned off while any is held. Lock order: `inner`
-    /// before `pins`, and nothing is locked while `pins` is held.
+    /// before `pins`, and only `settings` is locked while `pins` is held, by
+    /// [`ChangeLog::set_settings`].
     pins: Mutex<std::collections::BTreeMap<u64, usize>>,
     pending: Mutex<VecDeque<Pending>>,
     /// the background writer has been told about the queue
