@@ -13,35 +13,57 @@ agree. The check fails when a run holds other queries than --queries names, or w
 file is missing.
 """
 
-import importlib.util
 import re
 import sys
 from collections import defaultdict
 from pathlib import Path
 
-_spec = importlib.util.spec_from_file_location(
-    "bench_answers", Path(__file__).resolve().parent.parent / "bench-answers.py")
-ba = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(ba)
+def blank_tokens(query):
+    """The query with every comment, IRI and string literal, long or short, replaced by
+    spaces of the same length, so that words inside them are not read as syntax."""
+    out, i, n = [], 0, len(query)
+    while i < n:
+        c = query[i]
+        if c == "#":
+            j = query.find("\n", i)
+            j = n if j < 0 else j
+        elif c == "<" and (m := re.match(r"<[^<>\"{}|^`\\\s]*>", query[i:])):
+            j = i + m.end()
+        elif query.startswith('"""', i) or query.startswith("'''", i):
+            q3, j = query[i:i + 3], i + 3
+            while j < n and not query.startswith(q3, j):
+                j += 2 if query[j] == "\\" else 1
+            j = min(n, j + 3)
+        elif c in "\"'":
+            j = i + 1
+            while j < n and query[j] != c and query[j] != "\n":
+                j += 2 if query[j] == "\\" else 1
+            j = min(n, j + 1)
+        else:
+            out.append(c)
+            i += 1
+            continue
+        out.append(" " * (j - i))
+        i = j
+    return "".join(out)
 
 
 def unordered_slice(query):
-    """Whether the query has a top-level LIMIT and no top-level ORDER BY, with IRIs, strings
-    and comments blanked first, as bench-answers.py finds the ORDER BY."""
-    if ba._after_order_by(query) is not None:
-        return False
-    q = re.sub(r"<[^<>\s]*>", ba._blank, query)
-    q = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', ba._blank, q)
-    q = re.sub(r"#[^\n]*", ba._blank, q)
-    depth = 0
-    for m in re.finditer(r"[{}]|\blimit\s+\d+", q, re.I):
-        if m.group() == "{":
+    """Whether the query has a top-level LIMIT and no top-level ORDER BY."""
+    q = blank_tokens(query)
+    depth, limit, ordered = 0, False, False
+    for m in re.finditer(r"[{}]|\border\s+by\b|\blimit\s+\d+", q, re.I):
+        t = m.group()
+        if t == "{":
             depth += 1
-        elif m.group() == "}":
+        elif t == "}":
             depth -= 1
         elif depth == 0:
-            return True
-    return False
+            if t.lower().startswith("order"):
+                ordered = True
+            else:
+                limit = True
+    return limit and not ordered
 
 
 def tsv(path, problems):

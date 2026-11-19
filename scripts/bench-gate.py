@@ -297,14 +297,15 @@ def executors(args):
         # a run of other arms than eager and streaming has a digest of every timed answer,
         # and so does any run whose digests name their repetition
         per_request = (not legacy) or any(len(row) >= 5 for row in warm_rows)
-        if per_request:
-            # every digest names its repetition, and its query is one of the run's
-            short = sum(1 for row in warm_rows if len(row) != 5)
-            stray = sorted({row[2] for row in warm_rows} - set(order))
-            if short or stray:
-                checks.append({"name": f"{cell}/warm-answers", "ok": False,
-                               "detail": {"digest rows without exactly five fields": short,
-                                          "queries of no sample": stray}})
+        # every digest row has one width, five fields with the repetition, or four in an
+        # older run, and names a query of the run
+        widths = {5} if per_request else {4, 5}
+        short = sum(1 for row in warm_rows if len(row) not in widths)
+        stray = sorted({row[2] for row in warm_rows if len(row) >= 3} - set(order))
+        if short or stray:
+            checks.append({"name": f"{cell}/warm-answers", "ok": False,
+                           "detail": {f"digest rows of other than {' or '.join(map(str, sorted(widths)))} fields": short,
+                                      "queries of no sample": stray}})
         table = []
         for q in order:
             # LIMIT without ORDER BY may return other rows in each mode, so only the

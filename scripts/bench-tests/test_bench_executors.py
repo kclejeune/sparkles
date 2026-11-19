@@ -249,6 +249,25 @@ class TimedDigestTests(unittest.TestCase):
             self.assertFalse(checks["1.05m-1t/warm-answers"])
 
 
+class LegacyDigestTests(unittest.TestCase):
+    def test_malformed_rows_of_an_older_run_fail_and_short_rows_do_not_crash(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / "run"
+            res = root / "people-100000-threads-1" / "results"
+            res.mkdir(parents=True)
+            (root / "manifest.txt").write_text("host: forge\n")
+            res.joinpath("samples.tsv").write_text("round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n"
+                                                   "1\t1\tA\tq\t1\t1\t2\n1\t2\tB\tq\t1\t1\t2\n")
+            res.joinpath("answers.tsv").write_text("A\tq\t1\tx\nB\tq\t1\tx\n")
+            out = Path(d) / "record.json"
+            for extra, failed in (("", False), ("3\tA\tq\n", True), ("3\tA\n", True)):
+                res.joinpath("warm-answers.tsv").write_text("1\tA\tq\t1 rows, h\n2\tB\tq\t1 rows, h\n" + extra)
+                r = gate("executors", root, "--out", out)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                checks = {c["name"]: c["ok"] for c in json.loads(out.read_text())["checks"]}
+                self.assertEqual("1.05m-1t/warm-answers" in checks, failed, extra)
+
+
 class BestOfTests(unittest.TestCase):
     def record(self, d, name, metrics, manifest=None):
         manifest = dict(manifest or {"compilers": "rustc 1", "build_config": "{}", "base_compilers": "rustc 1",
