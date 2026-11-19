@@ -97,8 +97,8 @@ pub fn write(
                 r,
                 mode: EagerMode::Scratch,
             };
-            solutions(&mut source, writer, rows, |s, out, staged| {
-                native(s, out, staged, send, metadata)
+            solutions(&mut source, writer, rows, |s, out, _| {
+                native(s, out, send, metadata)
             })
         }
         (Source::Result(r), Format::Solutions(SolutionsFormat::Sparkles)) => {
@@ -133,15 +133,11 @@ pub fn write(
                 r,
                 mode: EagerMode::Rows,
             };
-            solutions(&mut source, writer, rows, |s, out, staged| {
-                thrift(s, out, staged, send)
-            })
+            solutions(&mut source, writer, rows, |s, out, _| thrift(s, out, send))
         }
         (Source::Select(cursor), Format::ResultsThrift) => {
             let mut source = CursorSolutions { cursor };
-            solutions(&mut source, writer, rows, |s, out, staged| {
-                thrift(s, out, staged, send)
-            })
+            solutions(&mut source, writer, rows, |s, out, _| thrift(s, out, send))
         }
         (_, Format::ResultsThrift) => Err(Error::invalid(
             "SPARQL Results Thrift holds SELECT results only",
@@ -149,8 +145,8 @@ pub fn write(
         (Source::Select(cursor), Format::Solutions(fmt)) => {
             let mut source = CursorSolutions { cursor };
             if fmt == SolutionsFormat::Sparkles {
-                solutions(&mut source, writer, rows, |s, out, staged| {
-                    native(s, out, staged, send, metadata)
+                solutions(&mut source, writer, rows, |s, out, _| {
+                    native(s, out, send, metadata)
                 })
             } else {
                 solutions(&mut source, writer, rows, |s, out, _| {
@@ -319,19 +315,20 @@ where
     }
 }
 
-/// SPARQL Results Thrift of a SELECT, from either source: the variables, then a data
-/// tuple per row.
+/// SPARQL Results Thrift of a SELECT, from either source: the variables as one piece,
+/// then a data tuple per row, each handed on whole in the explicit mode.
 fn thrift<S: SolutionSource>(
     source: &mut S,
     out: &mut RowOut<'_>,
-    staged: &Cell<u64>,
     send: Option<usize>,
 ) -> Result<()> {
     source.start()?;
+    out.begin_piece();
+    let mut thrift = ThriftResults::new(Explicit::new(out), source.variables()).map_err(io)?;
+    thrift.get_mut().end_piece().map_err(io)?;
     let mut rows = ThriftRows {
         width: source.variables().len(),
-        out: ThriftResults::new(&mut *out, source.variables()).map_err(io)?,
-        staged,
+        out: thrift,
         flush: S::FLUSH_FIRST,
     };
     source.drive(send, &mut rows)?;
@@ -339,18 +336,19 @@ fn thrift<S: SolutionSource>(
     Ok(())
 }
 
-struct ThriftRows<'o, W: Write> {
-    out: ThriftResults<W>,
-    staged: &'o Cell<u64>,
+struct ThriftRows<'o, 'a> {
+    out: ThriftResults<Explicit<'o, 'a>>,
     width: usize,
     /// flush after the first batch
     flush: bool,
 }
 
-impl<W: Write> BatchVisitor for ThriftRows<'_, W> {
+impl BatchVisitor for ThriftRows<'_, '_> {
     fn batch<B: RowBatch>(&mut self, batch: &mut B) -> Result<()> {
         for i in 0..batch.len() {
-            match batch.row(i)? {
+            let row = batch.row(i)?;
+            self.out.get_mut().begin_row()?;
+            match row {
                 RowView::Dense(terms) => self.out.row(terms),
                 RowView::Sparse(terms) => {
                     let mut bound = terms.iter().peekable();
@@ -362,7 +360,7 @@ impl<W: Write> BatchVisitor for ThriftRows<'_, W> {
                 }
             }
             .map_err(io)?;
-            self.staged.set(self.staged.get() + 1);
+            self.out.get_mut().end_row(1).map_err(io)?;
         }
         // the first batch's rows reach a writer that commits on a flush
         if std::mem::take(&mut self.flush) {
@@ -373,11 +371,11 @@ impl<W: Write> BatchVisitor for ThriftRows<'_, W> {
 }
 
 /// The native JSON document of a SELECT or ASK, from either source. Its rows are
-/// written by hand, cell by cell, and the source writes its own `meta` member.
+/// written by hand, cell by cell, each handed on whole in the explicit mode, and the
+/// source writes its own `meta` member.
 fn native<S: SolutionSource>(
     source: &mut S,
     out: &mut RowOut<'_>,
-    staged: &Cell<u64>,
     send: Option<usize>,
     metadata: Option<NativeJsonMetadata<'_>>,
 ) -> Result<()> {
@@ -389,13 +387,15 @@ fn native<S: SolutionSource>(
         out.write_all(if boolean { b"true" } else { b"false" })?;
         return source.native_trailer(out, None, send, metadata, started, initial_exec);
     }
-    out.write_all(b"{\"queryType\":\"SELECT\",\"vars\":")?;
-    json(&mut *out, &source.variables())?;
-    out.write_all(b",\"rows\":[")?;
+    let mut explicit = Explicit::new(&mut *out);
+    explicit.begin_piece();
+    explicit.write_all(b"{\"queryType\":\"SELECT\",\"vars\":")?;
+    json(&mut explicit, &source.variables())?;
+    explicit.write_all(b",\"rows\":[")?;
+    explicit.end_piece()?;
     let mut rows = NativeRows {
         width: source.variables().len(),
-        out: &mut *out,
-        staged,
+        out: explicit,
         sent: 0,
         flush: S::FLUSH_FIRST,
     };
@@ -406,8 +406,7 @@ fn native<S: SolutionSource>(
 }
 
 struct NativeRows<'o, 'w> {
-    out: &'o mut RowOut<'w>,
-    staged: &'o Cell<u64>,
+    out: Explicit<'o, 'w>,
     width: usize,
     sent: u64,
     /// flush after the first batch
@@ -416,9 +415,10 @@ struct NativeRows<'o, 'w> {
 
 impl BatchVisitor for NativeRows<'_, '_> {
     fn batch<B: RowBatch>(&mut self, batch: &mut B) -> Result<()> {
-        let out = &mut *self.out;
+        let out = &mut self.out;
         for i in 0..batch.len() {
             let row = batch.row(i)?;
+            out.begin_row()?;
             if self.sent > 0 {
                 out.write_all(b",")?;
             }
@@ -446,7 +446,7 @@ impl BatchVisitor for NativeRows<'_, '_> {
                 }
             }
             out.write_all(b"]")?;
-            self.staged.set(self.staged.get() + 1);
+            out.end_row(1)?;
             self.sent += 1;
         }
         // the first batch's rows reach a writer that commits on a flush

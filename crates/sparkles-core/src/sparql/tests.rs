@@ -1281,6 +1281,23 @@ fn native_json_streaming_stops_on_writer_error_and_cancel() {
     assert!(matches!(error, Error::Io(e) if e.kind() == io::ErrorKind::BrokenPipe));
     assert_eq!(sink.bytes.len(), 128);
 
+    // A row reaches the writer whole, so a cancellation is seen at the first write after
+    // the row in which it arrived. Rows below the buffer's size keep that within the
+    // buffer, where the malformed answer above would decode its sentinel after a whole row.
+    let values: String = (0..400)
+        .map(|i| format!("\"{i}{}\" ", "x".repeat(500)))
+        .collect();
+    let many = parse_query(
+        &format!("SELECT ?o WHERE {{ VALUES ?o {{ {values} }} }}"),
+        None,
+        &[],
+    )
+    .unwrap();
+    let prepared = super::prepare_query(s.snapshot(), &many, &options, None, None).unwrap();
+    let r = super::execute_prepared_parts(&many, &options, 0.0, 0.0, prepared)
+        .unwrap()
+        .freeze()
+        .unwrap();
     let cancel = Arc::new(AtomicBool::new(false));
     let sink = Sink {
         bytes: Vec::new(),

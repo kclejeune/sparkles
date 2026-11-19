@@ -284,20 +284,17 @@ async fn budget_cut_bodies_keep_their_status_and_error() {
 
 /// A row larger than the result-size budget that the response meets before it commits is
 /// refused with 507 in every execution, whatever pieces its encoder writes it in. Its
-/// 135,003 bytes of TSV, 90,002 of CSV and more of JSON and XML would pass the 64 KiB at which a
-/// streamed response commits if they went on in pieces. The formats listed hand each row
-/// on whole. On sparesults' JSON writer, SPARQL JSON in streaming answered 200 with a cut
-/// body here, since it reached the response in pieces of 8 KiB, and native JSON still
-/// does.
+/// 135,003 bytes of TSV, 90,002 of CSV and more of JSON, XML, Thrift and native JSON would
+/// pass the 64 KiB at which a streamed response commits if they went on in pieces. Every
+/// format hands each row on whole. On sparesults' JSON writer, SPARQL JSON in streaming
+/// answered 200 with a cut body here, since it reached the response in pieces of 8 KiB, and
+/// so did native JSON while its rows were written in the staged mode.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_row_past_the_budget_before_the_commit_is_refused() {
     let big = format!("<urn:ex:big> <urn:ex:p> \"{}\" .\n", "x\\t".repeat(45_000));
     let s = server_with(Some(80 << 10), &big);
     let mut failures = Vec::new();
     for &(fname, accept) in SOLUTIONS {
-        if !["tsv", "csv", "json", "xml"].contains(&fname) {
-            continue;
-        }
         for mode in MODES {
             let (status, _, body) = post(
                 &s.app,
