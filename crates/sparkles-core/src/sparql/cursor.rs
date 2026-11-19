@@ -27,6 +27,7 @@ mod extsort;
 mod filter;
 pub mod graph;
 mod group;
+mod history;
 mod joinspill;
 mod leaf;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
@@ -2585,6 +2586,8 @@ enum State {
     Service(Box<service::Service>),
     /// A text search without a limit, which holds its hits and decodes rows from them.
     Text(Box<text::Text>),
+    /// A history query without a limit or input, read a page of whole commits at a time.
+    History(Box<history::History>),
 }
 
 /// An eager kernel's node, its answer once it has run, and how far its consumer has
@@ -3025,6 +3028,8 @@ impl Operator {
         let service_reader = service::eligible(&node);
         // A text search without a limit holds its hits and decodes rows as they are read.
         let text_reader = text::eligible(&node);
+        // A history query without a limit holds a page of its changes at a time.
+        let history_reader = history::eligible(&node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -3037,6 +3042,7 @@ impl Operator {
             && !index_topk
             && !service_reader
             && !text_reader
+            && !history_reader
             && !pattern_counts
             && (!native_blocking || !exists_streams);
         // A kernel that answers whole tables runs as a native operator when its form is
@@ -3265,8 +3271,13 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input || text_reader).then(|| {
-            if text_reader {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input || text_reader || history_reader).then(|| {
+            if history_reader {
+                format!(
+                    "{} reads the change log a page of whole commits at a time under the memory budget, pinning the commits it has still to read",
+                    node.operator()
+                )
+            } else if text_reader {
                 format!(
                     "{} counts its hits, at most maxHits, holds them under the memory budget and decodes their rows a page at a time",
                     node.operator()
@@ -3339,6 +3350,8 @@ impl Operator {
             State::Service(Box::new(service::Service::new(ctx, &node, fallback)))
         } else if text_reader {
             State::Text(Box::new(text::Text::new(node)))
+        } else if history_reader {
+            State::History(Box::new(history::History::new(node)))
         } else if index_topk {
             State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
@@ -3514,6 +3527,7 @@ impl Operator {
             State::Ripple(ripple) => ripple.release_working_sets(),
             State::Service(service) => service.release(),
             State::Text(text) => text.release(),
+            State::History(history) => history.release(),
             _ => {}
         }
         if let Some(ahead) = &mut self.ahead {
@@ -4114,6 +4128,11 @@ impl Operator {
                 State::Text(text) => {
                     let b = text.next(ctx, cap)?;
                     self.done = text.done();
+                    b
+                }
+                State::History(history) => {
+                    let b = history.next(ctx, cap)?;
+                    self.done = history.done();
                     b
                 }
                 State::TopK(topk) => {

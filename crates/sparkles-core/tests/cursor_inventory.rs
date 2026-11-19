@@ -375,7 +375,7 @@ fn every_plan_form_has_a_native_operator_or_a_named_refusal() {
             "history changes without a limit",
             "HistoryChanges",
             "SELECT ?s ?c { SERVICE hist:changes { << ?s <urn:p> ?o >> hist:commit ?c } }",
-            Refused(Why::Pending("group 2")),
+            Native,
         ),
         // property functions
         form(

@@ -434,12 +434,7 @@ pub(super) fn run(
     vars: &[VarId],
 ) -> Result<Table> {
     let Some(input) = input else {
-        if let Some(v) = spec.from_var.or(spec.to_var) {
-            return Err(bad(format!(
-                "?{} in hist:from or hist:to is not bound by the rest of the group",
-                ctx.var_name(v)
-            )));
-        }
+        range_vars_bound(ctx, spec)?;
         let t = lookup(ctx, spec, vars)?;
         ctx.produced(t.len())?;
         return Ok(t);
@@ -488,6 +483,17 @@ pub(super) fn run(
     }
     ctx.produced(out.len())?;
     Ok(out)
+}
+
+/// A call without input fails when its range names a variable, which nothing binds.
+pub(super) fn range_vars_bound(ctx: &Ctx, spec: &HistorySpec) -> Result<()> {
+    if let Some(v) = spec.from_var.or(spec.to_var) {
+        return Err(bad(format!(
+            "?{} in hist:from or hist:to is not bound by the rest of the group",
+            ctx.var_name(v)
+        )));
+    }
+    Ok(())
 }
 
 /// The call with the values of one binding of its input variables as constants. An

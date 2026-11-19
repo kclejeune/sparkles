@@ -19,6 +19,7 @@ mod branch_tests;
 mod branching;
 pub mod caches;
 mod changelog;
+pub(crate) use changelog::HistoryPages;
 mod changes;
 mod clone;
 #[cfg(test)]

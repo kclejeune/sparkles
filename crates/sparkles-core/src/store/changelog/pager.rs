@@ -11,7 +11,6 @@
 //! keeps the commits it has still to read and the log cannot be turned off under it. A
 //! read-only log has neither retention nor a switch and is not pinned; its pages resume
 //! from the position where the previous page stopped.
-#![allow(dead_code)] // the cursor's history reader uses this module (item 829)
 use super::readonly::RoCursor;
 use super::*;
 use crate::store::diff::{key_quad, visible_key};

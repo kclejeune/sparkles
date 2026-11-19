@@ -59,6 +59,8 @@
 mod pager;
 mod readonly;
 
+pub(crate) use pager::HistoryPages;
+
 use super::diff::{Keys, QuadKey};
 use super::*;
 use rustc_hash::FxHashMap;
