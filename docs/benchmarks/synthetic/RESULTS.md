@@ -750,8 +750,9 @@ Eager `expr-bind-group` read 0.839 of the base, 0.50 ms against 0.60 ms, `expr-a
 and EXPLAIN marks it `[incremental]`. `group-avg` and `expr-bind-group` kept running state
 in the base as well. Streamed, the same queries read 0.975, 1.004 and 0.980. `types-grouped`,
 `predicate-counts` and `subquery-agg` keep their count plans and read 0.955 to 1.021 in
-both modes, within the spread of the base. Eager `types-grouped` read 1.003, a median of
-0.02 µs more in this one order of the A/B, under the 0.5 µs bound of the Intel rule. The
+both modes, within the spread of the base. Eager `subquery-agg` read 1.009 and streamed
+`predicate-counts` read 1.021. Eager `types-grouped` read 1.003, a median of 0.02 µs more
+in this order of the A/B, under the 0.5 µs bound of the Intel rule. The
 12-thread cells of these queries come from the forge matrix. Roadmap item 1067 follows
 these small deltas.
 
@@ -780,8 +781,11 @@ BIND form take about 13.5 ms in most server processes and 17 to 22 ms in some, i
 three builds, so the second pair's streamed ratios of 1.35 and 1.32 are noise that a round
 below 1.0 shows. Against the build before item 826, eager `SUM(STRLEN(?n))` grouped by
 employer reads 0.784, and eager `SUM(?s * 2)` reads 1.163, 57.9 ms against 49.7 ms, which
-roadmap item 1099 follows. Item 1067 holds the streamed costs of 1% to 7% that the same
-pair shows.
+roadmap item 1099 follows. With one thread at 10.5M triples, the same pair reads 1.039 for
+streamed `SUM(STRLEN(STR(?o)))`, 1.074 for streamed `expr-agg-arg`, 1.013 for streamed
+`SUM(?s * 2)` and 1.008 for streamed `SUM(STRLEN(?n))`. The fix is slower in all three
+rounds for each query. Item 1067 holds these costs and the 12-thread `group-avg` follow-up
+from the [pinned forge comparison](#pinned-checks-and-drift-at-batch-37).
 
 ### Per-query floor cache
 
@@ -950,14 +954,114 @@ of them under 0.3 ms. The table lists all 24 flags above 0.3 ms.
 Eager `minus` read 1.30 to 1.42 of cc94ac7f in the batch-30 record and 1.16 to 1.28 here.
 With one thread, every server process of a cell agrees on `lang-filter`, `regex-iri` and
 streamed `optional-chain`, and their ratios to cc94ac7f are within 0.04 of those in the
-[batch-30 record](#forge-record-at-batch-30-against-cc94ac7f). Row 1072 records
-`lang-filter` at about 2.5% slower after item 678, and no row records a cost on
-`regex-iri`, streamed `optional-chain` or streamed `optional-count`, so the drift of these
-four queries from cc94ac7f is larger than the recorded costs that
-[row 1074](../../ROADMAP.md) counts. An interleaved forge A/B of cc94ac7f and the current
-main decides how much of that drift is a cost of the code before the range is bisected. In
+[batch-30 record](#forge-record-at-batch-30-against-cc94ac7f). At batch 33, item 1072
+recorded `lang-filter` at about 2.5% slower after item 678. Costs on `regex-iri` and
+streamed `optional-chain` and `optional-count` had no rows. The drift of the four queries
+from cc94ac7f exceeded the costs that [row 1074](../../ROADMAP.md) counted and prompted
+the [pinned interleaved run](#pinned-checks-and-drift-at-batch-37). In
 wall time, streamed `export-500k` is 7% to 9% slower than cc94ac7f in all four cells, and
 `lang-filter` and `regex-iri` 9% slower at 10.5M triples with one thread.
+
+### Pinned checks and drift at batch 37
+
+Forge ran eleven interleaved pairs alone under its benchmark and build locks, in rounds of
+A,B,B,A, with release builds of the matrix recipe that the laptop made with the compilers
+and build configuration of the cc94ac7f build. The
+[run record](runs/2026-11-19-post-push-pinned-forge-stage3/README.md) holds the
+scripts, samples, answer checksums, binary hashes and verdicts. For every pair, the sorted
+TSV answers of both builds have the same checksums, and the timed responses were not
+compared. A query whose arm medians are both under 0.3 ms is judged by the D4 rule of the
+pinned checks above. Otherwise a ratio of 1.05 or more fails, and a lower ratio that is
+slower in every round is a confirmed cost that needs a roadmap row. The record's
+`verdict.txt` applies this rule to the output of `analyze.py`, whose own verdict field
+tests only the ratio above 0.3 ms.
+
+The screen flags of batches 33 and 35 pass. Against eda22fce, the main before batch 32,
+bccc5f7b runs `types-grouped` at 0.984 eager and 0.969 streamed. Under automatic execution
+it reads 1.030 with an interval that reaches 1.037, and it passes because the added time
+is 0.22 µs. Against ffb18866, the main before batch 35, `subquery-agg` reads 0.997 under
+automatic execution and 1.001 streamed, with intervals that reach 1.0.
+
+The pairs of eda22fce and bccc5f7b rerun the candidates above 0.3 ms that the
+[batch-33 record](#forge-record-at-batch-33-against-cc94ac7f) listed, apart from streamed
+`group-avg` and `export-500k` at 10.5M triples with one thread, which have no pair. Every
+ratio is below 1.05, and two are confirmed costs.
+
+| query | mode | cell | ratio | rounds slower |
+|---|---|---|--:|--:|
+| `export-500k` | streaming | 1.05M, one thread | 1.032 | 12 of 12 |
+| `group-avg` | streaming | 10.5M, 12 threads | 1.022 | 8 of 8 |
+| `expr-order-key` | streaming | 10.5M, 12 threads | 1.022 | 7 of 8 |
+| `order-by-full` | streaming | 10.5M, 12 threads | 1.009 | 7 of 8 |
+| `order-by-full` | eager | 10.5M, 12 threads | 1.001 | 4 of 8 |
+| `order-by-full` | eager | 1.05M, 12 threads | 1.003 | 6 of 12 |
+| `class-predicates` | streaming | 1.05M, 12 threads | 1.006 | 9 of 12 |
+
+Row 1063 holds the `export-500k` cost and row 1067 the `group-avg` cost. The pairs
+span batches 32 and 33. Batch 32 merged items 826, 678 and 1039, which are
+starting points for investigating `group-avg`. Streamed
+`expr-order-key` has an interval from 1.010 to 1.031 but is faster in one of eight rounds,
+which the rule above counts as noise. Eager `order-by-full` at 10.5M triples, which the
+separate matrix runs read at 1.20, reads 1.001 here with an interval from 0.994 to 1.007.
+
+The pair of cc94ac7f and 71c277b0, the main at batch 37, measures the drift of streamed
+queries since the fixed baseline with one thread at 1.05M triples.
+
+| query | cc94ac7f ms | 71c277b0 ms | ratio | 95% interval | rounds slower | row |
+|---|--:|--:|--:|---|--:|---|
+| `optional-chain` | 1.940 | 2.096 | 1.081 | 1.076 to 1.085 | 12 of 12 | 1202 |
+| `optional-count` | 0.517 | 0.545 | 1.056 | 1.052 to 1.059 | 12 of 12 | 1203 |
+| `regex-iri` | 3.476 | 3.593 | 1.034 | 1.031 to 1.038 | 12 of 12 | 1204 |
+| `lang-filter` | 1.632 | 1.679 | 1.029 | 1.027 to 1.031 | 12 of 12 | 1204 |
+| `export-500k` | 0.417 | 0.398 | 0.956 | 0.952 to 0.959 | 0 of 12 | none |
+
+Each ratio is the whole drift since cc94ac7f. The
+[separate timing of item 678](../../specs/X14-unified-executor/SPEC.md#charged-query-state-and-chunked-live-reservations)
+compares `lang-filter` against that item's own base. Roadmap item 1089 tracks that cost.
+The share of the 1.029 endpoint ratio attributable to item 678 remains unresolved. The
+separate matrix runs of 8baa5686 and bccc5f7b read
+`lang-filter` and `regex-iri` at 1.08 to 1.12 of the cc94ac7f run in the same cells, against
+1.03 here. Their instruction counts are nearly flat from 8baa5686 to 71c277b0, so the gap
+between the two methods is not explained. The 10.5M and 12-thread cells of these four
+queries have no interleaved pair. In wall time this pair reads 0.650 for `optional-chain`
+and 0.543 for `export-500k`, over every change from cc94ac7f to 71c277b0. The atlas
+comparison of 8baa5686 and a016b7bd in the
+[streamed response section](../../specs/X14-unified-executor/SPEC.md#the-streamed-response-cost)
+measures item 240's buffered cursor writer on its own and does not divide this difference.
+Server execution time covers the cursor's batches and leaves out the writer and its term
+cache.
+
+The [attribution files](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/README.md)
+count instructions per request on the laptop, streamed with one Rayon thread at 1.05M
+triples. They compare consecutive matrix builds from cc94ac7f to 71c277b0 and, between
+cc94ac7f and 8baa5686, cached screen builds of another toolchain. Counts locate a change in
+the code, and only the forge pair sizes a cost.
+
+- On `optional-count`, the screen builds 321508fe and 06ca04ef differ by 4.4%, and no
+  other adjacent step in the screen ladder adds more than 0.3%. The range holds item 825 and the Horn classifier
+  with individuals, which no synthetic query runs.
+- On `optional-chain`, the same range adds 0.5% while `export-500k` stays flat. The matrix
+  step from ffb18866 to 1cbc23cd adds another 0.55% to `optional-chain` and 0.47% to
+  `export-500k`, and from cc94ac7f to 8baa5686 the whole request runs 0.16% fewer
+  instructions. Most of this request is the writer, so these totals do not show where the
+  query's own instructions changed.
+- On `lang-filter` and `regex-iri`, adbe757c to 65c570db, which is batch 21, adds 1.8% and
+  1.6%, and no other adjacent step in the screen ladder adds more than 0.06%. Item 948 changed the checked vocabulary
+  decode in that batch and is a candidate that its own comparison would confirm.
+
+[Flat profiles](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/perf/) of
+cc94ac7f and 71c277b0 on the laptop's performance cores, sampled on user-space instructions,
+name the code without isolating the execution window. In cc94ac7f the cursor joined
+`optional-chain` through its own hash index in `cursor::binary`. In 71c277b0 it joins
+through the `join::hash` kernels that item 825 added, which build a partitioned index. The
+join symbols, counting the merge bounds and zipper on both sides, take an estimated 8.9
+million instructions per request against 6.9 million. The count of `optional-count` moved
+from the cursor's grouping count over `zipper::lower_bounds` to `join::merge::count` and
+`join::merge::bounds`, and those symbols with the zipper take an estimated 4.1 million
+instructions per request against 3.8 million. The merge keeps both kernel families, so
+both costs are on the kept path. The filter profiles do not locate the added instructions,
+so row 1204 is on the kept path by default. The laptop carried other work, so the cycle
+profiles are not measurements.
 
 ### Execution mode of quick texts in fresh servers
 
