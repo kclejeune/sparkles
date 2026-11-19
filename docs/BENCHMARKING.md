@@ -1144,9 +1144,9 @@ executor. Small smoke workloads establish transport and correctness only. Publis
 numbers still come from the benchmark host.
 
 The batch query screen runs through `bench:remote` on a Boat worker, and it is the only
-screen of record. A small or contested effect is checked on an Intel host. Item 1133
-tracks a bias of a few percent that the Boat screen showed against the earlier Namespace
-screen of the same batches.
+screen of record. A small or contested effect is checked on an Intel host. The Boat and
+Namespace screens of the same two batches disagreed by about 10% in their geometric means,
+and item 1133 settles the difference on an Intel host.
 
 <a id="namespace-query-screens"></a>
 
@@ -1221,6 +1221,7 @@ with B. `build.txt` and `manifest.txt` name the host that built each binary, and
 is reused wherever it was built.
 
 ```sh
+worker=boat:bx_ID   # an admitted warm Boat worker
 mise run bench:remote --executor "$worker" --build-host "$worker" main my-branch      # 1.05M triples, every query
 mise run bench:remote --executor "$worker" --build-host "$worker" ba547b89 c2fe4b92 --queries "optional-count minus regex-iri"
 scripts/bench-remote.sh --executor "$worker" --build-host "$worker" --people 1000000 --rounds 4 main my-branch   # 10.5M triples
@@ -1268,6 +1269,8 @@ confirm a change of a few percent, and [Choosing a host](#choosing-a-host) says 
 measure those. Queries under 0.1 ms vary widely between server processes and say little
 on their own.
 
+<a id="namespace-write-screens"></a>
+
 ### Write screens
 
 `bench:remote-writes` runs `scripts/writes-remote.sh`, which hands its arguments to
@@ -1302,10 +1305,10 @@ F13 compare `--views none` with `async:N` to measure what views add to a commit.
 `commit:Q` and `graph:N` are reserved for commit-time and graph views and are refused
 until the server has them.
 
-`delay-us=4000` adds 4 ms to every synchronization and write-through write, which
-brings the ordinary writer down to the 230 transactions/s it reached on forge, on a
-machine whose synchronization takes a fraction of a millisecond and would otherwise hide
-the cost of a slow device. Measure reader tails on forge.
+`delay-us=4000` adds 4 ms to every synchronization and write-through write, so that a
+machine whose synchronization takes a fraction of a millisecond shows the cost of a slow
+device. Item 1134 calibrates the delay on the write screen's host. Measure reader tails on
+forge.
 
 `scripts/write-bench.rs` is the client of `scripts/nsc-writes.sh`. It sends each update
 as one request on a kept-alive connection and requires distinct, contiguous receipts.

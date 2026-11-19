@@ -819,7 +819,7 @@ time goes, and item 534 itself is performance work for a capable implementer on 
 
 Items 678, 512, 534 and 825 run at the same time with item 827 within the ownership
 boundaries above. Items 826 and 829 follow their predecessors in the order of work. No two
-phases run the Namespace screen of one commit at once.
+phases run the query screen of one commit at once.
 
 ## Decisions
 

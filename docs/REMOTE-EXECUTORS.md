@@ -247,8 +247,9 @@ range is refused before the worker is admitted. A cold build of both revisions t
 admitted lifetime must cover both builds, the screen and its reruns.
 
 Binaries that a Boat screen builds therefore differ from those built for another host,
-and timings from different providers or hosts are never compared. Item 1133 tracks a
-bias of a few percent between the Boat and Namespace screens of the same batches.
+and timings from different providers or hosts are never compared. The Boat and Namespace
+screens of the same two batches disagreed by about 10% in their geometric means, and item
+1133 settles the difference on an Intel host.
 
 The operator establishes actual native/cgroup/lease closure before supplying the fresh
 job-closure receipt. `boat:finish` validates that evidence and observes the guard's
