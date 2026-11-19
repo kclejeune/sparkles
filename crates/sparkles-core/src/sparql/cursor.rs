@@ -902,6 +902,7 @@ pub fn select_source_cursor(
         cursor,
         Some(QueryKind::Select),
         Some(source),
+        None,
     )
     .map(|(cursor, _, _)| cursor)
 }
@@ -913,7 +914,28 @@ fn open_pattern_cursor(
     cursor: &CursorOptions,
     expected: Option<QueryKind>,
 ) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
-    open_pattern_cursor_input(snapshot, query, options, cursor, expected, None)
+    open_pattern_cursor_input(snapshot, query, options, cursor, expected, None, None)
+}
+
+/// A SELECT cursor for an in-process SERVICE call, whose memory counts against its
+/// caller's query from its first charge as well as against its own limit.
+pub(super) fn call_cursor(
+    snapshot: Arc<Snapshot>,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    parent: sparkles_budget::ParentHandle,
+) -> Result<QueryCursor> {
+    open_pattern_cursor_input(
+        snapshot,
+        query,
+        options,
+        cursor,
+        Some(QueryKind::Select),
+        None,
+        Some(parent),
+    )
+    .map(|(cursor, _, _)| cursor)
 }
 
 fn open_pattern_cursor_input(
@@ -923,6 +945,7 @@ fn open_pattern_cursor_input(
     cursor: &CursorOptions,
     expected: Option<QueryKind>,
     source: Option<crate::store::BoundReadSource>,
+    parent: Option<sparkles_budget::ParentHandle>,
 ) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
     if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
         return Err(Error::invalid(
@@ -973,6 +996,7 @@ fn open_pattern_cursor_input(
                 None,
                 source,
                 bound_policy.as_ref(),
+                parent,
             )?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let levels = levels.max(prepared.plan_depth);

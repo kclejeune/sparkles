@@ -687,7 +687,7 @@ fn make_ctx_input(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<Ctx> {
-    make_ctx_input_policy(snap, opts, dataset, base, source, None)
+    make_ctx_input_policy(snap, opts, dataset, base, source, None, None)
 }
 
 // Only the application root which just prepared this policy supplies the override.
@@ -699,6 +699,7 @@ fn make_ctx_input_policy(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    parent: Option<sparkles_budget::ParentHandle>,
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
@@ -740,6 +741,11 @@ fn make_ctx_input_policy(
         .map(|spill| Arc::new(spill.query(opts.max_spill_bytes)));
     if ctx.read_source.is_none() {
         ctx.set_grant(opts.query_grant());
+    }
+    // an in-process SERVICE call charges its caller's query too, from its first charge,
+    // once its grant is set
+    if let Some(parent) = parent {
+        ctx.set_memory_parent(parent)?;
     }
     if let Some(m) = opts.max_rows_produced {
         ctx.max_rows_produced = m;
@@ -1485,7 +1491,16 @@ fn prepare_query_input(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<PreparedQuery> {
-    prepare_query_input_policy(snap, parsed, opts, cursor_started, automatic, source, None)
+    prepare_query_input_policy(
+        snap,
+        parsed,
+        opts,
+        cursor_started,
+        automatic,
+        source,
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1497,6 +1512,7 @@ fn prepare_query_input_policy(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    parent: Option<sparkles_budget::ParentHandle>,
 ) -> Result<PreparedQuery> {
     let (_, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
@@ -1508,6 +1524,7 @@ fn prepare_query_input_policy(
         base,
         source,
         prepared_policy,
+        parent,
     )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;

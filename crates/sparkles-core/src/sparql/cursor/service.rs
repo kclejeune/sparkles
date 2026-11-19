@@ -224,13 +224,19 @@ impl Service {
                 fallback: self.fallback.at_pull(ctx),
                 ..options.clone()
             };
-            let execution = super::query_cursor(call.snap, &self.query, &call.options, &cursor)?;
-            let super::QueryExecution::Select(cursor) = execution else {
-                return Err(Error::Service(format!(
-                    "SERVICE <{}> did not answer with solutions",
-                    url.as_str()
-                )));
-            };
+            // the callee's memory counts against this query's too
+            let parent = ctx.memory_parent()?;
+            let cursor = super::call_cursor(call.snap, &self.query, &call.options, &cursor, parent)
+                .map(Box::new)
+                .map_err(|e| match e {
+                    Error::Unsupported(m) if m.starts_with("a Select cursor requires") => {
+                        Error::Service(format!(
+                            "SERVICE <{}> did not answer with solutions",
+                            url.as_str()
+                        ))
+                    }
+                    e => e,
+                })?;
             self.source = Some(Source::Local {
                 cursor,
                 batch: None,

@@ -958,3 +958,40 @@ fn a_large_literal_is_charged_while_the_parser_reads_it() {
         "{r:?}"
     );
 }
+
+/// An in-process call's memory counts against its caller's query. A callee that sorts
+/// its answer holds every row of it, and the caller's peak includes that state, as the
+/// caller's limit then does.
+#[test]
+fn an_in_process_call_charges_its_callers_query() {
+    let s = store();
+    let remote = Store::in_memory(StoreOptions::default());
+    let mut nt = String::new();
+    for i in 0..20_000 {
+        nt.push_str(&format!(
+            "<urn:s:{i}> <urn:p> \"a long enough literal value number {i:08}\" .\n"
+        ));
+    }
+    remote
+        .load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::Turtle, None)])
+        .unwrap();
+    let snap = s.snapshot();
+    let o = QueryOptions {
+        local_endpoints: Some(Arc::new(Local(remote.snapshot(), Arc::new(())))),
+        ..opts()
+    };
+    let inner = "SELECT ?s ?o { ?s <urn:p> ?o } ORDER BY DESC(?o)";
+    let mut callee = select_cursor(remote.snapshot(), inner, &o, &strict(64)).unwrap();
+    let mut n = 0;
+    while let Some(b) = callee.next_batch().unwrap() {
+        n += b.len();
+    }
+    assert_eq!(n, 20_000);
+    let alone = callee.stats().mem_peak_bytes;
+    drop(callee);
+    let q = format!("SELECT ?s ?o {{ SERVICE <http://local/sparql> {{ {inner} }} }}");
+    let mut cursor = select_cursor(snap.clone(), &q, &o, &strict(64)).unwrap();
+    assert_eq!(cursor.next_batch().unwrap().unwrap().len(), 64);
+    let peak = cursor.stats().mem_peak_bytes;
+    assert!(peak >= alone / 2, "caller {peak}, callee alone {alone}");
+}
