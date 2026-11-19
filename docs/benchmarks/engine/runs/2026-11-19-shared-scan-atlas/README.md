@@ -13,7 +13,8 @@ under automatic execution on atlas, `export-500k` 2.9% and 3.1%, and the LIMIT o
 the shared batch, in the weak handle the scan made on its block and dropped again at each
 batch, and in taking the block back at each read. Item 1063 changes the shared path so that
 a scan keeps no weak handle on a block it shares and reads it in place, and takes the
-block back from the shared batch only when it switches to owned rows inside the block.
+block back from the shared batch only when it switches to owned rows inside the block or
+a batch declines the shared path.
 This run asks how much of the cost the change recovers.
 
 ## Builds
@@ -46,6 +47,7 @@ Every run returned the same answers from both arms, which each summary states. A
 copied files to atlas and ran a 0.1 s test outside the lock during rounds 3 and 4 of
 `summary-pre-small-streaming-ab.md`. Without those two rounds, `root-scan` reads 1.0240,
 1.0208 to 1.0276, and `root-limit` 1.0314, 1.0026 to 1.0674, so they change no verdict.
+`pre-small-streaming-without-rounds-3-4-intel.md` holds that combination.
 
 ## Results
 
@@ -64,18 +66,22 @@ added time.
 The change is faster than `main` on every named query in both modes. Against `pre`,
 `root-limit` passes on its added time, `root-scan` passes under automatic execution and
 `export-500k` stays within 1%, but `root-scan` under streaming fails the rule at 1.024.
-The remainder is about 2 µs under streaming and 1 µs under automatic execution on both
-`root-scan` and `export-500k`, although the export reads about four times as many blocks,
-so it does not grow with the blocks a scan enters.
+Under the rule's own noise test, a 95% interval that reaches 1.0 or an added time of at
+most 0.5 µs, the costs that remain are `root-scan` under both modes and `export-500k` under
+streaming. The remainder is about 2 µs under streaming and 1 µs under automatic execution
+on both `root-scan` and `export-500k`, although the export reads more blocks. That reads
+like a cost per request rather than per block, but two queries do not settle it.
 
 Among the controls, `distinct-obj` and `predicate-counts` read 1.062 and 1.050 against
 `main` under streaming, 0.30 and 0.31 µs, and 0.976 and 0.986 under automatic execution.
 Their plans run an eager subplan under the cursor, and a profile of `distinct-obj` on
 stanley shows no sample in the scan code that the change touches, so the difference is
 not attributed to it. Against `pre`, `path-plus` under automatic execution reads 1.145,
-1.43 µs, and `subquery-agg` 1.013, 2.41 µs. Both are flat against `main`, and item 1039's
-own comparison with `pre` read `path-plus` 0.944 and `subquery-agg` 1.007 under automatic
-execution, so these costs come from the other merges of batches 30 to 32.
+1.43 µs, and `subquery-agg` 1.013, 2.41 µs, and 1.006, 1.14 µs, under streaming. All three
+are flat against `main`. Item 1039's own comparison on atlas, of `9acd6d74` with the tip of
+that item, read `path-plus` 0.944 and `subquery-agg` 1.007 under automatic execution and
+`subquery-agg` 1.000 under streaming. Most of these costs therefore come from the other
+merges of batches 30 to 32. The `distinct-obj` classifications are in `profile/`.
 
 ## Profile of the scan
 
@@ -90,14 +96,15 @@ most samples and varies with the host's load, so the table divides the scan's sa
 outside `block_passes` by those in `block_passes`, whose code and work the three builds
 share.
 
-| Build | Pass 1 | Pass 2 | Pass 3 | Pass 4 | Sum of samples |
+| Build | Pass 1 | Pass 2 | Pass 3 | Pass 4 | Samples outside `block_passes` |
 |---|--:|--:|--:|--:|--:|
 | `pre` | 0.642 | 0.465 | 0.432 | 0.370 | 3,515 |
-| `main` | 0.813 | 0.588 | 0.498 | 0.455 | 4,359 |
-| `fix` | 0.558 | 0.550 | 0.369 | 0.439 | 3,403 |
+| `main` | 0.813 | 0.588 | 0.498 | 0.455 | 4,393 |
+| `fix` | 0.558 | 0.550 | 0.369 | 0.439 | 3,409 |
 
 `main` is above `pre` in every pass, and `fix` is above `pre` in two passes and below it
 in two. The leaves that item 1039 added, such as `Block::downgrade`, the drop of the weak
 handle and the extra work of the shared batch, are gone or smaller in `fix`. On stanley, the
-scan therefore costs what it cost before item 1039. The profile does not reproduce the
+scan's cost in `fix` is within the spread of the passes around its cost in `pre`, and the
+profile does not resolve a smaller difference. The profile does not reproduce the
 remainder that atlas measures, and the cause of that remainder is open.

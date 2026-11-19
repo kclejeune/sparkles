@@ -183,8 +183,9 @@ is `4e9185f1`.
 
 *Measured on atlas.*
 
-`root-scan` under streaming takes 2 µs longer than the base, and roadmap item 1063 holds
-that remainder. The other cells pass the Intel rule or stay within 1%. The current build is
+`root-scan` under streaming takes 2 µs longer than the base and fails the Intel rule. It
+and the smaller costs of automatic `root-scan` and streaming `export-500k`, whose intervals
+lie above 1.0, are the remainder that roadmap item 1063 holds. The current build is
 1.6% to 3.5% faster than the build before item 1063 on each of these cells. The
 [run record](runs/2026-11-19-shared-scan-atlas/README.md) has the method, the controls and
 a cycle profile of the scan.
