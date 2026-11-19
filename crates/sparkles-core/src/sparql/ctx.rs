@@ -245,8 +245,8 @@ const FLOOR_TABLE_EVICTIONS: usize = 32;
 ///
 /// The first table has [`FLOOR_TABLE_FIRST`] slots, or fewer when the vocabulary has
 /// fewer strings or the cap allows less. A mask asks before each part of its rows whether
-/// the table should grow ([`Ctx::grow_floor_cache`]), which it does when the floors it
-/// evicted that had been read again pass [`FLOOR_TABLE_EVICTIONS`]. A query whose strings
+/// the table should grow ([`Ctx::grow_floor_cache`]), which it does when its estimate of
+/// the floors it evicted that had been read again passes [`FLOOR_TABLE_EVICTIONS`]. A query whose strings
 /// rarely repeat, whose evictions cost nothing, therefore keeps its first table. The new
 /// table is [`FLOOR_TABLE_GROWTH`] times larger and takes the floors of the old one as
 /// they are read. Each table is charged to the query before it is allocated, through a
@@ -301,7 +301,9 @@ pub(super) struct FloorTable {
     shift: u32,
     /// the distance that marks an id that is not a simple literal
     none: u64,
-    /// the floors evicted that had been read again, counted by the maps that end
+    /// an estimate of the floors evicted that had been read again, counted by the maps
+    /// that end against the word each read before its store, which another worker may
+    /// have replaced in between
     evicted: std::sync::atomic::AtomicUsize,
 }
 
@@ -325,10 +327,17 @@ impl FloorTable {
         }
     }
 
-    /// The bytes of a table of `slots`.
+    /// The bytes of a table of `slots`: its words, the table and the shared counts of
+    /// its `Arc`.
     fn bytes(slots: usize) -> u64 {
-        (slots as u64).saturating_mul(8)
+        (slots as u64)
+            .saturating_mul(8)
+            .saturating_add(Self::OVERHEAD)
     }
+
+    /// The bytes of a table besides its words.
+    pub(super) const OVERHEAD: u64 =
+        (std::mem::size_of::<FloorTable>() + 2 * std::mem::size_of::<usize>()) as u64;
 
     fn len(&self) -> usize {
         self.slots.len()
@@ -411,6 +420,12 @@ impl FloorCache {
     #[cfg(test)]
     pub(super) fn entries(&self) -> usize {
         self.tables.lock().cur.as_ref().map_or(0, |t| t.entries())
+    }
+
+    /// The bytes of every table allocated.
+    #[cfg(test)]
+    pub(super) fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
     }
 
     /// The slots of its current table.
@@ -3420,8 +3435,9 @@ impl Ctx {
     /// Make a table of at most `slots` the floor cache's current one, charged first, with
     /// the current table kept for reading. The slots are no more than the vocabulary's
     /// strings need, since past that no two ids share a slot, and no more than the cap
-    /// holds. A cap that allows fewer than [`FLOOR_TABLE_FEWEST`] slots, a refused charge
-    /// or one past the cap leaves the cache full.
+    /// holds. A cap that allows fewer than [`FLOOR_TABLE_FEWEST`] slots leaves the cache
+    /// full, unless the vocabulary's strings need no more than the cap allows, and so does
+    /// a refused charge or one past the cap.
     #[cold]
     #[inline(never)]
     fn install_floor_table(&self, tables: &mut FloorTables, slots: usize) {
@@ -3432,8 +3448,9 @@ impl Ctx {
             .unwrap_or(usize::MAX)
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX);
-        let room = usize::try_from(cap / 8).unwrap_or(usize::MAX);
-        // the largest power of two the cap's words allow
+        let room =
+            usize::try_from(cap.saturating_sub(FloorTable::OVERHEAD) / 8).unwrap_or(usize::MAX);
+        // the largest power of two of words that fits the cap with the table's overhead
         let room = if room == 0 { 0 } else { 1 << room.ilog2() };
         let wanted = slots.min(most);
         if room < wanted && room < FLOOR_TABLE_FEWEST {
@@ -4872,6 +4889,38 @@ mod charge_tests {
         assert!(t.put(q, Some(q), false));
         assert_eq!(t.get(q), Some(Some(q)));
         assert_eq!(t.entries(), 1);
+        // a hit's store of its read bit that lands after another id's store puts back the
+        // first id's word, which is still that id's floor
+        let a = p;
+        let b = p - 16;
+        assert!(t.put(a, Some(a - 5), false));
+        let seen = t.slot(a).load(Ordering::Relaxed);
+        assert!(t.put(b, Some(b - 7), false));
+        t.slot(a).store(seen | 1, Ordering::Relaxed);
+        assert_eq!(t.get(a), Some(Some(a - 5)));
+        assert_eq!(t.get(b), None);
+        // the widest ids keep a distance of at least two bits in any table, and a floor
+        // read from one table is kept by a larger one with wider distances
+        let top = (1u64 << crate::id::PAYLOAD_BITS) - 1;
+        for log in [0, 1, 4, 10, 16, 23] {
+            let t = FloorTable::new(1 << log, top);
+            assert!(t.none >= 3, "{log}");
+            let p = top - 1;
+            assert!(t.put(p, Some(p - 2), true));
+            assert_eq!(t.get(p), Some(Some(p - 2)), "{log}");
+            assert!(t.put(p, None, false));
+            assert_eq!(t.get(p), Some(None), "{log}");
+        }
+        let (small, large) = (
+            FloorTable::new(16, first_triple),
+            FloorTable::new(1 << 20, first_triple),
+        );
+        assert!(large.none > small.none);
+        let far = small.none - 1;
+        assert!(small.put(p, Some(p - far), false));
+        let floor = small.get(p).unwrap();
+        assert!(large.put(p, floor, true));
+        assert_eq!(large.get(p), Some(Some(p - far)));
         // a small vocabulary leaves the top part one bit, as every id is below the slots
         let t = FloorTable::new(1 << 10, 1000);
         assert_eq!(t.none, (1 << 62) - 1);

@@ -10665,6 +10665,18 @@ mod string_order_tests {
                     let cache = ctx.floor_cache();
                     let cap = (64u64 << 20).min(mem_limit / 16);
                     assert!(cache.reserved() <= cap, "{mem_limit} cursor {cursor}");
+                    // every table allocated, each with its overhead, is charged
+                    assert!(
+                        cache.reserved() >= cache.used(),
+                        "{mem_limit} cursor {cursor}"
+                    );
+                    let tables: u64 = if roomy { 4 } else { 3 };
+                    let words: u64 = [64u64, 512, 4096, 8192][..tables as usize].iter().sum();
+                    assert_eq!(
+                        cache.used(),
+                        8 * words + tables * super::super::ctx::FloorTable::OVERHEAD,
+                        "{mem_limit} cursor {cursor}"
+                    );
                     assert!(cache.reserved() > 0, "{mem_limit} cursor {cursor}");
                     assert!(
                         ctx.memory_room() + cache.reserved() <= room,
