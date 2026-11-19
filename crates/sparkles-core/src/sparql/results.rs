@@ -228,6 +228,7 @@ impl<W: Write> Write for LimitedWriter<W> {
     }
 }
 
+mod encode;
 mod rowout;
 mod source;
 mod writers;

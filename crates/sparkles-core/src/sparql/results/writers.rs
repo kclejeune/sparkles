@@ -1,6 +1,8 @@
 //! One writer per result format family over the sources of [`super::source`], and the
 //! entry that every caller writes a result through.
 
+use super::encode::Tsv;
+use super::rowout::Explicit;
 use super::source::{
     BatchVisitor, CursorGraph, CursorSolutions, EagerGraph, EagerMode, EagerSolutions, GraphSource,
     NativeGraphLayout, RowBatch, RowView, SolutionSource, Statement, StatementVisitor,
@@ -234,6 +236,18 @@ fn select<S: SolutionSource>(
         }
         return Ok(());
     }
+    if fmt == SolutionsFormat::Tsv {
+        let width = source.variables().len();
+        let mut out = Explicit::new(out);
+        Tsv::header(&mut out, source.variables()).map_err(io)?;
+        let mut rows = EncodedRows {
+            out,
+            width,
+            flush: S::FLUSH_FIRST,
+            row: Tsv::row,
+        };
+        return source.drive(send, &mut rows);
+    }
     let vars: Vec<Variable> = source
         .variables()
         .iter()
@@ -266,6 +280,33 @@ fn select<S: SolutionSource>(
         rows.serializer.finish().map_err(io)?;
     }
     Ok(())
+}
+
+/// The rows of a format the engine encodes, each marked in the explicit mode.
+struct EncodedRows<'o, 'a, R> {
+    out: Explicit<'o, 'a>,
+    width: usize,
+    /// flush after the first batch
+    flush: bool,
+    row: R,
+}
+
+impl<R> BatchVisitor for EncodedRows<'_, '_, R>
+where
+    R: Fn(&mut Explicit<'_, '_>, RowView<'_>, usize) -> std::io::Result<()>,
+{
+    fn batch<B: RowBatch>(&mut self, batch: &mut B) -> Result<()> {
+        for i in 0..batch.len() {
+            let row = batch.row(i)?;
+            self.out.begin_row()?;
+            (self.row)(&mut self.out, row, self.width).map_err(io)?;
+            self.out.end_row(1);
+        }
+        if std::mem::take(&mut self.flush) {
+            self.out.flush().map_err(io)?;
+        }
+        Ok(())
+    }
 }
 
 struct SelectRows<'v, W: Write, F> {

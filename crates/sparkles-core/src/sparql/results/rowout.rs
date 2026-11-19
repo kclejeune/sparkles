@@ -347,7 +347,6 @@ impl<'a> RowOut<'a> {
 
     /// Explicit mode: make room for the next row's mark, before any of its bytes, so that
     /// a refused growth fails before the row starts and [`RowOut::end_row`] cannot fail.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn begin_row(&mut self) -> Result<()> {
         if self.marks.len() < self.marks.capacity() {
             return Ok(());
@@ -358,7 +357,6 @@ impl<'a> RowOut<'a> {
 
     /// Explicit mode: `n` rows end here, `n` greater than one for a writer that counts
     /// several statements at once. It never allocates or fails.
-    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     pub(crate) fn end_row(&mut self, n: u64) {
         self.push_mark(n);
@@ -485,14 +483,23 @@ impl Drop for RowOut<'_> {
     }
 }
 
+impl RowOut<'_> {
+    /// Collect `b` without looking at the staged counter.
+    #[inline(always)]
+    fn put(&mut self, b: &[u8]) -> std::io::Result<()> {
+        if b.len() > self.buf.capacity() - self.buf.len() {
+            return self.write_full(b).map(|_| ());
+        }
+        self.buf.extend_from_slice(b);
+        Ok(())
+    }
+}
+
 impl Write for RowOut<'_> {
     #[inline(always)]
     fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
         self.note()?;
-        if b.len() > self.buf.capacity() - self.buf.len() {
-            return self.write_full(b);
-        }
-        self.buf.extend_from_slice(b);
+        self.put(b)?;
         Ok(b.len())
     }
 
@@ -505,6 +512,53 @@ impl Write for RowOut<'_> {
         self.note()?;
         self.drain()?;
         self.inner.flush()
+    }
+}
+
+/// A [`RowOut`] in the explicit mode, for a writer of the engine's own that marks each
+/// row's start and end. Its writes skip the staged counter that a foreign serializer's
+/// writes look at, so a byte costs only its copy into the buffer. Nothing may count rows in
+/// the staged counter while a row is open through this handle.
+pub(crate) struct Explicit<'o, 'a>(&'o mut RowOut<'a>);
+
+impl<'o, 'a> Explicit<'o, 'a> {
+    pub(crate) fn new(out: &'o mut RowOut<'a>) -> Self {
+        Explicit(out)
+    }
+
+    /// See [`RowOut::begin_row`].
+    #[inline]
+    pub(crate) fn begin_row(&mut self) -> Result<()> {
+        self.0.begin_row()
+    }
+
+    /// See [`RowOut::end_row`].
+    #[inline]
+    pub(crate) fn end_row(&mut self, n: u64) {
+        self.0.end_row(n)
+    }
+
+    #[inline(always)]
+    pub(crate) fn put(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.0.put(b)
+    }
+}
+
+impl Write for Explicit<'_, '_> {
+    #[inline(always)]
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.put(b)?;
+        Ok(b.len())
+    }
+
+    #[inline(always)]
+    fn write_all(&mut self, b: &[u8]) -> std::io::Result<()> {
+        self.0.put(b)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.drain()?;
+        self.0.inner.flush()
     }
 }
 
