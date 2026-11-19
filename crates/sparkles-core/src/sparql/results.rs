@@ -293,10 +293,9 @@ impl RowCharge {
     }
 }
 
-/// Consume SELECT batches directly, applying writer backpressure before requesting
-/// the next batch. A later error leaves partial bytes and no success terminator.
 /// A writer that a serializer writes to while the code around it keeps a way to flush
-/// it, which the cursor writers use after their first batch.
+/// it, which the cursor graph writers use after their first batch. The SPARQL result
+/// formats are written by the engine's encoders, which flush the explicit writer itself.
 pub(in crate::sparql) struct Shared<'a, W>(pub(in crate::sparql) &'a std::cell::RefCell<W>);
 
 impl<W: Write> Write for Shared<'_, W> {

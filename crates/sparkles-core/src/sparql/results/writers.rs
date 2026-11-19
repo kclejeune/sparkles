@@ -14,9 +14,8 @@ use super::{
 use crate::error::{Error, Result};
 use crate::jena_formats::{JenaFormat, ThriftResults};
 use crate::sparql::{CursorStats, GraphCursor, QueryCursor, QueryKind, QueryResult};
-use oxrdf::Variable;
 use oxrdfio::RdfFormat;
-use sparesults::{QueryResultsFormat, QueryResultsSerializer, WriterSolutionsSerializer};
+use sparesults::{QueryResultsFormat, QueryResultsSerializer};
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::time::Instant;
@@ -112,8 +111,8 @@ pub fn write(
                 r,
                 mode: EagerMode::Chunks,
             };
-            solutions(&mut source, writer, rows, |s, out, staged| {
-                select(s, fmt, out, staged, send)
+            solutions(&mut source, writer, rows, |s, out, _| {
+                select(s, fmt, out, send)
             })
         }
         // a complete graph result is written whole in the RDF and Jena formats
@@ -154,8 +153,8 @@ pub fn write(
                     native(s, out, staged, send, metadata)
                 })
             } else {
-                solutions(&mut source, writer, rows, |s, out, staged| {
-                    select(s, fmt, out, staged, send)
+                solutions(&mut source, writer, rows, |s, out, _| {
+                    select(s, fmt, out, send)
                 })
             }
         }
@@ -206,95 +205,61 @@ fn solutions<S: SolutionSource>(
     }
 }
 
-/// The SPARQL result formats, through sparesults, from either source. ASK in CSV and TSV
-/// is written as Jena writes it, a column `_askResult` that its clients read.
+/// The SPARQL result formats, from either source, a SELECT through the engine's encoders
+/// and an ASK through sparesults. ASK in CSV and TSV is written as Jena writes it, a column
+/// `_askResult` that its clients read.
 fn select<S: SolutionSource>(
     source: &mut S,
     fmt: SolutionsFormat,
     out: &mut RowOut<'_>,
-    staged: &Cell<u64>,
     send: Option<usize>,
 ) -> Result<()> {
     source.start()?;
-    let format = match fmt {
-        SolutionsFormat::Json => QueryResultsFormat::Json,
-        SolutionsFormat::Xml => QueryResultsFormat::Xml,
-        SolutionsFormat::Csv => QueryResultsFormat::Csv,
-        SolutionsFormat::Tsv => QueryResultsFormat::Tsv,
-        SolutionsFormat::Sparkles => unreachable!("the native document has its own writer"),
-    };
-    let serializer = QueryResultsSerializer::from_format(format);
     if let Some(boolean) = source.boolean() {
         match fmt {
             SolutionsFormat::Csv => write!(out, "_askResult\r\n{boolean}\r\n").map_err(io)?,
             SolutionsFormat::Tsv => write!(out, "?_askResult\n{boolean}\n").map_err(io)?,
-            _ => {
-                serializer
+            SolutionsFormat::Json | SolutionsFormat::Xml => {
+                let format = if fmt == SolutionsFormat::Json {
+                    QueryResultsFormat::Json
+                } else {
+                    QueryResultsFormat::Xml
+                };
+                QueryResultsSerializer::from_format(format)
                     .serialize_boolean_to_writer(out, boolean)
                     .map_err(io)?;
             }
+            SolutionsFormat::Sparkles => unreachable!("the native document has its own writer"),
         }
         return Ok(());
     }
     match fmt {
-        SolutionsFormat::Tsv => return encoded(source, out, send, Tsv::header, Tsv::row, None),
-        SolutionsFormat::Csv => return encoded(source, out, send, Csv::header, Csv::row, None),
+        SolutionsFormat::Tsv => encoded(source, out, send, Tsv::header, Tsv::row, None),
+        SolutionsFormat::Csv => encoded(source, out, send, Csv::header, Csv::row, None),
         SolutionsFormat::Json => {
             let mut json = Json::new(out.ctx(), source.variables())?;
-            return encoded(
+            encoded(
                 source,
                 out,
                 send,
                 Json::header,
                 |out: &mut Explicit<'_, '_>, row: RowView<'_>, width| json.row(out, row, width),
                 Some(Json::footer),
-            );
+            )
         }
         SolutionsFormat::Xml => {
             let mut xml = Xml::new(out.ctx(), source.variables())?;
-            return encoded(
+            encoded(
                 source,
                 out,
                 send,
                 Xml::header,
                 |out: &mut Explicit<'_, '_>, row: RowView<'_>, width| xml.row(out, row, width),
                 Some(Xml::footer),
-            );
+            )
         }
-        _ => {}
+        SolutionsFormat::Sparkles => unreachable!("the native document has its own writer"),
     }
-    let vars: Vec<Variable> = source
-        .variables()
-        .iter()
-        .map(|v| Variable::new_unchecked(v.clone()))
-        .collect();
-    if S::FLUSH_FIRST {
-        // the serializer holds the writer, and the first batch's flush goes past it
-        let shared = RefCell::new(out);
-        let mut writer = Shared(&shared);
-        let mut rows = SelectRows {
-            serializer: serializer
-                .serialize_solutions_to_writer(&mut writer, vars.clone())
-                .map_err(io)?,
-            vars: &vars,
-            staged,
-            flush: Some(|| shared.borrow_mut().flush()),
-        };
-        source.drive(send, &mut rows)?;
-        rows.serializer.finish().map_err(io)?;
-    } else {
-        let mut rows = SelectRows {
-            serializer: serializer
-                .serialize_solutions_to_writer(out, vars.clone())
-                .map_err(io)?,
-            vars: &vars,
-            staged,
-            flush: None::<fn() -> std::io::Result<()>>,
-        };
-        source.drive(send, &mut rows)?;
-        rows.serializer.finish().map_err(io)?;
-    }
-    Ok(())
 }
 
 /// A SELECT in a format the engine encodes, its header, its rows, each marked in the
@@ -349,41 +314,6 @@ where
         }
         if std::mem::take(&mut self.flush) {
             self.out.flush().map_err(io)?;
-        }
-        Ok(())
-    }
-}
-
-struct SelectRows<'v, W: Write, F> {
-    serializer: WriterSolutionsSerializer<W>,
-    vars: &'v [Variable],
-    staged: &'v Cell<u64>,
-    /// the flush after the first batch
-    flush: Option<F>,
-}
-
-impl<W: Write, F: FnOnce() -> std::io::Result<()>> BatchVisitor for SelectRows<'_, W, F> {
-    fn batch<B: RowBatch>(&mut self, batch: &mut B) -> Result<()> {
-        let vars = self.vars;
-        for i in 0..batch.len() {
-            match batch.row(i)? {
-                RowView::Dense(terms) => {
-                    self.serializer
-                        .serialize(terms.iter().enumerate().filter_map(|(c, term)| {
-                            term.as_ref().map(|t| (vars[c].as_ref(), t.as_ref()))
-                        }))
-                }
-                RowView::Sparse(terms) => self.serializer.serialize(
-                    terms
-                        .iter()
-                        .map(|(c, term)| (vars[*c].as_ref(), term.as_ref().as_ref())),
-                ),
-            }
-            .map_err(io)?;
-            self.staged.set(self.staged.get() + 1);
-        }
-        if let Some(flush) = self.flush.take() {
-            flush().map_err(io)?;
         }
         Ok(())
     }
