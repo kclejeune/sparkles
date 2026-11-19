@@ -1676,12 +1676,21 @@ fn late_streamed_byte_budget_aborts_and_reports_the_rows_sent() {
 /// A body cut by `--max-result-mb` while its reader has stopped reading cannot send the
 /// chunk it had buffered, because the idle timer ends the transfer first. The rows logged
 /// are the rows whose ends lie in the bytes the transport accepted, which leaves out the
-/// rows of that unsent chunk (item 243).
+/// rows of that unsent chunk (item 243). Short rows end many to a piece of the writer's
+/// buffer. Rows longer than the buffer go to the transport as direct writes, which are
+/// copied into its buffer in parts, and rows longer than a chunk end in a later chunk
+/// than the one they start in.
 #[test]
 fn a_failed_budget_flush_reports_only_the_rows_sent() {
-    const ROWS: usize = 5000;
-    let data = (0..ROWS)
-        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(512)))
+    let chunk = super::stream::CHUNK;
+    for (rows, len) in [(5000, 512), (120, 20 << 10), (40, chunk + chunk / 8)] {
+        failed_budget_flush_case(rows, len);
+    }
+}
+
+fn failed_budget_flush_case(rows: usize, len: usize) {
+    let data = (0..rows)
+        .map(|i| format!("<urn:big:{i}> <urn:big> \"{}\" .\n", "x".repeat(len)))
         .collect::<String>();
     let load = |s: &Server| {
         s.state
@@ -1738,7 +1747,7 @@ fn a_failed_budget_flush_reports_only_the_rows_sent() {
                 .oneshot(Request::get(uri).body(Body::empty()).unwrap())
                 .await
                 .unwrap();
-            assert_eq!(res.status(), StatusCode::OK, "{execution}");
+            assert_eq!(res.status(), StatusCode::OK, "{execution} {len}");
             // the idle timer ends the transfer while the budget flush waits for room
             tokio::time::sleep(Duration::from_millis(1500)).await;
             drop(res);
@@ -1746,18 +1755,18 @@ fn a_failed_budget_flush_reports_only_the_rows_sent() {
         .into_iter()
         .filter(|l| l.contains(r#""route":"/{ds}/sparql""#))
         .collect::<Vec<_>>();
-        assert_eq!(lines.len(), 1, "{execution}: {lines:#?}");
+        assert_eq!(lines.len(), 1, "{execution} {len}: {lines:#?}");
         let j: J = serde_json::from_str(&lines[0]).unwrap();
         let f = &j["fields"];
-        assert_eq!(f["outcome"], "budget", "{execution}: {f}");
+        assert_eq!(f["outcome"], "budget", "{execution} {len}: {f}");
         let bytes = f["response_bytes"].as_u64().unwrap() as usize;
-        assert!(bytes < whole.len(), "{execution}: {f}");
+        assert!(bytes < whole.len(), "{execution} {len}: {f}");
         // every whole line after the header within the bytes the transport accepted
         let lines = whole[..bytes].iter().filter(|&&b| b == b'\n').count() as u64;
         assert_eq!(
             f["rows"].as_u64(),
             Some(lines - 1),
-            "{execution}: the rows logged are the rows in the {bytes} bytes sent: {f}"
+            "{execution} {len}: the rows logged are the rows in the {bytes} bytes sent: {f}"
         );
     }
 }

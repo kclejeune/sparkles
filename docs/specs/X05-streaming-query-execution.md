@@ -1832,7 +1832,8 @@ whose bytes reached the response, so a streamed body that stopped partway report
 rows the response writer accepted, as an eager body does. A streamed body that the result-size budget stops after the
 response committed sends what it had buffered before it aborts the transfer, which only
 eager bodies did before. That send waits under the body's idle limit, and when it fails
-the report leaves out its bytes but still counts its rows. On the large answers at 1.05M
+the report leaves out its bytes and the rows that end in them, since item 243 counts a
+row only once the transport has handed over the bytes up to its end. On the large answers at 1.05M
 triples a streamed request runs 0.46 to 0.69 times the instructions it ran before, within
 2% of the eager request's count in native JSON or below it, and the
 [X14 Outcome](X14-unified-executor/SPEC.md#the-streamed-response-cost) gives the counts

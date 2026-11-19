@@ -1346,8 +1346,11 @@ partway, as they do for an eager one. A streamed body that the result-size budge
 after its first bytes now sends what it had buffered before it aborts, as an eager body
 already did, so the rows reported are the rows a client that keeps reading receives.
 That last send waits under the body's idle limit like any other, and when it fails the
-bytes reported leave out the unsent chunk while the row count still includes its rows,
-so the count is exact when the client keeps reading and otherwise within one chunk.
+bytes reported leave out the unsent chunk while the row count still included its rows,
+so the count was exact when the client kept reading and otherwise within one chunk.
+Roadmap item 243 made it exact in that case too. The writer records where each row
+ends, and the transport counts a row once a send that enqueued has handed over the bytes
+up to its end.
 
 Matched release builds of 8baa5686 and a016b7bd, both from wally, were counted on the
 laptop with the server on four performance cores, over two passes of 200 requests for
