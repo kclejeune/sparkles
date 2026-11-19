@@ -9063,8 +9063,9 @@ impl RemoteAnswer {
                         .map_err(|e| Self::failed(url.as_str(), e.into()))?;
                     if start.late && meter.strict {
                         return Err(Error::Service(format!(
-                            "<{}>: the response gives its results before the variables of its head, which a strict cursor cannot stream",
-                            url.as_str()
+                            "<{}>{}",
+                            url.as_str(),
+                            super::cursor::LATE_HEAD
                         )));
                     }
                     let base = (start.decided as u64).saturating_mul(super::svcread::head_factor());

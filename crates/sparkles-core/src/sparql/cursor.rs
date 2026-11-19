@@ -51,6 +51,11 @@ pub enum FallbackPolicy {
 /// other errors into values, as an EXISTS in an expression does, can tell it apart.
 pub(crate) const REFUSAL: &str = "cursor requires materialization at ";
 
+/// How the strict policy's refusal of a SERVICE response that gives its results before
+/// the variables of its head ends. The message begins with the endpoint's URL, so code
+/// that turns other errors into values tells it apart by this ending.
+pub(crate) const LATE_HEAD: &str = ": the response gives its results before the variables of its head, which a strict cursor cannot stream";
+
 impl FallbackPolicy {
     /// The policy for work an operator decides on at its first pull: the strict one when
     /// either the operator's or its query's cursor is strict. An EXISTS pattern's

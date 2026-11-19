@@ -836,8 +836,9 @@ struct MemoryFailure {
     failed: AtomicBool,
 }
 
-/// Only the supported resource outcomes become sticky. Arbitrary scalar/service
-/// errors keep their existing semantics; typed ownership errors never become UNDEF.
+/// Only the supported resource outcomes and the strict cursor policy's refusals become
+/// sticky. Other scalar and SERVICE errors keep their existing semantics, so a failed
+/// SERVICE inside an EXISTS is still false. Typed ownership errors never become UNDEF.
 #[derive(Clone)]
 enum ResourceRefusal {
     Budget(Budget),
@@ -853,11 +854,20 @@ enum ResourceRefusal {
     /// decides how to run at its first pull, such as an in-process SERVICE call inside
     /// an EXISTS. It fails the query, as the same refusal does outside an expression.
     Refused(String),
+    /// The strict cursor policy's refusal of a SERVICE response it cannot stream, such as
+    /// one that gives its results before its head. It keeps its SERVICE error.
+    ServiceRefused(String),
 }
 
 impl ResourceRefusal {
-    fn from_error(error: &Error) -> Option<Self> {
+    /// The refusal `error` records, if any. A SERVICE refusal is recognised only under
+    /// a strict cursor, the only policy that makes it, so that an endpoint's own error
+    /// text cannot make an ordinary failure sticky elsewhere.
+    fn from_error(error: &Error, strict: bool) -> Option<Self> {
         match error {
+            Error::Service(message) if strict && message.ends_with(super::cursor::LATE_HEAD) => {
+                Some(Self::ServiceRefused(message.clone()))
+            }
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
             Error::Cancelled => Some(Self::Cancelled),
             Error::Timeout => Some(Self::Timeout),
@@ -884,6 +894,7 @@ impl ResourceRefusal {
             Self::Cancelled => Error::Cancelled,
             Self::Timeout => Error::Timeout,
             Self::Refused(message) => Error::Unsupported(message),
+            Self::ServiceRefused(message) => Error::Service(message),
             Self::Parent {
                 component,
                 code,
@@ -1726,7 +1737,8 @@ impl Ctx {
         if self.memory_failure.failed.load(Ordering::Acquire) {
             return;
         }
-        if let Some(refusal) = ResourceRefusal::from_error(error) {
+        let strict = self.strict_cursor.load(Ordering::Relaxed);
+        if let Some(refusal) = ResourceRefusal::from_error(error, strict) {
             let failure = &self.memory_failure;
             failure.failure.lock().get_or_insert(refusal);
             failure.failed.store(true, Ordering::Release);

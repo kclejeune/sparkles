@@ -804,6 +804,64 @@ fn an_exists_over_an_in_process_call_keeps_the_strict_policy() {
     assert_eq!(auto(&snap, &nested, &o), eager(&snap, &nested, &o).unwrap());
 }
 
+/// The strict refusal of a response whose head comes late fails the query inside FILTER
+/// EXISTS and NOT EXISTS too, over the remote directly and through an in-process call,
+/// rather than reading as a false filter. A permissive cursor answers as eager does.
+#[test]
+fn a_late_head_refusal_inside_exists_fails_the_query() {
+    let s = store();
+    let snap = s.snapshot();
+    let late = Endpoint::start(Arc::new(|| {
+        (
+            200,
+            vec![Part::Bytes(
+                format!(
+                    r#"{{"results":{{"bindings":[{}]}},"head":{{"vars":["s","o"]}}}}"#,
+                    rows(10)
+                )
+                .into_bytes(),
+            )],
+        )
+    }));
+    let remote = Store::in_memory(StoreOptions::default());
+    remote
+        .load(&[Source::from_bytes(
+            b"<urn:x> <urn:p> 1 .\n".to_vec(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let o = QueryOptions {
+        local_endpoints: Some(Arc::new(Local(remote.snapshot(), Arc::new(())))),
+        ..opts()
+    };
+    let direct = format!("SERVICE <{}> {{ ?s ?p ?o }}", late.url);
+    let nested = format!(
+        "SERVICE <http://local/sparql> {{ ?x <urn:p> ?v SERVICE <{}> {{ ?s ?p ?o }} }}",
+        late.url
+    );
+    for inner in [&direct, &nested] {
+        for filter in ["EXISTS", "NOT EXISTS"] {
+            let q = format!("SELECT ?a {{ ?a <urn:b> ?w FILTER {filter} {{ {inner} }} }}");
+            let r = streamed(&snap, &q, &o, &strict(4));
+            assert!(
+                matches!(&r, Err(Error::Service(m)) if m.contains("before the variables of its head")),
+                "{filter} {inner}: {:?}",
+                r.map(|(rows, _)| rows)
+            );
+            let allow = CursorOptions {
+                fallback: FallbackPolicy::AllowMaterialization,
+                ..strict(4)
+            };
+            assert_eq!(
+                streamed(&snap, &q, &o, &allow).unwrap().0,
+                eager(&snap, &q, &o).unwrap(),
+                "{filter} {inner}"
+            );
+        }
+    }
+}
+
 /// The rows of a query under automatic admission and the default cursor policy.
 fn auto(snap: &Arc<Snapshot>, q: &str, o: &QueryOptions) -> Vec<Vec<Option<Term>>> {
     match query_execution(
