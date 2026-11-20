@@ -786,8 +786,9 @@ pair shows.
 ### Leaf cursors
 
 The first part of item 829 was compared with its base on forge alone, under the host's
-heavy lock. A is main at bccc5f7b and B is 9df856f3, whose engine code is the part-1 tip,
-both release builds made on stanley with the same compilers. The
+heavy lock. A is main at bccc5f7b and B is 9df856f3, the part-1 engine before a cursor
+returned the count on two variables to the eager kernel, both release builds made on
+stanley with the same compilers. The
 [run record](runs/2026-11-18-leaf-cursors-ab-forge-9df856f3/README.md) keeps the samples,
 answers, queries and scripts of every run. A first pass ran the 31-query matrix at 1.05M
 triples with one thread in eight rounds of A,B,B,A in each mode, and the text, geo and

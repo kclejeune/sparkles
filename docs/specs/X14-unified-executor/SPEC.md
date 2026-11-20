@@ -1192,12 +1192,14 @@ MiB eager and took the same time within 1 ms. An algorithm call over its group,
 over an edge pattern or over constants peaked within 1 MiB of eager and took within 1 ms of
 it. A streamed count over a join that eager counts from its pairs peaked at 0.3 MiB
 against 6.1 to 7.6 MiB eager. Over a filtered scan it took 6.0 ms against 6.3 ms, and on
-two shared variables it took 9.8 ms against 8.6 ms. Streaming trades that time for the
+two shared variables it took 9.8 ms against 8.6 ms, through the streamed join that a
+cursor no longer runs for that shape. Streaming trades that time for the
 memory, and automatic execution keeps such counts eager until the A/B of the item's
 plan admits them. A count of two scans on one variable from their key runs took 12.0 ms
 streamed against 6.1 ms eager.
 
-On forge at 1.05M triples with one thread, the part-1 tip, 9df856f3, was compared with
+On forge at 1.05M triples with one thread, 9df856f3, the part-1 tip before a cursor
+returned the count on two variables to the eager kernel, was compared with
 its base, bccc5f7b, in twelve rounds of A,B,B,A in both orders, and the tip's eager and
 streamed counts with each other in the same way. The streamed count on two shared
 variables took 1.81 times the eager count, 9.58 ms against 5.28 ms, and runs 2.26 times
