@@ -155,6 +155,22 @@ measurement. shoi-005 and shoi-027 then pass the bound and give their default an
 ontologies with keys or the universal property pass the bound. The repair that restores
 the selection is item 1220.
 
+Item 1229 contains a loss of rooted runs that count. With counting, an existential
+restriction into a singleton class has a successor term, and the context learns that the
+term names the individual only from the clause `x ≈ v` that the successor sends over the
+predecessor. Pred takes each clause that a successor sends with the restrictions that reach
+the successor when it arrives, and keeps it, while a new unit existential restriction took
+no Pred with the clauses its successor had already sent. The successor sends them again
+over the new backward link, and the context drops them as clauses it has taken. A context
+that reached a successor by one restriction and derived a second restriction into it after
+further rounds therefore never read its own facts about the individual over the second
+role, and could report itself complete without an entailed subsumption. A rooted run that
+counts now passes its bound on derived conclusions when such a restriction arrives, so the
+run classifies again without counting, leaves the axioms that need counting out and sets
+`Stats::dl_counting_over`. `SPARKLES_ROOTED_LATE_UNIT=0` turns the containment off and `=2`
+gives the new restriction Pred with the clauses its successor already sent, the repair
+that item 1229 proves before it replaces the containment.
+
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
 is the calculus's own at-most clause with the neighbours in its body, an exact
