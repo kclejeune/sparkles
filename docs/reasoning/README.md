@@ -43,6 +43,15 @@ request or on every write, and the schema report counts what the data holds.
   is not monotonic, or one that reads lists and builds them in a rule head, evaluates
   every rule as a join. A run whose rules read lists and derive list facts through a
   property, such as a subproperty of `rdf:first`, starts again without the operators.
+* Query-time reasoning closes the adorned copies of transitive rules and of `prp-trp`
+  with the same operators. A copy whose demand binds the subject walks forward from the
+  values its magic facts ask for, one that binds the object walks backward, and one that
+  binds neither closes the whole relation once it is asked for. Each operator emits the
+  copy's own fixpoint, so a query derives the facts the joins would derive. A query run
+  that derives list cells its rules read starts again without the operators, and the
+  query's later derivations use joins. Explanations, the compact strategy of small
+  graphs and lowered rule programs that read lists again evaluate the rules as joins,
+  and `SPARKLES_DEMAND_CLOSURES=0` turns the operators off.
 * A rule body of three or more atoms is ordered from sampled bindings where that is
   clearly cheaper than the order the statistics give. The planner follows up to 16
   bindings through the facts the plan reads and counts each atom's candidates under
@@ -909,8 +918,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 517. It leaves out `eq-ref`, `dt-type2`, `dt-eq` and `dt-diff`. Roadmap
   item 518. Its rule tests follow the Profiles tables rather than the OWL 2 test cases.
   Roadmap item 520.
-* Closure operators serve full materialization only. Incremental updates and query-time
-  reasoning evaluate transitive and equivalence rules as joins. Roadmap item 521.
+* Incremental updates evaluate transitive and equivalence rules as joins, and query-time
+  reasoning keeps `eq-sym` a join beside the `eq-trans` operator. Roadmap item 521.
+* A query-time operator emits the pairs of every value its copy's magic facts hold, and
+  the magic rules of a transitive copy ask for every value the chain reaches, so a chain
+  of n values asked from its first derives about n²/2 pairs where n would answer it.
+  The joins derive the same pairs. Roadmap item 1222.
 * A deletion in a large clique of a symmetric and transitive property, where every fact
   follows through every member, passes the bound on maintenance and runs in full. The
   bound leaves out the witness preparation of a deletion, which is roadmap item 815. A run

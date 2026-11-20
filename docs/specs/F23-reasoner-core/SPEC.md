@@ -135,7 +135,8 @@ The columnar derived tier, the first phase of the core, is built under item 835.
 SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its maintenance in
 item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core is built under
 item 839, with its evaluation by strata, maintenance, explanations, witnesses, demand and
-the rule frontend, and its restricted chase and planner over relations remain. The other core and
+the rule frontend, and its restricted chase and planner over relations remain. Phase 2,
+closure operators in demand programs, is built as the first half of item 521. The other core and
 convergence phases remain under [item 456](../../ROADMAP.md).
 
 ### Columnar derived tier
@@ -502,6 +503,36 @@ takes 5.0 to 5.3 s against 53 s. OWL2Bench with 10 universities exceeded the 14 
 operators, and with them a 28 GiB limit on a development host. Where that memory goes
 has not been profiled, and roadmap item 522 covers it.
 [The reasoning results](../../benchmarks/reasoning/RESULTS.md#owl2bench) give every run.
+
+Query-time reasoning uses the operators too (Phase 2). In a demand session's staged runs,
+`Closures::detect` takes a stage's magic predicates and finds the adorned copies of
+transitive rules, of `prp-trp` specialized to one predicate, whose guard becomes a constant
+atom checked each step, and of `prp-trp` under keys whose predicate a magic fact holds or
+leaves free. A copy whose magic atom binds the subject has, at its fixpoint, the pairs from
+each value its magic facts hold to every value that value reaches, because each such pair
+follows from a shorter one from the same value and one edge. The operator walks forward
+from those values through the indexes and emits that fixpoint. A copy that binds the object
+walks backward over reversed edges, and one that binds neither closes the relation once its
+magic fact holds. The operator keeps a mark per predicate for its edges and one for its
+magic facts, so a later step or a later demand of the session walks from every value only
+when the relation gained edges, and otherwise from the new values alone. Each operator emits
+exactly its copy's fixpoint, so the session derives the facts the joins derive, and
+`src/query_closure_tests.rs` checks that with the derived-table cache off on every kind of
+copy, on sessions of several demands and on random property graphs. The source rules are
+checked for the order of derivation once, since a stage's copies can have list heads that
+the source rules lack. A guarded operator whose guard admits `rdf:first` or `rdf:rest`
+gives its rule back. A run that derives list cells its rules read kills its own rows and
+runs again without operators, and the session's later runs use joins. Explanation sessions,
+the compact strategy and lowered programs that read lists again keep the joins, and
+`SPARKLES_DEMAND_CLOSURES=0` turns the operators off. The operators emit the pairs of every
+value the copy's magic rules ask for, as the joins do, and not only the pairs of the query's
+own values, which roadmap item 1222 covers.
+
+On stanley, a laptop under other load, at `c97471c3` against `5f3f69c2`, the OWL2Bench(1)
+queries q2, q7, q12 and q19 under `owl-rl` demand on the unmaterialized store took 14.1,
+12.0, 12.1 and 14.0 s against 188, 177, 142 and 152 s, at 1.1 GiB of RSS against 1.9 to
+2.0 GiB, and returned the same rows. These are one approximate run per query and not
+published numbers.
 
 ### Bounded incremental deletion
 
