@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### The selection of rooted runs is off and Join is partly exempt from the ground restriction
+
+With `Limits::rooted`, the selection of ground body literals and the restriction of Join
+on ground inferences, two of the departures F24 records, could make a run that reported
+itself complete miss an entailed subsumption or an unsatisfiable class. Rooted runs now
+select no ground body literals, and a Join whose premise on the side of the head has no
+ground body literal is exempt from the restriction, until roadmap item 1220 repairs the
+selection. The completeness of the rooted run is
+still not proved. shoi-005 and shoi-027 now pass the work bound and give the default
+answer, with the axioms it leaves out and the fallback in its statistics, so 46 of the 50
+`shoi` fixtures finish against 48.
+
 ### Targeted checks on a remote host
 
 `mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or

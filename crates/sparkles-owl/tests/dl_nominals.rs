@@ -1031,3 +1031,107 @@ fn a_conditional_class_of_a_nominal_reaches_the_successors_of_a_fact() {
     // a run that reports every answer incomplete would pass the loop above without a check
     assert!(checked > 0, "no run of the fixtures was complete");
 }
+
+/// Facts over constants that hold only under K, a successor of K that reaches the same
+/// constants, and an inference over the successor whose two premises each come from one
+/// of those facts (item 1220). The successor holds the facts only as markers, so each
+/// premise has a ground literal in its body. With the selection of such literals, the two
+/// premises never met, and the run reported itself complete without the subsumption.
+const MEET: &str = "SubClassOf(:K ObjectSomeValuesFrom(:r :D))
+     SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+     SubClassOf(ObjectSomeValuesFrom(:s2 :B2) :F2)
+     SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)";
+
+#[test]
+fn two_facts_under_a_class_meet_at_its_successor_over_two_constants() {
+    check(
+        &format!(
+            "{MEET}
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B)))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :B2)))
+             SubClassOf(:D ObjectHasValue(:s :v))
+             SubClassOf(:D ObjectHasValue(:s2 :w))
+             SubClassOf(ObjectIntersectionOf(:F :F2) :G)"
+        ),
+        &[("K", "Ans")],
+        &[("D", "G"), ("K", "G")],
+    );
+}
+
+#[test]
+fn two_facts_under_a_class_meet_at_its_successor_over_one_constant() {
+    check(
+        &format!(
+            "{MEET}
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B :B2)))
+             SubClassOf(:D ObjectHasValue(:s :v))
+             SubClassOf(:D ObjectHasValue(:s2 :v))
+             SubClassOf(ObjectIntersectionOf(:F :F2) :G)"
+        ),
+        &[("K", "Ans")],
+        &[("D", "G")],
+    );
+}
+
+#[test]
+fn two_facts_under_a_class_meet_even_when_the_predecessor_reads_their_atoms() {
+    // ∃r.F ⊑ X and ∃r.F2 ⊑ Y make the successor's F and F2 triggers of its predecessor,
+    // which still never learns that one successor is in both
+    for extra in [
+        "SubClassOf(ObjectSomeValuesFrom(:r :F) :X)",
+        "SubClassOf(ObjectSomeValuesFrom(:r :F) :X)
+         SubClassOf(ObjectSomeValuesFrom(:r :F2) :Y)",
+    ] {
+        check(
+            &format!(
+                "{MEET}
+                 {extra}
+                 SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B :B2)))
+                 SubClassOf(:D ObjectHasValue(:s :v))
+                 SubClassOf(:D ObjectHasValue(:s2 :v))
+                 SubClassOf(ObjectIntersectionOf(:F :F2) :G)"
+            ),
+            &[("K", "Ans"), ("K", "X")],
+            &[("D", "G")],
+        );
+    }
+}
+
+/// The successor's clash `B(v) ∧ B2(w) → ⊥` reaches K, which holds both facts as its own.
+/// Join resolves one literal at a time, and the restriction on ground inferences dropped
+/// the ground clause with a body that the first Join leaves, although no ancestor of K
+/// holds the facts to make the inference in its place (item 1220).
+#[test]
+fn a_clash_of_two_facts_under_a_class_at_its_successor_makes_the_class_empty() {
+    for (succ, clash) in [
+        (
+            "SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+             SubClassOf(ObjectSomeValuesFrom(:s2 :B2) :F2)",
+            "DisjointClasses(:F :F2)",
+        ),
+        (
+            "SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+             SubClassOf(:B2 ObjectAllValuesFrom(ObjectInverseOf(:s2) :F2))",
+            "DisjointClasses(:F :F2)",
+        ),
+    ] {
+        let out = rooted(
+            &format!(
+                "SubClassOf(:K ObjectSomeValuesFrom(:r :D))
+                 SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B)))
+                 SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :B2)))
+                 SubClassOf(:D ObjectHasValue(:s :v))
+                 SubClassOf(:D ObjectHasValue(:s2 :w))
+                 {succ}
+                 {clash}
+                 SubClassOf(:E ObjectSomeValuesFrom(:r :D))"
+            ),
+            false,
+            &[("K", "Nothing"), ("D", "Nothing"), ("E", "Nothing")],
+        );
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(out.taxonomy.is_unsatisfiable(&c("K")), "{succ} {clash}");
+        assert!(!out.taxonomy.is_unsatisfiable(&c("D")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("E")));
+    }
+}

@@ -1149,8 +1149,6 @@ pub fn promote() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_PROMOTE").is_none_or(|v| v != "0"))
 }
 
-/// Whether a context other than the root selects the ground literals in its bodies, item
-/// 804's selection (F24). `SPARKLES_ROOTED_SELECT_GROUND=0` turns it off, for measurement.
 /// Whether the at-least conjunctions of item 728's clauses rank below every class, which
 /// `SPARKLES_DL_LOW_H=1` turns on. It is off until its measurement, since with it
 /// `sriq-010` of the counting fixtures passes a bound of 8 million conclusions on one
@@ -1180,9 +1178,51 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
         .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
 }
 
+/// Whether a context other than the root selects the ground literals in its bodies, item
+/// 804's selection (F24). It is off until item 1220's repair, since two selected clauses of
+/// one context never meet in Hyper over x, so that a run could report itself complete and
+/// miss an entailed subsumption. `SPARKLES_ROOTED_SELECT_GROUND=1` turns it on, for
+/// measurement.
 pub fn select_ground() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "1"))
+}
+
+/// Which Joins the restriction on ground inferences exempts, item 1220's containment. When
+/// the partners are facts that hold only under the context's core, no ancestor holds
+/// them, and one Join, which resolves a single literal, leaves a ground clause with a body
+/// that the restriction would drop before the next Join could discharge it. Until item
+/// 1220's repair, a Join whose premise on the side of the head has no ground literal in its
+/// body is exempt, whatever the residual head. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts
+/// every Join and `=1` exempts every Join, for measurement.
+pub fn join_exempt() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_JOIN_EXEMPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Whether the restriction leaves out the conclusion `c` of a Join whose premise on the
+/// side of the head has the body `hb`.
+pub(super) fn join_restricted(
+    lits: &Lits,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    hb: &[Lit],
+    c: &Side,
+) -> bool {
+    match join_exempt() {
+        1 => false,
+        2 if !hb
+            .iter()
+            .any(|&l| l.kind() == XL && no_xy(lits.view(l, inv))) =>
+        {
+            false
+        }
+        _ => restricted(lits, inv, c),
+    }
 }
 
 /// Whether a clause of a context other than the root is selected: its body holds a literal
