@@ -1079,3 +1079,102 @@ fn a_clash_of_two_facts_under_a_class_at_its_successor_makes_the_class_empty() {
         assert!(!out.taxonomy.is_unsatisfiable(&c("E")));
     }
 }
+
+/// The premise lookups that leave out selected clauses (item 1220): Hyper at a constant,
+/// Pred from a successor over a successor term of a constant, Join, Eq and Factor, and the
+/// universals over role atoms at a constant. In each case the filter leaves out a selected
+/// premise, and the run still finds K ⊑ Ans, with the selection on or off.
+#[test]
+fn selected_premises_left_out_by_a_lookup_are_made_up_for() {
+    for (name, extra) in [
+        // a conjunction at a constant over two selected premises that keep an atom over x
+        (
+            "h41c",
+            "SubClassOf(:F ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A2))))
+             SubClassOf(ObjectIntersectionOf(:A :A2) :G)
+             SubClassOf(ObjectSomeValuesFrom(:q :G) :W)
+             SubClassOf(:Z :W)",
+        ),
+        // the same conjunction when the premises can go to the predecessor
+        (
+            "h41n",
+            "SubClassOf(:F ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A)))
+             SubClassOf(:F2 ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A2)))
+             SubClassOf(ObjectIntersectionOf(:A :A2) :G)
+             SubClassOf(ObjectSomeValuesFrom(:q :G) :W)",
+        ),
+        // two universals at v over v's successor term, whose conjunction the successor's Pred needs
+        (
+            "h41f",
+            "ClassAssertion(ObjectSomeValuesFrom(:e :E) :v)
+             SubClassOf(:F ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:e :A))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:e :A2))))
+             SubClassOf(ObjectSomeValuesFrom(:e ObjectIntersectionOf(:A :A2)) :G)
+             SubClassOf(ObjectSomeValuesFrom(:s :G) :W)
+             SubClassOf(:Z :W)",
+        ),
+        // a ground head that only a Join with a fact at c discharges, with an atom over x left
+        (
+            "h42",
+            "SubClassOf(:F ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :C))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :C2))))
+             SubClassOf(ObjectOneOf(:c) ObjectUnionOf(ObjectComplementOf(:C) ObjectComplementOf(:C2) :G))
+             SubClassOf(ObjectSomeValuesFrom(:q :G) :W)
+             SubClassOf(:Z :W)",
+        ),
+        // a selected x ≈ c that meets a marker A(c)
+        (
+            "h43e",
+            "SubClassOf(:K ObjectSomeValuesFrom(:t2 ObjectIntersectionOf(ObjectOneOf(:c) :A)))
+             SubClassOf(:F ObjectUnionOf(:Z ObjectOneOf(:c)))
+             SubClassOf(:Z :W)
+             SubClassOf(:A :W)",
+        ),
+        // x ≈ c ∨ x ≈ d under a selected body, with A at c and d only under K
+        (
+            "h43f",
+            "SubClassOf(:K ObjectSomeValuesFrom(:t2 ObjectIntersectionOf(ObjectOneOf(:c) :A)))
+             SubClassOf(:K ObjectSomeValuesFrom(:t3 ObjectIntersectionOf(ObjectOneOf(:d) :A)))
+             SubClassOf(:F ObjectUnionOf(ObjectOneOf(:c) ObjectOneOf(:d)))
+             SubClassOf(:A :W)",
+        ),
+        // a selected role atom between constants, from x ≈ c in q(x, w)
+        (
+            "h44",
+            "SubClassOf(:D ObjectHasValue(:q :w))
+             SubClassOf(:F ObjectOneOf(:c))
+             SubClassOf(:K ObjectSomeValuesFrom(:t2 ObjectIntersectionOf(ObjectOneOf(:c) ObjectAllValuesFrom(:q :M))))
+             SubClassOf(ObjectSomeValuesFrom(:q :M) :W)",
+        ),
+        // two selected universals at v over a root role atom from v to w
+        (
+            "h44r",
+            "ObjectPropertyAssertion(:p :v :w)
+             SubClassOf(:F ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:p :A))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:p :A2))))
+             SubClassOf(ObjectIntersectionOf(:A :A2 ObjectOneOf(:w)) :G0)
+             SubClassOf(:D ObjectHasValue(:q :w))
+             SubClassOf(ObjectSomeValuesFrom(:q :G0) :W)
+             SubClassOf(:Z :W)",
+        ),
+    ] {
+        let out = rooted(
+            &format!(
+                "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B :B2)))
+                 SubClassOf(:K ObjectSomeValuesFrom(:r :D))
+                 SubClassOf(:D ObjectHasValue(:s :v))
+                 SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+                 SubClassOf(ObjectSomeValuesFrom(:s :B2) :F2)
+                 SubClassOf(ObjectSomeValuesFrom(:r :W) :Ans)
+                 SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+                 {extra}"
+            ),
+            false,
+            &[("K", "Ans")],
+        );
+        assert_eq!(out.consistency, Consistency::Consistent, "{name}");
+        assert!(out.taxonomy.is_subclass(&c("K"), &c("Ans")), "{name}: K ⊑ Ans is missing");
+        assert!(!out.taxonomy.is_unsatisfiable(&c("K")), "{name}");
+    }
+}
