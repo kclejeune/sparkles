@@ -6304,6 +6304,8 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
         .cloned()
         .collect();
     let prefixes = super::keyfilter::KeyFilter::plan_prefixes(&on_key, v)?;
+    #[cfg(test)]
+    REACHED.with(|r| r.set((r.get().0, r.get().1.max(on_key.len()))));
     let vocab = &ctx.snap.generation.vocab;
     let mut ids = vec![(0, Id::vocab(0).0 - 1)];
     for p in prefixes {
@@ -6614,6 +6616,14 @@ pub(super) fn numeric_segment(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The most conjuncts moved into one range scan, and the most key tests that set
+    /// the rows of one scan, on this thread since the last reset.
+    pub(super) static REACHED: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
 /// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].
 fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
     let Kind::Scan(spec) = &n.kind else {
@@ -6677,6 +6687,8 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
     let read = (exact_rows + tested_rows).min(n.est);
     let est = (exact_rows + tested_rows * FILTER_SELECTIVITY.powi(pushed.len() as i32)).min(n.est);
     let seeks = 4.0 * ranges.len() as f64;
+    #[cfg(test)]
+    REACHED.with(|r| r.set((r.get().0.max(pushed.len()), r.get().1)));
     let spec = spec.clone();
     let mut r = Node {
         kind: Kind::RangeScan(

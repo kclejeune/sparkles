@@ -113,37 +113,271 @@ pub(crate) fn admitted_allocations_seen() -> usize {
 }
 
 thread_local! {
-    // Unadmitted-growth observer: original live-counter address, active stage,
-    // live bytes allocated in the stage, admitted bytes at its start, and the
-    // largest excess of live over newly admitted bytes per stage.
-    static EXCESS: Cell<(usize, usize, i64, u64, [i64; STAGES])> =
-        const { Cell::new((0, usize::MAX, 0, 0, [0; STAGES])) };
+    // The unadmitted-growth observation of this thread, null while none runs. Its state
+    // is allocated from `System`, never through this allocator, and only the allocator
+    // hooks, `Stage`, `Settled` and the credit release hook touch it, none reentrantly.
+    static OBSERVATION: Cell<*mut Observation> = const { Cell::new(std::ptr::null_mut()) };
+    // Stage epochs, unique on this thread across observations.
+    static EPOCH: Cell<u64> = const { Cell::new(0) };
 }
 
 pub(crate) const STAGES: usize = 10;
+const DEPTH: usize = 32;
+const SLOTS: usize = 1 << 18;
+const TABLE_FULL: u32 = 1;
+const TOO_DEEP: u32 = 2;
+const UNBALANCED: u32 = 4;
+const SETTLEMENT: u32 = 8;
+const OVER_SETTLED: u32 = 16;
+const CHILD: u8 = 1;
+const INPUT: u8 = 2;
+
+/// The event at which a stage's largest excess was seen.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum Event {
+    /// No event yet: the zeroed state of a stage's maximum.
+    #[allow(dead_code)]
+    None = 0,
+    Alloc,
+    Realloc,
+    ForeignRealloc,
+    Release,
+    Enter,
+    Exit,
+}
+
+/// A stage's largest excess, the event that set it and that event's ordinal.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Maximum {
+    pub(crate) excess: i64,
+    pub(crate) event: Event,
+    pub(crate) ordinal: u64,
+}
+
+/// One entered stage: its epoch and number, the bytes it allocated and still holds
+/// (plus the net credit its child stages acquired), the credit counter at entry, and
+/// the net child credit it imported, which bounds its child settlements.
+#[derive(Clone, Copy)]
+struct Frame {
+    epoch: u64,
+    stage: usize,
+    live: i64,
+    base: u64,
+    imported: i64,
+}
+
+/// A live allocation made while a stage was active, and that stage's epoch.
+#[derive(Clone, Copy)]
+struct Slot {
+    pointer: usize,
+    epoch: u64,
+    size: usize,
+}
+
+/// Every field is valid when zeroed, which is how an observation starts.
+struct Observation {
+    counter: usize,
+    depth: usize,
+    frames: [Frame; DEPTH],
+    max: [Maximum; STAGES],
+    events: u64,
+    entries: usize,
+    peak: usize,
+    failed: u32,
+    settling: u8,
+    settled: u64,
+    releases: u32,
+    slots: [Slot; SLOTS],
+}
+
+fn home(pointer: usize) -> usize {
+    ((pointer as u64 >> 4).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - SLOTS.trailing_zeros()))
+        as usize
+}
+
+impl Observation {
+    fn used(&self) -> u64 {
+        used_at(self.counter)
+    }
+
+    fn sample(&mut self, event: Event) {
+        self.events += 1;
+        if self.depth == 0 {
+            return;
+        }
+        let frame = self.frames[self.depth - 1];
+        let excess = frame.live - (self.used() as i64 - frame.base as i64);
+        let max = &mut self.max[frame.stage];
+        if excess > max.excess {
+            *max = Maximum {
+                excess,
+                event,
+                ordinal: self.events,
+            };
+        }
+    }
+
+    fn frame_of(&mut self, epoch: u64) -> Option<&mut Frame> {
+        self.frames[..self.depth]
+            .iter_mut()
+            .rev()
+            .find(|frame| frame.epoch == epoch)
+    }
+
+    fn insert(&mut self, pointer: usize, epoch: u64, size: usize) {
+        let mut i = home(pointer);
+        loop {
+            let slot = &mut self.slots[i];
+            if slot.pointer == pointer {
+                *slot = Slot {
+                    pointer,
+                    epoch,
+                    size,
+                };
+                return;
+            }
+            if slot.pointer == 0 {
+                if self.entries + 1 >= SLOTS / 2 {
+                    self.failed |= TABLE_FULL;
+                    return;
+                }
+                *slot = Slot {
+                    pointer,
+                    epoch,
+                    size,
+                };
+                self.entries += 1;
+                self.peak = self.peak.max(self.entries);
+                return;
+            }
+            i = (i + 1) & (SLOTS - 1);
+        }
+    }
+
+    /// Remove `pointer`'s entry, shifting later entries of its probe run back so that
+    /// the table never holds tombstones.
+    fn remove(&mut self, pointer: usize) -> Option<Slot> {
+        let mask = SLOTS - 1;
+        let mut i = home(pointer);
+        loop {
+            match self.slots[i].pointer {
+                0 => return None,
+                p if p == pointer => break,
+                _ => i = (i + 1) & mask,
+            }
+        }
+        let found = self.slots[i];
+        let mut j = i;
+        loop {
+            j = (j + 1) & mask;
+            let slot = self.slots[j];
+            if slot.pointer == 0 {
+                break;
+            }
+            let k = home(slot.pointer);
+            let stays = if i <= j {
+                i < k && k <= j
+            } else {
+                i < k || k <= j
+            };
+            if !stays {
+                self.slots[i] = slot;
+                i = j;
+            }
+        }
+        self.slots[i] = Slot {
+            pointer: 0,
+            epoch: 0,
+            size: 0,
+        };
+        self.entries -= 1;
+        Some(found)
+    }
+}
+
+/// `f` on this thread's observation, if one runs. No reference to it outlives `f`, and
+/// `f` neither allocates nor reaches another user of the observation.
+fn with<R>(f: impl FnOnce(&mut Observation) -> R) -> Option<R> {
+    let observation = OBSERVATION.try_with(Cell::get).ok()?;
+    if observation.is_null() {
+        return None;
+    }
+    // SAFETY: the observation lives until `record_unadmitted_events` clears the pointer,
+    // and the users above never hold a reference across one another.
+    Some(f(unsafe { &mut *observation }))
+}
 
 /// The largest excess, per stage, of bytes a planner stage allocated and still holds
 /// over the Preparation credit it acquired meanwhile, while `f` runs on this thread.
 pub(crate) fn record_unadmitted(preparation: &Preparation, f: impl FnOnce()) -> [i64; STAGES] {
-    struct Reset;
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            EXCESS.with(|cell| cell.set((0, usize::MAX, 0, 0, [0; STAGES])));
+    let (max, peak) = record_unadmitted_events(preparation, f);
+    for (stage, max) in max.iter().enumerate() {
+        if max.excess > 0 {
+            println!(
+                "observer: stage {stage} excess {} at {:?} event {} (peak {peak} entries)",
+                max.excess, max.event, max.ordinal
+            );
         }
     }
-    let _reset = Reset;
-    EXCESS.with(|cell| {
-        assert_eq!(cell.get().0, 0);
-        let counter = preparation.test_used_counter() as *const _ as usize;
-        cell.set((counter, usize::MAX, 0, 0, [0; STAGES]));
-    });
+    max.map(|max| max.excess)
+}
+
+/// [`record_unadmitted`] with the event that set each stage's largest excess, and the
+/// largest number of live allocations the observation tracked at once.
+pub(crate) fn record_unadmitted_events(
+    preparation: &Preparation,
+    f: impl FnOnce(),
+) -> ([Maximum; STAGES], usize) {
+    let layout = std::alloc::Layout::new::<Observation>();
+    struct Reset(*mut Observation, std::alloc::Layout);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OBSERVATION.with(|cell| cell.set(std::ptr::null_mut()));
+            // SAFETY: allocated below from System with this layout, and no longer reachable.
+            unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, self.0.cast(), self.1) };
+        }
+    }
+    assert!(
+        OBSERVATION.with(Cell::get).is_null(),
+        "one unadmitted-growth observation per thread"
+    );
+    // SAFETY: a nonzero layout, and an all-zero Observation is valid.
+    let observation = unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
+        .cast::<Observation>();
+    assert!(!observation.is_null());
+    let reset = Reset(observation, layout);
+    // SAFETY: valid and not yet shared.
+    unsafe { (*observation).counter = preparation.test_used_counter() as *const _ as usize };
+    OBSERVATION.with(|cell| cell.set(observation));
     f();
-    EXCESS.with(|cell| cell.get().4)
+    let (max, peak, failed, depth) = with(|o| (o.max, o.peak, o.failed, o.depth)).unwrap();
+    drop(reset);
+    assert_eq!(
+        (failed, depth),
+        (0, 0),
+        "unadmitted-growth observer failure (peak {peak} entries)"
+    );
+    (max, peak)
 }
 
 /// A planner stage observed by [`record_unadmitted`]. A nested stage pauses the
-/// outer one, whose excess then excludes the inner stage's unadmitted bytes.
-pub(crate) struct Stage(Option<(usize, i64, u64)>);
+/// outer one. The rules:
+///
+/// - A stage owns the allocations made while it is the active stage, under a fresh
+///   epoch per entry. Its live bytes count its own allocations and frees only, so a
+///   free of storage allocated before it, by an earlier entry, in another observation,
+///   or by a child stage after that child returned never reduces them.
+/// - A reallocation of a stage's own storage counts the change in size. Any other
+///   reallocation counts the whole new size, conservatively, and takes the storage over.
+/// - When a child stage returns, its whole net credit change enters the parent's live
+///   bytes, so the parent's excess is the same across the child: a child's surplus credit
+///   covers nothing of the parent's.
+/// - A credit release is sampled after it lowers the counter, as are stage entry and
+///   exit. A release is never assumed to belong to anything: a release of credit the
+///   stage did not acquire reads as excess unless it is the drop of one named
+///   reservation wrapped in [`Settled`], which neutralizes exactly that release.
+pub(crate) struct Stage(Option<u64>);
 
 fn used_at(counter: usize) -> u64 {
     unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }.load(Ordering::Relaxed)
@@ -153,10 +387,7 @@ impl Stage {
     /// [`Stage::enter`], unless `stage` is the active stage already, which then goes on
     /// unpaused: a stage reached from within itself is observed once, as a whole.
     pub(crate) fn within(stage: usize) -> Self {
-        let active = EXCESS.try_with(|cell| {
-            let (counter, active, ..) = cell.get();
-            counter != 0 && active == stage
-        });
+        let active = with(|o| o.depth > 0 && o.frames[o.depth - 1].stage == stage);
         if active.unwrap_or(false) {
             Self(None)
         } else {
@@ -165,51 +396,200 @@ impl Stage {
     }
 
     pub(crate) fn enter(stage: usize) -> Self {
-        let outer = EXCESS.try_with(|cell| {
-            let (counter, active, live, base, max) = cell.get();
-            if counter == 0 {
-                return None;
-            }
-            cell.set((counter, stage, 0, used_at(counter), max));
-            Some((active, live, base))
+        assert!(stage < STAGES);
+        let epoch = EPOCH.with(|epoch| {
+            let next = epoch.get() + 1;
+            epoch.set(next);
+            next
         });
-        Self(outer.ok().flatten())
+        Self(
+            with(|o| {
+                o.sample(Event::Enter);
+                if o.depth == DEPTH {
+                    o.failed |= TOO_DEEP;
+                    return None;
+                }
+                o.frames[o.depth] = Frame {
+                    epoch,
+                    stage,
+                    live: 0,
+                    base: o.used(),
+                    imported: 0,
+                };
+                o.depth += 1;
+                Some(epoch)
+            })
+            .flatten(),
+        )
     }
 }
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        if let Some((active, live, base)) = self.0 {
-            let _ = EXCESS.try_with(|cell| {
-                let (counter, _, inner_live, inner, max) = cell.get();
-                // The outer stage sees the inner stage's storage only as far as the
-                // credit the inner stage acquired covers it, and so neither its
-                // unadmitted bytes nor, when the outer stage releases the credit with
-                // the storage, the inner stage's excess credit.
-                let admitted = used_at(counter) as i64 - inner as i64;
-                cell.set((counter, active, live + admitted.min(inner_live), base, max));
+        let Some(epoch) = self.0 else {
+            return;
+        };
+        with(|o| {
+            if o.depth == 0 || o.frames[o.depth - 1].epoch != epoch {
+                o.failed |= UNBALANCED;
+                return;
+            }
+            o.sample(Event::Exit);
+            o.depth -= 1;
+            let child = o.frames[o.depth];
+            if o.depth > 0 {
+                let delta = o.used() as i64 - child.base as i64;
+                let parent = &mut o.frames[o.depth - 1];
+                parent.live += delta;
+                parent.imported += delta.max(0);
+            }
+        });
+    }
+}
+
+/// One named reservation whose drop the observer settles: the release it makes is
+/// neutralized in the active stage, as child credit (at most what the stage imported
+/// from its children) or as input credit acquired before the stage. The drop must
+/// release exactly the reservation's bytes, once, on the observed counter.
+pub(crate) struct Settled {
+    reservation: Option<crate::access::Reservation>,
+    kind: u8,
+}
+
+impl Settled {
+    pub(crate) fn child(reservation: Option<crate::access::Reservation>) -> Self {
+        Self {
+            reservation,
+            kind: CHILD,
+        }
+    }
+
+    pub(crate) fn input(reservation: Option<crate::access::Reservation>) -> Self {
+        Self {
+            reservation,
+            kind: INPUT,
+        }
+    }
+}
+
+impl Drop for Settled {
+    fn drop(&mut self) {
+        let Some(reservation) = self.reservation.take() else {
+            return;
+        };
+        let bytes = reservation.bytes();
+        let kind = self.kind;
+        let began = with(|o| {
+            if o.settling != 0 {
+                o.failed |= SETTLEMENT;
+                return false;
+            }
+            o.settling = kind;
+            o.settled = 0;
+            o.releases = 0;
+            true
+        });
+        drop(reservation);
+        if began == Some(true) {
+            with(|o| {
+                if o.releases != 1 || o.settled != bytes {
+                    o.failed |= SETTLEMENT;
+                }
+                o.settling = 0;
             });
         }
     }
 }
 
-fn observe(delta: i64) {
-    let _ = EXCESS.try_with(|cell| {
-        let (counter, active, live, base, mut max) = cell.get();
-        if counter == 0 || active == usize::MAX {
+/// Sample after a release of `bytes` of credit lowered `counter`, settling it first
+/// when it is the drop of a [`Settled`] reservation.
+pub(crate) fn released(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
+    with(|o| {
+        if o.counter != counter as *const _ as usize {
             return;
         }
-        let live = live + delta;
-        let excess = live - (used_at(counter) as i64 - base as i64);
-        max[active] = max[active].max(excess);
-        cell.set((counter, active, live, base, max));
+        if o.settling != 0 {
+            o.settled += bytes;
+            o.releases += 1;
+            if o.depth > 0 {
+                let frame = &mut o.frames[o.depth - 1];
+                frame.live -= bytes as i64;
+                if o.settling == CHILD {
+                    frame.imported -= bytes as i64;
+                    if frame.imported < 0 {
+                        o.failed |= OVER_SETTLED;
+                    }
+                }
+            }
+        }
+        o.sample(Event::Release);
     });
 }
 
 /// Recheck the unadmitted-growth observer's excess now, after credit was released
 /// without an allocation, so that the release is checked as an allocation would be.
 pub(crate) fn observe_release() {
-    observe(0);
+    with(|o| o.sample(Event::Release));
+}
+
+fn allocated(pointer: *mut u8, size: usize) {
+    if pointer.is_null() {
+        return;
+    }
+    with(|o| {
+        if o.depth == 0 {
+            o.remove(pointer as usize);
+            return;
+        }
+        let top = o.depth - 1;
+        o.insert(pointer as usize, o.frames[top].epoch, size);
+        o.frames[top].live += size as i64;
+        o.sample(Event::Alloc);
+    });
+}
+
+fn freed(pointer: *mut u8) {
+    with(|o| {
+        if let Some(slot) = o.remove(pointer as usize)
+            && let Some(frame) = o.frame_of(slot.epoch)
+        {
+            frame.live -= slot.size as i64;
+        }
+    });
+}
+
+/// A successful reallocation of `old` to `new` of `size` bytes. A failed one changes
+/// nothing, since the old storage stays as it was.
+fn reallocated(old: *mut u8, new: *mut u8, size: usize) {
+    if new.is_null() {
+        return;
+    }
+    with(|o| {
+        let was = o.remove(old as usize);
+        if o.depth == 0 {
+            o.remove(new as usize);
+            return;
+        }
+        let top = o.depth - 1;
+        let epoch = o.frames[top].epoch;
+        let event = match was {
+            Some(slot) if slot.epoch == epoch => {
+                o.frames[top].live += size as i64 - slot.size as i64;
+                Event::Realloc
+            }
+            was => {
+                if let Some(slot) = was
+                    && let Some(frame) = o.frame_of(slot.epoch)
+                {
+                    frame.live -= slot.size as i64;
+                }
+                o.frames[top].live += size as i64;
+                Event::ForeignRealloc
+            }
+        };
+        o.insert(new as usize, epoch, size);
+        o.sample(event);
+    });
 }
 
 /// Count an acquisition of `bytes` for [`record_admitted_allocations`].
@@ -225,10 +605,10 @@ fn admitted(bytes: usize) {
 }
 
 struct AllocationObserver;
-// SAFETY: System receives exactly the original layouts. A selected test-thread
-// watch retains its actual Preparation until cleared. Dealloc reads one atomic
-// and updates Copy TLS only, and alloc updates const Copy TLS only: no
-// allocation, callback, borrow, panic or reentry. Realloc updates the same TLS.
+// SAFETY: System receives exactly the original layouts, and the hooks only read the
+// returned pointers. A selected test-thread watch retains its actual Preparation until
+// cleared. The hooks read atomics and update Copy TLS and the observation, which lives
+// in System memory: no allocation, callback, borrow, panic or reentry.
 unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         let _ = LARGEST.try_with(|cell| {
@@ -238,8 +618,9 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
             }
         });
         admitted(layout.size());
-        observe(layout.size() as i64);
-        unsafe { std::alloc::System.alloc(layout) }
+        let pointer = unsafe { std::alloc::System.alloc(layout) };
+        allocated(pointer, layout.size());
+        pointer
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
         let _ = DEALLOCATION.try_with(|watch| {
@@ -250,15 +631,16 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
                 watch.set((0, counter, used, count + 1));
             }
         });
-        observe(-(layout.size() as i64));
+        freed(pointer);
         unsafe { std::alloc::System.dealloc(pointer, layout) };
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // Watched staging byte vectors are complete and never grow after arm. A
         // reallocation to the selected size acquires storage of that size.
         admitted(size);
-        observe(size as i64 - layout.size() as i64);
-        unsafe { std::alloc::System.realloc(pointer, layout, size) }
+        let new = unsafe { std::alloc::System.realloc(pointer, layout, size) };
+        reallocated(pointer, new, size);
+        new
     }
 }
 #[global_allocator]

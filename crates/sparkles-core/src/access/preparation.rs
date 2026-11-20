@@ -450,6 +450,8 @@ impl Preparation {
         #[cfg(test)]
         crate::sparql::checked_source_tests::observe_release(self, bytes);
         self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
+        #[cfg(test)]
+        crate::test_alloc::released(&self.inner.used, bytes);
         if let Some(grant) = &self.inner.grant {
             // No preparation lock is held when a grant invokes synchronous wakeups.
             grant.release(bytes);

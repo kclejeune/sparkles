@@ -338,6 +338,17 @@ fn keep_built(pl: &Planner, mut held: Reservation, n: &Node, sorts: [bool; 2]) -
     Ok(())
 }
 
+/// The filter credit that [`place_masked`] hands back for a filtered input copy in
+/// [`Dp::run`], dropped after the copy. Unit tests settle its drop with the observer.
+#[cfg(test)]
+fn leaf_kept(held: Option<Reservation>) -> crate::test_alloc::Settled {
+    crate::test_alloc::Settled::child(held)
+}
+#[cfg(not(test))]
+fn leaf_kept(held: Option<Reservation>) -> Option<Reservation> {
+    held
+}
+
 /// Join plans `a` and `b` as [`plan::join`] does: as a cross product when they share no
 /// variable, or one of them when the other is the one empty solution. On the checked
 /// route the join is admitted as [`build_join`] admits one.
@@ -2238,7 +2249,7 @@ impl Dp {
                         None
                     };
                     let placed = place_masked(pl, o.clone(), 0, filters, fvars)?;
-                    _kept = placed.2;
+                    _kept = leaf_kept(placed.2);
                     filtered = placed.0;
                     &filtered
                 } else {
