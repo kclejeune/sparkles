@@ -520,8 +520,9 @@ The rule for a new universal no longer searches the context's universals for the
 role and filler. A context derives each universal once, since a role and a filler have
 one node, and a repeat would only repeat work, because the successor rule deduplicates
 the fillers it collects. A debug assertion keeps the premise, and it held in the test
-suite, in debug classifications of GO, ore_ont_14817 and ore_ont_9663 on one and four
-threads, and in a corpus sweep with the same results as the build with the search. On
+suite and in debug classifications of GO, ore_ont_14817 and ore_ont_9663 on one and four
+threads. A corpus sweep of the release builds with and without the search gave the same
+results on the 1,010 pairs that both classified. On
 one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
 0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1232 follows.
 
