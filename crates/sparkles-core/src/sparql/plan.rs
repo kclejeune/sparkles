@@ -1185,6 +1185,34 @@ impl<'a> Planner<'a> {
         preparation.reserve(layout.bytes()).map(Some)
     }
 
+    /// Plan `gp` on the default graph as a checked graph branch is planned, with fresh
+    /// credit from `preparation`, for the tests that compare the two routes.
+    #[cfg(test)]
+    pub(super) fn plan_admitted_for_test(
+        &mut self,
+        gp: &GraphPattern,
+        preparation: &Preparation,
+    ) -> Result<Node> {
+        let previous = self.branch_payload.replace(Some(preparation.reserve(0)?));
+        let previous_shared = self
+            .branch_shared_payload
+            .replace(Some(preparation.reserve(0)?));
+        let node = self.plan(gp, &ActiveGraph::Default, Vec::new());
+        self.branch_payload.replace(previous);
+        self.branch_shared_payload.replace(previous_shared);
+        node
+    }
+
+    /// Report a checked planning phase, which rechecks the request's controls. The
+    /// ordinary route reports nothing.
+    pub(super) fn planning_stage(&self, phase: &str) -> Result<()> {
+        let preparation = match self.branch_payload.borrow().as_ref() {
+            Some(held) => held.preparation().clone(),
+            None => return Ok(()),
+        };
+        preparation.stage(phase)
+    }
+
     fn planning_vec<T>(&self) -> Result<PlanningVec<T>> {
         if let Some(held) = self.branch_payload.borrow().as_ref() {
             Ok(PlanningVec::Checked(PreparationBuffer::new(

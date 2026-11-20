@@ -665,8 +665,13 @@ impl Group {
 
 #[cfg(test)]
 thread_local! {
-    /// Refusals of the program's tables on this thread, for the tests of their admission.
+    /// Refusals and cancellations of the program's admissions on this thread, for the
+    /// tests of their admission.
     pub(super) static DP_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The bytes of the table storage the program last asked to grow to.
+    pub(super) static DP_GROWTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The rounds the program planned on this thread.
+    pub(super) static DP_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The set bits of `m`.
@@ -1346,8 +1351,9 @@ struct Dp {
     /// beside `dval`, each entry's domain of each join variable it binds (see
     /// [`plan::domain`]), the larger of its inputs'
     ddom: Vec<f64>,
-    /// the checked route's credit for the tables over the subsets, dropped after them
-    _held: Option<Reservation>,
+    /// the checked route's credit for the tables over the subsets and the storage of
+    /// `ents`, `dval` and `ddom`, dropped after them
+    held: Option<Reservation>,
 }
 
 /// One round's tables, per subset of the parts.
@@ -1364,8 +1370,9 @@ struct Round {
     minc: Vec<f64>,
     /// splits per subset size
     splits: Vec<u64>,
-    /// the checked route's credit for the round's tables, dropped after them
-    _held: Option<Reservation>,
+    /// the checked route's credit for the round's tables and the storage of `list`,
+    /// dropped after them
+    held: Option<Reservation>,
 }
 
 #[inline]
@@ -1400,23 +1407,21 @@ impl Dp {
         let size = 1usize << n;
         let fcount = g.filters.len().min(64);
         // The tables below are sized from the group before any is allocated.
-        let held = pl.planning_scratch(|layout| {
-            layout.slots::<VarId>(g.jvars.len())?;
-            layout.slots::<u32>(g.vars.len())?;
-            layout.slots::<u128>(2 * n)?;
-            layout.slots::<&FilterInfo>(fcount)?;
-            layout.slots::<u128>(2 * size)?;
-            layout.slots::<u64>(size)?;
-            layout.slots::<Option<(VarId, u32)>>(fcount)?;
-            layout.map::<VarId, u32>(g.jvars.len())?;
-            layout.slots::<Option<f64>>(fcount)?;
-            g.models.measure(layout)
+        let held = pl.planning_stage(PREPARE_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<VarId>(g.jvars.len())?;
+                layout.slots::<u32>(g.vars.len())?;
+                layout.slots::<u128>(2 * n)?;
+                layout.slots::<&FilterInfo>(fcount)?;
+                layout.slots::<u128>(2 * size)?;
+                layout.slots::<u64>(size)?;
+                layout.slots::<Option<(VarId, u32)>>(fcount)?;
+                layout.map::<VarId, u32>(g.jvars.len())?;
+                layout.slots::<Option<f64>>(fcount)?;
+                g.models.measure(layout)
+            })
         });
-        #[cfg(test)]
-        if held.is_err() {
-            DP_REFUSALS.with(|n| n.set(n.get() + 1));
-        }
-        let held = held?;
+        let held = refused(held)?;
         let jvar: Vec<VarId> = g.jvars.iter().map(|&l| g.vars[l as usize]).collect();
         let mut var_items = vec![0u32; g.vars.len()];
         let mut jb = vec![0u128; n];
@@ -1477,7 +1482,7 @@ impl Dp {
             ents: Vec::new(),
             dval: Vec::new(),
             ddom: Vec::new(),
-            _held: held,
+            held,
         }))
     }
 
@@ -1489,17 +1494,22 @@ impl Dp {
 
     /// The tables of a round over `parts`.
     fn round(&self, parts: Vec<Part>, pl: &Planner) -> Result<Round> {
+        #[cfg(test)]
+        DP_ROUNDS.with(|n| n.set(n.get() + 1));
         let k = parts.len();
         let size = 1usize << k;
         let listed: usize = parts.iter().map(|p| p.ents.len()).sum();
-        // The tables below are sized from the parts before any is allocated.
-        let held = pl.planning_scratch(|layout| {
-            layout.slots::<u32>(2 * size + k + listed)?;
-            layout.slots::<bool>(2 * size)?;
-            layout.slots::<u64>(k + 1)?;
-            layout.slots::<(u32, u32)>(size)?;
-            layout.slots::<f64>(size)
-        })?;
+        // The tables below are sized from the parts before any is allocated. `list`
+        // starts with the parts' entries and grows as the round plans subsets.
+        let held = refused(pl.planning_stage(ROUND_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<u32>(2 * size + k + listed)?;
+                layout.slots::<bool>(2 * size)?;
+                layout.slots::<u64>(k + 1)?;
+                layout.slots::<(u32, u32)>(size)?;
+                layout.slots::<f64>(size)
+            })
+        }))?;
         let mut inputs = vec![0u32; size];
         let mut nb = vec![0u32; size];
         let mut conn = vec![false; size];
@@ -1546,7 +1556,7 @@ impl Dp {
             list,
             minc,
             splits,
-            _held: held,
+            held,
         })
     }
 
@@ -1576,7 +1586,32 @@ impl Dp {
         let _stage = crate::test_alloc::Stage::enter(3);
         let ub = bound.unwrap_or(f64::INFINITY);
         let batched = plan::Costing::of(ctx);
-        let fvars = dp_filter_vars(filters);
+        let fvars = dp_filter_vars(filters, pl)?;
+        let fvars = &fvars.vars[..];
+        let leaves: usize = items.iter().map(Vec::len).sum();
+        // On the checked route, the parts' storage is admitted before it is allocated,
+        // and the credit is dropped after the parts.
+        let mut parts_held = pl.planning_scratch(|layout| {
+            layout.slots::<Part>(items.len())?;
+            layout.slots::<u32>(leaves)?;
+            layout.slots::<bool>(items.iter().map(Vec::len).max().unwrap_or(0))
+        })?;
+        if self.held.is_some() {
+            let vals: usize = (0..items.len())
+                .map(|i| items[i].len() * self.bnd(1 << i).count_ones() as usize)
+                .sum();
+            make_room(self.held.as_mut(), &mut self.ents, leaves)?;
+            make_room(self.held.as_mut(), &mut self.dval, vals)?;
+            make_room(self.held.as_mut(), &mut self.ddom, vals)?;
+        }
+        // Every plan's first sort variable is a join variable or a leaf's (see
+        // [`joins`]), which bounds the plans kept per subset.
+        let keys = 1 + self.jvar.len() + leaves;
+        let mut keep = Vec::with_capacity(if parts_held.is_some() {
+            items.iter().map(Vec::len).max().unwrap_or(0)
+        } else {
+            0
+        });
         // the inputs: every access path with the filters it binds
         let mut parts = Vec::with_capacity(items.len());
         for (i, opts) in items.iter().enumerate() {
@@ -1591,7 +1626,7 @@ impl Dp {
                     .take(64)
                     .any(|fv| !fv.is_empty() && fv.iter().all(|v| o.vars.contains(v)))
                 {
-                    filtered = place_masked(pl, o.clone(), 0, filters, &fvars).0;
+                    filtered = place_masked(pl, o.clone(), 0, filters, fvars).0;
                     &filtered
                 } else {
                     o
@@ -1619,9 +1654,11 @@ impl Dp {
                     },
                 });
             }
-            self.drop_dominated(m, &mut ents);
+            self.drop_dominated(m, &mut ents, &mut keep);
             parts.push(Part { inputs: m, ents });
         }
+        debug_assert!(self.ents.len() <= leaves);
+        drop(keep);
         let mut rounds = false;
         loop {
             let mut r = self.round(parts, pl)?;
@@ -1631,7 +1668,11 @@ impl Dp {
                 // planned in rounds from here on, where the parts keep only the plans
                 // that can matter later
                 rounds = true;
-                parts = r.parts.into_iter().map(|p| self.useful(p)).collect();
+                if let Some(held) = parts_held.as_mut() {
+                    held.grow_by(part_bytes(k))?;
+                }
+                parts = Vec::with_capacity(k);
+                parts.extend(r.parts.into_iter().map(|p| self.useful(p)));
                 continue;
             }
             let budget = if rounds { ROUND_SPLITS } else { DP_MAX_SPLITS };
@@ -1648,7 +1689,7 @@ impl Dp {
                     size = s;
                 }
             }
-            self.plan_round(&mut r, size, ub, batched, ctx)?;
+            self.plan_round(&mut r, size, keys, ub, batched, ctx)?;
             if size == k {
                 let (s, l) = r.slot[(1usize << k) - 1];
                 return Ok(self.cheapest(&r.list[s as usize..(s + l) as usize]));
@@ -1672,58 +1713,78 @@ impl Dp {
                 return Ok(None);
             };
             let (s, l) = r.slot[m as usize];
+            let rest = k - size + 1;
+            if let Some(held) = parts_held.as_mut() {
+                held.grow_by(part_bytes(rest) + 4 * l as u64)?;
+            }
             let merged = self.useful(Part {
                 inputs: r.inputs[m as usize],
                 ents: r.list[s as usize..(s + l) as usize].to_vec(),
             });
-            parts = r
-                .parts
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| m & (1 << i) == 0)
-                .map(|(_, p)| p)
-                .collect();
+            parts = Vec::with_capacity(rest);
+            parts.extend(
+                r.parts
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| m & (1 << i) == 0)
+                    .map(|(_, p)| p),
+            );
             parts.push(merged);
         }
     }
 
     /// The part with its cheapest plan and those sorted on a variable that later joins
     /// read.
-    fn useful(&self, p: Part) -> Part {
+    /// The entries are kept in place, in their order.
+    fn useful(&self, mut p: Part) -> Part {
         let cheapest = self.cheapest(&p.ents);
         let bnd = self.bnd(p.inputs);
-        let ents = p
-            .ents
-            .iter()
-            .copied()
-            .filter(|&e| {
-                Some(e) == cheapest
-                    || self.ents[e as usize].sum.sorted.is_some_and(|v| {
-                        self.jvar
-                            .iter()
-                            .position(|&x| x == v)
-                            .is_some_and(|j| bnd >> j & 1 == 1)
-                    })
-            })
-            .collect();
-        Part {
-            inputs: p.inputs,
-            ents,
-        }
+        p.ents.retain(|&e| {
+            Some(e) == cheapest
+                || self.ents[e as usize].sum.sorted.is_some_and(|v| {
+                    self.jvar
+                        .iter()
+                        .position(|&x| x == v)
+                        .is_some_and(|j| bnd >> j & 1 == 1)
+                })
+        });
+        p
     }
 
     /// Plan every connected subset of the round's parts of at most `size` parts.
+    /// `keys` bounds the plans kept per subset.
     fn plan_round(
         &mut self,
         r: &mut Round,
         size: usize,
+        keys: usize,
         ub: f64,
         batched: plan::Costing,
         ctx: &Ctx,
     ) -> Result<()> {
         let k = r.parts.len();
-        let mut cur: Vec<Best> = Vec::new();
-        let mut scratch = Scratch::default();
+        // On the checked route, the buffers reused across the round's subsets are
+        // admitted at their bounds before they are allocated, and the credit is dropped
+        // after them.
+        let jv = self.jvar.len();
+        let held = match self.held.as_ref() {
+            Some(held) => {
+                let preparation = held.preparation();
+                let mut layout = super::checked_layout::Layout::new(preparation);
+                layout.slots::<Best>(keys)?;
+                Scratch::measure(&mut layout, jv, self.cached.len(), keys)?;
+                Some(refused(preparation.reserve(layout.bytes()))?)
+            }
+            None => None,
+        };
+        let (mut cur, mut scratch) = if held.is_some() {
+            (
+                Vec::with_capacity(keys),
+                Scratch::with_capacity(jv, self.cached.len(), keys),
+            )
+        } else {
+            (Vec::new(), Scratch::default())
+        };
         for m in 1..(1u32 << k) {
             let c = m.count_ones() as usize;
             if c < 2 || c > size || !r.conn[m as usize] {
@@ -1739,8 +1800,10 @@ impl Dp {
                 self.split(r, m, sub, m ^ sub, ub, batched, ctx, &mut cur, &mut scratch);
                 sub = (sub - 1) & low;
             }
-            self.finish(r, m, &mut cur);
+            debug_assert!(held.is_none() || cur.capacity() == keys);
+            self.finish(r, m, &mut cur, &mut scratch)?;
         }
+        debug_assert!(held.is_none() || scratch.within(jv, self.cached.len(), keys));
         Ok(())
     }
 
@@ -1835,6 +1898,7 @@ impl Dp {
             pos,
             cached,
             cands,
+            ..
         } = sc;
         for &ea in &r.list[sa as usize..(sa + la) as usize] {
             let a = &self.ents[ea as usize];
@@ -1919,10 +1983,16 @@ impl Dp {
     }
 
     /// Store the best plans of subset `m`, in order of their sort variable.
-    fn finish(&mut self, r: &mut Round, m: u32, cur: &mut [Best]) {
+    fn finish(&mut self, r: &mut Round, m: u32, cur: &mut [Best], sc: &mut Scratch) -> Result<()> {
         cur.sort_unstable_by_key(|b| b.sorted);
         let start = r.list.len() as u32;
         let bnd = self.bnd(r.inputs[m as usize]);
+        // On the checked route, the tables grow only by admitted steps.
+        let vals = cur.len() * bnd.count_ones() as usize;
+        make_room(self.held.as_mut(), &mut self.ents, cur.len())?;
+        make_room(self.held.as_mut(), &mut self.dval, vals)?;
+        make_room(self.held.as_mut(), &mut self.ddom, vals)?;
+        make_room(r.held.as_mut(), &mut r.list, cur.len())?;
         for b in cur.iter() {
             let (ea, eb) = (self.ents[b.a as usize], self.ents[b.b as usize]);
             let (ja, jbm) = (self.jm[ea.mask as usize], self.jm[eb.mask as usize]);
@@ -1965,20 +2035,24 @@ impl Dp {
             });
         }
         let first = self.ents.len() as u32 - cur.len() as u32;
-        let mut ids: Vec<u32> = (first..self.ents.len() as u32).collect();
-        self.drop_dominated(r.inputs[m as usize], &mut ids);
-        for &e in &ids {
+        let Scratch { ids, keep, .. } = sc;
+        ids.clear();
+        ids.extend(first..self.ents.len() as u32);
+        self.drop_dominated(r.inputs[m as usize], ids, keep);
+        for &e in ids.iter() {
             r.minc[m as usize] = r.minc[m as usize].min(self.ents[e as usize].sum.cost);
         }
-        r.list.extend(&ids);
+        r.list.extend(ids.iter());
         r.slot[m as usize] = (start, ids.len() as u32);
+        Ok(())
     }
 
     /// Drop from `ids`, plans of the inputs `inputs`, those whose sort variable no later
     /// join or filter reads and that another plan matches in rows and distinct-value
     /// estimates at no more cost. Every plan made from a dropped one has a counterpart
     /// made from the other that costs no more, with the same estimates.
-    fn drop_dominated(&self, inputs: u32, ids: &mut Vec<u32>) {
+    /// `keep` is a buffer reused across calls.
+    fn drop_dominated(&self, inputs: u32, ids: &mut Vec<u32>, keep: &mut Vec<bool>) {
         if ids.len() < 2 {
             return;
         }
@@ -2005,7 +2079,8 @@ impl Dp {
                         == self.dval[(y.d + i) as usize].to_bits()
                 })
         };
-        let mut keep = vec![true; ids.len()];
+        keep.clear();
+        keep.resize(ids.len(), true);
         for i in 0..ids.len() {
             let x = &self.ents[ids[i] as usize];
             if !dead(x.sum.sorted) {
@@ -2040,9 +2115,18 @@ impl Dp {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::enter(4);
         let ctx = pl.ctx;
-        let fvars = dp_filter_vars(filters);
+        let fvars = dp_filter_vars(filters, pl)?;
+        let fvars = &fvars.vars[..];
+        // The plan joins each of the n inputs once, so it has 2n - 1 entries, and at
+        // most n built plans wait for their parent. On the checked route that storage is
+        // admitted before it is allocated, and the credit is dropped after it.
+        let held = pl.planning_scratch(|layout| {
+            layout.slots::<u32>(2 * self.n - 1)?;
+            layout.map::<u32, (Node, u64)>(self.n)
+        })?;
         // the entries of the plan, children before parents
-        let mut need = vec![root];
+        let mut need = Vec::with_capacity(if held.is_some() { 2 * self.n - 1 } else { 1 });
+        need.push(root);
         let mut i = 0;
         while i < need.len() {
             let e = self.ents[need[i] as usize];
@@ -2052,18 +2136,25 @@ impl Dp {
             }
             i += 1;
         }
+        debug_assert!(need.len() < 2 * self.n);
         need.sort_unstable();
-        let mut built: FxHashMap<u32, (Node, u64)> = FxHashMap::default();
+        let mut built: FxHashMap<u32, (Node, u64)> = if held.is_some() {
+            FxHashMap::with_capacity_and_hasher(self.n, Default::default())
+        } else {
+            FxHashMap::default()
+        };
+        #[cfg(debug_assertions)]
+        let capacity = built.capacity();
         for &x in &need {
             ctx.check()?;
             let e = self.ents[x as usize];
             let (n, f) = if e.mask.is_power_of_two() {
                 let leaf = std::mem::replace(&mut items[e.a as usize][e.b as usize], Node::unit());
-                place_masked(pl, leaf, 0, filters, &fvars)
+                place_masked(pl, leaf, 0, filters, fvars)
             } else {
                 let (na, fa) = built.remove(&e.a).unwrap();
                 let (nb, fb) = built.remove(&e.b).unwrap();
-                place_masked(pl, build_join(na, nb, e.how, ctx), fa | fb, filters, &fvars)
+                place_masked(pl, build_join(na, nb, e.how, ctx), fa | fb, filters, fvars)
             };
             debug_assert!(
                 n.cost.to_bits() == e.sum.cost.to_bits() && n.est.to_bits() == e.sum.est.to_bits(),
@@ -2074,6 +2165,8 @@ impl Dp {
             );
             built.insert(x, (n, f));
         }
+        #[cfg(debug_assertions)]
+        debug_assert!(held.is_none() || built.capacity() == capacity);
         Ok(built.remove(&root).unwrap())
     }
 }
@@ -2087,19 +2180,164 @@ struct Scratch {
     /// the variables of the filters placed on a join that an expression cache reads
     cached: Vec<VarId>,
     cands: Vec<Cand>,
+    /// a subset's new entries, and which of them [`Dp::drop_dominated`] keeps
+    ids: Vec<u32>,
+    keep: Vec<bool>,
+}
+
+impl Scratch {
+    /// The buffers' storage at their bounds: `jv` join variables, `cached` filters an
+    /// expression cache reads, and `keys` plans per subset. A join offers at most a
+    /// merge join per shared variable, a hash join and two index joins (see [`joins`]).
+    fn measure(
+        layout: &mut super::checked_layout::Layout<'_>,
+        jv: usize,
+        cached: usize,
+        keys: usize,
+    ) -> Result<()> {
+        layout.slots::<Shared>(jv)?;
+        layout.slots::<(u32, u32)>(jv)?;
+        layout.slots::<VarId>(cached)?;
+        layout.slots::<Cand>(jv + 3)?;
+        layout.slots::<u32>(keys)?;
+        layout.slots::<bool>(keys)
+    }
+
+    fn with_capacity(jv: usize, cached: usize, keys: usize) -> Scratch {
+        Scratch {
+            shared: Vec::with_capacity(jv),
+            pos: Vec::with_capacity(jv),
+            cached: Vec::with_capacity(cached),
+            cands: Vec::with_capacity(jv + 3),
+            ids: Vec::with_capacity(keys),
+            keep: Vec::with_capacity(keys),
+        }
+    }
+
+    /// Whether no buffer grew past the bounds it was made with.
+    fn within(&self, jv: usize, cached: usize, keys: usize) -> bool {
+        self.shared.capacity() == jv
+            && self.pos.capacity() == jv
+            && self.cached.capacity() == cached
+            && self.cands.capacity() == jv + 3
+            && self.ids.capacity() == keys
+            && self.keep.capacity() == keys
+    }
+}
+
+/// The phases a checked plan reports before it admits the program's tables, a round's
+/// tables, and the growth of either.
+pub(super) const PREPARE_PHASE: &str = "reserving join order tables";
+pub(super) const ROUND_PHASE: &str = "reserving join order round";
+pub(super) const GROW_PHASE: &str = "growing join order table";
+
+/// The storage of `count` parts.
+fn part_bytes(count: usize) -> u64 {
+    (count * std::mem::size_of::<Part>()) as u64
+}
+
+/// `held`, counted on this thread when refused, for the tests of the program's
+/// admission.
+fn refused<T>(held: Result<T>) -> Result<T> {
+    #[cfg(test)]
+    if held.is_err() {
+        DP_REFUSALS.with(|n| n.set(n.get() + 1));
+    }
+    held
+}
+
+/// Make room in `v` for `need` more values. On the checked route `credit`, which holds
+/// `v`'s storage among others, admits the larger storage before it is allocated.
+#[inline]
+fn make_room<T>(credit: Option<&mut Reservation>, v: &mut Vec<T>, need: usize) -> Result<()> {
+    match credit {
+        Some(credit) if v.capacity() - v.len() < need => grow_admitted(credit, v, need),
+        _ => Ok(()),
+    }
+}
+
+/// Grow `v` to at least twice its storage, holding credit for the old storage and the
+/// new while the values move, and then for the new storage only.
+#[cold]
+fn grow_admitted<T>(credit: &mut Reservation, v: &mut Vec<T>, need: usize) -> Result<()> {
+    let preparation = credit.preparation().clone();
+    let size = std::mem::size_of::<T>();
+    let bytes = |n: usize| {
+        n.checked_mul(size)
+            .and_then(|b| u64::try_from(b).ok())
+            .ok_or_else(|| preparation.exhausted())
+    };
+    let want = v
+        .len()
+        .checked_add(need)
+        .ok_or_else(|| preparation.exhausted())?;
+    let capacity = want.max(v.capacity().saturating_mul(2)).max(4);
+    let (old, new) = (bytes(v.capacity())?, bytes(capacity)?);
+    #[cfg(test)]
+    DP_GROWTH.with(|n| n.set(new as usize));
+    refused(preparation.stage(GROW_PHASE))?;
+    refused(credit.grow_by(new))?;
+    v.try_reserve_exact(capacity - v.len())
+        .map_err(|_| preparation.exhausted())?;
+    if size != 0 && v.capacity() != capacity {
+        return Err(preparation.exhausted());
+    }
+    credit.release_to(credit.bytes() - old);
+    Ok(())
 }
 
 /// The variables of each filter as the exhaustive program reads them (EXISTS never
-/// placed).
-fn dp_filter_vars(filters: &[Expr]) -> Vec<Vec<VarId>> {
-    filters
-        .iter()
-        .map(|f| {
-            if f.has_exists() {
+/// placed), with the checked route's credit for them, dropped after them.
+struct FilterVars {
+    vars: Vec<Vec<VarId>>,
+    _held: Option<Reservation>,
+}
+
+/// The variables of each filter (see [`FilterVars`]). On the checked route their
+/// storage is sized by a walk over the filters that allocates nothing, and admitted
+/// before it is allocated.
+fn dp_filter_vars(filters: &[Expr], pl: &Planner) -> Result<FilterVars> {
+    let count = |f: &Expr| {
+        let mut n = 0usize;
+        let Ok(()) = f.visit_vars(&mut |_| {
+            n += 1;
+            Ok::<_, std::convert::Infallible>(())
+        });
+        n
+    };
+    let held = pl.planning_scratch(|layout| {
+        layout.slots::<Vec<VarId>>(filters.len())?;
+        for f in filters {
+            layout.slots::<VarId>(if f.has_exists() { 1 } else { count(f) })?;
+        }
+        Ok(())
+    })?;
+    let vars = if held.is_some() {
+        let mut vars = Vec::with_capacity(filters.len());
+        for f in filters {
+            vars.push(if f.has_exists() {
                 vec![VarId::MAX]
             } else {
-                f.var_set()
-            }
-        })
-        .collect()
+                // the same variables as `var_set`, in storage of the counted size
+                let mut v = Vec::with_capacity(count(f));
+                f.vars(&mut v);
+                v.sort_unstable();
+                v.dedup();
+                v
+            });
+        }
+        vars
+    } else {
+        filters
+            .iter()
+            .map(|f| {
+                if f.has_exists() {
+                    vec![VarId::MAX]
+                } else {
+                    f.var_set()
+                }
+            })
+            .collect()
+    };
+    Ok(FilterVars { vars, _held: held })
 }

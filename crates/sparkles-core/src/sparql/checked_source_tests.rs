@@ -2624,14 +2624,253 @@ fn checked_join_order_excess(width: usize) -> [i64; crate::test_alloc::STAGES] {
 #[test]
 fn checked_graph_r12_admits_join_order_tables() {
     // Stage 2 builds the program's tables over every subset of the inputs, which grow
-    // with 2^n, and the greedy plan alone handles widths past 16.
+    // with 2^n, stage 3 runs the program over them and stage 4 rebuilds its plan. The
+    // greedy plan alone handles widths past 16. The few hundred bytes left in stage 3
+    // do not grow with the width.
     for width in [4, 8, 12] {
         let excess = checked_join_order_excess(width);
-        assert!(
-            excess[2] <= 512,
-            "program tables: {} unadmitted bytes at width {width}",
-            excess[2]
+        for (stage, name, cap) in [
+            (2, "program tables", 512),
+            (3, "program run", 1024),
+            (4, "program build", 256),
+        ] {
+            assert!(
+                excess[stage] <= cap,
+                "{name}: {} unadmitted bytes at width {width}",
+                excess[stage]
+            );
+        }
+    }
+}
+
+/// The outcome, produced rows and phase events of a checked GRAPH query whose progress
+/// callback acts at event `at` of `phase`: it cancels when `cancel`, fills the budget
+/// when `fill`, and otherwise only records. Also returns the program's growth target at
+/// that event, and the allocations of `size` bytes before that event and in all.
+#[allow(clippy::type_complexity)]
+fn checked_join_order_at_phase(
+    store: &Store,
+    text: &str,
+    phase: &'static str,
+    at: usize,
+    cancel: bool,
+    fill: bool,
+    size: usize,
+) -> (Result<QueryResult>, u64, usize, usize, usize, usize) {
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let events = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::new(AtomicUsize::new(usize::MAX));
+    let growth = Arc::new(AtomicUsize::new(0));
+    let account = Arc::new(parking_lot::Mutex::new(
+        None::<(Preparation, Option<crate::access::Reservation>)>,
+    ));
+    let mut control = Control::with_cancel(cancelled.clone());
+    control.progress = crate::task::Progress::new({
+        let (events, seen, growth, account) = (
+            events.clone(),
+            seen.clone(),
+            growth.clone(),
+            account.clone(),
         );
+        move |_, name| {
+            if name != phase || events.fetch_add(1, Ordering::Relaxed) != at {
+                return;
+            }
+            seen.store(
+                crate::test_alloc::admitted_allocations_seen(),
+                Ordering::Relaxed,
+            );
+            growth.store(
+                crate::sparql::joinorder::DP_GROWTH.with(std::cell::Cell::get),
+                Ordering::Relaxed,
+            );
+            if cancel {
+                cancelled.store(true, Ordering::Relaxed);
+            } else if fill {
+                let mut account = account.lock();
+                let (prep, filler) = account.as_mut().expect("set before query");
+                *filler = Some(prep.reserve(prep.room()).unwrap());
+            }
+        }
+    });
+    let prep = Preparation::new(control, 64 << 20).unwrap();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &prep)
+        .unwrap();
+    let before = prep.inner_used();
+    *account.lock() = Some((prep.clone(), None));
+    let rows = Arc::new(AtomicU64::new(0));
+    let mut outcome = None;
+    let (allocated, ..) = crate::test_alloc::record_admitted_allocations(&prep, size, || {
+        outcome = Some(query_prepared_source(
+            view.read_source(),
+            text,
+            &QueryOptions {
+                work: Some(rows.clone()),
+                ..opts()
+            },
+        ));
+    });
+    drop(account.lock().take());
+    let outcome = outcome.unwrap();
+    if outcome.is_err() {
+        assert_eq!(prep.inner_used(), before, "{phase}: credit returns");
+    }
+    (
+        outcome,
+        rows.load(Ordering::Relaxed),
+        events.load(Ordering::Relaxed),
+        growth.load(Ordering::Relaxed),
+        seen.load(Ordering::Relaxed),
+        allocated,
+    )
+}
+
+#[test]
+fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
+    use crate::sparql::joinorder::{GROW_PHASE, PREPARE_PHASE, ROUND_PHASE};
+
+    // A chain of 12 is planned by the program in one round over 12 inputs.
+    let width = 12;
+    let store = checked_chain_fixture(width);
+    let text = checked_chain_query(width).replacen("SELECT *", "SELECT ?g ?x0", 1);
+    // The largest table each admission allocates first: the subsets' join variables
+    // (one u128 per subset), the round's inputs per subset (one u32 per subset), and
+    // the grown table, whose size a recording run learns.
+    let n = 1usize << width;
+    // Growth events 0 to 2 make room before the inputs are entered, and later ones
+    // as subsets are planned. `usize::MAX` stands for the last event.
+    for (phase, at, size) in [
+        (PREPARE_PHASE, 0, 16 * n),
+        (ROUND_PHASE, 0, 4 * n),
+        (GROW_PHASE, 1, 0),
+        (GROW_PHASE, 3, 0),
+        (GROW_PHASE, usize::MAX, 0),
+    ] {
+        let at = if at == usize::MAX {
+            let (_, _, events, ..) =
+                checked_join_order_at_phase(&store, &text, phase, 0, false, false, 1);
+            assert!(events > 4, "{events} growth events");
+            events - 1
+        } else {
+            at
+        };
+        let (outcome, _, events, growth, ..) =
+            checked_join_order_at_phase(&store, &text, phase, at, false, false, 1);
+        assert!(outcome.is_ok(), "{phase}: the recording run answers");
+        assert!(events > at, "{phase}: {events} events");
+        let size = if size == 0 { growth } else { size };
+        assert!(size > 0, "{phase}: a growth target");
+        for cancel in [false, true] {
+            let (outcome, rows, events, _, seen, allocated) =
+                checked_join_order_at_phase(&store, &text, phase, at, cancel, !cancel, size);
+            if cancel {
+                assert!(matches!(outcome, Err(Error::Cancelled)), "{phase}");
+            } else {
+                assert!(
+                    matches!(
+                        outcome,
+                        Err(Error::BudgetExceeded(crate::error::Budget {
+                            kind: crate::error::BudgetKind::Memory,
+                            ..
+                        }))
+                    ),
+                    "{phase}: a refused admission fails the query"
+                );
+            }
+            assert_eq!(rows, 0, "{phase}");
+            assert_eq!(events, at + 1, "{phase}: no later admission");
+            assert_eq!(
+                allocated, seen,
+                "{phase}: the refused table was allocated after the refusal"
+            );
+        }
+    }
+}
+
+/// A chain of `width` patterns in the default graph, and a star of `width` patterns on
+/// `<urn:n:0>`.
+fn default_chain_fixture(width: usize) -> Store {
+    use std::fmt::Write;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut input = String::new();
+    for step in 1..=width {
+        writeln!(
+            input,
+            "<urn:n:{}> <urn:c:{step}> <urn:n:{step}> .",
+            step - 1
+        )
+        .unwrap();
+        writeln!(input, "<urn:n:0> <urn:s:{step}> <urn:m:{step}> .").unwrap();
+    }
+    store
+        .load(&[crate::io::Source::from_bytes(
+            input.into_bytes(),
+            crate::io::RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    store
+}
+
+#[test]
+fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
+    use plan::Planner;
+
+    use crate::sparql::joinorder::DP_ROUNDS;
+    use std::fmt::Write;
+
+    // The program plans chains up to 16 in one round, a star of 12 in several, and the
+    // greedy plan wider groups. Both routes plan the same group of the same graph, so
+    // only admission differs.
+    for (width, star) in [(4, false), (12, false), (12, true), (20, false)] {
+        let store = default_chain_fixture(width);
+        let data = physical_default(&store);
+        let ctx = validation_query_context(&data, opts()).unwrap();
+        let prep = ctx.source_preparation.as_ref().unwrap().clone();
+        let text = if star {
+            let mut text = String::from("SELECT * WHERE {");
+            for step in 1..=width {
+                write!(text, " ?x0 <urn:s:{step}> ?y{step} .").unwrap();
+            }
+            for step in 1..=width {
+                write!(text, " FILTER(?y{step} != <urn:n:absent>)").unwrap();
+            }
+            text.push_str(" BIND(?x0 AS ?first) }");
+            text
+        } else {
+            checked_chain_query(width)
+                .replacen("GRAPH ?g {", "", 1)
+                .replacen("} }", "}", 1)
+        };
+        let width = if star { width + 100 } else { width };
+        let Query::Select { pattern, .. } = parse_query(&text, None, &[]).unwrap() else {
+            unreachable!()
+        };
+        // A fresh planner per route, since a planner numbers the patterns it plans.
+        let ordinary = Planner::new(&ctx)
+            .plan(&pattern, &plan::ActiveGraph::Default, Vec::new())
+            .unwrap();
+        let before = prep.inner_used();
+        let rounds = DP_ROUNDS.with(std::cell::Cell::get);
+        let checked = Planner::new(&ctx)
+            .plan_admitted_for_test(&pattern, &prep)
+            .unwrap();
+        let rounds = DP_ROUNDS.with(std::cell::Cell::get) - rounds;
+        println!("width {width}: {rounds} rounds");
+        if width > 100 {
+            assert!(rounds > 1, "the star is planned in rounds");
+        }
+        assert_eq!(prep.inner_used(), before, "width {width}: credit returns");
+        let (a, b) = (
+            format!("{:?}", exec::describe(&ctx, &ordinary)),
+            format!("{:?}", exec::describe(&ctx, &checked)),
+        );
+        assert!(a.contains("Join"), "width {width}: {a}");
+        assert_eq!(a, b, "width {width}");
     }
 }
 
