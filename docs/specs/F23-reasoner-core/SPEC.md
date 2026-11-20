@@ -543,6 +543,17 @@ give the record. An earlier approximate run on stanley, a laptop with other work
 `c97471c3` against `5f3f69c2`, is in
 [its own directory](../../benchmarks/reasoning/runs/2026-11-20-item-521-stanley/env.txt).
 
+A demand session exports its derived facts sorted in predicate, object and subject order,
+the order in which joins mostly derive them, because a query that reads a cached table
+inserts its facts into the query's overlay and the operators' own order made that slower.
+A session decides at its first run whether its rules admit operators, so a session whose
+tables all come from the cache does not check, and `Closures::detect` passes over adorned
+copies whose body does not read the head's predicate twice before taking them apart. On
+forge at `5ef06e3f` against `5f3f69c2`, the reasoning latency gate found no metric slower
+in every round, with the same answer fingerprints. [The reasoning
+results](../../benchmarks/reasoning/RESULTS.md#query-time-closure-operators-on-owl2bench)
+describe that run.
+
 ### Bounded incremental deletion
 
 Roadmap item 798 bounds the maintenance after a deletion by the cost of a full run,

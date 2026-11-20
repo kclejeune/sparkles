@@ -1,0 +1,79 @@
+Per-round test of the forge latency rerun, 5ef06e3f (tip) against 5f3f69c2 (base), with
+the tip binary also run with SPARKLES_DEMAND_CLOSURES=0 (off). Each round's value is the
+median of its three timed runs, and each metric has 30 round ratios across its two pairs.
+Times are in ms and added times in microseconds. The tables list the metrics that
+bench-gate.py flagged in either pair, the metrics whose tip is slower in at least 27 of
+30 rounds, and the metrics that the first pass in ../2026-11-20-item-521-forge/ named.
+
+No metric is slower in every round of either pair of pairs. owl-rl/demand-cached/q11,
+which the first pass found slower in all 10 rounds, is slower in 19 of 30 rounds against
+base, at 1.026 and 0.984. The nearest to every round is owl-rl/demand/q6, slower in 29
+of 30 rounds by 2.5 and 3.6%, then owl-rl/demand/q5 in 27 of 30. Both off runs of q6 are
+at the tip's level (1,716 and 1,704 ms against 1,681 and 1,706 ms for the tip and 1,640
+and 1,647 ms for base), so that difference follows the binary and not the closure
+operators. The first pass, at 365cffcf, had q6 at 0.970 and 0.994. Instruction counts
+for owl-rl demand q6 were not taken. Against the tip, the off arm shows no metric slower
+in at least 27 of 30 rounds.
+
+Base pairs: tip against base. Pair 1 is 1-base against 2-tip and pair 2 is 6-base against 5-tip.
+metric                             base1   ratio1   ratio2    added1    added2 rounds slower
+rdfs/materialized/q1              0.0454    1.152    1.579       6.9      26.0 15/30
+rdfs/demand/q1                    0.9948    0.959    1.119     -41.0     118.0 16/30
+rdfs/demand-cached/q1             0.2672    1.005    1.126       1.4      33.1 20/30
+rdfs/materialized/q3              0.0459    0.941    1.121      -2.7       5.3 13/30
+rdfs/materialized/q7              0.0959    1.172    1.191      16.5      18.4 16/30
+rdfs/demand/q7                    1.6944    1.032    1.152      54.1     239.9 17/30
+rdfs/materialized/q10             0.0494    1.085    1.584       4.2      25.5 16/30
+rdfs/on-read/q13                  0.1175    0.966    1.235      -4.0      26.9 13/30
+owl-rl/demand/q1                  2.1029    0.949    1.149    -106.3     296.9 19/30
+owl-rl/demand-cached/q1           0.5447    1.052    1.067      28.3      35.8 21/30
+owl-rl/demand-cached/q3           0.5391    1.024    1.022      12.7      12.1 22/30
+owl-rl/demand/q4                  8.9599    1.047    1.037     422.5     344.0 25/30
+owl-rl/demand/q5                 35.3984    1.041    1.078    1441.7    2891.2 27/30
+owl-rl/demand/q6               1639.9037    1.025    1.036   41177.0   59004.8 29/30
+owl-rl/demand/q7                  7.3398    0.994    1.152     -42.6    1056.9 21/30
+owl-rl/materialized/q10           0.0483    1.177    1.298       8.6      15.2 15/30
+owl-rl/demand/q10                 4.1897    1.098    1.019     411.4      78.8 19/30
+owl-rl/demand/q11                 2.9370    0.979    0.970     -61.4     -87.9 7/30
+owl-rl/demand-cached/q11          0.7338    1.026    0.984      18.8     -11.6 19/30
+owl-rl/materialized/q13           0.0829    1.110    1.075       9.2       6.3 16/30
+owl-rl/demand-cached/q14          0.6853    1.000    1.012       0.0       8.0 20/30
+
+Off pairs: tip against off, the tip binary with SPARKLES_DEMAND_CLOSURES=0. Pair 1 is 3-off against 2-tip and pair 2 is 4-off against 5-tip.
+metric                              off1   ratio1   ratio2    added1    added2 rounds slower
+rdfs/materialized/q1              0.0448    1.169    1.476       7.6      22.9 17/30
+rdfs/demand/q1                    0.9320    1.023    1.154      21.9     147.6 20/30
+rdfs/materialized/q3              0.0430    1.004    1.155       0.2       6.5 12/30
+rdfs/materialized/q7              0.0947    1.187    1.206      17.8      19.7 18/30
+rdfs/materialized/q10             0.0469    1.143    1.567       6.7      25.0 11/30
+rdfs/demand/q12                   1.4792    1.128    1.012     188.9      18.1 19/30
+rdfs/on-read/q12                  0.1207    1.120    0.981      14.4      -2.4 18/30
+rdfs/demand/q13                   0.8275    1.100    0.989      82.8     -10.6 18/30
+rdfs/on-read/q13                  0.1127    1.007    1.248       0.8      28.1 14/30
+owl-rl/demand/q1                  1.9667    1.015    1.174      29.9     340.7 16/30
+owl-rl/demand-cached/q1           0.5558    1.031    1.018      17.3      10.2 19/30
+owl-rl/demand-cached/q3           0.5413    1.019    1.000      10.5       0.2 21/30
+owl-rl/demand/q4                  9.1217    1.029    1.017     260.8     157.1 23/30
+owl-rl/demand/q7                  7.3662    0.991    1.128     -69.0     908.6 17/30
+owl-rl/materialized/q10           0.0489    1.163    1.381       8.0      18.3 16/30
+owl-rl/demand/q10                 4.4523    1.033    0.964     148.8    -160.3 18/30
+owl-rl/demand/q11                 2.9048    0.990    0.992     -29.3     -22.8 10/30
+owl-rl/demand-cached/q11          0.7421    1.014    0.991      10.5      -6.9 15/30
+owl-rl/materialized/q13           0.0812    1.133    1.061      10.8       5.2 21/30
+owl-rl/demand-cached/q14          0.6848    1.001    1.003       0.5       1.8 15/30
+
+Rounds whose median exceeds 1.3 times the median of the metric's 90 round medians over
+all six runs, for the materialized metrics whose value in 1-base is under 0.1 ms. These
+modes run no reasoner code at query time.
+rdfs/materialized/q1       1-base [1, 4, 15]  2-tip [1, 9, 12]  3-off []  4-off [1, 6, 8]  5-tip [1, 2, 9, 10, 12]  6-base [1, 10]
+rdfs/materialized/q3       1-base [11, 13, 14]  2-tip [7, 13]  3-off [6]  4-off [2]  5-tip [4, 7, 15]  6-base [2, 13]
+rdfs/materialized/q7       1-base [2, 7]  2-tip [3, 7, 14]  3-off [13]  4-off [13]  5-tip [6, 7, 14]  6-base [2, 7, 9]
+rdfs/materialized/q10      1-base [1, 6, 10, 13]  2-tip [3, 4, 6, 13, 14]  3-off [1, 6, 13]  4-off [6, 8, 13]  5-tip [1, 2, 3, 6, 13, 14]  6-base [6]
+rdfs/materialized/q11      1-base [1, 10, 12]  2-tip [6]  3-off [5]  4-off [1, 12]  5-tip []  6-base [3, 8, 11, 13]
+rdfs/materialized/q12      1-base []  2-tip []  3-off []  4-off [1]  5-tip [4]  6-base []
+rdfs/materialized/q13      1-base []  2-tip []  3-off []  4-off []  5-tip []  6-base []
+owl-rl/materialized/q1     1-base [5, 12]  2-tip []  3-off [6, 12, 13, 14]  4-off [5, 6]  5-tip [5, 7, 8, 9, 12]  6-base [5, 6]
+owl-rl/materialized/q3     1-base [11, 14]  2-tip [11, 13]  3-off []  4-off [2]  5-tip [4, 7, 15]  6-base [8, 13]
+owl-rl/materialized/q10    1-base []  2-tip [3, 4, 6, 14]  3-off [5]  4-off [2]  5-tip [1, 2, 12, 14]  6-base [11, 13]
+owl-rl/materialized/q13    1-base [10, 15]  2-tip [2, 3, 6]  3-off [6]  4-off [2]  5-tip [4, 8, 9]  6-base []
+elevated rounds per run: {'1-base': 21, '2-tip': 23, '3-off': 12, '4-off': 16, '5-tip': 33, '6-base': 18}

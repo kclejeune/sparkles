@@ -21,6 +21,14 @@ operator does not. At OWL2Bench(1) q12, the walks that merged nothing read 1.3 m
 instead of 21 million, with the same rows. Roadmap item 1226 covers the scan of the closed
 relation that a later run of a session still makes.
 
+A demand session now exports its derived facts in predicate, object and subject order, the
+order in which joins mostly derive them, so a query that reads a cached table adds its facts
+to the query's overlay as fast as before the operators. A session checks its rules for
+operators at its first run, so a session served from the cache skips the check, and
+`Closures::detect` passes over adorned copies that cannot be transitive before taking them
+apart. On forge the reasoning latency gate then showed no query slower than before the
+operators in every round.
+
 ### Targeted checks on a remote host
 
 `mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
