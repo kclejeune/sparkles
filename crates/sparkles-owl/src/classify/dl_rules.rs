@@ -1191,17 +1191,17 @@ pub fn select_ground() -> bool {
 /// Which Joins the restriction on ground inferences exempts, item 1220's containment. When
 /// the partners are facts that hold only under the context's core, no ancestor holds
 /// them, and one Join, which resolves a single literal, leaves a ground clause with a body
-/// that the restriction would drop before the next Join could discharge it. Every Join is
-/// exempt until item 1220's repair. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts every Join and
-/// `=2` exempts a Join whose premise on the side of the head has no ground literal in its
-/// body, for measurement.
+/// that the restriction would drop before the next Join could discharge it. Until item
+/// 1220's repair, a Join whose premise on the side of the head has no ground literal in its
+/// body is exempt, whatever the residual head. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts
+/// every Join and `=1` exempts every Join, for measurement.
 pub fn join_exempt() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var("SPARKLES_ROOTED_JOIN_EXEMPT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1)
+            .unwrap_or(2)
     })
 }
 

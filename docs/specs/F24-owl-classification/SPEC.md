@@ -140,16 +140,19 @@ HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not
 since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
 same values. The gap of `owl:Thing` that item 805 found is closed.
 
-Item 1220 turns two of item 804's departures off in rooted runs, the selection of ground
-body literals and the restriction on ground inferences in Join, since each could make a
-run that reported itself complete miss an entailed subsumption or an unsatisfiable class.
-Generated ontologies found both, and with the two departures off no generated or fixture
-run that reports itself complete differs from HermiT, apart from g2-150, whose difference
-is HermiT's. `SPARKLES_ROOTED_SELECT_GROUND=1`
-and `SPARKLES_ROOTED_JOIN_EXEMPT=0` restore each for measurement. shoi-005 and shoi-027
-then pass the bound and give their default answer, so 46 of the 50 `shoi` fixtures are
-exact against HermiT, and 15 more of the 393 generated ontologies with keys or the
-universal property pass the bound. The repair that restores the selection is item 1220.
+Item 1220 turns off the selection of ground body literals in rooted runs and narrows the
+restriction on ground inferences in Join, since each could make a run that reported
+itself complete miss an entailed subsumption or an unsatisfiable class. A Join whose
+premise on the side of the head has no ground literal in its body is exempt from the
+restriction, whatever its residual head. Generated ontologies found both losses, and with
+the two changes no generated or fixture run that reports itself complete differs from
+HermiT, apart from g2-150, whose difference is HermiT's. That is evidence and not a proof,
+and a complete rooted answer is not a certificate of completeness while item 823 is open.
+`SPARKLES_ROOTED_SELECT_GROUND=1` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` restore each for
+measurement. shoi-005 and shoi-027 then pass the bound and give their default answer, so
+46 of the 50 `shoi` fixtures are exact against HermiT, and 14 more of the 393 generated
+ontologies with keys or the universal property pass the bound. The repair that restores
+the selection is item 1220.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
@@ -3884,7 +3887,8 @@ conclusions mention `x` or `y`. The ground consequences of a hypothesis alone ar
 the context that holds the marked literal in an actual clause.
 
 The argument does not hold for Join against facts that only the context's core gives, which
-no ancestor holds, so Join is exempt from the restriction until item 1220 repairs the
+no ancestor holds, so a Join whose premise on the side of the head has no ground body
+literal is exempt from the restriction until item 1220 repairs the
 departure, as the Outcome records.
 
 The argument for completeness is the one for ordered resolution. A root clause `A_1 ∧ … ∧
