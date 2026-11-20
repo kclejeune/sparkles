@@ -35,6 +35,22 @@ preferences draw. The outbound-policy test of ontology imports asks for a link-l
 address, which the test server's policy refuses before it connects, although it allows
 private addresses. This completes roadmap item 1131.
 
+### Registered property functions under RDFS on read and reasoning
+
+A query could abort the server process when RDFS on read was on and the schema declared
+a registered property function a subproperty of a predicate the query named. The
+rewrite added a call that the query had not been prepared for, the call panicked, and
+the stream's destructor panicked again while unwinding. A schema that gave the function
+a domain or range, or put a subproperty below it, could also add or change a call, and
+the seed queries of query-time reasoning ran a written call in the same unprepared way.
+The RDFS rewrite now derives nothing through a registered property. It keeps the
+query's own call and its list arguments as written, after the patterns that bind its
+inputs, and adds none, and a reasoning seed set that would need a call is derived from
+constants instead. RDFS on read had also refused a written call with a list argument,
+or one whose input came from a rewritten pattern, and both now run. A callback reached from an unprepared
+query now fails that query with an error, and the stream and accumulator destructors no
+longer panic. This completes roadmap item 1198.
+
 ### Streamed answers through the engine buffer
 
 The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write

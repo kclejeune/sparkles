@@ -93,7 +93,9 @@ request or on every write, and the schema report counts what the data holds.
 * RDFS on read matches Fuseki's `--rdfs` and Jena's `ja:DatasetRDFS`
   ([API.md](../API.md#rdfs-on-read)). Queries see the RDFS closure of each graph against a
   schema graph by rewriting the query, and the answers equal Jena 6.2's on 55 fixture
-  queries. `/$/rdfs/{ds}`, `serve --rdfs` and `query --rdfs` turn it on.
+  queries. `/$/rdfs/{ds}`, `serve --rdfs` and `query --rdfs` turn it on. The rewrite
+  never adds a call of a registered property function, and the schema derives nothing
+  through one ([API.md](../API.md#rdfs-on-read)).
 * Query-time reasoning with `reasoning=demand` derives the facts a query's patterns need
   as it runs, from RDFS, RDFS simple, OWL 2 RL or a Jena rule file, without the inferred
   graph ([API.md](../API.md#query-time-reasoning), [F17](../specs/F17-query-time-reasoning.md#outcome)).

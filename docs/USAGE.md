@@ -6030,6 +6030,13 @@ keeps more state. Callbacks must still check for cancellation inside their own l
 work. Parsing a composite literal also counts a conservative memory estimate, so a
 literal below the byte ceiling can still exceed a finite query memory budget.
 
+RDFS on read calls a registered function only where the query writes it
+([API.md](API.md#rdfs-on-read)). A schema that declares the predicate a subproperty of
+another, or gives it a domain or range, adds no call, and the seeds of query-time
+reasoning are not read through one. An OWL 2 QL ontology that relates the predicate to
+another property can still add a call, which roadmap item 1205 covers. A callback
+reached from a query that was not prepared for it fails that query with an error.
+
 The default volatility is `Volatile`. Queries that call registered callbacks skip the
 result cache and any optimization that would move a callback to another place in the
 plan. OPTIONAL and LATERAL still call the function once per input row. EXISTS is still

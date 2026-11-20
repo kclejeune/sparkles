@@ -1132,17 +1132,16 @@ pub(super) enum Accounting {
     Cursor,
 }
 
-/// The first supported resource refusal that infallible code met. Scalar evaluation cannot return
-/// a resource error, so it records the refusal here and the next check fails with it,
-/// which keeps a refused allocation from becoming an unbound value.
+/// The first supported execution refusal that infallible code met. Scalar evaluation
+/// records it here so the next check fails with it even when the expression falls back.
 #[derive(Default)]
 struct MemoryFailure {
     failure: parking_lot::Mutex<Option<ResourceRefusal>>,
     failed: AtomicBool,
 }
 
-/// Only the supported resource outcomes become sticky. Arbitrary scalar/service
-/// errors keep their existing semantics; typed ownership errors never become UNDEF.
+/// Resource and ownership refusals and the unconfigured extension refusal become sticky.
+/// Ordinary expression and service errors keep their existing semantics.
 #[derive(Clone)]
 enum ResourceRefusal {
     Budget(Budget),
@@ -1154,6 +1153,7 @@ enum ResourceRefusal {
     },
     Cancelled,
     Timeout,
+    UnconfiguredExtension,
 }
 
 impl ResourceRefusal {
@@ -1162,6 +1162,7 @@ impl ResourceRefusal {
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
             Error::Cancelled => Some(Self::Cancelled),
             Error::Timeout => Some(Self::Timeout),
+            error if super::extensions::is_unconfigured(error) => Some(Self::UnconfiguredExtension),
             Error::Component(component) => component
                 .source
                 .as_ref()
@@ -1181,6 +1182,7 @@ impl ResourceRefusal {
             Self::Budget(budget) => Error::BudgetExceeded(budget),
             Self::Cancelled => Error::Cancelled,
             Self::Timeout => Error::Timeout,
+            Self::UnconfiguredExtension => super::extensions::unconfigured(),
             Self::Parent {
                 component,
                 code,
@@ -1997,7 +1999,7 @@ impl Ctx {
         }
     }
 
-    /// Fail with the budget refusal that infallible code recorded (see
+    /// Fail with the refusal that infallible code recorded (see
     /// [`Ctx::fail_memory`]).
     #[inline]
     pub(super) fn check_memory_failure(&self) -> Result<()> {
@@ -2018,7 +2020,7 @@ impl Ctx {
         }
     }
 
-    /// Record the first supported resource refusal met by infallible code, so
+    /// Record the first supported execution refusal met by infallible code, so
     /// the next check preserves its original typed outcome in both modes.
     pub(super) fn fail_memory(&self, error: &Error) {
         if self.memory_failure.failed.load(Ordering::Acquire) {
@@ -2165,7 +2167,7 @@ impl Ctx {
     #[inline]
     pub fn check_rows(&self, n: usize) -> Result<()> {
         if n > self.max_rows {
-            return Err(Error::BudgetExceeded(Budget {
+            return Err(self.row_budget_error(Budget {
                 kind: BudgetKind::Rows,
                 limit: self.max_rows as u64,
                 requested: n as u64,
@@ -2200,11 +2202,24 @@ impl Ctx {
     }
 
     fn produced_exceeded(&self, requested: u64) -> Error {
-        Error::BudgetExceeded(Budget {
+        self.row_budget_error(Budget {
             kind: BudgetKind::RowsProduced,
             limit: self.max_rows_produced,
             requested,
         })
+    }
+
+    #[cold]
+    fn row_budget_error(&self, budget: Budget) -> Error {
+        // Row accounting can see a fallback row from a refused expression.
+        if matches!(
+            self.memory_failure.failure.lock().as_ref(),
+            Some(ResourceRefusal::UnconfiguredExtension)
+        ) {
+            super::extensions::unconfigured()
+        } else {
+            Error::BudgetExceeded(budget)
+        }
     }
 
     // --------------------------------------------------------------- memory ------

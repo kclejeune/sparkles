@@ -719,6 +719,7 @@ pub fn eval(e: &Expr, row: &Row<'_>, ctx: &Ctx) -> EvalResult<Val> {
                 super::plan::eval_exists(ctx, spec, &key, &row.table.vars)
             })
             .map_err(|error| {
+                // Preserve fatal refusals when an outer expression handles TypeError.
                 ctx.fail_memory(&error);
                 if ctx.calls_extensions {
                     ctx.fail_extension(super::extensions::ScalarError::from_engine(&error));
@@ -1012,7 +1013,10 @@ fn registered(
         terms.push(term);
     }
     let context = ScalarContext { ctx };
-    let _owner = CallbackGuard::enter(ctx);
+    let _owner = CallbackGuard::enter(ctx).map_err(|error| {
+        ctx.fail_memory(&error);
+        TypeError
+    })?;
     let arguments = [terms];
     let results = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         descriptor.implementation.call_batch(&context, &arguments)
