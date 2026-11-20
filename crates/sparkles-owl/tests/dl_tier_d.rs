@@ -2449,6 +2449,8 @@ fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
 #[test]
 #[ignore = "item 1229: passes with SPARKLES_COUNTING_LATE_UNIT=2"]
 fn a_late_restriction_that_shares_an_eager_successor_counts_with_it() {
+    // the repair, `SPARKLES_COUNTING_LATE_UNIT=2`, answers in full with counting
+    let repair = std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref() == Ok("2");
     let ax = axioms(
         "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
          SubClassOf(:K ObjectAllValuesFrom(:r :D))
@@ -2482,8 +2484,10 @@ fn a_late_restriction_that_shares_an_eager_successor_counts_with_it() {
             })
             .unwrap();
         assert_eq!(out.consistency, Consistency::Consistent);
-        if out.complete && k.excluded().is_empty() {
-            assert!(!out.stats.dl_counting_over);
+        let full = out.complete && k.excluded().is_empty();
+        assert!(full || !repair, "the repair answers in full");
+        if full {
+            assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
             assert!(
                 out.taxonomy.is_subclass(&c("K"), &c("Ans")),
                 "K ⊑ Ans is missing ({threads}, {expansion:?})"
