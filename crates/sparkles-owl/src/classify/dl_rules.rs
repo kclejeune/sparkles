@@ -905,7 +905,7 @@ fn partners_x(st: &State, a: Ex) -> Vec<Side> {
     };
     d.store
         .with_x(a)
-        .filter(|&i| !d.store.clauses[i as usize].sel)
+        .filter(|&i| sel_partners_x() || !d.store.clauses[i as usize].sel)
         .map(|i| side(&d.store.clauses[i as usize].c, Lit::x(a)))
         .collect()
 }
@@ -1188,6 +1188,16 @@ pub fn select_ground() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "1"))
 }
 
+/// Whether Hyper over x takes selected clauses as partners, item 1220's repair R1 of the
+/// selection: the partners of an atom over x, and in Pred from a successor over `f_e(u)`
+/// the partners of an atom over `f_e(u)` ([`super::dl_root::root_pred`]). Without it two
+/// selected clauses of one context never meet in such an inference. It matters only while
+/// [`select_ground`] is on. `SPARKLES_ROOTED_SEL_PARTNERS_X=1` turns it on and `=0` off.
+pub fn sel_partners_x() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SEL_PARTNERS_X").is_some_and(|v| v == "1"))
+}
+
 /// Which Joins the restriction on ground inferences exempts, item 1220's containment. When
 /// the partners are facts that hold only under the context's core, no ancestor holds
 /// them, and one Join, which resolves a single literal, leaves a ground clause with a body
@@ -1233,10 +1243,18 @@ pub(super) fn join_restricted(
 /// that let the context go on, so that the context never combines the markers of its
 /// predecessors in one body.
 pub(super) fn selected(lits: &Lits, inv: impl Fn(Role) -> Option<Role> + Copy, c: &Clause) -> bool {
-    select_ground()
-        && c.body()
-            .iter()
-            .any(|&l| l.kind() == XL && no_xy(lits.view(l, inv)))
+    select_ground() && selected_always(lits, inv, c)
+}
+
+/// [`selected`] whatever [`select_ground`] says.
+pub(super) fn selected_always(
+    lits: &Lits,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    c: &Clause,
+) -> bool {
+    c.body()
+        .iter()
+        .any(|&l| l.kind() == XL && no_xy(lits.view(l, inv)))
 }
 
 /// Whether an inference on the literal `v` is local to its context, so that a selected
@@ -1269,6 +1287,14 @@ pub(super) struct Found {
     pub(super) rule: &'static str,
     /// whether the conclusions are the root's, for the derivation trace
     pub(super) root: bool,
+}
+
+#[cfg(test)]
+impl Found {
+    /// The number of products, for tests.
+    pub(super) fn products_len(&self) -> usize {
+        self.prods.len()
+    }
 }
 
 impl Found {
