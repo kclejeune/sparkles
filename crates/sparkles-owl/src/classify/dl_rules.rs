@@ -541,7 +541,23 @@ pub struct DlRun {
     /// the most choices of one product that the run makes before it passes its bound on
     /// derived conclusions, zero for no limit (roadmap item 1011)
     width_limit: AtomicUsize,
+    /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
+    /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`], with
+    /// [`MREPAIR_HOLDER`] and [`MREPAIR_UNITS`] for measurements
+    pub mrepair: u8,
+    /// the repair's counts, for measurements: the notices of held triggers the root took,
+    /// the markers it sent and the clauses it returned
+    pub mcount: [AtomicUsize; 3],
 }
+
+/// [`DlRun::mrepair`]: M-send and M-return are on.
+pub const MREPAIR_ON: u8 = 1;
+/// [`DlRun::mrepair`]: M-send also sends the marker to the holder itself, which holds it
+/// already, so the marker is a tautology there.
+pub const MREPAIR_HOLDER: u8 = 2;
+/// [`DlRun::mrepair`]: M-send sends the marker of a trigger that is a live unit of the root
+/// too, which the registered contexts take as the root's fact already.
+pub const MREPAIR_UNITS: u8 = 4;
 
 impl DlRun {
     pub fn new(eager: bool, worked: std::sync::Arc<std::sync::atomic::AtomicBool>) -> DlRun {

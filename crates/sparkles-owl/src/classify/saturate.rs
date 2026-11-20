@@ -90,6 +90,15 @@ pub enum Concl {
     /// body over constants and their successor terms, a fact of the root, by its id in
     /// the run's table
     RFact(u32),
+    /// Tier D in a rooted run with row 1231's marker repair: the source context holds the
+    /// ground literal, by its id in the run's literals, as a maximal literal of a processed
+    /// clause other than a marker, so the root sends its marker to the contexts registered
+    /// for its constants (M-send)
+    RMark(Ex, u32),
+    /// Tier D in a rooted run with row 1231's marker repair: the root sent a processed
+    /// clause whose body is ground to a context that holds every body literal as a maximal
+    /// literal, by its id in the run's table (M-return)
+    RRet(u32),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -429,7 +438,9 @@ impl State {
             | Concl::RPred(..)
             | Concl::HypL(..)
             | Concl::REdge(..)
-            | Concl::RFact(..) => false,
+            | Concl::RFact(..)
+            | Concl::RMark(..)
+            | Concl::RRet(..) => false,
         }
     }
 
@@ -2996,13 +3007,17 @@ fn apply_rules<S: Sink, R: Rules>(
         Concl::HypL(l) if R::DISJ => dl_root::hyp_l(st, l, out),
         Concl::REdge(v, u) if R::DISJ => dl_root::redge(st, v, u, out),
         Concl::RFact(c) if R::DISJ => dl_root::rfact(ix, st, c, out),
+        Concl::RMark(h, l) if R::DISJ => dl_root::rmark(ix, st, h, l, out),
+        Concl::RRet(c) if R::DISJ => dl_root::rret(ix, st, c, out),
         Concl::Hyp(_)
         | Concl::DEdge(..)
         | Concl::PredC(..)
         | Concl::RPred(..)
         | Concl::HypL(..)
         | Concl::REdge(..)
-        | Concl::RFact(..) => {
+        | Concl::RFact(..)
+        | Concl::RMark(..)
+        | Concl::RRet(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }

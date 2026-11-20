@@ -1728,6 +1728,190 @@ fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment()
     }
 }
 
+/// Row 1231's marker repair fixtures (PLAN v3.1's rule M): each holds a ground fact about
+/// a constant that holds only under the query class K, whose consequence passes through an
+/// element outside K's successors, so that a rooted run without the repair misses it.
+const REPAIRS: [(&str, &str); 10] = [
+    // the regression itself
+    ("av2", AV2),
+    // a return whose body has two ground atoms, both held by the query context
+    ("multi", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectSomeValuesFrom(:t3 ObjectIntersectionOf(ObjectOneOf(:w2) :H)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(:E ObjectHasValue(:r3 :w2))
+     SubClassOf(ObjectIntersectionOf(ObjectSomeValuesFrom(:r2 :G) ObjectSomeValuesFrom(:r3 :H)) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // a holder clause whose residual head is an atom over x, a disjunction
+    ("resid", "SubClassOf(:K ObjectUnionOf(:B ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G))))
+     SubClassOf(:B :Ans)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // a holder clause whose residual head is a ground role atom, a disjunction
+    ("resid2", "SubClassOf(:K ObjectUnionOf(ObjectHasValue(:t4 :v2) ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G))))
+     SubClassOf(ObjectHasValue(:t4 :v2) :Ans)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the linked element links to a constant equal to the one the condition is about
+    ("cong", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SameIndividual(:w :w2)
+     SubClassOf(:E ObjectHasValue(:r2 :w2))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the link to the constant comes from a deeper derivation of the linked context
+    ("late", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E :E1)
+     SubClassOf(:E1 ObjectSomeValuesFrom(:r5 :E2))
+     SubClassOf(:E2 ObjectHasValue(:r6 :u))
+     SubClassOf(ObjectSomeValuesFrom(:r6 ObjectOneOf(:u)) :E3)
+     SubClassOf(ObjectSomeValuesFrom(:r5 :E3) :E4)
+     SubClassOf(:E4 ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // a returned consequence is itself a condition that a second linked element needs
+    ("chain", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C3)
+     SubClassOf(:C3 ObjectHasValue(:s3 :w3))
+     SubClassOf(:C3 ObjectAllValuesFrom(:s3 :G3))
+     ClassAssertion(ObjectSomeValuesFrom(:p2 :D2) :u2)
+     SubClassOf(:D2 ObjectSomeValuesFrom(:r :E5))
+     SubClassOf(:E5 ObjectHasValue(:r7 :w3))
+     SubClassOf(ObjectSomeValuesFrom(:r7 :G3) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is a ground role atom rather than a class atom
+    ("role", "SubClassOf(:K ObjectHasValue(:t :w))
+     SubClassOf(:K ObjectSomeValuesFrom(:t9 ObjectIntersectionOf(ObjectOneOf(:w) ObjectHasValue(:m :w5))))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 ObjectHasValue(:m :w5)) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is also a fact of the root, which the registered contexts take as one
+    ("pos", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+     ClassAssertion(:G :w)"),
+    // the linked element denies the condition, and the denial returns as a contradiction
+    ("denial2", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) owl:Nothing)"),
+];
+
+/// What a rooted run of a repair fixture must find: `K ⊑ Ans`, or for a denial `K ⊑ ⊥`.
+fn repaired(name: &str, out: &Classification) -> bool {
+    if name.starts_with("denial") {
+        out.taxonomy.is_subclass(&c("K"), &c("Nothing"))
+    } else {
+        out.taxonomy.is_subclass(&c("K"), &c("Ans"))
+    }
+}
+
+/// Row 1231's marker repair finds every fixture's entailment with a complete rooted answer,
+/// on every configuration, with the decline off so that the answer is the rooted run's.
+#[test]
+fn the_marker_repair_delivers_conditional_facts_outside_the_query_successors() {
+    for (name, body) in REPAIRS {
+        let ax = axioms(body);
+        for (threads, expansion) in CONFIGS {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    rooted_decline: false,
+                    rooted_marker_repair: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                rooted_claim(&k, &out),
+                "{name}, {threads} threads {expansion:?}: no claim"
+            );
+            assert!(
+                repaired(name, &out),
+                "{name}, {threads} threads {expansion:?}: the repair misses the entailment"
+            );
+        }
+    }
+}
+
+/// The control of the repair fixtures: without the repair and the decline, the rooted run
+/// claims an answer that misses each fixture's entailment, but for `pos`, whose condition
+/// is a fact of the root.
+#[test]
+fn without_the_marker_repair_a_rooted_run_misses_each_fixture() {
+    for (name, body) in REPAIRS {
+        let ax = axioms(body);
+        for (threads, expansion) in CONFIGS {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    rooted_decline: false,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                rooted_claim(&k, &out),
+                "{name}, {threads} threads {expansion:?}: no claim"
+            );
+            assert_eq!(
+                repaired(name, &out),
+                name == "pos",
+                "{name}, {threads} threads {expansion:?}: the control changed"
+            );
+        }
+    }
+}
+
 /// Row 1231's decline withdraws the rooted answer on every path a rooted run takes: a
 /// classification, its repetition on the same classifier, a run that counts, a saturation
 /// and a run of axioms that item 805 rewrites. Each reports the decline and its fallback,

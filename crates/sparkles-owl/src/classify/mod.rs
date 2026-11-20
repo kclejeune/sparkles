@@ -293,6 +293,15 @@ pub struct Limits {
     /// exempts contexts that it assumes the condition reaches some other way, which is
     /// unproved. A run with the option off keeps the rooted answer, for measurements.
     pub rooted_decline: bool,
+    /// whether a rooted run repairs the delivery of conditional ground facts (roadmap item
+    /// 1231, PLAN v3.1's rule M), a prototype that is off by default and changes nothing
+    /// without [`rooted`](Limits::rooted). A context that holds a ground literal as a
+    /// condition tells the root, which sends the literal's marker to the contexts
+    /// registered for its individuals, and the root returns its clauses whose bodies are
+    /// such literals to the contexts that hold them. `SPARKLES_ROOTED_MARKER_REPAIR`
+    /// overrides it for measurements, with `0`, `1`, or a sum of the bits of
+    /// [`dl_rules::DlRun::mrepair`].
+    pub rooted_marker_repair: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
     /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
@@ -345,6 +354,7 @@ impl Default for Limits {
             counting: false,
             rooted: false,
             rooted_decline: true,
+            rooted_marker_repair: false,
             number_order: true,
             dl_steps: true,
         }
@@ -2265,6 +2275,10 @@ impl Saturation {
             }
             _ => dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone()),
         });
+        let dl_run = dl_run.map(|mut d| {
+            d.mrepair = dl_root::marker_repair(limits.rooted_marker_repair);
+            d
+        });
         if let Some(scratch) = premises {
             stats.incremental = true;
             stats.cleared = self.invalidate(&scratch, &ix);
@@ -2887,12 +2901,20 @@ impl Saturation {
                         .iter()
                         .map(|t| format!("{}/{}/{}", t[0], t[1], t[2]))
                         .collect();
+                    let m = d
+                        .mcount
+                        .each_ref()
+                        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
                     eprintln!(
-                        "MARKER-DIAG work={} pr={}/{} tiers={}",
+                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{}",
                         stats.dl_work,
                         pr[0],
                         pr[1],
-                        t.join(",")
+                        t.join(","),
+                        d.mrepair,
+                        m[0],
+                        m[1],
+                        m[2]
                     );
                 }
                 if let Some(t) = decline

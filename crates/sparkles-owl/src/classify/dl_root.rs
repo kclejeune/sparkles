@@ -49,8 +49,8 @@
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
-    DlIx, Found, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id, restricted, side,
-    unit, with,
+    DlIx, DlSt, Found, MREPAIR_HOLDER, MREPAIR_ON, MREPAIR_UNITS, Side, alls, dix, dl, drain,
+    drain_with, ds, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -91,6 +91,21 @@ pub struct RootSt {
     /// the existential restrictions and constants of the context's edges over `f_e(u)` to
     /// each successor
     by_succ: FxHashMap<Ex, Vec<(Ex, u32)>>,
+    /// with row 1231's marker repair, in another context, the ground literals it told the
+    /// root it holds (M-send)
+    mheld: FxHashSet<Lit>,
+    /// with the repair, in another context, the clauses the root returned to it, by table
+    /// id, under each literal of their bodies (M-return)
+    rets: FxHashMap<Lit, Vec<u32>>,
+    /// with the repair, in the root, the contexts that hold each ground literal
+    holders: FxHashMap<Lit, Vec<Ex>>,
+    /// with the repair, in the root, the same holders as pairs of context and literal
+    hold_set: FxHashSet<(Ex, Lit)>,
+    /// with the repair, in the root, the held literals by id, under each of their constants
+    held_at: FxHashMap<u32, Vec<u32>>,
+    /// with the repair, in the root, its processed clauses whose bodies are ground
+    /// triggers, under each body literal
+    gbody: FxHashMap<Lit, Vec<u32>>,
 }
 
 impl RootSt {
@@ -101,9 +116,9 @@ impl RootSt {
     }
 
     pub fn bytes(&self) -> usize {
-        let lists = |m: &FxHashMap<u32, Vec<u32>>| {
+        fn lists<K>(m: &FxHashMap<K, Vec<u32>>) -> usize {
             table_bytes(m.capacity(), 32) + m.values().map(|v| v.capacity() * 4).sum::<usize>()
-        };
+        }
         std::mem::size_of::<RootSt>()
             + lists(&self.by_const)
             + lists(&self.roles_of)
@@ -123,6 +138,12 @@ impl RootSt {
                 .values()
                 .map(|v| v.capacity() * 8)
                 .sum::<usize>()
+            + table_bytes(self.mheld.capacity(), 8)
+            + lists(&self.rets)
+            + lists(&self.holders)
+            + table_bytes(self.hold_set.capacity(), 16)
+            + lists(&self.held_at)
+            + lists(&self.gbody)
     }
 
     /// Inserts `v` into `set`, whose entries take `size` bytes, and answers the bytes the
@@ -222,6 +243,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         let c = x.store.clauses[id as usize].c.clone();
         process(ix, st, &c, &max, out);
         offer(ix, st, id, &c, out);
+        m_offer(ix, st, id, &c, out);
         if out.stopped() {
             break;
         }
@@ -881,6 +903,12 @@ pub(super) fn on_max<S: Sink>(
     }
     if ground_trigger(v) {
         ground_out(ix, st, l, out);
+        if out.dl().mrepair & MREPAIR_ON != 0
+            && !is_marker(c)
+            && let Some(root) = dx.root
+        {
+            m_note(root, me, st, l, prem, found, out);
+        }
     }
     join_head(ix, st, c, l, prem, found, &out.dl().lits, sel);
     at_consts(ix, me, st, l, v, prem, found, out, sel);
@@ -978,6 +1006,9 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
         if let Some(cid) = pred_id(x, i, out) {
             out.send(v, Concl::RPred(cid));
         }
+    }
+    if out.dl().mrepair & MREPAIR_ON != 0 {
+        m_registered(x, v, &new, out);
     }
     true
 }
@@ -1364,6 +1395,276 @@ fn root_pred_of(
         Some((p, prem)) => {
             for (k, n) in need.iter().enumerate() {
                 if fits(n, p) {
+                    let mut lists = free.clone();
+                    lists[k] = vec![prem.clone()];
+                    found.products(lists, base.clone());
+                }
+            }
+        }
+    }
+}
+
+/// Row 1231's marker repair for a run, as [`DlRun::mrepair`](super::dl_rules::DlRun)
+/// holds it: `on` is [`Limits::rooted_marker_repair`](super::Limits), and
+/// `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for measurements with `0`, `1` or a sum of
+/// the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`] and [`MREPAIR_UNITS`].
+pub(super) fn marker_repair(on: bool) -> u8 {
+    static ENV: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_MARKER_REPAIR")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    });
+    env.unwrap_or(if on { MREPAIR_ON } else { 0 })
+}
+
+/// M-send in the context `me`, other than the root, on its new premise `prem` whose maximal
+/// literal `l` is a ground trigger of a processed clause other than a marker: the context
+/// tells the root once that it holds l, and the root sends l's marker to the contexts
+/// registered for l's constants. The premise also meets the clauses the root returned
+/// with l in their bodies (M-return's late premise).
+fn m_note<S: Sink>(
+    root: Ex,
+    me: Ex,
+    st: &mut State,
+    l: Lit,
+    prem: &Side,
+    found: &mut Found,
+    out: &mut S,
+) {
+    let r = rst(st, out);
+    if let Some(b) = RootSt::ins(&mut r.mheld, l, 8) {
+        out.dl().grow(b);
+        out.send(root, Concl::RMark(me, l.xid()));
+    }
+    let cids = r.rets.get(&l).cloned().unwrap_or_default();
+    for cid in cids {
+        let c = out.dl().table.get(cid).clone();
+        ret_products(st, &c, Some((l, prem)), found);
+    }
+}
+
+/// Whether the ground literal `l`, with the constant `u`, is a live unit of the root.
+fn root_unit(x: &DlSt, l: Lit, u: u32) -> bool {
+    let Some(r) = x.root.as_deref() else {
+        return false;
+    };
+    r.ready.get(&u).into_iter().flatten().any(|&i| {
+        let s = &x.store.clauses[i as usize];
+        !s.dead && s.c.body().is_empty() && s.c.head() == [l]
+    })
+}
+
+/// The root sends the marker of `l` to the context `d`, once.
+fn m_fwd<S: Sink>(r: &mut RootSt, d: Ex, l: Lit, out: &mut S) {
+    if let Some(b) = RootSt::ins(&mut r.gsent, (d, l), 16) {
+        out.dl().grow(b);
+        out.send(d, Concl::HypL(l.xid()));
+        out.dl().mcount[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The table id of the root's processed clause `i`, which a returned clause keeps whether
+/// or not it was subsumed since, since it holds in every model either way.
+fn ret_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> u32 {
+    let s = &mut x.store.clauses[i as usize];
+    match s.sent {
+        Some(id) => id,
+        None => {
+            let id = out.dl().table.push(s.c.clone());
+            s.sent = Some(id);
+            id
+        }
+    }
+}
+
+/// The root takes M-send's notice that the context `h` holds the ground literal `xid`:
+/// the contexts registered for one of its constants take its marker, unless it is a live
+/// unit of the root, which they take as a fact already, and `h` takes the root's clauses
+/// whose ground bodies it now holds every literal of (M-return).
+pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) -> bool {
+    if st.bottom {
+        return false;
+    }
+    let dx = dix(ix);
+    let Some(root) = dx.root else { return false };
+    let l = Lit::xl(xid);
+    let mut us = Vec::new();
+    consts(out.dl().lits.view(l, inv_of(ix, dx)), &mut us);
+    us.sort_unstable();
+    us.dedup();
+    let mode = out.dl().mrepair;
+    let x = ds(st);
+    root_of(x, out);
+    let r = x.root.as_deref_mut().expect("made above");
+    let Some(mut grown) = RootSt::ins(&mut r.hold_set, (h, l), 16) else {
+        return false;
+    };
+    out.dl().mcount[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let table = table_bytes(r.holders.capacity(), 32);
+    let first = !r.holders.contains_key(&l);
+    let hs = r.holders.entry(l).or_default();
+    let cap = hs.capacity();
+    hs.push(h);
+    grown +=
+        (hs.capacity() - cap) * 4 + table_bytes(r.holders.capacity(), 32).saturating_sub(table);
+    if first {
+        for &u in &us {
+            grown += RootSt::push(&mut r.held_at, u, xid);
+        }
+    }
+    out.dl().grow(grown);
+    let unit = mode & MREPAIR_UNITS == 0 && us.first().is_some_and(|&u| root_unit(x, l, u));
+    let r = x.root.as_deref_mut().expect("made above");
+    if !unit {
+        let mut to: Vec<Ex> = us
+            .iter()
+            .flat_map(|u| r.edges.get(u).into_iter().flatten().copied())
+            .filter(|&d| d != root && (d != h || mode & MREPAIR_HOLDER != 0))
+            .collect();
+        to.sort_unstable();
+        to.dedup();
+        for d in to {
+            m_fwd(r, d, l, out);
+        }
+    }
+    // the returns: the root's clauses with l in the body whose other body literals h holds
+    let ids: Vec<u32> = r
+        .gbody
+        .get(&l)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|&i| {
+            x.store.clauses[i as usize]
+                .c
+                .body()
+                .iter()
+                .all(|&m| m == l || r.hold_set.contains(&(h, m)))
+        })
+        .collect();
+    for i in ids {
+        let cid = ret_id(x, i, out);
+        out.send(h, Concl::RRet(cid));
+        out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    true
+}
+
+/// The root registered the context `v` for the constants `new`: v takes the markers of the
+/// literals over them that a context other than v holds, unless they are live units.
+fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
+    let mode = out.dl().mrepair;
+    let Some(r) = x.root.as_deref() else { return };
+    let mut ls: Vec<(u32, u32)> = Vec::new();
+    for &u in new {
+        for &i in r.held_at.get(&u).into_iter().flatten() {
+            ls.push((i, u));
+        }
+    }
+    ls.sort_unstable();
+    ls.dedup_by_key(|p| p.0);
+    for (i, u) in ls {
+        let l = Lit::xl(i);
+        let r = x.root.as_deref().expect("read above");
+        let held = r.holders.get(&l).is_some_and(|hs| {
+            hs.iter().any(|&h| h != v) || (mode & MREPAIR_HOLDER != 0 && !hs.is_empty())
+        });
+        if !held || (mode & MREPAIR_UNITS == 0 && root_unit(x, l, u)) {
+            continue;
+        }
+        m_fwd(x.root.as_deref_mut().expect("read above"), v, l, out);
+    }
+}
+
+/// M-return in the root: a processed clause `c` whose body is ground triggers goes to each
+/// context that holds every body literal, and is listed under its body literals for the
+/// holders that come later. The head may be empty, so a denial returns too.
+fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S) {
+    if out.dl().mrepair & MREPAIR_ON == 0 || st.bottom || c.body().is_empty() {
+        return;
+    }
+    let inv = inv_of(ix, dix(ix));
+    if !c
+        .body()
+        .iter()
+        .all(|&l| l.kind() == XL && ground_trigger(out.dl().lits.view(l, inv)))
+    {
+        return;
+    }
+    let x = ds(st);
+    let r = root_of(x, out);
+    let mut grown = 0;
+    for &l in c.body() {
+        grown += RootSt::push(&mut r.gbody, l, id);
+    }
+    let (first, rest) = c.body().split_first().expect("a body");
+    let hs: Vec<Ex> = r
+        .holders
+        .get(first)
+        .into_iter()
+        .flatten()
+        .copied()
+        .filter(|&h| rest.iter().all(|&m| r.hold_set.contains(&(h, m))))
+        .collect();
+    out.dl().grow(grown);
+    if hs.is_empty() {
+        return;
+    }
+    let cid = ret_id(x, id, out);
+    for h in hs {
+        out.send(h, Concl::RRet(cid));
+        out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// A context other than the root takes a clause the root returned (M-return), once: each
+/// choice of one of its processed clauses, other than a marker, with each body literal
+/// maximal, resolved with the returned clause on those literals, keeping the premises'
+/// bodies and residual heads. The clause is kept under its body literals for the premises
+/// that come later.
+pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool {
+    if st.bottom {
+        return false;
+    }
+    let r = root_of(ds(st), out);
+    match RootSt::ins(&mut r.seen, cid, 4) {
+        Some(b) => out.dl().grow(b),
+        None => return false,
+    }
+    let c = out.dl().table.get(cid).clone();
+    let mut grown = 0;
+    for &l in c.body() {
+        grown += RootSt::push(&mut r.rets, l, cid);
+    }
+    out.dl().grow(grown);
+    let mut found = Found::default();
+    ret_products(st, &c, None, &mut found);
+    drain(ix, st, found, out);
+    true
+}
+
+/// M-return's resolution of the returned clause `c` in a context: for each body literal,
+/// the context's processed clauses other than markers where it is maximal, selected ones
+/// included, or the premise `fixed` for its literal.
+fn ret_products(st: &State, c: &Clause, fixed: Option<(Lit, &Side)>, found: &mut Found) {
+    found.rule = "mret";
+    let body = c.body();
+    let free: Vec<Vec<Side>> = body
+        .iter()
+        .map(|&l| {
+            partners_of(st, l, true)
+                .into_iter()
+                .filter(|s| !(s.1.is_empty() && s.0 == [l]))
+                .collect()
+        })
+        .collect();
+    let base: Side = (Vec::new(), c.head().to_vec());
+    match fixed {
+        None => found.products(free, base),
+        Some((p, prem)) => {
+            for (k, &l) in body.iter().enumerate() {
+                if l == p {
                     let mut lists = free.clone();
                     lists[k] = vec![prem.clone()];
                     found.products(lists, base.clone());
