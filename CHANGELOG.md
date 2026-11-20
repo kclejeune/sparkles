@@ -19,6 +19,7 @@ derived conclusions of rooted runs that count, 0.47% to rooted runs without coun
 bound on derived conclusions, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` keeps
 the earlier containment, which now also covers rooted runs without counting, and `=0`
 turns both off, for measurement.
+
 ### Rooted runs withdraw answers that a ground fact under a class may leave incomplete
 
 With `Limits::rooted`, a run could report a complete answer that missed an entailment when
@@ -63,6 +64,7 @@ selection. The completeness of the rooted run is
 still not proved. shoi-005 and shoi-027 now pass the work bound and give the default
 answer, with the axioms it leaves out and the fallback in its statistics, so 46 of the 50
 `shoi` fixtures finish against 48.
+
 ### UTF-8 checks of key filters
 
 The key filters that answer CONTAINS, STRSTARTS, STRENDS, STRLEN, REGEX and LANGMATCHES
@@ -75,6 +77,7 @@ stanley at 1.05M triples, `lang-filter` counts 0.75 of the instructions per requ
 are unchanged. A key that is not ASCII pays one extra scan of its bytes before validation.
 When every name and title of the same data ends in a non-ASCII character, which is the worst
 case, `lang-filter` counts 1.026 of the instructions and `contains` 1.000.
+
 ### Cheaper disjunctive attempts, and a width limit on one thread
 
 The pruning of the disjunctive rules' product lists compares sides by a signature and a
@@ -93,6 +96,7 @@ The rule of the Horn rules for a new universal no longer searches the context's 
 for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
 `ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
 item 1234 follows (item 693).
+
 ### Cursor operators for searches, calls and counts
 
 The first part of roadmap item 829 runs text, hybrid, history, spatial and vector searches
@@ -107,6 +111,7 @@ covers. On forge, the text, geo and vector scripts read within noise of the base
 eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds, and
 streamed `q9-star` with 12 threads, which a rerun against the tip's merge base put at
 0.966.
+
 ### Closure operators in query-time reasoning
 
 Demand sessions now close the adorned copies of transitive rules and of `prp-trp` with
@@ -183,6 +188,7 @@ constants instead. RDFS on read had also refused a written call with a list argu
 or one whose input came from a rewritten pattern, and both now run. A callback reached from an unprepared
 query now fails that query with an error, and the stream and accumulator destructors no
 longer panic. This completes roadmap item 1198.
+
 ### DISTINCT on charged buffers
 
 A cursor DISTINCT keeps its set in `Charged` buffers, which take their memory charge from
