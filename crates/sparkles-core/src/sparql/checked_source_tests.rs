@@ -2819,6 +2819,10 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         (&chain, LEAF_PHASE, usize::MAX, usize::MAX),
         (&star, ROUND_PHASE, 1, 0),
         (&star, SCRATCH_PHASE, 1, 0),
+        // the switch to rounds, then the first merged part, whose entries are too few
+        // bytes to tell apart
+        (&star, PARTS_PHASE, 1, 0),
+        (&star, PARTS_PHASE, 2, usize::MAX),
         (&star, GROW_PHASE, usize::MAX, 0),
     ] {
         let at = if at == usize::MAX {
