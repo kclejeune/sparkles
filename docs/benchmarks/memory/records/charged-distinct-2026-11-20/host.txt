@@ -1,0 +1,12 @@
+forge
+Linux forge 7.2.9 #1-NixOS SMP PREEMPT_DYNAMIC Sat Oct  3 10:43:16 UTC 2026 x86_64 GNU/Linux
+ 13:17:44  up 26 days 21:38,  0 users,  load average: 3.27, 2.59, 1.86
+model name	: 13th Gen Intel(R) Core(TM) i5-13500
+20
+performance cpus 0-11 efficiency cpus 12-19
+cpu2 governor powersave epp balance_performance max 4800000
+cpu4 governor powersave epp balance_performance max 4800000
+no_turbo 0
+other heavy processes: 0
+rounds 8 reps 20 warmup 3 rerun 16 x 40 at B/A >= 1.10, server cpu 2 client cpu 4 port 18461 modes streaming auto
+ 14:17:42  up 26 days 22:38,  0 users,  load average: 3.20, 3.24, 3.17

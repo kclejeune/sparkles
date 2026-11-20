@@ -141,7 +141,12 @@ def main():
     out["unentailedFirst"] = extra[:5]
     if extra:
         out["outcome"] = "unsound"
-    elif report.get("outside", 0) or report.get("rules", 0) or report.get("partial"):
+    elif (
+        report.get("outside", 0)
+        or report.get("rules", 0)
+        or report.get("partial")
+        or report.get("dlRootedDeclined")
+    ):
         out["outcome"] = "sound"
     else:
         missing = unentailed(want, have)

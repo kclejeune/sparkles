@@ -1,0 +1,7 @@
+C2-START
+ore_ont_9663 tip c2h insn=27715537420 tax=0ca0ab55ef6cbf4a {"sat":3967.094688,"idx":57.259282,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_9663 c2 c2h insn=27537855774 tax=0ca0ab55ef6cbf4a {"sat":3692.736047,"idx":63.50222899999999,"concl":33992821,"conj":97227,"over":true,"dlWork":0}
+ore_ont_9663 tip c2h insn=27714043409 tax=0ca0ab55ef6cbf4a {"sat":3724.522175,"idx":53.269208,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_9663 c2 c2h insn=27537798149 tax=0ca0ab55ef6cbf4a {"sat":3317.499013,"idx":55.155460000000005,"concl":33992821,"conj":97227,"over":true,"dlWork":0}
+ore_ont_9663 tip c2d insn=51125373326 tax=0ca0ab55ef6cbf4a {"sat":4019.7175129999996,"idx":70.87218,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_9663 c2 c2d insn=50949087998 tax=0ca0ab55ef6cbf4a {"sat":3595.575481,"idx":64.408524,"concl":33992821,"conj":97227,"over":true,"dlWork":0}

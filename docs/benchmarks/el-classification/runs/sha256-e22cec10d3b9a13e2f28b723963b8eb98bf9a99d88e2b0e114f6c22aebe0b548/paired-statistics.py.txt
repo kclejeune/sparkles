@@ -1,0 +1,76 @@
+"""Summarize item 1025's paired Atlas rounds.
+
+Run python3 paired-statistics.py.txt record.json to print one TSV row for
+each candidate comparison. Times are the classifier's process medians.
+"""
+from collections import Counter, defaultdict
+from itertools import product
+from math import ceil
+from pathlib import Path
+from statistics import median
+import json
+import sys
+
+
+def percentile(distribution, probability):
+    rank = ceil(sum(count for _, count in distribution) * probability)
+    for value, count in distribution:
+        rank -= count
+        if rank <= 0:
+            return value
+    raise ValueError("empty bootstrap distribution")
+
+
+def interval(values):
+    size = len(values)
+    assert size == 6
+    ordered = sorted(values)
+    # The median of a six-pair resample comes from the two central ranks.
+    middle_ranks = Counter(
+        tuple(sorted(draw)[2:4]) for draw in product(range(size), repeat=size)
+    )
+    distribution = sorted(
+        ((ordered[a] + ordered[b]) / 2, count)
+        for (a, b), count in middle_ranks.items()
+    )
+    return percentile(distribution, 0.025), percentile(distribution, 0.975)
+
+
+def main():
+    record = json.loads(Path(sys.argv[1]).read_text())
+    reports = defaultdict(dict)
+    for process in record["timing"]["processes"]:
+        assert process["status"] == 0
+        round_name, arm, input_cell = process["path"].split("/")
+        reports[input_cell.removesuffix(".json"), arm][round_name] = process["report"]
+    print("file_threads\tarm\tref\tmedian_ratio\tci_low\tci_high\t"
+          "slower\tadded_ms\tadded_index_ms\tadded_saturation_ms\tround_ratios")
+    for (input_cell, arm), by_round in sorted(reports.items()):
+        if arm.startswith("base"):
+            continue
+        if arm == "el":
+            references = ["base-el"]
+        else:
+            suffix = "-horn" if arm.endswith("-horn") else ""
+            references = ["base" + suffix]
+            if arm.startswith("l2"):
+                references += ["l0" + suffix, "l1" + suffix]
+        for reference in references:
+            paired = [
+                (by_round[round_name], reports[input_cell, reference][round_name])
+                for round_name in sorted(by_round)
+            ]
+            ratios = [a["classifyMedianMs"] / b["classifyMedianMs"] for a, b in paired]
+            low, high = interval(ratios)
+            diffs = [
+                median(a[field] - b[field] for a, b in paired)
+                for field in ("classifyMedianMs", "indexMs", "saturationMs")
+            ]
+            print(input_cell, arm, reference, f"{median(ratios):.6f}", f"{low:.6f}",
+                  f"{high:.6f}", sum(ratio > 1 for ratio in ratios),
+                  *(f"{diff:.6f}" for diff in diffs),
+                  ",".join(f"{ratio:.6f}" for ratio in ratios), sep="\t")
+
+
+if __name__ == "__main__":
+    main()

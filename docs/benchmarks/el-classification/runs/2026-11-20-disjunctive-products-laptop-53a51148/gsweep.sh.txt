@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# gsweep.sh BIN TAG: BIN with SPARKLES_DL_DIAG on one thread over the 3,000 generated files with a
+# union (item 710's generator, horn-cost-693 gen/dfiles), four at a time; one line per file in
+# out/gsweep-TAG.txt: name, exit, taxonomy hash, [tier, dlOverBudget, dlAttemptOver, dlWork,
+# outside], and the last DLDIAG line's counters.
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+G=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/gen/dfiles
+export L G BIN=$1 TAG=$2 THREADS=${THREADS:-1}
+ls $G | xargs -P 4 -I{} bash -c '
+o=$(SPARKLES_DL_DIAG=1 timeout 60 $L/bin/$BIN --threads $THREADS --taxonomy /dev/stdout $G/{} 2>$L/out/tmp/gsw.$$.err)
+st=$?
+j=$(echo "$o" | grep "^{" | jq -c "[.tier,.dlOverBudget,.dlAttemptOver,.dlWork,.outside]")
+t=$(echo "$o" | grep -v "^{" | LC_ALL=C sort | sha256sum | cut -c1-12)
+d=$(grep -E "DLDIAG (end|over) " $L/out/tmp/gsw.$$.err | tail -1 | cut -d" " -f3-)
+rm -f $L/out/tmp/gsw.$$.err
+echo "{} $st $t $j $d"' > $L/out/gsweep-$TAG.txt
+echo GSWEEP-DONE >> $L/out/gsweep-$TAG.txt

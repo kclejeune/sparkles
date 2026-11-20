@@ -879,7 +879,7 @@ fn described_children(ctx: &Ctx, n: &Node) -> Vec<PlanInfo> {
 }
 
 /// Why the right side of a join did not run.
-const LEFT_EMPTY: &str = "the left side produced no rows";
+pub(super) const LEFT_EMPTY: &str = "the left side produced no rows";
 
 /// Execute with the result cache: subtrees that are cheap to recompute (leaf scans and
 /// value tables) bypass it; everything else is looked up and stored.
@@ -1434,7 +1434,7 @@ fn run_node<'ctx>(
             t.push_row(&[Id::from_i64(c as i64).unwrap_or(Id::UNDEF)]);
             t
         }
-        Kind::CountJoin { algo, var } => {
+        Kind::CountJoin { algo, var, .. } => {
             let l = child(0, infos)?;
             let r = if l.is_empty() {
                 infos.push(describe(ctx, &n.children[1]).skip(LEFT_EMPTY));
@@ -1688,24 +1688,8 @@ fn run_node<'ctx>(
             let l = child(0, infos)?;
             let rl = spec.service.as_deref().expect("a remote loop");
             let (t, st) = super::enhancer::run_remote(ctx, spec, rl, &l, &n.vars)?;
-            note = Some(format!(
-                "[{} inputs, {} requests, {} from the cache{}]",
-                st.inputs,
-                st.requests,
-                st.cache_hits,
-                if st.retried > 0 {
-                    format!(", {} bulk requests cut short and sent again", st.retried)
-                } else {
-                    String::new()
-                }
-            ));
-            let mut c = Counters::new();
-            c.insert("serviceInputs".into(), st.inputs.into());
-            c.insert("serviceRequests".into(), st.requests.into());
-            c.insert("serviceCacheHits".into(), st.cache_hits.into());
-            c.insert("serviceRetried".into(), st.retried.into());
-            c.insert("serviceSolutions".into(), st.solutions.into());
-            counters = Some(c);
+            note = Some(st.note());
+            counters = Some(st.counters());
             t
         }
         Kind::Lateral(spec) => {
@@ -4737,7 +4721,7 @@ fn merge_expand(
 }
 
 /// Number of join results; merge joins on a single exact key count run products.
-fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
+pub(super) fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
     let lay = layout(l, r);
     if merge && lay.shared.len() == 1 {
         let (lk, rk) = lay.shared[0];
@@ -8614,7 +8598,7 @@ fn entity_vector(
 }
 
 /// Distinct query vectors a variable query may bind.
-const MAX_QUERY_VECTORS: usize = 1000;
+pub(super) const MAX_QUERY_VECTORS: usize = 1000;
 
 /// The IRI of a search's predicate.
 fn pred_iri(ctx: &Ctx, pred: Id) -> Option<String> {
@@ -8735,7 +8719,7 @@ fn text_pushdown(ctx: &Ctx, l: &Table, right: &Node) -> Result<Option<(Table, Pl
 }
 
 /// The most distinct query strings a `text:query` call with a variable query runs.
-const MAX_TEXT_QUERIES: usize = 1000;
+pub(super) const MAX_TEXT_QUERIES: usize = 1000;
 
 /// A `text:query` call whose query string is a variable that its input binds: one
 /// search per distinct value, joined with the input rows of that value. A value that is
@@ -8824,6 +8808,23 @@ fn text_bound(
     c.insert("restricted".into(), restricted.into());
     c.insert("hits".into(), (hits.len() as u64).into());
     Ok((t, c))
+}
+
+/// Whether the vector search counter `key` describes the index the search read rather
+/// than work: one call over several query vectors reports these from its first search,
+/// and sums the others (`scored`, `searches`). A cursor that runs the kernel once per
+/// batch merges its counters by the same rule.
+pub(super) fn vector_counter_is_property(key: &str) -> bool {
+    matches!(
+        key,
+        "exactBecause"
+            | "index"
+            | "ef"
+            | "rows"
+            | "overlayInserts"
+            | "overlayPending"
+            | "overlayDeletes"
+    )
 }
 
 pub(super) fn vector_search(

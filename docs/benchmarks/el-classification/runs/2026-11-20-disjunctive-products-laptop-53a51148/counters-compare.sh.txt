@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# counters-compare.sh: per file, the DLDIAG lines of dldiag-d0.txt (diag) and dldiag-d1.txt
+# (a23d) without the time and a23d's added maxProd must agree; prints each difference and a count.
+norm() { grep "^$2 " $1 | sed -E 's/ ms=[0-9.]+//; s/ maxProd=[0-9]+//'; }
+n=0; d=0
+for f in $(cut -d' ' -f1 dldiag-d0.txt | sort -u); do
+  n=$((n+1)); cmp -s <(norm dldiag-d0.txt $f) <(norm dldiag-d1.txt $f) || { echo "DIFF $f"; d=$((d+1)); }
+done
+echo "files $n diffs $d"

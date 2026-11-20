@@ -1,0 +1,5 @@
+stanley
+source=c1619c3726f12c64acf9c05a6554de4fe3ff1a55
+68485372d20d1c45a6d8bb8cc48ed881ad8ced154586d8e56c4c4d17a3ee6e74  /home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/same-snapshot/diagnostic.patch
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+mbx 1.29.1

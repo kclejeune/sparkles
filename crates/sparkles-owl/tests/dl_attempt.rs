@@ -2,7 +2,9 @@
 //! (roadmap item 990): a run that passes it ends and the Horn rules answer, as past the
 //! run's memory budget, a run that keeps the contexts of the last one (roadmap item 753)
 //! counts the conclusions of the runs since the last that started again and starts again
-//! in full past the bound, and the kept and the fresh run agree at every bound.
+//! in full past the bound, and the kept and the fresh run agree at every bound. On one
+//! thread a product of more choices than its limit ends the attempt too (roadmap item
+//! 1011).
 
 use sparkles_owl::classify::{Classification, Classifier, Excluded, Limits, Tier};
 use sparkles_owl::model::*;
@@ -128,6 +130,119 @@ fn an_attempt_past_its_bound_takes_the_answer_of_the_horn_rules() {
         assert!(!out.stats.dl_attempt_over);
         assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
     }
+}
+
+/// Universals over inverses beside a union, from item 710's generator, whose case
+/// analysis on one thread makes a product of four choices.
+const WIDE: &str = "EquivalentClasses(:A3 ObjectSomeValuesFrom(:r1 ObjectSomeValuesFrom(:r0 :A0)))
+     SubClassOf(:A0 ObjectAllValuesFrom(:r2 :A3))
+     SubClassOf(ObjectIntersectionOf(:A6 :A3) :A3)
+     SubClassOf(ObjectIntersectionOf(:A2 :A1) :A4)
+     SubClassOf(:A7 :A7)
+     SubClassOf(ObjectSomeValuesFrom(ObjectInverseOf(:r1) ObjectSomeValuesFrom(:r1 :A5)) :A1)
+     SubClassOf(:A4 :A7)
+     SubClassOf(:A5 ObjectSomeValuesFrom(:r1 ObjectIntersectionOf(:A2 :A5)))
+     SubClassOf(:A3 :A1)
+     SubObjectPropertyOf(:r1 :r2)
+     SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))";
+
+#[test]
+fn an_attempt_on_one_thread_past_its_width_takes_the_answer_of_the_horn_rules() {
+    let held = axioms(WIDE);
+    let run = |threads: usize, width: Option<usize>| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                threads,
+                dl_attempt_width: width,
+                ..Limits::default()
+            })
+            .unwrap();
+        let a = answer(&out, &k);
+        (out, a)
+    };
+    let (full, whole) = run(1, None);
+    assert_eq!(full.stats.tier, Tier::Disjunctive);
+    assert!(!full.stats.dl_attempt_over && !full.stats.dl_over_budget);
+    // a product of more choices than the limit ends the attempt as its bound does, and
+    // the Horn rules answer
+    let (wide, horn) = run(1, Some(3));
+    assert!(wide.stats.dl_attempt_over && wide.stats.dl_over_budget);
+    assert!(!wide.stats.dl_counting_over && !wide.stats.dl_rooted_over);
+    let mut k = Classifier::of(&held);
+    let out = k.classify(&limits(1, Some(1))).unwrap();
+    assert!(out.stats.dl_attempt_over);
+    assert_eq!(answer(&out, &k), horn);
+    assert_ne!(horn, whole);
+    // a limit at the product's choices, and none, keep the whole answer
+    assert_eq!(run(1, Some(4)).1, whole);
+    assert_eq!(run(1, Some(0)).1, whole);
+    // without a bound on its conclusions the limit still ends the attempt, which would
+    // otherwise answer without the product's conclusions
+    let mut k = Classifier::of(&held);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            dl_attempt_work: Some(0),
+            dl_attempt_width: Some(3),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.stats.dl_attempt_over && out.stats.dl_over_budget);
+    assert_eq!(answer(&out, &k), horn);
+    // and a run that asks for a partial answer takes the answer it takes past its bound
+    let partial = |work: Option<usize>, width: Option<usize>| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                threads: 1,
+                dl_attempt_work: work,
+                dl_attempt_width: width,
+                partial: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        let a = answer(&out, &k);
+        (out.complete, out.stats.dl_attempt_over, a)
+    };
+    let past = partial(Some(1), Some(0));
+    assert!(past.1);
+    assert_eq!(partial(Some(0), Some(3)), past);
+    assert_eq!(partial(None, Some(3)), past);
+    // on more threads, where the width of a product depends on the schedule, the run has
+    // no such limit
+    for threads in [4, 8] {
+        let (o, a) = run(threads, Some(3));
+        assert!(!o.stats.dl_attempt_over, "{threads} threads");
+        assert_eq!(a, whole, "{threads} threads");
+    }
+}
+
+#[test]
+fn a_kept_run_past_its_width_answers_as_a_run_that_starts_again() {
+    let width = |w: Option<usize>| Limits {
+        threads: 1,
+        dl_attempt_width: w,
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&axioms(UNIONS));
+    let out = k.classify(&width(Some(3))).unwrap();
+    assert!(!out.stats.dl_attempt_over);
+    // the edit brings the product of four choices, which the kept run makes too
+    k.add(&axioms(WIDE));
+    let out = k.classify(&width(Some(3))).unwrap();
+    assert!(out.stats.dl_attempt_over && out.stats.dl_over_budget);
+    let mut held = axioms(UNIONS);
+    held.extend(axioms(WIDE));
+    let mut f = Classifier::of(&held);
+    let want = f.classify(&width(Some(3))).unwrap();
+    assert!(want.stats.dl_attempt_over);
+    assert_eq!(answer(&out, &k), answer(&want, &f));
+    // without the edit's product the kept run answers in full again
+    k.remove(&axioms(WIDE));
+    let out = k.classify(&width(Some(3))).unwrap();
+    assert!(!out.stats.dl_attempt_over && !out.stats.dl_over_budget);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
 }
 
 /// A run over `held` that passes the memory budget of the disjunctive rules and gets the

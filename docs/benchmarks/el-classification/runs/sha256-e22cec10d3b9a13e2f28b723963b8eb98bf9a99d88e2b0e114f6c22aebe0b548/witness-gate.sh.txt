@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# gate.sh: the gate of the third site of level 2 (the search for witnesses accepting a covered
+# successor) against HermiT. witness/cov/files are the files of gen-witness.py (seeds 7 and 8,
+# 12000 and 40000 files) on which a covered successor flips the check of some nominal: of the
+# 968 in cov/all, those of cov/list.txt (every decisive file, every file of special.txt, where
+# the individual was never offered the link or has more than 16 successors, and every third
+# of the rest), and
+# witness/hand the reduced decisive files and the mutants that make no world. HermiT, one JVM
+# per file; then bin/fixr (the rebased tip c1619c37) at levels 2, 1 and 0 on one and eight
+# threads, each judged by ours-compare.py; then bin/fixdiagw (8b311a59 with
+# witness/diag-witness.patch) at level 2 on one and eight threads for the counts, and
+# once more with SPARKLES_DIAG_NOCLAUSE, which leaves the clause out, for the worlds it changes.
+# Run under sparkles-heavy-run.
+set -u
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2
+G=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness
+FIX=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/bin/fixr; DIAG=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/bin/fixdiagw
+export ELK_HEAP=2g ELK_MEM_MAX=4G ELK_WORK=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/elk-work ELK_SCOPE=0
+cd $W
+for set in hand cov; do
+  files=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/$set; [ $set = cov ] && files=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/cov/files
+  refs=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/$set-hermit; mkdir -p $refs
+  for f in $files/*.ofn; do
+    n=$(basename "$f" .ofn)
+    [ -s "$refs/$n.txt" ] || timeout 300 scripts/elk-compare/elk.sh run --reasoner hermit --taxonomy "$refs/$n.txt" "$f" > "$refs/$n.json" 2> "$refs/$n.err"
+    echo "$n hermit=$?" >> /home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/hermit-log.txt
+    for arm in 2:1 2:8 1:1 1:8 0:1 0:8; do
+      l=${arm%:*}; t=${arm#*:}
+      o=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/out/$set/l$l-t$t; mkdir -p "$o"
+      SPARKLES_HORN_RULES=$l timeout 120 $FIX --threads $t --taxonomy "$o/$n.tax" "$f" > "$o/$n.json" 2> "$o/$n.err"
+      status=$?
+      python3 -I scripts/elk-compare/ours-compare.py --status $status --name "$n" --hermit "$refs/$n.txt" --konclude "" --report "$o/$n.json" --stderr "$o/$n.err" --taxonomy "$o/$n.tax" >> "$o/judge.jsonl" 2>> "$o/judge.err"
+      rm -f "$o/$n.tax" "$o/$n.json" "$o/$n.err"
+    done
+    for t in 1 8; do
+      e=$(SPARKLES_HORN_RULES=2 timeout 120 $DIAG --threads $t "$f" 2>&1 >/dev/null)
+      wo=$(SPARKLES_DIAG_NOCLAUSE=1 SPARKLES_HORN_RULES=2 timeout 120 $DIAG --threads $t "$f" 2>&1 >/dev/null | grep '^HORNWORLDS' | sed 's/HORNWORLDS //; s/ /,/')
+      wi=$(grep '^HORNWORLDS' <<< "$e" | sed 's/HORNWORLDS //; s/ /,/')
+      echo "$n $t $(grep -c '^HORNPASSED' <<< "$e") $(grep -c '^HORNSELF' <<< "$e") $(grep -c '^HORNWITNESS ' <<< "$e") $(grep -c '^HORNWITNESSMORE' <<< "$e") $(grep -c '^HORNDECISIVE' <<< "$e") with:${wi:-none} without:${wo:-none}" >> /home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/out/$set/counts.txt
+    done
+  done
+done
+echo GATE-DONE >> /home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/witness/out/log.txt

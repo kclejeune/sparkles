@@ -1,0 +1,10 @@
+hermit-checked s7-horn-witness-01803-reduced.ofn 1 [2, 3] ['http://example.org/d#C2'] ['http://example.org/d#C2']
+hermit-checked s7-horn-witness-01803-reduced.ofn 8 [2, 2] ['http://example.org/d#C2'] ['http://example.org/d#C2']
+hermit-checked s7-horn-witness-07846-reduced.ofn 1 [1, 2] ['http://example.org/d#C3'] ['http://example.org/d#C3']
+hermit-checked s7-horn-witness-07846-reduced.ofn 8 [1, 2] ['http://example.org/d#C3'] ['http://example.org/d#C3']
+hermit-checked s8-horn-witness-13164-m44-reduced.ofn 1 [0, 2] [] []
+hermit-checked s8-horn-witness-13164-m44-reduced.ofn 8 [0, 2] [] []
+{"phase": "hermit-checked", "threads": 1, "total": 369, "entangled": 369, "changed_witness_sets": 39, "changed_world_sets": 0, "nonempty_world_sets": 339}
+{"phase": "hermit-checked", "threads": 8, "total": 369, "entangled": 369, "changed_witness_sets": 36, "changed_world_sets": 0, "nonempty_world_sets": 339}
+{"phase": "generated", "threads": 1, "total": 968, "entangled": 968, "changed_witness_sets": 18, "changed_world_sets": 0, "nonempty_world_sets": 953}
+{"phase": "generated", "threads": 8, "total": 968, "entangled": 968, "changed_witness_sets": 16, "changed_world_sets": 0, "nonempty_world_sets": 953}

@@ -1127,6 +1127,118 @@ returned the same answers. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#grouping-operator) keep the run
 record.
 
+### Native search and leaf operators
+
+The first part of item 829 classifies each search, call and leaf by its form, from the
+`needs_input` of its specification, in `cursor/leaf.rs`. An expanding operator in
+`cursor/expand.rs` runs the kernel over each input batch for a text, hybrid, history or
+spatial search whose arguments come from its input and for a vector search with a
+variable query. It keeps the distinct query values of earlier batches in a charged set,
+so the caps of the text, hybrid, spatial and vector kernels hold for the whole input as
+they do for one eager call. A remote LATERAL loop runs through `enhancer::RemoteRun`,
+which the eager loop calls once and the cursor calls per batch. The cursor holds the rows
+of a partial bulk request until the request is full or its input ends, so it sends the
+requests and the bulk groups of an eager run, and it keeps the answers it holds charged
+and counts each key's solutions once. Both modes still parse a whole remote response before
+the budget sees it, which [item 1104](../../ROADMAP.md) changes.
+
+The whole-input operator of `cursor/whole.rs` serves a vector or hybrid search whose
+candidates come from its input, a path search under a limit and an algorithm call that
+reads its group or a nested edge pattern. It reads each input into a charged table, so
+an input over the budget refuses the query as a sort without spill does, and then calls
+the kernel once and serves its answer batch by batch. It calls `exec::vector_search`,
+`hybrid::search_bound`, `pathsearch::run` and `algosvc::run` itself rather than
+`run_node`. It adopts an algorithm's lease, charges every other answer, counts its rows
+against the work limit once and redacts its plan under a graph view, which `run_node`
+did for these kinds. It does not read or fill the result cache, so an algorithm call over
+an edge pattern that the cache answered under eager execution runs again when streamed.
+A search bounded by `k`, `maxHits` or its own limit argument, an algorithm call over
+constants and `CountJoin` run their kernel once into a charged table, as decision 2
+admits. The expanding kinds and those leaves still
+run the eager kernel through `execute_with_inputs` or `execute_owned`, so the merge must
+move them. EXPLAIN gives each operator a reason that names what it reads whole or what
+bounds its answer.
+
+The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
+spatial scan or relation over constants, a search without a bound, a path search between
+constants without a limit, a spatial join, a property function over constants and a
+registered property function without prefix output. They are the second part of the item. Automatic execution keeps its base
+set of expanding kinds, and each new kind joins it only after a same-host A/B of eager
+against streamed runs. The text, geo and vector benchmark scripts send an `EXECUTION`
+mode with every request, and the vector script fingerprints its exact and approximate
+answers, for the A/B of the item's plan. The W3C streaming record of the tip matches its
+base, with 24 eager fallbacks in ARQ's property-function suite and none elsewhere.
+
+Tests compare each form with eager answers at batches of one row to 4,096 rows, count
+the same rows as eager runs against the work limit, refuse an input over the memory
+budget in both modes, read a pending transaction's view in an algorithm call, redact a
+masked plan, and send the requests of an eager remote loop at every batch size, with a
+failing endpoint and with SILENT.
+
+`CountJoin` under streaming groups the rows of its join without keys and asks a merge
+join for its count, so it never holds the pairs that eager execution forms. The two modes
+admit the pairs against the row limit and the work limit by the same rule. The eager count
+counts a merge join on one shared variable from its key runs and forms the pairs of any
+other join, admitting them before it counts them, and the streamed count admits each
+batch of pairs of the same joins and checks the total once more when its join has read
+all of its input. Three differences remain. Eager execution chooses between the key runs
+and the pairs at run time and forms the pairs when a key column holds UNDEF or is not
+sorted, while the cursor chooses from the plan, so a limit can refuse such a join in one
+mode and not in the other. The eager count also admits the memory of its pair indices,
+which the streamed count never holds, so it can refuse under a memory budget that the
+streamed count meets, and the merge removes that difference. A count can refuse at a work
+limit equal to the work that its own run reported, in both modes, and
+[item 1103](../../ROADMAP.md) makes the two counts agree.
+
+A count over a merge join on two or more shared variables runs the eager kernel under a
+cursor instead, as a whole-input operator under either policy, because the streamed join
+writes every pair into its batches and took 1.81 times the eager count on forge. The
+operator reads both inputs under the memory budget and counts once, so it holds both
+inputs and the pair indices where the streamed join held one batch of pairs, and an eager
+run of such a count that exceeds the memory budget with spill on retries into the same
+kernel. [Item 1129](../../ROADMAP.md) counts that join in the cursor without writing its
+pairs and then streams it again.
+
+The ignored test `measure_whole_input_and_leaf_forms` in `query_cursor.rs` measured the
+peak memory and the best of five times of each form on 200,000 subjects in a release
+build on the development laptop, which is not a benchmark host. A path search under a
+limit of 10 over its group or over an edge pattern peaked at 7.1 MiB streamed against 3.1
+MiB eager and took the same time within 1 ms. An algorithm call over its group,
+over an edge pattern or over constants peaked within 1 MiB of eager and took within 1 ms of
+it. A streamed count over a join that eager counts from its pairs peaked at 0.3 MiB
+against 6.1 to 7.6 MiB eager. Over a filtered scan it took 6.0 ms against 6.3 ms, and on
+two shared variables it took 9.8 ms against 8.6 ms, through the streamed join that a
+cursor no longer runs for that shape. Streaming trades that time for the
+memory, and automatic execution keeps such counts eager until the A/B of the item's
+plan admits them. A count of two scans on one variable from their key runs took 12.0 ms
+streamed against 6.1 ms eager.
+
+On forge at 1.05M triples with one thread, 9df856f3, the part-1 tip before a cursor
+returned the count on two variables to the eager kernel, was compared with
+its base, bccc5f7b, in twelve rounds of A,B,B,A in both orders, and the tip's eager and
+streamed counts with each other in the same way. The streamed count on two shared
+variables took 1.81 times the eager count, 9.58 ms against 5.28 ms, and runs 2.26 times
+the instructions per request on stanley, since the cursor writes the merge join's pairs
+into batches that the eager count holds as indices, and item 1129 removes that cost.
+Explicit streaming has since run the eager kernel for that shape, as the paragraph above
+says. The
+streamed count over a filtered scan took 0.15 of the eager time, 8.4 ms against 55.3 ms,
+and automatic execution keeps both counts eager. Against the base, streamed queries that
+run 0.6% to 1.9% more instructions are 1.3% to 5.2% slower, which item 1160 holds, and
+queries that run the same instructions in either mode are 0.6% to 2.8% slower, which item
+1161 holds as likely code layout. Item 1074 holds the costs under 0.3 ms within its cap.
+
+The text, geo and vector scripts ran on forge in three rounds of the two binaries, with six
+pairs per query, as the phase's comparison of wall time. Of 88 configurations, 80 read as
+noise and 5 as faster. Eager `q6-touching-counties` with one thread reads 1.2% slower and
+eager `q-ef-64` with one thread 8.0% slower, which is over the plan's 5% threshold on wall
+time. Its wall times are bimodal, its servers differ from each other by up to 78% and its
+server time is 1.2% longer, and item 1162 holds both costs. Streamed `q9-star` with 12 threads read 1.144, and a rerun of that query
+alone, with 12 server processes per build and mode, put the tip at cde29b37 at 0.966 of
+its merge base with main, 5f3f69c2, streamed and 1.006 eager, so no query is 5% or more
+slower at 12 threads, which is the stage's acceptance gate. The
+[synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
+
 ### Readings of errors in aggregates
 
 Item 1064 makes the treatment of errors in MIN, MAX, AVG and GROUP_CONCAT a setting,

@@ -256,6 +256,12 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   an ORDER BY deduplicates below the sort in every mode when the query may spill, and
   `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in every
   mode.
+* A cursor DISTINCT keeps its set in buffers whose memory charge is their allocation
+  ([X19](../specs/X19-charged-buffers/README.md)), so the set is admitted before it grows
+  and a set that may spill stops growing while the operators above it still have room.
+  It fits every budget it fitted when the set was charged by formulas, and some smaller
+  ones. Two streamed DISTINCT queries of two columns take 0.8% and 3.3% longer than
+  before, which [roadmap item 1237](../ROADMAP.md) holds.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](../internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
@@ -312,6 +318,22 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   they have not finished and at most a batch more. A full sort and the
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
+* Under `execution=streaming`, text, hybrid, history and spatial searches whose
+  arguments come from their input, vector searches with a variable query and remote
+  LATERAL loops run over each input batch and keep their caps, their requests and their
+  cache across batches as one eager call does. A vector or hybrid search whose
+  candidates come from its input, a path search under a limit and an algorithm call over
+  their group or a nested edge pattern read that input under the memory budget, run
+  once and serve their answer batch by batch. Searches bounded by `k`, `maxHits` or a
+  limit argument, constant algorithm calls and count joins answer once into a charged
+  table. EXPLAIN states for each such operator
+  that it reads its whole input or what bounds its answer. A SERVICE, a view read, a
+  spatial scan or relation over constants, a spatial join, a search without a bound and
+  a property function over constants and a registered property function without
+  prefix output still need materialization, so
+  the strict policy refuses them and automatic execution runs them eagerly, as
+  [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every kind in this
+  list eagerly until a same-host measurement admits it.
 * A cursor scan keeps its place inside an index block between batches without charging
   the block to the query, since the block cache holds its decoded columns, and it
   decodes the block again when the cache has dropped it. A scan inside a plan therefore

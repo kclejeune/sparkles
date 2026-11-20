@@ -20,6 +20,7 @@ use std::time::Instant;
 
 mod binary;
 mod bind;
+mod countjoin;
 mod distinct;
 mod expand;
 mod extsort;
@@ -27,12 +28,14 @@ mod filter;
 pub mod graph;
 mod group;
 mod joinspill;
+mod leaf;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 pub(super) use joinspill::row_hash;
 mod merge;
 mod ripple;
 mod topk;
 mod walk;
+mod whole;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FallbackPolicy {
@@ -198,6 +201,21 @@ pub struct CursorStats {
     pub granted_bytes: Option<u64>,
     pub timing: Timing,
     pub error: Option<String>,
+}
+
+/// See [`QueryCursor::memory_meter`]. A meter keeps the query's context, and with it
+/// the snapshot and the grant, alive until it is dropped, so a test drops it with the
+/// cursor.
+#[doc(hidden)]
+pub struct MemoryMeter(Arc<Ctx>);
+
+impl MemoryMeter {
+    /// The admitted bytes now: exact, where a pool grant's `used` is a reservation
+    /// that grows in steps and is given back late. It takes no lock and allocates
+    /// nothing, so an allocator may call it.
+    pub fn live_bytes(&self) -> u64 {
+        self.0.live_bytes()
+    }
 }
 
 /// An immutable batch. Keeping it alive keeps its capacity on the query's budget
@@ -1541,7 +1559,7 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
             && (supported(&node.kind)
                 || binary::eligible(node)
                 || group::eligible(ctx, node)
-                || expand::eligible(node)
+                || expand::auto_eligible(node)
                 || walk::eligible(node)
                 || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
                     && node.children.len() == 1))
@@ -1990,6 +2008,13 @@ impl QueryCursor {
 
     pub(super) fn stack_depth(&self) -> usize {
         self.depth
+    }
+
+    /// A reader of the bytes the query has admitted to its memory budget, for tests
+    /// that compare them with an allocator's count. It is no part of the API.
+    #[doc(hidden)]
+    pub fn memory_meter(&self) -> MemoryMeter {
+        MemoryMeter(self.ctx.clone())
     }
 
     pub(super) fn fail_output(&mut self, error: &Error) {
@@ -2583,6 +2608,7 @@ enum State {
     RunGroup(Box<group::RunGroup>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
+    Whole(Box<whole::Whole>),
     Walk(Box<walk::Walk>),
     Scan(Scan),
     /// `spk:hasPredicate` read from the predicate patterns, a block of subjects at a time.
@@ -2649,6 +2675,12 @@ struct Operator {
     /// Whether the operator's rows stay out of the produced-row count, because an eager
     /// operator that runs this tree counts them as its own.
     uncounted: bool,
+    /// For the join below a count over a join, whether the eager count admits the pairs
+    /// as an intermediate result (`countjoin::eager_checks_pairs`). Such a join counts
+    /// none of its rows as produced. With `true` it holds the pairs so far to the row
+    /// limit and, with the rows produced so far, to the work limit, as the eager
+    /// admission does once for all of them, and with `false` it checks neither.
+    count_pairs: Option<bool>,
     /// The variables every output batch, and the concatenation of all of them, is
     /// sorted on in raw ID order. It is fixed when the operator is built, and each
     /// output batch carries it.
@@ -2871,6 +2903,12 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
     }
     for spec in specs {
         let planned = super::plan::Planner::new(ctx).plan(spec.pattern(), &spec.graph, Vec::new());
+        if let Err(error) = &planned
+            && super::extensions::is_unconfigured(error)
+        {
+            // This pattern needs no materialization. Its refusal matters only if it is evaluated.
+            continue;
+        }
         let built = planned
             .and_then(|node| Operator::build(ctx, node, FallbackPolicy::RejectMaterialization));
         match built {
@@ -3073,7 +3111,12 @@ impl Operator {
             }));
             return Ok(operator);
         }
-        let mut node = node;
+        // A count over a join runs the join and counts its rows.
+        let count_join = matches!(node.kind, Kind::CountJoin { .. });
+        // A count whose eager kernel runs holds no join below it (see `whole`).
+        let count_pairs =
+            countjoin::eager_checks_pairs(&node).filter(|_| !countjoin::eager_kernel(&node));
+        let mut node = countjoin::rewrite(ctx, node);
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
@@ -3085,6 +3128,8 @@ impl Operator {
         let run_group = exists_streams && group::runs_eligible(ctx, &node);
         let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
+        // A bounded kernel that needs all of its input reads it under a charge first.
+        let whole_input = exists_streams && whole::eligible(&node);
         // A pattern count over an input reads all of it, as a sort does, and then has one
         // row per predicate.
         let native_blocking = matches!(
@@ -3104,10 +3149,20 @@ impl Operator {
             && !run_group
             && !expanding
             && !walking
+            && !whole_input
             && !index_topk
             && !pattern_counts
             && (!native_blocking || !exists_streams);
-        if materializes && fallback == FallbackPolicy::RejectMaterialization {
+        // A kernel that answers whole tables runs as a native operator when its form is
+        // a whole-input one or a bounded leaf (see `leaf`).
+        let native = materializes
+            && exists_streams
+            && leaf::form(&node).is_some_and(|form| {
+                form.native()
+                    && (form != leaf::Form::WholeInput
+                        || (!native_blocking && exec::reads_inputs(&node)))
+            });
+        if materializes && !native && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
                 "cursor requires materialization at {}; use AllowMaterialization or eager execution",
                 node.operator()
@@ -3125,6 +3180,10 @@ impl Operator {
             }
         }
         let mut info = exec::describe_node(ctx, &node);
+        if count_join && matches!(node.kind, Kind::Group { .. }) {
+            info.operator = countjoin::OPERATOR.into();
+            info.description = format!("{} [counts the rows of the join below]", info.description);
+        }
         if let Kind::PatternScan(spec) = &node.kind {
             // the table the scan reads, as the eager plan names it
             info.description = format!("{} {}", info.description, spec.uses.note());
@@ -3271,6 +3330,7 @@ impl Operator {
             || run_group
             || expanding
             || walking
+            || whole_input
             || exists;
         let mut order = output_order(
             &node,
@@ -3331,7 +3391,7 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group).then(|| {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input).then(|| {
             if let Kind::OrderedTopK(spec) = &node.kind {
                 format!(
                     "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
@@ -3353,6 +3413,20 @@ impl Operator {
                     "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
                     node.operator()
                 )
+            } else if whole_input {
+                let reads = whole::reads(&node);
+                match whole::bound(&node) {
+                    Some(bound) => format!(
+                        "{} reads {reads} under the memory budget, runs once and serves its answer of {bound}",
+                        node.operator()
+                    ),
+                    None => format!(
+                        "{} reads {reads} under the memory budget, runs once and serves its charged answer",
+                        node.operator()
+                    ),
+                }
+            } else if native {
+                leaf::reason(&node, leaf::form(&node).expect("a native form"))
             } else if !materializes {
                 format!(
                     "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
@@ -3383,6 +3457,8 @@ impl Operator {
             State::TopK(Box::new(topk::TopK::new(ctx, &node, &children[0].vars)?))
         } else if expanding {
             State::Expand(Box::new(expand::Expand::new(node)))
+        } else if whole_input {
+            State::Whole(Box::new(whole::Whole::new(node)))
         } else if walking {
             State::Walk(Box::new(walk::Walk::new(ctx, &node)?))
         } else if native_blocking {
@@ -3462,6 +3538,13 @@ impl Operator {
         {
             order.clear();
         }
+        // The pairs of the join below a count over a join are no rows the eager count
+        // produces, and it admits them only when it forms them.
+        if let Some(checks) = count_pairs
+            && let Some(join) = children.first_mut()
+        {
+            join.count_pairs = Some(checks);
+        }
         let ahead = (reads_ahead && matches!(state, State::Unary(_))).then(Box::default);
         Ok(Self {
             state,
@@ -3470,12 +3553,13 @@ impl Operator {
             vars,
             rows: 0,
             done: false,
-            materializes,
+            materializes: materializes && !native,
             growing,
             reason,
             bind_reuse,
             released: false,
             uncounted: false,
+            count_pairs: None,
             order,
             #[cfg(debug_assertions)]
             last: None,
@@ -3527,6 +3611,7 @@ impl Operator {
             bind_reuse: None,
             released: false,
             uncounted: false,
+            count_pairs: None,
             order,
             #[cfg(debug_assertions)]
             last: None,
@@ -3658,11 +3743,13 @@ impl Operator {
             full_input_before_output: self.materializes
                 || matches!(
                     self.state,
-                    State::Binary(_)
+                    State::Fallback { .. }
+                        | State::Binary(_)
                         | State::Group(_)
                         | State::Scalar(_)
                         | State::Counts { .. }
                         | State::Blocking { .. }
+                        | State::Whole(_)
                         | State::TopK(_)
                         | State::IndexTopK(_)
                 ),
@@ -3670,6 +3757,18 @@ impl Operator {
             complete: false,
             reason: self.reason.clone(),
             children,
+        }
+    }
+
+    /// Mark this operator and those below it as never run, for `why`, as the eager plan
+    /// marks an input that its parent did not need.
+    fn mark_skipped(&mut self, why: &str) {
+        self.info.actual_rows = -1;
+        self.info.time_ms = 0.0;
+        self.info.fidelity_mut().skipped = Some(why.to_string());
+        self.done = true;
+        for child in &mut self.children {
+            child.mark_skipped(why);
         }
     }
 
@@ -3718,8 +3817,29 @@ impl Operator {
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
+        // A skipped operator never ran, and nor did anything its plan shows below it,
+        // including the children that an eager kernel describes without operators.
+        if let Some(why) = self.info.fidelity.as_ref().and_then(|f| f.skipped.clone()) {
+            fn mark(plan: &mut CursorPlan, why: &str) {
+                plan.operator.actual_rows = -1;
+                plan.operator.time_ms = 0.0;
+                plan.operator.fidelity_mut().skipped = Some(why.to_string());
+                plan.complete = true;
+                for child in &mut plan.children {
+                    mark(child, why);
+                }
+            }
+            mark(plan, &why);
+            return;
+        }
         if self.info.counters.is_some() {
             plan.operator.counters.clone_from(&self.info.counters);
+        }
+        // An expanding or whole-input kernel notes its runs in its description.
+        if matches!(self.state, State::Expand(_) | State::Whole(_))
+            && plan.operator.description != self.info.description
+        {
+            plan.operator.description.clone_from(&self.info.description);
         }
         fn update(info: &PlanInfo, plan: &mut CursorPlan) {
             plan.operator.actual_rows = info.actual_rows;
@@ -3738,7 +3858,7 @@ impl Operator {
         match &self.state {
             State::Fallback {
                 loaded: Some(_), ..
-            } if self.materializes => update(&self.info, plan),
+            } => update(&self.info, plan),
             State::Scalar(_) if self.done => {
                 for (info, plan) in self.info.children.iter().zip(&mut plan.children) {
                     update(info, plan);
@@ -3783,12 +3903,25 @@ impl Operator {
             return Ok(None);
         }
         let began = Instant::now();
-        let count = merge.count(ctx, &mut self.children, options)?;
+        let count = merge.count(
+            ctx,
+            &mut self.children,
+            options,
+            self.count_pairs != Some(false),
+        )?;
         self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
         self.rows =
             usize::try_from(count).map_err(|_| Error::invalid("cursor row count overflow"))?;
-        ctx.check_rows(self.rows)?;
-        ctx.produced(self.rows)?;
+        match self.count_pairs {
+            None => {
+                ctx.check_rows(self.rows)?;
+                if !self.uncounted {
+                    ctx.produced(self.rows)?;
+                }
+            }
+            Some(true) => ctx.check_output_rows(self.rows)?,
+            Some(false) => {}
+        }
         self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
         self.done = true;
         self.release_finished();
@@ -3857,12 +3990,23 @@ impl Operator {
                     .rows
                     .checked_add(rows)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                ctx.check_rows(self.rows)?;
-                if !self.uncounted {
-                    ctx.produced(rows)?;
+                match self.count_pairs {
+                    None => {
+                        ctx.check_rows(self.rows)?;
+                        if !self.uncounted {
+                            ctx.produced(rows)?;
+                        }
+                    }
+                    Some(true) => ctx.check_output_rows(self.rows)?,
+                    Some(false) => {}
                 }
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
+                // The inputs' last rows count once the pairs are all out, as they
+                // counted before the eager count admitted the pairs.
+                if self.count_pairs == Some(true) {
+                    ctx.check_output_rows(self.rows)?;
+                }
                 self.done = true;
                 self.release_finished();
             }
@@ -3900,9 +4044,14 @@ impl Operator {
                     .rows
                     .checked_add(b.table.len)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                ctx.check_rows(self.rows)?;
+                match self.count_pairs {
+                    None => ctx.check_rows(self.rows)?,
+                    Some(true) => ctx.check_output_rows(self.rows)?,
+                    Some(false) => {}
+                }
                 // Eager kernels already counted all their operator work during execution.
                 if !self.uncounted
+                    && self.count_pairs.is_none()
                     && !matches!(
                         self.state,
                         State::Fallback { .. }
@@ -3916,6 +4065,11 @@ impl Operator {
                 // a fallback counts the rows it emitted; `materializedRows` holds its table
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
+                // The inputs' last rows count once the pairs are all out, as they
+                // counted before the eager count admitted the pairs.
+                if self.count_pairs == Some(true) {
+                    ctx.check_output_rows(self.rows)?;
+                }
                 self.done = true;
                 self.release_finished();
             }
@@ -4042,8 +4196,39 @@ impl Operator {
                     self.done = walk.done();
                     batch
                 }
+                State::Whole(whole) => {
+                    let batch = whole.next(
+                        ctx,
+                        &mut self.children,
+                        options,
+                        &self.order,
+                        &self.vars,
+                        cap,
+                    )?;
+                    if let Some(counters) = &whole.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(description) = whole.description() {
+                        self.info.description = description;
+                    }
+                    // A graph view's plan tells nothing a kernel saw of other graphs.
+                    if ctx.graphs.is_some() {
+                        self.info.redact();
+                    }
+                    self.done = whole.done();
+                    batch
+                }
                 State::Expand(expand) => {
                     let batch = expand.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(counters) = expand.counters() {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(description) = expand.description() {
+                        self.info.description = description;
+                    }
+                    if ctx.graphs.is_some() {
+                        self.info.redact();
+                    }
                     let input = self.children.last().is_none_or(|c| c.done);
                     self.done = expand.done(input);
                     batch
@@ -5072,6 +5257,110 @@ fn successor(mut key: Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unconfigured_cursor(
+        query: &str,
+        max_rows_produced: Option<u64>,
+    ) -> (Result<QueryCursor>, Arc<AtomicUsize>) {
+        use super::super::callback_guard_tests::{prepare_unconfigured, unconfigured};
+        let parsed = super::super::parse_query(query, None, &[]).unwrap();
+        let (mut ctx, opens) = unconfigured();
+        if let Some(limit) = max_rows_produced {
+            ctx.max_rows_produced = limit;
+        }
+        let prepared = prepare_unconfigured(&parsed, ctx, true);
+        let levels = prepared.plan_depth;
+        let cursor = from_prepared(
+            prepared,
+            &parsed,
+            query,
+            &QueryOptions::default(),
+            &CursorOptions {
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+            Instant::now(),
+            0.0,
+            0.0,
+            levels,
+            QueryKind::Select,
+        )
+        .map(|(cursor, _, _)| cursor);
+        (cursor, opens)
+    }
+
+    #[test]
+    fn callback_guard_exists_fails_before_a_cursor_emits_rows() {
+        use super::super::callback_guard_tests::{EXISTS_QUERY, assert_unconfigured};
+        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY, None);
+        let mut cursor = cursor.unwrap();
+        let result = cursor.next_batch();
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        let error = match result {
+            Err(error) => error,
+            Ok(Some(batch)) => panic!(
+                "unexpected batch of {} rows starting with {:?}",
+                batch.len(),
+                batch
+                    .term(0, 0)
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.as_term())
+            ),
+            Ok(None) => panic!("the cursor finished without an error"),
+        };
+        assert_unconfigured(error);
+        assert_eq!(cursor.status(), CursorStatus::Failed);
+        assert_eq!(cursor.stats().emitted_rows, 0);
+    }
+
+    #[test]
+    fn callback_guard_cursor_preserves_the_refusal_at_its_produced_row_limit() {
+        use super::super::callback_guard_tests::{EXISTS_QUERY, assert_unconfigured};
+        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY, Some(1));
+        let mut cursor = cursor.unwrap();
+        let error = cursor.next_batch().err().expect("a refusal on first pull");
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        assert_eq!(cursor.status(), CursorStatus::Failed);
+        assert_eq!(cursor.stats().emitted_rows, 0);
+        assert_unconfigured(error);
+    }
+
+    #[test]
+    fn callback_guard_cursor_allows_untaken_exists_and_expression_fallback() {
+        use super::super::callback_guard_tests::FALLBACK_QUERY;
+        let (cursor, opens) = unconfigured_cursor(FALLBACK_QUERY, None);
+        let mut cursor = cursor.unwrap();
+        let batch = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(batch.len(), 1);
+        for (column, expected) in [true, false].into_iter().enumerate() {
+            let term = batch.term(0, column).unwrap().unwrap();
+            assert_eq!(
+                term.as_term(),
+                &Term::Literal(oxrdf::Literal::from(expected))
+            );
+        }
+        assert!(cursor.next_batch().unwrap().is_none());
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn callback_guard_cursor_still_checks_other_exists_patterns_for_materialization() {
+        let (cursor, opens) = unconfigured_cursor(
+            "SELECT ?b WHERE {
+                BIND(COALESCE(
+                    EXISTS { <urn:s> <urn:callback> ?x },
+                    EXISTS { SERVICE <urn:remote> { ?s <urn:p> ?o } }
+                ) AS ?b)
+            }",
+            None,
+        );
+        assert!(
+            matches!(cursor, Err(Error::Unsupported(message)) if message.starts_with("cursor requires materialization at Bind"))
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+    }
 
     fn collected_values(
         width: usize,

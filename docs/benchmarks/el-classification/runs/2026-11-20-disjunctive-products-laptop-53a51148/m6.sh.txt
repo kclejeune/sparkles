@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+. $L/files.sh
+$L/dsweep.sh w2 d3
+$L/gsweep.sh w2 g4
+for n in 14817 9663; do $L/run.sh w2 t4 $DEV/ore_ont_$n.owl 4; done
+for n in 16680 13103 5438 14817 9663 3215; do f=$DEV/ore_ont_$n.owl
+  CPUS=9 $L/insn.sh base def $f
+  CPUS=9 $L/insn.sh w2 w0 $f --dl-attempt-width 0
+  CPUS=9 $L/insn.sh w2 def $f
+done
+echo M6-DONE >> $L/out/insn.txt

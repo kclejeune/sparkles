@@ -93,7 +93,9 @@ request or on every write, and the schema report counts what the data holds.
 * RDFS on read matches Fuseki's `--rdfs` and Jena's `ja:DatasetRDFS`
   ([API.md](../API.md#rdfs-on-read)). Queries see the RDFS closure of each graph against a
   schema graph by rewriting the query, and the answers equal Jena 6.2's on 55 fixture
-  queries. `/$/rdfs/{ds}`, `serve --rdfs` and `query --rdfs` turn it on.
+  queries. `/$/rdfs/{ds}`, `serve --rdfs` and `query --rdfs` turn it on. The rewrite
+  never adds a call of a registered property function, and the schema derives nothing
+  through one ([API.md](../API.md#rdfs-on-read)).
 * Query-time reasoning with `reasoning=demand` derives the facts a query's patterns need
   as it runs, from RDFS, RDFS simple, OWL 2 RL or a Jena rule file, without the inferred
   graph ([API.md](../API.md#query-time-reasoning), [F17](../specs/F17-query-time-reasoning.md#outcome)).
@@ -448,14 +450,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   context keeps clauses under one total order of literals, and a named subsumer that only
   a case analysis gives is found by a test context for the class with the candidate's
   complement. `Limits::expansion` chooses the cautious or the eager successor strategy,
-  which give the same answers. These runs share the Horn rules' memory budget, and a run
+  whose full answers agree on every ontology of item 1229's gate. These runs share the Horn rules' memory budget, and a run
   that passes it classifies again by the Horn rules, leaves the disjunctive axioms out and
   reports them, and sets `Stats::dl_over_budget`. A run that neither counts nor is rooted
   also has a bound of 384 derived conclusions for each class of the signature, at least
   2,097,152, `Limits::dl_attempt_work`, past which it falls back in the same way and sets
   `Stats::dl_attempt_over` too. The attempts that finish on the ORE 2015 DL development
   set stay far within it, and those that cannot finish pass it well before their memory
-  budget. On several threads a schedule can decide the outcome of a run that derives
+  budget. On one thread the run also falls back when one product of its case analysis has
+  more than `Limits::dl_attempt_width` choices, 1,048,576 by default, which the attempts
+  that finish there stay far below. Several threads make products of other widths and
+  have no such limit. A run on one thread may therefore fall back to the Horn rules'
+  answer on an ontology where a run on four threads answers in full with the disjunctive
+  rules. On several threads a schedule can decide the outcome of a run that derives
   about the bound. With `Limits::partial`, a run of the
   disjunctive rules that its deadline, cancellation or memory budget stops returns the
   subsumptions it proved, with `Classification::complete` false, the classes it may have
@@ -498,8 +505,36 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   restriction into a singleton, or into a class below one, gives a role atom to the
   individual in place of an anonymous successor, except in a run that counts. It is off by default,
   since the completeness of the departed calculus is not proved, and every answer it gives
-  is entailed. A rooted run without counting has a bound of 524,288 derived conclusions,
-  `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
+  is entailed. A rooted answer that reports itself complete can still miss entailments,
+  as roadmap item 1231 records, so it cannot be relied on as complete while
+  roadmap item 823 is open. A rooted run selects ground body literals, and Hyper over `x`
+  and Pred from a successor over a successor term of a constant take selected clauses as
+  partners. It also exempts from the restriction on ground inferences a Join whose premise
+  on the side of the head has no ground body literal. Without these two repairs a run that
+  reported itself complete could miss entailed subsumptions and unsatisfiable classes.
+  The repaired selection is adopted on a measured gate of generated and fixture
+  ontologies, its completeness is not proved, and roadmap item 1220 stays open for that
+  proof. A run that counts and a rooted run give an existential restriction that reaches
+  a successor after the successor sent its clauses Pred with those clauses. That repair is
+  adopted on a measured gate without a proof that it covers every order of arrival, and
+  roadmap item 1229 stays open for the proof. A rooted run can
+  also miss an entailment while it reports itself complete when a fact that holds only
+  under the queried class concerns an individual reached from another individual, which
+  is roadmap item 1231. A rooted run without counting has a bound of 524,288 derived
+  proof. A rooted run with counting can still miss entailed subsumptions on a generated
+  ontology, with or without these repairs, which is roadmap item 1229. A fact that holds
+  only under the queried class and concerns an individual reached from another
+  individual can make a rooted run miss an entailment. After its saturation a rooted run
+  therefore looks for such a fact that cannot reach a context registered for its
+  individual, and when it finds one it classifies again without the rooted rules, gives
+  the default answer and sets `Stats::dl_rooted_declined` and `Stats::dl_over_budget`.
+  The check leaves out four kinds of context that it assumes the fact reaches another
+  way, which are the predecessors of the context that holds the fact, the individual's
+  own context, contexts that the root does not reach and the root's direct successors.
+  None of these exemptions is proved, so the check is partial containment, and it also
+  withdraws some answers that were complete. `Limits::rooted_decline` turns it off for
+  measurements. Roadmap item 1231 repairs the rules. A rooted run without counting has a bound of 524,288 derived
+  conclusions, `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
   keys over object properties and the universal object property by rewriting them into
   class axioms over fresh names, which never reach an answer, and a run of the rewritten
@@ -513,11 +548,15 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
   the top object property, is used as far as the calculus goes and reported as partial.
-  Every answer is entailed, and it is complete for named classes when nothing is reported.
-  For eligible EL additions and removals, the classifier keeps its contexts and saturates
-  again only those the changes can reach. A classification with the Horn rules of an
-  ontology without individuals, and one with the disjunctive rules that does not count,
-  keep their contexts in the same way. After an edit of class axioms the next run clears
+  Every answer is entailed, and outside a rooted run or a run that counts it is complete
+  for named classes when nothing is reported. A rooted run can miss entailments even when
+  it reports nothing left out and calls its answer complete, which is roadmap item 1231,
+  and the completeness of a run that counts rests on a repair that roadmap item 1229 has
+  not proved. For eligible EL additions
+  and removals, the classifier keeps its contexts and saturates again only those the
+  changes can reach. A classification with the Horn rules of an ontology without
+  individuals, and one with the disjunctive rules that does not count, keep their contexts
+  in the same way. After an edit of class axioms the next run clears
   the contexts that hold an expression whose rules changed, with the contexts that reach
   them, and its answer is that of a classification that starts again. A change to the
   property hierarchy, chains, reflexivity or ranges, an
@@ -1051,10 +1090,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * In an ontology with individuals, the Horn rules leave out an at-least restriction
   above one and report it, since the unfolding they use elsewhere is argued for
   tree-shaped models. Roadmap item 867.
-* On an ontology with many property assertions, the Horn rules take 1.8 to 2.0 times the
-  EL rules' time on one thread and derive about 2.2 times the conclusions. Every context
-  takes the subsumers of `owl:Thing`, a successor is told twice that it has an instance,
-  and the states of the automata and existential restrictions repeat. Roadmap item 1025.
+* On four assertion-heavy ORE 2015 DL files on `atlas`, the Horn rules take
+  1.63 to 1.68 times the EL-only time on one thread. These rules skip R7
+  searches for irrelevant predecessors and omit Horn links covered by an
+  existing subrole link to the same successor. Every context still takes the
+  subsumers of `owl:Thing`, and successors receive two conclusions about
+  realness. Roadmap item 1025 and the
+  [classification report](../benchmarks/el-classification/RESULTS.md#guarded-horn-rules-with-individuals)
+  track the remaining work.
 * GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
   rules on one thread and raise its peak resident set from 196 to 223 MiB. On two
   Uberon-based ontologies of the ORE 2015 DL sample the Horn rules take about five times
@@ -1072,17 +1115,14 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Horn ontologies whose successors no other successor dominates classify up to 6% slower
   than without the check for dominated successors, which costs more there than it saves.
   Roadmap item 991.
-* The EL saturation of one ORE 2015 DL ontology with 2.5 million existential
-  restrictions over a transitive symmetric role derives each link of the transitive
-  closure once per intermediate class, so it sends three billion messages for 32 million
-  conclusions. On `atlas` its saturation takes 8.9 s on four threads, 7.4 s on twelve and
-  24.6 s on one. Konclude 0.7.0 classifies it in 9.5 s on the same host at 6.7 GiB, with
-  any number of workers. Close to half of a four-thread run's cycles go to the checks of
-  the repeated messages against the contexts' tables, which roadmap item 956 follows. The ontology
-  takes the Horn rules, which classify it in 13.9 s on four threads with a peak resident
-  set of 6.0 GiB on `atlas`, as the
-  [EL classification results](../benchmarks/el-classification/RESULTS.md#symmetric-transitive-properties-with-the-horn-rules)
-  show.
+* Two files classify slightly slower where the left-linear chains of transitive roles
+  save no conclusions. On the benchmark host
+  `ore_ont_13482` of the ORE 2015 EL sample classifies 2.5% slower on four threads and
+  `ore_ont_9855` of the ORE 2015 DL sample 1.0% slower on one, with the same conclusions
+  in those cells.
+  Roadmap item 1224 follows them, and the
+  [EL classification results](../benchmarks/el-classification/RESULTS.md#left-linear-chains-of-transitive-roles)
+  give the rounds.
 * A small ontology's first classification in a process on several threads starts its
   helper threads after 0.5 ms of work, and later ones after as long as the last start of
   the helpers took. Warm runs of some small files on eight threads take up to 0.2 ms
@@ -1092,15 +1132,19 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the bindings always take the Horn axioms. Roadmap item 694.
 * By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
   analysis or counting in an ontology with individuals, are left out, since the rooted run
-  that takes them is an option whose completeness is not proved, and two of the 50
-  nominal fixtures of its gate pass its work bound. The rooted run also passes its bound
-  on ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
-  property, and then gives the default answer after the work. Roadmap items 823, 1061
-  and 1075. Axioms that
-  need case analysis in an ontology with data properties are left out, and an external DL
-  reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
-  datatype checker with data cardinalities before they take data properties, and 10 of
-  the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
+  that takes them is an option whose completeness is not proved, and two of the 50 nominal
+  fixtures of its gate pass its work bound. The rooted run also passes its bound on
+  ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
+  property, and then gives the default answer after the work. The repairs of its selection
+  and of its Join restriction are adopted on a measured gate without a proof of
+  completeness. With them the generated ontology s2-g2-011 passes the bound on one and on
+  four threads, and a version of shoi-022 whose individuals are merged beforehand passes
+  it on four threads with eager expansion. A rooted answer that reports itself complete can
+  still miss entailments. Roadmap items 823, 1061, 1075, 1220, 1227, 1228, 1229 and 1231.
+  Axioms that need case analysis in an ontology with data properties are left out,
+  and an external DL reasoner bridge is planned. Roadmap item 603. The disjunctive rules
+  need a datatype checker with data cardinalities before they take data properties, and 10
+  of the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
   item 768.
 * Counting is off by default. Five files of the ORE 2015 DL development set attempt
   counting. With the order between number restrictions, which a counting run uses by

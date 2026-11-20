@@ -1,0 +1,7 @@
+(project (?n) (extend ((?n ?c9431827461dcb4cfc041a1ea24cc826)) (group () (((count) ?c9431827461dcb4cfc041a1ea24cc826)) (bgp (triple ?a <http://xmlns.com/foaf/0.1/knows> ?b) (triple ?b <http://xmlns.com/foaf/0.1/knows> ?a)))))
+
+Project ?n  [est 1 rows, cost 1197382]
+  Bind ?n := ?c9431827461dcb4cfc041a1ea24cc826  [est 1 rows, cost 1197382]
+    CountJoin on ?a  [est 1 rows, cost 1197381]
+      IndexScan PSO ?a <http://xmlns.com/foaf/0.1/knows> ?b  [est 254762 rows, cost 254762]
+      IndexScan POS ?b <http://xmlns.com/foaf/0.1/knows> ?a  [est 254762 rows, cost 254762]

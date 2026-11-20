@@ -82,6 +82,12 @@ pub enum Made {
 }
 
 impl Lit {
+    /// The literal's bit of a signature, a union of such bits that a subset's union is
+    /// within.
+    #[inline]
+    pub(super) fn sig_bit(self) -> u64 {
+        1 << (self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
+    }
     #[inline]
     pub fn y(a: Ex) -> Lit {
         Lit((Y << KIND_SHIFT) | a as u64)
@@ -408,9 +414,7 @@ impl Clause {
     /// A signature of the literals: one bit for each, by a hash, so that a clause whose
     /// signature has a bit that another's lacks does not subsume it.
     pub fn sig(&self) -> u64 {
-        self.lits.iter().fold(0, |s, l| {
-            s | 1 << (l.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
-        })
+        self.lits.iter().fold(0, |s, l| s | l.sig_bit())
     }
     /// Whether this clause subsumes `other`: its body and its head are subsets of
     /// `other`'s.
@@ -727,7 +731,9 @@ impl Rooted<'_> {
 }
 
 /// Whether sorted `a` is a subset of sorted `b`.
-fn subset(a: &[Lit], b: &[Lit]) -> bool {
+/// Whether the sorted literals `a` without repeats are among the sorted literals `b`
+/// without repeats.
+pub(super) fn subset(a: &[Lit], b: &[Lit]) -> bool {
     if a.len() > b.len() {
         return false;
     }
@@ -1103,6 +1109,15 @@ impl Store {
     /// The first maximal literal of a processed clause that `p` takes. Without a rooted
     /// order a clause has one maximal literal, which [`Stored::max`] holds.
     #[inline]
+    /// Every maximal literal of the processed clause `i`.
+    pub fn maxes(&self, i: u32) -> impl Iterator<Item = Lit> + '_ {
+        let multi = self.multi.get(&i);
+        let first = self.clauses[i as usize].max.filter(|_| multi.is_none());
+        first
+            .into_iter()
+            .chain(multi.into_iter().flat_map(|m| m.iter().copied()))
+    }
+
     pub fn max_of(&self, i: u32, p: impl Fn(Lit) -> bool) -> Option<Lit> {
         match self.clauses[i as usize].max {
             Some(l) if p(l) => Some(l),

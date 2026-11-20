@@ -1,0 +1,12 @@
+# Correlates each server's P-core share of query-pool CPU ticks with its median
+# latency, over the rows of placement.md (the output of cpus_q9.py).
+import statistics as s, sys
+rows = [l.split('|')[1:-1] for l in open(sys.argv[1]) if l.startswith('| r')]
+for mode in ('streaming', 'eager'):
+    for srv in ('sparkles', 'sparkles-plain'):
+        xs = [(float(r[4]), float(r[6])) for r in rows if r[2].strip() == mode and r[3].strip() == srv]
+        p = [a for a, _ in xs]; m = [b for _, b in xs]
+        fast = [a for a, b in xs if b < 22]
+        print(f"{mode} {srv}: n={len(xs)} r={s.correlation(p, m):.3f} "
+              f"P share {min(p):.2f}-{max(p):.2f} median {s.median(p):.2f}; "
+              f"fast arms (median under 22 ms) {len(fast)} with P share {fast}")

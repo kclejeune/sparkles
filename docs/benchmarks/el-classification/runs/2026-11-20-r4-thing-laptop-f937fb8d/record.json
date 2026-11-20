@@ -1,0 +1,61 @@
+{
+ "suite": "el-classification",
+ "kind": "exploratory-measurement",
+ "scale": "GO, ore_ont_14817 and ore_ont_9663 of the ORE 2015 DL development set; no corpus sweep",
+ "host": {
+  "name": "stanley",
+  "role": "the laptop, with other lanes' work running beside these runs",
+  "cpu": "Intel(R) Core(TM) Ultra X7 358H",
+  "cpus": 16,
+  "ram_mib": 31627
+ },
+ "status": "Instruction counts on a loaded laptop, one thread pinned to cpu 2, a P-core. Times in the lines are not measurements. The change was not kept, and PERFORMANCE-EXPERIMENTS.md records it.",
+ "manifest": {
+  "sides": {
+   "tip": "378127e2, whose code is that of f937fb8d",
+   "c2": "f937fb8d with c2.patch.txt: HornIx::THING marks the told closure of owl:Thing in horn::absorb, and horn_rules::forall passes over R4, its propagation and its sends, for a filler so marked in a run without the disjunctive rules",
+   "c2d": "c2 with a counter (c2d.patch.txt). SPARKLES_C2_DIAG=1 prints, at each power of two of forall calls, the calls, those on a role with an inverse, those whose filler is marked, the sends then avoided and whether the index has the disjunctive rules"
+  },
+  "build": "build.sh.txt: ~/.local/bin/sparkles-heavy-run 8 mbx build --release -p sparkles-owl --example el_classify; bin-NAME.head.txt gives the HEAD and the SHA-256 of the diff",
+  "toolchain": {
+   "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+   "mbx": "1.29.1"
+  },
+  "binaries_sha256": {
+   "tip": "f281ac59d54bec65ae48d83b43999b2a37cce4accaeafe14ce6d6184fd568b0b",
+   "c2": "8c0de36f5328f1b1bb9c85c89c6d2b4586842442fd3fb9d8c9264791e784873f",
+   "c2d": "b6c81f0994ab44ddbc51164a23dc07906267b67695cfca234b598a208d702bc0"
+  },
+  "scripts": [
+   "build.sh.txt",
+   "insn.sh.txt"
+  ]
+ },
+ "settings": {
+  "threads": "one",
+  "commands": "insn.sh BIN TAG FILE [args] with CPUS=2: c2h is --dl-attempt-work 1, the Horn rules alone, twice per side, and c2d the default pipeline once. c2diag.txt comes from SPARKLES_C2_DIAG=1 el_classify --threads 1 --taxonomy FILE [--dl-attempt-work 1] INPUT with bin c2d, unpinned, and keeps the last C2DIAG line and the taxonomy hash"
+ },
+ "results": {
+  "insn.txt": "insn.sh lines NAME BIN TAG insn=USER_INSTRUCTIONS tax=TAXONOMY_HASH and the report's counters, where concl counts the applied messages, duplicates included",
+  "c2diag.txt": "the counters of c2d. The counters are process totals, so the default pipeline's line includes the attempt, where nothing is marked as skipped"
+ },
+ "summary": {
+  "marked_forall_calls": {
+   "go": 0,
+   "ore_ont_14817": 0,
+   "ore_ont_9663": "264,756 of the last 4,194,304 counted"
+  },
+  "ore_ont_9663_instructions_G": {
+   "horn_alone": {
+    "tip": 27.71,
+    "c2": 27.54
+   },
+   "default": {
+    "tip": 51.13,
+    "c2": 50.95
+   }
+  },
+  "ore_ont_9663_counters": "applied messages 35,611,566 against 33,992,821 and conjunction contexts 97,224 against 97,227, with the same taxonomy 0ca0ab55. The cause of the three added conjunction contexts is not established",
+  "taxonomies": "the same taxonomy hash on every file and side"
+ }
+}

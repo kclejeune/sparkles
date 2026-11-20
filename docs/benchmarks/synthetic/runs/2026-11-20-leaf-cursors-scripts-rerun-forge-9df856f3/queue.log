@@ -1,0 +1,36 @@
+2026-11-20T02:08:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:13:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:18:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:23:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:28:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:33:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:38:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:43:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:48:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:53:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T02:58:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:03:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:08:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:13:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:18:17-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:23:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:28:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:33:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:38:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:43:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:48:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:53:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T03:58:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:03:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:08:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:13:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:18:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:23:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:28:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:33:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:38:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:43:18-05:00 waiting: filter1204-bulk-full-v1.service 
+2026-11-20T04:48:18-05:00 queue clear, waiting for locks
+bin/base-bccc5f7b: OK
+bin/tip-9df856f3: OK
+2026-11-20T05:14:07-05:00 locks held

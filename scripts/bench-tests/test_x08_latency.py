@@ -7,6 +7,7 @@ base-and-tip form, with a stub server in place of sparkles.
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -151,6 +152,54 @@ class CombineTests(unittest.TestCase):
             self.assertIn("| pool-on-second ratio | pool-on-first ratio |", r.stdout)
 
 
+class LatencyRefusalTests(unittest.TestCase):
+    def _compiler_fixture(self, d, compiler):
+        # The gate checks the executable bit and reads the ELF sections without running it.
+        header = struct.Struct("<16sHHIQQQIHHHHHH")
+        section = struct.Struct("<IIQQQQIIQQ")
+        names = b"\0.shstrtab\0"
+        if compiler is not None:
+            names += b".comment\0"
+        data = names
+        sections = [
+            bytes(section.size),
+            section.pack(1, 3, 0, 0, header.size, len(names), 0, 0, 1, 0),  # .shstrtab
+        ]
+        if compiler is not None:
+            comment = compiler.encode() + b"\0"
+            sections.append(section.pack(names.index(b".comment"), 1, 0, 0,
+                                         header.size + len(data), len(comment), 0, 0, 1, 0))
+            data += comment
+        data += bytes(-len(data) % 8)  # Align the section header table.
+        # ELF64, little-endian, relocatable x86-64, with .shstrtab at index 1.
+        elf_header = header.pack(b"\x7fELF\x02\x01\x01", 1, 62, 1, 0, 0, header.size + len(data),
+                                 0, header.size, 0, 0, section.size, len(sections), 1)
+        path = Path(d) / "sparkles"
+        path.write_bytes(elf_header + data + b"".join(sections))
+        path.chmod(0o755)
+        return path
+
+    def _assert_refusal(self, d, binary, message, *options):
+        r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", binary, "--tip", binary, *options, d],
+                           capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn(message, r.stderr)
+
+    def test_refuses_unknown_compilers(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary = self._compiler_fixture(d, None)
+            r = subprocess.run([sys.executable, str(SCRIPTS / "bench-gate.py"), "compilers", binary],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("no compiler identities in its .comment section", r.stderr)
+            self._assert_refusal(d, binary, "names no compilers", "--base-build-config", "{}", "--tip-build-config", "{}")
+
+    def test_refuses_missing_build_configs(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary = self._compiler_fixture(d, "fixture compiler")
+            self._assert_refusal(d, binary, "needs --base-build-config and --tip-build-config")
+
+
 @unittest.skipUnless(all(shutil.which(t) for t in ("taskset", "chrt", "zstd", "curl")) and (os.cpu_count() or 1) >= 5,
                      "needs taskset, chrt, zstd, curl and five CPUs")
 class LatencyTests(unittest.TestCase):
@@ -224,19 +273,15 @@ class LatencyTests(unittest.TestCase):
 
     def test_refusals(self):
         with tempfile.TemporaryDirectory() as d:
-            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", "/bin/true", d],
+            w, bins = self.work(d)
+            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", bins["base"], w],
                                capture_output=True, text=True)
             self.assertIn("needs --base and --tip", r.stderr)
-            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--force", "--base", "/bin/true", "--tip",
-                                "/bin/true", "--rounds", "4", d], capture_output=True, text=True)
+            unprepared = Path(d) / "unprepared"
+            unprepared.mkdir()
+            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--force", "--base", bins["base"], "--tip",
+                                bins["tip"], "--rounds", "4", unprepared], capture_output=True, text=True)
             self.assertIn("at least 10 rounds", r.stderr)
-            w, bins = self.work(d)
-            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", bins["base"], "--tip", bins["tip"], w],
-                               capture_output=True, text=True)
-            self.assertIn("names no compilers", r.stderr)
-            r = subprocess.run(["bash", str(GATES / "latency.sh"), "--base", "/bin/true", "--tip", "/bin/true", w],
-                               capture_output=True, text=True)
-            self.assertIn("needs --base-build-config and --tip-build-config", r.stderr)
             (Path(d) / "count-all.rq").write_text("ASK {}")
             hidden = Path(d) / ".hidden.rq"
             hidden.write_text("ASK {}")

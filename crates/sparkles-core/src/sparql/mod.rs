@@ -8,6 +8,7 @@ pub mod arqpf;
 pub mod cache;
 pub mod catalog;
 pub mod cdt;
+mod charged;
 pub mod charsets;
 mod checked_layout;
 mod checked_syntax;
@@ -75,9 +76,9 @@ pub use aggerrors::AggregateErrors;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use cursor::{
     AskResult, CursorOptions, CursorPlan, CursorStats, CursorStatus, ExecutionMode, FallbackPolicy,
-    GraphBatch, GraphCursor, MaterializedResult, QueryBatch, QueryCursor, QueryExecution,
-    ask_streaming, graph_cursor, query_cursor, query_execution, query_execution_with_plan,
-    select_cursor, select_source_cursor,
+    GraphBatch, GraphCursor, MaterializedResult, MemoryMeter, QueryBatch, QueryCursor,
+    QueryExecution, ask_streaming, graph_cursor, query_cursor, query_execution,
+    query_execution_with_plan, select_cursor, select_source_cursor,
 };
 pub use exec::{PlanFidelity, PlanInfo};
 pub use policy::{Consumer, PolicyError, choose_execution};
@@ -2654,6 +2655,8 @@ fn graph_triple_bytes(t: &Triple) -> u64 {
 
 #[cfg(test)]
 mod access_tests;
+#[cfg(test)]
+mod callback_guard_tests;
 #[cfg(test)]
 mod charsets_tests;
 #[cfg(test)]

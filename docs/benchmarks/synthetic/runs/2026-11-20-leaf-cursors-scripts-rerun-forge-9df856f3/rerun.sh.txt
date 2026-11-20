@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Item 829 part 1: rerun of the text, geo and vector scripts in more rounds on forge
+# (coordinator decision 1 of 2026-11-20). Same binaries as the first pass (base
+# bccc5f7b, tip 9df856f3) and the same grid as ab/ab.sh, in ROUNDS rounds whose arm
+# order alternates (A,B,B,A in odd rounds, B,A,A,B in even rounds), over one work
+# directory per script that every round reuses, so all rounds read the same store.
+#
+#   rerun.sh ROOT BASE_BIN TIP_BIN OUT_DIR [ROUNDS]
+#
+# ROOT is a checkout (git archive) that supplies scripts/. OUT_DIR/r<N>/<step>.log ends
+# with rc=N; OUT_DIR/r<N>/results/<script>-<arm>-<mode>-t<threads>/ keeps each run's
+# results. RERUN-DONE in OUT_DIR marks the end, FAILED lists failed steps, and the exit
+# status is 1 when any step failed.
+set -uo pipefail
+ROOT=${1:?checkout} BASE=${2:?base binary} TIP=${3:?tip binary} OUT=${4:?output dir}
+ROUNDS=${5:-3}
+failed=0
+mkdir -p "$OUT"
+: "${TEXT_N:=100000}" "${GEO_N:=100000}" "${VEC_N:=100000}" "${VEC_DIM:=384}"
+WORK=$OUT/work
+loaded=()
+for r in $(seq 1 "$ROUNDS"); do
+  R=$OUT/r$r
+  mkdir -p "$R"
+  order="base tip tip2 base2"
+  [ $((r % 2)) = 0 ] && order="tip base base2 tip2"
+  for threads in 12 1; do
+    for mode in eager streaming; do
+      for arm in $order; do
+        bin=$BASE
+        case $arm in tip*) bin=$TIP ;; esac
+        tag=$arm-$mode-t$threads
+        export RAYON_NUM_THREADS=$threads EXECUTION=$mode SPARKLES=$bin
+        for script in text geo vector; do
+          skip=
+          [[ " ${loaded[*]} " == *" $script "* ]] && skip=1
+          rm -rf "$WORK/$script/results" "$WORK/$script"/*/results
+          echo "== $(date -Is) $script-$tag" >> "$R/steps.log"
+          case $script in
+            text) env SKIP_LOAD=$skip ENGINES=sparkles "$ROOT/scripts/bench-text.sh" "$TEXT_N" "$WORK/text" ;;
+            geo) env SKIP_LOAD=$skip "$ROOT/scripts/bench-geo.sh" "$GEO_N" "$WORK/geo" ;;
+            vector) env SKIP_LOAD=$skip "$ROOT/scripts/bench-vector.sh" "$VEC_N" "$VEC_DIM" "$WORK/vector" ;;
+          esac > "$R/$script-$tag.log" 2>&1
+          rc=$?
+          echo "rc=$rc" >> "$R/$script-$tag.log"
+          [ $rc = 0 ] || { failed=$((failed + 1)); echo "$script-$tag r$r rc=$rc" >> "$OUT/FAILED"; }
+          loaded+=("$script")
+          mkdir -p "$R/results/$script-$tag"
+          find "$WORK/$script" -path '*/results/*' -type f -exec cp {} "$R/results/$script-$tag/" \;
+        done
+      done
+    done
+  done
+done
+date -Is > "$OUT/RERUN-DONE"
+# Exit 1 when any step failed; OUT_DIR/FAILED names them.
+[ $failed = 0 ]

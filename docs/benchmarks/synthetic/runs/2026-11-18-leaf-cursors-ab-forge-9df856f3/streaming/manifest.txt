@@ -1,0 +1,7 @@
+A: commit bccc5f7b, release build on stanley (mbx build --release -p sparkles-server --bin sparkles)
+A sha256: af1f600cafe20755e0dbc6db5d677a39be0fc82a164453d1957725f7a028ba24
+B: commit 9df856f3 (engine code of the part-1 tip), release build on stanley (mbx build --release -p sparkles-server --bin sparkles)
+B sha256: 5e384d0f108d17bc2fd0f2d4cdae8cdc8abbfdcd520f084f63af3e7ffd3bec14
+data: 100000 people (scripts/gen-data.py)
+host: forge (ssh, nsc-bench-remote.sh run directly)
+settings: 31 queries, 8 rounds of A,B,B,A, 3 warm-up and 20 timed requests per query and server, RAYON_NUM_THREADS=1, server CPU 2, client CPU 4, spinners on, execution streaming

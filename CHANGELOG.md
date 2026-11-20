@@ -2,6 +2,112 @@
 
 ## Unreleased
 
+### Late existential restrictions take the clauses their successor already sent
+
+In a run that counts and in a rooted run, an existential restriction that reaches a
+successor after the successor sent its clauses over the predecessor, as a unit derived
+later or under eager expansion as a later edge into a shared successor, now takes Pred
+with those clauses, as roadmap item 1229's repair. Such a run could report itself complete
+and miss an entailed subsumption, and a rooted run that counted classified again without
+counting where it detected the case. The repair is adopted on a measured gate of
+generated and fixture ontologies without a proof, so item 1229 stays open, and the
+cautious and eager strategies give the same taxonomy on that gate wherever both answer in
+full. On the runs that answer in full with and without it, and where the run
+without it agrees with HermiT, the repair adds 0.29% to the
+derived conclusions of rooted runs that count, 0.47% to rooted runs without counting and
+0.90% to runs that count without the root, and three generated ontologies now exceed the
+bound on derived conclusions, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` keeps
+the earlier containment, which now also covers rooted runs without counting, and `=0`
+turns both off, for measurement.
+### Rooted runs withdraw answers that a ground fact under a class may leave incomplete
+
+With `Limits::rooted`, a run could report a complete answer that missed an entailment when
+a fact that holds only under the queried class concerns an individual reached from
+another individual. After its saturation a rooted run now looks for such a fact whose
+condition cannot reach a context registered for one of its individuals. When it finds
+one, it classifies again without the rooted rules, gives the default answer, which leaves
+the axioms outside OWL 2 EL out, and sets `Stats::dl_rooted_declined` and
+`Stats::dl_over_budget`. The `el_classify` report has `dlRootedDeclined`. The check
+exempts the predecessors of the context that holds the fact, the individual's own
+context, contexts that the root does not reach and the root's direct successors, and
+those exemptions are not proved, so this is partial containment and roadmap item 1231 stays open for the
+repair. On generated ontologies built around the loss, every miss is withdrawn. The check
+also withdraws answers that were complete, between 2 and 38 per generated corpus of several
+hundred to several thousand ontologies. `Limits::rooted_decline` set to false keeps the
+rooted answer, and `SPARKLES_ROOTED_MARKER_DECLINE` chooses the check's tier or `off` for
+measurements.
+
+### The selection of rooted runs is on again with selected partners
+
+With `Limits::rooted`, Hyper over `x` and Pred from a successor over a successor term of a
+constant take selected clauses as partners, and the selection of ground body literals is
+on again beside the Join exemption, as roadmap item 1220's repair. Generated ontologies
+built around the two losses find none with the repair in runs without counting, and
+every file that the run without the selection finished still finishes. With counting, one
+generated ontology loses subsumptions with or without the repair, which is item 1229. The repair is adopted on that measured
+gate without a proof of completeness, so item 1220 stays open. 48 of the 50 `shoi`
+fixtures are exact again. The generated ontology s2-g2-011 and a version of shoi-022 with
+its individuals merged, on four threads, pass the work bound where the run before item
+1220 finished, and they are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0` and
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0` turn the selection and the selected partners off for
+measurement.
+
+### The selection of rooted runs is off and Join is partly exempt from the ground restriction
+
+With `Limits::rooted`, the selection of ground body literals and the restriction of Join
+on ground inferences, two of the departures F24 records, could make a run that reported
+itself complete miss an entailed subsumption or an unsatisfiable class. Rooted runs now
+select no ground body literals, and a Join whose premise on the side of the head has no
+ground body literal is exempt from the restriction, until roadmap item 1220 repairs the
+selection. The completeness of the rooted run is
+still not proved. shoi-005 and shoi-027 now pass the work bound and give the default
+answer, with the axioms it leaves out and the fallback in its statistics, so 46 of the 50
+`shoi` fixtures finish against 48.
+### UTF-8 checks of key filters
+
+The key filters that answer CONTAINS, STRSTARTS, STRENDS, STRLEN, REGEX and LANGMATCHES
+on stored keys now check each key's UTF-8 through one helper. The helper accepts an ASCII
+key with a word-at-a-time scan and passes other keys to the standard validator, so an ASCII
+key no longer calls the standard library's validator, whose placement in the binary moved
+`lang-filter` by up to 10% between builds. Malformed keys are rejected as before. On
+stanley at 1.05M triples, `lang-filter` counts 0.75 of the instructions per request,
+`regex-iri` 0.86, `contains` 0.98 and `advisor-sparse` 0.98, and the other screen queries
+are unchanged. A key that is not ASCII pays one extra scan of its bytes before validation.
+When every name and title of the same data ends in a non-ASCII character, which is the worst
+case, `lang-filter` counts 1.026 of the instructions and `contains` 1.000.
+### Cheaper disjunctive attempts, and a width limit on one thread
+
+The pruning of the disjunctive rules' product lists compares sides by a signature and a
+sorted merge, and the Pred rule no longer copies its lists for a fixed premise. The attempts
+derive the same conclusions, and six of the largest classifications of the ORE 2015 DL
+development set take 0.80 to 0.91 times the instructions. On one thread an attempt also ends at a product
+of more than `Limits::dl_attempt_width` choices, 1,048,576 by default, so that
+`ore_ont_14817` and `ore_ont_9663` fall back to the Horn rules after 0.5 and 4 million
+conclusions instead of 22.4 million, in 25.6 and 51.1 G instructions against 584 and 700 G,
+with the same taxonomies (roadmap items 990 and 1011). `el_classify --dl-attempt-width N`
+sets the limit, and roadmap item 1225 follows why one thread makes such wide products.
+On one thread on forge the two files classify in 2.3 and 4.9 s against 57.4 and 74.3 s, and
+the other four in 0.86 to 0.91 times the base's time.
+
+The rule of the Horn rules for a new universal no longer searches the context's universals
+for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
+`ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
+item 1234 follows (item 693).
+### Cursor operators for searches, calls and counts
+
+The first part of roadmap item 829 runs text, hybrid, history, spatial and vector searches
+over their input, remote LATERAL loops, whole-input searches and algorithm calls, bounded
+leaves and `CountJoin` as cursor operators under explicit streaming, where they fell back
+to eager subtrees before. Automatic execution keeps its earlier choices for these kinds
+until a same-host A/B admits each one. A streamed count over a join that eager execution
+counts from its pairs holds one batch where eager holds every pair, and a count over a
+merge join on two or more variables still runs the eager kernel. The strict policy refuses
+the forms that remain without a resumable reader, which the second part of the item
+covers. On forge, the text, geo and vector scripts read within noise of the base except
+eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds, and
+streamed `q9-star` with 12 threads, which a rerun against the tip's merge base put at
+0.966.
+
 ### Targeted checks on a remote host
 
 `mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
@@ -34,6 +140,34 @@ a message when it is missing. `SPARKLES_E2E_NO_WASM=1` skips that check. The len
 preferences draw. The outbound-policy test of ontology imports asks for a link-local
 address, which the test server's policy refuses before it connects, although it allows
 private addresses. This completes roadmap item 1131.
+
+### Registered property functions under RDFS on read and reasoning
+
+A query could abort the server process when RDFS on read was on and the schema declared
+a registered property function a subproperty of a predicate the query named. The
+rewrite added a call that the query had not been prepared for, the call panicked, and
+the stream's destructor panicked again while unwinding. A schema that gave the function
+a domain or range, or put a subproperty below it, could also add or change a call, and
+the seed queries of query-time reasoning ran a written call in the same unprepared way.
+The RDFS rewrite now derives nothing through a registered property. It keeps the
+query's own call and its list arguments as written, after the patterns that bind its
+inputs, and adds none, and a reasoning seed set that would need a call is derived from
+constants instead. RDFS on read had also refused a written call with a list argument,
+or one whose input came from a rewritten pattern, and both now run. A callback reached from an unprepared
+query now fails that query with an error, and the stream and accumulator destructors no
+longer panic. This completes roadmap item 1198.
+### DISTINCT on charged buffers
+
+A cursor DISTINCT keeps its set in `Charged` buffers, which take their memory charge from
+their own allocations at one growth site, so the set is admitted to the query's budget
+before it grows, which completes roadmap item 1183. A shared heap audit compares every
+cursor operator's heap with its ledger, and the operators it finds above their ledger
+have roadmap items of their own. Seven DISTINCT sweeps over a range of budgets fit every
+budget they fitted before the move with the same answers, and three of them now fit from
+smaller budgets, such as 40,960 bytes in place of 57,344 for a one-column spilled set. On
+forge at 1.05M quads, streamed DISTINCT of two columns of a join takes 1.008 times as long
+as before and a wider one 1.033 times, which roadmap item 1237 recovers, and the other
+DISTINCT queries take the same time or up to 3.5% less.
 
 ### Streamed answers through the engine buffer
 
@@ -465,6 +599,13 @@ ordering.
 
 ### OWL classification
 
+The Horn classifier skips R7 predecessor searches when the trigger cannot
+contribute a pair and checks the run's bounds during growing scans. It also
+omits a link covered by a retained subrole link to the same successor and a
+repeated core at the successor itself. Four assertion-heavy ORE 2015 DL files
+classify 9 to 12% faster on one thread and 18 to 23% faster on four by the
+median of paired Atlas rounds, with unchanged taxonomies.
+
 A property assertion `r(a, b)` over a property with a range links `a` to `b`'s own
 context, and the index tells `b` the range. Before, the index made a context of `b` with
 the range for each such assertion, which derived `b` and repeated what `b` holds, under
@@ -659,6 +800,18 @@ ChEBI lite classifies 8 to 14% faster and GO 1 to 3% faster, and the taxonomies 
 298 ORE 2015 EL files, GO, ChEBI lite and `ore_ont_8737` are unchanged. An
 open-addressing table for large sets measured no faster and was reverted. The filter's
 remaining cost is item 956.
+
+A transitive role whose equivalent roles compose alike, and whose left partners compose
+again with a further link by it, now composes its chains left-linearly. A link of such a
+role that a chain composes from two links by its equivalents keeps no forward link at its
+source, so a middle context no longer derives the role's closure again, and the
+saturation stores the same backward links (roadmap item 956). On forge the saturation of
+`ore_ont_8737` takes 0.94 s on four threads instead of 8.22 s, 2.99 s on one instead of
+25.41 s and 0.70 s on twelve instead of 7.05 s, with a peak resident set of 2.3 instead
+of 6.3 GiB on four threads, and ChEBI lite classifies in 0.48 to 0.81 times the time.
+The taxonomies are unchanged. `ore_ont_13482` classifies 2.5% slower on four threads and
+`ore_ont_9855` 1.0% slower on one, which item 1224 follows. `SPARKLES_LINEAR_CHAINS=0`
+turns the composition off for measurements.
 
 ### Ask latency
 

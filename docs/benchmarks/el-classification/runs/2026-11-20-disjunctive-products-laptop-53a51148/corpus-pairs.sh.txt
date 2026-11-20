@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# corpus-pairs.sh: corpus.sh writes the base line and then the w2 line of each file and thread
+# count, so consecutive lines of corpus.txt form the pairs. Prints the pairs that either side did
+# not classify, each difference of taxonomy hash and report fields with the time removed, and the
+# counts. Keying by file name instead would merge the eight names in both the EL and DL directories.
+grep -v CORPUS-DONE corpus.txt | sed -E 's/,[0-9.]+\]$/]/' | awk '
+NR%2==1 {split($0,x," "); next}
+{split($0,y," ")
+ if (x[1]!=y[1]||x[3]!=y[3]||x[2]!="base"||y[2]!="w2") {print "MISALIGNED", NR; exit 1}
+ p++
+ if (x[4]!=0||y[4]!=0) {f++; print "NOTBOTH", x[1], x[3], x[4], y[4]; next}
+ if (x[5]" "x[6]!=y[5]" "y[6]) {d++; print "DIFF", x[1], x[3]}}
+END {print "pairs", p, "both-classified", p-f, "diffs", d+0}'

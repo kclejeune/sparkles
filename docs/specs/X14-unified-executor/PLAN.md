@@ -579,7 +579,10 @@ kernel over each input batch and serves the result where a batch's output is the
 of its rows. A text search groups the distinct query strings of a batch as the eager
 kernel groups them, a SERVICE keeps its correlation with its input rows, and a registered
 property function without the declaration still collects its whole input, since its calls
-may have effects. A vector or hybrid search whose candidates come from its input is not
+may have effects, and the strict policy refuses it, as it refuses the other unbounded
+whole-input kinds, until a whole-input operator that can spill exists. History changes
+and a path search bounded only by their own limit argument count as bounded leaves under
+decision 2, as `k` and `maxHits` do, since the argument bounds the output. A vector or hybrid search whose candidates come from its input is not
 such a form, because `exec::vector_search` collects the candidate subjects of the whole
 group before it asks for its global `k`, so two candidates split across batches would
 both be returned where one search returns the winner. That form accumulates its

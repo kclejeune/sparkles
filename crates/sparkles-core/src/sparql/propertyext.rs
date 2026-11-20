@@ -52,7 +52,7 @@ impl<'q> PropertyContext<'q> {
     }
     fn guarded<T>(&self, f: impl FnOnce() -> Result<T>) -> std::result::Result<T, ScalarError> {
         let ctx = self.scope.ctx;
-        let _owner = CallbackGuard::enter(ctx);
+        let _owner = CallbackGuard::enter(ctx).map_err(|e| ScalarError::from_engine(&e))?;
         ctx.check().and_then(|()| f()).map_err(|e| {
             let error = ScalarError::from_engine(&e);
             ctx.fail_extension(error.clone());
@@ -395,24 +395,33 @@ pub(super) fn has_calls(ctx: &Ctx, patterns: &[TriplePattern]) -> bool {
 
 // Query-written collection extraction is local to the registered contract. The
 // built-in text/property parser's 64-cell limit remains unchanged.
+// Under RDFS on read the query's blank nodes are variables with a reserved prefix
+// (`renamed`), which still name the cells the query wrote.
 fn take_list(
     patterns: &[TriplePattern],
     head: &TermPattern,
+    renamed: bool,
 ) -> Result<(Vec<TermPattern>, Vec<usize>)> {
     use oxrdf::vocab::rdf;
-    let TermPattern::BlankNode(head) = head else {
+    fn list_node(t: &TermPattern, renamed: bool) -> Option<&str> {
+        match t {
+            TermPattern::BlankNode(b) => Some(b.as_str()),
+            TermPattern::Variable(_) if renamed => super::rdfs::list_node(t),
+            _ => None,
+        }
+    }
+    let Some(mut cell) = list_node(head, renamed) else {
         return Err(Error::invalid(
             "property argument must be a query-written RDF list",
         ));
     };
-    let mut cell = head.clone();
     let mut used = FxHashSet::default();
     let mut elements = Vec::new();
     loop {
         let link = |predicate: oxrdf::NamedNodeRef<'_>| -> Result<usize> {
             let mut matches = patterns.iter().enumerate().filter(|(_, t)| {
-                matches!(&t.subject, TermPattern::BlankNode(b) if b == &cell)
-                    && matches!(&t.predicate, NamedNodePattern::NamedNode(n) if *n == predicate)
+                matches!(&t.predicate, NamedNodePattern::NamedNode(n) if *n == predicate)
+                    && list_node(&t.subject, renamed) == Some(cell)
             });
             let (Some((i, _)), None) = (matches.next(), matches.next()) else {
                 return Err(Error::invalid("malformed property argument list"));
@@ -430,8 +439,10 @@ fn take_list(
         elements.push(patterns[first].object.clone());
         match &patterns[rest].object {
             TermPattern::NamedNode(n) if *n == rdf::NIL => break,
-            TermPattern::BlankNode(next) => cell = next.clone(),
-            _ => return Err(Error::invalid("malformed property argument list")),
+            next => match list_node(next, renamed) {
+                Some(next) => cell = next,
+                None => return Err(Error::invalid("malformed property argument list")),
+            },
         }
     }
     Ok((elements, used.into_iter().collect()))
@@ -461,7 +472,7 @@ pub(super) fn take_calls(
                     Vec::new()
                 }
                 ArgumentShape::List(_) => {
-                    let (elements, cells) = take_list(patterns, head)?;
+                    let (elements, cells) = take_list(patterns, head, ctx.rdfs.is_some())?;
                     used.extend(cells);
                     elements
                 }
@@ -639,7 +650,7 @@ fn dispatch<T>(
 ) -> Result<Option<T>> {
     ctx.check()
         .inspect_err(|e| ctx.fail_extension(ScalarError::from_engine(e)))?;
-    let _owner = CallbackGuard::enter(ctx);
+    let _owner = CallbackGuard::enter(ctx)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
         .unwrap_or_else(|_| Err(ScalarError::Execution("property callback panicked".into())));
     if let Err(e) = &result {
@@ -660,14 +671,11 @@ struct OwnedStream<'q> {
 }
 impl Drop for OwnedStream<'_> {
     fn drop(&mut self) {
-        let _owner = CallbackGuard::enter(self.ctx);
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.inner.take())))
-            .is_err()
-        {
-            self.ctx.fail_extension(ScalarError::Execution(
-                "property stream destructor panicked".into(),
-            ));
-        }
+        CallbackGuard::drop_owned(
+            self.ctx,
+            self.inner.take(),
+            "property stream destructor panicked",
+        );
     }
 }
 

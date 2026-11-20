@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# step0.sh: the dev-profile C1 build (debug_assert in horn_rules::forall) on GO, ore_ont_14817 and
+# ore_ont_9663 at one and four threads; a panic means a context derived a universal twice.
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees
+GO=$W/horn-cost-1025/.artifacts/lanes/horn-cost-1025/data/go.ofn
+DEV=$W/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+run() { f=$1; t=$2; n=$(basename $f); n=${n%.*}; o=$L/out/c1dev.$n.t$t
+  timeout 5400 systemd-run --user --scope -q -p MemoryMax=8G -p MemorySwapMax=1G -p OOMPolicy=continue \
+    $L/bin/c1dev --threads $t --taxonomy $o.tax $f > $o.json 2> $o.err
+  st=$?; sha=$(LC_ALL=C sort $o.tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $o.tax
+  echo "$n c1dev t$t st=$st tax=$sha panic=$(grep -c 'derived twice' $o.err) $(grep '^{' $o.json | jq -c '{ms:.classifyMedianMs,tier,concl:.conclusions,over:.dlAttemptOver}' 2>/dev/null)" >> $L/out/step0.txt; }
+for t in 1 4; do for f in $GO $DEV/ore_ont_14817.owl $DEV/ore_ont_9663.owl; do run $f $t & done; done
+wait; echo STEP0-DONE >> $L/out/step0.txt

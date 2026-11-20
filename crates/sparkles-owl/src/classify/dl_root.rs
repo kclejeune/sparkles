@@ -450,6 +450,11 @@ pub(super) fn univ_from_x(
 /// The premises of a ground inference whose maximal literal is `l`, the selected clauses
 /// and the markers left out.
 fn partners(st: &State, l: Lit) -> Vec<Side> {
+    partners_of(st, l, false)
+}
+
+/// [`partners`], with the selected clauses too when `sel` is set.
+fn partners_of(st: &State, l: Lit, sel: bool) -> Vec<Side> {
     let Some(d) = dl(st) else {
         return Vec::new();
     };
@@ -460,7 +465,7 @@ fn partners(st: &State, l: Lit) -> Vec<Side> {
         .flatten()
         .filter(|&&i| {
             let s = &d.store.clauses[i as usize];
-            !s.dead && !s.sel
+            !s.dead && (sel || !s.sel)
         })
         .map(|&i| side(&d.store.clauses[i as usize].c, l))
         .collect()
@@ -770,7 +775,7 @@ fn is_marker(c: &Clause) -> bool {
 /// and a selected clause is no premise on the side of the head, as ordered resolution
 /// with selection has it. A Join of two clauses that hold neither x nor y is a ground
 /// inference, and its conclusion then holds neither, so the restriction applies to the
-/// conclusion.
+/// conclusion as [`super::dl_rules::join_exempt`] says.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn join_head(
     ix: &Index,
@@ -798,14 +803,15 @@ pub(super) fn join_head(
             s.c.head().to_vec(),
         );
         let c = merge(prem, &rest);
-        if !restricted(lits, inv, &c) {
+        if !super::dl_rules::join_restricted(lits, inv, &prem.0, &c) {
             found.push(c);
         }
     }
 }
 
 /// Join on a new clause `c` with ground literals in its body: for each, the processed
-/// clauses where it is maximal.
+/// clauses where it is maximal. The restriction on ground inferences applies to its
+/// conclusions as [`super::dl_rules::join_exempt`] says.
 pub(super) fn join_body(
     ix: &Index,
     st: &State,
@@ -831,7 +837,7 @@ pub(super) fn join_body(
             let s = &x.store.clauses[i as usize];
             if !s.dead && !s.sel && !is_marker(&s.c) {
                 let c = merge(&side(&s.c, l), &rest);
-                if !restricted(lits, inv, &c) {
+                if !super::dl_rules::join_restricted(lits, inv, s.c.body(), &c) {
                     found.push(c);
                 }
             }
@@ -1241,6 +1247,33 @@ pub(super) fn root_pred(
     found: &mut Found,
     lits: &super::dl_clause::Lits,
 ) {
+    root_pred_of(
+        ix,
+        st,
+        e,
+        u,
+        c,
+        fixed,
+        found,
+        lits,
+        super::dl_rules::sel_partners_x(),
+    );
+}
+
+/// [`root_pred`], whose premises over `f_e(u)` include the selected clauses when `sel` is
+/// set, as Hyper over x has them under [`super::dl_rules::sel_partners_x`].
+#[allow(clippy::too_many_arguments)]
+fn root_pred_of(
+    ix: &Index,
+    st: &State,
+    e: Ex,
+    u: u32,
+    c: &Clause,
+    fixed: Option<(Lit, &Side)>,
+    found: &mut Found,
+    lits: &super::dl_clause::Lits,
+    sel: bool,
+) {
     found.rule = "rpredc";
     use super::dl_clause::{RY, X as KX};
     let dx = dix(ix);
@@ -1321,7 +1354,7 @@ pub(super) fn root_pred(
     let free: Vec<Vec<Side>> = need
         .iter()
         .map(|n| match n {
-            Need::Atom(k) => partners(st, *k),
+            Need::Atom(k) => partners_of(st, *k, sel),
             Need::Role(s) => roles(*s),
         })
         .collect();
@@ -1338,6 +1371,312 @@ pub(super) fn root_pred(
             }
         }
     }
+}
+
+/// Row 1231's diagnostic, which `SPARKLES_ROOTED_MARKER_DIAG=1` turns on: after a rooted
+/// run saturates, the run reports on stderr how often a context that is registered with the
+/// root for a constant of a conditional ground trigger lies outside the successors of the
+/// trigger's holder, so that the trigger's marker never reaches it.
+pub(super) fn marker_diag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SPARKLES_ROOTED_MARKER_DIAG").is_some_and(|v| v == "1" || v == "2")
+    })
+}
+
+/// Whether row 1231's diagnostic also prints each pair, which `SPARKLES_ROOTED_MARKER_DIAG=2`
+/// turns on.
+fn marker_detail() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_MARKER_DIAG").is_some_and(|v| v == "2"))
+}
+
+/// The tier of [`marker_trips`] at which row 1231's decline withdraws a rooted run's answer,
+/// or `None` for no decline. A finished rooted run with a pair at that tier makes no claim:
+/// the classifier starts again without the rooted rules and reports
+/// `Stats::dl_rooted_declined`. `on` is [`Limits::rooted_decline`](super::Limits), which
+/// gives tier 4, and `SPARKLES_ROOTED_MARKER_DECLINE` overrides it for measurements, with
+/// `off` for no decline or a tier.
+pub(super) fn marker_decline(on: bool) -> Option<usize> {
+    static ENV: std::sync::OnceLock<Option<Option<usize>>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        let v = std::env::var("SPARKLES_ROOTED_MARKER_DECLINE").ok()?;
+        Some(if v == "off" {
+            None
+        } else {
+            v.parse().ok().filter(|&t| t < MARKER_TIERS)
+        })
+    });
+    env.unwrap_or(if on { Some(MARKER_DECLINE_TIER) } else { None })
+}
+
+/// The tier of [`marker_trips`] at which the decline is on by default.
+pub(super) const MARKER_DECLINE_TIER: usize = 4;
+
+/// The tiers of [`marker_trips`].
+pub(super) const MARKER_TIERS: usize = 5;
+
+/// What one context of a rooted run holds for [`marker_trips`].
+pub(super) struct MarkerCtx {
+    pub(super) me: Ex,
+    /// the context's successors
+    pub(super) succ: Vec<Ex>,
+    /// the context's maximal ground triggers that a processed clause other than a marker has
+    pub(super) held: Vec<Lit>,
+    /// in the root, the contexts registered for each constant
+    pub(super) edges: Vec<(u32, Vec<Ex>)>,
+    /// in the root, the heads of its live facts with one literal
+    pub(super) units: Vec<Lit>,
+}
+
+/// The factor by which a vector's capacity or a hash table's buckets can pass the
+/// entries they hold: a vector doubles, and a table keeps 7 of 8 buckets at most and
+/// rounds them up to a power of two.
+const SLACK: usize = 3;
+
+/// A bound on the bytes of the maps, sets and buffers that [`marker_trips`] builds over
+/// the copies `cs` with a `stop`, which the run admits before the search: the index by
+/// context, the predecessors with their lists, the root's reach, its successors and the
+/// singleton contexts, the root's units and registrations, one holder's successors and
+/// predecessors at a time, and the copies of successor lists that the searches take.
+pub(super) fn marker_search_bytes(cs: &[MarkerCtx]) -> usize {
+    use std::mem::size_of;
+    let n = cs.len();
+    let succ: usize = cs.iter().map(|c| c.succ.len()).sum();
+    let root: usize = cs.iter().map(|c| c.units.len() + c.edges.len()).sum();
+    // a hash entry of a context, of a context and its index, of a context and its list
+    let set = size_of::<Ex>() + 1;
+    let map = size_of::<(Ex, usize)>() + 1;
+    let list = size_of::<(Ex, Vec<Ex>)>() + 1;
+    let tables = n * (map + list + 4 * set) + root * (size_of::<(u32, &[Ex])>() + 1);
+    // the predecessor lists and the copies of successor lists taken while searching
+    let buffers = succ * size_of::<Ex>() * 2;
+    SLACK * (tables + buffers)
+}
+
+/// What [`marker_trips`] needs of the context `me` with the state `st`.
+/// `admit` takes the bytes the copy will hold, and with a negative count gives back
+/// those of its scratch sets, before anything is allocated. A refusal ends the copy with
+/// `Err`, and the run stops as past its memory budget.
+pub(super) fn marker_ctx(
+    ix: &Index,
+    me: Ex,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+    admit: &mut dyn FnMut(isize) -> bool,
+) -> Result<Option<MarkerCtx>, ()> {
+    let Some(x) = dl(st) else { return Ok(None) };
+    let dx = dix(ix);
+    let inv = inv_of(ix, dx);
+    let is_root = dx.root == Some(me);
+    // bounds on what the copy holds and on its two scratch sets of ground literals, with
+    // the slack of a vector's or a table's capacity
+    let ground = x.root.as_deref().map_or(0, |r| r.ground.len());
+    let scratch = (SLACK * ground * 2 * (std::mem::size_of::<Lit>() + 1)) as isize;
+    let mut kept = ground * std::mem::size_of::<Lit>()
+        + (x.edges.len() + x.root.as_deref().map_or(0, |r| r.by_succ.len()) + st.subs.len())
+            * std::mem::size_of::<Ex>();
+    if is_root {
+        kept += x.store.clauses.len() * std::mem::size_of::<Lit>();
+        if let Some(r) = x.root.as_deref() {
+            kept += r.edges.len() * std::mem::size_of::<(u32, Vec<Ex>)>()
+                + r.edges.values().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<Ex>();
+        }
+    }
+    let kept = SLACK * kept;
+    if !admit(kept as isize + scratch) {
+        return Err(());
+    }
+    let mut held = Vec::new();
+    if let Some(r) = x.root.as_deref()
+        && !r.ground.is_empty()
+    {
+        // every maximal literal of a processed clause other than a marker, dead or not,
+        // since a clause can have several and Stored::max holds the first
+        let ground: FxHashSet<Lit> = r.ground.iter().copied().collect();
+        let mut own: FxHashSet<Lit> = FxHashSet::default();
+        for i in 0..x.store.clauses.len() as u32 {
+            if is_marker(&x.store.clauses[i as usize].c) {
+                continue;
+            }
+            own.extend(x.store.maxes(i).filter(|m| ground.contains(m)));
+        }
+        for &l in &r.ground {
+            if own.contains(&l) && ground_trigger(lits.view(l, inv)) {
+                held.push(l);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    let mut units = Vec::new();
+    if is_root {
+        if let Some(r) = x.root.as_deref() {
+            edges = r.edges.iter().map(|(&u, v)| (u, v.clone())).collect();
+        }
+        for s in &x.store.clauses {
+            if !s.dead && s.c.body().is_empty() && s.c.head().len() == 1 {
+                units.push(s.c.head()[0]);
+            }
+        }
+    }
+    admit(-scratch);
+    Ok(Some(MarkerCtx {
+        me,
+        succ: successors(ix, st),
+        held,
+        edges,
+        units,
+    }))
+}
+
+/// Counts, for each tier, the conditional ground triggers, their constants and the pairs
+/// of a trigger's holder and a context registered with the root for one of the trigger's
+/// constants, that the holder's markers do not reach. A trigger is conditional when it is
+/// no fact of the root. The tiers leave out more contexts in turn: tier 0 leaves out only
+/// the holder and its successors, tier 1 also the holder's predecessors, tier 2 also the
+/// constant's singleton context, tier 3 also the contexts that the root does not reach,
+/// and tier 4 also the root's own successors. With `stop`, and without the pairs on
+/// stderr, the count ends at the first pair of that tier, which is all a decline needs.
+/// The answer also counts the pair set P_R of the repair (PLAN v3.1, D3), the pairs that
+/// tier 0 keeps whose context the root reaches, as triples of holder, trigger and context
+/// and as sends, the distinct pairs of context and trigger. Those two counts are complete
+/// only without `stop`, and the run builds the sets of distinct triggers, constants and
+/// sends only then, for the diagnostic, outside the run's memory budget.
+pub(super) fn marker_trips(
+    ix: &Index,
+    cs: &[MarkerCtx],
+    lits: &super::dl_clause::Lits,
+    stop: Option<usize>,
+) -> ([[usize; 3]; MARKER_TIERS], [usize; 2]) {
+    let dx = dix(ix);
+    let inv = inv_of(ix, dx);
+    let mut out = [[0usize; 3]; MARKER_TIERS];
+    let mut pr = [0usize; 2];
+    let mut sends: FxHashSet<(Ex, Lit)> = FxHashSet::default();
+    let Some(root) = dx.root else {
+        return (out, pr);
+    };
+    let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
+    let Some(&ri) = by.get(&root) else {
+        return (out, pr);
+    };
+    let detail = marker_detail();
+    let stop = stop.filter(|_| !detail);
+    let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
+    let edges: FxHashMap<u32, &[Ex]> = cs[ri].edges.iter().map(|(u, v)| (*u, &v[..])).collect();
+    let mut preds: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    for c in cs {
+        for &w in &c.succ {
+            preds.entry(w).or_default().push(c.me);
+        }
+    }
+    let reach = |from: Ex, next: &dyn Fn(Ex) -> Vec<Ex>| {
+        let mut seen: FxHashSet<Ex> = FxHashSet::default();
+        let mut todo = vec![from];
+        seen.insert(from);
+        while let Some(e) = todo.pop() {
+            for w in next(e) {
+                if seen.insert(w) {
+                    todo.push(w);
+                }
+            }
+        }
+        seen
+    };
+    let succ_of = |e: Ex| by.get(&e).map_or(Vec::new(), |&i| cs[i].succ.clone());
+    let pred_of = |e: Ex| preds.get(&e).cloned().unwrap_or_default();
+    let from_root = reach(root, &succ_of);
+    let root_succ: FxHashSet<Ex> = cs[ri].succ.iter().copied().collect();
+    let singleton: FxHashMap<u32, Ex> = dx.consts.iter().copied().collect();
+    let mut trig: [FxHashSet<Lit>; MARKER_TIERS] = Default::default();
+    let mut kons: [FxHashSet<u32>; MARKER_TIERS] = Default::default();
+    for c in cs {
+        if c.me == root || c.held.is_empty() {
+            continue;
+        }
+        // the holder's successors and predecessors, found only when a pair needs them
+        let down: std::cell::OnceCell<FxHashSet<Ex>> = std::cell::OnceCell::new();
+        let up: std::cell::OnceCell<FxHashSet<Ex>> = std::cell::OnceCell::new();
+        for &l in &c.held {
+            if units.contains(&l) {
+                continue;
+            }
+            let mut us = Vec::new();
+            consts(lits.view(l, inv), &mut us);
+            us.sort_unstable();
+            us.dedup();
+            let mut regs: Vec<(u32, Ex)> = Vec::new();
+            for &u in &us {
+                for &d in edges.get(&u).copied().unwrap_or(&[]) {
+                    regs.push((u, d));
+                }
+            }
+            regs.sort_unstable_by_key(|&(_, d)| d);
+            regs.dedup_by_key(|p| p.1);
+            for (_, d) in regs {
+                if d == root {
+                    continue;
+                }
+                // the tiers that need no search first, so that a decline skips the
+                // searches of the pairs it cannot use
+                let single = !us.iter().any(|v| {
+                    singleton.get(v) == Some(&d) || super::dl_rules::singleton_of(ix, d) == Some(*v)
+                });
+                let reached = from_root.contains(&d);
+                let direct = !root_succ.contains(&d);
+                if let Some(t) = stop
+                    && ![single, reached, direct][..t.saturating_sub(1).min(3)]
+                        .iter()
+                        .all(|&k| k)
+                {
+                    continue;
+                }
+                if down.get_or_init(|| reach(c.me, &succ_of)).contains(&d) {
+                    continue;
+                }
+                if reached && stop.is_none() {
+                    pr[0] += 1;
+                    sends.insert((d, l));
+                }
+                let keep = [
+                    true,
+                    !up.get_or_init(|| reach(c.me, &pred_of)).contains(&d),
+                    single,
+                    reached,
+                    direct,
+                ];
+                if detail {
+                    let t = keep.iter().take_while(|&&k| k).count();
+                    eprintln!(
+                        "MARKER-PAIR tier<={} holder={} lit={} ctx={d}",
+                        t.saturating_sub(1),
+                        c.me,
+                        super::dl_rules::tr(ix, lits, &[l])
+                    );
+                }
+                let mut tier = 0;
+                while tier < MARKER_TIERS && keep[..=tier].iter().all(|&k| k) {
+                    out[tier][2] += 1;
+                    // the sets of the diagnostic, which a decline does not build
+                    if stop.is_none() {
+                        trig[tier].insert(l);
+                        kons[tier].extend(us.iter().copied());
+                    }
+                    tier += 1;
+                }
+                if stop.is_some_and(|t| out[t][2] > 0) {
+                    pr[1] = sends.len();
+                    return (out, pr);
+                }
+            }
+        }
+    }
+    for t in 0..MARKER_TIERS {
+        out[t][0] = trig[t].len();
+        out[t][1] = kons[t].len();
+    }
+    pr[1] = sends.len();
+    (out, pr)
 }
 
 #[cfg(test)]
@@ -1542,6 +1881,77 @@ mod tests {
         match ix.head(u).node {
             Node::Nominal(k) => RTerm::C(k),
             _ => panic!("not a nominal"),
+        }
+    }
+
+    /// Item 1220's repair R1 in Pred from a successor over `f_e(u)`: two selected clauses
+    /// `H(u) → A(f_e(u)) ∨ Z(x)` and `H(u) → B(f_e(u)) ∨ Z(x)` are the premises of the
+    /// successor's `A(x) ∧ B(x) → Z(y)` only when selected partners count, with no fixed
+    /// premise and with either one fixed. The clauses cannot go to a predecessor, since
+    /// their heads hold an atom over x and one over `f_e(u)`.
+    #[test]
+    fn root_pred_takes_selected_partners_under_r1() {
+        use super::super::dl_clause::Rooted;
+        let mut sig = Sig::new();
+        let a = sig.class("A");
+        let b = sig.class("B");
+        let h = sig.class("H");
+        let z = sig.class("Z");
+        let v = sig.ind("v");
+        let r = sig.role("r");
+        let e = sig.some_h(r, a);
+        let done = saturate_root(sig);
+        let ix = &done.ix;
+        let lits = &done.run.lits;
+        let inv = inv_of(ix, dix(ix));
+        let RTerm::C(u) = c(v, ix) else {
+            unreachable!()
+        };
+        let literal = |x| match lits.lit(x, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("literal"),
+        };
+        let hyp = literal(XLit::Atom(h, RTerm::C(u)));
+        let fa = literal(XLit::Atom(a, RTerm::Fc(e, u)));
+        let fb = literal(XLit::Atom(b, RTerm::Fc(e, u)));
+        let answer = literal(XLit::Atom(z, RTerm::C(u)));
+        let mut st = State::default();
+        let o = Rooted {
+            ix,
+            lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        for l in [fa, fb] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![hyp], vec![l, Lit::x(z)]));
+        }
+        let mut maxima = Vec::new();
+        while let Some(i) = ds(&mut st).store.next(ix, Some(&o), &mut maxima) {
+            let s = &mut ds(&mut st).store.clauses[i as usize];
+            s.sel = super::super::dl_rules::selected_always(lits, inv, &s.c);
+        }
+        assert!(ds(&mut st).store.clauses.iter().all(|s| s.sel));
+        let succ = Clause::new(vec![Lit::x(a), Lit::x(b)], vec![answer]);
+        let fixed = side(&ds(&mut st).store.clauses[0].c, fa);
+        for (sel, want) in [(false, 0), (true, 1)] {
+            let mut found = Found::default();
+            root_pred_of(ix, &st, e, u, &succ, None, &mut found, lits, sel);
+            assert_eq!(found.products_len(), want, "no fixed premise, sel {sel}");
+            let mut found = Found::default();
+            root_pred_of(
+                ix,
+                &st,
+                e,
+                u,
+                &succ,
+                Some((fa, &fixed)),
+                &mut found,
+                lits,
+                sel,
+            );
+            assert_eq!(found.products_len(), want, "fixed premise, sel {sel}");
         }
     }
 

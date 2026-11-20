@@ -544,7 +544,6 @@ impl<'a> Layout<'a> {
             | Kind::Distinct
             | Kind::Slice { .. }
             | Kind::Unpack { .. }
-            | Kind::CountJoin { .. }
             | Kind::CountJoinRuns { .. } => Ok(()),
             Kind::Scan(scan)
             | Kind::CountScan { spec: scan, .. }
@@ -565,7 +564,10 @@ impl<'a> Layout<'a> {
                 self.node(&spec.fallback)
             }
             Kind::Values(table) => self.table(table),
-            Kind::Join { keys, .. } | Kind::Sort(keys) | Kind::Project(keys) => self.vector(keys),
+            Kind::Join { keys, .. }
+            | Kind::CountJoin { keys, .. }
+            | Kind::Sort(keys)
+            | Kind::Project(keys) => self.vector(keys),
             Kind::LeftJoin { expr } => self.expr_option(expr.as_ref()),
             Kind::KeyedJoin { expr, .. }
             | Kind::KeyedLeftJoin { expr, .. }
