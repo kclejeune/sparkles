@@ -153,7 +153,7 @@ no ancestor makes the inference. The rooted run now selects no ground body liter
 exempts Join from the restriction, and `SPARKLES_ROOTED_SELECT_GROUND=1` and
 `SPARKLES_ROOTED_JOIN_EXEMPT=0` restore each for measurement. shoi-005 and shoi-027 then
 pass the bound and give their default answer, so 46 of the 50 `shoi` fixtures are exact
-against HermiT, and 14 more of the 393 generated ontologies with keys or the universal
+against HermiT, and 15 more of the 393 generated ontologies with keys or the universal
 property pass the bound. The exemption of Join alone changes no fixture's result. The
 repair that restores the selection is row 1220.
 
