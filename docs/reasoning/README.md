@@ -526,11 +526,13 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
   the top object property, is used as far as the calculus goes and reported as partial.
-  Every answer is entailed, and it is complete for named classes when nothing is reported.
-  For eligible EL additions and removals, the classifier keeps its contexts and saturates
-  again only those the changes can reach. A classification with the Horn rules of an
-  ontology without individuals, and one with the disjunctive rules that does not count,
-  keep their contexts in the same way. After an edit of class axioms the next run clears
+  Every answer is entailed, and outside a rooted run it is complete for named classes when
+  nothing is reported. A rooted run can miss entailments even when it reports nothing left
+  out and calls its answer complete. Roadmap items 1229 and 1231. For eligible EL additions
+  and removals, the classifier keeps its contexts and saturates again only those the
+  changes can reach. A classification with the Horn rules of an ontology without
+  individuals, and one with the disjunctive rules that does not count, keep their contexts
+  in the same way. After an edit of class axioms the next run clears
   the contexts that hold an expression whose rules changed, with the contexts that reach
   them, and its answer is that of a classification that starts again. A change to the
   property hierarchy, chains, reflexivity or ranges, an

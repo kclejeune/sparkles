@@ -1795,8 +1795,9 @@ strategy, and the JSON operation, `POST /$/ontology/{ds}/classify`, the Python, 
 and JVM bindings and `sparkles ontology classify --partial --expansion` take them. Every
 answer gives `tier` and `consistency`, and a partial one has `partial` true, `complete`
 false and the open classes under `incomplete` with `incompleteCount`. The `complete` of
-the JSON and of `Classified::complete` stays true only for an answer that left nothing out
-and finished. The dataset keeps no partial answer. A request that writes its taxonomy,
+the JSON and of `Classified::complete` stays true only for a run that finished and reported
+no axiom left out. A rooted run can miss entailments with the flag true, which items 1229
+and 1231 record. The dataset keeps no partial answer. A request that writes its taxonomy,
 asks for the functional-style answer or runs a ROBOT-compatible command refuses or ignores
 the flag, since none of them can say that a taxonomy is partial. The command line takes
 `--timeout`, notes a partial answer on stderr and exits with status 2 for one that is
