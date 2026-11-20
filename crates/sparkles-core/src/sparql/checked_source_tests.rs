@@ -3257,6 +3257,15 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
     let chain20 = checked_chain_query(20).replacen("SELECT *", "SELECT ?g ?x0", 1);
     let star40 = checked_star_query(40).replacen("SELECT *", "SELECT ?g ?x0", 1);
     let apart20 = checked_apart_query(20).replacen("SELECT *", "SELECT ?g ?x0", 1);
+    // The last filter list each of these admits: the keyed join's condition, the late
+    // filters joining the remaining ones, and the settled filters joining them after the
+    // parts are planned.
+    let lists: Vec<String> = checked_filter_list_bodies()
+        .into_iter()
+        .filter(|(name, _)| matches!(*name, "keyed many" | "late grown" | "joined"))
+        .map(|(_, body)| format!("SELECT ?g ?x WHERE {{ GRAPH ?g {{ {body} }} }}"))
+        .collect();
+    assert_eq!(lists.len(), 3);
     let n = 1usize << width;
     for (store, text, phase, at, size) in [
         (&store, &chain, GREEDY_PHASE, 0, 0),
@@ -3318,6 +3327,9 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
                 13 * size_of::<crate::sparql::expr::Expr>(),
             ),
             (&chain, FILTER_LIST_PHASE, usize::MAX, usize::MAX),
+            (&lists[0], FILTER_LIST_PHASE, usize::MAX, usize::MAX),
+            (&lists[1], FILTER_LIST_PHASE, usize::MAX, usize::MAX),
+            (&lists[2], FILTER_LIST_PHASE, usize::MAX, usize::MAX),
             (&star, ROUND_PHASE, 1, 0),
             (&star, SCRATCH_PHASE, 1, 0),
             // the switch to rounds, then the first merged part, whose entries are too few
@@ -4180,7 +4192,8 @@ fn checked_graph_r12_refuses_graph_binding_index_candidate() {
 /// stays above the BIND, so that nothing moves below it. Two more join a second part of
 /// one pattern, whose scan choice leaves the remaining filters in a list of their own
 /// size: filters that wait for a path, which join that list late, and filters on both
-/// parts that wait for the UNION, which join it after the parts are planned.
+/// parts that wait for the UNION, which join it after the parts are planned. Another
+/// keys the join of two parts on many conjuncts that both parts bind.
 fn checked_filter_list_bodies() -> Vec<(&'static str, String)> {
     let conj = |n: usize, var: &str, base: i64| {
         (0..n)
@@ -4234,6 +4247,16 @@ fn checked_filter_list_bodies() -> Vec<(&'static str, String)> {
             ),
         ),
         (
+            "keyed many",
+            format!(
+                "?x <urn:v> ?v . ?z <urn:v> ?u . FILTER(?x = ?z && {}) BIND(?x AS ?first)",
+                (0..30)
+                    .map(|k| format!("?v - ?u > {}", -k))
+                    .collect::<Vec<_>>()
+                    .join(" && ")
+            ),
+        ),
+        (
             "late grown",
             format!(
                 "?x <urn:v> ?v . {union} ?z <urn:c:1>+ ?v . ?q <urn:v> ?u . FILTER(?u > 0 && {}) BIND(?x AS ?first)",
@@ -4284,6 +4307,8 @@ fn checked_graph_r12_admits_filter_input_lists() {
             "late" => &[(0, 30), (2, 30), (3, 30)],
             "late grown" => &[(0, 31), (2, 30), (3, 30), (8, 30)],
             "joined" => &[(0, 31), (2, 30), (4, 30)],
+            "keyed" => &[(0, 31), (5, 1)],
+            "keyed many" => &[(0, 31), (5, 31)],
             _ => &[(0, 30)],
         };
         for &(site, len) in expected {

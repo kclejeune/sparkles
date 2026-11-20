@@ -4813,13 +4813,52 @@ impl<'a> Planner<'a> {
         else {
             return self.place_filters(super::joinorder::join_admitted(a, b, self)?, filters);
         };
-        let (now, later): (Vec<Expr>, Vec<Expr>) =
-            std::mem::take(filters).into_iter().partition(|f| bound(f));
-        *filters = later;
-        let expr = now
-            .into_iter()
-            .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
-            .expect("the linking FILTER");
+        let expr = if self.branch_payload.borrow().is_none() {
+            let (now, later): (Vec<Expr>, Vec<Expr>) =
+                std::mem::take(filters).into_iter().partition(|f| bound(f));
+            *filters = later;
+            now.into_iter()
+                .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
+                .expect("the linking FILTER")
+        } else {
+            // The same test without allocating: every occurrence of a variable is bound
+            // by one of the sides, and there is one.
+            let (now, now_list) = self.extract_filters(filters, |f| {
+                !f.has_exists() && {
+                    let mut any = false;
+                    f.visit_vars(&mut |v| {
+                        any = true;
+                        if a.vars.contains(&v) || b.vars.contains(&v) {
+                            Ok(())
+                        } else {
+                            Err(())
+                        }
+                    })
+                    .is_ok()
+                        && any
+                }
+            })?;
+            let _now_list = list_credit(now_list);
+            #[cfg(test)]
+            note_list(5, now.len());
+            // The conjunction the join keeps boxes both sides of each conjunct it adds,
+            // admitted before it is made, with the plan's other storage.
+            let (expr, boxes) = {
+                #[cfg(test)]
+                let _stage = crate::test_alloc::Stage::enter(10);
+                let boxes = now.len().saturating_sub(1).saturating_mul(2);
+                let boxes = self
+                    .filter_list_scratch(boxes)?
+                    .expect("checked join condition");
+                let expr = now
+                    .into_iter()
+                    .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
+                    .expect("the linking FILTER");
+                (expr, boxes)
+            };
+            self.retain_planning(boxes);
+            expr
+        };
         // The larger input is streamed and the smaller one indexed.
         Ok(if a.est >= b.est {
             keyed_inner_join(a, b, expr, (x, y), self.ctx)
