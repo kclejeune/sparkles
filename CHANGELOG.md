@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
+
+Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
+builder's run blocks one zig-zag delta varint coder. The run reader decodes each column in place
+into the keys, which made the run decode about 4% faster on `atlas`. The on-disk bytes did not
+change. The store's test hooks, such as `Store::set_clock`, `Spill::inject_fault` and the
+vector and full-text pause hooks, now build only for tests or with the `failpoints` feature of
+`sparkles-core` and `sparkles`. `parse_source` and `parse_source_into` share their first rungs
+and one whole-slice parser. Before batch 46 two one-thread query cells read slower on `atlas`, while
+on batch 46 the instruction counts of every benchmark query stay within their noise floor, so
+roadmap item 1246 confirms the two cells on the matrix after the push.
+
 ### Late existential restrictions take the clauses their successor already sent
 
 In a run that counts and in a rooted run, an existential restriction that reaches a

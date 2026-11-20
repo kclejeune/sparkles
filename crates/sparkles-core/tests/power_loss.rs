@@ -1713,7 +1713,7 @@ fn crash_images_keep_every_acknowledged_commit() {
 /// checkpoints the index at every fence before its synchronization and from a side
 /// thread, so the images hold checkpoints of the run's own commits. Applying text changes
 /// before their fence makes this test fail. The checkpoint at each fence needs the
-/// `failpoints` feature, which a workspace build turns on through `sparkles-shacl`.
+/// `failpoints` feature, which the crate's own tests turn on through its dev-dependency.
 /// Without it the images would hold no checkpoint taken between a fence's apply and its
 /// synchronization, and the test would pass that mutation, so it is ignored instead.
 #[cfg(feature = "text")]
