@@ -796,3 +796,76 @@ fn imports_past_the_bound_keep_their_edges() {
         r.warnings
     );
 }
+
+/// A strict resolution reports an index error while scanning the `owl:imports`
+/// statements, where a lenient one reads the scan as empty; an import that resolves to no
+/// graph is a warning in both.
+#[cfg(unix)]
+#[test]
+fn a_strict_closure_reports_an_unreadable_imports_scan() {
+    use sparkles_reasoner::inputs::{ImportTargets, resolve_closure, try_resolve_closure};
+    use std::os::unix::fs::FileExt;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("db");
+    let s = Store::open(
+        &root,
+        StoreOptions {
+            bulk_threshold: 1,
+            ..StoreOptions::default()
+        },
+    )
+    .unwrap();
+    ttl(
+        &s,
+        Some("urn:a"),
+        "<urn:a> owl:imports <urn:b>, <urn:missing> . ex:A a owl:Class .",
+    );
+    ttl(&s, Some("urn:b"), "ex:B a owl:Class .");
+    let inputs = Inputs {
+        data_graphs: vec![GraphRef::Named("urn:a".into())],
+        ..Inputs::default()
+    };
+    let t = ImportTargets::default();
+    let all = |_: sparkles_core::id::Id| true;
+    let names = |r: &sparkles_reasoner::inputs::Resolved| {
+        let mut n: Vec<String> = r.graphs.iter().map(|g| g.as_str().to_string()).collect();
+        n.sort();
+        n
+    };
+    // the healthy store: both resolutions follow the import and warn of the missing one
+    let healthy = s.snapshot();
+    let (strict, _) = try_resolve_closure(&healthy, &inputs, &all, &t, &|| Ok(())).unwrap();
+    let (lenient, _) = resolve_closure(&healthy, &inputs, &all, &t);
+    assert_eq!(names(&strict), ["urn:a", "urn:b"]);
+    assert_eq!(strict, lenient);
+    assert!(
+        strict.warnings.iter().any(|w| w.contains("urn:missing")),
+        "{:?}",
+        strict.warnings
+    );
+    // the first block of the POS index, which the imports scan reads, becomes unreadable;
+    // the store is opened again so that no block of it is cached
+    drop(healthy);
+    drop(s);
+    let current = std::fs::read_to_string(root.join("CURRENT")).unwrap();
+    let pos = root.join(current.trim()).join("pos.dat");
+    let f = std::fs::OpenOptions::new().write(true).open(&pos).unwrap();
+    f.write_all_at(&[255; 4], 0).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let s = Store::open(&root, StoreOptions::default()).unwrap();
+    let damaged = s.snapshot();
+    // graph presence does not read POS, so it still finds the input graph
+    assert!(
+        GraphRef::Named("urn:a".into())
+            .try_id(&damaged)
+            .unwrap()
+            .is_some()
+    );
+    let e = try_resolve_closure(&damaged, &inputs, &all, &t, &|| Ok(()))
+        .expect_err("the strict resolution reports the scan error");
+    assert!(format!("{e:#}").contains("owl:imports"), "{e:#}");
+    // the lenient resolution reads the scan as empty and follows no import
+    let (lenient, _) = resolve_closure(&damaged, &inputs, &all, &t);
+    assert_eq!(names(&lenient), ["urn:a"]);
+}

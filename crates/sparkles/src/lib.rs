@@ -22,6 +22,7 @@ pub mod evidence;
 #[cfg(feature = "fmt")]
 pub mod fmt;
 pub mod forms;
+pub mod gate;
 pub mod handles;
 pub mod jobs;
 mod lookup;
