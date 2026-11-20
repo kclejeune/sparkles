@@ -1616,34 +1616,187 @@ fn a_late_edge_of_a_rooted_run_without_counting_reads_its_clauses() {
         (1, Expansion::Eager),
         (4, Expansion::Eager),
     ] {
+        /// The axioms of row 1231's regression: a ground fact about a constant that holds only
+        /// under the query class, G(w) under K, whose consequence passes through an element that
+        /// exists without K and is linked to w two edges below an individual, where the link is no
+        /// literal of the root.
+        const AV2: &str =
+            "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+     SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))";
+
+        /// The configurations of the regression's runs.
+        const CONFIGS: [(usize, Expansion); 4] = [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (1, Expansion::Eager),
+            (4, Expansion::Eager),
+        ];
+
+        /// The claim predicate of the lane harnesses: a complete rooted answer of Tier D that took
+        /// every axiom and did not start again without the rooted rules.
+        fn rooted_claim(k: &Classifier, out: &Classification) -> bool {
+            out.complete
+                && out.incomplete.is_empty()
+                && k.excluded().is_empty()
+                && out.stats.tier == Tier::Disjunctive
+                && !out.stats.dl_rooted_over
+                && !out.stats.dl_rooted_declined
+                && !out.stats.dl_over_budget
+        }
+
+        /// Row 1231: the rooted run of [`AV2`] either finds `K ⊑ Ans` or makes no claim of
+        /// completeness.
+        #[test]
+        fn a_conditional_fact_about_a_constant_reaches_an_element_outside_the_query_successors() {
+            let ax = axioms(AV2);
+            for (threads, expansion) in CONFIGS {
+                let mut k = Classifier::of(&ax);
+                let out = k
+                    .classify(&Limits {
+                        threads,
+                        expansion,
+                        rooted: true,
+                        ..Limits::default()
+                    })
+                    .unwrap();
+                assert_eq!(out.consistency, Consistency::Consistent);
+                if out.stats.dl_rooted_over {
+                    assert!(
+                        contained,
+                        "only the containment falls back ({threads}, {expansion:?})"
+                    );
+                    continue;
+                }
+                assert!(
+                    out.complete && k.excluded().is_empty(),
+                    "the rooted run answers in full ({threads}, {expansion:?})"
+                );
+                assert!(
+                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                    "K ⊑ Ans is missing ({threads}, {expansion:?})"
+                );
+                assert!(
+                    !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+                    "E ⊑ Ans is not entailed"
+                );
+            }
+        }
+        assert!(
+            !rooted_claim(&k, &out) || out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{threads} threads {expansion:?}: a complete rooted run misses K ⊑ Ans"
+        );
+    }
+}
+
+/// The control of row 1231's decline: with it off, the rooted run of [`AV2`] claims an
+/// answer that misses `K ⊑ Ans`, so the regression above fails without the decline.
+#[test]
+fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment() {
+    let ax = axioms(AV2);
+    for (threads, expansion) in CONFIGS {
         let mut k = Classifier::of(&ax);
         let out = k
             .classify(&Limits {
                 threads,
                 expansion,
                 rooted: true,
+                rooted_decline: false,
                 ..Limits::default()
             })
             .unwrap();
-        assert_eq!(out.consistency, Consistency::Consistent);
-        if out.stats.dl_rooted_over {
-            assert!(
-                contained,
-                "only the containment falls back ({threads}, {expansion:?})"
-            );
-            continue;
-        }
         assert!(
-            out.complete && k.excluded().is_empty(),
-            "the rooted run answers in full ({threads}, {expansion:?})"
-        );
-        assert!(
-            out.taxonomy.is_subclass(&c("K"), &c("Ans")),
-            "K ⊑ Ans is missing ({threads}, {expansion:?})"
-        );
-        assert!(
-            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
-            "E ⊑ Ans is not entailed"
+            rooted_claim(&k, &out) && !out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{threads} threads {expansion:?}: the control no longer misses K ⊑ Ans"
         );
     }
+}
+
+/// Row 1231's decline withdraws the rooted answer on every path a rooted run takes: a
+/// classification, its repetition on the same classifier, a run that counts, a saturation
+/// and a run of axioms that item 805 rewrites. Each reports the decline and its fallback,
+/// leaves axioms out, and answers as the run without the rooted rules does.
+#[test]
+fn the_decline_withdraws_the_rooted_answer_on_every_path() {
+    let keyed = format!("{AV2}\n     HasKey(:K (:q) ())");
+    let counted = format!("{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))");
+    for (name, body, counting) in [
+        ("plain", AV2.to_string(), false),
+        ("counting", counted, true),
+        ("keys", keyed, false),
+    ] {
+        let ax = axioms(&body);
+        for (threads, expansion) in CONFIGS {
+            let limits = Limits {
+                threads,
+                expansion,
+                counting,
+                rooted: true,
+                ..Limits::default()
+            };
+            let at = format!("{name}, {threads} threads {expansion:?}");
+            let mut k = Classifier::of(&ax);
+            for round in 0..2 {
+                let out = k.classify(&limits).unwrap();
+                assert!(out.stats.dl_rooted_declined, "{at}, round {round}");
+                assert!(out.stats.dl_over_budget, "{at}, round {round}");
+                assert!(!out.stats.dl_rooted_over, "{at}, round {round}");
+                assert!(!k.excluded().is_empty(), "{at}, round {round}");
+                assert!(!rooted_claim(&k, &out), "{at}, round {round}");
+                assert!(out.consistent, "{at}, round {round}");
+                assert!(
+                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                    "{at}, round {round}: the fallback misses K ⊑ Ans"
+                );
+            }
+            let mut k = Classifier::of(&ax);
+            let sat = k.saturate(&limits).unwrap();
+            assert!(
+                sat.consistent && sat.stats.dl_rooted_declined,
+                "{at}: saturate"
+            );
+            assert!(sat.stats.dl_over_budget, "{at}: saturate");
+        }
+    }
+}
+
+/// A rooted run with counting that passes its bound starts again without counting, and
+/// that run is rooted too: when it withdraws its answer, the run starts again without the
+/// rooted rules and reports both fallbacks. The bound lies between the work of the run
+/// with counting and that of the run without it.
+#[test]
+fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
+    let ax = axioms(&format!(
+        "{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))"
+    ));
+    let limits = Limits {
+        threads: 1,
+        counting: true,
+        rooted: true,
+        dl_work: Some(180),
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&limits).unwrap();
+    assert!(out.stats.dl_counting_over);
+    assert!(out.stats.dl_rooted_declined);
+    assert!(out.stats.dl_over_budget && !out.stats.dl_rooted_over);
+    assert!(!rooted_claim(&k, &out));
+    // the control: without the decline the run without counting answers rooted
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            rooted_decline: false,
+            ..limits
+        })
+        .unwrap();
+    assert!(out.stats.dl_counting_over && !out.stats.dl_rooted_declined);
+    assert!(out.stats.tier == Tier::Disjunctive && !out.stats.dl_rooted_over);
 }

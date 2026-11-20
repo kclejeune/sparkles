@@ -521,6 +521,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   also miss an entailment while it reports itself complete when a fact that holds only
   under the queried class concerns an individual reached from another individual, which
   is roadmap item 1231. A rooted run without counting has a bound of 524,288 derived
+  proof. A rooted run with counting can still miss entailed subsumptions on a generated
+  ontology, with or without these repairs, which is roadmap item 1229. A fact that holds
+  only under the queried class and concerns an individual reached from another
+  individual can make a rooted run miss an entailment. After its saturation a rooted run
+  therefore looks for such a fact that cannot reach a context registered for its
+  individual, and when it finds one it classifies again without the rooted rules, gives
+  the default answer and sets `Stats::dl_rooted_declined` and `Stats::dl_over_budget`.
+  The check leaves out four kinds of context that it assumes the fact reaches another
+  way, which are the predecessors of the context that holds the fact, the individual's
+  own context, contexts that the root does not reach and the root's direct successors.
+  None of these exemptions is proved, so the check is partial containment, and it also
+  withdraws some answers that were complete. `Limits::rooted_decline` turns it off for
+  measurements. Roadmap item 1231 repairs the rules. A rooted run without counting has a bound of 524,288 derived
   conclusions, `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
   keys over object properties and the universal object property by rewriting them into

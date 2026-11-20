@@ -1097,7 +1097,7 @@ pub(super) fn into_nominal(ix: &Index, d: Ex) -> Option<(Role, u32)> {
 /// its classes in arrays on the stack and allocates nothing. A search whose classes to
 /// visit outgrow [`SINGLETON_OPEN`] starts again in [`singleton_of_on_heap`], which gives
 /// the same answer with vectors.
-fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
+pub(super) fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
     let mut todo = [a; SINGLETON_OPEN];
     let mut open = 1;
     let mut seen = [a; SINGLETON_SEEN];
