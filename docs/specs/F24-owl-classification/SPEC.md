@@ -1324,6 +1324,34 @@ not kept. In a profile on the laptop the filter's probes take 45% of a four-thre
 cycles and the rules' inserts 13%, since the run still sends three billion messages for 32
 million conclusions, and item 956 follows them.
 
+Item 956 takes up the repeated links. A transitive role's closure was derived once for
+each intermediate context, since a middle context composed its backward links with every
+forward link it held, those that chains had composed included. A role is now linear when
+every pair of roles equivalent to it composes into the roles it composes into with
+itself, and every role that composes with one of its links on the right does so alike
+with its equivalents, into roles that compose again with a further link by it into the
+same roles. A link of a linear role that a chain composes from two links by its
+equivalents then keeps no forward link at its source, and a middle context pairs its
+backward links only with the forward links that the axioms and the other chains give.
+Every backward link that the saturation stored before it still stores, by induction on
+the composition of the links that keep no forward link, so the taxonomies do not change.
+`SPARKLES_LINEAR_CHAINS=0` composes every pair as before, for measurements. On the
+laptop a four-thread run of `ore_ont_8737` sends 296 million messages instead of 2.98
+billion and stores 15.8 instead of 20.9 million conclusions. On forge, against the build
+before the item, the file's saturation with the Horn rules takes 0.94 s on four threads
+against 8.22 s, 2.99 s on one against 25.41 s and 0.70 s on twelve against 7.05 s, its
+classification 1.39 s against 9.07 s on four threads, and its peak resident set 2.3
+instead of 6.3 GiB on four threads and 2.1 instead of 3.8 GiB on one. ChEBI lite
+classifies in 0.81 times the time on one thread, 0.69 on four and 0.48 on twelve, and
+GO and `ore_ont_3836` within the noise. `ore_ont_13482` classifies 2.5% slower on four
+threads and `ore_ont_9855` 1.0% slower on one, with the same conclusions and fewer
+instructions, which item 1224 follows. The six timed files give the same taxonomies on
+both builds, and on the laptop so do the 298 ORE 2015 EL files, GO and ChEBI lite on one
+and four threads and 205 of the 207 files of the ORE 2015 DL development set on four,
+where both builds refuse one file at the reader and stop one at its memory budget. The
+[EL classification results](../../benchmarks/el-classification/RESULTS.md#left-linear-chains-of-transitive-roles)
+give the rounds.
+
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the
 ontology inconsistent, which its rules cannot cause, since the properties in their heads

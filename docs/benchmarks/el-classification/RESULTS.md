@@ -1675,7 +1675,92 @@ and not to the reductions. It lies within the base's own rounds, which range fro
 to 10.17 s. Roadmap item 1090 follows it with the Uberon files' time outside the
 saturation. The peak resident set of `ore_ont_14375` on one thread is 95 against 87 MiB.
 
+### Left-linear chains of transitive roles
+
+After item 889 a four-thread saturation of `ore_ont_8737` sent three billion messages,
+since a middle context composed its backward links by a transitive role with every
+forward link it held, including those that chains had composed, and so derived each link
+of the closure once for each intermediate context. Roadmap item 956 makes such a role
+linear when its equivalent roles compose alike and every role that composes with it on the
+left composes again with a further link by it into the same roles, as
+[F24](../../specs/F24-owl-classification/SPEC.md#outcome) describes. A link of a linear
+role that a chain composes from two links by its equivalents keeps no forward link at its
+source, and the saturation stores the same backward links. `SPARKLES_LINEAR_CHAINS=0`
+turns the composition off for measurements.
+
+On forge the base, commit 5f3f69c2, and the build of the item, commit 0134cd85, both built
+on wally with rustc 1.99.1 and mbx 1.29.1, ran under rules fixed before the run. Each
+process ran `el_classify --threads T --repeat 5` in a 12 GiB scope without pinning, the
+base first in odd rounds and the build first in even ones, in three rounds for
+`ore_ont_8737` and six for the other files. Each time below is a side's median over the
+rounds of a process's median classification, or of its last saturation, and the
+interval is a 95% bootstrap interval of the ratio that resamples whole rounds. By the
+[Intel rule](../../specs/X14-unified-executor/PLAN.md#the-intel-rule) a ratio whose
+interval reaches 1.0 is noise. The load average was 3.1 when the run took the host's locks and
+1.8 when it ended, and 0.3 to 0.4 GiB of swap was in use. Both sides of every file take
+the Horn rules except `ore_ont_3836` and `ore_ont_13482`, which take the EL rules.
+
+| Threads | Base saturation, s | Build, s | Base classification, s | Build, s | Base process, s | Build, s | Base peak, GiB | Build peak, GiB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 25.41 | 2.99 | 28.33 | 3.91 | 144.0 | 22.4 | 3.81 | 2.11 |
+| 4 | 8.22 | 0.94 | 9.07 | 1.39 | 49.0 | 10.1 | 6.33 | 2.27 |
+| 12 | 7.05 | 0.70 | 7.39 | 1.13 | 40.6 | 8.8 | 7.42 | 2.70 |
+
+On `ore_ont_8737` the saturation takes 0.10 to 0.12 times the base's time and the
+classification 0.14 to 0.15 times, and the process, which reads the file and classifies
+it five times, 0.16 to 0.22 times. The peak resident set falls to 0.55 of the base's on
+one thread and 0.36 on four and twelve. A one-thread run takes 263 million conclusions
+against 1.62 billion. On the laptop, with a diagnostic patch that counts them, a
+four-thread run sends 296 million messages against 2.98 billion and stores 15.8 million
+conclusions against 20.9 million.
+
+| Ontology | Threads | Base classification, ms | Build, ms | Build / base | 95% interval | Base saturation, ms | Build, ms | Build / base | 95% interval |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---|
+| GO | 1 | 315 | 316 | 1.004 | 0.992 to 1.017 | 253 | 255 | 1.005 | 0.984 to 1.019 |
+| | 4 | 123 | 122 | 0.990 | 0.950 to 1.033 | 74.4 | 72.8 | 0.979 | 0.946 to 1.023 |
+| | 12 | 73.9 | 74.1 | 1.002 | 0.980 to 1.044 | 37.6 | 35.7 | 0.952 | 0.929 to 1.033 |
+| ChEBI lite | 1 | 925 | 751 | 0.811 | 0.799 to 0.821 | 566 | 390 | 0.688 | 0.669 to 0.693 |
+| | 4 | 435 | 300 | 0.688 | 0.677 to 0.701 | 233 | 105 | 0.451 | 0.424 to 0.496 |
+| | 12 | 424 | 203 | 0.480 | 0.446 to 0.502 | 244 | 53.0 | 0.217 | 0.168 to 0.259 |
+| `ore_ont_3836` | 1 | 596 | 594 | 0.997 | 0.984 to 1.006 | 134 | 132 | 0.987 | 0.980 to 0.992 |
+| | 4 | 272 | 266 | 0.977 | 0.949 to 1.003 | 38.2 | 36.5 | 0.956 | 0.909 to 1.043 |
+| | 12 | 197 | 199 | 1.008 | 0.995 to 1.010 | 16.0 | 16.3 | 1.014 | 0.973 to 1.027 |
+| `ore_ont_13482` | 1 | 944 | 944 | 1.000 | 0.994 to 1.013 | 569 | 568 | 0.998 | 0.987 to 1.016 |
+| | 4 | 429 | 439 | 1.025 | 1.002 to 1.049 | 165 | 176 | 1.068 | 1.008 to 1.126 |
+| | 12 | 294 | 295 | 1.006 | 0.995 to 1.014 | 77.2 | 79.0 | 1.024 | 0.976 to 1.031 |
+| `ore_ont_9855` | 1 | 925 | 934 | 1.010 | 1.008 to 1.013 | 900 | 908 | 1.009 | 1.004 to 1.018 |
+| | 4 | 346 | 345 | 0.997 | 0.970 to 1.030 | 331 | 317 | 0.957 | 0.940 to 1.014 |
+| | 12 | 176 | 173 | 0.982 | 0.909 to 1.067 | 157 | 149 | 0.952 | 0.852 to 1.079 |
+
+ChEBI lite classifies in 0.81 times the base's time on one thread, 0.69 on four and 0.48
+on twelve, with 17.7 million conclusions against 27.0 million and a peak resident set
+0.93 to 0.96 of the base's. GO takes 0.3% fewer conclusions on one thread, and its times are noise.
+`ore_ont_3836`, `ore_ont_13482` and `ore_ont_9855` take the same conclusions on both
+sides, and their times are noise except in three cells. `ore_ont_13482` classifies 2.5%
+slower on four threads, 10 ms, with a saturation 6.8% slower, and `ore_ont_9855`
+classifies 1.0% slower on one thread, 9 ms, with its saturation and its process 0.9%
+slower. The laptop counts 0.3% and 0.2% fewer instructions per classification of the two
+files on one pinned thread on the build, so the build does not add work there, and
+roadmap item 1224 follows the two costs.
+
+The laptop also counted 0.5% and 0.8% more instructions in whole processes of
+`ore_ont_13482` and `ore_ont_3836` outside the classification. Twenty rounds of one
+process with one classification per side on one thread put the build's process at 0.978
+of the base's time on `ore_ont_13482`, with an interval of 0.975 to 0.980, and 0.991 on
+`ore_ont_3836`, 0.990 to 0.995, and its read of the file at 0.956 and 0.989, so the count
+costs no time. The untimed runs after the rounds wrote the same taxonomy on both sides for
+each of the six files on four threads. On the laptop the 298 ORE 2015 EL files, GO and
+ChEBI lite gave the base's taxonomies on one and four threads, and 205 of the 207 files of
+the ORE 2015 DL development set gave them on four threads, where both sides refuse one
+file at the reader and stop one at its memory budget.
+
 ## Records
+
+The [record of item 956's left-linear chains](runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json)
+holds every process of the rounds on forge with its report, the rules fixed before the
+run, the analysis, the hash checks of the binaries and inputs, the host's state before and
+after, the taxonomy hashes, the laptop's instruction counts, message counts and taxonomy
+sweeps, and the scripts that ran.
 
 The [record of item 693's reduced automata](runs/2026-11-17-horn-automata-forge-7d064abd/record.json)
 holds every classification of the six rounds on forge of the base and of the build at

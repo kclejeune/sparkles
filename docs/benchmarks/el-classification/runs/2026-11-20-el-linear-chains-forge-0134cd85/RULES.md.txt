@@ -1,0 +1,42 @@
+# el-956 Intel timing rules
+
+These rules were written before any forge result and are not changed after the run.
+
+Builds. `el_classify` release builds (`mbx build --release -p sparkles-owl --example
+el_classify`, the EL classification README's method, mimalloc) of the base 5f3f69c2 and
+the tip 0134cd85 (engine code as 05838a64), built on wally through `scripts/remote-ci.sh --cmd` (rustc 1.99.1, mbx 1.29.1), hashes in
+bin/SHA256SUMS.
+Both arms use the same compiler and build configuration and run on forge only.
+
+Host. forge (i5-13500, 6 P-cores and 8 E-cores, 20 threads, 15 GiB) under
+`~/lanes/.bench.lock` and `~/lanes/.heavy.lock`, in a 12G scope, with nothing else heavy.
+No pinning, as in the earlier EL timings.
+
+Runs.
+- Warm cells are `el_classify --threads T --repeat 5 FILE` with T in 1, 4 and 12.
+  ore_ont_8737 runs in rounds 1 to 3. GO, ChEBI lite, ore_ont_3836, ore_ont_13482 and
+  ore_ont_9855 run in rounds 1 to 6.
+- Cold cells are `el_classify --threads 1 --repeat 1 FILE` of ore_ont_3836 and
+  ore_ont_13482 in rounds 1 to 20, one classification per process, to check the +0.8% and
+  +0.5% whole-process instruction increase outside the classification. The metrics there
+  are the process wall time and `readMs`. The page cache is warm for both arms alike, since
+  dropping it needs root. "Cold" means a fresh process with one classification.
+- Odd rounds run the base first and even rounds the tip first, in every cell.
+- After the rounds, one untimed run per file and arm at 4 threads writes the taxonomy, and
+  the two arms' SHA-256 must be equal. A difference, a failed process or a timeout makes
+  the run invalid.
+
+Metrics. `classifyMedianMs` (median of the 5 classifications), `saturationMs` (last
+classification), whole-process wall time and peak RSS (wait4 `ru_maxrss`), per process.
+
+Decision. For each cell and metric, each arm's median over the rounds, the tip/base ratio
+of those medians and a 95% bootstrap interval that resamples whole rounds (10,000
+resamples, seed 956). By the AGENTS.md Intel rule a difference is noise when the interval
+reaches 1.0 or the median added time is at most 0.5 µs per classification (per process for
+wall time). Otherwise it is faster or slower. Any cell and time metric that is slower by
+this rule gets a ROADMAP follow-up item in the change that lands item 956, including a
+cold-run wall time or `readMs` increase. A cold cell whose interval reaches 1.0 but whose upper end
+exceeds 1.005 is reported as not resolved rather than as noise, since it cannot tell the
++0.5% to +0.8% instruction increase from none. Peak RSS is reported, not gated. Three rounds of
+ore_ont_8737 bound its interval coarsely, which suffices for the expected effect of several
+times, and a 3-round interval that reaches 1.0 is reported as noise, not as a slowdown.

@@ -650,6 +650,18 @@ ChEBI lite classifies 8 to 14% faster and GO 1 to 3% faster, and the taxonomies 
 open-addressing table for large sets measured no faster and was reverted. The filter's
 remaining cost is item 956.
 
+A transitive role whose equivalent roles compose alike, and whose left partners compose
+again with a further link by it, now composes its chains left-linearly. A link of such a
+role that a chain composes from two links by its equivalents keeps no forward link at its
+source, so a middle context no longer derives the role's closure again, and the
+saturation stores the same backward links (roadmap item 956). On forge the saturation of
+`ore_ont_8737` takes 0.94 s on four threads instead of 8.22 s, 2.99 s on one instead of
+25.41 s and 0.70 s on twelve instead of 7.05 s, with a peak resident set of 2.3 instead
+of 6.3 GiB on four threads, and ChEBI lite classifies in 0.48 to 0.81 times the time.
+The taxonomies are unchanged. `ore_ont_13482` classifies 2.5% slower on four threads and
+`ore_ont_9855` 1.0% slower on one, which item 1224 follows. `SPARKLES_LINEAR_CHAINS=0`
+turns the composition off for measurements.
+
 ### Ask latency
 
 An ask whose question names an ambiguous mention now asks which one is meant before it

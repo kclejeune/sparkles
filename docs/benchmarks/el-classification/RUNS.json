@@ -1374,6 +1374,66 @@
     }
    },
    "metadata_note": "Manual record of roadmap item 889 on atlas: three rounds of ore_ont_8737 of every side on one, four and twelve threads, the rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482, the profiles on atlas, and the profiles, rounds and taxonomy sweeps taken on the laptop."
+  },
+  {
+   "run_id": "sha256-6f7898974a9e8c9395c1e1d12c92136aa8227e9a14f712481d2d31603ce33fc5",
+   "path": "runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json",
+   "sha256": "6f7898974a9e8c9395c1e1d12c92136aa8227e9a14f712481d2d31603ce33fc5",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "ore_ont_8737 and ore_ont_9855 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on forge",
+    "manifest": {
+     "sides": {
+      "base": "5f3f69c2, the lane base, origin/main of batch 40",
+      "tip": "0134cd85, the left-linear composition of transitive roles of item 956, whose engine code is that of 05838a64"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify on wally through scripts/remote-ci.sh --cmd, rustc 1.99.1, mbx 1.29.1, both sides from clean checkouts, copied to forge",
+     "commits": {
+      "base": "5f3f69c2",
+      "tip": "0134cd85"
+     },
+     "binaries_sha256": {
+      "base": "618b940ec1e7f2a5c2092eac3aa0937483307dd760a5f28cf4242f4e2be869ee",
+      "tip": "2d3c9e1a725dd63c123a66eb4eec364eddf7cce95cb896792e5e8ff14c572a98"
+     },
+     "data_sha256": {
+      "go.ofn": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+      "chebi_lite.ofn": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+      "ore_ont_8737.owl": "2f5e2478a6a21f304d5c49fa65aa6fc447cf5fe907b3a68ec375da05320f1cc6",
+      "ore_ont_9855.owl": "73e70d6d8af1c80ae7ce10d8e95cc2bb20e7ff8c6bc600d3f0e445bb59dbd9d4",
+      "ore_ont_3836.owl": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473",
+      "ore_ont_13482.owl": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+     },
+     "scripts": [
+      "timing.py.txt",
+      "analyze.py.txt",
+      "run.sh.txt",
+      "RULES.md.txt",
+      "make-record.py.txt",
+      "insn.sh.txt",
+      "corpus.sh.txt",
+      "stats.patch.txt"
+     ]
+    },
+    "settings": {
+     "threads": "one, four and twelve in the warm rounds, one in the cold rounds",
+     "scope": "one process per run in a 12 GiB systemd scope with at most 1 GiB of swap on forge, no pinning",
+     "lock": "the rounds ran under ~/lanes/.bench.lock and ~/lanes/.heavy.lock as the systemd user unit el-956-timing"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620
+     },
+     "method": "RULES.md fixed the rules before the run. timing.py ran warm cells of el_classify --threads T --repeat 5, three rounds of ore_ont_8737 and six of GO, ChEBI lite, ore_ont_3836, ore_ont_13482 and ore_ont_9855, and cold cells of --threads 1 --repeat 1 of ore_ont_3836 and ore_ont_13482 in twenty rounds, the base first in odd rounds and the tip first in even ones, then one untimed run per file and side on four threads that wrote the taxonomy. analyze.py takes each side's median over the rounds, the ratio of the medians and a 95% bootstrap interval over whole rounds, and applies the Intel rule of AGENTS.md.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "Manual record of roadmap item 956 on forge: the rounds of ore_ont_8737, GO, ChEBI lite, ore_ont_3836, ore_ont_13482 and ore_ont_9855 on one, four and twelve threads, the cold rounds of ore_ont_3836 and ore_ont_13482, the taxonomy hashes, and the instruction counts, message counts and taxonomy sweeps taken on the laptop."
   }
  ]
 }

@@ -1,0 +1,105 @@
+diff --git b/crates/sparkles-owl/src/classify/saturate.rs a/crates/sparkles-owl/src/classify/saturate.rs
+index 0fb60f02..8f22224d 100644
+--- b/crates/sparkles-owl/src/classify/saturate.rs
++++ a/crates/sparkles-owl/src/classify/saturate.rs
+@@ -759,6 +759,10 @@ struct Run<'a> {
+     /// the most memory counted so far, which the pool's grant covers
+     peak: AtomicUsize,
+     applied: AtomicUsize,
++    /// the messages sent to other contexts and the conclusions stored, which a run
++    /// prints when [`STATS_ENV`] is set
++    sent: AtomicUsize,
++    stored: AtomicUsize,
+     /// whether a context derived an individual other than its root
+     merged: AtomicBool,
+     /// whether the workers send through outboxes, which they do when there are several,
+@@ -907,6 +911,10 @@ struct StepOut {
+     marks: Marks,
+ }
+ 
++/// The variable that makes a saturation print the conclusions it applied and stored and
++/// the messages it sent to other contexts, for measurements (roadmap item 956).
++pub const STATS_ENV: &str = "SPARKLES_SATURATION_STATS";
++
+ /// What a worker counted since it last added to the totals.
+ #[derive(Default)]
+ struct Tally {
+@@ -915,6 +923,8 @@ struct Tally {
+     stored: usize,
+     /// the change in waiting messages
+     queued: isize,
++    /// the messages sent to other contexts, for [`STATS_ENV`]
++    sent: usize,
+ }
+ 
+ /// What a saturation did.
+@@ -971,6 +981,8 @@ pub fn saturate_counted(
+         queued: AtomicIsize::new(0),
+         peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
+         applied: AtomicUsize::new(0),
++        sent: AtomicUsize::new(0),
++        stored: AtomicUsize::new(0),
+         merged: AtomicBool::new(false),
+         batch: AtomicBool::new(bounds.threads > 1),
+         plain: plain(ix),
+@@ -1011,6 +1023,17 @@ pub fn saturate_counted(
+     }
+     let memory = run.memory.load(Ordering::Relaxed);
+     let peak = run.peak.load(Ordering::Relaxed).max(memory);
++    if std::env::var_os(STATS_ENV).is_some() {
++        eprintln!(
++            "saturation: threads={threads} applied={} sent={} stored={} linear={:?}",
++            run.applied.load(Ordering::Relaxed),
++            run.sent.load(Ordering::Relaxed),
++            run.stored.load(Ordering::Relaxed),
++            (0..ix.roles.linear.len())
++                .filter(|&t| ix.roles.linear[t])
++                .collect::<Vec<_>>(),
++        );
++    }
+     let totals = Totals {
+         conclusions: run.applied.load(Ordering::Relaxed),
+         memory,
+@@ -1879,6 +1902,7 @@ impl<'a> Run<'a> {
+     #[inline]
+     fn flush_sends(&self, out: &mut Out<'_, '_>, tally: &mut Tally) -> bool {
+         tally.queued += out.sent as isize;
++        tally.sent += out.sent;
+         out.sent = 0;
+         self.flush(tally)
+     }
+@@ -2052,7 +2076,7 @@ impl<'a> Run<'a> {
+                 // no roots are left: what the worker counted goes to the totals before
+                 // it waits for the others
+                 round = 0;
+-                if tally.applied > 0 || tally.stored > 0 || tally.queued != 0 {
++                if tally.applied > 0 || tally.stored > 0 || tally.queued != 0 || tally.sent > 0 {
+                     self.flush(&mut tally);
+                 }
+                 // the worker goes idle; the last to do so with the queue empty ends the
+@@ -2390,6 +2414,8 @@ impl<'a> Run<'a> {
+     /// Adds a worker's counts to the totals and checks the bounds.
+     fn flush(&self, t: &mut Tally) -> bool {
+         let ok = self.check(t.applied, t.stored * CONCLUSION_BYTES, t.queued);
++        self.sent.fetch_add(t.sent, Ordering::Relaxed);
++        self.stored.fetch_add(t.stored, Ordering::Relaxed);
+         *t = Tally::default();
+         ok
+     }
+@@ -2597,6 +2623,7 @@ impl<'a> Run<'a> {
+             self.flush_links(&st, &mut out, tally);
+         }
+         tally.queued += out.sent as isize;
++        tally.sent += out.sent;
+         if self.bounds.partial && (at < taken.len() || !out.local.is_empty()) {
+             // the rest of the batch in the order the reversed batch left it on `local`,
+             // below what the rules gave the context
+@@ -3477,6 +3504,8 @@ mod horn_accounting_tests {
+             queued: AtomicIsize::new(1),
+             peak: AtomicUsize::new(bounds.peak_memory),
+             applied: AtomicUsize::new(0),
++            sent: AtomicUsize::new(0),
++            stored: AtomicUsize::new(0),
+             merged: AtomicBool::new(false),
+             batch: AtomicBool::new(false),
+             plain: false,

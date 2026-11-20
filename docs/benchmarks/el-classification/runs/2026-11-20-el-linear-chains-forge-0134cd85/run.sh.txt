@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# run.sh: the body of the forge unit el-956-timing. Takes the bench lock and then the heavy
+# lock, checks the binaries' and inputs' hashes, records the host state, runs timing.py in a
+# 12G scope and analyze.py, and writes DONE with the exit status on every path once the
+# locks are held. The unit's own exit status is the same.
+set -u
+cd "$(dirname "$0")"
+mkdir -p out; rm -f DONE
+echo "$(date -Is) queued for locks" >> queue.log
+exec 8>> ~/lanes/.bench.lock
+flock 8 || { echo "$(date -Is) bench lock failed" >> queue.log; exit 2; }
+exec 9>> ~/lanes/.heavy.lock
+flock 9 || { echo "$(date -Is) heavy lock failed" >> queue.log; exit 2; }
+rc=1
+trap 'echo "exit=$rc" > DONE' EXIT
+rm -f DONE
+echo "$(date -Is) locks held" >> queue.log
+if ! sha256sum -c SHA256SUMS > out/sha-check.txt 2>&1; then rc=3; exit "$rc"; fi
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -m
+  systemctl --user list-units --no-legend --state=active --type=service; } > out/before.txt
+systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=1G -p OOMPolicy=continue \
+  python3 -B timing.py >> out/timing.stdout 2>&1
+trc=$?
+{ echo "end=$(date -Is)"; uptime; free -m; } > out/after.txt
+python3 -B analyze.py out > out/summary.md 2>&1
+arc=$?
+echo "timing=$trc analyze=$arc" >> queue.log
+if [ $trc -ne 0 ]; then rc=$trc; elif [ $arc -ne 0 ]; then rc=$((100 + arc)); else rc=0; fi
+exit $rc

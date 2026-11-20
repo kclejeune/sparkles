@@ -1,0 +1,72 @@
+# make-record.py TIMING_LANE EL_LANE DEST: builds the benchmark record of item 956 from the
+# forge rounds of timing.py, analyze.py's summary and the laptop's counts and sweeps. The home
+# directory in paths is written as ~ in the record and the copied scripts.
+import hashlib, json, os, shutil, sys
+tl, ll, dest = sys.argv[1], sys.argv[2], sys.argv[3]
+fo = os.path.join(tl, 'forge-out')
+def text(p):
+    with open(p) as f:
+        return f.read()
+def sha(p):
+    with open(p, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+bins = {l.split()[1].split('.')[-1]: l.split()[0] for l in text(os.path.join(tl, 'bin', 'SHA256SUMS')).splitlines()}
+data = {l.split()[1].split('/')[-1]: l.split()[0] for l in text(os.path.join(tl, 'files.sha256')).splitlines()}
+runs = [json.loads(l) for l in text(os.path.join(fo, 'out', 'runs.jsonl')).splitlines() if l.strip()]
+corpus = {}
+cdir = os.path.join(ll, 'out', 'corpus')
+for base, tip in [('base-t1', 'tip4-t1'), ('base-t4', 'tip4-t4'), ('dev207-base-t4', 'dev207-tip5-t4')]:
+    rows = {}
+    for side in (base, tip):
+        for n in sorted(os.listdir(os.path.join(cdir, side))):
+            if n.endswith('.tax') and os.path.getsize(os.path.join(cdir, side, n)) > 0:
+                rows.setdefault(n[:-4], {})['base' if side == base else 'tip'] = sha(os.path.join(cdir, side, n))
+    corpus[base + ' against ' + tip] = rows
+scripts = ['timing.py', 'analyze.py', 'run.sh', 'RULES.md', 'make-record.py']
+rec = {
+    'suite': 'el-classification', 'kind': 'measurement',
+    'scale': 'ore_ont_8737 and ore_ont_9855 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on forge',
+    'host': {'name': 'forge', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+    'manifest': {
+        'sides': {'base': '5f3f69c2, the lane base, origin/main of batch 40',
+                  'tip': '0134cd85, the left-linear composition of transitive roles of item 956, whose engine code is that of 05838a64'},
+        'build': 'mbx build --release -p sparkles-owl --example el_classify on wally through scripts/remote-ci.sh --cmd, rustc 1.99.1, mbx 1.29.1, both sides from clean checkouts, copied to forge',
+        'commits': {'base': '5f3f69c2', 'tip': '0134cd85'},
+        'binaries_sha256': bins,
+        'data_sha256': data,
+        'scripts': [s + '.txt' for s in scripts],
+    },
+    'settings': {
+        'threads': 'one, four and twelve in the warm rounds, one in the cold rounds',
+        'scope': 'one process per run in a 12 GiB systemd scope with at most 1 GiB of swap on forge, no pinning',
+        'lock': 'the rounds ran under ~/lanes/.bench.lock and ~/lanes/.heavy.lock as the systemd user unit el-956-timing',
+    },
+    'method': 'RULES.md fixed the rules before the run. timing.py ran warm cells of el_classify --threads T --repeat 5, three rounds of ore_ont_8737 and six of GO, ChEBI lite, ore_ont_3836, ore_ont_13482 and ore_ont_9855, and cold cells of --threads 1 --repeat 1 of ore_ont_3836 and ore_ont_13482 in twenty rounds, the base first in odd rounds and the tip first in even ones, then one untimed run per file and side on four threads that wrote the taxonomy. analyze.py takes each side\'s median over the rounds, the ratio of the medians and a 95% bootstrap interval over whole rounds, and applies the Intel rule of AGENTS.md.',
+    'timing': runs,
+    'timing_log': text(os.path.join(fo, 'out', 'log.txt')),
+    'summary': text(os.path.join(fo, 'out', 'summary.md')),
+    'hash_check': text(os.path.join(fo, 'out', 'sha-check.txt')),
+    'queue_log': text(os.path.join(fo, 'queue.log')),
+    'exit': text(os.path.join(fo, 'DONE')).strip(),
+    'hosts': {'before.txt': text(os.path.join(fo, 'out', 'before.txt')), 'after.txt': text(os.path.join(fo, 'out', 'after.txt'))},
+    'laptop_diagnostics': {
+        'host': 'stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB, with other work running, so only counts and hashes are evidence',
+        'instructions': text(os.path.join(ll, 'out', 'insn', 'tip4.txt')),
+        'instructions_note': 'insn.sh counted user-mode instructions in millions of whole el_classify processes pinned to one performance core, --repeat 1 and --repeat 3, base against tip4 (3f20f7db, the same linear composition before the charge of its table). Half the difference of the two is one warm classification.',
+        'message_counts': 'With stats.patch applied and SPARKLES_SATURATION_STATS=1, ore_ont_8737 on four threads sends 296 million messages against 2.98 billion, applies 0.23 billion conclusions against 1.32 billion and stores 15.8 million against 20.9 million, and ChEBI lite on one thread sends 6.2 million messages against 15.4 million.',
+        'taxonomy_sweeps': corpus,
+        'taxonomy_sweeps_note': 'corpus.sh classified the 298 ORE 2015 EL files, GO and ChEBI lite on one and four threads with base and tip4, and the 207 files of the ORE 2015 DL development set on four threads with base and tip5 (05838a64, the engine code of the tip). Each entry is a file whose taxonomy is not empty, with the SHA-256 of each side. Of the 207 development files both sides refuse one at the reader and stop one at its memory budget.',
+    },
+}
+HOME = os.path.expanduser('~')
+def copy(src, dst):
+    with open(dst, 'w') as f:
+        f.write(text(src).replace(HOME, '~'))
+os.makedirs(dest, exist_ok=True)
+for s in scripts:
+    copy(os.path.join(tl, s) if s != 'make-record.py' else os.path.abspath(__file__), os.path.join(dest, s + '.txt'))
+for s, p in [('insn.sh', os.path.join(ll, 'scripts', 'insn.sh')), ('corpus.sh', os.path.join(ll, 'scripts', 'corpus.sh')), ('stats.patch', os.path.join(ll, 'stats.patch'))]:
+    copy(p, os.path.join(dest, s + '.txt'))
+    rec['manifest']['scripts'].append(s + '.txt')
+with open(os.path.join(dest, 'record.json'), 'w') as f:
+    f.write(json.dumps(rec, indent=1).replace(HOME, '~') + '\n')
