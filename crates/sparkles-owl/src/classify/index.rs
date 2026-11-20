@@ -931,7 +931,17 @@ pub struct Roles {
     /// first and a role under the second between the same pair is a clash, which
     /// disjoint and asymmetric roles give
     pub clash: Vec<(Role, Role)>,
+    /// for each role, whether its chains compose left-linearly
+    /// ([`Roles::finish_chains`], roadmap item 956)
+    pub linear: Vec<bool>,
+    /// for each pair of [`Roles::comp`], the roles of the composed links whose source
+    /// keeps them as forward links
+    pub comp_fwd: FxHashMap<(Role, Role), Vec<Role>>,
 }
+
+/// The variable that turns the left-linear composition of [`Roles::finish_chains`] off
+/// when it is `0`, for measurements (roadmap item 956).
+pub const LINEAR_CHAINS_ENV: &str = "SPARKLES_LINEAR_CHAINS";
 
 /// No role, in [`Roles::inv`].
 pub const NO_ROLE: Role = Role::MAX;
@@ -959,6 +969,12 @@ impl Roles {
                 .map(|v| 24 + v.capacity() * 4)
                 .sum::<usize>()
             + self.empty.len()
+            + self.linear.len()
+            + self
+                .comp_fwd
+                .values()
+                .map(|v| 40 + v.capacity() * 4)
+                .sum::<usize>()
     }
 
     /// The functional superroles of a data role, itself included.
@@ -994,6 +1010,121 @@ impl Roles {
     #[inline]
     pub fn keeps_forward(&self, r: Role) -> bool {
         self.right.get(r as usize).copied().unwrap_or(false)
+    }
+
+    /// The roles of [`Roles::comp`] whose composed link its source keeps as a forward
+    /// link: those that keep forward links, less the left-linear compositions of
+    /// [`Roles::finish_chains`].
+    #[inline]
+    pub fn comp_fwd(&self, r1: Role, r2: Role) -> &[Role] {
+        if !self.left.get(r1 as usize).copied().unwrap_or(false) {
+            return &[];
+        }
+        self.comp_fwd.get(&(r1, r2)).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Composes every chain as before roadmap item 956, with every composed link kept as
+    /// a forward link where its role keeps them, for tests that compare the two.
+    #[cfg(test)]
+    pub fn without_linear(&mut self) {
+        self.linear.iter_mut().for_each(|l| *l = false);
+        let right = &self.right;
+        self.comp_fwd = self
+            .comp
+            .iter()
+            .map(|(&k, v)| {
+                let kept = v
+                    .iter()
+                    .copied()
+                    .filter(|&t| right.get(t as usize).copied().unwrap_or(false))
+                    .collect();
+                (k, kept)
+            })
+            .collect();
+    }
+
+    /// Whether `r` and `s` are equivalent roles.
+    fn equivalent(&self, r: Role, s: Role) -> bool {
+        self.sub(r, s) && self.sub(s, r)
+    }
+
+    /// Decides which roles compose left-linearly and fills [`Roles::comp_fwd`], once the
+    /// composition table is final (roadmap item 956).
+    ///
+    /// A role `t` is linear when every pair of roles equivalent to `t` composes into the
+    /// roles that `t` with itself does, and every role `s` that composes with a link by
+    /// `t` on its right composes alike with the roles equivalent to `t`, into roles `V`
+    /// each of which some role of `V` composed with `t` gives again. A link by `t` that
+    /// a chain composes from two links by roles equivalent to `t` then needs no forward
+    /// link at its source. A link `(w, s, x)` that would meet such a link `(x, t, z)`,
+    /// composed from `(x, a, y)` and `(y, b, z)`, gives `(w, u, y)` for every `u` of `V`
+    /// with `(x, a, y)`, directly or by induction on the composition when that link is one
+    /// of them too, and these with `(y, b, z)` give every role of `V` again. So the
+    /// saturation stores the same backward links, a middle context pairs its backward
+    /// links only with the forward links that are not such compositions, and the
+    /// transitive closure of a role is derived once for each link that ends in a link
+    /// the axioms give, rather than once for each intermediate context.
+    pub fn finish_chains(&mut self) {
+        let n = self.sup.len();
+        let mut linear = vec![false; n];
+        // a switch for measurements, which composes every pair as before
+        let off = std::env::var_os(LINEAR_CHAINS_ENV).is_some_and(|v| v == "0");
+        for t in 0..n as Role {
+            if off {
+                break;
+            }
+            if !self.keeps_forward(t) || !self.comp(t, t).contains(&t) {
+                continue;
+            }
+            let class: Vec<Role> = self.sup[t as usize]
+                .iter()
+                .copied()
+                .filter(|&s| self.sub(s, t))
+                .collect();
+            let sorted = |v: &[Role]| {
+                let mut v = v.to_vec();
+                v.sort_unstable();
+                v
+            };
+            let tt = sorted(self.comp(t, t));
+            // every pair of roles equivalent to t composes as t with itself
+            let uniform = class
+                .iter()
+                .all(|&a| class.iter().all(|&b| sorted(self.comp(a, b)) == tt));
+            // a role that composes with a link by t on its right does so alike with the
+            // roles equivalent to t, and each role it composes into comes again from one
+            // of them composed with a further link by t
+            let covered = self.comp.iter().all(|(&(s, b), v)| {
+                if b != t || v.is_empty() || !self.left[s as usize] {
+                    return true;
+                }
+                let st = sorted(v);
+                class.iter().all(|&a| sorted(self.comp(s, a)) == st)
+                    && st
+                        .iter()
+                        .all(|w| st.iter().any(|&u| self.comp(u, t).contains(w)))
+            });
+            linear[t as usize] = uniform && covered;
+        }
+        let comp_fwd = self
+            .comp
+            .iter()
+            .map(|(&(r1, r2), v)| {
+                let kept: Vec<Role> = v
+                    .iter()
+                    .copied()
+                    .filter(|&t| {
+                        self.keeps_forward(t)
+                            && !(linear[t as usize]
+                                && self.equivalent(r1, t)
+                                && self.equivalent(r2, t))
+                    })
+                    .collect();
+                ((r1, r2), kept)
+            })
+            .collect();
+        self.linear = linear;
+        self.comp_fwd = comp_fwd;
     }
 
     /// The inverse of a role, when the run has one.
@@ -1795,6 +1926,8 @@ impl Index {
             any_empty: a_any_empty,
             inv: a_inv,
             clash: a_clash,
+            linear: a_linear,
+            comp_fwd: a_comp_fwd,
         } = a_roles;
         let Roles {
             sup: b_sup,
@@ -1809,6 +1942,8 @@ impl Index {
             any_empty: b_any_empty,
             inv: b_inv,
             clash: b_clash,
+            linear: b_linear,
+            comp_fwd: b_comp_fwd,
         } = b_roles;
         assert_eq!(
             (
@@ -1840,6 +1975,11 @@ impl Index {
                 b_clash
             ),
             "fixture role content"
+        );
+        assert_eq!(
+            (a_linear, a_comp_fwd),
+            (b_linear, b_comp_fwd),
+            "fixture linear chains"
         );
         assert_eq!(a_vals, b_vals, "fixture values");
         assert_eq!(a_neg_data, b_neg_data, "fixture negative data");
@@ -2002,6 +2142,7 @@ impl Index {
             && a.functional.iter().all(|f| f.is_empty())
             && b.functional.iter().all(|f| f.is_empty())
             && prefix(&a.empty, &b.empty)
+            && prefix(&a.linear, &b.linear)
             && b.inv.len() >= a.inv.len()
             && b.inv[..a.inv.len()] == a.inv[..]
             && a.clash == b.clash
@@ -2672,6 +2813,7 @@ fn horn_index(
         ix.roles.comp = sel.comp;
         ix.roles.left = sel.left;
         ix.roles.right = sel.right;
+        ix.roles.finish_chains();
     }
     dead.sort_unstable();
     dead.dedup();
@@ -3252,7 +3394,10 @@ fn roles(
         empty,
         inv,
         clash,
+        linear: Vec::new(),
+        comp_fwd: FxHashMap::default(),
     };
+    roles.finish_chains();
     if !roles.clash.is_empty() {
         for r in 0..n as Role {
             if roles.clashes(r, r) {
