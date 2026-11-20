@@ -838,7 +838,7 @@ fn described_children(ctx: &Ctx, n: &Node) -> Vec<PlanInfo> {
 }
 
 /// Why the right side of a join did not run.
-const LEFT_EMPTY: &str = "the left side produced no rows";
+pub(super) const LEFT_EMPTY: &str = "the left side produced no rows";
 
 /// Execute with the result cache: subtrees that are cheap to recompute (leaf scans and
 /// value tables) bypass it; everything else is looked up and stored.

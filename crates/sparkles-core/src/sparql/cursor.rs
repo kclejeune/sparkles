@@ -3500,10 +3500,30 @@ impl Operator {
         }
     }
 
+    /// Mark this operator and those below it as never run, for `why`, as the eager plan
+    /// marks an input that its parent did not need.
+    fn mark_skipped(&mut self, why: &str) {
+        self.info.actual_rows = -1;
+        self.info.time_ms = 0.0;
+        self.info.fidelity_mut().skipped = Some(why.to_string());
+        self.done = true;
+        for child in &mut self.children {
+            child.mark_skipped(why);
+        }
+    }
+
     fn update_plan(&self, plan: &mut CursorPlan) {
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
+        if self
+            .info
+            .fidelity
+            .as_ref()
+            .is_some_and(|f| f.skipped.is_some())
+        {
+            plan.operator.fidelity.clone_from(&self.info.fidelity);
+        }
         if self.info.counters.is_some() {
             plan.operator.counters.clone_from(&self.info.counters);
         }

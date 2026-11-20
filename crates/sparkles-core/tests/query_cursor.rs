@@ -3817,7 +3817,36 @@ fn a_count_over_a_two_variable_merge_join_runs_the_eager_kernel() {
                     .any(|n| n.ends_with("Join") && n != "CountJoin"),
                 "{fallback:?}: {names:?}"
             );
-            assert_eq!(all(c), expected, "{fallback:?}; {rows}");
+            let mut c = c;
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(c.status(), CursorStatus::Complete);
+            assert_eq!(answer, expected, "{fallback:?}; {rows}");
+            // The right input never ran, and its plan says so as the eager plan does.
+            fn find<'a>(
+                plan: &'a sparkles_core::sparql::CursorPlan,
+                op: &str,
+            ) -> Option<&'a sparkles_core::sparql::CursorPlan> {
+                match plan.operator.operator == op {
+                    true => Some(plan),
+                    false => plan.children.iter().find_map(|c| find(c, op)),
+                }
+            }
+            fn all_skipped(plan: &sparkles_core::sparql::CursorPlan) -> bool {
+                let f = plan.operator.fidelity();
+                f.skipped.as_deref() == Some("the left side produced no rows")
+                    && !f.stopped_early
+                    && plan.operator.actual_rows == -1
+                    && plan.children.iter().all(all_skipped)
+            }
+            let count = find(c.plan(), "CountJoin").expect("a count join");
+            assert_eq!(count.children.len(), 2, "{:?}", count);
+            assert!(all_skipped(&count.children[1]), "{fallback:?}: {:?}", count);
+            assert!(count.children[0].operator.fidelity().skipped.is_none());
         }
     }
 }

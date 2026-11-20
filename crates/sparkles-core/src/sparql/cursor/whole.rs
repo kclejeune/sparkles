@@ -115,6 +115,7 @@ impl Whole {
                 // A count over a join with an empty left input reads nothing of its right
                 // input, as the eager count does.
                 if count && inputs.first().is_some_and(|l: &Buffer| l.table.is_empty()) {
+                    child.mark_skipped(crate::sparql::exec::LEFT_EMPTY);
                     inputs.push(Buffer::new(ctx, &child.vars, 0)?);
                     continue;
                 }
