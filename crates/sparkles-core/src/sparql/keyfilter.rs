@@ -221,6 +221,65 @@ impl KeyFilter {
         Self::compile(Programs::None, exprs, v)?.key_prefixes()
     }
 
+    /// The most that [`KeyFilter::plan_prefixes`] allocates for the conjunct `e` of its
+    /// list over `v`: the slots of its tests in a list that grows by doubling, each
+    /// substring test's boxed finder with its copy of the needle, each regular
+    /// expression's anchored prefix as it grows and as shared text, each language range,
+    /// and the at most two prefixes the filter gives. Conjuncts that are no key test
+    /// add nothing.
+    pub(super) fn plan_prefixes_bytes(e: &Expr, v: VarId) -> usize {
+        fn walk(e: &Expr, v: VarId, tests: &mut usize, heap: &mut usize, longest: &mut usize) {
+            if length_test(e, v).is_some() {
+                *tests += 1;
+                return;
+            }
+            if let Expr::And(a, b) = e {
+                walk(a, v, tests, heap, longest);
+                walk(b, v, tests, heap, longest);
+                return;
+            }
+            let Expr::Call(Func::Builtin(f), args) = e else {
+                return;
+            };
+            let (text, bytes) = match (f, args.as_slice()) {
+                (Function::Contains | Function::StrStarts | Function::StrEnds, [_, n]) => {
+                    let s = match n {
+                        Expr::Lit(_, Value::Str(s)) => s.len(),
+                        Expr::Lit(_, Value::Lang(s, _) | Value::LangDir(s, _, _)) => s.len(),
+                        _ => return,
+                    };
+                    (
+                        s,
+                        size_of::<memchr::memmem::Finder<'static>>().saturating_add(s),
+                    )
+                }
+                (Function::Regex, [_, p, ..]) => {
+                    let Some(p) = const_str(p) else { return };
+                    (p.len(), p.len().saturating_mul(3).saturating_add(32))
+                }
+                (Function::LangMatches, [_, r]) => {
+                    let Some(r) = const_str(r) else { return };
+                    (0, r.len().saturating_add(16))
+                }
+                _ => return,
+            };
+            *tests += 1;
+            *heap = heap.saturating_add(bytes);
+            *longest = (*longest).max(text);
+        }
+        let (mut tests, mut heap, mut longest) = (0, 0, 0);
+        walk(e, v, &mut tests, &mut heap, &mut longest);
+        if tests == 0 {
+            return 0;
+        }
+        tests
+            .max(4)
+            .saturating_mul(2 * size_of::<Test>())
+            .saturating_add(heap)
+            .saturating_add(longest.saturating_add(1).saturating_mul(2))
+            .saturating_add(3 * size_of::<Vec<u8>>())
+    }
+
     /// Reserve cursor metadata before compiling key tests. Regex programs and
     /// optional worker-local match caches carry separate query-owned charges.
     /// Include the finder/prefix copies of every possible 4,096-ID work item.

@@ -1708,11 +1708,22 @@ impl<'a> Planner<'a> {
                 if let Some(&c) = self.subst.get(&v) {
                     // the outer solution binds ?v (a LATERAL or EXISTS substitution): a
                     // different value drops the solution, and an error keeps it
-                    let keep = Expr::Coalesce(vec![
-                        Expr::Eq(Box::new(e), Box::new(Expr::Const(c))),
-                        Expr::Const(Id::from_bool(true)),
-                    ]);
-                    return self.apply_filters(self.filter_admitted(child, vec![keep])?, top);
+                    let n = {
+                        #[cfg(test)]
+                        let _stage = crate::test_alloc::Stage::within(6);
+                        // the test's list of two and its two boxes, and the FILTER's list
+                        let built = self.planning_scratch(|layout| layout.slots::<Expr>(5))?;
+                        let keep = Expr::Coalesce(vec![
+                            Expr::Eq(Box::new(e), Box::new(Expr::Const(c))),
+                            Expr::Const(Id::from_bool(true)),
+                        ]);
+                        let filters = vec![keep];
+                        if let Some(built) = built {
+                            self.retain_planning(built);
+                        }
+                        self.filter_admitted(child, filters)?
+                    };
+                    return self.apply_filters(n, top);
                 }
                 let n = if child.vars.contains(&v) {
                     // LET of a variable the pattern may bind: compared where it is bound
@@ -4880,12 +4891,25 @@ impl<'a> Planner<'a> {
                 let mut opts = self.scan_options(&t)?;
                 opts.sort_by(|a, b| a.cost.total_cmp(&b.cost));
                 let scan = opts.remove(0);
-                let list: Vec<Expr> = set
-                    .iter()
-                    .map(|n| Expr::Const(self.ctx.intern_term(&Term::NamedNode(n.clone()))))
-                    .collect();
-                let f = Expr::Not(Box::new(Expr::In(Box::new(Expr::Var(pv)), list)));
-                let mut n = self.filter_admitted(scan, vec![f])?;
+                let mut n = {
+                    #[cfg(test)]
+                    let _stage = crate::test_alloc::Stage::within(6);
+                    // the list of the set's terms, the test's two boxes and the FILTER's
+                    // list, which the plan keeps
+                    let built = self.planning_scratch(|layout| {
+                        layout.slots::<Expr>(set.len().saturating_add(3))
+                    })?;
+                    let list: Vec<Expr> = set
+                        .iter()
+                        .map(|n| Expr::Const(self.ctx.intern_term(&Term::NamedNode(n.clone()))))
+                        .collect();
+                    let filters =
+                        vec![Expr::Not(Box::new(Expr::In(Box::new(Expr::Var(pv)), list)))];
+                    if let Some(built) = built {
+                        self.retain_planning(built);
+                    }
+                    self.filter_admitted(scan, filters)?
+                };
                 n = project(
                     n.clone(),
                     n.vars.iter().copied().filter(|v| *v != pv).collect(),
@@ -6134,12 +6158,18 @@ pub(super) fn filter_bound<'e>(
             _ => 1,
         }
     }
-    let (mut count, mut conjuncts, mut text) = (0usize, 0usize, Count(0));
+    let (mut count, mut conjuncts, mut text, mut most) = (0usize, 0usize, Count(0), 0usize);
     for e in exprs.clone() {
         count += 1;
         conjuncts = conjuncts.saturating_add(leaves(e));
         text.0 = text.0.saturating_add(8);
         let _ = e.write_description(ctx, &mut text);
+        let mut occurrences = 0usize;
+        let _ = e.visit_vars(&mut |_| {
+            occurrences += 1;
+            Ok::<(), ()>(())
+        });
+        most = most.max(occurrences);
     }
     let copy = |layout: &mut super::checked_layout::Layout<'_>| -> Result<()> {
         layout.slots::<Expr>(count.max(4).saturating_mul(2))?;
@@ -6160,23 +6190,43 @@ pub(super) fn filter_bound<'e>(
         .saturating_add(64)
         .saturating_mul(6);
     if let Kind::Scan(spec) = &n.kind {
-        // range pushdown: the conjunct lists and their partition, the atoms, the id
-        // ranges, the rendered conjuncts and the copy of the scan
+        // range pushdown splits the filters into their conjuncts and partitions them
         layout.slots::<Expr>(slots.saturating_mul(8))?;
-        layout.slots::<(RangeOp, super::value::Value)>(slots.saturating_mul(2))?;
-        layout.slots::<IdRange>(64)?;
-        layout.slots::<String>(conjuncts)?;
-        layout.add(texts)?;
-        layout.scan(spec)?;
-        // key ranges of the sorted column: copies of the conjuncts on it, their key
-        // tests and the prefixes and id ranges they give
-        copy(layout)?;
-        layout.add(
-            text.0
-                .saturating_mul(6)
-                .saturating_add(conjuncts.saturating_mul(1024)),
+        // Then either range conjuncts move into a range scan, which the key ranges of
+        // the start do not read, or none do and the scan may read key ranges.
+        layout.larger(
+            |layout| {
+                // the atoms, the id ranges, the rendered conjuncts and the scan's copy
+                layout.slots::<(RangeOp, super::value::Value)>(slots.saturating_mul(2))?;
+                layout.slots::<IdRange>(64)?;
+                layout.slots::<String>(conjuncts)?;
+                layout.add(texts)?;
+                layout.scan(spec)
+            },
+            |layout| {
+                // copies of the conjuncts on the sorted column, their key tests with the
+                // prefixes they give, and the id ranges of those prefixes
+                layout.slots::<Expr>(slots.saturating_mul(2))?;
+                for e in exprs.clone() {
+                    layout.expression(e)?;
+                }
+                if let Some(&(_, v)) = spec.cols.first() {
+                    let mut tests = 0usize;
+                    for e in exprs.clone() {
+                        tests = tests
+                            .saturating_add(super::keyfilter::KeyFilter::plan_prefixes_bytes(e, v));
+                    }
+                    layout.add(tests)?;
+                }
+                layout.slots::<(u64, u64)>(4)
+            },
         )?;
     }
+    // the variables of one filter at a time, listed with every occurrence, and the
+    // reason a filter is not evaluated once per value, when it costs the FILTER's sort
+    // or tests the scan's key column
+    layout.slots::<VarId>(most.max(4).saturating_mul(2))?;
+    layout.add(128)?;
     // the rendered conjuncts, their sampled selectivities, the description, and the
     // FILTER's copy of its input's metadata
     layout.slots::<String>(conjuncts)?;

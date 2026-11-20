@@ -2706,6 +2706,36 @@ fn checked_join_order_excess_kinds(
 }
 
 #[test]
+#[ignore = "the set's terms are interned into the query's vocabulary without credit"]
+fn checked_graph_r12_admits_built_filters() {
+    // A negated property set is a scan under a FILTER that tests the set's terms, a list
+    // as long as the set, which the plan keeps.
+    use plan::{ActiveGraph, Planner};
+    for terms in [4, 400] {
+        let set = (0..terms)
+            .map(|step| format!("<urn:n:p{step}>"))
+            .collect::<Vec<_>>()
+            .join("|");
+        let text = format!("SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 }} }}");
+        let store = checked_chain_fixture(4);
+        let data = physical_default(&store);
+        let ctx = validation_query_context(&data, opts()).unwrap();
+        let prep = ctx.source_preparation.as_ref().unwrap().clone();
+        let Query::Select { pattern, .. } = parse_query(&text, None, &[]).unwrap() else {
+            unreachable!()
+        };
+        let mut planner = Planner::new(&ctx);
+        let excess = crate::test_alloc::record_unadmitted(&prep, || {
+            planner
+                .plan(&pattern, &ActiveGraph::Default, Vec::new())
+                .unwrap();
+        });
+        println!("negated set of {terms}: {excess:?}");
+        assert!(excess[6] <= 512, "filters: {} unadmitted bytes", excess[6]);
+    }
+}
+
+#[test]
 fn checked_graph_r12_admits_join_order_tables() {
     // Stage 0 indexes the group's variables, filters and join models. Stage 2 builds the program's tables over every subset of the inputs, which grow
     // with 2^n, stage 3 runs the program over them and stage 4 rebuilds its plan. The
@@ -2815,6 +2845,40 @@ fn checked_graph_r12_admits_join_order_tables() {
     };
     cases.push((12, prefix(12)));
     cases.push((40, prefix(40)));
+    // A range of 40 conjuncts on one scan's sorted column, a prefix with 24 more key
+    // tests of the same column, and ten filters on a BIND's variable, placed together
+    // after the BIND.
+    let many_range = {
+        let mut text = checked_chain_query(12);
+        let test = (0..40)
+            .map(|step| format!("?v > -{step}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        text.insert_str(text.len() - 4, &format!(" ?x1 <urn:v> ?v . FILTER({test})"));
+        text
+    };
+    cases.push((12, many_range));
+    let many_tests = {
+        let mut text = checked_star_query(12);
+        let mut test = String::from("STRSTARTS(STR(?y1), \"urn:m:1\")");
+        for step in 0..24 {
+            test.push_str(&format!(" && CONTAINS(STR(?y1), \"urn:m:{step:0>40}\")"));
+        }
+        text.insert_str(text.len() - 4, &format!(" FILTER({test})"));
+        text
+    };
+    cases.push((12, many_tests));
+    let bound_filters = {
+        let mut text = subtree(2);
+        for step in 0..10 {
+            text.insert_str(
+                text.len() - 4,
+                &format!(" FILTER(?first != <urn:n:b{step}>)"),
+            );
+        }
+        text
+    };
+    cases.push((12, bound_filters));
     let caps = [
         (0, "group", 512),
         (1, "greedy", 1024),

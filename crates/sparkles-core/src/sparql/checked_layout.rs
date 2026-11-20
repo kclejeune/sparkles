@@ -69,6 +69,22 @@ impl<'a> Layout<'a> {
         self.slots::<T>(slots)
     }
 
+    /// The larger of the layouts `a` and `b` add, for storage of two steps that is never
+    /// live at once.
+    pub(super) fn larger(
+        &mut self,
+        a: impl FnOnce(&mut Self) -> Result<()>,
+        b: impl FnOnce(&mut Self) -> Result<()>,
+    ) -> Result<()> {
+        let start = self.bytes;
+        a(self)?;
+        let first = self.bytes - start;
+        self.bytes = start;
+        b(self)?;
+        self.bytes = self.bytes.max(start + first);
+        Ok(())
+    }
+
     fn optional_vector<T>(&mut self, values: Option<&Vec<T>>) -> Result<()> {
         if let Some(values) = values {
             self.vector(values)?;
