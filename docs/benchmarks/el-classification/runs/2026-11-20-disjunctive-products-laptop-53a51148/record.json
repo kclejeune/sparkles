@@ -61,7 +61,7 @@
   "maxprod-d1.txt": "the widest product of each finishing development attempt on one thread from the d1 counters",
   "m4.txt, m5.txt, m5f.txt": "the width limit's checks on two, four and eight threads (m4.sh, m5.sh): taxonomy, time, flags and the DLDIAG counters",
   "profile-14817-fp.txt": "perf report --children of perf record on fp, ore_ont_14817, default pipeline, one thread",
-  "dldiag-d0.txt, dldiag-d1.txt": "the DLDIAG lines of the 15 files whose attempts print them of the d0 and d1 sweeps, prefixed by the file name; counters-compare.txt is counters-compare.sh's output, 0 differences once the time and d1's added maxProd are removed"
+  "dldiag-d0.txt, dldiag-d1.txt": "the DLDIAG lines of the 15 files whose attempts run the disjunctive rules, 12 that finish and 3 that fail of the d0 and d1 sweeps, prefixed by the file name; counters-compare.txt is counters-compare.sh's output, 0 differences once the time and d1's added maxProd are removed"
  },
  "summary": {
   "instructions_one_thread_G": {
@@ -97,6 +97,6 @@
    }
   },
   "taxonomies": "every pair of sides gives the same taxonomy hash on every file counted and swept",
-  "counters": "d0 and d1 give the same conclusions, products and clauses at every checkpoint on the 96 files, and the same estimated bytes"
+  "counters": "the 96 files give the same summary lines on d0 and d1, and the 15 whose attempts run the disjunctive rules print DLDIAG lines that agree at every checkpoint once the time and d1's added maxProd are removed"
  }
 }

@@ -1810,8 +1810,8 @@ the other three finish. A sweep classified GO, ChEBI lite, the 298 ORE 2015 EL f
 the 207 DL development files once per build on one and four threads, and the 998 pairs
 that both builds classified gave the same tier, flags, classes outside the rules, count of unsatisfiable classes,
 consistency and taxonomy bytes. On one thread the 96 disjunctive development files derive the same
-conclusions with the pruning change, and their counters of products and clauses agree at
-every doubling of the work.
+conclusions with the pruning change, and the counters of products and clauses of the 15
+that attempt the rules agree at every doubling of the work.
 
 ## Records
 

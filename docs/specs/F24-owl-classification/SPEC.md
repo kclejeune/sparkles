@@ -350,8 +350,8 @@ their literals and then by a merge of the sorted literals, where it searched eac
 and keeps the same sides in the same order. The Pred rule with a fixed premise moves its
 lists into the last product instead of copying them. The 96 disjunctive files of the
 development set derive the same conclusions with the same estimated bytes and taxonomies,
-and the 15 whose attempts reach 65,536 conclusions make the same products and clauses at
-every doubling of the work. The classifications take 0.80 to 0.91 times the base's
+and the 15 that attempt the rules make the same products and clauses at every doubling
+of the work. The classifications take 0.80 to 0.91 times the base's
 instructions on the six files counted, with the limit below off. The times on the loaded
 laptop are not measurements, but they show the attempt of ore_ont_14817 taking 97 against
 192 s on one thread in the sweeps with diagnostic counters. The
