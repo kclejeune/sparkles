@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Forge driver of the item 829 script rerun. Waits until the units it is queued behind
+# have left the host, then holds the bench lock and the heavy lock for the whole rerun in
+# a 13G scope. Run from ~/lanes/leaf-cursors-829-rerun as a named systemd user unit.
+set -u
+cd ~/lanes/leaf-cursors-829-rerun
+busy() {
+  systemctl --user list-units --no-legend --state=active,activating,reloading 2>/dev/null \
+    | grep -E 'rooted-term-growth-forge-followup-v3|filter1204|filter-1204' | grep -v exited
+}
+while busy > /dev/null; do
+  echo "$(date -Is) waiting: $(busy | awk '{print $1}' | tr '\n' ' ')" >> queue.log
+  sleep 300
+done
+echo "$(date -Is) queue clear, waiting for locks" >> queue.log
+sha256sum -c bin/SHA256SUMS >> queue.log 2>&1 || { echo "exit=sha" > EXIT; exit 1; }
+flock ~/lanes/.bench.lock flock ~/lanes/.heavy.lock bash -c '
+  uptime > uptime-before.txt
+  echo "$(date -Is) locks held" >> queue.log
+  systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=2G -p OOMPolicy=continue \
+    bash rerun.sh "$PWD/src" "$PWD/bin/base-bccc5f7b" "$PWD/bin/tip-9df856f3" "$PWD/out" 3
+' > rerun.log 2>&1
+echo "exit=$?" > EXIT
+rm -rf out/work

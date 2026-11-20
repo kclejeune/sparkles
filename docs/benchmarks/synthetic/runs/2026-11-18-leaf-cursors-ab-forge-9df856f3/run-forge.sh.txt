@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Runs the staged cells one after another on forge, each under the heavy lock in a 13G scope.
+set -u
+cd ~/lanes/leaf-cursors-829/matrix
+for n in "$@"; do
+  flock ~/lanes/.heavy.lock bash -c "uptime > $n/uptime-before.txt; systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=2G -p OOMPolicy=continue bash -c 'cd $n/stage && bash nsc-bench-remote.sh'" > $n/run.log 2>&1
+  echo "exit=$?" > $n/exit.txt
+  echo "$n $(cat $n/exit.txt)"
+done
+echo ALL-DONE > ALL-DONE

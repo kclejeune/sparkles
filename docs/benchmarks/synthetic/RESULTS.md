@@ -787,6 +787,136 @@ streamed `SUM(STRLEN(STR(?o)))`, 1.074 for streamed `expr-agg-arg`, 1.013 for st
 rounds for each query. Item 1067 holds these costs and the 12-thread `group-avg` follow-up
 from the [pinned forge comparison](#pinned-checks-and-drift-at-batch-37).
 
+### Leaf cursors
+
+The first part of item 829 was compared with its base on forge alone, under the host's
+heavy lock. A is main at bccc5f7b and B is 9df856f3, the part-1 engine before a cursor
+returned the count on two variables to the eager kernel, both release builds made on
+stanley with the same compilers. The
+[run record](runs/2026-11-18-leaf-cursors-ab-forge-9df856f3/README.md) keeps the samples,
+answers, queries and scripts of every run. A first pass ran the 31-query matrix at 1.05M
+triples with one thread in eight rounds of A,B,B,A in each mode, and the text, geo and
+vector scripts in one A,B,B,A round per mode with 12 threads and with one. A confirmation
+then ran the synthetic queries under 0.3 ms, the ones over it that the first pass flagged
+and the vector queries in twelve rounds of A,B,B,A in both orders, with 200 timed
+requests per query and server for the synthetic queries and 50 for the vector queries,
+and `scripts/x08-gates/combine.py` removed the position bias. Every server returned the
+same answers in every run.
+
+`mise run bench:request-insn` counted the instructions per request of the same two
+binaries on stanley, in eight rounds of A,B,B,A with 50 requests per query and server.
+Streamed `distinct-join`, `employee-docs`, `expr-bind-group`, `values-star` and
+`star-lookup` run 0.6% to 1.9% more instructions, and every other counted query runs
+the same count within the host's noise floor. Eager execution runs the same count as the
+base on every counted query.
+
+The confirmation's real costs in server time are these, where the item column names the
+roadmap item that holds each one. Costs under 0.3 ms within the cap of item 1074, with both modes of a
+query counted together, are its lines, each a kept-path cost without a profile. Instructions are the stanley ratio, and
+the vector store was not counted.
+
+| Query | Mode | Base | Tip/base | 95% interval | Added | Instructions | Item |
+|---|---|--:|--:|---|--:|--:|---|
+| `distinct-join` | streaming | 3.75 ms | 1.035 | 1.035–1.036 | 131 µs | 1.011 | 1160 |
+| `distinct-join` | eager | 3.57 ms | 1.022 | 1.021–1.023 | 78 µs | 1.000 | 1161 |
+| `lang-filter` | streaming | 1.79 ms | 1.028 | 1.027–1.029 | 50 µs | 1.000 | 1161 |
+| `lang-filter` | eager | 1.79 ms | 1.027 | 1.026–1.028 | 48 µs | 1.000 | 1161 |
+| `star-join` | eager | 1.39 ms | 1.019 | 1.016–1.022 | 27 µs | 1.000 | 1161 |
+| `star-join` | streaming | 1.41 ms | 1.013 | 1.010–1.016 | 18 µs | 1.001 | 1160 |
+| `regex-iri` | eager | 3.72 ms | 1.011 | 1.009–1.011 | 39 µs | 1.000 | 1161 |
+| `regex-iri` | streaming | 3.72 ms | 1.010 | 1.008–1.010 | 36 µs | 1.000 | 1161 |
+| `contains` | eager | 2.53 ms | 1.006 | 1.006–1.007 | 16 µs | 1.000 | 1161 |
+| `contains` | streaming | 2.53 ms | 1.006 | 1.006–1.007 | 16 µs | 1.000 | 1161 |
+| `minus` | eager | 0.36 ms | 1.008 | 1.003–1.010 | 2.7 µs | 1.000 | 1161 |
+| `expr-bind-group` | streaming | 0.36 ms | 1.013 | 1.009–1.015 | 4.7 µs | 1.013 | 1160 |
+| `employee-docs` | streaming | 0.041 ms | 1.039 | 1.030–1.053 | 1.6 µs | 1.019 | 1160 |
+| `star-lookup` | streaming | 0.063 ms | 1.032 | 1.027–1.037 | 2.0 µs | 1.006 | 1160 |
+| `star-lookup` | eager | 0.059 ms | 1.018 | 1.012–1.026 | 1.0 µs | 1.000 | 1161 |
+| `values-star` | streaming | 0.020 ms | 1.052 | 1.041–1.063 | 1.0 µs | 1.010 | 1160 |
+| `q-ef-256` | streaming | 0.57 ms | 1.006 | 1.001–1.009 | 3.2 µs | | 1162 |
+| `q-exact-true` | eager | 10.8 ms | 1.001 | 1.000–1.002 | 13 µs | | 1162 |
+| `q-ef-128` | eager | 0.22 ms | 1.006 | 1.003–1.010 | 1.3 µs | | 1074, 1162 |
+| `q-ef-128` | streaming | 0.23 ms | 1.007 | 1.002–1.012 | 1.6 µs | | 1074, 1162 |
+| `q-ef-64` | eager | 0.11 ms | 1.012 | 1.007–1.018 | 1.3 µs | | 1162 |
+| `q-ef-64` | streaming | 0.11 ms | 1.011 | 1.004–1.016 | 1.3 µs | | 1162 |
+| `q-ef-32` | eager | 0.071 ms | 1.009 | 1.006–1.020 | 0.65 µs | | 1162 |
+| `q-ef-32` | streaming | 0.075 ms | 1.013 | 1.008–1.022 | 0.99 µs | | 1162 |
+| `q-ef-16` | eager | 0.053 ms | 1.012 | 1.003–1.017 | 0.61 µs | | 1162 |
+| `q-ef-16` | streaming | 0.056 ms | 1.016 | 1.010–1.030 | 0.91 µs | | 1162 |
+
+The other confirmed queries read as noise by the Intel rule, with an interval that
+reaches 1.0 or a median added time of at most 0.5 µs, and `subquery-agg` reads 0.988
+eager and 0.996 streamed. The confirmation's wall times are curl's transfer times, which split between
+about 1 and 2 ms for many of the short queries, so their medians can move by a whole
+step between servers. Over that column, every vector query reads within 1.0006 of the
+base, and five synthetic queries read as real costs, which item 1161 holds beside their
+server time.
+
+| Query | Mode | Base wall | Tip/base | 95% interval | Added | Item |
+|---|---|--:|--:|---|--:|---|
+| `predicate-counts` | streaming | 1.78 ms | 1.160 | 1.028–1.359 | 285 µs | 1161 |
+| `distinct-join` | eager | 5.23 ms | 1.018 | 1.014–1.023 | 92 µs | 1161 |
+| `regex-iri` | streaming | 4.91 ms | 1.009 | 1.001–1.012 | 43 µs | 1161 |
+| `contains` | streaming | 3.75 ms | 1.007 | 1.0001–1.0121 | 26 µs | 1161 |
+| `contains` | eager | 3.70 ms | 1.005 | 1.004–1.013 | 20 µs | 1161 |
+
+Streamed `predicate-counts` reads as noise in server time and runs the same instructions
+as the base, and between 35% and 72% of the requests to each of its servers took the
+upper step, so its wall-time cost waits for a rerun that separates the step from the
+build.
+
+The [script rerun](runs/2026-11-20-leaf-cursors-scripts-rerun-forge-9df856f3/README.md)
+ran the text, geo and vector scripts again on forge with the same two binaries, in three
+rounds of A,B,B,A, B,A,A,B and A,B,B,A over one store per script, which gives six pairs
+per query. The ratios are of client wall time, which includes the start of a curl process
+per request, and a configuration is slower when every pair is above 1. Of the 88
+configurations, 80 read as noise, 5 as faster and 3 as slower, and every server returned
+the same answers. Two of the slower ones are real costs that item 1162 holds.
+
+| Script | Query | Mode | Threads | Base | Tip/base | Pairs | Same-binary spread | Item |
+|---|---|---|--:|--:|--:|---|--:|---|
+| geo | `q6-touching-counties` | eager | 1 | 1,937 ms | 1.012 | 1.000 to 1.019 | 0.8% | 1162 |
+| vector | `q-ef-64` | eager | 1 | 9.85 ms | 1.080 | 1.013 to 1.737 | 78% | 1162 |
+
+The wall times of eager `q-ef-64` with one thread are bimodal within a server, so its
+ratio is unsteady, and the confirmation above measured 1.2% more server time for it. The
+third slower configuration is streamed geo `q9-star` with 12 threads, which read 1.144
+pooled, with pairs from 1.002 to 1.504 and a same-binary spread of 13.9%.
+
+A [q9-star rerun](runs/2026-11-20-leaf-cursors-q9-star-forge-cde29b37/README.md) then
+timed that query alone on forge at 12 threads for three builds, which are the base
+bccc5f7b, main at 5f3f69c2 and the tip of item 829's first part at cde29b37 on that main.
+It ran six rounds in which the builds rotate through the positions, with 25 timed requests
+for each of 12 server processes per build and mode. Its ratios have a 95% bootstrap
+interval over server processes. The tip against main, item 829's own cost, reads 0.966
+streamed, with an interval of 0.944 to 0.991, and 1.006 eager, with an interval of 0.975 to
+1.044, so the item adds no cost to the query. The server without the spatial rewrites
+runs the same plan and reads 0.971 and 0.982.
+
+Main against the base reads 1.078 streamed, with an interval of 1.011 to 1.134 that
+excludes 1.0, so main's changes since bccc5f7b slow the streamed query, and item 1235
+investigates it. The requests of every build split between a fast mode under 22 ms and
+a slow mode of 26 to 30 ms. Streamed, 70 of the base's 300 requests take the fast mode
+against 22 of main's, and the base's servers differ from each other by up to 40.7%.
+Within the slow mode alone main reads 1.031 of the base, with an interval of 0.993 to
+1.080, so most of the difference is how often main's servers reach the fast mode. The
+run's CPU samples show no correlation between a server's median and its share of P
+cores, though with one indexed streamed server whose median is under 22 ms they cannot
+rule out placement of single requests, so the cause of the fast mode is open. The tip against the base reads 1.042
+streamed, with pairs from 0.834 to 1.376, and 0.997 eager.
+
+The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
+The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two
+variables, took 1.813 of the eager time, 9.58 ms against 5.28 ms, with an interval of
+1.807 to 1.815, and it runs 2.26 times the instructions of the base, which counted it
+eagerly in both modes. Item 1129 follows it, and until it lands a cursor runs the eager
+kernel for a count over a merge join on two or more variables, so streamed execution no
+longer takes the path measured here. The streamed count of
+`?a foaf:knows ?b FILTER(?a != ?b) ?b ex:worksFor ?o` took 0.151 of the eager time, 8.4 ms
+against 55.3 ms, and `two-hop-count`, which counts from key runs in both modes, read
+0.991. Automatic execution keeps both counts eager, item 1221 decides when it should
+stream the filtered one, and the record keeps the plans of both queries in each mode.
+
 ### Per-query floor cache
 
 The floor cache of item 1069, 3a8b7adb, whose workers share one table, was compared on

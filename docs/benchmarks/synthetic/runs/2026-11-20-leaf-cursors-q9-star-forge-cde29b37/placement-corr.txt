@@ -1,0 +1,4 @@
+streaming sparkles: n=36 r=-0.020 P share 0.44-0.65 median 0.53; fast arms (median under 22 ms) 1 with P share [0.54]
+streaming sparkles-plain: n=36 r=0.032 P share 0.44-0.66 median 0.54; fast arms (median under 22 ms) 0 with P share []
+eager sparkles: n=36 r=-0.113 P share 0.43-0.66 median 0.56; fast arms (median under 22 ms) 1 with P share [0.58]
+eager sparkles-plain: n=36 r=-0.031 P share 0.41-0.69 median 0.55; fast arms (median under 22 ms) 2 with P share [0.59, 0.57]

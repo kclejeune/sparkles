@@ -76,6 +76,20 @@ The rule of the Horn rules for a new universal no longer searches the context's 
 for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
 `ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
 item 1234 follows (item 693).
+### Cursor operators for searches, calls and counts
+
+The first part of roadmap item 829 runs text, hybrid, history, spatial and vector searches
+over their input, remote LATERAL loops, whole-input searches and algorithm calls, bounded
+leaves and `CountJoin` as cursor operators under explicit streaming, where they fell back
+to eager subtrees before. Automatic execution keeps its earlier choices for these kinds
+until a same-host A/B admits each one. A streamed count over a join that eager execution
+counts from its pairs holds one batch where eager holds every pair, and a count over a
+merge join on two or more variables still runs the eager kernel. The strict policy refuses
+the forms that remain without a resumable reader, which the second part of the item
+covers. On forge, the text, geo and vector scripts read within noise of the base except
+eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds, and
+streamed `q9-star` with 12 threads, which a rerun against the tip's merge base put at
+0.966.
 
 ### Targeted checks on a remote host
 

@@ -534,23 +534,26 @@ A change that a gate covers compares its own gate record with them using
 ### W3C suites under streaming execution
 
 `mise run test:w3c:streaming` ran the query evaluation suites with `execution=streaming`
-at commit fcff390a, whose engine code is that of 04d49b57. The suites came from the
-Apache Jena checkout that the tests read by default. Every suite passed with no new
-failures, and the debug test binary took 23 seconds on a busy development laptop.
+at commit 9df856f3, with `SPARKLES_W3C_FALLBACKS=1` so that the log names the operator of
+each fallback. The suites came from the Apache Jena checkout that `SPARKLES_W3C_DIR`
+named. Every suite passed with no new failures, and the debug test binary took 26 seconds
+on the development laptop.
 
 | Suite | Passed | Failed | Skipped | Queries with eager fallback |
 |---|--:|--:|--:|--:|
 | SPARQL 1.0 and 1.1 query | 508 | 0 | 103 | 0 |
 | SPARQL 1.2 | 63 | 0 | 206 | 0 |
-| Jena's CDT, FOLD and UNFOLD tests | 655 | 0 | 0 | 30 |
+| Jena's CDT, FOLD and UNFOLD tests | 655 | 0 | 0 | 0 |
 | ARQ property functions | 48 | 0 | 0 | 24 |
 
 The skipped tests are syntax and update tests, which do not depend on the execution mode
 and run in the default pass. The fallback counts are the queries whose plans hold an
 operator that the cursors do not stream, which then runs eagerly on first demand. These
-counts are the measure that the executor merge drives to zero. The
-[run record](runs/2026-11-01-w3c-streaming-stanley/record.json) and its
-[log](runs/2026-11-01-w3c-streaming-stanley/output.log) hold the counts. `mise run test`
+counts are the measure that the executor merge drives to zero. The 24 fallbacks of the
+property-function suite are calls over constant arguments, which the strict policy
+refuses until they get a reader of their own. The
+[run record](runs/2026-11-18-w3c-streaming-stanley/record.json) and its
+[log](runs/2026-11-18-w3c-streaming-stanley/output.log) hold the counts. `mise run test`
 runs the same tests in CI with Oxigraph's GeoSPARQL tests added. A separate run with the
 `geo` feature gave 37 passes and the 7 listed failures of those tests in both modes, with
 no eager fallback. The streaming tests

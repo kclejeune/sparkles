@@ -578,7 +578,33 @@ pub fn spatial_scan(
 // -------------------------------------------------------------------- SpatialPf --
 
 /// Distinct bindings of a call's variable arguments, each one search.
-const MAX_ARGUMENT_BINDINGS: usize = 100_000;
+pub const MAX_ARGUMENT_BINDINGS: usize = 100_000;
+
+/// The values of the deferred arguments `slots` in each row of `input`, as a call over
+/// its group searches them, or `None` for a row that leaves an argument unbound.
+pub fn argument_key<'a>(
+    slots: &'a [PathEnd],
+    input: &'a Table,
+) -> impl Fn(usize) -> Option<Vec<Id>> + 'a {
+    let cols: Vec<Option<usize>> = slots
+        .iter()
+        .map(|s| match s {
+            PathEnd::Var(v) => input.col_of(*v),
+            PathEnd::Const(_) => None,
+        })
+        .collect();
+    move |r| {
+        slots
+            .iter()
+            .zip(&cols)
+            .map(|(s, c)| match (s, c) {
+                (PathEnd::Const(id), _) => Some(*id),
+                (PathEnd::Var(_), Some(c)) => Some(input.get(r, *c)).filter(|id| *id != Id::UNDEF),
+                (PathEnd::Var(_), None) => None,
+            })
+            .collect()
+    }
+}
 
 /// A `spatial:` property function: a search leaf, or with `input` (the rest of its
 /// group, binding its variable arguments) one search per distinct binding of the
@@ -596,30 +622,15 @@ pub fn spatial_pf(
     let (Some(slots), Some(inp)) = (spec.deferred.as_deref(), input) else {
         return spatial_pf_once(ctx, spec, vars);
     };
-    let cols: Vec<Option<usize>> = slots
-        .iter()
-        .map(|s| match s {
-            PathEnd::Var(v) => inp.col_of(*v),
-            PathEnd::Const(_) => None,
-        })
-        .collect();
     // input rows by the values of the arguments, in the order they first appear
     let mut groups: FxHashMap<Vec<Id>, Vec<usize>> = FxHashMap::default();
     let mut order: Vec<Vec<Id>> = Vec::new();
-    'rows: for r in 0..inp.len() {
-        let mut key = Vec::with_capacity(slots.len());
-        for (s, c) in slots.iter().zip(&cols) {
-            let id = match (s, c) {
-                (PathEnd::Const(id), _) => *id,
-                (PathEnd::Var(_), Some(c)) => inp.get(r, *c),
-                (PathEnd::Var(_), None) => Id::UNDEF,
-            };
-            if id == Id::UNDEF {
-                // an unbound argument: no search, no match
-                continue 'rows;
-            }
-            key.push(id);
-        }
+    let argument_key = argument_key(slots, &inp);
+    for r in 0..inp.len() {
+        let Some(key) = argument_key(r) else {
+            // an unbound argument: no search, no match
+            continue;
+        };
         groups
             .entry(key)
             .or_insert_with_key(|k| {

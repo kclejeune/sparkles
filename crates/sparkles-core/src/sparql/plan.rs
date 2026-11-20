@@ -426,10 +426,12 @@ pub enum Kind {
         aggs: Vec<(VarId, Agg)>,
     },
     /// `COUNT(*)` over a single scan answered from index metadata
-    /// `COUNT(*)` over a join: counts matching pairs without materializing them
+    /// `COUNT(*)` over a join: counts matching pairs without materializing them. `keys`
+    /// are the join's, so that a cursor can run the join itself and count its rows.
     CountJoin {
         algo: JoinAlgo,
         var: VarId,
+        keys: Vec<VarId>,
     },
     /// `GROUP BY ?k` + `COUNT` over a single scan sorted on ?k: counts runs in the index
     /// blocks without materializing the scan (QLever `computeGroupByObjectWithCount`)
@@ -4064,7 +4066,7 @@ impl<'a> VarSet<'a> {
     }
 }
 
-fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Node {
+pub(super) fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Node {
     let (est, star) = join_est_with(&a, &b, &keys, ctx);
     let vars = union_vars(&a.vars, &b.vars);
     let certain = union_vars(&a.certain, &b.certain);
@@ -5406,7 +5408,10 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
         && matches!(aggs[0].1.func, AggregateFunction::Count)
         && aggs[0].1.expr.is_none()
         && !aggs[0].1.distinct
-        && let Kind::Join { algo, .. } = &child.kind
+        && let Kind::Join {
+            algo,
+            keys: join_keys,
+        } = &child.kind
         && *algo != JoinAlgo::Cross
     {
         let var = aggs[0].0;
@@ -5414,6 +5419,7 @@ fn group(child: Node, keys: Vec<VarId>, aggs: Vec<(VarId, Agg)>, ctx: &Ctx) -> N
             kind: Kind::CountJoin {
                 algo: algo.clone(),
                 var,
+                keys: join_keys.clone(),
             },
             vars: vec![var],
             certain: vec![var],

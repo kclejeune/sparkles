@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# stage.sh NAME ROUNDS REPS EXECUTION RAYON  (after grouping-826-ab/stage.sh)
+# Stages one nsc-bench-remote.sh cell of the 31-query matrix: base bccc5f7b against the
+# item 829 part-1 tip (engine code of 9df856f3), for forge over ssh.
+set -euo pipefail
+ROOT=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/leaf-cursors-829
+L=$(cd "$(dirname "$0")" && pwd); AB=$L/../ab/bin
+C=$HOME/.cache/sparkles-nsc
+N=$1 ROUNDS=$2 REPS=$3 EXECUTION=$4 RAYON=$5 PEOPLE=100000
+OUT=$L/$N; S=$OUT/stage
+rm -rf "$OUT"; mkdir -p "$S/queries"
+M=$OUT/manifest.txt; : > "$M"
+declare -A BIN=([A]=$AB/base-bccc5f7b [B]=$AB/tip-9df856f3) REV=([A]=bccc5f7b [B]="9df856f3 (engine code of the part-1 tip)")
+for v in A B; do
+  bin=${BIN[$v]}
+  echo "$v: commit ${REV[$v]}, release build on stanley (mbx build --release -p sparkles-server --bin sparkles)" >> "$M"
+  echo "$v sha256: $(sha256sum "$bin" | cut -d' ' -f1)" >> "$M"
+  echo "DYNAMIC_$v=0" >> "$S/run.env"
+  [ -f "$L/bin-$v.zst" ] || zstd -q -T0 -3 -f "$bin" -o "$L/bin-$v.zst"
+  ln -f "$L/bin-$v.zst" "$S/bin-$v.zst"
+done
+ln -f "$C/data/people-$PEOPLE.nt.zst" "$S/data.nt.zst" 2>/dev/null || cp "$C/data/people-$PEOPLE.nt.zst" "$S/data.nt.zst"
+echo "data: $PEOPLE people (scripts/gen-data.py)" >> "$M"
+P=$(sed -n "s/^P='\(.*\)'$/\1/p" "$ROOT/scripts/bench.sh")
+while IFS=$'\t' read -r n q; do printf '%s%s' "$P" "$q" > "$S/queries/$n.rq"; done < <(sed -n "s/^add \([a-z0-9-]*\) '\(.*\)'$/\1\t\2/p" "$ROOT/scripts/bench.sh")
+cp "$ROOT/scripts/nsc-bench-remote.sh" "$S/"
+cat >> "$S/run.env" <<ENV
+ROUNDS=$ROUNDS
+REPS=$REPS
+WARMUP=3
+RAYON_THREADS=$RAYON
+SERVER_CPU=${SERVER_CPU:-2}
+CLIENT_CPU=${CLIENT_CPU:-4}
+SPIN=${SPIN:-1}
+SERVE_ARGS=""
+EXECUTION=$EXECUTION
+PORT=41941
+PREPARE_A=""
+PREPARE_B=""
+PREPARE_REPEAT=""
+PREPARE_REPS=5
+ENV
+echo "host: forge (ssh, nsc-bench-remote.sh run directly)" >> "$M"
+echo "settings: $(ls $S/queries | wc -l) queries, $ROUNDS rounds of A,B,B,A, 3 warm-up and $REPS timed requests per query and server, RAYON_NUM_THREADS=$RAYON, server CPU ${SERVER_CPU:-2}, client CPU ${CLIENT_CPU:-4}, spinners $([ "${SPIN:-1}" = 1 ] && echo on || echo off), execution $EXECUTION" >> "$M"

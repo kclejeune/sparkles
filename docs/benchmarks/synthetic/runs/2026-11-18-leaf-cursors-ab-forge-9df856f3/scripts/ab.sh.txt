@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Item 829 part 1 A/B on atlas: base bccc5f7b against the part-1 tip over the PLAN's three
+# scripts, in eager and streaming execution, at 12 threads and 1, both builds on this host.
+#
+#   ab.sh BASE_BIN TIP_BIN OUT_DIR
+#
+# Run under `flock ~/lanes/.heavy.lock` as a named systemd user unit, with no other heavy
+# work on the host. The arms alternate per configuration (base, tip, tip, base) so drift
+# does not favour one build. Each run keeps its own work directory, so its answer
+# fingerprints (text-answers.json, geo-answers.json, fingerprint.json) can be compared
+# across builds and modes; a disagreement invalidates that configuration's timings.
+# The checkout this runs from supplies the scripts, which must carry EXECUTION.
+# AB-DONE in OUT_DIR marks the end; each step logs to OUT_DIR/<step>.log with rc=N.
+set -uo pipefail
+BASE=${1:?base binary} TIP=${2:?tip binary} OUT=${3:?output dir}
+ROOT=$(cd "$(dirname "$0")/../../../.." && pwd)
+mkdir -p "$OUT"
+: "${TEXT_N:=100000}" "${GEO_N:=100000}" "${VEC_N:=100000}" "${VEC_DIM:=384}"
+step() {
+  local name=$1; shift
+  echo "== $(date -Is) $name" >> "$OUT/steps.log"
+  "$@" > "$OUT/$name.log" 2>&1
+  echo "rc=$?" >> "$OUT/$name.log"
+}
+# One work directory per script holds the data and the loaded store, which no change in
+# this range touches; every run after the first reuses it (SKIP_LOAD=1), starts from an
+# empty results directory and keeps a copy of its results under OUT/results/<run>.
+loaded=()
+run() {
+  local script=$1 tag=$2; shift 2
+  local work=$OUT/work/$script skip=
+  [[ " ${loaded[*]} " == *" $script "* ]] && skip=1
+  rm -rf "$work/results" "$work"/*/results
+  step "$script-$tag" env SKIP_LOAD=$skip "$@"
+  loaded+=("$script")
+  mkdir -p "$OUT/results/$script-$tag"
+  find "$work" -path '*/results/*' -type f -exec cp {} "$OUT/results/$script-$tag/" \;
+}
+for threads in 12 1; do
+  for mode in eager streaming; do
+    for arm in base tip tip2 base2; do
+      bin=$BASE
+      case $arm in tip*) bin=$TIP ;; esac
+      tag=$arm-$mode-t$threads
+      export RAYON_NUM_THREADS=$threads EXECUTION=$mode SPARKLES=$bin
+      run text "$tag" ENGINES=sparkles "$ROOT/scripts/bench-text.sh" "$TEXT_N" "$OUT/work/text"
+      run geo "$tag" "$ROOT/scripts/bench-geo.sh" "$GEO_N" "$OUT/work/geo"
+      run vector "$tag" "$ROOT/scripts/bench-vector.sh" "$VEC_N" "$VEC_DIM" "$OUT/work/vector"
+    done
+  done
+done
+date -Is > "$OUT/AB-DONE"
