@@ -1073,8 +1073,11 @@ impl Roles {
     /// links only with the forward links that are not such compositions, and the
     /// transitive closure of a role is derived once for each link that ends in a link
     /// the axioms give, rather than once for each intermediate context.
-    /// The answer is the bytes of the tables it adds.
-    pub fn finish_chains(&mut self) -> usize {
+    /// `grow` takes the bytes of the tables it adds before it adds them.
+    pub fn finish_chains<E>(
+        &mut self,
+        mut grow: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
         let n = self.sup.len();
         let mut linear = vec![false; n];
         // a switch for measurements, which composes every pair as before
@@ -1130,28 +1133,25 @@ impl Roles {
             linear[t as usize] = uniform && covered;
         }
         self.linear = linear;
-        // a pair whose source takes nothing has no entry
-        let comp_fwd = self
-            .comp
-            .iter()
-            .filter_map(|(&(r1, r2), v)| {
-                let kept: Vec<Role> = v
-                    .iter()
-                    .flat_map(|&t| {
-                        let fwd = self.keeps_composed(r1, r2, t).then_some(t);
-                        let bottom = self.is_empty_role(t).then_some(NO_ROLE);
-                        fwd.into_iter().chain(bottom)
-                    })
-                    .collect();
-                (!kept.is_empty()).then_some(((r1, r2), kept))
-            })
-            .collect();
+        grow(n)?;
+        // a pair whose source takes nothing has no entry, and each entry is charged
+        // before it is made
+        let mut comp_fwd: FxHashMap<(Role, Role), Vec<Role>> = FxHashMap::default();
+        for (&(r1, r2), v) in &self.comp {
+            let products = |t: Role| {
+                let fwd = self.keeps_composed(r1, r2, t).then_some(t);
+                let bottom = self.is_empty_role(t).then_some(NO_ROLE);
+                fwd.into_iter().chain(bottom)
+            };
+            let len = v.iter().map(|&t| products(t).count()).sum::<usize>();
+            if len == 0 {
+                continue;
+            }
+            grow(40 + len * 4)?;
+            comp_fwd.insert((r1, r2), v.iter().flat_map(|&t| products(t)).collect());
+        }
         self.comp_fwd = comp_fwd;
-        self.comp_fwd
-            .values()
-            .map(|v| 40 + v.capacity() * 4)
-            .sum::<usize>()
-            + self.linear.len()
+        Ok(())
     }
 
     /// Whether the source of a link by `t` that a chain composes from links by `r1` and
@@ -2852,7 +2852,7 @@ fn horn_index(
         ix.roles.right = sel.right;
         // the selection keeps some of the chains, so its table is no larger than the
         // one the role table's build charged
-        let _ = ix.roles.finish_chains();
+        let _ = ix.roles.finish_chains(|_| Ok::<(), ()>(()));
     }
     dead.sort_unstable();
     dead.dedup();
@@ -3445,7 +3445,7 @@ fn roles(
     }
     roles.any_empty = roles.empty.contains(&true);
     // the products of the chains read the empty roles
-    grow(roles.finish_chains())?;
+    roles.finish_chains(grow)?;
     Ok(roles)
 }
 
