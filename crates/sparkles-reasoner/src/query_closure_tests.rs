@@ -84,23 +84,36 @@ fn demand(s: &str, p: &str, o: &str) -> Demand {
     }
 }
 
-/// The facts a session returned, written out, with how many it returned in all.
-fn returned(session: &Session) -> (BTreeSet<String>, usize) {
+fn show(session: &Session, t: &[u64; 3]) -> String {
     let show = |x: u64| {
         session
             .terms
             .term(x)
             .map_or_else(|| format!("#{x}"), |t| t.to_string())
     };
+    format!("{} {} {}", show(t[0]), show(t[1]), show(t[2]))
+}
+
+/// The live facts of a session's derived tier without its magic facts, written out,
+/// those RDF cannot state included, with the facts it returned and how many it returned
+/// in all.
+fn returned(session: &Session) -> (BTreeSet<String>, BTreeSet<String>, usize) {
+    let g = session.graph().unwrap();
+    let live: BTreeSet<String> = g
+        .facts()
+        .enumerate()
+        .filter(|(i, t)| g.alive(g.offset() + *i as u32) && !session.hidden.contains(&t[1]))
+        .map(|(_, t)| show(session, &t))
+        .collect();
     let mut n = 0;
     let mut out = BTreeSet::new();
     for c in &session.chunks {
         for t in c.iter() {
             n += 1;
-            out.insert(format!("{} {} {}", show(t[0]), show(t[1]), show(t[2])));
+            out.insert(show(session, t));
         }
     }
-    (out, n)
+    (live, out, n)
 }
 
 /// The derived facts of a materialization that match `d`, written out.
@@ -133,10 +146,11 @@ fn compare(ttl: &str, profile: &Profile, demands: &[Demand]) -> (Stats, Session)
     assert!(!with.compact && !without.compact, "{ttl}");
     assert!(!with.cached_equality && !without.cached_equality);
     assert_eq!(without.closure_stats, Stats::default());
-    let (w, wn) = returned(&with);
-    let (wo, won) = returned(&without);
-    assert_eq!(wn, w.len(), "a fact returned twice\n{ttl}");
-    assert_eq!(won, wo.len());
+    let (w, wout, wn) = returned(&with);
+    let (wo, woout, won) = returned(&without);
+    assert_eq!(wn, wout.len(), "a fact returned twice\n{ttl}");
+    assert_eq!(won, woout.len());
+    assert_eq!(wout, woout, "{ttl}");
     if w != wo {
         let extra: Vec<_> = w.difference(&wo).take(10).collect();
         let missing: Vec<_> = wo.difference(&w).take(10).collect();
@@ -321,8 +335,30 @@ fn reversed_walks_give_filtered_rules_back_at_literals() {
     let ttl = "ex:a ex:p \"01\"^^xsd:integer . ex:a ex:val \"1\"^^xsd:integer . ex:b ex:p ex:a .";
     let one = "\"01\"^^http://www.w3.org/2001/XMLSchema#integer";
     let (_, with) = compare(ttl, &profile, &[demand("?", "ex:p", one)]);
-    let (facts, _) = returned(&with);
-    assert!(!facts.iter().any(|f| f.starts_with("\"1\"")), "{facts:#?}");
+    let (facts, _, _) = returned(&with);
+    // the literal subject is derived, and the pair of equal values is not
+    assert!(facts.iter().any(|f| f.starts_with("\"1\"")), "{facts:#?}");
+    let zero_one = "\"01\"^^<http://www.w3.org/2001/XMLSchema#integer>";
+    assert!(
+        !facts
+            .iter()
+            .any(|f| f.starts_with("\"1\"") && f.ends_with(zero_one)),
+        "{facts:#?}"
+    );
+}
+
+/// A guarded rule whose guard admits `rdf:rest` gives its copies back to the joins, which
+/// close it, since the operators of a demand program never close list predicates.
+#[test]
+fn guarded_copies_give_list_predicates_back() {
+    let profile = rules("[t: (?p ex:kind ex:Trans), (?x ?p ?y), (?y ?p ?z) -> (?x ?p ?z)]");
+    let ttl = "rdf:rest ex:kind ex:Trans . ex:a rdf:rest ex:b . ex:b rdf:rest ex:c .
+        ex:h ex:kind ex:Trans . ex:a ex:h ex:b . ex:b ex:h ex:c .";
+    let (_, with) = compare(ttl, &profile, &[demand("ex:a", "?", "?")]);
+    let (facts, _, _) = returned(&with);
+    let rest =
+        "<http://ex.org/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://ex.org/c>";
+    assert!(facts.contains(rest), "{facts:#?}");
 }
 
 /// A run that derives a list cell that its rules read after an operator emitted starts

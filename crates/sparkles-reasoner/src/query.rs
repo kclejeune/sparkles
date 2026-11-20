@@ -992,14 +992,19 @@ impl Session {
                         && e.is::<crate::closure::Restart>() =>
                 {
                     tracing::debug!(target: "sparkles_reasoner::demand", "{e}");
-                    let rows: Vec<Triple> = (entry..g.len())
-                        .filter(|&i| g.alive(i))
-                        .map(|i| g.triple(i))
-                        .collect();
-                    for t in &rows {
-                        g.kill(t).map_err(|e| memory_error(e, what))?;
+                    // one row at a time, so that nothing beside the dead bits is held,
+                    // polling the query's stop meanwhile
+                    for i in entry..g.len() {
+                        if i % 4096 == 0 {
+                            (self.stop)()?;
+                        }
+                        if !g.alive(i) {
+                            continue;
+                        }
+                        let t = g.triple(i);
+                        g.kill(&t).map_err(|e| memory_error(e, what))?;
+                        killed += !self.hidden.contains(&t[1]) as usize;
                     }
-                    killed += rows.iter().filter(|t| !self.hidden.contains(&t[1])).count();
                     limits.closures = false;
                     limits.magic = None;
                     restarted = true;

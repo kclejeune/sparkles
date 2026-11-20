@@ -290,7 +290,8 @@ struct Op {
     /// the atoms of an adorned copy whose terms are all constants (the guard of a
     /// `prp-trp` copy for one predicate), which must hold for it to derive anything
     conds: Vec<Triple>,
-    /// in a demand program, `rdf:first` and `rdf:rest`, which the operator never closes
+    /// in a demand program, `rdf:first` and `rdf:rest`, which the operator never closes:
+    /// a guarded operator that meets either gives its rule back
     lists: Option<[u64; 2]>,
 }
 
@@ -755,9 +756,6 @@ impl Closures {
             };
             // the predicates and their charge, kept while they are read
             let (mut preds, _preds_held) = op.predicates(g, now, budget, &mut poll)?;
-            if let Some(ids) = op.lists {
-                preds.retain(|q| !ids.contains(q));
-            }
             if let (Some(s), Some(f)) = (&op.seeded, &seeds)
                 && s.p_at.is_some()
             {
@@ -775,7 +773,12 @@ impl Closures {
             let before = g.len();
             let mut done: Vec<u64> = Vec::new();
             let mut total = 0usize;
-            let mut back = false;
+            // in a demand program an operator never closes `rdf:first` or `rdf:rest`: a
+            // guarded one whose guard admits either gives its rule back, so that joins
+            // derive their facts, before it merges a pair
+            let mut back = op
+                .lists
+                .is_some_and(|ids| preds.iter().any(|q| ids.contains(q)));
             // a guarded operator with a `notEqual` filter gives its rules back when any of
             // its predicates has a literal subject, before it merges a pair of any of
             // them, as it did when it held every pair until the step was done
