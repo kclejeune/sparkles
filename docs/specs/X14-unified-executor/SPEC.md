@@ -1175,6 +1175,15 @@ streamed count meets, and the merge removes that difference. A count can refuse 
 limit equal to the work that its own run reported, in both modes, and
 [item 1103](../../ROADMAP.md) makes the two counts agree.
 
+A count over a merge join on two or more shared variables runs the eager kernel under a
+cursor instead, as a whole-input operator under either policy, because the streamed join
+writes every pair into its batches and took 1.81 times the eager count on forge. The
+operator reads both inputs under the memory budget and counts once, so it holds both
+inputs and the pair indices where the streamed join held one batch of pairs, and an eager
+run of such a count that exceeds the memory budget with spill on retries into the same
+kernel. [Item 1129](../../ROADMAP.md) counts that join in the cursor without writing its
+pairs and then streams it again.
+
 The ignored test `measure_whole_input_and_leaf_forms` in `query_cursor.rs` measured the
 peak memory and the best of five times of each form on 200,000 subjects in a release
 build on the development laptop, which is not a benchmark host. A path search under a
@@ -1193,7 +1202,9 @@ its base, bccc5f7b, in twelve rounds of A,B,B,A in both orders, and the tip's ea
 streamed counts with each other in the same way. The streamed count on two shared
 variables took 1.81 times the eager count, 9.58 ms against 5.28 ms, and runs 2.26 times
 the instructions per request on stanley, since the cursor writes the merge join's pairs
-into batches that the eager count holds as indices, and item 1129 removes that cost. The
+into batches that the eager count holds as indices, and item 1129 removes that cost.
+Explicit streaming has since run the eager kernel for that shape, as the paragraph above
+says. The
 streamed count over a filtered scan took 0.15 of the eager time, 8.4 ms against 55.3 ms,
 and automatic execution keeps both counts eager. Against the base, streamed queries that
 run 0.6% to 1.9% more instructions are 1.3% to 5.2% slower, which item 1160 holds, and

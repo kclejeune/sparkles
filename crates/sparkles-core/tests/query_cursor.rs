@@ -3596,6 +3596,11 @@ fn count_join_counts_a_streamed_join() {
             "SELECT (COUNT(*) AS ?n) WHERE { { ?a <urn:q> ?b BIND(?a AS ?s) BIND(?b AS ?t) } ?s <urn:w> ?t }".to_string(),
             true,
         ),
+        // a merge join on two variables, which the eager kernel counts (item 1129)
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?s <urn:w> ?t }".to_string(),
+            true,
+        ),
         // a key that some rows leave unbound
         (
             format!(
@@ -3691,6 +3696,77 @@ fn count_join_counts_a_streamed_join() {
                     "{q}; batch {batch}, max_rows {rows:?}, max_rows_produced {limit:?} (produced {produced}, count {count})"
                 );
             }
+        }
+    }
+}
+
+/// A count over a merge join on two variables runs its eager kernel as a whole-input
+/// operator under either policy, with no join operator below it, because the streamed
+/// join costs 1.8 times the eager count (item 1129). It gives the eager answer.
+#[test]
+fn a_count_over_a_two_variable_merge_join_runs_the_eager_kernel() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            let o = (i * 7) % 60;
+            let mut t = format!("<urn:s:{i}> <urn:q> <urn:s:{o}> .\n");
+            if i % 3 == 0 {
+                t += &format!("<urn:s:{i}> <urn:w> <urn:s:{o}> .\n");
+            }
+            t + &format!("<urn:s:{i}> <urn:w> <urn:z:{i}> .\n")
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn ops(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<String>) {
+        out.push(plan.operator.operator.clone());
+        for child in &plan.children {
+            ops(child, out);
+        }
+    }
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?s <urn:w> ?t }";
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        expected,
+        vec![vec![Some(Term::Literal(
+            oxrdf::Literal::new_typed_literal("20", oxrdf::vocab::xsd::INTEGER)
+        ))]]
+    );
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 2, 3, 4096] {
+            let opts = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &opts).unwrap();
+            let mut names = Vec::new();
+            ops(c.plan(), &mut names);
+            assert!(
+                !c.plan().has_materialization(),
+                "{fallback:?}: {:?}",
+                c.plan()
+            );
+            assert!(
+                names.iter().any(|n| n == "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.ends_with("Join") && n != "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            assert_eq!(all(c), expected, "{fallback:?}; {rows}");
         }
     }
 }

@@ -2888,7 +2888,9 @@ impl Operator {
         ctx.check()?;
         // A count over a join runs the join and counts its rows.
         let count_join = matches!(node.kind, Kind::CountJoin { .. });
-        let count_pairs = countjoin::eager_checks_pairs(&node);
+        // A count whose eager kernel runs holds no join below it (see `whole`).
+        let count_pairs =
+            countjoin::eager_checks_pairs(&node).filter(|_| !countjoin::eager_kernel(&node));
         let mut node = countjoin::rewrite(ctx, node);
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.

@@ -26,13 +26,32 @@ pub(super) fn eager_checks_pairs(node: &Node) -> Option<bool> {
     Some(!(*algo == crate::sparql::plan::JoinAlgo::Merge && shared == 1))
 }
 
+/// Whether a cursor runs the eager kernel of a `CountJoin` node as a whole-input
+/// operator instead of the join and its count. It does so for a merge join on two or
+/// more shared variables, which the eager kernel counts from pair indices, while the
+/// join below a streamed count writes every pair into its batches and costs 1.8 times
+/// the eager time on forge (item 1129). The operator reads both inputs whole under the
+/// memory budget and forms all pair indices at once, where the streamed join held one
+/// batch of pairs, so this shape takes more memory under a cursor until item 1129 makes
+/// the streamed join as cheap.
+pub(super) fn eager_kernel(node: &Node) -> bool {
+    let Kind::CountJoin { algo, .. } = &node.kind else {
+        return false;
+    };
+    let [left, right] = &node.children[..] else {
+        return false;
+    };
+    let shared = right.vars.iter().filter(|v| left.vars.contains(v)).count();
+    *algo == crate::sparql::plan::JoinAlgo::Merge && shared >= 2
+}
+
 /// The grouping and join that answer a `CountJoin` node, or the node itself when it is
-/// not one.
+/// not one or when its eager kernel runs (`eager_kernel`).
 pub(super) fn rewrite(ctx: &Ctx, node: Node) -> Node {
     let Kind::CountJoin { algo, var, keys } = &node.kind else {
         return node;
     };
-    if node.children.len() != 2 {
+    if node.children.len() != 2 || eager_kernel(&node) {
         return node;
     }
     let (algo, var, keys) = (algo.clone(), *var, keys.clone());

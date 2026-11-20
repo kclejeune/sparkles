@@ -900,11 +900,13 @@ The same confirmation compared the tip's eager and streamed `CountJoin` in both 
 The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two
 variables, took 1.813 of the eager time, 9.58 ms against 5.28 ms, with an interval of
 1.807 to 1.815, and it runs 2.26 times the instructions of the base, which counted it
-eagerly in both modes. Item 1129 follows it. The streamed count of
+eagerly in both modes. Item 1129 follows it, and until it lands a cursor runs the eager
+kernel for a count over a merge join on two or more variables, so streamed execution no
+longer takes the path measured here. The streamed count of
 `?a foaf:knows ?b FILTER(?a != ?b) ?b ex:worksFor ?o` took 0.151 of the eager time, 8.4 ms
 against 55.3 ms, and `two-hop-count`, which counts from key runs in both modes, read
-0.991. Automatic execution keeps both counts eager, and the record keeps the plans of
-both queries in each mode.
+0.991. Automatic execution keeps both counts eager, item 1221 decides when it should
+stream the filtered one, and the record keeps the plans of both queries in each mode.
 
 ### Per-query floor cache
 

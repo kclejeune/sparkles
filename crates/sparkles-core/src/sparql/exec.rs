@@ -4521,7 +4521,7 @@ fn merge_expand(
 }
 
 /// Number of join results; merge joins on a single exact key count run products.
-fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
+pub(super) fn join_count(ctx: &Ctx, l: &Table, r: &Table, merge: bool) -> Result<u64> {
     let lay = layout(l, r);
     if merge && lay.shared.len() == 1 {
         let (lk, rk) = lay.shared[0];

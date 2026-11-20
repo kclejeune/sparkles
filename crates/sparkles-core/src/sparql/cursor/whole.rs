@@ -2,7 +2,8 @@
 //! bounded: a vector or hybrid search that ranks the candidate subjects of its whole
 //! input against its global `k` or limit, a path search over its group under a limit,
 //! which takes its paths in one order across all of its sources, and an algorithm call
-//! over its group, which runs once from all of its sources. A path search under a limit
+//! over its group, which runs once from all of its sources, and a count over a merge
+//! join on two or more variables, whose one row the eager kernel counts (item 1129). A path search under a limit
 //! or an algorithm call whose edges come from a nested pattern reads that pattern whole
 //! in the same way, also when its sources are constants.
 //!
@@ -32,6 +33,8 @@ pub(super) fn eligible(node: &Node) -> bool {
         Kind::PathSearch(spec) => !node.children.is_empty() && spec.limit.is_some(),
         // Decision 2 of the X14 plan counts an algorithm call as bounded.
         Kind::AlgoCall(_) => !node.children.is_empty(),
+        // A count over a merge join on two or more variables has one row.
+        Kind::CountJoin { .. } => super::countjoin::eager_kernel(node),
         _ => false,
     }
 }
@@ -108,7 +111,13 @@ impl Whole {
         if self.counters.is_none() {
             let mut inputs = Vec::with_capacity(children.len());
             for child in children.iter_mut() {
-                inputs.push(read(ctx, child, options)?);
+                let mut input = read(ctx, child, options)?;
+                // The count merges its inputs when they are sorted on a shared key, as
+                // the eager tables say they are.
+                if matches!(self.node.kind, Kind::CountJoin { .. }) {
+                    input.table.sorted = child.order.clone();
+                }
+                inputs.push(input);
             }
             let mut answer = self.run(ctx, &mut inputs)?;
             drop(inputs);
@@ -174,6 +183,21 @@ impl Whole {
                 let input = group.then(|| take(0));
                 let (t, c) = crate::sparql::algosvc::run(ctx, spec, input, edges, vars)?;
                 (t.table, c, t.lease)
+            }
+            Kind::CountJoin { algo, var, .. } => {
+                let (l, r) = (take(0), take(1));
+                let c = match l.is_empty() || r.is_empty() {
+                    true => 0,
+                    false => crate::sparql::exec::join_count(
+                        ctx,
+                        &l,
+                        &r,
+                        *algo == crate::sparql::plan::JoinAlgo::Merge,
+                    )?,
+                };
+                let mut t = Table::new(vec![*var]);
+                t.push_row(&[crate::id::Id::from_i64(c as i64).unwrap_or(crate::id::Id::UNDEF)]);
+                (t, serde_json::Map::new(), None)
             }
             _ => unreachable!("{} is not a whole-input operator", self.node.operator()),
         };
