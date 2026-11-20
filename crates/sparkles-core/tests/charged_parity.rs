@@ -1,18 +1,20 @@
 //! Budget parity of the operators moved onto charged buffers (item 1183). Each fixture
-//! runs one streamed query at every budget of a range and must fit every budget that it
-//! fitted before the move, within the slack its row states, with the same answer.
+//! runs one streamed query at every budget of a sweep and must fit every budget that it
+//! fitted before the move, with the answer it gave before.
 //!
-//! The budgets the operator fitted before the move are pinned as the smallest fit of
-//! each fixture, read from the operator as it was. `PARITY_PRINT=1` prints the budgets
-//! each fixture fits now, which is how the pinned values were read.
+//! Each fixture pins the budgets of its sweep that the operator fitted before the move
+//! and the ones it fits now and did not before, so a budget that changes either way
+//! fails, and the answer the operator gave before, as a row count and a digest of the
+//! rows. `PARITY_PRINT=1` prints the budgets each fixture fits and its answer, which is
+//! how the pinned values were read from the operator as it was, at commit 74f229b9.
+//! `PARITY_ONLY=name` runs the fixtures whose names contain `name`.
 
 mod common;
 
-use common::heap;
 use oxrdfio::RdfFormat;
 use sparkles_core::Error;
 use sparkles_core::io::Source;
-use sparkles_core::sparql::{CursorOptions, QueryOptions, select_cursor};
+use sparkles_core::sparql::{CursorOptions, CursorPlan, QueryOptions, select_cursor};
 use sparkles_core::spill::{Spill, SpillOptions};
 use sparkles_core::store::{Store, StoreOptions};
 use std::hash::{BuildHasher, Hash, Hasher};
@@ -51,10 +53,37 @@ struct Fixture {
     spill: bool,
     /// The budgets swept: from, to and step.
     range: (u64, u64, u64),
-    /// The smallest budget the operator fitted before the move.
-    before: u64,
-    /// How far above a budget it fitted before the move may need now.
-    slack: u64,
+    /// The budgets of the sweep the operator fitted before the move, as ranges from and
+    /// to inclusive.
+    before: &'static [(u64, u64)],
+    /// The budgets it fits now and did not before.
+    gained: &'static [(u64, u64)],
+    /// The rows and their digest before the move.
+    answer: (usize, u64),
+    /// Whether the query orders its rows, which makes the digest follow their order.
+    ordered: bool,
+    /// Whether the DISTINCT numbers its rows below an ORDER BY.
+    numbered: bool,
+    /// Whether a budget of the sweep makes the DISTINCT spill.
+    spills: bool,
+}
+
+fn within(ranges: &[(u64, u64)], budget: u64) -> bool {
+    ranges
+        .iter()
+        .any(|&(from, to)| (from..=to).contains(&budget))
+}
+
+/// The budgets of a sweep in `fits` as ranges from and to inclusive.
+fn ranges(fits: &[u64], step: u64) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = Vec::new();
+    for &b in fits {
+        match out.last_mut() {
+            Some((_, to)) if *to + step == b => *to = b,
+            _ => out.push((b, b)),
+        }
+    }
+    out
 }
 
 const FIXTURES: &[Fixture] = &[
@@ -63,61 +92,84 @@ const FIXTURES: &[Fixture] = &[
         query: "SELECT DISTINCT ?o { ?s <urn:q> ?o }",
         spill: false,
         range: (64 * K, 512 * K, 4 * K),
-        before: 126976,
-        slack: 0,
+        before: &[(126976, 520192)],
+        gained: &[],
+        answer: (3000, 11144957503537614256),
+        ordered: false,
+        numbered: false,
+        spills: false,
     },
     Fixture {
         name: "distinct two columns",
         query: "SELECT DISTINCT ?v ?o { ?s <urn:p> ?v . ?s <urn:q> ?o }",
         spill: false,
         range: (512 * K, 4096 * K, 32 * K),
-        before: 1933312,
-        slack: 0,
+        before: &[(1933312, 4161536)],
+        gained: &[(1769472, 1900544)],
+        answer: (50000, 9997031802626865456),
+        ordered: false,
+        numbered: false,
+        spills: false,
     },
     Fixture {
         name: "distinct segmented",
         query: "SELECT DISTINCT ?s ?v { ?s <urn:q> ?o . ?s <urn:p> ?v }",
         spill: false,
         range: (16 * K, 512 * K, 4 * K),
-        // The operator as it was fitted 57,344 bytes and missed 61,440, since a budget
-        // that sizes the batches from the room it finds is not monotone, so the pin is
-        // its smallest fit above its last miss.
-        before: 65536,
-        slack: 0,
+        before: &[(57344, 57344), (65536, 520192)],
+        gained: &[],
+        answer: (20000, 10692260916293497201),
+        ordered: false,
+        numbered: false,
+        spills: false,
     },
     Fixture {
         name: "distinct numbered",
         query: "SELECT DISTINCT ?v ?o { ?s <urn:p> ?v . ?s <urn:q> ?o } ORDER BY ?v",
-        spill: false,
-        range: (512 * K, 8192 * K, 64 * K),
-        before: 6619136,
-        slack: 0,
+        spill: true,
+        range: (128 * K, 2048 * K, 32 * K),
+        before: &[(196608, 2064384)],
+        gained: &[],
+        answer: (50000, 18443397356448823050),
+        ordered: true,
+        numbered: true,
+        spills: true,
     },
     Fixture {
         name: "distinct one column spilled",
         query: "SELECT DISTINCT ?o { ?s <urn:q> ?o }",
         spill: true,
         range: (16 * K, 512 * K, 4 * K),
-        before: 57344,
-        slack: 0,
+        before: &[(57344, 520192)],
+        gained: &[(40960, 53248)],
+        answer: (3000, 11144957503537614256),
+        ordered: false,
+        numbered: false,
+        spills: true,
     },
     Fixture {
         name: "distinct spilled",
         query: "SELECT DISTINCT ?v ?o { ?s <urn:p> ?v . ?s <urn:q> ?o }",
         spill: true,
         range: (64 * K, 2048 * K, 32 * K),
-        before: 131072,
-        slack: 0,
+        before: &[(131072, 2064384)],
+        gained: &[(98304, 98304)],
+        answer: (50000, 9997031802626865456),
+        ordered: false,
+        numbered: false,
+        spills: true,
     },
 ];
 
-/// The row count and an order-free digest of the rows of `f` at `budget`.
+/// The row count and a digest of the rows of `f` at `budget`, which follows the rows'
+/// order when the fixture orders them, and the bytes its DISTINCT spilled. The plan
+/// must run the DISTINCT the fixture names.
 fn answer(
     s: &Store,
     f: &Fixture,
     budget: u64,
     dir: &std::path::Path,
-) -> Result<(usize, u64), Error> {
+) -> Result<((usize, u64), u64), Error> {
     let spill = f.spill.then(|| {
         Spill::open(&SpillOptions {
             dir: dir.to_path_buf(),
@@ -146,51 +198,120 @@ fn answer(
             for column in 0..b.width() {
                 format!("{:?}", b.term(row, column)?).hash(&mut h);
             }
-            digest = digest.wrapping_add(h.finish());
+            digest = if f.ordered {
+                digest
+                    .wrapping_mul(0x100_0000_01b3)
+                    .wrapping_add(h.finish())
+            } else {
+                digest.wrapping_add(h.finish())
+            };
         }
         rows += b.len();
     }
-    Ok((rows, digest))
+    let spilled = distinct(f, c.plan());
+    Ok(((rows, digest), spilled))
 }
 
-/// Every DISTINCT fixture fits each budget it fitted before the move, with the same
-/// answer.
+/// The bytes the plan's one DISTINCT spilled. A numbered DISTINCT has one column more
+/// than its input, the row number, and lies below an ORDER BY.
+fn distinct(f: &Fixture, plan: &CursorPlan) -> u64 {
+    fn walk<'a>(
+        plan: &'a CursorPlan,
+        path: &mut Vec<&'a str>,
+        out: &mut Vec<(&'a CursorPlan, bool)>,
+    ) {
+        if plan.operator.operator == "Distinct" {
+            out.push((plan, path.contains(&"OrderBy")));
+        }
+        path.push(&plan.operator.operator);
+        for child in &plan.children {
+            walk(child, path, out);
+        }
+        path.pop();
+    }
+    let mut found = Vec::new();
+    walk(plan, &mut Vec::new(), &mut found);
+    assert_eq!(found.len(), 1, "{}: one DISTINCT in {plan:?}", f.name);
+    let (node, ordered) = found[0];
+    assert!(!node.materializes, "{}: a native DISTINCT", f.name);
+    let numbered = ordered
+        && node.children.len() == 1
+        && node.operator.columns.len() == node.children[0].operator.columns.len() + 1;
+    assert_eq!(
+        numbered, f.numbered,
+        "{}: numbered DISTINCT in {plan:?}",
+        f.name
+    );
+    node.operator
+        .counters
+        .as_ref()
+        .and_then(|c| c.get("spilledBytes"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// Every DISTINCT fixture fits each budget it fitted before the move, with the answer it
+/// gave before, and fits no budget beyond those its row names.
 #[test]
 fn distinct_fits_every_budget_it_fitted_before() {
     let s = store(20_000);
     let tmp = tempfile::tempdir().unwrap();
+    let print = std::env::var_os("PARITY_PRINT").is_some();
+    let only = std::env::var("PARITY_ONLY").ok();
     for f in FIXTURES {
-        let expected = answer(&s, f, 1 << 30, tmp.path()).unwrap();
+        if only
+            .as_ref()
+            .is_some_and(|only| !f.name.contains(only.as_str()))
+        {
+            continue;
+        }
         let (from, to, step) = f.range;
-        if std::env::var_os("PARITY_PRINT").is_some() {
-            let fit = heap::fits(from..to, step, |b| answer(&s, f, b, tmp.path()).map(|_| ()));
+        let (expected, _) = answer(&s, f, 1 << 30, tmp.path()).unwrap();
+        let (mut fits, mut spilled) = (Vec::new(), false);
+        for budget in (from..to).step_by(step as usize) {
+            match answer(&s, f, budget, tmp.path()) {
+                Ok((answer, spill)) => {
+                    assert_eq!(answer, expected, "{}, {budget} bytes", f.name);
+                    spilled |= spill > 0;
+                    fits.push(budget);
+                }
+                Err(e) => {
+                    if print {
+                        println!("MISS {} {budget}: {e}", f.name);
+                    }
+                    assert!(common::heap::refused(&e), "{}, {budget} bytes: {e}", f.name)
+                }
+            }
+        }
+        if print {
             println!(
-                "PARITY {:24} smallest fit {:?} of {} fits, largest miss {:?}",
+                "PARITY {:28} answer {expected:?} spilled {spilled} fits {:?}",
                 f.name,
-                fit.first(),
-                fit.len(),
-                (from..to)
-                    .step_by(step as usize)
-                    .filter(|b| !fit.contains(b))
-                    .last()
+                ranges(&fits, step)
             );
             continue;
         }
-        let refusal = || answer(&s, f, 1 << 10, tmp.path()).unwrap_err();
-        let worst = heap::parity(
-            f.name,
-            from..to,
-            step,
-            f.slack,
-            |b| {
-                if b >= f.before {
-                    Ok(expected)
-                } else {
-                    Err(refusal())
-                }
-            },
-            |b| answer(&s, f, b, tmp.path()),
+        assert_eq!(expected, f.answer, "{}: the answer before the move", f.name);
+        assert_eq!(spilled, f.spills, "{}: a budget that spills", f.name);
+        assert!(
+            !fits.is_empty() && fits.len() < ((to - from) / step) as usize,
+            "{}: the sweep crosses no threshold",
+            f.name
         );
-        println!("PARITY {:24} needed {worst} bytes more", f.name);
+        for budget in (from..to).step_by(step as usize) {
+            let fit = fits.contains(&budget);
+            assert!(
+                !within(f.before, budget) || fit,
+                "{}: fitted {budget} bytes before the move and does not now",
+                f.name
+            );
+            assert_eq!(
+                fit,
+                within(f.before, budget) || within(f.gained, budget),
+                "{}: {budget} bytes, which the fixture's pinned budgets do not name",
+                f.name
+            );
+        }
+        println!("PARITY {:28} fits {:?}", f.name, ranges(&fits, step));
     }
 }

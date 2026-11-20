@@ -350,10 +350,11 @@ impl Distinct {
         if self.frozen {
             return Ok(false);
         }
-        // What the set holds once it grows now, or zero when it has room.
-        let (size, predicted) = match self.seen.as_ref().expect("distinct state") {
-            Seen::One(ids) => (ids.len(), ids.growth(len)),
-            Seen::Many(set) => (set.len(), set.growth(len)),
+        // What the set holds once it grows now, or zero when it has room, and the bytes
+        // of the new allocations the growth makes.
+        let (size, predicted, allocations) = match self.seen.as_ref().expect("distinct state") {
+            Seen::One(ids) => (ids.len(), ids.growth(len), ids.growth(len)),
+            Seen::Many(set) => (set.len(), set.growth(len), set.allocations(len)),
         };
         if predicted == 0 {
             return Ok(true);
@@ -362,7 +363,15 @@ impl Distinct {
         if self.query.is_some() && self.threshold == 0 {
             self.threshold = (ctx.memory_room() / 2).max(MIN_PASS_BYTES);
         }
-        if spills && (predicted >= self.threshold || ctx.memory_room() < self.threshold / 2) {
+        // A set that holds rows also stops growing when the room is less than the
+        // growth's new allocations taken whole. The growth itself needs less, since a
+        // wider set frees its old table before its arena grows, but it would leave the
+        // operators above the set, such as the sort above a numbered DISTINCT, too
+        // little to work in.
+        let room = ctx.memory_room();
+        if spills
+            && (predicted >= self.threshold || room < self.threshold / 2 || room < allocations)
+        {
             self.frozen = true;
             return Ok(false);
         }
@@ -877,12 +886,25 @@ mod tests {
         assert_eq!(after, (20_496, 57_344), "neither buffer grows");
     }
 
+    /// The pair's growth at the second batch admits 135,184 bytes, and its new table
+    /// and arena take 155,680 bytes whole. With room between the two the set stops
+    /// growing, as it did before its buffers were charged, and leaves that room to
+    /// the operators above it.
+    #[test]
+    fn a_growth_leaves_the_room_of_its_new_allocations() {
+        let (froze, after) = batches(2, 3584, 145_000, 2);
+        assert!(froze, "the set must stop growing");
+        assert_eq!(after, (20_496, 57_344), "neither buffer grows");
+        let (froze, _) = batches(2, 3584, 155_680, 2);
+        assert!(!froze, "the new allocations fit");
+    }
+
     /// A set that grows where a formula of its final size would have frozen it holds
     /// more when it stops growing later, and its frozen batch passes rows on in
     /// smaller ranges where its scratch does not fit at once.
     #[test]
     fn a_later_freeze_passes_rows_on_in_ranges_that_fit() {
-        let (froze, _) = batches(2, 3584, 140_000, 3);
+        let (froze, _) = batches(2, 3584, 160_000, 3);
         assert!(!froze, "the pair fits at the second batch");
         let (froze, _) = batches(1, 7168, 180_000, 3);
         assert!(!froze, "the table fits at the second batch");

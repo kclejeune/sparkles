@@ -145,6 +145,19 @@ that the sort writes and merges runs and DISTINCT passes rows on to later passes
 The scans, filters, BIND, the merge and hash joins, UNION, MINUS, EXISTS, DISTINCT, GRAPH,
 sequence paths and slices are within the exact allowance.
 
+The audit also ran on the tips of five branches that change cursor operators, under both
+realloc rules, with the allowances above. Three of them read beyond an allowance, and
+each excess shows under both rules, so it belongs to the operator's own item.
+
+| Branch tip | Reading | Item |
+|---|---|---|
+| bf0a4c6e, native leaf cursors | The history reader keeps about 223 KiB charged above its heap after a pull, and its ledger peaks 143 KiB above five quarters of its heap's peak. | 1190 |
+| 71695554, paths | The path search keeps about 71 KiB charged above its heap after a pull at batches of 256 rows. | 1189 |
+| e23b0b6e, merge traps | The spilled DISTINCT holds about 68 KiB above its ledger inside a pull at batches of 4,096 rows, past its allowance of 64 KiB. | 1194 |
+
+The tips ace44fca and 023b0d6c of the native leaf cursors and 368a6fc1 of the merge
+fan-out are within every allowance.
+
 ### DISTINCT
 
 DISTINCT keeps the rows of unordered and segmented input in a set of `Charged` buffers
@@ -152,9 +165,16 @@ on the query's retained account. A single column is a hash set of its IDs. Wider
 are a hash table of row numbers and an arena of their IDs, which grows toward the
 table's room so that the two stay in step, both in one `Rows` buffer. A query that may
 spill stops growing the set before a growth that would take the predicted size of its
-buffers to the pass's threshold, or when a growth is refused. The prediction is the
-bound each buffer would grow to, so a one-column set is predicted as its table alone and
-no longer with the bytes of rows it does not keep, and it freezes later than it did.
+buffers to the pass's threshold, before a growth whose new allocations taken whole
+exceed the room left, or when a growth is refused. The prediction is the bound each
+buffer would grow to, so a one-column set is predicted as its table alone and no longer
+with the bytes of rows it does not keep, and it freezes later than it did.
+
+The rule on new allocations keeps the room that the set left before the move, when it
+admitted its old and new buffers at once. A wider set's growth needs less than its new
+allocations, since its table is replaced before its arena grows. Without the rule the
+set grew into that room, and the sort above the numbered DISTINCT fixture was refused at
+294,912 bytes, a budget it had fitted.
 
 A set that grows where a formula of its final size froze it holds more when it freezes
 later, so less room is left for the scratch of a frozen batch. A frozen batch therefore
@@ -162,11 +182,19 @@ passes its rows on in ranges whose scratch fits. A range whose scratch is refuse
 any of its rows are written is halved, so the rows of each partition keep their order,
 and a refusal of the scratch of one row is the query's.
 
-`crates/sparkles-core/tests/charged_parity.rs` pins the smallest budget at which each
-of six DISTINCT fixtures fitted before the move, single and wider rows, segmented,
-numbered below an ORDER BY and spilled. Every budget of each sweep at or above it fits
-with the same answer and no slack. The wider-row fixture fits from 1,769,472 bytes,
-where it needed 1,933,312.
+`crates/sparkles-core/tests/charged_parity.rs` sweeps six DISTINCT fixtures, single
+and wider rows, segmented, numbered below an ORDER BY and two spilled ones, over a range
+of budgets in steps of 4 KiB or 32 KiB. Each fixture pins the budgets of its sweep that
+it fitted before the move, read at commit 74f229b9, and the budgets it fits now and did
+not then, together with its answer before the move as a row count and a digest of the
+rows, which follows their order in the numbered fixture. Every pinned budget must fit
+with that answer and no slack, and a budget that fits or misses outside the pins fails,
+so a hole inside a range is seen as well as a higher smallest fit. The plan must run one
+native DISTINCT, numbered in the numbered fixture, and the spilled fixtures must spill
+from that node. The wider-row fixture fits from 1,769,472 bytes where it needed
+1,933,312, the one-column spilled fixture from 40,960 where it needed 57,344, and the
+wider spilled fixture from 98,304 where it needed 131,072. A change of fit between two
+steps of a sweep is not seen.
 
 ## Acceptance criteria
 

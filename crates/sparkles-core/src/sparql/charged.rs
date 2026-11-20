@@ -637,6 +637,21 @@ impl<A: Account> Charged<Rows, A> {
         }
     }
 
+    /// The bytes of the new allocations that [`Self::reserve`] makes for `more` rows
+    /// where the budget allows the arena to grow to the table's room, the new table's
+    /// bound and the new arena together, or zero when the set has room. It counts each
+    /// new allocation whole, while the growth's admission counts only what the set holds
+    /// beyond its charge at the growth's peak.
+    pub(super) fn allocations(&self, more: usize) -> u64 {
+        match self.value.plan(more) {
+            None => 0,
+            Some(growth) => growth
+                .table
+                .unwrap_or(0)
+                .saturating_add(growth.arena.map_or(0, |(preferred, _)| ids_size(preferred))),
+        }
+    }
+
     /// Room for `more` rows. The growth of the table and of the arena is admitted as
     /// one before either allocates, with the arena at the table's room where the budget
     /// allows it and at what it needs where it does not. A refusal leaves both as they
