@@ -167,6 +167,12 @@ fn probe_scan(n: &Node) -> Option<(&Node, &ScanSpec)> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The filters [`probe_leaf`] copied on this thread since the last reset.
+    pub(super) static PROBE_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The scan under a probe side, with the filters over it.
 fn probe_leaf(n: &Node) -> Option<(&Node, &ScanSpec, Vec<Expr>)> {
     let mut filter = Vec::new();
@@ -174,6 +180,8 @@ fn probe_leaf(n: &Node) -> Option<(&Node, &ScanSpec, Vec<Expr>)> {
     loop {
         match &n.kind {
             Kind::Filter(es) if !es.iter().any(Expr::has_exists) => {
+                #[cfg(test)]
+                PROBE_COPIES.with(|copies| copies.set(copies.get() + es.len()));
                 filter.extend(es.iter().cloned());
                 n = &n.children[0];
             }

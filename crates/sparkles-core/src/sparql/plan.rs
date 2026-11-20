@@ -3578,6 +3578,15 @@ impl<'a> Planner<'a> {
             let mut retained = super::checked_layout::Layout::retained(preparation);
             retained.node(&branch)?;
             let retained_bytes = retained.bytes();
+            // Producers outside this admission (see the lane notes) still leave the
+            // branch short here, so tests read the shortfall rather than assert it.
+            #[cfg(test)]
+            BRANCH_SHORTFALL.with(|most| {
+                most.set(
+                    most.get()
+                        .max(retained_bytes.saturating_sub(payload.bytes())),
+                );
+            });
             payload.grow_to(retained_bytes)?;
             // Planning and join selection have dropped their temporary storage.
             // Shared backing has its own credit, independent of node copies.
@@ -4686,6 +4695,12 @@ impl<'a> Planner<'a> {
                     most = most.max(count);
                 }
                 layout.slots::<VarId>(most.max(4).saturating_mul(2))?;
+                #[cfg(test)]
+                BOUND_TERMS.with(|terms| {
+                    let mut t = terms.get();
+                    t[2] = t[2].max(filters.len() as u64);
+                    terms.set(t);
+                });
                 layout.slots::<Expr>(filters.len().saturating_add(8).saturating_mul(2))
             })?
         } else {
@@ -5782,6 +5797,23 @@ fn graph_join_metadata(
     layout.slots::<String>(1)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The most bytes a graph's branch kept beyond the credit admitted while it was
+    /// built, on this thread since the last reset.
+    pub(super) static BRANCH_SHORTFALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The event before the index candidate of a graph's binding is admitted.
+pub(super) const GRAPH_INDEX_PHASE: &str = "reserving graph binding index join";
+
+#[cfg(test)]
+thread_local! {
+    /// The index candidates of graph bindings built on this thread since the last reset.
+    pub(super) static GRAPH_INDEX_OFFERS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 fn checked_graph_binding_join(
     branch: Node,
     binding: Node,
@@ -5838,11 +5870,35 @@ fn checked_graph_binding_join(
     .transpose()?;
     let hash = alternative(false)?;
     let index = if ctx.opt.batched_join {
-        let mut copy = super::checked_layout::Layout::new(&preparation);
-        copy.node(&binding)?;
-        let held = preparation.reserve(copy.bytes())?;
-        super::indexjoin::graph_binding_candidate(&binding, &branch, ctx)
-            .map(|node| GraphJoinCandidate { node, held })
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(7);
+        // The candidate copies the binding, and offering it copies the branch's filters
+        // and builds the operator, whether or not it is then offered.
+        preparation.stage(GRAPH_INDEX_PHASE)?;
+        let mut bound = super::checked_layout::Layout::new(&preparation);
+        bound.node(&binding)?;
+        super::indexjoin::index_join_bound(&mut bound, &binding, &branch, ctx)?;
+        let mut held = preparation.reserve(bound.bytes())?;
+        match super::indexjoin::graph_binding_candidate(&binding, &branch, ctx) {
+            Some(node) => {
+                #[cfg(test)]
+                GRAPH_INDEX_OFFERS.with(|offers| offers.set(offers.get() + 1));
+                // The offer's temporary storage is gone, so the candidate keeps only
+                // what its plan keeps.
+                let mut retained = super::checked_layout::Layout::retained(&preparation);
+                retained.node(&node)?;
+                let kept = retained.bytes();
+                debug_assert!(
+                    kept <= held.bytes(),
+                    "the index candidate keeps {kept} bytes of the {} admitted",
+                    held.bytes()
+                );
+                held.grow_to(kept)?;
+                held.release_to(kept);
+                Some(GraphJoinCandidate { node, held })
+            }
+            None => None,
+        }
     } else {
         None
     };
@@ -6192,18 +6248,27 @@ pub(super) fn filter_bound<'e>(
     if let Kind::Scan(spec) = &n.kind {
         // range pushdown splits the filters into their conjuncts and partitions them
         layout.slots::<Expr>(slots.saturating_mul(8))?;
+        #[cfg(test)]
+        let sizes = std::cell::Cell::new((0u64, 0u64, 0usize));
         // Then either range conjuncts move into a range scan, which the key ranges of
         // the start do not read, or none do and the scan may read key ranges.
         layout.larger(
             |layout| {
+                #[cfg(test)]
+                let start = layout.bytes();
                 // the atoms, the id ranges, the rendered conjuncts and the scan's copy
                 layout.slots::<(RangeOp, super::value::Value)>(slots.saturating_mul(2))?;
                 layout.slots::<IdRange>(64)?;
                 layout.slots::<String>(conjuncts)?;
                 layout.add(texts)?;
-                layout.scan(spec)
+                layout.scan(spec)?;
+                #[cfg(test)]
+                sizes.set((layout.bytes() - start, sizes.get().1, sizes.get().2));
+                Ok(())
             },
             |layout| {
+                #[cfg(test)]
+                let start = layout.bytes();
                 // copies of the conjuncts on the sorted column, their key tests with the
                 // prefixes they give, and the id ranges of those prefixes
                 layout.slots::<Expr>(slots.saturating_mul(2))?;
@@ -6217,10 +6282,29 @@ pub(super) fn filter_bound<'e>(
                             .saturating_add(super::keyfilter::KeyFilter::plan_prefixes_bytes(e, v));
                     }
                     layout.add(tests)?;
+                    #[cfg(test)]
+                    sizes.set((sizes.get().0, sizes.get().1, tests));
                 }
-                layout.slots::<(u64, u64)>(4)
+                layout.slots::<(u64, u64)>(4)?;
+                #[cfg(test)]
+                sizes.set((sizes.get().0, layout.bytes() - start, sizes.get().2));
+                Ok(())
             },
         )?;
+        #[cfg(test)]
+        {
+            // the terms of the branch that sets the bound
+            let (range, keys, tests) = sizes.get();
+            BOUND_TERMS.with(|terms| {
+                let mut t = terms.get();
+                if range >= keys {
+                    t[0] = t[0].max(range);
+                } else {
+                    t[1] = t[1].max(tests as u64);
+                }
+                terms.set(t);
+            });
+        }
     }
     // the variables of one filter at a time, listed with every occurrence, and the
     // reason a filter is not evaluated once per value, when it costs the FILTER's sort
@@ -6622,6 +6706,12 @@ thread_local! {
     /// the rows of one scan, on this thread since the last reset.
     pub(super) static REACHED: std::cell::Cell<(usize, usize)> =
         const { std::cell::Cell::new((0, 0)) };
+    /// The terms of [`filter_bound`] and of the checked partition of filters that set a
+    /// bound, on this thread since the last reset: the most bytes of the range scan's
+    /// branch when it is the larger, the most bytes of key tests in the key ranges'
+    /// branch when that is the larger, and the most filters partitioned at once.
+    pub(super) static BOUND_TERMS: std::cell::Cell<[u64; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
 }
 
 /// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].

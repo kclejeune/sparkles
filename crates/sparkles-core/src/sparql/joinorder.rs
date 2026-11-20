@@ -778,11 +778,15 @@ impl Group {
                 (Some(credit), true) => {
                     let mut text = PreparationText::new(credit.preparation())?;
                     let written = f.write_description(ctx, &mut text);
-                    let (text, _credit) = text.finish()?;
+                    let (text, credit) = text.finish()?;
                     if written.is_err() {
                         return Err(Error::invalid("could not write a filter description"));
                     }
-                    ctx.sampled(&text).map(|s| s.sel)
+                    let sel = ctx.sampled(&text).map(|s| s.sel);
+                    // the text goes before its credit
+                    drop(text);
+                    drop(credit);
+                    sel
                 }
                 (None, true) => ctx.sampled(&f.display(ctx)).map(|s| s.sel),
             };
@@ -1334,15 +1338,12 @@ impl Greedy {
             if let Some(credit) = leaf_held.as_mut()
                 && placing > 0
             {
-                // the copy of the input and of the filters placed on it
+                // the copy of the input, under the filters placed on it, whose copies the
+                // FILTER admits
                 let preparation = credit.preparation().clone();
                 refused(preparation.stage(GREEDY_LEAF_PHASE))?;
                 let mut layout = super::checked_layout::Layout::new(&preparation);
                 layout.node(best)?;
-                layout.slots::<Expr>(placing)?;
-                for f in (0..filters.len()).filter(|&f| binds(f)) {
-                    layout.expression(&filters[f])?;
-                }
                 first_storage(|| layout.bytes() as usize);
                 refused(credit.grow_by(layout.bytes()))?;
             }
@@ -1355,21 +1356,14 @@ impl Greedy {
                     placed[f] = true;
                 }
                 let copy = best.clone();
-                let conjuncts: Vec<Expr> = now.iter().map(|&f| filters[f].clone()).collect();
                 #[cfg(test)]
                 let _stage = crate::test_alloc::Stage::within(6);
-                // the copies are admitted with the leaf, and the FILTER now
-                let scratch = refused(pl.filter_scratch(&copy, conjuncts.iter(), false))?;
-                let owned = match &scratch {
-                    Some(held) => {
-                        let mut layout =
-                            super::checked_layout::Layout::retained(held.preparation());
-                        layout.expressions(&conjuncts)?;
-                        layout.bytes()
-                    }
-                    None => 0,
-                };
-                let (node, kept) = pl.filter_held(scratch, copy, conjuncts, owned)?;
+                // the copy of the input is admitted with the leaf, and the FILTER with the
+                // copies of its filters now, before they are made
+                let scratch =
+                    refused(pl.filter_scratch(&copy, now.iter().map(|&f| &filters[f]), true))?;
+                let conjuncts: Vec<Expr> = now.iter().map(|&f| filters[f].clone()).collect();
+                let (node, kept) = pl.filter_held(scratch, copy, conjuncts, 0)?;
                 match (leaf_held.as_mut(), kept) {
                     (Some(credit), Some(kept)) => credit.merge(kept),
                     (None, Some(kept)) => pl.retain_planning(kept),

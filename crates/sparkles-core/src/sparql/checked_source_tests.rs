@@ -2706,17 +2706,20 @@ fn checked_join_order_excess_kinds(
 }
 
 #[test]
-#[ignore = "known red, see the lane notes"]
 fn checked_graph_r12_admits_built_filters() {
     // A negated property set is a scan under a FILTER that tests the set's terms, a list
-    // as long as the set, which the plan keeps.
+    // as long as the set, which the plan keeps. The BIND makes the graph's group one that
+    // is planned per graph. The set's terms are not in the store, so planning interns
+    // them in the context's vocabulary, which the context's own account admits. A first
+    // plan interns them, and the observed second plan finds them.
     use plan::{ActiveGraph, Planner};
     for terms in [4, 400] {
         let set = (0..terms)
             .map(|step| format!("<urn:n:p{step}>"))
             .collect::<Vec<_>>()
             .join("|");
-        let text = format!("SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 }} }}");
+        let text =
+            format!("SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 . BIND(?x0 AS ?first) }} }}");
         let store = checked_chain_fixture(4);
         let data = physical_default(&store);
         let ctx = validation_query_context(&data, opts()).unwrap();
@@ -2724,15 +2727,79 @@ fn checked_graph_r12_admits_built_filters() {
         let Query::Select { pattern, .. } = parse_query(&text, None, &[]).unwrap() else {
             unreachable!()
         };
-        let mut planner = Planner::new(&ctx);
-        let excess = crate::test_alloc::record_unadmitted(&prep, || {
-            planner
+        drop(
+            Planner::new(&ctx)
                 .plan(&pattern, &ActiveGraph::Default, Vec::new())
-                .unwrap();
+                .unwrap(),
+        );
+        let mut planner = Planner::new(&ctx);
+        let mut plan = None;
+        let excess = crate::test_alloc::record_unadmitted(&prep, || {
+            plan = Some(
+                planner
+                    .plan(&pattern, &ActiveGraph::Default, Vec::new())
+                    .unwrap(),
+            );
         });
+        checked_graph_group(plan.as_ref().unwrap());
         println!("negated set of {terms}: {excess:?}");
         assert!(excess[6] <= 512, "filters: {} unadmitted bytes", excess[6]);
     }
+}
+
+/// The unadmitted bytes per stage of planning `text` on a checked source, after a first
+/// plan has interned its constants.
+fn checked_second_plan_excess(text: &str) -> [i64; crate::test_alloc::STAGES] {
+    use plan::{ActiveGraph, Planner};
+    let store = checked_chain_fixture(4);
+    let data = physical_default(&store);
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let prep = ctx.source_preparation.as_ref().unwrap().clone();
+    let Query::Select { pattern, .. } = parse_query(text, None, &[]).unwrap() else {
+        unreachable!()
+    };
+    drop(
+        Planner::new(&ctx)
+            .plan(&pattern, &ActiveGraph::Default, Vec::new())
+            .unwrap(),
+    );
+    let mut planner = Planner::new(&ctx);
+    crate::test_alloc::record_unadmitted(&prep, || {
+        drop(
+            planner
+                .plan(&pattern, &ActiveGraph::Default, Vec::new())
+                .unwrap(),
+        );
+    })
+}
+
+#[test]
+#[ignore = "roadmap item 1236"]
+fn checked_graph_r12_admits_simple_graph_groups() {
+    // Without the BIND, the graph's group does not mention ?g and is planned on the
+    // ordinary route, whose FILTER list scales with the set.
+    let set = (0..400)
+        .map(|step| format!("<urn:n:p{step}>"))
+        .collect::<Vec<_>>()
+        .join("|");
+    let excess = checked_second_plan_excess(&format!(
+        "SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 }} }}"
+    ));
+    println!("simple negated set of 400: {excess:?}");
+    assert!(excess.iter().all(|&bytes| bytes <= 512), "{excess:?}");
+}
+
+#[test]
+#[ignore = "known red, see the lane notes"]
+fn checked_graph_r12_admits_optional_joins() {
+    // An OPTIONAL in a graph's branch builds its join after the payload is admitted.
+    plan::BRANCH_SHORTFALL.with(|most| most.set(0));
+    let excess = checked_second_plan_excess(
+        "SELECT * WHERE { GRAPH ?g { ?x0 <urn:c:1> ?x1 OPTIONAL { ?x1 <urn:c:2> ?x2 } BIND(?x0 AS ?first) } }",
+    );
+    let short = plan::BRANCH_SHORTFALL.with(std::cell::Cell::get);
+    println!("optional: {excess:?}, branch short {short}");
+    assert_eq!(short, 0);
 }
 
 #[test]
@@ -2859,11 +2926,14 @@ fn checked_graph_r12_admits_join_order_tables() {
         text
     };
     cases.push((12, many_range));
+    // The tests are over a pattern of its own, apart from the star, so that its scan is
+    // filtered alone and its key ranges are planned.
     let many_tests = {
         let mut text = checked_star_query(12);
-        let mut test = String::from("STRSTARTS(STR(?y1), \"urn:m:1\")");
+        text.insert_str(text.len() - 4, " ?w <urn:s:1> ?t .");
+        let mut test = String::from("STRSTARTS(STR(?t), \"urn:m:1\")");
         for step in 0..24 {
-            test.push_str(&format!(" && CONTAINS(STR(?y1), \"urn:m:{step:0>40}\")"));
+            test.push_str(&format!(" && CONTAINS(STR(?t), \"urn:m:{step:0>40}\")"));
         }
         text.insert_str(text.len() - 4, &format!(" FILTER({test})"));
         text
@@ -2895,17 +2965,24 @@ fn checked_graph_r12_admits_join_order_tables() {
     let mut kinds = [0; 4];
     for (width, text) in &cases {
         plan::REACHED.with(|r| r.set((0, 0)));
+        plan::BOUND_TERMS.with(|t| t.set([0; 3]));
         let (excess, of) = checked_join_order_excess_kinds(*width, text);
-        // The range and key-test cases reach the code their caps check.
+        // The range and key-test cases reach the code their caps check, and the terms of
+        // the bound for that code set the bound.
         let reached = plan::REACHED.with(std::cell::Cell::get);
-        if text.contains("?v > -39") && reached.0 < 40 {
-            failures.push(format!("no range scan of 40 conjuncts: {reached:?}"));
+        let terms = plan::BOUND_TERMS.with(std::cell::Cell::get);
+        if text.contains("?v > -39") && (reached.0 < 40 || terms[0] == 0) {
+            failures.push(format!(
+                "no range scan of 40 conjuncts bounded: {reached:?} {terms:?}"
+            ));
         }
-        if text.contains("CONTAINS(STR(?y1)") && reached.1 < 25 {
-            failures.push(format!("no scan set by 25 key tests: {reached:?}"));
+        if text.contains("CONTAINS(STR(?t)") && (reached.1 < 25 || terms[1] == 0) {
+            failures.push(format!(
+                "no scan set by 25 key tests bounded: {reached:?} {terms:?}"
+            ));
         }
         println!(
-            "{}: {excess:?} merge/hash/index/other joins {of:?}",
+            "{}: {excess:?} merge/hash/index/other joins {of:?} reached {reached:?} terms {terms:?}",
             &text[..text.len().min(160)]
         );
         if text.contains("?k2_") {
@@ -3710,9 +3787,11 @@ fn checked_graph_r12_observer_reallocations() {
         let mut grown = Vec::<u8>::with_capacity(1000);
         let _stage = Stage::enter(1);
         grown.reserve_exact(3000);
+        assert_eq!(grown.capacity(), 3000);
         std::hint::black_box(&grown);
     });
-    assert!(excess[1] >= 2000, "foreign growth: {excess:?}");
+    // the whole new storage, not only its growth
+    assert!(excess[1] >= 3000, "foreign growth: {excess:?}");
     // A failed reallocation changes nothing: the storage is still the stage's own.
     let excess = observer_excess(|prep| {
         let _stage = Stage::enter(1);
@@ -3724,6 +3803,20 @@ fn checked_graph_r12_observer_reallocations() {
         drop(held);
     });
     assert!(excess[1] <= 0, "failed reallocation: {excess:?}");
+    // ... and keeps the storage counted: with it and its credit kept, 800 bytes without
+    // credit are seen.
+    let excess = observer_excess(|prep| {
+        let _stage = Stage::enter(1);
+        let held = prep.reserve(1000).unwrap();
+        let mut kept = Vec::<u8>::with_capacity(1000);
+        assert!(kept.try_reserve_exact(isize::MAX as usize / 2).is_err());
+        let omitted = observer_bytes(800);
+        std::hint::black_box((&held, &kept, &omitted));
+        drop(omitted);
+        drop(kept);
+        drop(held);
+    });
+    assert!(excess[1] >= 800, "after a failed reallocation: {excess:?}");
 }
 
 #[test]
@@ -3745,5 +3838,96 @@ fn checked_graph_r12_observer_detects_release_without_allocation() {
             std::hint::black_box((&storage, &held_again));
         });
         assert!(excess[1] >= 1024, "acquired again {again}: {excess:?}");
+    }
+}
+
+/// A GRAPH ?g whose pattern also binds ?g, as the first key column of its scan, under a
+/// filter over a list of 101 variables, so that the index candidate of each graph's
+/// binding probes on ?g and copies a large filter.
+fn checked_graph_binding_query() -> String {
+    let list = vec!["?x"; 101].join(", ");
+    format!("SELECT * WHERE {{ GRAPH ?g {{ ?g <urn:c:1> ?x . FILTER(?g IN ({list})) }} }}")
+}
+
+/// Sets whether index joins are forced, and clears it again on drop.
+struct ForceIndexJoin;
+impl ForceIndexJoin {
+    fn set(force: bool) -> Self {
+        crate::sparql::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(force));
+        Self
+    }
+}
+impl Drop for ForceIndexJoin {
+    fn drop(&mut self) {
+        crate::sparql::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(false));
+    }
+}
+
+#[test]
+fn checked_graph_r12_admits_graph_binding_index_candidate() {
+    // Forced, the index candidate is offered and built. Not forced, the offer copies the
+    // filter whether or not it is then refused. Both are admitted before they allocate,
+    // and the branch keeps no more than was admitted while it was built.
+    for force in [true, false] {
+        let _force = ForceIndexJoin::set(force);
+        plan::GRAPH_INDEX_OFFERS.with(|offers| offers.set(0));
+        plan::BRANCH_SHORTFALL.with(|most| most.set(0));
+        crate::sparql::indexjoin::PROBE_COPIES.with(|copies| copies.set(0));
+        let (excess, of) = checked_join_order_excess_kinds(4, &checked_graph_binding_query());
+        let offers = plan::GRAPH_INDEX_OFFERS.with(std::cell::Cell::get);
+        let copies = crate::sparql::indexjoin::PROBE_COPIES.with(std::cell::Cell::get);
+        let short = plan::BRANCH_SHORTFALL.with(std::cell::Cell::get);
+        println!(
+            "graph binding, forced {force}: {excess:?} merge/hash/index/other joins {of:?}, \
+             {offers} index candidates, {copies} probe filter copies, branch short {short}"
+        );
+        assert_eq!(
+            short, 0,
+            "forced {force}: the branch keeps unadmitted bytes"
+        );
+        assert!(
+            copies > 0,
+            "forced {force}: the offer copies the probe's filter"
+        );
+        if force {
+            assert!(
+                offers > 0,
+                "the binding's index candidate is built when forced"
+            );
+        }
+        assert!(
+            excess[7] <= 512,
+            "forced {force}: {} unadmitted bytes in the graph binding's candidates",
+            excess[7]
+        );
+    }
+}
+
+#[test]
+fn checked_graph_r12_refuses_graph_binding_index_candidate() {
+    use crate::sparql::plan::GRAPH_INDEX_PHASE;
+    let _force = ForceIndexJoin::set(true);
+    let store = checked_chain_fixture(4);
+    let text = checked_graph_binding_query();
+    // The filter's list, which the candidate copies after the phase.
+    let size = 101 * std::mem::size_of::<crate::sparql::expr::Expr>();
+    let (outcome, rows, events, _, seen, allocated) =
+        checked_join_order_at_phase(&store, &text, GRAPH_INDEX_PHASE, 0, false, false, size);
+    outcome.unwrap();
+    assert!(events > 0, "the phase is reached");
+    assert!(
+        allocated > seen,
+        "the candidate copies the list after the phase"
+    );
+    let _ = rows;
+    for (cancel, fill) in [(true, false), (false, true)] {
+        let (outcome, rows, _, _, seen, allocated) =
+            checked_join_order_at_phase(&store, &text, GRAPH_INDEX_PHASE, 0, cancel, fill, size);
+        assert!(outcome.is_err(), "cancel {cancel}: the query stops");
+        assert_eq!(rows, 0, "cancel {cancel}: no rows");
+        assert_eq!(
+            allocated, seen,
+            "cancel {cancel}: no copy after the refusal"
+        );
     }
 }
