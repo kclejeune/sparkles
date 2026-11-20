@@ -861,41 +861,39 @@ as the base, and between 35% and 72% of the requests to each of its servers took
 upper step, so its wall-time cost waits for a rerun that separates the step from the
 build.
 
-The scripts' own client wall times, which include the start of a curl process per
-request, were not confirmed. Every query that their first pass read slower in both
-A,B,B,A pairs therefore counts as a cost of item 1162 until a rerun with more rounds
-settles it, though the vector queries' server time above adds only microseconds. The
-ratios are of client wall time, the pairs are the two halves of the round, and the
-same-binary ratios compare the two servers of each build. Only `q6-touching-counties`, the
-streamed text `highlight` and `text-join` and the streamed `q-ef-32`, `q-ef-64` and
-`q-ef-256` with one thread, and eager `q-ef-128` with 12 threads, differ from the base
-by more than either build's two servers differ from each other.
+The [script rerun](runs/2026-11-20-leaf-cursors-scripts-rerun-forge-9df856f3/README.md)
+ran the text, geo and vector scripts again on forge with the same two binaries, in three
+rounds of A,B,B,A, B,A,A,B and A,B,B,A over one store per script, which gives six pairs
+per query. The ratios are of client wall time, which includes the start of a curl process
+per request, and a configuration is slower when every pair is above 1. Of the 88
+configurations, 80 read as noise, 5 as faster and 3 as slower, and every server returned
+the same answers. Two of the slower ones are real costs that item 1162 holds.
 
-| Script | Query | Mode | Threads | Base | Tip/base | Pairs | Base, tip same-binary |
-|---|---|---|--:|--:|--:|---|---|
-| text | `highlight` | streaming | 1 | 10.46 ms | 1.041 | 1.020, 1.055 | 0.990, 1.024 |
-| text | `text-join` | streaming | 1 | 5.53 ms | 1.045 | 1.080, 1.032 | 1.029, 0.982 |
-| text | `conjunction` | streaming | 1 | 4.33 ms | 1.030 | 1.019, 1.016 | 0.945, 0.942 |
-| text | `conjunction` | streaming | 12 | 4.30 ms | 1.020 | 1.048, 1.024 | 0.933, 0.911 |
-| text | `highlight` | eager | 1 | 11.00 ms | 1.017 | 1.041, 1.000 | 1.021, 0.981 |
-| text | `common-top10` | eager | 1 | 4.18 ms | 1.027 | 1.013, 1.045 | 0.999, 1.030 |
-| text | `stemmed` | eager | 1 | 3.94 ms | 1.022 | 1.032, 1.017 | 0.976, 0.962 |
-| text | `rare-top10` | eager | 12 | 3.90 ms | 1.060 | 1.324, 1.029 | 1.032, 0.802 |
-| geo | `q6-touching-counties` | streaming | 1 | 1,932 ms | 1.011 | 1.012, 1.011 | 0.999, 0.997 |
-| geo | `q6-touching-counties` | eager | 1 | 1,932 ms | 1.009 | 1.006, 1.012 | 0.998, 1.004 |
-| geo | `q5-points-per-state` | streaming | 1 | 85.8 ms | 1.004 | 1.033, 1.003 | 1.033, 1.003 |
-| geo | `q5-points-per-state` | eager | 1 | 83.0 ms | 1.011 | 1.015, 1.001 | 1.024, 1.010 |
-| geo | `q2-distance` | streaming | 1 | 15.61 ms | 1.087 | 1.009, 1.261 | 0.839, 1.048 |
-| geo | `q2-distance` | eager | 1 | 15.78 ms | 1.017 | 1.058, 1.012 | 0.984, 0.941 |
-| geo | `q3-nearby` | streaming | 1 | 15.65 ms | 1.041 | 1.026, 1.015 | 0.879, 0.870 |
-| geo | `q3-nearby` | eager | 12 | 13.68 ms | 1.098 | 1.009, 1.238 | 0.859, 1.054 |
-| vector | `q-ef-32` | streaming | 1 | 6.25 ms | 1.870 | 1.374, 2.140 | 0.687, 1.070 |
-| vector | `q-ef-256` | streaming | 1 | 13.23 ms | 1.158 | 1.168, 1.126 | 0.994, 0.958 |
-| vector | `q-ef-64` | streaming | 1 | 10.74 ms | 1.097 | 1.135, 1.092 | 1.027, 0.988 |
-| vector | `q-ef-256` | eager | 1 | 12.05 ms | 1.093 | 1.174, 1.101 | 1.135, 1.064 |
-| vector | `q-ef-64` | eager | 1 | 10.32 ms | 1.033 | 1.045, 1.016 | 1.070, 1.040 |
-| vector | `q-exact-true` | eager | 12 | 15.92 ms | 1.115 | 1.108, 1.065 | 1.448, 1.391 |
-| vector | `q-ef-128` | eager | 12 | 9.87 ms | 1.015 | 1.009, 1.011 | 0.991, 0.993 |
+| Script | Query | Mode | Threads | Base | Tip/base | Pairs | Same-binary spread | Item |
+|---|---|---|--:|--:|--:|---|--:|---|
+| geo | `q6-touching-counties` | eager | 1 | 1,937 ms | 1.012 | 1.000 to 1.019 | 0.8% | 1162 |
+| vector | `q-ef-64` | eager | 1 | 9.85 ms | 1.080 | 1.013 to 1.737 | 78% | 1162 |
+
+The wall times of eager `q-ef-64` with one thread are bimodal within a server, so its
+ratio is unsteady, and the confirmation above measured 1.2% more server time for it. The
+third slower configuration is streamed geo `q9-star` with 12 threads, which read 1.144
+pooled, with pairs from 1.002 to 1.504 and a same-binary spread of 13.9%.
+
+A [q9-star rerun](runs/2026-11-20-leaf-cursors-q9-star-forge-cde29b37/README.md) then
+timed that query alone on forge at 12 threads for three builds, which are the base
+bccc5f7b, main at 5f3f69c2 and the tip of item 829's first part at cde29b37 on that main.
+It ran six rounds in which the builds rotate through the positions, with 25 timed requests
+for each of 12 server processes per build and mode. Its ratios have a 95% bootstrap
+interval over server processes. The tip against main, item 829's own cost, reads 0.966
+streamed, with an interval of 0.944 to 0.991, and 1.006 eager, with an interval of 0.975 to
+1.044, so the item adds no cost to the query. The server without the spatial rewrites
+runs the same plan and reads 0.971 and 0.982. Main against the base reads 1.078 streamed,
+with an interval of 1.011 to 1.134, but its twelve pairs run from 0.909 to 1.362 and the
+base's servers differ from each other by up to 40.7%, so by the rule that a difference
+not above 1 in every pair is noise it needs no item. The tip against the base reads 1.042
+streamed, with pairs from 0.834 to 1.376, and 0.997 eager. The requests of every build
+split between under 22 ms and 26 to 30 ms, in shares that vary between servers, and the
+run's CPU samples show no relation between a server's median and its share of P cores.
 
 The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
 The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two

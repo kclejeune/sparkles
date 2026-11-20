@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# explain.sh BIN TAG WORK OUT [PORT]: executed plans of geo q9-star (streaming, eager) at 12 threads.
+set -euo pipefail
+BIN=$1 TAG=$2 WORK=$3 OUT=$4 PORT=${5:-3949}
+mkdir -p "$OUT"
+export MBX_REMOTE_URL= RAYON_NUM_THREADS=12
+"$BIN" --result-cache-mb 0 serve --data "$OUT/server-$TAG" --loc bench="$WORK/geo.db" --port "$PORT" --timeout 600 --geo bench > "$OUT/$TAG.server.log" 2>&1 &
+SPID=$!
+trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
+for _ in $(seq 1 600); do curl -sf "localhost:$PORT/\$/geo/bench" > /dev/null 2>&1 && break; sleep 0.2; done
+for m in streaming eager; do
+  curl -sf -H 'Accept: application/x-sparkles+json' --data-urlencode "query@$WORK/queries/geo-q9-star.rq" "localhost:$PORT/bench/sparql?execution=$m" > "$OUT/plan-$TAG-$m.json"
+done

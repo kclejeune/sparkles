@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Cursor operators for searches, calls and counts
+
+The first part of roadmap item 829 runs text, hybrid, history, spatial and vector searches
+over their input, remote LATERAL loops, whole-input searches and algorithm calls, bounded
+leaves and `CountJoin` as cursor operators under explicit streaming, where they fell back
+to eager subtrees before. Automatic execution keeps its earlier choices for these kinds
+until a same-host A/B admits each one. A streamed count over a join that eager execution
+counts from its pairs holds one batch where eager holds every pair, and a count over a
+merge join on two or more variables still runs the eager kernel. The strict policy refuses
+the forms that remain without a resumable reader, which the second part of the item
+covers. On forge, the text, geo and vector scripts read within noise of the base except
+eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds.
+
 ### Targeted checks on a remote host
 
 `mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
