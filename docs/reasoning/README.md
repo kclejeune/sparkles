@@ -448,7 +448,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   context keeps clauses under one total order of literals, and a named subsumer that only
   a case analysis gives is found by a test context for the class with the candidate's
   complement. `Limits::expansion` chooses the cautious or the eager successor strategy,
-  which give the same answers. These runs share the Horn rules' memory budget, and a run
+  whose full answers agree on every ontology of item 1229's gate. These runs share the Horn rules' memory budget, and a run
   that passes it classifies again by the Horn rules, leaves the disjunctive axioms out and
   reports them, and sets `Stats::dl_over_budget`. A run that neither counts nor is rooted
   also has a bound of 384 derived conclusions for each class of the signature, at least

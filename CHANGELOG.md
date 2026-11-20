@@ -11,12 +11,13 @@ with those clauses, as roadmap item 1229's repair. Such a run could report itsel
 and miss an entailed subsumption, and a rooted run that counted classified again without
 counting where it detected the case. The repair is adopted on a measured gate of
 generated and fixture ontologies without a proof, so item 1229 stays open, and the
-cautious and eager strategies give the same answers on that gate. It adds 0.29% to the
-derived conclusions of rooted runs that count, 0.47% to rooted runs and 0.90% to runs that
-count without the root, on the runs that finish with and without it, and takes three generated
-ontologies past the bound on derived conclusions, which item 1232 follows.
-`SPARKLES_COUNTING_LATE_UNIT=1` keeps the
-earlier containment and `=0` turns both off, for measurement.
+cautious and eager strategies give the same taxonomy on that gate wherever both answer in
+full. On the runs that answer in full with and without it, the repair adds 0.29% to the
+derived conclusions of rooted runs that count, 0.47% to rooted runs without counting and
+0.90% to runs that count without the root, and three generated ontologies now exceed the
+bound on derived conclusions, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` keeps
+the earlier containment, which now also covers rooted runs without counting, and `=0`
+turns both off, for measurement.
 
 ### The selection of rooted runs is on again with selected partners
 
