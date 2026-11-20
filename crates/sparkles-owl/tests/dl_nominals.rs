@@ -1178,3 +1178,26 @@ fn selected_premises_left_out_by_a_lookup_are_made_up_for() {
         assert!(!out.taxonomy.is_unsatisfiable(&c("K")), "{name}");
     }
 }
+
+/// A selected premise over a successor term of a constant (item 1220). The equality
+/// `f(x) ≈ w` of E's existential is local, so Eq rewrites it with the marker of B(v) in the
+/// body and gives a head atom over w's successor term, which Pred from that successor needs.
+#[test]
+fn a_selected_premise_over_a_successor_term_of_a_constant_reaches_pred() {
+    check(
+        "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B)))
+         SubClassOf(:K ObjectSomeValuesFrom(:p :D))
+         SubClassOf(:D ObjectHasValue(:s :v))
+         SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+         SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+         SubClassOf(:E ObjectUnionOf(ObjectOneOf(:u) ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) ObjectSomeValuesFrom(:e :A)))))
+         SubClassOf(:F ObjectAllValuesFrom(:r :C))
+         SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+         SubClassOf(:C ObjectAllValuesFrom(ObjectInverseOf(:r) :W))
+         SubClassOf(:D ObjectHasValue(:z :w))
+         SubClassOf(ObjectSomeValuesFrom(:z ObjectSomeValuesFrom(:e :A)) :W)
+         SubClassOf(ObjectSomeValuesFrom(:p :W) :Ans)",
+        &[("K", "Ans")],
+        &[("D", "Ans")],
+    );
+}
