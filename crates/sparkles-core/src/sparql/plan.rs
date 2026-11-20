@@ -1171,7 +1171,7 @@ impl<'a> Planner<'a> {
         )
     }
 
-    fn planning_scratch(
+    pub(super) fn planning_scratch(
         &self,
         measure: impl FnOnce(&mut super::checked_layout::Layout<'_>) -> Result<()>,
     ) -> Result<Option<Reservation>> {

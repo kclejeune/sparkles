@@ -33,6 +33,7 @@ use super::indexjoin::{self, ProbeSide};
 use super::keyprobe::Side;
 use super::plan::{self, JoinModel, Node, Planner};
 use super::table::VarId;
+use crate::access::Reservation;
 use crate::error::Result;
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
@@ -376,6 +377,26 @@ impl Held {
 }
 
 impl Models {
+    /// Measure the storage of a copy of these models.
+    fn measure(&self, layout: &mut super::checked_layout::Layout<'_>) -> Result<()> {
+        layout.slice(&self.stars)?;
+        for stars in &self.stars {
+            layout.slice(stars)?;
+        }
+        layout.slice(&self.sides)?;
+        for sides in &self.sides {
+            layout.slice(sides)?;
+        }
+        layout.slice(&self.inputs)?;
+        for inputs in &self.inputs {
+            layout.slice(inputs)?;
+            for vars in inputs {
+                layout.slice(vars)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether one input of the inputs `ins` binds every key of `shared`, as
     /// [`plan::one_input_binds`] finds in the plan of them.
     fn one_binds<I: Iterator<Item = usize>>(&self, mut ins: I, shared: &[Shared]) -> bool {
@@ -642,6 +663,12 @@ impl Group {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Refusals of the program's tables on this thread, for the tests of their admission.
+    pub(super) static DP_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The set bits of `m`.
 fn bits_of(mut m: u32) -> impl Iterator<Item = usize> + Clone {
     std::iter::from_fn(move || {
@@ -663,7 +690,7 @@ pub(super) fn order(
     filters: &mut Vec<Expr>,
 ) -> Result<Node> {
     let g = Group::new(&items, filters, pl.ctx)?;
-    let dp = Dp::prepare(&g, &items);
+    let dp = Dp::prepare(&g, &items, pl)?;
     let greedy = Greedy::run(&g, &items, filters, pl.ctx)?;
     if let Some(mut dp) = dp {
         let bound = greedy.cost();
@@ -1319,6 +1346,8 @@ struct Dp {
     /// beside `dval`, each entry's domain of each join variable it binds (see
     /// [`plan::domain`]), the larger of its inputs'
     ddom: Vec<f64>,
+    /// the checked route's credit for the tables over the subsets, dropped after them
+    _held: Option<Reservation>,
 }
 
 /// One round's tables, per subset of the parts.
@@ -1335,6 +1364,8 @@ struct Round {
     minc: Vec<f64>,
     /// splits per subset size
     splits: Vec<u64>,
+    /// the checked route's credit for the round's tables, dropped after them
+    _held: Option<Reservation>,
 }
 
 #[inline]
@@ -1358,15 +1389,34 @@ fn connected(m: u32, nb: &[u32]) -> bool {
 impl Dp {
     /// The tables over the inputs' subsets, or `None` when the program cannot track
     /// the group (too many inputs or join variables).
-    fn prepare(g: &Group, items: &[Vec<Node>]) -> Option<Dp> {
+    fn prepare(g: &Group, items: &[Vec<Node>], pl: &Planner) -> Result<Option<Dp>> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::enter(2);
         let n = items.len();
         if n > DP_MAX_ITEMS || g.jvars.len() > DP_MAX_JOIN_VARS {
-            return None;
+            return Ok(None);
         }
         let full: u32 = (1u32 << n) - 1;
         let size = 1usize << n;
+        let fcount = g.filters.len().min(64);
+        // The tables below are sized from the group before any is allocated.
+        let held = pl.planning_scratch(|layout| {
+            layout.slots::<VarId>(g.jvars.len())?;
+            layout.slots::<u32>(g.vars.len())?;
+            layout.slots::<u128>(2 * n)?;
+            layout.slots::<&FilterInfo>(fcount)?;
+            layout.slots::<u128>(2 * size)?;
+            layout.slots::<u64>(size)?;
+            layout.slots::<Option<(VarId, u32)>>(fcount)?;
+            layout.map::<VarId, u32>(g.jvars.len())?;
+            layout.slots::<Option<f64>>(fcount)?;
+            g.models.measure(layout)
+        });
+        #[cfg(test)]
+        if held.is_err() {
+            DP_REFUSALS.with(|n| n.set(n.get() + 1));
+        }
+        let held = held?;
         let jvar: Vec<VarId> = g.jvars.iter().map(|&l| g.vars[l as usize]).collect();
         let mut var_items = vec![0u32; g.vars.len()];
         let mut jb = vec![0u128; n];
@@ -1414,7 +1464,7 @@ impl Dp {
             .map(|(j, &v)| (v, j as u32))
             .collect();
         let fsel = fl.iter().map(|fi| fi.sel).collect();
-        Some(Dp {
+        Ok(Some(Dp {
             n,
             jm,
             cm,
@@ -1427,7 +1477,8 @@ impl Dp {
             ents: Vec::new(),
             dval: Vec::new(),
             ddom: Vec::new(),
-        })
+            _held: held,
+        }))
     }
 
     /// The join variables of the inputs `m` that inputs outside them share.
@@ -1437,9 +1488,18 @@ impl Dp {
     }
 
     /// The tables of a round over `parts`.
-    fn round(&self, parts: Vec<Part>) -> Round {
+    fn round(&self, parts: Vec<Part>, pl: &Planner) -> Result<Round> {
         let k = parts.len();
         let size = 1usize << k;
+        let listed: usize = parts.iter().map(|p| p.ents.len()).sum();
+        // The tables below are sized from the parts before any is allocated.
+        let held = pl.planning_scratch(|layout| {
+            layout.slots::<u32>(2 * size + k + listed)?;
+            layout.slots::<bool>(2 * size)?;
+            layout.slots::<u64>(k + 1)?;
+            layout.slots::<(u32, u32)>(size)?;
+            layout.slots::<f64>(size)
+        })?;
         let mut inputs = vec![0u32; size];
         let mut nb = vec![0u32; size];
         let mut conn = vec![false; size];
@@ -1465,7 +1525,7 @@ impl Dp {
                 splits[c as usize] += (1u64 << (c - 1)) - 1;
             }
         }
-        let mut list = Vec::new();
+        let mut list = Vec::with_capacity(listed);
         let mut slot = vec![(0u32, 0u32); size];
         let mut minc = vec![f64::INFINITY; size];
         for (i, p) in parts.iter().enumerate() {
@@ -1477,7 +1537,7 @@ impl Dp {
                 minc[m] = minc[m].min(self.ents[e as usize].sum.cost);
             }
         }
-        Round {
+        Ok(Round {
             parts,
             inputs,
             conn,
@@ -1486,7 +1546,8 @@ impl Dp {
             list,
             minc,
             splits,
-        }
+            _held: held,
+        })
     }
 
     /// The entry among `ents` of least cost (the first of equal ones).
@@ -1563,7 +1624,7 @@ impl Dp {
         }
         let mut rounds = false;
         loop {
-            let mut r = self.round(parts);
+            let mut r = self.round(parts, pl)?;
             let k = r.parts.len();
             let total: u64 = r.splits.iter().sum();
             if !rounds && total > DP_MAX_SPLITS {

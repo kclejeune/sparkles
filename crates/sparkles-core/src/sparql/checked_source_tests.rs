@@ -2622,6 +2622,69 @@ fn checked_join_order_excess(width: usize) -> [i64; crate::test_alloc::STAGES] {
 }
 
 #[test]
+fn checked_graph_r12_admits_join_order_tables() {
+    // Stage 2 builds the program's tables over every subset of the inputs, which grow
+    // with 2^n, and the greedy plan alone handles widths past 16.
+    for width in [4, 8, 12] {
+        let excess = checked_join_order_excess(width);
+        assert!(
+            excess[2] <= 512,
+            "program tables: {} unadmitted bytes at width {width}",
+            excess[2]
+        );
+    }
+}
+
+#[test]
+fn checked_graph_r12_refuses_join_order_tables_without_fallback() {
+    use crate::sparql::joinorder::DP_REFUSALS;
+
+    let width = 12;
+    let store = checked_chain_fixture(width);
+    // The routes may order the columns of `SELECT *` differently, so project them.
+    let text = format!(
+        "{} ORDER BY ?g",
+        checked_chain_query(width).replacen("SELECT *", "SELECT ?g ?x0 ?x12", 1)
+    );
+    let ordinary = query(store.snapshot(), &text, &opts())
+        .unwrap()
+        .test_application_rows();
+    let mut refused = 0;
+    let mut answered = 0;
+    let mut memory = 64 << 10;
+    while memory <= 4 << 20 {
+        let prep = Preparation::new(Control::default(), memory).unwrap();
+        let view = GraphAccess::all()
+            .masked_controlled(&store.snapshot(), &prep)
+            .unwrap();
+        let before = prep.inner_used();
+        let refusals = DP_REFUSALS.with(std::cell::Cell::get);
+        let outcome = query_prepared_source(view.read_source(), &text, &opts());
+        let tables_refused = DP_REFUSALS.with(std::cell::Cell::get) > refusals;
+        match outcome {
+            Ok(rows) => {
+                assert!(
+                    !tables_refused,
+                    "{memory}: a refused program must fail the query"
+                );
+                assert_eq!(rows.test_application_rows(), ordinary, "{memory}");
+                answered += 1;
+            }
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            })) => refused += usize::from(tables_refused),
+            Err(error) => panic!("{memory}: {error}"),
+        }
+        assert_eq!(prep.inner_used(), before, "{memory}: credit returns");
+        memory += memory / 8;
+    }
+    println!("{refused} budgets refused the program's tables, {answered} answered");
+    assert!(refused > 0, "no budget refused the program's tables");
+    assert!(answered > 0, "no budget answered");
+}
+
+#[test]
 #[ignore = "fail-first witness for join-order admission, which is pending"]
 fn checked_graph_r12_admits_join_order_storage() {
     const STAGES: [&str; 8] = [
