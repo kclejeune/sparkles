@@ -1731,7 +1731,7 @@ fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment()
 /// Row 1231's marker repair fixtures (PLAN v3.1's rule M): each holds a ground fact about
 /// a constant that holds only under the query class K, whose consequence passes through an
 /// element outside K's successors, so that a rooted run without the repair misses it.
-const REPAIRS: [(&str, &str); 10] = [
+const REPAIRS: [(&str, &str); 13] = [
     // the regression itself
     ("av2", AV2),
     // a return whose body has two ground atoms, both held by the query context
@@ -1840,6 +1840,39 @@ const REPAIRS: [(&str, &str); 10] = [
      SubClassOf(:D ObjectSomeValuesFrom(:r :E))
      SubClassOf(:E ObjectHasValue(:r2 :w))
      SubClassOf(ObjectSomeValuesFrom(:r2 :G) owl:Nothing)"),
+    // the linked element needs a consequence at the constant that the holder derives and sends in turn
+    ("sel", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:G :C5)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :C5) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is an equality of two constants, and the root fact about one reaches the other
+    ("eq", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) ObjectOneOf(:w2))))
+     ClassAssertion(:G :w)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w2))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is an equality and a fact under it, about two names of one constant
+    ("eq2", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) ObjectOneOf(:w2))))
+     SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w2) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
 ];
 
 /// What a rooted run of a repair fixture must find: `K ⊑ Ans`, or for a denial `K ⊑ ⊥`.

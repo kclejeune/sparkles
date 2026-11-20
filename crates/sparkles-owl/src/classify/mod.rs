@@ -2905,8 +2905,9 @@ impl Saturation {
                         .mcount
                         .each_ref()
                         .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+                    let def = dl_root::marker_deficits(&ix, &cs, &d.lits);
                     eprintln!(
-                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{}",
+                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}",
                         stats.dl_work,
                         pr[0],
                         pr[1],
@@ -2914,7 +2915,9 @@ impl Saturation {
                         d.mrepair,
                         m[0],
                         m[1],
-                        m[2]
+                        m[2],
+                        def[0],
+                        def[1]
                     );
                 }
                 if let Some(t) = decline

@@ -1728,6 +1728,14 @@ pub(super) struct MarkerCtx {
     pub(super) edges: Vec<(u32, Vec<Ex>)>,
     /// in the root, the heads of its live facts with one literal
     pub(super) units: Vec<Lit>,
+    /// for the diagnostic's deficits only: in another context, the ground literals whose
+    /// markers it holds or has a live clause that subsumes, and the root's clauses it took
+    /// by table id
+    pub(super) marks: Vec<Lit>,
+    pub(super) took: Vec<u32>,
+    /// for the deficits only: in the root, the bodies and table ids of its live processed
+    /// clauses whose bodies are ground triggers
+    pub(super) gbody: Vec<(Vec<Lit>, Option<u32>)>,
 }
 
 /// The factor by which a vector's capacity or a hash table's buckets can pass the
@@ -1821,12 +1829,46 @@ pub(super) fn marker_ctx(
         }
     }
     admit(-scratch);
+    let (mut marks, mut took, mut gbody) = (Vec::new(), Vec::new(), Vec::new());
+    // the deficits' copies, outside the run's memory budget, as the diagnostic's sets are
+    if marker_diag() {
+        if let Some(r) = x.root.as_deref() {
+            marks.extend(r.gmarks.iter().copied());
+            took.extend(r.seen.iter().copied());
+        }
+        for s in &x.store.clauses {
+            if s.dead {
+                continue;
+            }
+            let (b, h) = (s.c.body(), s.c.head());
+            let one: Vec<Lit> = b.iter().chain(h).copied().collect();
+            if one.len() <= 2
+                && b.len() <= 1
+                && h.len() <= 1
+                && one.windows(2).all(|w| w[0] == w[1])
+                && let Some(&l) = one.first()
+                && l.kind() == XL
+            {
+                marks.push(l);
+            }
+            if is_root
+                && !b.is_empty()
+                && b.iter()
+                    .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
+            {
+                gbody.push((b.to_vec(), s.sent));
+            }
+        }
+    }
     Ok(Some(MarkerCtx {
         me,
         succ: successors(ix, st),
         held,
         edges,
         units,
+        marks,
+        took,
+        gbody,
     }))
 }
 
@@ -1978,6 +2020,78 @@ pub(super) fn marker_trips(
     }
     pr[1] = sends.len();
     (out, pr)
+}
+
+/// The two deficits of the marker repair (PLAN v3.1, D4), found at quiescence from the
+/// contexts' clauses and not from the sends: the triples of P_R, holder, trigger and context,
+/// whose context holds neither the trigger's marker nor a clause that subsumes it, and the
+/// pairs of a live root clause whose body is ground triggers and a context that holds every
+/// body literal and did not take it. A run without the repair has no clause to take, so its
+/// second count is every such pair.
+pub(super) fn marker_deficits(
+    ix: &Index,
+    cs: &[MarkerCtx],
+    lits: &super::dl_clause::Lits,
+) -> [usize; 2] {
+    let dx = dix(ix);
+    let inv = inv_of(ix, dx);
+    let mut out = [0usize; 2];
+    let Some(root) = dx.root else { return out };
+    let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
+    let Some(&ri) = by.get(&root) else { return out };
+    let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
+    let edges: FxHashMap<u32, &[Ex]> = cs[ri].edges.iter().map(|(u, v)| (*u, &v[..])).collect();
+    let reach = |from: Ex| {
+        let mut seen: FxHashSet<Ex> = FxHashSet::default();
+        let mut todo = vec![from];
+        seen.insert(from);
+        while let Some(e) = todo.pop() {
+            for &w in by.get(&e).map_or(&[][..], |&i| &cs[i].succ[..]) {
+                if seen.insert(w) {
+                    todo.push(w);
+                }
+            }
+        }
+        seen
+    };
+    let from_root = reach(root);
+    for c in cs {
+        if c.me == root || c.held.is_empty() {
+            continue;
+        }
+        let down = reach(c.me);
+        for &l in &c.held {
+            if units.contains(&l) {
+                continue;
+            }
+            let mut us = Vec::new();
+            consts(lits.view(l, inv), &mut us);
+            let mut to: Vec<Ex> = us
+                .iter()
+                .flat_map(|u| edges.get(u).copied().unwrap_or(&[]).iter().copied())
+                .filter(|d| *d != root && from_root.contains(d) && !down.contains(d))
+                .collect();
+            to.sort_unstable();
+            to.dedup();
+            for d in to {
+                let Some(&i) = by.get(&d) else { continue };
+                if !cs[i].marks.contains(&l) && !cs[i].held.contains(&l) {
+                    out[0] += 1;
+                }
+            }
+        }
+    }
+    for (b, id) in &cs[ri].gbody {
+        for c in cs {
+            if c.me != root
+                && b.iter().all(|l| c.held.contains(l))
+                && !id.is_some_and(|id| c.took.contains(&id))
+            {
+                out[1] += 1;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
