@@ -267,7 +267,7 @@ times, 51 µs and 1.07 ms more, with every round above 1. The same two queries u
 automatic execution, `distinct-join` in both modes and the queries under 0.3 ms showed
 no real difference, and streamed `distinct-one` and both class queries took 0.965 to
 0.975 times as long. Acceptance criterion 4 is therefore not met for the two streamed
-queries, and [roadmap item 1240](../../ROADMAP.md) holds both costs with their recovery.
+queries, and [roadmap item 1237](../../ROADMAP.md) holds both costs with their recovery.
 Instruction counts per request were not taken for this run. The
 [memory results](../../benchmarks/memory/RESULTS.md#charged-distinct-buffers) give the
 table and the [run record](../../benchmarks/memory/records/charged-distinct-2026-11-20/README.md)

@@ -12,7 +12,7 @@ have roadmap items of their own. Seven DISTINCT sweeps over a range of budgets f
 budget they fitted before the move with the same answers, and three of them now fit from
 smaller budgets, such as 40,960 bytes in place of 57,344 for a one-column spilled set. On
 forge at 1.05M quads, streamed DISTINCT of two columns of a join takes 1.008 times as long
-as before and a wider one 1.033 times, which roadmap item 1240 recovers, and the other
+as before and a wider one 1.033 times, which roadmap item 1237 recovers, and the other
 DISTINCT queries take the same time or up to 3.5% less.
 
 ### Streamed answers through the engine buffer

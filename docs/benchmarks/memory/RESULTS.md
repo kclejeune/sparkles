@@ -224,7 +224,7 @@ A. A bold ratio was above 1 in every round, or below 1 in every round for a gain
 *Measured on forge.*
 
 Streamed `distinct-two` takes 51 µs longer and streamed `distinct-two-wide` 1.07 ms
-longer, and [roadmap item 1240](../../ROADMAP.md) holds both costs with their recovery.
+longer, and [roadmap item 1237](../../ROADMAP.md) holds both costs with their recovery.
 In the streamed `distinct-two-wide` pass the processes of B took 32.2 to 33.8 ms by
 median and those of A 31.0 to 33.6 ms, with no trend across the run. The same query
 under automatic execution shows no difference. `distinct-obj` and `predicate-subjects`
