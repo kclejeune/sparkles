@@ -792,7 +792,8 @@ both release builds made on stanley with the same compilers. The
 answers, queries and scripts of every run. A first pass ran the 31-query matrix at 1.05M
 triples with one thread in eight rounds of A,B,B,A in each mode, and the text, geo and
 vector scripts in one A,B,B,A round per mode with 12 threads and with one. A confirmation
-then ran each flagged query in twelve rounds of A,B,B,A in both orders, with 200 timed
+then ran the synthetic queries under 0.3 ms, the ones over it that the first pass flagged
+and the vector queries in twelve rounds of A,B,B,A in both orders, with 200 timed
 requests per query and server for the synthetic queries and 50 for the vector queries,
 and `scripts/x08-gates/combine.py` removed the position bias. Every server returned the
 same answers in every run.
@@ -804,6 +805,11 @@ Streamed `distinct-join`, `employee-docs`, `expr-bind-group`, `values-star` and
 the same count within the host's noise floor. Eager execution runs the same count as the
 base on every query.
 
+The confirmation's real costs in server time are these, where the item column names the
+roadmap item that holds each one. Costs under 0.3 ms within the cap of item 1074 are its
+lines, each a kept-path cost without a profile. Instructions are the stanley ratio, and
+the vector store was not counted.
+
 | Query | Mode | Base | Tip/base | 95% interval | Added | Instructions | Item |
 |---|---|--:|--:|---|--:|--:|---|
 | `distinct-join` | streaming | 3.75 ms | 1.035 | 1.035–1.036 | 131 µs | 1.011 | 1160 |
@@ -812,25 +818,64 @@ base on every query.
 | `lang-filter` | eager | 1.79 ms | 1.027 | 1.026–1.028 | 48 µs | 1.000 | 1161 |
 | `star-join` | eager | 1.39 ms | 1.019 | 1.016–1.022 | 27 µs | 1.000 | 1161 |
 | `star-join` | streaming | 1.41 ms | 1.013 | 1.010–1.016 | 18 µs | 1.001 | 1160 |
+| `regex-iri` | eager | 3.72 ms | 1.011 | 1.009–1.011 | 39 µs | 1.000 | 1161 |
+| `regex-iri` | streaming | 3.72 ms | 1.010 | 1.008–1.010 | 36 µs | 1.000 | 1161 |
+| `contains` | eager | 2.53 ms | 1.006 | 1.006–1.007 | 16 µs | 1.000 | 1161 |
+| `contains` | streaming | 2.53 ms | 1.006 | 1.006–1.007 | 16 µs | 1.000 | 1161 |
+| `minus` | eager | 0.36 ms | 1.008 | 1.003–1.010 | 2.7 µs | 1.000 | 1161 |
 | `expr-bind-group` | streaming | 0.36 ms | 1.013 | 1.009–1.015 | 4.7 µs | 1.013 | 1160 |
 | `employee-docs` | streaming | 0.041 ms | 1.039 | 1.030–1.053 | 1.6 µs | 1.019 | 1160 |
 | `star-lookup` | streaming | 0.063 ms | 1.032 | 1.027–1.037 | 2.0 µs | 1.006 | 1160 |
-| `star-lookup` | eager | 0.059 ms | 1.018 | 1.012–1.026 | 1.0 µs | 1.000 | 1074 |
+| `star-lookup` | eager | 0.059 ms | 1.018 | 1.012–1.026 | 1.0 µs | 1.000 | 1074, 1161 |
 | `values-star` | streaming | 0.020 ms | 1.052 | 1.041–1.063 | 1.0 µs | 1.010 | 1160 |
+| `q-ef-256` | streaming | 0.57 ms | 1.006 | 1.001–1.009 | 3.2 µs | | 1162 |
+| `q-exact-true` | eager | 10.8 ms | 1.001 | 1.000–1.002 | 13 µs | | 1162 |
+| `q-ef-128` | eager | 0.22 ms | 1.006 | 1.003–1.010 | 1.3 µs | | 1074, 1162 |
+| `q-ef-128` | streaming | 0.23 ms | 1.007 | 1.002–1.012 | 1.6 µs | | 1074, 1162 |
+| `q-ef-64` | eager | 0.11 ms | 1.012 | 1.007–1.018 | 1.3 µs | | 1074, 1162 |
+| `q-ef-64` | streaming | 0.11 ms | 1.011 | 1.004–1.016 | 1.3 µs | | 1074, 1162 |
+| `q-ef-32` | eager | 0.071 ms | 1.009 | 1.006–1.020 | 0.65 µs | | 1074, 1162 |
+| `q-ef-32` | streaming | 0.075 ms | 1.013 | 1.008–1.022 | 0.99 µs | | 1074, 1162 |
+| `q-ef-16` | eager | 0.053 ms | 1.012 | 1.003–1.017 | 0.61 µs | | 1074, 1162 |
+| `q-ef-16` | streaming | 0.056 ms | 1.016 | 1.010–1.030 | 0.91 µs | | 1074, 1162 |
 
-`regex-iri` reads 1.010 in both modes and `contains` 1.006, at equal instruction
-counts, and eager `minus` reads 1.008, which item 1161 holds as well. The other queries
-under 0.3 ms read as noise by the Intel rule, with an interval that reaches 1.0 or a
-median added time of at most 0.5 µs, and `subquery-agg` reads 0.988 eager and 0.996
-streamed. With the vector store, server time reads 1.006 to 1.016 for `q-ef-16` to
-`q-ef-128`, which take 0.05 to 0.23 ms and add 0.6 to 1.6 µs and which item 1074 lists,
-1.006 for streamed `q-ef-256` and 1.001 for eager `q-exact-true`, which item 1162 holds.
-The first pass's client wall times of 9% to 17% more for `q-ef-64` and `q-ef-256` with
-one thread did not appear in server time. Streamed text `highlight` and `text-join`
-with one thread read 1.041 and 1.045 in client wall time, slower in both pairs and by
-more than either build's same-binary ratio, and geo `q6-touching-counties` read 1.009
-eager and 1.011 streamed, which item 1162 holds. With 12 threads, all three read faster
+The other confirmed queries read as noise by the Intel rule, with an interval that
+reaches 1.0 or a median added time of at most 0.5 µs, and `subquery-agg` reads 0.988
+eager and 0.996 streamed. The first pass's vector script read 3% to 87% more client wall
+time with one thread for `q-ef-32`, `q-ef-64` and `q-ef-256`, with the same binary
+varying by up to 31% between its two servers. The confirmation's wall time is curl's
+own transfer time, which leaves out the start of the client process, and in it every vector query
+reads within 1.0006 of the base and adds at most 7 µs. The approximate searches sit near
+a floor of about 1.95 ms of wall time there, which would hide a cost of under about
+1.4 ms, but their server time adds at most 3.2 µs, so the first pass's flags came from
+the client processes and not from the item.
+
+The text and geo scripts were not confirmed, and every query that their first pass read
+slower in both A,B,B,A pairs counts as a cost of item 1162 until a rerun with more rounds
+settles it. The ratios are of client wall time, the pairs are the two halves of the
+round, and the same-binary ratios compare the two servers of each build. Only
+`q6-touching-counties` and the streamed text `highlight` and `text-join` with one thread
+are slower than both same-binary ratios, and with 12 threads those three read faster
 than the base.
+
+| Script | Query | Mode | Threads | Base | Tip/base | Pairs | Base, tip same-binary |
+|---|---|---|--:|--:|--:|---|---|
+| text | `highlight` | streaming | 1 | 10.46 ms | 1.041 | 1.020, 1.055 | 0.990, 1.024 |
+| text | `text-join` | streaming | 1 | 5.53 ms | 1.045 | 1.080, 1.032 | 1.029, 0.982 |
+| text | `conjunction` | streaming | 1 | 4.33 ms | 1.030 | 1.019, 1.016 | 0.945, 0.942 |
+| text | `conjunction` | streaming | 12 | 4.30 ms | 1.020 | 1.048, 1.024 | 0.933, 0.911 |
+| text | `highlight` | eager | 1 | 11.00 ms | 1.017 | 1.041, 1.000 | 1.021, 0.981 |
+| text | `common-top10` | eager | 1 | 4.18 ms | 1.027 | 1.013, 1.045 | 0.999, 1.030 |
+| text | `stemmed` | eager | 1 | 3.94 ms | 1.022 | 1.032, 1.017 | 0.976, 0.962 |
+| text | `rare-top10` | eager | 12 | 3.90 ms | 1.060 | 1.324, 1.029 | 1.032, 0.802 |
+| geo | `q6-touching-counties` | streaming | 1 | 1,932 ms | 1.011 | 1.012, 1.011 | 0.999, 0.997 |
+| geo | `q6-touching-counties` | eager | 1 | 1,932 ms | 1.009 | 1.006, 1.012 | 0.998, 1.004 |
+| geo | `q5-points-per-state` | streaming | 1 | 85.8 ms | 1.004 | 1.033, 1.003 | 1.033, 1.003 |
+| geo | `q5-points-per-state` | eager | 1 | 83.0 ms | 1.011 | 1.015, 1.001 | 1.024, 1.010 |
+| geo | `q2-distance` | streaming | 1 | 15.61 ms | 1.087 | 1.009, 1.261 | 0.839, 1.048 |
+| geo | `q2-distance` | eager | 1 | 15.78 ms | 1.017 | 1.058, 1.012 | 0.984, 0.941 |
+| geo | `q3-nearby` | streaming | 1 | 15.65 ms | 1.041 | 1.026, 1.015 | 0.879, 0.870 |
+| geo | `q3-nearby` | eager | 12 | 13.68 ms | 1.098 | 1.009, 1.238 | 0.859, 1.054 |
 
 The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
 The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two

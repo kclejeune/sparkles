@@ -1197,9 +1197,9 @@ into batches that the eager count holds as indices, and item 1129 removes that c
 streamed count over a filtered scan took 0.15 of the eager time, 8.4 ms against 55.3 ms,
 and automatic execution keeps both counts eager. Against the base, streamed queries that
 run 0.6% to 1.9% more instructions are 1.3% to 5.2% slower, which item 1160 holds, and
-queries that run the same instructions in either mode are 0.6% to 2.7% slower, which item
-1161 holds as likely code layout. Item 1162 holds the one-thread costs of the text, geo
-and vector scripts, and item 1074 the costs under 0.3 ms within its cap. The
+queries that run the same instructions in either mode are 0.6% to 2.8% slower, which item
+1161 holds as likely code layout. Item 1162 holds the costs of the text, geo and vector
+scripts, and item 1074 the costs under 0.3 ms within its cap. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
 
 ### Readings of errors in aggregates
