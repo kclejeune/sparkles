@@ -1029,10 +1029,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * Horn ontologies whose successors no other successor dominates classify up to 6% slower
   than without the check for dominated successors, which costs more there than it saves.
   Roadmap item 991.
-* Two files on which the left-linear chains of transitive roles save no conclusions
-  classify slightly slower with them. On the benchmark host
+* Two files classify slightly slower where the left-linear chains of transitive roles
+  save no conclusions. On the benchmark host
   `ore_ont_13482` of the ORE 2015 EL sample classifies 2.5% slower on four threads and
-  `ore_ont_9855` of the ORE 2015 DL sample 1.0% slower on one, with the same conclusions.
+  `ore_ont_9855` of the ORE 2015 DL sample 1.0% slower on one, with the same conclusions
+  in those cells.
   Roadmap item 1224 follows them, and the
   [EL classification results](../benchmarks/el-classification/RESULTS.md#left-linear-chains-of-transitive-roles)
   give the rounds.

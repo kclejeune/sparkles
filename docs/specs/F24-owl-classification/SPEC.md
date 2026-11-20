@@ -1344,8 +1344,8 @@ classification 1.39 s against 9.07 s on four threads, and its peak resident set 
 instead of 6.3 GiB on four threads and 2.1 instead of 3.8 GiB on one. ChEBI lite
 classifies in 0.81 times the time on one thread, 0.69 on four and 0.48 on twelve, and
 GO and `ore_ont_3836` within the noise. `ore_ont_13482` classifies 2.5% slower on four
-threads and `ore_ont_9855` 1.0% slower on one, with the same conclusions and fewer
-instructions, which item 1224 follows. The six timed files give the same taxonomies on
+threads and `ore_ont_9855` 1.0% slower on one, with the same conclusions in those
+cells, which item 1224 follows. The six timed files give the same taxonomies on
 both builds, and on the laptop so do the 298 ORE 2015 EL files, GO and ChEBI lite on one
 and four threads and 205 of the 207 files of the ORE 2015 DL development set on four,
 where both builds refuse one file at the reader and stop one at its memory budget. The

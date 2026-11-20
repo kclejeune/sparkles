@@ -1702,7 +1702,7 @@ the Horn rules except `ore_ont_3836` and `ore_ont_13482`, which take the EL rule
 
 | Threads | Base saturation, s | Build, s | Base classification, s | Build, s | Base process, s | Build, s | Base peak, GiB | Build peak, GiB |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 25.41 | 2.99 | 28.33 | 3.91 | 144.0 | 22.4 | 3.81 | 2.11 |
+| 1 | 25.41 | 2.99 | 28.33 | 3.91 | 143.7 | 22.4 | 3.81 | 2.11 |
 | 4 | 8.22 | 0.94 | 9.07 | 1.39 | 49.0 | 10.1 | 6.33 | 2.27 |
 | 12 | 7.05 | 0.70 | 7.39 | 1.13 | 40.6 | 8.8 | 7.42 | 2.70 |
 
@@ -1735,13 +1735,16 @@ conclusions against 20.9 million.
 ChEBI lite classifies in 0.81 times the base's time on one thread, 0.69 on four and 0.48
 on twelve, with 17.7 million conclusions against 27.0 million and a peak resident set
 0.93 to 0.96 of the base's. GO takes 0.3% fewer conclusions on one thread, and its times are noise.
-`ore_ont_3836`, `ore_ont_13482` and `ore_ont_9855` take the same conclusions on both
-sides, and their times are noise except in three cells. `ore_ont_13482` classifies 2.5%
-slower on four threads, 10 ms, with a saturation 6.8% slower, and `ore_ont_9855`
-classifies 1.0% slower on one thread, 9 ms, with its saturation and its process 0.9%
-slower. The laptop counts 0.3% and 0.2% fewer instructions per classification of the two
-files on one pinned thread on the build, so the build does not add work there, and
-roadmap item 1224 follows the two costs.
+`ore_ont_3836` and `ore_ont_13482` take the same conclusions on both sides in every
+cell, and `ore_ont_9855` on one thread, while its four- and twelve-thread runs vary
+between processes on both sides. Their times are noise or slightly faster except in two
+cells.
+`ore_ont_13482` classifies 2.5% slower on four threads, 10.5 ms, with a saturation 6.8%
+slower, and `ore_ont_9855` classifies 1.0% slower on one thread, 9 ms, with its
+saturation and its process 0.9% slower. On the laptop commit 3f20f7db, the composition
+before its table was charged, counts 0.3% and 0.2% fewer instructions per classification
+of the two files than the base on one pinned thread. Roadmap item 1224 follows the two
+costs.
 
 The laptop also counted 0.5% and 0.8% more instructions in whole processes of
 `ore_ont_13482` and `ore_ont_3836` outside the classification. Twenty rounds of one
