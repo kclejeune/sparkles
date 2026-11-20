@@ -19,7 +19,7 @@ use crate::vocab::{SHNEX_NS, SPARQL_FN_NS, rdf, sh, shnex};
 use anyhow::{Context as _, Result, anyhow, bail};
 use oxrdf::vocab::xsd;
 use oxrdf::{NamedNode, NamedNodeRef, Term};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use spargebra::Query;
 use std::collections::BTreeMap;
 
@@ -387,7 +387,7 @@ impl Parser<'_> {
             Term::NamedNode(n) if n.as_ref() == sh::THIS => {
                 return Ok(self.push_expr(node, Expr::Var("focusNode".into())));
             }
-            Term::BlankNode(_) if self.is_af_form(node) => {}
+            Term::BlankNode(_) if self.is_af_form(node)? => {}
             _ => return self.expr(node),
         }
         if let Some(&id) = self.af_memo.get(node) {
@@ -409,18 +409,25 @@ impl Parser<'_> {
 
     /// Whether a blank node is one of the SHACL-AF 2017 forms, which [`Self::af_expr`]
     /// reads, rather than a SHACL 1.2 expression.
-    fn is_af_form(&self, node: &Term) -> bool {
-        let preds = self.predicates(node);
+    fn is_af_form(&self, node: &Term) -> Result<bool> {
+        let preds = self.predicates(node)?;
         if preds.iter().any(|p| {
             [sh::PATH, sh::FILTER_SHAPE, sh::INTERSECTION, sh::UNION].contains(&p.as_ref())
         }) {
-            return true;
+            return Ok(true);
         }
-        matches!(&preds[..], [f] if self.g.is_instance(&Term::NamedNode(f.clone()), sh::SPARQL_FUNCTION))
+        match &preds[..] {
+            [f] => self.g.is_instance_until(
+                &Term::NamedNode(f.clone()),
+                sh::SPARQL_FUNCTION,
+                self.deadline,
+            ),
+            _ => Ok(false),
+        }
     }
 
     fn af_list(&mut self, head: &Term) -> Result<Vec<ExprId>> {
-        let items = self.g.list(head)?;
+        let items = self.g.list(head, self.deadline)?;
         items.iter().map(|i| self.af_expr(i)).collect()
     }
 
@@ -430,7 +437,7 @@ impl Parser<'_> {
             None => None,
         };
         if let Some(p) = self.single(node, sh::PATH)? {
-            let path = PropertyPath::from_graph(&self.g, &p).context("sh:path")?;
+            let path = PropertyPath::from_graph(&self.g, &p, self.deadline).context("sh:path")?;
             let values = self.push_expr(node, Expr::PathValues { path, focus: None });
             // the values of the path from each node of sh:nodes, in one list
             return Ok(match nodes {
@@ -458,7 +465,7 @@ impl Parser<'_> {
             let all = self.push_expr(node, Expr::Concat(xs));
             return Ok(self.push_expr(node, Expr::Distinct(all)));
         }
-        let preds = self.predicates(node);
+        let preds = self.predicates(node)?;
         if let [f] = &preds[..] {
             let fnode = Term::NamedNode(f.clone());
             if self.g.is_instance(&fnode, sh::SPARQL_FUNCTION) {
@@ -499,7 +506,7 @@ impl Parser<'_> {
         }
         params.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
         let params: Vec<(String, bool)> = params.into_iter().map(|p| (p.1, p.2)).collect();
-        let prefixes = crate::sparql::prefixes(&self.g, &fnode);
+        let prefixes = crate::sparql::prefixes(&self.g, &fnode, self.deadline)?;
         let query = sparkles_core::sparql::parse_query(&text, None, &prefixes)
             .map_err(|e| anyhow!("{e}"))
             .with_context(|| format!("the sh:select of {f}"))?;
@@ -534,14 +541,21 @@ impl Parser<'_> {
 
     /// An ordinary target blank node may have application predicates. Only list and
     /// function syntax identifies it as an expression in a strict target.
-    pub(crate) fn has_expression_syntax(&self, node: &Term) -> bool {
-        matches!(node, Term::BlankNode(_))
-            && self.predicates(node).iter().any(|p| {
-                p.as_ref() == rdf::FIRST
-                    || p.as_ref() == rdf::REST
-                    || self.is_expression_key(p)
-                    || self.is_list_function(p)
-            })
+    pub(crate) fn has_expression_syntax(&self, node: &Term) -> Result<bool> {
+        if !matches!(node, Term::BlankNode(_)) {
+            return Ok(false);
+        }
+        for predicate in self.predicates(node)? {
+            self.check_deadline()?;
+            if predicate.as_ref() == rdf::FIRST
+                || predicate.as_ref() == rdf::REST
+                || self.is_expression_key(&predicate)
+                || self.is_list_function(&predicate)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn is_expression_key(&self, predicate: &NamedNode) -> bool {
@@ -558,29 +572,31 @@ impl Parser<'_> {
         as_subject(node).is_some_and(|s| self.g.g.triples_for_subject(s).next().is_some())
     }
 
-    fn predicates(&self, node: &Term) -> Vec<NamedNode> {
+    fn predicates(&self, node: &Term) -> Result<Vec<NamedNode>> {
         let Some(s) = as_subject(node) else {
-            return Vec::new();
+            return Ok(Vec::new());
         };
+        let mut seen = FxHashSet::default();
         let mut out: Vec<NamedNode> = Vec::new();
         for t in self.g.g.triples_for_subject(s) {
-            let p = t.predicate.into_owned();
-            if !out.contains(&p) {
-                out.push(p);
+            self.check_deadline()?;
+            if seen.insert(t.predicate) {
+                out.push(t.predicate.into_owned());
             }
         }
         out.sort();
-        out
+        self.check_deadline()?;
+        Ok(out)
     }
 
     /// The only value of `p` at `node`.
     fn single(&self, node: &Term, p: NamedNodeRef<'_>) -> Result<Option<Term>> {
-        let mut v = self.g.objects(node, p);
-        match v.len() {
-            0 => Ok(None),
-            1 => Ok(v.pop()),
-            _ => bail!("{} has more than one value", p.as_str()),
+        let mut values = self.g.values_until(node, p, self.deadline);
+        let first = values.next().transpose()?;
+        if values.next().transpose()?.is_some() {
+            bail!("{} has more than one value", p.as_str());
         }
+        Ok(first)
     }
 
     fn required(&self, node: &Term, p: NamedNodeRef<'_>) -> Result<Term> {
@@ -601,12 +617,12 @@ impl Parser<'_> {
     }
 
     fn expr_list(&mut self, head: &Term) -> Result<Vec<ExprId>> {
-        let items = self.g.list(head)?;
+        let items = self.g.list(head, self.deadline)?;
         items.iter().map(|i| self.expr(i)).collect()
     }
 
     fn blank_expr(&mut self, node: &Term) -> Result<ExprId> {
-        let preds = self.predicates(node);
+        let preds = self.predicates(node)?;
         if preds.is_empty() {
             return Ok(self.push_expr(node, Expr::Empty));
         }
@@ -626,9 +642,10 @@ impl Parser<'_> {
             }
         }
         if rdf_list {
-            let items = self.g.list(node)?;
+            let items = self.g.list(node, self.deadline)?;
             let mut ts = Vec::new();
             for i in items {
+                self.check_deadline()?;
                 if !matches!(i, Term::NamedNode(_) | Term::Literal(_)) {
                     bail!("a list expression holds only IRIs and literals, found {i}");
                 }
@@ -694,7 +711,8 @@ impl Parser<'_> {
             }
         } else if is(shnex::PATH_VALUES) {
             let p = self.required(node, shnex::PATH_VALUES)?;
-            let path = PropertyPath::from_graph(&self.g, &p).context("shnex:pathValues")?;
+            let path =
+                PropertyPath::from_graph(&self.g, &p, self.deadline).context("shnex:pathValues")?;
             let focus = self.opt_expr_param(node, shnex::FOCUS_NODE)?;
             Expr::PathValues { path, focus }
         } else if is(shnex::EXISTS) {
@@ -780,7 +798,7 @@ impl Parser<'_> {
                 Term::Literal(l) if l.datatype() == xsd::STRING => l.value().to_string(),
                 _ => bail!("{} expects an xsd:string, found {t}", p.as_str()),
             };
-            let prefixes = crate::sparql::prefixes(&self.g, node);
+            let prefixes = crate::sparql::prefixes(&self.g, node, self.deadline)?;
             let text = if select {
                 text
             } else {
@@ -812,11 +830,19 @@ impl Parser<'_> {
         if is_nil {
             return Ok(Vec::new());
         }
-        if matches!(o, Term::BlankNode(_))
-            && self.g.has(o, rdf::FIRST)
-            && let Ok(items) = self.g.list(o)
-        {
-            return items.iter().map(|i| self.expr(i)).collect();
+        if matches!(o, Term::BlankNode(_)) && self.g.has(o, rdf::FIRST) {
+            match self.g.list(o, self.deadline) {
+                Ok(items) => return items.iter().map(|i| self.expr(i)).collect(),
+                Err(error)
+                    if matches!(
+                        error.downcast_ref::<sparkles_core::Error>(),
+                        Some(sparkles_core::Error::Timeout)
+                    ) =>
+                {
+                    return Err(error);
+                }
+                Err(_) => {}
+            }
         }
         Ok(vec![self.expr(o)?])
     }

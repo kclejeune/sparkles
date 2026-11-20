@@ -1501,9 +1501,16 @@ impl<T> Buffer<T> {
     }
 
     pub(crate) fn push(&mut self, value: T) -> Result<()> {
+        self.push_staged(value, None)
+    }
+
+    pub(crate) fn push_staged(&mut self, value: T, stage: Option<&str>) -> Result<()> {
         let preparation = self.held.preparation.clone();
         preparation.check()?;
         if self.values.len() == self.values.capacity() {
+            if let Some(stage) = stage {
+                preparation.stage(stage)?;
+            }
             let capacity = self
                 .values
                 .capacity()
@@ -1542,8 +1549,19 @@ impl<T> Buffer<T> {
         self.values.pop()
     }
 
+    pub(crate) fn remove(&mut self, index: usize) -> T {
+        self.values.remove(index)
+    }
+
     pub(crate) fn truncate(&mut self, len: usize) {
         self.values.truncate(len);
+    }
+
+    pub(crate) fn dedup(&mut self)
+    where
+        T: PartialEq,
+    {
+        self.values.dedup();
     }
 }
 
@@ -1607,6 +1625,10 @@ impl<K: Copy + Eq + std::hash::Hash, V: Copy> Map<K, V> {
             self.held = held;
         }
         Ok(self.values.insert(key, value))
+    }
+
+    pub(crate) fn into_parts(self) -> (rustc_hash::FxHashMap<K, V>, Reservation) {
+        (self.values, self.held)
     }
 }
 

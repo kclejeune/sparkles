@@ -573,7 +573,7 @@ mod on {
         if let PathEnd::Var(v) = subject {
             vars.push(v);
         }
-        let Some((graph, graph_var)) = p.graph_filter(g) else {
+        let Some((graph, graph_var)) = p.graph_filter(g)? else {
             return Ok(Node::empty(vars));
         };
         if let Some(gv) = graph_var
@@ -1006,7 +1006,9 @@ mod on {
         match gf {
             GraphFilter::Default => cfg.graph_in_scope(crate::text::DEFAULT_GRAPH_IRI),
             GraphFilter::One(g) => iri(*g).is_some_and(|i| cfg.graph_in_scope(&i)),
-            GraphFilter::Set(s) => s
+            GraphFilter::Set(_) | GraphFilter::PreparedSet(_) => gf
+                .set_ids()
+                .unwrap()
                 .iter()
                 .all(|g| iri(*g).is_some_and(|i| cfg.graph_in_scope(&i))),
             GraphFilter::All | GraphFilter::Named => false,

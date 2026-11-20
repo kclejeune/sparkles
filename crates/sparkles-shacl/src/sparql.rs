@@ -7,7 +7,7 @@
 //! textually with the SPARQL form of the shape's path before parsing.
 
 use crate::nodeexpr::Expr;
-use crate::path::PropertyPath;
+use crate::path::{PropertyPath, append_checked};
 use crate::shapes::{Constraint, G, ShapeId, Shapes};
 use crate::validate::{Engine, Out, RPath};
 use crate::vocab::{owl, sh};
@@ -87,63 +87,88 @@ fn literal_text(t: &Term) -> Option<&str> {
 
 /// Prefix declarations reachable from the `sh:prefixes` values of `node`
 /// (following `owl:imports`).
-pub(crate) fn prefixes(g: &G<'_>, node: &Term) -> Vec<(String, String)> {
+pub(crate) fn prefixes(
+    g: &G<'_>,
+    node: &Term,
+    deadline: Option<Instant>,
+) -> Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut seen = FxHashSet::default();
-    let mut stack = g.objects(node, sh::PREFIXES);
+    let mut stack = g.objects_until(node, sh::PREFIXES, deadline)?;
     while let Some(p) = stack.pop() {
+        crate::data::check_deadline(deadline)?;
         if !seen.insert(p.clone()) {
             continue;
         }
-        for d in g.objects(&p, sh::DECLARE) {
+        for d in g.values_until(&p, sh::DECLARE, deadline) {
+            let d = d?;
             if let (Some(pre), Some(ns)) = (g.object(&d, sh::PREFIX), g.object(&d, sh::NAMESPACE))
                 && let (Some(pre), Some(ns)) = (literal_text(&pre), literal_text(&ns))
             {
                 out.push((pre.to_string(), ns.to_string()));
             }
         }
-        stack.extend(g.objects(&p, owl::IMPORTS));
+        for import in g.values_until(&p, owl::IMPORTS, deadline) {
+            stack.push(import?);
+        }
     }
-    out
+    Ok(out)
 }
 
-fn messages(g: &G<'_>, node: &Term) -> Vec<Literal> {
-    g.objects(node, sh::MESSAGE)
-        .into_iter()
-        .filter_map(|t| match t {
-            Term::Literal(l) => Some(l),
-            _ => None,
-        })
-        .collect()
+/// Whether `c` can continue a SPARQL variable name: `PN_CHARS_U`, a digit, `#x00B7`,
+/// `[#x0300-#x036F]` or `[#x203F-#x2040]` of the SPARQL 1.1 grammar.
+pub(crate) fn varname_char(c: char) -> bool {
+    matches!(c,
+        'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '\u{B7}'
+        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{37D}'
+        | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{203F}'..='\u{2040}'
+        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
+        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
 }
 
 /// Replace the `$PATH` placeholder (not `?PATH`, which is a normal variable) with a
 /// SPARQL path. Only real tokens are replaced: the same text inside string literals,
 /// IRIs or comments is left alone.
-fn substitute_path(text: &str, path: Option<&PropertyPath>) -> String {
-    let Some(p) = path else {
-        return text.to_string();
+fn substitute_path(
+    text: &str,
+    path: Option<&PropertyPath>,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    let check = || crate::data::check_deadline(deadline);
+    check()?;
+    let mut out = String::new();
+    let Some(path) = path else {
+        append_checked(&mut out, text, &check)?;
+        return Ok(out);
     };
-    let replacement = p.to_sparql();
+    let mut replacement: Option<String> = None;
     let b = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    // `text[copied..i]` is pending verbatim output; every delimiter below is ASCII, so
-    // these byte offsets are always character boundaries
+    let mut next_check = 4096;
+    let mut poll = |position: usize| {
+        if position >= next_check {
+            check()?;
+            next_check = position.saturating_add(4096);
+        }
+        Ok::<(), sparkles_core::Error>(())
+    };
+    // The ASCII delimiters below keep each pending output boundary on a UTF-8 boundary.
     let mut copied = 0;
     let mut i = 0;
     while i < b.len() {
+        poll(i)?;
         match b[i] {
             b'#' => {
-                i = b[i..]
-                    .iter()
-                    .position(|&c| c == b'\n')
-                    .map_or(b.len(), |n| i + n)
+                while i < b.len() && b[i] != b'\n' {
+                    poll(i)?;
+                    i += 1;
+                }
             }
             q @ (b'"' | b'\'') => {
                 let long = b[i..].starts_with(&[q, q, q]);
                 let delim = if long { 3 } else { 1 };
                 let mut j = i + delim;
                 while j < b.len() {
+                    poll(j)?;
                     if b[j] == b'\\' {
                         j += 2;
                     } else if b[j..].starts_with(&[q, q, q][..delim]) {
@@ -157,31 +182,43 @@ fn substitute_path(text: &str, path: Option<&PropertyPath>) -> String {
                 }
                 i = j.min(b.len());
             }
-            // an IRI reference; `<` followed by whitespace is the comparison operator
-            b'<' => match b[i + 1..].iter().position(|&c| {
-                c == b'>'
-                    || c <= b' '
-                    || matches!(c, b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`')
-            }) {
-                Some(n) if b[i + 1 + n] == b'>' => i += n + 2,
-                _ => i += 1,
-            },
+            // An IRI reference. A '<' followed by whitespace is the comparison operator.
+            b'<' => {
+                let mut j = i + 1;
+                while let Some(&c) = b.get(j) {
+                    poll(j)?;
+                    if c == b'>'
+                        || c <= b' '
+                        || matches!(c, b'<' | b'"' | b'{' | b'}' | b'|' | b'^' | b'`')
+                    {
+                        break;
+                    }
+                    j += 1;
+                }
+                i = if b.get(j) == Some(&b'>') {
+                    j + 1
+                } else {
+                    i + 1
+                };
+            }
             b'$' if b[i + 1..].starts_with(b"PATH")
-                && !text[i + 5..]
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_') =>
+                && !text[i + 5..].chars().next().is_some_and(varname_char) =>
             {
-                out.push_str(&text[copied..i]);
-                out.push_str(&replacement);
+                let replacement = match &replacement {
+                    Some(rendered) => rendered,
+                    None => replacement.insert(path.to_sparql_checked(check)?),
+                };
+                append_checked(&mut out, &text[copied..i], &check)?;
+                append_checked(&mut out, replacement, &check)?;
                 i += 5;
                 copied = i;
             }
             _ => i += 1,
         }
     }
-    out.push_str(&text[copied..]);
-    out
+    append_checked(&mut out, &text[copied..], &check)?;
+    check()?;
+    Ok(out)
 }
 
 /// SHACL-SPARQL's additional constraints on prebound variables and operations.
@@ -282,11 +319,16 @@ fn check_gate_validator(
     deadline: Option<Instant>,
 ) -> Result<()> {
     crate::data::check_deadline(deadline)?;
-    let parse = |text: &str| parse_query(text, None, prefixes);
+    let parse = |text: &str| -> Result<Query> {
+        crate::data::check_deadline(deadline)?;
+        let query = parse_query(text, None, prefixes);
+        crate::data::check_deadline(deadline)?;
+        query.map_err(Into::into)
+    };
     if predicate == sh::NODE_VALIDATOR {
         return check_gate_query(&parse(text)?);
     }
-    let property = substitute_path(text, Some(property_path));
+    let property = substitute_path(text, Some(property_path), deadline)?;
     if predicate == sh::PROPERTY_VALIDATOR {
         return check_gate_query(&parse(&property)?);
     }
@@ -305,7 +347,7 @@ fn check_gate_validator(
             check_gate_query(&property)
         }
         (Ok(query), Err(_)) | (Err(_), Ok(query)) => check_gate_query(&query),
-        (Err(error), Err(_)) => Err(error.into()),
+        (Err(error), Err(_)) => Err(error),
     }
 }
 
@@ -323,15 +365,16 @@ pub(crate) fn check_gate_declarations(g: &G<'_>, deadline: Option<Instant>) -> R
                 continue;
             }
             let validator = triple.object.into_owned();
-            for query in [sh::ASK, sh::SELECT]
-                .into_iter()
-                .flat_map(|p| g.objects(&validator, p))
-            {
-                let text = literal_text(&query)
-                    .ok_or_else(|| anyhow!("the validator of {component} needs a query literal"))?;
-                let prefixes = prefixes(g, &validator);
-                check_gate_validator(text, &prefixes, predicate, &path, deadline)
-                    .with_context(|| format!("validator of {component}"))?;
+            for p in [sh::ASK, sh::SELECT] {
+                for query in g.values_until(&validator, p, deadline) {
+                    let query = query?;
+                    let text = literal_text(&query).ok_or_else(|| {
+                        anyhow!("the validator of {component} needs a query literal")
+                    })?;
+                    let prefixes = prefixes(g, &validator, deadline)?;
+                    check_gate_validator(text, &prefixes, predicate, &path, deadline)
+                        .with_context(|| format!("validator of {component}"))?;
+                }
             }
         }
     }
@@ -345,8 +388,12 @@ pub(crate) fn check_gate_declarations(g: &G<'_>, deadline: Option<Instant>) -> R
             let query = triple.object.into_owned();
             let text = literal_text(&query)
                 .ok_or_else(|| anyhow!("the SPARQL function {function} needs a query literal"))?;
-            check_gate_query(&parse_query(text, None, &prefixes(g, &function))?)
-                .with_context(|| format!("SPARQL function {function}"))?;
+            check_gate_query(&parse_query(
+                text,
+                None,
+                &prefixes(g, &function, deadline)?,
+            )?)
+            .with_context(|| format!("SPARQL function {function}"))?;
         }
     }
     Ok(())
@@ -396,8 +443,9 @@ pub(crate) fn parse_sparql_constraint(
     node: &Term,
     path: Option<&PropertyPath>,
     gate: bool,
+    deadline: Option<Instant>,
 ) -> Result<Option<SparqlConstraint>> {
-    let flags = g.objects(node, sh::DEACTIVATED);
+    let flags = g.objects_until(node, sh::DEACTIVATED, deadline)?;
     let deactivated = if gate {
         match flags.as_slice() {
             [] => false,
@@ -419,9 +467,13 @@ pub(crate) fn parse_sparql_constraint(
         bail!("sh:sparql constraint {node} has no sh:select");
     };
     let text = literal_text(&sel).ok_or_else(|| anyhow!("sh:select must be a literal"))?;
-    let query = substitute_path(text, path);
+    let query = substitute_path(text, path, deadline)?;
     let prebound: Vec<String> = PREBOUND.iter().map(|s| s.to_string()).collect();
-    let parsed = parse(&query, &prefixes(g, node), &prebound)?;
+    let prefixes = prefixes(g, node, deadline)?;
+    crate::data::check_deadline(deadline)?;
+    let parsed = parse(&query, &prefixes, &prebound);
+    crate::data::check_deadline(deadline)?;
+    let parsed = parsed?;
     if !matches!(parsed, Query::Select { .. }) {
         bail!("sh:select of {node} is not a SELECT query");
     }
@@ -429,7 +481,7 @@ pub(crate) fn parse_sparql_constraint(
         node: node.clone(),
         query,
         parsed,
-        messages: messages(g, node),
+        messages: g.literals_until(node, sh::MESSAGE, deadline)?,
     }))
 }
 
@@ -438,18 +490,21 @@ fn local_name(iri: &str) -> &str {
     &iri[i..]
 }
 
-fn parse_validator(g: &G<'_>, node: &Term) -> Option<Validator> {
-    let (ask, text) = match (g.object(node, sh::ASK), g.object(node, sh::SELECT)) {
-        (Some(a), _) => (true, literal_text(&a)?.to_string()),
-        (None, Some(s)) => (false, literal_text(&s)?.to_string()),
-        _ => return None,
+fn parse_validator(g: &G<'_>, node: &Term, deadline: Option<Instant>) -> Result<Option<Validator>> {
+    let (ask, query) = match (g.object(node, sh::ASK), g.object(node, sh::SELECT)) {
+        (Some(a), _) => (true, a),
+        (None, Some(s)) => (false, s),
+        _ => return Ok(None),
     };
-    Some(Validator {
+    let Some(text) = literal_text(&query) else {
+        return Ok(None);
+    };
+    Ok(Some(Validator {
         ask,
-        text,
-        prefixes: prefixes(g, node),
-        messages: messages(g, node),
-    })
+        text: text.to_owned(),
+        prefixes: prefixes(g, node, deadline)?,
+        messages: g.literals_until(node, sh::MESSAGE, deadline)?,
+    }))
 }
 
 /// All SPARQL-based constraint components declared in the shapes graph.
@@ -475,31 +530,48 @@ pub(crate) fn parse_components(
             continue;
         }
         let mut params = Vec::new();
-        for p in g.objects_until(&c, sh::PARAMETER, deadline)? {
+        for p in g.values_until(&c, sh::PARAMETER, deadline) {
+            let p = p?;
             let Some(Term::NamedNode(path)) = g.object(&p, sh::PATH) else {
                 bail!("parameter {p} of {c} has no IRI sh:path");
             };
-            let optional = g
-                .objects(&p, sh::OPTIONAL)
-                .iter()
-                .any(|t| literal_text(t) == Some("true"));
+            let mut optional = false;
+            for value in g.values_until(&p, sh::OPTIONAL, deadline) {
+                if literal_text(&value?) == Some("true") {
+                    optional = true;
+                    break;
+                }
+            }
             params.push(Parameter {
                 var: local_name(path.as_str()).to_string(),
                 path,
                 optional,
             });
         }
-        let v = |p| g.object(&c, p).and_then(|n| parse_validator(g, &n));
+        let validator = |p| match g.object(&c, p) {
+            Some(node) => parse_validator(g, &node, deadline),
+            None => Ok(None),
+        };
         out.push(Arc::new(SparqlComponent {
             iri: iri.clone(),
             params,
-            validator: v(sh::VALIDATOR),
-            node_validator: v(sh::NODE_VALIDATOR),
-            property_validator: v(sh::PROPERTY_VALIDATOR),
-            messages: messages(g, &c),
+            validator: validator(sh::VALIDATOR)?,
+            node_validator: validator(sh::NODE_VALIDATOR)?,
+            property_validator: validator(sh::PROPERTY_VALIDATOR)?,
+            messages: g.literals_until(&c, sh::MESSAGE, deadline)?,
         }));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+thread_local! {
+    static EMBEDDED_PLANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_embedded_plans() -> usize {
+    EMBEDDED_PLANS.replace(0)
 }
 
 #[cfg(test)]
@@ -561,10 +633,10 @@ impl SparqlComponent {
         let mut prebound: Vec<String> = PREBOUND.iter().map(|s| s.to_string()).collect();
         prebound.extend(self.params.iter().map(|p| p.var.clone()));
         crate::data::check_deadline(deadline)?;
-        let text = substitute_path(&validator.text, path);
-        let parsed = parse(&text, &validator.prefixes, &prebound)
-            .with_context(|| format!("validator of {}", self.iri))?;
+        let text = substitute_path(&validator.text, path, deadline)?;
+        let parsed = parse(&text, &validator.prefixes, &prebound);
         crate::data::check_deadline(deadline)?;
+        let parsed = parsed.with_context(|| format!("validator of {}", self.iri))?;
         let messages = if validator.messages.is_empty() {
             &self.messages
         } else {
@@ -624,33 +696,40 @@ impl Engine<'_> {
     }
 
     fn run_query_on(&self, q: &Query, binds: &[(&str, Term)]) -> Result<(Table, Arc<Ctx>)> {
-        let mut ctx = Ctx::new(self.data.snap.clone());
-        ctx.use_cache = false;
-        ctx.allow_service = false;
-        ctx.forbid_service = true;
-        ctx.deadline = self.deadline;
-        if let Some(m) = self.query_memory {
-            ctx.mem_limit = ctx.mem_limit.min(m);
-        }
-        if let Some(opts) = &self.query_limits {
-            if let Some(rows) = opts.max_rows {
-                ctx.max_rows = ctx.max_rows.min(rows);
+        let ctx = if let Some(opts) = &self.query_limits {
+            sparkles_core::sparql::validation_query_context(
+                self.data,
+                sparkles_core::sparql::QueryOptions {
+                    deadline: self.controls.deadline,
+                    cancel: self.controls.cancel.clone(),
+                    cancellation: self.controls.cancellation.clone(),
+                    max_rows: opts.max_rows,
+                    max_memory_bytes: self
+                        .query_memory
+                        .into_iter()
+                        .chain(opts.max_memory_bytes)
+                        .min(),
+                    max_rows_produced: opts.max_rows_produced,
+                    work: opts.work.clone(),
+                    ..Default::default()
+                },
+            )?
+        } else {
+            let mut ctx = Ctx::new(self.data.snap.clone());
+            ctx.use_cache = false;
+            ctx.allow_service = false;
+            ctx.forbid_service = true;
+            ctx.deadline = self.controls.deadline;
+            ctx.cancellation = self.controls.cancellation.clone();
+            if let Some(m) = self.query_memory {
+                ctx.mem_limit = ctx.mem_limit.min(m);
             }
-            if let Some(bytes) = opts.max_memory_bytes {
-                ctx.mem_limit = ctx.mem_limit.min(bytes);
+            if let Some(c) = &self.controls.cancel {
+                ctx.cancel = c.clone();
             }
-            if let Some(work) = opts.max_rows_produced {
-                ctx.max_rows_produced = ctx.max_rows_produced.min(work);
-            }
-            if let Some(work) = &opts.work {
-                ctx.rows_produced = work.clone();
-            }
-        }
-        ctx.cancellation = self.cancellation.clone();
-        if let Some(c) = &self.cancel {
-            ctx.cancel = c.clone();
-        }
-        ctx.dataset.default = Some(self.data.sel.ids(&self.data.snap)?);
+            ctx.dataset.default = Some(self.data.sel.ids(&self.data.snap)?);
+            ctx
+        };
         let pattern = match q {
             Query::Ask { pattern, .. } => GraphPattern::Slice {
                 inner: Box::new(pattern.clone()),
@@ -670,6 +749,8 @@ impl Engine<'_> {
             }
             planner.plan(&pattern, &ActiveGraph::Default, Vec::new())?
         };
+        #[cfg(test)]
+        EMBEDDED_PLANS.with(|plans| plans.set(plans.get() + 1));
         // A shared context pulls an ASK, a LIMIT and an EXISTS only to the rows they need.
         let ctx = ctx.into_shared();
         let (table, _) = exec::execute(&ctx, &node)?;
@@ -907,6 +988,96 @@ fn fresh_blank_nodes(ctx: &Ctx, t: Term, tag: &str) -> Term {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gate_property_constraint_polls_wide_sparql_path_rendering() {
+        use crate::path::ObservePathRender;
+        use crate::shapes::{Constraint, Shapes};
+        use crate::vocab::SH_NS;
+        use sparkles_core::io::RdfFormat;
+        use std::time::{Duration, Instant};
+
+        let list = vec!["<urn:p>"; 128].join(" ");
+        let input = format!(
+            "@prefix sh: <{SH_NS}> .
+             <urn:S> sh:targetNode <urn:x> ; sh:path ({list}) ;
+                 sh:sparql [ sh:select 'SELECT $this WHERE {{ $this $PATH ?o }}' ] ."
+        );
+        let deadline = Instant::now().checked_add(Duration::from_secs(60));
+        let shapes = Shapes::parse_for_gate(&input, RdfFormat::Turtle, None, deadline).unwrap();
+        assert!(
+            shapes
+                .shapes
+                .iter()
+                .any(|shape| shape.constraints.iter().any(|c| {
+                    matches!(c, Constraint::Sparql(c) if c.query.matches("<urn:p>").count() == 128)
+                }))
+        );
+        let observed = ObservePathRender::start(true);
+        let result = Shapes::parse_for_gate(&input, RdfFormat::Turtle, None, deadline);
+        let visited = observed.count();
+        assert!(
+            matches!(
+                result.as_ref().err().and_then(|e| e.downcast_ref()),
+                Some(sparkles_core::Error::Timeout)
+            ) && (5..=6).contains(&visited),
+            "wide SPARQL substitution rendered {visited} predicates before returning"
+        );
+    }
+
+    #[test]
+    fn wide_component_path_is_polled_and_reused_for_repeated_tokens() {
+        use crate::path::ObservePathRender;
+        use crate::shapes::{Constraint, Shapes};
+        use crate::vocab::SH_NS;
+        use sparkles_core::io::RdfFormat;
+
+        let list = vec!["<urn:p>"; 128].join(" ");
+        let input = format!(
+            "@prefix sh: <{SH_NS}> .
+             <urn:Component> a sh:ConstraintComponent ;
+                 sh:parameter [ sh:path <urn:parameter> ] ;
+                 sh:propertyValidator [
+                     sh:select '''SELECT $this ?value WHERE {{
+                         $this $PATH ?value . $this $PATH ?other
+                     }}'''
+                 ] .
+             <urn:shape> sh:targetNode <urn:x> ; sh:path ({list}) ;
+                 <urn:parameter> true ."
+        );
+        let normal = ObservePathRender::start(false);
+        let shapes = Shapes::parse(&input, RdfFormat::Turtle, None).unwrap();
+        assert!(shapes.shapes.iter().any(|shape| {
+            shape
+                .constraints
+                .iter()
+                .any(|c| matches!(c, Constraint::Component(_)))
+        }));
+        assert_eq!(normal.count(), 128);
+        drop(normal);
+        let observed = ObservePathRender::start(true);
+        let result = Shapes::parse(&input, RdfFormat::Turtle, None);
+        assert!(matches!(
+            result.as_ref().err().and_then(|e| e.downcast_ref()),
+            Some(sparkles_core::Error::Timeout)
+        ));
+        assert_eq!(observed.count(), 5);
+    }
+
+    #[test]
+    fn sparql_without_a_real_path_token_never_renders_the_path() {
+        use crate::path::ObservePathRender;
+        let p = PropertyPath::Sequence(vec![
+            PropertyPath::Predicate(NamedNode::new_unchecked(
+                "urn:p"
+            ),);
+            1024
+        ]);
+        let text = "SELECT ?PATH ?value { BIND('$PATH' AS ?value) # $PATH\n FILTER(?value = <urn:$PATH> || $PATHsuffix = $PATHé || $PATH\u{0301} = $PATH\u{203F}) }";
+        let observed = ObservePathRender::start(false);
+        assert_eq!(substitute_path(text, Some(&p), None).unwrap(), text);
+        assert_eq!(observed.count(), 0, "rendered a path with no actual token");
+    }
+
     use super::substitute_path;
     use crate::path::PropertyPath;
     use oxrdf::NamedNode;
@@ -964,7 +1135,7 @@ mod tests {
   FILTER(?v != <http://ex.org/$PATH>) FILTER(?x<$PATH)
   ?v $PATHS ?w . ?v ?PATH ?u .
 }"#;
-        let out = substitute_path(text, Some(&p));
+        let out = substitute_path(text, Some(&p), None).unwrap();
         assert_eq!(
             out,
             r#"SELECT $this WHERE {
@@ -974,7 +1145,7 @@ mod tests {
   ?v $PATHS ?w . ?v ?PATH ?u .
 }"#
         );
-        assert_eq!(substitute_path(text, None), text);
+        assert_eq!(substitute_path(text, None, None).unwrap(), text);
     }
 
     #[test]

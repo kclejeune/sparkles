@@ -78,6 +78,40 @@ pub(crate) fn record_largest(f: impl FnOnce()) -> usize {
     LARGEST.with(|cell| cell.replace((false, 0)).1)
 }
 
+thread_local! {
+    // Selected size, original live-counter address, count, lowest and highest admission.
+    static ADMITTED: Cell<(usize, usize, usize, u64, u64)> =
+        const { Cell::new((0, 0, 0, u64::MAX, 0)) };
+}
+
+pub(crate) fn record_admitted_allocations(
+    preparation: &Preparation,
+    size: usize,
+    f: impl FnOnce(),
+) -> (usize, u64, u64) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            ADMITTED.with(|cell| cell.set((0, 0, 0, u64::MAX, 0)));
+        }
+    }
+    let _reset = Reset;
+    ADMITTED.with(|cell| {
+        assert_eq!(cell.get().0, 0);
+        let counter = preparation.test_used_counter() as *const _ as usize;
+        cell.set((size, counter, 0, u64::MAX, 0));
+    });
+    f();
+    ADMITTED.with(|cell| {
+        let (_, _, count, low, high) = cell.get();
+        (count, low, high)
+    })
+}
+
+pub(crate) fn admitted_allocations_seen() -> usize {
+    ADMITTED.with(|cell| cell.get().2)
+}
+
 struct AllocationObserver;
 // SAFETY: System receives exactly the original layouts. A selected test-thread
 // watch retains its actual Preparation until cleared. Dealloc reads one atomic
@@ -89,6 +123,14 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
             let (on, largest) = cell.get();
             if on {
                 cell.set((on, largest.max(layout.size())));
+            }
+        });
+        let _ = ADMITTED.try_with(|cell| {
+            let (size, counter, count, low, high) = cell.get();
+            if size != 0 && size == layout.size() {
+                let used = unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
+                    .load(Ordering::Relaxed);
+                cell.set((size, counter, count + 1, low.min(used), high.max(used)));
             }
         });
         unsafe { std::alloc::System.alloc(layout) }

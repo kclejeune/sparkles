@@ -2630,10 +2630,19 @@ impl PermIndex {
             } else if let Some(span) =
                 if b == lo { spans[0] } else { spans[1] }.filter(|_| b == lo || b == hi - 1)
             {
-                self.for_each_segment_rows(cache, b, span, &lo_key, &hi_key, bc, |_, s, e| {
-                    total += (e - s) as u64;
-                    Ok(true)
-                })?;
+                self.for_each_segment_rows(
+                    cache,
+                    b,
+                    span,
+                    &lo_key,
+                    &hi_key,
+                    bc,
+                    &|| Ok(()),
+                    |_, s, e| {
+                        total += (e - s) as u64;
+                        Ok(true)
+                    },
+                )?;
                 b += 1;
             } else {
                 let held = if b == lo {
@@ -2734,6 +2743,18 @@ impl PermIndex {
         lo_key: &Key,
         hi_key: &Key,
         mask_of: impl Fn(usize) -> ColMask,
+        f: impl FnMut(&Block, usize, usize) -> Result<bool>,
+    ) -> Result<()> {
+        self.for_each_key_range_masked_checked(cache, lo_key, hi_key, mask_of, &|| Ok(()), f)
+    }
+
+    pub(crate) fn for_each_key_range_masked_checked(
+        &self,
+        cache: &BlockCache,
+        lo_key: &Key,
+        hi_key: &Key,
+        mask_of: impl Fn(usize) -> ColMask,
+        check: &impl Fn() -> Result<()>,
         mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<()> {
         let (lo, hi) = self.key_block_range(lo_key, hi_key);
@@ -2749,12 +2770,15 @@ impl PermIndex {
             }
         };
         for b in lo..hi {
+            check()?;
             let m = &self.blocks[b];
             let mask = columns(b);
             let whole = m.first >= *lo_key && m.last <= *hi_key;
             if !whole && let Some(span) = self.read_span(cache, b, lo_key, hi_key, mask) {
                 // a few rows of the block: the segments that can hold them, one by one
-                if !self.for_each_segment_rows(cache, b, span, lo_key, hi_key, mask, &mut f)? {
+                if !self
+                    .for_each_segment_rows(cache, b, span, lo_key, hi_key, mask, check, &mut f)?
+                {
                     break;
                 }
                 continue;
@@ -2766,6 +2790,7 @@ impl PermIndex {
                     cache.get_cols_hinted(self, b, mask, hint)?
                 }
             };
+            check()?;
             let go_on = if whole {
                 f(&blk, 0, blk.len())?
             } else {
@@ -2792,10 +2817,13 @@ impl PermIndex {
         lo_key: &Key,
         hi_key: &Key,
         mask: ColMask,
+        check: &impl Fn() -> Result<()>,
         mut f: impl FnMut(&Block, usize, usize) -> Result<bool>,
     ) -> Result<bool> {
         for s in s0..s1 {
+            check()?;
             let blk = cache.get_segment(self, b, s, mask, true)?;
+            check()?;
             let (a, z) = blk.key_range(lo_key, hi_key);
             if a < z && !f(&blk, a, z)? {
                 return Ok(false);
@@ -2807,18 +2835,23 @@ impl PermIndex {
     /// A permission preparation reads one admitted segment at a time. Cache access
     /// is nonblocking; contention causes a controlled local decode, never a wait
     /// inside the shared cache. Dense-reader hints do not enlarge the segment.
-    pub(crate) fn for_each_prepared<E: From<Error>>(
+    pub(crate) fn for_each_prepared<E: From<Error>, const SKIP_FIRST: bool>(
         &self,
         cache: &BlockCache,
         lo: &Key,
         hi: &Key,
         preparation: &crate::access::Preparation,
+        skip_through: impl Fn(u64) -> bool,
         mut each: impl FnMut(&Block, usize, usize) -> std::result::Result<bool, E>,
     ) -> std::result::Result<(), E> {
         preparation.check()?;
         let (b0, b1) = self.key_block_range(lo, hi);
         for b in b0..b1 {
             preparation.check()?;
+            let block_last = self.blocks[b].last[0];
+            if SKIP_FIRST && skip_through(block_last) {
+                continue;
+            }
             let (s0, s1) = self.segs.as_ref().map_or((0, 1), |directory| {
                 let n = directory.count(b);
                 (
@@ -2827,6 +2860,20 @@ impl PermIndex {
                 )
             });
             for part in s0..s1 {
+                if SKIP_FIRST {
+                    preparation.check()?;
+                    // The next segment's first key also bounds this segment.
+                    let through = self.segs.as_ref().map_or(block_last, |directory| {
+                        if part + 1 < directory.count(b) {
+                            directory.first_key(b, part + 1)[0]
+                        } else {
+                            block_last
+                        }
+                    });
+                    if skip_through(through) {
+                        continue;
+                    }
+                }
                 let segment = self.segs.as_ref().map(|_| part);
                 let rows = segment.map_or(self.blocks[b].rows as usize, |s| {
                     let (start, end) = self.segment_rows(b, s);
@@ -3032,10 +3079,19 @@ impl PermIndex {
         }
         if let Some(span) = self.read_span(cache, b, key, key, ALL_COLS) {
             let mut found = false;
-            self.for_each_segment_rows(cache, b, span, key, key, ALL_COLS, |_, _, _| {
-                found = true;
-                Ok(false)
-            })?;
+            self.for_each_segment_rows(
+                cache,
+                b,
+                span,
+                key,
+                key,
+                ALL_COLS,
+                &|| Ok(()),
+                |_, _, _| {
+                    found = true;
+                    Ok(false)
+                },
+            )?;
             return Ok(found);
         }
         let blk = cache.get(self, b)?;

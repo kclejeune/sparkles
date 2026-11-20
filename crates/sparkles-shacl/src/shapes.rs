@@ -659,6 +659,7 @@ pub(crate) fn as_subject(t: &Term) -> Option<NamedOrBlankNodeRef<'_>> {
 }
 
 /// Read helpers over an oxrdf graph.
+#[derive(Clone, Copy)]
 pub(crate) struct G<'g> {
     pub g: &'g Graph,
 }
@@ -681,14 +682,54 @@ impl<'g> G<'g> {
         p: NamedNodeRef<'_>,
         deadline: Option<Instant>,
     ) -> Result<Vec<Term>> {
-        let mut values = Vec::new();
-        if let Some(subject) = as_subject(s) {
-            for value in self.g.objects_for_subject_predicate(subject, p) {
+        self.values_until(s, p, deadline).collect()
+    }
+
+    pub fn values_until<'a>(
+        self,
+        s: &'a Term,
+        p: NamedNodeRef<'a>,
+        deadline: Option<Instant>,
+    ) -> impl Iterator<Item = Result<Term>> + 'a
+    where
+        'g: 'a,
+    {
+        as_subject(s)
+            .into_iter()
+            .flat_map(move |s| self.g.objects_for_subject_predicate(s, p))
+            .map(move |value| {
                 crate::data::check_deadline(deadline)?;
-                values.push(value.into_owned());
+                Ok(value.into_owned())
+            })
+    }
+
+    pub fn literals_until(
+        &self,
+        s: &Term,
+        p: NamedNodeRef<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Literal>> {
+        let mut values = Vec::new();
+        for value in self.values_until(s, p, deadline) {
+            if let Term::Literal(literal) = value? {
+                values.push(literal);
             }
         }
         Ok(values)
+    }
+
+    pub fn is_true_until(
+        &self,
+        s: &Term,
+        p: NamedNodeRef<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<bool> {
+        for value in self.values_until(s, p, deadline) {
+            if literal_bool(&value?) == Some(true) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn object(&self, s: &Term, p: NamedNodeRef<'_>) -> Option<Term> {
@@ -705,12 +746,27 @@ impl<'g> G<'g> {
             .collect()
     }
 
+    fn subjects_until(
+        &self,
+        p: NamedNodeRef<'_>,
+        o: &Term,
+        deadline: Option<Instant>,
+    ) -> Result<Vec<Term>> {
+        self.g
+            .subjects_for_predicate_object(p, o.as_ref())
+            .map(|s| {
+                crate::data::check_deadline(deadline)?;
+                Ok(Term::from(s.into_owned()))
+            })
+            .collect()
+    }
+
     pub fn has(&self, s: &Term, p: NamedNodeRef<'_>) -> bool {
         self.object(s, p).is_some()
     }
 
     /// Elements of an RDF list.
-    pub fn list(&self, head: &Term) -> Result<Vec<Term>> {
+    pub fn list(&self, head: &Term, deadline: Option<Instant>) -> Result<Vec<Term>> {
         let mut out = Vec::new();
         let mut cur = head.clone();
         let mut seen = FxHashSet::default();
@@ -718,8 +774,12 @@ impl<'g> G<'g> {
             if let Term::NamedNode(n) = &cur
                 && n.as_ref() == rdf::NIL
             {
+                crate::data::check_deadline(deadline)?;
                 return Ok(out);
             }
+            #[cfg(test)]
+            compile_control_tests::observe(compile_control_tests::Phase::ReadList);
+            crate::data::check_deadline(deadline)?;
             if !seen.insert(cur.clone()) {
                 bail!("cyclic RDF list at {head}");
             }
@@ -856,7 +916,7 @@ pub(crate) struct Parser<'g> {
     pub(crate) g: G<'g>,
     pub(crate) out: Shapes,
     pub(crate) gate: bool,
-    deadline: Option<Instant>,
+    pub(crate) deadline: Option<Instant>,
     components: Vec<std::sync::Arc<SparqlComponent>>,
     pub(crate) fns: FnIndex,
     pub(crate) expr_memo: FxHashMap<Term, ExprId>,
@@ -967,6 +1027,12 @@ impl<'g> Parser<'g> {
             self.shape(&r)?;
         }
         if let Err(e) = self.parse_rules() {
+            if matches!(
+                e.downcast_ref::<sparkles_core::Error>(),
+                Some(sparkles_core::Error::Timeout)
+            ) {
+                return Err(e);
+            }
             self.out.rules.clear();
             self.out.rule_error = Some(format!("{e:#}"));
         }
@@ -989,34 +1055,31 @@ impl<'g> Parser<'g> {
         if let Some(&i) = self.out.by_node.get(node) {
             return Ok(i);
         }
+        // Leave room for constraint parsing and its nested property paths
+        // before the next shape reaches this stack check.
+        stacker::maybe_grow(1 << 20, 4 << 20, || self.parse_shape(node))
+    }
+
+    #[inline(never)]
+    fn parse_shape(&mut self, node: &Term) -> Result<ShapeId> {
         if as_subject(node).is_none() {
             bail!("a literal cannot be a shape: {node}");
         }
         let id = self.out.shapes.len();
-        let g = &self.g;
+        let g = self.g;
         let path = match g.object(node, sh::PATH) {
             Some(p) => Some(
-                PropertyPath::from_graph(g, &p)
+                PropertyPath::from_graph(&g, &p, self.deadline)
                     .with_context(|| format!("sh:path of shape {node}"))?,
             ),
             None => None,
         };
-        let deactivated = g
-            .objects(node, sh::DEACTIVATED)
-            .iter()
-            .any(|t| literal_bool(t) == Some(true));
+        let deactivated = g.is_true_until(node, sh::DEACTIVATED, self.deadline)?;
         let severity = match g.object(node, sh::SEVERITY) {
             Some(Term::NamedNode(n)) => n,
             _ => sh::VIOLATION.into_owned(),
         };
-        let messages = g
-            .objects(node, sh::MESSAGE)
-            .into_iter()
-            .filter_map(|t| match t {
-                Term::Literal(l) => Some(l),
-                _ => None,
-            })
-            .collect();
+        let messages = g.literals_until(node, sh::MESSAGE, self.deadline)?;
         self.out.shapes.push(Shape {
             node: node.clone(),
             path,
@@ -1031,13 +1094,14 @@ impl<'g> Parser<'g> {
             info: None,
         });
         self.out.by_node.insert(node.clone(), id);
-        let info = self.info(node);
+        let info = self.info(node)?;
         if !info.is_empty() {
             self.out.shapes[id].info = Some(Box::new(info));
         }
 
         // node expressions of the shape, read once the shape has its place
-        for t in self.g.objects(node, sh::DEACTIVATED) {
+        for t in g.values_until(node, sh::DEACTIVATED, self.deadline) {
+            let t = t?;
             if self.is_function_expr(&t) {
                 let e = self
                     .expr(&t)
@@ -1067,17 +1131,8 @@ impl<'g> Parser<'g> {
     }
 
     /// The non-validating characteristics of a shape, and the property group it names.
-    fn info(&mut self, node: &Term) -> ShapeInfo {
+    fn info(&mut self, node: &Term) -> Result<ShapeInfo> {
         let g = &self.g;
-        let literals = |p| {
-            g.objects(node, p)
-                .into_iter()
-                .filter_map(|t| match t {
-                    Term::Literal(l) => Some(l),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
         let number = |t: Option<Term>| match t {
             Some(Term::Literal(l)) => l
                 .value()
@@ -1095,8 +1150,8 @@ impl<'g> Parser<'g> {
             .object(node, sh::GROUP)
             .filter(|t| as_subject(t).is_some());
         let info = ShapeInfo {
-            names: literals(sh::NAME),
-            descriptions: literals(sh::DESCRIPTION),
+            names: g.literals_until(node, sh::NAME, self.deadline)?,
+            descriptions: g.literals_until(node, sh::DESCRIPTION, self.deadline)?,
             order: number(g.object(node, sh::ORDER)),
             group: group.clone(),
             default_value: g
@@ -1107,34 +1162,26 @@ impl<'g> Parser<'g> {
             single_line: g
                 .object(node, crate::vocab::dash::SINGLE_LINE)
                 .and_then(|t| literal_bool(&t)),
-            read_only: g
-                .objects(node, crate::vocab::dash::READ_ONLY)
-                .iter()
-                .any(|t| literal_bool(t) == Some(true)),
+            read_only: g.is_true_until(node, crate::vocab::dash::READ_ONLY, self.deadline)?,
         };
         if let Some(gr) = group
             && !self.out.groups.contains_key(&gr)
         {
-            let labels = g
-                .objects(&gr, rdfs::LABEL)
-                .into_iter()
-                .filter_map(|t| match t {
-                    Term::Literal(l) => Some(l),
-                    _ => None,
-                })
-                .collect();
+            let labels = g.literals_until(&gr, rdfs::LABEL, self.deadline)?;
             let order = number(g.object(&gr, sh::ORDER));
             self.out.groups.insert(gr, GroupInfo { labels, order });
         }
-        info
+        Ok(info)
     }
 
     fn targets(&mut self, node: &Term) -> Result<Vec<Target>> {
         let mut out = Vec::new();
-        for t in self.g.objects(node, sh::TARGET_NODE) {
+        let g = self.g;
+        for t in g.values_until(node, sh::TARGET_NODE, self.deadline) {
+            let t = t?;
             // a blank node that is a node expression (SHACL 1.2); other blank nodes are
             // plain nodes, as in SHACL 1.0
-            if self.gate && self.has_expression_syntax(&t) {
+            if self.gate && self.has_expression_syntax(&t)? {
                 let e = self
                     .expr(&t)
                     .with_context(|| format!("sh:targetNode of shape {node}"))?;
@@ -1150,8 +1197,12 @@ impl<'g> Parser<'g> {
             }
             out.push(Target::Node(self.out.intern(t)));
         }
-        for t in self.g.objects(node, sh::TARGET_CLASS) {
-            out.push(Target::Class(self.target_iri(node, sh::TARGET_CLASS, t)?));
+        for t in g.values_until(node, sh::TARGET_CLASS, self.deadline) {
+            out.push(Target::Class(self.target_iri(
+                node,
+                sh::TARGET_CLASS,
+                t?,
+            )?));
         }
         // implicit class target: the shape is also an rdfs:Class
         if matches!(node, Term::NamedNode(_))
@@ -1168,23 +1219,23 @@ impl<'g> Parser<'g> {
                 out.push(Target::Class(t));
             }
         }
-        for t in self.g.objects(node, sh::TARGET_SUBJECTS_OF) {
+        for t in g.values_until(node, sh::TARGET_SUBJECTS_OF, self.deadline) {
             out.push(Target::SubjectsOf(self.target_iri(
                 node,
                 sh::TARGET_SUBJECTS_OF,
-                t,
+                t?,
             )?));
         }
-        for t in self.g.objects(node, sh::TARGET_OBJECTS_OF) {
+        for t in g.values_until(node, sh::TARGET_OBJECTS_OF, self.deadline) {
             out.push(Target::ObjectsOf(self.target_iri(
                 node,
                 sh::TARGET_OBJECTS_OF,
-                t,
+                t?,
             )?));
         }
-        for t in self.g.objects(node, sh::TARGET_WHERE) {
+        for t in g.values_until(node, sh::TARGET_WHERE, self.deadline) {
             let w = self
-                .shape(&t)
+                .shape(&t?)
                 .with_context(|| format!("sh:targetWhere of shape {node}"))?;
             out.push(Target::Where(w));
         }
@@ -1200,7 +1251,7 @@ impl<'g> Parser<'g> {
     }
 
     fn shape_list(&mut self, head: &Term) -> Result<Vec<ShapeId>> {
-        let items = self.g.list(head)?;
+        let items = self.g.list(head, self.deadline)?;
         items.iter().map(|t| self.shape(t)).collect()
     }
 
@@ -1214,16 +1265,19 @@ impl<'g> Parser<'g> {
     fn constraints(&mut self, node: &Term, id: ShapeId) -> Result<Vec<Constraint>> {
         let mut cs = Vec::new();
         let g = G { g: self.g.g };
-        for t in g.objects(node, sh::CLASS) {
+        for t in g.values_until(node, sh::CLASS, self.deadline) {
+            let t = t?;
             cs.push(Constraint::Class(self.out.intern(t)));
         }
-        for t in g.objects(node, sh::DATATYPE) {
+        for t in g.values_until(node, sh::DATATYPE, self.deadline) {
+            let t = t?;
             match t {
                 Term::NamedNode(n) => cs.push(Constraint::Datatype(n)),
                 t => bail!("sh:datatype expects an IRI, found {t}"),
             }
         }
-        for t in g.objects(node, sh::NODE_KIND) {
+        for t in g.values_until(node, sh::NODE_KIND, self.deadline) {
+            let t = t?;
             let k = match &t {
                 Term::NamedNode(n) => NodeKind::from_iri(n.as_str()),
                 _ => None,
@@ -1232,10 +1286,12 @@ impl<'g> Parser<'g> {
                 k.ok_or_else(|| anyhow!("invalid sh:nodeKind {t}"))?,
             ));
         }
-        for t in g.objects(node, sh::MIN_COUNT) {
+        for t in g.values_until(node, sh::MIN_COUNT, self.deadline) {
+            let t = t?;
             cs.push(Constraint::MinCount(literal_u64(&t, "sh:minCount")?));
         }
-        for t in g.objects(node, sh::MAX_COUNT) {
+        for t in g.values_until(node, sh::MAX_COUNT, self.deadline) {
+            let t = t?;
             cs.push(Constraint::MaxCount(literal_u64(&t, "sh:maxCount")?));
         }
         type Mk = fn(Term, Value) -> Constraint;
@@ -1246,21 +1302,25 @@ impl<'g> Parser<'g> {
             (sh::MAX_INCLUSIVE, Constraint::MaxInclusive),
         ];
         for (p, mk) in ranges {
-            for t in g.objects(node, p) {
+            for t in g.values_until(node, p, self.deadline) {
+                let t = t?;
                 let v = Value::from_term(&t);
                 cs.push(mk(t, v));
             }
         }
-        for t in g.objects(node, sh::MIN_LENGTH) {
+        for t in g.values_until(node, sh::MIN_LENGTH, self.deadline) {
+            let t = t?;
             cs.push(Constraint::MinLength(literal_u64(&t, "sh:minLength")?));
         }
-        for t in g.objects(node, sh::MAX_LENGTH) {
+        for t in g.values_until(node, sh::MAX_LENGTH, self.deadline) {
+            let t = t?;
             cs.push(Constraint::MaxLength(literal_u64(&t, "sh:maxLength")?));
         }
         let flags = g
             .object(node, sh::FLAGS)
             .and_then(|f| literal_str(&f).map(str::to_string));
-        for t in g.objects(node, sh::PATTERN) {
+        for t in g.values_until(node, sh::PATTERN, self.deadline) {
+            let t = t?;
             let pattern = literal_str(&t)
                 .ok_or_else(|| anyhow!("sh:pattern expects a literal, found {t}"))?
                 .to_string();
@@ -1271,51 +1331,61 @@ impl<'g> Parser<'g> {
                 regex,
             })));
         }
-        for t in g.objects(node, sh::LANGUAGE_IN) {
-            let langs = g
-                .list(&t)?
-                .iter()
-                .filter_map(|l| literal_str(l).map(str::to_string))
-                .collect();
+        for t in g.values_until(node, sh::LANGUAGE_IN, self.deadline) {
+            let t = t?;
+            let mut langs = Vec::new();
+            for term in g.list(&t, self.deadline)? {
+                self.check_deadline()?;
+                if let Some(lang) = literal_str(&term) {
+                    langs.push(lang.to_owned());
+                }
+            }
             cs.push(Constraint::LanguageIn(langs));
         }
-        if g.objects(node, sh::UNIQUE_LANG)
-            .iter()
-            .any(|t| literal_bool(t) == Some(true))
-        {
+        if g.is_true_until(node, sh::UNIQUE_LANG, self.deadline)? {
             cs.push(Constraint::UniqueLang);
         }
-        for t in g.objects(node, sh::EQUALS) {
+        for t in g.values_until(node, sh::EQUALS, self.deadline) {
+            let t = t?;
             cs.push(Constraint::Equals(self.predicate(t, "sh:equals")?));
         }
-        for t in g.objects(node, sh::DISJOINT) {
+        for t in g.values_until(node, sh::DISJOINT, self.deadline) {
+            let t = t?;
             cs.push(Constraint::Disjoint(self.predicate(t, "sh:disjoint")?));
         }
-        for t in g.objects(node, sh::LESS_THAN) {
+        for t in g.values_until(node, sh::LESS_THAN, self.deadline) {
+            let t = t?;
             cs.push(Constraint::LessThan(self.predicate(t, "sh:lessThan")?));
         }
-        for t in g.objects(node, sh::LESS_THAN_OR_EQUALS) {
+        for t in g.values_until(node, sh::LESS_THAN_OR_EQUALS, self.deadline) {
+            let t = t?;
             cs.push(Constraint::LessThanOrEquals(
                 self.predicate(t, "sh:lessThanOrEquals")?,
             ));
         }
-        for t in g.objects(node, sh::NOT) {
+        for t in g.values_until(node, sh::NOT, self.deadline) {
+            let t = t?;
             cs.push(Constraint::Not(self.shape(&t)?));
         }
-        for t in g.objects(node, sh::AND) {
+        for t in g.values_until(node, sh::AND, self.deadline) {
+            let t = t?;
             cs.push(Constraint::And(self.shape_list(&t)?));
         }
-        for t in g.objects(node, sh::OR) {
+        for t in g.values_until(node, sh::OR, self.deadline) {
+            let t = t?;
             cs.push(Constraint::Or(self.shape_list(&t)?));
         }
-        for t in g.objects(node, sh::XONE) {
+        for t in g.values_until(node, sh::XONE, self.deadline) {
+            let t = t?;
             cs.push(Constraint::Xone(self.shape_list(&t)?));
         }
-        for t in g.objects(node, sh::NODE) {
+        for t in g.values_until(node, sh::NODE, self.deadline) {
+            let t = t?;
             cs.push(Constraint::Node(self.shape(&t)?));
         }
         let mut property_shapes = Vec::new();
-        for t in g.objects(node, sh::PROPERTY) {
+        for t in g.values_until(node, sh::PROPERTY, self.deadline) {
+            let t = t?;
             let ps = self.shape(&t)?;
             property_shapes.push(ps);
             cs.push(Constraint::Property(ps));
@@ -1327,20 +1397,22 @@ impl<'g> Parser<'g> {
             && (qmin.is_some() || qmax.is_some())
         {
             let shape = self.shape(&q)?;
-            let disjoint = g
-                .objects(node, sh::QUALIFIED_VALUE_SHAPES_DISJOINT)
-                .iter()
-                .any(|t| literal_bool(t) == Some(true));
+            let disjoint =
+                g.is_true_until(node, sh::QUALIFIED_VALUE_SHAPES_DISJOINT, self.deadline)?;
             let mut siblings = Vec::new();
             if disjoint {
-                for parent in g.subjects(sh::PROPERTY, node) {
-                    for sib_ps in g.objects(&parent, sh::PROPERTY) {
+                let mut seen = FxHashSet::default();
+                for parent in g.subjects_until(sh::PROPERTY, node, self.deadline)? {
+                    self.check_deadline()?;
+                    for sib_ps in g.values_until(&parent, sh::PROPERTY, self.deadline) {
+                        let sib_ps = sib_ps?;
                         if &sib_ps == node {
                             continue;
                         }
-                        for sq in g.objects(&sib_ps, sh::QUALIFIED_VALUE_SHAPE) {
-                            let s = self.shape(&sq)?;
-                            if !siblings.contains(&s) {
+                        for sq in g.values_until(&sib_ps, sh::QUALIFIED_VALUE_SHAPE, self.deadline)
+                        {
+                            let s = self.shape(&sq?)?;
+                            if seen.insert(s) {
                                 siblings.push(s);
                             }
                         }
@@ -1367,16 +1439,17 @@ impl<'g> Parser<'g> {
                 cs.push(Constraint::QualifiedMax(Box::new(q)));
             }
         }
-        if g.objects(node, sh::CLOSED)
-            .iter()
-            .any(|t| literal_bool(t) == Some(true))
-        {
+        if g.is_true_until(node, sh::CLOSED, self.deadline)? {
             let mut ignored = Vec::new();
-            for l in g.objects(node, sh::IGNORED_PROPERTIES) {
-                ignored.extend(g.list(&l)?);
+            for list in g.values_until(node, sh::IGNORED_PROPERTIES, self.deadline) {
+                for term in g.list(&list?, self.deadline)? {
+                    self.check_deadline()?;
+                    ignored.push(term);
+                }
             }
             let mut allowed = Vec::new();
             for &ps in &property_shapes {
+                self.check_deadline()?;
                 if let Some(PropertyPath::Predicate(p)) = &self.out.shapes[ps].path {
                     allowed.push(self.out.intern(Term::NamedNode(p.clone())));
                 } else if self.out.shapes[ps].path.is_none() {
@@ -1388,63 +1461,80 @@ impl<'g> Parser<'g> {
                 }
             }
             for t in &ignored {
+                self.check_deadline()?;
                 allowed.push(self.out.intern(t.clone()));
             }
             cs.push(Constraint::Closed { allowed, ignored });
         }
-        for t in g.objects(node, sh::HAS_VALUE) {
+        for t in g.values_until(node, sh::HAS_VALUE, self.deadline) {
+            let t = t?;
             cs.push(Constraint::HasValue(self.out.intern(t)));
         }
-        for t in g.objects(node, sh::IN) {
-            let items = g.list(&t)?;
-            let ids = items.into_iter().map(|i| self.out.intern(i)).collect();
+        for t in g.values_until(node, sh::IN, self.deadline) {
+            let t = t?;
+            let mut ids = Vec::new();
+            for item in g.list(&t, self.deadline)? {
+                #[cfg(test)]
+                compile_control_tests::observe(compile_control_tests::Phase::InternMember);
+                self.check_deadline()?;
+                ids.push(self.out.intern(item));
+            }
             cs.push(Constraint::In(ids));
         }
-        for t in g.objects(node, sh::MEMBER_SHAPE) {
+        for t in g.values_until(node, sh::MEMBER_SHAPE, self.deadline) {
+            let t = t?;
             cs.push(Constraint::MemberShape(self.shape(&t)?));
         }
-        for t in g.objects(node, sh::MIN_LIST_LENGTH) {
+        for t in g.values_until(node, sh::MIN_LIST_LENGTH, self.deadline) {
+            let t = t?;
             cs.push(Constraint::MinListLength(literal_u64(
                 &t,
                 "sh:minListLength",
             )?));
         }
-        for t in g.objects(node, sh::MAX_LIST_LENGTH) {
+        for t in g.values_until(node, sh::MAX_LIST_LENGTH, self.deadline) {
+            let t = t?;
             cs.push(Constraint::MaxListLength(literal_u64(
                 &t,
                 "sh:maxListLength",
             )?));
         }
-        for t in g.objects(node, sh::UNIQUE_MEMBERS) {
+        for t in g.values_until(node, sh::UNIQUE_MEMBERS, self.deadline) {
+            let t = t?;
             let b = literal_bool(&t)
                 .ok_or_else(|| anyhow!("sh:uniqueMembers expects a boolean literal, found {t}"))?;
             cs.push(Constraint::UniqueMembers(b));
         }
-        for t in g.objects(node, sh::EXPRESSION) {
+        for t in g.values_until(node, sh::EXPRESSION, self.deadline) {
+            let t = t?;
             let e = self
                 .expr(&t)
                 .with_context(|| format!("sh:expression of shape {node}"))?;
             cs.push(Constraint::Expression(e));
         }
-        for t in g.objects(node, sh::NODE_BY_EXPRESSION) {
+        for t in g.values_until(node, sh::NODE_BY_EXPRESSION, self.deadline) {
+            let t = t?;
             let e = self
                 .expr(&t)
                 .with_context(|| format!("sh:nodeByExpression of shape {node}"))?;
             cs.push(Constraint::NodeByExpression(e));
         }
-        for t in g.objects(node, sh::SPARQL) {
+        let path = self.out.shapes[id].path.as_ref();
+        for t in g.values_until(node, sh::SPARQL, self.deadline) {
+            let t = t?;
             self.check_deadline()?;
-            let path = self.out.shapes[id].path.clone();
             if let Some(c) =
-                crate::sparql::parse_sparql_constraint(&g, &t, path.as_ref(), self.gate)?
+                crate::sparql::parse_sparql_constraint(&g, &t, path, self.gate, self.deadline)?
             {
                 cs.push(Constraint::Sparql(Box::new(c)));
             }
         }
-        let path = self.out.shapes[id].path.clone();
-        for comp in self.components.clone() {
+        for comp in &self.components {
             self.check_deadline()?;
-            for inst in comp.instances(&g, node, path.as_ref(), self.deadline)? {
+            for inst in comp.instances(&g, node, path, self.deadline)? {
+                #[cfg(test)]
+                compile_control_tests::observe(compile_control_tests::Phase::AppendComponent);
+                self.check_deadline()?;
                 cs.push(Constraint::Component(Box::new(inst)));
             }
         }
@@ -1482,6 +1572,125 @@ pub(crate) fn compile_regex(pattern: &str, flags: Option<&str>) -> Result<regex:
     }
     b.build()
         .with_context(|| format!("invalid sh:pattern {pattern:?}"))
+}
+
+#[cfg(test)]
+mod compile_control_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase {
+        ReadList,
+        InternMember,
+        AppendComponent,
+    }
+
+    thread_local! {
+        static PHASE: Cell<Option<(Phase, usize)>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn observe(phase: Phase) {
+        PHASE.with(|state| {
+            if let Some((active, seen)) = state.get()
+                && active == phase
+            {
+                if seen == 4 {
+                    crate::data::set_deadline_checks_left(Some(0));
+                }
+                state.set(Some((active, seen + 1)));
+            }
+        });
+    }
+
+    struct Observe;
+
+    impl Drop for Observe {
+        fn drop(&mut self) {
+            PHASE.set(None);
+            crate::data::set_deadline_checks_left(None);
+        }
+    }
+
+    fn assert_expires_in(graph: &Graph, phase: Phase) {
+        let _guard = Observe;
+        PHASE.set(Some((phase, 0)));
+        let error = Parser::new(graph).for_gate(None).parse(false).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<sparkles_core::Error>(),
+            Some(sparkles_core::Error::Timeout)
+        ));
+        let (_, seen) = PHASE.get().unwrap();
+        assert!((5..=6).contains(&seen), "compiler visited {seen} entries");
+    }
+
+    #[test]
+    fn controlled_in_list_expires_inside_one_shape() {
+        let list = (0..1024)
+            .map(|i| (i % 23).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let graph = Shapes::read_graph(
+            &format!(
+                "@prefix sh: <http://www.w3.org/ns/shacl#> .
+                 <urn:S> sh:targetNode <urn:x> ; sh:in ({list}) ."
+            ),
+            ShapesSyntax::default(),
+            None,
+        )
+        .unwrap();
+        let compiled = Parser::new(&graph).for_gate(None).parse(false).unwrap();
+        let Constraint::In(ids) = &compiled.shapes[0].constraints[0] else {
+            panic!("expected the sh:in constraint");
+        };
+        let values: Vec<_> = ids
+            .iter()
+            .map(|&id| compiled.term(id).to_string())
+            .collect();
+        let expected: Vec<_> = (0..1024)
+            .map(|i| Literal::from(i % 23).to_string())
+            .collect();
+        assert_eq!(values, expected);
+        assert_expires_in(&graph, Phase::ReadList);
+    }
+
+    #[test]
+    fn controlled_in_member_conversion_expires_inside_one_shape() {
+        let list = (0..32).map(|i| i.to_string()).collect::<Vec<_>>().join(" ");
+        let graph = Shapes::read_graph(
+            &format!(
+                "@prefix sh: <http://www.w3.org/ns/shacl#> .
+                 <urn:S> sh:targetNode <urn:x> ; sh:in ({list}) ."
+            ),
+            ShapesSyntax::default(),
+            None,
+        )
+        .unwrap();
+        assert_expires_in(&graph, Phase::InternMember);
+    }
+
+    #[test]
+    fn controlled_component_append_expires_during_boxing() {
+        let values = (0..300)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let graph = Shapes::read_graph(
+            &format!(
+                "@prefix sh: <http://www.w3.org/ns/shacl#> .
+                 <urn:C> a sh:ConstraintComponent ;
+                    sh:parameter [ sh:path <urn:arg> ] ;
+                    sh:nodeValidator [ sh:select 'SELECT $this WHERE {{}}' ] .
+                 <urn:S> sh:targetNode <urn:x> ; <urn:arg> {values} ."
+            ),
+            ShapesSyntax::default(),
+            None,
+        )
+        .unwrap();
+        let compiled = Parser::new(&graph).for_gate(None).parse(false).unwrap();
+        assert_eq!(compiled.shapes[0].constraints.len(), 300);
+        assert_expires_in(&graph, Phase::AppendComponent);
+    }
 }
 
 #[cfg(test)]

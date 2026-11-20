@@ -9,6 +9,8 @@ pub mod cache;
 pub mod catalog;
 pub mod cdt;
 pub mod charsets;
+mod checked_layout;
+mod checked_syntax;
 mod constkeys;
 pub mod ctx;
 pub mod cursor;
@@ -1026,14 +1028,15 @@ fn resolve_selector_graphs(ctx: &mut Ctx, graphs: &GraphSel) -> Result<Vec<Id>> 
             }
         }
         GraphSel::All | GraphSel::AllExcept(_) => {
-            let mut add = |id: Id| {
-                if graphs.accepts(id.0) {
+            if graphs.accepts(Id::DEFAULT_GRAPH.0) {
+                selected.push(Id::DEFAULT_GRAPH)?;
+            }
+            ctx.snap.scan_graph_ids_prepared(preparation, |id| {
+                if id != Id::DEFAULT_GRAPH && graphs.accepts(id.0) {
                     selected.push(id)?;
                 }
                 Ok(())
-            };
-            add(Id::DEFAULT_GRAPH)?;
-            ctx.snap.for_each_graph_id_checked(|| ctx.check(), add)?;
+            })?;
         }
     }
     let (ids, held) = selected.into_parts();
@@ -1042,6 +1045,46 @@ fn resolve_selector_graphs(ctx: &mut Ctx, graphs: &GraphSel) -> Result<Vec<Id>> 
         .expect("source setup owner")
         .merge(held);
     Ok(ids)
+}
+
+/// Prepare an embedded query on the caller's physical validation data. Its selected
+/// graph IDs form the default dataset, while named graph access remains unchanged.
+/// The returned context retains the admission for that dataset.
+pub fn validation_query_context(
+    data: &crate::validation::DataGraph,
+    controls: QueryOptions,
+) -> Result<Ctx> {
+    let opts = QueryOptions {
+        deadline: controls.deadline,
+        cancel: controls.cancel,
+        cancellation: controls.cancellation,
+        max_rows: controls.max_rows,
+        max_memory_bytes: controls.max_memory_bytes,
+        max_rows_produced: controls.max_rows_produced,
+        work: controls.work,
+        ..Default::default()
+    };
+    let preparation = crate::access::Preparation::for_request(&opts)?;
+    let view = crate::access::GraphAccess::all().masked_controlled(&data.snap, &preparation)?;
+    let (mut ctx, access) = make_source_ctx_policy(view.read_source(), &opts, None)?;
+    ctx.use_cache = false;
+    ctx.allow_service = false;
+    ctx.forbid_service = true;
+    if let Some(rows) = opts.max_rows {
+        ctx.max_rows = ctx.max_rows.min(rows);
+    }
+    if let Some(bytes) = opts.max_memory_bytes {
+        ctx.mem_limit = ctx.mem_limit.min(bytes);
+    }
+    if let Some(work) = opts.max_rows_produced {
+        ctx.max_rows_produced = ctx.max_rows_produced.min(work);
+    }
+    if let Some(work) = opts.work {
+        ctx.rows_produced = work;
+    }
+    ctx.dataset.default = Some(resolve_selector_graphs(&mut ctx, &data.sel)?);
+    restrict_source_ctx(&mut ctx, access.as_ref())?;
+    Ok(ctx)
 }
 
 fn restrict_source_ctx(

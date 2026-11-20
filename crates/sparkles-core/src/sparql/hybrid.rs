@@ -332,7 +332,7 @@ pub(super) fn hybrid_leaf(
         Kind::VectorSearch(spec) => Some(spec),
         _ => None,
     };
-    let graph_var = p.graph_filter(g).and_then(|(_, gv)| gv);
+    let graph_var = p.graph_filter(g)?.and_then(|(_, gv)| gv);
     let mut vars = Vec::new();
     for x in [
         match subject {

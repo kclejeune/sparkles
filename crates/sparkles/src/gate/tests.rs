@@ -1503,6 +1503,65 @@ fn gate_shacl_covers_setup_and_embedded_query_resources() {
 
 #[cfg(feature = "shacl")]
 #[test]
+fn gate_shacl_admits_embedded_union_dataset_graphs() {
+    fn candidate(graphs: usize, union_default_graph: bool) -> Arc<Snapshot> {
+        use oxrdf::{NamedNode, Quad};
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+            union_default_graph,
+            ..Default::default()
+        });
+        let mut txn = store.write();
+        let s = NamedNode::new_unchecked("urn:x");
+        let p = NamedNode::new_unchecked("urn:p");
+        let o = NamedNode::new_unchecked("urn:o");
+        let mut labels = Default::default();
+        for i in 0..graphs {
+            let g = NamedNode::new_unchecked(format!("urn:g:{i}"));
+            let ids = txn
+                .encode_quad(&Quad::new(s.clone(), p.clone(), o.clone(), g), &mut labels)
+                .unwrap();
+            assert!(txn.insert(ids).unwrap());
+        }
+        txn.commit().unwrap();
+        let snap = store.snapshot();
+        assert_eq!(snap.delta.inserts(), graphs);
+        snap
+    }
+
+    let controls = GateControls {
+        budgets: crate::Budgets {
+            max_memory_bytes: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (selection, native_union) in [("; chk:dataGraph chk:UnionGraph", false), ("", true)] {
+        let small = candidate(1, native_union);
+        let large = candidate(16_384, native_union);
+        for query in [
+            "SELECT $this WHERE {}",
+            "SELECT $this WHERE { $this <urn:p> ?a . $this <urn:p> ?b . $this <urn:p> ?c }",
+        ] {
+            let suite = inline_shacl(
+                &format!(
+                    "<urn:S> sh:targetNode <urn:x> ;
+                     sh:sparql [ sh:select '{query}' ] ."
+                ),
+                selection,
+            );
+            let small_run = run_with_controls(&suite, &small, &controls);
+            assert_eq!(small_run.status, Status::Failed, "{small_run:?}");
+            assert_eq!(small_run.findings, 1, "{small_run:?}");
+            let baseline = run_with_controls(&suite, &large, &GateControls::default());
+            assert_eq!(baseline.status, Status::Failed, "{baseline:?}");
+            assert_eq!(baseline.findings, 1, "{baseline:?}");
+            gate_budget_refusal(&run_with_controls(&suite, &large, &controls));
+        }
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
 fn gate_shacl_bounds_nested_and_top_level_reports() {
     let ds = Dataset::memory();
     ds.update("INSERT DATA { <urn:x> <urn:list> (1 2) }")

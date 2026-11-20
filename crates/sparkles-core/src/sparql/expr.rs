@@ -4,6 +4,8 @@ use super::ctx::{Ctx, TermKind};
 use super::fnlib;
 use super::table::{Table, VarId};
 use super::value::{EvalResult, Num, NumOp, TypeError, Value, arith, compare, equals};
+use crate::access::{Preparation, Reservation};
+use crate::error::Result;
 use crate::id::{Id, Tag};
 use oxrdf::vocab::xsd;
 use oxrdf::{Literal, NamedNode, Term};
@@ -19,7 +21,7 @@ use std::sync::Arc;
 
 /// Pattern of an `EXISTS` / `NOT EXISTS`, evaluated by substitution (with memoization).
 pub struct ExistsSpec {
-    pub pattern: GraphPattern,
+    pattern: ExistsPattern,
     pub graph: super::plan::ActiveGraph,
     /// variables of the pattern that may be substituted from the outer row
     pub vars: Vec<VarId>,
@@ -41,6 +43,14 @@ pub struct ExistsSpec {
     memo_charge: Mutex<Option<super::ctx::RetainedCharge>>,
     /// the key set answering the EXISTS for every outer row (see [`super::exists`])
     pub decor: super::exists::Decor,
+    _held: Option<Reservation>,
+}
+
+// The ordinary owned pattern keeps its existing inline representation.
+#[allow(clippy::large_enum_variant)]
+enum ExistsPattern {
+    Ordinary(GraphPattern),
+    Checked(Arc<super::checked_syntax::Pattern>),
 }
 
 impl ExistsSpec {
@@ -50,9 +60,28 @@ impl ExistsSpec {
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
     ) -> ExistsSpec {
-        ExistsSpec {
-            calls_service: super::cursor::calls_service(&pattern),
+        let calls_service = super::cursor::calls_service(&pattern);
+        Self::from_pattern(
+            ExistsPattern::Ordinary(pattern),
+            calls_service,
+            graph,
+            vars,
+            bound,
+            None,
+        )
+    }
+
+    fn from_pattern(
+        pattern: ExistsPattern,
+        calls_service: bool,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        held: Option<Reservation>,
+    ) -> Self {
+        Self {
             pattern,
+            calls_service,
             graph,
             vars,
             bound,
@@ -60,6 +89,46 @@ impl ExistsSpec {
             unbound: Default::default(),
             memo_charge: Mutex::new(None),
             decor: Default::default(),
+            _held: held,
+        }
+    }
+
+    pub(super) fn new_checked(
+        pattern: Arc<super::checked_syntax::Pattern>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+        held: Reservation,
+    ) -> Self {
+        let calls_service = pattern.calls_service;
+        Self::from_pattern(
+            ExistsPattern::Checked(pattern),
+            calls_service,
+            graph,
+            vars,
+            bound,
+            Some(held),
+        )
+    }
+
+    pub(super) fn reserve_checked(
+        preparation: &Preparation,
+        vars: usize,
+        bound: usize,
+    ) -> Result<Reservation> {
+        let bytes = vars
+            .checked_mul(size_of::<VarId>())
+            .and_then(|bytes| bytes.checked_add(size_of::<Self>() + 2 * size_of::<usize>()))
+            .and_then(|bytes| bytes.checked_add(bound.checked_mul(size_of::<(VarId, Id)>())?))
+            .ok_or_else(|| preparation.exhausted())?;
+        preparation.reserve(bytes as u64)
+    }
+
+    /// The immutable algebra of this EXISTS, before per-row substitution.
+    pub fn pattern(&self) -> &GraphPattern {
+        match &self.pattern {
+            ExistsPattern::Ordinary(pattern) => pattern,
+            ExistsPattern::Checked(pattern) => &pattern.syntax,
         }
     }
 
@@ -108,15 +177,46 @@ impl ExistsSpec {
     }
 
     /// The same EXISTS with `v` substituted by `c` as well.
-    pub fn with_bound(&self, v: VarId, c: Id) -> ExistsSpec {
+    pub fn with_bound(&self, v: VarId, c: Id) -> Self {
         let mut bound = self.bound.clone();
         bound.push((v, c));
-        ExistsSpec::new(
-            self.pattern.clone(),
+        Self::new(
+            self.pattern().clone(),
             self.graph.clone(),
             self.vars.clone(),
             bound,
         )
+    }
+
+    pub(super) fn with_bound_checked(&self, v: VarId, c: Id) -> Result<Self> {
+        let ExistsPattern::Checked(pattern) = &self.pattern else {
+            return Ok(self.with_bound(v, c));
+        };
+        let preparation = self._held.as_ref().expect("checked EXISTS").preparation();
+        let new_len = self
+            .bound
+            .len()
+            .checked_add(1)
+            .ok_or_else(|| preparation.exhausted())?;
+        let held = Self::reserve_checked(preparation, self.vars.len(), new_len)?;
+        let mut bound = Vec::with_capacity(new_len);
+        for part in self.bound.chunks(1024) {
+            preparation.check()?;
+            bound.extend_from_slice(part);
+        }
+        bound.push((v, c));
+        let mut vars = Vec::with_capacity(self.vars.len());
+        for part in self.vars.chunks(1024) {
+            preparation.check()?;
+            vars.extend_from_slice(part);
+        }
+        Ok(Self::new_checked(
+            pattern.clone(),
+            self.graph.clone(),
+            vars,
+            bound,
+            held,
+        ))
     }
 
     /// The value of `v` in the outer solution of `row`: its column, else the constant
@@ -198,31 +298,55 @@ impl Expr {
     }
 
     pub fn vars(&self, out: &mut Vec<VarId>) {
+        match self.visit_vars(&mut |var| {
+            out.push(var);
+            Ok::<_, std::convert::Infallible>(())
+        }) {
+            Ok(()) => {}
+            Err(uninhabited) => match uninhabited {},
+        }
+    }
+
+    pub(super) fn visit_vars<E>(
+        &self,
+        out: &mut impl FnMut(VarId) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
         match self {
             Expr::Const(_) | Expr::Lit(..) => {}
-            Expr::Var(v) | Expr::Bound(v) => out.push(*v),
+            Expr::Var(var) | Expr::Bound(var) => out(*var)?,
             Expr::Or(a, b)
             | Expr::And(a, b)
             | Expr::Eq(a, b)
             | Expr::SameTerm(a, b)
             | Expr::Cmp(a, b, _)
             | Expr::Arith(a, b, _) => {
-                a.vars(out);
-                b.vars(out);
+                a.visit_vars(out)?;
+                b.visit_vars(out)?;
             }
-            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => a.vars(out),
-            Expr::In(a, l) => {
-                a.vars(out);
-                l.iter().for_each(|e| e.vars(out));
+            Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => a.visit_vars(out)?,
+            Expr::In(a, list) => {
+                a.visit_vars(out)?;
+                for expr in list {
+                    expr.visit_vars(out)?;
+                }
             }
             Expr::If(a, b, c) => {
-                a.vars(out);
-                b.vars(out);
-                c.vars(out);
+                a.visit_vars(out)?;
+                b.visit_vars(out)?;
+                c.visit_vars(out)?;
             }
-            Expr::Coalesce(l) | Expr::Call(_, l) => l.iter().for_each(|e| e.vars(out)),
-            Expr::Exists(s) => out.extend(&s.vars),
+            Expr::Coalesce(list) | Expr::Call(_, list) => {
+                for expr in list {
+                    expr.visit_vars(out)?;
+                }
+            }
+            Expr::Exists(spec) => {
+                for &var in &spec.vars {
+                    out(var)?;
+                }
+            }
         }
+        Ok(())
     }
 
     pub fn var_set(&self) -> Vec<VarId> {
@@ -324,34 +448,67 @@ impl Expr {
     }
 
     pub fn display(&self, ctx: &Ctx) -> String {
-        let mut s = String::new();
-        self.fmt_into(ctx, &mut s);
-        s
+        let mut text = String::new();
+        self.write_description(ctx, &mut text)
+            .expect("writing to String");
+        text
     }
 
-    fn fmt_into(&self, ctx: &Ctx, s: &mut String) {
-        let bin = |s: &mut String, a: &Expr, op: &str, b: &Expr| {
-            s.push('(');
-            a.fmt_into(ctx, s);
-            let _ = write!(s, " {op} ");
-            b.fmt_into(ctx, s);
-            s.push(')');
-        };
+    /// The same rendering for ordinary strings and admitted diagnostic buffers.
+    pub(super) fn write_description(
+        &self,
+        ctx: &Ctx,
+        text: &mut (impl std::fmt::Write + ?Sized),
+    ) -> std::fmt::Result {
+        fn binary<W: std::fmt::Write + ?Sized>(
+            ctx: &Ctx,
+            text: &mut W,
+            a: &Expr,
+            op: &str,
+            b: &Expr,
+        ) -> std::fmt::Result {
+            text.write_char('(')?;
+            a.write_description(ctx, text)?;
+            write!(text, " {op} ")?;
+            b.write_description(ctx, text)?;
+            text.write_char(')')
+        }
+        fn arguments<W: std::fmt::Write + ?Sized>(
+            ctx: &Ctx,
+            text: &mut W,
+            args: &[Expr],
+        ) -> std::fmt::Result {
+            text.write_char('(')?;
+            for (index, arg) in args.iter().enumerate() {
+                if index > 0 {
+                    text.write_str(", ")?;
+                }
+                arg.write_description(ctx, text)?;
+            }
+            text.write_char(')')
+        }
+        struct Uppercase<'a, W: ?Sized>(&'a mut W);
+        impl<W: std::fmt::Write + ?Sized> std::fmt::Write for Uppercase<'_, W> {
+            fn write_str(&mut self, value: &str) -> std::fmt::Result {
+                for ch in value.chars().flat_map(char::to_uppercase) {
+                    self.0.write_char(ch)?;
+                }
+                Ok(())
+            }
+        }
+
         match self {
             Expr::Const(id) | Expr::Lit(id, _) => match ctx.term(*id) {
-                Some(t) => {
-                    let _ = write!(s, "{t}");
-                }
-                None => s.push_str("UNDEF"),
+                Some(term) => write!(text, "{term}"),
+                None => text.write_str("UNDEF"),
             },
-            Expr::Var(v) => {
-                let _ = write!(s, "?{}", ctx.var_name(*v));
-            }
-            Expr::Or(a, b) => bin(s, a, "||", b),
-            Expr::And(a, b) => bin(s, a, "&&", b),
-            Expr::Eq(a, b) => bin(s, a, "=", b),
-            Expr::Cmp(a, b, op) => bin(
-                s,
+            Expr::Var(var) => write!(text, "?{}", ctx.var_names.read()[*var as usize]),
+            Expr::Or(a, b) => binary(ctx, text, a, "||", b),
+            Expr::And(a, b) => binary(ctx, text, a, "&&", b),
+            Expr::Eq(a, b) => binary(ctx, text, a, "=", b),
+            Expr::Cmp(a, b, op) => binary(
+                ctx,
+                text,
                 a,
                 match op {
                     CmpOp::Lt => "<",
@@ -361,8 +518,9 @@ impl Expr {
                 },
                 b,
             ),
-            Expr::Arith(a, b, op) => bin(
-                s,
+            Expr::Arith(a, b, op) => binary(
+                ctx,
+                text,
                 a,
                 match op {
                     ArithOp::Add => "+",
@@ -373,72 +531,51 @@ impl Expr {
                 b,
             ),
             Expr::Not(a) => {
-                s.push('!');
-                a.fmt_into(ctx, s)
+                text.write_char('!')?;
+                a.write_description(ctx, text)
             }
             Expr::Neg(a) => {
-                s.push('-');
-                a.fmt_into(ctx, s)
+                text.write_char('-')?;
+                a.write_description(ctx, text)
             }
-            Expr::Pos(a) => a.fmt_into(ctx, s),
-            Expr::Bound(v) => {
-                let _ = write!(s, "BOUND(?{})", ctx.var_name(*v));
-            }
-            Expr::Exists(_) => s.push_str("EXISTS{…}"),
+            Expr::Pos(a) => a.write_description(ctx, text),
+            Expr::Bound(var) => write!(text, "BOUND(?{})", ctx.var_names.read()[*var as usize]),
+            Expr::Exists(_) => text.write_str("EXISTS{…}"),
             Expr::SameTerm(a, b) => {
-                s.push_str("sameTerm");
-                bin(s, a, ",", b)
+                text.write_str("sameTerm")?;
+                binary(ctx, text, a, ",", b)
             }
-            Expr::In(a, l) => {
-                a.fmt_into(ctx, s);
-                s.push_str(" IN (");
-                for (i, e) in l.iter().enumerate() {
-                    if i > 0 {
-                        s.push_str(", ");
-                    }
-                    e.fmt_into(ctx, s);
-                }
-                s.push(')');
+            Expr::In(a, list) => {
+                a.write_description(ctx, text)?;
+                text.write_str(" IN ")?;
+                arguments(ctx, text, list)
             }
             Expr::If(a, b, c) => {
-                s.push_str("IF(");
-                a.fmt_into(ctx, s);
-                s.push_str(", ");
-                b.fmt_into(ctx, s);
-                s.push_str(", ");
-                c.fmt_into(ctx, s);
-                s.push(')');
+                text.write_str("IF(")?;
+                a.write_description(ctx, text)?;
+                text.write_str(", ")?;
+                b.write_description(ctx, text)?;
+                text.write_str(", ")?;
+                c.write_description(ctx, text)?;
+                text.write_char(')')
             }
-            Expr::Coalesce(l) | Expr::Call(_, l) => {
-                match self {
-                    Expr::Coalesce(_) => s.push_str("COALESCE"),
-                    Expr::Call(Func::Builtin(f), _) => {
-                        let _ = write!(s, "{}", format!("{f:?}").to_uppercase());
-                    }
-                    Expr::Call(Func::Cast(n), _) => {
-                        let _ = write!(s, "{n}");
-                    }
-                    Expr::Call(Func::Registered(d), _) => {
-                        let _ = write!(
-                            s,
-                            "<{}> [scalar {:?}; singleton batch]",
-                            d.iri.as_str(),
-                            d.volatility
-                        );
-                    }
-                    Expr::Call(Func::Ext(n), _) => {
-                        let _ = write!(s, "<{n}>");
-                    }
-                    _ => {}
+            Expr::Coalesce(args) => {
+                text.write_str("COALESCE")?;
+                arguments(ctx, text, args)
+            }
+            Expr::Call(function, args) => {
+                match function {
+                    Func::Builtin(function) => write!(Uppercase(text), "{function:?}")?,
+                    Func::Cast(iri) => write!(text, "{iri}")?,
+                    Func::Registered(desc) => write!(
+                        text,
+                        "<{}> [scalar {:?}; singleton batch]",
+                        desc.iri.as_str(),
+                        desc.volatility
+                    )?,
+                    Func::Ext(iri) => write!(text, "<{iri}>")?,
                 }
-                s.push('(');
-                for (i, e) in l.iter().enumerate() {
-                    if i > 0 {
-                        s.push_str(", ");
-                    }
-                    e.fmt_into(ctx, s);
-                }
-                s.push(')');
+                arguments(ctx, text, args)
             }
         }
     }
@@ -2132,70 +2269,104 @@ pub struct Compiler<'a> {
 
 impl Compiler<'_> {
     pub fn compile(&self, e: &Expression) -> Expr {
-        use Expression as E;
-        let bx = |e: &Expression| Box::new(self.compile(e));
-        match e {
-            E::NamedNode(n) => Expr::Const(self.ctx.intern_term(&Term::NamedNode(n.clone()))),
-            E::Literal(l) => {
-                let t = Term::Literal(self.ctx.query_literal(l).into_owned());
-                let id = self.ctx.intern_term(&t);
-                if id.is_inline() {
-                    Expr::Const(id)
-                } else {
-                    Expr::Lit(id, Value::from_term(&t))
-                }
-            }
-            E::Variable(v) => {
-                let id = self.ctx.var(v.as_str());
-                match self.subst.get(&id) {
-                    Some(c) => Expr::Const(*c),
-                    None => Expr::Var(id),
-                }
-            }
-            E::Or(a, c) => Expr::Or(bx(a), bx(c)),
-            E::And(a, c) => Expr::And(bx(a), bx(c)),
-            E::Equal(a, c) => Expr::Eq(bx(a), bx(c)),
-            E::SameTerm(a, c) => Expr::SameTerm(bx(a), bx(c)),
-            E::Greater(a, c) => Expr::Cmp(bx(a), bx(c), CmpOp::Gt),
-            E::GreaterOrEqual(a, c) => Expr::Cmp(bx(a), bx(c), CmpOp::Ge),
-            E::Less(a, c) => Expr::Cmp(bx(a), bx(c), CmpOp::Lt),
-            E::LessOrEqual(a, c) => Expr::Cmp(bx(a), bx(c), CmpOp::Le),
-            E::In(a, l) => Expr::In(bx(a), l.iter().map(|x| self.compile(x)).collect()),
-            E::Add(a, c) => Expr::Arith(bx(a), bx(c), ArithOp::Add),
-            E::Subtract(a, c) => Expr::Arith(bx(a), bx(c), ArithOp::Sub),
-            E::Multiply(a, c) => Expr::Arith(bx(a), bx(c), ArithOp::Mul),
-            E::Divide(a, c) => Expr::Arith(bx(a), bx(c), ArithOp::Div),
-            E::UnaryPlus(a) => Expr::Pos(bx(a)),
-            E::UnaryMinus(a) => Expr::Neg(bx(a)),
-            E::Not(a) => Expr::Not(bx(a)),
-            E::Exists(p) => Expr::Exists((self.exists)(p)),
-            E::Bound(v) => {
-                let id = self.ctx.var(v.as_str());
-                if self.subst.contains_key(&id) {
-                    Expr::Const(Id::from_bool(true))
-                } else {
-                    Expr::Bound(id)
-                }
-            }
-            E::If(a, c, d) => Expr::If(bx(a), bx(c), bx(d)),
-            E::Coalesce(l) => Expr::Coalesce(l.iter().map(|x| self.compile(x)).collect()),
-            E::FunctionCall(f, args) => {
-                let args: Vec<Expr> = args.iter().map(|x| self.compile(x)).collect();
-                let f = match f {
-                    Function::Custom(n) if is_cast(n.as_str()) => Func::Cast(n.clone()),
-                    Function::Custom(n) => match self
-                        .ctx
-                        .extensions
-                        .as_ref()
-                        .and_then(|r| r.scalar(n.as_str()))
-                    {
-                        Some(d) => Func::Registered(d.clone()),
-                        None => Func::Ext(n.as_str().to_string()),
-                    },
-                    f => Func::Builtin(f.clone()),
-                };
-                Expr::Call(f, args)
-            }
+        let exists =
+            |pattern: &GraphPattern| Ok::<_, std::convert::Infallible>((self.exists)(pattern));
+        match compile_expression(
+            self.ctx,
+            self.subst,
+            &exists,
+            &|_| Ok(()),
+            &|name| Ok(self.ctx.var(name)),
+            e,
+        ) {
+            Ok(compiled) => compiled,
+            Err(uninhabited) => match uninhabited {},
         }
     }
+}
+
+pub(super) fn compile_expression<T>(
+    ctx: &Ctx,
+    subst: &FxHashMap<VarId, Id>,
+    exists: &dyn Fn(&GraphPattern) -> std::result::Result<Arc<ExistsSpec>, T>,
+    admit: &dyn Fn(&Expression) -> std::result::Result<(), T>,
+    variable: &dyn Fn(&str) -> std::result::Result<VarId, T>,
+    e: &Expression,
+) -> std::result::Result<Expr, T> {
+    use Expression as E;
+    admit(e)?;
+    let compile = |e: &Expression| compile_expression(ctx, subst, exists, admit, variable, e);
+    let bx = |e: &Expression| compile(e).map(Box::new);
+    Ok(match e {
+        E::NamedNode(n) => Expr::Const(ctx.intern_term(&Term::NamedNode(n.clone()))),
+        E::Literal(l) => {
+            let t = Term::Literal(ctx.query_literal(l).into_owned());
+            let id = ctx.intern_term(&t);
+            if id.is_inline() {
+                Expr::Const(id)
+            } else {
+                Expr::Lit(id, Value::from_term(&t))
+            }
+        }
+        E::Variable(v) => {
+            let id = variable(v.as_str())?;
+            match subst.get(&id) {
+                Some(c) => Expr::Const(*c),
+                None => Expr::Var(id),
+            }
+        }
+        E::Or(a, c) => Expr::Or(bx(a)?, bx(c)?),
+        E::And(a, c) => Expr::And(bx(a)?, bx(c)?),
+        E::Equal(a, c) => Expr::Eq(bx(a)?, bx(c)?),
+        E::SameTerm(a, c) => Expr::SameTerm(bx(a)?, bx(c)?),
+        E::Greater(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Gt),
+        E::GreaterOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Ge),
+        E::Less(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Lt),
+        E::LessOrEqual(a, c) => Expr::Cmp(bx(a)?, bx(c)?, CmpOp::Le),
+        E::In(a, l) => Expr::In(
+            bx(a)?,
+            l.iter()
+                .map(|x| compile(x))
+                .collect::<std::result::Result<_, T>>()?,
+        ),
+        E::Add(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Add),
+        E::Subtract(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Sub),
+        E::Multiply(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Mul),
+        E::Divide(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Div),
+        E::UnaryPlus(a) => Expr::Pos(bx(a)?),
+        E::UnaryMinus(a) => Expr::Neg(bx(a)?),
+        E::Not(a) => Expr::Not(bx(a)?),
+        E::Exists(p) => Expr::Exists(exists(p)?),
+        E::Bound(v) => {
+            let id = variable(v.as_str())?;
+            if subst.contains_key(&id) {
+                Expr::Const(Id::from_bool(true))
+            } else {
+                Expr::Bound(id)
+            }
+        }
+        E::If(a, c, d) => Expr::If(bx(a)?, bx(c)?, bx(d)?),
+        E::Coalesce(l) => Expr::Coalesce(
+            l.iter()
+                .map(|x| compile(x))
+                .collect::<std::result::Result<_, T>>()?,
+        ),
+        E::FunctionCall(f, args) => {
+            let args: Vec<Expr> = args
+                .iter()
+                .map(|x| compile(x))
+                .collect::<std::result::Result<_, T>>()?;
+            let f = match f {
+                Function::Custom(n) if is_cast(n.as_str()) => Func::Cast(n.clone()),
+                Function::Custom(n) => {
+                    match ctx.extensions.as_ref().and_then(|r| r.scalar(n.as_str())) {
+                        Some(d) => Func::Registered(d.clone()),
+                        None => Func::Ext(n.as_str().to_string()),
+                    }
+                }
+                f => Func::Builtin(f.clone()),
+            };
+            Expr::Call(f, args)
+        }
+    })
 }

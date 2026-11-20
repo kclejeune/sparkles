@@ -55,19 +55,20 @@ impl DataGraph {
         exclude: &[String],
         shapes: &Shapes,
     ) -> Result<(DataGraph, Vec<Id>)> {
-        Self::new_until(snap, data_graph, extra, exclude, shapes, None)
+        Self::new_checked(snap, data_graph, extra, exclude, shapes, || Ok(()))
     }
 
-    pub fn new_until(
+    pub fn new_checked(
         snap: Arc<Snapshot>,
         data_graph: Option<&str>,
         extra: &[String],
         exclude: &[String],
         shapes: &Shapes,
-        deadline: Option<Instant>,
+        check: impl Fn() -> sparkles_core::Result<()>,
     ) -> Result<(DataGraph, Vec<Id>)> {
-        check_deadline(deadline)?;
+        check()?;
         let graph = validation::DataGraph::new(snap, data_graph, extra, exclude)?;
+        check()?;
         let mut d = DataGraph {
             rdf_type: Id::UNDEF,
             sub_class_of: Id::UNDEF,
@@ -86,11 +87,13 @@ impl DataGraph {
         let mut ids = Vec::with_capacity(shapes.terms.len());
         for (i, term) in shapes.terms.iter().enumerate() {
             if i % 256 == 0 {
-                check_deadline(deadline)?;
+                check()?;
             }
             ids.push(d.resolve(term, shapes.bnodes_in_store));
+            #[cfg(test)]
+            observe_term_mapping();
         }
-        check_deadline(deadline)?;
+        check()?;
         Ok((d, ids))
     }
 
@@ -140,19 +143,33 @@ impl DataGraph {
 
     /// `class` and all its subclasses (rdfs:subClassOf* in the data graph), cached.
     pub fn subclasses(&self, class: Id) -> Result<Arc<FxHashSet<Id>>> {
-        if let Some(s) = self.subclasses.read().unwrap().get(&class) {
-            return Ok(s.clone());
+        self.subclasses_checked(class, || Ok(()))
+    }
+
+    fn subclasses_checked(
+        &self,
+        class: Id,
+        check: impl Fn() -> sparkles_core::Result<()>,
+    ) -> Result<Arc<FxHashSet<Id>>> {
+        check()?;
+        let cached = self.subclasses.read().unwrap().get(&class).cloned();
+        if let Some(cached) = cached {
+            check()?;
+            return Ok(cached);
         }
         let mut set = FxHashSet::default();
         set.insert(class);
         let mut stack = vec![class];
         while let Some(c) = stack.pop() {
-            for sub in self.subjects(self.sub_class_of, c)? {
+            check()?;
+            for sub in self.subjects_checked(self.sub_class_of, c, &check)? {
+                check()?;
                 if set.insert(sub) {
                     stack.push(sub);
                 }
             }
         }
+        check()?;
         let set = Arc::new(set);
         self.subclasses.write().unwrap().insert(class, set.clone());
         Ok(set)
@@ -160,26 +177,58 @@ impl DataGraph {
 
     /// Is `node` a SHACL instance of `class` (rdf:type/rdfs:subClassOf*)?
     pub fn is_instance(&self, node: Id, class: Id) -> Result<bool> {
-        let types = self.objects(node, self.rdf_type)?;
+        self.is_instance_checked(node, class, || Ok(()))
+    }
+
+    pub fn is_instance_checked(
+        &self,
+        node: Id,
+        class: Id,
+        check: impl Fn() -> sparkles_core::Result<()>,
+    ) -> Result<bool> {
+        let types = self.objects_checked(node, self.rdf_type, &check)?;
         if types.is_empty() {
             return Ok(false);
         }
-        if types.contains(&class) {
-            return Ok(true);
+        for ty in &types {
+            check()?;
+            if *ty == class {
+                return Ok(true);
+            }
         }
-        let subs = self.subclasses(class)?;
-        Ok(types.iter().any(|t| subs.contains(t)))
+        let subs = self.subclasses_checked(class, &check)?;
+        for ty in types {
+            check()?;
+            if subs.contains(&ty) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// All SHACL instances of `class`.
     pub fn instances(&self, class: Id) -> Result<Vec<Id>> {
-        let subs = self.subclasses(class)?;
+        self.instances_checked(class, || Ok(()))
+    }
+
+    pub fn instances_checked(
+        &self,
+        class: Id,
+        check: impl Fn() -> sparkles_core::Result<()>,
+    ) -> Result<Vec<Id>> {
+        let subs = self.subclasses_checked(class, &check)?;
         let mut out = Vec::new();
         let mut seen = FxHashSet::default();
-        let mut classes: Vec<Id> = subs.iter().copied().collect();
+        let mut classes = Vec::new();
+        for &class in subs.iter() {
+            check()?;
+            classes.push(class);
+        }
         classes.sort_unstable();
+        check()?;
         for c in classes {
-            for s in self.subjects(self.rdf_type, c)? {
+            for s in self.subjects_checked(self.rdf_type, c, &check)? {
+                check()?;
                 if seen.insert(s) {
                     out.push(s);
                 }
@@ -234,29 +283,147 @@ pub(crate) fn check_deadline(deadline: Option<Instant>) -> sparkles_core::Result
 pub(crate) fn read_graph_by_id(snap: &Snapshot, g: Id, deadline: Option<Instant>) -> Result<Graph> {
     check_deadline(deadline)?;
     let mut out = Graph::new();
-    snap.scan(Perm::Gspo, &[g.0], |c| {
-        check_deadline(deadline)?;
-        let mut add = |k: Key| -> sparkles_core::Result<()> {
-            let q = Perm::Gspo.to_quad(&k);
-            let q = snap.quad_to_terms(&q).ok_or_else(|| {
-                sparkles_core::Error::invalid(format!("cannot decode quad {q:?}"))
-            })?;
-            out.insert(&Triple::new(q.subject, q.predicate, q.object));
-            Ok(())
-        };
-        match c {
-            Chunk::Block(b, s, e) => {
-                for i in s..e {
-                    if i % 256 == 0 {
-                        check_deadline(deadline)?;
+    snap.scan_checked(
+        Perm::Gspo,
+        &[g.0],
+        || check_deadline(deadline),
+        |c| {
+            check_deadline(deadline)?;
+            let mut add = |k: Key| -> sparkles_core::Result<()> {
+                let q = Perm::Gspo.to_quad(&k);
+                let q = snap.quad_to_terms(&q).ok_or_else(|| {
+                    sparkles_core::Error::invalid(format!("cannot decode quad {q:?}"))
+                })?;
+                out.insert(&Triple::new(q.subject, q.predicate, q.object));
+                Ok(())
+            };
+            match c {
+                Chunk::Block(b, s, e) => {
+                    for i in s..e {
+                        if i % 256 == 0 {
+                            check_deadline(deadline)?;
+                        }
+                        add(b.key(i))?;
                     }
-                    add(b.key(i))?;
                 }
+                Chunk::Row(k) => add(k)?,
             }
-            Chunk::Row(k) => add(k)?,
-        }
-        Ok(true)
-    })?;
+            Ok(true)
+        },
+    )?;
     check_deadline(deadline)?;
     Ok(out)
+}
+
+#[cfg(test)]
+pub(crate) struct ScopedDeadlineChecks;
+
+#[cfg(test)]
+impl ScopedDeadlineChecks {
+    pub(crate) fn expire_after(checks: usize) -> Self {
+        set_deadline_checks_left(Some(checks));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScopedDeadlineChecks {
+    fn drop(&mut self) {
+        set_deadline_checks_left(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn scan_fixture() -> (
+    sparkles_core::store::Store,
+    Arc<Snapshot>,
+    Arc<Snapshot>,
+    Id,
+) {
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+    use std::fmt::Write;
+
+    let store = Store::in_memory(StoreOptions {
+        bulk_threshold: 1,
+        ..Default::default()
+    });
+    let mut nq = String::new();
+    for i in 0..4096 {
+        writeln!(nq, "<urn:s:{i}> <urn:p> <urn:o:{i}> <urn:shapes> .").unwrap();
+    }
+    store
+        .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+        .unwrap();
+    let before = store.snapshot();
+    assert_eq!(before.len(), 4096);
+    assert_eq!(before.delta.inserts(), 0);
+    let g = before.lookup_iri("urn:shapes").unwrap();
+    let mut txn = store.write();
+    for key in before.scan_keys(Perm::Gspo, &[g.0]).unwrap() {
+        assert!(txn.delete(Perm::Gspo.to_quad(&key)).unwrap());
+    }
+    txn.commit().unwrap();
+    let after = store.snapshot();
+    assert_eq!(after.delta.deletes(), 4096);
+    assert_eq!(after.count(Perm::Gspo, &[g.0]).unwrap(), 0);
+    (store, before, after, g)
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+
+    #[test]
+    fn pinned_graph_load_expires_inside_deleted_rows() {
+        let (_store, before, after, graph) = scan_fixture();
+        let deadline = Instant::now().checked_add(std::time::Duration::from_secs(60));
+        assert_eq!(
+            read_graph_by_id(&before, graph, deadline).unwrap().len(),
+            4096
+        );
+        assert!(
+            read_graph_by_id(&after, graph, deadline)
+                .unwrap()
+                .is_empty()
+        );
+        let _clock = ScopedDeadlineChecks::expire_after(8);
+        let result = read_graph_by_id(&after, graph, deadline);
+        assert!(
+            matches!(
+                result.as_ref().err().and_then(|e| e.downcast_ref()),
+                Some(sparkles_core::Error::Timeout)
+            ),
+            "read finished without a raw-scan timeout: {result:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SETUP_MAPPING: std::cell::RefCell<(usize, Option<Arc<std::sync::atomic::AtomicBool>>)> =
+        const { std::cell::RefCell::new((0, None)) };
+}
+
+#[cfg(test)]
+pub(crate) fn observe_mapping_with(flag: Option<Arc<std::sync::atomic::AtomicBool>>) {
+    SETUP_MAPPING.with(|state| state.replace((0, flag)));
+}
+
+#[cfg(test)]
+pub(crate) fn mapped_terms() -> usize {
+    SETUP_MAPPING.with(|state| state.borrow().0)
+}
+
+#[cfg(test)]
+fn observe_term_mapping() {
+    SETUP_MAPPING.with(|state| {
+        let mut state = state.borrow_mut();
+        state.0 += 1;
+        if state.0 == 5
+            && let Some(flag) = state.1.take()
+        {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
 }

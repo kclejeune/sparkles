@@ -198,6 +198,14 @@ fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
     Some(offer.build(drive.clone(), probe))
 }
 
+/// The one direction that can be offered when a VALUES leaf binds a graph name.
+pub(super) fn graph_binding_candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
+    ctx.opt
+        .batched_join
+        .then(|| candidate(drive, probe, ctx))
+        .flatten()
+}
+
 /// The index join of `drive` into the pattern `probe`, or `drive` back when none is
 /// offered.
 pub(super) fn index_join(
@@ -274,7 +282,7 @@ fn first_rows_fit(
             {
                 let fixed = scan.graph_col < scan.prefix.len()
                     || matches!(scan.graph, GraphFilter::Default | GraphFilter::One(_))
-                    || matches!(&scan.graph, GraphFilter::Set(gs) if gs.len() <= 1);
+                    || scan.graph.set_ids().is_some_and(|ids| ids.len() <= 1);
                 if fixed {
                     return true;
                 }

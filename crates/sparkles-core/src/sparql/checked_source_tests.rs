@@ -21,6 +21,84 @@ fn opts() -> QueryOptions {
 }
 
 #[test]
+fn validation_query_context_admits_physical_ids_and_retains_their_credit() {
+    use crate::sparql::ctx::{DEFAULT_GRAPH_IRI, UNION_GRAPH_IRI};
+    use crate::validation::DataGraph;
+    let store = store();
+    let snap = store.snapshot();
+    let empty = DataGraph::new(
+        snap.clone(),
+        Some(DEFAULT_GRAPH_IRI),
+        &[],
+        &[DEFAULT_GRAPH_IRI.into()],
+    )
+    .unwrap();
+    let all = DataGraph::new(snap, Some(UNION_GRAPH_IRI), &[], &[]).unwrap();
+    let empty_ctx = validation_query_context(&empty, opts()).unwrap();
+    assert_eq!(empty_ctx.dataset.default.as_deref(), Some(&[][..]));
+    let empty_bytes = empty_ctx.source_setup.as_ref().unwrap().bytes();
+    let empty_used = empty_ctx.source_preparation.as_ref().unwrap().inner_used();
+    drop(empty_ctx);
+    let work = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let refusal = validation_query_context(
+        &all,
+        QueryOptions {
+            max_memory_bytes: Some(empty_used),
+            work: Some(work.clone()),
+            ..opts()
+        },
+    );
+    assert!(
+        matches!(
+            refusal,
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            }))
+        ),
+        "the same cap fits fixed setup alone"
+    );
+    assert_eq!(work.load(Ordering::Relaxed), 0);
+
+    let ctx = validation_query_context(&all, opts()).unwrap();
+    let ids = ctx.dataset.default.as_ref().unwrap();
+    assert_eq!(ids.as_slice(), all.sel.ids(&all.snap).unwrap());
+    assert_eq!(ids.first(), Some(&Id::DEFAULT_GRAPH));
+    assert!(ctx.dataset.named.is_none());
+    assert!(
+        ctx.source_setup.as_ref().unwrap().bytes()
+            >= empty_bytes + (ids.capacity() * std::mem::size_of::<Id>()) as u64
+    );
+    let preparation = ctx.source_preparation.as_ref().unwrap().clone();
+    let shared = ctx.into_shared();
+    let last = shared.clone();
+    let used = preparation.inner_used();
+    drop(shared);
+    assert_eq!(preparation.inner_used(), used);
+    drop(last);
+    assert!(preparation.inner_used() < used);
+
+    let query_controls = || QueryOptions {
+        max_rows_produced: Some(1),
+        work: Some(work.clone()),
+        ..opts()
+    };
+    validation_query_context(&all, query_controls())
+        .unwrap()
+        .produced(1)
+        .unwrap();
+    let second = validation_query_context(&all, query_controls()).unwrap();
+    assert_eq!(second.rows_produced(), 1);
+    assert!(matches!(
+        second.produced(1),
+        Err(Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::error::BudgetKind::RowsProduced,
+            ..
+        }))
+    ));
+}
+
+#[test]
 fn prepared_query_retains_genuine_source_credit_and_releases_on_final_result() {
     let store = store();
     let preparation = Preparation::new(Control::none(), 2 << 20).unwrap();
@@ -1726,4 +1804,714 @@ fn transferred_vocabulary_literal_frees_its_buffer_before_original_preparation_c
     assert_eq!(preparation.inner_used(), view_only);
     drop(view);
     assert_eq!(preparation.inner_used(), original);
+}
+
+#[test]
+fn controlled_default_plan_keeps_graph_filter_memory_admitted() {
+    use crate::sparql::ctx::UNION_GRAPH_IRI;
+    use crate::sparql::plan::{ActiveGraph, Planner};
+    use crate::validation::DataGraph;
+    use std::fmt::Write;
+
+    const GRAPHS: usize = 512;
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..GRAPHS {
+        writeln!(
+            data,
+            "<urn:s:{i}> <urn:p> <urn:o> <urn:g:{i}> .
+             <urn:s:{i}> <urn:q> <urn:o> <urn:g:{i}> .
+             <urn:s:{i}> <urn:r> <urn:o> <urn:g:{i}> ."
+        )
+        .unwrap();
+    }
+    store
+        .load(&[crate::io::Source::from_bytes(
+            data.into_bytes(),
+            crate::io::RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    let snap = store.snapshot();
+    let data = DataGraph::new(snap, Some(UNION_GRAPH_IRI), &[], &[]).unwrap();
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let preparation = ctx.source_preparation.as_ref().unwrap().clone();
+    let before = preparation.inner_used();
+    let Query::Select { pattern, .. } = parse_query(
+        "SELECT ?s WHERE { ?s <urn:p> ?o . ?s <urn:q> ?x . ?s <urn:r> ?y }",
+        None,
+        &[],
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    let ids_bytes = (GRAPHS * std::mem::size_of::<Id>()) as u64;
+    let filler = preparation
+        .reserve(preparation.room() - (ids_bytes - 1))
+        .unwrap();
+    let refused = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new());
+    assert!(matches!(
+        refused,
+        Err(Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::error::BudgetKind::Memory,
+            ..
+        }))
+    ));
+    drop(filler);
+    assert_eq!(preparation.inner_used(), before);
+    let mut planner = Planner::new(&ctx);
+    let plan = planner
+        .plan(&pattern, &ActiveGraph::Default, Vec::new())
+        .unwrap();
+    let owner = plan.clone();
+    let after_clone = preparation.inner_used();
+    drop(plan);
+    drop(planner);
+    drop(ctx);
+    let retained = preparation.inner_used();
+    assert!(
+        after_clone >= before + ids_bytes && retained >= ids_bytes,
+        "controlled default graph filters have no retained admission: before {before}, cloned {after_clone}, retained {retained}"
+    );
+    drop(owner);
+    assert!(preparation.inner_used() < retained);
+}
+
+#[test]
+fn checked_non_simple_graph_charges_branches_after_graph_names_fit() {
+    use crate::sparql::ctx::DEFAULT_GRAPH_IRI;
+    use crate::sparql::plan::{ActiveGraph, Planner};
+    use crate::validation::DataGraph;
+    use std::fmt::Write;
+
+    let store = Store::in_memory(StoreOptions {
+        bulk_threshold: u64::MAX,
+        ..Default::default()
+    });
+    let mut input = String::new();
+    for i in 0..16 {
+        writeln!(input, "<urn:x> <urn:p> <urn:o> <urn:g:{i}> .").unwrap();
+    }
+    store
+        .load(&[crate::io::Source::from_bytes(
+            input.into_bytes(),
+            crate::io::RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    let data = DataGraph::new(store.snapshot(), Some(DEFAULT_GRAPH_IRI), &[], &[]).unwrap();
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let preparation = ctx.source_preparation.as_ref().unwrap();
+    let filler = preparation.reserve(preparation.room() - 8192).unwrap();
+    let before = preparation.inner_used();
+    for (query, refused) in [
+        ("SELECT ?g WHERE { GRAPH ?g {} }", false),
+        (
+            "SELECT ?g WHERE { GRAPH ?g { OPTIONAL { <urn:x> <urn:p> ?o } } }",
+            true,
+        ),
+    ] {
+        let Query::Select { pattern, .. } = parse_query(query, None, &[]).unwrap() else {
+            unreachable!()
+        };
+        let plan = Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new());
+        if refused {
+            assert!(
+                matches!(
+                    plan,
+                    Err(Error::BudgetExceeded(crate::error::Budget {
+                        kind: crate::error::BudgetKind::Memory,
+                        ..
+                    }))
+                ),
+                "{query}"
+            );
+        } else {
+            drop(plan.unwrap());
+        }
+        assert_eq!(preparation.inner_used(), before);
+    }
+    drop(filler);
+}
+
+fn checked_graph_fixture(count: usize) -> Store {
+    use std::fmt::Write;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut input = String::new();
+    for graph in 0..count {
+        let predicate = if graph == 0 { "urn:p" } else { "urn:q" };
+        writeln!(
+            input,
+            "<urn:s> <{predicate}> <urn:g:{graph}> <urn:g:{graph}> ."
+        )
+        .unwrap();
+    }
+    store
+        .load(&[crate::io::Source::from_bytes(
+            input.into_bytes(),
+            crate::io::RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    store
+}
+
+fn physical_default(store: &Store) -> crate::validation::DataGraph {
+    crate::validation::DataGraph::new(store.snapshot(), Some(ctx::DEFAULT_GRAPH_IRI), &[], &[])
+        .unwrap()
+}
+
+fn checked_exists_query(width: usize, term_bytes: usize) -> String {
+    use std::fmt::Write;
+
+    let mut text = String::from("SELECT ?g ?hit WHERE { GRAPH ?g { BIND(EXISTS {");
+    let literal = "L".repeat(term_bytes);
+    for i in 0..width {
+        write!(text, " <urn:missing> <urn:p:{i}> \"{literal}\" .").unwrap();
+    }
+    text.push_str(" } AS ?hit) } } LIMIT 1");
+    text
+}
+
+fn checked_graph_group(node: &plan::Node) -> &plan::PreparedGraphBranches {
+    match &node.kind {
+        plan::Kind::GraphBranches(group) => group,
+        _ => node
+            .children
+            .iter()
+            .find_map(find_checked_graph_group)
+            .expect("non-simple GRAPH must retain its prepared branches"),
+    }
+}
+
+fn find_checked_graph_group(node: &plan::Node) -> Option<&plan::PreparedGraphBranches> {
+    match &node.kind {
+        plan::Kind::GraphBranches(group) => Some(group),
+        _ => node.children.iter().find_map(find_checked_graph_group),
+    }
+}
+
+fn branch_exists(node: &plan::Node) -> Option<&expr::ExistsSpec> {
+    match &node.kind {
+        plan::Kind::Extend(_, expr::Expr::Exists(spec)) => Some(spec),
+        _ => node.children.iter().find_map(branch_exists),
+    }
+}
+
+#[test]
+fn checked_graph_r12_shares_admitted_exists_syntax() {
+    use plan::{ActiveGraph, Planner};
+    use spargebra::algebra::GraphPattern;
+
+    let mut failures = Vec::new();
+    for graphs in [1, 2, 8] {
+        for (width, term_bytes) in [(8, 4097), (32, 1025)] {
+            let store = checked_graph_fixture(graphs);
+            let data = physical_default(&store);
+            let ctx = validation_query_context(&data, opts()).unwrap();
+            let prep = ctx.source_preparation.as_ref().unwrap().clone();
+            let before = prep.inner_used();
+            let Query::Select { pattern, .. } =
+                parse_query(&checked_exists_query(width, term_bytes), None, &[]).unwrap()
+            else {
+                unreachable!()
+            };
+            let mut planner = Planner::new(&ctx);
+            let plan = planner
+                .plan(&pattern, &ActiveGraph::Default, Vec::new())
+                .unwrap();
+            let branches = &checked_graph_group(&plan).inputs;
+            assert_eq!(branches.len(), graphs);
+            let mut patterns = Vec::new();
+            let mut specs = Vec::new();
+            for branch in branches {
+                let spec = branch_exists(branch).expect("compiled EXISTS");
+                let GraphPattern::Bgp { patterns: triples } = spec.pattern() else {
+                    panic!("expected a flat EXISTS BGP")
+                };
+                assert_eq!(triples.len(), width);
+                patterns.push(triples.as_ptr());
+                specs.push(spec as *const _);
+            }
+            assert!(specs.windows(2).all(|pair| pair[0] != pair[1]));
+            let admitted = prep.inner_used() - before;
+            let owner = plan.clone();
+            drop(plan);
+            drop(planner);
+            drop(ctx);
+            let retained = prep.inner_used();
+            drop(owner);
+            let released = retained - prep.inner_used();
+            let shared = patterns.windows(2).all(|pair| pair[0] == pair[1]);
+            if !shared
+                || admitted < (width * term_bytes) as u64
+                || released < (width * term_bytes) as u64
+            {
+                failures.push(format!(
+                    "{graphs} graphs, {width} triples, literal {term_bytes} bytes: shared backing {shared}, admitted {admitted}, released {released}"
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn checked_graph_r12_refuses_before_copying_exists() {
+    use plan::{ActiveGraph, Planner};
+
+    let store = checked_graph_fixture(2);
+    let data = physical_default(&store);
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let prep = ctx.source_preparation.as_ref().unwrap();
+    let empty = prep.inner_used();
+    let filler = prep.reserve(prep.room() - 8192).unwrap();
+    let before = prep.inner_used();
+    let Query::Select { pattern, .. } =
+        parse_query(&checked_exists_query(2, 65521), None, &[]).unwrap()
+    else {
+        unreachable!()
+    };
+    let mut result = None;
+    let largest = crate::test_alloc::record_largest(|| {
+        result = Some(Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new()));
+    });
+    let result = result.unwrap();
+    let refused = matches!(
+        result,
+        Err(Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::error::BudgetKind::Memory,
+            ..
+        }))
+    );
+    drop(result);
+    assert_eq!(ctx.rows_produced(), 0);
+    assert_eq!(prep.inner_used(), before);
+    drop(filler);
+    assert_eq!(prep.inner_used(), empty);
+    assert!(
+        refused && largest <= 8192,
+        "a branch allocated {largest} bytes with only 8192 bytes available, refused {refused}"
+    );
+}
+
+#[test]
+fn checked_graph_r12_admits_simultaneous_keyed_values_copies() {
+    use plan::{ActiveGraph, Planner};
+
+    const ROWS: usize = 4096;
+    const COLUMN_BYTES: usize = ROWS * std::mem::size_of::<Id>();
+    const ROOM: u64 = 116 * 1024;
+
+    let store = checked_graph_fixture(4);
+    let data = physical_default(&store);
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let prep = ctx.source_preparation.as_ref().unwrap();
+    let empty = prep.inner_used();
+    let filler = prep.reserve(prep.room() - ROOM).unwrap();
+    let before = prep.inner_used();
+    let values = "<urn:g:0> ".repeat(ROWS);
+    let text = format!("SELECT ?g {{ GRAPH ?g {{ VALUES ?g {{ {values} }} }} }}");
+    let Query::Select { pattern, .. } = parse_query(&text, None, &[]).unwrap() else {
+        unreachable!()
+    };
+    assert!(plan::merge_offered(ROWS as f64, false, 1.0, false));
+    let mut result = None;
+    let (copies, smallest, largest) =
+        crate::test_alloc::record_admitted_allocations(prep, COLUMN_BYTES, || {
+            result = Some(Planner::new(&ctx).plan(&pattern, &ActiveGraph::Default, Vec::new()))
+        });
+    let result = result.unwrap();
+    let refused = matches!(
+        result,
+        Err(Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::error::BudgetKind::Memory,
+            ..
+        }))
+    );
+    drop(result);
+    assert_eq!(ctx.rows_produced(), 0);
+    assert_eq!(prep.inner_used(), before);
+    drop(filler);
+    assert_eq!(prep.inner_used(), empty);
+    assert!(
+        refused
+            && copies >= 4
+            && smallest >= before + COLUMN_BYTES as u64
+            && largest >= before + (3 * COLUMN_BYTES) as u64,
+        "{copies} keyed candidate column copies, admitted {} to {} bytes above baseline, refused {refused}",
+        smallest.saturating_sub(before),
+        largest.saturating_sub(before),
+    );
+}
+
+const GRAPH_R12_BIND: &str = "SELECT ?g ?value { GRAPH ?g { ?s <urn:p> ?o . BIND(?o AS ?value) } }";
+
+fn graph_r12_open_cursor(
+    store: &Store,
+    query: &str,
+    work_limit: Option<u64>,
+    fallback: FallbackPolicy,
+) -> Result<QueryCursor> {
+    let policy = Arc::new(GraphAccess::all());
+    let preparation = Preparation::new(Control::none(), 32 << 20).unwrap();
+    let view = store.prepare_read(policy.clone(), &preparation).unwrap();
+    select_source_cursor(
+        view.read_source(),
+        store,
+        query,
+        &QueryOptions {
+            graphs: Some(policy),
+            max_rows_produced: work_limit,
+            ..opts()
+        },
+        &CursorOptions {
+            batch_rows: 1,
+            fallback,
+            ..Default::default()
+        },
+    )
+}
+
+#[test]
+fn checked_graph_r12_preserves_eager_singleton_rows_and_diagnostics() {
+    let store = checked_graph_fixture(1);
+    let ordinary = query(store.snapshot(), GRAPH_R12_BIND, &opts()).unwrap();
+    let checked = query_snapshot_prepared(store.snapshot(), GRAPH_R12_BIND, opts()).unwrap();
+    assert_eq!(
+        checked.test_application_rows(),
+        ordinary.test_application_rows()
+    );
+    fn shape(plan: &PlanInfo) -> (String, Vec<String>, Vec<String>) {
+        let mut operators = Vec::new();
+        fn walk(plan: &PlanInfo, operators: &mut Vec<String>) {
+            operators.push(plan.operator.clone());
+            for child in &plan.children {
+                walk(child, operators);
+            }
+        }
+        walk(plan, &mut operators);
+        (plan.operator.clone(), plan.sorted_on.clone(), operators)
+    }
+    let exact_limit = QueryOptions {
+        max_rows_produced: Some(ordinary.rows_produced),
+        ..opts()
+    };
+    let bounded = query_snapshot_prepared(store.snapshot(), GRAPH_R12_BIND, exact_limit);
+    assert_eq!(
+        (
+            checked.rows_produced,
+            shape(checked.plan()),
+            bounded.is_ok()
+        ),
+        (ordinary.rows_produced, shape(ordinary.plan()), true)
+    );
+}
+
+#[test]
+fn checked_graph_r12_preserves_cursor_singleton_rows_and_diagnostics() {
+    fn operators(plan: &CursorPlan, out: &mut Vec<String>) {
+        out.push(plan.operator.operator.clone());
+        for child in &plan.children {
+            operators(child, out);
+        }
+    }
+
+    let store = checked_graph_fixture(1);
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        let options = CursorOptions {
+            batch_rows: 1,
+            fallback,
+            ..Default::default()
+        };
+        let mut ordinary =
+            select_cursor(store.snapshot(), GRAPH_R12_BIND, &opts(), &options).unwrap();
+        let mut expected = Vec::new();
+        operators(ordinary.plan(), &mut expected);
+        let mut ordinary_rows = 0;
+        while let Some(batch) = ordinary.next_batch().unwrap() {
+            ordinary_rows += batch.len();
+        }
+        let mut checked = graph_r12_open_cursor(&store, GRAPH_R12_BIND, None, fallback).unwrap();
+        let mut actual = Vec::new();
+        operators(checked.plan(), &mut actual);
+        let mut checked_rows = 0;
+        while let Some(batch) = checked.next_batch().unwrap() {
+            checked_rows += batch.len();
+        }
+        let allowed = ordinary.stats().rows_produced;
+        let mut tight =
+            graph_r12_open_cursor(&store, GRAPH_R12_BIND, Some(allowed), fallback).unwrap();
+        let bounded = (|| -> Result<()> {
+            while tight.next_batch()?.is_some() {}
+            Ok(())
+        })();
+        assert_eq!(
+            (
+                checked_rows,
+                checked.stats().rows_produced,
+                actual,
+                bounded.is_ok()
+            ),
+            (ordinary_rows, allowed, expected, true),
+            "{fallback:?}"
+        );
+    }
+}
+
+#[test]
+fn checked_graph_r12_keeps_exists_evaluation_distinct_by_graph() {
+    let store = checked_graph_fixture(2);
+    let query_text = "SELECT ?g ?hit {
+        GRAPH ?g {
+            VALUES ?s { <urn:s> <urn:s> }
+            BIND(EXISTS { ?s <urn:p> ?g } AS ?hit)
+        }
+    } ORDER BY ?g ?hit";
+    let ordinary = query(store.snapshot(), query_text, &opts()).unwrap();
+    let checked = query_snapshot_prepared(store.snapshot(), query_text, opts()).unwrap();
+    let rows = ordinary.test_application_rows();
+    assert_eq!(rows.len(), 4);
+    let hit = |i: usize| rows[i][1].as_ref().unwrap().to_string();
+    assert_eq!(hit(0), hit(1));
+    assert_eq!(hit(2), hit(3));
+    assert_ne!(hit(0), hit(2));
+    assert_eq!(checked.test_application_rows(), rows);
+}
+
+#[test]
+fn checked_graph_r12_cancels_and_releases_partial_syntax_and_candidates() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    let store = checked_graph_fixture(2);
+    let values = "<urn:g:0> ".repeat(64);
+    let join = format!("SELECT ?g {{ GRAPH ?g {{ VALUES ?g {{ {values} }} }} }}");
+    for (query, phase, at) in [
+        (
+            checked_exists_query(2, 16_513),
+            "copying checked graph text",
+            2,
+        ),
+        (join, "copying graph join candidate", 2),
+    ] {
+        let flag = Arc::new(AtomicBool::new(false));
+        let stop = flag.clone();
+        let checkpoints = Arc::new(AtomicUsize::new(0));
+        let hits = checkpoints.clone();
+        let mut control = Control::with_cancel(flag);
+        control.progress = crate::task::Progress::new(move |_, message| {
+            if message == phase && hits.fetch_add(1, Ordering::Relaxed) + 1 == at {
+                stop.store(true, Ordering::Relaxed);
+            }
+        });
+        let preparation = Preparation::new(control, 2 << 20).unwrap();
+        let view = GraphAccess::all()
+            .masked_controlled(&store.snapshot(), &preparation)
+            .unwrap();
+        let before = preparation.inner_used();
+        let work = Arc::new(AtomicU64::new(0));
+        let result = query_prepared_source(
+            view.read_source(),
+            &query,
+            &QueryOptions {
+                work: Some(work.clone()),
+                ..opts()
+            },
+        );
+        assert!(matches!(result, Err(Error::Cancelled)), "{phase}");
+        assert_eq!(checkpoints.load(Ordering::Relaxed), at);
+        assert_eq!(work.load(Ordering::Relaxed), 0);
+        assert_eq!(preparation.inner_used(), before);
+    }
+}
+
+#[test]
+fn checked_graph_r12_keeps_ordered_branch_diagnostics_for_limit() {
+    fn eager_group(plan: &PlanInfo) -> Option<&PlanInfo> {
+        if plan.operator == "GraphBranches" {
+            Some(plan)
+        } else {
+            plan.children.iter().find_map(eager_group)
+        }
+    }
+
+    fn cursor_group(plan: &CursorPlan) -> Option<&CursorPlan> {
+        if plan.operator.operator == "GraphBranches" {
+            Some(plan)
+        } else {
+            plan.children.iter().find_map(cursor_group)
+        }
+    }
+
+    let store = checked_graph_fixture(2);
+    let all = "SELECT ?g ?value WHERE { GRAPH ?g { VALUES ?value { 1 } } }";
+    let limited = format!("{all} LIMIT 1");
+    let eager = query_snapshot_prepared(store.snapshot(), all, opts()).unwrap();
+    let children = &eager_group(eager.plan()).unwrap().children;
+    assert_eq!(children.len(), 2);
+    assert!(children.iter().all(|branch| branch.actual_rows == 1));
+    let eager = query_snapshot_prepared(store.snapshot(), &limited, opts()).unwrap();
+    let children = &eager_group(eager.plan()).unwrap().children;
+    assert!(children[0].actual_rows >= 0);
+    assert_eq!(children[1].actual_rows, -1);
+
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        let mut cursor = graph_r12_open_cursor(&store, &limited, None, fallback).unwrap();
+        let children = &cursor_group(cursor.plan()).unwrap().children;
+        assert_eq!(children.len(), 2);
+        assert!(
+            children
+                .iter()
+                .all(|branch| branch.operator.actual_rows == -1)
+        );
+        assert_eq!(cursor.next_batch().unwrap().unwrap().len(), 1);
+        assert!(cursor.next_batch().unwrap().is_none());
+        let children = &cursor_group(cursor.plan()).unwrap().children;
+        assert!(children[0].operator.actual_rows >= 0);
+        assert_eq!(children[1].operator.actual_rows, -1);
+        assert!(!children[1].complete);
+
+        let mut cursor = graph_r12_open_cursor(&store, all, None, fallback).unwrap();
+        while cursor.next_batch().unwrap().is_some() {}
+        let children = &cursor_group(cursor.plan()).unwrap().children;
+        assert_eq!(children.len(), 2);
+        assert!(
+            children
+                .iter()
+                .all(|branch| branch.operator.actual_rows == 1)
+        );
+        assert!(children.iter().all(|branch| branch.complete));
+    }
+}
+
+#[test]
+fn checked_graph_r12_matches_ordinary_group_answers() {
+    let store = checked_graph_fixture(2);
+    for group in [
+        "OPTIONAL { ?s <urn:p> ?value }",
+        "?s <urn:p> ?o . BIND(?o AS ?value)",
+        "BIND(EXISTS { ?s <urn:p> ?g } AS ?value)",
+        "BIND(NOT EXISTS { ?s <urn:p> ?g } AS ?value)",
+        "VALUES ?s { <urn:s> } FILTER EXISTS { ?s <urn:p> ?g } BIND(?s AS ?value)",
+        "{ BIND(1 AS ?value) } UNION { BIND(2 AS ?value) }",
+        "{ SELECT (COUNT(?o) AS ?value) WHERE { ?s <urn:p> ?o } }",
+        "VALUES (?g ?value) { (<urn:g:0> 1) (<urn:g:1> 2) (UNDEF 3) }",
+        "GRAPH ?nested { OPTIONAL { ?s <urn:p> ?value } }",
+    ] {
+        let query_text =
+            format!("SELECT ?g ?value WHERE {{ GRAPH ?g {{ {group} }} }} ORDER BY ?g ?value");
+        for bound in [false, true] {
+            let options = if bound {
+                QueryOptions {
+                    initial_bindings: vec![(
+                        "g".into(),
+                        Term::NamedNode(oxrdf::NamedNode::new_unchecked("urn:g:0")),
+                    )],
+                    ..opts()
+                }
+            } else {
+                opts()
+            };
+            let ordinary = query(store.snapshot(), &query_text, &options).unwrap();
+            let prepared = query_snapshot_prepared(store.snapshot(), &query_text, options).unwrap();
+            assert_eq!(
+                ordinary.test_application_rows(),
+                prepared.test_application_rows(),
+                "{group}, initial graph {bound}",
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_graph_r12_refuses_or_cancels_before_growing_group_items() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize};
+
+    let store = checked_graph_fixture(2);
+    let text = "SELECT ?g { GRAPH ?g { OPTIONAL {
+        ?s <urn:p:1> ?value . ?s <urn:p:2> ?value .
+        ?s <urn:p:3> ?value . ?s <urn:p:4> ?value .
+        ?s <urn:p:5> ?value . ?s <urn:p:6> ?value .
+        ?s <urn:p:7> ?value .
+    } } }";
+    for cancel in [false, true] {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let grows = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(AtomicUsize::new(usize::MAX));
+        let account = Arc::new(parking_lot::Mutex::new(
+            None::<(Preparation, Option<crate::access::Reservation>)>,
+        ));
+        let mut control = Control::with_cancel(cancelled.clone());
+        control.progress = crate::task::Progress::new({
+            let (grows, seen, account) = (grows.clone(), seen.clone(), account.clone());
+            move |_, phase| {
+                if phase != "growing checked graph planning buffer"
+                    || grows.fetch_add(1, Ordering::Relaxed) != 1
+                {
+                    return;
+                }
+                seen.store(
+                    crate::test_alloc::admitted_allocations_seen(),
+                    Ordering::Relaxed,
+                );
+                if cancel {
+                    cancelled.store(true, Ordering::Relaxed);
+                } else {
+                    let mut account = account.lock();
+                    let (prep, filler) = account.as_mut().expect("set before query");
+                    *filler = Some(prep.reserve(prep.room()).unwrap());
+                }
+            }
+        });
+        let prep = Preparation::new(control, 2 << 20).unwrap();
+        let view = GraphAccess::all()
+            .masked_controlled(&store.snapshot(), &prep)
+            .unwrap();
+        let before = prep.inner_used();
+        *account.lock() = Some((prep.clone(), None));
+        let rows = Arc::new(AtomicU64::new(0));
+        let mut outcome = None;
+        let (allocated, ..) = crate::test_alloc::record_admitted_allocations(
+            &prep,
+            plan::graph_item_slots_bytes(8),
+            || {
+                outcome = Some(query_prepared_source(
+                    view.read_source(),
+                    text,
+                    &QueryOptions {
+                        work: Some(rows.clone()),
+                        ..opts()
+                    },
+                ));
+            },
+        );
+        drop(account.lock().take());
+        let outcome = outcome.unwrap();
+        if cancel {
+            assert!(matches!(outcome, Err(Error::Cancelled)));
+        } else {
+            assert!(matches!(
+                outcome,
+                Err(Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::error::BudgetKind::Memory,
+                    ..
+                }))
+            ));
+        }
+        assert_eq!(grows.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            allocated,
+            seen.load(Ordering::Relaxed),
+            "the replacement item vector allocated after refusal"
+        );
+        assert_eq!(rows.load(Ordering::Relaxed), 0);
+        assert_eq!(prep.inner_used(), before);
+    }
 }

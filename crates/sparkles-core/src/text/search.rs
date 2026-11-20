@@ -233,8 +233,14 @@ fn scoped(
             let names: Vec<String> = graph_name(snap, Id(*g)).into_iter().collect();
             filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
         }
-        GraphFilter::Set(gs) => {
-            let names: Vec<String> = gs.iter().filter_map(|g| graph_name(snap, Id(*g))).collect();
+        GraphFilter::Set(_) | GraphFilter::PreparedSet(_) => {
+            let names: Vec<String> = spec
+                .graph
+                .set_ids()
+                .unwrap()
+                .iter()
+                .filter_map(|g| graph_name(snap, Id(*g)))
+                .collect();
             filters.push((Occur::Must, str_terms(f.g, &mut names.into_iter())));
         }
     }
