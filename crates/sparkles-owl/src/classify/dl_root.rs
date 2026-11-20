@@ -1429,15 +1429,29 @@ pub(super) struct MarkerCtx {
     pub(super) units: Vec<Lit>,
 }
 
-/// A bound on the bytes of the maps and sets that [`marker_trips`] builds over the copies
-/// `cs` with a `stop`, which the run checks against its budget before the search: the
-/// index by context, the predecessors, the root's reach, the root's units and
-/// registrations, one holder's successors and predecessors at a time, each a hash entry of
-/// about 16 bytes, and the copies of successor lists that the searches take.
+/// The factor by which a vector's capacity or a hash table's buckets can pass the
+/// entries they hold: a vector doubles, and a table keeps 7 of 8 buckets at most and
+/// rounds them up to a power of two.
+const SLACK: usize = 3;
+
+/// A bound on the bytes of the maps, sets and buffers that [`marker_trips`] builds over
+/// the copies `cs` with a `stop`, which the run admits before the search: the index by
+/// context, the predecessors with their lists, the root's reach, its successors and the
+/// singleton contexts, the root's units and registrations, one holder's successors and
+/// predecessors at a time, and the copies of successor lists that the searches take.
 pub(super) fn marker_search_bytes(cs: &[MarkerCtx]) -> usize {
+    use std::mem::size_of;
+    let n = cs.len();
     let succ: usize = cs.iter().map(|c| c.succ.len()).sum();
     let root: usize = cs.iter().map(|c| c.units.len() + c.edges.len()).sum();
-    cs.len() * 16 * 5 + succ * (std::mem::size_of::<Ex>() + 16) + root * 16
+    // a hash entry of a context, of a context and its index, of a context and its list
+    let set = size_of::<Ex>() + 1;
+    let map = size_of::<(Ex, usize)>() + 1;
+    let list = size_of::<(Ex, Vec<Ex>)>() + 1;
+    let tables = n * (map + list + 4 * set) + root * (size_of::<(u32, &[Ex])>() + 1);
+    // the predecessor lists and the copies of successor lists taken while searching
+    let buffers = succ * size_of::<Ex>() * 2;
+    SLACK * (tables + buffers)
 }
 
 /// What [`marker_trips`] needs of the context `me` with the state `st`.
@@ -1455,12 +1469,11 @@ pub(super) fn marker_ctx(
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let is_root = dx.root == Some(me);
-    // bounds on what the copy holds and on its two scratch sets of ground literals, each
-    // a hash entry of about 16 bytes
+    // bounds on what the copy holds and on its two scratch sets of ground literals, with
+    // the slack of a vector's or a table's capacity
     let ground = x.root.as_deref().map_or(0, |r| r.ground.len());
-    let scratch = (ground * 32) as isize;
-    let mut kept = std::mem::size_of::<MarkerCtx>()
-        + ground * std::mem::size_of::<Lit>()
+    let scratch = (SLACK * ground * 2 * (std::mem::size_of::<Lit>() + 1)) as isize;
+    let mut kept = ground * std::mem::size_of::<Lit>()
         + (x.edges.len() + x.root.as_deref().map_or(0, |r| r.by_succ.len()) + st.subs.len())
             * std::mem::size_of::<Ex>();
     if is_root {
@@ -1470,6 +1483,7 @@ pub(super) fn marker_ctx(
                 + r.edges.values().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<Ex>();
         }
     }
+    let kept = SLACK * kept;
     if !admit(kept as isize + scratch) {
         return Err(());
     }

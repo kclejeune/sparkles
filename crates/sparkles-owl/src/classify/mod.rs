@@ -2818,8 +2818,10 @@ impl Saturation {
                     }
                     true
                 };
-                let mut cs = Vec::new();
-                let mut ok = true;
+                // the copies' own vector, reserved for every context before any copy
+                let n = self.ctx.len() + dynamic.as_ref().map_or(0, |dy| dy.len());
+                let mut ok = admit((n * std::mem::size_of::<dl_root::MarkerCtx>()) as isize);
+                let mut cs = Vec::with_capacity(if ok { n } else { 0 });
                 for (e, c) in self
                     .ctx
                     .iter()
@@ -2827,6 +2829,9 @@ impl Saturation {
                     .filter_map(|(e, c)| c.get().map(|c| (e as Ex, &**c)))
                     .chain(made)
                 {
+                    if !ok {
+                        break;
+                    }
                     match dl_root::marker_ctx(&ix, e, &c.st.lock(), &d.lits, &mut admit) {
                         Ok(Some(m)) => cs.push(m),
                         Ok(None) => {}
@@ -2836,12 +2841,7 @@ impl Saturation {
                         }
                     }
                 }
-                ok = ok
-                    && admit(
-                        (dl_root::marker_search_bytes(&cs)
-                            + cs.capacity() * std::mem::size_of::<dl_root::MarkerCtx>())
-                            as isize,
-                    );
+                ok = ok && admit(dl_root::marker_search_bytes(&cs) as isize);
                 drop(admit);
                 if !ok {
                     return Err(Error::Memory {
