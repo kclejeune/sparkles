@@ -16,9 +16,9 @@ Roadmap item 1222 covers pairs derived for values the query did not ask for.
 
 Within a run, an operator no longer walks a relation again for pairs other operators
 merged, or once a copy that binds neither end closed the whole relation and no other edge
-has arrived since. On a debug build, the operators of OWL2Bench(1) q12 spent 2.3 s instead
-of 21.3 s, and the walks that merged nothing read 1.3 million edges instead of 21 million.
-Roadmap item 1224 covers the walk that each later run of a session still makes.
+has arrived since. At OWL2Bench(1) q12, the walks that merged nothing read 1.3 million edges
+instead of 21 million, with the same rows. Roadmap item 1224 covers the scan of the closed
+relation that a later run of a session still makes.
 
 ### Targeted checks on a remote host
 
