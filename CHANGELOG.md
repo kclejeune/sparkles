@@ -12,6 +12,8 @@ key no longer calls the standard library's validator, whose placement in the bin
 stanley at 1.05M triples, `lang-filter` counts 0.75 of the instructions per request,
 `regex-iri` 0.86, `contains` 0.98 and `advisor-sparse` 0.98, and the other screen queries
 are unchanged. A key that is not ASCII pays one extra scan of its bytes before validation.
+When every name and title of the same data ends in a non-ASCII character, which is the worst
+case, `lang-filter` counts 1.026 of the instructions and `contains` 1.000.
 
 ### Targeted checks on a remote host
 
