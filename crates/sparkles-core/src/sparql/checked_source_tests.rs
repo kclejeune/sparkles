@@ -2732,34 +2732,64 @@ fn checked_graph_r12_admits_join_order_tables() {
     cases.push((40, checked_star_query(40)));
     cases.push((30, opaque(2)));
     cases.push((60, opaque(60)));
+    // Two sub-selects that share only long-named variables they may leave unbound, so
+    // that they meet in a hash join with many long keys to describe.
+    let hash_keys = |k: usize| {
+        let key = |step: usize| format!("k{step}_{}", "a".repeat(200));
+        let side = |s: &str| {
+            let mut text = format!("{{ SELECT * WHERE {{ ?{s} <urn:s:1> ?{s}m .");
+            for step in 2..=k {
+                text.push_str(&format!(
+                    " OPTIONAL {{ ?{s} <urn:s:{step}> ?{} }}",
+                    key(step)
+                ));
+            }
+            text.push_str(" } }");
+            text
+        };
+        format!(
+            "SELECT * WHERE {{ GRAPH ?g {{ {} {} BIND(?p AS ?first) }} }}",
+            side("p"),
+            side("q")
+        )
+    };
+    cases.push((12, hash_keys(9)));
     let apart = checked_apart_query;
     cases.push((12, subtree(2)));
     cases.push((12, subtree(12)));
     cases.push((6, apart(6)));
     cases.push((20, apart(20)));
+    let caps = [
+        (0, "group", 512),
+        (1, "greedy", 1024),
+        (2, "program tables", 512),
+        (3, "program run", 512),
+        (4, "program build", 256),
+        (5, "greedy build", 256),
+        (7, "joins", 512),
+    ];
     let mut failures = Vec::new();
     let mut run = Vec::new();
     let mut kinds = [0; 4];
     for (width, text) in &cases {
         let (excess, of) = checked_join_order_excess_kinds(*width, text);
-        println!("{text}: {excess:?} merge/hash/index/other joins {of:?}");
+        println!(
+            "{}: {excess:?} merge/hash/index/other joins {of:?}",
+            &text[..text.len().min(160)]
+        );
+        if text.contains("?k2_") {
+            assert!(of[1] > 0, "the sub-selects meet in a hash join");
+        }
         for (all, one) in kinds.iter_mut().zip(of) {
             *all += one;
         }
         run.push(excess[3]);
-        for (stage, name, cap) in [
-            (0, "group", 512),
-            (1, "greedy", 1024),
-            (2, "program tables", 512),
-            (3, "program run", 512),
-            (4, "program build", 256),
-            (5, "greedy build", 256),
-            (7, "joins", 512),
-        ] {
+        for (stage, name, cap) in caps {
             if excess[stage] > cap {
                 failures.push(format!(
-                    "{name}: {} unadmitted bytes for {text}",
-                    excess[stage]
+                    "{name}: {} unadmitted bytes for {}",
+                    excess[stage],
+                    &text[..text.len().min(160)]
                 ));
             }
         }
@@ -2779,6 +2809,27 @@ fn checked_graph_r12_admits_join_order_tables() {
     }
     let _unforce = Unforce;
     crate::sparql::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(true));
+    // A chain of one-letter variables whose filters test each variable against a long
+    // list of itself, which are large expressions with short descriptions, so that the
+    // copies of the probes' filters outweigh their text.
+    let lists = |width: usize| {
+        let name = |step: usize| char::from(b'h' + step as u8);
+        let mut text = String::from("SELECT * WHERE { GRAPH ?g {");
+        for step in 1..=width {
+            text.push_str(&format!(
+                " ?{} <urn:c:{step}> ?{} .",
+                name(step - 1),
+                name(step)
+            ));
+        }
+        for step in 0..=width {
+            let v = name(step);
+            let list = vec![format!("?{v}"); 100].join(", ");
+            text.push_str(&format!(" FILTER(?{v} IN ({list}))"));
+        }
+        text.push_str(" BIND(?h AS ?first) } }");
+        text
+    };
     let mut index = 0;
     for (width, text) in [
         (12, checked_chain_query(12)),
@@ -2786,8 +2837,10 @@ fn checked_graph_r12_admits_join_order_tables() {
         (12, checked_star_query(12)),
         (60, opaque(60)),
         (20, apart(20)),
+        (12, lists(12)),
     ] {
         let (excess, of) = checked_join_order_excess_kinds(width, &text);
+        let text = &text[..text.len().min(160)];
         println!("forced {text}: {excess:?} merge/hash/index/other joins {of:?}");
         index += of[2];
         if excess[7] > 512 {
@@ -2827,11 +2880,13 @@ fn checked_graph_r12_admits_join_order_tables() {
         crate::sparql::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(force));
         let (excess, of) = checked_join_order_excess_kinds(12, &heavy);
         println!("long names, forced {force}: {excess:?} merge/hash/index/other joins {of:?}");
-        if excess[7] > 512 {
-            failures.push(format!(
-                "long names, forced {force}: {} unadmitted bytes in joins",
-                excess[7]
-            ));
+        for (stage, name, cap) in caps {
+            if excess[stage] > cap {
+                failures.push(format!(
+                    "long names, forced {force}: {} unadmitted bytes in {name}",
+                    excess[stage]
+                ));
+            }
         }
     }
     // The copy of the larger sub-select is admitted as the smaller one is.
@@ -3165,11 +3220,16 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
         if rounds_expected {
             assert!(rounds > 1, "the star is planned in rounds");
         }
-        // The query context's ledger keeps its admitted high point, one growth step for
-        // the filter over both chains apart. Its live bytes are unchanged, and shrinking
-        // it returns the credit.
-        if prep.inner_used() != before {
+        // For the chains apart, the checked plan takes the query context's first growth
+        // step, when it decodes a scan's constant term for the plan text (in its scan
+        // options), and the step stays as the context's admitted high point. Its live
+        // bytes are unchanged, and shrinking it returns the credit.
+        if apart {
             assert_eq!(ctx.live_bytes(), live_before, "width {width}: live bytes");
+            assert!(
+                prep.inner_used() <= before + (64 << 10),
+                "width {width}: one growth step"
+            );
             ctx.shrink_retained(0).unwrap();
         }
         assert_eq!(prep.inner_used(), before, "width {width}: credit returns");

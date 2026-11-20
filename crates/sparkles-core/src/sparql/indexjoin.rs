@@ -155,6 +155,18 @@ pub(super) fn candidates(a: &Node, b: &Node, ctx: &Ctx) -> Vec<Node> {
         .collect()
 }
 
+/// The scan under a probe side, without copying the filters over it.
+fn probe_scan(n: &Node) -> Option<(&Node, &ScanSpec)> {
+    let mut n = n;
+    loop {
+        match &n.kind {
+            Kind::Filter(es) if !es.iter().any(Expr::has_exists) => n = &n.children[0],
+            Kind::Scan(spec) | Kind::RangeScan(spec, _) => return Some((n, spec)),
+            _ => return None,
+        }
+    }
+}
+
 /// The scan under a probe side, with the filters over it.
 fn probe_leaf(n: &Node) -> Option<(&Node, &ScanSpec, Vec<Expr>)> {
     let mut filter = Vec::new();
@@ -207,7 +219,7 @@ pub(super) fn graph_binding_candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> 
 }
 
 /// The most that [`index_join`] of `drive` into `probe` allocates at once, counting what
-/// the join keeps: the copies of the filters over the pattern (made twice while offering),
+/// the join keeps: the copy of the filters over the pattern,
 /// the keys, the order, the description, which renders the filters, and the operator.
 pub(super) fn index_join_bound(
     layout: &mut super::checked_layout::Layout<'_>,
@@ -227,7 +239,6 @@ pub(super) fn index_join_bound(
     let mut filter = |layout: &mut super::checked_layout::Layout<'_>, es: &[Expr]| -> Result<()> {
         for e in es {
             count += 1;
-            layout.expression(e)?;
             layout.expression(e)?;
             text.0 = text.0.saturating_add(8);
             let _ = e.write_description(ctx, &mut text);
@@ -572,7 +583,7 @@ pub(super) struct ProbeSide {
 
 /// The pattern under `probe` as the probed side of an index join, if it can be one.
 pub(super) fn probe_side(probe: &Node, ctx: &Ctx) -> Option<ProbeSide> {
-    let (scan, spec, _) = probe_leaf(probe)?;
+    let (scan, spec) = probe_scan(probe)?;
     let &key = probe.sorted.first()?;
     if spec.cols.first() != Some(&(spec.prefix.len(), key)) || spec.graph_col == spec.prefix.len() {
         return None;
