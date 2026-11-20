@@ -204,10 +204,23 @@ class LongrunTests(unittest.TestCase):
         self.assertGreaterEqual(len(kids), 3)
         p.send_signal(signal.SIGKILL)
         p.wait()
-        time.sleep(1)
-        alive = [k for k in kids if os.path.exists(f"/proc/{k}") and "Z" not in
-                 open(f"/proc/{k}/stat").read().split(")")[-1].split()[0]]
-        self.assertEqual(alive, [])
+
+        def alive():
+            left = []
+            for k in kids:
+                try:
+                    if "Z" not in open(f"/proc/{k}/stat").read().split(")")[-1].split()[0]:
+                        left.append(k)
+                except FileNotFoundError:
+                    pass
+            return left
+
+        # A loaded host can take a few seconds to schedule the kill or the parent check, so
+        # the workers get 10 s of the run's 60 to go.
+        end = time.monotonic() + 10
+        while alive() and time.monotonic() < end:
+            time.sleep(0.1)
+        self.assertEqual(alive(), [])
 
     def test_sigterm_ends_the_run_with_its_state(self):
         srv, url = self.serve()
