@@ -2138,4 +2138,36 @@ mod tests {
         assert_eq!(l.closed.capacity(), 2 * cap);
         assert_eq!(l.held.as_ref().unwrap().bytes(), bytes(2 * cap));
     }
+
+    /// A growth of a full range list charges the old and the new list together, as a
+    /// table's growth does: four ranges apart fill the first list, and the fifth needs
+    /// room for twelve.
+    #[test]
+    fn ledger_range_growth_charges_both_lists() {
+        let four = |l: &mut Ledger, budget: &Arc<Budget>| {
+            for r in 0..4u32 {
+                l.merge(7, 2 * r, 2 * r + 1, budget).unwrap();
+            }
+        };
+        let mut l = Ledger::default();
+        four(&mut l, &Budget::new(None));
+        assert_eq!(l.merged[&7].capacity(), 4);
+        let h = l.held.as_ref().unwrap().bytes();
+        let pair = size_of::<(u32, u32)>();
+        let budget = Budget::new(Some(h + 8 * pair - 1));
+        let mut l = Ledger::default();
+        four(&mut l, &budget);
+        let e = l
+            .merge(7, 8, 9, &budget)
+            .expect_err("both lists do not fit");
+        assert!(e.is::<crate::budget::MemoryExceeded>(), "{e:#}");
+        assert_eq!(l.merged[&7].len(), 4);
+        assert_eq!(l.merged[&7].capacity(), 4);
+        let budget = Budget::new(Some(h + 8 * pair));
+        let mut l = Ledger::default();
+        four(&mut l, &budget);
+        l.merge(7, 8, 9, &budget).expect("both lists fit");
+        assert_eq!(l.merged[&7].capacity(), 8);
+        assert_eq!(l.held.as_ref().unwrap().bytes(), h + 4 * pair);
+    }
 }
