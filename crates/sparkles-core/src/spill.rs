@@ -434,6 +434,7 @@ impl Spill {
     }
 
     /// Make the `after`-th next operation of kind `fault` fail (tests only).
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn inject_fault(&self, fault: Fault, after: u64) {
         *self.fault.lock() = Some((fault, after));

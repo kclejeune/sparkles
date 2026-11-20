@@ -689,19 +689,23 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
     parallelism: usize,
     make_sink: F,
 ) -> Result<BTreeMap<String, String>> {
-    if let Some(j) = src.format.jena() {
-        // Thrift and Protobuf streams have no record boundaries to split at, and TriX
-        // and RDF/JSON are documents: one decoder feeds the loader's sinks.
-        parse_jena_bulk(src, j, parallelism, make_sink)?;
-        return Ok(BTreeMap::new());
-    }
-    if src.format == RdfSyntax::OwlFunctional {
-        let mut prefixes = BTreeMap::new();
-        pipe_quads(parallelism, make_sink, |emit| {
-            prefixes = parse_ofn(src, emit)?;
-            Ok(())
-        })?;
-        return Ok(prefixes);
+    let rung = Rung::of(src);
+    match rung {
+        Rung::Jena(j) => {
+            // Thrift and Protobuf streams have no record boundaries to split at, and
+            // TriX and RDF/JSON are documents: one decoder feeds the loader's sinks.
+            parse_jena_bulk(src, j, parallelism, make_sink)?;
+            return Ok(BTreeMap::new());
+        }
+        Rung::Ofn => {
+            let mut prefixes = BTreeMap::new();
+            pipe_quads(parallelism, make_sink, |emit| {
+                prefixes = parse_ofn(src, emit)?;
+                Ok(())
+            })?;
+            return Ok(prefixes);
+        }
+        Rung::Buffered | Rung::Rdf => {}
     }
     let format = src.rdf_format()?;
     let parser = source_parser(src)?;
@@ -736,10 +740,19 @@ pub fn parse_source<S: QuadSink, F: Fn() -> S + Sync>(
         SourceData::File(p) if codec == Codec::None => Some(std::fs::metadata(p)?.len()),
         _ => None,
     };
-    let bytes = if src.parse_mode == ParseMode::Buffered
-        || (codec == Codec::None
-            && !reader
-            && (splittable || matches!(src.data, SourceData::Bytes(_))))
+    // a buffered source is parsed from the whole document, after the checks above
+    if rung == Rung::Buffered {
+        return parse_slice(
+            src,
+            parser,
+            load_bytes(src)?.as_ref(),
+            parallelism,
+            make_sink,
+        );
+    }
+    let bytes = if (codec == Codec::None
+        && !reader
+        && (splittable || matches!(src.data, SourceData::Bytes(_))))
         || mapped_size.is_some_and(|n| n < buffer_limit as u64)
     {
         load_bytes(src)?
@@ -989,36 +1002,53 @@ pub fn read_ofn(src: &Source, threads: usize) -> Result<(sparkles_owl::ofn_read:
 /// Automatic mode uses the reader path here; explicit buffered mode is respected.
 pub fn parse_source_into(
     src: &Source,
-    sink: impl FnMut(Quad) -> Result<()>,
+    mut sink: impl FnMut(Quad) -> Result<()>,
 ) -> Result<BTreeMap<String, String>> {
-    if let Some(j) = src.format.jena() {
-        let mut sink = sink;
-        parse_jena(src, j, false, |q, _| sink(q))?;
-        return Ok(BTreeMap::new());
-    }
-    if src.format == RdfSyntax::OwlFunctional {
-        let mut sink = sink;
-        return parse_ofn(src, &mut |q, _| sink(q));
-    }
-    if src.parse_mode == ParseMode::Buffered {
-        let bytes = load_bytes(src)?;
-        crate::nesting::check(src.rdf_format()?, bytes.as_ref(), &src.name)?;
-        let mut parsed = source_parser(src)?.for_slice(bytes.as_ref());
-        let mut sink = sink;
-        for q in parsed.by_ref() {
-            sink(q.map_err(|e| Error::RdfParse(format!("{}: {e}", src.name)))?)?;
+    match Rung::of(src) {
+        Rung::Jena(j) => {
+            parse_jena(src, j, false, |q, _| sink(q))?;
+            Ok(BTreeMap::new())
         }
-        return Ok(parsed
-            .prefixes()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect());
+        Rung::Ofn => parse_ofn(src, &mut |q, _| sink(q)),
+        Rung::Buffered => {
+            let bytes = load_bytes(src)?;
+            crate::nesting::check(src.rdf_format()?, bytes.as_ref(), &src.name)?;
+            parse_whole_slice(src, source_parser(src)?, bytes.as_ref(), sink)
+        }
+        Rung::Rdf => parse_reader(
+            src,
+            source_parser(src)?,
+            source_reader(src, src.codec()?)?,
+            sink,
+        ),
     }
-    parse_reader(
-        src,
-        source_parser(src)?,
-        source_reader(src, src.codec()?)?,
-        sink,
-    )
+}
+
+/// The first rungs of the ladders of [`parse_source`] and [`parse_source_into`], which
+/// the second takes alone. Jena's syntaxes and the OWL functional-style syntax have
+/// readers of their own, and a buffered source is parsed from the whole document in
+/// memory. [`parse_source`] chooses among more paths for the other sources of a W3C
+/// syntax, and [`parse_source_into`] reads them with the reader parser.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rung {
+    Jena(JenaFormat),
+    Ofn,
+    Buffered,
+    Rdf,
+}
+
+impl Rung {
+    fn of(src: &Source) -> Rung {
+        if let Some(j) = src.format.jena() {
+            Rung::Jena(j)
+        } else if src.format == RdfSyntax::OwlFunctional {
+            Rung::Ofn
+        } else if src.parse_mode == ParseMode::Buffered {
+            Rung::Buffered
+        } else {
+            Rung::Rdf
+        }
+    }
 }
 
 /// Read a source in one of Jena's syntaxes into a callback, straight from the
@@ -1315,19 +1345,31 @@ fn parse_slice<S: QuadSink, F: Fn() -> S + Sync>(
                 }
                 sink.finish()
             })?;
+        Ok(prefixes.into_inner())
     } else {
         let mut sink = make_sink();
-        let mut p = parser.for_slice(slice);
-        for q in p.by_ref() {
-            sink.quad(q.map_err(|e| err(&e))?)?;
-        }
-        let mut pm = prefixes.lock();
-        for (k, v) in p.prefixes() {
-            pm.insert(k.to_string(), v.to_string());
-        }
+        let prefixes = parse_whole_slice(src, parser, slice, |q| sink.quad(q))?;
         sink.finish()?;
+        Ok(prefixes)
     }
-    Ok(prefixes.into_inner())
+}
+
+/// Parse all of `slice` as one document into `sink` and return its prefixes. The caller
+/// has checked its nesting.
+fn parse_whole_slice(
+    src: &Source,
+    parser: RdfParser,
+    slice: &[u8],
+    mut sink: impl FnMut(Quad) -> Result<()>,
+) -> Result<BTreeMap<String, String>> {
+    let mut parsed = parser.for_slice(slice);
+    for q in parsed.by_ref() {
+        sink(q.map_err(|e| Error::RdfParse(format!("{}: {e}", src.name)))?)?;
+    }
+    Ok(parsed
+        .prefixes()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect())
 }
 
 /// Decompressed bytes per block of a streamed source: blocks end at a line break and
@@ -1510,6 +1552,7 @@ fn read_blocks(
 
 /// Parse the N-Triples or N-Quads of `src` in blocks of `block` bytes as automatic mode
 /// parses a stream, with one parser per block. For tests of the block reader's memory.
+#[cfg(any(test, feature = "failpoints"))]
 #[doc(hidden)]
 pub fn parse_lines_in_blocks<S: QuadSink, F: Fn() -> S + Sync>(
     src: &Source,
@@ -1720,6 +1763,90 @@ mod tests {
         let mut w = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         std::io::Write::write_all(&mut w, data).unwrap();
         w.finish().unwrap()
+    }
+
+    /// The quads, the prefixes and the number of sinks of both entry points for every
+    /// combination of syntax, parse mode, codec and kind of data agree.
+    #[test]
+    fn entry_points_agree_on_every_rung() {
+        let ttl = "@prefix e: <http://e/> .\ne:s e:p e:o , e:o2 .\n_:b e:q \"x\" .\n";
+        let nt = "<http://e/s> <http://e/p> <http://e/o> .\n_:b <http://e/q> \"x\" .\n";
+        let dir = tempfile::tempdir().unwrap();
+        let mut sinks_seen = Vec::new();
+        for (format, doc, ext) in [
+            (RdfFormat::Turtle, ttl, "ttl"),
+            (RdfFormat::NTriples, nt, "nt"),
+        ] {
+            let mut want: Vec<String> = RdfParser::from_format(format)
+                .for_slice(doc.as_bytes())
+                .map(|q| q.unwrap().to_string())
+                .collect();
+            want.sort();
+            // a blank node's label differs between parses, so compare without them
+            let strip = |v: &mut Vec<String>| {
+                for q in v.iter_mut() {
+                    *q = q
+                        .split_whitespace()
+                        .filter(|t| !t.starts_with("_:"))
+                        .collect();
+                }
+                v.sort();
+            };
+            strip(&mut want);
+            for mode in [ParseMode::Auto, ParseMode::Streaming, ParseMode::Buffered] {
+                for gz in [false, true] {
+                    for data in ["bytes", "file", "reader"] {
+                        let body = if gz {
+                            gzip(doc.as_bytes())
+                        } else {
+                            doc.as_bytes().to_vec()
+                        };
+                        let make = || match data {
+                            "bytes" => Source::from_bytes(body.clone(), format, None),
+                            "file" => {
+                                let p = dir.path().join(format!("d{gz}.{ext}"));
+                                std::fs::write(&p, &body).unwrap();
+                                let mut s = Source::from_path(&p, None).unwrap();
+                                s.base = None;
+                                s
+                            }
+                            _ => Source::from_reader(
+                                std::io::Cursor::new(body.clone()),
+                                format,
+                                None,
+                            ),
+                        };
+                        let case = format!("{format} {mode:?} gz={gz} {data}");
+                        let mut src = make();
+                        src.parse_mode = mode;
+                        let (all, finished) = (Mutex::new(Vec::new()), Mutex::new(0));
+                        let prefixes =
+                            parse_source(&src, 3, || Collect(&all, Vec::new(), &finished)).unwrap();
+                        let mut got = all.into_inner();
+                        strip(&mut got);
+                        assert_eq!(got, want, "{case}");
+                        let mut src = make();
+                        src.parse_mode = mode;
+                        let mut into = Vec::new();
+                        let into_prefixes = parse_source_into(&src, |q| {
+                            into.push(q.to_string());
+                            Ok(())
+                        })
+                        .unwrap();
+                        strip(&mut into);
+                        assert_eq!(into, want, "{case}");
+                        assert_eq!(into_prefixes, prefixes, "{case}");
+                        sinks_seen.push((case, prefixes.len(), finished.into_inner()));
+                    }
+                }
+            }
+        }
+        // a document this small takes one sink on every rung, and the Turtle document
+        // declares one prefix
+        for (case, prefixes, sinks) in sinks_seen {
+            assert_eq!(prefixes, usize::from(case.starts_with("Turtle")), "{case}");
+            assert_eq!(sinks, 1, "{case}");
+        }
     }
 
     #[test]
