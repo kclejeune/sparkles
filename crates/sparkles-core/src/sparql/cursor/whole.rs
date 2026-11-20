@@ -110,12 +110,19 @@ impl Whole {
     ) -> Result<Option<Buffer>> {
         if self.counters.is_none() {
             let mut inputs = Vec::with_capacity(children.len());
+            let count = matches!(self.node.kind, Kind::CountJoin { .. });
             for child in children.iter_mut() {
+                // A count over a join with an empty left input reads nothing of its right
+                // input, as the eager count does.
+                if count && inputs.first().is_some_and(|l: &Buffer| l.table.is_empty()) {
+                    inputs.push(Buffer::new(ctx, &child.vars, 0)?);
+                    continue;
+                }
                 let mut input = read(ctx, child, options)?;
                 // The count merges its inputs when they are sorted on a shared key, as
                 // the eager tables say they are.
-                if matches!(self.node.kind, Kind::CountJoin { .. }) {
-                    input.table.sorted = child.order.clone();
+                if count {
+                    input.set_order(&child.order)?;
                 }
                 inputs.push(input);
             }

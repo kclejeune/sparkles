@@ -3766,6 +3766,57 @@ fn a_count_over_a_two_variable_merge_join_runs_the_eager_kernel() {
                     .any(|n| n.ends_with("Join") && n != "CountJoin"),
                 "{fallback:?}: {names:?}"
             );
+            fn count_join(
+                plan: &sparkles_core::sparql::CursorPlan,
+            ) -> Option<&sparkles_core::sparql::CursorPlan> {
+                match plan.operator.operator == "CountJoin" {
+                    true => Some(plan),
+                    false => plan.children.iter().find_map(count_join),
+                }
+            }
+            // It holds both of its inputs.
+            assert!(
+                count_join(c.plan()).is_some_and(|p| p.growing_state),
+                "{fallback:?}: {:?}",
+                c.plan()
+            );
+            assert_eq!(all(c), expected, "{fallback:?}; {rows}");
+        }
+    }
+    // With an empty left input the count reads nothing of its right input, as eager
+    // does, so a work limit below the right input's rows refuses neither.
+    let empty = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t FILTER(STRSTARTS(STR(?t), \"urn:absent\")) ?s <urn:w> ?t }";
+    let limited = |limit: u64| QueryOptions {
+        no_cache: true,
+        max_rows_produced: Some(limit),
+        ..Default::default()
+    };
+    let expected = query(s.snapshot(), empty, &limited(65))
+        .unwrap()
+        .application_rows();
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 4096] {
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), empty, &limited(65), &o).unwrap();
+            let mut names = Vec::new();
+            ops(c.plan(), &mut names);
+            assert!(
+                names.iter().any(|n| n == "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.ends_with("Join") && n != "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
             assert_eq!(all(c), expected, "{fallback:?}; {rows}");
         }
     }

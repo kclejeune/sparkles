@@ -3094,6 +3094,7 @@ impl Operator {
             || run_group
             || expanding
             || walking
+            || whole_input
             || exists;
         let mut order = output_order(
             &node,
