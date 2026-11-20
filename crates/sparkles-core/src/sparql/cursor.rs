@@ -203,6 +203,21 @@ pub struct CursorStats {
     pub error: Option<String>,
 }
 
+/// See [`QueryCursor::memory_meter`]. A meter keeps the query's context, and with it
+/// the snapshot and the grant, alive until it is dropped, so a test drops it with the
+/// cursor.
+#[doc(hidden)]
+pub struct MemoryMeter(Arc<Ctx>);
+
+impl MemoryMeter {
+    /// The admitted bytes now: exact, where a pool grant's `used` is a reservation
+    /// that grows in steps and is given back late. It takes no lock and allocates
+    /// nothing, so an allocator may call it.
+    pub fn live_bytes(&self) -> u64 {
+        self.0.live_bytes()
+    }
+}
+
 /// An immutable batch. Keeping it alive keeps its capacity on the query's budget
 /// and pins the snapshot/local vocabulary needed to resolve its private IDs.
 #[derive(Clone)]
@@ -1995,6 +2010,13 @@ impl QueryCursor {
 
     pub(super) fn stack_depth(&self) -> usize {
         self.depth
+    }
+
+    /// A reader of the bytes the query has admitted to its memory budget, for tests
+    /// that compare them with an allocator's count. It is no part of the API.
+    #[doc(hidden)]
+    pub fn memory_meter(&self) -> MemoryMeter {
+        MemoryMeter(self.ctx.clone())
     }
 
     pub(super) fn fail_output(&mut self, error: &Error) {

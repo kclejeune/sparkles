@@ -377,6 +377,9 @@ Read the [design provenance](X18-fragment-composition/SPEC.md#provenance).
 ## Formal verification
 
 Read the [design provenance](X20-formal-verification/SPEC.md#provenance).
+## Charged buffers
+
+Read the [provenance record](X19-charged-buffers/SPEC.md#provenance).
 
 ## Reasoner core
 
