@@ -668,7 +668,8 @@ thread_local! {
     /// Refusals and cancellations of the program's admissions on this thread, for the
     /// tests of their admission.
     pub(super) static DP_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// The bytes of the table storage the program last asked to grow to.
+    /// The bytes of the first storage that the program's latest admission covers: the
+    /// table it last asked to grow to, or the first buffer of another admission.
     pub(super) static DP_GROWTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The rounds the program planned on this thread.
     pub(super) static DP_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -1075,6 +1076,8 @@ impl Greedy {
         }
         let model = match shared.as_slice() {
             [s] => {
+                #[cfg(test)]
+                let _stage = crate::test_alloc::Stage::enter(8);
                 let j = g.join[g.idx[&s.v] as usize];
                 g.models
                     .of_held(ctx, s.v, ua.held_on(j), ub.held_on(j))
@@ -1499,9 +1502,10 @@ impl Dp {
         let k = parts.len();
         let size = 1usize << k;
         let listed: usize = parts.iter().map(|p| p.ents.len()).sum();
+        first_storage(|| 4 * size);
         // The tables below are sized from the parts before any is allocated. `list`
         // starts with the parts' entries and grows as the round plans subsets.
-        let held = refused(pl.planning_stage(ROUND_PHASE).and_then(|()| {
+        let mut held = refused(pl.planning_stage(ROUND_PHASE).and_then(|()| {
             pl.planning_scratch(|layout| {
                 layout.slots::<u32>(2 * size + k + listed)?;
                 layout.slots::<bool>(2 * size)?;
@@ -1534,6 +1538,12 @@ impl Dp {
                 let c = m.count_ones();
                 splits[c as usize] += (1u64 << (c - 1)) - 1;
             }
+        }
+        // The neighbours serve only to find the connected subsets, so their storage
+        // and its credit go before the round is planned.
+        drop((nb, adj));
+        if let Some(held) = held.as_mut() {
+            held.release_to(held.bytes() - (4 * (size + k)) as u64);
         }
         let mut list = Vec::with_capacity(listed);
         let mut slot = vec![(0u32, 0u32); size];
@@ -1591,11 +1601,14 @@ impl Dp {
         let leaves: usize = items.iter().map(Vec::len).sum();
         // On the checked route, the parts' storage is admitted before it is allocated,
         // and the credit is dropped after the parts.
-        let mut parts_held = pl.planning_scratch(|layout| {
-            layout.slots::<Part>(items.len())?;
-            layout.slots::<u32>(leaves)?;
-            layout.slots::<bool>(items.iter().map(Vec::len).max().unwrap_or(0))
-        })?;
+        first_storage(|| items.len() * std::mem::size_of::<Part>());
+        let mut parts_held = refused(pl.planning_stage(PARTS_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<Part>(items.len())?;
+                layout.slots::<u32>(leaves)?;
+                layout.slots::<bool>(items.iter().map(Vec::len).max().unwrap_or(0))
+            })
+        }))?;
         if self.held.is_some() {
             let vals: usize = (0..items.len())
                 .map(|i| items[i].len() * self.bnd(1 << i).count_ones() as usize)
@@ -1619,13 +1632,24 @@ impl Dp {
             let bnd = self.bnd(m);
             let mut ents = Vec::with_capacity(opts.len());
             for (k, o) in opts.iter().enumerate() {
-                // copied only to place filters on, since an input can be a whole subtree
+                // copied only to place filters on, since an input can be a whole subtree.
+                // On the checked route the copy is admitted before it is made, and the
+                // credit is dropped after it.
+                let _copy;
                 let filtered;
                 let o = if fvars
                     .iter()
                     .take(64)
                     .any(|fv| !fv.is_empty() && fv.iter().all(|v| o.vars.contains(v)))
                 {
+                    _copy = if parts_held.is_some() {
+                        refused(
+                            pl.planning_stage(LEAF_PHASE)
+                                .and_then(|()| pl.planning_scratch(|layout| layout.node(o))),
+                        )?
+                    } else {
+                        None
+                    };
                     filtered = place_masked(pl, o.clone(), 0, filters, fvars).0;
                     &filtered
                 } else {
@@ -1669,7 +1693,9 @@ impl Dp {
                 // that can matter later
                 rounds = true;
                 if let Some(held) = parts_held.as_mut() {
-                    held.grow_by(part_bytes(k))?;
+                    first_storage(|| part_bytes(k) as usize);
+                    refused(pl.planning_stage(PARTS_PHASE))?;
+                    refused(held.grow_by(part_bytes(k)))?;
                 }
                 parts = Vec::with_capacity(k);
                 parts.extend(r.parts.into_iter().map(|p| self.useful(p)));
@@ -1715,7 +1741,10 @@ impl Dp {
             let (s, l) = r.slot[m as usize];
             let rest = k - size + 1;
             if let Some(held) = parts_held.as_mut() {
-                held.grow_by(part_bytes(rest) + 4 * l as u64)?;
+                // the merged part's entries are copied first
+                first_storage(|| 4 * l as usize);
+                refused(pl.planning_stage(PARTS_PHASE))?;
+                refused(held.grow_by(part_bytes(rest) + 4 * l as u64))?;
             }
             let merged = self.useful(Part {
                 inputs: r.inputs[m as usize],
@@ -1770,10 +1799,15 @@ impl Dp {
         let held = match self.held.as_ref() {
             Some(held) => {
                 let preparation = held.preparation();
-                let mut layout = super::checked_layout::Layout::new(preparation);
-                layout.slots::<Best>(keys)?;
-                Scratch::measure(&mut layout, jv, self.cached.len(), keys)?;
-                Some(refused(preparation.reserve(layout.bytes()))?)
+                first_storage(|| keys * std::mem::size_of::<Best>());
+                let reserve = || {
+                    preparation.stage(SCRATCH_PHASE)?;
+                    let mut layout = super::checked_layout::Layout::new(preparation);
+                    layout.slots::<Best>(keys)?;
+                    Scratch::measure(&mut layout, jv, self.cached.len(), keys)?;
+                    preparation.reserve(layout.bytes())
+                };
+                Some(refused(reserve())?)
             }
             None => None,
         };
@@ -1842,6 +1876,8 @@ impl Dp {
         // a join on one variable: from probed values or characteristic sets
         let model = if sh.count_ones() == 1 {
             let j = sh.trailing_zeros();
+            #[cfg(test)]
+            let _stage = crate::test_alloc::Stage::enter(8);
             self.models
                 .of(ctx, self.jvar[j as usize], j, bits_of(ia), bits_of(ib))
                 .map(|m| (j, m))
@@ -2120,10 +2156,13 @@ impl Dp {
         // The plan joins each of the n inputs once, so it has 2n - 1 entries, and at
         // most n built plans wait for their parent. On the checked route that storage is
         // admitted before it is allocated, and the credit is dropped after it.
-        let held = pl.planning_scratch(|layout| {
-            layout.slots::<u32>(2 * self.n - 1)?;
-            layout.map::<u32, (Node, u64)>(self.n)
-        })?;
+        first_storage(|| (2 * self.n - 1) * std::mem::size_of::<u32>());
+        let held = refused(pl.planning_stage(BUILD_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<u32>(2 * self.n - 1)?;
+                layout.map::<u32, (Node, u64)>(self.n)
+            })
+        }))?;
         // the entries of the plan, children before parents
         let mut need = Vec::with_capacity(if held.is_some() { 2 * self.n - 1 } else { 1 });
         need.push(root);
@@ -2230,6 +2269,22 @@ impl Scratch {
 pub(super) const PREPARE_PHASE: &str = "reserving join order tables";
 pub(super) const ROUND_PHASE: &str = "reserving join order round";
 pub(super) const GROW_PHASE: &str = "growing join order table";
+/// The phases a checked plan reports before it admits the filters' variables, the
+/// parts, a round's reused buffers, the rebuilt plan's lists, and the copy of an input
+/// that filters are placed on to cost it.
+pub(super) const FILTER_VARS_PHASE: &str = "reserving join order filter variables";
+pub(super) const PARTS_PHASE: &str = "reserving join order parts";
+pub(super) const SCRATCH_PHASE: &str = "reserving join order round scratch";
+pub(super) const BUILD_PHASE: &str = "reserving join order rebuild";
+pub(super) const LEAF_PHASE: &str = "copying join order input";
+
+/// Record, for the tests of the program's admission, the bytes of the first storage
+/// that the next admission covers.
+#[inline]
+fn first_storage(_bytes: impl FnOnce() -> usize) {
+    #[cfg(test)]
+    DP_GROWTH.with(|n| n.set(_bytes()));
+}
 
 /// The storage of `count` parts.
 fn part_bytes(count: usize) -> u64 {
@@ -2305,13 +2360,16 @@ fn dp_filter_vars(filters: &[Expr], pl: &Planner) -> Result<FilterVars> {
         });
         n
     };
-    let held = pl.planning_scratch(|layout| {
-        layout.slots::<Vec<VarId>>(filters.len())?;
-        for f in filters {
-            layout.slots::<VarId>(if f.has_exists() { 1 } else { count(f) })?;
-        }
-        Ok(())
-    })?;
+    first_storage(|| filters.len() * std::mem::size_of::<Vec<VarId>>());
+    let held = refused(pl.planning_stage(FILTER_VARS_PHASE).and_then(|()| {
+        pl.planning_scratch(|layout| {
+            layout.slots::<Vec<VarId>>(filters.len())?;
+            for f in filters {
+                layout.slots::<VarId>(if f.has_exists() { 1 } else { count(f) })?;
+            }
+            Ok(())
+        })
+    }))?;
     let vars = if held.is_some() {
         let mut vars = Vec::with_capacity(filters.len());
         for f in filters {

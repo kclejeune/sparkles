@@ -2567,6 +2567,11 @@ fn checked_chain_fixture(width: usize) -> Store {
                 step - 1
             )
             .unwrap();
+            writeln!(
+                input,
+                "<urn:n:0> <urn:s:{step}> <urn:m:{step}> <urn:g:{graph}> ."
+            )
+            .unwrap();
         }
     }
     store
@@ -2594,18 +2599,37 @@ fn checked_chain_query(width: usize) -> String {
     text
 }
 
+/// A star of `width` patterns on `?x0` in each graph, which the program plans in
+/// rounds from a width of 11.
+fn checked_star_query(width: usize) -> String {
+    use std::fmt::Write;
+
+    let mut text = String::from("SELECT * WHERE { GRAPH ?g {");
+    for step in 1..=width {
+        write!(text, " ?x0 <urn:s:{step}> ?y{step} .").unwrap();
+    }
+    for step in 1..=width {
+        write!(text, " FILTER(?y{step} != <urn:n:absent>)").unwrap();
+    }
+    text.push_str(" BIND(?x0 AS ?first) } }");
+    text
+}
+
 /// The planner storage of each join-order stage that a checked GRAPH plan holds
 /// beyond the credit it acquired, for a connected chain of `width` patterns.
 fn checked_join_order_excess(width: usize) -> [i64; crate::test_alloc::STAGES] {
+    checked_join_order_excess_of(width, &checked_chain_query(width))
+}
+
+/// [`checked_join_order_excess`] for the query `text` over the chain fixture of `width`.
+fn checked_join_order_excess_of(width: usize, text: &str) -> [i64; crate::test_alloc::STAGES] {
     use plan::{ActiveGraph, Planner};
 
     let store = checked_chain_fixture(width);
     let data = physical_default(&store);
     let ctx = validation_query_context(&data, opts()).unwrap();
     let prep = ctx.source_preparation.as_ref().unwrap().clone();
-    let Query::Select { pattern, .. } =
-        parse_query(&checked_chain_query(width), None, &[]).unwrap()
-    else {
+    let Query::Select { pattern, .. } = parse_query(text, None, &[]).unwrap() else {
         unreachable!()
     };
     let mut planner = Planner::new(&ctx);
@@ -2625,22 +2649,54 @@ fn checked_join_order_excess(width: usize) -> [i64; crate::test_alloc::STAGES] {
 fn checked_graph_r12_admits_join_order_tables() {
     // Stage 2 builds the program's tables over every subset of the inputs, which grow
     // with 2^n, stage 3 runs the program over them and stage 4 rebuilds its plan. The
-    // greedy plan alone handles widths past 16. The few hundred bytes left in stage 3
-    // do not grow with the width.
-    for width in [4, 8, 12] {
-        let excess = checked_join_order_excess(width);
+    // greedy plan alone handles widths past 16, and a star of 12 is planned in rounds.
+    // The copies of inputs that filters are placed on, whose size follows the input,
+    // are admitted in stage 3. Filter placement itself is stage 6, and the join
+    // estimates from characteristic sets or probes are stage 8. The last cases have a
+    // sub-select input of 2 and of 12 patterns with a filter on its variables.
+    let subtree = |k: usize| {
+        let mut text = String::from("SELECT * WHERE { GRAPH ?g { { SELECT ?x0 ?x1 WHERE {");
+        for step in 1..=k {
+            text.push_str(&format!(" ?x{} <urn:c:{step}> ?x{step} .", step - 1));
+        }
+        text.push_str(" } } ?x0 <urn:s:1> ?y1 . ?x0 <urn:s:2> ?y2 .");
+        text.push_str(" FILTER(?x1 != <urn:n:absent>) BIND(?x0 AS ?first) } }");
+        text
+    };
+    let mut cases: Vec<(usize, String)> = [4, 8, 12]
+        .into_iter()
+        .map(|width| (width, checked_chain_query(width)))
+        .collect();
+    cases.push((12, checked_star_query(12)));
+    cases.push((12, subtree(2)));
+    cases.push((12, subtree(12)));
+    let mut failures = Vec::new();
+    let mut run = Vec::new();
+    for (width, text) in &cases {
+        let excess = checked_join_order_excess_of(*width, text);
+        println!("{text}: {excess:?}");
+        run.push(excess[3]);
         for (stage, name, cap) in [
             (2, "program tables", 512),
-            (3, "program run", 1024),
+            (3, "program run", 512),
             (4, "program build", 256),
         ] {
-            assert!(
-                excess[stage] <= cap,
-                "{name}: {} unadmitted bytes at width {width}",
-                excess[stage]
-            );
+            if excess[stage] > cap {
+                failures.push(format!(
+                    "{name}: {} unadmitted bytes for {text}",
+                    excess[stage]
+                ));
+            }
         }
     }
+    // The copy of the larger sub-select is admitted as the smaller one is.
+    let (small, large) = (run[run.len() - 2], run[run.len() - 1]);
+    if large > small + 256 {
+        failures.push(format!(
+            "input copies: {small} then {large} unadmitted bytes"
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// The outcome, produced rows and phase events of a checked GRAPH query whose progress
@@ -2730,44 +2786,74 @@ fn checked_join_order_at_phase(
 
 #[test]
 fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
-    use crate::sparql::joinorder::{GROW_PHASE, PREPARE_PHASE, ROUND_PHASE};
+    use crate::sparql::joinorder::{
+        BUILD_PHASE, FILTER_VARS_PHASE, GROW_PHASE, LEAF_PHASE, PARTS_PHASE, PREPARE_PHASE,
+        ROUND_PHASE, SCRATCH_PHASE,
+    };
 
-    // A chain of 12 is planned by the program in one round over 12 inputs.
+    // A chain of 12 is planned by the program in one round over 12 inputs, and a star
+    // of 12 in several rounds.
     let width = 12;
     let store = checked_chain_fixture(width);
-    let text = checked_chain_query(width).replacen("SELECT *", "SELECT ?g ?x0", 1);
+    let chain = checked_chain_query(width).replacen("SELECT *", "SELECT ?g ?x0", 1);
+    let star = checked_star_query(width).replacen("SELECT *", "SELECT ?g ?x0", 1);
     // The largest table each admission allocates first: the subsets' join variables
-    // (one u128 per subset), the round's inputs per subset (one u32 per subset), and
-    // the grown table, whose size a recording run learns.
+    // (one u128 per subset), and the round's inputs per subset (one u32 per subset).
+    // A size of 0 stands for the first storage the admission covers, which a recording
+    // run learns, and `usize::MAX` for an admission of a copy, whose allocations are
+    // not told apart. Growth events 0 to 2 make room before the inputs are entered, and
+    // later ones as subsets are planned. An event of `usize::MAX` stands for the last.
     let n = 1usize << width;
-    // Growth events 0 to 2 make room before the inputs are entered, and later ones
-    // as subsets are planned. `usize::MAX` stands for the last event.
-    for (phase, at, size) in [
-        (PREPARE_PHASE, 0, 16 * n),
-        (ROUND_PHASE, 0, 4 * n),
-        (GROW_PHASE, 1, 0),
-        (GROW_PHASE, 3, 0),
-        (GROW_PHASE, usize::MAX, 0),
+    for (text, phase, at, size) in [
+        (&chain, PREPARE_PHASE, 0, 16 * n),
+        (&chain, ROUND_PHASE, 0, 4 * n),
+        (&chain, GROW_PHASE, 1, 0),
+        (&chain, GROW_PHASE, 3, 0),
+        (&chain, GROW_PHASE, usize::MAX, 0),
+        (&chain, FILTER_VARS_PHASE, 0, 0),
+        (&chain, FILTER_VARS_PHASE, 1, 0),
+        (&chain, PARTS_PHASE, 0, 0),
+        (&chain, SCRATCH_PHASE, 0, 0),
+        (&chain, BUILD_PHASE, 0, 0),
+        (&chain, LEAF_PHASE, 0, usize::MAX),
+        (&chain, LEAF_PHASE, usize::MAX, usize::MAX),
+        (&star, ROUND_PHASE, 1, 0),
+        (&star, SCRATCH_PHASE, 1, 0),
+        (&star, GROW_PHASE, usize::MAX, 0),
     ] {
         let at = if at == usize::MAX {
             let (_, _, events, ..) =
-                checked_join_order_at_phase(&store, &text, phase, 0, false, false, 1);
-            assert!(events > 4, "{events} growth events");
+                checked_join_order_at_phase(&store, text, phase, 0, false, false, 1);
+            assert!(events > 1, "{phase}: {events} events");
             events - 1
         } else {
             at
         };
         let (outcome, _, events, growth, ..) =
-            checked_join_order_at_phase(&store, &text, phase, at, false, false, 1);
+            checked_join_order_at_phase(&store, text, phase, at, false, false, 1);
         assert!(outcome.is_ok(), "{phase}: the recording run answers");
         assert!(events > at, "{phase}: {events} events");
         let size = if size == 0 { growth } else { size };
         assert!(size > 0, "{phase}: a growth target");
+        if size != usize::MAX {
+            // the storage is allocated after the event when nothing refuses it
+            let (_, _, _, _, seen, allocated) =
+                checked_join_order_at_phase(&store, text, phase, at, false, false, size);
+            assert!(
+                allocated > seen,
+                "{phase} {at}: {size} bytes allocated after"
+            );
+        }
+        if text == &star && phase == ROUND_PHASE {
+            // both graphs plan the star in several rounds, so event 1 is the first
+            // graph's second round
+            assert!(events >= 4, "{events} rounds");
+        }
         for cancel in [false, true] {
             let (outcome, rows, events, _, seen, allocated) =
-                checked_join_order_at_phase(&store, &text, phase, at, cancel, !cancel, size);
+                checked_join_order_at_phase(&store, text, phase, at, cancel, !cancel, size);
             if cancel {
-                assert!(matches!(outcome, Err(Error::Cancelled)), "{phase}");
+                assert!(matches!(outcome, Err(Error::Cancelled)), "{phase} {at}");
             } else {
                 assert!(
                     matches!(
@@ -2777,14 +2863,14 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
                             ..
                         }))
                     ),
-                    "{phase}: a refused admission fails the query"
+                    "{phase} {at}: a refused admission fails the query"
                 );
             }
-            assert_eq!(rows, 0, "{phase}");
-            assert_eq!(events, at + 1, "{phase}: no later admission");
+            assert_eq!(rows, 0, "{phase} {at}");
+            assert_eq!(events, at + 1, "{phase} {at}: no later admission");
             assert_eq!(
                 allocated, seen,
-                "{phase}: the refused table was allocated after the refusal"
+                "{phase} {at}: the refused table was allocated after the refusal"
             );
         }
     }
@@ -2926,7 +3012,7 @@ fn checked_graph_r12_refuses_join_order_tables_without_fallback() {
 #[test]
 #[ignore = "fail-first witness for join-order admission, which is pending"]
 fn checked_graph_r12_admits_join_order_storage() {
-    const STAGES: [&str; 8] = [
+    const STAGES: [&str; 9] = [
         "group",
         "greedy",
         "program tables",
@@ -2935,6 +3021,7 @@ fn checked_graph_r12_admits_join_order_storage() {
         "greedy build",
         "filtered plans",
         "join plans",
+        "join estimates",
     ];
     // The exhaustive program plans up to 16 inputs, and greedy alone plans more.
     let mut failures = Vec::new();

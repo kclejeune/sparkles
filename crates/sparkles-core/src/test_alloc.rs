@@ -120,7 +120,7 @@ thread_local! {
         const { Cell::new((0, usize::MAX, 0, 0, [0; STAGES])) };
 }
 
-pub(crate) const STAGES: usize = 8;
+pub(crate) const STAGES: usize = 9;
 
 /// The largest excess, per stage, of bytes a planner stage allocated and still holds
 /// over the Preparation credit it acquired meanwhile, while `f` runs on this thread.
@@ -189,11 +189,23 @@ fn observe(delta: i64) {
     });
 }
 
+/// Count an acquisition of `bytes` for [`record_admitted_allocations`].
+fn admitted(bytes: usize) {
+    let _ = ADMITTED.try_with(|cell| {
+        let (size, counter, count, low, high) = cell.get();
+        if size != 0 && size == bytes {
+            let used = unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
+                .load(Ordering::Relaxed);
+            cell.set((size, counter, count + 1, low.min(used), high.max(used)));
+        }
+    });
+}
+
 struct AllocationObserver;
 // SAFETY: System receives exactly the original layouts. A selected test-thread
 // watch retains its actual Preparation until cleared. Dealloc reads one atomic
 // and updates Copy TLS only, and alloc updates const Copy TLS only: no
-// allocation, callback, borrow, panic or reentry.
+// allocation, callback, borrow, panic or reentry. Realloc updates the same TLS.
 unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
     unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
         let _ = LARGEST.try_with(|cell| {
@@ -202,14 +214,7 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
                 cell.set((on, largest.max(layout.size())));
             }
         });
-        let _ = ADMITTED.try_with(|cell| {
-            let (size, counter, count, low, high) = cell.get();
-            if size != 0 && size == layout.size() {
-                let used = unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }
-                    .load(Ordering::Relaxed);
-                cell.set((size, counter, count + 1, low.min(used), high.max(used)));
-            }
-        });
+        admitted(layout.size());
         observe(layout.size() as i64);
         unsafe { std::alloc::System.alloc(layout) }
     }
@@ -226,7 +231,9 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
         unsafe { std::alloc::System.dealloc(pointer, layout) };
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        // Watched staging byte vectors are complete and never grow after arm.
+        // Watched staging byte vectors are complete and never grow after arm. A
+        // reallocation to the selected size acquires storage of that size.
+        admitted(size);
         observe(size as i64 - layout.size() as i64);
         unsafe { std::alloc::System.realloc(pointer, layout, size) }
     }
