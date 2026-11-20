@@ -1178,6 +1178,51 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
         .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
 }
 
+/// Whether a rooted run that counts declines to answer when a unit existential restriction
+/// arrives after its EL successor sent clauses over the predecessor, item 1229's
+/// containment (F24). Pred took each such clause with the restrictions that reached the
+/// successor when it came, and the successor sends it again over the new backward link
+/// only to find it taken, so the new restriction's successor term never meets it. Such a
+/// run passes its bound on derived conclusions and classifies again without counting.
+/// `SPARKLES_ROOTED_LATE_UNIT=0` turns the containment off, for measurement, and `=2`
+/// replays the clauses with the new restriction in its place, item 1229's repair, which is
+/// off until its proof.
+pub fn late_unit_mode() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_LATE_UNIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
+}
+
+/// The rule of [`late_unit_mode`] on a new unit `d(x)` of a rooted run that counts, whose
+/// EL successor is `v`.
+fn late_unit<S: Sink>(ix: &Index, st: &State, d: Ex, v: Ex, found: &mut Found, out: &mut S) {
+    let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&v)) else {
+        return;
+    };
+    if cids.is_empty() {
+        return;
+    }
+    match late_unit_mode() {
+        0 => {}
+        2 => {
+            for &cid in cids {
+                let c = out.dl().table.get(cid).clone();
+                pred(ix, st, d, &c, None, found, &out.dl().lits);
+            }
+        }
+        _ => {
+            if tracing() {
+                eprintln!("TR LATE {} e={d} succ={v}", tr_ctx(st, false));
+            }
+            found.over = true;
+        }
+    }
+}
+
 /// Whether a context other than the root selects the ground literals in its bodies, item
 /// 804's selection (F24). It is off until item 1220's repair, since two selected clauses of
 /// one context never meet in Hyper over x, so that a run could report itself complete and
@@ -2498,6 +2543,9 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         && into_nominal(ix, d).is_none()
     {
         on_rl(ix, st, d, r, &unit, &mut found);
+        if dx.counting && dx.root.is_some() {
+            late_unit(ix, st, d, h.succ, &mut found, out);
+        }
         if dx.counting && dx.root.is_none() {
             let mut us = Vec::new();
             unit_lits(ix, dx, st, d, &mut us);

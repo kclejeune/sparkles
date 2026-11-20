@@ -1201,3 +1201,65 @@ fn a_selected_premise_over_a_successor_term_of_a_constant_reaches_pred() {
         &[("D", "Ans")],
     );
 }
+
+/// K reaches the successor `{v} ⊓ B0` by t4 at once, and by s7 only after its successor D2
+/// read K's fact B1(v) and sent `∃r1.H` back, so the successor's `x ≈ v` came before the
+/// second restriction did. With counting the restriction has a successor term, which takes
+/// the constant only from that clause. A run that counts either finds K ⊑ Ans or does not
+/// answer in full, which it marks by classifying again without counting (item 1229).
+#[test]
+fn a_late_restriction_into_a_successor_that_already_answered_reads_its_clauses() {
+    let body = "SubClassOf(:K ObjectSomeValuesFrom(:t4 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         SubClassOf(:K ObjectSomeValuesFrom(:t10 ObjectIntersectionOf(ObjectOneOf(:v) :B1)))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 :D2))
+         SubClassOf(:D2 ObjectHasValue(:s9 :v))
+         SubClassOf(ObjectSomeValuesFrom(:s9 :B1) :G0)
+         SubClassOf(:G0 :H)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :H) :A0)
+         SubClassOf(:A0 :A)
+         SubClassOf(:A ObjectSomeValuesFrom(:s7 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         SubClassOf(ObjectSomeValuesFrom(:s7 :B1) :F0)
+         SubClassOf(:F0 :Ans)
+         SubClassOf(:Ctl ObjectSomeValuesFrom(:s7 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         FunctionalObjectProperty(:zz)";
+    let ax = axioms(body);
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        let full = out.complete && k.excluded().is_empty();
+        if full {
+            assert!(!out.stats.dl_counting_over);
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing"
+            );
+        } else {
+            // the run without counting leaves the functional property out and answers
+            assert!(out.stats.dl_counting_over, "{:#?}", k.excluded());
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing"
+            );
+        }
+        for (a, b) in [("Ctl", "Ans"), ("D2", "G0"), ("K", "B0")] {
+            assert!(
+                !out.taxonomy.is_subclass(&c(a), &c(b)),
+                "{a} ⊑ {b} is not entailed"
+            );
+        }
+    }
+}
