@@ -5,7 +5,9 @@ It answers `--version`, `load --loc DIR FILE` and `serve ... --loc NAME=DIR --po
 server answers /$/ready and POST /NAME/sparql with one row, as TSV or as the native JSON
 format with `meta.timing.execMs`, and appends one line per query request to requests.tsv
 in its working directory: the binary's IDENTITY, the store it serves, the execution field
-(or "-") and the Accept header. STUB_EXEC_MS in the file below, not the environment, sets
+(or "-") and the Accept header. It speaks HTTP/1.1 with kept-alive connections and appends
+the client's port and the raw form body of each query request to connections.tsv, so that
+a test can count the connections a client opened and compare the bodies it sent. STUB_EXEC_MS in the file below, not the environment, sets
 the reported execution time, since the runners clear the environment.
 """
 
@@ -17,6 +19,9 @@ import urllib.parse
 
 IDENTITY = "stub"
 EXEC_MS = 1.0
+# with CLOSE_EVERY n > 0, every n-th query request closes its connection after the answer,
+# without saying so, as a server does with an idle kept-alive connection
+CLOSE_EVERY = 0
 
 
 def main():
@@ -39,12 +44,18 @@ def main():
     owner = open(os.path.join(store, "owner")).read()
     log = os.path.abspath("requests.tsv")
 
+    conns = os.path.abspath("connections.tsv")
+
     class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        served = 0
+
         def log_message(self, *a):
             pass
 
         def do_GET(self):
             self.send_response(200)
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
         def do_POST(self):
@@ -55,6 +66,8 @@ def main():
             mode = form.get("execution", ["-"])[0]
             with open(log, "a") as f:
                 f.write(f"{IDENTITY}\t{owner}\t{store}\t{mode}\t{accept}\n")
+            with open(conns, "a") as f:
+                f.write(f"{self.client_address[1]}\t{body}\n")
             ask = "ASK" in form.get("query", [""])[0].upper().split("{")[0]
             if ask and "tab-separated" in accept:
                 out = b"?_askResult\ntrue\n"
@@ -73,8 +86,11 @@ def main():
             self.send_header("Content-Length", str(len(out)))
             self.end_headers()
             self.wfile.write(out)
+            Handler.served += 1
+            if CLOSE_EVERY and Handler.served % CLOSE_EVERY == 0:
+                self.close_connection = True
 
-    http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+    http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
 
 if __name__ == "__main__":

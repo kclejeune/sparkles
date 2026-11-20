@@ -209,6 +209,84 @@ class RemoteRunnerTests(unittest.TestCase):
         self.assertEqual(loads, ["A", "B", "C"])
 
 
+@unittest.skipUnless(all(shutil.which(t) for t in NEEDS), "needs taskset, zstd and curl")
+class RequestClientTests(unittest.TestCase):
+    """REQUEST_CLIENT=persistent writes what the curl loop writes, over fewer connections."""
+
+    def run_client(self, client, extra="", close_every=0):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        shutil.copy(SCRIPTS / "nsc-bench-remote.sh", d)
+        (d / "queries").mkdir()
+        (d / "queries" / "count.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }\n")
+        (d / "queries" / "ask.rq").write_text("ASK { ?s <http://e/p> \"a b&c=d+é\" }\n")
+        digest = d / "digest.sh"
+        digest.write_text('#!/bin/sh\nshift\nfor f; do if [ -f "$f" ]; then wc -c < "$f"; else echo missing; fi; done\n')
+        digest.chmod(0o755)
+        (d / "run.env").write_text(
+            "SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\nROUNDS=2\nREPS=3\nWARMUP=2\n"
+            f"EXECUTION=,streaming\nREQUEST_CLIENT={client}\nWARM_DIGEST={digest}\nPORT={free_port()}\n" + extra)
+        for v in "AB":
+            (d / f"bin-{v}").write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{v}"')
+                                        .replace("EXEC_MS = 1.0", "EXEC_MS = 2.5")
+                                        .replace("CLOSE_EVERY = 0", f"CLOSE_EVERY = {close_every}"))
+        subprocess.run(["zstd", "-q", "-o", str(d / "data.nt.zst")], input=b"", check=True)
+        r = subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True, timeout=120)
+        self.assertEqual((d / "results" / "done").read_text().strip(), "ok", r.stdout + r.stderr)
+        return d
+
+    def test_persistent_matches_curl(self):
+        c, p = self.run_client("curl"), self.run_client("persistent")
+
+        def samples(d):
+            rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()]
+            for r in rows[1:]:
+                float(r[6])
+            return [r[:6] for r in rows]
+
+        self.assertEqual(samples(c), samples(p))
+        self.assertEqual(len(samples(p)), 1 + 2 * 4 * 2 * 3)
+        self.assertTrue(all(r[5] == "2.5" for r in samples(p)[1:]))
+        for f in ("answers.tsv", "warm-answers.tsv"):
+            self.assertEqual((c / "results" / f).read_text(), (p / "results" / f).read_text(), f)
+        self.assertNotIn("missing", (p / "results" / "warm-answers.tsv").read_text())
+        # the server saw the same requests, with the same form fields and Accept headers
+        self.assertEqual((c / "requests.tsv").read_text(), (p / "requests.tsv").read_text())
+        self.assertIn("request client: A=persistent(gap 0 ms) B=persistent(gap 0 ms) Python", (p / "results" / "env.txt").read_text())
+        # curl opens a connection per request, the persistent client one per server process
+        # beside the answer checks, which run once per variant with curl
+        log = lambda d: [l.split("\t") for l in (d / "connections.tsv").read_text().splitlines()]
+        self.assertEqual([b for _, b in log(c)], [b for _, b in log(p)])
+        self.assertIn("query=ASK+%7B+%3Fs+%3Chttp%3A%2F%2Fe%2Fp%3E+%22a+b%26c%3Dd%2B%C3%A9%22+%7D%0A",
+                      {b for _, b in log(p)})
+        conns = lambda d: len({port for port, _ in log(d)})
+        requests = 2 * 4 * 2 * (2 + 3)
+        self.assertEqual(conns(c), requests + 2 * 2)
+        self.assertEqual(conns(p), 2 * 4 + 2 * 2)
+
+    def test_an_unknown_client_is_refused(self):
+        d = self.run_client("persistent")
+        (d / "results" / "done").unlink()
+        (d / "run.env").write_text((d / "run.env").read_text() + "REQUEST_CLIENT=wget\n")
+        subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True, timeout=60)
+        self.assertIn("REQUEST_CLIENT is curl or persistent, not wget for A", (d / "results" / "done").read_text())
+
+    def test_a_connection_the_server_closed_is_reopened(self):
+        d = self.run_client("persistent", close_every=3)
+        rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()[1:]]
+        self.assertEqual(len(rows), 2 * 4 * 2 * 3)
+        self.assertNotIn("error", {r[5] for r in rows})
+        # each request reached the server once
+        self.assertEqual(len((d / "requests.tsv").read_text().splitlines()), 2 * 4 * 2 * (2 + 3) + 2 * 2)
+
+    def test_one_variant_per_client(self):
+        d = self.run_client("persistent", "REQUEST_CLIENT_A=curl\nREQUEST_GAP_MS_B=1.5\n")
+        self.assertIn("request client: A=curl B=persistent(gap 1.5 ms) Python", (d / "results" / "env.txt").read_text())
+        rows = [l.split("\t") for l in (d / "connections.tsv").read_text().splitlines()]
+        # A's 20 requests per server process each open a connection, B's share one
+        self.assertEqual(len({port for port, _ in rows}), 4 * 2 * (2 + 3) + 4 + 2 * 2)
+
+
 class TimedDigestTests(unittest.TestCase):
     def run_dir(self, d, warm):
         root = Path(d) / "run"

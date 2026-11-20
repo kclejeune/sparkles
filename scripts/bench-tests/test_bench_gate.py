@@ -799,6 +799,39 @@ class GateTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("Answers differ or failed for: sorted", r.stdout)
 
+    def test_cell_summary_reads_one_pair_of_a_queue(self):
+        # a base A and two tips B and C, with C 20% slower than A and B as fast as A
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            epoch = 0
+            for rnd in (1, 2):
+                for v in "ABCCBA":
+                    epoch += 1
+                    for rep in (1, 2):
+                        x = {"A": 1.0, "B": 1.0, "C": 1.2}[v] * (1 + 0.001 * epoch)
+                        lines.append(f"{rnd}\t{epoch}\t{v}\tq\t{rep}\t{x}\t{x + 1}")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            res.joinpath("answers.tsv").write_text("A\tq\t1\tx\nB\tq\t1\tx\nC\tq\t1\ty\n")
+            summary = SCRIPTS / "nsc-bench-summary.py"
+            r = subprocess.run([sys.executable, str(summary), "--pair", "A,C", d], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Variant A is A and variant C is B", r.stdout)
+            self.assertIn("Answers differ or failed for: q", r.stdout)
+            s = json.loads((Path(d) / "summary-A-C.json").read_text())
+            self.assertAlmostEqual(s["queries"]["q"]["exec_ms"]["ratio"], 1.2, places=2)
+            self.assertTrue(s["validity"]["valid"])
+            self.assertEqual(s["pair"], {"A": "A", "B": "C"})
+            r = subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, text=True)
+            self.assertIn("same sorted TSV answers", r.stdout)
+            s = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertAlmostEqual(s["queries"]["q"]["exec_ms"]["ratio"], 1.0, places=2)
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check",
+                                             str(Path(d) / "summary-A-B.json"), "first"]).returncode, 0)
+            r = subprocess.run([sys.executable, str(summary), "--pair", "A,A", d], capture_output=True, text=True)
+            self.assertIn("two different variants", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

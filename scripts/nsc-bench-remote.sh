@@ -35,6 +35,20 @@
 # requests, which in a VM costs a hypervisor exit and a cold wake-up, and it yields to the
 # server and client as soon as they run. In a noise test with one binary, it halved the
 # spread within a server process and between server processes.
+#
+# REQUEST_CLIENT picks the client of the warm-up and timed requests. With curl (the
+# default), each request forks curl, grep and awk, which costs about 19 ms of client time
+# per request and opens a new connection each time, and wall_ms is curl's time_total. With
+# persistent, one python3 process per server process sends every query's requests over one
+# kept-alive connection, reconnecting only when the server closes it, and wall_ms runs from
+# sending the request to reading the last byte of the answer. The request, its form fields
+# and headers, and the execMs read from the answer are the same with either client, so
+# exec_ms measures the same server work. The answer checks and the readiness probe use
+# curl with either client. REQUEST_CLIENT_<v> sets variant v's client, so that a run of one
+# binary as A and B can compare the two clients. Back-to-back requests find the server's
+# caches warmer than curl's, so very short queries read faster with the persistent client,
+# and REQUEST_GAP_MS (0 by default) makes it wait that long before each request.
+# REQUEST_GAP_MS_<v> sets variant v's gap.
 set -euo pipefail
 cd "$(dirname "$0")"
 # shellcheck source=/dev/null
@@ -45,7 +59,7 @@ source ./run.env
 # store, which compares settings of one binary without the differences between two stores.
 # scripts/nsc-bench.sh does not write these three, and scripts/x08-gates/latency.sh does.
 : "${SERVE_ARGS_A:=}" "${SERVE_ARGS_B:=}" "${SHARE_STORE:=0}"
-: "${VARIANTS:=A B}" "${ORDERS:=A B B A}"
+: "${VARIANTS:=A B}" "${ORDERS:=A B B A}" "${REQUEST_CLIENT:=curl}" "${REQUEST_GAP_MS:=0}"
 read -r -a VARIANT_LIST <<< "$VARIANTS"
 # PREPARE_A and PREPARE_B are sparkles commands run once on each variant's store after its
 # load, and PREPARE_REPEAT one run PREPARE_REPS times after that. Each run is timed into
@@ -101,6 +115,20 @@ for o in "${ORDER_LIST[@]}"; do
   for v in $o; do [ -n "${MODE[$v]+x}" ] || fail "ORDERS names $v, which is not a variant"; done
   for v in "${VARIANT_LIST[@]}"; do [[ " $o " == *" $v "* ]] || fail "the order '$o' leaves out $v"; done
 done
+declare -A CLIENT_OF GAP_OF
+PERSISTENT=0
+for v in "${VARIANT_LIST[@]}"; do
+  c=REQUEST_CLIENT_$v g=REQUEST_GAP_MS_$v
+  CLIENT_OF[$v]=${!c:-$REQUEST_CLIENT}
+  GAP_OF[$v]=${!g:-$REQUEST_GAP_MS}
+  [[ ${GAP_OF[$v]} =~ ^[0-9]+([.][0-9]+)?$ ]] || fail "REQUEST_GAP_MS of $v is not a number of milliseconds: ${GAP_OF[$v]}"
+  case ${CLIENT_OF[$v]} in
+    curl) ;;
+    persistent) PERSISTENT=1 ;;
+    *) fail "REQUEST_CLIENT is curl or persistent, not ${CLIENT_OF[$v]} for $v" ;;
+  esac
+done
+[ "$PERSISTENT" = 0 ] || command -v python3 > /dev/null || fail "REQUEST_CLIENT=persistent needs python3"
 
 # The binaries are built on another Linux and name the build host's glibc loader, so a
 # dynamically linked one (DYNAMIC_A, DYNAMIC_B) runs under this image's loader.
@@ -119,6 +147,7 @@ done
   echo "memory: $(free -m | awk '/Mem:/ {print $2}') MiB"
   echo "smt siblings: $(sort -u /sys/devices/system/cpu/cpu*/topology/thread_siblings_list | tr '\n' ' ')"
   echo "loader: $( (/lib64/ld-linux-x86-64.so.2 --version 2> /dev/null || echo none) | head -1)"
+  echo "request client: $(for v in "${VARIANT_LIST[@]}"; do [ "${CLIENT_OF[$v]}" = curl ] && printf '%s=curl ' "$v" || printf '%s=persistent(gap %s ms) ' "$v" "${GAP_OF[$v]}"; done)$([ "$PERSISTENT" = 0 ] || python3 --version 2>&1)"
 } > "$R/env.txt"
 # the steal and total jiffies of the whole machine: summed before and after the timed part
 stat_cpu() { awk '/^cpu / {t = 0; for (i = 2; i <= NF; i++) t += $i; print $9, t}' /proc/stat; }
@@ -231,6 +260,109 @@ request() { # <query> -> "execMs wallSeconds", or "error"
   echo "${e:-error} $w"
 }
 
+# The persistent client: one process per server process runs every query's warm-up and
+# timed requests in order and appends the same samples.tsv and warm-answers.tsv lines as
+# the curl loop below.
+if [ "$PERSISTENT" = 1 ]; then
+  cat > bench-client.py << 'PY'
+import argparse, http.client, os, re, shlex, subprocess, sys, time, urllib.parse
+
+p = argparse.ArgumentParser()
+p.add_argument("--port", type=int, required=True)
+p.add_argument("--round", required=True)
+p.add_argument("--epoch", required=True)
+p.add_argument("--variant", required=True)
+p.add_argument("--warmup", type=int, required=True)
+p.add_argument("--reps", type=int, required=True)
+p.add_argument("--max-time", type=float, required=True)
+p.add_argument("--execution", default="")
+p.add_argument("--digest", default="")
+p.add_argument("--gap-ms", type=float, default=0.0)
+p.add_argument("--samples", required=True)
+p.add_argument("--warm-answers", required=True)
+p.add_argument("queries", nargs="+")
+a = p.parse_args()
+EXEC = re.compile(rb'"execMs":([0-9.eE+-]*)')
+HEADERS = {"Accept": "application/x-sparkles+json", "Content-Type": "application/x-www-form-urlencoded"}
+conn = http.client.HTTPConnection("localhost", a.port, timeout=a.max_time)
+
+
+def form(text):
+    # curl --data-urlencode writes a space as + and escapes every other byte but A-Z a-z 0-9
+    # - . _ ~, and so does quote_plus
+    body = "query=" + urllib.parse.quote_plus(text, safe="")
+    if a.execution:
+        body += "&execution=" + urllib.parse.quote_plus(a.execution, safe="")
+    return body.encode()
+
+
+def request(body):
+    """(execMs text or None, wall seconds, answer bytes or None)"""
+    global conn
+    if a.gap_ms > 0:
+        time.sleep(a.gap_ms / 1000)
+    for attempt in (1, 2):
+        # A kept-alive connection that the server closed while it was idle fails before any
+        # answer arrives, so the request is sent once more on a new connection, and timed
+        # from there. A new connection that fails gives an error row.
+        reused = conn.sock is not None
+        t0 = time.perf_counter()
+        got = False
+        try:
+            conn.request("POST", "/bench/sparql", body, HEADERS)
+            r = conn.getresponse()
+            got = True
+            data = r.read()
+            break
+        except (OSError, http.client.HTTPException):
+            conn.close()
+            conn = http.client.HTTPConnection("localhost", a.port, timeout=a.max_time)
+            if got or not reused or attempt == 2:
+                return None, None, None
+    w = time.perf_counter() - t0
+    if r.status >= 400:
+        return None, w, None
+    m = EXEC.search(data)
+    return (m.group(1).decode() if m and m.group(1) else None), w, data
+
+
+with open(a.samples, "a") as samples, open(a.warm_answers, "a") as warm:
+    for q in a.queries:
+        path = f"queries/{q}.rq"
+        with open(path, encoding="utf-8", newline="") as f:
+            body = form(f.read())
+        for _ in range(a.warmup):
+            request(body)
+        files = []
+        for rep in range(1, a.reps + 1):
+            e, w, data = request(body)
+            if e is None:
+                samples.write(f"{a.round}\t{a.epoch}\t{a.variant}\t{q}\t{rep}\terror\terror\n")
+            else:
+                samples.write(f"{a.round}\t{a.epoch}\t{a.variant}\t{q}\t{rep}\t{e}\t{w * 1000:.6g}\n")
+            if a.digest:
+                name = f"timed-{rep}.json"
+                files.append(name)
+                if data is not None:
+                    with open(name, "wb") as out:
+                        out.write(data)
+                elif os.path.exists(name):
+                    os.remove(name)
+        samples.flush()
+        if a.digest:
+            r = subprocess.run(shlex.split(a.digest) + [path] + files, stdout=subprocess.PIPE, text=True)
+            digests = r.stdout.splitlines()
+            for rep in range(1, a.reps + 1):
+                d = (digests[rep - 1] if rep <= len(digests) else "") or "no digest"
+                warm.write(f"{a.epoch}\t{a.variant}\t{q}\t{rep}\t{d}\n")
+            warm.flush()
+            for name in files:
+                if os.path.exists(name):
+                    os.remove(name)
+conn.close()
+PY
+fi
+
 SPINNERS=()
 if [ "$SPIN" = 1 ]; then
   for c in "$SERVER_CPU" "$CLIENT_CPU"; do
@@ -266,7 +398,16 @@ for round in $(seq "$ROUNDS"); do
         fi
       done
     fi
-    for q in "${QUERIES[@]}"; do
+    if [ "${CLIENT_OF[$v]}" = persistent ]; then
+      python3 bench-client.py --port "$PORT" --round "$round" --epoch "$epoch" --variant "$v" \
+        --warmup "$WARMUP" --reps "$REPS" --max-time "$MAX_TIME" --execution "${MODE[$v]}" --gap-ms "${GAP_OF[$v]}" \
+        --digest "${WARM_DIGEST:-}" --samples "$R/samples.tsv" --warm-answers "$R/warm-answers.tsv" \
+        "${QUERIES[@]}" || fail "the request client failed in epoch $epoch ($v)"
+      QUERY_LOOP=()
+    else
+      QUERY_LOOP=("${QUERIES[@]}")
+    fi
+    for q in ${QUERY_LOOP[@]+"${QUERY_LOOP[@]}"}; do
       for _ in $(seq "$WARMUP"); do request "$q" > /dev/null; done
       for rep in $(seq "$REPS"); do
         read -r e w <<< "$(request "$q")"
