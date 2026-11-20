@@ -515,7 +515,12 @@ from those values through the indexes and emits that fixpoint. A copy that binds
 walks backward over reversed edges, and one that binds neither closes the relation once its
 magic fact holds. The operator keeps a mark per predicate for its edges and one for its
 magic facts, so a later step or a later demand of the session walks from every value only
-when the relation gained edges, and otherwise from the new values alone. Each operator emits
+when the relation gained edges, and otherwise from the new values alone. The run also records
+the rows of the pairs that transitive operators merged, which change what no value reaches
+and so call for no walk, and the row before which a copy that binds neither end closed the
+whole relation. Until an edge that is not such a pair follows that row, no transitive
+operator over the predicate walks it. Each later run of the session walks a closed
+relation once more, which roadmap item 1224 covers. Each operator emits
 exactly its copy's fixpoint, so the session derives the facts the joins derive, and
 `src/query_closure_tests.rs` checks that with the derived-table cache off on every kind of
 copy, on sessions of several demands and on random property graphs. The source rules are

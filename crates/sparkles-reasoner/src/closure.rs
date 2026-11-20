@@ -346,6 +346,16 @@ pub(crate) struct Stats {
     /// adorned copies of a rule with a variable predicate (`prp-trp`), of every kind
     /// above
     pub guarded: Counts,
+    /// adorned copies of a rule with a constant predicate under a key whose magic facts
+    /// hold the predicate (`Bound`), of every kind above
+    pub bound_constant: Counts,
+    /// graphs of a relation that operators built and closed
+    pub walks: u64,
+    /// of those, the ones that merged no pair
+    pub idle: u64,
+    /// of those, the ones that new edges since the operator last closed the relation
+    /// called for, for every value asked for or for the whole relation
+    pub rewalks: u64,
 }
 
 /// What one closure step did.
@@ -365,6 +375,104 @@ pub(crate) struct Closures {
     /// what the list builtins read depend on when it appears
     lists: Option<[u64; 2]>,
     stats: Stats,
+    ledger: Ledger,
+}
+
+/// What the run's operators know of each relation they close, which spares them walks
+/// that merge nothing.
+#[derive(Debug, Default)]
+struct Ledger {
+    /// per predicate, the row ranges of the pairs that transitive operators merged, in
+    /// order: each pair is in the closure of the edges before it, so it changes what no
+    /// value reaches, and edges after a mark that are all such pairs call for no walk
+    merged: FxHashMap<u64, Vec<(u32, u32)>>,
+    /// per predicate, the row before which a transitive operator closed the whole
+    /// relation, and whether it left out the pairs `(x, x)` (a `notEqual` filter): until
+    /// an edge that is not a merged pair follows it, every pair an operator over the
+    /// predicate could emit is there
+    closed: FxHashMap<u64, (u32, bool)>,
+    /// the charge of the above, which lasts for the run
+    held: Option<Held>,
+}
+
+impl Ledger {
+    /// The edges of `q` in rows `[lo, now)` that are not pairs operators merged.
+    fn edges(&self, g: &Graph, q: u64, lo: u32, now: u32) -> usize {
+        if lo >= now {
+            return 0;
+        }
+        let n = g.count_p(q, lo, now);
+        let Some(rs) = self.merged.get(&q) else {
+            return n;
+        };
+        let from = rs.partition_point(|r| r.1 <= lo);
+        let merged: usize = rs[from..]
+            .iter()
+            .take_while(|r| r.0 < now)
+            .map(|r| (r.1.min(now) - r.0.max(lo)) as usize)
+            .sum();
+        n - merged.min(n)
+    }
+
+    /// Whether the relation of `q` is closed for an operator, with or without its
+    /// `notEqual` filter, at row `now`.
+    fn holds(&self, g: &Graph, q: u64, irreflexive: bool, now: u32) -> bool {
+        self.closed
+            .get(&q)
+            .is_some_and(|&(at, irr)| (irreflexive || !irr) && self.edges(g, q, at, now) == 0)
+    }
+
+    /// Record the rows `[lo, hi)` of pairs of `q` that a transitive operator merged.
+    fn merge(
+        &mut self,
+        q: u64,
+        lo: u32,
+        hi: u32,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetFailure> {
+        if lo >= hi {
+            return Ok(());
+        }
+        let rs = self.merged.entry(q).or_default();
+        match rs.last_mut() {
+            Some(last) if last.1 == lo => last.1 = hi,
+            _ => rs.push((lo, hi)),
+        }
+        self.charge(budget)
+    }
+
+    /// Record that a transitive operator closed the whole relation of `q` from its edges
+    /// before row `at`.
+    fn close(
+        &mut self,
+        q: u64,
+        at: u32,
+        irreflexive: bool,
+        budget: &Arc<Budget>,
+    ) -> Result<(), BudgetFailure> {
+        let e = self.closed.entry(q).or_insert((at, irreflexive));
+        // the later closure, and of two at one row the one with the pairs `(x, x)`, which
+        // holds for an operator either way
+        if at > e.0 || (at == e.0 && !irreflexive) {
+            *e = (at, irreflexive);
+        }
+        self.charge(budget)
+    }
+
+    fn charge(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
+        let want = table_bytes(self.merged.capacity(), size_of::<(u64, Vec<(u32, u32)>)>())
+            + self
+                .merged
+                .values()
+                .map(|v| v.capacity() * size_of::<(u32, u32)>())
+                .sum::<usize>()
+            + table_bytes(self.closed.capacity(), size_of::<(u64, (u32, bool))>());
+        let held = self.held.get_or_insert_with(|| Held::new(budget));
+        if want > held.bytes() {
+            held.try_set(want)?;
+        }
+        Ok(())
+    }
 }
 
 /// A run with closure operators derived list structure that rules read, so it starts
@@ -687,6 +795,7 @@ impl Closures {
             start,
             lists,
             stats: Stats::default(),
+            ledger: Ledger::default(),
         }))
     }
 
@@ -738,10 +847,14 @@ impl Closures {
         self.check_lists(g)?;
         let start = self.start;
         let mut poll = Poll::new(cancel);
+        let mut ops_ms = 0f64;
         for op in &mut self.ops {
             if op.off {
                 continue;
             }
+            let t_op = std::time::Instant::now();
+            let (mut walks, mut idle, mut rewalks, mut edges, mut nsrc) =
+                (0u64, 0u64, 0u64, 0usize, 0usize);
             let now = g.len();
             // the magic facts of an adorned copy, kept while they are read
             let seeds = match &op.seeded {
@@ -756,6 +869,8 @@ impl Closures {
             };
             // the predicates and their charge, kept while they are read
             let (mut preds, _preds_held) = op.predicates(g, now, budget, &mut poll)?;
+            let prep_ms = t_op.elapsed().as_secs_f64() * 1e3;
+            let npreds = preds.len();
             if let (Some(s), Some(f)) = (&op.seeded, &seeds)
                 && s.p_at.is_some()
             {
@@ -785,7 +900,16 @@ impl Closures {
             if op.irreflexive && matches!(op.over, Over::Guarded(..)) {
                 for &q in &preds {
                     poll.tick(1)?;
-                    let Some(local) = op.local(g, q, now, start, seeds.as_ref(), budget, cancel)?
+                    let Some((local, _)) = op.local(
+                        g,
+                        q,
+                        now,
+                        start,
+                        seeds.as_ref(),
+                        &self.ledger,
+                        budget,
+                        cancel,
+                    )?
                     else {
                         continue;
                     };
@@ -800,10 +924,28 @@ impl Closures {
                     break;
                 }
                 poll.tick(1)?;
-                let Some(local) = op.local(g, q, now, start, seeds.as_ref(), budget, cancel)?
+                let Some((local, again)) = op.local(
+                    g,
+                    q,
+                    now,
+                    start,
+                    seeds.as_ref(),
+                    &self.ledger,
+                    budget,
+                    cancel,
+                )?
                 else {
                     continue;
                 };
+                walks += 1;
+                rewalks += u64::from(again);
+                edges += local.adj.len();
+                nsrc += if local.emit.is_empty() {
+                    local.ids.len()
+                } else {
+                    local.emit.iter().filter(|&&e| e).count()
+                };
+                let rows0 = g.len();
                 let mut sink = Sink::new(g, budget, total, max_out);
                 let closed = match op.shape {
                     Shape::Transitive => {
@@ -844,10 +986,49 @@ impl Closures {
                     anyhow::bail!("reasoning cancelled");
                 }
                 total = sink.finish()?;
+                if g.len() == rows0 {
+                    idle += 1;
+                }
+                if op.shape == Shape::Transitive {
+                    self.ledger.merge(q, rows0, g.len(), budget)?;
+                    // a copy that binds no end closes the whole relation of its edges
+                    if op.seeded.as_ref().is_some_and(|s| s.end.is_none()) {
+                        self.ledger.close(q, now, op.irreflexive, budget)?;
+                    }
+                }
                 done.push(q);
             }
+            let nseeds = seeds.as_ref().map_or(0, |f| f.rows.len());
             drop(seeds);
             let after = g.len();
+            self.stats.walks += walks;
+            self.stats.idle += idle;
+            self.stats.rewalks += rewalks;
+            let op_ms = t_op.elapsed().as_secs_f64() * 1e3;
+            ops_ms += op_ms;
+            if op_ms >= 2.0 {
+                let mode = match op.seeded.as_ref().map(|s| s.end) {
+                    None => "plain",
+                    Some(Some((_, Dir::Forward))) => "forward",
+                    Some(Some((_, Dir::Backward))) => "backward",
+                    Some(None) => "full",
+                };
+                tracing::debug!(
+                    rule = %rules[op.rules[0]].name,
+                    mode,
+                    op_ms,
+                    prep_ms,
+                    preds = npreds,
+                    walks,
+                    idle,
+                    rewalks,
+                    edges,
+                    sources = nsrc,
+                    seeds = nseeds,
+                    new = after - before,
+                    "closure operator step"
+                );
+            }
             stepped.added += (after - before) as usize;
             if after > before {
                 let n = (after - before) as u64;
@@ -857,6 +1038,12 @@ impl Closures {
                 if op.seeded.is_some() && matches!(op.over, Over::Guarded(..)) {
                     self.stats.guarded.pairs += n;
                     self.stats.guarded.steps += 1;
+                }
+                if let (Some(s), Over::Fixed(c)) = (&op.seeded, op.over)
+                    && s.fixed.iter().any(|&(_, v)| v == c)
+                {
+                    self.stats.bound_constant.pairs += n;
+                    self.stats.bound_constant.steps += 1;
                 }
             }
             if back {
@@ -872,6 +1059,7 @@ impl Closures {
                 s.mm = Some(now);
             }
         }
+        tracing::debug!(ops_ms, "closure operators' own time in the step");
         self.check_lists(g)?;
         Ok(stepped)
     }
@@ -906,10 +1094,14 @@ impl Stats {
             (&mut self.backward, other.backward),
             (&mut self.full, other.full),
             (&mut self.guarded, other.guarded),
+            (&mut self.bound_constant, other.bound_constant),
         ] {
             a.pairs += b.pairs;
             a.steps += b.steps;
         }
+        self.walks += other.walks;
+        self.idle += other.idle;
+        self.rewalks += other.rewalks;
     }
 }
 
@@ -1050,16 +1242,21 @@ impl Op {
         now: u32,
         start: Option<u32>,
         seeds: Option<&Seeds>,
+        ledger: &Ledger,
         budget: &Arc<Budget>,
         cancel: Option<&AtomicBool>,
-    ) -> anyhow::Result<Option<Local>> {
+    ) -> anyhow::Result<Option<(Local, bool)>> {
         if !self.conds.is_empty() {
             let mut memo = Memo::default();
             if !self.conds.iter().all(|c| g.holds_before(&mut memo, c, now)) {
                 return Ok(None);
             }
         }
-        let fresh = |mark: u32| mark < now && g.count_p(q, mark, now) > 0;
+        // a transitive operator has nothing to add to a relation closed as a whole
+        if self.shape == Shape::Transitive && ledger.holds(g, q, self.irreflexive, now) {
+            return Ok(None);
+        }
+        let fresh = |mark: u32| ledger.edges(g, q, mark, now) > 0;
         let (Some(s), Some(f)) = (&self.seeded, seeds) else {
             let mark = match self.marks.get(&q) {
                 Some(&m) => m,
@@ -1068,7 +1265,9 @@ impl Op {
             if !fresh(mark) {
                 return Ok(None);
             }
-            return Local::build(g, q, mark, now, self.shape, budget, cancel).map(Some);
+            let again = self.marks.contains_key(&q);
+            return Local::build(g, q, mark, now, self.shape, budget, cancel)
+                .map(|l| Some((l, again)));
         };
         let mine = f.of(q, s.p_at.is_some());
         if mine.is_empty() {
@@ -1087,7 +1286,8 @@ impl Op {
                 if !fresh(mark) {
                     return Ok(None);
                 }
-                Local::build(g, q, mark, now, self.shape, budget, cancel).map(Some)
+                let again = self.marks.contains_key(&q);
+                Local::build(g, q, mark, now, self.shape, budget, cancel).map(|l| Some((l, again)))
             }
             Some((_, dir)) => {
                 let mark = match self.marks.get(&q) {
@@ -1108,7 +1308,8 @@ impl Op {
                 }
                 sources.sort_unstable();
                 sources.dedup();
-                Local::seeded(g, q, &sources, now, dir, budget, cancel).map(Some)
+                let again = all && self.marks.contains_key(&q);
+                Local::seeded(g, q, &sources, now, dir, budget, cancel).map(|l| Some((l, again)))
             }
         }
     }

@@ -14,6 +14,12 @@ OWL2Bench(1) queries q2, q7, q12 and q19 under `owl-rl` demand took 12 to 14 s i
 rules read starts again without the operators. `SPARKLES_DEMAND_CLOSURES=0` turns them off.
 Roadmap item 1222 covers pairs derived for values the query did not ask for.
 
+Within a run, an operator no longer walks a relation again for pairs other operators
+merged, or once a copy that binds neither end closed the whole relation and no other edge
+has arrived since. On a debug build, the operators of OWL2Bench(1) q12 spent 2.3 s instead
+of 21.3 s, and the walks that merged nothing read 1.3 million edges instead of 21 million.
+Roadmap item 1224 covers the walk that each later run of a session still makes.
+
 ### Targeted checks on a remote host
 
 `mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or

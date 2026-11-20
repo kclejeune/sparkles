@@ -5,7 +5,7 @@
 
 use super::*;
 use crate::ReasonOptions;
-use crate::closure::Stats;
+use crate::closure::{Counts, Stats};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::sparql::reasoning::DemandTerm;
 use sparkles_core::store::{Store, StoreOptions};
@@ -136,12 +136,19 @@ fn materialized(ts: &[oxrdf::Triple], d: &Demand) -> BTreeSet<String> {
 /// without, over a store each: both return the same facts, each once, and those of each
 /// demand are the materialization's. Returns the operators' counts and the session.
 fn compare(ttl: &str, profile: &Profile, demands: &[Demand]) -> (Stats, Session) {
+    let calls: Vec<&[Demand]> = demands.iter().map(std::slice::from_ref).collect();
+    compare_calls(ttl, profile, &calls)
+}
+
+/// [`compare`] with the demands of each call derived together.
+fn compare_calls(ttl: &str, profile: &Profile, calls: &[&[Demand]]) -> (Stats, Session) {
+    let demands: Vec<Demand> = calls.iter().flat_map(|c| c.iter().cloned()).collect();
     let (a, b) = (store(ttl), store(ttl));
     let mut with = session(&a, profile, true);
     let mut without = session(&b, profile, false);
-    for d in demands {
-        with.derive_all(std::slice::from_ref(d)).unwrap();
-        without.derive_all(std::slice::from_ref(d)).unwrap();
+    for c in calls {
+        with.derive_all(c).unwrap();
+        without.derive_all(c).unwrap();
     }
     assert!(!with.compact && !without.compact, "{ttl}");
     assert!(!with.cached_equality && !without.cached_equality);
@@ -157,7 +164,7 @@ fn compare(ttl: &str, profile: &Profile, demands: &[Demand]) -> (Stats, Session)
         panic!("{ttl}\n{demands:?}\nonly with operators: {extra:#?}\nonly without: {missing:#?}");
     }
     let (ts, _) = crate::infer(a.snapshot(), profile, &ReasonOptions::default()).unwrap();
-    for d in demands {
+    for d in &demands {
         let want = materialized(&ts, d);
         let got: BTreeSet<String> = {
             let ok = |x: &DemandTerm, v: &str| match x {
@@ -268,6 +275,107 @@ fn prp_trp_copies_engage_under_each_key() {
             "{d:?}: no {key:?} key"
         );
     }
+}
+
+/// The pairs an operator merges are in the closure of the relation, so they change what
+/// no value reaches: another operator over the same predicate does not walk its values
+/// again for them. Here a forward and a backward copy of `t` close one chain in one run,
+/// and each walks only the values its magic facts add.
+#[test]
+fn merged_pairs_call_for_no_second_walk() {
+    let profile = rules("[t: (?a ex:p ?b), (?b ex:p ?c) -> (?a ex:p ?c)]");
+    let ttl = chain("ex:p", 10);
+    let (s, _) = compare_calls(
+        &ttl,
+        &profile,
+        &[&[demand("ex:a0", "ex:p", "?"), demand("?", "ex:p", "ex:a10")]],
+    );
+    assert!(s.forward.pairs > 0 && s.backward.pairs > 0, "{s:?}");
+    assert!(s.walks > 0 && s.rewalks == 0, "{s:?}");
+}
+
+/// A copy that binds no end closes the whole relation, after which no operator over the
+/// predicate walks it again until an edge that is not a merged pair arrives: the forward
+/// copy of a call that also asks for every `ex:p` fact merges nothing for its new values,
+/// nor walks for them.
+#[test]
+fn closed_relations_call_for_no_walk() {
+    let profile = rules("[t: (?a ex:p ?b), (?b ex:p ?c) -> (?a ex:p ?c)]");
+    let ttl = chain("ex:p", 10);
+    let (s, _) = compare_calls(
+        &ttl,
+        &profile,
+        &[&[demand("?", "ex:p", "?"), demand("ex:a0", "ex:p", "?")]],
+    );
+    assert!(s.full.pairs > 0, "{s:?}");
+    assert!(s.walks > 0 && s.idle == 0, "{s:?}");
+}
+
+/// An edge that a join derives after an operator closed the relation calls for walks
+/// again: `j` adds `ex:p` edges from `ex:q` facts that `k` derives an iteration later,
+/// which extend the closed chain.
+#[test]
+fn join_edges_after_a_closure_walk_again() {
+    let profile = rules(
+        "[t: (?a ex:p ?b), (?b ex:p ?c) -> (?a ex:p ?c)]
+         [k: (?x ex:r ?y) -> (?x ex:q ?y)]
+         [j: (?x ex:q ?y) -> (?x ex:p ?y)]",
+    );
+    let ttl = chain("ex:p", 6) + "ex:a6 ex:r ex:b0 . ex:b0 ex:p ex:b1 . ex:b1 ex:r ex:b2 .\n";
+    for calls in [
+        &[demand("?", "ex:p", "?"), demand("ex:a0", "ex:p", "?")][..],
+        &[demand("?", "ex:p", "?")][..],
+        &[demand("ex:a2", "ex:p", "?")][..],
+    ] {
+        let (s, with) = compare_calls(&ttl, &profile, &[calls]);
+        let (facts, _, _) = returned(&with);
+        assert!(
+            facts.contains("<http://ex.org/a2> <http://ex.org/p> <http://ex.org/b2>"),
+            "{calls:?}: {s:?}\n{facts:#?}"
+        );
+    }
+}
+
+/// A transitive rule over a constant predicate answers a key that holds the predicate
+/// as a value: a demand through the super-property of `ex:p` asks `sp` for `(?x ?p ?y)`
+/// with `?p` bound at run time, so the copy of `t` under that `Bound` key has a magic atom
+/// whose predicate slot is the constant `ex:p`, which each magic fact must match.
+#[test]
+fn constant_transitive_copies_answer_bound_predicate_keys() {
+    let profile = rules(
+        "[t: (?a ex:p ?b), (?b ex:p ?c) -> (?a ex:p ?c)]
+         [sp: (?p ex:sub ?q), (?x ?p ?y) -> (?x ?q ?y)]",
+    );
+    // `ex:z` is asked for through `ex:s` alone, so a copy that took its magic facts for
+    // those of `ex:p` would derive `ex:p` facts from it that the joins do not
+    let ttl = chain("ex:p", 8)
+        + "ex:p ex:sub ex:r . ex:q ex:sub ex:r .\n"
+        + &chain("ex:q", 3)
+        + "ex:z ex:p ex:a2 . ex:z ex:s ex:w . ex:s ex:sub ex:r2 .\n";
+    for (d, engaged) in [
+        (
+            demand("ex:a0", "ex:r", "?"),
+            (|s: &Stats| s.forward.pairs > 0) as fn(&Stats) -> bool,
+        ),
+        (demand("?", "ex:r", "ex:a8"), |s: &Stats| {
+            s.backward.pairs > 0
+        }),
+    ] {
+        let (s, with) = compare(&ttl, &profile, std::slice::from_ref(&d));
+        assert!(engaged(&s) && s.bound_constant.pairs > 0, "{d:?}: {s:?}");
+        assert_eq!(s.guarded, Counts::default(), "{d:?}: {s:?}");
+        assert!(
+            with.program.as_ref().unwrap().stages[0]
+                .keys()
+                .any(|(k, _)| k.p == KeyP::Bound),
+            "{d:?}: no Bound key"
+        );
+    }
+    compare_calls(
+        &ttl,
+        &profile,
+        &[&[demand("ex:a0", "ex:r", "?"), demand("ex:z", "ex:r2", "?")]],
+    );
 }
 
 /// The equality stage derives `owl:sameAs` with the free adornment, where `eq-trans`
@@ -391,9 +499,11 @@ impl Rng {
     }
 }
 
-/// Random property graphs with transitive, symmetric and inverse properties, property
-/// hierarchies, sameAs and classes, and random demands of every shape, derived one after
-/// the other. `SPARKLES_CLOSURE_CASES` sets the number of cases (6 by default).
+/// Random property graphs with transitive, symmetric, inverse, functional and inverse
+/// functional properties, property hierarchies and chains of two and three properties,
+/// sameAs between individuals and with literals, literal values whose ids differ for
+/// equal values, and classes, and random demands of every shape, derived one after the
+/// other. `SPARKLES_CLOSURE_CASES` sets the number of cases (6 by default).
 #[test]
 fn random_sessions_derive_what_the_joins_derive() {
     let mut engaged = Stats::default();
@@ -421,6 +531,53 @@ fn random_sessions_derive_what_the_joins_derive() {
             if r.below(100) < 20 {
                 t += &format!("ex:p{i} rdfs:domain ex:C{} .\n", r.below(3));
             }
+            if r.below(100) < 15 {
+                t += &format!("ex:p{i} a owl:FunctionalProperty .\n");
+            }
+            if r.below(100) < 10 {
+                t += &format!("ex:p{i} a owl:InverseFunctionalProperty .\n");
+            }
+            match r.below(100) {
+                0..15 => {
+                    t += &format!(
+                        "ex:p{i} owl:propertyChainAxiom ( ex:p{} ex:p{} ) .\n",
+                        r.below(props),
+                        r.below(props)
+                    );
+                }
+                15..20 => {
+                    t += &format!(
+                        "ex:p{i} owl:propertyChainAxiom ( ex:p{} ex:p{} ex:p{} ) .\n",
+                        r.below(props),
+                        r.below(props),
+                        r.below(props)
+                    );
+                }
+                _ => {}
+            }
+        }
+        // values whose ids differ although `1` and `01` are equal
+        let lits = [
+            "\"1\"^^xsd:integer",
+            "\"01\"^^xsd:integer",
+            "\"2\"^^xsd:integer",
+        ];
+        if r.below(100) < 40 {
+            for _ in 0..1 + r.below(3) {
+                t += &format!(
+                    "ex:i{} ex:p{} {} .\n",
+                    r.below(inds),
+                    r.below(props),
+                    lits[r.below(3) as usize]
+                );
+            }
+        }
+        if r.below(100) < 25 {
+            t += &format!(
+                "ex:i{} owl:sameAs {} .\n",
+                r.below(inds),
+                lits[r.below(3) as usize]
+            );
         }
         for _ in 0..2 * inds {
             t += &format!(
@@ -437,12 +594,16 @@ fn random_sessions_derive_what_the_joins_derive() {
         for _ in 0..3 {
             let i = format!("ex:i{}", r.below(inds));
             let p = format!("ex:p{}", r.below(props));
-            demands.push(match r.below(6) {
+            let lit = ["1", "01", "2"][r.below(3) as usize];
+            let lit = format!("\"{lit}\"^^http://www.w3.org/2001/XMLSchema#integer");
+            demands.push(match r.below(8) {
                 0 => demand(&i, &p, "?"),
                 1 => demand("?", &p, &i),
                 2 => demand(&i, "?", "?"),
                 3 => demand("?", "?", &i),
                 4 => demand("?", &p, "?"),
+                5 => demand("?", "owl:sameAs", &i),
+                6 => demand("?", &p, &lit),
                 _ => demand("?", "rdf:type", &format!("ex:C{}", r.below(3))),
             });
         }
