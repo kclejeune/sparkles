@@ -117,7 +117,12 @@ it checks nothing.
 
 `crates/sparkles-core/tests/cursor_memory_audit.rs` runs one fixture for each cursor
 operator, under the query's own account and a pool grant, with batches of 256 and 4,096
-rows, and a spilled fixture for each operator that spills. An operator whose charges follow its allocations is held to the exact allowance of
+rows, and a spilled fixture for the sort, DISTINCT, the hashed grouping and the hash
+join. Each fixture names the plan operator it exercises, and the run fails when the
+plan has no native node of that operator, so a fixture whose query the planner turns
+into another operator or a materialized fallback is seen. The path search is the one
+fixture that runs as a fallback. A spilled fixture also fails unless that node's own
+`spilledBytes` counter is above zero, so a spill below it does not count. An operator whose charges follow its allocations is held to the exact allowance of
 16 KiB on each side, which covers its plan and cursor, and 64 KiB at its peak. A fixture
 with a known finding is held to its measured excess rounded up, under the item that owns
 it, so a change that makes it worse fails.
@@ -131,7 +136,12 @@ that the sort writes and merges runs and DISTINCT passes rows on to later passes
 | Fixture | Reading | Item |
 |---|---|---|
 | leaf scan | The ledger stands about 1 MiB above a heap of 12 KiB. | 1184 |
-| group count, ordered group | The heap passes the ledger by up to 108 KiB and 750 KiB inside a pull. | 1185 |
+| filter | At batches of 4,096 rows the ledger peaks at 713 KiB for a heap peak of 112 KiB. | 1192 |
+| filter expression | The ledger peaks at 2.7 MB for a heap peak of 0.4 MB, from the decode of the expression's values. | 1187 |
+| group count, ordered group | The count read from the index passes the ledger by up to 108 KiB and 750 KiB inside a pull. | 1185 |
+| group by | The hashed grouping passes the ledger by up to 87 KiB inside a pull and keeps 435 KiB charged above its heap after it. Under `AUDIT_REALLOC=exact` its ledger also peaks 238 KiB above five quarters of its heap's peak. | 1185 |
+| spilled grouping | The heap passes the ledger by up to 17 KiB inside a pull, and the ledger stays 134 KiB above the heap after it. | 1185 |
+| spilled hash join | The heap passes the ledger by up to 18 KiB inside a pull. | 1192 |
 | group concat | The ledger stands about 1 MiB above the heap after its pull. | 1185 |
 | top k | The ledger stands about 62 KiB above the heap after its pull. | 1186 |
 | sort | The ledger peaks at 11.1 MB for a heap peak of 2.9 MB, from the decode of the sort's keys. | 1187 |
@@ -142,8 +152,11 @@ that the sort writes and merges runs and DISTINCT passes rows on to later passes
 | history | The heap passes the ledger by up to 410 KiB inside a pull. | 1190 |
 | text | The heap passes the ledger by up to 450 KiB inside a pull. | 1191 |
 
-The scans, filters, BIND, the merge and hash joins, UNION, MINUS, EXISTS, DISTINCT, GRAPH,
-sequence paths and slices are within the exact allowance.
+The scans, BIND, the merge and hash joins, UNION, MINUS, EXISTS, DISTINCT, GRAPH,
+sequence paths and slices are within the exact allowance. The hash join fixture joins on
+an object whose input is ordered on its subject, since the planner joins the audit
+store's other patterns by merge, and the spilled hash join runs over the store of
+`spill_join.rs`.
 
 The audit also ran on the tips of five branches that change cursor operators, under both
 realloc rules, with the allowances above. Three of them read beyond an allowance, and
@@ -211,10 +224,12 @@ steps of a sweep is not seen.
 ## Outcome
 
 The `Charged` type, the shared audit and a fixture for each cursor operator are in
-place, with spilled fixtures for the sort and DISTINCT. The first run's findings are
+place, with spilled fixtures for the sort, DISTINCT, the hashed grouping and the hash
+join, and every fixture checks the plan operator it exercises. The first run's findings are
 recorded above with their items. DISTINCT is on `Charged` buffers. Removing the charge
 of its arena or of its one-column set, or admitting a growth only after it allocates,
-fails its fixtures. The external sort moves under item 1193, and the operators that
+fails its fixtures. Its six parity sweeps fit every budget they fitted before the move,
+with the answers they gave. The external sort moves under item 1193, and the operators that
 other work is rewriting move under item 1192.
 
 ## Provenance

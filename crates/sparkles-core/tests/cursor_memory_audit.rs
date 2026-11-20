@@ -74,80 +74,209 @@ fn store(n: usize) -> Store {
     s
 }
 
-/// The queries of the sweep, by the operator each one exercises.
-const FIXTURES: &[(&str, &str)] = &[
-    ("leaf scan", "SELECT ?s ?o { ?s <urn:q> ?o }"),
-    ("filter", "SELECT ?s ?v { ?s <urn:p> ?v FILTER(?v > 50) }"),
-    ("bind", "SELECT ?s ?w { ?s <urn:p> ?v BIND(?v * 2 AS ?w) }"),
+/// The queries of the sweep: a fixture's name, its query, the plan operator it
+/// exercises and whether that operator runs natively rather than as a materialized
+/// fallback. A run whose plan has no such node fails.
+const FIXTURES: &[(&str, &str, &str, bool)] = &[
+    (
+        "leaf scan",
+        "SELECT ?s ?o { ?s <urn:q> ?o }",
+        "IndexScan",
+        true,
+    ),
+    (
+        "filter",
+        "SELECT ?s ?o { ?s <urn:q> ?o FILTER(?o != <urn:o:7>) }",
+        "Filter",
+        true,
+    ),
+    (
+        "filter expression",
+        "SELECT ?s ?v { ?s <urn:p> ?v FILTER(?v * 2 > 100) }",
+        "Filter",
+        true,
+    ),
+    (
+        "bind",
+        "SELECT ?s ?w { ?s <urn:p> ?v BIND(?v * 2 AS ?w) }",
+        "Bind",
+        true,
+    ),
     (
         "merge join",
         "SELECT ?s ?v ?o { ?s <urn:p> ?v . ?s <urn:q> ?o }",
+        "MergeJoin",
+        true,
     ),
     (
         "merge optional",
         "SELECT ?s ?v ?o { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o } }",
+        "OptionalJoin",
+        true,
     ),
     (
         "conditional optional",
         "SELECT ?s ?v ?o { ?s <urn:p> ?v OPTIONAL { ?s <urn:q> ?o FILTER(?o = <urn:o:7>) } }",
+        "OptionalJoin",
+        true,
     ),
     (
         "hash join",
-        "SELECT ?s ?o ?k { ?s <urn:q> ?o . ?o <urn:r> ?k }",
+        "SELECT ?s ?n ?o { ?s <urn:name> ?n . ?s <urn:q> ?o . ?o <urn:r> ?k }",
+        "HashJoin",
+        true,
     ),
     (
         "union",
         "SELECT ?s ?x { { ?s <urn:p> ?x } UNION { ?s <urn:q> ?x } }",
+        "Union",
+        true,
     ),
     (
         "minus",
         "SELECT ?s ?v { ?s <urn:p> ?v MINUS { ?s <urn:q> <urn:o:7> } }",
+        "Minus",
+        true,
     ),
     (
         "exists",
         "SELECT ?s ?o { ?s <urn:q> ?o FILTER EXISTS { ?o <urn:r> ?k } }",
+        "Filter",
+        true,
     ),
     (
         "distinct one column",
         "SELECT DISTINCT ?o { ?s <urn:q> ?o }",
+        "Distinct",
+        true,
     ),
     (
         "distinct two columns",
         "SELECT DISTINCT ?v ?o { ?s <urn:p> ?v . ?s <urn:q> ?o }",
+        "Distinct",
+        true,
     ),
-    ("distinct ordered", "SELECT DISTINCT ?s { ?s <urn:q> ?o }"),
+    (
+        "distinct ordered",
+        "SELECT DISTINCT ?s { ?s <urn:q> ?o }",
+        "Distinct",
+        true,
+    ),
     (
         "group count",
         "SELECT ?o (COUNT(*) AS ?c) { ?s <urn:q> ?o } GROUP BY ?o",
+        "GroupCountFromIndex",
+        true,
+    ),
+    (
+        "group by",
+        "SELECT ?o (COUNT(*) AS ?c) (SUM(?v) AS ?t) { ?s <urn:q> ?o . ?s <urn:p> ?v } GROUP BY ?o",
+        "GroupBy",
+        true,
     ),
     (
         "group concat",
         "SELECT ?v (GROUP_CONCAT(?n) AS ?c) { ?s <urn:p> ?v . ?s <urn:name> ?n } GROUP BY ?v",
+        "GroupBy",
+        true,
     ),
     (
         "ordered group",
         "SELECT ?s (COUNT(?o) AS ?c) { ?s <urn:q> ?o } GROUP BY ?s",
+        "GroupCountFromIndex",
+        true,
     ),
     (
         "top k",
         "SELECT ?s ?n { ?s <urn:name> ?n } ORDER BY ?n LIMIT 20",
+        "IndexTopK",
+        true,
     ),
     (
         "sort",
         "SELECT ?s ?n { ?s <urn:name> ?n } ORDER BY DESC(?n)",
+        "OrderBy",
+        true,
     ),
-    ("graph", "SELECT ?g ?s ?v { GRAPH ?g { ?s <urn:p> ?v } }"),
-    ("sequence path", "SELECT ?s ?k { ?s <urn:q>/<urn:r> ?k }"),
-    ("transitive path", "SELECT ?x { <urn:c:0> <urn:n>+ ?x }"),
+    // GRAPH ?g runs as a hash join of the graph names with the patterns inside it.
+    (
+        "graph",
+        "SELECT ?g ?s ?v { GRAPH ?g { ?s <urn:p> ?v } }",
+        "HashJoin",
+        true,
+    ),
+    (
+        "sequence path",
+        "SELECT ?s ?k { ?s <urn:q>/<urn:r> ?k }",
+        "MergeJoin",
+        true,
+    ),
+    (
+        "transitive path",
+        "SELECT ?x { <urn:c:0> <urn:n>+ ?x }",
+        "TransitivePath",
+        true,
+    ),
     (
         "slice",
         "SELECT ?s ?o { ?s <urn:q> ?o } LIMIT 500 OFFSET 3000",
+        "Limit",
+        true,
     ),
+    // item 1189: a path search under a cursor runs as a materialized fallback
     (
         "path search",
         "PREFIX path: <urn:x-sparkles:path#> SELECT ?b ?p { SERVICE path:search { [] path:source <urn:c:0> ; path:target ?b ; path:predicate <urn:n> ; path:algorithm path:all ; path:maxLength 3000 ; path:pathIndex ?p } }",
+        "PathSearch",
+        false,
     ),
 ];
+
+/// The nodes of a plan that `QueryCursor::plan_json` wrote, parents first.
+fn nodes(plan: &serde_json::Value) -> Vec<&serde_json::Value> {
+    let mut out = vec![plan];
+    let mut at = 0;
+    while at < out.len() {
+        out.extend(out[at]["children"].as_array().into_iter().flatten());
+        at += 1;
+    }
+    out
+}
+
+/// The bytes that the nodes of `plan` running `operator` spilled, read from their own
+/// counters and not their children's. A plan without such a node fails, and so does one
+/// whose every such node is a materialized fallback when `native` is asked for.
+fn target(plan: &str, operator: &str, native: bool) -> Result<u64, String> {
+    let plan: serde_json::Value =
+        serde_json::from_str(plan).map_err(|e| format!("a plan that does not parse: {e}"))?;
+    let found: Vec<_> = nodes(&plan)
+        .into_iter()
+        .filter(|n| n["operator"]["operator"].as_str() == Some(operator))
+        .filter(|n| !native || n["materializes"].as_bool() != Some(true))
+        .collect();
+    if found.is_empty() {
+        return Err(format!(
+            "no {}{operator} in {plan}",
+            if native { "native " } else { "" }
+        ));
+    }
+    Ok(found
+        .iter()
+        .map(|n| {
+            n["operator"]["counters"]["spilledBytes"]
+                .as_u64()
+                .unwrap_or(0)
+        })
+        .sum())
+}
+
+/// The bytes the native `operator` of `plan` spilled itself, which must be some.
+fn spilled(plan: &str, operator: &str) -> Result<u64, String> {
+    match target(plan, operator, true)? {
+        0 => Err(format!("the {operator} spilled nothing itself in {plan}")),
+        bytes => Ok(bytes),
+    }
+}
 
 /// The allowance of each fixture. An operator whose charges follow its allocations
 /// gets [`Allowance::EXACT`]. A fixture with a known finding gets the measured excess
@@ -164,8 +293,28 @@ fn allowance(name: &str) -> Allowance {
             peak: 1100 * K,
             ..exact
         },
-        // item 1185: the grouping's state is charged after it grows, and a string
-        // aggregate's charge stays above what it holds
+        // item 1192: the filter's charge for a batch of 4,096 rows stands several times
+        // above what it allocates
+        "filter" => Allowance {
+            peak: 600 * K,
+            ..exact
+        },
+        // item 1187: the filter's expression charges the decode of its values at the
+        // bound of `Ctx::decoded_bytes`, several times what it allocates
+        "filter expression" => Allowance {
+            peak: 2400 * K,
+            ..exact
+        },
+        // item 1185: the grouping's state is charged after it grows, and its charge and
+        // a string aggregate's stay above what they hold
+        // and a table that the allocator grows in place, which `AUDIT_REALLOC=exact`
+        // counts at its larger size alone, leaves its charge for the old and new tables
+        // above five quarters of the heap's peak
+        "group by" => Allowance {
+            under: 96 * K,
+            over: 460 * K,
+            peak: if exact_realloc() { 256 * K } else { exact.peak },
+        },
         "group count" => Allowance {
             under: 128 * K,
             ..exact
@@ -227,6 +376,19 @@ fn allowance(name: &str) -> Allowance {
         // at its peak here, so only that mode reads the rule's cost.
         "distinct two columns" if exact_realloc() => Allowance {
             peak: 192 * K,
+            ..exact
+        },
+        // item 1185: the spilling grouping holds its partitions' state outside its
+        // ledger inside a pull and keeps a charge above what it holds after it
+        "group spilled" => Allowance {
+            under: 24 * K,
+            over: 140 * K,
+            ..exact
+        },
+        // item 1192: the spilling hash join holds a few KiB beyond the exact allowance
+        // inside a pull
+        "hash join spilled" => Allowance {
+            under: 24 * K,
             ..exact
         },
         // item 1194: DISTINCT's passes hold their spill frames outside its ledger
@@ -292,7 +454,7 @@ fn every_cursor_operator_holds_its_ledger_and_no_more() {
     let _serial = heap::serial();
     let s = store(20_000);
     let mut found = Vec::new();
-    for (name, q) in FIXTURES {
+    for &(name, q, operator, native) in FIXTURES {
         for (granted, mode) in [(false, "local"), (true, "granted")] {
             for batch in [256, 4096] {
                 // Two runs warm what the store keeps between queries.
@@ -302,6 +464,9 @@ fn every_cursor_operator_holds_its_ledger_and_no_more() {
                 }
                 print(name, &format!("{mode}/{batch}"), &a);
                 assert!(a.rows > 0, "{name}: no rows");
+                if let Err(e) = target(&a.plan, operator, native) {
+                    panic!("{name}: {e}");
+                }
                 found.extend(a.check(&format!("{name} ({mode}, batch {batch})"), &allowance(name)));
             }
         }
@@ -310,20 +475,68 @@ fn every_cursor_operator_holds_its_ledger_and_no_more() {
 }
 
 /// The operators that spill, each under a budget that its state outgrows, so that the
-/// sort writes and merges runs and DISTINCT passes rows on to later passes. Their
+/// sort writes and merges runs, DISTINCT passes rows on to later passes, the grouping
+/// writes partitions and the hash join partitions both inputs. Each names its plan
+/// operator, which must spill itself, and whether it runs over [`join_store`]. The
 /// spill files are outside the heap and outside the ledger.
-const SPILLED: &[(&str, &str, u64)] = &[
+const SPILLED: &[(&str, &str, u64, &str, bool)] = &[
     (
         "sort spilled",
         "SELECT ?s ?n { ?s <urn:name> ?n } ORDER BY DESC(?n)",
         2 << 20,
+        "OrderBy",
+        false,
     ),
     (
         "distinct spilled",
         "SELECT DISTINCT ?v ?o { ?s <urn:p> ?v . ?s <urn:q> ?o }",
         512 << 10,
+        "Distinct",
+        false,
+    ),
+    (
+        "group spilled",
+        "SELECT ?o (COUNT(*) AS ?c) (SUM(?v) AS ?t) { ?s <urn:q> ?o . ?s <urn:p> ?v } GROUP BY ?o",
+        1 << 20,
+        "GroupBy",
+        false,
+    ),
+    (
+        "hash join spilled",
+        "SELECT ?a ?v ?b ?w ?k { ?a <urn:v> ?v . ?a <urn:p> ?k . ?b <urn:q> ?k . ?b <urn:w> ?w . ?b <urn:l> ?l }",
+        1 << 20,
+        "HashJoin",
+        true,
     ),
 ];
+
+/// `n` rows on each side of a join on `?k` whose inputs come in no order of the key, as
+/// in `spill_join.rs`, so that the cursor joins them by hash.
+fn join_store(n: usize) -> Store {
+    let s = Store::in_memory(StoreOptions::default());
+    let key = |i: usize| (i * 7919) % (n / 3).max(1);
+    let mut data = String::new();
+    for i in 0..n {
+        let a = (i * 104_729) % n;
+        data.push_str(&format!("<urn:a:{a}> <urn:v> {} .\n", a % 13));
+        if !a.is_multiple_of(20) {
+            data.push_str(&format!("<urn:a:{a}> <urn:p> <urn:k:{}> .\n", key(a)));
+        }
+        let b = (i * 15_485_863) % n;
+        data.push_str(&format!("<urn:b:{b}> <urn:w> {} .\n", b % 11));
+        data.push_str(&format!("<urn:b:{b}> <urn:l> \"label {b}\" .\n"));
+        if b % 20 != 3 {
+            data.push_str(&format!("<urn:b:{b}> <urn:q> <urn:k:{}> .\n", key(b * 7)));
+        }
+    }
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    s
+}
 
 /// Every spilling fixture holds its ledger while it spills, under both accounts and at
 /// both batch sizes.
@@ -331,6 +544,7 @@ const SPILLED: &[(&str, &str, u64)] = &[
 fn every_spilling_operator_holds_its_ledger_and_no_more() {
     let _serial = heap::serial();
     let s = store(20_000);
+    let joins = join_store(30_000);
     let tmp = tempfile::tempdir().unwrap();
     let spill = Spill::open(&SpillOptions {
         dir: tmp.path().to_path_buf(),
@@ -341,26 +555,76 @@ fn every_spilling_operator_holds_its_ledger_and_no_more() {
     })
     .unwrap();
     let mut found = Vec::new();
-    for &(name, q, budget) in SPILLED {
+    for &(name, q, budget, operator, join) in SPILLED {
+        let s = if join { &joins } else { &s };
         for (granted, mode) in [(false, "local"), (true, "granted")] {
             for batch in [256, 4096] {
-                let go = || run_under(&s, q, granted, batch, budget, Some(spill.clone()));
+                let go = || run_under(s, q, granted, batch, budget, Some(spill.clone()));
                 let mut a = go();
                 for _ in 0..2 {
                     a = go();
                 }
                 print(name, &format!("{mode}/{batch}"), &a);
                 assert!(a.rows > 0, "{name}: no rows");
-                assert!(
-                    a.plan.contains("spilledBytes"),
-                    "{name}: no spill in {}",
-                    a.plan
-                );
+                if let Err(e) = spilled(&a.plan, operator) {
+                    panic!("{name} ({mode}, batch {batch}): {e}");
+                }
                 found.extend(a.check(&format!("{name} ({mode}, batch {batch})"), &allowance(name)));
             }
         }
     }
     assert!(found.is_empty(), "{}", found.join("\n"));
+}
+
+/// The plan checks fail a spill counted only on a child, a target whose counter is zero,
+/// a plan of another operator and a materialized fallback, and pass the target's own
+/// spill.
+#[test]
+fn the_plan_checks_find_the_operator_that_spilled() {
+    let node = |op: &str, spilled: Option<u64>, materializes: bool, children: &str| {
+        let counters = spilled.map_or(String::new(), |b| {
+            format!(r#","counters":{{"spilledBytes":{b}}}"#)
+        });
+        format!(
+            r#"{{"operator":{{"operator":"{op}"{counters}}},"materializes":{materializes},"children":[{children}]}}"#
+        )
+    };
+    let child_only = node(
+        "Distinct",
+        None,
+        false,
+        &node("OrderBy", Some(4096), false, ""),
+    );
+    assert!(spilled(&child_only, "Distinct").is_err(), "a child's spill");
+    assert_eq!(spilled(&child_only, "OrderBy"), Ok(4096));
+    let zero = node(
+        "Distinct",
+        Some(0),
+        false,
+        &node("IndexScan", None, false, ""),
+    );
+    assert!(spilled(&zero, "Distinct").is_err(), "a zero counter");
+    let other = node(
+        "MergeJoin",
+        Some(64),
+        false,
+        &node("IndexScan", None, false, ""),
+    );
+    assert!(
+        target(&other, "HashJoin", true).is_err(),
+        "another operator"
+    );
+    assert!(spilled(&other, "HashJoin").is_err(), "another operator");
+    let fallback = node("PathSearch", None, true, "");
+    assert!(target(&fallback, "PathSearch", true).is_err(), "a fallback");
+    assert_eq!(target(&fallback, "PathSearch", false), Ok(0));
+    let own = node(
+        "Project",
+        None,
+        false,
+        &node("HashJoin", Some(512), false, ""),
+    );
+    assert_eq!(spilled(&own, "HashJoin"), Ok(512));
 }
 
 /// The change log's reader, over a store with 640 commits.
