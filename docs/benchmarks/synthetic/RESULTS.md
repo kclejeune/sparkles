@@ -783,6 +783,65 @@ employer reads 0.784, and eager `SUM(?s * 2)` reads 1.163, 57.9 ms against 49.7 
 roadmap item 1099 follows. Item 1067 holds the streamed costs of 1% to 7% that the same
 pair shows.
 
+### Leaf cursors
+
+The first part of item 829 was compared with its base on forge alone, under the host's
+heavy lock. A is main at bccc5f7b and B is 9df856f3, whose engine code is the part-1 tip,
+both release builds made on stanley with the same compilers. The
+[run record](runs/2026-11-18-leaf-cursors-ab-forge-9df856f3/README.md) keeps the samples,
+answers, queries and scripts of every run. A first pass ran the 31-query matrix at 1.05M
+triples with one thread in eight rounds of A,B,B,A in each mode, and the text, geo and
+vector scripts in one A,B,B,A round per mode with 12 threads and with one. A confirmation
+then ran each flagged query in twelve rounds of A,B,B,A in both orders, with 200 timed
+requests per query and server for the synthetic queries and 50 for the vector queries,
+and `scripts/x08-gates/combine.py` removed the position bias. Every server returned the
+same answers in every run.
+
+`mise run bench:request-insn` counted the instructions per request of the same two
+binaries on stanley, in eight rounds of A,B,B,A with 50 requests per query and server.
+Streamed `distinct-join`, `employee-docs`, `expr-bind-group`, `values-star` and
+`star-lookup` run 0.6% to 1.9% more instructions, and every other synthetic query runs
+the same count within the host's noise floor. Eager execution runs the same count as the
+base on every query.
+
+| Query | Mode | Base | Tip/base | 95% interval | Added | Instructions | Item |
+|---|---|--:|--:|---|--:|--:|---|
+| `distinct-join` | streaming | 3.75 ms | 1.035 | 1.035–1.036 | 131 µs | 1.011 | 1160 |
+| `distinct-join` | eager | 3.57 ms | 1.022 | 1.021–1.023 | 78 µs | 1.000 | 1161 |
+| `lang-filter` | streaming | 1.79 ms | 1.028 | 1.027–1.029 | 50 µs | 1.000 | 1161 |
+| `lang-filter` | eager | 1.79 ms | 1.027 | 1.026–1.028 | 48 µs | 1.000 | 1161 |
+| `star-join` | eager | 1.39 ms | 1.019 | 1.016–1.022 | 27 µs | 1.000 | 1161 |
+| `star-join` | streaming | 1.41 ms | 1.013 | 1.010–1.016 | 18 µs | 1.001 | 1160 |
+| `expr-bind-group` | streaming | 0.36 ms | 1.013 | 1.009–1.015 | 4.7 µs | 1.013 | 1160 |
+| `employee-docs` | streaming | 0.041 ms | 1.039 | 1.030–1.053 | 1.6 µs | 1.019 | 1160 |
+| `star-lookup` | streaming | 0.063 ms | 1.032 | 1.027–1.037 | 2.0 µs | 1.006 | 1160 |
+| `star-lookup` | eager | 0.059 ms | 1.018 | 1.012–1.026 | 1.0 µs | 1.000 | 1074 |
+| `values-star` | streaming | 0.020 ms | 1.052 | 1.041–1.063 | 1.0 µs | 1.010 | 1160 |
+
+`regex-iri` reads 1.010 in both modes and `contains` 1.006, at equal instruction
+counts, and eager `minus` reads 1.008, which item 1161 holds as well. The other queries
+under 0.3 ms read as noise by the Intel rule, with an interval that reaches 1.0 or a
+median added time of at most 0.5 µs, and `subquery-agg` reads 0.988 eager and 0.996
+streamed. With the vector store, server time reads 1.006 to 1.016 for `q-ef-16` to
+`q-ef-128`, which take 0.05 to 0.23 ms and add 0.6 to 1.6 µs and which item 1074 lists,
+1.006 for streamed `q-ef-256` and 1.001 for eager `q-exact-true`, which item 1162 holds.
+The first pass's client wall times of 9% to 17% more for `q-ef-64` and `q-ef-256` with
+one thread did not appear in server time. Streamed text `highlight` and `text-join`
+with one thread read 1.041 and 1.045 in client wall time, slower in both pairs and by
+more than either build's same-binary ratio, and geo `q6-touching-counties` read 1.009
+eager and 1.011 streamed, which item 1162 holds. With 12 threads, all three read faster
+than the base.
+
+The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
+The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two
+variables, took 1.813 of the eager time, 9.58 ms against 5.28 ms, with an interval of
+1.807 to 1.815, and it runs 2.26 times the instructions of the base, which counted it
+eagerly in both modes. Item 1129 follows it. The streamed count of
+`?a foaf:knows ?b FILTER(?a != ?b) ?b ex:worksFor ?o` took 0.151 of the eager time, 8.4 ms
+against 55.3 ms, and `two-hop-count`, which counts from key runs in both modes, read
+0.991. Automatic execution keeps both counts eager, and the record keeps the plans of
+both queries in each mode.
+
 ### Per-query floor cache
 
 The floor cache of item 1069, 3a8b7adb, whose workers share one table, was compared on

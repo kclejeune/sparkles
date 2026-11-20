@@ -34,7 +34,11 @@ start of the steps. The text and geo fingerprints agree across all 16 runs of ea
 The vector fingerprints agree within each mode and differ between the modes only in the
 recorded request path. The geo script's step without the spatial rewrites exited with
 status 1 in the 12 runs outside the one-thread streaming configuration, at the base and
-the tip alike, after its indexed and scan timings were written.
+the tip alike, after its indexed and scan timings were written. Its `geo-index` call
+found the store still held by the server that the script had just stopped, because the
+script waited only for that server's port to close, and the script discarded the call's
+message. The script now waits
+for the server to exit, which leaves the recorded timings as they are.
 
 ## Analysis
 
@@ -46,3 +50,31 @@ pooled medians, the ratio of each A,B,B,A pair and the same-binary ratios of the
 servers of each build. Its last column is a first-pass flag from the interval or from the
 two pairs alone, before the same-binary spread and the confirmation runs are weighed, and
 the verdicts are in the synthetic results.
+
+## Confirmation
+
+`confirm` holds the runs that settle the first pass's flags, which `confirm/stage.sh.txt`
+staged from the matrix binaries and stores and `confirm/run-forge.sh.txt` ran under the
+heavy lock, with `confirm/driver.log` giving their order. Each run used
+`scripts/nsc-bench-remote.sh` with one Rayon thread, the server pinned to CPU 2 and the
+client to CPU 4 with idle spinners, five warm-up requests and the settings in its
+`run.env`. `small-eager-ab` and `small-eager-ba` compare A and B in both orders over the
+matrix queries under 0.3 ms and the ones over it that the first pass flagged, in twelve
+rounds of 200 timed requests, and the `small-streaming` pair does the same in streaming
+execution. The `vec` pairs do the same over the vector script's store and queries in
+twelve rounds of 50 requests. `cj-es` and `cj-se` run B on both sides, eager against
+streaming in both orders, in twelve rounds of 100 requests. Each run keeps its queries,
+samples, answers, environment and exit status, and every server of every run returned
+the same answers. `confirm/combined` holds the output of `scripts/x08-gates/combine.py`
+over each pair, and `confirm/explain` the plans of the two `CountJoin` queries in each
+mode from B on stanley over the same data.
+
+## Instruction counts
+
+`insn-stanley` holds `mise run bench:request-insn` over A and B on stanley, an Intel
+Core Ultra X7 358H, which is not forge's hardware. It counted the confirmation's synthetic
+and `CountJoin` queries in eager and streaming execution, in eight rounds of A,B,B,A with
+50 counted requests per query and server, on the store that the task loads from the
+synthetic data at 100,000 people. `report.md` is the task's report, and `samples.tsv.gz`
+and `manifest.json` its samples and settings. The verdicts are in the synthetic results.
+

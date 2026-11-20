@@ -1188,6 +1188,20 @@ memory, and automatic execution keeps such counts eager until the A/B of the ite
 plan admits them. A count of two scans on one variable from their key runs took 12.0 ms
 streamed against 6.1 ms eager.
 
+On forge at 1.05M triples with one thread, the part-1 tip, 9df856f3, was compared with
+its base, bccc5f7b, in twelve rounds of A,B,B,A in both orders, and the tip's eager and
+streamed counts with each other in the same way. The streamed count on two shared
+variables took 1.81 times the eager count, 9.58 ms against 5.28 ms, and runs 2.26 times
+the instructions per request on stanley, since the cursor writes the merge join's pairs
+into batches that the eager count holds as indices, and item 1129 removes that cost. The
+streamed count over a filtered scan took 0.15 of the eager time, 8.4 ms against 55.3 ms,
+and automatic execution keeps both counts eager. Against the base, streamed queries that
+run 0.6% to 1.9% more instructions are 1.3% to 5.2% slower, which item 1160 holds, and
+queries that run the same instructions in either mode are 0.6% to 2.7% slower, which item
+1161 holds as likely code layout. Item 1162 holds the one-thread costs of the text, geo
+and vector scripts, and item 1074 the costs under 0.3 ms within its cap. The
+[synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
+
 ### Readings of errors in aggregates
 
 Item 1064 makes the treatment of errors in MIN, MAX, AVG and GROUP_CONCAT a setting,
