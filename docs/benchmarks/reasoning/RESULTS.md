@@ -179,16 +179,16 @@ commands, the [gate script](runs/2026-11-20-item-521-forge/gate.sh.txt), its
 timings](runs/2026-11-20-item-521-forge/owl2bench-summary.txt).
 
 A second forge run compared `5ef06e3f` with `5f3f69c2` on the [reasoning latency
-gate](#query-time-reasoning-latency). That commit also exports a demand session's derived
-facts in predicate, object and subject order and checks the rules for operators at a
+gate](#query-time-reasoning-latency). That commit also sorts each chunk of a demand session's
+exported facts in predicate, object and subject order and checks the rules for operators at a
 session's first run. The harness ran six times with 15 rounds of three timed runs, in the
 order base, tip, the tip with the operators off twice, tip and base. No pair failed a check
 or changed an answer fingerprint, and no metric of the tip was slower than base in every
 round. The closest was `owl-rl` demand `q6`,
 slower in 29 of 30 rounds by 2.5 to 3.6% at about 1.6 s, and the tip with the operators off
-was as slow, so that difference does not come from the operators. The metrics that
-`bench-gate.py` flagged at 10% were slower in 13 to 21 of 30 rounds, and most of them are
-materialized queries under 0.1 ms whose rounds burst in every run. The [run
+was as slow, so that difference does not come from the operators. The 12 metrics that
+`bench-gate.py` flagged at 10% against base were slower in 13 to 21 of 30 rounds, and six of
+them are materialized queries under 0.1 ms whose rounds burst in every run. The [run
 directory](runs/2026-11-20-item-521-forge-rerun/env.txt) holds the records, the
 [comparisons](runs/2026-11-20-item-521-forge-rerun/latency-summary.txt) and the [per-round
 analysis](runs/2026-11-20-item-521-forge-rerun/analysis.txt). The OWL2Bench timings above

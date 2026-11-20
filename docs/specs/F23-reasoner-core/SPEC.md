@@ -543,8 +543,8 @@ give the record. An earlier approximate run on stanley, a laptop with other work
 `c97471c3` against `5f3f69c2`, is in
 [its own directory](../../benchmarks/reasoning/runs/2026-11-20-item-521-stanley/env.txt).
 
-A demand session exports its derived facts sorted in predicate, object and subject order,
-the order in which joins mostly derive them, because a query that reads a cached table
+A demand session sorts each chunk of derived facts it exports in predicate, object and
+subject order, the order in which joins mostly derive them, because a query that reads a cached table
 inserts its facts into the query's overlay and the operators' own order made that slower.
 A session decides at its first run whether its rules admit operators, so a session whose
 tables all come from the cache does not check, and `Closures::detect` passes over adorned
