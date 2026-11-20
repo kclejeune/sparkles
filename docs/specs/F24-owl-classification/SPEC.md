@@ -140,20 +140,36 @@ HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not
 since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
 same values. The gap of `owl:Thing` that item 805 found is closed.
 
-Item 1220 turns off the selection of ground body literals in rooted runs and narrows the
-restriction on ground inferences in Join, since each could make a run that reported
-itself complete miss an entailed subsumption or an unsatisfiable class. A Join whose
-premise on the side of the head has no ground literal in its body is exempt from the
+Item 1220 first turned off the selection of ground body literals in rooted runs and
+narrowed the restriction on ground inferences in Join, since each could make a run that
+reported itself complete miss an entailed subsumption or an unsatisfiable class. A Join
+whose premise on the side of the head has no ground literal in its body is exempt from the
 restriction, whatever its residual head. Generated ontologies found both losses, and with
-the two changes no generated or fixture run that finishes within the bound, reports itself
-complete and leaves no axiom out differs from HermiT, apart from g2-150, whose difference
-is HermiT's. That is evidence and not a proof,
-and a complete rooted answer is not a certificate of completeness while item 823 is open.
-`SPARKLES_ROOTED_SELECT_GROUND=1` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` restore each for
-measurement. shoi-005 and shoi-027 then pass the bound and give their default answer, so
-46 of the 50 `shoi` fixtures are exact against HermiT, and 14 more of the 393 generated
-ontologies with keys or the universal property pass the bound. The repair that restores
-the selection is item 1220.
+the two changes no generated or fixture run that finished within the bound, reported itself
+complete and left no axiom out differed from HermiT, apart from g2-150, whose difference
+is HermiT's. That is evidence and not a proof, and a complete rooted answer is not a
+certificate of completeness while item 823 is open. shoi-005 and shoi-027 then passed the bound and gave their default answer, so 46 of the
+50 `shoi` fixtures were exact against HermiT, and 14 more of the 393 generated ontologies
+with keys or the universal property passed the bound.
+
+Item 1220's repair then turned the selection back on. Hyper over `x` takes selected
+clauses as partners of an atom over `x`, and Pred from a successor over a successor term
+`f_e(u)` of a constant takes them as partners of an atom over `f_e(u)`, so two selected
+clauses of one context meet in both inferences. The Join exemption stays. Generated
+ontologies built around both losses, with bodies of two to four literals, delayed and
+disjunctive support, residues on edges, successor-term hypotheses, missing premises and
+renamed twins, find the losses in many runs with the selection and without the repair and,
+without counting, in none with the repair, apart from g2-150. With counting, one generated
+ontology loses subsumptions with the repair, with the selection off and with both
+restrictions off, so that loss is not the selection's, and it is item 1229. Every fixture and generated run that the
+run without the selection finishes within the bound still finishes, with counting on and
+off. The repair is adopted on that measured gate, and its completeness is not proved, so
+item 1220 stays open for the proof. Against the run before item 1220, 48 of the 50 `shoi`
+fixtures are exact again, and two runs pass the bound that finished before, s2-g2-011 on
+one thread and on four and a version of shoi-022 with its individuals merged on four
+threads, which are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0`,
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` turn each part off
+for measurement.
 
 Item 1229 records a loss of runs that count. Pred takes each clause that a successor sends
 with the restrictions that reach the successor when it arrives, and a unit existential
@@ -1791,8 +1807,9 @@ strategy, and the JSON operation, `POST /$/ontology/{ds}/classify`, the Python, 
 and JVM bindings and `sparkles ontology classify --partial --expansion` take them. Every
 answer gives `tier` and `consistency`, and a partial one has `partial` true, `complete`
 false and the open classes under `incomplete` with `incompleteCount`. The `complete` of
-the JSON and of `Classified::complete` stays true only for an answer that left nothing out
-and finished. The dataset keeps no partial answer. A request that writes its taxonomy,
+the JSON and of `Classified::complete` stays true only for a run that finished and reported
+no axiom left out. A rooted run or a run that counts can miss entailments with the flag
+true, which items 1229 and 1231 record. The dataset keeps no partial answer. A request that writes its taxonomy,
 asks for the functional-style answer or runs a ROBOT-compatible command refuses or ignores
 the flag, since none of them can say that a taxonomy is partial. The command line takes
 `--timeout`, notes a partial answer on stderr and exits with status 2 for one that is
@@ -3901,8 +3918,7 @@ the context that holds the marked literal in an actual clause.
 
 The argument does not hold for Join against facts that only the context's core gives, which
 no ancestor holds, so a Join whose premise on the side of the head has no ground body
-literal is exempt from the restriction until item 1220 repairs the
-departure, as the Outcome records.
+literal is exempt from the restriction, as the Outcome records for item 1220.
 
 The argument for completeness is the one for ordered resolution. A root clause `A_1 ∧ … ∧
 A_n → Δ` that r-Pred would hand to a context `v`, where `v` holds each `A_iσ` as a
@@ -3969,30 +3985,33 @@ departures in place.
 
 **Equalities with `x` in query contexts.** The rewriting equality `x ≈ u` rewrites `x` to
 `u` only in a unit clause whose atom is a core atom of a query context, which is the
-context of a named class or, since item 1070, of `owl:Thing`, and rewrites `u` to `x` only in a named-class atom over `u` and
-only in a query context. Elsewhere Eq does not rewrite with `x ≈ u`. Every other rule
-stays. Factor takes `x ≈ u` and `x ≈ v` in one head as Table 2 says, and an equality of
-constants `u ≈ v` rewrites the constant in `x ≈ u` to give `x ≈ v`, since it is the
-rewriting equality and `x ≈ u` only the rewritten literal, and `f(x) ≈ u` rewrites as
-usual. The journal's Section 7.2.3 reports that its completeness proof needs `x ≈ u` as
-the rewriting equality only in query contexts and only on query atoms, and its Lemmas 21
-and 22 use exactly the two forms kept. Lemma 21 rewrites a unit `Γ_0 → A(x)` with `A(x)`
-in the query body, which for classification is the context's core atom, so that the
-constant's facts include `A(u)` and the consequences at `u` follow from the ontology's
-clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and then needs a clause with
-`x ≈ u` maximal beside named atoms, which the second form rewrites back to `x`. A
-successor context has no query and needs neither form. Its element's equality to a
-constant reaches the predecessor as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual
-and the predecessor reasons at `u`. Sequoia blocks the same inferences. The journal's
-observation is about its own calculus, and that it carries over to the run without the
-root's markers is part of the open obligation above. Without the blocking the run
-rewrites every clause over `x` of a context that holds `x ≈ u`, and in the earlier
-experiments the blocking was on in every configuration that finished.
+context of a named class or, since item 1070, of `owl:Thing`, and rewrites `u` to `x` only
+in a named-class atom over `u` and only in a query context. Elsewhere Eq does not rewrite
+with `x ≈ u`. Every other rule stays. Factor takes `x ≈ u` and `x ≈ v` in one head as
+Table 2 says, and an equality of constants `u ≈ v` rewrites the constant in `x ≈ u` to
+give `x ≈ v`, since it is the rewriting equality and `x ≈ u` only the rewritten literal,
+and `f(x) ≈ u` rewrites as usual. The journal's Section 7.2.3 reports that its
+completeness proof needs `x ≈ u` as the rewriting equality only in query contexts and only
+on query atoms, and its Lemmas 21 and 22 use exactly the two forms kept. Lemma 21 rewrites
+a unit `Γ_0 → A(x)` with `A(x)` in the query body, which for classification is the
+context's core atom, so that the constant's facts include `A(u)` and the consequences at
+`u` follow from the ontology's clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and
+then needs a clause with `x ≈ u` maximal beside named atoms, which the second form
+rewrites back to `x`. A successor context that is not the context of a named class has no
+query and needs neither form. Its element's equality to a constant reaches the predecessor
+as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual and the predecessor reasons at
+`u`. A successor that reuses the context of a named class has that class's query, and
+there Eq and Factor in the form of a query leave out a selected premise. That no
+entailment is lost there is the open case of item 1220. Sequoia blocks the same
+inferences. The journal's observation is about its own calculus, and that it carries over
+to the run without the root's markers is part of the open obligation above. Without the
+blocking the run rewrites every clause over `x` of a context that holds `x ≈ u`, and in
+the earlier experiments the blocking was on in every configuration that finished.
 
-**Selection of the ground literals in bodies.** In a context other than the root, a
-clause whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) →
-A(u)` included. A selected clause is a premise only of an inference local to the context,
-of Join on its ground body literal as the side with the body, of Pred and of Succ, and it
+**Selection of the ground literals in bodies.** In a context other than the root, a clause
+whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) → A(u)`
+included. A selected clause is a premise only of an inference local to the context, of
+Join on its ground body literal as the side with the body, of Pred and of Succ, and it
 still sends the hypotheses and markers of its maximal literals. An inference is local when
 it is on a literal that holds a successor term of the context or on a role atom between
 `x` or `y` and a constant or a successor term of a constant, since no predecessor sees
@@ -4002,27 +4021,28 @@ the predecessor, which receives the clause by Pred, discharges the ground body b
 against its actual clauses and sends the hypotheses and markers that let the context go
 on. One exception stays in the context. A selected clause whose head holds an atom over
 `x` cannot go to the predecessor, since Pred carries no such head, so it takes the Hyper
-over `x` itself, with the unselected clauses as its partners. Partner lookups leave out
-selected clauses the same way, so an inference between two clauses fires or not whatever
-their order of processing. The rationale is the measured cause of the remaining work
-after the first three departures. In shoi-005's dominant context 13,731 of 17,384 distinct
-clauses held a ground literal in the body and 9,731 two or more, which is the root's
-marker explosion moved into one context, since the context combined the markers of all
-its predecessors in bodies. A restriction of inferences is sound. The argument for
-completeness is that of ordered resolution with selection, where a clause with a selected
-literal resolves only on it, and the predecessor that holds the marked literal in an
-actual clause makes the inference the context leaves out. What the argument leaves open is
-the return path. The predecessor's clause after Join holds the context's literals over
-`f(x)` and sends them as hypotheses, and whether every inference the context leaves out
-comes back this way across a shared successor or a chain of successors is not shown. A
-consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑ ∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`,
-`A ⊑ ⊥` as a case where the exception is needed, and it is a regression test, which
-passes. The selection is measured with it on and off, and the run keeps it only if the
-gate needs it.
+over `x` itself. Hyper over `x`, and Pred from a successor over a successor term of a
+constant, take selected clauses as partners, and the other partner lookups leave out
+selected clauses the same way that the rules leave out a selected premise, so an inference
+between two clauses fires or not whatever their order of processing. The rationale is the
+measured cause of the remaining work after the first three departures. In shoi-005's
+dominant context 13,731 of 17,384 distinct clauses held a ground literal in the body and
+9,731 two or more, which is the root's marker explosion moved into one context, since the
+context combined the markers of all its predecessors in bodies. A restriction of
+inferences is sound. The argument for completeness is that of ordered resolution with
+selection, where a clause with a selected literal resolves only on it, and the predecessor
+that holds the marked literal in an actual clause makes the inference the context leaves
+out. What the argument leaves open is the return path. The predecessor's clause after Join
+holds the context's literals over `f(x)` and sends them as hypotheses, and whether every
+inference the context leaves out comes back this way across a shared successor or a chain
+of successors is not shown. A consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑
+∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`, `A ⊑ ⊥` as a case where the exception is needed, and it is a
+regression test, which passes. The selection is measured with it on and off, and the run
+keeps it only if the gate needs it.
 
 The argument does not hold when both premises of an inference over `x` are selected, since
-no predecessor then holds either premise, and the run selects no ground body literals until
-item 1220 repairs the departure, as the Outcome records.
+no predecessor then holds either premise. That is why those two lookups take selected
+partners, as the Outcome records for item 1220, whose completeness is not proved.
 
 **The facts of a hypothetical successor go to the root.** A hypothetical successor has the
 empty core and no denied class, and its hypotheses and markers are in the bodies of its

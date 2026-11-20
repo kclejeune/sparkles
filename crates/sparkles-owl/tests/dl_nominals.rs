@@ -979,8 +979,9 @@ fn a_rewritten_run_that_does_not_take_tier_d_answers_as_a_fresh_classifier() {
 /// Facts over constants that hold only under K, a successor of K that reaches the same
 /// constants, and an inference over the successor whose two premises each come from one
 /// of those facts (item 1220). The successor holds the facts only as markers, so each
-/// premise has a ground literal in its body. With the selection of such literals, the two
-/// premises never met, and the run reported itself complete without the subsumption.
+/// premise has a ground literal in its body. With the selection of such literals and
+/// without selected partners in Hyper over x, the two premises never met, and the run
+/// reported itself complete without the subsumption.
 const MEET: &str = "SubClassOf(:K ObjectSomeValuesFrom(:r :D))
      SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
      SubClassOf(ObjectSomeValuesFrom(:s2 :B2) :F2)
@@ -1083,7 +1084,8 @@ fn a_clash_of_two_facts_under_a_class_at_its_successor_makes_the_class_empty() {
 /// The premise lookups that leave out selected clauses (item 1220): Hyper at a constant,
 /// Pred from a successor over a successor term of a constant, Join, Eq and Factor, and the
 /// universals over role atoms at a constant. In each case the filter leaves out a selected
-/// premise, and the run still finds K ⊑ Ans, with the selection on or off.
+/// premise, and the run still finds K ⊑ Ans, with the selection on or off and with or
+/// without selected partners.
 #[test]
 fn selected_premises_left_out_by_a_lookup_are_made_up_for() {
     for (name, extra) in [
@@ -1261,5 +1263,192 @@ fn a_late_restriction_into_a_successor_that_already_answered_reads_its_clauses()
                 "{a} ⊑ {b} is not entailed"
             );
         }
+    }
+}
+
+/// A successor S that is the context of a named class, and so a query context, holds a
+/// selected disjunction of equalities of its element with constants under a marker of a
+/// fact of K (item 1220). The query-form Eq and Factor leave out such a premise, and the
+/// run must still find what a run without the selection finds, which is HermiT's answer.
+#[test]
+fn a_selected_equality_of_a_successor_with_constants_gives_the_answer_of_its_query() {
+    for (body, yes) in [
+        // s5e
+        (
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             SubClassOf(:W ObjectAllValuesFrom(:p :B))
+             ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+             DisjointClasses(:B :D)
+             ClassAssertion(:Cq :u)
+             ClassAssertion(:Cq :v)
+             SubClassOf(ObjectSomeValuesFrom(:r :Cq) :Ans)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SameIndividual(:u :v)",
+            &[("K", "Ans"), ("Z", "Cq")][..],
+        ),
+        // s5g
+        (
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             SubClassOf(:W ObjectAllValuesFrom(:p :B))
+             ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+             DisjointClasses(:B :D)
+             ClassAssertion(:Cq :u)
+             ClassAssertion(:Cq :v)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:S :Y)
+             SubClassOf(:Y ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectOneOf(:v)))",
+            &[("K", "Ans"), ("S", "Y"), ("Z", "Cq")][..],
+        ),
+        // s5h
+        (
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             SubClassOf(:W ObjectAllValuesFrom(:p :B))
+             ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+             DisjointClasses(:B :D)
+             ClassAssertion(:Cq :u)
+             ClassAssertion(:Cq :v)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:S :Y)
+             SubClassOf(:Y ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SameIndividual(:u :v)",
+            &[("K", "Ans"), ("S", "Y"), ("Z", "Cq")][..],
+        ),
+    ] {
+        check(body, yes, &[("S", "Ans"), ("K", "Cq")]);
+    }
+}
+
+/// The same successor, where S's element answers K only through S's own successor, so
+/// the route through K's equalities with the constants is cut, with two or three
+/// constants, a longer chain, a disjunctive marker and a branch that only an inequality
+/// of the constants closes, for Factor (item 1220).
+#[test]
+fn a_selected_equality_of_a_successor_with_constants_reaches_its_own_successor() {
+    for body in [
+        // q1
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)",
+        // q2
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             SameIndividual(:u :v)",
+        // q3
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)",
+        // q4
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :R))
+             SubClassOf(:R ObjectSomeValuesFrom(:r2 :S))
+             SubClassOf(ObjectSomeValuesFrom(:r2 :G) :G)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)",
+        // q5
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v :w))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)
+             ClassAssertion(:Cx :w)",
+        // q6
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Bv :v)
+             DisjointClasses(:Bv :S)",
+        // q7
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Bv :v)
+             SubClassOf(:S ObjectComplementOf(:Bv))
+             DifferentIndividuals(:u :v)",
+        // q8
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u))
+             ClassAssertion(:Cx :u)",
+    ] {
+        check(body, &[("K", "Ans")], &[("S", "Ans")]);
     }
 }

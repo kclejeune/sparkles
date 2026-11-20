@@ -498,18 +498,24 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   restriction into a singleton, or into a class below one, gives a role atom to the
   individual in place of an anonymous successor, except in a run that counts. It is off by default,
   since the completeness of the departed calculus is not proved, and every answer it gives
-  is entailed. A complete rooted answer is not a certificate of completeness while roadmap
-  item 823 is open. A rooted run selects no ground body literals and exempts from the
-  restriction on ground inferences a Join whose premise on the side of the head has no
-  ground body literal, since without those changes a run that reported itself complete
-  could miss entailed subsumptions and unsatisfiable classes. Roadmap item 1220 restores
-  the selection once a repair has an argument for completeness, and until then shoi-005
-  and shoi-027 pass the bound. While roadmap item 1229 is open, a run that counts can
-  report itself complete and still miss an entailed subsumption that depends on an
-  existential restriction the run derives late. A rooted run that counts detects the known
-  form of the case and classifies again without counting, and a run that counts without
-  the rooted rules does not. A rooted run without counting has a bound of 524,288 derived conclusions,
-  `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
+  is entailed. A rooted answer that reports itself complete can still miss entailments,
+  as roadmap items 1229 and 1231 record, so it cannot be relied on as complete while
+  roadmap item 823 is open. A rooted run selects ground body literals, and Hyper over `x`
+  and Pred from a successor over a successor term of a constant take selected clauses as
+  partners. It also exempts from the restriction on ground inferences a Join whose premise
+  on the side of the head has no ground body literal. Without these two repairs a run that
+  reported itself complete could miss entailed subsumptions and unsatisfiable classes.
+  The repaired selection is adopted on a measured gate of generated and fixture
+  ontologies, its completeness is not proved, and roadmap item 1220 stays open for that
+  proof. While roadmap item 1229 is open, a run that counts, rooted or not, can report itself
+  complete and still miss an entailed subsumption that depends on an existential
+  restriction the run derives late. A rooted run that counts detects the known forms of
+  the case and classifies again without counting, and a run that counts without the
+  rooted rules does not. A rooted run can
+  also miss an entailment while it reports itself complete when a fact that holds only
+  under the queried class concerns an individual reached from another individual, which
+  is roadmap item 1231. A rooted run without counting has a bound of 524,288 derived
+  conclusions, `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
   keys over object properties and the universal object property by rewriting them into
   class axioms over fresh names, which never reach an answer, and a run of the rewritten
@@ -523,11 +529,13 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
   the top object property, is used as far as the calculus goes and reported as partial.
-  Every answer is entailed, and it is complete for named classes when nothing is reported.
-  For eligible EL additions and removals, the classifier keeps its contexts and saturates
-  again only those the changes can reach. A classification with the Horn rules of an
-  ontology without individuals, and one with the disjunctive rules that does not count,
-  keep their contexts in the same way. After an edit of class axioms the next run clears
+  Every answer is entailed, and outside a rooted run or a run that counts it is complete
+  for named classes when nothing is reported. A rooted run or a run that counts can miss
+  entailments even when it reports nothing left out and calls its answer complete. Roadmap items 1229 and 1231. For eligible EL additions
+  and removals, the classifier keeps its contexts and saturates again only those the
+  changes can reach. A classification with the Horn rules of an ontology without
+  individuals, and one with the disjunctive rules that does not count, keep their contexts
+  in the same way. After an edit of class axioms the next run clears
   the contexts that hold an expression whose rules changed, with the contexts that reach
   them, and its answer is that of a classification that starts again. A change to the
   property hierarchy, chains, reflexivity or ranges, an
@@ -1059,18 +1067,19 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the bindings always take the Horn axioms. Roadmap item 694.
 * By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
   analysis or counting in an ontology with individuals, are left out, since the rooted run
-  that takes them is an option whose completeness is not proved, and four of the 50
-  nominal fixtures of its gate pass its work bound. The rooted run also passes its bound
-  on ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
-  property, and then gives the default answer after the work. The selection of ground
-  body literals is off and Join is partly exempt from the ground restriction, since both
-  could make a run that reported itself complete miss entailed subsumptions and
-  unsatisfiable classes, which costs two of the four fixtures. Roadmap items 823, 1061, 1075
-  and 1220. Axioms that
-  need case analysis in an ontology with data properties are left out, and an external DL
-  reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
-  datatype checker with data cardinalities before they take data properties, and 10 of
-  the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
+  that takes them is an option whose completeness is not proved, and two of the 50 nominal
+  fixtures of its gate pass its work bound. The rooted run also passes its bound on
+  ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
+  property, and then gives the default answer after the work. The repairs of its selection
+  and of its Join restriction are adopted on a measured gate without a proof of
+  completeness. With them the generated ontology s2-g2-011 passes the bound on one and on
+  four threads, and a version of shoi-022 whose individuals are merged beforehand passes
+  it on four threads with eager expansion. A rooted answer that reports itself complete can
+  still miss entailments. Roadmap items 823, 1061, 1075, 1220, 1227, 1228, 1229 and 1231.
+  Axioms that need case analysis in an ontology with data properties are left out,
+  and an external DL reasoner bridge is planned. Roadmap item 603. The disjunctive rules
+  need a datatype checker with data cardinalities before they take data properties, and 10
+  of the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
   item 768.
 * Counting is off by default. Five files of the ORE 2015 DL development set attempt
   counting. With the order between number restrictions, which a counting run uses by

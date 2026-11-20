@@ -1230,31 +1230,35 @@ fn late_unit<S: Sink>(ix: &Index, st: &State, d: Ex, v: Ex, found: &mut Found, o
 }
 
 /// Whether a context other than the root selects the ground literals in its bodies, item
-/// 804's selection (F24). It is off until item 1220's repair, since two selected clauses of
-/// one context never meet in Hyper over x, so that a run could report itself complete and
-/// miss an entailed subsumption. `SPARKLES_ROOTED_SELECT_GROUND=1` turns it on, for
-/// measurement.
+/// 804's selection (F24). It is on, with item 1220's repair [`sel_partners_x`], since
+/// without that repair two selected clauses of one context never meet in Hyper over x, so
+/// that a run could report itself complete and miss an entailed subsumption. The repair is
+/// adopted on a measured gate and its completeness is not proved.
+/// `SPARKLES_ROOTED_SELECT_GROUND=0` turns the selection off, for measurement.
 pub fn select_ground() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| !std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "0"))
 }
 
 /// Whether Hyper over x takes selected clauses as partners, item 1220's repair R1 of the
 /// selection: the partners of an atom over x, and in Pred from a successor over `f_e(u)`
 /// the partners of an atom over `f_e(u)` ([`super::dl_root::root_pred`]). Without it two
 /// selected clauses of one context never meet in such an inference. It matters only while
-/// [`select_ground`] is on. `SPARKLES_ROOTED_SEL_PARTNERS_X=1` turns it on and `=0` off.
+/// [`select_ground`] is on. It is on by default, and `SPARKLES_ROOTED_SEL_PARTNERS_X=0`
+/// turns it off, for measurement.
 pub fn sel_partners_x() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SEL_PARTNERS_X").is_some_and(|v| v == "1"))
+    *ON.get_or_init(|| {
+        !std::env::var_os("SPARKLES_ROOTED_SEL_PARTNERS_X").is_some_and(|v| v == "0")
+    })
 }
 
-/// Which Joins the restriction on ground inferences exempts, item 1220's containment. When
-/// the partners are facts that hold only under the context's core, no ancestor holds
+/// Which Joins the restriction on ground inferences exempts, part of item 1220's repair.
+/// When the partners are facts that hold only under the context's core, no ancestor holds
 /// them, and one Join, which resolves a single literal, leaves a ground clause with a body
-/// that the restriction would drop before the next Join could discharge it. Until item
-/// 1220's repair, a Join whose premise on the side of the head has no ground literal in its
-/// body is exempt, whatever the residual head. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts
+/// that the restriction would drop before the next Join could discharge it. A Join whose
+/// premise on the side of the head has no ground literal in its body is exempt, whatever
+/// the residual head. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts
 /// every Join and `=1` exempts every Join, for measurement.
 pub fn join_exempt() -> u8 {
     static ON: OnceLock<u8> = OnceLock::new();
@@ -3231,7 +3235,8 @@ fn process<S: Sink>(
     }
     // a selected clause takes only the local inferences, Join, Pred and Succ, except that
     // one Pred cannot carry, whose head holds an atom over x, takes the Hyper over x too,
-    // since no predecessor sees it (its partners are still the unselected clauses)
+    // since no predecessor sees it (with sel_partners_x its partners include selected
+    // clauses, as do those of Pred from a successor over `f_e(u)`)
     let sel = rooted && dl(st).is_some_and(|x| x.store.clauses[id as usize].sel);
     let sel_x = sel && ready;
     let mut ps: Vec<(Role, Ex)> = Vec::new();
