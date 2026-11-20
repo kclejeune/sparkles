@@ -8,8 +8,9 @@ The record of the first pass gives their compilers, build command and `.text` si
 
 `queue.sh.txt` waited until the units queued ahead of it had left the host and then held
 forge's benchmark lock and heavy lock for the whole rerun in a 13 GiB scope. `queue.log`
-gives the times, with the locks held from 05:14:07 to 08:39:07 Eastern on 2026-11-20, and
-`uptime-before.txt` the load when the locks were taken. `rerun.sh.txt` ran the first
+gives the time the locks were taken, 05:14:07 Eastern on 2026-11-20, `out/RERUN-DONE` in
+`results.tar.gz` the end of the rerun at 08:39:07, and `uptime-before.txt` the load when
+the locks were taken. `rerun.sh.txt` ran the first
 pass's grid, which is `scripts/bench-text.sh`, `scripts/bench-geo.sh` and
 `scripts/bench-vector.sh` at 100,000 documents, points and vectors of 384 dimensions, in
 eager and streaming execution with 12 threads and with one, from a `git archive` of
