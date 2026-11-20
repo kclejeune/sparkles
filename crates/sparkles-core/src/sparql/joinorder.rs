@@ -342,7 +342,7 @@ fn keep_built(pl: &Planner, mut held: Reservation, n: &Node, sorts: [bool; 2]) -
 /// [`Dp::run`], dropped after the copy. Unit tests settle its drop with the observer.
 #[cfg(test)]
 fn leaf_kept(held: Option<Reservation>) -> crate::test_alloc::Settled {
-    crate::test_alloc::Settled::child(held)
+    crate::test_alloc::Settled::new(crate::test_alloc::Origin::handed_up(), held)
 }
 #[cfg(not(test))]
 fn leaf_kept(held: Option<Reservation>) -> Option<Reservation> {

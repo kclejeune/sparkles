@@ -129,8 +129,6 @@ const TOO_DEEP: u32 = 2;
 const UNBALANCED: u32 = 4;
 const SETTLEMENT: u32 = 8;
 const OVER_SETTLED: u32 = 16;
-const CHILD: u8 = 1;
-const INPUT: u8 = 2;
 
 /// The event at which a stage's largest excess was seen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,8 +154,9 @@ pub(crate) struct Maximum {
 }
 
 /// One entered stage: its epoch and number, the bytes it allocated and still holds
-/// (plus the net credit its child stages acquired), the credit counter at entry, and
-/// the net child credit it imported, which bounds its child settlements.
+/// (plus the net credit its child stages acquired), the credit counter at entry, the
+/// net child credit it imported, which bounds its child settlements, and the settled
+/// releases of credit acquired before it entered, which its parent does not import.
 #[derive(Clone, Copy)]
 struct Frame {
     epoch: u64,
@@ -165,6 +164,7 @@ struct Frame {
     live: i64,
     base: u64,
     imported: i64,
+    inputs: i64,
 }
 
 /// A live allocation made while a stage was active, and that stage's epoch.
@@ -185,7 +185,8 @@ struct Observation {
     entries: usize,
     peak: usize,
     failed: u32,
-    settling: u8,
+    settling: bool,
+    origin: Origin,
     settled: u64,
     releases: u32,
     slots: [Slot; SLOTS],
@@ -372,7 +373,8 @@ pub(crate) fn record_unadmitted_events(
 ///   reallocation counts the whole new size, conservatively, and takes the storage over.
 /// - When a child stage returns, its whole net credit change enters the parent's live
 ///   bytes, so the parent's excess is the same across the child: a child's surplus credit
-///   covers nothing of the parent's.
+///   covers nothing of the parent's. Settled releases of credit acquired before the child
+///   entered are left out, since every frame they reached reconciled them itself.
 /// - A credit release is sampled after it lowers the counter, as are stage entry and
 ///   exit. A release is never assumed to belong to anything: a release of credit the
 ///   stage did not acquire reads as excess unless it is the drop of one named
@@ -415,6 +417,7 @@ impl Stage {
                     live: 0,
                     base: o.used(),
                     imported: 0,
+                    inputs: 0,
                 };
                 o.depth += 1;
                 Some(epoch)
@@ -438,7 +441,9 @@ impl Drop for Stage {
             o.depth -= 1;
             let child = o.frames[o.depth];
             if o.depth > 0 {
-                let delta = o.used() as i64 - child.base as i64;
+                // The child's net credit change, less the settled releases of credit
+                // acquired before it, which each frame reconciled for itself.
+                let delta = o.used() as i64 - child.base as i64 + child.inputs;
                 let parent = &mut o.frames[o.depth - 1];
                 parent.live += delta;
                 parent.imported += delta.max(0);
@@ -447,27 +452,55 @@ impl Drop for Stage {
     }
 }
 
-/// One named reservation whose drop the observer settles: the release it makes is
-/// neutralized in the active stage, as child credit (at most what the stage imported
-/// from its children) or as input credit acquired before the stage. The drop must
-/// release exactly the reservation's bytes, once, on the observed counter.
-pub(crate) struct Settled {
-    reservation: Option<crate::access::Reservation>,
-    kind: u8,
+/// Where a reservation's credit was acquired: the epoch of the stage active then (0
+/// when none was) and the last stage epoch entered before it. A [`Settled`] drop names
+/// it, so that each live frame reconciles the release by how it saw the credit.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Origin {
+    frame: u64,
+    entered: u64,
 }
 
-impl Settled {
-    pub(crate) fn child(reservation: Option<crate::access::Reservation>) -> Self {
+/// A frame epoch no stage has, for credit a returned child stage handed up.
+const HANDED_UP: u64 = u64::MAX;
+
+impl Origin {
+    /// Credit acquired now, in the active stage.
+    pub(crate) fn now() -> Self {
         Self {
-            reservation,
-            kind: CHILD,
+            frame: with(|o| o.depth.checked_sub(1).map_or(0, |top| o.frames[top].epoch))
+                .unwrap_or(0),
+            entered: EPOCH.with(Cell::get),
         }
     }
 
-    pub(crate) fn input(reservation: Option<crate::access::Reservation>) -> Self {
+    /// Credit that a child stage acquired and handed up to the active stage when it
+    /// returned. The active stage imported it as child credit.
+    pub(crate) fn handed_up() -> Self {
+        Self {
+            frame: HANDED_UP,
+            entered: EPOCH.with(Cell::get),
+        }
+    }
+}
+
+/// One named reservation whose drop the observer settles, with the [`Origin`] of its
+/// credit. Each live frame entered after the credit was acquired saw it as credit from
+/// before the frame: the release is neutralized there and not imported by its parent.
+/// The deepest frame entered before it acquired the credit itself, which needs nothing,
+/// or imported it from a returned child, which the release retires from its imported
+/// child credit, failing the observation if that goes below zero. The drop must release
+/// exactly the reservation's bytes, once, on the observed counter.
+pub(crate) struct Settled {
+    reservation: Option<crate::access::Reservation>,
+    origin: Origin,
+}
+
+impl Settled {
+    pub(crate) fn new(origin: Origin, reservation: Option<crate::access::Reservation>) -> Self {
         Self {
             reservation,
-            kind: INPUT,
+            origin,
         }
     }
 }
@@ -478,13 +511,14 @@ impl Drop for Settled {
             return;
         };
         let bytes = reservation.bytes();
-        let kind = self.kind;
+        let origin = self.origin;
         let began = with(|o| {
-            if o.settling != 0 {
+            if o.settling {
                 o.failed |= SETTLEMENT;
                 return false;
             }
-            o.settling = kind;
+            o.settling = true;
+            o.origin = origin;
             o.settled = 0;
             o.releases = 0;
             true
@@ -495,7 +529,7 @@ impl Drop for Settled {
                 if o.releases != 1 || o.settled != bytes {
                     o.failed |= SETTLEMENT;
                 }
-                o.settling = 0;
+                o.settling = false;
             });
         }
     }
@@ -508,18 +542,27 @@ pub(crate) fn released(counter: &std::sync::atomic::AtomicU64, bytes: u64) {
         if o.counter != counter as *const _ as usize {
             return;
         }
-        if o.settling != 0 {
+        if o.settling {
             o.settled += bytes;
             o.releases += 1;
-            if o.depth > 0 {
-                let frame = &mut o.frames[o.depth - 1];
-                frame.live -= bytes as i64;
-                if o.settling == CHILD {
-                    frame.imported -= bytes as i64;
-                    if frame.imported < 0 {
-                        o.failed |= OVER_SETTLED;
-                    }
+            let origin = o.origin;
+            let bytes = bytes as i64;
+            let mut over = false;
+            for frame in o.frames[..o.depth].iter_mut().rev() {
+                if frame.epoch > origin.entered {
+                    frame.live -= bytes;
+                    frame.inputs += bytes;
+                    continue;
                 }
+                if frame.epoch != origin.frame {
+                    frame.live -= bytes;
+                    frame.imported -= bytes;
+                    over = frame.imported < 0;
+                }
+                break;
+            }
+            if over {
+                o.failed |= OVER_SETTLED;
             }
         }
         o.sample(Event::Release);

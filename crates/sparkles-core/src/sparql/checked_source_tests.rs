@@ -2795,7 +2795,7 @@ fn checked_graph_r12_admits_optional_joins() {
     // An OPTIONAL in a graph's branch builds its join after the payload is admitted.
     plan::BRANCH_SHORTFALL.with(|most| most.set(0));
     let excess = checked_second_plan_excess(
-        "SELECT * WHERE { GRAPH ?g { ?x0 <urn:c:1> ?x1 OPTIONAL { ?x1 <urn:c:2> ?x2 } BIND(?x0 AS ?first) } }",
+        "SELECT * WHERE { GRAPH ?g { OPTIONAL { ?x0 <urn:c:1> ?x1 } } }",
     );
     let short = plan::BRANCH_SHORTFALL.with(std::cell::Cell::get);
     println!("optional: {excess:?}, branch short {short}");
@@ -3616,7 +3616,7 @@ fn checked_graph_r12_observer_nested_surplus() {
 
 #[test]
 fn checked_graph_r12_observer_nested_retirement() {
-    use crate::test_alloc::{Settled, Stage};
+    use crate::test_alloc::{Origin, Settled, Stage};
     // The outer stage retires the inner storage and, as a named settlement, the inner
     // credit. That is no deficit, and it leaves no cushion for a later omission.
     for omitted in [0, 800] {
@@ -3627,7 +3627,7 @@ fn checked_graph_r12_observer_nested_retirement() {
                 (prep.reserve(1000).unwrap(), observer_bytes(100))
             };
             drop(storage);
-            drop(Settled::child(Some(held)));
+            drop(Settled::new(Origin::handed_up(), Some(held)));
             let omitted = (omitted > 0).then(|| observer_bytes(omitted));
             std::hint::black_box(&omitted);
         });
@@ -3653,17 +3653,18 @@ fn checked_graph_r12_observer_nested_retirement() {
 
 #[test]
 fn checked_graph_r12_observer_settles_nested_frames() {
-    use crate::test_alloc::{Settled, Stage};
+    use crate::test_alloc::{Origin, Settled, Stage};
     // A settlement inside a nested frame hands the parent no deficit, for credit acquired
     // before the stages and for credit a child stage handed up.
     let excess = observer_excess(|prep| {
+        let origin = Origin::now();
         let input = prep.reserve(1000).unwrap();
         let storage = observer_bytes(1000);
         let _outer = Stage::enter(1);
         {
             let _inner = Stage::enter(2);
             drop(storage);
-            drop(Settled::input(Some(input)));
+            drop(Settled::new(origin, Some(input)));
         }
     });
     assert!(excess[1] <= 0 && excess[2] <= 0, "input: {excess:?}");
@@ -3676,7 +3677,7 @@ fn checked_graph_r12_observer_settles_nested_frames() {
                 (prep.reserve(1000).unwrap(), observer_bytes(100))
             };
             drop(storage);
-            drop(Settled::child(Some(held)));
+            drop(Settled::new(Origin::handed_up(), Some(held)));
         }
     });
     assert!(
@@ -3686,8 +3687,171 @@ fn checked_graph_r12_observer_settles_nested_frames() {
 }
 
 #[test]
+fn checked_graph_r12_observer_retires_by_origin() {
+    use crate::test_alloc::{Origin, Settled, Stage};
+    // The parent acquires 4096 bytes of credit for 4096 bytes of storage. Wherever the
+    // storage and the credit go away, the parent then sees exactly the Y bytes it
+    // allocates without credit, and the child sees nothing.
+    for omitted in [0usize, 3072] {
+        for case in 0..4 {
+            let excess = observer_excess(|prep| {
+                let _parent = Stage::enter(1);
+                let origin = Origin::now();
+                let held = prep.reserve(4096).unwrap();
+                let mut storage = Some(observer_bytes(4096));
+                let mut held = Some(held);
+                if case == 1 {
+                    drop(storage.take());
+                }
+                {
+                    let _child = Stage::enter(2);
+                    if case == 0 || case == 2 {
+                        drop(storage.take());
+                    }
+                    if case < 2 {
+                        drop(Settled::new(origin, held.take()));
+                    }
+                }
+                drop(storage.take());
+                drop(held.take());
+                let omitted = (omitted > 0).then(|| observer_bytes(omitted));
+                std::hint::black_box(&omitted);
+            });
+            assert_eq!(
+                (excess[1], excess[2]),
+                (omitted as i64, 0),
+                "case {case}, omitted {omitted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_graph_r12_observer_retires_two_levels_down() {
+    use crate::test_alloc::{Origin, Settled, Stage};
+    // The grandparent's credit and storage go away two stages below it. No frame reads
+    // a deficit, and an omission in any frame afterwards is seen exactly there.
+    for at in [0, 1, 2, 3] {
+        let excess = observer_excess(|prep| {
+            let _grand = Stage::enter(1);
+            let origin = Origin::now();
+            let held = prep.reserve(2048).unwrap();
+            let storage = observer_bytes(2048);
+            // Options, not a list, so that keeping them allocates nothing more.
+            let (mut low, mut mid, mut top) = (None, None, None);
+            {
+                let _middle = Stage::enter(2);
+                {
+                    let _inner = Stage::enter(3);
+                    drop(storage);
+                    drop(Settled::new(origin, Some(held)));
+                    if at == 3 {
+                        top = Some(observer_bytes(700));
+                    }
+                }
+                if at == 2 {
+                    mid = Some(observer_bytes(700));
+                }
+            }
+            if at == 1 {
+                low = Some(observer_bytes(700));
+            }
+            std::hint::black_box((&low, &mid, &top));
+        });
+        let mut expected = [0i64; crate::test_alloc::STAGES];
+        if at > 0 {
+            expected[at] = 700;
+        }
+        assert_eq!(excess, expected, "omission at {at}");
+    }
+}
+
+#[test]
+fn checked_graph_r12_observer_retires_imported_credit_in_a_later_child() {
+    use crate::test_alloc::{Origin, Settled, Stage};
+    // An earlier child hands its credit and storage up; a later child retires both.
+    // The imported credit is consumed, so it covers no later omission.
+    for omitted in [0usize, 900] {
+        let excess = observer_excess(|prep| {
+            let _parent = Stage::enter(1);
+            let (origin, held, storage) = {
+                let _earlier = Stage::enter(2);
+                let origin = Origin::now();
+                (origin, prep.reserve(1500).unwrap(), observer_bytes(1500))
+            };
+            {
+                let _later = Stage::enter(3);
+                drop(storage);
+                drop(Settled::new(origin, Some(held)));
+            }
+            let omitted = (omitted > 0).then(|| observer_bytes(omitted));
+            std::hint::black_box(&omitted);
+        });
+        assert_eq!(
+            (excess[1], excess[2], excess[3]),
+            (omitted as i64, 0, 0),
+            "omitted {omitted}"
+        );
+    }
+}
+
+#[test]
+fn checked_graph_r12_observer_child_settlement_leaves_no_cushion() {
+    use crate::test_alloc::{Origin, Settled, Stage};
+    // A child keeps 1000 bytes of credit for 100 bytes of storage and hands both up, one
+    // or two stages. Its ancestor frees the storage and then settles the credit: no
+    // deficit, and an omission afterwards is seen in full.
+    for levels in [1, 2] {
+        for omitted in [0usize, 800] {
+            let excess = observer_excess(|prep| {
+                let _outer = Stage::enter(1);
+                let (held, storage) = {
+                    let _middle = (levels == 2).then(|| Stage::enter(2));
+                    let _inner = Stage::enter(3);
+                    (prep.reserve(1000).unwrap(), observer_bytes(100))
+                };
+                drop(storage);
+                drop(Settled::new(Origin::handed_up(), Some(held)));
+                let omitted = (omitted > 0).then(|| observer_bytes(omitted));
+                std::hint::black_box(&omitted);
+            });
+            assert_eq!(
+                (excess[1], excess[2], excess[3]),
+                (omitted as i64, 0, 0),
+                "levels {levels}, omitted {omitted}"
+            );
+        }
+    }
+}
+
+#[test]
+fn checked_graph_r12_observer_surplus_witness_is_the_omission() {
+    use crate::test_alloc::{Event, Stage};
+    // The outer stage's maximum is set by its own uncredited allocation, not by the
+    // teardown after it.
+    let prep = Preparation::new(Control::none(), 1 << 20).unwrap();
+    let (max, _) = crate::test_alloc::record_unadmitted_events(&prep, || {
+        // The inner credit outlives the outer stage, so that its release is no event of
+        // the outer stage.
+        let held;
+        {
+            let _outer = Stage::enter(1);
+            held = {
+                let _inner = Stage::enter(2);
+                (prep.reserve(1000).unwrap(), observer_bytes(100))
+            };
+            let omitted = observer_bytes(800);
+            std::hint::black_box(&omitted);
+        }
+        drop(held);
+    });
+    assert_eq!((max[1].excess, max[1].event), (800, Event::Alloc));
+    assert!(max[2].excess <= 0);
+}
+
+#[test]
 fn checked_graph_r12_observer_foreign_frees() {
-    use crate::test_alloc::{Settled, Stage};
+    use crate::test_alloc::{Origin, Settled, Stage};
     // Storage allocated before the stage and freed in it is no cushion.
     let excess = observer_excess(|_| {
         let early = observer_bytes(4096);
@@ -3701,11 +3865,12 @@ fn checked_graph_r12_observer_foreign_frees() {
     // unrelated omission after it is still seen.
     for omitted in [0, 3072] {
         let excess = observer_excess(|prep| {
+            let origin = Origin::now();
             let held = prep.reserve(4096).unwrap();
             let early = observer_bytes(4096);
             let _stage = Stage::enter(1);
             drop(early);
-            drop(Settled::input(Some(held)));
+            drop(Settled::new(origin, Some(held)));
             let omitted = (omitted > 0).then(|| observer_bytes(omitted));
             std::hint::black_box(&omitted);
         });
