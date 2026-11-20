@@ -2710,46 +2710,33 @@ fn checked_graph_r12_admits_built_filters() {
     // A negated property set is a scan under a FILTER that tests the set's terms, a list
     // as long as the set, which the plan keeps. The BIND makes the graph's group one that
     // is planned per graph. The set's terms are not in the store, so planning interns
-    // them in the context's vocabulary, which the context's own account admits. A first
-    // plan interns them, and the observed second plan finds them.
-    use plan::{ActiveGraph, Planner};
+    // them in the context's vocabulary, which the context's own account admits. They are
+    // interned before the observed plan, so that nothing else the context caches is.
     for terms in [4, 400] {
         let set = (0..terms)
             .map(|step| format!("<urn:n:p{step}>"))
             .collect::<Vec<_>>()
             .join("|");
-        let text =
-            format!("SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 . BIND(?x0 AS ?first) }} }}");
-        let store = checked_chain_fixture(4);
-        let data = physical_default(&store);
-        let ctx = validation_query_context(&data, opts()).unwrap();
-        let prep = ctx.source_preparation.as_ref().unwrap().clone();
-        let Query::Select { pattern, .. } = parse_query(&text, None, &[]).unwrap() else {
-            unreachable!()
-        };
-        drop(
-            Planner::new(&ctx)
-                .plan(&pattern, &ActiveGraph::Default, Vec::new())
-                .unwrap(),
+        let excess = checked_interned_plan_excess(
+            &format!("SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 . BIND(?x0 AS ?first) }} }}"),
+            terms,
+            |plan| {
+                checked_graph_group(plan);
+            },
         );
-        let mut planner = Planner::new(&ctx);
-        let mut plan = None;
-        let excess = crate::test_alloc::record_unadmitted(&prep, || {
-            plan = Some(
-                planner
-                    .plan(&pattern, &ActiveGraph::Default, Vec::new())
-                    .unwrap(),
-            );
-        });
-        checked_graph_group(plan.as_ref().unwrap());
         println!("negated set of {terms}: {excess:?}");
         assert!(excess[6] <= 512, "filters: {} unadmitted bytes", excess[6]);
     }
 }
 
-/// The unadmitted bytes per stage of planning `text` on a checked source, after a first
-/// plan has interned its constants.
-fn checked_second_plan_excess(text: &str) -> [i64; crate::test_alloc::STAGES] {
+/// The unadmitted bytes per stage of planning `text` on a checked source, after the
+/// context interned the IRIs `urn:n:p0` to `urn:n:p{terms - 1}`, which the store does
+/// not hold. `check` reads the plan.
+fn checked_interned_plan_excess(
+    text: &str,
+    terms: usize,
+    check: impl FnOnce(&plan::Node),
+) -> [i64; crate::test_alloc::STAGES] {
     use plan::{ActiveGraph, Planner};
     let store = checked_chain_fixture(4);
     let data = physical_default(&store);
@@ -2758,19 +2745,22 @@ fn checked_second_plan_excess(text: &str) -> [i64; crate::test_alloc::STAGES] {
     let Query::Select { pattern, .. } = parse_query(text, None, &[]).unwrap() else {
         unreachable!()
     };
-    drop(
-        Planner::new(&ctx)
-            .plan(&pattern, &ActiveGraph::Default, Vec::new())
-            .unwrap(),
-    );
+    for step in 0..terms {
+        ctx.intern_term(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(format!(
+            "urn:n:p{step}"
+        ))));
+    }
     let mut planner = Planner::new(&ctx);
-    crate::test_alloc::record_unadmitted(&prep, || {
-        drop(
+    let mut plan = None;
+    let excess = crate::test_alloc::record_unadmitted(&prep, || {
+        plan = Some(
             planner
                 .plan(&pattern, &ActiveGraph::Default, Vec::new())
                 .unwrap(),
         );
-    })
+    });
+    check(plan.as_ref().unwrap());
+    excess
 }
 
 #[test]
@@ -2782,15 +2772,17 @@ fn checked_graph_r12_admits_simple_graph_groups() {
         .map(|step| format!("<urn:n:p{step}>"))
         .collect::<Vec<_>>()
         .join("|");
-    let excess = checked_second_plan_excess(&format!(
-        "SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 }} }}"
-    ));
+    let excess = checked_interned_plan_excess(
+        &format!("SELECT * WHERE {{ GRAPH ?g {{ ?x0 !({set}) ?x1 }} }}"),
+        400,
+        |_| {},
+    );
     println!("simple negated set of 400: {excess:?}");
     assert!(excess.iter().all(|&bytes| bytes <= 512), "{excess:?}");
 }
 
 #[test]
-#[ignore = "known red, see the lane notes"]
+#[ignore = "roadmap item 1238"]
 fn checked_graph_r12_admits_optional_joins() {
     // An OPTIONAL in a graph's branch builds its join after the payload is admitted.
     use crate::sparql::ctx::DEFAULT_GRAPH_IRI;

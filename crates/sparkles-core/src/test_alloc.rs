@@ -377,8 +377,19 @@ pub(crate) fn record_unadmitted_events(
 ///   entered are left out, since every frame they reached reconciled them itself.
 /// - A credit release is sampled after it lowers the counter, as are stage entry and
 ///   exit. A release is never assumed to belong to anything: a release of credit the
-///   stage did not acquire reads as excess unless it is the drop of one named
-///   reservation wrapped in [`Settled`], which neutralizes exactly that release.
+///   stage did not acquire lowers its credit as its own release would, unless it is the
+///   drop of one named reservation wrapped in [`Settled`], which neutralizes exactly
+///   that release.
+///
+/// The observer has limits. The release hook sees a byte count and not a reservation,
+/// so a release of an ancestor's credit that is not wrapped in [`Settled`] reads as
+/// excess only when the stage has no surplus credit to absorb it: a child holding more
+/// credit than it allocated hides an equal undeclared release, and the observation does
+/// not prove that every release belongs to the stage that made it. [`Origin::handed_up`]
+/// is the caller's declaration, checked only against the frame's total imported child
+/// credit, so a wrong declaration that unrelated imported credit covers passes. One
+/// [`Origin`] names one acquisition, so a reservation grown or merged across stages of
+/// different origins cannot be settled correctly.
 pub(crate) struct Stage(Option<u64>);
 
 fn used_at(counter: usize) -> u64 {
