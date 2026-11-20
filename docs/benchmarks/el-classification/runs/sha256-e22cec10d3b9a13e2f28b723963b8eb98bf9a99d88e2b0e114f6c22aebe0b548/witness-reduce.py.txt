@@ -1,0 +1,35 @@
+#!/usr/bin/env python3
+"""reduce.py IN OUT PATTERN [ABSENT]: removes axiom lines of IN one at a time while bin/fixdiagw at
+level 2 on one thread still prints a line matching PATTERN (and none
+matching ABSENT, and stays consistent), and writes what is left to OUT."""
+import os, re, subprocess, sys, tempfile
+src, dst, pat = sys.argv[1:4]
+absent = sys.argv[4] if len(sys.argv) > 4 else None
+B = os.path.join(os.path.dirname(os.path.abspath(__file__)), "../bin/fixdiagw")
+lines = open(src).read().splitlines()
+head = [l for l in lines if l.startswith(("Prefix", "Ontology"))]
+decl = [l for l in lines if l.startswith("Declaration")]
+ax = [l for l in lines if l not in head and l not in decl and l != ")"]
+def ok(ax):
+    with tempfile.NamedTemporaryFile("w", suffix=".ofn", delete=False) as f:
+        f.write("\n".join(head + decl + ax + [")"]) + "\n")
+    try:
+        p = subprocess.run([B, "--threads", "1", f.name], env={**os.environ, "SPARKLES_HORN_RULES": "2"},
+                           capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return False
+    finally:
+        os.unlink(f.name)
+    if absent and (re.search(absent, p.stderr) or '"consistency":"consistent"' not in p.stdout):
+        return False
+    return p.returncode == 0 and re.search(pat, p.stderr) is not None
+assert ok(ax)
+changed = True
+while changed:
+    changed = False
+    for i in range(len(ax)):
+        t = ax[:i] + ax[i + 1:]
+        if ok(t):
+            ax = t; changed = True; break
+open(dst, "w").write("\n".join(head + decl + ax + [")"]) + "\n")
+print("\n".join(ax))

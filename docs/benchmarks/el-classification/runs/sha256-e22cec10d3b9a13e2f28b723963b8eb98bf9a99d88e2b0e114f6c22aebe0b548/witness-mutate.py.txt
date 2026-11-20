@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""mutate.py OUTDIR TRIES SEED FILE...: adds one to three random axioms of the family to each
+FILE and keeps a variant on which bin/fixdiagw at level 2 prints HORNDECISIVE and no
+HORNWORLDS line: the clause of the search for witnesses decides, and the run makes no world."""
+import os, random, subprocess, sys, tempfile
+from multiprocessing import Pool
+here = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(here, "../../../../../crates/sparkles-owl/tests/fixtures/dl603"))
+import generate as g  # noqa: E402
+B = os.path.join(here, "../bin/fixdiagw")
+out, tries, seed = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+OPS = ["forall", "max1", "nominal", "self"]
+AX = ["horn", "role_sub", "role_inverse_sub", "inverses", "domain", "range", "class_assertion",
+      "role_assertion", "role_assertion", "class_assertion"]
+def job(a):
+    src, k = a
+    r = random.Random(f"{seed}:{src}:{k}")
+    gen = g.Gen(r, set(OPS), AX, True)
+    lines = open(src).read().splitlines()
+    body = lines[:-1] + [gen.axiom() for _ in range(r.randint(1, 3))] + [")"]
+    with tempfile.NamedTemporaryFile("w", suffix=".ofn", delete=False) as f:
+        f.write("\n".join(body) + "\n")
+    try:
+        p = subprocess.run([B, "--threads", "1", f.name], env={**os.environ, "SPARKLES_HORN_RULES": "2"},
+                           capture_output=True, text=True, timeout=20)
+        if "HORNDECISIVE" in p.stderr and "HORNWORLDS" not in p.stderr and '"consistency":"consistent"' in p.stdout:
+            name = f"{out}/{os.path.basename(src)[:-4]}-m{k}.ofn"
+            os.replace(f.name, name)
+            return name
+    except subprocess.TimeoutExpired:
+        pass
+    if os.path.exists(f.name):
+        os.unlink(f.name)
+    return None
+if __name__ == "__main__":
+    os.makedirs(out, exist_ok=True)
+    jobs = [(s, k) for s in sys.argv[4:] for k in range(tries)]
+    with Pool(5) as pool:
+        hits = [h for h in pool.imap_unordered(job, jobs, chunksize=20) if h]
+    print(len(jobs), len(hits)); print("\n".join(sorted(hits)[:20]))

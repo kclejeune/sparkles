@@ -357,10 +357,8 @@ million conclusions against 1.15 million for the EL rules alone on one thread. A
 diagnostic build on the laptop counted the difference as five subsumers that every
 context takes from `owl:Thing`, 300 thousand conclusions, the two conclusions that tell a
 successor it is real, 548 thousand, the states of the automata, 103 thousand, 218
-thousand further repeats of existential restrictions and 40 thousand successors. Item
-1025 keeps that remainder and the conjunctions of a class that is equivalent to an
-individual. A prototype in which a successor learns that it is real from one conclusion
-in place of two took 1.4 to 1.9% off the four files on one thread and was not kept, as
+thousand further repeats of existential restrictions and 40 thousand successors. A
+prototype in which a successor learns that it is real from one conclusion in place of two took 1.4 to 1.9% off the four files on one thread and was not kept, as
 [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
 
 Item 1026 bounds what R5 gives a context before the activation applies it. A flush merges
@@ -381,6 +379,26 @@ median of 8.75 against 8.17 s and is slower in 12 rounds, and on one thread 76.3
 75.8 s with the same conclusions in each of four rounds. Almost all of the difference is
 outside the Horn rules' final saturation, in time that holds the attempt of the
 disjunctive rules, which item 869 does not change. Item 1027 follows it.
+
+Item 1025's guarded R7 search and covered link rules reduce classification time
+on the four assertion-heavy ORE files. In six rounds on `atlas`, commit
+`8b311a59` against `48344bca` takes 0.88 to 0.91 times the time on one thread
+and 0.77 to 0.82 times on four by the median paired ratio. The Horn rules
+take 1.63 to 1.68 times the EL-only time on one thread and 1.52 to 1.54 times
+on four. On one thread `ore_ont_4510` takes 207.5 against 235.3 ms and
+derives 2.21 against 2.36 million conclusions. Its 116 conjunction contexts
+hold only 2,228 of 758,645 subsumers, so their duplication accounts for little
+of the remaining work. On the rebased classifier the generated and hand-written
+cases, including contexts whose witness verdict the covered successor changes,
+agree with HermiT. The two paths with and without the witness clause select
+identical sets of named classes for worlds when evaluated against the same
+saturated state. This holds across 369 HermiT-checked cases and a set of 968
+generated cases on one and eight threads. The clause changes a context's
+witness verdict in 39 and 36 of the HermiT-checked cases, respectively.
+Item 1028 follows the
+one-thread costs on GO and EL-only `ore_ont_10951`. The
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#guarded-horn-rules-with-individuals)
+gives the stages, controls and evidence.
 
 Item 693 reduces the automata by which a run with the Horn rules unfolds its universal
 and negative existential restrictions, as [the Horn rules](#the-horn-rules) describe. It
@@ -1550,6 +1568,31 @@ went three ways. The index links the restriction of an assertion to `b`'s own co
 and tells `b` the range, as [the EL classifier](#the-owl-2-el-classifier) argues for
 individuals, so the run makes none of these contexts (item 1025).
 
+**Guarded Horn rules.** When a new predecessor triggers R7, the rule looks for
+pairs only if the predecessor is real and the current restriction counts it.
+The rule visits the same predecessor pairs in the same order when the run
+continues. It checks the run's bounds periodically during the scans and after
+a restriction that makes a pair or sends a message. The scan of the roles that
+clash is charged before the lookup. Successor counting and singular propagation
+read the existing at-most restrictions one at a time.
+
+A Horn link to a successor is covered when the context already holds a link
+by a different subrole to that same successor. When the new role has an inverse,
+the covering inverse must exist and be a subrole of that inverse. This preserves
+what R6, R7 and R8 can read at the target. The retained link matches the
+superroles needed by the forward rules, the two operands of a composition,
+and clashes inherited under subroles. The link retains the same source and
+target for filler and realness propagation. The rule applies the coverage
+check to Horn links in runs with individuals while the source already holds
+at most sixteen successors. If the broader link arrives first, it stays.
+R6 also omits a repeated core at a predecessor that is itself the successor,
+whose core was scheduled when that context was initialized.
+
+`SPARKLES_HORN_RULES` selects the comparison level. Level 0 uses the earlier
+rule bodies. Level 1 adds guarded R7 and reads restrictions without copying
+the list. Level 2 also uses covered links and omits the repeated core. Level
+2 is the default.
+
 **Witnesses and worlds.** The reachability condition of the EL rules of individuals stays
 the mechanism that makes a conclusion that depends on a class having an instance hold
 only where it does. The rules that read whether a context is real are the exchange from
@@ -1559,9 +1602,12 @@ in a world. A world for a class makes the class and what it reaches real, so a c
 whose global subsumers are incomplete reaches a context that one of these rules would
 read as real. Each such context is a witness. A context that is not real, derives an
 individual and has a subsumer, a Horn successor or a loop that the individual lacks is
-one, which extends today's witness by the Horn successors and the loops. A context that
-is not real and that an at-most restriction of a singular context counts as a
-predecessor is one, since R7 identifies it with another predecessor only where it has an
+one, which extends the EL witness by the Horn successors and loops. At level 2
+the individual already has a Horn successor when its own retained link covers
+it by the rule above. The witness check applies this criterion at any successor
+count. The individual may have obtained its subrole link without ever receiving
+the broader link. A context that is not real and that an at-most restriction of a
+singular context counts as a predecessor is one, since R7 identifies it with another predecessor only where it has an
 instance. A context that is not real and holds a fact's restriction on a universal role
 is one, as today. The keys read the links of a real context to named individuals and its
 data values, which come from its subsumers and its Horn successors, so a context that

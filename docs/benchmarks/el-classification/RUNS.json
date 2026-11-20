@@ -1374,6 +1374,120 @@
     }
    },
    "metadata_note": "Manual record of roadmap item 889 on atlas: three rounds of ore_ont_8737 of every side on one, four and twelve threads, the rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482, the profiles on atlas, and the profiles, rounds and taxonomy sweeps taken on the laptop."
+  },
+  {
+   "run_id": "sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548",
+   "path": "runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json",
+   "sha256": "e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "15 ORE 2015 DL development ontologies, Gene Ontology and ChEBI lite",
+    "manifest": {
+     "commits": {
+      "base": "48344bca4066b70552b8305b9caa6248e77e2d82",
+      "candidate": "8b311a59255af60a20689a3cd6df5987ebed541b",
+      "hermit_comparison": "c1619c3726f12c64acf9c05a6554de4fe3ff1a55"
+     },
+     "build_host": "stanley",
+     "build_command": "mbx build -j 8 --release -p sparkles-owl --example el_classify",
+     "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+     "binaries_sha256": {
+      "base2": "cf23ad585b136964a838f6ece8cf8ddb7d6e4455084052716d49b35be6459633",
+      "fix": "b7b96085ba6a8ae34ad4e27d097ddafccf20827ea21bdd5018345944722d2227",
+      "fixr": "df98475d34a55bd79b1d87e4d0e2ce34c2b82e43d77fc93fde25b6aa11c10e07",
+      "fixdiagw": "56419c7ff2d765ab6b4805b89e79113cc838f78a50180d3757263d491eb63540"
+     },
+     "data_sha256": {
+      "chebi_lite.ofn": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+      "go.ofn": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+      "ore_ont_10073.owl": "ad0146f453b0f4f75c4a0e91730fe136cda8387b1563b6f8596c882707d6d1b6",
+      "ore_ont_10754.owl": "acd5d5f758e629b0322846bdbecef876350e812966336a20662f260115a1de6d",
+      "ore_ont_10951.owl": "cb814e4020b7c45892ff45a781c1530014721f2f293a4f7f0049fbb4461597ae",
+      "ore_ont_12901.owl": "6b68cf4ade1e3e27961d609ab1e46b456b34617606b9edc2ebad665056895c2d",
+      "ore_ont_1370.owl": "984580a8e09cbad8a44b0413a28dae22c0e49cff296e8bd00ac71af1077af75e",
+      "ore_ont_14375.owl": "021b73ea8a49c9ecce3323c98ac3ce83353e797d5906338d3f2229ffda886660",
+      "ore_ont_14817.owl": "c9ef59caad989ff6ab355038030256b9ac6409c1dd11265fa28e8266b63c100f",
+      "ore_ont_16744.owl": "14e1d911dddd8863c088733a4c27ed66a9323e6ea4e12af7b9c3ac3bf816a4fc",
+      "ore_ont_4510.owl": "9d6246688fe292693f91ced5d096d3c732ccfa1bcf5fb57bad1f25ae2aa8766a",
+      "ore_ont_4572.owl": "b08b653cca5f336c9b278bc8af0111ffba9be0900264f5a7d664ac345e611077",
+      "ore_ont_6132.owl": "8a4bd9612f1aaab4e24e5c0a7c2236867473587d6f1616c165a205f7cbca4077",
+      "ore_ont_8737.owl": "2f5e2478a6a21f304d5c49fa65aa6fc447cf5fe907b3a68ec375da05320f1cc6",
+      "ore_ont_9654.owl": "9b80e89d2d93b66d438ba597a125905f576fd0871502a000ac3676db87eb2513",
+      "ore_ont_9663.owl": "13497cacd9c6fc1035450e50255c8f2d605a7aa85829958aa4c5d9fedfc7c86b",
+      "ore_ont_9855.owl": "73e70d6d8af1c80ae7ce10d8e95cc2bb20e7ff8c6bc600d3f0e445bb59dbd9d4"
+     }
+    },
+    "settings": {
+     "rounds": 6,
+     "threads": [
+      1,
+      4
+     ],
+     "scope": "One process per file, arm and thread count, with a 13 GiB systemd scope without swap",
+     "lock": "horn-1025b-ab held ~/lanes/.heavy.lock",
+     "arms": {
+      "base": "old binary",
+      "l0": "new binary with the old rule bodies",
+      "l1": "new binary with guarded R7 and reduced copying",
+      "l2": "new binary with default Horn rules",
+      "base-el": "old binary with --el-only on the four main files",
+      "el": "new binary with --el-only on the four main files",
+      "-horn": "--dl-attempt-work 1 on the two Uberon files"
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "atlas",
+      "role": "Intel benchmark worker"
+     },
+     "method": "Within each round, compute the ratio of the two process medians. Report the median of the six ratios, their range, and the two-sided percentile interval over all 46656 six-pair resamples with replacement. Median added time is the median of paired differences. Odd and even rounds used reverse arm orders.",
+     "kind": "measurement",
+     "scope": "Atlas classification timing and separately traced HermiT correctness checks"
+    }
+   }
+  },
+  {
+   "run_id": "sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859",
+   "path": "runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json",
+   "sha256": "5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "21 hand cases and 968 generated cases. The HermiT-checked phase includes 348 of the generated cases.",
+    "manifest": {
+     "commit": "c1619c3726f12c64acf9c05a6554de4fe3ff1a55",
+     "diagnostic_patch_sha256": "68485372d20d1c45a6d8bb8cc48ed881ad8ced154586d8e56c4c4d17a3ee6e74",
+     "diagnostic_binary_sha256": "bf55846b4c87ecce1a67125e4e7f8f869b533361c29ce366487fe5891d19d338",
+     "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+     "mbx": "1.29.1",
+     "build": "mbx build -j 6 --release -p sparkles-owl --example el_classify inside mbx sparkles-task",
+     "atlas_timing_record": "runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json",
+     "fixture_input_sha256": "8d6458e9b9299ffbb7db391df435dcc304d73dff313a785c787943b6d004557c",
+     "fixture_hermit_taxonomy_sha256": "18b901cacf57dbf26f2d70d2c52c073e79d77348db6f982c9e4214378620c332"
+    },
+    "settings": {
+     "threads": [
+      1,
+      8
+     ],
+     "horn_rules_level": 2,
+     "phase_sizes": {
+      "hermit-checked": 369,
+      "generated": 968
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "stanley"
+     },
+     "method": "Evaluate the production witness predicate twice on the same post-saturation state, toggling only recognition of a covered successor. Call the ordinary world-reachability routine on both witness sets and record sorted class IRIs before any world runs. The classifier then continues using the enabled result.",
+     "kind": "correctness-evidence",
+     "scope": "Same-snapshot Horn witness and named-class world-selection comparison"
+    }
+   }
   }
  ]
 }
