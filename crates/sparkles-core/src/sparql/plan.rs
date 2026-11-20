@@ -4682,46 +4682,49 @@ impl<'a> Planner<'a> {
     ) -> Result<(Node, Option<Reservation>)> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::within(6);
-        let partition = if self.branch_payload.borrow().is_some() && !filters.is_empty() {
-            self.planning_stage(FILTER_PHASE)?;
-            self.planning_scratch(|layout| {
-                // a filter's variable set lists every occurrence before it dedups them
-                let mut most = 0usize;
-                for f in filters.iter() {
-                    let mut count = 0usize;
-                    let _ = f.visit_vars(&mut |_| {
-                        count += 1;
-                        Ok::<(), ()>(())
-                    });
-                    most = most.max(count);
-                }
-                layout.slots::<VarId>(most.max(4).saturating_mul(2))?;
-                #[cfg(test)]
-                BOUND_TERMS.with(|terms| {
-                    let mut t = terms.get();
-                    t[2] = t[2].max(filters.len() as u64);
-                    terms.set(t);
-                });
-                // the filters placed here, in a list that grows by doubling
-                layout.slots::<Expr>(filters.len().saturating_add(8).saturating_mul(2))
-            })?
-        } else {
-            None
-        };
         let applies = |f: &Expr| {
             !f.has_exists() && {
                 let vs = f.var_set();
                 (constant || !vs.is_empty()) && vs.iter().all(|v| n.vars.contains(v))
             }
         };
-        // On the checked route the rest stays in the caller's list, whose credit the
-        // caller holds, so that only the list of the filters placed here is new.
-        let now: Vec<Expr> = if partition.is_some() {
-            filters.extract_if(.., |f| applies(f)).collect()
+        // The same test without allocating: every occurrence of a variable is bound by
+        // `n`, and there is one unless `constant`.
+        let bound = |f: &Expr| {
+            !f.has_exists() && {
+                let mut any = false;
+                f.visit_vars(&mut |v| {
+                    any = true;
+                    if n.vars.contains(&v) { Ok(()) } else { Err(()) }
+                })
+                .is_ok()
+                    && (constant || any)
+            }
+        };
+        let (partition, now) = if self.branch_payload.borrow().is_some() && !filters.is_empty() {
+            self.planning_stage(FILTER_PHASE)?;
+            let placed = filters.iter().filter(|f| bound(f)).count();
+            #[cfg(test)]
+            BOUND_TERMS.with(|terms| {
+                let mut t = terms.get();
+                t[2] = t[2].max(filters.len() as u64);
+                terms.set(t);
+            });
+            // The filters placed here move into a list of their own, made to its size,
+            // and the rest stay in the caller's list, whose credit the caller holds.
+            let partition = self
+                .planning_scratch(|layout| layout.slots::<Expr>(placed))?
+                .expect("checked filter partition");
+            let mut now = Vec::new();
+            now.try_reserve_exact(placed)
+                .map_err(|_| partition.preparation().exhausted())?;
+            now.extend(filters.extract_if(.., |f| bound(f)));
+            debug_assert_eq!(now.len(), placed);
+            (Some(partition), now)
         } else {
             let (now, later) = std::mem::take(filters).into_iter().partition(applies);
             *filters = later;
-            now
+            (None, now)
         };
         let Some(mut partition) = partition else {
             return Ok((
