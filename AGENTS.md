@@ -321,17 +321,18 @@ affect and falls back to the whole workspace when a shared root changes. Lanes d
 full gates of their own.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
-batch. One gate runs on the batch, with a query screen on an admitted
-Boat worker (`mise run bench:remote --executor boat:bx_ID --build-host boat:bx_ID
-origin/main HEAD`), which is the only screen of record. A small or contested effect is
-checked on an Intel host, and timings from different providers are never compared.
+batch. One gate runs on the batch, with a query screen on a quiet Intel benchmark
+worker, which is the screen of record. Both arms and the reruns of flagged queries run on
+that one host with nothing beside them, and timings from different hosts are never
+compared. A Boat screen (`mise run bench:remote --executor boat:bx_ID A B`) is approximate
+and decides nothing.
 `scripts/gate/gate.sh <rev>` runs the gate on the configured gate hosts and selects its checks from the batch's diff against `origin/main`.
 It runs the `scripts/ci.sh` tasks, conformance suites and spill matrices that the changed
 files call for, with Clippy and the Rust tests for the packages they can affect, as the
 [batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Build configuration, the CI
 scripts and files that no rule covers run everything. Push when the tests pass and the
 screen shows no query 10% or more slower after the rerun of the flagged queries with more
-rounds, which the screen runs on the same worker and reports beside the first pass.
+rounds, which the screen runs on the same host and reports beside the first pass.
 The screen is skipped when `gate.sh` prints `skip screen (reason)`, which it does only
 when every changed file is one that cannot reach the server's query path or the screen,
 such as documentation, the CI scripts, tests or the OWL and validation crates. Any change

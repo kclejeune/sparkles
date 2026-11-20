@@ -33,15 +33,16 @@ Each kind of claim needs a host that can resolve it.
 
 Use available local resources for builds and validation first, with Boat for overflow
 and isolation, as described under [remote executors](DEVELOPMENT.md#remote-executors).
-Keep benchmark workers free for measurements. The quick query screen runs on an admitted
-Boat worker. Keep each A/B comparison on one host with matching tools and configuration,
+Keep benchmark workers free for measurements. The batch query screen runs on a quiet
+Intel host, and a Boat worker gives quick approximate checks that decide nothing. Keep
+each A/B comparison on one host with matching tools and configuration,
 retain the actual host identity with its results, and never compare timings from
 different providers.
 
 | Host | Use | Why |
 |---|---|---|
-| Boat worker, `mise run bench:remote --executor boat:bx_ID A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | A Boat worker is a shared virtual machine, so it cannot confirm a change of a few percent. |
-| `atlas` or `forge`, Intel Core i5-13500 | Effects under about 5%, queries under 0.3 ms and changes sensitive to code generation | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
+| Boat worker, `mise run bench:remote --executor boat:bx_ID A B` | Quick approximate A/B checks of changes of about 10% or more | A Boat worker is a shared virtual machine. The same binary's speed moves too much between its server processes for a verdict. |
+| `atlas` or `forge`, Intel Core i5-13500 | The batch query screen, effects under about 5%, queries under 0.3 ms and changes sensitive to code generation | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
 | `forge` | Published reference numbers | The main comparison tables use this host and preserve each run's environment. |
 | `wally`, Intel Core i7-12800H with 32 GiB RAM | Separately qualified memory-heavy query recovery | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
 
@@ -1196,10 +1197,44 @@ without it, and `bench:jena-remote` still falls back to the retired Namespace ex
 of the shared screen script. Small smoke workloads establish transport and correctness only. Published
 numbers still come from the benchmark host.
 
-The batch query screen runs through `bench:remote` on a Boat worker, and it is the only
-screen of record. A small or contested effect is checked on an Intel host. The Boat and
-Namespace screens of the same two batches disagreed by about 10% in their geometric means,
-and item 1133 settles the difference on an Intel host.
+The batch query screen runs on a quiet Intel host, `atlas` or `forge`, under the host's
+locks with nothing beside it, and it is the screen of record. Both arms and the reruns of
+its flagged queries stay on that host. A screen through `bench:remote` on a Boat worker is
+approximate and decides nothing. There one binary timed against itself read between 0.91
+and 1.06, against a same-binary spread of about 2% on an Intel host.
+
+### Timing runs on an Intel host
+
+`scripts/timing-kit.py` stages, checks and queues an interleaved timing run on `atlas` or
+`forge`. `stage` builds one run directory for `scripts/nsc-bench-remote.sh` from a base
+binary and one or more tips. Tips that share the base, the data, the queries and the
+settings are timed in one run, in which every round runs the palindrome of the variants
+and the base's server processes serve every pair. Each pair gets its own summary, its own
+same-binary validity and its own verdict, but pairs that share base processes are not
+independent of each other. Groups with different data or queries are separate stages that
+one unit runs in turn.
+
+`preflight` refuses a stage before the host is booked when its server and client lack
+their own explicit CPUs, when the busy loops that keep those CPUs awake are off, when a
+round runs a variant fewer than twice, when fewer than three control queries of at least
+0.3 ms are staged, when a pair mixes request clients or when a binary does not match its
+hash. With `--host-side` it also refuses CPUs that are offline, SMT siblings of each other
+or not performance cores, a port in use, missing locks or runtime paths, and a set
+`MBX_REMOTE_URL`. `launch` runs the check locally and on the host, copies the stage under
+the host's locks and queues a systemd user unit that takes `~/lanes/.bench.lock` and then
+`~/lanes/.heavy.lock`, and `--dry-run` prints those commands instead. The unit's `run`
+checks again under the locks, times a first pass, reruns the queries flagged in any pair
+with more rounds and writes `verdict.md`.
+
+The harness forks curl, grep and awk for every request, which costs about 19 ms of client
+time per request and most of a screen's time. `REQUEST_CLIENT=persistent` sends the same
+requests from one process over one kept-alive connection, so a server process's work
+takes a fraction of the time. Back-to-back requests find the server warmer, though, and
+queries under about 0.5 ms read several times faster in `execMs` than with curl, so the
+persistent client measures a different regime and no screen uses it until it is qualified
+on an Intel host. `REQUEST_GAP_MS` adds a pause before each of its requests, and
+`timing-kit.py stage --clients` times every arm under several clients in one run for that
+qualification.
 
 <a id="namespace-query-screens"></a>
 
@@ -1316,8 +1351,8 @@ read, unless `--allow-mixed-compilers` is given. A revision it builds also gets 
 and the cargo flags. A cache entry that a build outside the shell left behind has to be
 removed before the revision is built again in the shell.
 
-A Boat worker is a shared virtual machine. The screen is therefore suited to changes of
-about 10% or more and to checking that a change leaves the other queries alone. It cannot
+A Boat worker is a shared virtual machine. A screen there is therefore suited only to a
+quick look at changes of about 10% or more. It cannot
 confirm a change of a few percent, and [Choosing a host](#choosing-a-host) says where to
 measure those. Queries under 0.1 ms vary widely between server processes and say little
 on their own.
