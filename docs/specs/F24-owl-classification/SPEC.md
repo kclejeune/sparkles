@@ -384,6 +384,15 @@ full, as past the bound on conclusions. A run that leaves out an inference too w
 for this limit or for an at-most restriction with too many candidates, now falls back even when it has
 no bound on its conclusions, where it answered as complete without the inference before.
 
+On one thread on forge the six files of the laptop counts classify in 0.79 to 0.91 times
+the base's time with the pruning alone, and with the width limit ore_ont_14817 and
+ore_ont_9663 take 2.3 and 4.9 s against 57.4 and 74.3 s for the base. GO, which has no
+disjunctive attempt, takes 0.99 times the base's time. On four threads the rounds of one
+binary spread by up to 24% on those two files, so the forge run decides nothing there,
+and the four other files take 0.88 to 0.96 times the base's time. The
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#the-disjunctive-attempt-and-the-universals-on-the-benchmark-host)
+gives every file.
+
 Item 869 found where the Horn rules with individuals spend their time on four files of
 the ORE 2015 DL development set with 7,856 to 114,957 property assertions,
 `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`. A diagnostic build
@@ -506,6 +515,15 @@ rules and not kept, as [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#r
 records. Item 693 keeps the remaining cost of the Horn rules on the two files, which
 still derive 22.1 and 35.6 million conclusions against 16.5 and 10.8 million for the EL
 rules alone.
+
+The rule for a new universal no longer searches the context's universals for the same
+role and filler. A context derives each universal once, since a role and a filler have
+one node, and a repeat would only repeat work, because the successor rule deduplicates
+the fillers it collects. A debug assertion keeps the premise, and it held in the test
+suite, in debug classifications of GO, ore_ont_14817 and ore_ont_9663 on one and four
+threads, and in a corpus sweep with the same results as the build with the search. On
+one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
+0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1232 follows.
 
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and

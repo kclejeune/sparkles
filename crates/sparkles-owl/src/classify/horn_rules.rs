@@ -771,9 +771,12 @@ pub fn forall<S: Sink>(ix: &Index, _me: Ex, st: &mut State, s: Role, a: Ex, out:
         return;
     }
     let h = hs(st);
-    if h.alls.contains(&(s, a)) {
-        return;
-    }
+    // the rule runs once for each universal the context derives, whose node is the only
+    // one of its role and filler, so the list holds it already only when it came twice
+    debug_assert!(
+        !h.alls.contains(&(s, a)),
+        "a universal that the context derived twice"
+    );
     h.alls.push((s, a));
     if !h.all_roles.contains(&s) {
         h.all_roles.push(s);

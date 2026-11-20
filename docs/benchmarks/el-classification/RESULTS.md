@@ -1813,6 +1813,55 @@ consistency and taxonomy bytes. On one thread the 96 disjunctive development fil
 conclusions with the pruning change, and the counters of products and clauses of the 15
 that attempt the rules agree at every doubling of the work.
 
+### The disjunctive attempt and the universals on the benchmark host
+
+Forge ran five rounds of four builds on one and four threads, one process per build, file
+and thread count, in an order that rotates with the round. The base is commit 09f6ed15.
+The tip, commit 378127e2, runs with the pruning of items 990 and 1011 and the one-thread
+width limit, and tip0 is the same binary with the limit off. The fourth build is the tip
+without the check for a repeated universal in the rule for a new universal (item 693),
+which the next section describes. Each cell is the median over the rounds of each
+process's median classification time, and the range is that of the five rounds' ratios.
+
+| Ontology | Base ms | Tip ms | Tip / base | Tip0 / base | Without the check / tip | Range of that ratio |
+|---|---:|---:|---:|---:|---:|---|
+| GO | 307.0 | 303.5 | 0.989 | 0.989 | 1.004 | 1.002 to 1.007 |
+| `ore_ont_13103` | 1,928.7 | 1,743.6 | 0.904 | 0.903 | 1.000 | 0.996 to 1.002 |
+| `ore_ont_14817` | 57,350.4 | 2,325.9 | 0.041 | 0.831 | 0.979 | 0.978 to 0.987 |
+| `ore_ont_16680` | 5,866.2 | 5,140.5 | 0.876 | 0.875 | 0.997 | 0.997 to 1.004 |
+| `ore_ont_3215` | 13,616.4 | 11,652.6 | 0.856 | 0.858 | 1.006 | 0.997 to 1.012 |
+| `ore_ont_5438` | 609.0 | 553.7 | 0.909 | 0.909 | 0.998 | 0.996 to 1.000 |
+| `ore_ont_9663` | 74,250.1 | 4,939.5 | 0.067 | 0.788 | 0.976 | 0.973 to 0.983 |
+
+The table gives the one-thread runs. Every run of every build exited normally and gave the
+same taxonomy on each file. On one thread the pruning alone makes the six ORE files 9% to
+21% faster, and the width limit ends the failing attempts of `ore_ont_14817` and
+`ore_ont_9663` 25 and 15 times sooner. GO has no disjunctive attempt and moves by about 1%.
+
+On four threads the rounds of one binary spread too widely to decide these changes. Tip
+and tip0 are one binary doing the same work above one thread, and their ratio ranges from
+1.02 to 1.17 on `ore_ont_14817` and from 0.76 to 1.07 on `ore_ont_9663`. Against the base,
+the tip's medians are 0.89 and 1.12 on those two files, with ranges of 0.77 to 0.94 and
+0.87 to 1.21, so neither is a speedup or a slowdown. On the other four ORE files the tip
+on four threads is 4% to 12% faster than the base, below 1 in every round.
+
+### The check for a repeated universal
+
+The rule for a new universal searched the context's list of universals for the same role
+and filler before it added one. A context derives each universal once, since each pair of a
+role and a filler has one node, so the build in the table above drops the search and keeps
+it as a debug assertion. A duplicate would only repeat work, because the successor rule
+deduplicates the fillers it collects. The assertion held in the whole test suite, in debug
+classifications of GO, `ore_ont_14817` and `ore_ont_9663` on one and four threads, and the
+corpus sweep of GO, ChEBI lite, the 298 ORE 2015 EL files and the 207 DL development files
+on one and four threads gave the same results with and without the search on the 1,010
+pairs that both builds classified.
+
+On one thread on forge `ore_ont_14817` and `ore_ont_9663` classify 2.1% and 2.4% faster without the
+search, below 1 in every round. GO takes 0.2% to 0.7% longer in each round, a median of
+0.6 ms of 303 ms, although the two arms of one binary on GO range from 0.997 to 1.009.
+Roadmap item 1232 holds that cost. The other files move by less than the spread of their rounds.
+
 ## Records
 
 The [record of the guarded Horn rules](runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json) holds the Atlas process reports and taxonomy hashes, the HermiT comparison summary, the original count-only witness diagnostics and the separate four-round Atlas control of the default Uberon attempt. The [same-snapshot witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) holds the later correctness comparison of the named-class sets.
@@ -1931,6 +1980,13 @@ holds the instruction counts, the corpus sweep with its comparison, the counter 
 the development set and of the generated ontologies with a union, the profile of
 `ore_ont_14817`, the patches of the diagnostic builds and the scripts. Its times come from
 a loaded laptop and are not measurements.
+
+The [forge record of the disjunctive attempt and the universals](runs/2026-11-20-horn-cost-forge-378127e2/record.json)
+holds every classification of the five rounds on forge of the base, the tip with and
+without the width limit and the build without the check for a repeated universal, with
+their process reports, taxonomy hashes, binary and data hashes, the host state before and
+after, the patch of that build, the laptop's corpus sweep and debug classifications of
+that build and the scripts that ran.
 
 The [record of item 990](runs/2026-11-15-disjunctive-bound-atlas-0decd1de/record.json)
 holds every classification of the rounds on `atlas` of both builds, the attempts that pass

@@ -39,6 +39,13 @@ of more than `Limits::dl_attempt_width` choices, 1,048,576 by default, so that
 conclusions instead of 22.4 million, in 25.6 and 51.1 G instructions against 584 and 700 G,
 with the same taxonomies (roadmap items 990 and 1011). `el_classify --dl-attempt-width N`
 sets the limit, and roadmap item 1225 follows why one thread makes such wide products.
+On one thread on forge the two files classify in 2.3 and 4.9 s against 57.4 and 74.3 s, and
+the other four in 0.86 to 0.91 times the base's time.
+
+The rule of the Horn rules for a new universal no longer searches the context's universals
+for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
+`ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
+item 1232 follows (item 693).
 
 ### Targeted checks on a remote host
 
