@@ -357,16 +357,44 @@ fn table_growth<T>(len: usize, capacity: usize, more: usize) -> u64 {
     table_bound(target, std::mem::size_of::<T>())
 }
 
+/// The width in bytes of hashbrown's control groups on this target, chosen as hashbrown
+/// 0.16 chooses its group implementation. SSE2 on x86 scans 16 bytes at once, NEON on
+/// little-endian ARM64 scans 8, and the portable groups scan a machine word. The
+/// workspace pins hashbrown and does not enable its `nightly` feature, so the 16-byte
+/// LSX groups of LoongArch are not chosen.
+const GROUP_WIDTH: usize = if cfg!(all(
+    target_feature = "sse2",
+    any(target_arch = "x86", target_arch = "x86_64"),
+    not(miri),
+)) {
+    16
+} else if cfg!(any(
+    target_pointer_width = "64",
+    target_arch = "aarch64",
+    target_arch = "x86_64",
+    target_arch = "wasm32",
+)) {
+    8
+} else {
+    4
+};
+
 /// The buckets a hashbrown table of entries of `entry` bytes allocates for room for
 /// `capacity` entries, which are a power of two at most seven eighths full, and at
-/// least four. A small table of entries of one to three bytes is given room for at
-/// least 14 or 7 entries, so that its buckets fill a control group of 16 bytes. That is
-/// the rule for the 16-byte groups of SSE2, and an upper bound for the 8-byte groups of
-/// other targets.
+/// least four. A small table of entries smaller than a control group is given more
+/// room, so that its buckets fill the group's alignment. With 16-byte groups that is at
+/// least 14 entries of one byte or 7 of two or three bytes, and with 8-byte groups at
+/// least 7 entries of one byte.
 fn buckets(capacity: usize, entry: usize) -> usize {
-    let capacity = match entry {
-        0..=1 => capacity.max(14),
-        2..=3 => capacity.max(7),
+    buckets_for(GROUP_WIDTH, capacity, entry)
+}
+
+/// [`buckets`] for control groups of `width` bytes.
+fn buckets_for(width: usize, capacity: usize, entry: usize) -> usize {
+    let capacity = match (width, entry) {
+        (16, 0..=1) => capacity.max(14),
+        (16, 2..=3) => capacity.max(7),
+        (8, 0..=1) => capacity.max(7),
         _ => capacity,
     };
     if capacity < 8 {
@@ -888,6 +916,70 @@ mod tests {
             t.insert_reserved(x as u64, x, hash);
             assert_eq!(t.bytes(), t.allocation_size() as u64);
         }
+    }
+
+    /// The predicted room of a table equals hashbrown's for entries of no bytes to an
+    /// over-aligned 32, grown from empty, grown from the room it has, asked for no more
+    /// and reused after a clear, which checks the group width this target's rule
+    /// assumes. Each table stays within its admitted bound.
+    #[test]
+    fn the_predicted_room_matches_hashbrown_for_small_entries() {
+        #[derive(Default)]
+        #[repr(align(32))]
+        struct Wide(#[allow(dead_code)] u8);
+        fn check<T: Default>(entry: &str) {
+            let size = std::mem::size_of::<T>();
+            for cap in 1..=300 {
+                let mut t = hashbrown::HashTable::<T>::new();
+                assert_eq!(table_capacity_after::<T>(0, 0, 0), 0);
+                t.reserve(cap, |_| 0);
+                assert_eq!(
+                    table_capacity_after::<T>(0, 0, cap),
+                    t.capacity(),
+                    "{entry} {cap} with groups of {GROUP_WIDTH}"
+                );
+                assert!(
+                    t.allocation_size() as u64 <= table_bound(cap, size),
+                    "{entry} {cap}"
+                );
+            }
+            // fill a table one entry at a time, growing from the room it has
+            let mut t = hashbrown::HashTable::<T>::new();
+            for n in 0..300u64 {
+                let (len, capacity) = (t.len(), t.capacity());
+                assert_eq!(table_capacity_after::<T>(len, capacity, 0), capacity);
+                let room = table_capacity_after::<T>(len, capacity, 1);
+                t.reserve(1, |_| n);
+                assert_eq!(t.capacity(), room, "{entry} at {len}");
+                t.insert_unique(n, T::default(), |_| n);
+            }
+            let capacity = t.capacity();
+            t.clear();
+            assert_eq!(table_capacity_after::<T>(0, capacity, capacity), capacity);
+            t.reserve(capacity, |_| 0);
+            assert_eq!(t.capacity(), capacity, "{entry} reused");
+        }
+        check::<()>("()");
+        check::<u8>("u8");
+        check::<u16>("u16");
+        check::<[u8; 3]>("[u8; 3]");
+        check::<u32>("u32");
+        check::<u64>("u64");
+        check::<Id>("Id");
+        check::<Wide>("Wide");
+    }
+
+    /// The bucket rule of both group widths, which a target checks against hashbrown
+    /// for its own width only.
+    #[test]
+    fn the_bucket_rule_follows_the_group_width() {
+        // one entry of one, two and four bytes
+        assert_eq!([1, 2, 4].map(|entry| buckets_for(16, 1, entry)), [16, 8, 4]);
+        assert_eq!([1, 2, 4].map(|entry| buckets_for(8, 1, entry)), [8, 4, 4]);
+        // seven and eight entries of one byte, and fifteen of any size
+        assert_eq!([7, 8, 15].map(|cap| buckets_for(16, cap, 1)), [16, 16, 32]);
+        assert_eq!([7, 8, 15].map(|cap| buckets_for(8, cap, 1)), [8, 16, 32]);
+        assert_eq!([3, 4, 15].map(|cap| buckets_for(8, cap, 8)), [4, 8, 32]);
     }
 
     fn ids(xs: &[i64]) -> Vec<Id> {

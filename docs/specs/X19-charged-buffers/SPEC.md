@@ -237,6 +237,11 @@ other work is rewriting move under item 1192.
 The design comes from Sparkles' own operators and their audits. It uses no outside
 source beyond the hashbrown crate, a workspace dependency pinned at 0.16.1. Its
 documented `allocation_size` gives a table's size, and the bound a table is admitted at
-follows that release's bucket rule, which raises a small table of one-byte entries to 14
-entries and of two- or three-byte entries to 7. A hashbrown upgrade rechecks
-`the_bound_covers_every_table_size` and `a_table_of_bytes_grows_within_its_bound`.
+follows that release's bucket rule. The rule raises a small table to fill its control
+group. With the 16-byte groups of SSE2 on x86 a table of one-byte entries gets room for
+at least 14 entries and one of two- or three-byte entries room for 7, and with the 8-byte
+groups of ARM64 and the portable implementation a table of one-byte entries gets room for
+7. `Charged` chooses the group width as that release chooses its group implementation. A
+hashbrown upgrade rechecks `the_bound_covers_every_table_size`,
+`a_table_of_bytes_grows_within_its_bound` and
+`the_predicted_room_matches_hashbrown_for_small_entries`.

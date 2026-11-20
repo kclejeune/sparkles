@@ -798,9 +798,9 @@ mod tests {
     /// `count` batches of `rows` new rows each, of `width` columns, under a budget that
     /// sets the pass's threshold at its least and leaves `room` bytes when the second
     /// batch arrives. Every row comes out once, and every charge returns. Returns
-    /// whether the set stopped growing at the second batch and the sizes of its
-    /// buffers after it.
-    fn batches(width: usize, rows: usize, room: u64, count: usize) -> (bool, (u64, u64)) {
+    /// whether the set stopped growing at the second batch, whether its buffers kept
+    /// the sizes they had before it, and those sizes.
+    fn batches(width: usize, rows: usize, room: u64, count: usize) -> (bool, bool, (u64, u64)) {
         let tmp = tempfile::tempdir().unwrap();
         let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
             dir: tmp.path().to_path_buf(),
@@ -833,7 +833,11 @@ mod tests {
         let mut output = Vec::new();
         let mut neighbor = None;
         let mut froze = false;
-        let mut after = (0, 0);
+        let (mut before, mut after) = ((0, 0), (0, 0));
+        let sizes = |distinct: &Distinct| match distinct.seen.as_ref().expect("distinct state") {
+            Seen::One(ids) => (ids.bytes(), 0),
+            Seen::Many(set) => (set.table_bytes(), set.arena_bytes()),
+        };
         for b in 0..count {
             let mut buffer = Buffer::new(&ctx, &vars, rows).unwrap();
             for (c, column) in buffer.table.cols.iter_mut().enumerate() {
@@ -846,16 +850,14 @@ mod tests {
                 assert!(free > room, "{free} bytes of room");
                 neighbor = ctx.retained_charge(free - room).unwrap();
                 assert_eq!(ctx.memory_room(), room);
+                before = sizes(&distinct);
             }
             distinct
                 .apply(&ctx, &mut buffer)
                 .unwrap_or_else(|e| panic!("batch {b} with {room} bytes of room: {e}"));
             if b == 1 {
                 froze = distinct.frozen;
-                after = match distinct.seen.as_ref().expect("distinct state") {
-                    Seen::One(ids) => (ids.bytes(), 0),
-                    Seen::Many(set) => (set.table_bytes(), set.arena_bytes()),
-                };
+                after = sizes(&distinct);
             }
             collect(&buffer, &mut output);
         }
@@ -872,7 +874,8 @@ mod tests {
         drop(distinct);
         assert_eq!(ctx.live_bytes(), baseline);
         assert_eq!(spill.reserved_bytes(), 0);
-        (froze, after)
+        assert!(before.0 > 0, "the set holds the first batch");
+        (froze, after == before, after)
     }
 
     /// The table and the arena of a two-column set grow one after the other, and their
@@ -881,21 +884,22 @@ mod tests {
     /// scratch that a table grown alone would have taken.
     #[test]
     fn a_pair_growth_that_does_not_fit_leaves_both_buffers() {
-        let (froze, after) = batches(2, 3584, 132_000, 2);
+        let (froze, kept, after) = batches(2, 3584, 132_000, 2);
         assert!(froze, "the set must stop growing");
-        assert_eq!(after, (20_496, 57_344), "neither buffer grows");
+        assert!(kept, "neither buffer grows, and they hold {after:?}");
     }
 
     /// The pair's growth at the second batch admits 135,184 bytes, and its new table
-    /// and arena take 155,680 bytes whole. With room between the two the set stops
-    /// growing, as it did before its buffers were charged, and leaves that room to
-    /// the operators above it.
+    /// and arena take 155,680 bytes whole, with the 16-byte control groups of SSE2.
+    /// With room between the two the set stops growing, as it did before its buffers
+    /// were charged, and leaves that room to the operators above it. With 8-byte groups
+    /// the new table is 8 bytes smaller, and the same rooms give the same results.
     #[test]
     fn a_growth_leaves_the_room_of_its_new_allocations() {
-        let (froze, after) = batches(2, 3584, 145_000, 2);
+        let (froze, kept, after) = batches(2, 3584, 145_000, 2);
         assert!(froze, "the set must stop growing");
-        assert_eq!(after, (20_496, 57_344), "neither buffer grows");
-        let (froze, _) = batches(2, 3584, 155_680, 2);
+        assert!(kept, "neither buffer grows, and they hold {after:?}");
+        let (froze, _, _) = batches(2, 3584, 155_680, 2);
         assert!(!froze, "the new allocations fit");
     }
 
@@ -904,9 +908,9 @@ mod tests {
     /// smaller ranges where its scratch does not fit at once.
     #[test]
     fn a_later_freeze_passes_rows_on_in_ranges_that_fit() {
-        let (froze, _) = batches(2, 3584, 160_000, 3);
+        let (froze, _, _) = batches(2, 3584, 160_000, 3);
         assert!(!froze, "the pair fits at the second batch");
-        let (froze, _) = batches(1, 7168, 180_000, 3);
+        let (froze, _, _) = batches(1, 7168, 180_000, 3);
         assert!(!froze, "the table fits at the second batch");
     }
 }
