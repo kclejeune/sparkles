@@ -66,8 +66,9 @@ twelve rounds of 50 requests. `cj-es` and `cj-se` run B on both sides, eager aga
 streaming in both orders, in twelve rounds of 100 requests. Each run keeps its queries,
 samples, answers, environment and exit status, and every server of every run returned
 the same answers. `confirm/combined` holds the output of `scripts/x08-gates/combine.py`
-over each pair's server time, and `confirm/combined-wall` its output over curl's wall
-time, which the same samples record in their `wall_ms` column, and `confirm/explain` the plans of the two `CountJoin` queries in each
+over each pair's server time. The samples' `wall_ms` column is curl's transfer time,
+which splits between about 1 and 2 ms for many short queries, so the analysis does not
+use it, and `confirm/explain` the plans of the two `CountJoin` queries in each
 mode from B on stanley over the same data.
 
 ## Instruction counts

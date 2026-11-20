@@ -841,22 +841,19 @@ the vector store was not counted.
 
 The other confirmed queries read as noise by the Intel rule, with an interval that
 reaches 1.0 or a median added time of at most 0.5 µs, and `subquery-agg` reads 0.988
-eager and 0.996 streamed. The first pass's vector script read 3% to 87% more client wall
-time with one thread for `q-ef-32`, `q-ef-64` and `q-ef-256`, with the same binary
-varying by up to 31% between its two servers. The confirmation's wall time is curl's
-own transfer time, which leaves out the start of the client process, and in it every vector query
-reads within 1.0006 of the base and adds at most 7 µs. The approximate searches sit near
-a floor of about 1.95 ms of wall time there, which would hide a cost of under about
-1.4 ms, but their server time adds at most 3.2 µs, so the first pass's flags came from
-the client processes and not from the item.
+eager and 0.996 streamed. The confirmation's wall times are curl's transfer times, which split between
+about 1 and 2 ms for many of the short queries, so the medians of that column move by a
+whole step between servers and the analysis uses server time.
 
-The text and geo scripts were not confirmed, and every query that their first pass read
-slower in both A,B,B,A pairs counts as a cost of item 1162 until a rerun with more rounds
-settles it. The ratios are of client wall time, the pairs are the two halves of the
-round, and the same-binary ratios compare the two servers of each build. Only
-`q6-touching-counties` and the streamed text `highlight` and `text-join` with one thread
-are slower than both same-binary ratios, and with 12 threads those three read faster
-than the base.
+The scripts' own client wall times, which include the start of a curl process per
+request, were not confirmed. Every query that their first pass read slower in both
+A,B,B,A pairs therefore counts as a cost of item 1162 until a rerun with more rounds
+settles it, though the vector queries' server time above adds only microseconds. The
+ratios are of client wall time, the pairs are the two halves of the round, and the
+same-binary ratios compare the two servers of each build. Only `q6-touching-counties`, the
+streamed text `highlight` and `text-join` and the streamed `q-ef-32`, `q-ef-64` and
+`q-ef-256` with one thread, and eager `q-ef-128` with 12 threads, differ from the base
+by more than either build's two servers differ from each other.
 
 | Script | Query | Mode | Threads | Base | Tip/base | Pairs | Base, tip same-binary |
 |---|---|---|--:|--:|--:|---|---|
@@ -876,6 +873,13 @@ than the base.
 | geo | `q2-distance` | eager | 1 | 15.78 ms | 1.017 | 1.058, 1.012 | 0.984, 0.941 |
 | geo | `q3-nearby` | streaming | 1 | 15.65 ms | 1.041 | 1.026, 1.015 | 0.879, 0.870 |
 | geo | `q3-nearby` | eager | 12 | 13.68 ms | 1.098 | 1.009, 1.238 | 0.859, 1.054 |
+| vector | `q-ef-32` | streaming | 1 | 6.25 ms | 1.870 | 1.374, 2.140 | 0.687, 1.070 |
+| vector | `q-ef-256` | streaming | 1 | 13.23 ms | 1.158 | 1.168, 1.126 | 0.994, 0.958 |
+| vector | `q-ef-64` | streaming | 1 | 10.74 ms | 1.097 | 1.135, 1.092 | 1.027, 0.988 |
+| vector | `q-ef-256` | eager | 1 | 12.05 ms | 1.093 | 1.174, 1.101 | 1.135, 1.064 |
+| vector | `q-ef-64` | eager | 1 | 10.32 ms | 1.033 | 1.045, 1.016 | 1.070, 1.040 |
+| vector | `q-exact-true` | eager | 12 | 15.92 ms | 1.115 | 1.108, 1.065 | 1.448, 1.391 |
+| vector | `q-ef-128` | eager | 12 | 9.87 ms | 1.015 | 1.009, 1.011 | 0.991, 0.993 |
 
 The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
 The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two
