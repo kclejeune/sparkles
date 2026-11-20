@@ -45,7 +45,7 @@ the other four in 0.86 to 0.91 times the base's time.
 The rule of the Horn rules for a new universal no longer searches the context's universals
 for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
 `ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
-item 1232 follows (item 693).
+item 1234 follows (item 693).
 
 ### Targeted checks on a remote host
 

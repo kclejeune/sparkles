@@ -524,7 +524,7 @@ suite and in debug classifications of GO, ore_ont_14817 and ore_ont_9663 on one 
 threads. A corpus sweep of the release builds with and without the search gave the same
 results on the 1,010 pairs that both classified. On
 one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
-0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1232 follows.
+0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1234 follows.
 
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and

@@ -1860,7 +1860,7 @@ pairs that both builds classified.
 On one thread on forge `ore_ont_14817` and `ore_ont_9663` classify 2.1% and 2.4% faster without the
 search, below 1 in every round. GO takes 0.2% to 0.7% longer in each round, a median of
 0.6 ms of 303 ms, although the two arms of one binary on GO range from 0.997 to 1.009.
-Roadmap item 1232 holds that cost. The other files move by less than the spread of their rounds.
+Roadmap item 1234 holds that cost. The other files move by less than the spread of their rounds.
 
 ## Records
 
