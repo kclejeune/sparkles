@@ -6,7 +6,8 @@
 //! and the ones it fits now and did not before, so a budget that changes either way
 //! fails, and the answer the operator gave before, as a row count and a digest of the
 //! rows. `PARITY_PRINT=1` prints the budgets each fixture fits and its answer, which is
-//! how the pinned values were read from the operator as it was, at commit 74f229b9.
+//! how the pinned values were read from the operator as it was, at commit 74f229b9, with
+//! this file copied onto that commit.
 //! `PARITY_ONLY=name` runs the fixtures whose names contain `name`.
 
 mod common;
@@ -131,6 +132,21 @@ const FIXTURES: &[Fixture] = &[
         before: &[(196608, 2064384)],
         gained: &[],
         answer: (50000, 18443397356448823050),
+        ordered: true,
+        numbered: true,
+        spills: true,
+    },
+    // Subjects 3000 apart have the same objects, so each pair of a subject's objects
+    // recurs every 3000 subjects, across batches and spills, and pairs tied on `?o`
+    // arrive as A, B, A. The order of their first rows differs from that of their last.
+    Fixture {
+        name: "distinct numbered duplicates",
+        query: "SELECT DISTINCT ?o ?x { ?s <urn:q> ?o . ?s <urn:q> ?x } ORDER BY ?o",
+        spill: true,
+        range: (64 * K, 4096 * K, 32 * K),
+        before: &[(196608, 196608), (262144, 4161536)],
+        gained: &[],
+        answer: (15000, 10725031878691118488),
         ordered: true,
         numbered: true,
         spills: true,
@@ -314,4 +330,50 @@ fn distinct_fits_every_budget_it_fitted_before() {
         }
         println!("PARITY {:28} fits {:?}", f.name, ranges(&fits, step));
     }
+}
+
+/// The rows of `query` at an unlimited budget, each as the text of its terms.
+fn rows(s: &Store, query: &str) -> Vec<Vec<String>> {
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let mut c = select_cursor(s.snapshot(), query, &opts, &CursorOptions::default()).unwrap();
+    let mut out = Vec::new();
+    while let Some(b) = c.next_batch().unwrap() {
+        for row in 0..b.len() {
+            out.push(
+                (0..b.width())
+                    .map(|column| format!("{:?}", b.term(row, column).unwrap()))
+                    .collect(),
+            );
+        }
+    }
+    out
+}
+
+/// The numbered DISTINCT of the duplicates fixture keeps each row's first occurrence
+/// among the rows tied on the order key, which the order of the rows' last occurrences
+/// would not give, so the fixture's pinned answer tells the two apart.
+#[test]
+fn the_numbered_duplicates_keep_their_first_rows() {
+    let s = store(20_000);
+    let f = FIXTURES
+        .iter()
+        .find(|f| f.name == "distinct numbered duplicates")
+        .unwrap();
+    let all = rows(&s, &f.query.replacen("DISTINCT ", "", 1));
+    let mut seen = std::collections::HashSet::new();
+    let first: Vec<_> = all.iter().filter(|r| seen.insert(*r)).cloned().collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut last: Vec<_> = all
+        .iter()
+        .rev()
+        .filter(|r| seen.insert(*r))
+        .cloned()
+        .collect();
+    last.reverse();
+    assert!(all.len() > first.len(), "the fixture has no duplicates");
+    assert_ne!(first, last, "the first and last rows give one order");
+    assert_eq!(rows(&s, f.query), first);
 }

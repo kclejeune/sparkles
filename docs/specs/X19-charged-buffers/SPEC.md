@@ -188,7 +188,15 @@ fan-out are within every allowance.
 DISTINCT keeps the rows of unordered and segmented input in a set of `Charged` buffers
 on the query's retained account. A single column is a hash set of its IDs. Wider rows
 are a hash table of row numbers and an arena of their IDs, which grows toward the
-table's room so that the two stay in step, both in one `Rows` buffer. A query that may
+table's room so that the two stay in step, both in one `Rows` buffer. When the table
+grows, the arena's share of that room is at most the rows the set needs or twice the
+table's old room, whichever is more, which is the size the set grew to before the move.
+Hashbrown rounds a table's room up to a power of two of buckets, so a first growth or a
+large batch leaves the table room for many more rows than the set needs. An arena sized
+to all of that room takes room that the operators above a spilling set need. In the
+duplicates fixture below its first growth took 12,288 bytes more than before the move,
+and the sort above the numbered DISTINCT was refused at a budget of 196,608 bytes that
+the operator fitted before. A query that may
 spill stops growing the set before a growth that would take the predicted size of its
 buffers to the pass's threshold, before a growth whose new allocations taken whole
 exceed the room left, or when a growth is refused. The prediction is the bound each
@@ -207,15 +215,20 @@ passes its rows on in ranges whose scratch fits. A range whose scratch is refuse
 any of its rows are written is halved, so the rows of each partition keep their order,
 and a refusal of the scratch of one row is the query's.
 
-`crates/sparkles-core/tests/charged_parity.rs` sweeps six DISTINCT fixtures, single
-and wider rows, segmented, numbered below an ORDER BY and two spilled ones, over a range
+`crates/sparkles-core/tests/charged_parity.rs` sweeps seven DISTINCT fixtures, single
+and wider rows, segmented, two numbered below an ORDER BY and two spilled ones, over a range
 of budgets in steps of 4 KiB or 32 KiB. Each fixture pins the budgets of its sweep that
 it fitted before the move, read at commit 74f229b9, and the budgets it fits now and did
 not then, together with its answer before the move as a row count and a digest of the
-rows, which follows their order in the numbered fixture. Every pinned budget must fit
+rows, which follows their order in the numbered fixtures. The second numbered fixture
+pairs the objects of each subject, which recur every 3,000 subjects, so rows tied on the
+order key arrive as A, B, A across batches and spills. Its own test derives from the same
+query without DISTINCT that the rows repeat and that the order of their first rows
+differs from that of their last, and requires the DISTINCT's answer to be the first.
+It fits the budgets it fitted before, 196,608 bytes and every budget from 262,144. Every pinned budget must fit
 with that answer and no slack, and a budget that fits or misses outside the pins fails,
 so a hole inside a range is seen as well as a higher smallest fit. The plan must run one
-native DISTINCT, numbered in the numbered fixture, and the spilled fixtures must spill
+native DISTINCT, numbered in the numbered fixtures, and the spilled fixtures must spill
 from that node. The wider-row fixture fits from 1,769,472 bytes where it needed
 1,933,312, the one-column spilled fixture from 40,960 where it needed 57,344, and the
 wider spilled fixture from 98,304 where it needed 131,072. A change of fit between two
@@ -240,8 +253,9 @@ place, with spilled fixtures for the sort, DISTINCT, the hashed grouping and the
 join, and every fixture checks the plan operator it exercises. The first run's findings are
 recorded above with their items. DISTINCT is on `Charged` buffers. Removing the charge
 of its arena or of its one-column set, or admitting a growth only after it allocates,
-fails its fixtures. Its six parity sweeps fit every budget they fitted before the move,
-with the answers they gave. The external sort moves under item 1193, and the operators that
+fails its fixtures. Its seven parity sweeps, one of them with rows that repeat across
+batches and spills, fit every budget they fitted before the move, with the answers they
+gave. The external sort moves under item 1193, and the operators that
 other work is rewriting move under item 1192.
 
 ## Provenance

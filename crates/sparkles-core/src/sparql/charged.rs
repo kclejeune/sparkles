@@ -595,7 +595,8 @@ impl Rows {
 
     /// What a growth for `more` rows makes: whether the table and the arena grow, the
     /// table's bound, and the arena's IDs where the budget allows the arena to grow to
-    /// the table's room and where it does not.
+    /// the table's room and where it does not. A growth of the table bounds that room at
+    /// the rows the set needs or twice the table's old room, whichever is more.
     fn plan(&self, more: usize) -> Option<RowsGrowth> {
         let (len, capacity) = (self.table.len(), self.table.capacity());
         let need = self.ids.len().checked_add(more.checked_mul(self.width)?)?;
@@ -605,8 +606,19 @@ impl Rows {
             return None;
         }
         // The arena grows toward the rows the table has room for, which keeps the two
-        // in step and keeps the arena from doubling past the table.
-        let toward = table_capacity_after::<u32>(len, capacity, more).saturating_mul(self.width);
+        // in step and keeps the arena from doubling past the table. When the table
+        // grows, that is at most the rows the batch needs or twice the table's old room,
+        // whichever is more. A table rounds its room up to a power of two of buckets, so
+        // a first growth or a large batch leaves it room well past both, and an arena
+        // sized to that room would hold IDs for rows the set may never keep, in room
+        // that operators above a spilling set need.
+        let after = table_capacity_after::<u32>(len, capacity, more);
+        let rows = if table {
+            after.min(len.saturating_add(more).max(capacity.saturating_mul(2)))
+        } else {
+            after
+        };
+        let toward = rows.saturating_mul(self.width);
         Some(RowsGrowth {
             table: table.then(|| table_growth::<u32>(len, capacity, more)),
             arena: arena.then_some((need.max(toward), need)),

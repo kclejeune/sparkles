@@ -567,8 +567,9 @@ mod tests {
     }
 
     /// A DISTINCT over 32 rows and then 40 more, of which eight repeat earlier rows, under
-    /// `limit`. Hashbrown rounds 32 entries to room for 56 and the arena grows to match,
-    /// so the second batch grows both. They grow one after the other on one charge, which
+    /// `limit`. Hashbrown rounds 32 entries to room for 56 and the arena takes the 32 rows
+    /// the batch needs, so the second batch grows both, the arena to the table's room of
+    /// 112. They grow one after the other on one charge, which
     /// admits the larger of the two growths before either, and not both.
     /// Returns the room the batch needs with the arena at the table's room and with the
     /// arena at what it needs, read from the buffers' sizes.
@@ -626,8 +627,8 @@ mod tests {
         let (old_table, old_arena, hash, arena) = sizes(&distinct);
         assert_eq!(
             (hash, arena),
-            (56, 56 * width),
-            "the arena keeps step with the table"
+            (56, 32 * width),
+            "a first growth sizes the arena to the batch, not the table's rounded room"
         );
         let rest = ctx.live_bytes() - old_table - old_arena;
         let neighbor = ctx
@@ -881,7 +882,11 @@ mod tests {
     /// The table and the arena of a two-column set grow one after the other, and their
     /// pair is admitted before either allocates. Here the table's growth fits and the
     /// pair's does not, so neither grows and the frozen batch has the room for its
-    /// scratch that a table grown alone would have taken.
+    /// scratch that a table grown alone would have taken. The room is also below the
+    /// growth's new allocations, so the set stops growing before the pair is admitted,
+    /// and a table grown on its own charge passes this test. The non-spilling
+    /// `set_growth_is_charged_and_denied_before_allocation` reaches the pair's admission
+    /// and fails such a table.
     #[test]
     fn a_pair_growth_that_does_not_fit_leaves_both_buffers() {
         let (froze, kept, after) = batches(2, 3584, 132_000, 2);
