@@ -13,7 +13,9 @@ counts from its pairs holds one batch where eager holds every pair, and a count 
 merge join on two or more variables still runs the eager kernel. The strict policy refuses
 the forms that remain without a resumable reader, which the second part of the item
 covers. On forge, the text, geo and vector scripts read within noise of the base except
-eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds.
+eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds, and
+streamed `q9-star` with 12 threads, which a rerun against the tip's merge base put at
+0.966.
 
 ### Targeted checks on a remote host
 

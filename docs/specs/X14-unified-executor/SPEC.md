@@ -1216,12 +1216,12 @@ queries that run the same instructions in either mode are 0.6% to 2.8% slower, w
 The text, geo and vector scripts ran on forge in three rounds of the two binaries, with six
 pairs per query, as the phase's comparison of wall time. Of 88 configurations, 80 read as
 noise and 5 as faster. Eager `q6-touching-counties` with one thread reads 1.2% slower and
-eager `q-ef-64` with one thread 8.0% slower, though its wall times are bimodal, its servers
-differ from each other by up to 78% and its server time is 1.2% longer, and item 1162
-holds both. Streamed `q9-star` with 12 threads read 1.144, and a rerun of that query
+eager `q-ef-64` with one thread 8.0% slower, which is over the plan's 5% threshold on wall
+time. Its wall times are bimodal, its servers differ from each other by up to 78% and its
+server time is 1.2% longer, and item 1162 holds both costs. Streamed `q9-star` with 12 threads read 1.144, and a rerun of that query
 alone, with 12 server processes per build and mode, put the tip at cde29b37 at 0.966 of
 its merge base with main, 5f3f69c2, streamed and 1.006 eager, so no query is 5% or more
-slower at 12 threads. The
+slower at 12 threads, which is the stage's acceptance gate. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
 
 ### Readings of errors in aggregates
