@@ -1179,7 +1179,7 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
 }
 
 /// Whether a context other than the root selects the ground literals in its bodies, item
-/// 804's selection (F24). It is off until row 1220's repair, since two selected clauses of
+/// 804's selection (F24). It is off until item 1220's repair, since two selected clauses of
 /// one context never meet in Hyper over x, so that a run could report itself complete and
 /// miss an entailed subsumption. `SPARKLES_ROOTED_SELECT_GROUND=1` turns it on, for
 /// measurement.
@@ -1188,11 +1188,11 @@ pub fn select_ground() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "1"))
 }
 
-/// Which Joins the restriction on ground inferences exempts, row 1220's containment. When
+/// Which Joins the restriction on ground inferences exempts, item 1220's containment. When
 /// the partners are facts that hold only under the context's core, no ancestor holds
 /// them, and one Join, which resolves a single literal, leaves a ground clause with a body
 /// that the restriction would drop before the next Join could discharge it. Every Join is
-/// exempt until row 1220's repair. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts every Join and
+/// exempt until item 1220's repair. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts every Join and
 /// `=2` exempts a Join whose premise on the side of the head has no ground literal in its
 /// body, for measurement.
 pub fn join_exempt() -> u8 {

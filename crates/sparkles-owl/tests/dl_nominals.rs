@@ -978,7 +978,7 @@ fn a_rewritten_run_that_does_not_take_tier_d_answers_as_a_fresh_classifier() {
 
 /// Facts over constants that hold only under K, a successor of K that reaches the same
 /// constants, and an inference over the successor whose two premises each come from one
-/// of those facts (row 1220). The successor holds the facts only as markers, so each
+/// of those facts (item 1220). The successor holds the facts only as markers, so each
 /// premise has a ground literal in its body. With the selection of such literals, the two
 /// premises never met, and the run reported itself complete without the subsumption.
 const MEET: &str = "SubClassOf(:K ObjectSomeValuesFrom(:r :D))
@@ -1044,7 +1044,7 @@ fn two_facts_under_a_class_meet_even_when_the_predecessor_reads_their_atoms() {
 /// The successor's clash `B(v) ∧ B2(w) → ⊥` reaches K, which holds both facts as its own.
 /// Join resolves one literal at a time, and the restriction on ground inferences dropped
 /// the ground clause with a body that the first Join leaves, although no ancestor of K
-/// holds the facts to make the inference in its place (row 1220).
+/// holds the facts to make the inference in its place (item 1220).
 #[test]
 fn a_clash_of_two_facts_under_a_class_at_its_successor_makes_the_class_empty() {
     for (succ, clash) in [

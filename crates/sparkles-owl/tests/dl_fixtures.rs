@@ -480,7 +480,7 @@ fn the_rooted_run_is_exact_on_the_shoi_fixtures_within_its_bound() {
         .collect();
     cases.sort();
     assert_eq!(cases.len(), 50);
-    // shoi-005 and shoi-027 pass the bound while row 1220 keeps the selection of ground
+    // shoi-005 and shoi-027 pass the bound while item 1220 keeps the selection of ground
     // body literals off
     let past_bound = ["shoi-005", "shoi-022", "shoi-027", "shoi-042"];
     let mut exact = 0;
