@@ -10,9 +10,9 @@ into the keys, which made the run decode about 4% faster on `atlas`. The on-disk
 change. The store's test hooks, such as `Store::set_clock`, `Spill::inject_fault` and the
 vector and full-text pause hooks, now build only for tests or with the `failpoints` feature of
 `sparkles-core` and `sparkles`. `parse_source` and `parse_source_into` share their first rungs
-and one whole-slice parser. Before batch 46 two one-thread query cells read slower on `atlas`, and
-the instruction counts on batch 46 are equal, so roadmap item 1246 confirms them on the matrix
-after the push.
+and one whole-slice parser. Before batch 46 two one-thread query cells read slower on `atlas`, while
+on batch 46 the instruction counts of every benchmark query stay within their noise floor, so
+roadmap item 1246 confirms the two cells on the matrix after the push.
 
 ### Late existential restrictions take the clauses their successor already sent
 
