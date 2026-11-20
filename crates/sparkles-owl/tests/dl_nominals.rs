@@ -997,6 +997,7 @@ fn a_conditional_class_of_a_nominal_reaches_the_successors_of_a_fact() {
     assert_eq!(files.len(), 9, "{files:?}");
     let z = Class::new("http://example.org/n#Z");
     let ans = Class::new("http://example.org/n#Ans");
+    let mut checked = 0;
     for path in &files {
         let ax = ofn_read::parse(&std::fs::read_to_string(path).unwrap())
             .unwrap()
@@ -1019,6 +1020,7 @@ fn a_conditional_class_of_a_nominal_reaches_the_successors_of_a_fact() {
             let name = path.file_name().unwrap().to_string_lossy();
             assert_eq!(out.consistency, Consistency::Consistent, "{name}");
             if out.complete && k.excluded().is_empty() {
+                checked += 1;
                 assert!(
                     out.taxonomy.is_subclass(&z, &ans),
                     "{name}, {threads} threads, {expansion:?}: a complete run misses Z ⊑ Ans"
@@ -1026,4 +1028,6 @@ fn a_conditional_class_of_a_nominal_reaches_the_successors_of_a_fact() {
             }
         }
     }
+    // a run that reports every answer incomplete would pass the loop above without a check
+    assert!(checked > 0, "no run of the fixtures was complete");
 }
