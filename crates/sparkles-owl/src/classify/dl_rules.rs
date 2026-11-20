@@ -543,7 +543,7 @@ pub struct DlRun {
     width_limit: AtomicUsize,
     /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
     /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`], with
-    /// [`MREPAIR_HOLDER`] and [`MREPAIR_UNITS`] for measurements
+    /// [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements
     pub mrepair: u8,
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
@@ -558,6 +558,9 @@ pub const MREPAIR_HOLDER: u8 = 2;
 /// [`DlRun::mrepair`]: M-send sends the marker of a trigger that is a live unit of the root
 /// too, which the registered contexts take as the root's fact already.
 pub const MREPAIR_UNITS: u8 = 4;
+/// [`DlRun::mrepair`]: M-send sends the marker to every registered context, the wide arm,
+/// and not only to those that the root reaches by successors, the pair set P_R of PLAN v3.1.
+pub const MREPAIR_WIDE: u8 = 8;
 
 impl DlRun {
     pub fn new(eager: bool, worked: std::sync::Arc<std::sync::atomic::AtomicBool>) -> DlRun {

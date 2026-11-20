@@ -49,8 +49,8 @@
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
-    DlIx, DlSt, Found, MREPAIR_HOLDER, MREPAIR_ON, MREPAIR_UNITS, Side, alls, dix, dl, drain,
-    drain_with, ds, merge, pred_id, restricted, side, unit, with,
+    DlIx, DlSt, Found, MREPAIR_HOLDER, MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, Side, alls, dix,
+    dl, drain, drain_with, ds, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -106,6 +106,13 @@ pub struct RootSt {
     /// with the repair, in the root, its processed clauses whose bodies are ground
     /// triggers, under each body literal
     gbody: FxHashMap<Lit, Vec<u32>>,
+    /// with the repair's pair set, whether the root reaches the context by successors,
+    /// which the root is from its start
+    reached: bool,
+    /// with the repair's pair set, in the root, the contexts it reaches by successors that
+    /// told it so, and the constants each context registered for
+    reach_set: FxHashSet<Ex>,
+    regs: FxHashMap<Ex, Vec<u32>>,
 }
 
 impl RootSt {
@@ -144,6 +151,8 @@ impl RootSt {
             + table_bytes(self.hold_set.capacity(), 16)
             + lists(&self.held_at)
             + lists(&self.gbody)
+            + table_bytes(self.reach_set.capacity(), 4)
+            + lists(&self.regs)
     }
 
     /// Inserts `v` into `set`, whose entries take `size` bytes, and answers the bytes the
@@ -197,7 +206,7 @@ fn atom<S: Sink>(ix: &Index, out: &S, a: Ex, u: u32) -> Lit {
 /// the body `owl:Thing` give u.
 pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     st.init = true;
-    root_of(ds(st), out);
+    root_of(ds(st), out).reached = true;
     let mut found = Found::default();
     found.root = true;
     found.rule = "init";
@@ -971,9 +980,13 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
     let r = root_of(x, out);
     let mut grown = 0;
     let mut new = Vec::new();
+    let pairs = out.dl().mrepair & (MREPAIR_ON | MREPAIR_WIDE) == MREPAIR_ON;
     for &u in &us {
         if let Some(b) = RootSt::ins(&mut r.edge_set, (v, u), 8) {
             grown += b + RootSt::push(&mut r.edges, u, v);
+            if pairs {
+                grown += RootSt::push(&mut r.regs, v, u);
+            }
             new.push(u);
         }
     }
@@ -1007,7 +1020,9 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
             out.send(v, Concl::RPred(cid));
         }
     }
-    if out.dl().mrepair & MREPAIR_ON != 0 {
+    if out.dl().mrepair & MREPAIR_ON != 0
+        && (!pairs || x.root.as_deref().is_some_and(|r| r.reach_set.contains(&v)))
+    {
         m_registered(x, v, &new, out);
     }
     true
@@ -1148,6 +1163,13 @@ fn send_ground<S: Sink>(st: &mut State, w: Ex, l: Lit, out: &mut S) {
 /// A new successor w of the context takes the markers of the context's maximal ground
 /// literals.
 pub(super) fn new_succ<S: Sink>(st: &mut State, w: Ex, out: &mut S) {
+    if out.dl().mrepair & (MREPAIR_ON | MREPAIR_WIDE) == MREPAIR_ON
+        && dl(st)
+            .and_then(|x| x.root.as_deref())
+            .is_some_and(|r| r.reached)
+    {
+        out.send(w, Concl::RReach(TOP));
+    }
     let Some(ls) = dl(st)
         .and_then(|x| x.root.as_deref())
         .map(|r| r.ground.clone())
@@ -1407,7 +1429,7 @@ fn root_pred_of(
 /// Row 1231's marker repair for a run, as [`DlRun::mrepair`](super::dl_rules::DlRun)
 /// holds it: `on` is [`Limits::rooted_marker_repair`](super::Limits), and
 /// `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for measurements with `0`, `1` or a sum of
-/// the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`] and [`MREPAIR_UNITS`].
+/// the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`].
 pub(super) fn marker_repair(on: bool) -> u8 {
     static ENV: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
     let env = *ENV.get_or_init(|| {
@@ -1442,6 +1464,41 @@ fn m_note<S: Sink>(
         let c = out.dl().table.get(cid).clone();
         ret_products(st, &c, Some((l, prem)), found);
     }
+}
+
+/// The repair's pair set: the root reaches the context `me` by successors, from a
+/// predecessor that it reaches. The context tells the root, which sends it the markers of
+/// the held literals over the constants it registered for, and tells its successors in
+/// turn. In the root, the message is a context's, `e`, that the root now reaches.
+pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -> bool {
+    let Some(root) = dix(ix).root else {
+        return false;
+    };
+    if me == root {
+        let bottom = st.bottom;
+        let x = ds(st);
+        let r = root_of(x, out);
+        let Some(b) = RootSt::ins(&mut r.reach_set, e, 4) else {
+            return false;
+        };
+        out.dl().grow(b);
+        if bottom {
+            return true;
+        }
+        let us = r.regs.get(&e).cloned().unwrap_or_default();
+        m_registered(x, e, &us, out);
+        return true;
+    }
+    let r = rst(st, out);
+    if r.reached {
+        return false;
+    }
+    r.reached = true;
+    out.send(root, Concl::RReach(me));
+    for w in successors(ix, st) {
+        out.send(w, Concl::RReach(TOP));
+    }
+    true
 }
 
 /// Whether the ground literal `l`, with the constant `u`, is a live unit of the root.
@@ -1521,6 +1578,7 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
             .iter()
             .flat_map(|u| r.edges.get(u).into_iter().flatten().copied())
             .filter(|&d| d != root && (d != h || mode & MREPAIR_HOLDER != 0))
+            .filter(|d| mode & MREPAIR_WIDE != 0 || r.reach_set.contains(d))
             .collect();
         to.sort_unstable();
         to.dedup();

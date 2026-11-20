@@ -99,6 +99,9 @@ pub enum Concl {
     /// clause whose body is ground to a context that holds every body literal as a maximal
     /// literal, by its id in the run's table (M-return)
     RRet(u32),
+    /// Tier D in a rooted run with row 1231's marker repair: the root reaches the context
+    /// by successors, or in the root, the root reaches the context named
+    RReach(Ex),
 }
 
 // a conclusion takes three words, so that the to-do lists and outboxes keep their size
@@ -440,7 +443,8 @@ impl State {
             | Concl::REdge(..)
             | Concl::RFact(..)
             | Concl::RMark(..)
-            | Concl::RRet(..) => false,
+            | Concl::RRet(..)
+            | Concl::RReach(..) => false,
         }
     }
 
@@ -3009,6 +3013,7 @@ fn apply_rules<S: Sink, R: Rules>(
         Concl::RFact(c) if R::DISJ => dl_root::rfact(ix, st, c, out),
         Concl::RMark(h, l) if R::DISJ => dl_root::rmark(ix, st, h, l, out),
         Concl::RRet(c) if R::DISJ => dl_root::rret(ix, st, c, out),
+        Concl::RReach(e) if R::DISJ => dl_root::rreach(ix, me, st, e, out),
         Concl::Hyp(_)
         | Concl::DEdge(..)
         | Concl::PredC(..)
@@ -3017,7 +3022,8 @@ fn apply_rules<S: Sink, R: Rules>(
         | Concl::REdge(..)
         | Concl::RFact(..)
         | Concl::RMark(..)
-        | Concl::RRet(..) => {
+        | Concl::RRet(..)
+        | Concl::RReach(..) => {
             unreachable!("a conclusion of Tier D in a saturation without it")
         }
     }
