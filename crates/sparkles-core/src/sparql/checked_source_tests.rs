@@ -2830,8 +2830,9 @@ fn checked_graph_r12_admits_join_order_tables() {
     // with 2^n, stage 3 runs the program over them and stage 4 rebuilds its plan. The
     // greedy plan alone handles widths past 16, and a star of 12 is planned in rounds.
     // The copies of inputs that filters are placed on, whose size follows the input,
-    // are admitted in stage 3. Filter placement itself is stage 6, and the join
-    // estimates from characteristic sets or probes are stage 8. The last cases have a
+    // are admitted in stage 3. Filter placement itself is stage 6, the join
+    // estimates from characteristic sets or probes are stage 8, and the lists that
+    // filters move into between operators are stage 10. The last cases have a
     // sub-select input of 2 and of 12 patterns with a filter on its variables.
     let subtree = |k: usize| {
         let mut text = String::from("SELECT * WHERE { GRAPH ?g { { SELECT ?x0 ?x1 WHERE {");
@@ -2992,6 +2993,7 @@ fn checked_graph_r12_admits_join_order_tables() {
         (5, "greedy build", 256),
         (6, "filters", 512),
         (7, "joins", 512),
+        (10, "filter lists", 512),
     ];
     let mut failures = Vec::new();
     let mut run = Vec::new();
@@ -3235,7 +3237,7 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         GREEDY_PHASE, GREEDY_UNIT_PHASE, GROUP_PHASE, GROW_PHASE, JOIN_BUILD_PHASE, LEAF_PHASE,
         MODELS_PHASE, PARTS_PHASE, PREPARE_PHASE, ROUND_PHASE, SCRATCH_PHASE,
     };
-    use crate::sparql::plan::FILTER_PHASE;
+    use crate::sparql::plan::{FILTER_LIST_PHASE, FILTER_PHASE};
 
     // A chain of 12 is planned by the program in one round over 12 inputs, and a star
     // of 12 in several rounds.
@@ -3302,6 +3304,20 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
             (&chain, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
             (&chain, FILTER_PHASE, 0, usize::MAX),
             (&chain, FILTER_PHASE, usize::MAX, usize::MAX),
+            // the group's 13 filters as one FILTER's conjuncts, then moved below its BIND
+            (
+                &chain,
+                FILTER_LIST_PHASE,
+                0,
+                13 * size_of::<crate::sparql::expr::Expr>(),
+            ),
+            (
+                &chain,
+                FILTER_LIST_PHASE,
+                1,
+                13 * size_of::<crate::sparql::expr::Expr>(),
+            ),
+            (&chain, FILTER_LIST_PHASE, usize::MAX, usize::MAX),
             (&star, ROUND_PHASE, 1, 0),
             (&star, SCRATCH_PHASE, 1, 0),
             // the switch to rounds, then the first merged part, whose entries are too few
@@ -4152,6 +4168,145 @@ fn checked_graph_r12_refuses_graph_binding_index_candidate() {
         assert_eq!(
             allocated, seen,
             "cancel {cancel}: no copy after the refusal"
+        );
+    }
+}
+
+/// Groups whose filters planning moves between lists: a FILTER of 40 conjuncts that a
+/// BIND passes down, the same with one conjunct that stays above the BIND, a FILTER of
+/// a nested group that joins an outer one, filters that wait for a UNION that may
+/// leave their variable unbound, the same with a path that also binds it, and filters
+/// of two parts that share no variable, which meet in a keyed join.
+fn checked_filter_list_bodies() -> Vec<(&'static str, String)> {
+    let conj = |n: usize, var: &str, base: i64| {
+        (0..n)
+            .map(|k| format!("?{var} > {}", base - k as i64))
+            .collect::<Vec<_>>()
+            .join(" && ")
+    };
+    let union = "{ ?x <urn:c:1> ?y } UNION { ?x <urn:c:2> ?v }";
+    vec![
+        (
+            "conjuncts",
+            format!(
+                "?x <urn:v> ?v . FILTER({}) BIND(?x AS ?first)",
+                conj(40, "v", 0)
+            ),
+        ),
+        (
+            "one above",
+            format!(
+                "?x <urn:v> ?v . FILTER({} && ?first != <urn:n:absent>) BIND(?x AS ?first)",
+                conj(40, "v", 0)
+            ),
+        ),
+        (
+            "nested",
+            format!(
+                "{{ ?x <urn:v> ?v . FILTER({}) }} FILTER({}) BIND(?x AS ?first)",
+                conj(20, "v", 0),
+                conj(20, "v", -100)
+            ),
+        ),
+        (
+            "deferred",
+            format!(
+                "?x <urn:v> ?v . {union} FILTER({}) BIND(?x AS ?first)",
+                conj(30, "v", 0)
+            ),
+        ),
+        (
+            "late",
+            format!(
+                "?x <urn:v> ?v . {union} ?z <urn:c:1>+ ?v . FILTER({}) BIND(?x AS ?first)",
+                conj(30, "v", 0)
+            ),
+        ),
+        (
+            "keyed",
+            format!(
+                "?x <urn:v> ?v . ?z <urn:v> ?u . FILTER(?x = ?z && {}) BIND(?x AS ?first)",
+                conj(30, "u", 0)
+            ),
+        ),
+    ]
+}
+
+#[test]
+fn checked_graph_r12_admits_filter_input_lists() {
+    // Stage 10 is the lists of filters that planning makes or grows as it moves filters
+    // between operators, and stage 6 the FILTERs placed on the plan.
+    let mut failures = Vec::new();
+    for (name, body) in checked_filter_list_bodies() {
+        plan::LIST_REACH.with(|r| r.set([0; 6]));
+        let text = format!("SELECT * WHERE {{ GRAPH ?g {{ {body} }} }}");
+        let (excess, _) = checked_join_order_excess_kinds(12, &text);
+        let reach = plan::LIST_REACH.with(std::cell::Cell::get);
+        println!("{name}: {excess:?} lists {reach:?}");
+        for (stage, cap) in [(6, 512), (10, 512)] {
+            if excess[stage] > cap {
+                failures.push(format!(
+                    "{name}: {} unadmitted bytes in stage {stage}",
+                    excess[stage]
+                ));
+            }
+        }
+        let expected: &[(usize, usize)] = match name {
+            "conjuncts" | "one above" => &[(0, 40), (1, 40)],
+            "nested" => &[(0, 40), (1, 20)],
+            _ => &[(0, 30)],
+        };
+        for &(site, len) in expected {
+            if reach[site] < len {
+                failures.push(format!(
+                    "{name}: list {site} reached {} of {len}",
+                    reach[site]
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn checked_graph_r12_filter_input_lists_match_ordinary() {
+    use plan::Planner;
+    let store = default_chain_fixture(12);
+    let data = physical_default(&store);
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let prep = ctx.source_preparation.as_ref().unwrap().clone();
+    let graphs = checked_chain_fixture(12);
+    for (name, body) in checked_filter_list_bodies() {
+        let text = format!("SELECT * WHERE {{ {body} }}");
+        let Query::Select { pattern, .. } = parse_query(&text, None, &[]).unwrap() else {
+            unreachable!()
+        };
+        let ordinary = Planner::new(&ctx)
+            .plan(&pattern, &plan::ActiveGraph::Default, Vec::new())
+            .unwrap();
+        // The checked plan may take the query context's first growth step for the plan
+        // text of a constant, which shrinking returns (see the plan text test above).
+        ctx.shrink_retained(0).unwrap();
+        let before = prep.inner_used();
+        let live_before = ctx.live_bytes();
+        let checked = Planner::new(&ctx)
+            .plan_admitted_for_test(&pattern, &prep)
+            .unwrap();
+        assert_eq!(ctx.live_bytes(), live_before, "{name}: live bytes");
+        ctx.shrink_retained(0).unwrap();
+        assert_eq!(prep.inner_used(), before, "{name}: credit returns");
+        assert_eq!(
+            format!("{:?}", exec::describe(&ctx, &ordinary)),
+            format!("{:?}", exec::describe(&ctx, &checked)),
+            "{name}"
+        );
+        let text = format!("SELECT ?g ?x ?v WHERE {{ GRAPH ?g {{ {body} }} }} ORDER BY ?g ?x ?v");
+        let ordinary = query(graphs.snapshot(), &text, &opts()).unwrap();
+        let prepared = query_snapshot_prepared(graphs.snapshot(), &text, opts()).unwrap();
+        assert_eq!(
+            ordinary.test_application_rows(),
+            prepared.test_application_rows(),
+            "{name}"
         );
     }
 }

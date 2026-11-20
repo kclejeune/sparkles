@@ -369,6 +369,26 @@ impl Expr {
         }
     }
 
+    /// The number of top-level conjuncts, which [`Expr::conjuncts`] lists.
+    pub fn conjunct_count(&self) -> usize {
+        match self {
+            Expr::And(a, b) => a.conjunct_count().saturating_add(b.conjunct_count()),
+            _ => 1,
+        }
+    }
+
+    /// Push the top-level conjuncts onto `out` in the order of [`Expr::conjuncts`],
+    /// without a list of their own.
+    pub fn conjuncts_into(self, out: &mut Vec<Expr>) {
+        match self {
+            Expr::And(a, b) => {
+                a.conjuncts_into(out);
+                b.conjuncts_into(out);
+            }
+            e => out.push(e),
+        }
+    }
+
     pub fn has_exists(&self) -> bool {
         match self {
             Expr::Exists(_) => true,

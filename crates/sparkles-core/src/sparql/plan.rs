@@ -1466,7 +1466,8 @@ impl<'a> Planner<'a> {
             // Jena's `SERVICE <loop:…>`: evaluated per solution of the patterns before it
             GP::Join { left, right } if super::enhancer::is_loop(right) => {
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::enhancer::plan_loop(self, l, right, g, None)?;
                 self.apply_filters(n, top)
@@ -1477,7 +1478,8 @@ impl<'a> Planner<'a> {
                 expression,
             } if super::enhancer::is_loop(right) => {
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::enhancer::plan_loop(self, l, right, g, Some(expression.clone()))?;
                 self.apply_filters(n, top)
@@ -1565,7 +1567,8 @@ impl<'a> Planner<'a> {
                 // filters on variables every left row binds keep their value in the
                 // merged rows, as the right side cannot bind them differently
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::lateral::plan(self, l, right, g)?;
                 self.apply_filters(n, top)
@@ -1575,12 +1578,29 @@ impl<'a> Planner<'a> {
                 // short-circuiting. No sampling, conjunct reordering or pushdown.
                 let child = self.plan(inner, g, Vec::new())?;
                 let expression = self.compile_in_branch(expr, g)?;
-                let node = self.apply_filters(child, vec![expression])?;
+                // On the checked route the list of one is admitted before it is made.
+                let mut single = Vec::new();
+                let _single = self.grow_filters(&mut single, 1)?;
+                if single.capacity() == 0 {
+                    single = vec![expression];
+                } else {
+                    single.push(expression);
+                }
+                let node = self.apply_filters(child, single)?;
                 self.apply_filters(node, filters)
             }
             GP::Filter { expr, inner } => {
                 let mut fs = filters;
-                fs.extend(self.compile_in_branch(expr, g)?.conjuncts());
+                let compiled = self.compile_in_branch(expr, g)?;
+                if self.branch_payload.borrow().is_none() {
+                    fs.extend(compiled.conjuncts());
+                    return self.plan(inner, g, fs);
+                }
+                // The conjuncts join the list in place, which grows to its size first.
+                let _grown = self.grow_filters(&mut fs, compiled.conjunct_count())?;
+                compiled.conjuncts_into(&mut fs);
+                #[cfg(test)]
+                note_list(0, fs.len());
                 self.plan(inner, g, fs)
             }
             GP::LeftJoin {
@@ -1593,7 +1613,8 @@ impl<'a> Planner<'a> {
                 // ARQ evaluates the OPTIONAL per left row, so that the property functions
                 // of the right side read the left side's values
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::lateral::plan_optional(self, l, right, expression.as_ref(), g)?;
                 self.apply_filters(n, top)
@@ -1604,7 +1625,8 @@ impl<'a> Planner<'a> {
                 expression,
             } => {
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let r = self.plan(right, g, Vec::new())?;
                 let expr = expression
@@ -1678,7 +1700,7 @@ impl<'a> Planner<'a> {
                 expression,
             } => {
                 let v = self.branch_var(variable.as_str())?;
-                let (push, top) = self.split_filters(filters, |x| *x != v);
+                let (push, top, _push_list) = self.split_filters(filters, |x| *x != v)?;
                 let child = self.plan(inner, g, push)?;
                 let e = self.compile_in_branch(expression, g)?;
                 self.admit_binding_shape(&child, 1)?;
@@ -1697,7 +1719,7 @@ impl<'a> Planner<'a> {
                 expression,
             } => {
                 let v = self.branch_var(variable.as_str())?;
-                let (push, top) = self.split_filters(filters, |x| *x != v);
+                let (push, top, _push_list) = self.split_filters(filters, |x| *x != v)?;
                 let child = self.plan(inner, g, push)?;
                 let e = self.compile_in_branch(expression, g)?;
                 self.admit_binding_shape(&child, 1)?;
@@ -1750,7 +1772,8 @@ impl<'a> Planner<'a> {
                     .as_ref()
                     .map(|s| self.branch_var(s.as_str()))
                     .transpose()?;
-                let (push, top) = self.split_filters(filters, |x| *x != v && Some(*x) != w);
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |x| *x != v && Some(*x) != w)?;
                 let child = self.plan(inner, g, push)?;
                 let e = self.compile_in_branch(expression, g)?;
                 self.admit_binding_shape(&child, 1 + usize::from(second.is_some()))?;
@@ -2116,14 +2139,90 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// The filters without EXISTS whose variables all pass `ok`, which move below an
+    /// operator, and the rest, which stay above it. On the checked route the first list
+    /// is admitted before it is made, to its size, the rest stay in `filters`' own list,
+    /// and the credit returned holds the first list while the caller plans with it.
     fn split_filters(
         &self,
         filters: Vec<Expr>,
         ok: impl Fn(&VarId) -> bool,
-    ) -> (Vec<Expr>, Vec<Expr>) {
-        filters
-            .into_iter()
-            .partition(|f| !f.has_exists() && f.var_set().iter().all(&ok))
+    ) -> Result<(Vec<Expr>, Vec<Expr>, ListCredit)> {
+        if self.branch_payload.borrow().is_none() || filters.is_empty() {
+            let (push, top) = filters
+                .into_iter()
+                .partition(|f| !f.has_exists() && f.var_set().iter().all(&ok));
+            return Ok((push, top, list_credit(None)));
+        }
+        let mut top = filters;
+        // The same test without allocating: every occurrence of a variable passes `ok`.
+        let (push, credit) = self.extract_filters(&mut top, |f| {
+            !f.has_exists()
+                && f.visit_vars(&mut |v| if ok(&v) { Ok(()) } else { Err(()) })
+                    .is_ok()
+        })?;
+        #[cfg(test)]
+        if credit.is_some() {
+            note_list(1, push.len());
+        }
+        Ok((push, top, list_credit(credit)))
+    }
+
+    /// On the checked route, the credit for a list of `slots` filters, taken before the
+    /// list is made or grown. `None` on the ordinary route.
+    fn filter_list_scratch(&self, slots: usize) -> Result<Option<Reservation>> {
+        if self.branch_payload.borrow().is_none() {
+            return Ok(None);
+        }
+        self.planning_stage(FILTER_LIST_PHASE)?;
+        self.planning_scratch(|layout| layout.slots::<Expr>(slots))
+    }
+
+    /// Move the filters that `take` selects out of `filters` into a list made to their
+    /// number and admitted before it is made, keeping the order of both. The rest stay
+    /// in `filters`' own list. The credit returned holds the new list.
+    fn extract_filters(
+        &self,
+        filters: &mut Vec<Expr>,
+        take: impl Fn(&Expr) -> bool,
+    ) -> Result<(Vec<Expr>, Option<Reservation>)> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(10);
+        let count = filters.iter().filter(|f| take(f)).count();
+        let credit = self.filter_list_scratch(count)?;
+        let mut out = Vec::new();
+        if let Some(credit) = &credit {
+            out.try_reserve_exact(count)
+                .map_err(|_| credit.preparation().exhausted())?;
+        }
+        out.extend(filters.extract_if(.., |f| take(f)));
+        debug_assert_eq!(out.len(), count);
+        Ok((out, credit))
+    }
+
+    /// Make room in `filters` for `more` filters. On the checked route, when the list must
+    /// grow, the whole grown list is admitted before it is made, since the old list and
+    /// its replacement can be live at once. The credit returned holds the grown list.
+    fn grow_filters(&self, filters: &mut Vec<Expr>, more: usize) -> Result<ListCredit> {
+        let need = filters
+            .len()
+            .checked_add(more)
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        if self.branch_payload.borrow().is_none() || filters.capacity() >= need {
+            return Ok(list_credit(None));
+        }
+        let credit = {
+            #[cfg(test)]
+            let _stage = crate::test_alloc::Stage::enter(10);
+            let credit = self
+                .filter_list_scratch(need)?
+                .expect("checked filter list");
+            filters
+                .try_reserve_exact(more)
+                .map_err(|_| credit.preparation().exhausted())?;
+            credit
+        };
+        Ok(list_credit(Some(credit)))
     }
 
     fn apply_filters(&self, n: Node, filters: Vec<Expr>) -> Result<Node> {
@@ -4838,7 +4937,17 @@ impl<'a> Planner<'a> {
     fn filter_admitted(&self, n: Node, exprs: Vec<Expr>) -> Result<Node> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::within(6);
-        let scratch = self.filter_scratch(&n, exprs.iter(), false)?;
+        let mut scratch = self.filter_scratch(&n, exprs.iter(), false)?;
+        // A list that filters were moved out of in place keeps its capacity, which the
+        // FILTER keeps with it.
+        let spare = exprs.capacity() - exprs.len();
+        if let Some(scratch) = scratch.as_mut()
+            && spare > 0
+        {
+            let mut layout = super::checked_layout::Layout::new(scratch.preparation());
+            layout.slots::<Expr>(spare)?;
+            scratch.grow_by(layout.bytes())?;
+        }
         let owned = self.filters_owned(&exprs)?;
         let (n, kept) = self.filter_held(scratch, n, exprs, owned)?;
         if let Some(kept) = kept {
@@ -6196,6 +6305,44 @@ fn checked_union_shape(
 /// The phase that admits a FILTER placed on a plan (see [`Planner::filter_scratch`]).
 pub(super) const FILTER_PHASE: &str = "reserving filter";
 
+/// The phase that admits a list of filters that planning moves filters into or grows.
+pub(super) const FILTER_LIST_PHASE: &str = "reserving filter list";
+
+/// The credit for a list of filters, held while the caller plans with the list. Unit
+/// tests settle its drop with the observer, as credit handed up by the stage that
+/// acquired it.
+#[cfg(test)]
+type ListCredit = crate::test_alloc::Settled;
+#[cfg(not(test))]
+type ListCredit = Option<Reservation>;
+
+#[cfg(test)]
+thread_local! {
+    /// The longest admitted filter list per producer: the FILTER's conjuncts, the
+    /// filters moved below an operator, the deferred and the late filters, the grown
+    /// lists of a group's remaining filters, and the filters of a keyed join.
+    pub(super) static LIST_REACH: std::cell::Cell<[usize; 6]> =
+        const { std::cell::Cell::new([0; 6]) };
+}
+
+#[cfg(test)]
+fn note_list(site: usize, len: usize) {
+    LIST_REACH.with(|reach| {
+        let mut all = reach.get();
+        all[site] = all[site].max(len);
+        reach.set(all);
+    });
+}
+
+#[cfg(test)]
+fn list_credit(held: Option<Reservation>) -> ListCredit {
+    crate::test_alloc::Settled::new(crate::test_alloc::Origin::handed_up(), held)
+}
+#[cfg(not(test))]
+fn list_credit(held: Option<Reservation>) -> ListCredit {
+    held
+}
+
 /// The most that [`filter`] of `n` under `exprs` allocates at once, counting what the
 /// FILTER keeps but not what it keeps of `n`, and the copies of `exprs` when `copies`.
 /// Moving range conjuncts into a scan of `n` splits the filters into their conjuncts,
@@ -6217,16 +6364,10 @@ pub(super) fn filter_bound<'e>(
             Ok(())
         }
     }
-    fn leaves(e: &Expr) -> usize {
-        match e {
-            Expr::And(a, b) => leaves(a).saturating_add(leaves(b)),
-            _ => 1,
-        }
-    }
     let (mut count, mut conjuncts, mut text, mut most) = (0usize, 0usize, Count(0), 0usize);
     for e in exprs.clone() {
         count += 1;
-        conjuncts = conjuncts.saturating_add(leaves(e));
+        conjuncts = conjuncts.saturating_add(e.conjunct_count());
         text.0 = text.0.saturating_add(8);
         let _ = e.write_description(ctx, &mut text);
         let mut occurrences = 0usize;

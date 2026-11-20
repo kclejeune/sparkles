@@ -121,7 +121,7 @@ thread_local! {
     static EPOCH: Cell<u64> = const { Cell::new(0) };
 }
 
-pub(crate) const STAGES: usize = 10;
+pub(crate) const STAGES: usize = 11;
 const DEPTH: usize = 32;
 const SLOTS: usize = 1 << 18;
 const TABLE_FULL: u32 = 1;
