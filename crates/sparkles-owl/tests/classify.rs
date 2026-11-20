@@ -1701,6 +1701,49 @@ fn large_ontology(n: usize) -> Vec<Axiom> {
     axioms
 }
 
+/// A run that keeps the contexts of a transitive role's chain, whose composed links keep
+/// no forward links (roadmap item 956), gives a new predecessor the closure through the
+/// kept contexts one link at a time, and a removed link takes it away again.
+#[test]
+fn an_edit_reaches_the_closure_of_a_transitive_role_through_kept_contexts() {
+    let base = vec![
+        ax(AxiomKind::TransitiveObjectProperty(ope("r"))),
+        sub(c("A"), some("r", c("B"))),
+        sub(c("B"), some("r", c("C"))),
+        sub(c("C"), some("r", c("D"))),
+        sub(some("r", c("D")), c("G")),
+    ];
+    let is_sub =
+        |t: &sparkles_owl::classify::Taxonomy, a: &str, b: &str| t.is_subclass(&c(a), &c(b));
+    for threads in [1, 4] {
+        let limits = Limits {
+            threads,
+            ..Limits::default()
+        };
+        let mut held = base.clone();
+        let mut k = Classifier::of(&held);
+        let first = k.classify(&limits).unwrap();
+        assert!(
+            ["A", "B", "C"]
+                .iter()
+                .all(|x| is_sub(&first.taxonomy, x, "G"))
+        );
+        let add = vec![sub(c("Z"), some("r", c("A")))];
+        k.add(&add);
+        held.extend(add);
+        let inc = k.classify(&limits).unwrap();
+        assert!(is_sub(&inc.taxonomy, "Z", "G"), "{threads} threads");
+        let full = Classifier::of(&held).classify(&limits).unwrap();
+        assert_eq!(inc.taxonomy, full.taxonomy, "{threads} threads");
+        let gone = held.remove(3);
+        k.remove(&[gone]);
+        let inc = k.classify(&limits).unwrap();
+        assert!(!is_sub(&inc.taxonomy, "Z", "G"), "{threads} threads");
+        let full = Classifier::of(&held).classify(&limits).unwrap();
+        assert_eq!(inc.taxonomy, full.taxonomy, "{threads} threads, removed");
+    }
+}
+
 #[test]
 fn the_taxonomy_is_the_same_for_every_number_of_threads() {
     let axioms = large_ontology(3000);
