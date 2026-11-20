@@ -112,6 +112,83 @@ pub(crate) fn admitted_allocations_seen() -> usize {
     ADMITTED.with(|cell| cell.get().2)
 }
 
+thread_local! {
+    // Unadmitted-growth observer: original live-counter address, active stage,
+    // live bytes allocated in the stage, admitted bytes at its start, and the
+    // largest excess of live over newly admitted bytes per stage.
+    static EXCESS: Cell<(usize, usize, i64, u64, [i64; STAGES])> =
+        const { Cell::new((0, usize::MAX, 0, 0, [0; STAGES])) };
+}
+
+pub(crate) const STAGES: usize = 8;
+
+/// The largest excess, per stage, of bytes a planner stage allocated and still holds
+/// over the Preparation credit it acquired meanwhile, while `f` runs on this thread.
+pub(crate) fn record_unadmitted(preparation: &Preparation, f: impl FnOnce()) -> [i64; STAGES] {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            EXCESS.with(|cell| cell.set((0, usize::MAX, 0, 0, [0; STAGES])));
+        }
+    }
+    let _reset = Reset;
+    EXCESS.with(|cell| {
+        assert_eq!(cell.get().0, 0);
+        let counter = preparation.test_used_counter() as *const _ as usize;
+        cell.set((counter, usize::MAX, 0, 0, [0; STAGES]));
+    });
+    f();
+    EXCESS.with(|cell| cell.get().4)
+}
+
+/// A planner stage observed by [`record_unadmitted`]. A nested stage pauses the
+/// outer one, whose excess then excludes the inner stage's unadmitted bytes.
+pub(crate) struct Stage(Option<(usize, i64, u64)>);
+
+fn used_at(counter: usize) -> u64 {
+    unsafe { &*(counter as *const std::sync::atomic::AtomicU64) }.load(Ordering::Relaxed)
+}
+
+impl Stage {
+    pub(crate) fn enter(stage: usize) -> Self {
+        let outer = EXCESS.try_with(|cell| {
+            let (counter, active, live, base, max) = cell.get();
+            if counter == 0 {
+                return None;
+            }
+            cell.set((counter, stage, 0, used_at(counter), max));
+            Some((active, live, base))
+        });
+        Self(outer.ok().flatten())
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        if let Some((active, live, base)) = self.0 {
+            let _ = EXCESS.try_with(|cell| {
+                let (counter, _, _, inner, max) = cell.get();
+                // The outer stage sees only the credit the inner stage acquired.
+                let admitted = used_at(counter) as i64 - inner as i64;
+                cell.set((counter, active, live + admitted, base, max));
+            });
+        }
+    }
+}
+
+fn observe(delta: i64) {
+    let _ = EXCESS.try_with(|cell| {
+        let (counter, active, live, base, mut max) = cell.get();
+        if counter == 0 || active == usize::MAX {
+            return;
+        }
+        let live = live + delta;
+        let excess = live - (used_at(counter) as i64 - base as i64);
+        max[active] = max[active].max(excess);
+        cell.set((counter, active, live, base, max));
+    });
+}
+
 struct AllocationObserver;
 // SAFETY: System receives exactly the original layouts. A selected test-thread
 // watch retains its actual Preparation until cleared. Dealloc reads one atomic
@@ -133,6 +210,7 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
                 cell.set((size, counter, count + 1, low.min(used), high.max(used)));
             }
         });
+        observe(layout.size() as i64);
         unsafe { std::alloc::System.alloc(layout) }
     }
     unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
@@ -144,10 +222,12 @@ unsafe impl std::alloc::GlobalAlloc for AllocationObserver {
                 watch.set((0, counter, used, count + 1));
             }
         });
+        observe(-(layout.size() as i64));
         unsafe { std::alloc::System.dealloc(pointer, layout) };
     }
     unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
         // Watched staging byte vectors are complete and never grow after arm.
+        observe(size as i64 - layout.size() as i64);
         unsafe { std::alloc::System.realloc(pointer, layout, size) }
     }
 }

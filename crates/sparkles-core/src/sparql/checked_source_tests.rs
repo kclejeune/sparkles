@@ -2515,3 +2515,119 @@ fn checked_graph_r12_refuses_or_cancels_before_growing_group_items() {
         assert_eq!(prep.inner_used(), before);
     }
 }
+
+fn checked_chain_fixture(width: usize) -> Store {
+    use std::fmt::Write;
+
+    let store = Store::in_memory(StoreOptions::default());
+    let mut input = String::new();
+    for graph in 0..2 {
+        for step in 1..=width {
+            writeln!(
+                input,
+                "<urn:n:{}> <urn:c:{step}> <urn:n:{step}> <urn:g:{graph}> .",
+                step - 1
+            )
+            .unwrap();
+        }
+    }
+    store
+        .load(&[crate::io::Source::from_bytes(
+            input.into_bytes(),
+            crate::io::RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    store
+}
+
+fn checked_chain_query(width: usize) -> String {
+    use std::fmt::Write;
+
+    let mut text = String::from("SELECT * WHERE { GRAPH ?g {");
+    for step in 1..=width {
+        write!(text, " ?x{} <urn:c:{step}> ?x{step} .", step - 1).unwrap();
+    }
+    for step in 0..=width {
+        write!(text, " FILTER(?x{step} != <urn:n:absent>)").unwrap();
+    }
+    // The BIND makes the group non-simple, so each graph gets its own branch.
+    text.push_str(" BIND(?x0 AS ?first) } }");
+    text
+}
+
+/// The planner storage of each join-order stage that a checked GRAPH plan holds
+/// beyond the credit it acquired, for a connected chain of `width` patterns.
+fn checked_join_order_excess(width: usize) -> [i64; crate::test_alloc::STAGES] {
+    use plan::{ActiveGraph, Planner};
+
+    let store = checked_chain_fixture(width);
+    let data = physical_default(&store);
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let prep = ctx.source_preparation.as_ref().unwrap().clone();
+    let Query::Select { pattern, .. } =
+        parse_query(&checked_chain_query(width), None, &[]).unwrap()
+    else {
+        unreachable!()
+    };
+    let mut planner = Planner::new(&ctx);
+    let mut plan = None;
+    let excess = crate::test_alloc::record_unadmitted(&prep, || {
+        plan = Some(
+            planner
+                .plan(&pattern, &ActiveGraph::Default, Vec::new())
+                .unwrap(),
+        );
+    });
+    assert_eq!(checked_graph_group(plan.as_ref().unwrap()).inputs.len(), 2);
+    excess
+}
+
+#[test]
+#[ignore = "fail-first witness for join-order admission, which is pending"]
+fn checked_graph_r12_admits_join_order_storage() {
+    const STAGES: [&str; 8] = [
+        "group",
+        "greedy",
+        "program tables",
+        "program run",
+        "program build",
+        "greedy build",
+        "filtered plans",
+        "join plans",
+    ];
+    // The exhaustive program plans up to 16 inputs, and greedy alone plans more.
+    let mut failures = Vec::new();
+    for (small, large) in [(4, 12), (20, 40)] {
+        let (a, b) = (
+            checked_join_order_excess(small),
+            checked_join_order_excess(large),
+        );
+        println!("widths {small}/{large}: {a:?} / {b:?}");
+        for (stage, name) in STAGES.iter().enumerate() {
+            if b[stage] > a[stage].max(0) + 4096 {
+                failures.push(format!(
+                    "{name}: {} unadmitted bytes at width {small}, {} at width {large}",
+                    a[stage], b[stage]
+                ));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn checked_graph_r12_join_order_matches_ordinary_answers() {
+    for width in [4, 12, 20] {
+        let store = checked_chain_fixture(width);
+        let text = format!(
+            "{} ORDER BY ?g",
+            checked_chain_query(width).replacen("SELECT *", "SELECT ?g ?x0", 1)
+        );
+        let ordinary = query(store.snapshot(), &text, &opts()).unwrap();
+        let prepared = query_snapshot_prepared(store.snapshot(), &text, opts()).unwrap();
+        let rows = ordinary.test_application_rows();
+        assert_eq!(rows.len(), 2, "width {width}");
+        assert_eq!(rows, prepared.test_application_rows(), "width {width}");
+    }
+}

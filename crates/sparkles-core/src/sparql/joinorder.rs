@@ -280,6 +280,8 @@ fn filtered(cost: f64, est: f64, sel: f64, unsorted: bool) -> (f64, f64) {
 
 /// Join `a` and `b` the given way (the same nodes as the planner's join candidates).
 fn build_join(a: Node, b: Node, how: How, ctx: &Ctx) -> Node {
+    #[cfg(test)]
+    let _stage = crate::test_alloc::Stage::enter(7);
     let keys: Vec<VarId> = a
         .vars
         .iter()
@@ -521,6 +523,8 @@ fn merge_held(a: &[(u32, Held)], b: &[(u32, Held)]) -> Vec<(u32, Held)> {
 
 impl Group {
     fn new(items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Result<Group> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(0);
         let mut idx: FxHashMap<VarId, u32> = FxHashMap::default();
         let mut vars = Vec::new();
         let mut count: Vec<u32> = Vec::new();
@@ -693,6 +697,8 @@ pub(super) fn place_masked(
     filters: &[Expr],
     fvars: &[Vec<VarId>],
 ) -> (Node, u64) {
+    #[cfg(test)]
+    let _stage = crate::test_alloc::Stage::enter(6);
     let mut now = Vec::new();
     let mut mask = applied;
     for (i, f) in filters.iter().enumerate().take(64) {
@@ -849,6 +855,8 @@ struct Greedy {
 
 impl Greedy {
     fn run(g: &Group, items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Result<Greedy> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(1);
         let nv = g.vars.len();
         let batched = plan::Costing::of(ctx);
         let mut placed = vec![false; filters.len()];
@@ -880,6 +888,8 @@ impl Greedy {
                 for &f in &now {
                     placed[f] = true;
                 }
+                #[cfg(test)]
+                let _stage = crate::test_alloc::Stage::enter(6);
                 Some(plan::filter(
                     best.clone(),
                     now.iter().map(|&f| filters[f].clone()).collect(),
@@ -1183,6 +1193,8 @@ impl Greedy {
 
     /// Build the plan tree from the inputs, removing the placed filters from `filters`.
     fn build(self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>, pl: &Planner) -> Result<Node> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(5);
         let ctx = pl.ctx;
         let mut nodes: Vec<Option<Node>> = Vec::with_capacity(self.units.len());
         let mut leaves = self.leaves.into_iter().zip(items);
@@ -1199,6 +1211,8 @@ impl Greedy {
                     if u.filters.is_empty() {
                         n
                     } else {
+                        #[cfg(test)]
+                        let _stage = crate::test_alloc::Stage::enter(6);
                         plan::filter(
                             n,
                             u.filters.iter().map(|&f| filters[f].clone()).collect(),
@@ -1345,6 +1359,8 @@ impl Dp {
     /// The tables over the inputs' subsets, or `None` when the program cannot track
     /// the group (too many inputs or join variables).
     fn prepare(g: &Group, items: &[Vec<Node>]) -> Option<Dp> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(2);
         let n = items.len();
         if n > DP_MAX_ITEMS || g.jvars.len() > DP_MAX_JOIN_VARS {
             return None;
@@ -1495,6 +1511,8 @@ impl Dp {
         pl: &Planner,
     ) -> Result<Option<u32>> {
         let ctx = pl.ctx;
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(3);
         let ub = bound.unwrap_or(f64::INFINITY);
         let batched = plan::Costing::of(ctx);
         let fvars = dp_filter_vars(filters);
@@ -1958,6 +1976,8 @@ impl Dp {
         filters: &[Expr],
         pl: &Planner,
     ) -> Result<(Node, u64)> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(4);
         let ctx = pl.ctx;
         let fvars = dp_filter_vars(filters);
         // the entries of the plan, children before parents
