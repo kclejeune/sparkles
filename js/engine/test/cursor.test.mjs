@@ -338,7 +338,8 @@ test('a lowered query limit is not exceeded by running queries', { timeout: 3000
     slow = controllers.map((controller) =>
       ds
         .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
-          timeout: 10000,
+          // Longer than the 10 s poll below, so a slow query cannot time out before the assertions
+          timeout: 20000,
           signal: controller.signal,
         })
         .catch((e) => e),
