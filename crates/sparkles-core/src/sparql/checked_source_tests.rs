@@ -4176,7 +4176,8 @@ fn checked_graph_r12_refuses_graph_binding_index_candidate() {
 /// BIND passes down, the same with one conjunct that stays above the BIND, a FILTER of
 /// a nested group that joins an outer one, filters that wait for a UNION that may
 /// leave their variable unbound, the same with a path that also binds it, and filters
-/// of two parts that share no variable, which meet in a keyed join.
+/// of two parts that share no variable, which meet in a keyed join, and a filter that
+/// stays above the BIND, so that nothing moves below it.
 fn checked_filter_list_bodies() -> Vec<(&'static str, String)> {
     let conj = |n: usize, var: &str, base: i64| {
         (0..n)
@@ -4229,6 +4230,10 @@ fn checked_filter_list_bodies() -> Vec<(&'static str, String)> {
                 conj(30, "u", 0)
             ),
         ),
+        (
+            "all top",
+            "?x <urn:v> ?v . FILTER(?first != <urn:n:absent>) BIND(?x AS ?first)".into(),
+        ),
     ]
 }
 
@@ -4238,7 +4243,7 @@ fn checked_graph_r12_admits_filter_input_lists() {
     // between operators, and stage 6 the FILTERs placed on the plan.
     let mut failures = Vec::new();
     for (name, body) in checked_filter_list_bodies() {
-        plan::LIST_REACH.with(|r| r.set([0; 6]));
+        plan::LIST_REACH.with(|r| r.set([0; 7]));
         let text = format!("SELECT * WHERE {{ GRAPH ?g {{ {body} }} }}");
         let (excess, _) = checked_join_order_excess_kinds(12, &text);
         let reach = plan::LIST_REACH.with(std::cell::Cell::get);
@@ -4254,6 +4259,7 @@ fn checked_graph_r12_admits_filter_input_lists() {
         let expected: &[(usize, usize)] = match name {
             "conjuncts" | "one above" => &[(0, 40), (1, 40)],
             "nested" => &[(0, 40), (1, 20)],
+            "all top" => &[(0, 1)],
             _ => &[(0, 30)],
         };
         for &(site, len) in expected {
@@ -4266,6 +4272,35 @@ fn checked_graph_r12_admits_filter_input_lists() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn checked_graph_r12_admits_extension_filter_list() {
+    // A FILTER that calls application extensions keeps its expression in a list of one,
+    // which the checked route admits before it is made, to its size.
+    use plan::{ActiveGraph, Planner};
+    let store = checked_chain_fixture(12);
+    let data = physical_default(&store);
+    let mut ctx = validation_query_context(&data, opts()).unwrap();
+    ctx.calls_extensions = true;
+    let prep = ctx.source_preparation.as_ref().unwrap().clone();
+    let text = "SELECT * WHERE { GRAPH ?g { ?x <urn:v> ?v . FILTER(?v > 0) BIND(?x AS ?first) } }";
+    let Query::Select { pattern, .. } = parse_query(text, None, &[]).unwrap() else {
+        unreachable!()
+    };
+    plan::LIST_REACH.with(|r| r.set([0; 7]));
+    let mut planner = Planner::new(&ctx);
+    let excess = crate::test_alloc::record_unadmitted(&prep, || {
+        planner
+            .plan(&pattern, &ActiveGraph::Default, Vec::new())
+            .unwrap();
+    });
+    let reach = plan::LIST_REACH.with(std::cell::Cell::get);
+    assert_eq!(reach[6], 1, "the list of one is admitted: {reach:?}");
+    assert_eq!(
+        excess[10], 0,
+        "the list of one is made to its size: {excess:?}"
+    );
 }
 
 #[test]

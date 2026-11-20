@@ -1579,13 +1579,15 @@ impl<'a> Planner<'a> {
                 let child = self.plan(inner, g, Vec::new())?;
                 let expression = self.compile_in_branch(expr, g)?;
                 // On the checked route the list of one is admitted before it is made.
-                let mut single = Vec::new();
-                let _single = self.grow_filters(&mut single, 1)?;
-                if single.capacity() == 0 {
-                    single = vec![expression];
+                let (single, _single) = if self.branch_payload.borrow().is_none() {
+                    (vec![expression], list_credit(None))
                 } else {
-                    single.push(expression);
-                }
+                    let mut single = Vec::new();
+                    let credit = self.grow_filters(&mut single, 1, |s| s.push(expression))?;
+                    #[cfg(test)]
+                    note_list(6, single.len());
+                    (single, credit)
+                };
                 let node = self.apply_filters(child, single)?;
                 self.apply_filters(node, filters)
             }
@@ -1597,8 +1599,8 @@ impl<'a> Planner<'a> {
                     return self.plan(inner, g, fs);
                 }
                 // The conjuncts join the list in place, which grows to its size first.
-                let _grown = self.grow_filters(&mut fs, compiled.conjunct_count())?;
-                compiled.conjuncts_into(&mut fs);
+                let more = compiled.conjunct_count();
+                let _grown = self.grow_filters(&mut fs, more, |fs| compiled.conjuncts_into(fs))?;
                 #[cfg(test)]
                 note_list(0, fs.len());
                 self.plan(inner, g, fs)
@@ -2200,15 +2202,23 @@ impl<'a> Planner<'a> {
         Ok((out, credit))
     }
 
-    /// Make room in `filters` for `more` filters. On the checked route, when the list must
-    /// grow, the whole grown list is admitted before it is made, since the old list and
-    /// its replacement can be live at once. The credit returned holds the grown list.
-    fn grow_filters(&self, filters: &mut Vec<Expr>, more: usize) -> Result<ListCredit> {
+    /// Add `more` filters to `filters` with `fill`. On the checked route, when the list
+    /// must grow, the whole grown list is admitted before it is made, since the old list
+    /// and its replacement can be live at once, and `fill` runs under the same admission.
+    /// The credit returned holds the grown list.
+    fn grow_filters(
+        &self,
+        filters: &mut Vec<Expr>,
+        more: usize,
+        fill: impl FnOnce(&mut Vec<Expr>),
+    ) -> Result<ListCredit> {
         let need = filters
             .len()
             .checked_add(more)
             .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
         if self.branch_payload.borrow().is_none() || filters.capacity() >= need {
+            fill(filters);
+            debug_assert_eq!(filters.len(), need);
             return Ok(list_credit(None));
         }
         let credit = {
@@ -2220,6 +2230,8 @@ impl<'a> Planner<'a> {
             filters
                 .try_reserve_exact(more)
                 .map_err(|_| credit.preparation().exhausted())?;
+            fill(filters);
+            debug_assert_eq!(filters.len(), need);
             credit
         };
         Ok(list_credit(Some(credit)))
@@ -6320,9 +6332,10 @@ type ListCredit = Option<Reservation>;
 thread_local! {
     /// The longest admitted filter list per producer: the FILTER's conjuncts, the
     /// filters moved below an operator, the deferred and the late filters, the grown
-    /// lists of a group's remaining filters, and the filters of a keyed join.
-    pub(super) static LIST_REACH: std::cell::Cell<[usize; 6]> =
-        const { std::cell::Cell::new([0; 6]) };
+    /// lists of a group's remaining filters, the filters of a keyed join, and the list
+    /// of one FILTER that calls application extensions.
+    pub(super) static LIST_REACH: std::cell::Cell<[usize; 7]> =
+        const { std::cell::Cell::new([0; 7]) };
 }
 
 #[cfg(test)]
