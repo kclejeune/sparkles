@@ -3841,6 +3841,7 @@ fn a_count_over_a_two_variable_merge_join_runs_the_eager_kernel() {
                 f.skipped.as_deref() == Some("the left side produced no rows")
                     && !f.stopped_early
                     && plan.operator.actual_rows == -1
+                    && plan.operator.time_ms == 0.0
                     && plan.children.iter().all(all_skipped)
             }
             let count = find(c.plan(), "CountJoin").expect("a count join");

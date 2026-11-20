@@ -3516,13 +3516,20 @@ impl Operator {
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
-        if self
-            .info
-            .fidelity
-            .as_ref()
-            .is_some_and(|f| f.skipped.is_some())
-        {
-            plan.operator.fidelity.clone_from(&self.info.fidelity);
+        // A skipped operator never ran, and nor did anything its plan shows below it,
+        // including the children that an eager kernel describes without operators.
+        if let Some(why) = self.info.fidelity.as_ref().and_then(|f| f.skipped.clone()) {
+            fn mark(plan: &mut CursorPlan, why: &str) {
+                plan.operator.actual_rows = -1;
+                plan.operator.time_ms = 0.0;
+                plan.operator.fidelity_mut().skipped = Some(why.to_string());
+                plan.complete = true;
+                for child in &mut plan.children {
+                    mark(child, why);
+                }
+            }
+            mark(plan, &why);
+            return;
         }
         if self.info.counters.is_some() {
             plan.operator.counters.clone_from(&self.info.counters);
