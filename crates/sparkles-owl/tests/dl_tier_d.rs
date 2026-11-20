@@ -2379,3 +2379,63 @@ fn a_context_that_gives_way_sends_the_products_of_its_links_first() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// K's r-successor C is a D, and the s-successor that K derives only after a case analysis
+/// is the same C context. At most one p-successor in B, which both are, makes them one
+/// individual, so K ⊑ ∃s.D ⊑ Ans. The qualified role of B comes back from C over the
+/// predecessor before the s-restriction arrives. A run that counts either finds K ⊑ Ans
+/// or does not answer in full. A run without the root does neither until item 1229's repair,
+/// which `SPARKLES_COUNTING_LATE_UNIT=2` turns on and with which this test passes.
+#[test]
+#[ignore = "item 1229: passes with SPARKLES_COUNTING_LATE_UNIT=2"]
+fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
+    for late in [
+        "SubClassOf(:K ObjectUnionOf(:X1 :X2))
+         SubClassOf(:X1 :A)
+         SubClassOf(:X2 :A)",
+        "SubClassOf(:K ObjectSomeValuesFrom(:r1 :D2))
+         SubClassOf(:D2 ObjectAllValuesFrom(ObjectInverseOf(:r1) :A))",
+    ] {
+        let ax = axioms(&format!(
+            "SubObjectPropertyOf(:r :p)
+             SubObjectPropertyOf(:s :p)
+             SubClassOf(:C :B)
+             SubClassOf(:K ObjectMaxCardinality(1 :p :B))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+             SubClassOf(:K ObjectAllValuesFrom(:r :D))
+             {late}
+             SubClassOf(:A ObjectSomeValuesFrom(:s :C))
+             SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+             SubClassOf(:E ObjectSomeValuesFrom(:s :C))"
+        ));
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (1, Expansion::Eager),
+            (4, Expansion::Eager),
+        ] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    counting: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert_eq!(out.consistency, Consistency::Consistent);
+            if out.complete && k.excluded().is_empty() {
+                assert!(
+                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                    "K ⊑ Ans is missing"
+                );
+            } else {
+                assert!(out.stats.dl_counting_over, "{:#?}", k.excluded());
+            }
+            assert!(
+                !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+                "E ⊑ Ans is not entailed"
+            );
+        }
+    }
+}
