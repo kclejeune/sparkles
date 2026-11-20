@@ -3181,7 +3181,8 @@ fn process<S: Sink>(
     }
     // a selected clause takes only the local inferences, Join, Pred and Succ, except that
     // one Pred cannot carry, whose head holds an atom over x, takes the Hyper over x too,
-    // since no predecessor sees it (its partners are still the unselected clauses)
+    // since no predecessor sees it (with sel_partners_x its partners include selected
+    // clauses, as do those of Pred from a successor over `f_e(u)`)
     let sel = rooted && dl(st).is_some_and(|x| x.store.clauses[id as usize].sel);
     let sel_x = sel && ready;
     let mut ps: Vec<(Role, Ex)> = Vec::new();

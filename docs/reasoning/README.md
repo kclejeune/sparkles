@@ -507,7 +507,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   The repaired selection is adopted on a measured gate of generated and fixture
   ontologies, its completeness is not proved, and roadmap item 1220 stays open for that
   proof. A rooted run with counting can still miss entailed subsumptions on a generated
-  ontology, with or without these repairs, which is roadmap item 1229. A rooted run without counting has a bound of 524,288 derived conclusions,
+  ontology, with or without these repairs, which is roadmap item 1229. A rooted run
+  without counting has a bound of 524,288 derived conclusions,
   `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
   keys over object properties and the universal object property by rewriting them into
@@ -1058,19 +1059,18 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   the bindings always take the Horn axioms. Roadmap item 694.
 * By default, axioms outside OWL 2 EL that need nominals, and axioms that need case
   analysis or counting in an ontology with individuals, are left out, since the rooted run
-  that takes them is an option whose completeness is not proved, and two of the 50
-  nominal fixtures of its gate pass its work bound. The rooted run also passes its bound
-  on ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
+  that takes them is an option whose completeness is not proved, and two of the 50 nominal
+  fixtures of its gate pass its work bound. The rooted run also passes its bound on
+  ore_ont_14924, ore_ont_15803 and many generated ontologies with keys or the universal
   property, and then gives the default answer after the work. The repairs of its selection
   and of its Join restriction are adopted on a measured gate without a proof of
-  completeness. They make one generated ontology, and a version of shoi-022 whose
-  individuals are merged beforehand on four threads, pass the bound where the run before
-  them finished. Roadmap items 823, 1061, 1075, 1220, 1227
-  and 1228. Axioms that
-  need case analysis in an ontology with data properties are left out, and an external DL
-  reasoner bridge is planned. Roadmap item 603. The disjunctive rules need a
-  datatype checker with data cardinalities before they take data properties, and 10 of
-  the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
+  completeness. With them the generated ontology s2-g2-011 passes the bound on one and on
+  four threads, and a version of shoi-022 whose individuals are merged beforehand passes
+  it on four threads with eager expansion. Roadmap items 823, 1061, 1075, 1220, 1227 and
+  1228. Axioms that need case analysis in an ontology with data properties are left out,
+  and an external DL reasoner bridge is planned. Roadmap item 603. The disjunctive rules
+  need a datatype checker with data cardinalities before they take data properties, and 10
+  of the 97 disjunctive development files of the ORE 2015 DL sample wait on it. Roadmap
   item 768.
 * Counting is off by default. Five files of the ORE 2015 DL development set attempt
   counting. With the order between number restrictions, which a counting run uses by

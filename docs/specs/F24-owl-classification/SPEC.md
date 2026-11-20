@@ -3972,30 +3972,33 @@ departures in place.
 
 **Equalities with `x` in query contexts.** The rewriting equality `x ≈ u` rewrites `x` to
 `u` only in a unit clause whose atom is a core atom of a query context, which is the
-context of a named class or, since item 1070, of `owl:Thing`, and rewrites `u` to `x` only in a named-class atom over `u` and
-only in a query context. Elsewhere Eq does not rewrite with `x ≈ u`. Every other rule
-stays. Factor takes `x ≈ u` and `x ≈ v` in one head as Table 2 says, and an equality of
-constants `u ≈ v` rewrites the constant in `x ≈ u` to give `x ≈ v`, since it is the
-rewriting equality and `x ≈ u` only the rewritten literal, and `f(x) ≈ u` rewrites as
-usual. The journal's Section 7.2.3 reports that its completeness proof needs `x ≈ u` as
-the rewriting equality only in query contexts and only on query atoms, and its Lemmas 21
-and 22 use exactly the two forms kept. Lemma 21 rewrites a unit `Γ_0 → A(x)` with `A(x)`
-in the query body, which for classification is the context's core atom, so that the
-constant's facts include `A(u)` and the consequences at `u` follow from the ontology's
-clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and then needs a clause with
-`x ≈ u` maximal beside named atoms, which the second form rewrites back to `x`. A
-successor context has no query and needs neither form. Its element's equality to a
-constant reaches the predecessor as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual
-and the predecessor reasons at `u`. Sequoia blocks the same inferences. The journal's
-observation is about its own calculus, and that it carries over to the run without the
-root's markers is part of the open obligation above. Without the blocking the run
-rewrites every clause over `x` of a context that holds `x ≈ u`, and in the earlier
-experiments the blocking was on in every configuration that finished.
+context of a named class or, since item 1070, of `owl:Thing`, and rewrites `u` to `x` only
+in a named-class atom over `u` and only in a query context. Elsewhere Eq does not rewrite
+with `x ≈ u`. Every other rule stays. Factor takes `x ≈ u` and `x ≈ v` in one head as
+Table 2 says, and an equality of constants `u ≈ v` rewrites the constant in `x ≈ u` to
+give `x ≈ v`, since it is the rewriting equality and `x ≈ u` only the rewritten literal,
+and `f(x) ≈ u` rewrites as usual. The journal's Section 7.2.3 reports that its
+completeness proof needs `x ≈ u` as the rewriting equality only in query contexts and only
+on query atoms, and its Lemmas 21 and 22 use exactly the two forms kept. Lemma 21 rewrites
+a unit `Γ_0 → A(x)` with `A(x)` in the query body, which for classification is the
+context's core atom, so that the constant's facts include `A(u)` and the consequences at
+`u` follow from the ontology's clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and
+then needs a clause with `x ≈ u` maximal beside named atoms, which the second form
+rewrites back to `x`. A successor context that is not the context of a named class has no
+query and needs neither form. Its element's equality to a constant reaches the predecessor
+as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual and the predecessor reasons at
+`u`. A successor that reuses the context of a named class has that class's query, and
+there Eq and Factor in the form of a query leave out a selected premise. That no
+entailment is lost there is the open case of item 1220. Sequoia blocks the same
+inferences. The journal's observation is about its own calculus, and that it carries over
+to the run without the root's markers is part of the open obligation above. Without the
+blocking the run rewrites every clause over `x` of a context that holds `x ≈ u`, and in
+the earlier experiments the blocking was on in every configuration that finished.
 
-**Selection of the ground literals in bodies.** In a context other than the root, a
-clause whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) →
-A(u)` included. A selected clause is a premise only of an inference local to the context,
-of Join on its ground body literal as the side with the body, of Pred and of Succ, and it
+**Selection of the ground literals in bodies.** In a context other than the root, a clause
+whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) → A(u)`
+included. A selected clause is a premise only of an inference local to the context, of
+Join on its ground body literal as the side with the body, of Pred and of Succ, and it
 still sends the hypotheses and markers of its maximal literals. An inference is local when
 it is on a literal that holds a successor term of the context or on a role atom between
 `x` or `y` and a constant or a successor term of a constant, since no predecessor sees
@@ -4005,28 +4008,28 @@ the predecessor, which receives the clause by Pred, discharges the ground body b
 against its actual clauses and sends the hypotheses and markers that let the context go
 on. One exception stays in the context. A selected clause whose head holds an atom over
 `x` cannot go to the predecessor, since Pred carries no such head, so it takes the Hyper
-over `x` itself, with the unselected clauses as its partners. Partner lookups leave out
-selected clauses the same way, so an inference between two clauses fires or not whatever
-their order of processing. The rationale is the measured cause of the remaining work
-after the first three departures. In shoi-005's dominant context 13,731 of 17,384 distinct
-clauses held a ground literal in the body and 9,731 two or more, which is the root's
-marker explosion moved into one context, since the context combined the markers of all
-its predecessors in bodies. A restriction of inferences is sound. The argument for
-completeness is that of ordered resolution with selection, where a clause with a selected
-literal resolves only on it, and the predecessor that holds the marked literal in an
-actual clause makes the inference the context leaves out. What the argument leaves open is
-the return path. The predecessor's clause after Join holds the context's literals over
-`f(x)` and sends them as hypotheses, and whether every inference the context leaves out
-comes back this way across a shared successor or a chain of successors is not shown. A
-consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑ ∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`,
-`A ⊑ ⊥` as a case where the exception is needed, and it is a regression test, which
-passes. The selection is measured with it on and off, and the run keeps it only if the
-gate needs it.
+over `x` itself. Hyper over `x`, and Pred from a successor over a successor term of a
+constant, take selected clauses as partners, and the other partner lookups leave out
+selected clauses the same way that the rules leave out a selected premise, so an inference
+between two clauses fires or not whatever their order of processing. The rationale is the
+measured cause of the remaining work after the first three departures. In shoi-005's
+dominant context 13,731 of 17,384 distinct clauses held a ground literal in the body and
+9,731 two or more, which is the root's marker explosion moved into one context, since the
+context combined the markers of all its predecessors in bodies. A restriction of
+inferences is sound. The argument for completeness is that of ordered resolution with
+selection, where a clause with a selected literal resolves only on it, and the predecessor
+that holds the marked literal in an actual clause makes the inference the context leaves
+out. What the argument leaves open is the return path. The predecessor's clause after Join
+holds the context's literals over `f(x)` and sends them as hypotheses, and whether every
+inference the context leaves out comes back this way across a shared successor or a chain
+of successors is not shown. A consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑
+∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`, `A ⊑ ⊥` as a case where the exception is needed, and it is a
+regression test, which passes. The selection is measured with it on and off, and the run
+keeps it only if the gate needs it.
 
 The argument does not hold when both premises of an inference over `x` are selected, since
-no predecessor then holds either premise. Hyper over `x`, and Pred from a successor over
-a successor term of a constant, therefore take selected clauses as partners, as the
-Outcome records for item 1220, whose completeness is not proved.
+no predecessor then holds either premise. That is why those two lookups take selected
+partners, as the Outcome records for item 1220, whose completeness is not proved.
 
 **The facts of a hypothetical successor go to the root.** A hypothetical successor has the
 empty core and no denied class, and its hypotheses and markers are in the bodies of its
