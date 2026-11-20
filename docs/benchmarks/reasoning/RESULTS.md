@@ -166,7 +166,7 @@ round.
 | Query | Joins | Joins, peak RSS | Operators | Operators, peak RSS | Rows |
 |---|---:|---:|---:|---:|---:|
 | q2 | 113.2 s | 2,352 MiB | 8.33 s | 1,222 MiB | 7,422 |
-| q7 | 117.4 s | 2,322 MiB | 8.39 s | 1,226 MiB | 1,685 |
+| q7 | 117.4 s | 2,323 MiB | 8.39 s | 1,226 MiB | 1,685 |
 | q12 | 115.1 s | 2,354 MiB | 8.50 s | 1,203 MiB | 2,495 |
 | q19 | 115.7 s | 2,376 MiB | 8.53 s | 1,236 MiB | 859 |
 
@@ -179,8 +179,7 @@ commands, the [gate script](runs/2026-11-20-item-521-forge/gate.sh.txt), its
 timings](runs/2026-11-20-item-521-forge/owl2bench-summary.txt). The same run compared the
 two builds on the [reasoning latency gate](#query-time-reasoning-latency), and its records
 and their [per-round analysis](runs/2026-11-20-item-521-forge/analysis.txt) are in the
-directory too. An earlier approximate run on stanley, a laptop with other work beside it, is in
-[its own directory](runs/2026-11-20-item-521-stanley/env.txt).
+directory too.
 
 ### Sampled rule-body planning
 

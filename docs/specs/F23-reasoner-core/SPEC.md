@@ -539,7 +539,9 @@ q2, q7, q12 and q19 under `owl-rl` demand on the unmaterialized store took 8.3 t
 against 113 to 117 s, the medians of three alternating rounds, at 1.2 GiB of peak RSS
 against 2.3 GiB, and returned the same rows.
 [The reasoning results](../../benchmarks/reasoning/RESULTS.md#query-time-closure-operators-on-owl2bench)
-give the record.
+give the record. An earlier approximate run on stanley, a laptop with other work beside it, at
+`c97471c3` against `5f3f69c2`, is in
+[its own directory](../../benchmarks/reasoning/runs/2026-11-20-item-521-stanley/env.txt).
 
 ### Bounded incremental deletion
 
