@@ -2054,10 +2054,11 @@ impl Session {
             }
             chunk.push(*t);
         }
-        // in key order, which the query's overlay inserts fastest: a closure operator
-        // derives its pairs in another order than joins do, and the overlay of a cached
-        // table, made again for every query, took 10% longer for it
-        chunk.sort_unstable();
+        // in predicate, object and subject order, the order joins mostly derive them in,
+        // which the query's overlay inserts fastest: a closure operator derives its pairs
+        // in another order, and the overlay of a cached table, made again for every
+        // query, took 10% longer for it. Subject order cost some queries 2% against this.
+        chunk.sort_unstable_by_key(|t| (t[1], t[2], t[0]));
         out.facts.extend_from_slice(&chunk);
         if !chunk.is_empty() {
             self.chunks.push(Arc::new(chunk));

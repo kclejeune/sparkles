@@ -221,11 +221,12 @@ fn constant_transitive_copies_engage_by_shape() {
     assert!(s.backward.pairs > 0, "{s:?}");
 }
 
-/// A session with operators returns the facts of one without them in the same order, key
-/// order, though its walks derive pairs in another order than joins do: a query's overlay
-/// inserts a cached table's facts again for every query, fastest in key order.
+/// A session with operators returns the facts of one without them in the same order,
+/// predicate, object and subject order, though its walks derive pairs in another order
+/// than joins do: a query's overlay inserts a cached table's facts again for every query,
+/// fastest in that order.
 #[test]
-fn returned_facts_come_in_key_order() {
+fn returned_facts_come_in_pos_order() {
     let profile = rules("[t: (?a ex:p ?b), (?b ex:p ?c) -> (?a ex:p ?c)]");
     let ttl = chain("ex:p", 40);
     for d in [
@@ -241,7 +242,10 @@ fn returned_facts_come_in_key_order() {
             let facts = session.derive(vec![(0, Vec::new())]).unwrap().facts;
             assert!(!session.compact);
             assert!(facts.len() > 40, "{d:?}");
-            assert!(facts.is_sorted(), "{d:?} with operators {on}");
+            assert!(
+                facts.is_sorted_by_key(|t| (t[1], t[2], t[0])),
+                "{d:?} with operators {on}"
+            );
             let pairs = session.closure_stats;
             assert_eq!(pairs == Stats::default(), !on, "{d:?}: {pairs:?}");
             out.push(facts.iter().map(|t| show(&session, t)).collect::<Vec<_>>());
