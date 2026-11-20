@@ -26,7 +26,7 @@ use super::dl_root;
 use super::dl_rules;
 use super::horn::HornIx;
 use super::horn_rules;
-use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, NO_ROLE, Node, Role, TOP};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
@@ -759,10 +759,6 @@ struct Run<'a> {
     /// the most memory counted so far, which the pool's grant covers
     peak: AtomicUsize,
     applied: AtomicUsize,
-    /// the messages sent to other contexts and the conclusions stored, which a run
-    /// prints when [`STATS_ENV`] is set
-    sent: AtomicUsize,
-    stored: AtomicUsize,
     /// whether a context derived an individual other than its root
     merged: AtomicBool,
     /// whether the workers send through outboxes, which they do when there are several,
@@ -911,10 +907,6 @@ struct StepOut {
     marks: Marks,
 }
 
-/// The variable that makes a saturation print the conclusions it applied and stored and
-/// the messages it sent to other contexts, for measurements (roadmap item 956).
-pub const STATS_ENV: &str = "SPARKLES_SATURATION_STATS";
-
 /// What a worker counted since it last added to the totals.
 #[derive(Default)]
 struct Tally {
@@ -923,8 +915,6 @@ struct Tally {
     stored: usize,
     /// the change in waiting messages
     queued: isize,
-    /// the messages sent to other contexts, for [`STATS_ENV`]
-    sent: usize,
 }
 
 /// What a saturation did.
@@ -981,8 +971,6 @@ pub fn saturate_counted(
         queued: AtomicIsize::new(0),
         peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
         applied: AtomicUsize::new(0),
-        sent: AtomicUsize::new(0),
-        stored: AtomicUsize::new(0),
         merged: AtomicBool::new(false),
         batch: AtomicBool::new(bounds.threads > 1),
         plain: plain(ix),
@@ -1023,17 +1011,6 @@ pub fn saturate_counted(
     }
     let memory = run.memory.load(Ordering::Relaxed);
     let peak = run.peak.load(Ordering::Relaxed).max(memory);
-    if std::env::var_os(STATS_ENV).is_some() {
-        eprintln!(
-            "saturation: threads={threads} applied={} sent={} stored={} linear={:?}",
-            run.applied.load(Ordering::Relaxed),
-            run.sent.load(Ordering::Relaxed),
-            run.stored.load(Ordering::Relaxed),
-            (0..ix.roles.linear.len())
-                .filter(|&t| ix.roles.linear[t])
-                .collect::<Vec<_>>(),
-        );
-    }
     let totals = Totals {
         conclusions: run.applied.load(Ordering::Relaxed),
         memory,
@@ -1809,18 +1786,13 @@ impl<'a> Run<'a> {
                     .map(|&(_, x)| Concl::Sub(x));
                 // a left-linear composition keeps no forward link (roadmap item 956)
                 let links = fwds.iter().flat_map(|&(r2, f)| {
-                    let fwd = roles
-                        .comp_fwd(r1, r2)
-                        .iter()
-                        .map(move |&t| Concl::Fwd(t, f));
-                    let bottom = roles
-                        .any_empty
-                        .then(|| roles.comp(r1, r2))
-                        .into_iter()
-                        .flatten()
-                        .filter(|&&t| roles.is_empty_role(t))
-                        .map(|_| Concl::Sub(BOTTOM));
-                    fwd.chain(bottom)
+                    roles.comp_fwd(r1, r2).iter().map(move |&t| {
+                        if t == NO_ROLE {
+                            Concl::Sub(BOTTOM)
+                        } else {
+                            Concl::Fwd(t, f)
+                        }
+                    })
                 });
                 let mut products = subs.chain(links);
                 loop {
@@ -1902,7 +1874,6 @@ impl<'a> Run<'a> {
     #[inline]
     fn flush_sends(&self, out: &mut Out<'_, '_>, tally: &mut Tally) -> bool {
         tally.queued += out.sent as isize;
-        tally.sent += out.sent;
         out.sent = 0;
         self.flush(tally)
     }
@@ -2076,7 +2047,7 @@ impl<'a> Run<'a> {
                 // no roots are left: what the worker counted goes to the totals before
                 // it waits for the others
                 round = 0;
-                if tally.applied > 0 || tally.stored > 0 || tally.queued != 0 || tally.sent > 0 {
+                if tally.applied > 0 || tally.stored > 0 || tally.queued != 0 {
                     self.flush(&mut tally);
                 }
                 // the worker goes idle; the last to do so with the queue empty ends the
@@ -2414,8 +2385,6 @@ impl<'a> Run<'a> {
     /// Adds a worker's counts to the totals and checks the bounds.
     fn flush(&self, t: &mut Tally) -> bool {
         let ok = self.check(t.applied, t.stored * CONCLUSION_BYTES, t.queued);
-        self.sent.fetch_add(t.sent, Ordering::Relaxed);
-        self.stored.fetch_add(t.stored, Ordering::Relaxed);
         *t = Tally::default();
         ok
     }
@@ -2623,7 +2592,6 @@ impl<'a> Run<'a> {
             self.flush_links(&st, &mut out, tally);
         }
         tally.queued += out.sent as isize;
-        tally.sent += out.sent;
         if self.bounds.partial && (at < taken.len() || !out.local.is_empty()) {
             // the rest of the batch in the order the reversed batch left it on `local`,
             // below what the rules gave the context
@@ -2909,7 +2877,7 @@ fn apply_rules<S: Sink, R: Rules>(
                 }
                 for &(r2, f) in &st.fwd.list {
                     for &t in roles.comp(r, r2) {
-                        compose(roles, e, t, f, roles.comp_fwd(r, r2).contains(&t), out);
+                        compose(roles, e, t, f, roles.keeps_composed(r, r2, t), out);
                     }
                 }
             }
@@ -2941,7 +2909,7 @@ fn apply_rules<S: Sink, R: Rules>(
             if !out.defer() {
                 for (r1, srcs) in &st.back {
                     for &t in roles.comp(*r1, r2) {
-                        let fwd = roles.comp_fwd(*r1, r2).contains(&t);
+                        let fwd = roles.keeps_composed(*r1, r2, t);
                         for &e in &srcs.list {
                             compose(roles, e, t, f, fwd, out);
                         }
@@ -3504,8 +3472,6 @@ mod horn_accounting_tests {
             queued: AtomicIsize::new(1),
             peak: AtomicUsize::new(bounds.peak_memory),
             applied: AtomicUsize::new(0),
-            sent: AtomicUsize::new(0),
-            stored: AtomicUsize::new(0),
             merged: AtomicBool::new(false),
             batch: AtomicBool::new(false),
             plain: false,
@@ -4787,6 +4753,79 @@ mod linear_chain_tests {
                 .map(|&r| b.ix.roles.linear[r as usize])
                 .collect();
             assert_eq!(got, want, "case {i}");
+        }
+    }
+
+    /// The rules applied one conclusion at a time with a sink that does not defer the
+    /// products of links, as a world's does, to a fixpoint on one thread.
+    fn immediate(b: &Built) -> Vec<Held> {
+        struct Queue {
+            me: Ex,
+            out: Vec<(Ex, Concl)>,
+        }
+        impl Sink for Queue {
+            fn send(&mut self, to: Ex, c: Concl) {
+                self.out.push((to, c));
+            }
+            fn me(&mut self, c: Concl) {
+                self.out.push((self.me, c));
+            }
+        }
+        let mut states = vec![State::default(); b.size];
+        let mut q = Queue {
+            me: 0,
+            out: Vec::new(),
+        };
+        let mut todo: VecDeque<(Ex, Concl)> = VecDeque::new();
+        for &c in &b.classes {
+            q.me = c;
+            init(&b.ix, c, &mut states[c as usize], &[], &mut q);
+            todo.extend(q.out.drain(..));
+        }
+        while let Some((e, c)) = todo.pop_front() {
+            q.me = e;
+            let st = &mut states[e as usize];
+            if !st.init {
+                init(&b.ix, e, st, &[], &mut q);
+            }
+            apply(&b.ix, e, st, c, &mut q);
+            todo.extend(q.out.drain(..));
+        }
+        states
+            .iter()
+            .map(|st| {
+                if !st.init {
+                    return (Vec::new(), Vec::new());
+                }
+                let mut subs: Vec<Ex> = st.subs.iter().copied().collect();
+                subs.sort_unstable();
+                let mut back: Vec<(Role, Ex)> = st
+                    .back
+                    .iter()
+                    .flat_map(|(r, v)| v.list.iter().map(move |&e| (*r, e)))
+                    .collect();
+                back.sort_unstable();
+                (subs, back)
+            })
+            .collect()
+    }
+
+    /// The rules without the deferred flush give the same subsumers and backward links
+    /// with left-linear composition as without it, and as the concurrent saturation.
+    #[test]
+    fn immediate_composition_stores_the_same_backward_links() {
+        for (i, case) in CASES.iter().enumerate() {
+            for seed in [3, 17] {
+                let lin = build(case, 32, seed);
+                let mut all = build(case, 32, seed);
+                all.ix.roles.without_linear();
+                let a = immediate(&lin);
+                assert!(a == immediate(&all), "case {i} seed {seed}");
+                assert!(
+                    a == saturated(&lin, 1).0,
+                    "case {i} seed {seed} against a run"
+                );
+            }
         }
     }
 

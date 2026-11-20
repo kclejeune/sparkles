@@ -934,8 +934,9 @@ pub struct Roles {
     /// for each role, whether its chains compose left-linearly
     /// ([`Roles::finish_chains`], roadmap item 956)
     pub linear: Vec<bool>,
-    /// for each pair of [`Roles::comp`], the roles of the composed links whose source
-    /// keeps them as forward links
+    /// for each pair of [`Roles::comp`], what the source of the composed links takes:
+    /// the roles of those it keeps as forward links, and [`NO_ROLE`] for each that is
+    /// empty, in the order of the composition table
     pub comp_fwd: FxHashMap<(Role, Role), Vec<Role>>,
 }
 
@@ -1012,9 +1013,10 @@ impl Roles {
         self.right.get(r as usize).copied().unwrap_or(false)
     }
 
-    /// The roles of [`Roles::comp`] whose composed link its source keeps as a forward
-    /// link: those that keep forward links, less the left-linear compositions of
-    /// [`Roles::finish_chains`].
+    /// What the source of the links that [`Roles::comp`] composes takes, one message
+    /// each: a forward link by each role that keeps them, less the left-linear
+    /// compositions of [`Roles::finish_chains`], and the bottom, as [`NO_ROLE`], for each
+    /// empty role.
     #[inline]
     pub fn comp_fwd(&self, r1: Role, r2: Role) -> &[Role] {
         if !self.left.get(r1 as usize).copied().unwrap_or(false) {
@@ -1028,15 +1030,22 @@ impl Roles {
     #[cfg(test)]
     pub fn without_linear(&mut self) {
         self.linear.iter_mut().for_each(|l| *l = false);
-        let right = &self.right;
+        let (right, empty) = (&self.right, &self.empty);
         self.comp_fwd = self
             .comp
             .iter()
             .map(|(&k, v)| {
                 let kept = v
                     .iter()
-                    .copied()
-                    .filter(|&t| right.get(t as usize).copied().unwrap_or(false))
+                    .flat_map(|&t| {
+                        let fwd = right.get(t as usize).copied().unwrap_or(false).then_some(t);
+                        let bottom = empty
+                            .get(t as usize)
+                            .copied()
+                            .unwrap_or(false)
+                            .then_some(NO_ROLE);
+                        fwd.into_iter().chain(bottom)
+                    })
                     .collect();
                 (k, kept)
             })
@@ -1064,18 +1073,35 @@ impl Roles {
     /// links only with the forward links that are not such compositions, and the
     /// transitive closure of a role is derived once for each link that ends in a link
     /// the axioms give, rather than once for each intermediate context.
-    pub fn finish_chains(&mut self) {
+    /// The answer is the bytes of the tables it adds.
+    pub fn finish_chains(&mut self) -> usize {
         let n = self.sup.len();
         let mut linear = vec![false; n];
         // a switch for measurements, which composes every pair as before
-        let off = std::env::var_os(LINEAR_CHAINS_ENV).is_some_and(|v| v == "0");
-        for t in 0..n as Role {
-            if off {
-                break;
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off =
+            *OFF.get_or_init(|| std::env::var_os(LINEAR_CHAINS_ENV).is_some_and(|v| v == "0"));
+        // the roles that two of their own links compose into, and the pairs with a link
+        // by each of them on the right, which one pass over the table finds
+        let mut right_of: FxHashMap<Role, Vec<Role>> = FxHashMap::default();
+        if !off {
+            for t in 0..n as Role {
+                if self.keeps_forward(t) && self.comp(t, t).contains(&t) {
+                    right_of.insert(t, Vec::new());
+                }
             }
-            if !self.keeps_forward(t) || !self.comp(t, t).contains(&t) {
-                continue;
+        }
+        if !right_of.is_empty() {
+            for (&(s, b), v) in &self.comp {
+                if let Some(l) = right_of.get_mut(&b)
+                    && !v.is_empty()
+                    && self.left[s as usize]
+                {
+                    l.push(s);
+                }
             }
+        }
+        for (&t, lefts) in &right_of {
             let class: Vec<Role> = self.sup[t as usize]
                 .iter()
                 .copied()
@@ -1094,11 +1120,8 @@ impl Roles {
             // a role that composes with a link by t on its right does so alike with the
             // roles equivalent to t, and each role it composes into comes again from one
             // of them composed with a further link by t
-            let covered = self.comp.iter().all(|(&(s, b), v)| {
-                if b != t || v.is_empty() || !self.left[s as usize] {
-                    return true;
-                }
-                let st = sorted(v);
+            let covered = lefts.iter().all(|&s| {
+                let st = sorted(self.comp(s, t));
                 class.iter().all(|&a| sorted(self.comp(s, a)) == st)
                     && st
                         .iter()
@@ -1106,25 +1129,39 @@ impl Roles {
             });
             linear[t as usize] = uniform && covered;
         }
+        self.linear = linear;
+        // a pair whose source takes nothing has no entry
         let comp_fwd = self
             .comp
             .iter()
-            .map(|(&(r1, r2), v)| {
+            .filter_map(|(&(r1, r2), v)| {
                 let kept: Vec<Role> = v
                     .iter()
-                    .copied()
-                    .filter(|&t| {
-                        self.keeps_forward(t)
-                            && !(linear[t as usize]
-                                && self.equivalent(r1, t)
-                                && self.equivalent(r2, t))
+                    .flat_map(|&t| {
+                        let fwd = self.keeps_composed(r1, r2, t).then_some(t);
+                        let bottom = self.is_empty_role(t).then_some(NO_ROLE);
+                        fwd.into_iter().chain(bottom)
                     })
                     .collect();
-                ((r1, r2), kept)
+                (!kept.is_empty()).then_some(((r1, r2), kept))
             })
             .collect();
-        self.linear = linear;
         self.comp_fwd = comp_fwd;
+        self.comp_fwd
+            .values()
+            .map(|v| 40 + v.capacity() * 4)
+            .sum::<usize>()
+            + self.linear.len()
+    }
+
+    /// Whether the source of a link by `t` that a chain composes from links by `r1` and
+    /// `r2` keeps it as a forward link ([`Roles::comp_fwd`]).
+    #[inline]
+    pub fn keeps_composed(&self, r1: Role, r2: Role, t: Role) -> bool {
+        self.keeps_forward(t)
+            && !(self.linear.get(t as usize).copied().unwrap_or(false)
+                && self.equivalent(r1, t)
+                && self.equivalent(r2, t))
     }
 
     /// The inverse of a role, when the run has one.
@@ -2813,7 +2850,9 @@ fn horn_index(
         ix.roles.comp = sel.comp;
         ix.roles.left = sel.left;
         ix.roles.right = sel.right;
-        ix.roles.finish_chains();
+        // the selection keeps some of the chains, so its table is no larger than the
+        // one the role table's build charged
+        let _ = ix.roles.finish_chains();
     }
     dead.sort_unstable();
     dead.dedup();
@@ -3397,7 +3436,6 @@ fn roles(
         linear: Vec::new(),
         comp_fwd: FxHashMap::default(),
     };
-    roles.finish_chains();
     if !roles.clash.is_empty() {
         for r in 0..n as Role {
             if roles.clashes(r, r) {
@@ -3406,6 +3444,8 @@ fn roles(
         }
     }
     roles.any_empty = roles.empty.contains(&true);
+    // the products of the chains read the empty roles
+    grow(roles.finish_chains())?;
     Ok(roles)
 }
 
