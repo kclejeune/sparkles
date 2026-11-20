@@ -2384,11 +2384,14 @@ fn a_context_that_gives_way_sends_the_products_of_its_links_first() {
 /// is the same C context. At most one p-successor in B, which both are, makes them one
 /// individual, so K ⊑ ∃s.D ⊑ Ans. The qualified role of B comes back from C over the
 /// predecessor before the s-restriction arrives. A run that counts either finds K ⊑ Ans
-/// or does not answer in full. A run without the root does neither until item 1229's repair,
-/// which `SPARKLES_COUNTING_LATE_UNIT=2` turns on and with which this test passes.
+/// or does not answer in full, and with item 1229's repair it answers in full. Without the
+/// repair, `SPARKLES_COUNTING_LATE_UNIT=0` or `=1`, a run without the root does neither.
 #[test]
-#[ignore = "item 1229: passes with SPARKLES_COUNTING_LATE_UNIT=2"]
 fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
+    let repair = !matches!(
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref(),
+        Ok("0" | "1")
+    );
     for late in [
         "SubClassOf(:K ObjectUnionOf(:X1 :X2))
          SubClassOf(:X1 :A)
@@ -2424,7 +2427,9 @@ fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
                 })
                 .unwrap();
             assert_eq!(out.consistency, Consistency::Consistent);
-            if out.complete && k.excluded().is_empty() {
+            let full = out.complete && k.excluded().is_empty();
+            assert!(full || !repair, "the repair answers in full");
+            if full {
                 assert!(
                     out.taxonomy.is_subclass(&c("K"), &c("Ans")),
                     "K ⊑ Ans is missing"
@@ -2444,13 +2449,15 @@ fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
 /// analysis. Under the eager strategy both restrictions reach the one successor whose core
 /// is C and D, which sent its clauses over the predecessor when the r-edge was made, and
 /// the s-edge comes later. The functional p makes the two successors one, so K ⊑ ∃s.D ⊑ Ans.
-/// A run that counts without the root misses it until item 1229's repair, which
-/// `SPARKLES_COUNTING_LATE_UNIT=2` turns on and with which this test passes.
+/// A run that counts without the root misses it without item 1229's repair, which is on
+/// unless `SPARKLES_COUNTING_LATE_UNIT` is 0 or 1.
 #[test]
-#[ignore = "item 1229: passes with SPARKLES_COUNTING_LATE_UNIT=2"]
 fn a_late_restriction_that_shares_an_eager_successor_counts_with_it() {
-    // the repair, `SPARKLES_COUNTING_LATE_UNIT=2`, answers in full with counting
-    let repair = std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref() == Ok("2");
+    // the repair answers in full with counting
+    let repair = !matches!(
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref(),
+        Ok("0" | "1")
+    );
     let ax = axioms(
         "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
          SubClassOf(:K ObjectAllValuesFrom(:r :D))
