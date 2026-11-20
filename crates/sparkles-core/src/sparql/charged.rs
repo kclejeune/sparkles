@@ -172,7 +172,7 @@ impl<V: Storage, A: Account> Charged<V, A> {
     /// Afterwards the charge is set to what the collection reports, whether `f` failed
     /// or not. A refused admission leaves the buffer as it was.
     #[cold]
-    pub(super) fn grow<E>(
+    fn grow<E>(
         &mut self,
         grown: u64,
         f: impl FnOnce(&mut V) -> std::result::Result<(), E>,
@@ -204,7 +204,7 @@ impl<V: Storage, A: Account> Charged<V, A> {
     /// Run `f`, which frees storage and does not grow it, then lower the charge to what
     /// the collection holds.
     #[allow(dead_code, reason = "the operators of item 1192 use it")]
-    pub(super) fn shrink(&mut self, f: impl FnOnce(&mut V)) -> Result<()> {
+    fn shrink(&mut self, f: impl FnOnce(&mut V)) -> Result<()> {
         f(&mut self.value);
         let now = self.value.heap_bytes();
         debug_assert!(now <= self.charged, "a shrink grew the allocation");
@@ -328,9 +328,18 @@ fn table_growth<T>(len: usize, capacity: usize, more: usize) -> u64 {
     table_bound(target, std::mem::size_of::<T>())
 }
 
-/// The buckets a hashbrown table allocates for room for `capacity` entries, which are
-/// a power of two at most seven eighths full, and at least four.
-fn buckets(capacity: usize) -> usize {
+/// The buckets a hashbrown table of entries of `entry` bytes allocates for room for
+/// `capacity` entries, which are a power of two at most seven eighths full, and at
+/// least four. A small table of entries of one to three bytes is given room for at
+/// least 14 or 7 entries, so that its buckets fill a control group of 16 bytes. That is
+/// the rule for the 16-byte groups of SSE2, and an upper bound for the 8-byte groups of
+/// other targets.
+fn buckets(capacity: usize, entry: usize) -> usize {
+    let capacity = match entry {
+        0..=1 => capacity.max(14),
+        2..=3 => capacity.max(7),
+        _ => capacity,
+    };
     if capacity < 8 {
         if capacity < 4 { 4 } else { 8 }
     } else {
@@ -347,7 +356,10 @@ impl<T, A: Account> Charged<hashbrown::HashTable<T>, A> {
         if capacity - len >= more {
             return capacity;
         }
-        let buckets = buckets(len.saturating_add(more).max(capacity.saturating_add(1)));
+        let buckets = buckets(
+            len.saturating_add(more).max(capacity.saturating_add(1)),
+            std::mem::size_of::<T>(),
+        );
         if buckets <= 8 {
             buckets - 1
         } else {
@@ -441,7 +453,7 @@ pub(super) fn table_bound(capacity: usize, entry: usize) -> u64 {
     if capacity == 0 {
         return 0;
     }
-    let buckets = buckets(capacity);
+    let buckets = buckets(capacity, entry);
     // a bucket of `entry` bytes and one control byte, a control group of 16 bytes
     // beyond the buckets, and the alignment of the entries before the control bytes
     (buckets as u64)
@@ -478,8 +490,9 @@ mod tests {
         }
         // the old and the new storage were admitted together when it last doubled
         assert!(ctx.mem_peak() - base >= (v.capacity() + v.capacity() / 2) as u64 * 8);
-        v.shrink(|v| v.shrink_to_fit()).unwrap();
-        assert_eq!(ctx.live_bytes() - base, v.capacity() as u64 * 8);
+        // a free that moves nothing, as `shrink` requires
+        v.clear_free().unwrap();
+        assert_eq!(ctx.live_bytes(), base);
         drop(v);
         assert_eq!(ctx.live_bytes(), base);
     }
@@ -575,6 +588,40 @@ mod tests {
             let mut t = hashbrown::HashTable::<[u64; 3]>::new();
             t.reserve(cap, |x| x[0]);
             assert!(t.allocation_size() as u64 <= table_bound(cap, 24), "{cap}");
+            // Entries of one to three bytes get a larger smallest table.
+            let mut t = hashbrown::HashTable::<u8>::new();
+            t.reserve(cap, |&x| x as u64);
+            assert!(
+                t.allocation_size() as u64 <= table_bound(cap, 1),
+                "u8 {cap}"
+            );
+            let mut t = hashbrown::HashTable::<u16>::new();
+            t.reserve(cap, |&x| x as u64);
+            assert!(
+                t.allocation_size() as u64 <= table_bound(cap, 2),
+                "u16 {cap}"
+            );
+        }
+    }
+
+    /// A small table of byte entries grows within its admitted bound and predicts its
+    /// room, where the bound for four-byte entries fell short of hashbrown's smallest
+    /// table of 16 buckets.
+    #[test]
+    fn a_table_of_bytes_grows_within_its_bound() {
+        let ctx = context(1 << 20);
+        let mut t = Charged::new(
+            hashbrown::HashTable::<u8>::new(),
+            ctx.retained_charge(0).unwrap(),
+        )
+        .unwrap();
+        let hash = |&x: &u8| x as u64;
+        for x in 0..=255u8 {
+            let room = t.capacity_after(1);
+            t.reserve(1, hash).unwrap();
+            assert_eq!(t.capacity(), room, "{x}");
+            t.insert_reserved(x as u64, x, hash);
+            assert_eq!(t.bytes(), t.allocation_size() as u64);
         }
     }
 

@@ -69,7 +69,12 @@ same moment. A meter that counts after the system call, or uncounts before it, r
 low when another counted thread frees during an allocation or a reallocation, or
 allocates during a free. The meter's own test stops a counted thread at each of the
 three sites and has a second counted thread make the opposite call there, and it fails
-when the system calls move outside the lock. The lock serializes the counted threads'
+when the system calls move outside the lock. The window opens and closes under the same
+lock, and its peak is read as it closes, so no call is half counted at either edge. A
+block the window counted stays counted when any thread reallocates it, as a free lowers
+the count whichever thread frees it. The meter's pointer to the audited query's counter
+is set and cleared under the lock too, so no allocation reads a counter that is gone.
+The lock serializes the counted threads'
 allocations while a window is open, which slows the audited fixtures and nothing else.
 
 A reallocated block counts its old and new sizes together, whether the allocator moves
@@ -83,7 +88,7 @@ under the default rule comes from an operator that grows a block without admitti
 old size beside the new one, and it belongs to item 1192. An excess that shows under
 both rules is an undercharge for the operator's own item.
 
-The streamed merge's audit in `crates/sparkles-core/tests/cursor_alloc_audit.rs` has
+The streamed merge's allocator audit, which item 570's work adds as `cursor_alloc_audit.rs`, has
 its own copy of the meter, which counts a block grown in place at its larger size and
 counts outside the lock. It moves onto `tests/common/heap.rs` once both are on the
 main branch, and its fixtures then read old and new sizes for blocks that grow in place.

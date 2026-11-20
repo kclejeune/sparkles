@@ -221,6 +221,14 @@ fn allowance(name: &str) -> Allowance {
             over: 300 * K,
             peak: 1300 * K,
         },
+        // X19's growth rule charges a block that the allocator grows in place as a
+        // move, its old and new bytes together, and `AUDIT_REALLOC=exact` counts such
+        // a block once, at its larger size. The row arena of DISTINCT grows in place
+        // at its peak here, so only that mode reads the rule's cost.
+        "distinct two columns" if exact_realloc() => Allowance {
+            peak: 192 * K,
+            ..exact
+        },
         // item 1194: DISTINCT's passes hold their spill frames outside its ledger
         "distinct spilled" => Allowance {
             under: 64 * K,
@@ -228,6 +236,11 @@ fn allowance(name: &str) -> Allowance {
         },
         _ => exact,
     }
+}
+
+/// Whether the meter counts a block grown in place at its larger size alone.
+fn exact_realloc() -> bool {
+    std::env::var("AUDIT_REALLOC").is_ok_and(|v| v == "exact")
 }
 
 fn run(s: &Store, q: &str, granted: bool, batch: usize) -> Audit {
@@ -437,11 +450,12 @@ fn the_meter_counts_the_window_of_the_counted_thread_alone() {
     // A reallocated block counts its old and its new bytes together, whether it moves
     // or stays where it is, which is the allocator's choice. `AUDIT_REALLOC=exact`
     // counts one that stays at its larger size.
-    let exact = std::env::var("AUDIT_REALLOC").is_ok_and(|v| v == "exact");
+    let exact = exact_realloc();
     for (from, to) in [(MIB, MIB), (64, 2 * MIB)] {
         let (moved, peak) = heap::peak(|| unsafe {
             let layout = Layout::from_size_align(from, 8).unwrap();
             let p = std::alloc::alloc(layout);
+            assert!(!p.is_null());
             let old = p as usize;
             let q = std::alloc::realloc(p, layout, to);
             assert!(!q.is_null());
@@ -480,6 +494,10 @@ fn the_meter_counts_the_window_of_the_counted_thread_alone() {
         };
         if overlapped {
             found.push(format!("site {site}: the other call ran inside the site"));
+        } else if !heap::CONTENDED.load(Ordering::SeqCst) {
+            found.push(format!(
+                "site {site}: the other call never reached the allocator during the stop"
+            ));
         }
         if !(expected..expected + MIB / 4).contains(&peak) {
             found.push(format!("site {site}: read {peak}, expected {expected}"));
@@ -492,17 +510,44 @@ fn the_meter_counts_the_window_of_the_counted_thread_alone() {
         drop(std::hint::black_box(Vec::<u8>::with_capacity(MIB)));
     });
     assert!((2 * MIB..3 * MIB).contains(&peak), "{peak}");
+    // A block that the window counted stays counted when a thread that does not count
+    // reallocates it.
+    let (live, peak) = heap::peak(|| {
+        let block = Vec::<u8>::with_capacity(MIB);
+        let block = std::thread::spawn(move || {
+            let mut block = block;
+            block.reserve_exact(2 * MIB);
+            block
+        })
+        .join()
+        .unwrap();
+        let live = heap::live();
+        drop(block);
+        live
+    });
+    assert!((2 * MIB..2 * MIB + MIB / 4).contains(&live), "{live}");
+    let least = if exact { 2 * MIB } else { 3 * MIB };
+    assert!((least..3 * MIB + MIB / 4).contains(&peak), "{peak}");
 }
 
 /// One case of the meter's race test, run on the counted thread. See its caller.
 fn meter_race(site: usize) -> bool {
     const MIB: usize = 1 << 20;
-    for flag in [&heap::REACHED, &heap::DONE, &heap::OVERLAPPED] {
+    static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    READY.store(false, Ordering::SeqCst);
+    for flag in [
+        &heap::REACHED,
+        &heap::DONE,
+        &heap::CONTENDED,
+        &heap::OVERLAPPED,
+    ] {
         flag.store(false, Ordering::SeqCst);
     }
     let held = (site != 2).then(|| Vec::<u8>::with_capacity(24 * MIB));
     let other = std::thread::spawn(move || {
         heap::count_this_thread();
+        heap::contend_here();
+        READY.store(true, Ordering::SeqCst);
         let start = std::time::Instant::now();
         while !heap::REACHED.load(Ordering::SeqCst) {
             assert!(start.elapsed().as_secs() < 10, "the stop was never reached");
@@ -520,6 +565,11 @@ fn meter_race(site: usize) -> bool {
         heap::DONE.store(true, Ordering::SeqCst);
         drop(made);
     });
+    // The other thread is started and allocates nothing more before its call, so it
+    // cannot wait for the lock that the stop holds on a call of its own start.
+    while !READY.load(Ordering::SeqCst) {
+        std::hint::spin_loop();
+    }
     heap::stop_here(true);
     let moved = unsafe {
         match site {

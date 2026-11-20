@@ -78,6 +78,9 @@ fn locked<T>(f: impl FnOnce() -> T) -> T {
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
     {
+        if CONTENDS.try_with(Cell::get).unwrap_or(false) {
+            CONTENDED.store(true, Ordering::SeqCst);
+        }
         std::hint::spin_loop();
     }
     let r = f();
@@ -90,36 +93,42 @@ fn slot(address: usize) -> usize {
 }
 
 /// The meter's own test stops a counted thread at one site of the allocator, after
-/// the system call and before the count settles, to let another counted thread try
+/// the system call and before the count settles, to let another counted thread make
 /// the opposite call there. `HOOK` names the site, 1 for `alloc`, 2 for `dealloc` and
-/// 3 for `realloc`, and is cleared when the stop is taken. `REACHED` reports the stop,
-/// `DONE` is set by the other thread once its call returned, and `OVERLAPPED` reads
-/// `DONE` as the stop ends, which is whether the other call ran inside the site.
+/// 3 for `realloc`, and is cleared when the stop is taken. `REACHED` reports the stop
+/// to the other thread. The stop ends when the other thread has found the meter's lock
+/// held, which `CONTENDED` reports, or when its call has returned, which it reports with
+/// `DONE`. `OVERLAPPED` reads `DONE` as the stop ends, which is whether the other call
+/// ran inside the site.
 pub static HOOK: AtomicUsize = AtomicUsize::new(0);
 pub static REACHED: AtomicBool = AtomicBool::new(false);
 pub static DONE: AtomicBool = AtomicBool::new(false);
+pub static CONTENDED: AtomicBool = AtomicBool::new(false);
 pub static OVERLAPPED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    /// Whether this thread takes the stop. Like `COUNTED`, it has no destructor.
+    /// Whether this thread takes the stop, and whether it reports finding the lock
+    /// held. Like `COUNTED`, they have no destructor.
     static STOPS: Cell<bool> = const { Cell::new(false) };
+    static CONTENDS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Stop here, for at most a tenth of a second, if the meter's test asked for a stop at
-/// `site` on this thread. The other thread waits for the meter's lock, which this
-/// thread holds, so the stop ends at its bound and the other call runs after the site.
+/// Stop here if the meter's test asked for a stop at `site` on this thread, until the
+/// other thread found the lock held or its call returned. The wait is bounded by a
+/// count of spins, so it reads no clock inside the allocator, and a bound that runs out
+/// leaves both flags unset, which the test reports.
 fn pause(site: usize) {
     if STOPS.try_with(Cell::get).unwrap_or(false)
         && HOOK
             .compare_exchange(site, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     {
+        CONTENDED.store(false, Ordering::SeqCst);
         REACHED.store(true, Ordering::SeqCst);
-        let start = std::time::Instant::now();
-        while !DONE.load(Ordering::SeqCst)
-            && start.elapsed() < std::time::Duration::from_millis(100)
-        {
+        let mut spins = 0u64;
+        while !DONE.load(Ordering::SeqCst) && !CONTENDED.load(Ordering::SeqCst) && spins < 1 << 34 {
             std::hint::spin_loop();
+            spins += 1;
         }
         OVERLAPPED.store(DONE.load(Ordering::SeqCst), Ordering::SeqCst);
     }
@@ -128,6 +137,11 @@ fn pause(site: usize) {
 /// Count this thread's allocations, for the meter's own tests.
 pub fn count_this_thread() {
     COUNTED.set(true);
+}
+
+/// Let this thread report finding the meter's lock held, for the meter's own tests.
+pub fn contend_here() {
+    CONTENDS.set(true);
 }
 
 /// Let this thread take the stop at `HOOK`, for the meter's own tests.
@@ -278,7 +292,9 @@ unsafe impl GlobalAlloc for Counting {
                 return q;
             }
             let old = forget(p as usize);
-            if OPEN.load(Ordering::Relaxed) && counted() {
+            // A block the window counted stays counted at its new address, whichever
+            // thread reallocates it, as a free lowers the count whichever thread frees.
+            if OPEN.load(Ordering::Relaxed) && (counted() || old.is_some()) {
                 // A block that moved was live beside its copy while the bytes moved.
                 // One that stayed in place reads the same, old and new together, which
                 // is what `Charged::grow` admits: whether a block can stay in place
@@ -330,7 +346,7 @@ pub fn pool() -> &'static rayon::ThreadPool {
     })
 }
 
-fn open() {
+fn open() -> Window {
     // Read before the window opens, since reading the variable allocates.
     let exact = std::env::var("AUDIT_REALLOC").is_ok_and(|v| v == "exact");
     EXACT_REALLOC.store(exact, Ordering::Relaxed);
@@ -341,15 +357,43 @@ fn open() {
         BLOCKS.store(0, Ordering::Relaxed);
         LIVE.store(0, Ordering::Relaxed);
         PEAK.store(0, Ordering::Relaxed);
+        WITHIN.store(i64::MIN, Ordering::Relaxed);
+        FULL.store(false, Ordering::Relaxed);
+        OPEN.store(true, Ordering::Relaxed);
     });
-    WITHIN.store(i64::MIN, Ordering::Relaxed);
-    FULL.store(false, Ordering::Relaxed);
-    OPEN.store(true, Ordering::Relaxed);
+    Window { open: true }
 }
 
-fn close() {
-    OPEN.store(false, Ordering::Relaxed);
-    assert!(!FULL.load(Ordering::Relaxed), "the block table filled");
+/// An open window. It is closed under the meter's lock, so no allocator call is half
+/// done when its reading is taken, and it closes when it is dropped too, also while a
+/// panic unwinds, so that no later test finds it open.
+struct Window {
+    open: bool,
+}
+
+impl Window {
+    /// Close the window and give its peak and the largest excess inside a pull.
+    fn close(mut self) -> (usize, i64) {
+        self.open = false;
+        let (peak, within, full) = locked(|| {
+            OPEN.store(false, Ordering::Relaxed);
+            (
+                PEAK.load(Ordering::Relaxed),
+                WITHIN.load(Ordering::Relaxed),
+                FULL.load(Ordering::Relaxed),
+            )
+        });
+        assert!(!full, "the block table filled");
+        (peak, within)
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        if self.open {
+            locked(|| OPEN.store(false, Ordering::Relaxed));
+        }
+    }
 }
 
 /// The bytes the window has counted and still holds.
@@ -360,27 +404,30 @@ pub fn live() -> usize {
 /// The most bytes that `f`, run on the counted thread, held of what it allocated.
 pub fn peak<T: Send>(f: impl FnOnce() -> T + Send) -> (T, usize) {
     pool().install(|| {
-        open();
+        let window = open();
         let r = f();
-        close();
-        (r, PEAK.load(Ordering::Relaxed))
+        let (peak, _) = window.close();
+        (r, peak)
     })
 }
 
 /// Ends the in-pull comparison when it is dropped, also while a panic unwinds, so that
-/// no later allocation reads a meter that is gone.
-struct Watch;
+/// no later allocation reads a meter that is gone. It borrows the meter, so the meter
+/// outlives it, and it sets and clears the pointer under the meter's lock, which every
+/// read of the pointer holds.
+struct Watch<'a>(std::marker::PhantomData<&'a MemoryMeter>);
 
-impl Watch {
-    fn new(meter: &MemoryMeter) -> Watch {
-        METER.store(std::ptr::from_ref(meter).cast_mut(), Ordering::Relaxed);
-        Watch
+impl<'a> Watch<'a> {
+    fn new(meter: &'a MemoryMeter) -> Watch<'a> {
+        let at = std::ptr::from_ref(meter).cast_mut();
+        locked(|| METER.store(at, Ordering::Relaxed));
+        Watch(std::marker::PhantomData)
     }
 }
 
-impl Drop for Watch {
+impl Drop for Watch<'_> {
     fn drop(&mut self) {
-        METER.store(std::ptr::null_mut(), Ordering::Relaxed);
+        locked(|| METER.store(std::ptr::null_mut(), Ordering::Relaxed));
     }
 }
 
@@ -467,7 +514,7 @@ impl Audit {
 /// inside the window, so what the cursor allocates for its plan counts.
 pub fn audit(make: impl FnOnce() -> QueryCursor + Send) -> Audit {
     pool().install(|| {
-        open();
+        let window = open();
         let mut c = make();
         let meter = c.memory_meter();
         let mut a = Audit {
@@ -500,9 +547,7 @@ pub fn audit(make: impl FnOnce() -> QueryCursor + Send) -> Audit {
                 }
             }
         }
-        a.within = WITHIN.load(Ordering::Relaxed);
-        a.peak = PEAK.load(Ordering::Relaxed);
-        close();
+        (a.peak, a.within) = window.close();
         a.ledger = c.stats().mem_peak_bytes;
         a.plan = c.plan_json().unwrap_or_default();
         drop(meter);
