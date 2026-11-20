@@ -338,12 +338,27 @@ test('a lowered query limit is not exceeded by running queries', { timeout: 3000
     slow = controllers.map((controller) =>
       ds
         .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
-          timeout: 10000,
+          // Longer than the 10 s poll below, so a slow query cannot time out before the assertions
+          timeout: 20000,
           signal: controller.signal,
         })
         .catch((e) => e),
     );
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    // The engine exposes no count of running queries, so probe at the original limit of 2. A
+    // probe that is admitted proves a slow query has not taken its permit yet, and a
+    // ConflictError proves that both have.
+    const deadline = Date.now() + 10000;
+    for (;;) {
+      try {
+        const probe = await ds.select('SELECT * { ?s ?p ?o } LIMIT 1', { noWait: true });
+        await probe.toArray();
+      } catch (e) {
+        if (e instanceof ConflictError) break;
+        throw e;
+      }
+      assert.ok(Date.now() < deadline, 'the slow queries did not take both permits within 10 s');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
     // Both running queries keep their permits, so the lowered limit owes one.
     configure({ maxConcurrentQueries: 1 });
     await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
