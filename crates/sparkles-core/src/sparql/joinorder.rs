@@ -870,6 +870,10 @@ thread_local! {
     pub(super) static DP_GROWTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The rounds the program planned on this thread.
     pub(super) static DP_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The scratch credit the last checked greedy ordering released when it finished,
+    /// the credit it kept, and the storage it keeps (see `Greedy::storage`).
+    pub(super) static GREEDY_RELEASED: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// The set bits of `m`.
@@ -1134,6 +1138,8 @@ impl Greedy {
         let mut placed = vec![false; filters.len()];
         let mut units: Vec<Unit> = Vec::with_capacity(2 * n);
         let mut leaves = Vec::with_capacity(n);
+        // the credit of the leaves' transient lists, released when the ordering ends
+        let mut listed = 0;
         for (i, opts) in items.iter().enumerate() {
             ctx.check()?;
             let mut at = 0;
@@ -1181,6 +1187,11 @@ impl Greedy {
                 let preparation = credit.preparation().clone();
                 refused(preparation.stage(GREEDY_UNIT_PHASE))?;
                 refused(credit.grow_by(bytes as u64))?;
+                // the filter list and the variables `held_by_within` lists them from
+                listed += placing * std::mem::size_of::<usize>();
+                if starred {
+                    listed += g.models.held_by_bound(i) * std::mem::size_of::<u32>();
+                }
             }
             if let Some(credit) = leaf_held.as_mut()
                 && placing > 0
@@ -1345,7 +1356,54 @@ impl Greedy {
             }
             gr.alive.push(w);
         }
+        // The ordering keeps the plans, the leaves, the plans left and the placed
+        // filters. The heap and the working lists are dropped here, and with them
+        // their credit, sized as above.
+        let heap_bytes = heap.capacity() * std::mem::size_of::<Pair>();
+        drop((heap, cands, shared, holders, seen, with, dead));
+        if let Some(credit) = gr.held.as_mut() {
+            let scratch = heap_bytes
+                + listed
+                + n * std::mem::size_of::<usize>()
+                + 2 * n * (std::mem::size_of::<usize>() + std::mem::size_of::<bool>())
+                + nv * (std::mem::size_of::<Vec<usize>>() + std::mem::size_of::<u32>())
+                + held_vars * std::mem::size_of::<usize>()
+                + jv * std::mem::size_of::<Shared>()
+                + (jv + 3) * std::mem::size_of::<Cand>();
+            credit.release_to(credit.bytes() - scratch as u64);
+            #[cfg(test)]
+            {
+                let (kept, storage) = (credit.bytes() as usize, gr.storage());
+                GREEDY_RELEASED.with(|r| r.set((scratch, kept, storage)));
+            }
+        }
         Ok(gr)
+    }
+
+    /// The storage the ordering keeps, besides the copies of its leaves, measured from
+    /// its vectors.
+    #[cfg(test)]
+    fn storage(&self) -> usize {
+        use std::mem::size_of;
+        let bits = |b: &Bits| b.0.capacity() * size_of::<u64>();
+        let units: usize = self
+            .units
+            .iter()
+            .map(|u| {
+                bits(&u.inputs)
+                    + bits(&u.has)
+                    + bits(&u.certain)
+                    + u.vars.capacity() * size_of::<u32>()
+                    + (u.d.capacity() + u.dom.capacity()) * size_of::<(u32, f64)>()
+                    + u.filters.capacity() * size_of::<usize>()
+                    + u.held.capacity() * size_of::<(u32, Held)>()
+            })
+            .sum();
+        units
+            + self.units.capacity() * size_of::<Unit>()
+            + self.leaves.capacity() * size_of::<(usize, Option<Node>)>()
+            + self.alive.capacity() * size_of::<usize>()
+            + self.placed.capacity() * size_of::<bool>()
     }
 
     /// Cost the joins of plans `a` and `b` (`a` made first) and queue the best.

@@ -2684,7 +2684,7 @@ fn checked_graph_r12_admits_join_order_tables() {
     cases.push((12, checked_star_query(12)));
     cases.push((40, checked_star_query(40)));
     cases.push((30, opaque(2)));
-    cases.push((30, opaque(30)));
+    cases.push((60, opaque(60)));
     cases.push((12, subtree(2)));
     cases.push((12, subtree(12)));
     let mut failures = Vec::new();
@@ -2960,7 +2960,7 @@ fn default_chain_fixture(width: usize) -> Store {
 fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
     use plan::Planner;
 
-    use crate::sparql::joinorder::DP_ROUNDS;
+    use crate::sparql::joinorder::{DP_ROUNDS, GREEDY_RELEASED};
     use std::fmt::Write;
 
     // The program plans chains up to 16 in one round, a star of 12 in several, and the
@@ -3003,6 +3003,19 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
             .unwrap();
         let rounds = DP_ROUNDS.with(std::cell::Cell::get) - rounds;
         println!("width {width}: {rounds} rounds");
+        let (released, kept, storage) = GREEDY_RELEASED.with(|r| r.replace((0, 0, 0)));
+        println!("width {width}: greedy released {released}, kept {kept} for {storage}");
+        // The greedy ordering keeps credit for the plans it keeps and releases its heap
+        // and working lists when it ends.
+        assert!(
+            released > 0,
+            "width {width}: the ordering released its scratch"
+        );
+        assert!(kept >= storage, "width {width}: {kept} kept for {storage}");
+        assert!(
+            kept <= storage + storage / 4 + 256,
+            "width {width}: {kept} kept for {storage}"
+        );
         if rounds_expected {
             assert!(rounds > 1, "the star is planned in rounds");
         }
