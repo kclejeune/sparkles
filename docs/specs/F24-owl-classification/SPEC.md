@@ -350,7 +350,8 @@ each literal, and keeps the same sides in the same order. The Pred rule with a f
 premise moves its lists into the last product instead of copying them. The 96 disjunctive
 files of the development set derive the same conclusions, products and clauses at every
 doubling of the work, with the same estimated bytes and taxonomies. The classifications
-take 0.80 to 0.91 times the base's instructions on the six attempts counted, and on the
+take 0.80 to 0.91 times the base's instructions on the six files counted, with the
+limit below off, and on the
 loaded laptop the attempts took about half the time, such as 91 against 184 s on
 ore_ont_14817 on one thread.
 
@@ -363,12 +364,14 @@ after 4 million, where the bound is 22.4 million. Their classifications on one t
 25.6 and 51.1 G instructions against 584 and 700 G without the limit, with the same
 taxonomies, and every other file of the two sweeps keeps its answer and its statistics.
 The width of a product depends on the order in which contexts receive their premises. On
-four and eight threads the finishing attempts make products of up to 22,500 choices,
-ore_ont_9663 of at most 22,707 and ore_ont_14817 of 1.7 million after about 10 million
-conclusions, so the width does not tell an attempt that finishes from one that cannot,
-and a run on more threads has no limit on it. On one thread the order is fixed, and the
+four and eight threads the finishing attempts make products of up to 22,500 choices, and
+in three runs on four threads ore_ont_9663 made products of at most 22,707 to 923,521
+choices and ore_ont_14817 of 1.3 to 5.1 million, so the width does not tell an attempt
+that finishes from one that cannot, and a run on more threads has no limit on it. Unlike
+the bound on conclusions, the limit therefore depends on the number of threads, and an
+ontology near it can fall back on one thread where several threads answer in full. On one thread the order is fixed, and the
 widest product of ore_ont_9663 falls from 999 million choices on one thread to 1.3 million
-on two and 22,707 on four, with 355, 71 and 24 million choices made by the products'
+on two and 22,707 in one run on four, with 355, 71 and 24 million choices made by the products'
 steps, which item 1220 follows. A kept run whose product passes the limit starts again in
 full, as past the bound on conclusions.
 

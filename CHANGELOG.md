@@ -32,8 +32,8 @@ answer, with the axioms it leaves out and the fallback in its statistics, so 46 
 
 The pruning of the disjunctive rules' product lists compares sides by a signature and a
 sorted merge, and the Pred rule no longer copies its lists for a fixed premise. The attempts
-derive the same conclusions and take 0.80 to 0.91 times the instructions on six
-attempts of the ORE 2015 DL development set. On one thread an attempt also ends at a product
+derive the same conclusions, and six of the largest classifications of the ORE 2015 DL
+development set take 0.80 to 0.91 times the instructions. On one thread an attempt also ends at a product
 of more than `Limits::dl_attempt_width` choices, 1,048,576 by default, so that
 `ore_ont_14817` and `ore_ont_9663` fall back to the Horn rules after 0.5 and 4 million
 conclusions instead of 22.4 million, in 25.6 and 51.1 G instructions against 584 and 700 G,

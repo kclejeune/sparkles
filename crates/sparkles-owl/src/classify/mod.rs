@@ -181,8 +181,9 @@ const DL_ATTEMPT_PER_CLASS: usize = 384;
 /// most 3,645, while the attempts of ore_ont_14817 and ore_ont_9663 make one of 120
 /// million choices after 0.5 million conclusions and one of 4.2 million after 4 million.
 /// On four and eight threads the finishing attempts make products of up to 22,500
-/// choices and ore_ont_9663 of at most 22,707, so the width tells them apart only on one
-/// thread, and a run on more threads has no such limit.
+/// choices, and in three runs on four threads ore_ont_9663 made products of at most 22,707
+/// to 923,521 choices and ore_ont_14817 of 1.3 to 5.1 million, so the width tells them
+/// apart only on one thread, and a run on more threads has no such limit.
 const DL_ATTEMPT_WIDTH: usize = 1 << 20;
 
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
@@ -253,8 +254,10 @@ pub struct Limits {
     /// as past [`dl_attempt_work`](Limits::dl_attempt_work) (roadmap item 1011). `None`
     /// takes 1,048,576, far above what the attempts that finish make on one thread, and
     /// `Some(0)` takes no limit. A run on more threads has no such limit, since there the
-    /// width of a product depends on the schedule. A kept run that passes it starts again
-    /// in full, as past the bound.
+    /// width of a product depends on the schedule, so a run on one thread can fall back to
+    /// the Horn rules where a run on several answers in full. A kept run that passes it
+    /// starts again in full, as past the bound, and a kept run whose products stay within
+    /// it can answer in full where a run that starts again passes it.
     pub dl_attempt_width: Option<usize>,
     /// whether Tier D counts, which is off by default. A run that counts takes number
     /// restrictions, functional and inverse functional properties, disjoint properties and

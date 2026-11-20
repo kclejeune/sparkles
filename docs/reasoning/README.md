@@ -459,7 +459,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   set stay far within it, and those that cannot finish pass it well before their memory
   budget. On one thread the run also falls back when one product of its case analysis has
   more than `Limits::dl_attempt_width` choices, 1,048,576 by default, which the attempts
-  that finish there stay far below. On several threads a schedule can decide the outcome of a run that derives
+  that finish there stay far below. Several threads make products of other widths, so
+  they have no such limit, and an ontology near it can fall back on one thread where
+  several threads answer in full. On several threads a schedule can decide the outcome of a run that derives
   about the bound. With `Limits::partial`, a run of the
   disjunctive rules that its deadline, cancellation or memory budget stops returns the
   subsumptions it proved, with `Classification::complete` false, the classes it may have
