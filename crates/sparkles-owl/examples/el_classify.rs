@@ -252,45 +252,77 @@ fn main() {
             writeln!(f, "{l}").expect("write taxonomy");
         }
     }
+    let measured = measures(
+        &out,
+        &input,
+        axioms.len(),
+        read_ms,
+        &times,
+        &add_times,
+        rss_read,
+        heap.then(|| PEAK.load(Ordering::Relaxed)),
+    );
+    println!("{}", report(answer(&out, &excluded, rules), measured));
+}
+
+/// The report's line: the fields of [`answer`] and those of [`measures`].
+fn report(answer: serde_json::Value, measures: serde_json::Value) -> serde_json::Value {
+    let mut report = answer;
+    if let (Some(r), serde_json::Value::Object(m)) = (report.as_object_mut(), measures) {
+        r.extend(m);
+    }
+    report
+}
+
+/// The fields of the report that count and time the run.
+#[allow(clippy::too_many_arguments)]
+fn measures(
+    out: &sparkles_owl::classify::Classification,
+    input: &str,
+    axioms: usize,
+    read_ms: f64,
+    times: &[f64],
+    add_times: &[f64],
+    rss_read: Option<u64>,
+    peak_heap: Option<isize>,
+) -> serde_json::Value {
     let s = &out.stats;
     let median = |times: &[f64]| {
         let mut v = times.to_vec();
         v.sort_by(|a, b| a.total_cmp(b));
-        v[v.len() / 2]
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
     };
-    let mut report = answer(&out, &excluded, rules);
-    let rest = serde_json::json!({
-            "input": input,
-            "axioms": axioms.len(),
-            "classes": out.taxonomy.classes().count(),
-            "nodes": out.taxonomy.nodes().len(),
-            "unsatisfiable": out.taxonomy.unsatisfiable().count(),
-            "consistent": out.consistent,
-            "dlTests": s.dl_tests,
-            "dlStored": s.dl_stored,
-            "dlWork": s.dl_work,
-            "dlTestsHeld": s.dl_tests_held,
-            "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
-            "threads": s.threads,
-            "readMs": read_ms,
-            "classifyMs": times,
-            "classifyMedianMs": median(&times),
-            "addMs": median(&add_times),
-            "indexMs": s.index.as_secs_f64() * 1000.0,
-            "saturationMs": s.saturation.as_secs_f64() * 1000.0,
-            "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
-            "contexts": s.contexts,
-            "conclusions": s.conclusions,
-            "estimatedBytes": s.memory,
-            "peakEstimatedBytes": s.peak_memory,
-            "peakRssKibAfterRead": rss_read,
-            "peakRssKib": peak_rss_kib(),
-            "peakHeapBytes": heap.then(|| PEAK.load(Ordering::Relaxed)),
-    });
-    if let (Some(r), serde_json::Value::Object(m)) = (report.as_object_mut(), rest) {
-        r.extend(m);
-    }
-    println!("{report}");
+    serde_json::json!({
+        "input": input,
+        "axioms": axioms,
+        "classes": out.taxonomy.classes().count(),
+        "nodes": out.taxonomy.nodes().len(),
+        "unsatisfiable": out.taxonomy.unsatisfiable().count(),
+        "consistent": out.consistent,
+        "conjunctions": s.conjunctions,
+        "clauses": s.clauses,
+        "dlContexts": s.dl_contexts,
+        "dlTests": s.dl_tests,
+        "dlStored": s.dl_stored,
+        "dlWork": s.dl_work,
+        "dlTestsHeld": s.dl_tests_held,
+        "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
+        "threads": s.threads,
+        "readMs": read_ms,
+        "classifyMs": times,
+        "classifyMedianMs": median(times),
+        "addMs": median(add_times),
+        "indexMs": s.index.as_secs_f64() * 1000.0,
+        "saturationMs": s.saturation.as_secs_f64() * 1000.0,
+        "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
+        "contexts": s.contexts,
+        "conclusions": s.conclusions,
+        "estimatedBytes": s.memory,
+        "peakEstimatedBytes": s.peak_memory,
+        "peakRssKibAfterRead": rss_read,
+        "peakRssKib": peak_rss_kib(),
+        "peakHeapBytes": peak_heap,
+    })
 }
 
 /// The fields of the report that say what the answer claims: whether it is complete, the
@@ -379,5 +411,73 @@ mod tests {
             assert_eq!(claim, !decline, "{r}");
             assert_eq!(r["dlRootedDeclined"], decline, "{r}");
         }
+    }
+
+    /// The report keeps every field it had, and adds `dlRootedDeclined`.
+    #[test]
+    fn the_report_has_every_field() {
+        let doc = ofn_read::parse_with(
+            "Prefix(:=<http://example.org/h#>) Ontology(SubClassOf(:A :B))",
+            ofn_read::Options { skip_rules: true },
+        )
+        .expect("parse");
+        let mut k = Classifier::of(&doc.axioms);
+        let out = k.classify(&Limits::default()).expect("classify");
+        let r = report(
+            answer(&out, &k.excluded(), 0),
+            measures(&out, "in", 1, 0.0, &[1.0], &[1.0], None, None),
+        );
+        let mut have: Vec<&str> = r.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        have.sort_unstable();
+        let mut want = vec![
+            "addMs",
+            "axioms",
+            "classes",
+            "classifyMedianMs",
+            "classifyMs",
+            "clauses",
+            "complete",
+            "conclusions",
+            "conjunctions",
+            "consistency",
+            "consistent",
+            "contexts",
+            "dlAttemptOver",
+            "dlContexts",
+            "dlCountingOver",
+            "dlOverBudget",
+            "dlRootedDeclined",
+            "dlRootedOver",
+            "dlStored",
+            "dlTests",
+            "dlTestingMs",
+            "dlTestsHeld",
+            "dlWork",
+            "estimatedBytes",
+            "hornOverBudget",
+            "incomplete",
+            "indexMs",
+            "input",
+            "nodes",
+            "outside",
+            "outsideDisjunctive",
+            "outsideGlobal",
+            "outsideHorn",
+            "outsideTaken",
+            "partial",
+            "peakEstimatedBytes",
+            "peakHeapBytes",
+            "peakRssKib",
+            "peakRssKibAfterRead",
+            "readMs",
+            "rules",
+            "saturationMs",
+            "taxonomyMs",
+            "threads",
+            "tier",
+            "unsatisfiable",
+        ];
+        want.sort_unstable();
+        assert_eq!(have, want);
     }
 }

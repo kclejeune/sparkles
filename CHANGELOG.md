@@ -11,8 +11,9 @@ condition cannot reach a context registered for one of its individuals. When it 
 one, it classifies again without the rooted rules, gives the default answer, which leaves
 the axioms outside OWL 2 EL out, and sets `Stats::dl_rooted_declined` and
 `Stats::dl_over_budget`. The `el_classify` report has `dlRootedDeclined`. The check
-exempts contexts that it assumes the fact reaches another way, and those exemptions are
-not proved, so this is partial containment and roadmap item 1231 stays open for the
+exempts the predecessors of the context that holds the fact, the individual's own
+context, contexts that the root does not reach and the root's direct successors, and
+those exemptions are not proved, so this is partial containment and roadmap item 1231 stays open for the
 repair. On generated ontologies built around the loss, every miss is withdrawn. The check
 also withdraws answers that were complete, between 2 and 38 per generated corpus of several
 hundred to several thousand ontologies. `Limits::rooted_decline` set to false keeps the

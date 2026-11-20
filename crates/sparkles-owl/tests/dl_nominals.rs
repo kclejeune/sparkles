@@ -1478,9 +1478,10 @@ fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment()
 #[test]
 fn the_decline_withdraws_the_rooted_answer_on_every_path() {
     let keyed = format!("{AV2}\n     HasKey(:K (:q) ())");
+    let counted = format!("{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))");
     for (name, body, counting) in [
         ("plain", AV2.to_string(), false),
-        ("counting", AV2.to_string(), true),
+        ("counting", counted, true),
         ("keys", keyed, false),
     ] {
         let ax = axioms(&body);
@@ -1516,4 +1517,38 @@ fn the_decline_withdraws_the_rooted_answer_on_every_path() {
             assert!(sat.stats.dl_over_budget, "{at}: saturate");
         }
     }
+}
+
+/// A rooted run with counting that passes its bound starts again without counting, and
+/// that run is rooted too: when it withdraws its answer, the run starts again without the
+/// rooted rules and reports both fallbacks. The bound lies between the work of the run
+/// with counting and that of the run without it.
+#[test]
+fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
+    let ax = axioms(&format!(
+        "{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))"
+    ));
+    let limits = Limits {
+        threads: 1,
+        counting: true,
+        rooted: true,
+        dl_work: Some(180),
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&limits).unwrap();
+    assert!(out.stats.dl_counting_over);
+    assert!(out.stats.dl_rooted_declined);
+    assert!(out.stats.dl_over_budget && !out.stats.dl_rooted_over);
+    assert!(!rooted_claim(&k, &out));
+    // the control: without the decline the run without counting answers rooted
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            rooted_decline: false,
+            ..limits
+        })
+        .unwrap();
+    assert!(out.stats.dl_counting_over && !out.stats.dl_rooted_declined);
+    assert!(out.stats.tier == Tier::Disjunctive && !out.stats.dl_rooted_over);
 }

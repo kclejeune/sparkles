@@ -1429,6 +1429,29 @@ pub(super) struct MarkerCtx {
     pub(super) units: Vec<Lit>,
 }
 
+/// The bytes that [`marker_trips`] holds for the contexts `cs`, their copies and the maps
+/// and sets it builds over them, a bound that the run checks against its budget before
+/// the search.
+pub(super) fn marker_scan_bytes(cs: &[MarkerCtx]) -> usize {
+    use std::mem::size_of;
+    let mut b = std::mem::size_of_val(cs);
+    let mut succ = 0;
+    for c in cs {
+        succ += c.succ.len();
+        b += c.succ.capacity() * size_of::<Ex>()
+            + c.held.capacity() * size_of::<Lit>()
+            + c.units.capacity() * size_of::<Lit>()
+            + c.edges.capacity() * size_of::<(u32, Vec<Ex>)>()
+            + c.edges
+                .iter()
+                .map(|(_, v)| v.capacity() * size_of::<Ex>())
+                .sum::<usize>();
+    }
+    // the index by context, the predecessors, and the root's reach with one holder's
+    // successors and predecessors at a time, each a hash entry of about 16 bytes
+    b + cs.len() * 16 * 4 + succ * (size_of::<Ex>() + 16)
+}
+
 /// What [`marker_trips`] needs of the context `me` with the state `st`.
 pub(super) fn marker_ctx(
     ix: &Index,
@@ -1489,18 +1512,28 @@ pub(super) fn marker_ctx(
 /// constant's singleton context, tier 3 also the contexts that the root does not reach,
 /// and tier 4 also the root's own successors. With `stop`, and without the pairs on
 /// stderr, the count ends at the first pair of that tier, which is all a decline needs.
+/// The answer also counts the pair set P_R of the repair (PLAN v3.1, D3), the pairs that
+/// tier 0 keeps whose context the root reaches, as triples of holder, trigger and context
+/// and as sends, the distinct pairs of context and trigger. Those two counts are complete
+/// only without `stop`.
 pub(super) fn marker_trips(
     ix: &Index,
     cs: &[MarkerCtx],
     lits: &super::dl_clause::Lits,
     stop: Option<usize>,
-) -> [[usize; 3]; MARKER_TIERS] {
+) -> ([[usize; 3]; MARKER_TIERS], [usize; 2]) {
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let mut out = [[0usize; 3]; MARKER_TIERS];
-    let Some(root) = dx.root else { return out };
+    let mut pr = [0usize; 2];
+    let mut sends: FxHashSet<(Ex, Lit)> = FxHashSet::default();
+    let Some(root) = dx.root else {
+        return (out, pr);
+    };
     let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
-    let Some(&ri) = by.get(&root) else { return out };
+    let Some(&ri) = by.get(&root) else {
+        return (out, pr);
+    };
     let detail = marker_detail();
     let stop = stop.filter(|_| !detail);
     let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
@@ -1575,6 +1608,10 @@ pub(super) fn marker_trips(
                 if down.get_or_init(|| reach(c.me, &succ_of)).contains(&d) {
                     continue;
                 }
+                if reached {
+                    pr[0] += 1;
+                    sends.insert((d, l));
+                }
                 let keep = [
                     true,
                     !up.get_or_init(|| reach(c.me, &pred_of)).contains(&d),
@@ -1599,7 +1636,8 @@ pub(super) fn marker_trips(
                     tier += 1;
                 }
                 if stop.is_some_and(|t| out[t][2] > 0) {
-                    return out;
+                    pr[1] = sends.len();
+                    return (out, pr);
                 }
             }
         }
@@ -1608,7 +1646,8 @@ pub(super) fn marker_trips(
         out[t][0] = trig[t].len();
         out[t][1] = kons[t].len();
     }
-    out
+    pr[1] = sends.len();
+    (out, pr)
 }
 
 #[cfg(test)]
