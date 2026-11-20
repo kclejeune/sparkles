@@ -975,3 +975,59 @@ fn a_rewritten_run_that_does_not_take_tier_d_answers_as_a_fresh_classifier() {
     assert_eq!(k.excluded(), fresh.excluded());
     no_internal_names(&k, &out, &[Class::thing(), c("A"), c("B")]);
 }
+
+/// The fixtures of roadmap item 1061 in `tests/fixtures/dl1061` each entail `Z ⊑ Ans` by
+/// HermiT 1.4.5. In each, Z holds a hypothetical role atom to the individual a with a class
+/// P whose universal closes a cycle through the fact `R(b)`, its successors and a back-link
+/// `s(a, x)`, so that only the conditional class P(a) under Z's hypothesis reaches the
+/// successors of b. They guard the registration of the root's facts in a
+/// context: a run that narrows which facts a context receives must still find the
+/// subsumption, or must not report the run complete. The `fam-` files come from a family
+/// that varies the chain of role facts from b, the depth of ordinary successors below b's
+/// existential, where Z's role atom to a sits, and a second role atom from Z to b.
+#[test]
+fn a_conditional_class_of_a_nominal_reaches_the_successors_of_a_fact() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl1061");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ofn"))
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 9, "{files:?}");
+    let z = Class::new("http://example.org/n#Z");
+    let ans = Class::new("http://example.org/n#Ans");
+    let mut checked = 0;
+    for path in &files {
+        let ax = ofn_read::parse(&std::fs::read_to_string(path).unwrap())
+            .unwrap()
+            .axioms;
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (1, Expansion::Eager),
+            (4, Expansion::Eager),
+        ] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert_eq!(out.consistency, Consistency::Consistent, "{name}");
+            if out.complete && k.excluded().is_empty() {
+                checked += 1;
+                assert!(
+                    out.taxonomy.is_subclass(&z, &ans),
+                    "{name}, {threads} threads, {expansion:?}: a complete run misses Z ⊑ Ans"
+                );
+            }
+        }
+    }
+    // a run that reports every answer incomplete would pass the loop above without a check
+    assert!(checked > 0, "no run of the fixtures was complete");
+}
