@@ -1616,12 +1616,43 @@ fn a_late_edge_of_a_rooted_run_without_counting_reads_its_clauses() {
         (1, Expansion::Eager),
         (4, Expansion::Eager),
     ] {
-        /// The axioms of row 1231's regression: a ground fact about a constant that holds only
-        /// under the query class, G(w) under K, whose consequence passes through an element that
-        /// exists without K and is linked to w two edges below an individual, where the link is no
-        /// literal of the root.
-        const AV2: &str =
-            "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        if out.stats.dl_rooted_over {
+            assert!(
+                contained,
+                "only the containment falls back ({threads}, {expansion:?})"
+            );
+            continue;
+        }
+        assert!(
+            out.complete && k.excluded().is_empty(),
+            "the rooted run answers in full ({threads}, {expansion:?})"
+        );
+        assert!(
+            out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "K ⊑ Ans is missing ({threads}, {expansion:?})"
+        );
+        assert!(
+            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+            "E ⊑ Ans is not entailed"
+        );
+    }
+}
+
+/// The axioms of row 1231's regression: a ground fact about a constant that holds only
+/// under the query class, G(w) under K, whose consequence passes through an element that
+/// exists without K and is linked to w two edges below an individual, where the link is no
+/// literal of the root.
+const AV2: &str = "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
      SubClassOf(:K ObjectHasValue(:q :v))
      SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
      ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
@@ -1632,63 +1663,41 @@ fn a_late_edge_of_a_rooted_run_without_counting_reads_its_clauses() {
      SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
      SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))";
 
-        /// The configurations of the regression's runs.
-        const CONFIGS: [(usize, Expansion); 4] = [
-            (1, Expansion::Cautious),
-            (4, Expansion::Cautious),
-            (1, Expansion::Eager),
-            (4, Expansion::Eager),
-        ];
+/// The configurations of the regression's runs.
+const CONFIGS: [(usize, Expansion); 4] = [
+    (1, Expansion::Cautious),
+    (4, Expansion::Cautious),
+    (1, Expansion::Eager),
+    (4, Expansion::Eager),
+];
 
-        /// The claim predicate of the lane harnesses: a complete rooted answer of Tier D that took
-        /// every axiom and did not start again without the rooted rules.
-        fn rooted_claim(k: &Classifier, out: &Classification) -> bool {
-            out.complete
-                && out.incomplete.is_empty()
-                && k.excluded().is_empty()
-                && out.stats.tier == Tier::Disjunctive
-                && !out.stats.dl_rooted_over
-                && !out.stats.dl_rooted_declined
-                && !out.stats.dl_over_budget
-        }
+/// The claim predicate of the lane harnesses: a complete rooted answer of Tier D that took
+/// every axiom and did not start again without the rooted rules.
+fn rooted_claim(k: &Classifier, out: &Classification) -> bool {
+    out.complete
+        && out.incomplete.is_empty()
+        && k.excluded().is_empty()
+        && out.stats.tier == Tier::Disjunctive
+        && !out.stats.dl_rooted_over
+        && !out.stats.dl_rooted_declined
+        && !out.stats.dl_over_budget
+}
 
-        /// Row 1231: the rooted run of [`AV2`] either finds `K ⊑ Ans` or makes no claim of
-        /// completeness.
-        #[test]
-        fn a_conditional_fact_about_a_constant_reaches_an_element_outside_the_query_successors() {
-            let ax = axioms(AV2);
-            for (threads, expansion) in CONFIGS {
-                let mut k = Classifier::of(&ax);
-                let out = k
-                    .classify(&Limits {
-                        threads,
-                        expansion,
-                        rooted: true,
-                        ..Limits::default()
-                    })
-                    .unwrap();
-                assert_eq!(out.consistency, Consistency::Consistent);
-                if out.stats.dl_rooted_over {
-                    assert!(
-                        contained,
-                        "only the containment falls back ({threads}, {expansion:?})"
-                    );
-                    continue;
-                }
-                assert!(
-                    out.complete && k.excluded().is_empty(),
-                    "the rooted run answers in full ({threads}, {expansion:?})"
-                );
-                assert!(
-                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
-                    "K ⊑ Ans is missing ({threads}, {expansion:?})"
-                );
-                assert!(
-                    !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
-                    "E ⊑ Ans is not entailed"
-                );
-            }
-        }
+/// Row 1231: the rooted run of [`AV2`] either finds `K ⊑ Ans` or makes no claim of
+/// completeness.
+#[test]
+fn a_conditional_fact_about_a_constant_reaches_an_element_outside_the_query_successors() {
+    let ax = axioms(AV2);
+    for (threads, expansion) in CONFIGS {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
         assert!(
             !rooted_claim(&k, &out) || out.taxonomy.is_subclass(&c("K"), &c("Ans")),
             "{threads} threads {expansion:?}: a complete rooted run misses K ⊑ Ans"
