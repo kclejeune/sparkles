@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# stanley A/B of OWL2Bench(1) demand queries, base 5f3f69c2 against the lane tip.
+# Usage: ab.sh OUTDIR [queries...]
+set -euo pipefail
+here=$(cd "$(dirname "$0")" && pwd)
+out=$(realpath -m "$1"); shift
+qs=("${@:-2 7 12 19}")
+mkdir -p "$out"
+cd "$here/owl2bench"
+for q in ${qs[@]}; do
+  for arm in tip base; do
+    bin="$here/sparkles-$arm"
+    /run/current-system/sw/bin/time -f "%e s %M KiB" -o "$out/q$q.$arm.time" \
+      "$bin" query --loc base.db --reasoning demand --profile owl-rl --max-derived 0 \
+      --query "queries/q$q.rq" --results tsv > "$out/q$q.$arm.tsv" 2> "$out/q$q.$arm.err" || echo "exit $?" >> "$out/q$q.$arm.time"
+    sort "$out/q$q.$arm.tsv" > "$out/q$q.$arm.sorted"
+    echo "q$q $arm $(cat "$out/q$q.$arm.time" | tr '\n' ' ') rows $(($(wc -l < "$out/q$q.$arm.tsv") - 1))" | tee -a "$out/summary.txt"
+  done
+  if cmp -s "$out/q$q.tip.sorted" "$out/q$q.base.sorted"; then
+    echo "q$q rows equal" | tee -a "$out/summary.txt"
+  else
+    echo "q$q ROWS DIFFER" | tee -a "$out/summary.txt"
+  fi
+done
+echo done >> "$out/summary.txt"

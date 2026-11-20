@@ -153,6 +153,28 @@ before the grouped probes. Both builds derived 52,966,139 and 10,907,379 facts, 
 OWL2Bench(5) stayed at 4.6 GB and the tier ended at 2,746 MB. These are benchmark-worker
 measurements, and the benchmark host has not rerun them.
 
+### Query-time closure operators on OWL2Bench
+
+Derivation on demand closes the adorned copies of transitive rules with closure operators
+([F23](../../specs/F23-reasoner-core/SPEC.md#closure-operators)). This is a manual report of
+one run per query on stanley, a laptop with other builds and tests running beside it, so
+its times are approximate. Each query ran `sparkles query --reasoning demand --profile
+owl-rl --max-derived 0` on an unmaterialized OWL2Bench(1) store, first with the operators
+at `c97471c3` and then with the joins at `5f3f69c2`. Both builds returned the same rows for
+every query.
+
+| Query | Joins | Joins, peak RSS | Operators | Operators, peak RSS | Rows |
+|---|---:|---:|---:|---:|---:|
+| q2 | 188.4 s | 1,946 MiB | 14.1 s | 1,090 MiB | 7,422 |
+| q7 | 177.1 s | 2,033 MiB | 12.0 s | 1,147 MiB | 1,685 |
+| q12 | 142.1 s | 1,988 MiB | 12.1 s | 1,123 MiB | 2,495 |
+| q19 | 152.1 s | 1,935 MiB | 14.0 s | 1,108 MiB | 859 |
+
+The [run directory](runs/2026-11-20-item-521-stanley/env.txt) holds the host, builds and
+commands, the [script](runs/2026-11-20-item-521-stanley/ab.sh.txt) and the
+[timings](runs/2026-11-20-item-521-stanley/results.txt). The benchmark host has not rerun
+these queries.
+
 ### Sampled rule-body planning
 
 Roadmap item 939 orders rule bodies from sampled bindings. On atlas, an Intel Core

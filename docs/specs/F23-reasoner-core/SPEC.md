@@ -479,8 +479,8 @@ relation with Tarjan's algorithm, computes each component's reachable set once i
 reverse topological order, and releases a set once every component that reads it is
 done. An equivalence closes its classes with union-find. With few new edges the operator
 reads only the nodes that reach them, through the indexes. The rules stay in the
-program, so explanations, incremental maintenance and query-time reasoning, which
-evaluate them as joins, still name them.
+program, so explanations and incremental maintenance, which evaluate them as joins,
+still name them.
 
 The result equals the join evaluation. `tests/closure.rs` compares both on 300 random
 ontologies under three profiles, on late edges, on literals with equal values in
@@ -532,7 +532,8 @@ On stanley, a laptop under other load, at `c97471c3` against `5f3f69c2`, the OWL
 queries q2, q7, q12 and q19 under `owl-rl` demand on the unmaterialized store took 14.1,
 12.0, 12.1 and 14.0 s against 188, 177, 142 and 152 s, at 1.1 GiB of RSS against 1.9 to
 2.0 GiB, and returned the same rows. These are one approximate run per query and not
-published numbers.
+published numbers, and [the reasoning results](../../benchmarks/reasoning/RESULTS.md#query-time-closure-operators-on-owl2bench)
+give the record.
 
 ### Bounded incremental deletion
 
