@@ -311,6 +311,25 @@ fn closed_relations_call_for_no_walk() {
     assert!(s.walks > 0 && s.idle == 0, "{s:?}");
 }
 
+/// A relation closed by a copy that filters `notEqual` lacks the pairs `(x, x)`, so it is
+/// not closed for an operator without the filter: on the cycle `a -> b -> a`, the
+/// unfiltered rule still derives `(a, a)` and `(b, b)`, in either order of the rules.
+#[test]
+fn irreflexive_closures_leave_unfiltered_operators_to_walk() {
+    let tf = "[tf: (?a ex:p ?b), (?b ex:p ?c), notEqual(?a, ?c) -> (?a ex:p ?c)]";
+    let tu = "[tu: (?a ex:p ?b), (?b ex:p ?c) -> (?a ex:p ?c)]";
+    let ttl = "ex:a ex:p ex:b . ex:b ex:p ex:a .\n";
+    for text in [format!("{tf} {tu}"), format!("{tu} {tf}")] {
+        let (s, with) = compare_calls(ttl, &rules(&text), &[&[demand("?", "ex:p", "?")]]);
+        assert!(s.full.pairs > 0, "{text}: {s:?}");
+        let (facts, _, _) = returned(&with);
+        for x in ["a", "b"] {
+            let f = format!("<http://ex.org/{x}> <http://ex.org/p> <http://ex.org/{x}>");
+            assert!(facts.contains(&f), "{text}: {s:?}\n{facts:#?}");
+        }
+    }
+}
+
 /// An edge that a join derives after an operator closed the relation calls for walks
 /// again: `j` adds `ex:p` edges from `ex:q` facts that `k` derives an iteration later,
 /// which extend the closed chain.
@@ -499,6 +518,16 @@ impl Rng {
     }
 }
 
+/// What one case of [`random_sessions_derive_what_the_joins_derive`] held and did.
+#[derive(Debug)]
+struct Tally {
+    transitive: bool,
+    chain: bool,
+    same_as: bool,
+    engaged: bool,
+    off: bool,
+}
+
 /// Random property graphs with transitive, symmetric, inverse, functional and inverse
 /// functional properties, property hierarchies and chains of two and three properties,
 /// sameAs between individuals and with literals, literal values whose ids differ for
@@ -507,6 +536,7 @@ impl Rng {
 #[test]
 fn random_sessions_derive_what_the_joins_derive() {
     let mut engaged = Stats::default();
+    let mut tally = Vec::new();
     let cases: u64 = std::env::var("SPARKLES_CLOSURE_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -607,8 +637,36 @@ fn random_sessions_derive_what_the_joins_derive() {
                 _ => demand("?", "rdf:type", &format!("ex:C{}", r.below(3))),
             });
         }
-        let (s, _) = compare(&format!("# seed {seed}\n{t}"), &Profile::OwlRl, &demands);
+        let (s, sess) = compare(&format!("# seed {seed}\n{t}"), &Profile::OwlRl, &demands);
         engaged.add(&s);
+        let pairs = s.forward.pairs + s.backward.pairs + s.full.pairs + s.plain.pairs;
+        let row = Tally {
+            transitive: t.contains("TransitiveProperty"),
+            chain: t.contains("propertyChainAxiom"),
+            same_as: t.contains("owl:sameAs"),
+            engaged: pairs > 0 || s.walks > 0,
+            off: sess.closures_off,
+        };
+        eprintln!(
+            "tally seed={seed} {row:?} pairs={pairs} walks={} idle={} rewalks={}",
+            s.walks, s.idle, s.rewalks
+        );
+        tally.push(row);
+    }
+    for (name, pick) in [
+        ("all", (|_| true) as fn(&Tally) -> bool),
+        ("transitive", |r| r.transitive),
+        ("chain", |r| r.chain),
+        ("transitive+chain", |r| r.transitive && r.chain),
+        ("sameAs", |r| r.same_as),
+    ] {
+        let rows: Vec<_> = tally.iter().filter(|r| pick(r)).collect();
+        eprintln!(
+            "tally {name}: cases={} engaged={} closures_off={}",
+            rows.len(),
+            rows.iter().filter(|r| r.engaged).count(),
+            rows.iter().filter(|r| r.off).count()
+        );
     }
     assert!(
         engaged.forward.pairs + engaged.backward.pairs + engaged.full.pairs > 0,

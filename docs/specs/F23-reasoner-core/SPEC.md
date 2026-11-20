@@ -519,7 +519,8 @@ when the relation gained edges, and otherwise from the new values alone. The run
 the rows of the pairs that transitive operators merged, which change what no value reaches
 and so call for no walk, and the row before which a copy that binds neither end closed the
 whole relation. Until an edge that is not such a pair follows that row, no transitive
-operator over the predicate walks it. A later run of the session scans a closed
+operator over the predicate walks it, except that a closure filtered by `notEqual` lacks
+the pairs from a value to itself, so an operator without the filter still walks it. A later run of the session scans a closed
 relation once more, which roadmap item 1226 covers. Each operator emits
 exactly its copy's fixpoint, so the session derives the facts the joins derive, and
 `src/query_closure_tests.rs` checks that with the derived-table cache off on every kind of

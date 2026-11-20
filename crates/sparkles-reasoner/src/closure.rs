@@ -253,6 +253,27 @@ fn push<T>(v: &mut Vec<T>, x: T, held: &mut Held) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Make room in `map` for one more entry, charging a growth of its table to `held` before
+/// it is reserved.
+fn reserve_one<V>(map: &mut FxHashMap<u64, V>, held: &mut Held) -> Result<(), BudgetFailure> {
+    if map.len() == map.capacity() {
+        let before = map.capacity();
+        let want = (before * 2).max(16);
+        held.try_grow(
+            table_bytes(want, size_of::<(u64, V)>())
+                .saturating_sub(table_bytes(before, size_of::<(u64, V)>())),
+        )?;
+        map.reserve(want - map.len());
+        if map.capacity() > want {
+            held.try_grow(
+                table_bytes(map.capacity(), size_of::<(u64, V)>())
+                    .saturating_sub(table_bytes(want, size_of::<(u64, V)>())),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 /// The predicates an operator closes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Over {
@@ -423,22 +444,20 @@ impl Ledger {
     }
 
     /// Record the rows `[lo, hi)` of pairs of `q` that a transitive operator merged.
-    fn merge(
-        &mut self,
-        q: u64,
-        lo: u32,
-        hi: u32,
-        budget: &Arc<Budget>,
-    ) -> Result<(), BudgetFailure> {
+    fn merge(&mut self, q: u64, lo: u32, hi: u32, budget: &Arc<Budget>) -> anyhow::Result<()> {
         if lo >= hi {
             return Ok(());
+        }
+        let held = self.held.get_or_insert_with(|| Held::new(budget));
+        if !self.merged.contains_key(&q) {
+            reserve_one(&mut self.merged, held)?;
         }
         let rs = self.merged.entry(q).or_default();
         match rs.last_mut() {
             Some(last) if last.1 == lo => last.1 = hi,
-            _ => rs.push((lo, hi)),
+            _ => push(rs, (lo, hi), held)?,
         }
-        self.charge(budget)
+        Ok(())
     }
 
     /// Record that a transitive operator closed the whole relation of `q` from its edges
@@ -450,26 +469,15 @@ impl Ledger {
         irreflexive: bool,
         budget: &Arc<Budget>,
     ) -> Result<(), BudgetFailure> {
+        if !self.closed.contains_key(&q) {
+            let held = self.held.get_or_insert_with(|| Held::new(budget));
+            reserve_one(&mut self.closed, held)?;
+        }
         let e = self.closed.entry(q).or_insert((at, irreflexive));
         // the later closure, and of two at one row the one with the pairs `(x, x)`, which
         // holds for an operator either way
         if at > e.0 || (at == e.0 && !irreflexive) {
             *e = (at, irreflexive);
-        }
-        self.charge(budget)
-    }
-
-    fn charge(&mut self, budget: &Arc<Budget>) -> Result<(), BudgetFailure> {
-        let want = table_bytes(self.merged.capacity(), size_of::<(u64, Vec<(u32, u32)>)>())
-            + self
-                .merged
-                .values()
-                .map(|v| v.capacity() * size_of::<(u32, u32)>())
-                .sum::<usize>()
-            + table_bytes(self.closed.capacity(), size_of::<(u64, (u32, bool))>());
-        let held = self.held.get_or_insert_with(|| Held::new(budget));
-        if want > held.bytes() {
-            held.try_set(want)?;
         }
         Ok(())
     }
@@ -2051,5 +2059,35 @@ mod tests {
             sink.emit([i, 1, 2]).expect("both buffers fit");
         }
         assert_eq!(sink.held.bytes(), 2048 * size_of::<Triple>());
+    }
+
+    /// The ledger charges a growth of its tables and range lists before it reserves them:
+    /// a budget too small for the first table refuses the record and leaves nothing
+    /// allocated, and extending the last range of a predicate charges nothing.
+    #[test]
+    fn ledger_charges_before_it_grows() {
+        let first = table_bytes(16, size_of::<(u64, Vec<(u32, u32)>)>());
+        let budget = Budget::new(Some(first - 1));
+        let mut l = Ledger::default();
+        let e = l
+            .merge(7, 0, 4, &budget)
+            .expect_err("the table does not fit");
+        assert!(e.is::<crate::budget::MemoryExceeded>(), "{e:#}");
+        assert_eq!(l.merged.capacity(), 0);
+        let budget = Budget::new(Some(table_bytes(16, size_of::<(u64, (u32, bool))>()) - 1));
+        let mut l = Ledger::default();
+        let e = l
+            .close(7, 4, false, &budget)
+            .expect_err("the table does not fit");
+        assert!(anyhow::Error::from(e).is::<crate::budget::MemoryExceeded>());
+        assert_eq!(l.closed.capacity(), 0);
+        let budget = Budget::new(None);
+        let mut l = Ledger::default();
+        l.merge(7, 0, 4, &budget).unwrap();
+        let held = l.held.as_ref().unwrap().bytes();
+        assert!(held >= first + 16 * size_of::<(u32, u32)>(), "{held}");
+        l.merge(7, 4, 9, &budget).unwrap();
+        assert_eq!(l.merged[&7], vec![(0, 9)]);
+        assert_eq!(l.held.as_ref().unwrap().bytes(), held);
     }
 }
