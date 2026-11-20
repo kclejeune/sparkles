@@ -1900,17 +1900,15 @@ fn checked_non_simple_graph_charges_branches_after_graph_names_fit() {
         )])
         .unwrap();
     let data = DataGraph::new(store.snapshot(), Some(DEFAULT_GRAPH_IRI), &[], &[]).unwrap();
+    // A twin context that plans nothing gives the credit a dropped context leaves behind.
+    let twin = validation_query_context(&data, opts()).unwrap();
+    let twin_preparation = twin.source_preparation.clone().unwrap();
+    drop(twin);
+    let dropped = twin_preparation.inner_used();
     let ctx = validation_query_context(&data, opts()).unwrap();
-    let preparation = ctx.source_preparation.as_ref().unwrap();
+    let preparation = ctx.source_preparation.clone().unwrap();
     let filler = preparation.reserve(preparation.room() - 8192).unwrap();
-    let before = preparation.inner_used();
-    for (query, refused) in [
-        ("SELECT ?g WHERE { GRAPH ?g {} }", false),
-        (
-            "SELECT ?g WHERE { GRAPH ?g { OPTIONAL { <urn:x> <urn:p> ?o } } }",
-            true,
-        ),
-    ] {
+    let plan_query = |query: &str, refused: bool| {
         let Query::Select { pattern, .. } = parse_query(query, None, &[]).unwrap() else {
             unreachable!()
         };
@@ -1929,9 +1927,49 @@ fn checked_non_simple_graph_charges_branches_after_graph_names_fit() {
         } else {
             drop(plan.unwrap());
         }
-        assert_eq!(preparation.inner_used(), before);
+    };
+    ctx.shrink_retained(0).unwrap();
+    let before = preparation.inner_used();
+    let live = ctx.live_bytes();
+    let refused_query = "SELECT ?g WHERE { GRAPH ?g { OPTIONAL { <urn:x> <urn:p> ?o } } }";
+    for (query, refused) in [
+        ("SELECT ?g WHERE { GRAPH ?g {} }", false),
+        (refused_query, true),
+    ] {
+        plan_query(query, refused);
+        assert_eq!(
+            ctx.live_bytes(),
+            live,
+            "planning {query} keeps no live bytes"
+        );
+        // The context's memory account keeps its admitted high point, here the plan
+        // text's decoded constants, until the context lowers it or drops. Branch
+        // credit is not part of it, and a second plan of the same query adds nothing.
+        let held = preparation.inner_used();
+        assert!(
+            held - before <= ctx.mem_peak(),
+            "planning {query} holds {} bytes above its account's high point {}",
+            held - before,
+            ctx.mem_peak()
+        );
+        plan_query(query, refused);
+        assert_eq!(
+            preparation.inner_used(),
+            held,
+            "planning {query} again must hold no more credit"
+        );
+        ctx.shrink_retained(0).unwrap();
+        assert_eq!(
+            preparation.inner_used(),
+            before,
+            "planning {query} must return its credit"
+        );
     }
+    // Without the shrink, dropping the context returns the account's high point.
+    plan_query(refused_query, true);
     drop(filler);
+    drop(ctx);
+    assert_eq!(preparation.inner_used(), dropped);
 }
 
 fn checked_graph_fixture(count: usize) -> Store {
