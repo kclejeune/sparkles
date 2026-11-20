@@ -450,6 +450,11 @@ pub(super) fn univ_from_x(
 /// The premises of a ground inference whose maximal literal is `l`, the selected clauses
 /// and the markers left out.
 fn partners(st: &State, l: Lit) -> Vec<Side> {
+    partners_of(st, l, false)
+}
+
+/// [`partners`], with the selected clauses too when `sel` is set.
+fn partners_of(st: &State, l: Lit, sel: bool) -> Vec<Side> {
     let Some(d) = dl(st) else {
         return Vec::new();
     };
@@ -460,7 +465,7 @@ fn partners(st: &State, l: Lit) -> Vec<Side> {
         .flatten()
         .filter(|&&i| {
             let s = &d.store.clauses[i as usize];
-            !s.dead && !s.sel
+            !s.dead && (sel || !s.sel)
         })
         .map(|&i| side(&d.store.clauses[i as usize].c, l))
         .collect()
@@ -1242,6 +1247,33 @@ pub(super) fn root_pred(
     found: &mut Found,
     lits: &super::dl_clause::Lits,
 ) {
+    root_pred_of(
+        ix,
+        st,
+        e,
+        u,
+        c,
+        fixed,
+        found,
+        lits,
+        super::dl_rules::sel_partners_x(),
+    );
+}
+
+/// [`root_pred`], whose premises over `f_e(u)` include the selected clauses when `sel` is
+/// set, as Hyper over x has them under [`super::dl_rules::sel_partners_x`].
+#[allow(clippy::too_many_arguments)]
+fn root_pred_of(
+    ix: &Index,
+    st: &State,
+    e: Ex,
+    u: u32,
+    c: &Clause,
+    fixed: Option<(Lit, &Side)>,
+    found: &mut Found,
+    lits: &super::dl_clause::Lits,
+    sel: bool,
+) {
     found.rule = "rpredc";
     use super::dl_clause::{RY, X as KX};
     let dx = dix(ix);
@@ -1322,7 +1354,7 @@ pub(super) fn root_pred(
     let free: Vec<Vec<Side>> = need
         .iter()
         .map(|n| match n {
-            Need::Atom(k) => partners(st, *k),
+            Need::Atom(k) => partners_of(st, *k, sel),
             Need::Role(s) => roles(*s),
         })
         .collect();
@@ -1543,6 +1575,77 @@ mod tests {
         match ix.head(u).node {
             Node::Nominal(k) => RTerm::C(k),
             _ => panic!("not a nominal"),
+        }
+    }
+
+    /// Item 1220's repair R1 in Pred from a successor over `f_e(u)`: two selected clauses
+    /// `H(u) → A(f_e(u)) ∨ Z(x)` and `H(u) → B(f_e(u)) ∨ Z(x)` are the premises of the
+    /// successor's `A(x) ∧ B(x) → Z(y)` only when selected partners count, with no fixed
+    /// premise and with either one fixed. The clauses cannot go to a predecessor, since
+    /// their heads hold an atom over x and one over `f_e(u)`.
+    #[test]
+    fn root_pred_takes_selected_partners_under_r1() {
+        use super::super::dl_clause::Rooted;
+        let mut sig = Sig::new();
+        let a = sig.class("A");
+        let b = sig.class("B");
+        let h = sig.class("H");
+        let z = sig.class("Z");
+        let v = sig.ind("v");
+        let r = sig.role("r");
+        let e = sig.some_h(r, a);
+        let done = saturate_root(sig);
+        let ix = &done.ix;
+        let lits = &done.run.lits;
+        let inv = inv_of(ix, dix(ix));
+        let RTerm::C(u) = c(v, ix) else {
+            unreachable!()
+        };
+        let literal = |x| match lits.lit(x, inv) {
+            Made::Lit(l) => l,
+            _ => panic!("literal"),
+        };
+        let hyp = literal(XLit::Atom(h, RTerm::C(u)));
+        let fa = literal(XLit::Atom(a, RTerm::Fc(e, u)));
+        let fb = literal(XLit::Atom(b, RTerm::Fc(e, u)));
+        let answer = literal(XLit::Atom(z, RTerm::C(u)));
+        let mut st = State::default();
+        let o = Rooted {
+            ix,
+            lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        for l in [fa, fb] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![hyp], vec![l, Lit::x(z)]));
+        }
+        let mut maxima = Vec::new();
+        while let Some(i) = ds(&mut st).store.next(ix, Some(&o), &mut maxima) {
+            let s = &mut ds(&mut st).store.clauses[i as usize];
+            s.sel = super::super::dl_rules::selected_always(lits, inv, &s.c);
+        }
+        assert!(ds(&mut st).store.clauses.iter().all(|s| s.sel));
+        let succ = Clause::new(vec![Lit::x(a), Lit::x(b)], vec![answer]);
+        let fixed = side(&ds(&mut st).store.clauses[0].c, fa);
+        for (sel, want) in [(false, 0), (true, 1)] {
+            let mut found = Found::default();
+            root_pred_of(ix, &st, e, u, &succ, None, &mut found, lits, sel);
+            assert_eq!(found.products_len(), want, "no fixed premise, sel {sel}");
+            let mut found = Found::default();
+            root_pred_of(
+                ix,
+                &st,
+                e,
+                u,
+                &succ,
+                Some((fa, &fixed)),
+                &mut found,
+                lits,
+                sel,
+            );
+            assert_eq!(found.products_len(), want, "fixed premise, sel {sel}");
         }
     }
 
