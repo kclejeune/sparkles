@@ -3740,19 +3740,7 @@ impl Operator {
         CursorPlan {
             operator: self.info.clone(),
             materializes: self.materializes,
-            full_input_before_output: self.materializes
-                || matches!(
-                    self.state,
-                    State::Fallback { .. }
-                        | State::Binary(_)
-                        | State::Group(_)
-                        | State::Scalar(_)
-                        | State::Counts { .. }
-                        | State::Blocking { .. }
-                        | State::Whole(_)
-                        | State::TopK(_)
-                        | State::IndexTopK(_)
-                ),
+            full_input_before_output: self.full_input_before_output(),
             growing_state: self.growing,
             complete: false,
             reason: self.reason.clone(),
@@ -3800,19 +3788,27 @@ impl Operator {
         Ok(())
     }
 
-    fn update_plan(&mut self, plan: &mut CursorPlan) {
-        plan.materializes = self.materializes;
-        plan.full_input_before_output = self.materializes
+    /// Whether this operator reads its whole input before its first output, as its plan
+    /// reports both when it is described and after each pull.
+    fn full_input_before_output(&self) -> bool {
+        self.materializes
             || matches!(
                 self.state,
-                State::Binary(_)
+                State::Fallback { .. }
+                    | State::Binary(_)
                     | State::Group(_)
                     | State::Scalar(_)
                     | State::Counts { .. }
                     | State::Blocking { .. }
+                    | State::Whole(_)
                     | State::TopK(_)
                     | State::IndexTopK(_)
-            );
+            )
+    }
+
+    fn update_plan(&mut self, plan: &mut CursorPlan) {
+        plan.materializes = self.materializes;
+        plan.full_input_before_output = self.full_input_before_output();
         plan.growing_state = self.growing;
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;

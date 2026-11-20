@@ -2892,3 +2892,64 @@ fn a_streamed_algorithm_call_reads_pending_views_and_redacts_masked_plans() {
     assert!(call.operator.counters.is_none(), "{call:?}");
     assert_eq!(call.operator.estimated_rows, -1.0, "{call:?}");
 }
+
+#[test]
+fn an_algorithm_call_keeps_its_full_input_flag_across_pulls() {
+    use sparkles_core::sparql::{CursorOptions, CursorPlan, FallbackPolicy, select_cursor};
+    fn flags(p: &CursorPlan, out: &mut Vec<(String, bool, bool)>) {
+        out.push((
+            p.operator.operator.clone(),
+            p.full_input_before_output,
+            p.materializes,
+        ));
+        for c in &p.children {
+            flags(c, out);
+        }
+    }
+    let store = projection_cache_store();
+    for (body, whole) in [
+        // a call over an input that it reads whole
+        (
+            "VALUES ?src { ex:a } SERVICE algo:bfs { [] algo:predicate ex:p ; algo:source ?src ; algo:node ?n }",
+            true,
+        ),
+        // a call whose source is a constant, a leaf of the cursor
+        (
+            "SERVICE algo:bfs { [] algo:predicate ex:p ; algo:source ex:a ; algo:node ?n }",
+            false,
+        ),
+    ] {
+        let q = format!("{PREFIXES}SELECT ?n WHERE {{ {body} }}");
+        let mut c = select_cursor(
+            store.snapshot(),
+            &q,
+            &QueryOptions::default(),
+            &CursorOptions {
+                batch_rows: 1,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut before = Vec::new();
+        flags(c.plan(), &mut before);
+        let call = before
+            .iter()
+            .find(|f| f.0 == "AlgoCall")
+            .expect("algorithm call");
+        if whole {
+            assert!(call.1 && !call.2, "{body}: {before:?}");
+        }
+        let mut pulled = false;
+        while let Some(_batch) = c.next_batch().unwrap() {
+            let mut now = Vec::new();
+            flags(c.plan(), &mut now);
+            assert_eq!(before, now, "{body}, after a pull");
+            pulled = true;
+        }
+        assert!(pulled, "{body}");
+        let mut after = Vec::new();
+        flags(c.plan(), &mut after);
+        assert_eq!(before, after, "{body}, after the last pull");
+    }
+}
