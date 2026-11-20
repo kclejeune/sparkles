@@ -2302,6 +2302,72 @@ fn checked_graph_r12_preserves_cursor_singleton_rows_and_diagnostics() {
 }
 
 #[test]
+fn checked_graph_r12_count_join_matches_ordinary() {
+    fn operators(plan: &CursorPlan, out: &mut Vec<String>) {
+        out.push(plan.operator.operator.clone());
+        for child in &plan.children {
+            operators(child, out);
+        }
+    }
+
+    use std::fmt::Write;
+    let store = Store::in_memory(StoreOptions::default());
+    let mut input = String::new();
+    for i in 0..20 {
+        writeln!(input, "<urn:a{i}> <urn:p> <urn:a{}> .", i + 1).unwrap();
+    }
+    store
+        .load(&[crate::io::Source::from_bytes(
+            input.into_bytes(),
+            crate::io::RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+    // a chain of three, so that the count's join reads no key runs of two scans
+    let text = "SELECT (COUNT(*) AS ?n) WHERE { ?a <urn:p> ?b . ?b <urn:p> ?c . ?c <urn:p> ?d }";
+    let ordinary = query(store.snapshot(), text, &opts()).unwrap();
+    let checked = query_snapshot_prepared(store.snapshot(), text, opts()).unwrap();
+    assert_eq!(
+        ordinary.test_application_rows(),
+        checked.test_application_rows()
+    );
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        let options = CursorOptions {
+            batch_rows: 1,
+            fallback,
+            ..Default::default()
+        };
+        let mut ordinary = select_cursor(store.snapshot(), text, &opts(), &options).unwrap();
+        let mut expected = Vec::new();
+        operators(ordinary.plan(), &mut expected);
+        let mut ordinary_rows = 0;
+        while let Some(batch) = ordinary.next_batch().unwrap() {
+            ordinary_rows += batch.len();
+        }
+        // the cursor runs main's count over the join it rebuilds from the plan's node
+        assert!(
+            expected.iter().any(|o| o == "CountJoin"),
+            "{fallback:?}: {expected:?}"
+        );
+        let mut checked = graph_r12_open_cursor(&store, text, None, fallback).unwrap();
+        let mut actual = Vec::new();
+        operators(checked.plan(), &mut actual);
+        let mut checked_rows = 0;
+        while let Some(batch) = checked.next_batch().unwrap() {
+            checked_rows += batch.len();
+        }
+        assert_eq!(
+            (checked_rows, actual),
+            (ordinary_rows, expected),
+            "{fallback:?}"
+        );
+    }
+}
+
+#[test]
 fn checked_graph_r12_keeps_exists_evaluation_distinct_by_graph() {
     let store = checked_graph_fixture(2);
     let query_text = "SELECT ?g ?hit {

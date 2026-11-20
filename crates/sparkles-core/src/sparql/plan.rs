@@ -4266,7 +4266,16 @@ impl<'a> Planner<'a> {
 
     // ------------------------------------------------------------- join groups ------
 
-    fn plan_group(&mut self, items: PlanningVec<Item>, mut filters: Vec<Expr>) -> Result<Node> {
+    fn plan_group(&mut self, items: PlanningVec<Item>, filters: Vec<Expr>) -> Result<Node> {
+        // The credit for each filter list on the checked route is declared before the
+        // list it covers, and the parameter is moved below them, so that every list is
+        // freed before its credit is released on each path, refusals included.
+        let _deferred_list;
+        let _late_list;
+        let mut joined_list = list_credit(None);
+        let _settled_list;
+        let _late_joined;
+        let mut filters = filters;
         let mut triples = self.planning_vec()?;
         let mut paths = self.planning_vec()?;
         let mut nodes = self.planning_vec()?;
@@ -4346,7 +4355,8 @@ impl<'a> Planner<'a> {
         // variable that an element may leave unbound (a UNION branch, an OPTIONAL, a
         // failed BIND, an UNDEF of VALUES) does not, when another element can still bind
         // it. Such a FILTER waits until every element that binds them has joined.
-        let (deferred, _deferred_list) = if self.branch_payload.borrow().is_none() {
+        let deferred;
+        (deferred, _deferred_list) = if self.branch_payload.borrow().is_none() {
             let deferred = defer_open_filters(&mut filters, &triples, &paths, &nodes, &unpacks);
             (deferred, list_credit(None))
         } else {
@@ -4430,7 +4440,9 @@ impl<'a> Planner<'a> {
                     .any(|u| u.t == v || u.parts.contains(&PT::V(v)))
                 || dependent.iter().any(|n| n.vars.contains(&v))
         };
-        let (mut settled, late, _late_list) =
+        let mut settled;
+        let late;
+        (settled, late, _late_list) =
             if self.branch_payload.borrow().is_none() || deferred.is_empty() {
                 let (settled, late): (Vec<Expr>, Vec<Expr>) = deferred
                     .into_iter()
@@ -4452,21 +4464,21 @@ impl<'a> Planner<'a> {
         if self.ctx.opt.probed_keys && leaves.len() > 1 {
             super::keyprobe::prepare(self.ctx, &leaves);
         }
-        let (mut result, _joined_list) = if leaves.is_empty() {
+        let mut result = if leaves.is_empty() {
             drop(leaves);
-            (Node::unit(), list_credit(None))
+            Node::unit()
         } else if leaves.iter().any(|l| l[0].is_empty()) {
             let mut vars: Vec<VarId> = leaves.iter().flat_map(|l| l[0].vars.clone()).collect();
             vars.sort_unstable();
             vars.dedup();
             drop(leaves);
-            (Node::empty(vars), list_credit(None))
+            Node::empty(vars)
         } else {
-            self.join_order(leaves, &mut filters, &mut settled)?
+            self.join_order(leaves, &mut filters, &mut settled, &mut joined_list)?
         };
         drop(scan_storage);
         drop(leaf_storage);
-        let _settled_list = if self.branch_payload.borrow().is_none() {
+        _settled_list = if self.branch_payload.borrow().is_none() {
             filters.append(&mut settled);
             list_credit(None)
         } else {
@@ -4507,7 +4519,7 @@ impl<'a> Planner<'a> {
             };
             result = self.place_retained(result, &mut filters, true)?;
         }
-        let _late_joined = if self.branch_payload.borrow().is_none() {
+        _late_joined = if self.branch_payload.borrow().is_none() {
             filters.extend(late);
             list_credit(None)
         } else {
@@ -4604,7 +4616,8 @@ impl<'a> Planner<'a> {
         leaves: Vec<Vec<Node>>,
         filters: &mut Vec<Expr>,
         settled: &mut Vec<Expr>,
-    ) -> Result<(Node, ListCredit)> {
+        append_credit: &mut ListCredit,
+    ) -> Result<Node> {
         let n = leaves.len();
         let preparation = self
             .branch_payload
@@ -4739,13 +4752,14 @@ impl<'a> Planner<'a> {
             };
             parts.push(self.place_filters(plan, settled)?);
         }
-        let joined = if preparation.is_none() {
+        // On the checked route the credit for the grown list goes into the caller's slot,
+        // which is declared before the caller's list, before anything else can fail.
+        if preparation.is_none() {
             filters.append(settled);
-            list_credit(None)
         } else {
             let more = settled.len();
-            self.grow_filters(filters, more, 4, |f| f.append(settled))?
-        };
+            *append_credit = self.grow_filters(filters, more, 4, |f| f.append(settled))?;
+        }
         // components connected by a spatial conjunct are joined on it
         super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
         // cross products between components, smallest first
@@ -4755,7 +4769,7 @@ impl<'a> Planner<'a> {
         for p in it {
             acc = self.join_components(acc, p, filters)?;
         }
-        Ok((super::indexjoin::fuse_stars(acc, self.ctx), joined))
+        Ok(super::indexjoin::fuse_stars(acc, self.ctx))
     }
 
     fn choose_checked_scan(&self, options: Vec<Node>, filters: &mut Vec<Expr>) -> Result<Node> {
@@ -4829,22 +4843,27 @@ impl<'a> Planner<'a> {
         } else {
             // The same test without allocating: every occurrence of a variable is bound
             // by one of the sides, and there is one.
-            let (now, now_list) = self.extract_filters(filters, |f| {
-                !f.has_exists() && {
-                    let mut any = false;
-                    f.visit_vars(&mut |v| {
-                        any = true;
-                        if a.vars.contains(&v) || b.vars.contains(&v) {
-                            Ok(())
-                        } else {
-                            Err(())
-                        }
-                    })
-                    .is_ok()
-                        && any
-                }
-            })?;
-            let _now_list = list_credit(now_list);
+            // The credit is declared before the list, which is freed first on a refusal.
+            let _now_list;
+            let now = {
+                let (now, now_list) = self.extract_filters(filters, |f| {
+                    !f.has_exists() && {
+                        let mut any = false;
+                        f.visit_vars(&mut |v| {
+                            any = true;
+                            if a.vars.contains(&v) || b.vars.contains(&v) {
+                                Ok(())
+                            } else {
+                                Err(())
+                            }
+                        })
+                        .is_ok()
+                            && any
+                    }
+                })?;
+                _now_list = list_credit(now_list);
+                now
+            };
             #[cfg(test)]
             note_list(5, now.len());
             // The conjunction the join keeps boxes both sides of each conjunct it adds,
@@ -4929,7 +4948,10 @@ impl<'a> Planner<'a> {
                     && (constant || any)
             }
         };
-        let (partition, now) = if self.branch_payload.borrow().is_some() && !filters.is_empty() {
+        // The reservation is declared before the list it covers, which is freed first on
+        // a refusal.
+        let mut partition;
+        let (held, now) = if self.branch_payload.borrow().is_some() && !filters.is_empty() {
             self.planning_stage(FILTER_PHASE)?;
             let placed = filters.iter().filter(|f| bound(f)).count();
             #[cfg(test)]
@@ -4954,15 +4976,18 @@ impl<'a> Planner<'a> {
             *filters = later;
             (None, now)
         };
-        let Some(mut partition) = partition else {
-            return Ok((
-                if now.is_empty() {
-                    n
-                } else {
-                    filter(n, now, self.ctx)
-                },
-                None,
-            ));
+        partition = match held {
+            Some(held) => held,
+            None => {
+                return Ok((
+                    if now.is_empty() {
+                        n
+                    } else {
+                        filter(n, now, self.ctx)
+                    },
+                    None,
+                ));
+            }
         };
         let (n, kept) = if now.is_empty() {
             (n, None)
