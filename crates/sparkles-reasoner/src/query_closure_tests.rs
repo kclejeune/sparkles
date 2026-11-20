@@ -221,6 +221,35 @@ fn constant_transitive_copies_engage_by_shape() {
     assert!(s.backward.pairs > 0, "{s:?}");
 }
 
+/// A session with operators returns the facts of one without them in the same order, key
+/// order, though its walks derive pairs in another order than joins do: a query's overlay
+/// inserts a cached table's facts again for every query, fastest in key order.
+#[test]
+fn returned_facts_come_in_key_order() {
+    let profile = rules("[t: (?a ex:p ?b), (?b ex:p ?c) -> (?a ex:p ?c)]");
+    let ttl = chain("ex:p", 40);
+    for d in [
+        demand("?", "ex:p", "ex:a40"),
+        demand("ex:a0", "ex:p", "?"),
+        demand("?", "ex:p", "?"),
+    ] {
+        let (a, b) = (store(&ttl), store(&ttl));
+        let mut out = Vec::new();
+        for (st, on) in [(&a, true), (&b, false)] {
+            let mut session = session(st, &profile, on);
+            session.prepare(std::slice::from_ref(&d), false).unwrap();
+            let facts = session.derive(vec![(0, Vec::new())]).unwrap().facts;
+            assert!(!session.compact);
+            assert!(facts.len() > 40, "{d:?}");
+            assert!(facts.is_sorted(), "{d:?} with operators {on}");
+            let pairs = session.closure_stats;
+            assert_eq!(pairs == Stats::default(), !on, "{d:?}: {pairs:?}");
+            out.push(facts.iter().map(|t| show(&session, t)).collect::<Vec<_>>());
+        }
+        assert_eq!(out[0], out[1], "{d:?}");
+    }
+}
+
 /// `prp-trp` under each key: specialized to a constant predicate with its guard as a
 /// constant atom (also through `prp-spo1`, which the schema specializes), and under keys
 /// whose predicate a magic fact leaves free or holds (`Bound`, through `prp-symp`).

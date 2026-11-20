@@ -419,7 +419,7 @@ impl QueryReasoner {
         req.no_cache = true;
         let mut s = Session::new(self.shared.clone(), req)?;
         s.rewrite_linear = false;
-        s.closures = false;
+        s.closures = Some(false);
         s.view = None;
         if !cached {
             s.schema_view = None;
@@ -716,8 +716,9 @@ pub(crate) struct Session {
     seeds: Vec<FxHashSet<u64>>,
     /// whether the session's demand programs may use closure operators (spec F23 Phase
     /// 2): the reasoner allows them, the session is not an explanation's, and the source
-    /// rules admit them (decided with the program)
-    closures: bool,
+    /// rules admit them. `None` until the first run decides it, so that a session whose
+    /// tables all come from the cache does not check the rules.
+    closures: Option<bool>,
     /// a run derived list structure that its rules read, so the session's runs go on
     /// without operators (see [`closure::Restart`])
     closures_off: bool,
@@ -749,9 +750,7 @@ impl Session {
             ),
             Some(source) => program_rules(source, &terms, &budget, &mut warnings)?,
         };
-        let closures = shared.closures
-            && crate::closure::Closures::admits(compiled.rules(), &terms)
-                .map_err(|e| memory_error(e, "the rules"))?;
+        let closures = (!shared.closures).then_some(false);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
         let resolved = match &req.readable {
             Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
@@ -908,7 +907,17 @@ impl Session {
             .then_some((self.terms.rdf_first, self.terms.rdf_rest));
         // the adorned copies of transitive rules are closed by operators, but not in a
         // compact run, which reads the source rules, nor in a lowered program's
-        let closures = self.closures && !self.closures_off && !compact && lists.is_none();
+        let closures = !self.closures_off && !compact && lists.is_none() && {
+            match self.closures {
+                Some(c) => c,
+                None => {
+                    let c = crate::closure::Closures::admits(self.compiled.rules(), &self.terms)
+                        .map_err(|e| memory_error(e, "the rules"))?;
+                    self.closures = Some(c);
+                    c
+                }
+            }
+        };
         let magic = if closures {
             match &self.magic {
                 Some(m) if m.len() == self.hidden.len() => Some(m.clone()),
@@ -2045,6 +2054,10 @@ impl Session {
             }
             chunk.push(*t);
         }
+        // in key order, which the query's overlay inserts fastest: a closure operator
+        // derives its pairs in another order than joins do, and the overlay of a cached
+        // table, made again for every query, took 10% longer for it
+        chunk.sort_unstable();
         out.facts.extend_from_slice(&chunk);
         if !chunk.is_empty() {
             self.chunks.push(Arc::new(chunk));
