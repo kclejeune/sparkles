@@ -625,15 +625,16 @@ impl DlRun {
         self.exhausted.store(true, Ordering::Relaxed);
     }
     /// Whether the run derived more conclusions than its bound, with those of the runs
-    /// whose contexts it keeps.
+    /// whose contexts it keeps, or left out an inference too wide to make, which passes
+    /// the bound even when the run has none, since the run is incomplete without it.
     pub fn over_work(&self) -> bool {
         let l = self.work_limit.load(Ordering::Relaxed);
-        let over = l != 0
-            && (self.exhausted.load(Ordering::Relaxed)
-                || self
+        let over = self.exhausted.load(Ordering::Relaxed)
+            || l != 0
+                && self
                     .carried
                     .saturating_add(self.work.load(Ordering::Relaxed))
-                    > l);
+                    > l;
         if over {
             self.worked.store(true, Ordering::Relaxed);
         }
@@ -3858,6 +3859,61 @@ mod tests {
         }
         assert!(run.over_work());
         assert_eq!(run.work(), 100);
+    }
+
+    /// The pruning before item 1011, which searched each literal.
+    fn prune_by_search(l: &mut Vec<Side>) {
+        if l.len() < 2 {
+            return;
+        }
+        let within = |a: &Side, b: &Side| {
+            a.0.iter().all(|x| b.0.contains(x)) && a.1.iter().all(|x| b.1.contains(x))
+        };
+        l.sort_by_key(|s| s.0.len() + s.1.len());
+        let mut keep: Vec<Side> = Vec::with_capacity(l.len());
+        for s in l.drain(..) {
+            if !keep.iter().any(|k| within(k, &s)) {
+                keep.push(s);
+            }
+        }
+        *l = keep;
+    }
+
+    #[test]
+    fn pruning_keeps_the_sides_that_a_search_of_each_literal_keeps() {
+        // sides over few literals, so that many contain others, sorted or not, with
+        // repeats and empty halves, and more literals than a signature has bits
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..2000 {
+            let atoms = if round % 2 == 0 { 6 } else { 90 };
+            let lits = |next: &mut dyn FnMut(u64) -> u64| -> Vec<Lit> {
+                let n = next(5) as usize;
+                let mut v: Vec<Lit> = (0..n).map(|_| Lit::x(next(atoms) as Ex + 2)).collect();
+                match next(3) {
+                    0 => {
+                        v.sort_unstable();
+                        v.dedup();
+                    }
+                    1 => v.sort_unstable(),
+                    _ => {}
+                }
+                v
+            };
+            let len = next(12) as usize;
+            let list: Vec<Side> = (0..len)
+                .map(|_| (lits(&mut next), lits(&mut next)))
+                .collect();
+            let (mut a, mut b) = (list.clone(), list);
+            prune(&mut a);
+            prune_by_search(&mut b);
+            assert_eq!(a, b, "round {round}");
+        }
     }
 
     #[test]

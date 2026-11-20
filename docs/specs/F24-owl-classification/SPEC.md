@@ -349,7 +349,7 @@ a signature of their literals and then by a merge of the sorted literals, where 
 each literal, and keeps the same sides in the same order. The Pred rule with a fixed
 premise moves its lists into the last product instead of copying them. The 96 disjunctive
 files of the development set derive the same conclusions, products and clauses at every
-doubling of the work, with the same estimated bytes and taxonomies. The classifications
+doubling of the work, with the same estimated bytes and taxonomies. On the laptop the classifications
 take 0.80 to 0.91 times the base's instructions on the six files counted, with the
 limit below off, and on the
 loaded laptop the attempts took about half the time, such as 91 against 184 s on
@@ -360,8 +360,8 @@ On one thread an attempt also ends when one product of its rules has more choice
 that finish make products of at most 256 choices on one thread, and the 2,166 generated
 ontologies of item 969 with a union of at most 3,645. ore_ont_14817 makes a product of
 120 million choices after 0.5 million conclusions, and ore_ont_9663 one of 4.2 million
-after 4 million, where the bound is 22.4 million. Their classifications on one thread take
-25.6 and 51.1 G instructions against 584 and 700 G without the limit, with the same
+after 4 million, where the bound is 22.4 million. Their classifications on one thread on
+the laptop take 25.6 and 51.1 G instructions against 584 and 700 G without the limit, with the same
 taxonomies, and every other file of the two sweeps keeps its answer and its statistics.
 The width of a product depends on the order in which contexts receive their premises. On
 four and eight threads the finishing attempts make products of up to 22,500 choices, and
@@ -373,7 +373,9 @@ ontology near it can fall back on one thread where several threads answer in ful
 widest product of ore_ont_9663 falls from 999 million choices on one thread to 1.3 million
 on two and 22,707 in one run on four, with 355, 71 and 24 million choices made by the products'
 steps, which item 1220 follows. A kept run whose product passes the limit starts again in
-full, as past the bound on conclusions.
+full, as past the bound on conclusions. A run that leaves out an inference too wide to make,
+for this limit or for an at-most restriction with too many candidates, now falls back even when it has
+no bound on its conclusions, where it answered as complete without the inference before.
 
 Item 869 found where the Horn rules with individuals spend their time on four files of
 the ORE 2015 DL development set with 7,856 to 114,957 property assertions,

@@ -177,6 +177,38 @@ fn an_attempt_on_one_thread_past_its_width_takes_the_answer_of_the_horn_rules() 
     // a limit at the product's choices, and none, keep the whole answer
     assert_eq!(run(1, Some(4)).1, whole);
     assert_eq!(run(1, Some(0)).1, whole);
+    // without a bound on its conclusions the limit still ends the attempt, which would
+    // otherwise answer without the product's conclusions
+    let mut k = Classifier::of(&held);
+    let out = k
+        .classify(&Limits {
+            threads: 1,
+            dl_attempt_work: Some(0),
+            dl_attempt_width: Some(3),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.stats.dl_attempt_over && out.stats.dl_over_budget);
+    assert_eq!(answer(&out, &k), horn);
+    // and a run that asks for a partial answer takes the answer it takes past its bound
+    let partial = |work: Option<usize>, width: Option<usize>| {
+        let mut k = Classifier::of(&held);
+        let out = k
+            .classify(&Limits {
+                threads: 1,
+                dl_attempt_work: work,
+                dl_attempt_width: width,
+                partial: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        let a = answer(&out, &k);
+        (out.complete, out.stats.dl_attempt_over, a)
+    };
+    let past = partial(Some(1), Some(0));
+    assert!(past.1);
+    assert_eq!(partial(Some(0), Some(3)), past);
+    assert_eq!(partial(None, Some(3)), past);
     // on more threads, where the width of a product depends on the schedule, the run has
     // no such limit
     for threads in [4, 8] {
