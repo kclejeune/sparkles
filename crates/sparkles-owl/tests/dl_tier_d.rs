@@ -2396,8 +2396,10 @@ fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
         "SubClassOf(:K ObjectUnionOf(:X1 :X2))
          SubClassOf(:X1 :A)
          SubClassOf(:X2 :A)",
+        // an unrelated union keeps this Horn arrival order on the disjunctive rules
         "SubClassOf(:K ObjectSomeValuesFrom(:r1 :D2))
-         SubClassOf(:D2 ObjectAllValuesFrom(ObjectInverseOf(:r1) :A))",
+         SubClassOf(:D2 ObjectAllValuesFrom(ObjectInverseOf(:r1) :A))
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))",
     ] {
         let ax = axioms(&format!(
             "SubObjectPropertyOf(:r :p)
@@ -2427,6 +2429,7 @@ fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
                 })
                 .unwrap();
             assert_eq!(out.consistency, Consistency::Consistent);
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
             let full = out.complete && k.excluded().is_empty();
             assert!(full || !repair, "the repair answers in full");
             if full {
