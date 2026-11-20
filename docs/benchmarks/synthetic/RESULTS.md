@@ -896,8 +896,9 @@ a slow mode of 26 to 30 ms. Streamed, 70 of the base's 300 requests take the fas
 against 22 of main's, and the base's servers differ from each other by up to 40.7%.
 Within the slow mode alone main reads 1.031 of the base, with an interval of 0.993 to
 1.080, so most of the difference is how often main's servers reach the fast mode. The
-run's CPU samples show no relation between a server's median and its share of P cores,
-so thread placement does not explain the fast mode. The tip against the base reads 1.042
+run's CPU samples show no correlation between a server's median and its share of P
+cores, though with one indexed streamed server whose median is under 22 ms they cannot
+rule out placement of single requests, so the cause of the fast mode is open. The tip against the base reads 1.042
 streamed, with pairs from 0.834 to 1.376, and 0.997 eager.
 
 The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
