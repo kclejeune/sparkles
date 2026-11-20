@@ -2647,7 +2647,7 @@ fn checked_join_order_excess_of(width: usize, text: &str) -> [i64; crate::test_a
 
 #[test]
 fn checked_graph_r12_admits_join_order_tables() {
-    // Stage 2 builds the program's tables over every subset of the inputs, which grow
+    // Stage 0 indexes the group's variables, filters and join models. Stage 2 builds the program's tables over every subset of the inputs, which grow
     // with 2^n, stage 3 runs the program over them and stage 4 rebuilds its plan. The
     // greedy plan alone handles widths past 16, and a star of 12 is planned in rounds.
     // The copies of inputs that filters are placed on, whose size follows the input,
@@ -2667,6 +2667,7 @@ fn checked_graph_r12_admits_join_order_tables() {
         .into_iter()
         .map(|width| (width, checked_chain_query(width)))
         .collect();
+    cases.push((40, checked_chain_query(40)));
     cases.push((12, checked_star_query(12)));
     cases.push((12, subtree(2)));
     cases.push((12, subtree(12)));
@@ -2677,6 +2678,7 @@ fn checked_graph_r12_admits_join_order_tables() {
         println!("{text}: {excess:?}");
         run.push(excess[3]);
         for (stage, name, cap) in [
+            (0, "group", 512),
             (2, "program tables", 512),
             (3, "program run", 512),
             (4, "program build", 256),
@@ -2787,8 +2789,8 @@ fn checked_join_order_at_phase(
 #[test]
 fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
     use crate::sparql::joinorder::{
-        BUILD_PHASE, FILTER_VARS_PHASE, GROW_PHASE, LEAF_PHASE, PARTS_PHASE, PREPARE_PHASE,
-        ROUND_PHASE, SCRATCH_PHASE,
+        BUILD_PHASE, FILTER_VARS_PHASE, GROUP_PHASE, GROW_PHASE, LEAF_PHASE, MODELS_PHASE,
+        PARTS_PHASE, PREPARE_PHASE, ROUND_PHASE, SCRATCH_PHASE,
     };
 
     // A chain of 12 is planned by the program in one round over 12 inputs, and a star
@@ -2805,6 +2807,10 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
     // later ones as subsets are planned. An event of `usize::MAX` stands for the last.
     let n = 1usize << width;
     for (text, phase, at, size) in [
+        (&chain, GROUP_PHASE, 0, 0),
+        (&chain, GROUP_PHASE, usize::MAX, 0),
+        (&chain, MODELS_PHASE, 0, 0),
+        (&star, MODELS_PHASE, 1, 0),
         (&chain, PREPARE_PHASE, 0, 16 * n),
         (&chain, ROUND_PHASE, 0, 4 * n),
         (&chain, GROW_PHASE, 1, 0),

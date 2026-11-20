@@ -576,6 +576,41 @@ pub(super) fn of_node(ctx: &Ctx, n: &Node, out: &mut Vec<(VarId, u64)>) {
     });
 }
 
+/// The most entries that [`of_node`] adds for plan `n`, counted without allocating, so
+/// that a checked plan can admit them first.
+pub(super) fn of_node_bound(ctx: &Ctx, n: &Node) -> usize {
+    let reg = ctx.stars.lock();
+    if reg.is_empty() {
+        return 0;
+    }
+    let rdf_type = ctx.snap.generation.charsets.get().and_then(|i| i.rdf_type);
+    let mut calls = 0usize;
+    walk(&reg, n, rdf_type, None, &mut |_, _| calls += 1);
+    calls
+}
+
+/// [`of_node`] into an empty `out`, with the storage for `bound` entries (see
+/// [`of_node_bound`]) allocated up front.
+pub(super) fn of_node_within(ctx: &Ctx, n: &Node, out: &mut Vec<(VarId, u64)>, bound: usize) {
+    debug_assert!(out.is_empty());
+    let reg = ctx.stars.lock();
+    if reg.is_empty() {
+        return;
+    }
+    let rdf_type = ctx.snap.generation.charsets.get().and_then(|i| i.rdf_type);
+    out.reserve_exact(bound);
+    let mut at: FxHashMap<VarId, usize> =
+        FxHashMap::with_capacity_and_hasher(bound, Default::default());
+    walk(&reg, n, rdf_type, None, &mut |v, bit| match at.get(&v) {
+        Some(&i) => out[i].1 = merge(out[i].1, bit),
+        None => {
+            at.insert(v, out.len());
+            out.push((v, bit));
+        }
+    });
+    debug_assert!(out.len() <= bound);
+}
+
 /// The star mask of `v` among the patterns of plan `n` (0 when it has none): its entry
 /// in [`of_node`], found without collecting the others.
 pub(super) fn mask_in(ctx: &Ctx, n: &Node, v: VarId) -> u64 {

@@ -1755,6 +1755,12 @@ impl Ctx {
         m.get(text).copied()
     }
 
+    /// Whether some selectivity was measured on a sample while planning this query, so
+    /// that [`Ctx::sampled`] can find one.
+    pub(super) fn has_sampled(&self) -> bool {
+        !self.sampled.lock().is_empty()
+    }
+
     /// Keep the selectivity measured for the conjunct shown as `text` (the first one
     /// measured stays, so that every plan compared sees the same).
     pub(super) fn set_sampled(&self, text: String, s: super::sample::Sampled) {

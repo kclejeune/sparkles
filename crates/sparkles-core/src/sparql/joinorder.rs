@@ -33,8 +33,8 @@ use super::indexjoin::{self, ProbeSide};
 use super::keyprobe::Side;
 use super::plan::{self, JoinModel, Node, Planner};
 use super::table::VarId;
-use crate::access::Reservation;
-use crate::error::Result;
+use crate::access::{PreparationText, Reservation};
+use crate::error::{Error, Result};
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -339,6 +339,8 @@ struct Group {
     filters: Vec<FilterInfo>,
     /// how the joins are estimated when not from distinct values
     models: Models,
+    /// the checked route's credit for the above, dropped after them
+    _held: Option<Reservation>,
 }
 
 /// What the inputs of a group hold that estimates a join other than from distinct values.
@@ -543,12 +545,44 @@ fn merge_held(a: &[(u32, Held)], b: &[(u32, Held)]) -> Vec<(u32, Held)> {
 }
 
 impl Group {
-    fn new(items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Result<Group> {
+    /// The group of `items` and `filters`. On the checked route the storage is sized
+    /// from the inputs and the filters before any of it is allocated, and admitted in
+    /// two steps, the variables and filters first and the join models once the join
+    /// variables are known. The group holds the credit until it drops.
+    fn new(items: &[Vec<Node>], filters: &[Expr], pl: &Planner) -> Result<Group> {
         #[cfg(test)]
         let _stage = crate::test_alloc::Stage::enter(0);
-        let mut idx: FxHashMap<VarId, u32> = FxHashMap::default();
-        let mut vars = Vec::new();
-        let mut count: Vec<u32> = Vec::new();
+        let ctx = pl.ctx;
+        let total: usize = items.iter().map(|it| it[0].vars.len()).sum();
+        first_storage(|| total * std::mem::size_of::<VarId>());
+        let mut held = refused(pl.planning_stage(GROUP_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<VarId>(total)?;
+                layout.map::<VarId, u32>(total)?;
+                // count, join and jvars
+                layout.slots::<u32>(3 * total)?;
+                layout.slots::<Vec<u32>>(items.len())?;
+                for it in items {
+                    layout.slots::<u32>(it[0].vars.len())?;
+                }
+                layout.slots::<FilterInfo>(filters.len())?;
+                let mut most = 0;
+                for f in filters {
+                    let c = var_count(f);
+                    layout.slots::<u32>(c)?;
+                    most = most.max(c);
+                }
+                // one filter's variable set and local indices at a time
+                layout.slots::<VarId>(most)?;
+                layout.slots::<Option<u32>>(most)
+            })
+        }))?;
+        let checked = held.is_some();
+        let cap = if checked { total } else { 0 };
+        let mut vars = Vec::with_capacity(cap);
+        let mut idx: FxHashMap<VarId, u32> =
+            FxHashMap::with_capacity_and_hasher(cap, Default::default());
+        let mut count: Vec<u32> = Vec::with_capacity(cap);
         let mut item_vars = Vec::with_capacity(items.len());
         for it in items {
             let mut iv = Vec::with_capacity(it[0].vars.len());
@@ -566,57 +600,157 @@ impl Group {
             item_vars.push(iv);
         }
         let mut join = vec![u32::MAX; vars.len()];
-        let mut jvars = Vec::new();
+        let mut jvars = Vec::with_capacity(cap);
         for (l, &c) in count.iter().enumerate() {
             if c >= 2 {
                 join[l] = jvars.len() as u32;
                 jvars.push(l as u32);
             }
         }
-        let filters = filters
-            .iter()
-            .map(|f| {
-                let vs = f.var_set();
-                let local: Vec<Option<u32>> = vs.iter().map(|v| idx.get(v).copied()).collect();
-                let placeable =
-                    !f.has_exists() && !vs.is_empty() && local.iter().all(Option::is_some);
-                let cached = super::exprcache::eligible(&[f])
-                    .ok()
-                    .flatten()
-                    .and_then(|v| idx.get(&v).copied());
-                FilterInfo {
-                    placeable,
-                    vars: local.into_iter().flatten().collect(),
-                    cached,
-                    sel: ctx.sampled(&f.display(ctx)).map(|s| s.sel),
+        // a conjunct is looked up by its text only when some selectivity was sampled
+        let sampling = ctx.has_sampled();
+        let mut infos = Vec::with_capacity(filters.len());
+        for f in filters {
+            let vs = if checked {
+                // the same variables as `var_set`, in storage of the counted size
+                let mut vs = Vec::with_capacity(var_count(f));
+                f.vars(&mut vs);
+                vs.sort_unstable();
+                vs.dedup();
+                vs
+            } else {
+                f.var_set()
+            };
+            let local: Vec<Option<u32>> = vs.iter().map(|v| idx.get(v).copied()).collect();
+            let placeable = !f.has_exists() && !vs.is_empty() && local.iter().all(Option::is_some);
+            let cached = super::exprcache::eligible(&[f])
+                .ok()
+                .flatten()
+                .and_then(|v| idx.get(&v).copied());
+            let sel = match (&held, sampling) {
+                (_, false) => None,
+                (Some(credit), true) => {
+                    let mut text = PreparationText::new(credit.preparation())?;
+                    let written = f.write_description(ctx, &mut text);
+                    let (text, _credit) = text.finish()?;
+                    if written.is_err() {
+                        return Err(Error::invalid("could not write a filter description"));
+                    }
+                    ctx.sampled(&text).map(|s| s.sel)
                 }
-            })
-            .collect();
-        let mut models = Models::default();
+                (None, true) => ctx.sampled(&f.display(ctx)).map(|s| s.sel),
+            };
+            let vars = if checked {
+                let mut out = Vec::with_capacity(local.iter().flatten().count());
+                out.extend(local.iter().flatten().copied());
+                out
+            } else {
+                local.into_iter().flatten().collect()
+            };
+            infos.push(FilterInfo {
+                placeable,
+                vars,
+                cached,
+                sel,
+            });
+        }
+        let filters = infos;
+        // the inputs that bind several keys, needed only when two inputs could each bind
+        // several keys of one join
+        let several =
+            |iv: &Vec<u32>| iv.iter().filter(|&&l| join[l as usize] != u32::MAX).count() > 1;
+        let backoff = ctx.opt.key_backoff && item_vars.iter().filter(|iv| several(iv)).count() > 1;
+        // The models' credit, with the scratch of one input at a time, which is released
+        // once they are built.
+        let mut scratch = 0;
+        if let Some(credit) = held.as_mut() {
+            first_storage(|| items.len() * std::mem::size_of::<Vec<(u32, u64)>>());
+            let models = refused(pl.planning_stage(MODELS_PHASE).and_then(|()| {
+                pl.planning_scratch(|layout| {
+                    let mut most = super::checked_layout::Layout::new(credit.preparation());
+                    layout.slots::<Vec<(u32, u64)>>(items.len())?;
+                    layout.slots::<Vec<(u32, Side)>>(items.len())?;
+                    for (i, it) in items.iter().enumerate() {
+                        let mut one = super::checked_layout::Layout::new(credit.preparation());
+                        if ctx.opt.characteristic_sets {
+                            let bound = super::charsets::of_node_bound(ctx, &it[0]);
+                            layout.slots::<(u32, u64)>(bound)?;
+                            one.slots::<(VarId, u64)>(bound)?;
+                            one.map::<VarId, usize>(bound)?;
+                        }
+                        if ctx.opt.probed_keys {
+                            let own = own_keys(&item_vars[i], &join).count();
+                            layout.slots::<(u32, Side)>(own)?;
+                            one.slots::<u32>(own)?;
+                        }
+                        if one.bytes() > most.bytes() {
+                            most = one;
+                        }
+                    }
+                    if backoff {
+                        layout.slots::<Vec<Vec<u32>>>(items.len())?;
+                        for it in items {
+                            let (mut inputs, mut keys) = (0usize, 0usize);
+                            plan::input_vars(&it[0], &mut |vs| {
+                                let k = keys_in(vs, &idx, &join).count();
+                                if k > 1 {
+                                    inputs += 1;
+                                    keys += k;
+                                }
+                            });
+                            layout.slots::<Vec<u32>>(inputs)?;
+                            layout.slots::<u32>(keys)?;
+                        }
+                    }
+                    scratch = most.bytes();
+                    layout.add(
+                        usize::try_from(scratch).map_err(|_| credit.preparation().exhausted())?,
+                    )
+                })
+            }))?;
+            if let Some(models) = models {
+                credit.merge(models);
+            }
+        }
+        let checked_cap = |n: usize| if checked { n } else { 0 };
+        let mut models = Models {
+            stars: Vec::with_capacity(checked_cap(items.len())),
+            sides: Vec::with_capacity(checked_cap(items.len())),
+            ..Models::default()
+        };
         for (i, it) in items.iter().enumerate() {
             ctx.check()?;
             let mut masks = Vec::new();
             if ctx.opt.characteristic_sets {
-                super::charsets::of_node(ctx, &it[0], &mut masks);
+                if checked {
+                    let bound = super::charsets::of_node_bound(ctx, &it[0]);
+                    super::charsets::of_node_within(ctx, &it[0], &mut masks, bound);
+                } else {
+                    super::charsets::of_node(ctx, &it[0], &mut masks);
+                }
             }
-            models.stars.push(
-                masks
-                    .into_iter()
-                    .filter_map(|(v, m)| {
-                        let j = join[*idx.get(&v)? as usize];
-                        (j != u32::MAX).then_some((j, m))
-                    })
-                    .collect(),
-            );
-            let mut sides = Vec::new();
+            let star = |(v, m): (VarId, u64)| {
+                let j = join[*idx.get(&v)? as usize];
+                (j != u32::MAX).then_some((j, m))
+            };
+            models.stars.push(if checked {
+                let kept = masks.iter().copied().filter_map(star).count();
+                let mut stars = Vec::with_capacity(kept);
+                stars.extend(masks.iter().copied().filter_map(star));
+                drop(masks);
+                stars
+            } else {
+                masks.into_iter().filter_map(star).collect()
+            });
+            let mut sides = if checked && ctx.opt.probed_keys {
+                Vec::with_capacity(own_keys(&item_vars[i], &join).count())
+            } else {
+                Vec::new()
+            };
             if ctx.opt.probed_keys {
                 // an input without the variable holds no leaf on it, and its side merges
                 // as nothing
-                let mut own: Vec<u32> = item_vars[i]
-                    .iter()
-                    .map(|&l| join[l as usize])
-                    .filter(|&j| j != u32::MAX)
-                    .collect();
+                let mut own: Vec<u32> = own_keys(&item_vars[i], &join).collect();
                 own.sort_unstable();
                 for j in own {
                     let v = vars[jvars[j as usize] as usize];
@@ -627,19 +761,25 @@ impl Group {
             }
             models.sides.push(sides);
         }
-        // the inputs that bind several keys, needed only when two inputs could each bind
-        // several keys of one join
-        let several =
-            |iv: &Vec<u32>| iv.iter().filter(|&&l| join[l as usize] != u32::MAX).count() > 1;
-        if ctx.opt.key_backoff && item_vars.iter().filter(|iv| several(iv)).count() > 1 {
+        if backoff {
+            models.inputs.reserve_exact(checked_cap(items.len()));
             for it in items {
                 let mut inputs = Vec::new();
+                if checked {
+                    let mut count = 0;
+                    plan::input_vars(&it[0], &mut |vs| {
+                        count += usize::from(keys_in(vs, &idx, &join).count() > 1);
+                    });
+                    inputs.reserve_exact(count);
+                }
                 plan::input_vars(&it[0], &mut |vs| {
-                    let mut x: Vec<u32> = vs
-                        .iter()
-                        .filter_map(|v| idx.get(v).map(|&l| join[l as usize]))
-                        .filter(|&j| j != u32::MAX)
-                        .collect();
+                    let mut x: Vec<u32> = if checked {
+                        let mut x = Vec::with_capacity(keys_in(vs, &idx, &join).count());
+                        x.extend(keys_in(vs, &idx, &join));
+                        x
+                    } else {
+                        keys_in(vs, &idx, &join).collect()
+                    };
                     if x.len() > 1 {
                         x.sort_unstable();
                         x.dedup();
@@ -651,6 +791,9 @@ impl Group {
         }
         models.starred = models.stars.iter().any(|s| !s.is_empty());
         models.probed = models.sides.iter().any(|s| !s.is_empty());
+        if let Some(credit) = held.as_mut() {
+            credit.release_to(credit.bytes() - scratch);
+        }
         Ok(Group {
             vars,
             idx,
@@ -659,8 +802,37 @@ impl Group {
             item_vars,
             filters,
             models,
+            _held: held,
         })
     }
+}
+
+/// The join variable indexes of the variables `vs`, unsorted.
+fn keys_in<'a>(
+    vs: &'a [VarId],
+    idx: &'a FxHashMap<VarId, u32>,
+    join: &'a [u32],
+) -> impl Iterator<Item = u32> + 'a {
+    vs.iter()
+        .filter_map(|v| idx.get(v).map(|&l| join[l as usize]))
+        .filter(|&j| j != u32::MAX)
+}
+
+/// The join variable indexes of the local variables `iv`.
+fn own_keys<'a>(iv: &'a [u32], join: &'a [u32]) -> impl Iterator<Item = u32> + 'a {
+    iv.iter()
+        .map(|&l| join[l as usize])
+        .filter(|&j| j != u32::MAX)
+}
+
+/// The occurrences of variables in `f`, which bound its variable set.
+fn var_count(f: &Expr) -> usize {
+    let mut n = 0usize;
+    let Ok(()) = f.visit_vars(&mut |_| {
+        n += 1;
+        Ok::<_, std::convert::Infallible>(())
+    });
+    n
 }
 
 #[cfg(test)]
@@ -695,7 +867,7 @@ pub(super) fn order(
     mut items: Vec<Vec<Node>>,
     filters: &mut Vec<Expr>,
 ) -> Result<Node> {
-    let g = Group::new(&items, filters, pl.ctx)?;
+    let g = Group::new(&items, filters, pl)?;
     let dp = Dp::prepare(&g, &items, pl)?;
     let greedy = Greedy::run(&g, &items, filters, pl.ctx)?;
     if let Some(mut dp) = dp {
@@ -2267,6 +2439,10 @@ impl Scratch {
 /// The phases a checked plan reports before it admits the program's tables, a round's
 /// tables, and the growth of either.
 pub(super) const PREPARE_PHASE: &str = "reserving join order tables";
+/// The phases a checked plan reports before it admits the group's variables and
+/// filters, and then its join models.
+pub(super) const GROUP_PHASE: &str = "reserving join order group";
+pub(super) const MODELS_PHASE: &str = "reserving join order models";
 pub(super) const ROUND_PHASE: &str = "reserving join order round";
 pub(super) const GROW_PHASE: &str = "growing join order table";
 /// The phases a checked plan reports before it admits the filters' variables, the
@@ -2352,14 +2528,7 @@ struct FilterVars {
 /// storage is sized by a walk over the filters that allocates nothing, and admitted
 /// before it is allocated.
 fn dp_filter_vars(filters: &[Expr], pl: &Planner) -> Result<FilterVars> {
-    let count = |f: &Expr| {
-        let mut n = 0usize;
-        let Ok(()) = f.visit_vars(&mut |_| {
-            n += 1;
-            Ok::<_, std::convert::Infallible>(())
-        });
-        n
-    };
+    let count = var_count;
     first_storage(|| filters.len() * std::mem::size_of::<Vec<VarId>>());
     let held = refused(pl.planning_stage(FILTER_VARS_PHASE).and_then(|()| {
         pl.planning_scratch(|layout| {
