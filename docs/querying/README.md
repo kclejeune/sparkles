@@ -217,9 +217,12 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
   as IF or OR, an aggregate argument or an ORDER BY key, is answered from the same key
   set. Every row is probed before the expression is evaluated, also a row on which the
-  expression does not reach the EXISTS. Automatic execution streams a plan with an
-  EXISTS in any of these positions unless the pattern calls a SERVICE, the EXISTS is
-  nested more than four levels deep or it is an OPTIONAL condition.
+  expression does not reach the EXISTS. Under the ordinary admission of a SELECT,
+  automatic execution may stream a plan with an EXISTS in a FILTER, a BIND, an aggregate
+  argument or an ORDER BY key unless the pattern calls a SERVICE or the EXISTS is nested
+  more than four levels deep. It keeps an OPTIONAL whose condition holds an EXISTS eager,
+  because the cursor's conditional merge is slower than the eager one at higher fan-out,
+  which roadmap item 570 covers. A strict cursor runs such an OPTIONAL.
 * An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
   every execution mode, so each operator reads its inputs a batch at a time and stops
   once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
@@ -274,11 +277,16 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   least a thousand rows, groupings of an estimated 20,000 input rows or more and every
   ASK without initial bindings. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice. Both modes join
-  through the same hash, keyed and merge kernels, so an OPTIONAL without a condition over
-  two inputs sorted on their shared variable merges in both when `merge_left_join` is on
-  and hashes in both when it is off, a hash join's OPTIONAL condition is tested once over
-  each chunk of candidate pairs rather than over the whole product, and EXPLAIN names
-  the algorithm that ran in either mode.
+  through the same hash, keyed and merge primitives, so an OPTIONAL over two inputs
+  sorted on their one shared variable, which both bind, merges in both when
+  `merge_left_join` is on and hashes in both when it is off, a hash join's OPTIONAL
+  condition is tested once over each chunk of candidate pairs rather than over the
+  whole product, and EXPLAIN names the algorithm that ran in either mode. The cursor
+  also merges on a leading variable that is certainly bound when the inputs share
+  further variables. The two modes test a merge OPTIONAL's condition in separate
+  implementations, eager execution over all of the matched pairs at once and the cursor
+  over each batch's pairs. In the measured OPTIONALs over `foaf:knows`, with about 2.5
+  pairs per left row, the cursor took 1.18 to 1.36 times the eager time.
 * Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
   GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms
   keep one running state per group, on one key or several and with expression arguments,
@@ -330,6 +338,19 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   it is closed. The
   decoding of a large term beside such a batch can be refused under a budget at which a
   copy would answer, which [roadmap item 1051](../ROADMAP.md) holds.
+* `FILTER(?x < ?y)` and the other order comparisons of two columns of stored simple
+  literals, over a table or cursor batch of at least 4,096 rows, read the strings' order
+  from their vocabulary ids and each string's floor in both modes, so neither column is
+  decoded. The workers keep the floors they compute in one shared table of a cache that
+  lasts the query and grows when repeated strings evict each other, charged to its
+  budget and capped at 64 MiB or a sixteenth of the budget, which trades that memory for
+  not computing a repeated string's floor again. Once the cache is full, the floors it
+  lacks are computed each time. The comparison covers simple literals of the base
+  vocabulary. When one of the first 64 rows holds another value, the whole table or
+  batch takes the generic comparison, and a later row with another value takes it alone.
+  In streaming execution, the measured `str-pair-colleague`, whose strings rarely
+  repeat, runs 4.2% slower than before roadmap item 1069 with one thread and 6.5% slower
+  with 12, which [roadmap item 1088](../ROADMAP.md) recovers.
 * Property path closures run within the query's memory budget and timeout in both
   executors. A closure counts its visited set, its frontier and the edge relation of a
   sequence or alternative path against the budget, and the walk checks the deadline while

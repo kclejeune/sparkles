@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+### Targeted checks on a remote host
+
+`mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
+`mbx nextest run -p <crate> --test <name>`, on an ssh build host or a Boat worker in a full
+copy of the working tree, with the pinned compiler and mbx, and prints its log and exits
+with its code. It is `scripts/remote-ci.sh --cmd`, so it waits for the host's heavy lock and
+keeps the host's disk floor.
+
+### A free-disk floor on ssh build hosts
+
+`scripts/remote-ci.sh` and the batch gate now refuse an ssh host whose disk is below the
+floor, as they refused a Boat worker, which completes roadmap item 1130. Under the host's
+heavy lock a lane CI job needs 85 GiB free and a gate part 110 GiB, and an ssh host that is
+short first runs `mbx gc` with `gc.min_free_size` raised to the floor. On an ssh host a lane
+CI job also watches the free space while its build and tests run and stops with exit 5
+when less than 4 GiB is left, so the server's tests no longer fail against their 1 GiB
+reserve when another job fills the disk, and its temporary files live beside its worktree. The
+gate driver's own check only reads and warns. The gate's
+default disk needs rise from 30 GiB for a ci half and 15 GiB for a conformance half to the
+110 GiB floor of a cold build, and `gate.sh --hosts` shows each host against the floors.
+
+### Browser tests on a local debug build
+
+`mise run ui:e2e` now builds the formatter's WebAssembly module before the UI, as
+`ui:e2e:mock` does. The tests of the Pattern pane, the plan's pattern and **Apply to
+query** in the facets of a query need the module, and they now pass against a local debug
+server. Before the servers start, the setup looks for the module in the directory that
+`SPARKLES_UI_DIR` names, or else in `ui/build` for the default debug binary, and stops with
+a message when it is missing. `SPARKLES_E2E_NO_WASM=1` skips that check. The lens tests now look for unlabelled nodes under the full IRIs that the rendering
+preferences draw. The outbound-policy test of ontology imports asks for a link-local
+address, which the test server's policy refuses before it connects, although it allows
+private addresses. This completes roadmap item 1131.
+
 ### Streamed answers through the engine buffer
 
 The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
@@ -156,6 +189,19 @@ with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which
 their advisories. The SvelteKit advisories that only 3.x fixes concern features the
 static UI does not use, and roadmap item 1049 covers the migration.
 
+### String comparisons through a per-query floor cache
+
+`FILTER(?x < ?y)` and the other order comparisons of two columns of stored strings read
+the strings' order from their vocabulary ids and floors in streaming execution as well as
+in eager execution, which completes roadmap items 678 and 1069. The floors live in a cache
+that lasts the query, charged to its memory budget inside the spill threshold and capped
+at 64 MiB or a sixteenth of the budget, so a cursor's batches share them. On forge at 1.05M
+triples with one thread, streaming `str-pair-names` takes 0.517 of its earlier time and
+`str-pair-lt` 0.815, while `str-pair-colleague`, whose names rarely repeat, takes 1.042,
+and 1.065 with 12 threads, which item 1088 follows. Every worker of a comparison reads and
+writes the slots of one table of floors without a lock, which replaced an earlier map per worker that
+computed a repeated string's floor once per worker.
+
 ### Fewer rooted classification runs past their bound
 
 With `Limits::rooted`, an existential restriction into a singleton, or into a class below
@@ -235,6 +281,19 @@ EXISTS, so an IF branch that is never taken still builds the key set, which road
 1080 covers. An EXISTS pattern evaluated per key now streams too, and the plans that stay
 eager are an EXISTS over a SERVICE, an EXISTS nested more than four levels deep, which item
 1081 covers, and an OPTIONAL whose condition holds an EXISTS, which item 570 covers.
+
+### Conditional merge OPTIONAL in the cursor
+
+The cursor merges an OPTIONAL with a condition over two inputs sorted on their shared
+variable, as eager execution does, and tests the condition on each batch's pairs. Both
+plans name the merge, and `merge_left_join` selects it in both modes. On an Intel host
+at 10.5M quads with one Rayon thread, the streamed `optional-filter` went from 46.6 to
+19.3 ms and `optional-cond` from 70.1 to 19.4 ms. At about 2.5 pairs per left row the cursor still takes 1.18 to 1.36 times
+the eager time, so an OPTIONAL whose condition holds an EXISTS stays eager under
+automatic execution, which item 570 keeps open. Item 1105 gives a future admission the
+build's merge order, and items 1106, 1137, 1143, 1144 and 1145 follow the EXISTS
+counters of the cursor's plan, the charge of the merge's variable map, a 0.9% cost of a
+hashed control, the reservation of a spooled frame and the eager memory retry.
 
 ### MCP tool profiles and semantic search
 

@@ -1508,9 +1508,11 @@ const AUTO_EXISTS_DEPTH: usize = 4;
 /// key set filled by a child cursor under the query's charges where the key set can
 /// answer it, and otherwise evaluated once per distinct outer key with a charged memo,
 /// as eager execution evaluates it. A pattern that calls a SERVICE keeps the plan eager,
-/// and so does an OPTIONAL whose condition holds an EXISTS, because the cursor's
-/// conditional OPTIONAL took 3.7 to 4.6 times as long as eager execution on Namespace at
-/// 10.5M quads, whatever the condition. The patterns are planned here only to read
+/// and so does an OPTIONAL whose condition holds an EXISTS. The cursor merges such an
+/// OPTIONAL and tests the condition on each batch's pairs, which matches eager execution
+/// where a left row has about one pair. On an Intel host at 1M people, where a left row
+/// has about 2.5 pairs, it took 1.18 to 1.36 times as long as eager execution, which
+/// tests the condition inside the merge. The patterns are planned here only to read
 /// their operators. Planning interns their variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
     fn pattern(ctx: &Ctx, node: &Node, e: &Expr, depth: usize) -> bool {
@@ -3109,7 +3111,7 @@ impl Operator {
             },
         );
         let merge = incremental_merge
-            .then(|| merge::Merge::new(ctx, &node))
+            .then(|| merge::Merge::new(ctx, &mut node))
             .transpose()?;
         let group = incremental_group
             .then(|| group::Group::new(ctx, &node))
@@ -3136,7 +3138,7 @@ impl Operator {
                 info.description
             );
         }
-        if let Kind::LeftJoin { expr: None } = node.kind {
+        if let Kind::LeftJoin { .. } = node.kind {
             // the plan names the algorithm the merge_left_join switch selected, as the
             // eager plan does
             if let Some(merge) = &merge {
@@ -5525,14 +5527,19 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
                 true,
             ),
-            // an EXISTS answered from a key set in BIND, and in an OPTIONAL condition,
-            // whose conditional OPTIONAL is slower in the cursor
+            // an EXISTS answered from a key set in BIND, but not in the condition of an
+            // OPTIONAL, whether or not the cursor can merge it, because the cursor's
+            // conditional merge is slower than eager execution's at higher fan-out
             (
                 "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
                 true,
             ),
             (
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
+                false,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?x <urn:p> ?s OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
                 false,
             ),
             // and one inside a larger expression, an aggregate argument or an ORDER BY

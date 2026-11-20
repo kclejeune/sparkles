@@ -889,12 +889,38 @@ class BuildHost(unittest.TestCase):
             ["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out), "--build-host", "h1",
              self.sha, self.sha], env=dict(self.env, FAKE_BUILD_DELAY="60"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        # A failed wait or assertion below still ends and reaps the run and its scope, so no
+        # process outlives the test. The cleanup runs after tearDown, so it cancels the run as
+        # an interrupt does, which stops its scope, and then ends the test's own scope if it
+        # is still there, whether or not the run had already exited.
+        owned = {}
+        def reap():
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.communicate(timeout=20)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            process.communicate()
+            if "scope" in owned:
+                try:
+                    os.killpg(owned["scope"], signal.SIGKILL)
+                except OSError:
+                    pass
+        self.addCleanup(reap)
         deadline = time.monotonic() + 20
         while not (self.hosts / "build-started").exists():
             self.assertLess(time.monotonic(), deadline, "the build did not start")
             time.sleep(0.05)
         [unit] = list((self.hosts / "units").iterdir())
         scope = int(unit.read_text().split()[0])
+        owned["scope"] = scope
         os.killpg(process.pid, signal.SIGINT)
         process.communicate(timeout=20)
         self.assertEqual(process.returncode, 130)

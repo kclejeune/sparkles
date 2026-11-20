@@ -12,7 +12,9 @@
 //
 // SPARKLES_BIN selects the binary (default: ../target/debug/sparkles, which serves ui/build
 // from disk); SPARKLES_E2E_KEEP=1 keeps the data directory and server log;
-// SPARKLES_E2E_PORT=N runs the servers on ports N and N + 1 instead of free ones.
+// SPARKLES_E2E_PORT=N runs the servers on ports N and N + 1 instead of free ones;
+// SPARKLES_E2E_NO_WASM=1 runs against a debug server whose ui/build lacks the formatter's
+// browser module.
 
 import { request, type FullConfig } from '@playwright/test';
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
@@ -23,7 +25,9 @@ import {
   mkdirSync,
   mkdtempSync,
   openSync,
+  readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
@@ -64,6 +68,42 @@ function binary(): string {
       `no Sparkles binary at ${bin}: run \`cargo build -p sparkles-server\` or set SPARKLES_BIN`,
     );
   return bin;
+}
+
+/**
+ * The Pattern pane, the plan's pattern and Apply to query in the facets of a query have no
+ * server fallback for the formatter's WebAssembly module, so without it in the UI the server
+ * reads, their tests fail on a pane that reports "unavailable", far from the cause. The
+ * server reads the UI from `SPARKLES_UI_DIR` when that is set, and the debug build reads
+ * ui/build from disk. Another binary embeds its own UI or names one in a wrapper, which this
+ * check cannot see. It looks for the module's asset only, so a build with
+ * `VITE_PATTERN_WASM=off` passes it. `SPARKLES_E2E_NO_WASM=1` skips the check, and the tests
+ * that need the module then fail.
+ */
+function checkModule(bin: string) {
+  if (process.env.SPARKLES_E2E_NO_WASM === '1') return;
+  // real paths, as the operating system resolves them for the server: Node's join and
+  // resolve fold `..` before following a symbolic link such as Boxington's managed target
+  const real = (p: string) => {
+    try {
+      return realpathSync.native(p);
+    } catch {
+      return null;
+    }
+  };
+  const debug = real(bin) === real(resolve(UI_DIR, '../target/debug/sparkles'));
+  const configured = process.env.SPARKLES_UI_DIR || null;
+  if (!configured && !debug) return;
+  const ui = configured ?? join(UI_DIR, 'build');
+  const assets = real(ui) && real(`${ui}/_app/immutable/assets`);
+  const built =
+    assets !== null && readdirSync(assets).some((f) => /^sparkles_fmt_wasm_bg\..*\.wasm$/.test(f));
+  if (!built)
+    throw new Error(
+      `The UI build in ${ui} has no browser module of the formatter, which the Pattern pane ` +
+        'and the facets tests need. Run `mise run ui:e2e`, which builds it with ' +
+        '`mise run ui:wasm` before the UI, or set SPARKLES_E2E_NO_WASM=1.',
+    );
 }
 
 /** A port that was free a moment ago (the server is retried on another if it is taken). */
@@ -152,6 +192,7 @@ async function serve(bin: string, data: string, log: string, extra: string[], of
 
 export default async function globalSetup(_config: FullConfig) {
   const bin = binary();
+  checkModule(bin);
   const dir = mkdtempSync(join(tmpdir(), 'sparkles-e2e-'));
   const log = join(dir, 'server.log');
 

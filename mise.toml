@@ -230,10 +230,15 @@ cache = { enabled = false }
 description = "Rebuild the browser formatter if it was built before (`mise run ui:wasm`) and the formatter changed since"
 hide = true
 run = "if [ -e ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm ]; then mise run ui:wasm; fi"
+# after ui:wasm when one task graph, such as ui:e2e's, runs both, so that the graph builds the
+# module once (separate mise runs in one checkout are not serialized)
+wait_for = ["ui:wasm"]
 
 [tasks."ui:build"]
 description = "Build the SvelteKit UI (embedded into the server binary)"
 depends = ["ui:install", "ui:wasm:refresh"]
+# in a task graph that also runs ui:wasm, this build has the module
+wait_for = ["ui:wasm"]
 dir = "ui"
 run = "pnpm build"
 sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json", "pnpm-lock.yaml"]
@@ -287,7 +292,9 @@ pnpm exec playwright install chromium
 
 [tasks."ui:e2e"]
 description = "UI end-to-end tests (Playwright) against a real `sparkles serve` (debug build; SPARKLES_BIN=… for another); extra args go to `playwright test`"
-depends = ["ui:build", "ui:e2e:browsers"]
+# ui:wasm: the Pattern pane and the facets of a query have no server fallback, and the
+# flake's ui-e2e check runs against a UI built with the module
+depends = ["ui:wasm", "ui:build", "ui:e2e:browsers"]
 dir = "ui"
 # The server is built inside the lease that the tests run in, so collection cannot remove
 # the binary before they start it.
@@ -572,6 +579,16 @@ run = 'scripts/ci.sh --jobs "$usage_jobs" ${usage_exhaustive_features:+--exhaust
 [tasks."ci:fast"]
 description = "The quick CI subset for iterating: formatting, cited doc paths, Clippy on the workspace and the Rust tests"
 run = "scripts/ci.sh --fast"
+
+[tasks."check:remote"]
+description = "Run one targeted command, such as `mbx check` or `mbx nextest run -p X --test Y`, on a remote host in a full copy of this working tree, and print its log and exit with its code (scripts/remote-ci.sh --cmd)"
+usage = '''
+flag "--host <host>" help="an ssh host such as wally, atlas or forge, or boat:bx_ID (default SPARKLES_REMOTE_CI_HOST)"
+flag "--commit" help="check HEAD as committed instead of the working tree"
+flag "--no-wait" help="start the job and return; scripts/remote-ci.sh --status and --fetch follow it"
+arg "<command>" help="the command, run with bash -c in the checkout"
+'''
+run = 'scripts/remote-ci.sh ${usage_host:+--host "$usage_host"} $([ "${usage_commit:-false}" = true ] || echo --worktree) ${usage_no_wait:+--no-wait} --cmd "$usage_command"'
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
@@ -1456,7 +1473,7 @@ python3 scripts/bench-gate.py w3c "$out/output.log" --out "$out/record.json" \
 '''
 
 [tasks."bench:executors"]
-description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; writes a gate record"
+description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; with --base, a four-arm A/B of a base and a tip binary; writes a gate record"
 usage = '''
 arg "[binary]" help="a built sparkles binary (default: build this checkout's release binary)"
 flag "--out <dir>" help="results directory (default .artifacts/bench-executors/<UTC time>)"
@@ -1467,6 +1484,11 @@ flag "--reps <n>" default="10" help="timed requests per query and server process
 flag "--queries <list>" help="only these queries (default: all 31)"
 flag "--commit <rev>" help="the commit the binary was built from, for the record"
 flag "--build-config <json>" help="a prebuilt binary's build configuration, from scripts/bench-gate.py build-config --cargo '<its cargo arguments>' in its build environment; compare refuses a record without one"
+flag "--modes <list>" help="the binary's execution modes, or the tip's with --base (default 'eager streaming', or 'default streaming' with --base, where default sends no execution field)"
+flag "--base <binary>" help="a prebuilt base binary: the run interleaves its --base-modes with the tip's --modes, and needs an even --rounds"
+flag "--base-modes <list>" help="the base binary's execution modes (default 'eager streaming')"
+flag "--base-commit <rev>" help="the commit the base binary was built from, for the record"
+flag "--base-build-config <json>" help="the base binary's build configuration, as --build-config gives the tip's"
 '''
 run = '''
 mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
@@ -1482,7 +1504,10 @@ if [ -z "$bin" ]; then
 fi
 scripts/bench-executors.sh --scales "$usage_scales" --threads "$usage_threads" \
   --rounds "$usage_rounds" --reps "$usage_reps" ${usage_queries:+--queries "$usage_queries"} \
-  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} ${config:+--build-config "$config"} "$bin"
+  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} ${config:+--build-config "$config"} \
+  ${usage_modes:+--modes "$usage_modes"} ${usage_base:+--base "$usage_base"} \
+  ${usage_base_modes:+--base-modes "$usage_base_modes"} ${usage_base_commit:+--base-commit "$usage_base_commit"} \
+  ${usage_base_build_config:+--base-build-config "$usage_base_build_config"} "$bin"
 SPARKLES_TASK
 '''
 

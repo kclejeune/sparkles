@@ -117,7 +117,10 @@ class Counters(unittest.TestCase):
         try:
             c = ri.Counters(p.pid, False)
         except OSError as e:
+            # A runner without counters skips here, and a process left unwaited would warn
+            # when a later test collects it.
             p.kill()
+            p.wait()
             os.close(w)
             self.skipTest(f"no counters here: {e}")
         c0 = c.read()

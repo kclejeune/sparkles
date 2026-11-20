@@ -4693,22 +4693,32 @@ fn cursor_node<'a>(
 }
 
 /// The cursor's ordered top-k holds a morsel per worker thread and the rows they keep,
-/// however many rows its pieces without value order hold: two workers read 4 and 12
-/// morsels of a single block with the same peak.
+/// however many rows its pieces without value order hold. On one worker the peak is a
+/// single morsel's, the same for 4 and 12 morsels of a single block. On two workers it is
+/// at most two morsels' peaks, for 4 and 12 morsels alike.
+///
+/// The two-worker bound comes from the one-worker peaks, which do not depend on
+/// scheduling. A two-worker peak is not a fixed baseline, since it depends on how far the
+/// work of two morsels overlaps in time, and an idle or busy worker that overlaps them
+/// less gives a lower peak.
 #[test]
 fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
+    let pools = [1, 2].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    });
     let q = "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 10";
+    // the peaks of one and of two workers, for each store
     let mut peaks = Vec::new();
     for n in [300_000, 900_000] {
         let s = decimal_store(n, 3, "");
         let eager = query(s.snapshot(), q, &Default::default()).unwrap();
         assert!(plan_has(eager.plan(), "IndexTopK"), "{:#?}", eager.plan());
-        let peak = |opts: &QueryOptions| {
-            let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+        let peak = |pool: &rayon::ThreadPool| {
+            let mut c =
+                select_cursor(s.snapshot(), q, &QueryOptions::default(), &options(4096)).unwrap();
             let rows = pool.install(|| {
                 let mut rows = Vec::new();
                 while let Some(b) = c.next_batch().unwrap() {
@@ -4719,9 +4729,16 @@ fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
             assert_eq!(rows, eager.application_rows());
             c.stats().mem_peak_bytes
         };
-        peaks.push(peak(&QueryOptions::default()));
+        peaks.push(pools.each_ref().map(peak));
     }
-    assert!(peaks[1] < peaks[0] * 5 / 4, "{peaks:?}");
+    // one worker: the same morsel peak however many morsels there are
+    assert!(peaks[1][0] < peaks[0][0] * 9 / 8, "{peaks:?}");
+    // two workers: at most twice one worker's peak, with a margin for per-worker state
+    let bound = peaks[0][0] * 2 * 9 / 8;
+    assert!(
+        peaks.iter().all(|p| p[1] < bound),
+        "{peaks:?} against {bound}"
+    );
 }
 
 /// A store whose `<urn:p>` values in `<urn:g1>` are 400,000 inline decimals below 5,
@@ -5357,7 +5374,17 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         None,
     )])
     .unwrap();
-    let q = "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }";
+    // The second query's condition reads both sides, and the third's is an EXISTS.
+    for q in [
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }",
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x FILTER(?o > 50 && ?x != \"77\") } }",
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x FILTER EXISTS { ?s <urn:p> ?v FILTER(?v < 120) } } }",
+    ] {
+        optional_merge_names_its_algorithm(&s, q);
+    }
+}
+
+fn optional_merge_names_its_algorithm(s: &Store, q: &str) {
     let expected = bag(query(s.snapshot(), q, &Default::default())
         .unwrap()
         .application_rows());
@@ -5383,8 +5410,8 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
             );
         }
         assert_eq!(plan.contains("[hash join]"), !merge, "{plan}");
-        assert_eq!(bag(all(c)), expected, "merge_left_join {merge}");
-        assert_eq!(bag(eager.application_rows()), expected);
+        assert_eq!(bag(all(c)), expected, "{q}: merge_left_join {merge}");
+        assert_eq!(bag(eager.application_rows()), expected, "{q}");
     }
 }
 

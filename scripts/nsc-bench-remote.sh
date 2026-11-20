@@ -20,6 +20,16 @@
 # prints a line for each; results/warm-answers.tsv gets them, so that the timed format's
 # answers are checked too. Progress goes to results/progress.log and results/done marks the end.
 #
+# VARIANTS names the variants, "A B" by default. A run of more variants, such as the four
+# arms of scripts/bench-executors.sh with a base and a tip binary, names them there, and
+# BINARY_OF_<v> and STORE_OF_<v> let variant v run another variant's binary and serve from
+# its store, so only the variants that own a binary need bin-<v> and only those that own a
+# store load one. SHARE_STORE=1 is STORE_OF_B=A. ORDERS lists the order of each round's
+# server processes as sequences separated by semicolons, "A B B A" by default, and round r
+# takes the sequences in turn. Every sequence names every variant. EXECUTION is one mode
+# for every variant or a comma-separated mode per variant in the order of VARIANTS, where
+# an empty mode sends no execution field.
+#
 # With SPIN=1 (the default), a busy loop at the lowest priority (SCHED_IDLE) runs on the
 # server and client CPUs during the timed part. It keeps their vCPUs from halting between
 # requests, which in a VM costs a hypervisor exit and a cold wake-up, and it yields to the
@@ -35,6 +45,8 @@ source ./run.env
 # store, which compares settings of one binary without the differences between two stores.
 # scripts/nsc-bench.sh does not write these three, and scripts/x08-gates/latency.sh does.
 : "${SERVE_ARGS_A:=}" "${SERVE_ARGS_B:=}" "${SHARE_STORE:=0}"
+: "${VARIANTS:=A B}" "${ORDERS:=A B B A}"
+read -r -a VARIANT_LIST <<< "$VARIANTS"
 # PREPARE_A and PREPARE_B are sparkles commands run once on each variant's store after its
 # load, and PREPARE_REPEAT one run PREPARE_REPS times after that. Each run is timed into
 # results/prepare.tsv as variant, command, seconds and the store's size in KiB after it.
@@ -55,13 +67,49 @@ fail() {
 }
 trap 'fail "line $LINENO"' ERR
 
+# the variant each variant takes its binary and its store from
+declare -A BINARY_OF STORE_OF MODE
+for v in "${VARIANT_LIST[@]}"; do
+  [[ $v =~ ^[A-Z]$ ]] || fail "variant names are single capital letters, not $v"
+  b=BINARY_OF_$v s=STORE_OF_$v
+  BINARY_OF[$v]=${!b:-$v}
+  STORE_OF[$v]=${!s:-${BINARY_OF[$v]}}
+done
+[ "$SHARE_STORE" = 1 ] && STORE_OF[B]=A
+for v in "${VARIANT_LIST[@]}"; do
+  [ -n "${BINARY_OF[${BINARY_OF[$v]}]:-}" ] && [ "${BINARY_OF[${BINARY_OF[$v]}]}" = "${BINARY_OF[$v]}" ] ||
+    fail "BINARY_OF_$v names ${BINARY_OF[$v]}, which is not a variant with its own binary"
+  [ -n "${STORE_OF[${STORE_OF[$v]}]:-}" ] && [ "${STORE_OF[${STORE_OF[$v]}]}" = "${STORE_OF[$v]}" ] ||
+    fail "STORE_OF_$v names ${STORE_OF[$v]}, which is not a variant with its own store"
+done
+# EXECUTION's fields, keeping empty ones
+modes=()
+rest=$EXECUTION,
+while [ -n "$rest" ]; do
+  modes+=("${rest%%,*}")
+  rest=${rest#*,}
+done
+if [ ${#modes[@]} -le 1 ]; then
+  for v in "${VARIANT_LIST[@]}"; do MODE[$v]=$EXECUTION; done
+elif [ ${#modes[@]} = ${#VARIANT_LIST[@]} ]; then
+  for i in "${!VARIANT_LIST[@]}"; do MODE[${VARIANT_LIST[$i]}]=${modes[$i]}; done
+else
+  fail "EXECUTION has ${#modes[@]} modes for ${#VARIANT_LIST[@]} variants"
+fi
+IFS=';' read -r -a ORDER_LIST <<< "$ORDERS"
+for o in "${ORDER_LIST[@]}"; do
+  for v in $o; do [ -n "${MODE[$v]+x}" ] || fail "ORDERS names $v, which is not a variant"; done
+  for v in "${VARIANT_LIST[@]}"; do [[ " $o " == *" $v "* ]] || fail "the order '$o' leaves out $v"; done
+done
+
 # The binaries are built on another Linux and name the build host's glibc loader, so a
 # dynamically linked one (DYNAMIC_A, DYNAMIC_B) runs under this image's loader.
 # BIN[v] is the command that runs variant v.
 declare -A BIN
-for v in A B; do
-  d=DYNAMIC_$v
-  if [ "${!d:-1}" = 1 ]; then BIN[$v]="/lib64/ld-linux-x86-64.so.2 $v/sparkles"; else BIN[$v]=$v/sparkles; fi
+for v in "${VARIANT_LIST[@]}"; do
+  o=${BINARY_OF[$v]}
+  d=DYNAMIC_$o
+  if [ "${!d:-1}" = 1 ]; then BIN[$v]="/lib64/ld-linux-x86-64.so.2 $o/sparkles"; else BIN[$v]=$o/sparkles; fi
 done
 
 {
@@ -79,21 +127,24 @@ log "unpacking"
 # A binary that scripts/nsc-bench.sh copied here on a Boat worker arrives as bin-A or bin-B,
 # uncompressed, and is linked rather than copied where it can be. results/binaries.sha256
 # records what runs.
-for v in A B; do
+OWN_BINARIES=()
+for v in "${VARIANT_LIST[@]}"; do
+  [ "${BINARY_OF[$v]}" = "$v" ] || continue
+  OWN_BINARIES+=("$v/sparkles")
   mkdir -p "$v"
   if [ -f "bin-$v" ]; then ln -f "bin-$v" "$v/sparkles" 2> /dev/null || cp -f "bin-$v" "$v/sparkles"; else zstd -q -d -f "bin-$v.zst" -o "$v/sparkles"; fi
   chmod +x "$v/sparkles"
 done
-sha256sum A/sparkles B/sparkles > "$R/binaries.sha256"
+sha256sum "${OWN_BINARIES[@]}" > "$R/binaries.sha256"
 zstd -q -d -f data.nt.zst -o data.nt
 log "data: $(wc -l < data.nt) triples"
 
 : > "$R/load.tsv"
-for v in A B; do
+for v in "${VARIANT_LIST[@]}"; do
   rm -rf "stores/$v"
   mkdir -p stores
-  if [ "$v" = B ] && [ "$SHARE_STORE" = 1 ]; then
-    ln -s A "stores/B"
+  if [ "${STORE_OF[$v]}" != "$v" ]; then
+    ln -s "${STORE_OF[$v]}" "stores/$v"
     continue
   fi
   t0=$EPOCHREALTIME
@@ -115,18 +166,18 @@ prepare() { # <variant> <command…>
   printf '%s\t%s\t%s\t%s KiB\n' "$v" "$*" "$(awk "BEGIN {print $t1 - $t0}")" "$(du -sk "stores/$v" | cut -f1)" >> "$R/prepare.tsv"
   log "$v: $* took $(awk "BEGIN {printf \"%.2f\", $t1 - $t0}") s"
 }
-VARIANTS=(A B)
-[ "$SHARE_STORE" = 1 ] && VARIANTS=(A)
-for v in "${VARIANTS[@]}"; do
+PREPARED=()
+for v in "${VARIANT_LIST[@]}"; do [ "${STORE_OF[$v]}" = "$v" ] && PREPARED+=("$v"); done
+for v in "${PREPARED[@]}"; do
   p=PREPARE_$v
   # shellcheck disable=SC2086 # the commands are word lists
-  [ -z "${!p}" ] || prepare "$v" ${!p}
+  [ -z "${!p:-}" ] || prepare "$v" ${!p:-}
 done
 # the repeated runs alternate A, B and B, A
 if [ -n "$PREPARE_REPEAT" ]; then
   for i in $(seq "$PREPARE_REPS"); do
-    order=("${VARIANTS[@]}")
-    [ $((i % 2)) = 0 ] && [ ${#VARIANTS[@]} = 2 ] && order=(B A)
+    order=("${PREPARED[@]}")
+    [ $((i % 2)) = 0 ] && [ ${#PREPARED[@]} = 2 ] && order=("${PREPARED[1]}" "${PREPARED[0]}")
     for v in "${order[@]}"; do
       # shellcheck disable=SC2086
       prepare "$v" $PREPARE_REPEAT
@@ -138,13 +189,13 @@ mapfile -t QUERIES < <(cd queries && for f in *.rq; do echo "${f%.rq}"; done)
 log "queries: ${QUERIES[*]}"
 
 URL=localhost:$PORT/bench/sparql
-# EXECUTION is one mode for both variants or "A_MODE,B_MODE". The mode for the running
-# variant goes in the form body next to the query and is left out when EXECUTION is empty.
+# The mode of the running variant goes in the form body next to the query and is left out
+# when it is empty.
 EXEC_FIELD=()
 SPID=
 start_server() { # <variant> <epoch>
-  local env=() mode=${EXECUTION%%,*} extra=$SERVE_ARGS_A
-  [ "$1" = B ] && mode=${EXECUTION#*,} && extra=$SERVE_ARGS_B
+  local env=() mode=${MODE[$1]} a=SERVE_ARGS_$1
+  local extra=${!a:-}
   EXEC_FIELD=()
   [ -z "$mode" ] || EXEC_FIELD=(--data-urlencode "execution=$mode")
   [ "$RAYON_THREADS" != default ] && env=(RAYON_NUM_THREADS="$RAYON_THREADS")
@@ -194,7 +245,8 @@ read -r steal0 total0 < <(stat_cpu)
 epoch=0
 checked=" "
 for round in $(seq "$ROUNDS"); do
-  for v in A B B A; do
+  read -r -a ORDER <<< "${ORDER_LIST[$(((round - 1) % ${#ORDER_LIST[@]}))]}"
+  for v in "${ORDER[@]}"; do
     epoch=$((epoch + 1))
     start_server "$v" "$epoch"
     if [[ $checked != *" $v "* ]]; then

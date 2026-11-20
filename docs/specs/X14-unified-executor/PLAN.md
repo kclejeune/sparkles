@@ -14,9 +14,9 @@ answers, and the schedule below follows them.
 
 Stages 1 and 3 have shipped, apart from the storage items 479 and 484 that
 [X16](../X16-storage-consolidation/README.md) holds. Stage 4's accounting model and
-mode-neutral kernels have shipped as items 671 to 674. Item 678 has shipped in part,
-and item 1069's per-query floor cache completes it by letting cursor batches compare
-strings through the floors. Item 675's hierarchical budget is landing. The rest of the design is
+mode-neutral kernels have shipped as items 671 to 674, and its decoding twins as items
+678 and 1069, whose per-query floor cache lets cursor batches compare strings through
+the floors. Item 675's hierarchical budget is landing. The rest of the design is
 stages 5 and 6, together with the phases that are scheduled with their area and the
 execution additions, which this plan does not schedule.
 
@@ -248,14 +248,13 @@ of this section listed. Before the change the test counts eight sites, the mode 
 `query_execution_with_plan`, the EXISTS key set accumulated across batches in
 `exists::prepare`, `envelope_refuses`, `string_order_mask` and the four direct reads.
 
-The floors now decode inside the envelope, and `decode_for` decodes through the one
-sorted pre-decode. Cursor batches still skip the floors. On atlas, comparing through
-floors cached per batch made `str-pair-lt` 24.8% slower and `str-pair-names` 33.4% slower
-in streaming mode. The names of `str-pair-names` repeat across batches, so each batch
-computes floors again, while every name of `str-pair-lt` is distinct and the cause of its
-loss is not established. The exclusion in `string_order_mask` therefore stays, and the
-bound stays at eight. Item 1069 takes up a charged per-query floor cache that serves both
-modes, the removal of the exclusion and the bound of seven.
+The floors decode inside the envelope, and `decode_for` decodes through the one sorted
+pre-decode. Floors cached per batch measured 24.8% and 33.4% slower than the direct
+comparison on streaming `str-pair-lt` and `str-pair-names` on atlas, so item 1069 gave
+the context a charged floor cache that lasts the query and serves both modes. Cursor
+batches now compare through the floors, the exclusion in `string_order_mask` is gone and
+the bound is seven. The [Outcome](SPEC.md#outcome) records the forge measurements, and
+items 1088, 1089 and 1140 hold the costs that remain.
 
 ## Stage 5: shared kernels
 
@@ -291,13 +290,12 @@ modes and EXPLAIN names the algorithm the switch selected in both. An OPTIONAL c
 is evaluated once over the gathered candidates of a chunk in both modes, as
 `Binary::condition` already does for the cursor and `left_join` for the eager table, and
 the phase measures the conditional OPTIONAL of item 570's record,
-`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. Item
-570 closes when that measurement puts the streamed query within the gate of the eager
-one and the admission of an OPTIONAL whose condition is an EXISTS with a key set, whose
-earlier admission and revert
-[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records,
-passes the same measurement. Until then item 570 stays open with the measurement
-recorded. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
+`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. The
+[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
+records that measurement, in which the cursor merges the query and streams it within
+the gate. Item 570 states the remaining acceptance rule, which adds OPTIONALs with
+several pairs per left row and the admission of an OPTIONAL whose condition holds an
+EXISTS. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
 for keys the hash cannot take.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
@@ -514,11 +512,10 @@ and sampled filters planning choices that do not depend on the mode. The result 
 serves a cursor's subtree when the subtree is materialized anyway, and sampled filters
 prepare their samples once per plan. EXPLAIN then prints one plan for a query whatever
 the mode, which `plan_fidelity_tests.rs` checks, with a spill-configured DISTINCT over
-ORDER BY among its cases. After item 827 the mode is read in eight places, the mode
+ORDER BY among its cases. After item 1069 the mode is read in seven places, the mode
 branch of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
-`envelope_refuses`, the cursor exclusion of `string_order_mask` and the four direct reads
-in `ctx.rs`, and the bounded-reads test's bound is eight. Item 1069 removes the exclusion
-of `string_order_mask`, and the merge removes the rest.
+`envelope_refuses` and the four direct reads in `ctx.rs`, and the bounded-reads test's
+bound is seven. The merge removes the rest.
 
 The phase then routes every ASK and unordered LIMIT through pull demand. A streaming
 request already pulls its ASK through the cursor, so the change is that automatic and
@@ -612,7 +609,8 @@ merge removes it with the eager executor. In both cases
 `mise run test:w3c:streaming` records no eager fallback for the W3C query suites, which
 hold no such shape. The EXISTS shapes that automatic execution keeps eager through
 `streams_natively` are an admission choice rather than a fallback, and the merge removes
-the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, an
+the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, since
+the cursor merges it but is slower than eager execution at higher fan-out, an
 EXISTS deeper than four levels is item 1081 and an EXISTS pattern that calls a SERVICE
 stays eager because a cursor cannot repeat its effects.
 
@@ -854,4 +852,4 @@ The maintainer took these answers, and the phases above follow them.
    before it lands. The merge also runs the full matrix on atlas before it lands, since
    it deletes the eager executor and atlas has forge's hardware.
 9. The bounded-reads test counts direct reads of the mode flag as well as `streams()`
-   calls, so its bound is eight after item 827 and seven after item 1069.
+   calls, so its bound is seven after item 1069.

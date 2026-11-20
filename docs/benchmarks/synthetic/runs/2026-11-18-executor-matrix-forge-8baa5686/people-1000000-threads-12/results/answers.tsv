@@ -1,0 +1,62 @@
+A	class-predicate-list	8	92e2de579339d1e5	distinct:8 schema:87042da4
+A	class-predicates	8	69bc68a8a68c2c95	distinct:8 schema:1a211c07
+A	contains	1	e75346c0dc4a64f8	distinct:1 schema:bd2038c1
+A	count-all	1	815111a89ce816e3	distinct:1 schema:bd2038c1
+A	distinct-join	20000	33caf19c71e7442c	distinct:20000 schema:b2b79717
+A	distinct-obj	1	003da6d611c47d25	distinct:1 schema:bd2038c1
+A	employee-docs	14	31e9df7f038873a7	distinct:14 schema:5f05f90d
+A	exists-join	1	2f4018c04fd42558	distinct:1 schema:bd2038c1
+A	export-500k	500000	336b9c46485bf1de	distinct:500000 schema:90661623 missing:0
+A	expr-agg-arg	10	4ffad2b215c51a54	keys:b128198d7fce0e99
+A	expr-bind-group	8	3b1cfde28f9aef77	keys:cb44d1a5a87303e9
+A	expr-order-key	10	0ba07f2d17433a53	rows:84521df65a65c0c5
+A	group-avg	10	a792a7795f4fdaa8	keys:9e7df82121b2a6df
+A	knows-reach	1	d6126b1882e25159	distinct:1 schema:bd2038c1
+A	lang-filter	1	a29a5d92b76c3bdb	distinct:1 schema:bd2038c1
+A	minus	1	32cc2d6d2cbd5aad	distinct:1 schema:bd2038c1
+A	not-exists	1	32cc2d6d2cbd5aad	distinct:1 schema:bd2038c1
+A	optional-chain	300191	d9265af4176879fa	distinct:300191 schema:e44bd636
+A	optional-count	1	a965d17b19d9da4a	distinct:1 schema:bd2038c1
+A	order-by-full	1020000	f2b26bdd1a691f9e	keys:4768b51f5e294f24
+A	path-plus	1	a7bd995042aa5f03	distinct:1 schema:bd2038c1
+A	predicate-counts	19	f2c32d5bdc8a8b32	distinct:19 schema:1a211c07
+A	predicate-subjects	19	89a1bbc01c87b500	distinct:19 schema:1a211c07
+A	range-topk	10	95421fa315822942	keys:148c2341f63abf90
+A	regex-iri	1	d1b8c3abde8d8e8d	distinct:1 schema:bd2038c1
+A	star-join	29717	7a6e28796168dd03	distinct:29717 schema:9bc038b3
+A	star-lookup	34	63c08b5be6516383	distinct:34 schema:8a1fa112
+A	subquery-agg	9	4e4f43dac02ec885	distinct:9 schema:e238595d
+A	two-hop-count	1	3691ba2ba7a910c7	distinct:1 schema:906d2154
+A	types-grouped	11	3f8a02093aae50f1	keys:ea2687e87e90900a
+A	values-star	12	26eccbad59f872fe	distinct:12 schema:43c82740
+B	class-predicate-list	8	92e2de579339d1e5	distinct:8 schema:87042da4
+B	class-predicates	8	69bc68a8a68c2c95	distinct:8 schema:1a211c07
+B	contains	1	e75346c0dc4a64f8	distinct:1 schema:bd2038c1
+B	count-all	1	815111a89ce816e3	distinct:1 schema:bd2038c1
+B	distinct-join	20000	33caf19c71e7442c	distinct:20000 schema:b2b79717
+B	distinct-obj	1	003da6d611c47d25	distinct:1 schema:bd2038c1
+B	employee-docs	14	31e9df7f038873a7	distinct:14 schema:5f05f90d
+B	exists-join	1	2f4018c04fd42558	distinct:1 schema:bd2038c1
+B	export-500k	500000	336b9c46485bf1de	distinct:500000 schema:90661623 missing:0
+B	expr-agg-arg	10	4ffad2b215c51a54	keys:b128198d7fce0e99
+B	expr-bind-group	8	3b1cfde28f9aef77	keys:cb44d1a5a87303e9
+B	expr-order-key	10	0ba07f2d17433a53	rows:84521df65a65c0c5
+B	group-avg	10	a792a7795f4fdaa8	keys:9e7df82121b2a6df
+B	knows-reach	1	d6126b1882e25159	distinct:1 schema:bd2038c1
+B	lang-filter	1	a29a5d92b76c3bdb	distinct:1 schema:bd2038c1
+B	minus	1	32cc2d6d2cbd5aad	distinct:1 schema:bd2038c1
+B	not-exists	1	32cc2d6d2cbd5aad	distinct:1 schema:bd2038c1
+B	optional-chain	300191	d9265af4176879fa	distinct:300191 schema:e44bd636
+B	optional-count	1	a965d17b19d9da4a	distinct:1 schema:bd2038c1
+B	order-by-full	1020000	f2b26bdd1a691f9e	keys:4768b51f5e294f24
+B	path-plus	1	a7bd995042aa5f03	distinct:1 schema:bd2038c1
+B	predicate-counts	19	f2c32d5bdc8a8b32	distinct:19 schema:1a211c07
+B	predicate-subjects	19	89a1bbc01c87b500	distinct:19 schema:1a211c07
+B	range-topk	10	95421fa315822942	keys:148c2341f63abf90
+B	regex-iri	1	d1b8c3abde8d8e8d	distinct:1 schema:bd2038c1
+B	star-join	29717	7a6e28796168dd03	distinct:29717 schema:9bc038b3
+B	star-lookup	34	63c08b5be6516383	distinct:34 schema:8a1fa112
+B	subquery-agg	9	4e4f43dac02ec885	distinct:9 schema:e238595d
+B	two-hop-count	1	3691ba2ba7a910c7	distinct:1 schema:906d2154
+B	types-grouped	11	3f8a02093aae50f1	keys:ea2687e87e90900a
+B	values-star	12	26eccbad59f872fe	distinct:12 schema:43c82740

@@ -1,0 +1,17 @@
+binary: /home/kclejeune/lanes/forge-backlog/bin/sparkles-eda22fce-matrix
+binary sha256: 915ba62e2bade5551f25d5b0c7acca90aa8578e21f180dfb7ccdbf6290fc023c
+binary commit: eda22fce
+version: sparkles 0.1.0
+compilers: GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 23.1.0git; rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+build config: {"Cargo.toml":{"release":{"codegen-units":4,"debug":1,"lto":"thin","package":{"sparkles-core":{"codegen-units":1},"sparkles-owl":{"codegen-units":1}}}},"cargo":"build --release -p sparkles-server --bin sparkles","env":{"CARGO_INCREMENTAL":"0"},"mbx_policy":"779a99e845a5ac3f1c4d64a3c95bcc74b33f47418e829bf008542ec2dbbcd151","profile":"release"}
+runtime env: clean
+scripts commit: unknown
+scripts dirty: 0
+host: forge
+started: 2026-11-19T02:31:44Z
+settings: 31 queries, scales 100000 1000000 people, threads 12 1, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server
+variants: A execution=eager, B execution=streaming, one binary and one shared store
+generator sha256: c04719e3cb2b687c0d0575e290cc42cec74314ff1ab815a75063e1a85159923c
+load before: 3.38 3.15 3.03 1/667 256692
+ended: 2026-11-19T04:54:54Z
+load after: 3.12 3.10 3.01 1/681 393567
