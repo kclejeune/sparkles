@@ -156,24 +156,31 @@ measurements, and the benchmark host has not rerun them.
 ### Query-time closure operators on OWL2Bench
 
 Derivation on demand closes the adorned copies of transitive rules with closure operators
-([F23](../../specs/F23-reasoner-core/SPEC.md#closure-operators)). This is a manual report of
-one run per query on stanley, a laptop with other builds and tests running beside it, so
-its times are approximate. Each query ran `sparkles query --reasoning demand --profile
-owl-rl --max-derived 0` on an unmaterialized OWL2Bench(1) store, first with the operators
-at `c97471c3` and then with the joins at `5f3f69c2`. Both builds returned the same rows for
-every query.
+([F23](../../specs/F23-reasoner-core/SPEC.md#closure-operators)). On forge, the benchmark
+host, each query ran `sparkles query --reasoning demand --profile owl-rl --max-derived 0`
+on an unmaterialized OWL2Bench(1) store with the joins at `5f3f69c2` and with the operators
+at `365cffcf`. Each figure is the median of three rounds that alternate the order of the
+builds, and the peak RSS comes from GNU time. Both builds returned the same rows in every
+round.
 
 | Query | Joins | Joins, peak RSS | Operators | Operators, peak RSS | Rows |
 |---|---:|---:|---:|---:|---:|
-| q2 | 188.4 s | 1,946 MiB | 14.1 s | 1,090 MiB | 7,422 |
-| q7 | 177.1 s | 2,033 MiB | 12.0 s | 1,147 MiB | 1,685 |
-| q12 | 142.1 s | 1,988 MiB | 12.1 s | 1,123 MiB | 2,495 |
-| q19 | 152.1 s | 1,935 MiB | 14.0 s | 1,108 MiB | 859 |
+| q2 | 113.2 s | 2,352 MiB | 8.33 s | 1,222 MiB | 7,422 |
+| q7 | 117.4 s | 2,322 MiB | 8.39 s | 1,226 MiB | 1,685 |
+| q12 | 115.1 s | 2,354 MiB | 8.50 s | 1,203 MiB | 2,495 |
+| q19 | 115.7 s | 2,376 MiB | 8.53 s | 1,236 MiB | 859 |
 
-The [run directory](runs/2026-11-20-item-521-stanley/env.txt) holds the host, builds and
-commands, the [script](runs/2026-11-20-item-521-stanley/ab.sh.txt) and the
-[timings](runs/2026-11-20-item-521-stanley/results.txt). The benchmark host has not rerun
-these queries.
+The operators make these queries 13.5 to 14 times faster and use about half the peak
+memory.
+
+The [run directory](runs/2026-11-20-item-521-forge/env.txt) holds the host, builds and
+commands, the [gate script](runs/2026-11-20-item-521-forge/gate.sh.txt), its
+[log](runs/2026-11-20-item-521-forge/gate.log.txt) and the [OWL2Bench
+timings](runs/2026-11-20-item-521-forge/owl2bench-summary.txt). The same run compared the
+two builds on the [reasoning latency gate](#query-time-reasoning-latency), and its records
+and their [per-round analysis](runs/2026-11-20-item-521-forge/analysis.txt) are in the
+directory too. An earlier approximate run on stanley, a laptop with other work beside it, is in
+[its own directory](runs/2026-11-20-item-521-stanley/env.txt).
 
 ### Sampled rule-body planning
 

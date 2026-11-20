@@ -8,9 +8,9 @@ Demand sessions now close the adorned copies of transitive rules and of `prp-trp
 closure operators seeded by their magic facts, the first half of roadmap item 521 and
 Phase 2 of spec F23. A copy whose demand binds the subject walks forward from the values it
 is asked for, one that binds the object walks backward, and one that binds neither closes
-the relation, each emitting the facts its joins would derive. On a loaded laptop the
-OWL2Bench(1) queries q2, q7, q12 and q19 under `owl-rl` demand took 12 to 14 s instead of
-142 to 188 s, with the same rows and about 45% less RSS. A run that derives list cells its
+the relation, each emitting the facts its joins would derive. On forge the OWL2Bench(1)
+queries q2, q7, q12 and q19 under `owl-rl` demand took 8.3 to 8.5 s instead of 113 to
+117 s, with the same rows and about half the peak RSS. A run that derives list cells its
 rules read starts again without the operators. `SPARKLES_DEMAND_CLOSURES=0` turns them off.
 Roadmap item 1222 covers pairs derived for values the query did not ask for.
 

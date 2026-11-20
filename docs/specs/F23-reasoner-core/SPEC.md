@@ -534,11 +534,11 @@ the compact strategy and lowered programs that read lists again keep the joins, 
 value the copy's magic rules ask for, as the joins do, and not only the pairs of the query's
 own values, which roadmap item 1222 covers.
 
-On stanley, a laptop under other load, at `c97471c3` against `5f3f69c2`, the OWL2Bench(1)
-queries q2, q7, q12 and q19 under `owl-rl` demand on the unmaterialized store took 14.1,
-12.0, 12.1 and 14.0 s against 188, 177, 142 and 152 s, at 1.1 GiB of RSS against 1.9 to
-2.0 GiB, and returned the same rows. These are one approximate run per query and not
-published numbers, and [the reasoning results](../../benchmarks/reasoning/RESULTS.md#query-time-closure-operators-on-owl2bench)
+On forge, the benchmark host, at `365cffcf` against `5f3f69c2`, the OWL2Bench(1) queries
+q2, q7, q12 and q19 under `owl-rl` demand on the unmaterialized store took 8.3 to 8.5 s
+against 113 to 117 s, the medians of three alternating rounds, at 1.2 GiB of peak RSS
+against 2.3 GiB, and returned the same rows.
+[The reasoning results](../../benchmarks/reasoning/RESULTS.md#query-time-closure-operators-on-owl2bench)
 give the record.
 
 ### Bounded incremental deletion
