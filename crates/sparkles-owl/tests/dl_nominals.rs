@@ -976,11 +976,11 @@ fn a_rewritten_run_that_does_not_take_tier_d_answers_as_a_fresh_classifier() {
     no_internal_names(&k, &out, &[Class::thing(), c("A"), c("B")]);
 }
 
-/// Fixtures of roadmap item 1061 in `tests/fixtures/dl1061`, each of which entails `Z ⊑ Ans`
-/// by HermiT 1.4.5. In each, Z holds a hypothetical role atom to the individual a with a
-/// class P whose universal closes a cycle through the fact `R(b)`, its successors and a
-/// back-link `s(x, a)`, so that only the conditional class P(a) under Z's hypothesis
-/// reaches the successors of b. They guard the registration of the root's facts in a
+/// The fixtures of roadmap item 1061 in `tests/fixtures/dl1061` each entail `Z ⊑ Ans` by
+/// HermiT 1.4.5. In each, Z holds a hypothetical role atom to the individual a with a class
+/// P whose universal closes a cycle through the fact `R(b)`, its successors and a back-link
+/// `s(a, x)`, so that only the conditional class P(a) under Z's hypothesis reaches the
+/// successors of b. They guard the registration of the root's facts in a
 /// context: a run that narrows which facts a context receives must still find the
 /// subsumption, or must not report the run complete. The `fam-` files come from a family
 /// that varies the chain of role facts from b, the depth of ordinary successors below b's
