@@ -2664,8 +2664,12 @@ impl Saturation {
                 }
             }
             stats.dl_work = d.work();
-            if self.dl_rooted && (dl_root::marker_diag() || dl_root::marker_decline().is_some()) {
-                // row 1231's diagnostic and decline, off by default
+            if self.dl_rooted
+                && open.is_none()
+                && (dl_root::marker_diag() || dl_root::marker_decline().is_some())
+            {
+                // row 1231's diagnostic and decline, off by default, after a saturation that
+                // finished (a partial answer keeps its own path)
                 let made = dynamic.iter().flat_map(|dy| {
                     (0..dy.len() as Ex)
                         .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))

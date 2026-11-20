@@ -1433,11 +1433,12 @@ pub(super) fn marker_ctx(
     let mut held = Vec::new();
     if let Some(r) = x.root.as_deref() {
         for &l in &r.ground {
-            let own = x
-                .store
-                .clauses
-                .iter()
-                .any(|s| s.max == Some(l) && !is_marker(&s.c));
+            // every maximal literal of a processed clause, dead or not, since a clause
+            // can have several and Stored::max holds the first
+            let own = (0..x.store.clauses.len() as u32).any(|i| {
+                x.store.max_of(i, |m| m == l).is_some()
+                    && !is_marker(&x.store.clauses[i as usize].c)
+            });
             if own && ground_trigger(lits.view(l, inv)) {
                 held.push(l);
             }
