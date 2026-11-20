@@ -171,6 +171,37 @@ threads, which are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0`,
 `SPARKLES_ROOTED_SEL_PARTNERS_X=0` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` turn each part off
 for measurement.
 
+Item 1229 records a loss of runs that count and of rooted runs. Pred takes each clause
+that a successor sends with the restrictions that reach the successor when it arrives, and
+drops the clause when the successor sends it again over a later link. A unit existential
+restriction that the context derived later took no Pred with the clauses its successor
+had already sent. Under the eager strategy two restrictions can share a successor, and the
+second restriction's edge can come after the successor's clauses did, when the context
+replayed Pred only with the literal that made the edge, so a clause whose body lacks that
+literal missed the new restriction in the same way. With counting Pred's conclusion can
+name the restriction's own successor term in a role atom, and in a rooted run in an
+equality with a constant, so such a run could report itself complete and miss an entailed
+subsumption. Without counting or the root, a conclusion names the successor term only
+through premises whose own arrival replays Pred, and runs that force the replay on in that
+case change no taxonomy. A run that counts or is rooted now replays every clause that the
+successor already sent with the late restriction, for a new unit, for a unit whose earlier
+edge went to another successor, and for a new edge, whose replay of the literal that made
+it is then left out for that successor as already included. The repair is adopted on a measured gate and
+item 1229 stays open for the proof that it covers every order of arrival. On generated and
+fixture ontologies built around the loss and on the selection's sets, on one and four
+threads with both strategies, every run that answers in full, with nothing left out
+and no fallback, agrees with HermiT wherever HermiT gives a taxonomy, and the cautious and
+eager runs that both answer in full give the same taxonomy.
+On the runs that answer in full with and without it, and where the run without it agrees
+with HermiT, the replay adds 0.29% to the derived
+conclusions of rooted runs that count, 0.47% to rooted runs without counting and 0.90% to
+runs that count without the root, because it charges its products before the redundancy check. Three
+generated ontologies that finished close to the bound now exceed it and give the answer
+without counting or without the rooted rules, with the same taxonomy as before at a raised
+bound, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` gives the earlier containment, in
+which a rooted run classifies again without counting or without the rooted rules when such
+a restriction or edge arrives, and `=0` turns both off, for measurement.
+
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
 is the calculus's own at-most clause with the neighbours in its body, an exact
@@ -1872,8 +1903,8 @@ and JVM bindings and `sparkles ontology classify --partial --expansion` take the
 answer gives `tier` and `consistency`, and a partial one has `partial` true, `complete`
 false and the open classes under `incomplete` with `incompleteCount`. The `complete` of
 the JSON and of `Classified::complete` stays true only for a run that finished and reported
-no axiom left out. A rooted run can miss entailments with the flag true, which items 1229
-and 1231 record. The dataset keeps no partial answer. A request that writes its taxonomy,
+no axiom left out. A rooted run can miss entailments with the flag true, which item 1231
+records, and a run that counts rests on item 1229's repair, which is not proved. The dataset keeps no partial answer. A request that writes its taxonomy,
 asks for the functional-style answer or runs a ROBOT-compatible command refuses or ignores
 the flag, since none of them can say that a taxonomy is partial. The command line takes
 `--timeout`, notes a partial answer on stderr and exits with status 2 for one that is

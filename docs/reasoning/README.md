@@ -450,7 +450,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   context keeps clauses under one total order of literals, and a named subsumer that only
   a case analysis gives is found by a test context for the class with the candidate's
   complement. `Limits::expansion` chooses the cautious or the eager successor strategy,
-  which give the same answers. These runs share the Horn rules' memory budget, and a run
+  whose full answers agree on every ontology of item 1229's gate. These runs share the Horn rules' memory budget, and a run
   that passes it classifies again by the Horn rules, leaves the disjunctive axioms out and
   reports them, and sets `Stats::dl_over_budget`. A run that neither counts nor is rooted
   also has a bound of 384 derived conclusions for each class of the signature, at least
@@ -501,7 +501,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   individual in place of an anonymous successor, except in a run that counts. It is off by default,
   since the completeness of the departed calculus is not proved, and every answer it gives
   is entailed. A rooted answer that reports itself complete can still miss entailments,
-  as roadmap items 1229 and 1231 record, so it cannot be relied on as complete while
+  as roadmap item 1231 records, so it cannot be relied on as complete while
   roadmap item 823 is open. A rooted run selects ground body literals, and Hyper over `x`
   and Pred from a successor over a successor term of a constant take selected clauses as
   partners. It also exempts from the restriction on ground inferences a Join whose premise
@@ -509,8 +509,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   reported itself complete could miss entailed subsumptions and unsatisfiable classes.
   The repaired selection is adopted on a measured gate of generated and fixture
   ontologies, its completeness is not proved, and roadmap item 1220 stays open for that
-  proof. A rooted run with counting can still miss entailed subsumptions on a generated
-  ontology, with or without these repairs, which is roadmap item 1229. A rooted run can
+  proof. A run that counts and a rooted run give an existential restriction that reaches
+  a successor after the successor sent its clauses Pred with those clauses. That repair is
+  adopted on a measured gate without a proof that it covers every order of arrival, and
+  roadmap item 1229 stays open for the proof. A rooted run can
   also miss an entailment while it reports itself complete when a fact that holds only
   under the queried class concerns an individual reached from another individual, which
   is roadmap item 1231. A rooted run without counting has a bound of 524,288 derived
@@ -528,9 +530,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
   the top object property, is used as far as the calculus goes and reported as partial.
-  Every answer is entailed, and outside a rooted run it is complete for named classes when
-  nothing is reported. A rooted run can miss entailments even when it reports nothing left
-  out and calls its answer complete. Roadmap items 1229 and 1231. For eligible EL additions
+  Every answer is entailed, and outside a rooted run or a run that counts it is complete
+  for named classes when nothing is reported. A rooted run can miss entailments even when
+  it reports nothing left out and calls its answer complete, which is roadmap item 1231,
+  and the completeness of a run that counts rests on a repair that roadmap item 1229 has
+  not proved. For eligible EL additions
   and removals, the classifier keeps its contexts and saturates again only those the
   changes can reach. A classification with the Horn rules of an ontology without
   individuals, and one with the disjunctive rules that does not count, keep their contexts

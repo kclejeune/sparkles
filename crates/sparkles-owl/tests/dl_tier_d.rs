@@ -2379,3 +2379,135 @@ fn a_context_that_gives_way_sends_the_products_of_its_links_first() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// K's r-successor C is a D, and the s-successor that K derives only after a case analysis
+/// is the same C context. At most one p-successor in B, which both are, makes them one
+/// individual, so K ⊑ ∃s.D ⊑ Ans. The qualified role of B comes back from C over the
+/// predecessor before the s-restriction arrives. A run that counts either finds K ⊑ Ans
+/// or does not answer in full, and with item 1229's repair it answers in full. Without the
+/// repair, `SPARKLES_COUNTING_LATE_UNIT=0` or `=1`, a run without the root does neither.
+#[test]
+fn a_late_restriction_into_a_successor_that_already_answered_counts_with_it() {
+    let repair = !matches!(
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref(),
+        Ok("0" | "1")
+    );
+    for late in [
+        "SubClassOf(:K ObjectUnionOf(:X1 :X2))
+         SubClassOf(:X1 :A)
+         SubClassOf(:X2 :A)",
+        // an unrelated union keeps this Horn arrival order on the disjunctive rules
+        "SubClassOf(:K ObjectSomeValuesFrom(:r1 :D2))
+         SubClassOf(:D2 ObjectAllValuesFrom(ObjectInverseOf(:r1) :A))
+         SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))",
+    ] {
+        let ax = axioms(&format!(
+            "SubObjectPropertyOf(:r :p)
+             SubObjectPropertyOf(:s :p)
+             SubClassOf(:C :B)
+             SubClassOf(:K ObjectMaxCardinality(1 :p :B))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+             SubClassOf(:K ObjectAllValuesFrom(:r :D))
+             {late}
+             SubClassOf(:A ObjectSomeValuesFrom(:s :C))
+             SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+             SubClassOf(:E ObjectSomeValuesFrom(:s :C))"
+        ));
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (1, Expansion::Eager),
+            (4, Expansion::Eager),
+        ] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    counting: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert_eq!(out.consistency, Consistency::Consistent);
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+            let full = out.complete && k.excluded().is_empty();
+            assert!(full || !repair, "the repair answers in full");
+            if full {
+                assert!(
+                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                    "K ⊑ Ans is missing"
+                );
+            } else {
+                assert!(out.stats.dl_counting_over, "{:#?}", k.excluded());
+            }
+            assert!(
+                !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+                "E ⊑ Ans is not entailed"
+            );
+        }
+    }
+}
+
+/// K's r-successor is a C and a D, and K derives its s-restriction into C only after a case
+/// analysis. Under the eager strategy both restrictions reach the one successor whose core
+/// is C and D, which sent its clauses over the predecessor when the r-edge was made, and
+/// the s-edge comes later. The functional p makes the two successors one, so K ⊑ ∃s.D ⊑ Ans.
+/// A run that counts without the root misses it without item 1229's repair, which is on
+/// unless `SPARKLES_COUNTING_LATE_UNIT` is 0 or 1.
+#[test]
+fn a_late_restriction_that_shares_an_eager_successor_counts_with_it() {
+    // the repair answers in full with counting
+    let repair = !matches!(
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref(),
+        Ok("0" | "1")
+    );
+    let ax = axioms(
+        "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:K ObjectAllValuesFrom(:r :D))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 ObjectUnionOf(:Y1 :Y2)))
+         SubClassOf(:Y1 :Y)
+         SubClassOf(:Y2 :Y)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :Y) :A)
+         SubClassOf(:A :L0)
+         SubClassOf(:L0 :L1)
+         SubClassOf(:L1 ObjectSomeValuesFrom(:s :C))
+         SubClassOf(:C ObjectIntersectionOf(:B :B2))
+         SubObjectPropertyOf(:r :p)
+         SubObjectPropertyOf(:s :p)
+         FunctionalObjectProperty(:p)
+         SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+         SubClassOf(:E ObjectSomeValuesFrom(:s :C))",
+    );
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        let full = out.complete && k.excluded().is_empty();
+        assert!(full || !repair, "the repair answers in full");
+        if full {
+            assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing ({threads}, {expansion:?})"
+            );
+        } else {
+            assert!(out.stats.dl_counting_over, "{:#?}", k.excluded());
+        }
+        assert!(
+            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+            "E ⊑ Ans is not entailed"
+        );
+    }
+}

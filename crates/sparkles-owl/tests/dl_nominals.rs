@@ -1260,6 +1260,68 @@ fn a_selected_premise_over_a_successor_term_of_a_constant_reaches_pred() {
     );
 }
 
+/// K reaches the successor `{v} ⊓ B0` by t4 at once, and by s7 only after its successor D2
+/// read K's fact B1(v) and sent `∃r1.H` back, so the successor's `x ≈ v` came before the
+/// second restriction did. With counting the restriction has a successor term, which takes
+/// the constant only from that clause. A run that counts either finds K ⊑ Ans or does not
+/// answer in full, which it marks by classifying again without counting (item 1229).
+#[test]
+fn a_late_restriction_into_a_successor_that_already_answered_reads_its_clauses() {
+    let body = "SubClassOf(:K ObjectSomeValuesFrom(:t4 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         SubClassOf(:K ObjectSomeValuesFrom(:t10 ObjectIntersectionOf(ObjectOneOf(:v) :B1)))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 :D2))
+         SubClassOf(:D2 ObjectHasValue(:s9 :v))
+         SubClassOf(ObjectSomeValuesFrom(:s9 :B1) :G0)
+         SubClassOf(:G0 :H)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :H) :A0)
+         SubClassOf(:A0 :A)
+         SubClassOf(:A ObjectSomeValuesFrom(:s7 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         SubClassOf(ObjectSomeValuesFrom(:s7 :B1) :F0)
+         SubClassOf(:F0 :Ans)
+         SubClassOf(:Ctl ObjectSomeValuesFrom(:s7 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         FunctionalObjectProperty(:zz)";
+    let ax = axioms(body);
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        let full = out.complete && k.excluded().is_empty();
+        if full {
+            assert!(!out.stats.dl_counting_over);
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing"
+            );
+        } else {
+            // the run without counting leaves the functional property out and answers
+            assert!(out.stats.dl_counting_over, "{:#?}", k.excluded());
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing"
+            );
+        }
+        for (a, b) in [("Ctl", "Ans"), ("D2", "G0"), ("K", "B0")] {
+            assert!(
+                !out.taxonomy.is_subclass(&c(a), &c(b)),
+                "{a} ⊑ {b} is not entailed"
+            );
+        }
+    }
+}
+
 /// A successor S that is the context of a named class, and so a query context, holds a
 /// selected disjunction of equalities of its element with constants under a marker of a
 /// fact of K (item 1220). The query-form Eq and Factor leave out such a premise, and the
@@ -1444,5 +1506,144 @@ fn a_selected_equality_of_a_successor_with_constants_reaches_its_own_successor()
              ClassAssertion(:Cx :u)",
     ] {
         check(body, &[("K", "Ans")], &[("S", "Ans")]);
+    }
+}
+
+/// K's r-successor is a C and a D, and K derives its s-restriction into C only after a case
+/// analysis. Under the eager strategy both restrictions reach the one successor whose core
+/// is C and D, which sent its clauses over the predecessor when the r-edge was made, and
+/// the s-edge comes later. The functional p makes the two successors one, so K ⊑ ∃s.D ⊑ Ans.
+/// A rooted run that counts either finds K ⊑ Ans or classifies again without counting,
+/// which leaves the functional property out and reports it (item 1229).
+#[test]
+fn a_late_restriction_that_shares_an_eager_successor_reads_its_clauses() {
+    // the repair answers in full with counting, unless `SPARKLES_COUNTING_LATE_UNIT` is 0
+    // or 1
+    let repair = !matches!(
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref(),
+        Ok("0" | "1")
+    );
+    let ax = axioms(
+        "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:K ObjectAllValuesFrom(:r :D))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 ObjectUnionOf(:Y1 :Y2)))
+         SubClassOf(:Y1 :Y)
+         SubClassOf(:Y2 :Y)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :Y) :A)
+         SubClassOf(:A :L0)
+         SubClassOf(:L0 :L1)
+         SubClassOf(:L1 ObjectSomeValuesFrom(:s :C))
+         SubClassOf(:C ObjectIntersectionOf(:B :B2))
+         SubObjectPropertyOf(:r :p)
+         SubObjectPropertyOf(:s :p)
+         FunctionalObjectProperty(:p)
+         SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+         SubClassOf(:E ObjectSomeValuesFrom(:s :C))
+         ClassAssertion(:K :a)",
+    );
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        let full = out.complete && k.excluded().is_empty();
+        assert!(full || !repair, "the repair answers in full");
+        if full {
+            assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing ({threads}, {expansion:?})"
+            );
+        } else {
+            // the run without counting leaves the functional property out, so K ⊑ Ans with it
+            assert!(out.stats.dl_counting_over && out.stats.dl_over_budget);
+            let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
+            assert!(
+                matches!(left[..], [AxiomKind::FunctionalObjectProperty(_)]),
+                "only the functional axiom is left out: {left:#?}"
+            );
+        }
+        assert!(
+            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+            "E ⊑ Ans is not entailed"
+        );
+    }
+}
+
+/// The same late s-edge into the eager successor whose core is C and D, in a rooted run
+/// without counting, with K ⊑ ∀s.D in place of the functional property. The rooted
+/// context registers with every successor over all its clauses, so the successor's clause
+/// for ∃s.D ⊑ Ans arrived with the r-edge and the s-edge found it taken. The rooted run
+/// finds K ⊑ Ans, and with `SPARKLES_COUNTING_LATE_UNIT=1` it classifies again without
+/// the rooted rules (item 1229).
+#[test]
+fn a_late_edge_of_a_rooted_run_without_counting_reads_its_clauses() {
+    let mode = std::env::var("SPARKLES_COUNTING_LATE_UNIT");
+    let contained = mode.as_deref() == Ok("1");
+    let ax = axioms(
+        "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:K ObjectAllValuesFrom(:r :D))
+         SubClassOf(:K ObjectAllValuesFrom(:s :D))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 ObjectUnionOf(:Y1 :Y2)))
+         SubClassOf(:Y1 :Y)
+         SubClassOf(:Y2 :Y)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :Y) :A)
+         SubClassOf(:A :L0)
+         SubClassOf(:L0 :L1)
+         SubClassOf(:L1 ObjectSomeValuesFrom(:s :C))
+         SubClassOf(:C ObjectIntersectionOf(:B :B2))
+         SubObjectPropertyOf(:r :p)
+         SubObjectPropertyOf(:s :p)
+         SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+         SubClassOf(:E ObjectSomeValuesFrom(:s :C))
+         ClassAssertion(:K :a)",
+    );
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        if out.stats.dl_rooted_over {
+            assert!(
+                contained,
+                "only the containment falls back ({threads}, {expansion:?})"
+            );
+            continue;
+        }
+        assert!(
+            out.complete && k.excluded().is_empty(),
+            "the rooted run answers in full ({threads}, {expansion:?})"
+        );
+        assert!(
+            out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "K ⊑ Ans is missing ({threads}, {expansion:?})"
+        );
+        assert!(
+            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+            "E ⊑ Ans is not entailed"
+        );
     }
 }

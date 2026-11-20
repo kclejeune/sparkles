@@ -1178,6 +1178,89 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
         .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
 }
 
+/// What a run that counts or has the root does when an existential restriction reaches a
+/// successor after the successor sent clauses over the predecessor, item 1229 (F24). Pred
+/// takes each such clause once, with the restrictions that reach the successor when it
+/// comes, and drops it when the successor sends it again over a later link. A restriction
+/// reaches a successor late as a unit derived later, as a unit that had an edge to another
+/// successor before, or under the eager strategy as a second edge into a shared successor,
+/// whose replay takes only the literal that made the edge. In these runs Pred's conclusion
+/// can name the restriction's own successor term, in a role atom over it with counting or
+/// in an equality with a constant in a rooted run, so the late restriction could miss what
+/// the clause gives it. By default the context replays every clause the successor sent
+/// with the late restriction in Pred, item 1229's repair, which is adopted on a measured
+/// gate and not proved. `SPARKLES_COUNTING_LATE_UNIT=1` gives the containment instead,
+/// in which a rooted run passes its bound on derived conclusions and classifies again
+/// without counting or without the rooted rules, and `=0` turns both off, for
+/// measurement.
+pub fn late_unit_mode() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Whether a run takes the rule of [`late_unit_mode`]: one that counts or has the root,
+/// in which Pred's conclusion can name the restriction's successor term.
+fn late_rules(dx: &DlIx) -> bool {
+    dx.counting || dx.root.is_some()
+}
+
+/// The rule of [`late_unit_mode`] on a restriction `e` of the context `me` that newly
+/// reaches the successor `v`, as a new unit whose EL successor is v, as a unit that had an
+/// edge to v before, or as a new edge to v. Under the eager strategy two restrictions can
+/// share a successor, so the second one's edge can come after the clauses did, and the
+/// context replays on the edge only Pred with the literal that made it. The answer is
+/// whether the rule replayed the clauses, which then include the products with that
+/// literal.
+#[allow(clippy::too_many_arguments)]
+fn late<S: Sink>(
+    ix: &Index,
+    me: Ex,
+    st: &State,
+    e: Ex,
+    v: Ex,
+    kind: &str,
+    found: &mut Found,
+    out: &mut S,
+) -> bool {
+    let dx = dix(ix);
+    // the root takes no Pred over the successor terms of x, and a restriction into a
+    // singleton has no successor term, as in pred_c
+    if dx.is_root(me) || into_nominal(ix, e).is_some() {
+        return false;
+    }
+    let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&v)) else {
+        return false;
+    };
+    if cids.is_empty() {
+        return false;
+    }
+    match late_unit_mode() {
+        0 => false,
+        // the containment holds only for a rooted run, which classifies again without
+        // the rooted rules or counting
+        1 if dx.root.is_none() => false,
+        1 => {
+            if tracing() {
+                eprintln!("TR LATE {kind} {} e={e} succ={v}", tr_ctx(st, false));
+            }
+            found.over = true;
+            false
+        }
+        _ => {
+            for &cid in cids {
+                let c = out.dl().table.get(cid).clone();
+                pred(ix, st, e, &c, None, found, &out.dl().lits);
+            }
+            true
+        }
+    }
+}
+
 /// Whether a context other than the root selects the ground literals in its bodies, item
 /// 804's selection (F24). It is on, with item 1220's repair [`sel_partners_x`], since
 /// without that repair two selected clauses of one context never meet in Hyper over x, so
@@ -2502,6 +2585,15 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         && into_nominal(ix, d).is_none()
     {
         on_rl(ix, st, d, r, &unit, &mut found);
+        if late_rules(dx) {
+            late(ix, me, st, d, h.succ, "unit", &mut found, out);
+            // a restriction that had an edge before it became a unit reaches that
+            // successor too, now with the unit's premises
+            let w = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == d).map(|&(_, w)| w));
+            if let Some(w) = w.filter(|&w| w != h.succ) {
+                late(ix, me, st, d, w, "unit-edge", &mut found, out);
+            }
+        }
         if dx.counting && dx.root.is_none() {
             let mut us = Vec::new();
             unit_lits(ix, dx, st, d, &mut us);
@@ -3294,8 +3386,16 @@ fn process<S: Sink>(
             }
             F | RL | EQ | NE => {
                 let e = l.fun();
+                let had = dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e));
                 // Succ: the successor takes the marker
                 let v = target(ix, me, st, e, out);
+                let edge_v = v;
+                // the late rule's replay takes the clauses with every partner, this
+                // premise included, so the replay below skips v
+                let replayed = late_rules(dx)
+                    && !had
+                    && dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e))
+                    && late(ix, me, st, e, v, "edge", &mut found, out);
                 match l.kind() {
                     F => send_hyp(ix, st, v, l.atom(), out),
                     RL => on_rl(ix, st, e, l.atom(), &prem, &mut found),
@@ -3330,6 +3430,9 @@ fn process<S: Sink>(
                 }
                 let table = &out.dl().table;
                 for &v in &es {
+                    if replayed && v == edge_v {
+                        continue;
+                    }
                     let cids = dl(st)
                         .and_then(|x| x.pred_in.get(&v))
                         .map_or(&[][..], |v| v.as_slice());

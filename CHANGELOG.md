@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### Late existential restrictions take the clauses their successor already sent
+
+In a run that counts and in a rooted run, an existential restriction that reaches a
+successor after the successor sent its clauses over the predecessor, as a unit derived
+later or under eager expansion as a later edge into a shared successor, now takes Pred
+with those clauses, as roadmap item 1229's repair. Such a run could report itself complete
+and miss an entailed subsumption, and a rooted run that counted classified again without
+counting where it detected the case. The repair is adopted on a measured gate of
+generated and fixture ontologies without a proof, so item 1229 stays open, and the
+cautious and eager strategies give the same taxonomy on that gate wherever both answer in
+full. On the runs that answer in full with and without it, and where the run
+without it agrees with HermiT, the repair adds 0.29% to the
+derived conclusions of rooted runs that count, 0.47% to rooted runs without counting and
+0.90% to runs that count without the root, and three generated ontologies now exceed the
+bound on derived conclusions, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` keeps
+the earlier containment, which now also covers rooted runs without counting, and `=0`
+turns both off, for measurement.
+
 ### The selection of rooted runs is on again with selected partners
 
 With `Limits::rooted`, Hyper over `x` and Pred from a successor over a successor term of a
