@@ -1583,9 +1583,7 @@ impl<'a> Planner<'a> {
                     (vec![expression], list_credit(None))
                 } else {
                     let mut single = Vec::new();
-                    let credit = self.grow_filters(&mut single, 1, |s| s.push(expression))?;
-                    #[cfg(test)]
-                    note_list(6, single.len());
+                    let credit = self.grow_filters(&mut single, 1, 6, |s| s.push(expression))?;
                     (single, credit)
                 };
                 let node = self.apply_filters(child, single)?;
@@ -1600,9 +1598,8 @@ impl<'a> Planner<'a> {
                 }
                 // The conjuncts join the list in place, which grows to its size first.
                 let more = compiled.conjunct_count();
-                let _grown = self.grow_filters(&mut fs, more, |fs| compiled.conjuncts_into(fs))?;
-                #[cfg(test)]
-                note_list(0, fs.len());
+                let _grown =
+                    self.grow_filters(&mut fs, more, 0, |fs| compiled.conjuncts_into(fs))?;
                 self.plan(inner, g, fs)
             }
             GP::LeftJoin {
@@ -2170,6 +2167,38 @@ impl<'a> Planner<'a> {
         Ok((push, top, list_credit(credit)))
     }
 
+    /// [`defer_open_filters`] on the checked route: the deferred filters move into a list
+    /// made to their number and admitted before it is made, and the rest stay in
+    /// `filters`' own list. The credit returned holds the deferred list.
+    fn defer_open_filters_checked(
+        &self,
+        filters: &mut Vec<Expr>,
+        triples: &[Triple],
+        paths: &[PathItem],
+        nodes: &[Node],
+        unpacks: &[UnpackItem],
+    ) -> Result<(Vec<Expr>, ListCredit)> {
+        if filters.is_empty() || !may_defer(nodes) {
+            return Ok((Vec::new(), list_credit(None)));
+        }
+        // The same test without allocating: a variable of the filter is open.
+        let (deferred, credit) = self.extract_filters(filters, |f| {
+            f.visit_vars(&mut |v| {
+                if open_filter_var(v, triples, paths, nodes, unpacks) {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        })?;
+        #[cfg(test)]
+        if credit.is_some() {
+            note_list(2, deferred.len());
+        }
+        Ok((deferred, list_credit(credit)))
+    }
+
     /// On the checked route, the credit for a list of `slots` filters, taken before the
     /// list is made or grown. `None` on the ordinary route.
     fn filter_list_scratch(&self, slots: usize) -> Result<Option<Reservation>> {
@@ -2210,6 +2239,7 @@ impl<'a> Planner<'a> {
         &self,
         filters: &mut Vec<Expr>,
         more: usize,
+        #[allow(unused_variables)] site: usize,
         fill: impl FnOnce(&mut Vec<Expr>),
     ) -> Result<ListCredit> {
         let need = filters
@@ -2232,6 +2262,8 @@ impl<'a> Planner<'a> {
                 .map_err(|_| credit.preparation().exhausted())?;
             fill(filters);
             debug_assert_eq!(filters.len(), need);
+            #[cfg(test)]
+            note_list(site, need);
             credit
         };
         Ok(list_credit(Some(credit)))
@@ -4308,7 +4340,12 @@ impl<'a> Planner<'a> {
         // variable that an element may leave unbound (a UNION branch, an OPTIONAL, a
         // failed BIND, an UNDEF of VALUES) does not, when another element can still bind
         // it. Such a FILTER waits until every element that binds them has joined.
-        let deferred = defer_open_filters(&mut filters, &triples, &paths, &nodes, &unpacks);
+        let (deferred, _deferred_list) = if self.branch_payload.borrow().is_none() {
+            let deferred = defer_open_filters(&mut filters, &triples, &paths, &nodes, &unpacks);
+            (deferred, list_credit(None))
+        } else {
+            self.defer_open_filters_checked(&mut filters, &triples, &paths, &nodes, &unpacks)?
+        };
 
         let leaf_slots = triples
             .len()
@@ -4387,27 +4424,49 @@ impl<'a> Planner<'a> {
                     .any(|u| u.t == v || u.parts.contains(&PT::V(v)))
                 || dependent.iter().any(|n| n.vars.contains(&v))
         };
-        let (mut settled, late): (Vec<Expr>, Vec<Expr>) = deferred
-            .into_iter()
-            .partition(|f| !f.var_set().into_iter().any(binds_late));
+        let (mut settled, late, _late_list) =
+            if self.branch_payload.borrow().is_none() || deferred.is_empty() {
+                let (settled, late): (Vec<Expr>, Vec<Expr>) = deferred
+                    .into_iter()
+                    .partition(|f| !f.var_set().into_iter().any(binds_late));
+                (settled, late, list_credit(None))
+            } else {
+                // The late filters move out of the deferred list, the settled ones stay.
+                let mut settled = deferred;
+                let (late, credit) = self.extract_filters(&mut settled, |f| {
+                    f.visit_vars(&mut |v| if binds_late(v) { Err(()) } else { Ok(()) })
+                        .is_err()
+                })?;
+                #[cfg(test)]
+                if credit.is_some() {
+                    note_list(3, late.len());
+                }
+                (settled, late, list_credit(credit))
+            };
         if self.ctx.opt.probed_keys && leaves.len() > 1 {
             super::keyprobe::prepare(self.ctx, &leaves);
         }
-        let mut result = if leaves.is_empty() {
+        let (mut result, _joined_list) = if leaves.is_empty() {
             drop(leaves);
-            Node::unit()
+            (Node::unit(), list_credit(None))
         } else if leaves.iter().any(|l| l[0].is_empty()) {
             let mut vars: Vec<VarId> = leaves.iter().flat_map(|l| l[0].vars.clone()).collect();
             vars.sort_unstable();
             vars.dedup();
             drop(leaves);
-            Node::empty(vars)
+            (Node::empty(vars), list_credit(None))
         } else {
             self.join_order(leaves, &mut filters, &mut settled)?
         };
         drop(scan_storage);
         drop(leaf_storage);
-        filters.append(&mut settled);
+        let _settled_list = if self.branch_payload.borrow().is_none() {
+            filters.append(&mut settled);
+            list_credit(None)
+        } else {
+            let more = settled.len();
+            self.grow_filters(&mut filters, more, 7, |f| f.append(&mut settled))?
+        };
 
         // attach property paths, preferring those whose endpoint is already bound
         while !paths.is_empty() {
@@ -4442,7 +4501,13 @@ impl<'a> Planner<'a> {
             };
             result = self.place_retained(result, &mut filters, true)?;
         }
-        filters.extend(late);
+        let _late_joined = if self.branch_payload.borrow().is_none() {
+            filters.extend(late);
+            list_credit(None)
+        } else {
+            let more = late.len();
+            self.grow_filters(&mut filters, more, 8, |f| f.extend(late))?
+        };
         if !filters.is_empty() {
             result = self.filter_admitted(result, filters)?;
         }
@@ -4526,13 +4591,14 @@ impl<'a> Planner<'a> {
     /// DP / greedy join ordering over connected components (QLever QueryPlanner).
     /// `settled` are FILTERs that may run only on whole components: each is placed on
     /// the component that binds all its variables, and the rest join the `filters` of
-    /// the joins between components.
+    /// the joins between components. On the checked route the credit returned holds
+    /// `filters` when they grow for the rest of `settled`.
     fn join_order(
         &self,
         leaves: Vec<Vec<Node>>,
         filters: &mut Vec<Expr>,
         settled: &mut Vec<Expr>,
-    ) -> Result<Node> {
+    ) -> Result<(Node, ListCredit)> {
         let n = leaves.len();
         let preparation = self
             .branch_payload
@@ -4667,7 +4733,13 @@ impl<'a> Planner<'a> {
             };
             parts.push(self.place_filters(plan, settled)?);
         }
-        filters.append(settled);
+        let joined = if preparation.is_none() {
+            filters.append(settled);
+            list_credit(None)
+        } else {
+            let more = settled.len();
+            self.grow_filters(filters, more, 4, |f| f.append(settled))?
+        };
         // components connected by a spatial conjunct are joined on it
         super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
         // cross products between components, smallest first
@@ -4677,7 +4749,7 @@ impl<'a> Planner<'a> {
         for p in it {
             acc = self.join_components(acc, p, filters)?;
         }
-        Ok(super::indexjoin::fuse_stars(acc, self.ctx))
+        Ok((super::indexjoin::fuse_stars(acc, self.ctx), joined))
     }
 
     fn choose_checked_scan(&self, options: Vec<Node>, filters: &mut Vec<Expr>) -> Result<Node> {
@@ -6331,11 +6403,13 @@ type ListCredit = Option<Reservation>;
 #[cfg(test)]
 thread_local! {
     /// The longest admitted filter list per producer: the FILTER's conjuncts, the
-    /// filters moved below an operator, the deferred and the late filters, the grown
-    /// lists of a group's remaining filters, the filters of a keyed join, and the list
-    /// of one FILTER that calls application extensions.
-    pub(super) static LIST_REACH: std::cell::Cell<[usize; 7]> =
-        const { std::cell::Cell::new([0; 7]) };
+    /// filters moved below an operator, the deferred and the late filters, the
+    /// remaining filters that the settled ones join after the components, the filters
+    /// of a keyed join, the list of one FILTER that calls application extensions, and
+    /// the remaining filters that the settled ones join without components and that the
+    /// late ones join.
+    pub(super) static LIST_REACH: std::cell::Cell<[usize; 9]> =
+        const { std::cell::Cell::new([0; 9]) };
 }
 
 #[cfg(test)]
@@ -7892,37 +7966,53 @@ fn defer_open_filters(
     nodes: &[Node],
     unpacks: &[UnpackItem],
 ) -> Vec<Expr> {
-    if filters.is_empty() || !nodes.iter().any(|n| n.certain.len() < n.vars.len()) {
+    if filters.is_empty() || !may_defer(nodes) {
         return Vec::new();
     }
-    let in_graph = |g: &ActiveGraph, v: VarId| matches!(g, ActiveGraph::Var(x) if *x == v);
-    let open = |v: VarId| {
-        if !nodes
-            .iter()
-            .any(|n| n.vars.contains(&v) && !n.certain.contains(&v))
-        {
-            return false;
-        }
-        let elements = triples
-            .iter()
-            .filter(|t| t.t.contains(&PT::V(v)) || in_graph(&t.graph, v))
-            .count()
-            + paths
-                .iter()
-                .filter(|p| p.s == PT::V(v) || p.o == PT::V(v) || in_graph(&p.graph, v))
-                .count()
-            + nodes.iter().filter(|n| n.vars.contains(&v)).count()
-            + unpacks
-                .iter()
-                .filter(|u| u.t == v || u.parts.contains(&PT::V(v)))
-                .count();
-        elements > 1
-    };
+    let open = |v: VarId| open_filter_var(v, triples, paths, nodes, unpacks);
     let (deferred, kept): (Vec<Expr>, Vec<Expr>) = std::mem::take(filters)
         .into_iter()
         .partition(|f| f.var_set().into_iter().any(open));
     *filters = kept;
     deferred
+}
+
+/// Whether an element of the group may leave a variable unbound, so that a FILTER of the
+/// group may wait (see [`defer_open_filters`]).
+fn may_defer(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| n.certain.len() < n.vars.len())
+}
+
+/// Whether a FILTER on `v` waits until every element of the group that binds `v` has
+/// joined (see [`defer_open_filters`]).
+fn open_filter_var(
+    v: VarId,
+    triples: &[Triple],
+    paths: &[PathItem],
+    nodes: &[Node],
+    unpacks: &[UnpackItem],
+) -> bool {
+    let in_graph = |g: &ActiveGraph, v: VarId| matches!(g, ActiveGraph::Var(x) if *x == v);
+    if !nodes
+        .iter()
+        .any(|n| n.vars.contains(&v) && !n.certain.contains(&v))
+    {
+        return false;
+    }
+    let elements = triples
+        .iter()
+        .filter(|t| t.t.contains(&PT::V(v)) || in_graph(&t.graph, v))
+        .count()
+        + paths
+            .iter()
+            .filter(|p| p.s == PT::V(v) || p.o == PT::V(v) || in_graph(&p.graph, v))
+            .count()
+        + nodes.iter().filter(|n| n.vars.contains(&v)).count()
+        + unpacks
+            .iter()
+            .filter(|u| u.t == v || u.parts.contains(&PT::V(v)))
+            .count();
+    elements > 1
 }
 
 fn flatten_union<'g>(gp: &'g GraphPattern, out: &mut PlanningVec<&'g GraphPattern>) -> Result<()> {

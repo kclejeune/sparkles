@@ -4177,7 +4177,10 @@ fn checked_graph_r12_refuses_graph_binding_index_candidate() {
 /// a nested group that joins an outer one, filters that wait for a UNION that may
 /// leave their variable unbound, the same with a path that also binds it, and filters
 /// of two parts that share no variable, which meet in a keyed join, and a filter that
-/// stays above the BIND, so that nothing moves below it.
+/// stays above the BIND, so that nothing moves below it. Two more join a second part of
+/// one pattern, whose scan choice leaves the remaining filters in a list of their own
+/// size: filters that wait for a path, which join that list late, and filters on both
+/// parts that wait for the UNION, which join it after the parts are planned.
 fn checked_filter_list_bodies() -> Vec<(&'static str, String)> {
     let conj = |n: usize, var: &str, base: i64| {
         (0..n)
@@ -4231,6 +4234,23 @@ fn checked_filter_list_bodies() -> Vec<(&'static str, String)> {
             ),
         ),
         (
+            "late grown",
+            format!(
+                "?x <urn:v> ?v . {union} ?z <urn:c:1>+ ?v . ?q <urn:v> ?u . FILTER(?u > 0 && {}) BIND(?x AS ?first)",
+                conj(30, "v", 0)
+            ),
+        ),
+        (
+            "joined",
+            format!(
+                "?x <urn:v> ?v . {union} ?q <urn:v> ?u . FILTER(?u > 0 && {}) BIND(?x AS ?first)",
+                (0..30)
+                    .map(|k| format!("?v - ?u > {}", -k))
+                    .collect::<Vec<_>>()
+                    .join(" && ")
+            ),
+        ),
+        (
             "all top",
             "?x <urn:v> ?v . FILTER(?first != <urn:n:absent>) BIND(?x AS ?first)".into(),
         ),
@@ -4243,7 +4263,7 @@ fn checked_graph_r12_admits_filter_input_lists() {
     // between operators, and stage 6 the FILTERs placed on the plan.
     let mut failures = Vec::new();
     for (name, body) in checked_filter_list_bodies() {
-        plan::LIST_REACH.with(|r| r.set([0; 7]));
+        plan::LIST_REACH.with(|r| r.set([0; 9]));
         let text = format!("SELECT * WHERE {{ GRAPH ?g {{ {body} }} }}");
         let (excess, _) = checked_join_order_excess_kinds(12, &text);
         let reach = plan::LIST_REACH.with(std::cell::Cell::get);
@@ -4260,6 +4280,10 @@ fn checked_graph_r12_admits_filter_input_lists() {
             "conjuncts" | "one above" => &[(0, 40), (1, 40)],
             "nested" => &[(0, 40), (1, 20)],
             "all top" => &[(0, 1)],
+            "deferred" => &[(0, 30), (2, 30)],
+            "late" => &[(0, 30), (2, 30), (3, 30)],
+            "late grown" => &[(0, 31), (2, 30), (3, 30), (8, 30)],
+            "joined" => &[(0, 31), (2, 30), (4, 30)],
             _ => &[(0, 30)],
         };
         for &(site, len) in expected {
@@ -4288,7 +4312,7 @@ fn checked_graph_r12_admits_extension_filter_list() {
     let Query::Select { pattern, .. } = parse_query(text, None, &[]).unwrap() else {
         unreachable!()
     };
-    plan::LIST_REACH.with(|r| r.set([0; 7]));
+    plan::LIST_REACH.with(|r| r.set([0; 9]));
     let mut planner = Planner::new(&ctx);
     let excess = crate::test_alloc::record_unadmitted(&prep, || {
         planner
