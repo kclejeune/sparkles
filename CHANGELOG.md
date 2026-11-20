@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### The selection of rooted runs is on again with selected partners
+
+With `Limits::rooted`, Hyper over `x` and Pred from a successor over a successor term of a
+constant take selected clauses as partners, and the selection of ground body literals is
+on again beside the Join exemption, as roadmap item 1220's repair. Generated ontologies
+built around the two losses find none with the repair in runs without counting, and
+every file that the run without the selection finished still finishes. With counting, one
+generated ontology loses subsumptions with or without the repair, which is item 1229. The repair is adopted on that measured
+gate without a proof of completeness, so item 1220 stays open. 48 of the 50 `shoi`
+fixtures are exact again. The generated ontology s2-g2-011 and a version of shoi-022 with
+its individuals merged, on four threads, pass the work bound where the run before item
+1220 finished, and they are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0` and
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0` turn the selection and the selected partners off for
+measurement.
+
 ### The selection of rooted runs is off and Join is partly exempt from the ground restriction
 
 With `Limits::rooted`, the selection of ground body literals and the restriction of Join
