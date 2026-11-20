@@ -145,8 +145,9 @@ restriction on ground inferences in Join, since each could make a run that repor
 itself complete miss an entailed subsumption or an unsatisfiable class. A Join whose
 premise on the side of the head has no ground literal in its body is exempt from the
 restriction, whatever its residual head. Generated ontologies found both losses, and with
-the two changes no generated or fixture run that reports itself complete differs from
-HermiT, apart from g2-150, whose difference is HermiT's. That is evidence and not a proof,
+the two changes no generated or fixture run that finishes within the bound, reports itself
+complete and leaves no axiom out differs from HermiT, apart from g2-150, whose difference
+is HermiT's. That is evidence and not a proof,
 and a complete rooted answer is not a certificate of completeness while item 823 is open.
 `SPARKLES_ROOTED_SELECT_GROUND=1` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` restore each for
 measurement. shoi-005 and shoi-027 then pass the bound and give their default answer, so
