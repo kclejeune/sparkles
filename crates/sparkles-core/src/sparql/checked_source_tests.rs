@@ -2793,12 +2793,43 @@ fn checked_graph_r12_admits_simple_graph_groups() {
 #[ignore = "known red, see the lane notes"]
 fn checked_graph_r12_admits_optional_joins() {
     // An OPTIONAL in a graph's branch builds its join after the payload is admitted.
+    use crate::sparql::ctx::DEFAULT_GRAPH_IRI;
+    use crate::sparql::plan::{ActiveGraph, Planner};
+    use crate::validation::DataGraph;
+    use std::fmt::Write;
+    let store = Store::in_memory(StoreOptions {
+        bulk_threshold: u64::MAX,
+        ..Default::default()
+    });
+    let mut input = String::new();
+    for i in 0..4 {
+        writeln!(input, "<urn:x> <urn:p> <urn:o> <urn:g:{i}> .").unwrap();
+    }
+    store
+        .load(&[crate::io::Source::from_bytes(
+            input.into_bytes(),
+            crate::io::RdfFormat::NQuads,
+            None,
+        )])
+        .unwrap();
+    let data = DataGraph::new(store.snapshot(), Some(DEFAULT_GRAPH_IRI), &[], &[]).unwrap();
+    let ctx = validation_query_context(&data, opts()).unwrap();
+    let Query::Select { pattern, .. } = parse_query(
+        "SELECT ?g WHERE { GRAPH ?g { OPTIONAL { <urn:x> <urn:p> ?o } } }",
+        None,
+        &[],
+    )
+    .unwrap() else {
+        unreachable!()
+    };
     plan::BRANCH_SHORTFALL.with(|most| most.set(0));
-    let excess = checked_second_plan_excess(
-        "SELECT * WHERE { GRAPH ?g { OPTIONAL { ?x0 <urn:c:1> ?x1 } } }",
+    drop(
+        Planner::new(&ctx)
+            .plan(&pattern, &ActiveGraph::Default, Vec::new())
+            .unwrap(),
     );
     let short = plan::BRANCH_SHORTFALL.with(std::cell::Cell::get);
-    println!("optional: {excess:?}, branch short {short}");
+    println!("optional: branch short {short}");
     assert_eq!(short, 0);
 }
 
@@ -3793,6 +3824,29 @@ fn checked_graph_r12_observer_retires_imported_credit_in_a_later_child() {
             "omitted {omitted}"
         );
     }
+}
+
+#[test]
+#[should_panic(expected = "unadmitted-growth observer failure")]
+fn checked_graph_r12_observer_retirement_consumes_imported_credit() {
+    use crate::test_alloc::{Origin, Settled, Stage};
+    // Once a later child retires the credit an earlier child handed up, the parent has
+    // no child credit left, so settling more as handed up fails the observation.
+    observer_excess(|prep| {
+        let _parent = Stage::enter(1);
+        let (origin, held, storage) = {
+            let _earlier = Stage::enter(2);
+            let origin = Origin::now();
+            (origin, prep.reserve(1500).unwrap(), observer_bytes(1500))
+        };
+        {
+            let _later = Stage::enter(3);
+            drop(storage);
+            drop(Settled::new(origin, Some(held)));
+        }
+        let own = prep.reserve(1500).unwrap();
+        drop(Settled::new(Origin::handed_up(), Some(own)));
+    });
 }
 
 #[test]

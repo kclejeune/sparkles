@@ -441,8 +441,9 @@ impl Drop for Stage {
             o.depth -= 1;
             let child = o.frames[o.depth];
             if o.depth > 0 {
-                // The child's net credit change, less the settled releases of credit
-                // acquired before it, which each frame reconciled for itself.
+                // The child's net credit change plus the magnitude of its settled
+                // releases of credit acquired before it, which each frame reconciled
+                // for itself.
                 let delta = o.used() as i64 - child.base as i64 + child.inputs;
                 let parent = &mut o.frames[o.depth - 1];
                 parent.live += delta;
