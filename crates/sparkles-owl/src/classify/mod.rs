@@ -2664,6 +2664,41 @@ impl Saturation {
                 }
             }
             stats.dl_work = d.work();
+            if self.dl_rooted && (dl_root::marker_diag() || dl_root::marker_decline().is_some()) {
+                // row 1231's diagnostic and decline, off by default
+                let made = dynamic.iter().flat_map(|dy| {
+                    (0..dy.len() as Ex)
+                        .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))
+                });
+                let mut cs = Vec::new();
+                for (e, c) in self
+                    .ctx
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(e, c)| c.get().map(|c| (e as Ex, &**c)))
+                    .chain(made)
+                {
+                    if let Some(m) = dl_root::marker_ctx(&ix, e, &c.st.lock(), &d.lits) {
+                        cs.push(m);
+                    }
+                }
+                let trips = dl_root::marker_trips(&ix, &cs, &d.lits);
+                if dl_root::marker_diag() {
+                    let t: Vec<String> = trips
+                        .iter()
+                        .map(|t| format!("{}/{}/{}", t[0], t[1], t[2]))
+                        .collect();
+                    eprintln!("MARKER-DIAG work={} tiers={}", stats.dl_work, t.join(","));
+                }
+                if let Some(t) = dl_root::marker_decline()
+                    && trips.get(t).is_some_and(|t| t[2] > 0)
+                {
+                    return Err(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used: totals.peak,
+                    });
+                }
+            }
             if open.is_some() {
                 // A partial answer has taken its record, and the next run starts again,
                 // so the clause stores and the clause table go before its taxonomy.

@@ -1390,3 +1390,52 @@ fn a_selected_equality_of_a_successor_with_constants_reaches_its_own_successor()
         check(body, &[("K", "Ans")], &[("S", "Ans")]);
     }
 }
+
+/// A ground fact about a constant that holds only under the query class, G(w) under K,
+/// whose consequence passes through an element that exists without K and is linked to w
+/// two edges below an individual, where the link is no literal of the root (row 1231).
+/// The rooted run either finds `K ⊑ Ans` or makes no claim of completeness.
+#[test]
+#[ignore = "row 1231: the fact G(w) under K never reaches the context of E, which is outside K's successors"]
+fn a_conditional_fact_about_a_constant_reaches_an_element_outside_the_query_successors() {
+    let ax = axioms(
+        "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+         SubClassOf(:K ObjectHasValue(:q :v))
+         SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+         ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+         SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+         SubClassOf(:E ObjectHasValue(:r2 :w))
+         SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+         SubClassOf(:C2 ObjectHasValue(:s :v))
+         SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+         SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))",
+    );
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        // the claim predicate of the lane harnesses: a complete rooted answer of Tier D
+        // that took every axiom and did not start again without the rooted rules
+        let claim = out.complete
+            && out.incomplete.is_empty()
+            && k.excluded().is_empty()
+            && out.stats.tier == Tier::Disjunctive
+            && !out.stats.dl_rooted_over
+            && !out.stats.dl_over_budget;
+        assert!(
+            !claim || out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{threads} threads {expansion:?}: a complete rooted run misses K ⊑ Ans"
+        );
+    }
+}

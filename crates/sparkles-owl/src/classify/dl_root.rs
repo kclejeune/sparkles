@@ -1373,6 +1373,205 @@ fn root_pred_of(
     }
 }
 
+/// Row 1231's diagnostic, which `SPARKLES_ROOTED_MARKER_DIAG=1` turns on: after a rooted
+/// run saturates, the run reports on stderr how often a context that is registered with the
+/// root for a constant of a conditional ground trigger lies outside the successors of the
+/// trigger's holder, so that the trigger's marker never reaches it.
+pub(super) fn marker_diag() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SPARKLES_ROOTED_MARKER_DIAG").is_some_and(|v| v == "1" || v == "2")
+    })
+}
+
+/// Whether row 1231's diagnostic also prints each pair, which `SPARKLES_ROOTED_MARKER_DIAG=2`
+/// turns on.
+fn marker_detail() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_MARKER_DIAG").is_some_and(|v| v == "2"))
+}
+
+/// Row 1231's decline, which `SPARKLES_ROOTED_MARKER_DECLINE=t` turns on for tier t of
+/// [`marker_trips`]: a run with a trip at that tier makes no claim and starts again without
+/// the rooted rules, as past its bound.
+pub(super) fn marker_decline() -> Option<usize> {
+    static ON: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_MARKER_DECLINE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+/// The tiers of [`marker_trips`].
+pub(super) const MARKER_TIERS: usize = 5;
+
+/// What one context of a rooted run holds for [`marker_trips`].
+pub(super) struct MarkerCtx {
+    pub(super) me: Ex,
+    /// the context's successors
+    pub(super) succ: Vec<Ex>,
+    /// the context's maximal ground triggers that a processed clause other than a marker has
+    pub(super) held: Vec<Lit>,
+    /// in the root, the contexts registered for each constant
+    pub(super) edges: Vec<(u32, Vec<Ex>)>,
+    /// in the root, the heads of its live facts with one literal
+    pub(super) units: Vec<Lit>,
+}
+
+/// What [`marker_trips`] needs of the context `me` with the state `st`.
+pub(super) fn marker_ctx(
+    ix: &Index,
+    me: Ex,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+) -> Option<MarkerCtx> {
+    let x = dl(st)?;
+    let dx = dix(ix);
+    let inv = inv_of(ix, dx);
+    let is_root = dx.root == Some(me);
+    let mut held = Vec::new();
+    if let Some(r) = x.root.as_deref() {
+        for &l in &r.ground {
+            let own = x
+                .store
+                .clauses
+                .iter()
+                .any(|s| s.max == Some(l) && !is_marker(&s.c));
+            if own && ground_trigger(lits.view(l, inv)) {
+                held.push(l);
+            }
+        }
+    }
+    let mut edges = Vec::new();
+    let mut units = Vec::new();
+    if is_root {
+        if let Some(r) = x.root.as_deref() {
+            edges = r.edges.iter().map(|(&u, v)| (u, v.clone())).collect();
+        }
+        for s in &x.store.clauses {
+            if !s.dead && s.c.body().is_empty() && s.c.head().len() == 1 {
+                units.push(s.c.head()[0]);
+            }
+        }
+    }
+    Some(MarkerCtx {
+        me,
+        succ: successors(ix, st),
+        held,
+        edges,
+        units,
+    })
+}
+
+/// Counts, for each tier, the conditional ground triggers, their constants and the pairs
+/// of a trigger's holder and a context registered with the root for one of the trigger's
+/// constants, that the holder's markers do not reach. A trigger is conditional when it is
+/// no fact of the root. The tiers leave out more contexts in turn: tier 0 leaves out only
+/// the holder and its successors, tier 1 also the holder's predecessors, tier 2 also the
+/// constant's singleton context, tier 3 also the contexts that the root does not reach,
+/// and tier 4 also the root's own successors.
+pub(super) fn marker_trips(
+    ix: &Index,
+    cs: &[MarkerCtx],
+    lits: &super::dl_clause::Lits,
+) -> [[usize; 3]; MARKER_TIERS] {
+    let dx = dix(ix);
+    let inv = inv_of(ix, dx);
+    let mut out = [[0usize; 3]; MARKER_TIERS];
+    let Some(root) = dx.root else { return out };
+    let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
+    let Some(&ri) = by.get(&root) else { return out };
+    let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
+    let edges: FxHashMap<u32, &[Ex]> = cs[ri].edges.iter().map(|(u, v)| (*u, &v[..])).collect();
+    let mut preds: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
+    for c in cs {
+        for &w in &c.succ {
+            preds.entry(w).or_default().push(c.me);
+        }
+    }
+    let reach = |from: Ex, next: &dyn Fn(Ex) -> Vec<Ex>| {
+        let mut seen: FxHashSet<Ex> = FxHashSet::default();
+        let mut todo = vec![from];
+        seen.insert(from);
+        while let Some(e) = todo.pop() {
+            for w in next(e) {
+                if seen.insert(w) {
+                    todo.push(w);
+                }
+            }
+        }
+        seen
+    };
+    let succ_of = |e: Ex| by.get(&e).map_or(Vec::new(), |&i| cs[i].succ.clone());
+    let pred_of = |e: Ex| preds.get(&e).cloned().unwrap_or_default();
+    let from_root = reach(root, &succ_of);
+    let root_succ: FxHashSet<Ex> = cs[ri].succ.iter().copied().collect();
+    let singleton: FxHashMap<u32, Ex> = dx.consts.iter().copied().collect();
+    let mut trig: [FxHashSet<Lit>; MARKER_TIERS] = Default::default();
+    let mut kons: [FxHashSet<u32>; MARKER_TIERS] = Default::default();
+    for c in cs {
+        if c.me == root || c.held.is_empty() {
+            continue;
+        }
+        let down = reach(c.me, &succ_of);
+        let up = reach(c.me, &pred_of);
+        for &l in &c.held {
+            if units.contains(&l) {
+                continue;
+            }
+            let mut us = Vec::new();
+            consts(lits.view(l, inv), &mut us);
+            us.sort_unstable();
+            us.dedup();
+            let mut regs: Vec<(u32, Ex)> = Vec::new();
+            for &u in &us {
+                for &d in edges.get(&u).copied().unwrap_or(&[]) {
+                    regs.push((u, d));
+                }
+            }
+            regs.sort_unstable_by_key(|&(_, d)| d);
+            regs.dedup_by_key(|p| p.1);
+            for (_, d) in regs {
+                if d == root || down.contains(&d) {
+                    continue;
+                }
+                let mut tier = 0;
+                let keep = [
+                    true,
+                    !up.contains(&d),
+                    !us.iter().any(|v| {
+                        singleton.get(v) == Some(&d)
+                            || super::dl_rules::singleton_of(ix, d) == Some(*v)
+                    }),
+                    from_root.contains(&d),
+                    !root_succ.contains(&d),
+                ];
+                if marker_detail() {
+                    let t = keep.iter().take_while(|&&k| k).count();
+                    eprintln!(
+                        "MARKER-PAIR tier<={} holder={} lit={} ctx={d}",
+                        t.saturating_sub(1),
+                        c.me,
+                        super::dl_rules::tr(ix, lits, &[l])
+                    );
+                }
+                while tier < MARKER_TIERS && keep[..=tier].iter().all(|&k| k) {
+                    out[tier][2] += 1;
+                    trig[tier].insert(l);
+                    kons[tier].extend(us.iter().copied());
+                    tier += 1;
+                }
+            }
+        }
+    }
+    for t in 0..MARKER_TIERS {
+        out[t][0] = trig[t].len();
+        out[t][1] = kons[t].len();
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::dl_norm::DlAx;
