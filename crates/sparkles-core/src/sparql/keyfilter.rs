@@ -900,28 +900,28 @@ mod tests {
         let lex = |lex: &[u8]| [b"\"".as_slice(), lex].concat();
         let lang = |lex: &[u8], tag: &[u8]| [b"\"".as_slice(), lex, &[KEY_SEP], b"@", tag].concat();
         let iri = |i: &[u8]| [b"<".as_slice(), i].concat();
-        let strlen = |arg: Expr, n: i64| {
+        let strlen = |arg: Expr, op: CmpOp, n: i64| {
             Expr::Cmp(
                 Box::new(call(Function::StrLen, vec![arg])),
                 Box::new(Expr::Lit(crate::id::Id::UNDEF, Value::Integer(n.into()))),
-                CmpOp::Ge,
+                op,
             )
         };
         let str_v = call(Function::Str, vec![Expr::Var(v)]);
         let cases: Vec<(Expr, Vec<u8>, Vec<u8>)> = vec![
-            // STRLEN counts characters: three bytes of `日` are one
+            // STRLEN counts characters, so `a日` of four bytes has a length of at most 2
             (
-                strlen(Expr::Var(v), 2),
+                strlen(Expr::Var(v), CmpOp::Le, 2),
                 lex("a日".as_bytes()),
                 lex(b"a\xe6\x97"),
             ),
             (
-                strlen(str_v.clone(), 4),
+                strlen(str_v.clone(), CmpOp::Le, 5),
                 iri("urn:日".as_bytes()),
                 iri(b"urn:\xe6\x97"),
             ),
             (
-                strlen(Expr::Var(v), 1),
+                strlen(Expr::Var(v), CmpOp::Ge, 1),
                 lang("日".as_bytes(), b"ja"),
                 lang(b"a", b"j\xc3"),
             ),
