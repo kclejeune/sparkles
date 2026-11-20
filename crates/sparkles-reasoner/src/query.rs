@@ -69,6 +69,9 @@ struct Shared {
     /// `program` was given directly (by a test) and not made from the rule text, so the
     /// table cache's keys do not name it
     direct_program: bool,
+    /// whether the sessions close the adorned copies of transitive rules with closure
+    /// operators (spec F23 Phase 2); `SPARKLES_DEMAND_CLOSURES=0` turns them off
+    closures: bool,
 }
 
 /// A rule program of the IR over a session's terms.
@@ -124,6 +127,7 @@ impl QueryReasoner {
                 warnings,
                 program,
                 direct_program: false,
+                closures: std::env::var("SPARKLES_DEMAND_CLOSURES").map_or(true, |v| v != "0"),
             }),
         })
     }
@@ -147,6 +151,7 @@ impl QueryReasoner {
                 warnings: s.warnings.clone(),
                 program: s.program.clone(),
                 direct_program: s.direct_program,
+                closures: s.closures,
             }),
         }
     }
@@ -170,6 +175,7 @@ impl QueryReasoner {
                 warnings: s.warnings.clone(),
                 program: s.program.clone(),
                 direct_program: s.direct_program,
+                closures: s.closures,
             }),
         }
     }
@@ -196,7 +202,34 @@ impl QueryReasoner {
                 warnings: s.warnings.clone(),
                 program: Some(source),
                 direct_program: true,
+                closures: s.closures,
             }),
+        }
+    }
+
+    /// The same reasoner with the closure operators of its demand programs on or off,
+    /// for the tests that compare the two.
+    #[cfg(test)]
+    pub(crate) fn with_closures(self, on: bool) -> QueryReasoner {
+        let mut shared = Arc::try_unwrap(self.shared).unwrap_or_else(|s| Shared {
+            profile: s.profile.clone(),
+            extras: s.extras.clone(),
+            rules: s.rules.clone(),
+            sources: s.sources.clone(),
+            geo_default: s.geo_default,
+            inputs: s.inputs.clone(),
+            digest: s.digest,
+            max_derived: s.max_derived,
+            max_iterations: s.max_iterations,
+            max_union: s.max_union,
+            warnings: s.warnings.clone(),
+            program: s.program.clone(),
+            direct_program: s.direct_program,
+            closures: s.closures,
+        });
+        shared.closures = on;
+        QueryReasoner {
+            shared: Arc::new(shared),
         }
     }
 
@@ -386,6 +419,7 @@ impl QueryReasoner {
         req.no_cache = true;
         let mut s = Session::new(self.shared.clone(), req)?;
         s.rewrite_linear = false;
+        s.closures = false;
         s.view = None;
         if !cached {
             s.schema_view = None;
@@ -680,6 +714,21 @@ pub(crate) struct Session {
     cached: Vec<Arc<Table>>,
     reports: Vec<DemandReport>,
     seeds: Vec<FxHashSet<u64>>,
+    /// whether the session's demand programs may use closure operators (spec F23 Phase
+    /// 2): the reasoner allows them, the session is not an explanation's, and the source
+    /// rules admit them (decided with the program)
+    closures: bool,
+    /// a run derived list structure that its rules read, so the session's runs go on
+    /// without operators (see [`closure::Restart`])
+    closures_off: bool,
+    /// the magic predicates of the session's programs for the operators, made again when
+    /// the set grows
+    magic: Option<Arc<FxHashSet<u64>>>,
+    /// the facts that are not magic facts among the rows a restarted run killed, which
+    /// the session's limit of derived facts does not count again
+    killed: usize,
+    /// what the closure operators of the session's runs did
+    closure_stats: crate::closure::Stats,
 }
 
 impl Session {
@@ -700,6 +749,9 @@ impl Session {
             ),
             Some(source) => program_rules(source, &terms, &budget, &mut warnings)?,
         };
+        let closures = shared.closures
+            && crate::closure::Closures::admits(compiled.rules(), &terms)
+                .map_err(|e| memory_error(e, "the rules"))?;
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
         let resolved = match &req.readable {
             Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
@@ -798,6 +850,11 @@ impl Session {
             cached: Vec::new(),
             reports: Vec::new(),
             seeds: Vec::new(),
+            closures,
+            closures_off: false,
+            magic: None,
+            killed: 0,
+            closure_stats: Default::default(),
         })
     }
 
@@ -844,9 +901,30 @@ impl Session {
         } else {
             &program.stages[stage].rules
         };
+        // a lowered program's rules read a list again when its cells arrive, as its full
+        // run reads them (item 839's plan, §20.1)
+        // in every stage, since a lower stage may hold none of the IR's features
+        let lists = (!compact && self.compiled.replays_lists())
+            .then_some((self.terms.rdf_first, self.terms.rdf_rest));
+        // the adorned copies of transitive rules are closed by operators, but not in a
+        // compact run, which reads the source rules, nor in a lowered program's
+        let closures = self.closures && !self.closures_off && !compact && lists.is_none();
+        let magic = if closures {
+            match &self.magic {
+                Some(m) if m.len() == self.hidden.len() => Some(m.clone()),
+                _ => {
+                    let m = Arc::new(self.hidden.clone());
+                    self.magic = Some(m.clone());
+                    Some(m)
+                }
+            }
+        } else {
+            None
+        };
         let g = self.graph.as_mut().expect("graph made");
-        // magic facts are charged to the memory budget, not to the limit of facts
-        let derived = g.inferred_since(g.offset());
+        // magic facts are charged to the memory budget, not to the limit of facts, and
+        // the rows a restarted run killed are not counted again
+        let derived = g.inferred_since(g.offset()).saturating_sub(self.killed);
         let max = self.shared.max_derived;
         if derived > max {
             return Err(component(
@@ -857,14 +935,15 @@ impl Session {
             ));
         }
         let flag = Arc::new(AtomicBool::new(false));
-        let limits = engine::Limits {
+        let mut limits = engine::Limits {
             max_iterations: self.shared.max_iterations,
             max_inferred: max - derived,
             cancel: Some(flag.clone()),
             deadline: None,
             progress: None,
             budget: self.budget.clone(),
-            closures: false,
+            closures,
+            magic,
             sampled_planning: false,
         };
         let terms = &self.terms;
@@ -887,24 +966,54 @@ impl Session {
             ends[*count] = end;
             *count += 1;
         };
-        // a lowered program's rules read a list again when its cells arrive, as its full
-        // run reads them (item 839's plan, §20.1)
-        // in every stage, since a lower stage may hold none of the IR's features
-        let lists = (!compact && self.compiled.replays_lists())
-            .then_some((terms.rdf_first, terms.rdf_rest));
-        let (r, stopped) = watched(&self.stop, &flag, || {
-            if compact {
-                engine::run_observed(g, rules, terms, &limits, None, Some(&mut note))
-            } else if lists.is_some() {
-                let origin = engine::Origin {
-                    lists,
-                    ..engine::Origin::default()
-                };
-                engine::run_from(g, rules, terms, &limits, Some(start), None, origin)
-            } else {
-                engine::run(g, rules, terms, &limits, Some(start))
+        // the rows from here on are this run's: a run with operators that derived list
+        // structure its rules read starts again from here without them
+        let entry = g.len();
+        let mut killed = 0usize;
+        let mut restarted = false;
+        let (r, stopped) = loop {
+            let (r, stopped) = watched(&self.stop, &flag, || {
+                if compact {
+                    engine::run_observed(g, rules, terms, &limits, None, Some(&mut note))
+                } else if lists.is_some() {
+                    let origin = engine::Origin {
+                        lists,
+                        ..engine::Origin::default()
+                    };
+                    engine::run_from(g, rules, terms, &limits, Some(start), None, origin)
+                } else {
+                    engine::run(g, rules, terms, &limits, Some(start))
+                }
+            });
+            match &r {
+                Err(e)
+                    if stopped.is_none()
+                        && limits.closures
+                        && e.is::<crate::closure::Restart>() =>
+                {
+                    tracing::debug!(target: "sparkles_reasoner::demand", "{e}");
+                    let rows: Vec<Triple> = (entry..g.len())
+                        .filter(|&i| g.alive(i))
+                        .map(|i| g.triple(i))
+                        .collect();
+                    for t in &rows {
+                        g.kill(t).map_err(|e| memory_error(e, what))?;
+                    }
+                    killed += rows.iter().filter(|t| !self.hidden.contains(&t[1])).count();
+                    limits.closures = false;
+                    limits.magic = None;
+                    restarted = true;
+                }
+                _ => break (r, stopped),
             }
-        });
+        };
+        self.killed += killed;
+        if restarted {
+            self.closures_off = true;
+        }
+        if let Ok(o) = &r {
+            self.closure_stats.add(&o.closure);
+        }
         if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
             self.trace_facts(pre);
         }
@@ -1114,8 +1223,10 @@ impl Session {
         // columns a replay cannot map, and the stages above the equality stages, where
         // only owl:sameAs is complete, derive the relation facts they ask for again
         let kept = || {
-            g.facts()
-                .filter(|t| !self.hidden.contains(&t[1]) && !crate::ir::lower::is_key(t[1]))
+            g.facts().enumerate().filter_map(|(i, t)| {
+                (!self.hidden.contains(&t[1]) && !crate::ir::lower::is_key(t[1]) && live(g, i))
+                    .then_some(t)
+            })
         };
         let local = |x: &u64| Id(*x).tag() == Tag::Local;
         // the facts and their local ids are counted first, and each list is made at the
@@ -1827,7 +1938,7 @@ impl Session {
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for (i, t) in g.facts_from(from).enumerate() {
             let t = &t;
-            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+            if self.hidden.contains(&t[1]) || !self.terms.valid(t) || !live(g, from + i) {
                 continue;
             }
             let schema = || {
@@ -1901,9 +2012,9 @@ impl Session {
     fn export_rows(&mut self, lo: usize, hi: usize, which: Rows, out: &mut Derived) {
         let g = self.graph.as_ref().expect("graph made");
         let mut chunk: Vec<[u64; 3]> = Vec::new();
-        for t in g.facts_range(lo, hi) {
+        for (i, t) in g.facts_range(lo, hi).enumerate() {
             let t = &t;
-            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+            if self.hidden.contains(&t[1]) || !self.terms.valid(t) || !live(g, lo + i) {
                 continue;
             }
             match which {
@@ -2401,6 +2512,13 @@ impl ReasoningSession for Session {
             warnings: self.warnings.as_slice().to_vec(),
         }
     }
+}
+
+/// Whether the `i`-th fact of `g`'s derived tier is live: a run that started again
+/// without closure operators killed the rows it had derived with them.
+#[inline]
+fn live(g: &Graph, i: usize) -> bool {
+    g.dead_rows() == 0 || g.alive(g.offset() + i as u32)
 }
 
 /// `f` run while a thread polls `stop`, the query's deadline and cancellation, and sets
@@ -3204,3 +3322,7 @@ mod program_identity_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "query_closure_tests.rs"]
+mod closure_tests;

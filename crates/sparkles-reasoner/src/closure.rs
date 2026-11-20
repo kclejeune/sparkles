@@ -239,14 +239,14 @@ fn insert(set: &mut FxHashSet<u64>, x: u64, held: &mut Held) -> anyhow::Result<b
 }
 
 /// Push `x` onto `v`, charging a growth of its buffer to `held` before it is reserved.
-fn push(v: &mut Vec<u64>, x: u64, held: &mut Held) -> anyhow::Result<()> {
+fn push<T>(v: &mut Vec<T>, x: T, held: &mut Held) -> anyhow::Result<()> {
     if v.len() == v.capacity() {
         let before = v.capacity();
         let want = (before * 2).max(16);
-        held.try_grow((want - before) * size_of::<u64>())?;
+        held.try_grow((want - before) * size_of::<T>())?;
         v.reserve_exact(want - v.len());
         if v.capacity() > want {
-            held.try_grow((v.capacity() - want) * size_of::<u64>())?;
+            held.try_grow((v.capacity() - want) * size_of::<T>())?;
         }
     }
     v.push(x);
@@ -285,6 +285,66 @@ struct Op {
     /// the charge of `marks` and of the base's cached counts of the predicates the
     /// operator has probed, which both last for the run: it only grows
     kept: Option<Held>,
+    /// an adorned copy of a demand program: how its magic atom binds it
+    seeded: Option<Seeded>,
+    /// the atoms of an adorned copy whose terms are all constants (the guard of a
+    /// `prp-trp` copy for one predicate), which must hold for it to derive anything
+    conds: Vec<Triple>,
+    /// in a demand program, `rdf:first` and `rdf:rest`, which the operator never closes
+    lists: Option<[u64; 2]>,
+}
+
+/// Which way an adorned copy reads its relation from the values asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Dir {
+    /// the magic atom binds the subject: the objects each value reaches
+    Forward,
+    /// the magic atom binds the object: the subjects that reach each value
+    Backward,
+}
+
+/// How the magic atom of an adorned copy binds it (spec F23 Phase 2). A copy
+/// `m(..), (?x P ?y), (?y P ?z) -> (?x P ?z)` whose magic atom binds `?x` derives, at its
+/// fixpoint, the pairs `(x, z)` for every `x` its magic facts hold and every `z` that `x`
+/// reaches, since each such pair follows from a shorter one from the same `x` and one
+/// edge. The mirror holds for `?z`, and a copy that binds neither derives the whole
+/// closure once its magic fact holds. The operator emits that fixpoint, so the program
+/// derives the facts the joins would.
+#[derive(Debug)]
+struct Seeded {
+    /// the magic predicate
+    m: u64,
+    /// positions of the magic fact (0 or 2) that hold a constant of the atom, with it
+    fixed: Vec<(usize, u64)>,
+    /// the position of the bound end in the magic fact, and the way it reads
+    end: Option<(usize, Dir)>,
+    /// the position of the predicate in the magic fact, for a guarded rule
+    p_at: Option<usize>,
+    /// the magic facts before this row were read in the run, or none yet
+    mm: Option<u32>,
+}
+
+/// The pairs that operators of one kind merged, and the steps in which they merged any.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Counts {
+    pub pairs: u64,
+    pub steps: u64,
+}
+
+/// What the closure operators of a run did, by the kind of rule they stand for.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Stats {
+    /// rules without a magic atom
+    pub plain: Counts,
+    /// adorned copies whose magic atom binds the subject
+    pub forward: Counts,
+    /// adorned copies whose magic atom binds the object
+    pub backward: Counts,
+    /// adorned copies whose magic atom binds neither end
+    pub full: Counts,
+    /// adorned copies of a rule with a variable predicate (`prp-trp`), of every kind
+    /// above
+    pub guarded: Counts,
 }
 
 /// What one closure step did.
@@ -303,6 +363,7 @@ pub(crate) struct Closures {
     /// `rdf:first` and `rdf:rest` when a rule reads lists: a derived fact of either makes
     /// what the list builtins read depend on when it appears
     lists: Option<[u64; 2]>,
+    stats: Stats,
 }
 
 /// A run with closure operators derived list structure that rules read, so it starts
@@ -347,6 +408,11 @@ fn filtered(r: &CRule, a: usize, b: usize) -> Option<bool> {
 
 /// A transitive rule: what it closes and whether it filters reflexive pairs.
 fn transitive(r: &CRule) -> Option<(Over, bool)> {
+    transitive_with(r, r.nvars)
+}
+
+/// [`transitive`] for a rule with `nvars` variables.
+fn transitive_with(r: &CRule, nvars: usize) -> Option<(Over, bool)> {
     let [CHead::Triple(hs, hp, ho)] = r.head.as_slice() else {
         return None;
     };
@@ -358,7 +424,7 @@ fn transitive(r: &CRule) -> Option<(Over, bool)> {
     match (*hp, r.atoms.as_slice()) {
         (Slot::Const(c), [a, b]) if a.p == Slot::Const(c) && b.p == Slot::Const(c) => {
             chain(a, b, x, z).or_else(|| chain(b, a, x, z))?;
-            (r.nvars == 3).then_some((Over::Fixed(c), irreflexive))
+            (nvars == 3).then_some((Over::Fixed(c), irreflexive))
         }
         (Slot::Var(p), atoms) if atoms.len() == 3 => {
             let gi = atoms.iter().position(|a| {
@@ -374,8 +440,7 @@ fn transitive(r: &CRule) -> Option<(Over, bool)> {
             let (Slot::Const(g), Slot::Const(o)) = (atoms[gi].p, atoms[gi].o) else {
                 return None;
             };
-            (r.nvars == 4 && p != x && p != y && p != z)
-                .then_some((Over::Guarded(g, o), irreflexive))
+            (nvars == 4 && p != x && p != y && p != z).then_some((Over::Guarded(g, o), irreflexive))
         }
         _ => None,
     }
@@ -404,44 +469,168 @@ fn relation_builtins(r: &CRule) -> bool {
         .any(|b| matches!(b.kind, B::RelTail | B::RelTuple | B::RelAbsent))
 }
 
+/// A rule whose body has one atom over a magic predicate, an adorned copy of a demand
+/// program: what the copy closes, whether it filters reflexive pairs, how its magic atom
+/// binds it, and its atoms whose terms are all constants. `None` when the copy is not
+/// one of a transitive rule, or when its magic atom binds both ends, where the join is a
+/// lookup of the pairs asked for.
+fn adorned(r: &CRule, magic: &FxHashSet<u64>) -> Option<(Over, bool, Seeded, Vec<Triple>)> {
+    let at: Vec<usize> = (0..r.atoms.len())
+        .filter(|&i| matches!(r.atoms[i].p, Slot::Const(m) if magic.contains(&m)))
+        .collect();
+    let [gi] = at[..] else {
+        return None;
+    };
+    let guard = r.atoms[gi].clone();
+    let mut conds: Vec<Triple> = Vec::new();
+    let mut rest = r.clone_shallow();
+    rest.atoms.clear();
+    for (i, a) in r.atoms.iter().enumerate() {
+        if i == gi {
+            continue;
+        }
+        match (a.s, a.p, a.o) {
+            (Slot::Const(s), Slot::Const(p), Slot::Const(o)) => conds.push([s, p, o]),
+            _ => rest.atoms.push(a.clone()),
+        }
+    }
+    // the variables the rule uses without its magic atom, which must hold the atom's
+    let mut used: FxHashSet<usize> = FxHashSet::default();
+    let slots = rest
+        .atoms
+        .iter()
+        .flat_map(|a| [a.s, a.p, a.o])
+        .chain(rest.builtins.iter().flat_map(|b| b.args.iter().copied()))
+        .chain(rest.head.iter().flat_map(|h| match h {
+            CHead::Triple(s, p, o) => vec![*s, *p, *o],
+            CHead::Action(_, args) => args.clone(),
+        }));
+    for s in slots {
+        if let Slot::Var(v) = s {
+            used.insert(v);
+        }
+    }
+    let (over, irreflexive) = transitive_with(&rest, used.len())?;
+    // a guarded rule's guard is an atom with variables, which a copy keeps
+    if matches!(over, Over::Guarded(..)) && !conds.is_empty() {
+        return None;
+    }
+    let [CHead::Triple(hs, hp, ho)] = rest.head.as_slice() else {
+        return None;
+    };
+    let (x, z, p) = (var(*hs)?, var(*ho)?, var(*hp));
+    let mut seeded = Seeded {
+        m: match guard.p {
+            Slot::Const(m) => m,
+            _ => return None,
+        },
+        fixed: Vec::new(),
+        end: None,
+        p_at: None,
+        mm: None,
+    };
+    let (mut xs, mut zs) = (None, None);
+    for (pos, s) in [(0usize, guard.s), (2, guard.o)] {
+        match s {
+            Slot::Const(c) => seeded.fixed.push((pos, c)),
+            Slot::Var(v) if v == x => xs = Some(pos),
+            Slot::Var(v) if v == z => zs = Some(pos),
+            Slot::Var(v) if Some(v) == p => seeded.p_at = Some(pos),
+            _ => return None,
+        }
+    }
+    seeded.end = match (xs, zs) {
+        (Some(_), Some(_)) => return None,
+        (Some(pos), None) => Some((pos, Dir::Forward)),
+        (None, Some(pos)) => Some((pos, Dir::Backward)),
+        (None, None) => None,
+    };
+    if seeded.p_at.is_some() && !matches!(over, Over::Guarded(..)) {
+        return None;
+    }
+    Some((over, irreflexive, seeded, conds))
+}
+
+/// Whether `r` is a rule of a demand program that derives magic facts alone, whose
+/// heads hold magic predicates and blank nodes local to the run.
+fn magic_rule(r: &CRule, magic: &FxHashSet<u64>) -> bool {
+    !r.head.is_empty()
+        && r.head
+            .iter()
+            .all(|h| matches!(h, CHead::Triple(_, Slot::Const(p), _) if magic.contains(p)))
+}
+
 impl Closures {
-    /// The operators of `rules`, or `None` when no rule has one or the program has a rule
-    /// whose result depends on the order of derivation. `start` is the row before which
-    /// the facts are closed under the rules, as for [`crate::engine::run`].
-    pub(crate) fn detect(
-        rules: &[CRule],
-        terms: &Terms,
-        start: Option<u32>,
-    ) -> Result<Option<Closures>, BudgetFailure> {
+    /// Whether the rules of a program allow operators: no rule's result depends on the
+    /// order of derivation, no rule reads a relation's tail, and no rule both reads lists
+    /// and builds them in its head.
+    pub(crate) fn admits(rules: &[CRule], terms: &Terms) -> Result<bool, BudgetFailure> {
         // the operators read no relation tails (item 839), which only builtins see
         if rules
             .iter()
             .any(|r| incremental_blocker(r, terms).is_some() || relation_builtins(r))
         {
-            return Ok(None);
+            return Ok(false);
         }
         // what a list builtin reads depends on when derived list facts appear, and the
         // operators derive their pairs earlier than joins do: a program that reads lists
         // and builds them in a rule head runs without operators, and one whose rules
         // derive list facts through a variable predicate starts again without them
         // (see `Restart`)
-        let lists = if rules.iter().any(reads_lists) {
-            Some([
+        if rules.iter().any(reads_lists) {
+            let ids = [
                 terms.id_for(&Term::NamedNode(rdf::FIRST.into_owned()))?,
                 terms.id_for(&Term::NamedNode(rdf::REST.into_owned()))?,
-            ])
-        } else {
-            None
-        };
-        if let Some(ids) = lists
-            && rules.iter().any(|r| {
+            ];
+            if rules.iter().any(|r| {
                 r.head
                     .iter()
                     .any(|h| matches!(h, CHead::Triple(_, Slot::Const(p), _) if ids.contains(p)))
-            })
-        {
-            return Ok(None);
+            }) {
+                return Ok(false);
+            }
         }
+        Ok(true)
+    }
+
+    /// The operators of `rules`, or `None` when no rule has one or the program has a rule
+    /// whose result depends on the order of derivation. `start` is the row before which
+    /// the facts are closed under the rules, as for [`crate::engine::run`].
+    ///
+    /// With `magic`, the magic predicates of a demand program (spec F23 Phase 2), the
+    /// rules are a stage of that program, and an adorned copy of a transitive rule gets an
+    /// operator that closes the relation for the values its magic facts ask for. The
+    /// caller checks the source rules with [`Closures::admits`]: a stage's copies of a
+    /// rule with a variable predicate can have a constant `rdf:first` or `rdf:rest` head
+    /// that the source rule does not, and its magic rules have blank node heads. The
+    /// stage's other rules are checked for the order of derivation and relation tails
+    /// here too, and its operators never close `rdf:first` or `rdf:rest`.
+    pub(crate) fn detect(
+        rules: &[CRule],
+        terms: &Terms,
+        start: Option<u32>,
+        magic: Option<&FxHashSet<u64>>,
+    ) -> Result<Option<Closures>, BudgetFailure> {
+        match magic {
+            None => {
+                if !Closures::admits(rules, terms)? {
+                    return Ok(None);
+                }
+            }
+            Some(mp) => {
+                if rules.iter().any(|r| {
+                    !magic_rule(r, mp)
+                        && (incremental_blocker(r, terms).is_some() || relation_builtins(r))
+                }) {
+                    return Ok(None);
+                }
+            }
+        }
+        let list_ids = [
+            terms.id_for(&Term::NamedNode(rdf::FIRST.into_owned()))?,
+            terms.id_for(&Term::NamedNode(rdf::REST.into_owned()))?,
+        ];
+        let lists = rules.iter().any(reads_lists).then_some(list_ids);
         let syms: Vec<(usize, u64)> = rules
             .iter()
             .enumerate()
@@ -449,9 +638,22 @@ impl Closures {
             .collect();
         let mut ops: Vec<Op> = Vec::new();
         for (i, r) in rules.iter().enumerate() {
-            let Some((over, irreflexive)) = transitive(r) else {
+            let found = match magic {
+                Some(mp)
+                    if r.atoms
+                        .iter()
+                        .any(|a| matches!(a.p, Slot::Const(m) if mp.contains(&m))) =>
+                {
+                    adorned(r, mp).map(|(o, irr, s, c)| (o, irr, Some(s), c))
+                }
+                _ => transitive(r).map(|(o, irr)| (o, irr, None, Vec::new())),
+            };
+            let Some((over, irreflexive, seeded, conds)) = found else {
                 continue;
             };
+            if magic.is_some() && matches!(over, Over::Fixed(c) if list_ids.contains(&c)) {
+                continue;
+            }
             let mut op = Op {
                 rules: vec![i],
                 over,
@@ -460,8 +662,12 @@ impl Closures {
                 marks: FxHashMap::default(),
                 off: false,
                 kept: None,
+                seeded,
+                conds,
+                lists: magic.map(|_| list_ids),
             };
-            if let Over::Fixed(c) = over
+            if op.seeded.is_none()
+                && let Over::Fixed(c) = over
                 && let Some(&(si, _)) = syms.iter().find(|s| s.1 == c)
             {
                 op.shape = Shape::Equivalence;
@@ -475,12 +681,22 @@ impl Closures {
             op.rules.retain(|&r| taken.insert(r));
         }
         ops.retain(|op| !op.rules.is_empty());
-        Ok((!ops.is_empty()).then_some(Closures { ops, start, lists }))
+        Ok((!ops.is_empty()).then_some(Closures {
+            ops,
+            start,
+            lists,
+            stats: Stats::default(),
+        }))
     }
 
     /// Whether rule `ri` is evaluated by an operator now.
     pub(crate) fn replaces(&self, ri: usize) -> bool {
         self.ops.iter().any(|op| !op.off && op.rules.contains(&ri))
+    }
+
+    /// What the operators did so far.
+    pub(crate) fn stats(&self) -> Stats {
+        self.stats
     }
 
     /// The operators' names, for the log.
@@ -489,7 +705,15 @@ impl Closures {
             .iter()
             .map(|op| {
                 let names: Vec<&str> = op.rules.iter().map(|&r| rules[r].name.as_str()).collect();
-                format!("{:?} {}", op.shape, names.join("+"))
+                let mode = match &op.seeded {
+                    None => "",
+                    Some(s) => match s.end {
+                        Some((_, Dir::Forward)) => " forward",
+                        Some((_, Dir::Backward)) => " backward",
+                        None => " full",
+                    },
+                };
+                format!("{:?}{mode} {}", op.shape, names.join("+"))
             })
             .collect()
     }
@@ -518,8 +742,27 @@ impl Closures {
                 continue;
             }
             let now = g.len();
+            // the magic facts of an adorned copy, kept while they are read
+            let seeds = match &op.seeded {
+                Some(s) => {
+                    let f = s.facts(g, now, budget, &mut poll)?;
+                    if f.rows.is_empty() {
+                        continue;
+                    }
+                    Some(f)
+                }
+                None => None,
+            };
             // the predicates and their charge, kept while they are read
-            let (preds, _preds_held) = op.predicates(g, now, budget, &mut poll)?;
+            let (mut preds, _preds_held) = op.predicates(g, now, budget, &mut poll)?;
+            if let Some(ids) = op.lists {
+                preds.retain(|q| !ids.contains(q));
+            }
+            if let (Some(s), Some(f)) = (&op.seeded, &seeds)
+                && s.p_at.is_some()
+            {
+                preds.retain(|q| !f.of(*q, true).is_empty());
+            }
             // the marks the operator keeps and the base's cached count of each predicate
             let kept = op.kept.get_or_insert_with(|| Held::new(budget));
             let want = table_bytes(
@@ -533,24 +776,16 @@ impl Closures {
             let mut done: Vec<u64> = Vec::new();
             let mut total = 0usize;
             let mut back = false;
-            // the row from which a predicate has new edges, or None without any
-            let fresh = |op: &Op, g: &Graph, q: u64| -> Option<u32> {
-                let mark = match op.marks.get(&q) {
-                    Some(&m) => m,
-                    None => op.initial(g, q, start),
-                };
-                (mark < now && g.count_p(q, mark, now) > 0).then_some(mark)
-            };
             // a guarded operator with a `notEqual` filter gives its rules back when any of
             // its predicates has a literal subject, before it merges a pair of any of
             // them, as it did when it held every pair until the step was done
             if op.irreflexive && matches!(op.over, Over::Guarded(..)) {
                 for &q in &preds {
                     poll.tick(1)?;
-                    let Some(mark) = fresh(op, g, q) else {
+                    let Some(local) = op.local(g, q, now, start, seeds.as_ref(), budget, cancel)?
+                    else {
                         continue;
                     };
-                    let local = Local::build(g, q, mark, now, op.shape, budget, cancel)?;
                     if local.literal_subject(terms) {
                         back = true;
                         break;
@@ -562,10 +797,10 @@ impl Closures {
                     break;
                 }
                 poll.tick(1)?;
-                let Some(mark) = fresh(op, g, q) else {
+                let Some(local) = op.local(g, q, now, start, seeds.as_ref(), budget, cancel)?
+                else {
                     continue;
                 };
-                let local = Local::build(g, q, mark, now, op.shape, budget, cancel)?;
                 let mut sink = Sink::new(g, budget, total, max_out);
                 let closed = match op.shape {
                     Shape::Transitive => {
@@ -608,8 +843,19 @@ impl Closures {
                 total = sink.finish()?;
                 done.push(q);
             }
+            drop(seeds);
             let after = g.len();
             stepped.added += (after - before) as usize;
+            if after > before {
+                let n = (after - before) as u64;
+                let counts = self.stats.of(op.seeded.as_ref());
+                counts.pairs += n;
+                counts.steps += 1;
+                if op.seeded.is_some() && matches!(op.over, Over::Guarded(..)) {
+                    self.stats.guarded.pairs += n;
+                    self.stats.guarded.steps += 1;
+                }
+            }
             if back {
                 tracing::debug!(rule = %rules[op.rules[0]].name, "closure operator gives its rules back");
                 op.off = true;
@@ -618,6 +864,9 @@ impl Closures {
             }
             for q in done {
                 op.marks.insert(q, after);
+            }
+            if let Some(s) = op.seeded.as_mut() {
+                s.mm = Some(now);
             }
         }
         self.check_lists(g)?;
@@ -633,6 +882,81 @@ impl Closures {
             }
         }
         Ok(())
+    }
+}
+
+impl Stats {
+    fn of(&mut self, seeded: Option<&Seeded>) -> &mut Counts {
+        match seeded.map(|s| s.end) {
+            None => &mut self.plain,
+            Some(Some((_, Dir::Forward))) => &mut self.forward,
+            Some(Some((_, Dir::Backward))) => &mut self.backward,
+            Some(None) => &mut self.full,
+        }
+    }
+
+    /// The counts of `self` and `other` together.
+    pub(crate) fn add(&mut self, other: &Stats) {
+        for (a, b) in [
+            (&mut self.plain, other.plain),
+            (&mut self.forward, other.forward),
+            (&mut self.backward, other.backward),
+            (&mut self.full, other.full),
+            (&mut self.guarded, other.guarded),
+        ] {
+            a.pairs += b.pairs;
+            a.steps += b.steps;
+        }
+    }
+}
+
+/// The magic facts of an adorned copy, as (row, value of the bound end, predicate),
+/// sorted by predicate and row, with their charge.
+struct Seeds {
+    rows: Vec<(u64, u32, u64)>,
+    _held: Held,
+}
+
+impl Seeds {
+    /// The facts that ask for predicate `q`, or all of them when the magic atom does not
+    /// hold the predicate (`by_p` false).
+    fn of(&self, q: u64, by_p: bool) -> &[(u64, u32, u64)] {
+        if !by_p {
+            return &self.rows;
+        }
+        let lo = self.rows.partition_point(|r| r.0 < q);
+        let hi = self.rows.partition_point(|r| r.0 <= q);
+        &self.rows[lo..hi]
+    }
+}
+
+impl Seeded {
+    /// The magic facts among rows `< now` that the copy's magic atom matches.
+    fn facts(
+        &self,
+        g: &Graph,
+        now: u32,
+        budget: &Arc<Budget>,
+        poll: &mut Poll,
+    ) -> anyhow::Result<Seeds> {
+        let mut held = Held::new(budget);
+        let mut rows: Vec<(u64, u32, u64)> = Vec::new();
+        let c = g.cands(None, Some(self.m), None, g.offset(), now);
+        for r in c.iter() {
+            poll.tick(1)?;
+            if !g.alive(r) {
+                continue;
+            }
+            let t = g.triple(r);
+            if t[1] != self.m || self.fixed.iter().any(|&(pos, v)| t[pos] != v) {
+                continue;
+            }
+            let end = self.end.map_or(0, |(pos, _)| t[pos]);
+            let q = self.p_at.map_or(0, |pos| t[pos]);
+            push(&mut rows, (q, r, end), &mut held)?;
+        }
+        rows.sort_unstable();
+        Ok(Seeds { rows, _held: held })
     }
 }
 
@@ -686,20 +1010,102 @@ impl Op {
     }
 
     /// The mark of a predicate the operator has not closed in this run: the facts
-    /// before `start` are closed under the rules, the guard included.
+    /// before `start` are closed under the rules, the guard and the constant atoms of an
+    /// adorned copy included.
     fn initial(&self, g: &Graph, q: u64, start: Option<u32>) -> u32 {
         let Some(st) = start else {
             return 0;
         };
+        let mut memo = Memo::default();
+        if !self.conds.iter().all(|c| g.holds_before(&mut memo, c, st)) {
+            return 0;
+        }
         match self.over {
             Over::Fixed(_) => st,
             Over::Guarded(gp, go) => {
-                let mut memo = Memo::default();
                 if g.holds_before(&mut memo, &[q, gp, go], st) {
                     st
                 } else {
                     0
                 }
+            }
+        }
+    }
+
+    /// The graph of predicate `q` that the operator closes in this step, or `None` when
+    /// nothing changed for it. A rule without a magic atom reads the nodes that new edges
+    /// since the mark change. An adorned copy reads, from the values its magic facts ask
+    /// for, the nodes they reach: from every such value when the predicate has new edges
+    /// since its mark or the operator meets the predicate first, and from the values of
+    /// new magic facts alone otherwise. A copy whose magic atom binds no end closes the
+    /// whole relation once a magic fact asks for it, from row 0 when that fact is new.
+    #[allow(clippy::too_many_arguments)]
+    fn local(
+        &self,
+        g: &Graph,
+        q: u64,
+        now: u32,
+        start: Option<u32>,
+        seeds: Option<&Seeds>,
+        budget: &Arc<Budget>,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<Option<Local>> {
+        if !self.conds.is_empty() {
+            let mut memo = Memo::default();
+            if !self.conds.iter().all(|c| g.holds_before(&mut memo, c, now)) {
+                return Ok(None);
+            }
+        }
+        let fresh = |mark: u32| mark < now && g.count_p(q, mark, now) > 0;
+        let (Some(s), Some(f)) = (&self.seeded, seeds) else {
+            let mark = match self.marks.get(&q) {
+                Some(&m) => m,
+                None => self.initial(g, q, start),
+            };
+            if !fresh(mark) {
+                return Ok(None);
+            }
+            return Local::build(g, q, mark, now, self.shape, budget, cancel).map(Some);
+        };
+        let mine = f.of(q, s.p_at.is_some());
+        if mine.is_empty() {
+            return Ok(None);
+        }
+        match s.end {
+            None => {
+                // closed before `start` only for a magic fact from before it
+                let mark = match self.marks.get(&q) {
+                    Some(&m) => m,
+                    None if start.is_some_and(|st| mine.iter().any(|r| r.1 < st)) => {
+                        self.initial(g, q, start)
+                    }
+                    None => 0,
+                };
+                if !fresh(mark) {
+                    return Ok(None);
+                }
+                Local::build(g, q, mark, now, self.shape, budget, cancel).map(Some)
+            }
+            Some((_, dir)) => {
+                let mark = match self.marks.get(&q) {
+                    Some(&m) => m,
+                    None => self.initial(g, q, start),
+                };
+                let mm = s.mm.or(start).unwrap_or(0);
+                let all = fresh(mark);
+                let mut held = Held::new(budget);
+                let mut sources: Vec<u64> = Vec::new();
+                for r in mine {
+                    if all || r.1 >= mm {
+                        push(&mut sources, r.2, &mut held)?;
+                    }
+                }
+                if sources.is_empty() {
+                    return Ok(None);
+                }
+                sources.sort_unstable();
+                sources.dedup();
+                Local::seeded(g, q, &sources, now, dir, budget, cancel).map(Some)
             }
         }
     }
@@ -713,6 +1119,9 @@ struct Local {
     adj: Vec<u32>,
     /// the nodes whose pairs to emit; all of them when empty
     emit: Vec<bool>,
+    /// the edges are the relation's reversed: node `x`'s out-edges are the subjects of
+    /// the facts whose object `x` is, and a pair `(x, z)` is the fact `(z q x)`
+    reversed: bool,
     /// the charge of the above
     _held: Held,
 }
@@ -837,6 +1246,7 @@ impl Builder {
             off,
             adj,
             emit,
+            reversed: false,
             _held: held,
         })
     }
@@ -1016,6 +1426,61 @@ impl Local {
         result
     }
 
+    /// The nodes that `sources` reach through predicate `q`'s edges in rows `< now`,
+    /// forward or, with the edges reversed, backward, each with all its edges, read
+    /// through the indexes. Only the sources emit their pairs.
+    fn seeded(
+        g: &Graph,
+        q: u64,
+        sources: &[u64],
+        now: u32,
+        dir: Dir,
+        budget: &Arc<Budget>,
+        cancel: Option<&AtomicBool>,
+    ) -> anyhow::Result<Local> {
+        let mut poll = Poll::new(cancel);
+        let mut memo = Memo::default();
+        let mut b = Builder::new(budget);
+        // the search's own sets and queue, each growth charged before it is reserved
+        let mut search = Held::new(budget);
+        let result = (|| -> anyhow::Result<Local> {
+            let mut from: FxHashSet<u64> = FxHashSet::default();
+            let mut seen: FxHashSet<u64> = FxHashSet::default();
+            let mut queue: Vec<u64> = Vec::new();
+            for &s in sources {
+                poll.tick(1)?;
+                insert(&mut from, s, &mut search)?;
+                if insert(&mut seen, s, &mut search)? {
+                    b.node(s)?;
+                    push(&mut queue, s, &mut search)?;
+                }
+            }
+            while let Some(x) = queue.pop() {
+                let visit = |y: u64| -> anyhow::Result<bool> {
+                    poll.tick(1)?;
+                    b.edge(x, y)?;
+                    if insert(&mut seen, y, &mut search)? {
+                        push(&mut queue, y, &mut search)?;
+                    }
+                    Ok(true)
+                };
+                match dir {
+                    Dir::Forward => g.each_object(&mut memo, x, q, now, visit)?,
+                    Dir::Backward => g.each_subject(&mut memo, q, x, now, visit)?,
+                }
+            }
+            search.try_grow(b.ids.len())?;
+            let emit: Vec<bool> = b.ids.iter().map(|id| from.contains(id)).collect();
+            let mut l = std::mem::replace(&mut b, Builder::new(budget)).finish(emit)?;
+            l.reversed = dir == Dir::Backward;
+            Ok(l)
+        })();
+        if let Some(base) = g.base() {
+            base.add_scans(memo.scans);
+        }
+        result
+    }
+
     #[inline]
     fn out(&self, x: u32) -> &[u32] {
         &self.adj[self.off[x as usize] as usize..self.off[x as usize + 1] as usize]
@@ -1029,6 +1494,13 @@ impl Local {
     /// Whether a literal has an out-edge, so that a `notEqual` of values may differ from
     /// a comparison of ids.
     fn literal_subject(&self, terms: &Terms) -> bool {
+        if self.reversed {
+            // a subject of the relation is the end of a reversed edge
+            return self
+                .adj
+                .iter()
+                .any(|&y| terms.kind(self.ids[y as usize]) == Kind::Literal);
+        }
         (0..self.ids.len())
             .any(|x| self.off[x] < self.off[x + 1] && terms.kind(self.ids[x]) == Kind::Literal)
     }
@@ -1153,7 +1625,8 @@ impl Local {
                     if h < have.len() && have[h] == z {
                         continue;
                     }
-                    sink.emit([self.ids[x as usize], q, self.ids[z as usize]])?;
+                    let (a, b) = (self.ids[x as usize], self.ids[z as usize]);
+                    sink.emit(if self.reversed { [b, q, a] } else { [a, q, b] })?;
                 }
             }
             if readers[c] > 0 {
