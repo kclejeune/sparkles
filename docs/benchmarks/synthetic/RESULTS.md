@@ -801,13 +801,13 @@ same answers in every run.
 `mise run bench:request-insn` counted the instructions per request of the same two
 binaries on stanley, in eight rounds of A,B,B,A with 50 requests per query and server.
 Streamed `distinct-join`, `employee-docs`, `expr-bind-group`, `values-star` and
-`star-lookup` run 0.6% to 1.9% more instructions, and every other synthetic query runs
+`star-lookup` run 0.6% to 1.9% more instructions, and every other counted query runs
 the same count within the host's noise floor. Eager execution runs the same count as the
-base on every query.
+base on every counted query.
 
 The confirmation's real costs in server time are these, where the item column names the
-roadmap item that holds each one. Costs under 0.3 ms within the cap of item 1074 are its
-lines, each a kept-path cost without a profile. Instructions are the stanley ratio, and
+roadmap item that holds each one. Costs under 0.3 ms within the cap of item 1074, with both modes of a
+query counted together, are its lines, each a kept-path cost without a profile. Instructions are the stanley ratio, and
 the vector store was not counted.
 
 | Query | Mode | Base | Tip/base | 95% interval | Added | Instructions | Item |
@@ -826,18 +826,18 @@ the vector store was not counted.
 | `expr-bind-group` | streaming | 0.36 ms | 1.013 | 1.009–1.015 | 4.7 µs | 1.013 | 1160 |
 | `employee-docs` | streaming | 0.041 ms | 1.039 | 1.030–1.053 | 1.6 µs | 1.019 | 1160 |
 | `star-lookup` | streaming | 0.063 ms | 1.032 | 1.027–1.037 | 2.0 µs | 1.006 | 1160 |
-| `star-lookup` | eager | 0.059 ms | 1.018 | 1.012–1.026 | 1.0 µs | 1.000 | 1074, 1161 |
+| `star-lookup` | eager | 0.059 ms | 1.018 | 1.012–1.026 | 1.0 µs | 1.000 | 1161 |
 | `values-star` | streaming | 0.020 ms | 1.052 | 1.041–1.063 | 1.0 µs | 1.010 | 1160 |
 | `q-ef-256` | streaming | 0.57 ms | 1.006 | 1.001–1.009 | 3.2 µs | | 1162 |
 | `q-exact-true` | eager | 10.8 ms | 1.001 | 1.000–1.002 | 13 µs | | 1162 |
 | `q-ef-128` | eager | 0.22 ms | 1.006 | 1.003–1.010 | 1.3 µs | | 1074, 1162 |
 | `q-ef-128` | streaming | 0.23 ms | 1.007 | 1.002–1.012 | 1.6 µs | | 1074, 1162 |
-| `q-ef-64` | eager | 0.11 ms | 1.012 | 1.007–1.018 | 1.3 µs | | 1074, 1162 |
-| `q-ef-64` | streaming | 0.11 ms | 1.011 | 1.004–1.016 | 1.3 µs | | 1074, 1162 |
-| `q-ef-32` | eager | 0.071 ms | 1.009 | 1.006–1.020 | 0.65 µs | | 1074, 1162 |
-| `q-ef-32` | streaming | 0.075 ms | 1.013 | 1.008–1.022 | 0.99 µs | | 1074, 1162 |
-| `q-ef-16` | eager | 0.053 ms | 1.012 | 1.003–1.017 | 0.61 µs | | 1074, 1162 |
-| `q-ef-16` | streaming | 0.056 ms | 1.016 | 1.010–1.030 | 0.91 µs | | 1074, 1162 |
+| `q-ef-64` | eager | 0.11 ms | 1.012 | 1.007–1.018 | 1.3 µs | | 1162 |
+| `q-ef-64` | streaming | 0.11 ms | 1.011 | 1.004–1.016 | 1.3 µs | | 1162 |
+| `q-ef-32` | eager | 0.071 ms | 1.009 | 1.006–1.020 | 0.65 µs | | 1162 |
+| `q-ef-32` | streaming | 0.075 ms | 1.013 | 1.008–1.022 | 0.99 µs | | 1162 |
+| `q-ef-16` | eager | 0.053 ms | 1.012 | 1.003–1.017 | 0.61 µs | | 1162 |
+| `q-ef-16` | streaming | 0.056 ms | 1.016 | 1.010–1.030 | 0.91 µs | | 1162 |
 
 The other confirmed queries read as noise by the Intel rule, with an interval that
 reaches 1.0 or a median added time of at most 0.5 µs, and `subquery-agg` reads 0.988

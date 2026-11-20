@@ -37,8 +37,10 @@ status 1 in the 12 runs outside the one-thread streaming configuration, at the b
 the tip alike, after its indexed and scan timings were written. Its `geo-index` call
 found the store still held by the server that the script had just stopped, because the
 script waited only for that server's port to close, and the script discarded the call's
-message. The script now waits
-for the server to exit, which leaves the recorded timings as they are.
+message. Run again on stanley at
+100,000 points in eager execution with 12 threads, the script reproduced the exit with
+the message that the store was in use by another process. It now waits for the server
+to exit and passes that run, which leaves the recorded timings as they are.
 
 ## Analysis
 
