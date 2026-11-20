@@ -206,6 +206,81 @@ pub(super) fn graph_binding_candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> 
         .flatten()
 }
 
+/// The most that [`index_join`] of `drive` into `probe` allocates at once, counting what
+/// the join keeps: the copies of the filters over the pattern (made twice while offering),
+/// the keys, the order, the description, which renders the filters, and the operator.
+pub(super) fn index_join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    drive: &Node,
+    probe: &Node,
+    ctx: &Ctx,
+) -> Result<()> {
+    struct Count(usize);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 = self.0.saturating_add(s.len());
+            Ok(())
+        }
+    }
+    let mut n = probe;
+    let (mut count, mut text) = (0usize, Count(0));
+    let mut filter = |layout: &mut super::checked_layout::Layout<'_>, es: &[Expr]| -> Result<()> {
+        for e in es {
+            count += 1;
+            layout.expression(e)?;
+            layout.expression(e)?;
+            text.0 = text.0.saturating_add(8);
+            let _ = e.write_description(ctx, &mut text);
+        }
+        Ok(())
+    };
+    let spec = loop {
+        match &n.kind {
+            Kind::Filter(es) if !es.iter().any(Expr::has_exists) => {
+                filter(layout, es)?;
+                n = &n.children[0];
+            }
+            Kind::Scan(spec) => break Some(spec),
+            Kind::RangeScan(spec, range) => {
+                filter(layout, &range.filter)?;
+                break Some(spec);
+            }
+            _ => break None,
+        }
+    };
+    layout.slots::<Expr>(count.max(4).saturating_mul(6))?;
+    let names = ctx.var_names.read();
+    let name = probe
+        .vars
+        .iter()
+        .map(|&v| names[v as usize].len())
+        .max()
+        .unwrap_or(0);
+    drop(names);
+    // the keys and the order the join keeps
+    layout.slots::<VarId>(probe.vars.len().saturating_add(1).max(4).saturating_mul(3))?;
+    layout.slots::<VarId>(drive.sorted.len().max(4).saturating_mul(3))?;
+    // the spelled key, the rendered filters, their list and the joined description
+    layout.slots::<String>(count)?;
+    layout.add(
+        text.0
+            .saturating_add(name.saturating_mul(2))
+            .saturating_add(n.desc.len())
+            .saturating_add(64)
+            .saturating_mul(6),
+    )?;
+    super::plan::union_bound(layout, drive.vars.len(), probe.vars.len())?;
+    super::plan::union_bound(layout, drive.certain.len(), probe.vars.len())?;
+    super::plan::dist_bound(layout, drive.vars.len(), probe.vars.len())?;
+    layout.slots::<IndexJoinSpec>(1)?;
+    layout.slots::<Probe>(1)?;
+    if let Some(spec) = spec {
+        layout.scan(spec)?;
+        layout.graph(&spec.graph)?;
+    }
+    layout.slots::<Node>(1)
+}
+
 /// The index join of `drive` into the pattern `probe`, or `drive` back when none is
 /// offered.
 pub(super) fn index_join(
@@ -623,7 +698,11 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx, gated: bool) -> Option<Of
             .iter()
             .filter(|v| **v != key && drive.vars.contains(v)),
     );
-    let (est, star) = super::plan::join_est_with(drive, probe, &keys, ctx);
+    let (est, star) = {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(8);
+        super::plan::join_est_with(drive, probe, &keys, ctx)
+    };
     // the input's order is kept, except where a shared variable unbound in the input
     // takes the pattern's value
     let sorted = drive

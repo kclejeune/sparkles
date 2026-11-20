@@ -2623,6 +2623,33 @@ fn checked_join_order_excess(width: usize) -> [i64; crate::test_alloc::STAGES] {
 
 /// [`checked_join_order_excess`] for the query `text` over the chain fixture of `width`.
 fn checked_join_order_excess_of(width: usize, text: &str) -> [i64; crate::test_alloc::STAGES] {
+    checked_join_order_excess_kinds(width, text).0
+}
+
+/// The merge, hash, index and other joins of `node` and its children, added to `out`.
+fn checked_join_kinds(node: &plan::Node, out: &mut [usize; 4]) {
+    match &node.kind {
+        plan::Kind::Join { algo, .. } => {
+            out[match algo {
+                plan::JoinAlgo::Merge => 0,
+                plan::JoinAlgo::Hash => 1,
+                _ => 3,
+            }] += 1
+        }
+        plan::Kind::IndexJoin(_) => out[2] += 1,
+        _ => {}
+    }
+    for child in &node.children {
+        checked_join_kinds(child, out);
+    }
+}
+
+/// [`checked_join_order_excess_of`] with the merge, hash, index and other joins of the
+/// branches' plans.
+fn checked_join_order_excess_kinds(
+    width: usize,
+    text: &str,
+) -> ([i64; crate::test_alloc::STAGES], [usize; 4]) {
     use plan::{ActiveGraph, Planner};
 
     let store = checked_chain_fixture(width);
@@ -2641,8 +2668,13 @@ fn checked_join_order_excess_of(width: usize, text: &str) -> [i64; crate::test_a
                 .unwrap(),
         );
     });
-    assert_eq!(checked_graph_group(plan.as_ref().unwrap()).inputs.len(), 2);
-    excess
+    let group = checked_graph_group(plan.as_ref().unwrap());
+    assert_eq!(group.inputs.len(), 2);
+    let mut kinds = [0; 4];
+    for input in &group.inputs {
+        checked_join_kinds(input, &mut kinds);
+    }
+    (excess, kinds)
 }
 
 #[test]
@@ -2685,13 +2717,30 @@ fn checked_graph_r12_admits_join_order_tables() {
     cases.push((40, checked_star_query(40)));
     cases.push((30, opaque(2)));
     cases.push((60, opaque(60)));
+    // Two chains that share no variable, joined by the program below a width of 16 and
+    // left disconnected by the greedy plan above it, with a filter over both.
+    let apart = |k: usize| {
+        let mut text = String::from("SELECT * WHERE { GRAPH ?g {");
+        for step in 1..=k {
+            text.push_str(&format!(" ?x{} <urn:c:{step}> ?x{step} .", step - 1));
+            text.push_str(&format!(" ?z{} <urn:c:{step}> ?z{step} .", step - 1));
+        }
+        text.push_str(" FILTER(?x0 != ?z1) BIND(?x0 AS ?first) } }");
+        text
+    };
     cases.push((12, subtree(2)));
     cases.push((12, subtree(12)));
+    cases.push((6, apart(6)));
+    cases.push((20, apart(20)));
     let mut failures = Vec::new();
     let mut run = Vec::new();
+    let mut kinds = [0; 4];
     for (width, text) in &cases {
-        let excess = checked_join_order_excess_of(*width, text);
-        println!("{text}: {excess:?}");
+        let (excess, of) = checked_join_order_excess_kinds(*width, text);
+        println!("{text}: {excess:?} merge/hash/index/other joins {of:?}");
+        for (all, one) in kinds.iter_mut().zip(of) {
+            *all += one;
+        }
         run.push(excess[3]);
         for (stage, name, cap) in [
             (0, "group", 512),
@@ -2700,6 +2749,7 @@ fn checked_graph_r12_admits_join_order_tables() {
             (3, "program run", 512),
             (4, "program build", 256),
             (5, "greedy build", 256),
+            (7, "joins", 512),
         ] {
             if excess[stage] > cap {
                 failures.push(format!(
@@ -2709,8 +2759,42 @@ fn checked_graph_r12_admits_join_order_tables() {
             }
         }
     }
+    println!("merge/hash/index/other joins in all: {kinds:?}");
+    assert!(
+        kinds[0] > 0 && kinds[1] > 0,
+        "merge and hash joins are built"
+    );
+    // Index joins, forced since probing these small patterns never beats reading them,
+    // including probes into filtered patterns and wide inputs.
+    struct Unforce;
+    impl Drop for Unforce {
+        fn drop(&mut self) {
+            crate::sparql::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(false));
+        }
+    }
+    let _unforce = Unforce;
+    crate::sparql::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(true));
+    let mut index = 0;
+    for (width, text) in [
+        (12, checked_chain_query(12)),
+        (40, checked_chain_query(40)),
+        (12, checked_star_query(12)),
+        (60, opaque(60)),
+        (20, apart(20)),
+    ] {
+        let (excess, of) = checked_join_order_excess_kinds(width, &text);
+        println!("forced {text}: {excess:?} merge/hash/index/other joins {of:?}");
+        index += of[2];
+        if excess[7] > 512 {
+            failures.push(format!(
+                "forced joins: {} unadmitted bytes for {text}",
+                excess[7]
+            ));
+        }
+    }
+    assert!(index > 0, "index joins are built");
     // The copy of the larger sub-select is admitted as the smaller one is.
-    let (small, large) = (run[run.len() - 2], run[run.len() - 1]);
+    let (small, large) = (run[run.len() - 4], run[run.len() - 3]);
     if large > small + 256 {
         failures.push(format!(
             "input copies: {small} then {large} unadmitted bytes"
@@ -2808,8 +2892,8 @@ fn checked_join_order_at_phase(
 fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
     use crate::sparql::joinorder::{
         BUILD_PHASE, FILTER_VARS_PHASE, GREEDY_BUILD_PHASE, GREEDY_GROW_PHASE, GREEDY_LEAF_PHASE,
-        GREEDY_PHASE, GREEDY_UNIT_PHASE, GROUP_PHASE, GROW_PHASE, LEAF_PHASE, MODELS_PHASE,
-        PARTS_PHASE, PREPARE_PHASE, ROUND_PHASE, SCRATCH_PHASE,
+        GREEDY_PHASE, GREEDY_UNIT_PHASE, GROUP_PHASE, GROW_PHASE, JOIN_BUILD_PHASE, LEAF_PHASE,
+        MODELS_PHASE, PARTS_PHASE, PREPARE_PHASE, ROUND_PHASE, SCRATCH_PHASE,
     };
 
     // A chain of 12 is planned by the program in one round over 12 inputs, and a star
@@ -2844,6 +2928,9 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         (&wide, &star40, GREEDY_GROW_PHASE, 0, 0),
         (&wide, &star40, GREEDY_GROW_PHASE, usize::MAX, 0),
         (&wide, &star40, GREEDY_BUILD_PHASE, 0, 0),
+        (&wide, &chain20, JOIN_BUILD_PHASE, 0, usize::MAX),
+        (&wide, &chain20, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
+        (&wide, &star40, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
     ]
     .into_iter()
     .chain(
@@ -2864,6 +2951,8 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
             (&chain, BUILD_PHASE, 0, 0),
             (&chain, LEAF_PHASE, 0, usize::MAX),
             (&chain, LEAF_PHASE, usize::MAX, usize::MAX),
+            (&chain, JOIN_BUILD_PHASE, 0, usize::MAX),
+            (&chain, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
             (&star, ROUND_PHASE, 1, 0),
             (&star, SCRATCH_PHASE, 1, 0),
             // the switch to rounds, then the first merged part, whose entries are too few

@@ -454,7 +454,7 @@ impl<'a> Layout<'a> {
         Ok(())
     }
 
-    fn graph(&mut self, graph: &GraphFilter) -> Result<()> {
+    pub(super) fn graph(&mut self, graph: &GraphFilter) -> Result<()> {
         match graph {
             GraphFilter::Set(ids) => self.vector(ids),
             GraphFilter::All
@@ -465,7 +465,7 @@ impl<'a> Layout<'a> {
         }
     }
 
-    fn scan(&mut self, scan: &ScanSpec) -> Result<()> {
+    pub(super) fn scan(&mut self, scan: &ScanSpec) -> Result<()> {
         self.vector(&scan.prefix)?;
         self.vector(&scan.cols)?;
         self.vector(&scan.eqs)?;
@@ -499,6 +499,13 @@ impl<'a> Layout<'a> {
         self.vector(&node.sorted)?;
         self.map::<super::table::VarId, f64>(node.dist.capacity())?;
         self.string(&node.desc)
+    }
+
+    /// A node's own storage: its metadata, children vector and kind, but not its children.
+    pub(super) fn shallow(&mut self, node: &Node) -> Result<()> {
+        self.metadata(node)?;
+        self.vector(&node.children)?;
+        self.kind(&node.kind)
     }
 
     pub(super) fn node(&mut self, node: &Node) -> Result<()> {

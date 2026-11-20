@@ -279,17 +279,130 @@ fn filtered(cost: f64, est: f64, sel: f64, unsorted: bool) -> (f64, f64) {
     (cost, (est * sel).max(if est > 0.0 { 1.0 } else { 0.0 }))
 }
 
-/// Join `a` and `b` the given way (the same nodes as the planner's join candidates).
-fn build_join(a: Node, b: Node, how: How, ctx: &Ctx) -> Node {
+/// The variables of `a` that `b` also has, in `a`'s order.
+fn shared_vars<'a>(a: &'a Node, b: &'a Node) -> impl Iterator<Item = VarId> + 'a {
+    a.vars.iter().filter(|v| b.vars.contains(v)).copied()
+}
+
+/// The most that [`build_join`] of `a` and `b` the given way allocates at once, counting
+/// what the join keeps and the hash join made instead of an index join no longer offered.
+fn join_build_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+    how: How,
+    ctx: &Ctx,
+) -> Result<()> {
+    let keys = shared_vars(a, b).count();
+    layout.slots::<VarId>(keys)?;
+    match how {
+        How::Merge(v) => plan::merge_join_bound(layout, a, b, v, keys, ctx),
+        How::Hash => plan::hash_join_bound(layout, a, b, shared_vars(a, b), ctx),
+        How::ProbeRight | How::ProbeLeft => {
+            let (drive, probe) = match how {
+                How::ProbeRight => (a, b),
+                _ => (b, a),
+            };
+            indexjoin::index_join_bound(layout, drive, probe, ctx)?;
+            plan::hash_join_bound(layout, a, b, shared_vars(a, b), ctx)
+        }
+    }
+}
+
+/// Keep, of `held`'s credit, what `n` and the sorts that made it (`sorts`, per child)
+/// keep, and add it to the branch's plan storage.
+fn keep_built(pl: &Planner, mut held: Reservation, n: &Node, sorts: [bool; 2]) -> Result<()> {
+    let kept = {
+        let mut layout = super::checked_layout::Layout::retained(held.preparation());
+        layout.shallow(n)?;
+        for (child, sorted) in n.children.iter().zip(sorts) {
+            if sorted {
+                layout.shallow(child)?;
+            }
+        }
+        layout.bytes()
+    };
+    debug_assert!(
+        kept <= held.bytes(),
+        "the plan keeps {kept} bytes of the {} admitted",
+        held.bytes()
+    );
+    if kept <= held.bytes() {
+        held.release_to(kept);
+    } else {
+        held.grow_by(kept - held.bytes())?;
+    }
+    pl.retain_planning(held);
+    Ok(())
+}
+
+/// Join plans `a` and `b`, which share no variable, as [`plan::join`] does: as a cross
+/// product, or one of them when the other is the one empty solution. On the checked
+/// route the join is admitted as [`build_join`] admits one.
+fn join_disconnected(a: Node, b: Node, pl: &Planner) -> Result<Node> {
     #[cfg(test)]
     let _stage = crate::test_alloc::Stage::enter(7);
-    let keys: Vec<VarId> = a
-        .vars
-        .iter()
-        .filter(|v| b.vars.contains(v))
-        .copied()
-        .collect();
-    match how {
+    let ctx = pl.ctx;
+    let keys = shared_vars(&a, &b).count();
+    debug_assert_eq!(
+        keys, 0,
+        "the plans left by the greedy order share no variable"
+    );
+    let held = refused(pl.planning_stage(JOIN_BUILD_PHASE).and_then(|()| {
+        pl.planning_scratch(|layout| {
+            plan::join_bound(layout, &a, &b)?;
+            if keys > 0 {
+                // the planner's join candidates, each made from copies of both plans
+                for _ in 0..keys + 3 {
+                    layout.node(&a)?;
+                    layout.node(&b)?;
+                }
+                for v in shared_vars(&a, &b) {
+                    plan::merge_join_bound(layout, &a, &b, v, keys, ctx)?;
+                }
+                plan::hash_join_bound(layout, &a, &b, shared_vars(&a, &b), ctx)?;
+                indexjoin::index_join_bound(layout, &a, &b, ctx)?;
+                indexjoin::index_join_bound(layout, &b, &a, ctx)?;
+            }
+            Ok(())
+        })
+    }))?;
+    let keeps_input = plan::join_keeps_input(&a, &b);
+    let n = plan::join(a, b, ctx);
+    if let Some(held) = held {
+        if keeps_input {
+            drop(held);
+        } else {
+            keep_built(pl, held, &n, [keys > 0; 2])?;
+        }
+    }
+    Ok(n)
+}
+
+/// Join `a` and `b` the given way (the same nodes as the planner's join candidates). On
+/// the checked route the most the join allocates is admitted before it is made, and what
+/// the plan keeps of it stays with the branch's plan storage.
+fn build_join(a: Node, b: Node, how: How, pl: &Planner) -> Result<Node> {
+    #[cfg(test)]
+    let _stage = crate::test_alloc::Stage::enter(7);
+    let ctx = pl.ctx;
+    let held =
+        refused(pl.planning_stage(JOIN_BUILD_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| join_build_bound(layout, &a, &b, how, ctx))
+        }))?;
+    let keys: Vec<VarId> = match &held {
+        Some(_) => {
+            let mut keys = Vec::with_capacity(shared_vars(&a, &b).count());
+            keys.extend(shared_vars(&a, &b));
+            keys
+        }
+        None => shared_vars(&a, &b).collect(),
+    };
+    let sorts = match how {
+        How::Merge(v) => [a.sorted.first() != Some(&v), b.sorted.first() != Some(&v)],
+        _ => [false; 2],
+    };
+    let n = match how {
         How::Merge(v) => plan::merge_join(a, b, v, &keys, ctx),
         How::Hash => plan::hash_join(a, b, keys, ctx),
         How::ProbeRight => match indexjoin::index_join(a, &b, ctx) {
@@ -306,7 +419,11 @@ fn build_join(a: Node, b: Node, how: How, ctx: &Ctx) -> Node {
                 plan::hash_join(a, *b, keys, ctx)
             }
         },
+    };
+    if let Some(held) = held {
+        keep_built(pl, held, &n, sorts)?;
     }
+    Ok(n)
 }
 
 /// What the ordering needs to know about a FILTER conjunct.
@@ -1672,7 +1789,7 @@ impl Greedy {
                 },
                 From::Join(a, b, how) => {
                     let (na, nb) = (nodes[a].take().unwrap(), nodes[b].take().unwrap());
-                    let n = build_join(na, nb, how, ctx);
+                    let n = build_join(na, nb, how, pl)?;
                     if u.filters.is_empty() {
                         n
                     } else {
@@ -1705,7 +1822,7 @@ impl Greedy {
         let mut acc = nodes[it.next().unwrap()].take().unwrap();
         for u in it {
             let n = nodes[u].take().unwrap();
-            acc = pl.place_filters(plan::join(acc, n, ctx), filters);
+            acc = pl.place_filters(join_disconnected(acc, n, pl)?, filters);
         }
         Ok(acc)
     }
@@ -2623,7 +2740,7 @@ impl Dp {
             } else {
                 let (na, fa) = built.remove(&e.a).unwrap();
                 let (nb, fb) = built.remove(&e.b).unwrap();
-                place_masked(pl, build_join(na, nb, e.how, ctx), fa | fb, filters, fvars)
+                place_masked(pl, build_join(na, nb, e.how, pl)?, fa | fb, filters, fvars)
             };
             debug_assert!(
                 n.cost.to_bits() == e.sum.cost.to_bits() && n.est.to_bits() == e.sum.est.to_bits(),
@@ -2719,6 +2836,8 @@ pub(super) const GREEDY_UNIT_PHASE: &str = "reserving greedy join order plan";
 pub(super) const GREEDY_LEAF_PHASE: &str = "copying greedy join order input";
 pub(super) const GREEDY_GROW_PHASE: &str = "growing greedy join order heap";
 pub(super) const GREEDY_BUILD_PHASE: &str = "reserving greedy join order rebuild";
+/// The phase a checked plan reports before it admits a join of its rebuilt plan.
+pub(super) const JOIN_BUILD_PHASE: &str = "reserving join order join";
 
 /// Record, for the tests of the program's admission, the bytes of the first storage
 /// that the next admission covers.

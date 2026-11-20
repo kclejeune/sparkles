@@ -5306,8 +5306,109 @@ impl<'a> VarSet<'a> {
     }
 }
 
+/// The most that [`union_vars`] of `a` and `b` variables allocates at once: the copy of
+/// the first list, which grows to hold both while old and new storage coexist, and the
+/// set of seen variables of a long union with its growth.
+pub(super) fn union_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: usize,
+    b: usize,
+) -> Result<()> {
+    let width = a.saturating_add(b);
+    layout.slots::<VarId>(width.max(4).saturating_mul(3))?;
+    if b > 32 && width > 64 {
+        layout.map::<VarId, ()>(width)?;
+        layout.map::<VarId, ()>(width)?;
+    }
+    Ok(())
+}
+
+/// The most that [`merge_dist`] of plans with `a` and `b` variables allocates at once:
+/// the membership sets of long inputs and the table, with its growth.
+pub(super) fn dist_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: usize,
+    b: usize,
+) -> Result<()> {
+    let width = a.saturating_add(b);
+    for side in [a, b] {
+        if side > 32 && width > 32 {
+            layout.map::<VarId, ()>(side)?;
+        }
+    }
+    layout.map::<VarId, f64>(width)?;
+    layout.map::<VarId, f64>(width)
+}
+
+/// The most that [`mk_join`] of `a` and `b` allocates at once, counting what the join
+/// keeps: the variable unions, the order, the distinct values, a short description and
+/// the children. The keys are the caller's.
+pub(super) fn join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+) -> Result<()> {
+    union_bound(layout, a.vars.len(), b.vars.len())?;
+    union_bound(layout, a.certain.len(), b.certain.len())?;
+    layout.slots::<VarId>(a.sorted.len().max(b.sorted.len()).max(1))?;
+    dist_bound(layout, a.vars.len(), b.vars.len())?;
+    layout.add(64)?;
+    layout.slots::<Node>(2)
+}
+
+/// The most that [`merge_join`] of `a` and `b` on `v`, which share `keys` variables,
+/// allocates at once: the join, a sort over each input not sorted on `v`, the keys with
+/// `v` first, and the description naming `v`.
+pub(super) fn merge_join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+    v: VarId,
+    keys: usize,
+    ctx: &Ctx,
+) -> Result<()> {
+    join_bound(layout, a, b)?;
+    for input in [a, b] {
+        if input.sorted.first() != Some(&v) {
+            layout.metadata(input)?;
+            layout.slots::<Node>(1)?;
+            layout.slots::<VarId>(2)?;
+        }
+    }
+    layout.slots::<VarId>(keys.saturating_add(1).max(4).saturating_mul(2))?;
+    let name = ctx.var_names.read()[v as usize].len();
+    layout.add(name.saturating_add(16).saturating_mul(4))
+}
+
+/// The most that [`hash_join`] of `a` and `b` on `keys` allocates at once: the join and
+/// its description, which spells each key, collects the spellings and joins them.
+pub(super) fn hash_join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+    keys: impl Iterator<Item = VarId>,
+    ctx: &Ctx,
+) -> Result<()> {
+    join_bound(layout, a, b)?;
+    let names = ctx.var_names.read();
+    let (mut count, mut text) = (0usize, 0usize);
+    for v in keys {
+        count += 1;
+        text = text.saturating_add(names[v as usize].len().saturating_add(2));
+    }
+    drop(names);
+    layout.slots::<String>(count)?;
+    layout.add(text.saturating_mul(6))?;
+    layout.add(64)
+}
+
 fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Node {
-    let (est, star) = join_est_with(&a, &b, &keys, ctx);
+    let (est, star) = {
+        // estimates can grow the query's memo of characteristic sets (a stage of its own)
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(8);
+        join_est_with(&a, &b, &keys, ctx)
+    };
     let vars = union_vars(&a.vars, &b.vars);
     let certain = union_vars(&a.certain, &b.certain);
     let sorted = match algo {
@@ -5422,6 +5523,13 @@ pub(super) fn hash_join(a: Node, b: Node, keys: Vec<VarId>, ctx: &Ctx) -> Node {
     let mut h = mk_join(a, b, JoinAlgo::Hash, keys, ctx);
     h.desc = desc;
     h
+}
+
+/// Whether [`join`] of `a` and `b` returns one of them unchanged, since the other is
+/// the one empty solution.
+pub(super) fn join_keeps_input(a: &Node, b: &Node) -> bool {
+    let unit = |n: &Node| n.vars.is_empty() && matches!(&n.kind, Kind::Values(t) if t.len() == 1);
+    !a.is_empty() && !b.is_empty() && (unit(a) || unit(b))
 }
 
 /// Best single join of two plans (used outside the DP).
