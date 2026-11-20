@@ -228,7 +228,7 @@ longer, and [roadmap item 1240](../../ROADMAP.md) holds both costs with their re
 In the streamed `distinct-two-wide` pass the processes of B took 32.2 to 33.8 ms by
 median and those of A 31.0 to 33.6 ms, with no trend across the run. The same query
 under automatic execution shows no difference. `distinct-obj` and `predicate-subjects`
-take 4 to 9 µs, below what this harness resolves, and showed no consistent change. The
+take 4 to 9 µs, below what this harness resolves, and showed no slowdown. The
 [run record](records/charged-distinct-2026-11-20/README.md) holds the samples, the
 answers and the host's frequency and memory readings.
 
