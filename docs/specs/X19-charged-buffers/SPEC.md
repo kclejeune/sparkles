@@ -73,8 +73,10 @@ counted heap with the bytes the query has admitted, read exactly through the hid
 both sides again. A pool grant's `used` grows in steps of 64 KiB and is given back only
 1 MiB late, so the audit never reads it.
 
-The meter holds its lock across the system call of every counted allocation, and of
-every free and reallocation while a counted block may be live. A counted block's life is
+The meter holds its lock across the system call of every allocation, free and
+reallocation of a counted thread, and of every free and reallocation of another thread
+while a counted block may be live. A counted thread reads under the lock whether a window
+is open. A counted block's life is
 then one ordered sequence of system calls and counts, so the live bytes are exactly what
 the system holds of the counted blocks, whatever a second counted thread does at the
 same moment. A meter that counts after the system call, or uncounts before it, reads
@@ -83,9 +85,19 @@ allocates during a free. The meter's own test stops a counted thread at each of 
 three sites and has a second counted thread make the opposite call there, and it fails
 when the system calls move outside the lock. The window opens and closes under the same
 lock, and its peak is read as it closes, so no call is half counted at either edge. A
+test stops the window as it opens, holding the lock, while a counted thread allocates,
+frees or grows a block from before the window, and requires the call to wait for the
+lock and to count its new block alone. Another stops an allocation between its system
+call and its count while the window closes, and requires the close to wait and read the
+block. A
 block the window counted stays counted when any thread reallocates it, as a free lowers
 the count whichever thread frees it. The meter's pointer to the audited query's counter
-is set and cleared under the lock too, so no allocation reads a counter that is gone.
+is set and cleared under the lock too, so no allocation reads a counter that is gone. A
+test stops a counted thread after it reads the pointer and before it follows it, drops
+the watch on another thread normally and while a panic unwinds, and requires the drop to
+wait for the lock. A window that a panic leaves is closed, a window whose block table
+filled gives no reading even once its blocks are freed, and the next window starts
+clean, which their own tests check.
 The lock serializes the counted threads'
 allocations while a window is open, which slows the audited fixtures and nothing else.
 

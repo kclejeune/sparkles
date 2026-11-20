@@ -15,9 +15,12 @@
 //! either direction. The counted threads are the one thread of the Rayon pool that runs
 //! each audited query, which also takes the query's parallel work, and the engine's
 //! block decoders, which a query waits for. The allocator holds its lock across the
-//! system call of each counted allocation, free and reallocation, so a second counted
-//! thread cannot free or allocate between a system call and its count, and the reading
-//! is exact whatever the counted threads do at once. A reallocated block counts its old
+//! system call of each allocation, free and reallocation of a counted thread, and of a
+//! free or reallocation of another thread while a block may be counted, so a second
+//! counted thread cannot free or allocate between a system call and its count, and the
+//! reading is exact whatever the counted threads do at once. A counted thread reads
+//! under the lock whether the window is open, so a window that opens or closes during
+//! one of its calls counts the whole call or none of it. A reallocated block counts its old
 //! and new sizes together, whether it moves or grows in place, as `Charged::grow`
 //! admits it, and `AUDIT_REALLOC=exact` counts one that stays in place at its larger
 //! size.
@@ -92,19 +95,22 @@ fn slot(address: usize) -> usize {
     (address >> 3).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (usize::BITS - SLOTS.trailing_zeros())
 }
 
-/// The meter's own test stops a counted thread at one site of the allocator, after
-/// the system call and before the count settles, to let another counted thread make
-/// the opposite call there. `HOOK` names the site, 1 for `alloc`, 2 for `dealloc` and
-/// 3 for `realloc`, and is cleared when the stop is taken. `REACHED` reports the stop
-/// to the other thread. The stop ends when the other thread has found the meter's lock
-/// held, which `CONTENDED` reports, or when its call has returned, which it reports with
-/// `DONE`. `OVERLAPPED` reads `DONE` as the stop ends, which is whether the other call
-/// ran inside the site.
+/// The meter's own tests stop a counted thread at one site of the allocator, to let
+/// another thread act there. `HOOK` names the site and is cleared when the stop is
+/// taken. Sites 1 for `alloc`, 2 for `dealloc` and 3 for `realloc` lie after the system
+/// call and before the count settles, site 4 lies in `open` under the lock before it
+/// publishes the window, and site 5 lies after `sample` reads the meter's pointer and before it
+/// follows it. `REACHED` reports the stop to the other thread. The stop ends when the
+/// other thread has found the meter's lock held, which `CONTENDED` reports, or when its
+/// action has finished, which it reports with `DONE`. `OVERLAPPED` reads `DONE` as the
+/// stop ends, which is whether the other action ran inside the site.
 pub static HOOK: AtomicUsize = AtomicUsize::new(0);
 pub static REACHED: AtomicBool = AtomicBool::new(false);
 pub static DONE: AtomicBool = AtomicBool::new(false);
 pub static CONTENDED: AtomicBool = AtomicBool::new(false);
 pub static OVERLAPPED: AtomicBool = AtomicBool::new(false);
+/// Whether a stop at site 5 ended with the meter's pointer gone from under the reader.
+pub static STALE: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     /// Whether this thread takes the stop, and whether it reports finding the lock
@@ -160,6 +166,11 @@ fn sample(live: usize) {
     PEAK.fetch_max(live, Ordering::Relaxed);
     let m = METER.load(Ordering::Relaxed);
     if !m.is_null() {
+        pause(5);
+        // The meter's own test reads whether the watch was dropped during the stop.
+        if METER.load(Ordering::Relaxed) != m {
+            STALE.store(true, Ordering::SeqCst);
+        }
         // SAFETY: `audit` keeps the meter alive for as long as the pointer is set, and
         // the tests that set it hold the serial lock.
         let admitted = unsafe { (*m).live_bytes() } as i64;
@@ -237,33 +248,40 @@ fn forget(address: usize) -> Option<usize> {
     Some(size)
 }
 
-/// Whether a free or a reallocation must take the lock: while a window is open, or
-/// while the table holds a block that a window counted.
+/// Whether a free or a reallocation on a thread that does not count must take the lock:
+/// while a window is open, or while the table holds a block that a window counted. A
+/// counted thread always takes it and decides under it. A thread that does not count
+/// can free or reallocate a counted block only after the thread that allocated it
+/// handed it over, which orders the block's count before this read, so the read sees
+/// the block in the table.
 fn watched() -> bool {
     OPEN.load(Ordering::Relaxed) || BLOCKS.load(Ordering::Relaxed) > 0
 }
 
-// The meter holds `LOCK` across the system call of every counted allocation, and of
-// every free and reallocation while a block could be counted. A counted block's life
-// is then one ordered sequence of system calls and counts, so the live bytes are
-// exactly what the system holds of the counted blocks at each count, whatever another
-// counted thread does at the same time. Without it, a free on another thread between a
-// system call and its count hides the peak, and an allocation on another thread
-// between a count and the free it stands for is read without the block the system
-// still holds. The system allocator never calls back into `Counting`, so the lock is
-// never taken twice by one thread. Allocations on threads that do not count take no
-// lock. The lock serializes the counted threads' allocations while a window is open,
-// which the audit's fixtures accept.
+// The meter holds `LOCK` across the system call of every allocation, free and
+// reallocation of a counted thread, and of every free and reallocation of another
+// thread while a block could be counted. A counted thread reads under the lock whether
+// a window is open, so a window that opens or closes meanwhile cannot split one of its
+// calls. A counted block's life is then one ordered sequence of system calls and
+// counts, so the live bytes are exactly what the system holds of the counted blocks at
+// each count, whatever another counted thread does at the same time. Without it, a free
+// on another thread between a system call and its count hides the peak, and an
+// allocation on another thread between a count and the free it stands for is read
+// without the block the system still holds. The system allocator never calls back into
+// `Counting`, so the lock is never taken twice by one thread. Allocations on threads
+// that do not count take no lock. The lock serializes the counted threads' calls, which
+// the audit's fixtures accept.
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        if !(OPEN.load(Ordering::Relaxed) && counted()) {
+        if !counted() {
             return unsafe { System.alloc(l) };
         }
+        // Whether the window is open is read under the lock, so a window that opens or
+        // closes while this thread waits for it either counts the whole allocation or
+        // none of it.
         locked(|| {
             let p = unsafe { System.alloc(l) };
             pause(1);
-            // A window that closed while this thread waited for the lock counts no
-            // more blocks.
             if !p.is_null() && OPEN.load(Ordering::Relaxed) {
                 count(p as usize, l.size());
             }
@@ -271,7 +289,7 @@ unsafe impl GlobalAlloc for Counting {
         })
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
-        if !watched() {
+        if !(counted() || watched()) {
             return unsafe { System.dealloc(p, l) };
         }
         locked(|| {
@@ -281,7 +299,7 @@ unsafe impl GlobalAlloc for Counting {
         });
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        if !watched() {
+        if !(counted() || watched()) {
             return unsafe { System.realloc(p, l, new) };
         }
         locked(|| {
@@ -359,6 +377,7 @@ fn open() -> Window {
         PEAK.store(0, Ordering::Relaxed);
         WITHIN.store(i64::MIN, Ordering::Relaxed);
         FULL.store(false, Ordering::Relaxed);
+        pause(4);
         OPEN.store(true, Ordering::Relaxed);
     });
     Window { open: true }
@@ -429,6 +448,171 @@ impl Drop for Watch<'_> {
     fn drop(&mut self) {
         locked(|| METER.store(std::ptr::null_mut(), Ordering::Relaxed));
     }
+}
+
+/// The most blocks the table takes before it fills.
+pub const TABLE: usize = SLOTS / 2;
+
+/// Whether a window is open, for the meter's own tests.
+pub fn is_open() -> bool {
+    OPEN.load(Ordering::SeqCst)
+}
+
+/// Clear the flags of a stop before a race case.
+fn reset_stop() {
+    for flag in [&REACHED, &DONE, &CONTENDED, &OVERLAPPED, &STALE] {
+        flag.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Wait for a stop to be taken, reading no clock but `Instant`, which does not
+/// allocate, and fail after ten seconds.
+fn await_stop() {
+    let start = std::time::Instant::now();
+    while !REACHED.load(Ordering::SeqCst) {
+        assert!(start.elapsed().as_secs() < 10, "the stop was never reached");
+        std::hint::spin_loop();
+    }
+}
+
+/// A block of one MiB on a counted thread that does not stop.
+const MIB: usize = 1 << 20;
+
+/// The opening boundary. The window stops as it opens, holding the lock before it
+/// publishes itself, and a counted thread then makes `call`: 1 allocates a block of one
+/// MiB, 2 frees a block of a quarter MiB from before the window, and 3 grows that block
+/// to one MiB. The call must wait for the lock and see the window. It gives the bytes
+/// the window holds after the call, whether the call found the lock held, and whether
+/// it finished inside the stop.
+pub fn opening_race(call: usize) -> (usize, bool, bool) {
+    pool().install(|| {
+        reset_stop();
+        let old = std::hint::black_box(Vec::<u8>::with_capacity(MIB / 4));
+        let thread = std::thread::spawn(move || {
+            COUNTED.set(true);
+            CONTENDS.set(true);
+            await_stop();
+            let block = match call {
+                1 => Some(std::hint::black_box(Vec::<u8>::with_capacity(MIB))),
+                2 => {
+                    drop(old);
+                    None
+                }
+                _ => {
+                    let mut old = old;
+                    old.reserve_exact(MIB);
+                    Some(old)
+                }
+            };
+            DONE.store(true, Ordering::SeqCst);
+            CONTENDS.set(false);
+            block
+        });
+        STOPS.set(true);
+        HOOK.store(4, Ordering::SeqCst);
+        let window = open();
+        STOPS.set(false);
+        let block = thread.join().unwrap();
+        let held = live();
+        drop(block);
+        window.close();
+        (
+            held,
+            CONTENDED.load(Ordering::SeqCst),
+            OVERLAPPED.load(Ordering::SeqCst),
+        )
+    })
+}
+
+/// The closing boundary. A counted thread stops in `alloc` between the system call of
+/// a block of one MiB and its count, and the window then closes, which must wait for
+/// the count. It gives the window's peak and whether the closer found the lock held.
+pub fn closing_race() -> (usize, bool) {
+    pool().install(|| {
+        let window = open();
+        reset_stop();
+        HOOK.store(1, Ordering::SeqCst);
+        let thread = std::thread::spawn(|| {
+            COUNTED.set(true);
+            STOPS.set(true);
+            let block = std::hint::black_box(Vec::<u8>::with_capacity(MIB));
+            STOPS.set(false);
+            block
+        });
+        await_stop();
+        CONTENDS.set(true);
+        let (peak, _) = window.close();
+        CONTENDS.set(false);
+        DONE.store(true, Ordering::SeqCst);
+        drop(thread.join().unwrap());
+        HOOK.store(0, Ordering::SeqCst);
+        (peak, CONTENDED.load(Ordering::SeqCst))
+    })
+}
+
+/// What a teardown race showed: whether the teardown found the lock held while the
+/// reader was stopped, whether the teardown finished inside the stop, whether the
+/// pointer the reader held was gone as its stop ended, and whether the watch was
+/// dropped while a panic unwound.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Teardown {
+    pub contended: bool,
+    pub overlapped: bool,
+    pub stale: bool,
+    pub unwound: bool,
+}
+
+/// The watch's teardown against a reader of the meter's pointer. A counted thread
+/// stops in `sample` after it read the pointer and before it follows it, and another
+/// thread then drops the watch, normally or while a panic unwinds. The drop must wait
+/// for the read, so the meter it borrows is never followed after the watch is gone.
+/// The tearing thread does not count, so the panic it raises takes no lock.
+pub fn watch_teardown_race(meter: &MemoryMeter, unwind: bool) -> Teardown {
+    static WATCHING: AtomicBool = AtomicBool::new(false);
+    pool().install(|| {
+        let window = open();
+        reset_stop();
+        WATCHING.store(false, Ordering::SeqCst);
+        let unwound = std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                COUNTED.set(true);
+                STOPS.set(true);
+                while !WATCHING.load(Ordering::SeqCst) {
+                    std::hint::spin_loop();
+                }
+                HOOK.store(5, Ordering::SeqCst);
+                drop(std::hint::black_box(Vec::<u8>::with_capacity(MIB)));
+                STOPS.set(false);
+            });
+            let teardown = s.spawn(|| {
+                CONTENDS.set(true);
+                let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let watch = Watch::new(meter);
+                    WATCHING.store(true, Ordering::SeqCst);
+                    await_stop();
+                    if unwind {
+                        std::panic::resume_unwind(Box::new(()));
+                    }
+                    drop(watch);
+                }))
+                .is_err();
+                DONE.store(true, Ordering::SeqCst);
+                CONTENDS.set(false);
+                unwound
+            });
+            let unwound = teardown.join().unwrap();
+            reader.join().unwrap();
+            unwound
+        });
+        HOOK.store(0, Ordering::SeqCst);
+        window.close();
+        Teardown {
+            contended: CONTENDED.load(Ordering::SeqCst),
+            overlapped: OVERLAPPED.load(Ordering::SeqCst),
+            stale: STALE.load(Ordering::SeqCst),
+            unwound,
+        }
+    })
 }
 
 /// What an audited cursor showed. `within` is the largest excess of the counted heap

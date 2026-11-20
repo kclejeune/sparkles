@@ -794,6 +794,112 @@ fn the_meter_counts_the_window_of_the_counted_thread_alone() {
     assert!((least..3 * MIB + MIB / 4).contains(&peak), "{peak}");
 }
 
+/// A window that opens or closes while a counted thread calls the allocator counts the
+/// whole call. A counted thread decides under the allocator's lock whether a window is
+/// open, and the window opens and closes under the lock.
+#[test]
+fn the_meter_counts_an_allocation_at_the_window_boundaries() {
+    let _serial = heap::serial();
+    const MIB: usize = 1 << 20;
+    // An allocation and a reallocation count their new block, and the reallocated
+    // block from before the window counts at its new size alone. A free of a block
+    // from before the window counts nothing, and waits like the others.
+    let mut found = Vec::new();
+    for (call, least) in [(1, MIB), (2, 0), (3, MIB)] {
+        let (held, contended, overlapped) = heap::opening_race(call);
+        if !contended {
+            found.push(format!(
+                "call {call} never found the opening window's lock held"
+            ));
+        }
+        if overlapped {
+            found.push(format!("call {call} finished while the window was opening"));
+        }
+        if !(least..least + MIB / 8).contains(&held) {
+            found.push(format!(
+                "call {call}: the window that opened during it holds {held} bytes"
+            ));
+        }
+    }
+    assert!(found.is_empty(), "{found:#?}");
+    let (peak, contended) = heap::closing_race();
+    assert!(contended, "the closer never found the lock held");
+    assert!(
+        (MIB..MIB + MIB / 4).contains(&peak),
+        "the window that closed during the allocation read {peak}"
+    );
+}
+
+/// The watch that lets the allocator read the meter waits, as it is dropped, for a
+/// reader that has its pointer, so the meter is never read after the watch is gone. It
+/// waits on a normal drop and on a drop while a panic unwinds.
+#[test]
+fn the_watch_waits_for_a_reader_of_the_meter() {
+    let _serial = heap::serial();
+    let s = Store::in_memory(StoreOptions::default());
+    let opts = QueryOptions {
+        no_cache: true,
+        ..Default::default()
+    };
+    let c = select_cursor(
+        s.snapshot(),
+        "SELECT * WHERE { ?s ?p ?o }",
+        &opts,
+        &CursorOptions::default(),
+    )
+    .unwrap();
+    let meter = c.memory_meter();
+    let read = [false, true].map(|unwind| heap::watch_teardown_race(&meter, unwind));
+    let expected = [false, true].map(|unwind| heap::Teardown {
+        contended: true,
+        overlapped: false,
+        stale: false,
+        unwound: unwind,
+    });
+    assert_eq!(read, expected);
+}
+
+/// A window closes while a panic unwinds out of it, and the next window reads only its
+/// own blocks.
+#[test]
+fn a_window_closes_when_a_panic_leaves_it() {
+    let _serial = heap::serial();
+    const MIB: usize = 1 << 20;
+    let left = std::panic::catch_unwind(|| {
+        heap::peak(|| {
+            let block = std::hint::black_box(Vec::<u8>::with_capacity(4 * MIB));
+            std::panic::resume_unwind(Box::new(block));
+        })
+    });
+    assert!(left.is_err());
+    assert!(!heap::is_open(), "the window stayed open after the panic");
+    let (_, peak) = heap::peak(|| drop(std::hint::black_box(Vec::<u8>::with_capacity(MIB))));
+    assert!((MIB..MIB + MIB / 4).contains(&peak), "{peak}");
+}
+
+/// A window whose block table filled voids its reading, even once the blocks are freed,
+/// and the next window starts with an empty table.
+#[test]
+fn a_full_block_table_voids_the_window() {
+    let _serial = heap::serial();
+    const MIB: usize = 1 << 20;
+    let filled = std::panic::catch_unwind(|| {
+        heap::peak(|| {
+            let blocks: Vec<Box<u8>> = (0..=heap::TABLE).map(|_| Box::new(0)).collect();
+            drop(std::hint::black_box(blocks));
+        })
+    });
+    let payload = filled.expect_err("a window whose table filled gave a reading");
+    let message = payload
+        .downcast_ref::<&str>()
+        .map(|m| m.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_default();
+    assert!(message.contains("table filled"), "{message}");
+    let (_, peak) = heap::peak(|| drop(std::hint::black_box(Vec::<u8>::with_capacity(MIB))));
+    assert!((MIB..MIB + MIB / 4).contains(&peak), "{peak}");
+}
+
 /// One case of the meter's race test, run on the counted thread. See its caller.
 fn meter_race(site: usize) -> bool {
     const MIB: usize = 1 << 20;
