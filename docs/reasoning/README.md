@@ -457,7 +457,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   2,097,152, `Limits::dl_attempt_work`, past which it falls back in the same way and sets
   `Stats::dl_attempt_over` too. The attempts that finish on the ORE 2015 DL development
   set stay far within it, and those that cannot finish pass it well before their memory
-  budget. On several threads a schedule can decide the outcome of a run that derives
+  budget. On one thread the run also falls back when one product of its case analysis has
+  more than `Limits::dl_attempt_width` choices, 1,048,576 by default, which the attempts
+  that finish there stay far below. On several threads a schedule can decide the outcome of a run that derives
   about the bound. With `Limits::partial`, a run of the
   disjunctive rules that its deadline, cancellation or memory budget stops returns the
   subsumptions it proved, with `Classification::complete` false, the classes it may have

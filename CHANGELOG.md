@@ -28,6 +28,17 @@ selection. The completeness of the rooted run is
 still not proved. shoi-005 and shoi-027 now pass the work bound and give the default
 answer, with the axioms it leaves out and the fallback in its statistics, so 46 of the 50
 `shoi` fixtures finish against 48.
+### Cheaper disjunctive attempts, and a width limit on one thread
+
+The pruning of the disjunctive rules' product lists compares sides by a signature and a
+sorted merge, and the Pred rule no longer copies its lists for a fixed premise. The attempts
+derive the same conclusions and take 0.80 to 0.91 times the instructions on six
+attempts of the ORE 2015 DL development set. On one thread an attempt also ends at a product
+of more than `Limits::dl_attempt_width` choices, 1,048,576 by default, so that
+`ore_ont_14817` and `ore_ont_9663` fall back to the Horn rules after 0.5 and 4 million
+conclusions instead of 22.4 million, in 25.6 and 51.1 G instructions against 584 and 700 G,
+with the same taxonomies (roadmap items 990 and 1011). `el_classify --dl-attempt-width N`
+sets the limit, and roadmap item 1220 follows why one thread makes such wide products.
 
 ### Targeted checks on a remote host
 

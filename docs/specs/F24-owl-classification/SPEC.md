@@ -338,6 +338,40 @@ kept run counts the conclusions of the runs before it, as
 and item 1010 follows the edits after which a kept and a fresh run fall on two sides of the
 bound. Item 1011 follows the bound's form on other ontologies.
 
+Item 1011 found what the attempts spend beyond their counted conclusions. On one thread
+on the laptop the attempt took about 703 of the 725 G instructions of ore_ont_14817's
+classification and 829 of 857 G on ore_ont_9663, and its cost per conclusion grew as its
+clause stores grew, so that ore_ont_14817 took 5.1, 7.9, 19.3, 47.6 and 96.6 s with bounds
+of 1, 4, 8, 16 and 22.4 million conclusions. Half of the time went into the products of
+the rules, whose choices below 4,096 unions a step count nothing toward the bound, and a
+fifth into pruning their lists. The pruning of a product's lists now compares two sides by
+a signature of their literals and then by a merge of the sorted literals, where it searched
+each literal, and keeps the same sides in the same order. The Pred rule with a fixed
+premise moves its lists into the last product instead of copying them. The 96 disjunctive
+files of the development set derive the same conclusions, products and clauses at every
+doubling of the work, with the same estimated bytes and taxonomies. The classifications
+take 0.80 to 0.91 times the base's instructions on the six attempts counted, and on the
+loaded laptop the attempts took about half the time, such as 91 against 184 s on
+ore_ont_14817 on one thread.
+
+On one thread an attempt also ends when one product of its rules has more choices than
+`Limits::dl_attempt_width`, 1,048,576 by default. The 12 attempts of the development set
+that finish make products of at most 256 choices on one thread, and the 2,166 generated
+ontologies of item 969 with a union of at most 3,645. ore_ont_14817 makes a product of
+120 million choices after 0.5 million conclusions, and ore_ont_9663 one of 4.2 million
+after 4 million, where the bound is 22.4 million. Their classifications on one thread take
+25.6 and 51.1 G instructions against 584 and 700 G without the limit, with the same
+taxonomies, and every other file of the two sweeps keeps its answer and its statistics.
+The width of a product depends on the order in which contexts receive their premises. On
+four and eight threads the finishing attempts make products of up to 22,500 choices,
+ore_ont_9663 of at most 22,707 and ore_ont_14817 of 1.7 million after about 10 million
+conclusions, so the width does not tell an attempt that finishes from one that cannot,
+and a run on more threads has no limit on it. On one thread the order is fixed, and the
+widest product of ore_ont_9663 falls from 999 million choices on one thread to 1.3 million
+on two and 22,707 on four, with 355, 71 and 24 million choices made by the products'
+steps, which item 1220 follows. A kept run whose product passes the limit starts again in
+full, as past the bound on conclusions.
+
 Item 869 found where the Horn rules with individuals spend their time on four files of
 the ORE 2015 DL development set with 7,856 to 114,957 property assertions,
 `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`. A diagnostic build
@@ -1892,7 +1926,8 @@ Horn rules, leaves the axioms that need case analysis out and reports them, and 
 `Stats::dl_over_budget`. A run that neither counts nor is rooted also has a bound on the
 conclusions it derives, `Limits::dl_attempt_work`, of 384 for each class of the signature
 and at least 2,097,152, past which it falls back in the same way and sets
-`Stats::dl_attempt_over` too (item 990). ore_ont_3215 of the ORE 2015 DL sample, with
+`Stats::dl_attempt_over` too (item 990). On one thread such a run also falls back when one
+product of its rules has more than `Limits::dl_attempt_width` choices (item 1011). ore_ont_3215 of the ORE 2015 DL sample, with
 18,323 unions over a transitive property, needs this, item 713.
 
 Counting is part of the same rules and is off by default. `Limits::counting` turns it on,
