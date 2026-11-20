@@ -1103,6 +1103,15 @@ impl Store {
     /// The first maximal literal of a processed clause that `p` takes. Without a rooted
     /// order a clause has one maximal literal, which [`Stored::max`] holds.
     #[inline]
+    /// Every maximal literal of the processed clause `i`.
+    pub fn maxes(&self, i: u32) -> impl Iterator<Item = Lit> + '_ {
+        let multi = self.multi.get(&i);
+        let first = self.clauses[i as usize].max.filter(|_| multi.is_none());
+        first
+            .into_iter()
+            .chain(multi.into_iter().flat_map(|m| m.iter().copied()))
+    }
+
     pub fn max_of(&self, i: u32, p: impl Fn(Lit) -> bool) -> Option<Lit> {
         match self.clauses[i as usize].max {
             Some(l) if p(l) => Some(l),

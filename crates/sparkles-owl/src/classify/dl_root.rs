@@ -1391,18 +1391,27 @@ fn marker_detail() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_MARKER_DIAG").is_some_and(|v| v == "2"))
 }
 
-/// Row 1231's decline, which `SPARKLES_ROOTED_MARKER_DECLINE=t` turns on for tier t of
-/// [`marker_trips`]: a finished run with a trip at that tier makes no claim. It ends as a run
-/// of Tier D past its budget does, so the classifier answers by the Horn rules and reports
-/// `dl_over_budget`, not `dl_rooted_over`.
-pub(super) fn marker_decline() -> Option<usize> {
-    static ON: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("SPARKLES_ROOTED_MARKER_DECLINE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-    })
+/// The tier of [`marker_trips`] at which row 1231's decline withdraws a rooted run's answer,
+/// or `None` for no decline. A finished rooted run with a pair at that tier makes no claim:
+/// the classifier starts again without the rooted rules and reports
+/// `Stats::dl_rooted_declined`. `on` is [`Limits::rooted_decline`](super::Limits), which
+/// gives tier 4, and `SPARKLES_ROOTED_MARKER_DECLINE` overrides it for measurements, with
+/// `off` for no decline or a tier.
+pub(super) fn marker_decline(on: bool) -> Option<usize> {
+    static ENV: std::sync::OnceLock<Option<Option<usize>>> = std::sync::OnceLock::new();
+    let env = *ENV.get_or_init(|| {
+        let v = std::env::var("SPARKLES_ROOTED_MARKER_DECLINE").ok()?;
+        Some(if v == "off" {
+            None
+        } else {
+            v.parse().ok().filter(|&t| t < MARKER_TIERS)
+        })
+    });
+    env.unwrap_or(if on { Some(MARKER_DECLINE_TIER) } else { None })
 }
+
+/// The tier of [`marker_trips`] at which the decline is on by default.
+pub(super) const MARKER_DECLINE_TIER: usize = 4;
 
 /// The tiers of [`marker_trips`].
 pub(super) const MARKER_TIERS: usize = 5;
@@ -1432,15 +1441,21 @@ pub(super) fn marker_ctx(
     let inv = inv_of(ix, dx);
     let is_root = dx.root == Some(me);
     let mut held = Vec::new();
-    if let Some(r) = x.root.as_deref() {
+    if let Some(r) = x.root.as_deref()
+        && !r.ground.is_empty()
+    {
+        // every maximal literal of a processed clause other than a marker, dead or not,
+        // since a clause can have several and Stored::max holds the first
+        let ground: FxHashSet<Lit> = r.ground.iter().copied().collect();
+        let mut own: FxHashSet<Lit> = FxHashSet::default();
+        for i in 0..x.store.clauses.len() as u32 {
+            if is_marker(&x.store.clauses[i as usize].c) {
+                continue;
+            }
+            own.extend(x.store.maxes(i).filter(|m| ground.contains(m)));
+        }
         for &l in &r.ground {
-            // every maximal literal of a processed clause, dead or not, since a clause
-            // can have several and Stored::max holds the first
-            let own = (0..x.store.clauses.len() as u32).any(|i| {
-                x.store.max_of(i, |m| m == l).is_some()
-                    && !is_marker(&x.store.clauses[i as usize].c)
-            });
-            if own && ground_trigger(lits.view(l, inv)) {
+            if own.contains(&l) && ground_trigger(lits.view(l, inv)) {
                 held.push(l);
             }
         }
@@ -1472,11 +1487,13 @@ pub(super) fn marker_ctx(
 /// no fact of the root. The tiers leave out more contexts in turn: tier 0 leaves out only
 /// the holder and its successors, tier 1 also the holder's predecessors, tier 2 also the
 /// constant's singleton context, tier 3 also the contexts that the root does not reach,
-/// and tier 4 also the root's own successors.
+/// and tier 4 also the root's own successors. With `stop`, and without the pairs on
+/// stderr, the count ends at the first pair of that tier, which is all a decline needs.
 pub(super) fn marker_trips(
     ix: &Index,
     cs: &[MarkerCtx],
     lits: &super::dl_clause::Lits,
+    stop: Option<usize>,
 ) -> [[usize; 3]; MARKER_TIERS] {
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
@@ -1484,6 +1501,8 @@ pub(super) fn marker_trips(
     let Some(root) = dx.root else { return out };
     let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
     let Some(&ri) = by.get(&root) else { return out };
+    let detail = marker_detail();
+    let stop = stop.filter(|_| !detail);
     let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
     let edges: FxHashMap<u32, &[Ex]> = cs[ri].edges.iter().map(|(u, v)| (*u, &v[..])).collect();
     let mut preds: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
@@ -1516,8 +1535,9 @@ pub(super) fn marker_trips(
         if c.me == root || c.held.is_empty() {
             continue;
         }
-        let down = reach(c.me, &succ_of);
-        let up = reach(c.me, &pred_of);
+        // the holder's successors and predecessors, found only when a pair needs them
+        let down: std::cell::OnceCell<FxHashSet<Ex>> = std::cell::OnceCell::new();
+        let up: std::cell::OnceCell<FxHashSet<Ex>> = std::cell::OnceCell::new();
         for &l in &c.held {
             if units.contains(&l) {
                 continue;
@@ -1535,21 +1555,34 @@ pub(super) fn marker_trips(
             regs.sort_unstable_by_key(|&(_, d)| d);
             regs.dedup_by_key(|p| p.1);
             for (_, d) in regs {
-                if d == root || down.contains(&d) {
+                if d == root {
                     continue;
                 }
-                let mut tier = 0;
+                // the tiers that need no search first, so that a decline skips the
+                // searches of the pairs it cannot use
+                let single = !us.iter().any(|v| {
+                    singleton.get(v) == Some(&d) || super::dl_rules::singleton_of(ix, d) == Some(*v)
+                });
+                let reached = from_root.contains(&d);
+                let direct = !root_succ.contains(&d);
+                if let Some(t) = stop
+                    && ![single, reached, direct][..t.saturating_sub(1).min(3)]
+                        .iter()
+                        .all(|&k| k)
+                {
+                    continue;
+                }
+                if down.get_or_init(|| reach(c.me, &succ_of)).contains(&d) {
+                    continue;
+                }
                 let keep = [
                     true,
-                    !up.contains(&d),
-                    !us.iter().any(|v| {
-                        singleton.get(v) == Some(&d)
-                            || super::dl_rules::singleton_of(ix, d) == Some(*v)
-                    }),
-                    from_root.contains(&d),
-                    !root_succ.contains(&d),
+                    !up.get_or_init(|| reach(c.me, &pred_of)).contains(&d),
+                    single,
+                    reached,
+                    direct,
                 ];
-                if marker_detail() {
+                if detail {
                     let t = keep.iter().take_while(|&&k| k).count();
                     eprintln!(
                         "MARKER-PAIR tier<={} holder={} lit={} ctx={d}",
@@ -1558,11 +1591,15 @@ pub(super) fn marker_trips(
                         super::dl_rules::tr(ix, lits, &[l])
                     );
                 }
+                let mut tier = 0;
                 while tier < MARKER_TIERS && keep[..=tier].iter().all(|&k| k) {
                     out[tier][2] += 1;
                     trig[tier].insert(l);
                     kons[tier].extend(us.iter().copied());
                     tier += 1;
+                }
+                if stop.is_some_and(|t| out[t][2] > 0) {
+                    return out;
                 }
             }
         }

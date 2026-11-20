@@ -228,16 +228,6 @@ fn main() {
             eprintln!("excluded {:?}: {:?}", e.gap, e.axiom);
         }
     }
-    let outside = excluded
-        .iter()
-        .filter(|e| matches!(e.gap, Gap::Outside { .. }))
-        .count();
-    let mut partial: std::collections::BTreeMap<&str, usize> = Default::default();
-    for e in &excluded {
-        if let Gap::Partial(why) = e.gap {
-            *partial.entry(why).or_default() += 1;
-        }
-    }
     if let Some(path) = &tax_out {
         let t = &out.taxonomy;
         let mut lines: Vec<String> = Vec::new();
@@ -268,43 +258,19 @@ fn main() {
         v.sort_by(|a, b| a.total_cmp(b));
         v[v.len() / 2]
     };
-    println!(
-        "{}",
-        serde_json::json!({
+    let mut report = answer(&out, &excluded, rules);
+    let rest = serde_json::json!({
             "input": input,
             "axioms": axioms.len(),
             "classes": out.taxonomy.classes().count(),
             "nodes": out.taxonomy.nodes().len(),
             "unsatisfiable": out.taxonomy.unsatisfiable().count(),
             "consistent": out.consistent,
-            "complete": out.complete,
-            "incomplete": out.incomplete.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            "consistency": match out.consistency {
-                sparkles_owl::classify::Consistency::Consistent => "consistent",
-                sparkles_owl::classify::Consistency::Inconsistent => "inconsistent",
-                sparkles_owl::classify::Consistency::Unknown => "unknown",
-            },
-            "outside": outside + rules,
-            "rules": rules,
-            "tier": s.tier.as_str(),
-            "outsideHorn": s.outside_el.horn,
-            "outsideDisjunctive": s.outside_el.disjunctive,
-            "outsideGlobal": s.outside_el.global,
-            "outsideTaken": s.outside_el.taken,
-            "conjunctions": s.conjunctions,
-            "hornOverBudget": s.horn_over_budget,
-            "clauses": s.clauses,
-            "dlContexts": s.dl_contexts,
-            "dlOverBudget": s.dl_over_budget,
             "dlTests": s.dl_tests,
             "dlStored": s.dl_stored,
             "dlWork": s.dl_work,
-            "dlCountingOver": s.dl_counting_over,
-            "dlRootedOver": s.dl_rooted_over,
-            "dlAttemptOver": s.dl_attempt_over,
             "dlTestsHeld": s.dl_tests_held,
             "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
-            "partial": partial,
             "threads": s.threads,
             "readMs": read_ms,
             "classifyMs": times,
@@ -320,6 +286,98 @@ fn main() {
             "peakRssKibAfterRead": rss_read,
             "peakRssKib": peak_rss_kib(),
             "peakHeapBytes": heap.then(|| PEAK.load(Ordering::Relaxed)),
-        })
-    );
+    });
+    if let (Some(r), serde_json::Value::Object(m)) = (report.as_object_mut(), rest) {
+        r.extend(m);
+    }
+    println!("{report}");
+}
+
+/// The fields of the report that say what the answer claims: whether it is complete, the
+/// axioms it left out and the fallbacks it took. An answer claims every subsumption only
+/// when `complete` is true, `incomplete` is empty, `outside` is 0 and no fallback is set.
+fn answer(
+    out: &sparkles_owl::classify::Classification,
+    excluded: &[sparkles_owl::classify::Excluded],
+    rules: usize,
+) -> serde_json::Value {
+    let s = &out.stats;
+    let outside = excluded
+        .iter()
+        .filter(|e| matches!(e.gap, Gap::Outside { .. }))
+        .count();
+    let mut partial: std::collections::BTreeMap<&str, usize> = Default::default();
+    for e in excluded {
+        if let Gap::Partial(why) = e.gap {
+            *partial.entry(why).or_default() += 1;
+        }
+    }
+    serde_json::json!({
+        "complete": out.complete,
+        "incomplete": out.incomplete.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        "consistency": match out.consistency {
+            sparkles_owl::classify::Consistency::Consistent => "consistent",
+            sparkles_owl::classify::Consistency::Inconsistent => "inconsistent",
+            sparkles_owl::classify::Consistency::Unknown => "unknown",
+        },
+        "outside": outside + rules,
+        "rules": rules,
+        "tier": s.tier.as_str(),
+        "outsideHorn": s.outside_el.horn,
+        "outsideDisjunctive": s.outside_el.disjunctive,
+        "outsideGlobal": s.outside_el.global,
+        "outsideTaken": s.outside_el.taken,
+        "hornOverBudget": s.horn_over_budget,
+        "dlOverBudget": s.dl_over_budget,
+        "dlCountingOver": s.dl_counting_over,
+        "dlRootedOver": s.dl_rooted_over,
+        "dlRootedDeclined": s.dl_rooted_declined,
+        "dlAttemptOver": s.dl_attempt_over,
+        "partial": partial,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rooted run that withdraws its answer (roadmap item 1231) claims nothing in the
+    /// report, and says why.
+    #[test]
+    fn a_declined_rooted_answer_claims_nothing_in_the_report() {
+        let text = "Prefix(:=<http://example.org/h#>)
+            Ontology(<http://example.org/h>
+            SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+            SubClassOf(:K ObjectHasValue(:q :v))
+            SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+            ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+            SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+            SubClassOf(:E ObjectHasValue(:r2 :w))
+            SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+            SubClassOf(:C2 ObjectHasValue(:s :v))
+            SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+            SubClassOf(:Q ObjectUnionOf(:Q1 :Q2)))";
+        let doc =
+            ofn_read::parse_with(text, ofn_read::Options { skip_rules: true }).expect("parse");
+        for decline in [true, false] {
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_decline: decline,
+                    ..Limits::default()
+                })
+                .expect("classify");
+            let r = answer(&out, &k.excluded(), 0);
+            let claim = r["complete"] == true
+                && r["incomplete"].as_array().is_some_and(|v| v.is_empty())
+                && r["outside"] == 0
+                && r["dlOverBudget"] == false
+                && r["dlRootedOver"] == false
+                && r["dlRootedDeclined"] == false;
+            assert_eq!(claim, !decline, "{r}");
+            assert_eq!(r["dlRootedDeclined"], decline, "{r}");
+        }
+    }
 }

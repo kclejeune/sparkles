@@ -261,6 +261,16 @@ pub struct Limits {
     /// option changes nothing for an ontology without individuals, nominals or the
     /// universal object property.
     pub rooted: bool,
+    /// whether a rooted run withdraws an answer that can miss an entailment of a
+    /// conditional ground fact (roadmap item 1231), which is on by default and changes
+    /// nothing without [`rooted`](Limits::rooted). After its saturation the run looks for
+    /// a context that holds a ground literal as a condition and a context registered with
+    /// the root for one of the literal's individuals that the condition does not reach.
+    /// When it finds one, the run starts again without the rooted rules, as past its bound,
+    /// and reports [`Stats::dl_rooted_declined`]. The check is a partial containment: it
+    /// exempts contexts that it assumes the condition reaches some other way, which is
+    /// unproved. A run with the option off keeps the rooted answer, for measurements.
+    pub rooted_decline: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
     /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
@@ -311,6 +321,7 @@ impl Default for Limits {
             dl_attempt_work: None,
             counting: false,
             rooted: false,
+            rooted_decline: true,
             number_order: true,
             dl_steps: true,
         }
@@ -412,6 +423,12 @@ pub struct Stats {
     /// conclusions, so the run classified again without the rooted rules and left the
     /// axioms outside OWL 2 EL out, as a run without the option does
     pub dl_rooted_over: bool,
+    /// a rooted run of Tier D finished with a ground literal held as a condition that does
+    /// not reach a context registered for one of its individuals
+    /// ([`Limits::rooted_decline`]), so its answer could miss entailments and the run
+    /// classified again without the rooted rules, as past its bound, and left the axioms
+    /// outside OWL 2 EL out
+    pub dl_rooted_declined: bool,
     /// a run of Tier D without counting and without the rooted rules passed its bound on
     /// derived conclusions ([`Limits::dl_attempt_work`]), so the run classified with the
     /// Horn rules and left the disjunctive axioms out
@@ -428,7 +445,9 @@ pub struct Stats {
     /// on derived conclusions and the run classified without counting
     /// ([`dl_counting_over`](Stats::dl_counting_over)), or a rooted run passed its bound
     /// and the run classified without the rooted rules
-    /// ([`dl_rooted_over`](Stats::dl_rooted_over))
+    /// ([`dl_rooted_over`](Stats::dl_rooted_over)), or a rooted run withdrew its answer
+    /// and the run classified without the rooted rules
+    /// ([`dl_rooted_declined`](Stats::dl_rooted_declined))
     pub dl_over_budget: bool,
 }
 
@@ -578,6 +597,9 @@ pub struct Saturation {
     /// set while a run classifies again without the rooted rules, past a rooted run's
     /// bound on derived conclusions, which leaves the axioms outside OWL 2 EL out
     no_rooted: bool,
+    /// set by a rooted run that withdrew its answer (item 1231), which classifies again
+    /// without the rooted rules
+    rooted_declined: bool,
     /// set while a run classifies the axioms that item 805's reductions made, so that the
     /// classes they made up stay out of the taxonomy
     hide_internal: bool,
@@ -1091,6 +1113,7 @@ impl Saturation {
             skip_dl: false,
             no_counting: false,
             no_rooted: false,
+            rooted_declined: false,
             hide_internal: false,
             chain_ranged: Vec::new(),
             reduced: false,
@@ -1176,6 +1199,7 @@ impl Saturation {
             _ => limits,
         };
         self.dl_worked.store(false, Ordering::Relaxed);
+        self.rooted_declined = false;
         let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
         if let Err(Error::Memory { .. }) = r
             && self.reused
@@ -1191,9 +1215,10 @@ impl Saturation {
             // a run of Tier D that neither counts nor is rooted, which counts the
             // conclusions of the runs that derived the kept contexts (roadmap item 990).
             // Its charges draw first on what the pool admitted. Whether it passed a bound
-            // on derived conclusions is the new run's to say.
+            // on derived conclusions, or withdrew a rooted answer, is the new run's to say.
             self.reset();
             self.dl_worked.store(false, Ordering::Relaxed);
+            self.rooted_declined = false;
             let a = admitted.clone();
             let counting = limits.charge.clone().map(|f| {
                 let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
@@ -1211,6 +1236,40 @@ impl Saturation {
                 ..limits.clone()
             };
             r = self.run(axioms, None, held_bytes, &again, with_taxonomy);
+        }
+        let mut declined = None;
+        if std::mem::take(&mut self.rooted_declined) {
+            // A rooted run withdrew its answer (item 1231): the run starts again without
+            // the rooted rules, as past its bound, so that the ontology takes the paths it
+            // takes without the option and the axioms outside OWL 2 EL are left out and
+            // reported, before it falls back further. The fallbacks below keep the rooted
+            // rules off. Its charges draw first on what the pool admitted.
+            debug_assert!(matches!(r, Err(Error::Memory { .. })));
+            let used = match r {
+                Err(Error::Memory { used, .. }) => used,
+                _ => 0,
+            };
+            self.reset();
+            self.dl_worked.store(false, Ordering::Relaxed);
+            self.no_rooted = true;
+            let a = admitted.clone();
+            let counting = limits.charge.clone().map(|f| {
+                let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                    std::sync::Arc::new(move |bytes: usize| {
+                        let ok = f(bytes);
+                        if ok {
+                            a.fetch_add(bytes, Ordering::Relaxed);
+                        }
+                        ok
+                    });
+                drawing_on(admitted.load(Ordering::Relaxed), f)
+            });
+            let unrooted = Limits {
+                charge: counting,
+                ..limits.clone()
+            };
+            r = self.run(axioms, None, held_bytes, &unrooted, with_taxonomy);
+            declined = Some(used);
         }
         if let Err(Error::Memory { .. }) = r
             && self.dl_tried
@@ -1420,6 +1479,17 @@ impl Saturation {
             // the high-water mark of the rooted run, which the retry's may not reach
             stats.peak_memory = stats.peak_memory.max(used);
             stats.dl_rooted_over = true;
+            stats.dl_over_budget = true;
+        }
+        if declined.is_some() {
+            self.no_rooted = false;
+        }
+        if let Some(used) = declined
+            && let Ok((_, _, stats)) = &mut r
+        {
+            // the high-water mark of the rooted run, which the retry's may not reach
+            stats.peak_memory = stats.peak_memory.max(used);
+            stats.dl_rooted_declined = true;
             stats.dl_over_budget = true;
         }
         r
@@ -2664,12 +2734,11 @@ impl Saturation {
                 }
             }
             stats.dl_work = d.work();
-            if self.dl_rooted
-                && open.is_none()
-                && (dl_root::marker_diag() || dl_root::marker_decline().is_some())
-            {
-                // row 1231's diagnostic and decline, off by default, after a saturation that
-                // finished (a partial answer keeps its own path)
+            let decline = dl_root::marker_decline(limits.rooted_decline);
+            if self.dl_rooted && open.is_none() && (dl_root::marker_diag() || decline.is_some()) {
+                // item 1231's decline, and its diagnostic, after a saturation that finished.
+                // A stopped rooted run leaves every class open, so its partial answer
+                // claims nothing.
                 let made = dynamic.iter().flat_map(|dy| {
                     (0..dy.len() as Ex)
                         .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))
@@ -2686,17 +2755,21 @@ impl Saturation {
                         cs.push(m);
                     }
                 }
-                let trips = dl_root::marker_trips(&ix, &cs, &d.lits);
-                if dl_root::marker_diag() {
+                let diag = dl_root::marker_diag();
+                let trips = dl_root::marker_trips(&ix, &cs, &d.lits, decline.filter(|_| !diag));
+                if diag {
                     let t: Vec<String> = trips
                         .iter()
                         .map(|t| format!("{}/{}/{}", t[0], t[1], t[2]))
                         .collect();
                     eprintln!("MARKER-DIAG work={} tiers={}", stats.dl_work, t.join(","));
                 }
-                if let Some(t) = dl_root::marker_decline()
+                if let Some(t) = decline
                     && trips.get(t).is_some_and(|t| t[2] > 0)
                 {
+                    // run_with takes the flag first and starts again without the rooted
+                    // rules, whatever the error
+                    self.rooted_declined = true;
                     return Err(Error::Memory {
                         limit: limits.max_memory.unwrap_or(usize::MAX),
                         used: totals.peak,
