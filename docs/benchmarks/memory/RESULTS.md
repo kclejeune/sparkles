@@ -199,6 +199,39 @@ mixed. The cursor also holds much less. At 10.5M its ledger peaked at 2.2 MB for
 102.1 MB. A full sort stays eager by default, because the in-memory cursor sort holds its
 whole input with decoded keys, 580 MB in the ledger against 31 MB eagerly.
 
+<a id="charged-distinct-buffers"></a>
+
+#### DISTINCT on charged buffers
+
+DISTINCT keeps its set in `Charged` buffers, which take their charge from their own
+allocations ([X19](../../specs/X19-charged-buffers/SPEC.md#distinct)). This comparison
+ran the build before that change, 74f229b9, as A against 62f72e53 as B on `forge`, at
+1.05M quads with one Rayon thread and no budget that binds. Each mode ran 8 rounds of
+A, B, B, A with a fresh pinned server per process and 20 timed requests per query, both
+passes were valid with a same-binary spread of 1.9% and 2.8%, and both builds returned
+the same answers. The table gives median server execution times and the ratio of B to
+A. A bold ratio was above 1 in every round, or below 1 in every round for a gain.
+
+| 1.05M, ms | Streamed, A | Streamed, B | Ratio | Automatic, A | Automatic, B | Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `distinct-one`, DISTINCT of one column | 2.92 | 2.85 | **0.975** | 2.98 | 2.98 | 1.000 |
+| `distinct-two`, DISTINCT of two columns of a join | 6.54 | 6.59 | **1.008** | 7.66 | 7.69 | 1.004 |
+| `distinct-two-wide`, DISTINCT of two columns of a 28 MB set | 32.3 | 33.4 | **1.033** | 41.6 | 41.7 | 1.001 |
+| `distinct-join`, DISTINCT of one column of a join | 3.79 | 3.80 | 1.002 | 3.63 | 3.63 | 1.000 |
+| `class-predicate-list`, DISTINCT predicates of a class | 0.935 | 0.903 | **0.965** | 0.938 | 0.906 | **0.965** |
+| `class-predicates`, COUNT(DISTINCT) per predicate of a class | 0.944 | 0.915 | **0.970** | 0.946 | 0.914 | **0.966** |
+
+*Measured on forge.*
+
+Streamed `distinct-two` takes 51 µs longer and streamed `distinct-two-wide` 1.07 ms
+longer, and [roadmap item 1240](../../ROADMAP.md) holds both costs with their recovery.
+In the streamed `distinct-two-wide` pass the processes of B took 32.2 to 33.8 ms by
+median and those of A 31.0 to 33.6 ms, with no trend across the run. The same query
+under automatic execution shows no difference. `distinct-obj` and `predicate-subjects`
+take 4 to 9 µs, below what this harness resolves, and showed no consistent change. The
+[run record](records/charged-distinct-2026-11-20/README.md) holds the samples, the
+answers and the host's frequency and memory readings.
+
 <a id="automatic-exists"></a>
 
 #### Groupings with EXISTS

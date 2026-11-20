@@ -253,6 +253,12 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   an ORDER BY deduplicates below the sort in every mode when the query may spill, and
   `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in every
   mode.
+* A cursor DISTINCT keeps its set in buffers whose memory charge is their allocation
+  ([X19](../specs/X19-charged-buffers/README.md)), so the set is admitted before it grows
+  and a set that may spill stops growing while the operators above it still have room.
+  It fits every budget it fitted when the set was charged by formulas, and some smaller
+  ones. Two streamed DISTINCT queries of two columns take 0.8% and 3.3% longer than
+  before, which [roadmap item 1240](../ROADMAP.md) holds.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](../internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4

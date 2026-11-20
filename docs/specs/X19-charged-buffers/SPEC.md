@@ -258,6 +258,23 @@ batches and spills, fit every budget they fitted before the move, with the answe
 gave. The external sort moves under item 1193, and the operators that
 other work is rewriting move under item 1192.
 
+Roadmap item 1183 shipped with the move of DISTINCT. A timing run on `forge` compared
+74f229b9, the build before the move, with 62f72e53 at 1.05M quads, with one Rayon thread
+and no budget that binds, in eight rounds of A, B, B, A per execution mode with pinned
+fresh servers. Both passes were valid and both builds returned the same answers.
+Streamed `distinct-two` took 1.008 times as long and streamed `distinct-two-wide` 1.033
+times, 51 µs and 1.07 ms more, with every round above 1. The same two queries under
+automatic execution, `distinct-join` in both modes and the queries under 0.3 ms showed
+no real difference, and streamed `distinct-one` and both class queries took 0.965 to
+0.975 times as long. Acceptance criterion 4 is therefore not met for the two streamed
+queries, and [roadmap item 1240](../../ROADMAP.md) holds both costs with their recovery.
+Instruction counts per request were not taken for this run. The
+[memory results](../../benchmarks/memory/RESULTS.md#charged-distinct-buffers) give the
+table and the [run record](../../benchmarks/memory/records/charged-distinct-2026-11-20/README.md)
+the samples. The charged and DISTINCT unit tests ran on x86-64 only, together with the
+8-byte group rule run through its parameter, and a native ARM64 run waits for the ARM64
+jobs of the GitHub workflow.
+
 ## Provenance
 
 The design comes from Sparkles' own operators and their audits. It uses no outside

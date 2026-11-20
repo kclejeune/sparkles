@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### DISTINCT on charged buffers
+
+A cursor DISTINCT keeps its set in `Charged` buffers, which take their memory charge from
+their own allocations at one growth site, so the set is admitted to the query's budget
+before it grows, which completes roadmap item 1183. A shared heap audit compares every
+cursor operator's heap with its ledger, and the operators it finds above their ledger
+have roadmap items of their own. Seven DISTINCT sweeps over a range of budgets fit every
+budget they fitted before the move with the same answers, and three of them now fit from
+smaller budgets, such as 40,960 bytes in place of 57,344 for a one-column spilled set. On
+forge at 1.05M quads, streamed DISTINCT of two columns of a join takes 1.008 times as long
+as before and a wider one 1.033 times, which roadmap item 1240 recovers, and the other
+DISTINCT queries take the same time or up to 3.5% less.
+
 ### Streamed answers through the engine buffer
 
 The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
