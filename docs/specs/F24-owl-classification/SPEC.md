@@ -175,13 +175,17 @@ Item 1229 records a loss of runs that count. Pred takes each clause that a succe
 with the restrictions that reach the successor when it arrives, and a unit existential
 restriction that the context derived later took no Pred with the clauses its successor had
 already sent. With counting, Pred's conclusion can name the restriction's own successor
-term, so a run could report itself complete and miss an entailed subsumption. A rooted run
-that counts now passes its bound on derived conclusions when such a restriction arrives
-and classifies again without counting. A run that counts without the rooted rules has no
+term, so a run could report itself complete and miss an entailed subsumption. Under the
+eager strategy two restrictions can share a successor, and the second restriction's edge
+can come after the successor's clauses did. The context then replays Pred only with the
+literal that made the edge, so a clause whose body lacks that literal misses the new
+restriction in the same way. A rooted run that counts now passes its bound on derived
+conclusions when such a restriction or edge arrives and classifies again without counting. A run that counts without the rooted rules has no
 such containment, so while item 1229 is open a run that counts can report itself complete
-and miss an entailed subsumption. `SPARKLES_COUNTING_LATE_UNIT=0` turns the containment off, and `=2` gives
-the late restriction Pred with the clauses its successor already sent in every run that
-counts, the repair that item 1229 proves before it replaces the containment.
+and miss an entailed subsumption. `SPARKLES_COUNTING_LATE_UNIT=0` turns the containment
+off, and `=2` gives the late restriction or edge Pred with the clauses its successor
+already sent in every run that counts, the repair that item 1229 proves before it replaces
+the containment.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
