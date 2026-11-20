@@ -216,7 +216,7 @@ A. A bold ratio was above 1 in every round, or below 1 in every round for a gain
 |---|---:|---:|---:|---:|---:|---:|
 | `distinct-one`, DISTINCT of one column | 2.92 | 2.85 | **0.975** | 2.98 | 2.98 | 1.000 |
 | `distinct-two`, DISTINCT of two columns of a join | 6.54 | 6.59 | **1.008** | 7.66 | 7.69 | 1.004 |
-| `distinct-two-wide`, DISTINCT of two columns of a 28 MB set | 32.3 | 33.4 | **1.033** | 41.6 | 41.7 | 1.001 |
+| `distinct-two-wide`, DISTINCT of two columns of a two-hop join | 32.3 | 33.4 | **1.033** | 41.6 | 41.7 | 1.001 |
 | `distinct-join`, DISTINCT of one column of a join | 3.79 | 3.80 | 1.002 | 3.63 | 3.63 | 1.000 |
 | `class-predicate-list`, DISTINCT predicates of a class | 0.935 | 0.903 | **0.965** | 0.938 | 0.906 | **0.965** |
 | `class-predicates`, COUNT(DISTINCT) per predicate of a class | 0.944 | 0.915 | **0.970** | 0.946 | 0.914 | **0.966** |
