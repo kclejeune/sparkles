@@ -1429,40 +1429,50 @@ pub(super) struct MarkerCtx {
     pub(super) units: Vec<Lit>,
 }
 
-/// The bytes that [`marker_trips`] holds for the contexts `cs`, their copies and the maps
-/// and sets it builds over them, a bound that the run checks against its budget before
-/// the search.
-pub(super) fn marker_scan_bytes(cs: &[MarkerCtx]) -> usize {
-    use std::mem::size_of;
-    let mut b = std::mem::size_of_val(cs);
-    let mut succ = 0;
-    for c in cs {
-        succ += c.succ.len();
-        b += c.succ.capacity() * size_of::<Ex>()
-            + c.held.capacity() * size_of::<Lit>()
-            + c.units.capacity() * size_of::<Lit>()
-            + c.edges.capacity() * size_of::<(u32, Vec<Ex>)>()
-            + c.edges
-                .iter()
-                .map(|(_, v)| v.capacity() * size_of::<Ex>())
-                .sum::<usize>();
-    }
-    // the index by context, the predecessors, and the root's reach with one holder's
-    // successors and predecessors at a time, each a hash entry of about 16 bytes
-    b + cs.len() * 16 * 4 + succ * (size_of::<Ex>() + 16)
+/// A bound on the bytes of the maps and sets that [`marker_trips`] builds over the copies
+/// `cs` with a `stop`, which the run checks against its budget before the search: the
+/// index by context, the predecessors, the root's reach, the root's units and
+/// registrations, one holder's successors and predecessors at a time, each a hash entry of
+/// about 16 bytes, and the copies of successor lists that the searches take.
+pub(super) fn marker_search_bytes(cs: &[MarkerCtx]) -> usize {
+    let succ: usize = cs.iter().map(|c| c.succ.len()).sum();
+    let root: usize = cs.iter().map(|c| c.units.len() + c.edges.len()).sum();
+    cs.len() * 16 * 5 + succ * (std::mem::size_of::<Ex>() + 16) + root * 16
 }
 
 /// What [`marker_trips`] needs of the context `me` with the state `st`.
+/// `admit` takes the bytes the copy will hold, and with a negative count gives back
+/// those of its scratch sets, before anything is allocated. A refusal ends the copy with
+/// `Err`, and the run stops as past its memory budget.
 pub(super) fn marker_ctx(
     ix: &Index,
     me: Ex,
     st: &State,
     lits: &super::dl_clause::Lits,
-) -> Option<MarkerCtx> {
-    let x = dl(st)?;
+    admit: &mut dyn FnMut(isize) -> bool,
+) -> Result<Option<MarkerCtx>, ()> {
+    let Some(x) = dl(st) else { return Ok(None) };
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let is_root = dx.root == Some(me);
+    // bounds on what the copy holds and on its two scratch sets of ground literals, each
+    // a hash entry of about 16 bytes
+    let ground = x.root.as_deref().map_or(0, |r| r.ground.len());
+    let scratch = (ground * 32) as isize;
+    let mut kept = std::mem::size_of::<MarkerCtx>()
+        + ground * std::mem::size_of::<Lit>()
+        + (x.edges.len() + x.root.as_deref().map_or(0, |r| r.by_succ.len()) + st.subs.len())
+            * std::mem::size_of::<Ex>();
+    if is_root {
+        kept += x.store.clauses.len() * std::mem::size_of::<Lit>();
+        if let Some(r) = x.root.as_deref() {
+            kept += r.edges.len() * std::mem::size_of::<(u32, Vec<Ex>)>()
+                + r.edges.values().map(|v| v.len()).sum::<usize>() * std::mem::size_of::<Ex>();
+        }
+    }
+    if !admit(kept as isize + scratch) {
+        return Err(());
+    }
     let mut held = Vec::new();
     if let Some(r) = x.root.as_deref()
         && !r.ground.is_empty()
@@ -1495,13 +1505,14 @@ pub(super) fn marker_ctx(
             }
         }
     }
-    Some(MarkerCtx {
+    admit(-scratch);
+    Ok(Some(MarkerCtx {
         me,
         succ: successors(ix, st),
         held,
         edges,
         units,
-    })
+    }))
 }
 
 /// Counts, for each tier, the conditional ground triggers, their constants and the pairs
@@ -1515,7 +1526,8 @@ pub(super) fn marker_ctx(
 /// The answer also counts the pair set P_R of the repair (PLAN v3.1, D3), the pairs that
 /// tier 0 keeps whose context the root reaches, as triples of holder, trigger and context
 /// and as sends, the distinct pairs of context and trigger. Those two counts are complete
-/// only without `stop`.
+/// only without `stop`, and the run builds the sets of distinct triggers, constants and
+/// sends only then, for the diagnostic, outside the run's memory budget.
 pub(super) fn marker_trips(
     ix: &Index,
     cs: &[MarkerCtx],
@@ -1608,7 +1620,7 @@ pub(super) fn marker_trips(
                 if down.get_or_init(|| reach(c.me, &succ_of)).contains(&d) {
                     continue;
                 }
-                if reached {
+                if reached && stop.is_none() {
                     pr[0] += 1;
                     sends.insert((d, l));
                 }
@@ -1631,8 +1643,11 @@ pub(super) fn marker_trips(
                 let mut tier = 0;
                 while tier < MARKER_TIERS && keep[..=tier].iter().all(|&k| k) {
                     out[tier][2] += 1;
-                    trig[tier].insert(l);
-                    kons[tier].extend(us.iter().copied());
+                    // the sets of the diagnostic, which a decline does not build
+                    if stop.is_none() {
+                        trig[tier].insert(l);
+                        kons[tier].extend(us.iter().copied());
+                    }
                     tier += 1;
                 }
                 if stop.is_some_and(|t| out[t][2] > 0) {

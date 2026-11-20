@@ -2790,7 +2790,36 @@ impl Saturation {
                     (0..dy.len() as Ex)
                         .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))
                 });
+                // The scan's copies of the contexts' successors and triggers, their scratch
+                // sets and the maps and sets of the search count beside the saturated state
+                // and the table of conjunctions, which are still held. Each part is admitted
+                // against the run's budget before it is allocated, and the pool is charged
+                // for what passes the peak.
+                let held = totals.memory + d.bytes() + dynamic.as_ref().map_or(0, |dy| dy.bytes());
+                #[cfg(test)]
+                let mut scan = SCAN_EXTRA.with(|x| x.get()) as isize;
+                #[cfg(not(test))]
+                let mut scan = 0isize;
+                let mut refused = None;
+                let peak = &mut totals.peak;
+                let mut admit = |delta: isize| {
+                    scan += delta;
+                    if delta <= 0 {
+                        return true;
+                    }
+                    let used = held + scan.max(0) as usize;
+                    let grown = used.saturating_sub(*peak);
+                    *peak = (*peak).max(used);
+                    if max_memory.is_some_and(|m| used > m)
+                        || (grown > 0 && charge_fn.is_some_and(|f| !f(grown)))
+                    {
+                        refused = Some(used);
+                        return false;
+                    }
+                    true
+                };
                 let mut cs = Vec::new();
+                let mut ok = true;
                 for (e, c) in self
                     .ctx
                     .iter()
@@ -2798,25 +2827,26 @@ impl Saturation {
                     .filter_map(|(e, c)| c.get().map(|c| (e as Ex, &**c)))
                     .chain(made)
                 {
-                    if let Some(m) = dl_root::marker_ctx(&ix, e, &c.st.lock(), &d.lits) {
-                        cs.push(m);
+                    match dl_root::marker_ctx(&ix, e, &c.st.lock(), &d.lits, &mut admit) {
+                        Ok(Some(m)) => cs.push(m),
+                        Ok(None) => {}
+                        Err(()) => {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
-                // The scan's copies of the contexts' successors and triggers, its maps and
-                // the sets it searches count beside the saturated state, which is still
-                // held, and the pool is charged for what passes the peak.
-                let scan = dl_root::marker_scan_bytes(&cs);
-                #[cfg(test)]
-                let scan = scan + SCAN_EXTRA.with(|x| x.get());
-                let used = totals.memory + d.bytes() + scan;
-                let grown = used.saturating_sub(totals.peak);
-                totals.peak = totals.peak.max(used);
-                if max_memory.is_some_and(|m| used > m)
-                    || (grown > 0 && charge_fn.is_some_and(|f| !f(grown)))
-                {
+                ok = ok
+                    && admit(
+                        (dl_root::marker_search_bytes(&cs)
+                            + cs.capacity() * std::mem::size_of::<dl_root::MarkerCtx>())
+                            as isize,
+                    );
+                drop(admit);
+                if !ok {
                     return Err(Error::Memory {
                         limit: max_memory.unwrap_or(usize::MAX),
-                        used,
+                        used: refused.unwrap_or(held),
                     });
                 }
                 let diag = dl_root::marker_diag();
