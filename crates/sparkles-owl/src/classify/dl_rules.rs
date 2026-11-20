@@ -538,6 +538,9 @@ pub struct DlRun {
     /// set once an inference was too wide to make, which passes the bound whatever the
     /// count is
     exhausted: std::sync::atomic::AtomicBool,
+    /// the most choices of one product that the run makes before it passes its bound on
+    /// derived conclusions, zero for no limit (roadmap item 1011)
+    width_limit: AtomicUsize,
 }
 
 impl DlRun {
@@ -566,6 +569,7 @@ impl DlRun {
         self.carried = self.carried.saturating_add(*self.work.get_mut());
         *self.work.get_mut() = 0;
         *self.work_limit.get_mut() = 0;
+        *self.width_limit.get_mut() = 0;
         *self.exhausted.get_mut() = false;
     }
     pub(super) fn grow(&self, bytes: usize) {
@@ -575,6 +579,20 @@ impl DlRun {
     /// conclusions keep its memory flat.
     pub fn set_work_limit(&self, n: usize) {
         self.work_limit.store(n, Ordering::Relaxed);
+    }
+    /// Limits the choices of one product of the run, past which it passes its bound on
+    /// derived conclusions (roadmap item 1011).
+    pub fn set_width_limit(&self, n: usize) {
+        self.width_limit.store(n, Ordering::Relaxed);
+    }
+    /// Whether a product of these lists has more choices than the run's limit.
+    pub(super) fn too_wide(&self, lists: &[Vec<Side>]) -> bool {
+        let l = self.width_limit.load(Ordering::Relaxed);
+        l != 0
+            && lists
+                .iter()
+                .try_fold(1usize, |n, x| n.checked_mul(x.len()).filter(|&n| n <= l))
+                .is_none()
     }
     /// Whether the run has a bound on the conclusions it derives.
     pub fn bounded(&self) -> bool {
@@ -1609,6 +1627,13 @@ pub(super) fn drain_with<S: Sink>(
     let dx = ix.dl.as_deref();
     let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
     for (lists, base, ground, rule) in found.prods {
+        // a product past the run's limit on choices ends the run as its bound does, before
+        // the product spends its work (roadmap item 1011)
+        if out.dl().too_wide(&lists) {
+            out.dl().exhaust();
+            ds(st).store.interrupted = true;
+            return;
+        }
         if !ground {
             if !fold(ix, st, &lists, base, rule, found.root, trace, out, &derive) {
                 return;
@@ -3833,5 +3858,25 @@ mod tests {
         }
         assert!(run.over_work());
         assert_eq!(run.work(), 100);
+    }
+
+    #[test]
+    fn a_product_wider_than_the_limit_is_too_wide() {
+        let run = DlRun::default();
+        let list = |n: usize| vec![unit(); n];
+        let lists = vec![list(3), list(4)];
+        assert!(!run.too_wide(&lists), "no limit");
+        run.set_width_limit(12);
+        assert!(!run.too_wide(&lists));
+        run.set_width_limit(11);
+        assert!(run.too_wide(&lists));
+        // a product whose count passes the range of the count is too wide
+        let wide = vec![list(1 << 12); 6];
+        run.set_width_limit(usize::MAX);
+        assert!(run.too_wide(&wide));
+        // a run that starts again has no limit until it is given one
+        let mut run = run;
+        run.begin_run();
+        assert!(!run.too_wide(&lists));
     }
 }

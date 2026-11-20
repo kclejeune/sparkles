@@ -174,6 +174,17 @@ const DL_ATTEMPT_FLOOR: usize = 1 << 21;
 /// in a fortieth.
 const DL_ATTEMPT_PER_CLASS: usize = 384;
 
+/// The most choices of one product of a run of Tier D on one thread without counting or
+/// the rooted rules before it ends and the Horn rules answer (roadmap item 1011). On one
+/// thread the ORE 2015 DL development set's 12 attempts that finish make products of at
+/// most 256 choices, and the 2,166 generated ontologies of item 969 with a union of at
+/// most 3,645, while the attempts of ore_ont_14817 and ore_ont_9663 make one of 120
+/// million choices after 0.5 million conclusions and one of 4.2 million after 4 million.
+/// On four and eight threads the finishing attempts make products of up to 22,500
+/// choices and ore_ont_9663 of at most 22,707, so the width tells them apart only on one
+/// thread, and a run on more threads has no such limit.
+const DL_ATTEMPT_WIDTH: usize = 1 << 20;
+
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
 /// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
 /// its index and axioms, on a small ontology.
@@ -237,6 +248,14 @@ pub struct Limits {
     /// ontology whose run derives about the bound can answer in full on one schedule and
     /// fall back on another.
     pub dl_attempt_work: Option<usize>,
+    /// the most choices of one product, the premises it combines, that a run of Tier D
+    /// on one thread without counting and without the rooted rules makes before it ends
+    /// as past [`dl_attempt_work`](Limits::dl_attempt_work) (roadmap item 1011). `None`
+    /// takes 1,048,576, far above what the attempts that finish make on one thread, and
+    /// `Some(0)` takes no limit. A run on more threads has no such limit, since there the
+    /// width of a product depends on the schedule. A kept run that passes it starts again
+    /// in full, as past the bound.
+    pub dl_attempt_width: Option<usize>,
     /// whether Tier D counts, which is off by default. A run that counts takes number
     /// restrictions, functional and inverse functional properties, disjoint properties and
     /// asymmetric properties into the case analysis, and it is complete for them when it
@@ -309,6 +328,7 @@ impl Default for Limits {
             expansion: Expansion::default(),
             dl_work: None,
             dl_attempt_work: None,
+            dl_attempt_width: None,
             counting: false,
             rooted: false,
             number_order: true,
@@ -2224,6 +2244,8 @@ impl Saturation {
             // cannot expect to finish soon, before the Horn rules take over; a rooted run
             // without counting has its own bound, past which the run starts again without
             // the rooted rules
+            // only an attempt has a limit on the choices of a product
+            d.set_width_limit(0);
             if self.dl_rooted && !self.dl_counted {
                 d.set_work_limit(limits.dl_work.unwrap_or(ROOTED_WORK_BOUND).max(1));
             } else if self.no_counting {
@@ -2239,6 +2261,11 @@ impl Saturation {
                 d.set_work_limit(limits.dl_attempt_work.unwrap_or_else(|| {
                     DL_ATTEMPT_FLOOR.max(DL_ATTEMPT_PER_CLASS.saturating_mul(classes))
                 }));
+                // and on one thread, whose order is fixed, a product of more choices than
+                // any attempt that finishes makes ends it too (roadmap item 1011)
+                if threads == 1 {
+                    d.set_width_limit(limits.dl_attempt_width.unwrap_or(DL_ATTEMPT_WIDTH));
+                }
             }
         }
         let max_memory = if horn || disj {
