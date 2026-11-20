@@ -186,9 +186,10 @@ order base, tip, the tip with the operators off twice, tip and base. No pair fai
 or changed an answer fingerprint, and no metric of the tip was slower than base in every
 round. The closest was `owl-rl` demand `q6`,
 slower in 29 of 30 rounds by 2.5 to 3.6% at about 1.6 s, and the tip with the operators off
-was as slow, so that difference does not come from the operators. The 12 metrics that
-`bench-gate.py` flagged at 10% against base were slower in 13 to 21 of 30 rounds, and six of
-them are materialized queries under 0.1 ms. Their rounds burst in every run, more often in
+was as slow, so that difference does not come from the operators. `owl-rl` demand `q5` was
+slower in 27 of 30 rounds, and [item 1244](../../ROADMAP.md) holds both costs until they are
+recovered. The 12 metrics that `bench-gate.py` flagged at 10% against base were slower in 13
+to 21 of 30 rounds, and six of them are materialized queries under 0.1 ms. Their rounds burst in every run, more often in
 the tip's runs than in base's or in those of the tip with the operators off. The [run
 directory](runs/2026-11-20-item-521-forge-rerun/env.txt) holds the records, the
 [comparisons](runs/2026-11-20-item-521-forge-rerun/latency-summary.txt) and the [per-round
