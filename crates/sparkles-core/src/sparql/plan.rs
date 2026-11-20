@@ -4671,8 +4671,9 @@ impl<'a> Planner<'a> {
 
     /// Apply (and remove) the filters without EXISTS whose variables are all bound by
     /// `n`, and those without variables when `constant`. On the checked route the
-    /// partition of the filters is admitted before it is made, and the credit returned
-    /// holds what the plan keeps of the FILTER and the filter list's growth.
+    /// partition of the filters is admitted before it is made, the filters not placed
+    /// stay in `filters`' own list, and the credit returned holds what the plan keeps of
+    /// the FILTER.
     fn place_where(
         &self,
         n: Node,
@@ -4701,21 +4702,27 @@ impl<'a> Planner<'a> {
                     t[2] = t[2].max(filters.len() as u64);
                     terms.set(t);
                 });
+                // the filters placed here, in a list that grows by doubling
                 layout.slots::<Expr>(filters.len().saturating_add(8).saturating_mul(2))
             })?
         } else {
             None
         };
-        let old = filters.capacity();
-        let (now, later): (Vec<Expr>, Vec<Expr>) =
-            std::mem::take(filters).into_iter().partition(|f| {
-                !f.has_exists() && {
-                    let vs = f.var_set();
-                    (constant || !vs.is_empty()) && vs.iter().all(|v| n.vars.contains(v))
-                }
-            });
-        let grown = later.capacity().saturating_sub(old);
-        *filters = later;
+        let applies = |f: &Expr| {
+            !f.has_exists() && {
+                let vs = f.var_set();
+                (constant || !vs.is_empty()) && vs.iter().all(|v| n.vars.contains(v))
+            }
+        };
+        // On the checked route the rest stays in the caller's list, whose credit the
+        // caller holds, so that only the list of the filters placed here is new.
+        let now: Vec<Expr> = if partition.is_some() {
+            filters.extract_if(.., |f| applies(f)).collect()
+        } else {
+            let (now, later) = std::mem::take(filters).into_iter().partition(applies);
+            *filters = later;
+            now
+        };
         let Some(mut partition) = partition else {
             return Ok((
                 if now.is_empty() {
@@ -4733,9 +4740,8 @@ impl<'a> Planner<'a> {
             let owned = self.filters_owned(&now)?;
             self.filter_held(scratch, n, now, owned)?
         };
-        // the filter list keeps its growth, and the FILTER its list of conjuncts
-        let grown = (grown.saturating_mul(size_of::<Expr>()) as u64).min(partition.bytes());
-        partition.release_to(grown);
+        // the FILTER keeps its list of conjuncts, which `kept` holds
+        partition.release_to(0);
         #[cfg(test)]
         crate::test_alloc::observe_release();
         if let Some(kept) = kept {

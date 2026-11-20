@@ -2766,8 +2766,7 @@ fn checked_interned_plan_excess(
 #[test]
 #[ignore = "roadmap item 1236"]
 fn checked_graph_r12_admits_simple_graph_groups() {
-    // Without the BIND, the graph's group does not mention ?g and is planned on the
-    // ordinary route, whose FILTER list scales with the set.
+    // The planning route that roadmap item 1236 covers.
     let set = (0..400)
         .map(|step| format!("<urn:n:p{step}>"))
         .collect::<Vec<_>>()
@@ -2784,7 +2783,7 @@ fn checked_graph_r12_admits_simple_graph_groups() {
 #[test]
 #[ignore = "roadmap item 1238"]
 fn checked_graph_r12_admits_optional_joins() {
-    // An OPTIONAL in a graph's branch builds its join after the payload is admitted.
+    // The operators that roadmap item 1238 covers.
     use crate::sparql::ctx::DEFAULT_GRAPH_IRI;
     use crate::sparql::plan::{ActiveGraph, Planner};
     use crate::validation::DataGraph;
@@ -2826,7 +2825,6 @@ fn checked_graph_r12_admits_optional_joins() {
 }
 
 #[test]
-#[ignore = "known red, see the lane notes"]
 fn checked_graph_r12_admits_join_order_tables() {
     // Stage 0 indexes the group's variables, filters and join models. Stage 2 builds the program's tables over every subset of the inputs, which grow
     // with 2^n, stage 3 runs the program over them and stage 4 rebuilds its plan. The
