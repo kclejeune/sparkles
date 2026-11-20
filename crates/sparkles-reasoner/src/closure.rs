@@ -605,6 +605,15 @@ fn relation_builtins(r: &CRule) -> bool {
 /// one of a transitive rule, or when its magic atom binds both ends, where the join is a
 /// lookup of the pairs asked for.
 fn adorned(r: &CRule, magic: &FxHashSet<u64>) -> Option<(Over, bool, Seeded, Vec<Triple>)> {
+    // [`transitive_with`] closes a rule whose two edge atoms read its head's predicate, so a
+    // copy without two such atoms is passed over before it is taken apart: a run detects
+    // its operators again for every stage, over every copy of a large program
+    let [CHead::Triple(_, hp, _)] = r.head.as_slice() else {
+        return None;
+    };
+    if r.atoms.iter().filter(|a| a.p == *hp).count() < 2 {
+        return None;
+    }
     let at: Vec<usize> = (0..r.atoms.len())
         .filter(|&i| matches!(r.atoms[i].p, Slot::Const(m) if magic.contains(&m)))
         .collect();
