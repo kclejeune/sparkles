@@ -17,7 +17,8 @@ them, and each has been found separately in a different operator.
 
 `Charged<V, A>` in `crates/sparkles-core/src/sparql/charged.rs` owns one collection `V`
 and the account `A` that holds its charge. The collection is a `Vec`, a hashbrown
-`HashTable` or a hashbrown `HashSet`, and its size is read from the collection itself,
+`HashTable`, a hashbrown `HashSet` or `Rows`, a set of rows that pairs a table of row
+numbers with a flat arena of the rows' IDs. Its size is read from the collection itself,
 as a vector's capacity times its element size or a table's `allocation_size`. The
 account is the type the operator already used, a `RetainedCharge` or an `OwnedCharge`,
 so moving an operator onto `Charged` buffers does not move it between the query's lock-free
@@ -32,22 +33,33 @@ before it allocates, so the caller passes an upper bound, `table_bound`, which i
 admitted and then replaced by the real size. A refused admission leaves the buffer and
 its charge as they were.
 
-The charge is lowered only after storage is freed, by `shrink`, `clear_free` or drop.
-The collection is declared before the account, so on drop it is freed first. Callers
-reach the collection through `Deref` and through named mutators, never through a `&mut`
-to it, so no caller has a second growth site. Debug builds assert that the charge equals
-the allocation at each growth and that an insert has room reserved for it.
+A buffer starts empty, from `Charged::empty` or `Charged::rows`, and is never built over
+a collection that already holds entries. A hash table's growth is predicted from its
+length and room, and a table with removed entries grows sooner than that prediction.
 
-Each buffer has its own charge. An operator with several buffers, such as DISTINCT's
-hash table and row arena, grows them one after the other, so its transient peak is the
-larger of the two growths and not their sum.
+The charge is lowered only after storage is freed, by `clear_free` or drop. The
+collection is declared before the account, so on drop it is freed first. Callers reach
+the collection through `Deref` and through named mutators, never through a `&mut` to it,
+so no caller has a second growth site. The mutators that add entries to reserved room
+check that room in release builds too and panic before they change anything, since an
+insert past the room would allocate what no admission covered. Debug builds also assert
+that the charge equals the allocation at each growth.
+
+Each buffer has its own charge. Buffers that grow together for each batch are one
+buffer. `Rows` holds DISTINCT's hash table and row arena on one charge, and its growth
+admits the pair before either allocates. The table grows first, while the old arena is
+live, and the arena second, while the new table is live. With the old table `t`, the
+table's bound `T`, its size afterwards `T'` and the arena's growth `A`, the pair admits
+`max(T, T' - t + A)` bytes beyond what it holds. It tries the arena at the table's room
+and then at its exact need, and a refusal leaves both buffers as they were. Two buffers
+on separate charges would let the table grow and the arena be refused, which spends room
+that the caller then needs for something else.
 
 ### Cost
 
 A charge moves only when a buffer's allocation changes, which a doubling vector does a
 logarithmic number of times in its length. Operators reserve the room for a whole batch
-before they insert its rows, so the per-row path is a plain insert with a debug
-assertion. The growth path is marked cold. No buffer allocates a fixed-size cache.
+before they insert its rows, so the per-row path is a plain insert with a room check. The growth path is marked cold. No buffer allocates a fixed-size cache.
 
 ### The audit
 
@@ -138,11 +150,17 @@ sequence paths and slices are within the exact allowance.
 DISTINCT keeps the rows of unordered and segmented input in a set of `Charged` buffers
 on the query's retained account. A single column is a hash set of its IDs. Wider rows
 are a hash table of row numbers and an arena of their IDs, which grows toward the
-table's room so that the two stay in step. A query that may spill stops growing the
-set before a growth that would take the predicted size of its buffers to the pass's
-threshold, or when a growth is refused. The prediction is the bound each buffer would
-grow to, so a one-column set is predicted as its table alone and no longer with the
-bytes of rows it does not keep, and it freezes later than it did.
+table's room so that the two stay in step, both in one `Rows` buffer. A query that may
+spill stops growing the set before a growth that would take the predicted size of its
+buffers to the pass's threshold, or when a growth is refused. The prediction is the
+bound each buffer would grow to, so a one-column set is predicted as its table alone and
+no longer with the bytes of rows it does not keep, and it freezes later than it did.
+
+A set that grows where a formula of its final size froze it holds more when it freezes
+later, so less room is left for the scratch of a frozen batch. A frozen batch therefore
+passes its rows on in ranges whose scratch fits. A range whose scratch is refused before
+any of its rows are written is halved, so the rows of each partition keep their order,
+and a refusal of the scratch of one row is the query's.
 
 `crates/sparkles-core/tests/charged_parity.rs` pins the smallest budget at which each
 of six DISTINCT fixtures fitted before the move, single and wider rows, segmented,
@@ -174,5 +192,8 @@ other work is rewriting move under item 1192.
 ## Provenance
 
 The design comes from Sparkles' own operators and their audits. It uses no outside
-source beyond the documented `allocation_size` of the hashbrown crate, a workspace
-dependency.
+source beyond the hashbrown crate, a workspace dependency pinned at 0.16.1. Its
+documented `allocation_size` gives a table's size, and the bound a table is admitted at
+follows that release's bucket rule, which raises a small table of one-byte entries to 14
+entries and of two- or three-byte entries to 7. A hashbrown upgrade rechecks
+`the_bound_covers_every_table_size` and `a_table_of_bytes_grows_within_its_bound`.

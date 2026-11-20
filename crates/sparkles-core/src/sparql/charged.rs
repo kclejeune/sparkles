@@ -5,13 +5,16 @@
 //! before it allocates, since both are live while the entries move, and then sets the
 //! charge to the size the collection reports. Its size is read from the collection, a
 //! vector's capacity or a hash table's allocation, and never from a formula. The charge
-//! is lowered only after the storage is freed, by [`Charged::shrink`] or [`Charged::clear_free`],
-//! and on drop, where the collection is declared before the charge and so freed first.
+//! is lowered only after the storage is freed, by [`Charged::clear_free`], and on drop,
+//! where the collection is declared before the charge and so freed first. A buffer
+//! starts empty, since a hash table's growth is predicted from its length and room, and
+//! a table with removed entries grows sooner than that.
 //!
 //! The collection is reachable through `Deref` and through the mutators this module
 //! names, never through a `&mut` to the collection, so no caller has a second growth
-//! site. A mutator that adds entries asserts in debug builds that room was made for them
-//! first, and every growth checks in debug builds that the charge equals the size.
+//! site. A mutator that adds entries to reserved room checks in release builds that the
+//! room was made and panics before it changes anything, and every growth checks in debug
+//! builds that the charge equals the size.
 //!
 //! # The growth rule
 //!
@@ -37,15 +40,17 @@
 //! the `toward` of [`Charged::reserve_toward`], with at least 16 entries. A hash table's
 //! is the bound of what hashbrown allocates for the larger of its need and one more
 //! entry than its capacity, which doubles its buckets. The `growth` methods give a
-//! buffer's `target` before it grows, so an operator can predict its size. The smallest budget at which a buffer reaches a given length is
-//! therefore set by its last growth, the old allocation plus the new one, and not by the
-//! length alone. Two buffers of one operator grow one after the other, so their
-//! transient peak is the larger of their growths. An operator that keeps several copies
+//! buffer's `target` before it grows, so an operator can predict its size. The smallest
+//! budget at which a buffer reaches a given length is therefore set by its last growth,
+//! the old allocation plus the new one, and not by the length alone. Buffers that grow
+//! together for each batch are one buffer, as [`Rows`] holds a table and its arena, and
+//! admit their sequential growths as one before either allocates, so a refusal never
+//! leaves one grown and the other not. An operator that keeps several copies
 //! of its state, such as one that grows a held run while an earlier run is live, pays
 //! this rule for each buffer, and its budget parity against a formula that charged the
 //! final size alone moves by the old allocation at each growth.
 //!
-//! [`Charged::shrink`] is for storage that is freed and not moved. A shrink that copies
+//! The private `shrink` is for storage that is freed and not moved. A shrink that copies
 //! into a smaller block, as `Vec::shrink_to` may, holds both blocks for the copy while
 //! `shrink` admits nothing beyond the old size, so it goes through `grow` with the
 //! smaller size instead.
@@ -55,7 +60,10 @@
 //! the room for a batch at once, so the per-row path is a plain insert.
 
 use crate::error::{Error, Result};
+use crate::id::Id;
 use crate::sparql::ctx::{OwnedCharge, RetainedCharge};
+use rustc_hash::FxBuildHasher;
+use std::hash::BuildHasher;
 use std::ops::Deref;
 
 /// The account a [`Charged`] holds its bytes on. An operator keeps the account type it
@@ -140,9 +148,20 @@ impl<V: Storage, A: Account> Deref for Charged<V, A> {
 }
 
 impl<V: Storage, A: Account> Charged<V, A> {
-    /// A buffer over `value` that charges `account`, which holds no bytes yet. The
-    /// value's existing allocation is admitted before it is kept.
-    pub(super) fn new(value: V, mut account: A) -> Result<Self> {
+    /// An empty buffer that charges `account`, which holds no bytes yet. A buffer is
+    /// never built over a collection that already holds entries, since a hash table's
+    /// growth is predicted from its length and room alone, and a table with removed
+    /// entries grows sooner than those predict.
+    pub(super) fn empty(account: A) -> Result<Self>
+    where
+        V: Default,
+    {
+        Self::new(V::default(), account)
+    }
+
+    /// A buffer over `value`, which holds no entries, that charges `account`. Its
+    /// allocation is admitted before it is kept.
+    fn new(value: V, mut account: A) -> Result<Self> {
         let charged = value.heap_bytes();
         account.resize(charged)?;
         Ok(Self {
@@ -154,6 +173,7 @@ impl<V: Storage, A: Account> Charged<V, A> {
 
     /// The bytes the buffer charges, which are its collection's allocation.
     #[inline]
+    #[allow(dead_code, reason = "tests and the operators of item 1192 read it")]
     pub(super) fn bytes(&self) -> u64 {
         self.charged
     }
@@ -167,24 +187,27 @@ impl<V: Storage, A: Account> Charged<V, A> {
         );
     }
 
-    /// The one growth site. `grown` is the size of the allocation that `f` makes, or an
-    /// upper bound on it, which is admitted beside the old allocation before `f` runs.
-    /// Afterwards the charge is set to what the collection reports, whether `f` failed
-    /// or not. A refused admission leaves the buffer as it was.
+    /// The one growth site. `admit` bytes beyond the old allocation are admitted
+    /// before `f` runs, which for one collection is the size of the allocation that `f`
+    /// makes, or an upper bound on it. `bound` is an upper bound on the size the
+    /// collection reports after `f`. Afterwards the charge is set to what the
+    /// collection reports, whether `f` failed or not. A refused admission leaves the
+    /// buffer as it was.
     #[cold]
     fn grow<E>(
         &mut self,
-        grown: u64,
+        admit: u64,
+        bound: u64,
         f: impl FnOnce(&mut V) -> std::result::Result<(), E>,
     ) -> Result<()> {
         self.check();
         let old = self.charged;
-        self.account.resize(old.saturating_add(grown))?;
+        self.account.resize(old.saturating_add(admit))?;
         let done = f(&mut self.value);
         let now = self.value.heap_bytes();
         debug_assert!(
-            now <= grown.max(old),
-            "a grown allocation of {now} bytes above the {grown} admitted"
+            now <= bound.max(old) && now <= old.saturating_add(admit),
+            "a grown allocation of {now} bytes above the {bound} predicted"
         );
         self.settle(now)?;
         done.map_err(|_| no_room())
@@ -244,6 +267,7 @@ impl<T, A: Account> Charged<Vec<T>, A> {
     /// The bytes [`Self::reserve_toward`] would allocate for `more` entries where the
     /// budget allows its target, or zero when the vector has room.
     #[inline]
+    #[allow(dead_code, reason = "the operators of item 1192 use it")]
     pub(super) fn growth(&self, more: usize, toward: usize) -> u64 {
         if self.value.capacity() - self.value.len() >= more {
             return 0;
@@ -271,21 +295,25 @@ impl<T, A: Account> Charged<Vec<T>, A> {
         let need = len.checked_add(more).ok_or_else(no_room)?;
         let size = Self::size;
         let doubled = self.target(need, toward);
-        match self.grow(size(doubled), |v| v.try_reserve_exact(doubled - len)) {
-            Err(Error::BudgetExceeded(_)) if doubled > need => {
-                self.grow(size(need), |v| v.try_reserve_exact(need - len))
-            }
+        let grow = |this: &mut Self, to: usize| {
+            this.grow(size(to), size(to), |v| v.try_reserve_exact(to - len))
+        };
+        match grow(self, doubled) {
+            Err(Error::BudgetExceeded(_)) if doubled > need => grow(self, need),
             r => r,
         }
     }
 
     /// Add `items` to room that [`Self::reserve`] made.
     #[inline]
+    #[allow(dead_code, reason = "the operators of item 1192 use it")]
     pub(super) fn extend_reserved(&mut self, items: &[T])
     where
         T: Clone,
     {
-        debug_assert!(
+        // A check in release builds too: an extend past the room would allocate
+        // what no admission covered. It panics before the vector changes.
+        assert!(
             self.value.capacity() - self.value.len() >= items.len(),
             "an extend without room"
         );
@@ -315,6 +343,7 @@ impl<T, A: Account> Charged<Vec<T>, A> {
 
     /// Drop the entries and keep the allocation.
     #[inline]
+    #[allow(dead_code, reason = "the operators of item 1192 use it")]
     pub(super) fn clear(&mut self) {
         self.value.clear();
     }
@@ -347,24 +376,30 @@ fn buckets(capacity: usize, entry: usize) -> usize {
     }
 }
 
+/// The room for entries a hashbrown table of `len` entries and room for `capacity` has
+/// once it makes room for `more`.
+fn table_capacity_after<T>(len: usize, capacity: usize, more: usize) -> usize {
+    if capacity - len >= more {
+        return capacity;
+    }
+    let buckets = buckets(
+        len.saturating_add(more).max(capacity.saturating_add(1)),
+        std::mem::size_of::<T>(),
+    );
+    if buckets <= 8 {
+        buckets - 1
+    } else {
+        buckets / 8 * 7
+    }
+}
+
+#[allow(dead_code, reason = "the operators of item 1192 use it")]
 impl<T, A: Account> Charged<hashbrown::HashTable<T>, A> {
     /// The room for entries the table has once [`Self::reserve`] makes room for `more`.
     /// A caller that sizes a buffer beside the table from it reads it before the table
     /// grows, to predict the pair's size.
     pub(super) fn capacity_after(&self, more: usize) -> usize {
-        let (len, capacity) = (self.value.len(), self.value.capacity());
-        if capacity - len >= more {
-            return capacity;
-        }
-        let buckets = buckets(
-            len.saturating_add(more).max(capacity.saturating_add(1)),
-            std::mem::size_of::<T>(),
-        );
-        if buckets <= 8 {
-            buckets - 1
-        } else {
-            buckets / 8 * 7
-        }
+        table_capacity_after::<T>(self.value.len(), self.value.capacity(), more)
     }
 
     /// The bound on what [`Self::reserve`] allocates for `more` entries, or zero when
@@ -386,13 +421,14 @@ impl<T, A: Account> Charged<hashbrown::HashTable<T>, A> {
             return Ok(());
         }
         let grown = table_growth::<T>(self.value.len(), self.value.capacity(), more);
-        self.grow(grown, |t| t.try_reserve(more, hasher))
+        self.grow(grown, grown, |t| t.try_reserve(more, hasher))
     }
 
     /// Add an entry to room that [`Self::reserve`] made.
     #[inline]
     pub(super) fn insert_reserved(&mut self, hash: u64, value: T, hasher: impl Fn(&T) -> u64) {
-        debug_assert!(
+        // A check in release builds too, as for `extend_reserved`.
+        assert!(
             self.value.len() < self.value.capacity(),
             "an insert without room"
         );
@@ -426,13 +462,14 @@ impl<T: Eq + std::hash::Hash, S: std::hash::BuildHasher, A: Account>
             return Ok(());
         }
         let grown = table_growth::<T>(self.value.len(), self.value.capacity(), more);
-        self.grow(grown, |s| s.try_reserve(more))
+        self.grow(grown, grown, |s| s.try_reserve(more))
     }
 
     /// Add an entry to room that [`Self::reserve`] made. Returns whether it was new.
     #[inline]
     pub(super) fn insert_reserved(&mut self, value: T) -> bool {
-        debug_assert!(
+        // A check in release builds too, as for `extend_reserved`.
+        assert!(
             self.value.len() < self.value.capacity(),
             "an insert without room"
         );
@@ -443,6 +480,229 @@ impl<T: Eq + std::hash::Hash, S: std::hash::BuildHasher, A: Account>
     #[inline]
     pub(super) fn clear(&mut self) {
         self.value.clear();
+    }
+}
+
+/// A set of rows of `width` IDs each: a flat arena of the rows' IDs and a hash table of
+/// their row numbers, which hashes and compares a row by its IDs in the arena. The two
+/// grow together for each batch, so one [`Charged`] holds both on one charge, and a
+/// growth admits the pair before either allocates. The table grows first, while the
+/// old arena is live, and then the arena, while the new table is live, so the pair
+/// needs `max(T, T' - t + A)` bytes beyond what it holds, where `t` is the old table,
+/// `T` the table's growth and `T'` its size after, and `A` the arena's growth.
+pub(super) struct Rows {
+    table: hashbrown::HashTable<u32>,
+    ids: Vec<Id>,
+    width: usize,
+}
+
+impl Storage for Rows {
+    #[inline]
+    fn heap_bytes(&self) -> u64 {
+        self.table_bytes().saturating_add(self.arena_bytes())
+    }
+}
+
+/// The hash of row `r` of an arena of rows of `width` IDs.
+#[inline]
+fn row_hash(ids: &[Id], width: usize, r: u32) -> u64 {
+    let r = r as usize;
+    FxBuildHasher.hash_one(&ids[r * width..(r + 1) * width])
+}
+
+impl Rows {
+    /// The number of rows.
+    #[inline]
+    pub(super) fn len(&self) -> usize {
+        self.table.len()
+    }
+
+    /// The rows the table has room for.
+    #[inline]
+    pub(super) fn capacity(&self) -> usize {
+        self.table.capacity()
+    }
+
+    /// The IDs the arena holds.
+    #[cfg(test)]
+    pub(super) fn arena_len(&self) -> usize {
+        self.ids.len()
+    }
+
+    /// The IDs the arena has room for.
+    #[cfg(test)]
+    pub(super) fn arena_capacity(&self) -> usize {
+        self.ids.capacity()
+    }
+
+    /// The bytes of the table's allocation.
+    #[inline]
+    pub(super) fn table_bytes(&self) -> u64 {
+        self.table.allocation_size() as u64
+    }
+
+    /// The bytes of the arena's allocation.
+    #[inline]
+    pub(super) fn arena_bytes(&self) -> u64 {
+        Storage::heap_bytes(&self.ids)
+    }
+
+    /// The hash of a row of `width` IDs.
+    #[inline]
+    pub(super) fn hash(key: &[Id]) -> u64 {
+        FxBuildHasher.hash_one(key)
+    }
+
+    /// Whether the set holds `key`, whose hash is `hash`.
+    #[inline]
+    pub(super) fn contains(&self, key: &[Id], hash: u64) -> bool {
+        let (ids, width) = (&self.ids, self.width);
+        self.table
+            .find(hash, |&r| {
+                let r = r as usize;
+                ids[r * width..(r + 1) * width] == *key
+            })
+            .is_some()
+    }
+
+    /// What a growth for `more` rows makes: whether the table and the arena grow, the
+    /// table's bound, and the arena's IDs where the budget allows the arena to grow to
+    /// the table's room and where it does not.
+    fn plan(&self, more: usize) -> Option<RowsGrowth> {
+        let (len, capacity) = (self.table.len(), self.table.capacity());
+        let need = self.ids.len().checked_add(more.checked_mul(self.width)?)?;
+        let table = capacity - len < more;
+        let arena = self.ids.capacity() < need;
+        if !table && !arena {
+            return None;
+        }
+        // The arena grows toward the rows the table has room for, which keeps the two
+        // in step and keeps the arena from doubling past the table.
+        let toward = table_capacity_after::<u32>(len, capacity, more).saturating_mul(self.width);
+        Some(RowsGrowth {
+            table: table.then(|| table_growth::<u32>(len, capacity, more)),
+            arena: arena.then_some((need.max(toward), need)),
+        })
+    }
+
+    fn admit(&self, growth: &RowsGrowth, ids: Option<usize>) -> (u64, u64) {
+        let old = self.table_bytes();
+        let grown = growth.table.unwrap_or(0);
+        let after = growth.table.unwrap_or(old);
+        let arena = ids.map_or(0, ids_size);
+        let admit = grown.max(after.saturating_sub(old).saturating_add(arena));
+        let bound = after.saturating_add(ids.map_or(self.arena_bytes(), ids_size));
+        (admit, bound)
+    }
+}
+
+/// The bytes of an arena of `ids` IDs.
+fn ids_size(ids: usize) -> u64 {
+    (ids as u64).saturating_mul(std::mem::size_of::<Id>() as u64)
+}
+
+/// What [`Rows::plan`] finds a growth makes.
+struct RowsGrowth {
+    /// The table's bound, when it grows.
+    table: Option<u64>,
+    /// The arena's IDs where its growth to the table's room fits and where only its
+    /// need does, when it grows.
+    arena: Option<(usize, usize)>,
+}
+
+impl<A: Account> Charged<Rows, A> {
+    /// An empty set of rows of `width` IDs that charges `account`.
+    pub(super) fn rows(width: usize, account: A) -> Result<Self> {
+        assert!(width > 0, "a row of no IDs");
+        Self::new(
+            Rows {
+                table: hashbrown::HashTable::new(),
+                ids: Vec::new(),
+                width,
+            },
+            account,
+        )
+    }
+
+    /// The bytes the set holds once [`Self::reserve`] makes room for `more` rows where
+    /// the budget allows the arena to grow to the table's room, or zero when the set has
+    /// room. A caller reads it to predict the set's size before it grows.
+    pub(super) fn growth(&self, more: usize) -> u64 {
+        match self.value.plan(more) {
+            None => 0,
+            Some(growth) => {
+                let ids = growth.arena.map(|(preferred, _)| preferred);
+                self.value.admit(&growth, ids).1
+            }
+        }
+    }
+
+    /// Room for `more` rows. The growth of the table and of the arena is admitted as
+    /// one before either allocates, with the arena at the table's room where the budget
+    /// allows it and at what it needs where it does not. A refusal leaves both as they
+    /// were.
+    pub(super) fn reserve(&mut self, more: usize) -> Result<()> {
+        let Some(growth) = self.value.plan(more) else {
+            if more.checked_mul(self.value.width).is_none() {
+                return Err(no_room());
+            }
+            return Ok(());
+        };
+        let grow = |this: &mut Self, ids: Option<usize>| {
+            let (admit, bound) = this.value.admit(&growth, ids);
+            let table = growth.table.is_some();
+            this.grow(admit, bound, |v: &mut Rows| {
+                let Rows {
+                    table: t,
+                    ids: arena,
+                    width,
+                } = v;
+                if table {
+                    t.try_reserve(more, |&r| row_hash(arena, *width, r))
+                        .map_err(|_| ())?;
+                }
+                if let Some(to) = ids {
+                    arena.try_reserve_exact(to - arena.len()).map_err(|_| ())?;
+                }
+                Ok::<(), ()>(())
+            })
+        };
+        match growth.arena {
+            Some((preferred, need)) if preferred > need => match grow(self, Some(preferred)) {
+                Err(Error::BudgetExceeded(_)) => grow(self, Some(need)),
+                r => r,
+            },
+            arena => grow(self, arena.map(|(_, need)| need)),
+        }
+    }
+
+    /// Add `key`, a row of the set's width whose hash is `hash`, to room that
+    /// [`Self::reserve`] made, unless the set holds it. Returns whether it was new.
+    #[inline]
+    pub(super) fn insert_reserved(&mut self, key: &[Id], hash: u64) -> bool {
+        if self.value.contains(key, hash) {
+            return false;
+        }
+        let Rows { table, ids, width } = &mut self.value;
+        let width = *width;
+        // Checks in release builds too, as for `extend_reserved`. They panic before
+        // the set changes.
+        assert_eq!(key.len(), width, "a row of another width");
+        assert!(
+            table.len() < table.capacity() && ids.capacity() - ids.len() >= width,
+            "an insert without room"
+        );
+        let number = u32::try_from(table.len()).expect("a set of fewer than 2^32 rows");
+        ids.extend_from_slice(key);
+        table.insert_unique(hash, number, |&r| row_hash(ids, width, r));
+        true
+    }
+
+    /// Drop the rows and keep the allocations.
+    #[inline]
+    pub(super) fn clear(&mut self) {
+        self.value.table.clear();
+        self.value.ids.clear();
     }
 }
 
@@ -482,7 +742,7 @@ mod tests {
     fn a_vector_charges_its_capacity_and_releases_it_on_drop() {
         let ctx = context(1 << 20);
         let base = ctx.live_bytes();
-        let mut v = Charged::new(Vec::<u64>::new(), ctx.retained_charge(0).unwrap()).unwrap();
+        let mut v = Charged::<Vec<u64>, _>::empty(ctx.retained_charge(0).unwrap()).unwrap();
         for i in 0..1000 {
             v.push(i).unwrap();
             assert_eq!(ctx.live_bytes() - base, v.capacity() as u64 * 8);
@@ -501,7 +761,7 @@ mod tests {
     fn a_refused_growth_leaves_the_buffer_and_its_charge_as_they_were() {
         let ctx = context(64 << 10);
         let base = ctx.live_bytes();
-        let mut v = Charged::new(Vec::<u64>::new(), ctx.retained_charge(0).unwrap()).unwrap();
+        let mut v = Charged::<Vec<u64>, _>::empty(ctx.retained_charge(0).unwrap()).unwrap();
         let mut refused = false;
         for i in 0..100_000 {
             let (len, cap) = (v.len(), v.capacity());
@@ -529,13 +789,9 @@ mod tests {
         let ctx = context(1 << 24);
         let base = ctx.live_bytes();
         let hash = |x: &u64| x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
-        let mut t = Charged::new(
-            hashbrown::HashTable::<u64>::new(),
-            ctx.retained_charge(0).unwrap(),
-        )
-        .unwrap();
-        let mut s = Charged::new(
-            hashbrown::HashSet::<u64, rustc_hash::FxBuildHasher>::default(),
+        let mut t = Charged::<hashbrown::HashTable<u64>, _>::empty(ctx.retained_charge(0).unwrap())
+            .unwrap();
+        let mut s = Charged::<hashbrown::HashSet<u64, rustc_hash::FxBuildHasher>, _>::empty(
             ctx.retained_charge(0).unwrap(),
         )
         .unwrap();
@@ -563,11 +819,8 @@ mod tests {
     fn the_predicted_capacity_is_the_tables() {
         let ctx = context(1 << 30);
         let hash = |x: &u32| *x as u64;
-        let mut t = Charged::new(
-            hashbrown::HashTable::<u32>::new(),
-            ctx.retained_charge(0).unwrap(),
-        )
-        .unwrap();
+        let mut t = Charged::<hashbrown::HashTable<u32>, _>::empty(ctx.retained_charge(0).unwrap())
+            .unwrap();
         for batch in [1, 3, 7, 1, 50, 200, 1, 1000, 5000, 1] {
             let predicted = t.capacity_after(batch);
             t.reserve(batch, hash).unwrap();
@@ -610,11 +863,8 @@ mod tests {
     #[test]
     fn a_table_of_bytes_grows_within_its_bound() {
         let ctx = context(1 << 20);
-        let mut t = Charged::new(
-            hashbrown::HashTable::<u8>::new(),
-            ctx.retained_charge(0).unwrap(),
-        )
-        .unwrap();
+        let mut t =
+            Charged::<hashbrown::HashTable<u8>, _>::empty(ctx.retained_charge(0).unwrap()).unwrap();
         let hash = |&x: &u8| x as u64;
         for x in 0..=255u8 {
             let room = t.capacity_after(1);
@@ -625,9 +875,164 @@ mod tests {
         }
     }
 
+    fn ids(xs: &[i64]) -> Vec<Id> {
+        xs.iter().map(|&x| Id::from_i64(x).unwrap()).collect()
+    }
+
+    /// The bytes a context holds beyond `base`.
+    fn held(ctx: &Ctx, base: u64) -> u64 {
+        ctx.live_bytes() - base
+    }
+
+    /// A set of rows admits its table's and its arena's growth as one, the larger of the
+    /// table's growth and the table's growth less the old table plus the arena's, and a
+    /// refusal leaves both. With the arena at the table's room refused it grows to what
+    /// it needs.
+    #[test]
+    fn a_set_of_rows_admits_its_pair_before_either_grows() {
+        for width in [1, 2, 3] {
+            // the room the second growth needs, then a budget one byte short of it
+            let grow = |limit: Option<u64>, exact: bool| -> std::result::Result<u64, u64> {
+                let ctx = context(limit.unwrap_or(1 << 24));
+                let base = ctx.live_bytes();
+                let mut set = Charged::rows(width, ctx.retained_charge(0).unwrap()).unwrap();
+                let row = |i: usize| ids(&vec![i as i64; width]);
+                set.reserve(32).unwrap();
+                for i in 0..32 {
+                    assert!(set.insert_reserved(&row(i), Rows::hash(&row(i))));
+                }
+                let (t, a) = (set.table_bytes(), set.arena_bytes());
+                let (cap, arena) = (set.capacity(), set.arena_capacity());
+                assert_eq!(held(&ctx, base), t + a);
+                let predicted = set.growth(40);
+                let before = ctx.mem_peak();
+                match set.reserve(40) {
+                    Ok(()) => {
+                        // the table's bound and the arena at the table's room, or at its
+                        // need
+                        let ids = if exact { 72 * width } else { 112 * width };
+                        assert_eq!(set.arena_capacity(), ids);
+                        assert_eq!(set.capacity(), 112);
+                        if !exact {
+                            assert!(set.bytes() <= predicted);
+                        }
+                        assert_eq!(held(&ctx, base), set.bytes());
+                        let table = predicted - 112 * width as u64 * 8;
+                        let arena = ids as u64 * 8;
+                        let admitted = t + a + table.max(table - t + arena);
+                        assert!(ctx.mem_peak().max(before) - base >= admitted - 16);
+                        Ok(admitted)
+                    }
+                    Err(Error::BudgetExceeded(_)) => {
+                        assert_eq!((set.capacity(), set.arena_capacity()), (cap, arena));
+                        assert_eq!((set.table_bytes(), set.arena_bytes()), (t, a));
+                        assert_eq!(held(&ctx, base), t + a);
+                        assert_eq!(set.len(), 32);
+                        Err(base)
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            };
+            let full = grow(None, false).unwrap();
+            let ctx = context(1 << 24);
+            let base = ctx.live_bytes();
+            drop(ctx);
+            // the budget a growth needs, the context's own charges included
+            let at = |admitted: u64| Some(base + admitted);
+            grow(at(full), false).unwrap();
+            let exact = grow(at(full - 1), true).unwrap();
+            assert!(exact < full);
+            grow(at(exact), true).unwrap();
+            grow(at(exact - 1), true).unwrap_err();
+        }
+    }
+
+    /// A growth of the arena alone admits the arena, and a set that has room admits
+    /// nothing. Rows already held are not added twice.
+    #[test]
+    fn a_set_of_rows_grows_its_arena_alone_and_keeps_rows_once() {
+        let ctx = context(1 << 24);
+        let base = ctx.live_bytes();
+        let mut set = Charged::rows(2, ctx.retained_charge(0).unwrap()).unwrap();
+        set.reserve(3).unwrap();
+        let (table, arena) = (set.capacity(), set.arena_capacity());
+        assert_eq!(table, 3);
+        assert_eq!(arena, 6);
+        for i in 0..3 {
+            let row = ids(&[i, i]);
+            assert!(set.insert_reserved(&row, Rows::hash(&row)));
+            assert!(!set.insert_reserved(&row, Rows::hash(&row)));
+        }
+        assert_eq!(set.growth(0), 0);
+        set.reserve(0).unwrap();
+        assert_eq!(set.bytes(), held(&ctx, base));
+        set.clear();
+        assert_eq!((set.capacity(), set.arena_capacity()), (table, arena));
+        drop(set);
+        assert_eq!(ctx.live_bytes(), base);
+    }
+
+    /// Each reserved mutator checks its room in release builds too, and panics before
+    /// it changes the buffer or its charge.
+    #[test]
+    fn reserved_mutators_without_room_panic_before_they_change_anything() {
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        let ctx = context(1 << 24);
+        let base = ctx.live_bytes();
+        let mut v = Charged::<Vec<u64>, _>::empty(ctx.retained_charge(0).unwrap()).unwrap();
+        v.reserve(16).unwrap();
+        v.extend_reserved(&[]);
+        v.extend_reserved(&[7; 16]);
+        let (len, cap, bytes) = (v.len(), v.capacity(), v.bytes());
+        assert!(catch_unwind(AssertUnwindSafe(|| v.extend_reserved(&[1]))).is_err());
+        assert_eq!((v.len(), v.capacity(), v.bytes()), (len, cap, bytes));
+
+        let hash = |x: &u64| x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let mut t = Charged::<hashbrown::HashTable<u64>, _>::empty(ctx.retained_charge(0).unwrap())
+            .unwrap();
+        assert!(catch_unwind(AssertUnwindSafe(|| t.insert_reserved(hash(&1), 1, hash))).is_err());
+        assert_eq!((t.len(), t.capacity(), t.bytes()), (0, 0, 0));
+        t.reserve(3, hash).unwrap();
+        let room = t.capacity();
+        for x in 0..room as u64 {
+            t.insert_reserved(hash(&x), x, hash);
+        }
+        let bytes = t.bytes();
+        assert!(catch_unwind(AssertUnwindSafe(|| t.insert_reserved(hash(&99), 99, hash))).is_err());
+        assert_eq!((t.len(), t.capacity(), t.bytes()), (room, room, bytes));
+
+        let mut s = Charged::<hashbrown::HashSet<u64, rustc_hash::FxBuildHasher>, _>::empty(
+            ctx.retained_charge(0).unwrap(),
+        )
+        .unwrap();
+        assert!(catch_unwind(AssertUnwindSafe(|| s.insert_reserved(1))).is_err());
+        assert_eq!((s.len(), s.capacity(), s.bytes()), (0, 0, 0));
+
+        let mut r = Charged::rows(2, ctx.retained_charge(0).unwrap()).unwrap();
+        let row = ids(&[1, 2]);
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || r.insert_reserved(&row, Rows::hash(&row))
+            ))
+            .is_err()
+        );
+        assert_eq!((r.len(), r.arena_len(), r.bytes()), (0, 0, 0));
+        r.reserve(1).unwrap();
+        let wide = ids(&[1, 2, 3]);
+        assert!(
+            catch_unwind(AssertUnwindSafe(
+                || r.insert_reserved(&wide, Rows::hash(&wide))
+            ))
+            .is_err()
+        );
+        assert_eq!(r.len(), 0);
+        drop((v, t, s, r));
+        assert_eq!(ctx.live_bytes(), base);
+    }
+
     #[test]
     fn an_uncharged_buffer_grows_without_an_account() {
-        let mut v = Charged::new(Vec::<u8>::new(), None::<RetainedCharge>).unwrap();
+        let mut v = Charged::<Vec<u8>, _>::empty(None::<RetainedCharge>).unwrap();
         v.extend_from_slice(&[1; 100]).unwrap();
         assert_eq!(v.bytes(), v.capacity() as u64);
     }
