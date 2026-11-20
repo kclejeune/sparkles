@@ -1179,7 +1179,8 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
 }
 
 /// What a run that counts does when a unit existential restriction arrives after its EL
-/// successor sent clauses over the predecessor, item 1229 (F24). Pred took each such clause
+/// successor sent clauses over the predecessor, or an edge after its successor did, item
+/// 1229 (F24). Pred took each such clause
 /// with the restrictions that reached the successor when it came, and the successor sends
 /// it again over the new backward link only to find it taken. With counting, Pred's
 /// conclusion can hold the restriction's own successor term, in a role atom over it or, in
@@ -1223,6 +1224,39 @@ fn late_unit<S: Sink>(ix: &Index, st: &State, d: Ex, v: Ex, found: &mut Found, o
             }
             if tracing() {
                 eprintln!("TR LATE {} e={d} succ={v}", tr_ctx(st, false));
+            }
+            found.over = true;
+        }
+    }
+}
+
+/// The rule of [`late_unit_mode`] on a new edge of a run that counts, from `e` to a
+/// successor `v` that already sent clauses over the predecessor. Under the eager strategy
+/// two restrictions can share a successor, and the second one's edge can come after the
+/// clauses did. On the edge the context replays only Pred with the literal that made it,
+/// so a clause whose body lacks that literal would miss the new restriction as a late
+/// unit does, and the rule takes it the same way.
+fn late_edge<S: Sink>(ix: &Index, st: &State, e: Ex, v: Ex, found: &mut Found, out: &mut S) {
+    let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&v)) else {
+        return;
+    };
+    if cids.is_empty() {
+        return;
+    }
+    match late_unit_mode() {
+        0 => {}
+        2 => {
+            for &cid in cids {
+                let c = out.dl().table.get(cid).clone();
+                pred(ix, st, e, &c, None, found, &out.dl().lits);
+            }
+        }
+        _ => {
+            if dix(ix).root.is_none() {
+                return;
+            }
+            if tracing() {
+                eprintln!("TR LATEEDGE {} e={e} succ={v}", tr_ctx(st, false));
             }
             found.over = true;
         }
@@ -3348,8 +3382,15 @@ fn process<S: Sink>(
             }
             F | RL | EQ | NE => {
                 let e = l.fun();
+                let had = dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e));
                 // Succ: the successor takes the marker
                 let v = target(ix, me, st, e, out);
+                if dx.counting
+                    && !had
+                    && dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e))
+                {
+                    late_edge(ix, st, e, v, &mut found, out);
+                }
                 match l.kind() {
                     F => send_hyp(ix, st, v, l.atom(), out),
                     RL => on_rl(ix, st, e, l.atom(), &prem, &mut found),

@@ -1452,3 +1452,63 @@ fn a_selected_equality_of_a_successor_with_constants_reaches_its_own_successor()
         check(body, &[("K", "Ans")], &[("S", "Ans")]);
     }
 }
+
+/// K's r-successor is a C and a D, and K derives its s-restriction into C only after a case
+/// analysis. Under the eager strategy both restrictions reach the one successor whose core
+/// is C and D, which sent its clauses over the predecessor when the r-edge was made, and
+/// the s-edge comes later. The functional p makes the two successors one, so K ⊑ ∃s.D ⊑ Ans.
+/// A rooted run that counts either finds K ⊑ Ans or classifies again without counting,
+/// which leaves the functional property out and reports it (item 1229).
+#[test]
+fn a_late_restriction_that_shares_an_eager_successor_reads_its_clauses() {
+    let ax = axioms(
+        "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:K ObjectAllValuesFrom(:r :D))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 ObjectUnionOf(:Y1 :Y2)))
+         SubClassOf(:Y1 :Y)
+         SubClassOf(:Y2 :Y)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :Y) :A)
+         SubClassOf(:A :L0)
+         SubClassOf(:L0 :L1)
+         SubClassOf(:L1 ObjectSomeValuesFrom(:s :C))
+         SubClassOf(:C ObjectIntersectionOf(:B :B2))
+         SubObjectPropertyOf(:r :p)
+         SubObjectPropertyOf(:s :p)
+         FunctionalObjectProperty(:p)
+         SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+         SubClassOf(:E ObjectSomeValuesFrom(:s :C))
+         ClassAssertion(:K :a)",
+    );
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        if out.complete && k.excluded().is_empty() {
+            assert!(!out.stats.dl_counting_over);
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing ({threads}, {expansion:?})"
+            );
+        } else {
+            // the run without counting leaves the functional property out, so K ⊑ Ans with it
+            assert!(out.stats.dl_counting_over, "{:#?}", k.excluded());
+        }
+        assert!(
+            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+            "E ⊑ Ans is not entailed"
+        );
+    }
+}
