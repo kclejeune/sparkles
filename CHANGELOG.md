@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Rooted runs no longer report a complete answer that misses entailments
+
+With `Limits::rooted`, the selection of ground body literals and the restriction of Join
+on ground inferences, two of the departures F24 records, could make a run that reported
+itself complete miss an entailed subsumption or an unsatisfiable class. Both are off in
+rooted runs until roadmap item 1220 repairs them. shoi-005 and shoi-027 now pass the work
+bound and give the default answer, which is sound and reported as partial, so 46 of the
+50 `shoi` fixtures finish against 48.
+
 ### Targeted checks on a remote host
 
 `mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
