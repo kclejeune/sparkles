@@ -38,7 +38,7 @@ of more than `Limits::dl_attempt_width` choices, 1,048,576 by default, so that
 `ore_ont_14817` and `ore_ont_9663` fall back to the Horn rules after 0.5 and 4 million
 conclusions instead of 22.4 million, in 25.6 and 51.1 G instructions against 584 and 700 G,
 with the same taxonomies (roadmap items 990 and 1011). `el_classify --dl-attempt-width N`
-sets the limit, and roadmap item 1220 follows why one thread makes such wide products.
+sets the limit, and roadmap item 1225 follows why one thread makes such wide products.
 
 ### Targeted checks on a remote host
 

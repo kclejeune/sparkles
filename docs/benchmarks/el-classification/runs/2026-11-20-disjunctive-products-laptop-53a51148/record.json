@@ -1,0 +1,102 @@
+{
+ "suite": "el-classification",
+ "kind": "exploratory-measurement",
+ "scale": "ORE 2015 DL development files ore_ont_14817, ore_ont_9663, ore_ont_3215, ore_ont_16680, ore_ont_13103 and ore_ont_5438 for instruction counts; the 96 disjunctive files of the development set and the 3,000 generated ontologies with a union of item 710's generator (2,166 of them take the disjunctive rules) for the attempt's counters; and a taxonomy sweep of GO, ChEBI lite, 298 ORE 2015 EL files and the 207 DL development files",
+ "host": {
+  "name": "stanley",
+  "role": "the laptop, with other lanes' work running beside these runs",
+  "cpu": "Intel(R) Core(TM) Ultra X7 358H",
+  "cpus": 16,
+  "ram_mib": 31627
+ },
+ "status": "Times in this record come from a loaded laptop and are not measurements. Instruction counts (perf stat instructions:u, one thread, pinned to one core) and the conclusion, product and taxonomy counts are the evidence. The Intel timing of the same binaries is a separate record.",
+ "manifest": {
+  "sides": {
+   "base": "09f6ed15, the lane base (batch 42 tip, contains item 1025)",
+   "w2": "e0722fab with the working-tree diff bin-w2.patch.txt, whose code is that of 53a51148: the pruning by signatures and merges, the moved Pred lists, and the one-thread width limit Limits::dl_attempt_width; w0 is w2 run with --dl-attempt-width 0",
+   "diag": "09f6ed15 with diag.patch.txt (SPARKLES_DL_DIAG=1 prints the attempt's counters at each doubling of work from 2^16 and at its end or stop)",
+   "a23d": "09f6ed15 with the pruning change and the diagnostics (bin-a23d.patch.txt)",
+   "w1d": "e0722fab with the width limit and the diagnostics (bin-w1d.patch.txt)",
+   "fp": "09f6ed15 built with frame pointers for perf record"
+  },
+  "build": "build.sh.txt: ~/.local/bin/sparkles-heavy-run 8 mbx build --release -p sparkles-owl --example el_classify on stanley; each bin-NAME.head.txt gives the HEAD and the SHA-256 of its diff",
+  "toolchain": {
+   "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+   "mbx": "1.29.1"
+  },
+  "binaries_sha256": {
+   "base": "0e0a8f6aef8b8671f707fd8f08a57a7c194367433060acf1d7b3cf967906a945",
+   "w2": "e8da14758c9180e22934ec6ec1f42d1ec55563b086ad0d32a5568db087229854",
+   "diag": "4f15c9e09c3de67baf2c75863504ae73e3831ae492242ace5bf0baae75451e09",
+   "a23d": "a01ae6f76d918cd6b6c9230fc283339e840f0b9f1ec6ffde6f6a95239b707acd",
+   "w1d": "aef431b6fe003b44e9059f11abca9b4b4e8549332b7a185c6af690a1e0d050d5",
+   "fp": "efe95df166c1b56391f111c474c4945f253cabac9e81eefcc6fbafd4afc3100b"
+  },
+  "scripts": [
+   "build.sh.txt",
+   "insn.sh.txt",
+   "run.sh.txt",
+   "corpus.sh.txt",
+   "corpus-compare.sh.txt",
+   "dsweep.sh.txt",
+   "gsweep.sh.txt",
+   "files.sh.txt",
+   "m4.sh.txt",
+   "m5.sh.txt",
+   "m6.sh.txt",
+   "counters-compare.sh.txt"
+  ]
+ },
+ "settings": {
+  "threads": "one for instruction counts and the counter sweeps; one and four in the corpus sweep; two, four and eight in the width checks",
+  "scope": "each classification in a systemd user scope of 8 or 10 GiB with 1 GiB of swap, pinned with taskset",
+  "commands": "el_classify --threads N --taxonomy FILE [--dl-attempt-width N | --dl-attempt-work N] INPUT"
+ },
+ "results": {
+  "insn.txt": "insn.sh lines NAME BIN TAG insn=USER_INSTRUCTIONS tax=TAXONOMY_HASH and the report's counters. The lines after M2-DONE are m6.sh: base def, w2 w0 and w2 def on the six files. The lines before are the base with the EL rules alone (el), the Horn rules alone (horn) and the default pipeline (def).",
+  "runs.txt": "run.sh lines: the base's bound sweep on ore_ont_14817 (tags w1000000 to w16000000 are --dl-attempt-work), the four-thread runs of w2, and three interleaved four-thread rounds ab4r1 to ab4r3 of base and w2.",
+  "corpus.txt": "corpus.sh lines NAME SIDE THREADS EXIT TAXONOMY_HASH [tier, dlAttemptOver, dlOverBudget, hornOverBudget, outside, unsatisfiable, consistency, ms]; corpus-compare.txt is corpus-compare.sh's output, 998 pairs with 0 differences once the time is removed. ore_ont_7192 is killed by the memory cap and the reader refuses ore_ont_9881 on both sides.",
+  "dsweep-d0..d3.txt": "dsweep.sh over the 96 disjunctive development files on one thread: d0 diag, d1 a23d, d2 w1d, d3 w2. Each line: NAME exit taxonomy [ms, tier, dlAttemptOver, dlOverBudget, dlWork, dlContexts, dlStored, dlTests, conclusions, estimatedBytes, peakEstimatedBytes]. Once the time is removed d0 and d1 give the same lines, and d2 and d3 differ from them only in the peak estimated bytes of ore_ont_14817, 557,619,643 against 988,372,022, since the width limit ends its attempt early.",
+  "gsweep-g0..g4.txt": "gsweep.sh over the 3,000 generated files: g0 diag, g1 a23d, g2 w1d on one thread, g3 w1d on four threads, g4 w2 on one thread. Each line ends with the last DLDIAG counters, maxProd the widest product.",
+  "maxprod-d1.txt": "the widest product of each finishing development attempt on one thread from the d1 counters",
+  "m4.txt, m5.txt, m5f.txt": "the width limit's checks on two, four and eight threads (m4.sh, m5.sh): taxonomy, time, flags and the DLDIAG counters",
+  "profile-14817-fp.txt": "perf report --children of perf record on fp, ore_ont_14817, default pipeline, one thread",
+  "dldiag-d0.txt, dldiag-d1.txt": "the DLDIAG lines of the 15 files whose attempts print them of the d0 and d1 sweeps, prefixed by the file name; counters-compare.txt is counters-compare.sh's output, 0 differences once the time and d1's added maxProd are removed"
+ },
+ "summary": {
+  "instructions_one_thread_G": {
+   "ore_ont_14817": {
+    "base": 727.6,
+    "w0": 583.6,
+    "w2": 25.6
+   },
+   "ore_ont_9663": {
+    "base": 857.3,
+    "w0": 700.4,
+    "w2": 51.1
+   },
+   "ore_ont_3215": {
+    "base": 183.1,
+    "w0": 158.8,
+    "w2": 158.9
+   },
+   "ore_ont_16680": {
+    "base": 66.4,
+    "w0": 57.4,
+    "w2": 57.4
+   },
+   "ore_ont_13103": {
+    "base": 22.1,
+    "w0": 20.0,
+    "w2": 20.0
+   },
+   "ore_ont_5438": {
+    "base": 7.18,
+    "w0": 6.53,
+    "w2": 6.53
+   }
+  },
+  "taxonomies": "every pair of sides gives the same taxonomy hash on every file counted and swept",
+  "counters": "d0 and d1 give the same conclusions, products and clauses at every checkpoint on the 96 files, and the same estimated bytes"
+ }
+}

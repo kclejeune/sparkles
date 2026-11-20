@@ -1,0 +1,2 @@
+GO=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-1025/.artifacts/lanes/horn-cost-1025/data/go.ofn
+DEV=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev

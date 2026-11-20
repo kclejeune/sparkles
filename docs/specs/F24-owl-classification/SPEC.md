@@ -339,21 +339,24 @@ and item 1010 follows the edits after which a kept and a fresh run fall on two s
 bound. Item 1011 follows the bound's form on other ontologies.
 
 Item 1011 found what the attempts spend beyond their counted conclusions. On one thread
-on the laptop the attempt took about 703 of the 725 G instructions of ore_ont_14817's
+on the laptop the attempt took about 706 of the 728 G instructions of ore_ont_14817's
 classification and 829 of 857 G on ore_ont_9663, and its cost per conclusion grew as its
-clause stores grew, so that ore_ont_14817 took 5.1, 7.9, 19.3, 47.6 and 96.6 s with bounds
-of 1, 4, 8, 16 and 22.4 million conclusions. Half of the time went into the products of
-the rules, whose choices below 4,096 unions a step count nothing toward the bound, and a
-fifth into pruning their lists. The pruning of a product's lists now compares two sides by
-a signature of their literals and then by a merge of the sorted literals, where it searched
-each literal, and keeps the same sides in the same order. The Pred rule with a fixed
-premise moves its lists into the last product instead of copying them. The 96 disjunctive
-files of the development set derive the same conclusions, products and clauses at every
-doubling of the work, with the same estimated bytes and taxonomies. On the laptop the classifications
-take 0.80 to 0.91 times the base's instructions on the six files counted, with the
-limit below off, and on the
-loaded laptop the attempts took about half the time, such as 91 against 184 s on
-ore_ont_14817 on one thread.
+clause stores grew. On the loaded laptop ore_ont_14817 took 5.1, 6.2, 7.9, 19.3 and 47.6 s
+with bounds of 1, 2, 4, 8 and 16 million conclusions and 89 s with the default bound of
+22.4 million. Half of the attempt's time went into the products of the rules, whose
+choices below 4,096 unions a step count nothing toward the bound, and a fifth into pruning
+their lists. The pruning of a product's lists now compares two sides by a signature of
+their literals and then by a merge of the sorted literals, where it searched each literal,
+and keeps the same sides in the same order. The Pred rule with a fixed premise moves its
+lists into the last product instead of copying them. The 96 disjunctive files of the
+development set derive the same conclusions with the same estimated bytes and taxonomies,
+and the 15 whose attempts reach 65,536 conclusions make the same products and clauses at
+every doubling of the work. The classifications take 0.80 to 0.91 times the base's
+instructions on the six files counted, with the limit below off. The times on the loaded
+laptop are not measurements, but they show the attempt of ore_ont_14817 taking 97 against
+192 s on one thread in the sweeps with diagnostic counters. The
+[laptop record](../../benchmarks/el-classification/runs/2026-11-20-disjunctive-products-laptop-53a51148/record.json)
+holds the counts, the sweeps and the scripts.
 
 On one thread an attempt also ends when one product of its rules has more choices than
 `Limits::dl_attempt_width`, 1,048,576 by default. The 12 attempts of the development set
@@ -368,11 +371,15 @@ four and eight threads the finishing attempts make products of up to 22,500 choi
 in three runs on four threads ore_ont_9663 made products of at most 22,707 to 923,521
 choices and ore_ont_14817 of 1.3 to 5.1 million, so the width does not tell an attempt
 that finishes from one that cannot, and a run on more threads has no limit on it. Unlike
-the bound on conclusions, the limit therefore depends on the number of threads, and an
-ontology near it can fall back on one thread where several threads answer in full. On one thread the order is fixed, and the
+the bound on conclusions, the limit therefore depends on the number of threads. A run on
+one thread may fall back to the Horn rules' answer, as any attempt that does not finish
+does, on an ontology where a run on four threads answers in full with the disjunctive
+rules, and the classifier accepts this. No file of the development set and none of the
+generated ontologies does so, since their widest products on one thread stay 4,096 and
+288 times under the limit. On one thread the order is fixed, and the
 widest product of ore_ont_9663 falls from 999 million choices on one thread to 1.3 million
 on two and 22,707 in one run on four, with 355, 71 and 24 million choices made by the products'
-steps, which item 1220 follows. A kept run whose product passes the limit starts again in
+steps, which item 1225 follows. A kept run whose product passes the limit starts again in
 full, as past the bound on conclusions. A run that leaves out an inference too wide to make,
 for this limit or for an at-most restriction with too many candidates, now falls back even when it has
 no bound on its conclusions, where it answered as complete without the inference before.

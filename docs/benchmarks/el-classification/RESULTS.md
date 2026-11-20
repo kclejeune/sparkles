@@ -1784,6 +1784,35 @@ automata. Item 1090 follows the disjunctive attempt. The four Atlas rounds
 qualify this build separately from the six forge rounds of the reduced
 automata.
 
+<a id="products-of-the-disjunctive-attempt"></a>
+
+### Products of the disjunctive attempt
+
+Roadmap items 990 and 1011 made the products of the disjunctive rules cheaper and end a
+one-thread attempt at a product of more than 1,048,576 choices. The counts below are user
+instructions of one classification on one thread on the laptop, pinned to one core, of the
+base, commit 09f6ed15, and of the build of commit 53a51148 with and without the width
+limit. The laptop ran other work beside them, so they compare instructions and not time.
+
+| Ontology | Base G | Without the limit G | With the limit G | Without the limit / base |
+|---|---:|---:|---:|---:|
+| `ore_ont_14817` | 727.6 | 583.6 | 25.6 | 0.802 |
+| `ore_ont_9663` | 857.3 | 700.4 | 51.1 | 0.817 |
+| `ore_ont_3215` | 183.1 | 158.8 | 158.9 | 0.867 |
+| `ore_ont_16680` | 66.4 | 57.4 | 57.4 | 0.865 |
+| `ore_ont_13103` | 22.1 | 20.0 | 20.0 | 0.903 |
+| `ore_ont_5438` | 7.18 | 6.53 | 6.53 | 0.909 |
+
+All three give the same taxonomy on each file. The attempts of `ore_ont_14817` and
+`ore_ont_9663` fail on every build, and the limit ends them after 0.5 and 4 million
+conclusions instead of 22.4 million. The attempt of `ore_ont_3215` fails by its count, and
+the other three finish. A sweep classified GO, ChEBI lite, the 298 ORE 2015 EL files and
+the 207 DL development files once per build on one and four threads, and the 998 pairs
+that both builds classified gave the same tier, flags, classes outside the rules, count of unsatisfiable classes,
+consistency and taxonomy bytes. On one thread the 96 disjunctive development files derive the same
+conclusions with the pruning change, and their counters of products and clauses agree at
+every doubling of the work.
+
 ## Records
 
 The [record of the guarded Horn rules](runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json) holds the Atlas process reports and taxonomy hashes, the HermiT comparison summary, the original count-only witness diagnostics and the separate four-round Atlas control of the default Uberon attempt. The [same-snapshot witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) holds the later correctness comparison of the named-class sets.
@@ -1896,6 +1925,12 @@ holds every classification of the rounds on `atlas`, the twelve further rounds a
 one-thread runs of `ore_ont_14817` and `ore_ont_3215`, the sweep's
 taxonomy hashes, the scan of witnesses and worlds of item 868, the runs of `ore_ont_7192`
 and `ore_ont_11378` on the laptop and the scripts that ran.
+
+The [laptop record of items 990 and 1011's products](runs/2026-11-20-disjunctive-products-laptop-53a51148/record.json)
+holds the instruction counts, the corpus sweep with its comparison, the counter sweeps of
+the development set and of the generated ontologies with a union, the profile of
+`ore_ont_14817`, the patches of the diagnostic builds and the scripts. Its times come from
+a loaded laptop and are not measurements.
 
 The [record of item 990](runs/2026-11-15-disjunctive-bound-atlas-0decd1de/record.json)
 holds every classification of the rounds on `atlas` of both builds, the attempts that pass

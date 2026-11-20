@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# m4.sh: the width limit's sweeps and its trip on four threads.
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+. $L/files.sh
+$L/dsweep.sh w1d d2
+$L/gsweep.sh w1d g2
+for i in 1 2 3; do for n in 14817 9663; do
+  o=$L/out/w1d.t4.$n.$i
+  SPARKLES_DL_DIAG=1 taskset -c 8-11 $L/bin/w1d --threads 4 --taxonomy $o.tax $DEV/ore_ont_$n.owl > $o.json 2> $o.err
+  echo "$n t4 run$i tax=$(LC_ALL=C sort $o.tax | sha256sum | cut -c1-16) $(jq -c '[.classifyMs[0],.dlAttemptOver,.dlOverBudget]' $o.json) $(grep -E 'DLDIAG (over|end) ' $o.err | cut -d' ' -f2-4)" >> $L/out/m4.txt
+  rm -f $o.tax
+done; done
+echo M4-DONE >> $L/out/m4.txt
