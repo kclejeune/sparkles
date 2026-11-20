@@ -58,6 +58,24 @@ stanley at 1.05M triples, `lang-filter` counts 0.75 of the instructions per requ
 are unchanged. A key that is not ASCII pays one extra scan of its bytes before validation.
 When every name and title of the same data ends in a non-ASCII character, which is the worst
 case, `lang-filter` counts 1.026 of the instructions and `contains` 1.000.
+### Cheaper disjunctive attempts, and a width limit on one thread
+
+The pruning of the disjunctive rules' product lists compares sides by a signature and a
+sorted merge, and the Pred rule no longer copies its lists for a fixed premise. The attempts
+derive the same conclusions, and six of the largest classifications of the ORE 2015 DL
+development set take 0.80 to 0.91 times the instructions. On one thread an attempt also ends at a product
+of more than `Limits::dl_attempt_width` choices, 1,048,576 by default, so that
+`ore_ont_14817` and `ore_ont_9663` fall back to the Horn rules after 0.5 and 4 million
+conclusions instead of 22.4 million, in 25.6 and 51.1 G instructions against 584 and 700 G,
+with the same taxonomies (roadmap items 990 and 1011). `el_classify --dl-attempt-width N`
+sets the limit, and roadmap item 1225 follows why one thread makes such wide products.
+On one thread on forge the two files classify in 2.3 and 4.9 s against 57.4 and 74.3 s, and
+the other four in 0.86 to 0.91 times the base's time.
+
+The rule of the Horn rules for a new universal no longer searches the context's universals
+for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
+`ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
+item 1234 follows (item 693).
 
 ### Targeted checks on a remote host
 

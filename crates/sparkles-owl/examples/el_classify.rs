@@ -2,7 +2,7 @@
 //! reference reasoner and the measurements of `docs/benchmarks/el-classification`.
 //!
 //! ```text
-//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
+//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--dl-attempt-width N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax (`.ofn`, or any file that starts with `Prefix(` or
@@ -86,6 +86,7 @@ fn main() {
     let mut eager = false;
     let mut dl_work: Option<usize> = None;
     let mut dl_attempt_work: Option<usize> = None;
+    let mut dl_attempt_width: Option<usize> = None;
     let mut counting = false;
     let mut number_order = true;
     let mut rooted = false;
@@ -109,12 +110,13 @@ fn main() {
             "--no-dl-steps" => dl_steps = false,
             "--dl-work" => dl_work = args.next().and_then(|v| v.parse().ok()),
             "--dl-attempt-work" => dl_attempt_work = args.next().and_then(|v| v.parse().ok()),
+            "--dl-attempt-width" => dl_attempt_width = args.next().and_then(|v| v.parse().ok()),
             _ => input = Some(a),
         }
     }
     let Some(input) = input else {
         eprintln!(
-            "usage: el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--no-dl-steps] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+            "usage: el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--dl-attempt-width N] [--no-dl-steps] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
         );
         std::process::exit(2);
     };
@@ -171,6 +173,7 @@ fn main() {
         },
         dl_work,
         dl_attempt_work,
+        dl_attempt_width,
         counting,
         rooted,
         number_order,

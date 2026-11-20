@@ -82,6 +82,12 @@ pub enum Made {
 }
 
 impl Lit {
+    /// The literal's bit of a signature, a union of such bits that a subset's union is
+    /// within.
+    #[inline]
+    pub(super) fn sig_bit(self) -> u64 {
+        1 << (self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
+    }
     #[inline]
     pub fn y(a: Ex) -> Lit {
         Lit((Y << KIND_SHIFT) | a as u64)
@@ -408,9 +414,7 @@ impl Clause {
     /// A signature of the literals: one bit for each, by a hash, so that a clause whose
     /// signature has a bit that another's lacks does not subsume it.
     pub fn sig(&self) -> u64 {
-        self.lits.iter().fold(0, |s, l| {
-            s | 1 << (l.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
-        })
+        self.lits.iter().fold(0, |s, l| s | l.sig_bit())
     }
     /// Whether this clause subsumes `other`: its body and its head are subsets of
     /// `other`'s.
@@ -727,7 +731,9 @@ impl Rooted<'_> {
 }
 
 /// Whether sorted `a` is a subset of sorted `b`.
-fn subset(a: &[Lit], b: &[Lit]) -> bool {
+/// Whether the sorted literals `a` without repeats are among the sorted literals `b`
+/// without repeats.
+pub(super) fn subset(a: &[Lit], b: &[Lit]) -> bool {
     if a.len() > b.len() {
         return false;
     }

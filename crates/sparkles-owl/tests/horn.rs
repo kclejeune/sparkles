@@ -104,6 +104,34 @@ fn r3_a_universal_reaches_the_successor() {
     );
 }
 
+/// A context reaches one universal by several routes, told, through two subsumers, a
+/// conjunction and an equivalence, in a named context and in a conjunction context, and
+/// the rule for a new universal runs once for it, which its debug assertion checks
+/// (item 693). R3 and R4 still carry the universal to the successor and back.
+#[test]
+fn a_universal_reached_by_several_routes_is_derived_once() {
+    check(
+        "SubClassOf(:A :P)
+         SubClassOf(:A :Q)
+         SubClassOf(:A ObjectAllValuesFrom(:r :C))
+         SubClassOf(:P ObjectAllValuesFrom(:r :C))
+         SubClassOf(:Q ObjectAllValuesFrom(:r :C))
+         SubClassOf(:A ObjectIntersectionOf(:P ObjectAllValuesFrom(:r :C)))
+         EquivalentClasses(:U ObjectAllValuesFrom(:r :C))
+         SubClassOf(:A :U)
+         SubClassOf(:A ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :D)))
+         SubClassOf(:B ObjectAllValuesFrom(:t :E))
+         SubClassOf(:D ObjectAllValuesFrom(:t :E))
+         SubClassOf(ObjectIntersectionOf(:B :D) ObjectAllValuesFrom(:t :E))
+         SubClassOf(ObjectIntersectionOf(:B :D) ObjectSomeValuesFrom(:t :K))
+         SubClassOf(:K ObjectAllValuesFrom(ObjectInverseOf(:t) :H))
+         EquivalentClasses(:G ObjectSomeValuesFrom(:r ObjectIntersectionOf(:B :C :H
+             ObjectSomeValuesFrom(:t ObjectIntersectionOf(:E :K)))))",
+        &[("A", "G"), ("A", "U")],
+        &[("B", "E"), ("G", "A")],
+    );
+}
+
 #[test]
 fn r3_through_a_superrole_and_nested_universals() {
     check(

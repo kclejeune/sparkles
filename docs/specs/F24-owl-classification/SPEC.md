@@ -369,6 +369,61 @@ kept run counts the conclusions of the runs before it, as
 and item 1010 follows the edits after which a kept and a fresh run fall on two sides of the
 bound. Item 1011 follows the bound's form on other ontologies.
 
+Item 1011 found what the attempts spend beyond their counted conclusions. On one thread
+on the laptop the attempt took about 706 of the 728 G instructions of ore_ont_14817's
+classification and 829 of 857 G on ore_ont_9663, and its cost per conclusion grew as its
+clause stores grew. On the loaded laptop ore_ont_14817 took 5.1, 6.2, 7.9, 19.3 and 47.6 s
+with bounds of 1, 2, 4, 8 and 16 million conclusions and 89 s with the default bound of
+22.4 million. Half of the attempt's time went into the products of the rules, whose
+choices below 4,096 unions a step count nothing toward the bound, and a fifth into pruning
+their lists. The pruning of a product's lists now compares two sides by a signature of
+their literals and then by a merge of the sorted literals, where it searched each literal,
+and keeps the same sides in the same order. The Pred rule with a fixed premise moves its
+lists into the last product instead of copying them. The 96 disjunctive files of the
+development set derive the same conclusions with the same estimated bytes and taxonomies,
+and the 15 that attempt the rules make the same products and clauses at every doubling
+of the work. The classifications take 0.80 to 0.91 times the base's
+instructions on the six files counted, with the limit below off. The times on the loaded
+laptop are not measurements, but they show the classification of ore_ont_14817 taking 97
+against 192 s on one thread in the sweeps with diagnostic counters. The
+[laptop record](../../benchmarks/el-classification/runs/2026-11-20-disjunctive-products-laptop-53a51148/record.json)
+holds the counts, the sweeps and the scripts.
+
+On one thread an attempt also ends when one product of its rules has more choices than
+`Limits::dl_attempt_width`, 1,048,576 by default. The 12 attempts of the development set
+that finish make products of at most 256 choices on one thread, and the 2,166 generated
+ontologies of item 969 with a union of at most 3,645. ore_ont_14817 makes a product of
+120 million choices after 0.5 million conclusions, and ore_ont_9663 one of 4.2 million
+after 4 million, where the bound is 22.4 million. Their classifications on one thread on
+the laptop take 25.6 and 51.1 G instructions against 584 and 700 G without the limit, with the same
+taxonomies, and every other file of the two sweeps keeps its answer and its statistics.
+The width of a product depends on the order in which contexts receive their premises. On
+four and eight threads the finishing attempts make products of up to 22,500 choices, and
+in three runs on four threads ore_ont_9663 made products of at most 22,707 to 923,521
+choices and ore_ont_14817 of 1.3 to 5.1 million, so the width does not tell an attempt
+that finishes from one that cannot, and a run on more threads has no limit on it. Unlike
+the bound on conclusions, the limit therefore depends on the number of threads. A run on
+one thread may fall back to the Horn rules' answer, as any attempt that does not finish
+does, on an ontology where a run on four threads answers in full with the disjunctive
+rules, and the classifier accepts this. No file of the development set and none of the
+generated ontologies does so, since their widest products on one thread stay 4,096 and
+288 times under the limit. On one thread the order is fixed, and the
+widest product of ore_ont_9663 falls from 999 million choices on one thread to 1.3 million
+on two and 22,707 in one run on four, with 355, 71 and 24 million choices made by the products'
+steps, which item 1225 follows. A kept run whose product passes the limit starts again in
+full, as past the bound on conclusions. A run that leaves out an inference too wide to make,
+for this limit or for an at-most restriction with too many candidates, now falls back even when it has
+no bound on its conclusions, where it answered as complete without the inference before.
+
+On one thread on forge the six files of the laptop counts classify in 0.79 to 0.91 times
+the base's time with the pruning alone, and with the width limit ore_ont_14817 and
+ore_ont_9663 take 2.3 and 4.9 s against 57.4 and 74.3 s for the base. GO, which has no
+disjunctive attempt, takes 0.99 times the base's time. On four threads the rounds of one
+binary spread by up to 24% on those two files, so the forge run decides nothing there,
+and the four other files take 0.88 to 0.96 times the base's time. The
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#the-disjunctive-attempt-and-the-universals-on-the-benchmark-host)
+gives every file.
+
 Item 869 found where the Horn rules with individuals spend their time on four files of
 the ORE 2015 DL development set with 7,856 to 114,957 property assertions,
 `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`. A diagnostic build
@@ -491,6 +546,16 @@ rules and not kept, as [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#r
 records. Item 693 keeps the remaining cost of the Horn rules on the two files, which
 still derive 22.1 and 35.6 million conclusions against 16.5 and 10.8 million for the EL
 rules alone.
+
+The rule for a new universal no longer searches the context's universals for the same
+role and filler. A context derives each universal once, since a role and a filler have
+one node, and a repeat would only repeat work, because the successor rule deduplicates
+the fillers it collects. A debug assertion keeps the premise, and it held in the test
+suite and in debug classifications of GO, ore_ont_14817 and ore_ont_9663 on one and four
+threads. A corpus sweep of the release builds with and without the search gave the same
+results on the 1,010 pairs that both classified. On
+one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
+0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1234 follows.
 
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
@@ -1923,7 +1988,8 @@ Horn rules, leaves the axioms that need case analysis out and reports them, and 
 `Stats::dl_over_budget`. A run that neither counts nor is rooted also has a bound on the
 conclusions it derives, `Limits::dl_attempt_work`, of 384 for each class of the signature
 and at least 2,097,152, past which it falls back in the same way and sets
-`Stats::dl_attempt_over` too (item 990). ore_ont_3215 of the ORE 2015 DL sample, with
+`Stats::dl_attempt_over` too (item 990). On one thread such a run also falls back when one
+product of its rules has more than `Limits::dl_attempt_width` choices (item 1011). ore_ont_3215 of the ORE 2015 DL sample, with
 18,323 unions over a transitive property, needs this, item 713.
 
 Counting is part of the same rules and is off by default. `Limits::counting` turns it on,

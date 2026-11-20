@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# corpus-compare.sh: per file and thread count, the base and w2 lines of out/corpus.txt with the
+# time removed must agree; prints each difference and a count.
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+grep -v CORPUS-DONE $L/out/corpus.txt | sed -E 's/,[0-9.]+\]$/]/' | awk '{k=$1" "$3; v=$4" "$5" "$6; if ($2=="base") b[k]=v; else w[k]=v} END {d=0; for (k in b) if ((k in w) && b[k]!=w[k]) {print "DIFF", k, b[k], "|", w[k]; d++} print "pairs", length(w), "diffs", d}'
