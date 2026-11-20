@@ -2663,12 +2663,28 @@ fn checked_graph_r12_admits_join_order_tables() {
         text.push_str(" FILTER(?x1 != <urn:n:absent>) BIND(?x0 AS ?first) } }");
         text
     };
+    // Two sub-selects that each bind every variable of a chain of `k`, so that each
+    // input of the group holds `k + 1` join variables in one input.
+    let opaque = |k: usize| {
+        let mut chain = String::new();
+        for step in 1..=k {
+            chain.push_str(&format!(" ?x{} <urn:c:{step}> ?x{step} .", step - 1));
+        }
+        format!(
+            "SELECT * WHERE {{ GRAPH ?g {{ {{ SELECT * WHERE {{{chain} }} }} \
+             {{ SELECT * WHERE {{{chain} }} }} ?x0 <urn:s:1> ?y1 . \
+             BIND(?x0 AS ?first) }} }}"
+        )
+    };
     let mut cases: Vec<(usize, String)> = [4, 8, 12]
         .into_iter()
         .map(|width| (width, checked_chain_query(width)))
         .collect();
     cases.push((40, checked_chain_query(40)));
     cases.push((12, checked_star_query(12)));
+    cases.push((40, checked_star_query(40)));
+    cases.push((30, opaque(2)));
+    cases.push((30, opaque(30)));
     cases.push((12, subtree(2)));
     cases.push((12, subtree(12)));
     let mut failures = Vec::new();
@@ -2679,9 +2695,11 @@ fn checked_graph_r12_admits_join_order_tables() {
         run.push(excess[3]);
         for (stage, name, cap) in [
             (0, "group", 512),
+            (1, "greedy", 1024),
             (2, "program tables", 512),
             (3, "program run", 512),
             (4, "program build", 256),
+            (5, "greedy build", 256),
         ] {
             if excess[stage] > cap {
                 failures.push(format!(
@@ -2789,7 +2807,8 @@ fn checked_join_order_at_phase(
 #[test]
 fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
     use crate::sparql::joinorder::{
-        BUILD_PHASE, FILTER_VARS_PHASE, GROUP_PHASE, GROW_PHASE, LEAF_PHASE, MODELS_PHASE,
+        BUILD_PHASE, FILTER_VARS_PHASE, GREEDY_BUILD_PHASE, GREEDY_GROW_PHASE, GREEDY_LEAF_PHASE,
+        GREEDY_PHASE, GREEDY_UNIT_PHASE, GROUP_PHASE, GROW_PHASE, LEAF_PHASE, MODELS_PHASE,
         PARTS_PHASE, PREPARE_PHASE, ROUND_PHASE, SCRATCH_PHASE,
     };
 
@@ -2805,42 +2824,67 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
     // run learns, and `usize::MAX` for an admission of a copy, whose allocations are
     // not told apart. Growth events 0 to 2 make room before the inputs are entered, and
     // later ones as subsets are planned. An event of `usize::MAX` stands for the last.
+    // The greedy plan alone orders a chain of 20 and a star of 40, and the program's
+    // bound is the greedy plan of the chain of 12.
+    let wide = checked_chain_fixture(40);
+    let chain20 = checked_chain_query(20).replacen("SELECT *", "SELECT ?g ?x0", 1);
+    let star40 = checked_star_query(40).replacen("SELECT *", "SELECT ?g ?x0", 1);
     let n = 1usize << width;
-    for (text, phase, at, size) in [
-        (&chain, GROUP_PHASE, 0, 0),
-        (&chain, GROUP_PHASE, usize::MAX, 0),
-        (&chain, MODELS_PHASE, 0, 0),
-        (&star, MODELS_PHASE, 1, 0),
-        (&chain, PREPARE_PHASE, 0, 16 * n),
-        (&chain, ROUND_PHASE, 0, 4 * n),
-        (&chain, GROW_PHASE, 1, 0),
-        (&chain, GROW_PHASE, 3, 0),
-        (&chain, GROW_PHASE, usize::MAX, 0),
-        (&chain, FILTER_VARS_PHASE, 0, 0),
-        (&chain, FILTER_VARS_PHASE, 1, 0),
-        (&chain, PARTS_PHASE, 0, 0),
-        (&chain, SCRATCH_PHASE, 0, 0),
-        (&chain, BUILD_PHASE, 0, 0),
-        (&chain, LEAF_PHASE, 0, usize::MAX),
-        (&chain, LEAF_PHASE, usize::MAX, usize::MAX),
-        (&star, ROUND_PHASE, 1, 0),
-        (&star, SCRATCH_PHASE, 1, 0),
-        // the switch to rounds, then the first merged part, whose entries are too few
-        // bytes to tell apart
-        (&star, PARTS_PHASE, 1, 0),
-        (&star, PARTS_PHASE, 2, usize::MAX),
-        (&star, GROW_PHASE, usize::MAX, 0),
-    ] {
+    for (store, text, phase, at, size) in [
+        (&store, &chain, GREEDY_PHASE, 0, 0),
+        (&store, &chain, GREEDY_UNIT_PHASE, 0, usize::MAX),
+        (&store, &chain, GREEDY_UNIT_PHASE, usize::MAX, usize::MAX),
+        (&store, &chain, GREEDY_LEAF_PHASE, 0, usize::MAX),
+        (&store, &chain, GREEDY_LEAF_PHASE, usize::MAX, usize::MAX),
+        (&store, &chain, GREEDY_GROW_PHASE, 0, 0),
+        (&wide, &chain20, GREEDY_PHASE, 0, 0),
+        (&wide, &chain20, GREEDY_UNIT_PHASE, usize::MAX, usize::MAX),
+        (&wide, &chain20, GREEDY_BUILD_PHASE, 0, 0),
+        (&wide, &chain20, GREEDY_BUILD_PHASE, 1, 0),
+        (&wide, &star40, GREEDY_GROW_PHASE, 0, 0),
+        (&wide, &star40, GREEDY_GROW_PHASE, usize::MAX, 0),
+        (&wide, &star40, GREEDY_BUILD_PHASE, 0, 0),
+    ]
+    .into_iter()
+    .chain(
+        [
+            (&chain, GROUP_PHASE, 0, 0),
+            (&chain, GROUP_PHASE, usize::MAX, 0),
+            (&chain, MODELS_PHASE, 0, 0),
+            (&star, MODELS_PHASE, 1, 0),
+            (&chain, PREPARE_PHASE, 0, 16 * n),
+            (&chain, ROUND_PHASE, 0, 4 * n),
+            (&chain, GROW_PHASE, 1, 0),
+            (&chain, GROW_PHASE, 3, 0),
+            (&chain, GROW_PHASE, usize::MAX, 0),
+            (&chain, FILTER_VARS_PHASE, 0, 0),
+            (&chain, FILTER_VARS_PHASE, 1, 0),
+            (&chain, PARTS_PHASE, 0, 0),
+            (&chain, SCRATCH_PHASE, 0, 0),
+            (&chain, BUILD_PHASE, 0, 0),
+            (&chain, LEAF_PHASE, 0, usize::MAX),
+            (&chain, LEAF_PHASE, usize::MAX, usize::MAX),
+            (&star, ROUND_PHASE, 1, 0),
+            (&star, SCRATCH_PHASE, 1, 0),
+            // the switch to rounds, then the first merged part, whose entries are too few
+            // bytes to tell apart
+            (&star, PARTS_PHASE, 1, 0),
+            (&star, PARTS_PHASE, 2, usize::MAX),
+            (&star, GROW_PHASE, usize::MAX, 0),
+        ]
+        .into_iter()
+        .map(|(text, phase, at, size)| (&store, text, phase, at, size)),
+    ) {
         let at = if at == usize::MAX {
             let (_, _, events, ..) =
-                checked_join_order_at_phase(&store, text, phase, 0, false, false, 1);
+                checked_join_order_at_phase(store, text, phase, 0, false, false, 1);
             assert!(events > 1, "{phase}: {events} events");
             events - 1
         } else {
             at
         };
         let (outcome, _, events, growth, ..) =
-            checked_join_order_at_phase(&store, text, phase, at, false, false, 1);
+            checked_join_order_at_phase(store, text, phase, at, false, false, 1);
         assert!(outcome.is_ok(), "{phase}: the recording run answers");
         assert!(events > at, "{phase}: {events} events");
         let size = if size == 0 { growth } else { size };
@@ -2848,7 +2892,7 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         if size != usize::MAX {
             // the storage is allocated after the event when nothing refuses it
             let (_, _, _, _, seen, allocated) =
-                checked_join_order_at_phase(&store, text, phase, at, false, false, size);
+                checked_join_order_at_phase(store, text, phase, at, false, false, size);
             assert!(
                 allocated > seen,
                 "{phase} {at}: {size} bytes allocated after"
@@ -2861,7 +2905,7 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         }
         for cancel in [false, true] {
             let (outcome, rows, events, _, seen, allocated) =
-                checked_join_order_at_phase(&store, text, phase, at, cancel, !cancel, size);
+                checked_join_order_at_phase(store, text, phase, at, cancel, !cancel, size);
             if cancel {
                 assert!(matches!(outcome, Err(Error::Cancelled)), "{phase} {at}");
             } else {
@@ -2922,7 +2966,7 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
     // The program plans chains up to 16 in one round, a star of 12 in several, and the
     // greedy plan wider groups. Both routes plan the same group of the same graph, so
     // only admission differs.
-    for (width, star) in [(4, false), (12, false), (12, true), (20, false)] {
+    for (width, star) in [(4, false), (12, false), (12, true), (20, false), (40, true)] {
         let store = default_chain_fixture(width);
         let data = physical_default(&store);
         let ctx = validation_query_context(&data, opts()).unwrap();
@@ -2942,6 +2986,8 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
                 .replacen("GRAPH ?g {", "", 1)
                 .replacen("} }", "}", 1)
         };
+        // the program plans a star of 16 or fewer in rounds, and the greedy plan a wider one
+        let rounds_expected = star && width <= 16;
         let width = if star { width + 100 } else { width };
         let Query::Select { pattern, .. } = parse_query(&text, None, &[]).unwrap() else {
             unreachable!()
@@ -2957,7 +3003,7 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
             .unwrap();
         let rounds = DP_ROUNDS.with(std::cell::Cell::get) - rounds;
         println!("width {width}: {rounds} rounds");
-        if width > 100 {
+        if rounds_expected {
             assert!(rounds > 1, "the star is planned in rounds");
         }
         assert_eq!(prep.inner_used(), before, "width {width}: credit returns");
@@ -3020,7 +3066,6 @@ fn checked_graph_r12_refuses_join_order_tables_without_fallback() {
 }
 
 #[test]
-#[ignore = "fail-first witness for join-order admission, which is pending"]
 fn checked_graph_r12_admits_join_order_storage() {
     const STAGES: [&str; 9] = [
         "group",

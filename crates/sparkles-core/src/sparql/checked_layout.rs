@@ -369,6 +369,11 @@ impl<'a> Layout<'a> {
         Ok(())
     }
 
+    /// The storage that a copy of `expression` owns beyond its own slot.
+    pub(super) fn expression(&mut self, expression: &Expr) -> Result<()> {
+        self.expr(expression)
+    }
+
     fn expr_box(&mut self, expr: &Expr) -> Result<()> {
         self.slots::<Expr>(1)?;
         self.expr(expr)

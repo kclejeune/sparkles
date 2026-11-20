@@ -1185,6 +1185,15 @@ impl<'a> Planner<'a> {
         preparation.reserve(layout.bytes()).map(Some)
     }
 
+    /// Keep `held`, the credit for storage that the plan being made keeps, for as long
+    /// as the checked branch's other plan storage.
+    pub(super) fn retain_planning(&self, held: Reservation) {
+        match self.branch_payload.borrow_mut().as_mut() {
+            Some(credit) => credit.merge(held),
+            None => drop(held),
+        }
+    }
+
     /// Plan `gp` on the default graph as a checked graph branch is planned, with fresh
     /// credit from `preparation`, for the tests that compare the two routes.
     #[cfg(test)]
