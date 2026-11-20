@@ -50,7 +50,7 @@
  },
  "settings": {
   "threads": "one for instruction counts and the counter sweeps; one and four in the corpus sweep; two, four and eight in the width checks",
-  "scope": "each classification in a systemd user scope of 8 or 10 GiB with 1 GiB of swap, pinned with taskset",
+  "scope": "run.sh and corpus.sh run each classification in a systemd user scope of 10 GiB and dsweep.sh in one of 8 GiB, each with 1 GiB of swap and pinned with taskset. insn.sh, m4.sh and m5.sh pin with taskset and set no memory cap, and gsweep.sh sets neither and runs four files at once with a 60 s timeout each.",
   "commands": "el_classify --threads N --taxonomy FILE [--dl-attempt-width N | --dl-attempt-work N] INPUT"
  },
  "results": {
@@ -61,6 +61,7 @@
   "gsweep-g0..g4.txt": "gsweep.sh over the 3,000 generated files: g0 diag, g1 a23d, g2 w1d on one thread, g3 w1d on four threads, g4 w2 on one thread. Each line ends with the last DLDIAG counters, maxProd the widest product.",
   "maxprod-d1.txt": "the widest product of each finishing development attempt on one thread from the d1 counters",
   "m4.txt, m5.txt, m5f.txt": "the width limit's checks on two, four and eight threads (m4.sh, m5.sh): taxonomy, time, flags and the DLDIAG counters",
+  "dldiag-t4-fail.txt": "the last DLDIAG line of each of m4.sh's three four-thread runs of w1d on ore_ont_9663 and ore_ont_14817, with the widest product (maxProd), the products' steps' choices (foldChoice) and the attempt's time (ms) that F24 and roadmap rows 1011 and 1225 quote",
   "profile-14817-fp.txt": "perf report --children of perf record on fp, ore_ont_14817, default pipeline, one thread",
   "dldiag-d0.txt, dldiag-d1.txt": "the DLDIAG lines of the 15 files whose attempts run the disjunctive rules, 12 that finish and 3 that fail of the d0 and d1 sweeps, prefixed by the file name; counters-compare.txt is counters-compare.sh's output, 0 differences once the time and d1's added maxProd are removed"
  },

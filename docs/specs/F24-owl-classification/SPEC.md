@@ -353,8 +353,8 @@ development set derive the same conclusions with the same estimated bytes and ta
 and the 15 that attempt the rules make the same products and clauses at every doubling
 of the work. The classifications take 0.80 to 0.91 times the base's
 instructions on the six files counted, with the limit below off. The times on the loaded
-laptop are not measurements, but they show the attempt of ore_ont_14817 taking 97 against
-192 s on one thread in the sweeps with diagnostic counters. The
+laptop are not measurements, but they show the classification of ore_ont_14817 taking 97
+against 192 s on one thread in the sweeps with diagnostic counters. The
 [laptop record](../../benchmarks/el-classification/runs/2026-11-20-disjunctive-products-laptop-53a51148/record.json)
 holds the counts, the sweeps and the scripts.
 
