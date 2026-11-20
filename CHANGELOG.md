@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### UTF-8 checks of key filters
+
+The key filters that answer CONTAINS, STRSTARTS, STRENDS, STRLEN, REGEX and LANGMATCHES
+on stored keys now check each key's UTF-8 through one helper. The helper accepts an ASCII
+key with a word-at-a-time scan and passes other keys to the standard validator, so an ASCII
+key no longer calls the standard library's validator, whose placement in the binary moved
+`lang-filter` by up to 10% between builds. Malformed keys are rejected as before. On
+stanley at 1.05M triples, `lang-filter` counts 0.75 of the instructions per request,
+`regex-iri` 0.86, `contains` 0.98 and `advisor-sparse` 0.98, and the other screen queries
+are unchanged. A key that is not ASCII pays one extra scan of its bytes before validation.
+
 ### Targeted checks on a remote host
 
 `mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
