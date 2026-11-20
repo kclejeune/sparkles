@@ -154,7 +154,7 @@ fn split(key: &[u8]) -> Key<'_> {
 /// word-at-a-time scan before the general validator runs. Every site of the filter calls
 /// this one function, and it stays out of line so that the scan does not grow
 /// [`KeyFilter::test_with`].
-#[inline(never)]
+#[inline(always)]
 fn utf8(s: &[u8]) -> Option<&str> {
     if s.is_ascii() {
         // SAFETY: every sequence of ASCII bytes is UTF-8.
