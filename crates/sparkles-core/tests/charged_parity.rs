@@ -8,7 +8,8 @@
 //! rows. `PARITY_PRINT=1` prints the budgets each fixture fits and its answer, which is
 //! how the pinned values were read from the operator as it was, at commit 74f229b9, with
 //! this file copied onto that commit.
-//! `PARITY_ONLY=name` runs the fixtures whose names contain `name`.
+//! Each fixture's sweep is a test of its own, so that no one test runs long enough to
+//! reach nextest's limit on a slow runner.
 
 mod common;
 
@@ -266,70 +267,98 @@ fn distinct(f: &Fixture, plan: &CursorPlan) -> u64 {
         .unwrap_or(0)
 }
 
-/// Every DISTINCT fixture fits each budget it fitted before the move, with the answer it
+/// The fixture of FIXTURES named `name`.
+fn fixture(name: &str) -> &'static Fixture {
+    FIXTURES.iter().find(|f| f.name == name).unwrap()
+}
+
+/// The fixture named `name` fits each budget it fitted before the move, with the answer it
 /// gave before, and fits no budget beyond those its row names.
-#[test]
-fn distinct_fits_every_budget_it_fitted_before() {
+fn sweep(name: &str) {
+    let f = fixture(name);
     let s = store(20_000);
     let tmp = tempfile::tempdir().unwrap();
     let print = std::env::var_os("PARITY_PRINT").is_some();
-    let only = std::env::var("PARITY_ONLY").ok();
-    for f in FIXTURES {
-        if only
-            .as_ref()
-            .is_some_and(|only| !f.name.contains(only.as_str()))
-        {
-            continue;
-        }
-        let (from, to, step) = f.range;
-        let (expected, _) = answer(&s, f, 1 << 30, tmp.path()).unwrap();
-        let (mut fits, mut spilled) = (Vec::new(), false);
-        for budget in (from..to).step_by(step as usize) {
-            match answer(&s, f, budget, tmp.path()) {
-                Ok((answer, spill)) => {
-                    assert_eq!(answer, expected, "{}, {budget} bytes", f.name);
-                    spilled |= spill > 0;
-                    fits.push(budget);
+    let (from, to, step) = f.range;
+    let (expected, _) = answer(&s, f, 1 << 30, tmp.path()).unwrap();
+    let (mut fits, mut spilled) = (Vec::new(), false);
+    for budget in (from..to).step_by(step as usize) {
+        match answer(&s, f, budget, tmp.path()) {
+            Ok((answer, spill)) => {
+                assert_eq!(answer, expected, "{}, {budget} bytes", f.name);
+                spilled |= spill > 0;
+                fits.push(budget);
+            }
+            Err(e) => {
+                if print {
+                    println!("MISS {} {budget}: {e}", f.name);
                 }
-                Err(e) => {
-                    if print {
-                        println!("MISS {} {budget}: {e}", f.name);
-                    }
-                    assert!(common::heap::refused(&e), "{}, {budget} bytes: {e}", f.name)
-                }
+                assert!(common::heap::refused(&e), "{}, {budget} bytes: {e}", f.name)
             }
         }
-        if print {
-            println!(
-                "PARITY {:28} answer {expected:?} spilled {spilled} fits {:?}",
-                f.name,
-                ranges(&fits, step)
-            );
-            continue;
-        }
-        assert_eq!(expected, f.answer, "{}: the answer before the move", f.name);
-        assert_eq!(spilled, f.spills, "{}: a budget that spills", f.name);
+    }
+    if print {
+        println!(
+            "PARITY {:28} answer {expected:?} spilled {spilled} fits {:?}",
+            f.name,
+            ranges(&fits, step)
+        );
+        return;
+    }
+    assert_eq!(expected, f.answer, "{}: the answer before the move", f.name);
+    assert_eq!(spilled, f.spills, "{}: a budget that spills", f.name);
+    assert!(
+        !fits.is_empty() && fits.len() < ((to - from) / step) as usize,
+        "{}: the sweep crosses no threshold",
+        f.name
+    );
+    for budget in (from..to).step_by(step as usize) {
+        let fit = fits.contains(&budget);
         assert!(
-            !fits.is_empty() && fits.len() < ((to - from) / step) as usize,
-            "{}: the sweep crosses no threshold",
+            !within(f.before, budget) || fit,
+            "{}: fitted {budget} bytes before the move and does not now",
             f.name
         );
-        for budget in (from..to).step_by(step as usize) {
-            let fit = fits.contains(&budget);
-            assert!(
-                !within(f.before, budget) || fit,
-                "{}: fitted {budget} bytes before the move and does not now",
-                f.name
-            );
-            assert_eq!(
-                fit,
-                within(f.before, budget) || within(f.gained, budget),
-                "{}: {budget} bytes, which the fixture's pinned budgets do not name",
-                f.name
-            );
-        }
-        println!("PARITY {:28} fits {:?}", f.name, ranges(&fits, step));
+        assert_eq!(
+            fit,
+            within(f.before, budget) || within(f.gained, budget),
+            "{}: {budget} bytes, which the fixture's pinned budgets do not name",
+            f.name
+        );
     }
+    println!("PARITY {:28} fits {:?}", f.name, ranges(&fits, step));
+}
+
+/// One test per fixture, named after it, which sweeps that fixture.
+macro_rules! sweeps {
+    ($($test:ident => $name:literal,)*) => {
+        $(
+            #[test]
+            fn $test() {
+                sweep($name);
+            }
+        )*
+
+        /// Every fixture has its test.
+        #[test]
+        fn every_fixture_is_swept() {
+            let swept = [$($name),*];
+            for f in FIXTURES {
+                assert!(swept.contains(&f.name), "{} has no sweep", f.name);
+            }
+            assert_eq!(swept.len(), FIXTURES.len());
+        }
+    };
+}
+
+sweeps! {
+    distinct_one_column_fits_every_budget_it_fitted_before => "distinct one column",
+    distinct_two_columns_fits_every_budget_it_fitted_before => "distinct two columns",
+    distinct_segmented_fits_every_budget_it_fitted_before => "distinct segmented",
+    distinct_numbered_fits_every_budget_it_fitted_before => "distinct numbered",
+    distinct_numbered_duplicates_fits_every_budget_it_fitted_before => "distinct numbered duplicates",
+    distinct_one_column_spilled_fits_every_budget_it_fitted_before => "distinct one column spilled",
+    distinct_spilled_fits_every_budget_it_fitted_before => "distinct spilled",
 }
 
 /// The rows of `query` at an unlimited budget, each as the text of its terms.
@@ -358,10 +387,7 @@ fn rows(s: &Store, query: &str) -> Vec<Vec<String>> {
 #[test]
 fn the_numbered_duplicates_keep_their_first_rows() {
     let s = store(20_000);
-    let f = FIXTURES
-        .iter()
-        .find(|f| f.name == "distinct numbered duplicates")
-        .unwrap();
+    let f = fixture("distinct numbered duplicates");
     let all = rows(&s, &f.query.replacen("DISTINCT ", "", 1));
     let mut seen = std::collections::HashSet::new();
     let first: Vec<_> = all.iter().filter(|r| seen.insert(*r)).cloned().collect();
