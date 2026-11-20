@@ -17,7 +17,7 @@ in at least 27 of 30 rounds.
 
 The materialized metrics under 0.1 ms burst more often in the tip's runs than in the
 others. rdfs/materialized/q1, rdfs/materialized/q7 and owl-rl/materialized/q10 are flagged
-at 10% in all four comparisons, against base and against off, while slower in only 11 to
+at 10% in all four comparisons, against base and against off, while slower in only 15 to
 18 of 30 rounds. The tip's runs have 23 and 33 elevated rounds, base 21 and 18, and off 12
 and 16. Off is the tip binary, so code layout does not explain the tip's excess over off.
 These modes run no reasoner code at query time, so a cause would be state that the
