@@ -1071,7 +1071,7 @@ fn a_clash_of_two_facts_under_a_class_at_its_successor_makes_the_class_empty() {
                  SubClassOf(:E ObjectSomeValuesFrom(:r :D))"
             ),
             false,
-            &[("K", "Nothing")],
+            &[("K", "Nothing"), ("D", "Nothing"), ("E", "Nothing")],
         );
         assert_eq!(out.consistency, Consistency::Consistent);
         assert!(out.taxonomy.is_unsatisfiable(&c("K")), "{succ} {clash}");

@@ -2,14 +2,15 @@
 
 ## Unreleased
 
-### Rooted runs no longer report a complete answer that misses entailments
+### Two departures of rooted runs are off
 
 With `Limits::rooted`, the selection of ground body literals and the restriction of Join
 on ground inferences, two of the departures F24 records, could make a run that reported
 itself complete miss an entailed subsumption or an unsatisfiable class. Both are off in
-rooted runs until roadmap item 1220 repairs them. shoi-005 and shoi-027 now pass the work
-bound and give the default answer, which is sound and reported as partial, so 46 of the
-50 `shoi` fixtures finish against 48.
+rooted runs until roadmap item 1220 repairs them. The completeness of the rooted run is
+still not proved. shoi-005 and shoi-027 now pass the work bound and give the default
+answer, with the axioms it leaves out and the fallback in its statistics, so 46 of the 50
+`shoi` fixtures finish against 48.
 
 ### Targeted checks on a remote host
 
