@@ -3852,6 +3852,79 @@ fn a_count_over_a_two_variable_merge_join_runs_the_eager_kernel() {
     }
 }
 
+/// The skipped right input of a count over a two-variable merge join is marked as never
+/// run down to the children that an eager kernel describes without operators, here the
+/// scans of a count from key runs inside a subquery (Sol review of item 829, round 10).
+#[test]
+fn a_skipped_count_input_marks_its_described_children() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:q> <urn:s:{}> .\n<urn:s:{i}> <urn:w> <urn:z:{i}> .\n",
+                (i * 7) % 60
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    type Plan = sparkles_core::sparql::CursorPlan;
+    fn find<'a>(plan: &'a Plan, op: &str) -> Option<&'a Plan> {
+        match plan.operator.operator == op {
+            true => Some(plan),
+            false => plan.children.iter().find_map(|c| find(c, op)),
+        }
+    }
+    fn all_skipped(plan: &Plan) -> bool {
+        let f = plan.operator.fidelity();
+        f.skipped.as_deref() == Some("the left side produced no rows")
+            && !f.stopped_early
+            && !f.incomplete
+            && plan.operator.actual_rows == -1
+            && plan.operator.time_ms == 0.0
+            && plan.children.iter().all(all_skipped)
+    }
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { \
+        ?s <urn:q> ?t FILTER(STRSTARTS(STR(?t), \"urn:absent\")) \
+        { SELECT ?s ?t WHERE { \
+            { SELECT (COUNT(*) AS ?c) WHERE { ?a <urn:q> ?b . ?a <urn:w> ?d } } \
+            VALUES (?s ?t) { (<urn:s:1> <urn:s:7>) } } } }";
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 4096] {
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &o).unwrap();
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(c.status(), CursorStatus::Complete);
+            assert_eq!(answer, expected, "{fallback:?}; {rows}");
+            let count = find(c.plan(), "CountJoin").expect("a count join");
+            assert_eq!(count.children.len(), 2, "{count:?}");
+            let runs = find(&count.children[1], "CountJoinFromRuns")
+                .unwrap_or_else(|| panic!("{fallback:?}: {count:?}"));
+            assert!(!runs.children.is_empty(), "{runs:?}");
+            assert!(all_skipped(&count.children[1]), "{fallback:?}: {count:?}");
+        }
+    }
+}
+
 /// An operator without a cursor implementation materializes only itself. Its inputs
 /// are cursors of their own, and they stream into it.
 #[test]
