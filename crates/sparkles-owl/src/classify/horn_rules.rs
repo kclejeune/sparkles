@@ -754,8 +754,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
 /// The context derives `∀s.a`: R4 to the predecessors, and R3 to the successors.
 pub fn forall<S: Sink>(ix: &Index, _me: Ex, st: &mut State, s: Role, a: Ex, out: &mut S) {
     let roles = &ix.roles;
-    // R4 passes over a filler that every predecessor holds from its start
-    if let Some(i) = roles.inv(s).filter(|_| !thing(ix, a)) {
+    if let Some(i) = roles.inv(s) {
         st.props.push((i, a));
         if !out.defer() {
             for (r, srcs) in &st.back {
@@ -1099,14 +1098,6 @@ pub fn self_loop<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, out: &mut
             counted(ix, me, st, s, b, Member::Loop(r), out);
         }
     }
-}
-
-/// Whether every context of the run derives the expression from `owl:Thing`, which
-/// [`HornIx::THING`] describes. A run with the disjunctive rules withholds some told
-/// subsumers until it takes their units, so R4 there keeps every filler.
-#[inline]
-fn thing(ix: &Index, a: Ex) -> bool {
-    ix.dl.is_none() && ix.horn.as_ref().is_some_and(|h| h.is(a, HornIx::THING))
 }
 
 /// Whether an expression adds nothing that every context does not hold, which

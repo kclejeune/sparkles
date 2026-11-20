@@ -96,10 +96,6 @@ impl HornIx {
     /// real context holds it, as a fact of a universal role (F24, "The Horn rules with
     /// individuals"), so that R3 and R4 pass over it.
     pub const GLOBAL: u8 = 8;
-    /// The expression is in the told closure of `owl:Thing`, which every context of a run
-    /// without the disjunctive rules derives from its start, so that R4 passes over a
-    /// universal with such a filler, whose predecessors derive it anyway.
-    pub const THING: u8 = 16;
 
     #[inline]
     pub fn is(&self, e: Ex, flag: u8) -> bool {
@@ -142,9 +138,11 @@ impl HornIx {
 /// cancellation came. The work is linear in the told subsumptions: a rejected candidate
 /// rejects the candidates whose told subsumers it is. A run with individuals marks none,
 /// since a successor that R3 would extend can stand for an individual, which then takes
-/// the filler as a subsumer of its own (F24, "The Horn rules with individuals"). Every
-/// run marks [`HornIx::THING`] first, unless it stops.
+/// the filler as a subsumer of its own (F24, "The Horn rules with individuals").
 pub fn absorb(ix: &mut super::index::Index, stop: &dyn Fn() -> bool) {
+    if ix.has_individuals() {
+        return;
+    }
     let n = ix
         .horn
         .as_ref()
@@ -167,15 +165,6 @@ pub fn absorb(ix: &mut super::index::Index, stop: &dyn Fn() -> bool) {
             }
             stack.extend(told.iter().copied());
         }
-    }
-    let flags = &mut ix.horn.as_mut().expect("a run with the Horn rules").flags;
-    for (e, &g) in global.iter().enumerate() {
-        if g {
-            flags[e] |= HornIx::THING;
-        }
-    }
-    if ix.has_individuals() {
-        return;
     }
     let flags = &ix.horn.as_ref().expect("a run with the Horn rules").flags;
     let inert = |e: Ex| {
