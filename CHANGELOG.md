@@ -107,6 +107,33 @@ covers. On forge, the text, geo and vector scripts read within noise of the base
 eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds, and
 streamed `q9-star` with 12 threads, which a rerun against the tip's merge base put at
 0.966.
+### Closure operators in query-time reasoning
+
+Demand sessions now close the adorned copies of transitive rules and of `prp-trp` with
+closure operators seeded by their magic facts, the first half of roadmap item 521 and
+Phase 2 of spec F23. A copy whose demand binds the subject walks forward from the values it
+is asked for, one that binds the object walks backward, and one that binds neither closes
+the relation, each emitting the facts its joins would derive. On forge the OWL2Bench(1)
+queries q2, q7, q12 and q19 under `owl-rl` demand took 8.3 to 8.5 s instead of 113 to
+117 s, with the same rows and about half the peak RSS. A run that derives list cells its
+rules read starts again without the operators. `SPARKLES_DEMAND_CLOSURES=0` turns them off.
+Roadmap item 1222 covers pairs derived for values the query did not ask for.
+
+Within a run, an operator no longer walks a relation again for pairs other operators
+merged, or once a copy that binds neither end closed the whole relation and no other edge
+has arrived since, unless that closure left out the pairs from a value to itself and the
+operator does not. At OWL2Bench(1) q12, the walks that merged nothing read 1.3 million edges
+instead of 21 million, with the same rows. Roadmap item 1226 covers the scan of the closed
+relation that a later run of a session still makes.
+
+A demand session now sorts each chunk of derived facts it exports in predicate, object and
+subject order, the order in which joins mostly derive them, because a query that reads a
+cached table inserts its facts into the query's overlay and the operators' own order made
+that slower. A session checks its rules for operators at its first run, so a session served
+from the cache skips the check, and `Closures::detect` passes over adorned copies that
+cannot be transitive before taking them apart. On forge the reasoning latency gate then
+found no metric slower than before the operators in every round, where the first gate had
+found `owl-rl` demand-cached `q11` slower in every round.
 
 ### Targeted checks on a remote host
 
