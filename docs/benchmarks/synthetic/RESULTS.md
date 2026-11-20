@@ -842,8 +842,23 @@ the vector store was not counted.
 The other confirmed queries read as noise by the Intel rule, with an interval that
 reaches 1.0 or a median added time of at most 0.5 µs, and `subquery-agg` reads 0.988
 eager and 0.996 streamed. The confirmation's wall times are curl's transfer times, which split between
-about 1 and 2 ms for many of the short queries, so the medians of that column move by a
-whole step between servers and the analysis uses server time.
+about 1 and 2 ms for many of the short queries, so their medians can move by a whole
+step between servers. Over that column, every vector query reads within 1.0006 of the
+base, and five synthetic queries read as real costs, which item 1161 holds beside their
+server time.
+
+| Query | Mode | Base wall | Tip/base | 95% interval | Added | Item |
+|---|---|--:|--:|---|--:|---|
+| `predicate-counts` | streaming | 1.78 ms | 1.160 | 1.028–1.359 | 285 µs | 1161 |
+| `distinct-join` | eager | 5.23 ms | 1.018 | 1.014–1.023 | 92 µs | 1161 |
+| `regex-iri` | streaming | 4.91 ms | 1.009 | 1.001–1.012 | 43 µs | 1161 |
+| `contains` | streaming | 3.75 ms | 1.007 | 1.0001–1.0121 | 26 µs | 1161 |
+| `contains` | eager | 3.70 ms | 1.005 | 1.004–1.013 | 20 µs | 1161 |
+
+Streamed `predicate-counts` reads as noise in server time and runs the same instructions
+as the base, and between 35% and 72% of the requests to each of its servers took the
+upper step, so its wall-time cost waits for a rerun that separates the step from the
+build.
 
 The scripts' own client wall times, which include the start of a curl process per
 request, were not confirmed. Every query that their first pass read slower in both
