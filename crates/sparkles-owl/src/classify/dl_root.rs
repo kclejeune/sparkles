@@ -1392,8 +1392,9 @@ fn marker_detail() -> bool {
 }
 
 /// Row 1231's decline, which `SPARKLES_ROOTED_MARKER_DECLINE=t` turns on for tier t of
-/// [`marker_trips`]: a run with a trip at that tier makes no claim and starts again without
-/// the rooted rules, as past its bound.
+/// [`marker_trips`]: a finished run with a trip at that tier makes no claim. It ends as a run
+/// of Tier D past its budget does, so the classifier answers by the Horn rules and reports
+/// `dl_over_budget`, not `dl_rooted_over`.
 pub(super) fn marker_decline() -> Option<usize> {
     static ON: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
