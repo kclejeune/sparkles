@@ -803,6 +803,17 @@ frame for a control state of a million entries, as
 takes a persistent ordered map shared with the B+ tree of `KeySet`, after which the
 dependency can leave. No on-disk format changed.
 
+The query matrix on `atlas` compared Phase 5, d05e6b9d, with its base, 5f3f69c2, at 1.05M and
+10.5M triples with one and twelve Rayon threads, in eager and streamed execution. No query of 0.3 ms or
+more read 5% slower with twelve threads. With one thread, the execution of `lang-filter` took 1.08
+to 1.09 times as long at both scales,
+and streamed `optional-chain` at 1.05M took 1.063 times as long in client wall time with its
+execution time unchanged. Built on batch 46, which includes item 1204's ASCII key check, Phase 5 and
+its base count the same user-space instructions per request on every benchmark query in both
+modes within the noise floor of the counts, so these cells point to code placement rather than
+added work.
+[Item 1246](../../ROADMAP.md) confirms them on the forge matrix after the push.
+
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the
 code, which found about 114 twin readers rather than 80, three publish paths with a
