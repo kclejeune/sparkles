@@ -770,7 +770,7 @@ fn is_marker(c: &Clause) -> bool {
 /// and a selected clause is no premise on the side of the head, as ordered resolution
 /// with selection has it. A Join of two clauses that hold neither x nor y is a ground
 /// inference, and its conclusion then holds neither, so the restriction applies to the
-/// conclusion.
+/// conclusion as [`super::dl_rules::join_exempt`] says.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn join_head(
     ix: &Index,
@@ -798,14 +798,15 @@ pub(super) fn join_head(
             s.c.head().to_vec(),
         );
         let c = merge(prem, &rest);
-        if !restricted(lits, inv, &c) {
+        if !super::dl_rules::join_restricted(lits, inv, &prem.0, &c) {
             found.push(c);
         }
     }
 }
 
 /// Join on a new clause `c` with ground literals in its body: for each, the processed
-/// clauses where it is maximal.
+/// clauses where it is maximal. The restriction on ground inferences applies to its
+/// conclusions as [`super::dl_rules::join_exempt`] says.
 pub(super) fn join_body(
     ix: &Index,
     st: &State,
@@ -831,7 +832,7 @@ pub(super) fn join_body(
             let s = &x.store.clauses[i as usize];
             if !s.dead && !s.sel && !is_marker(&s.c) {
                 let c = merge(&side(&s.c, l), &rest);
-                if !restricted(lits, inv, &c) {
+                if !super::dl_rules::join_restricted(lits, inv, s.c.body(), &c) {
                     found.push(c);
                 }
             }
