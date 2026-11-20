@@ -162,7 +162,8 @@ already sent. With counting, Pred's conclusion can name the restriction's own su
 term, so a run could report itself complete and miss an entailed subsumption. A rooted run
 that counts now passes its bound on derived conclusions when such a restriction arrives
 and classifies again without counting. A run that counts without the rooted rules has no
-such containment. `SPARKLES_COUNTING_LATE_UNIT=0` turns the containment off, and `=2` gives
+such containment, so while item 1229 is open a run that counts can report itself complete
+and miss an entailed subsumption. `SPARKLES_COUNTING_LATE_UNIT=0` turns the containment off, and `=2` gives
 the late restriction Pred with the clauses its successor already sent in every run that
 counts, the repair that item 1229 proves before it replaces the containment.
 

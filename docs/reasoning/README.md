@@ -504,11 +504,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   ground body literal, since without those changes a run that reported itself complete
   could miss entailed subsumptions and unsatisfiable classes. Roadmap item 1220 restores
   the selection once a repair has an argument for completeness, and until then shoi-005
-  and shoi-027 pass the bound. A run that counts can miss an entailed subsumption
-  that depends on an existential restriction the run derives late, while it reports itself
-  complete. A rooted run that counts detects the case and classifies again without
-  counting, and a run that counts without the rooted rules does not, which roadmap item
-  1229 repairs. A rooted run without counting has a bound of 524,288 derived conclusions,
+  and shoi-027 pass the bound. While roadmap item 1229 is open, a run that counts can
+  report itself complete and still miss an entailed subsumption that depends on an
+  existential restriction the run derives late. A rooted run that counts detects the known
+  form of the case and classifies again without counting, and a run that counts without
+  the rooted rules does not. A rooted run without counting has a bound of 524,288 derived conclusions,
   `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
   keys over object properties and the universal object property by rewriting them into
