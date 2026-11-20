@@ -185,7 +185,10 @@ such containment, so while item 1229 is open a run that counts can report itself
 and miss an entailed subsumption. `SPARKLES_COUNTING_LATE_UNIT=0` turns the containment
 off, and `=2` gives the late restriction or edge Pred with the clauses its successor
 already sent in every run that counts, the repair that item 1229 proves before it replaces
-the containment.
+the containment. Its gate includes generated ontologies whose late edges come from a role
+atom, an equality and an inequality over the successor term, and whose restriction becomes
+a unit when only its earlier edge's successor has sent clauses, each shown to take that
+path and to agree with HermiT with and without the rooted rules.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
