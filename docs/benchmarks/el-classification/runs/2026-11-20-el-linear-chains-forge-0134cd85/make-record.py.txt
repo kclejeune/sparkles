@@ -53,7 +53,10 @@ rec = {
         'host': 'stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB, with other work running, so only counts and hashes are evidence',
         'instructions': text(os.path.join(ll, 'out', 'insn', 'tip4.txt')),
         'instructions_note': 'insn.sh counted user-mode instructions in millions of whole el_classify processes pinned to one performance core, --repeat 1 and --repeat 3, base against tip4 (3f20f7db, the same linear composition before the charge of its table). Half the difference of the two is one warm classification.',
-        'message_counts': 'With stats.patch applied and SPARKLES_SATURATION_STATS=1, ore_ont_8737 on four threads sends 296 million messages against 2.98 billion, applies 0.23 billion conclusions against 1.32 billion and stores 15.8 million against 20.9 million, and ChEBI lite on one thread sends 6.2 million messages against 15.4 million.',
+        'message_counts_note': 'An early build of the composition with stats.patch applied, run with SPARKLES_SATURATION_STATS=1 as tip and with SPARKLES_LINEAR_CHAINS=0 as tipoff. Each line is the saturation counter line from the stderr of one process: ore_ont_8737 on four threads by run8737.sh, first --el-only and then the default pipeline, and ChEBI lite by corpus.sh.',
+        'message_counts': {k: [l for l in text(os.path.join(ll, 'out', *k.split('/'))).splitlines() if l.startswith('saturation:')]
+                           for k in ['tip/8737.el.t4.err', 'tip/8737.default.t4.err', 'tipoff/8737.el.t4.err', 'tipoff/8737.default.t4.err',
+                                     'corpus/tip-t1/chebi_lite.err', 'corpus/tipoff-t1/chebi_lite.err']},
         'taxonomy_sweeps': corpus,
         'taxonomy_sweeps_note': 'corpus.sh classified the 298 ORE 2015 EL files, GO and ChEBI lite on one and four threads with base and tip4, and the 207 files of the ORE 2015 DL development set on four threads with base and tip5 (05838a64, the engine code of the tip). Each entry is a file whose taxonomy is not empty, with the SHA-256 of each side. Of the 207 development files both sides refuse one at the reader and stop one at its memory budget.',
     },
@@ -65,7 +68,7 @@ def copy(src, dst):
 os.makedirs(dest, exist_ok=True)
 for s in scripts:
     copy(os.path.join(tl, s) if s != 'make-record.py' else os.path.abspath(__file__), os.path.join(dest, s + '.txt'))
-for s, p in [('insn.sh', os.path.join(ll, 'scripts', 'insn.sh')), ('corpus.sh', os.path.join(ll, 'scripts', 'corpus.sh')), ('stats.patch', os.path.join(ll, 'stats.patch'))]:
+for s, p in [('run8737.sh', os.path.join(ll, 'scripts', 'run8737.sh')), ('insn.sh', os.path.join(ll, 'scripts', 'insn.sh')), ('corpus.sh', os.path.join(ll, 'scripts', 'corpus.sh')), ('stats.patch', os.path.join(ll, 'stats.patch'))]:
     copy(p, os.path.join(dest, s + '.txt'))
     rec['manifest']['scripts'].append(s + '.txt')
 with open(os.path.join(dest, 'record.json'), 'w') as f:

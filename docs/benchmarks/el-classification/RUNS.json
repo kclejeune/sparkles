@@ -1376,9 +1376,9 @@
    "metadata_note": "Manual record of roadmap item 889 on atlas: three rounds of ore_ont_8737 of every side on one, four and twelve threads, the rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482, the profiles on atlas, and the profiles, rounds and taxonomy sweeps taken on the laptop."
   },
   {
-   "run_id": "sha256-6f7898974a9e8c9395c1e1d12c92136aa8227e9a14f712481d2d31603ce33fc5",
+   "run_id": "sha256-bd270f0721daa1055ea67a1a7a82a4c4a1ed96732fc09277a3299c1ec8489851",
    "path": "runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json",
-   "sha256": "6f7898974a9e8c9395c1e1d12c92136aa8227e9a14f712481d2d31603ce33fc5",
+   "sha256": "bd270f0721daa1055ea67a1a7a82a4c4a1ed96732fc09277a3299c1ec8489851",
    "format": "legacy-assessment",
    "context": {
     "suite": "el-classification",
@@ -1411,6 +1411,7 @@
       "run.sh.txt",
       "RULES.md.txt",
       "make-record.py.txt",
+      "run8737.sh.txt",
       "insn.sh.txt",
       "corpus.sh.txt",
       "stats.patch.txt"

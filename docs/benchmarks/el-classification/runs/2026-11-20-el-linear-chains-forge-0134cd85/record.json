@@ -36,6 +36,7 @@
    "run.sh.txt",
    "RULES.md.txt",
    "make-record.py.txt",
+   "run8737.sh.txt",
    "insn.sh.txt",
    "corpus.sh.txt",
    "stats.patch.txt"
@@ -20284,7 +20285,27 @@
   "host": "stanley, the laptop, Intel Core Ultra X7 358H, 16 CPUs, 30 GiB, with other work running, so only counts and hashes are evidence",
   "instructions": "ore_ont_13482.owl base r1 22553\nore_ont_13482.owl base r3 39756\nore_ont_13482.owl tip4 r1 22662\nore_ont_13482.owl tip4 r3 39815\nore_ont_3836.owl base r1 34346\nore_ont_3836.owl base r3 48553\nore_ont_3836.owl tip4 r1 34619\nore_ont_3836.owl tip4 r3 48776\ngo.ofn base r1 6536\ngo.ofn base r3 17220\ngo.ofn tip4 r1 6462\ngo.ofn tip4 r3 16972\nchebi_lite.ofn base r1 15577\nchebi_lite.ofn base r3 35768\nchebi_lite.ofn tip4 r1 13780\nchebi_lite.ofn tip4 r3 30263\nore_ont_9855.owl base r1 10963\nore_ont_9855.owl base r3 32304\nore_ont_9855.owl tip4 r1 10945\nore_ont_9855.owl tip4 r3 32246\n",
   "instructions_note": "insn.sh counted user-mode instructions in millions of whole el_classify processes pinned to one performance core, --repeat 1 and --repeat 3, base against tip4 (3f20f7db, the same linear composition before the charge of its table). Half the difference of the two is one warm classification.",
-  "message_counts": "With stats.patch applied and SPARKLES_SATURATION_STATS=1, ore_ont_8737 on four threads sends 296 million messages against 2.98 billion, applies 0.23 billion conclusions against 1.32 billion and stores 15.8 million against 20.9 million, and ChEBI lite on one thread sends 6.2 million messages against 15.4 million.",
+  "message_counts_note": "An early build of the composition with stats.patch applied, run with SPARKLES_SATURATION_STATS=1 as tip and with SPARKLES_LINEAR_CHAINS=0 as tipoff. Each line is the saturation counter line from the stderr of one process: ore_ont_8737 on four threads by run8737.sh, first --el-only and then the default pipeline, and ChEBI lite by corpus.sh.",
+  "message_counts": {
+   "tip/8737.el.t4.err": [
+    "saturation: threads=4 applied=225823774 sent=296277734 stored=15783597 linear=[0, 2]"
+   ],
+   "tip/8737.default.t4.err": [
+    "saturation: threads=4 applied=225420724 sent=296277734 stored=15783597 linear=[0, 2, 10]"
+   ],
+   "tipoff/8737.el.t4.err": [
+    "saturation: threads=4 applied=1296158575 sent=2980147042 stored=20927351 linear=[]"
+   ],
+   "tipoff/8737.default.t4.err": [
+    "saturation: threads=4 applied=1240546868 sent=2980147042 stored=20927351 linear=[]"
+   ],
+   "corpus/tip-t1/chebi_lite.err": [
+    "saturation: threads=1 applied=17660432 sent=6156956 stored=17508955 linear=[3, 7, 12, 16]"
+   ],
+   "corpus/tipoff-t1/chebi_lite.err": [
+    "saturation: threads=1 applied=26995717 sent=15412418 stored=18374367 linear=[]"
+   ]
+  },
   "taxonomy_sweeps": {
    "base-t1 against tip4-t1": {
     "chebi_lite": {

@@ -1336,8 +1336,9 @@ backward links only with the forward links that the axioms and the other chains 
 Every backward link that the saturation stored before it still stores, by induction on
 the composition of the links that keep no forward link, so the taxonomies do not change.
 `SPARKLES_LINEAR_CHAINS=0` composes every pair as before, for measurements. On the
-laptop a four-thread run of `ore_ont_8737` sends 296 million messages instead of 2.98
-billion and stores 15.8 instead of 20.9 million conclusions. On forge, against the build
+laptop a four-thread run of `ore_ont_8737` with an early build of the composition sends
+296 million messages instead of the 2.98 billion it sends with the switch off, and stores
+15.8 instead of 20.9 million conclusions. On forge, against the build
 before the item, the file's saturation with the Horn rules takes 0.94 s on four threads
 against 8.22 s, 2.99 s on one against 25.41 s and 0.70 s on twelve against 7.05 s, its
 classification 1.39 s against 9.07 s on four threads, and its peak resident set 2.3
@@ -1346,9 +1347,10 @@ classifies in 0.81 times the time on one thread, 0.69 on four and 0.48 on twelve
 GO and `ore_ont_3836` within the noise. `ore_ont_13482` classifies 2.5% slower on four
 threads and `ore_ont_9855` 1.0% slower on one, with the same conclusions in those
 cells, which item 1224 follows. The six timed files give the same taxonomies on
-both builds, and on the laptop so do the 298 ORE 2015 EL files, GO and ChEBI lite on one
-and four threads and 205 of the 207 files of the ORE 2015 DL development set on four,
-where both builds refuse one file at the reader and stop one at its memory budget. The
+both builds. On the laptop so do the 298 ORE 2015 EL files, GO and ChEBI lite on one and
+four threads with commit 3f20f7db, and 205 of the 207 files of the ORE 2015 DL
+development set on four with commit 05838a64, which has the item's engine code, where
+both builds refuse one file at the reader and stop one at its memory budget. The
 [EL classification results](../../benchmarks/el-classification/RESULTS.md#left-linear-chains-of-transitive-roles)
 give the rounds.
 

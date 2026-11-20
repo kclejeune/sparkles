@@ -1710,9 +1710,9 @@ On `ore_ont_8737` the saturation takes 0.10 to 0.12 times the base's time and th
 classification 0.14 to 0.15 times, and the process, which reads the file and classifies
 it five times, 0.16 to 0.22 times. The peak resident set falls to 0.55 of the base's on
 one thread and 0.36 on four and twelve. A one-thread run takes 263 million conclusions
-against 1.62 billion. On the laptop, with a diagnostic patch that counts them, a
-four-thread run sends 296 million messages against 2.98 billion and stores 15.8 million
-conclusions against 20.9 million.
+against 1.62 billion. On the laptop an early build of the composition with a patch that
+counts them sends 296 million messages on four threads against 2.98 billion with
+`SPARKLES_LINEAR_CHAINS=0`, and stores 15.8 million conclusions against 20.9 million.
 
 | Ontology | Threads | Base classification, ms | Build, ms | Build / base | 95% interval | Base saturation, ms | Build, ms | Build / base | 95% interval |
 |---|---:|---:|---:|---:|---|---:|---:|---:|---|
@@ -1740,22 +1740,24 @@ cell, and `ore_ont_9855` on one thread, while its four- and twelve-thread runs v
 between processes on both sides. Their times are noise or slightly faster except in two
 cells.
 `ore_ont_13482` classifies 2.5% slower on four threads, 10.5 ms, with a saturation 6.8%
-slower, and `ore_ont_9855` classifies 1.0% slower on one thread, 9 ms, with its
+slower, and `ore_ont_9855` classifies 1.0% slower on one thread, 9.4 ms, with its
 saturation and its process 0.9% slower. On the laptop commit 3f20f7db, the composition
 before its table was charged, counts 0.3% and 0.2% fewer instructions per classification
 of the two files than the base on one pinned thread. Roadmap item 1224 follows the two
 costs.
 
-The laptop also counted 0.5% and 0.8% more instructions in whole processes of
-`ore_ont_13482` and `ore_ont_3836` outside the classification. Twenty rounds of one
+On the laptop commit 3f20f7db also counted 0.5% and 0.8% more instructions than the base
+in whole processes of `ore_ont_13482` and `ore_ont_3836`, an increase that lies outside
+the classification. Twenty rounds of one
 process with one classification per side on one thread put the build's process at 0.978
 of the base's time on `ore_ont_13482`, with an interval of 0.975 to 0.980, and 0.991 on
 `ore_ont_3836`, 0.990 to 0.995, and its read of the file at 0.956 and 0.989, so the count
 costs no time. The untimed runs after the rounds wrote the same taxonomy on both sides for
 each of the six files on four threads. On the laptop the 298 ORE 2015 EL files, GO and
-ChEBI lite gave the base's taxonomies on one and four threads, and 205 of the 207 files of
-the ORE 2015 DL development set gave them on four threads, where both sides refuse one
-file at the reader and stop one at its memory budget.
+ChEBI lite gave the base's taxonomies on one and four threads with commit 3f20f7db, and
+205 of the 207 files of the ORE 2015 DL development set gave them on four threads with
+commit 05838a64, whose engine code is the build's, where both sides refuse one file at
+the reader and stop one at its memory budget.
 
 ## Records
 
