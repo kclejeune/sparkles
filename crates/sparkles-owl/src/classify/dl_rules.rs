@@ -1345,22 +1345,39 @@ pub(super) fn tr_ctx(st: &State, root: bool) -> String {
 }
 
 /// Drops from a product's list each premise whose side has every literal of another's: a
-/// choice of it gives a conclusion that the other's choice subsumes.
+/// choice of it gives a conclusion that the other's choice subsumes. The sides are taken
+/// shortest first, in their order among sides of one length, and each is compared with
+/// the sides kept before it, first by a signature of its literals, then by a merge when
+/// both sides are sorted without repeats, as the sides of [`fold`] and of stored clauses
+/// are, and by a search of each literal otherwise.
 fn prune(l: &mut Vec<Side>) {
     if l.len() < 2 {
         return;
     }
-    let within = |a: &Side, b: &Side| {
-        a.0.iter().all(|x| b.0.contains(x)) && a.1.iter().all(|x| b.1.contains(x))
+    let sig = |x: &[Lit]| x.iter().fold(0u64, |s, l| s | l.sig_bit());
+    let strict = |x: &[Lit]| x.windows(2).all(|w| w[0] < w[1]);
+    let within = |a: &(Side, u64, u64, bool), b: &(Side, u64, u64, bool)| {
+        if a.1 & !b.1 != 0 || a.2 & !b.2 != 0 {
+            return false;
+        }
+        let ((a0, a1), (b0, b1)) = (&a.0, &b.0);
+        if a.3 && b.3 {
+            super::dl_clause::subset(a0, b0) && super::dl_clause::subset(a1, b1)
+        } else {
+            a0.iter().all(|x| b0.contains(x)) && a1.iter().all(|x| b1.contains(x))
+        }
     };
     l.sort_by_key(|s| s.0.len() + s.1.len());
-    let mut keep: Vec<Side> = Vec::with_capacity(l.len());
+    let mut keep: Vec<(Side, u64, u64, bool)> = Vec::with_capacity(l.len());
     for s in l.drain(..) {
+        let (s0, s1) = (sig(&s.0), sig(&s.1));
+        let sorted = strict(&s.0) && strict(&s.1);
+        let s = (s, s0, s1, sorted);
         if !keep.iter().any(|k| within(k, &s)) {
             keep.push(s);
         }
     }
-    *l = keep;
+    l.extend(keep.into_iter().map(|k| k.0));
 }
 
 /// The choices of a product between two checks of the run's bounds.
@@ -3027,17 +3044,30 @@ fn pred(
     match fixed {
         None => found.products(lists_free, base),
         Some((p, side)) => {
-            for (k, &n) in need.iter().enumerate() {
-                if !fits(n, p) {
-                    continue;
-                }
-                let mut lists = lists_free.clone();
+            // without counting the premise fits one place
+            let places: Vec<usize> = need
+                .iter()
+                .enumerate()
+                .filter(|&(_, &n)| fits(n, p))
+                .map(|(k, _)| k)
+                .take(if dx.counting { usize::MAX } else { 1 })
+                .collect();
+            // the last place takes the lists and the base themselves
+            let (mut lists_free, mut base) = (Some(lists_free), Some(base));
+            for (i, &k) in places.iter().enumerate() {
+                let (mut lists, b) = if i + 1 == places.len() {
+                    (
+                        lists_free.take().expect("the lists"),
+                        base.take().expect("the base"),
+                    )
+                } else {
+                    (
+                        lists_free.clone().expect("the lists"),
+                        base.clone().expect("the base"),
+                    )
+                };
                 lists[k] = vec![side.clone()];
-                found.products(lists, base.clone());
-                // without counting the premise fits one place
-                if !dx.counting {
-                    break;
-                }
+                found.products(lists, b);
             }
         }
     }
