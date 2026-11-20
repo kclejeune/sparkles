@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Rooted runs withdraw answers that a ground fact under a class may leave incomplete
+
+With `Limits::rooted`, a run could report a complete answer that missed an entailment when
+a fact that holds only under the queried class concerns an individual reached from
+another individual. After its saturation a rooted run now looks for such a fact whose
+condition cannot reach a context registered for one of its individuals. When it finds
+one, it classifies again without the rooted rules, gives the default answer, which leaves
+the axioms outside OWL 2 EL out, and sets `Stats::dl_rooted_declined` and
+`Stats::dl_over_budget`. The `el_classify` report has `dlRootedDeclined`. The check
+exempts contexts that it assumes the fact reaches another way, and those exemptions are
+not proved, so this is partial containment and roadmap item 1231 stays open for the
+repair. On generated ontologies built around the loss, every miss is withdrawn. The check
+also withdraws answers that were complete, between 2 and 38 per generated corpus of several
+hundred to several thousand ontologies. `Limits::rooted_decline` set to false keeps the
+rooted answer, and `SPARKLES_ROOTED_MARKER_DECLINE` chooses the check's tier or `off` for
+measurements.
+
 ### The selection of rooted runs is on again with selected partners
 
 With `Limits::rooted`, Hyper over `x` and Pred from a successor over a successor term of a
