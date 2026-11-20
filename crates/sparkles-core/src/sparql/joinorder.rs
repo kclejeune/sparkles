@@ -332,6 +332,8 @@ fn keep_built(pl: &Planner, mut held: Reservation, n: &Node, sorts: [bool; 2]) -
     } else {
         held.grow_by(kept - held.bytes())?;
     }
+    #[cfg(test)]
+    crate::test_alloc::observe_release();
     pl.retain_planning(held);
     Ok(())
 }
@@ -343,13 +345,15 @@ fn join_disconnected(a: Node, b: Node, pl: &Planner) -> Result<Node> {
     #[cfg(test)]
     let _stage = crate::test_alloc::Stage::enter(7);
     let ctx = pl.ctx;
-    let keys = shared_vars(&a, &b).count();
     debug_assert_eq!(
-        keys, 0,
+        shared_vars(&a, &b).count(),
+        0,
         "the plans left by the greedy order share no variable"
     );
+    let mut keys = 0;
     let held = refused(pl.planning_stage(JOIN_BUILD_PHASE).and_then(|()| {
         pl.planning_scratch(|layout| {
+            keys = shared_vars(&a, &b).count();
             plan::join_bound(layout, &a, &b)?;
             if keys > 0 {
                 // the planner's join candidates, each made from copies of both plans
@@ -367,7 +371,7 @@ fn join_disconnected(a: Node, b: Node, pl: &Planner) -> Result<Node> {
             Ok(())
         })
     }))?;
-    let keeps_input = plan::join_keeps_input(&a, &b);
+    let keeps_input = held.is_some() && plan::join_keeps_input(&a, &b);
     let n = plan::join(a, b, ctx);
     if let Some(held) = held {
         if keeps_input {

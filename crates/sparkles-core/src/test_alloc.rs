@@ -189,6 +189,12 @@ fn observe(delta: i64) {
     });
 }
 
+/// Recheck the unadmitted-growth observer's excess now, after credit was released
+/// without an allocation, so that the release is checked as an allocation would be.
+pub(crate) fn observe_release() {
+    observe(0);
+}
+
 /// Count an acquisition of `bytes` for [`record_admitted_allocations`].
 fn admitted(bytes: usize) {
     let _ = ADMITTED.try_with(|cell| {

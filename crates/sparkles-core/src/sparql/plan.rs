@@ -5375,7 +5375,8 @@ pub(super) fn merge_join_bound(
             layout.slots::<VarId>(2)?;
         }
     }
-    layout.slots::<VarId>(keys.saturating_add(1).max(4).saturating_mul(2))?;
+    // the keys grow by pushes from one, and old and new storage can coexist
+    layout.slots::<VarId>(keys.saturating_add(1).max(4).saturating_mul(3))?;
     let name = ctx.var_names.read()[v as usize].len();
     layout.add(name.saturating_add(16).saturating_mul(4))
 }

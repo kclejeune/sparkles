@@ -2615,6 +2615,21 @@ fn checked_star_query(width: usize) -> String {
     text
 }
 
+/// Two chains of `width` patterns in each graph that share no variable, which the
+/// program joins below a width of 16 and the greedy plan leaves disconnected above it,
+/// with a filter over both.
+fn checked_apart_query(width: usize) -> String {
+    use std::fmt::Write;
+
+    let mut text = String::from("SELECT * WHERE { GRAPH ?g {");
+    for step in 1..=width {
+        write!(text, " ?x{} <urn:c:{step}> ?x{step} .", step - 1).unwrap();
+        write!(text, " ?z{} <urn:c:{step}> ?z{step} .", step - 1).unwrap();
+    }
+    text.push_str(" FILTER(?x0 != ?z1) BIND(?x0 AS ?first) } }");
+    text
+}
+
 /// The planner storage of each join-order stage that a checked GRAPH plan holds
 /// beyond the credit it acquired, for a connected chain of `width` patterns.
 fn checked_join_order_excess(width: usize) -> [i64; crate::test_alloc::STAGES] {
@@ -2717,17 +2732,7 @@ fn checked_graph_r12_admits_join_order_tables() {
     cases.push((40, checked_star_query(40)));
     cases.push((30, opaque(2)));
     cases.push((60, opaque(60)));
-    // Two chains that share no variable, joined by the program below a width of 16 and
-    // left disconnected by the greedy plan above it, with a filter over both.
-    let apart = |k: usize| {
-        let mut text = String::from("SELECT * WHERE { GRAPH ?g {");
-        for step in 1..=k {
-            text.push_str(&format!(" ?x{} <urn:c:{step}> ?x{step} .", step - 1));
-            text.push_str(&format!(" ?z{} <urn:c:{step}> ?z{step} .", step - 1));
-        }
-        text.push_str(" FILTER(?x0 != ?z1) BIND(?x0 AS ?first) } }");
-        text
-    };
+    let apart = checked_apart_query;
     cases.push((12, subtree(2)));
     cases.push((12, subtree(12)));
     cases.push((6, apart(6)));
@@ -2793,6 +2798,42 @@ fn checked_graph_r12_admits_join_order_tables() {
         }
     }
     assert!(index > 0, "index joins are built");
+    // Long variable names and filters with long constants over the probed patterns, so
+    // that the join descriptions and the copies of the probes' filters are large.
+    let heavy = {
+        let name = |step: usize| format!("v{step}_{}", "a".repeat(200));
+        let mut text = String::from("SELECT * WHERE { GRAPH ?g {");
+        for step in 1..=12 {
+            text.push_str(&format!(
+                " ?{} <urn:c:{step}> ?{} .",
+                name(step - 1),
+                name(step)
+            ));
+        }
+        for step in 0..=12 {
+            let absent: Vec<String> = (0..40)
+                .map(|i| format!("<urn:n:absent-{i}-{}>", "b".repeat(100)))
+                .collect();
+            text.push_str(&format!(
+                " FILTER(?{} NOT IN ({}))",
+                name(step),
+                absent.join(", ")
+            ));
+        }
+        text.push_str(&format!(" BIND(?{} AS ?first) }} }}", name(0)));
+        text
+    };
+    for force in [true, false] {
+        crate::sparql::indexjoin::FORCE_INDEX_JOIN.with(|f| f.set(force));
+        let (excess, of) = checked_join_order_excess_kinds(12, &heavy);
+        println!("long names, forced {force}: {excess:?} merge/hash/index/other joins {of:?}");
+        if excess[7] > 512 {
+            failures.push(format!(
+                "long names, forced {force}: {} unadmitted bytes in joins",
+                excess[7]
+            ));
+        }
+    }
     // The copy of the larger sub-select is admitted as the smaller one is.
     let (small, large) = (run[run.len() - 4], run[run.len() - 3]);
     if large > small + 256 {
@@ -2913,6 +2954,7 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
     let wide = checked_chain_fixture(40);
     let chain20 = checked_chain_query(20).replacen("SELECT *", "SELECT ?g ?x0", 1);
     let star40 = checked_star_query(40).replacen("SELECT *", "SELECT ?g ?x0", 1);
+    let apart20 = checked_apart_query(20).replacen("SELECT *", "SELECT ?g ?x0", 1);
     let n = 1usize << width;
     for (store, text, phase, at, size) in [
         (&store, &chain, GREEDY_PHASE, 0, 0),
@@ -2931,6 +2973,8 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         (&wide, &chain20, JOIN_BUILD_PHASE, 0, usize::MAX),
         (&wide, &chain20, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
         (&wide, &star40, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
+        // the last join of the greedy plan joins its disconnected parts
+        (&wide, &apart20, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
     ]
     .into_iter()
     .chain(
@@ -3055,7 +3099,15 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
     // The program plans chains up to 16 in one round, a star of 12 in several, and the
     // greedy plan wider groups. Both routes plan the same group of the same graph, so
     // only admission differs.
-    for (width, star) in [(4, false), (12, false), (12, true), (20, false), (40, true)] {
+    for (width, star, apart) in [
+        (4, false, false),
+        (12, false, false),
+        (12, true, false),
+        (20, false, false),
+        (40, true, false),
+        (6, false, true),
+        (20, false, true),
+    ] {
         let store = default_chain_fixture(width);
         let data = physical_default(&store);
         let ctx = validation_query_context(&data, opts()).unwrap();
@@ -3070,6 +3122,10 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
             }
             text.push_str(" BIND(?x0 AS ?first) }");
             text
+        } else if apart {
+            checked_apart_query(width)
+                .replacen("GRAPH ?g {", "", 1)
+                .replacen("} }", "}", 1)
         } else {
             checked_chain_query(width)
                 .replacen("GRAPH ?g {", "", 1)
@@ -3086,6 +3142,7 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
             .plan(&pattern, &plan::ActiveGraph::Default, Vec::new())
             .unwrap();
         let before = prep.inner_used();
+        let live_before = ctx.live_bytes();
         let rounds = DP_ROUNDS.with(std::cell::Cell::get);
         let checked = Planner::new(&ctx)
             .plan_admitted_for_test(&pattern, &prep)
@@ -3107,6 +3164,13 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
         );
         if rounds_expected {
             assert!(rounds > 1, "the star is planned in rounds");
+        }
+        // The query context's ledger keeps its admitted high point, one growth step for
+        // the filter over both chains apart. Its live bytes are unchanged, and shrinking
+        // it returns the credit.
+        if prep.inner_used() != before {
+            assert_eq!(ctx.live_bytes(), live_before, "width {width}: live bytes");
+            ctx.shrink_retained(0).unwrap();
         }
         assert_eq!(prep.inner_used(), before, "width {width}: credit returns");
         let (a, b) = (
