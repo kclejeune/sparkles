@@ -840,12 +840,20 @@ can pass. See [C31](../specs/C31-checks-and-protected-merges/SPEC.md#outcome) fo
 
 The controlled Rust runner uses the earliest of its parent deadline and each check's
 timeouts. The deadline is cooperative and includes loading, parsing and compiling
-inputs, evaluation and report collection. A completed violation still blocks if its
-checker returns late. A timed-out or incomplete check returns an error.
+inputs, evaluation and report collection. SHACL checks it while compiling RDF lists
+and property paths, substituting SPARQL paths, and scanning pinned shapes and
+candidate data. Target conformance probes check the deadline while reading the
+candidate, including when they find no matches. A completed violation still blocks if its checker returns
+late. A timed-out or incomplete check returns an error.
 
 The produced-row budget is shared by all queries of a check. Intermediate row and
-query memory limits apply to each query. ShEx also enforces the same memory limit across
-shared preparation, FOCUS scan workspace and retained selector output. Retaining the
+query memory limits apply to each query. An embedded SHACL query's memory limit includes
+the workspace and graph IDs used to prepare its default dataset and the shared
+graph filter its plans retain. The public controlled SHACL API also supports queries
+with named graphs. Its query memory limit covers discovering their names and the
+estimated storage for the resulting per-graph plans. ShEx also enforces the
+same memory limit across shared preparation, FOCUS scan workspace and retained selector
+output. Retaining the
 first selector's output can reduce the memory available to a later selector. The runner
 can separately limit the number and estimated bytes of retained validation results.
 These bounds include SHACL detail results, ShEx expanded associations and explanations,

@@ -95,7 +95,11 @@ describes the supported profiles.
 
 The controlled Rust runner shares one deadline and produced-row allowance across each
 check's setup and queries, and bounds retained validation results including SHACL
-details. ShEx also shares its query memory ceiling across preparation, FOCUS scan
+details. The deadline covers SHACL list and property path compilation, SPARQL path
+substitution, pinned shapes reads, and physical scans for targets and their
+conformance probes. Each embedded SHACL query's memory ceiling includes preparing
+its default graph IDs and retaining the graph filter shared by its plan. ShEx also shares its
+query memory ceiling across preparation, FOCUS scan
 workspace and retained selector output. Diagnostics with materialized inference reading
 turned off exclude the inferred graph even when the store's SPARQL default is a union.
 
