@@ -2589,6 +2589,12 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         on_rl(ix, st, d, r, &unit, &mut found);
         if dx.counting {
             late_unit(ix, st, d, h.succ, &mut found, out);
+            // a restriction that had an edge before it became a unit reaches that
+            // successor too
+            let w = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == d).map(|&(_, w)| w));
+            if let Some(w) = w.filter(|&w| w != h.succ) {
+                late_unit(ix, st, d, w, &mut found, out);
+            }
         }
         if dx.counting && dx.root.is_none() {
             let mut us = Vec::new();
