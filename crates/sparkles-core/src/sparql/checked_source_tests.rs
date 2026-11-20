@@ -2572,6 +2572,19 @@ fn checked_chain_fixture(width: usize) -> Store {
                 "<urn:n:0> <urn:s:{step}> <urn:m:{step}> <urn:g:{graph}> ."
             )
             .unwrap();
+            writeln!(
+                input,
+                "<urn:n:{step}> <urn:v> \"{step}\"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g:{graph}> ."
+            )
+            .unwrap();
+        }
+        // enough values that a range read beats a filtered scan
+        for k in 0..400 {
+            writeln!(
+                input,
+                "<urn:w:{k}> <urn:v> \"{k}\"^^<http://www.w3.org/2001/XMLSchema#integer> <urn:g:{graph}> ."
+            )
+            .unwrap();
         }
     }
     store
@@ -2759,6 +2772,49 @@ fn checked_graph_r12_admits_join_order_tables() {
     cases.push((12, subtree(12)));
     cases.push((6, apart(6)));
     cases.push((20, apart(20)));
+    // Filters over a wide input and with many conjuncts, a numeric range on a scan's
+    // sorted column, which moves into the scan, and a string prefix of a scan's sorted
+    // column, which sets the rows the filter reads.
+    let wide_filter = {
+        let mut text = opaque(60);
+        let test = (0..60)
+            .map(|step| format!("?x{step} != ?x{}", step + 1))
+            .collect::<Vec<_>>()
+            .join(" || ");
+        text.insert_str(text.len() - 4, &format!(" FILTER({test})"));
+        text
+    };
+    cases.push((60, wide_filter));
+    let conjuncts = {
+        let mut text = checked_chain_query(12);
+        let test = (0..48)
+            .map(|step| format!("?x{} != <urn:n:a{step}>", step % 13))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        text.insert_str(text.len() - 4, &format!(" FILTER({test})"));
+        text
+    };
+    cases.push((12, conjuncts));
+    let range = |width: usize| {
+        let mut text = checked_chain_query(width);
+        let at = text.len() - 4;
+        text.insert_str(
+            at,
+            " ?x1 <urn:v> ?v . FILTER(?v > 2 && ?v < 9 && ?v != 5 && ?v >= -1) \
+             ?w <urn:v> ?u . FILTER(?u > 2 && ?u < 9)",
+        );
+        text
+    };
+    cases.push((12, range(12)));
+    cases.push((20, range(20)));
+    let prefix = |width: usize| {
+        let mut text = checked_star_query(width);
+        let at = text.len() - 4;
+        text.insert_str(at, " FILTER(STRSTARTS(STR(?y1), \"urn:m:1\"))");
+        text
+    };
+    cases.push((12, prefix(12)));
+    cases.push((40, prefix(40)));
     let caps = [
         (0, "group", 512),
         (1, "greedy", 1024),
@@ -2766,6 +2822,7 @@ fn checked_graph_r12_admits_join_order_tables() {
         (3, "program run", 512),
         (4, "program build", 256),
         (5, "greedy build", 256),
+        (6, "filters", 512),
         (7, "joins", 512),
     ];
     let mut failures = Vec::new();
@@ -2991,6 +3048,7 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         GREEDY_PHASE, GREEDY_UNIT_PHASE, GROUP_PHASE, GROW_PHASE, JOIN_BUILD_PHASE, LEAF_PHASE,
         MODELS_PHASE, PARTS_PHASE, PREPARE_PHASE, ROUND_PHASE, SCRATCH_PHASE,
     };
+    use crate::sparql::plan::FILTER_PHASE;
 
     // A chain of 12 is planned by the program in one round over 12 inputs, and a star
     // of 12 in several rounds.
@@ -3030,6 +3088,9 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
         (&wide, &star40, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
         // the last join of the greedy plan joins its disconnected parts
         (&wide, &apart20, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
+        (&wide, &chain20, FILTER_PHASE, 0, usize::MAX),
+        (&wide, &chain20, FILTER_PHASE, usize::MAX, usize::MAX),
+        (&wide, &apart20, FILTER_PHASE, usize::MAX, usize::MAX),
     ]
     .into_iter()
     .chain(
@@ -3052,6 +3113,8 @@ fn checked_graph_r12_refuses_or_cancels_join_order_admissions() {
             (&chain, LEAF_PHASE, usize::MAX, usize::MAX),
             (&chain, JOIN_BUILD_PHASE, 0, usize::MAX),
             (&chain, JOIN_BUILD_PHASE, usize::MAX, usize::MAX),
+            (&chain, FILTER_PHASE, 0, usize::MAX),
+            (&chain, FILTER_PHASE, usize::MAX, usize::MAX),
             (&star, ROUND_PHASE, 1, 0),
             (&star, SCRATCH_PHASE, 1, 0),
             // the switch to rounds, then the first merged part, whose entries are too few
@@ -3133,6 +3196,19 @@ fn default_chain_fixture(width: usize) -> Store {
         )
         .unwrap();
         writeln!(input, "<urn:n:0> <urn:s:{step}> <urn:m:{step}> .").unwrap();
+        writeln!(
+            input,
+            "<urn:n:{step}> <urn:v> \"{step}\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        )
+        .unwrap();
+    }
+    // enough values that a range read beats a filtered scan
+    for k in 0..400 {
+        writeln!(
+            input,
+            "<urn:w:{k}> <urn:v> \"{k}\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+        )
+        .unwrap();
     }
     store
         .load(&[crate::io::Source::from_bytes(
@@ -3154,20 +3230,29 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
     // The program plans chains up to 16 in one round, a star of 12 in several, and the
     // greedy plan wider groups. Both routes plan the same group of the same graph, so
     // only admission differs.
-    for (width, star, apart) in [
-        (4, false, false),
-        (12, false, false),
-        (12, true, false),
-        (20, false, false),
-        (40, true, false),
-        (6, false, true),
-        (20, false, true),
+    // The last cases add a numeric range that moves into a scan and a string prefix
+    // that sets the rows a filtered scan reads.
+    let range = " ?x1 <urn:v> ?v . FILTER(?v > 2 && ?v < 9 && ?v != 5) \
+        ?w <urn:v> ?u . FILTER(?u > 2 && ?u < 9)";
+    let prefix = " FILTER(STRSTARTS(STR(?y1), \"urn:m:1\"))";
+    for (width, star, apart, extra) in [
+        (4, false, false, ""),
+        (12, false, false, ""),
+        (12, true, false, ""),
+        (20, false, false, ""),
+        (40, true, false, ""),
+        (6, false, true, ""),
+        (20, false, true, ""),
+        (12, false, false, range),
+        (20, false, false, range),
+        (12, true, false, prefix),
+        (40, true, false, prefix),
     ] {
         let store = default_chain_fixture(width);
         let data = physical_default(&store);
         let ctx = validation_query_context(&data, opts()).unwrap();
         let prep = ctx.source_preparation.as_ref().unwrap().clone();
-        let text = if star {
+        let mut text = if star {
             let mut text = String::from("SELECT * WHERE {");
             for step in 1..=width {
                 write!(text, " ?x0 <urn:s:{step}> ?y{step} .").unwrap();
@@ -3186,6 +3271,7 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
                 .replacen("GRAPH ?g {", "", 1)
                 .replacen("} }", "}", 1)
         };
+        text.insert_str(text.len() - 2, extra);
         // the program plans a star of 16 or fewer in rounds, and the greedy plan a wider one
         let rounds_expected = star && width <= 16;
         let width = if star { width + 100 } else { width };
@@ -3239,6 +3325,14 @@ fn checked_graph_r12_join_order_matches_ordinary_plan_text() {
         );
         assert!(a.contains("Join"), "width {width}: {a}");
         assert_eq!(a, b, "width {width}");
+        fn ranged(n: &plan::Node) -> bool {
+            matches!(n.kind, plan::Kind::RangeScan(..)) || n.children.iter().any(ranged)
+        }
+        assert_eq!(
+            ranged(&checked),
+            extra == range,
+            "width {width}: range scan in {b}"
+        );
     }
 }
 

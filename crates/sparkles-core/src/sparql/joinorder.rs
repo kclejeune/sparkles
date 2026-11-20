@@ -338,18 +338,13 @@ fn keep_built(pl: &Planner, mut held: Reservation, n: &Node, sorts: [bool; 2]) -
     Ok(())
 }
 
-/// Join plans `a` and `b`, which share no variable, as [`plan::join`] does: as a cross
-/// product, or one of them when the other is the one empty solution. On the checked
+/// Join plans `a` and `b` as [`plan::join`] does: as a cross product when they share no
+/// variable, or one of them when the other is the one empty solution. On the checked
 /// route the join is admitted as [`build_join`] admits one.
-fn join_disconnected(a: Node, b: Node, pl: &Planner) -> Result<Node> {
+pub(super) fn join_admitted(a: Node, b: Node, pl: &Planner) -> Result<Node> {
     #[cfg(test)]
     let _stage = crate::test_alloc::Stage::enter(7);
     let ctx = pl.ctx;
-    debug_assert_eq!(
-        shared_vars(&a, &b).count(),
-        0,
-        "the plans left by the greedy order share no variable"
-    );
     let mut keys = 0;
     let held = refused(pl.planning_stage(JOIN_BUILD_PHASE).and_then(|()| {
         pl.planning_scratch(|layout| {
@@ -1045,31 +1040,42 @@ pub(super) fn order(
 /// mark and whose variables `n` binds, and return `n` with `applied` and those filters
 /// marked. `fvars` holds each filter's variables, with an impossible variable for one
 /// that holds an EXISTS, which is never placed here.
+/// On the checked route the FILTER is admitted before the filters are copied, and the
+/// credit returned holds what the plan keeps of it.
 pub(super) fn place_masked(
     pl: &Planner,
     n: Node,
     applied: u64,
     filters: &[Expr],
     fvars: &[Vec<VarId>],
-) -> (Node, u64) {
+) -> Result<(Node, u64, Option<Reservation>)> {
     #[cfg(test)]
-    let _stage = crate::test_alloc::Stage::enter(6);
-    let mut now = Vec::new();
+    let _stage = crate::test_alloc::Stage::within(6);
     let mut mask = applied;
-    for (i, f) in filters.iter().enumerate().take(64) {
-        if mask & (1 << i) == 0
-            && !fvars[i].is_empty()
-            && fvars[i].iter().all(|v| n.vars.contains(v))
-        {
-            now.push(f.clone());
+    let mut count = 0;
+    for (i, fv) in fvars.iter().enumerate().take(filters.len().min(64)) {
+        if mask & (1 << i) == 0 && !fv.is_empty() && fv.iter().all(|v| n.vars.contains(v)) {
             mask |= 1 << i;
+            count += 1;
         }
     }
-    if now.is_empty() {
-        (n, mask)
-    } else {
-        (plan::filter(n, now, pl.ctx), mask)
+    if count == 0 {
+        return Ok((n, mask, None));
     }
+    let placed = mask & !applied;
+    let now = || {
+        filters
+            .iter()
+            .take(64)
+            .enumerate()
+            .filter(move |&(i, _)| placed & (1 << i) != 0)
+            .map(|(_, f)| f)
+    };
+    let scratch = refused(pl.filter_scratch(&n, now(), true))?;
+    let mut copies = Vec::with_capacity(count);
+    copies.extend(now().cloned());
+    let (n, kept) = pl.filter_held(scratch, n, copies, 0)?;
+    Ok((n, mask, kept))
 }
 
 // ------------------------------------------------------------------------------
@@ -1338,10 +1344,27 @@ impl Greedy {
                     placed[f] = true;
                 }
                 let copy = best.clone();
-                let conjuncts = now.iter().map(|&f| filters[f].clone()).collect();
+                let conjuncts: Vec<Expr> = now.iter().map(|&f| filters[f].clone()).collect();
                 #[cfg(test)]
-                let _stage = crate::test_alloc::Stage::enter(6);
-                Some(plan::filter(copy, conjuncts, ctx))
+                let _stage = crate::test_alloc::Stage::within(6);
+                // the copies are admitted with the leaf, and the FILTER now
+                let scratch = refused(pl.filter_scratch(&copy, conjuncts.iter(), false))?;
+                let owned = match &scratch {
+                    Some(held) => {
+                        let mut layout =
+                            super::checked_layout::Layout::retained(held.preparation());
+                        layout.expressions(&conjuncts)?;
+                        layout.bytes()
+                    }
+                    None => 0,
+                };
+                let (node, kept) = pl.filter_held(scratch, copy, conjuncts, owned)?;
+                match (leaf_held.as_mut(), kept) {
+                    (Some(credit), Some(kept)) => credit.merge(kept),
+                    (None, Some(kept)) => pl.retain_planning(kept),
+                    _ => {}
+                }
+                Some(node)
             };
             drop(now);
             let node = filtered.as_ref().unwrap_or(best);
@@ -1798,12 +1821,19 @@ impl Greedy {
                         n
                     } else {
                         #[cfg(test)]
-                        let _stage = crate::test_alloc::Stage::enter(6);
-                        plan::filter(
-                            n,
-                            u.filters.iter().map(|&f| filters[f].clone()).collect(),
-                            ctx,
-                        )
+                        let _stage = crate::test_alloc::Stage::within(6);
+                        let scratch = refused(pl.filter_scratch(
+                            &n,
+                            u.filters.iter().map(|&f| &filters[f]),
+                            true,
+                        ))?;
+                        let mut copies = Vec::with_capacity(u.filters.len());
+                        copies.extend(u.filters.iter().map(|&f| filters[f].clone()));
+                        let (n, kept) = pl.filter_held(scratch, n, copies, 0)?;
+                        if let Some(kept) = kept {
+                            pl.retain_planning(kept);
+                        }
+                        n
                     }
                 }
             };
@@ -1826,7 +1856,12 @@ impl Greedy {
         let mut acc = nodes[it.next().unwrap()].take().unwrap();
         for u in it {
             let n = nodes[u].take().unwrap();
-            acc = pl.place_filters(join_disconnected(acc, n, pl)?, filters);
+            debug_assert_eq!(
+                shared_vars(&acc, &n).count(),
+                0,
+                "the plans left by the greedy order share no variable"
+            );
+            acc = pl.place_filters(join_admitted(acc, n, pl)?, filters)?;
         }
         Ok(acc)
     }
@@ -2187,6 +2222,7 @@ impl Dp {
                 // On the checked route the copy is admitted before it is made, and the
                 // credit is dropped after it.
                 let _copy;
+                let _kept;
                 let filtered;
                 let o = if fvars
                     .iter()
@@ -2201,7 +2237,9 @@ impl Dp {
                     } else {
                         None
                     };
-                    filtered = place_masked(pl, o.clone(), 0, filters, fvars).0;
+                    let placed = place_masked(pl, o.clone(), 0, filters, fvars)?;
+                    _kept = placed.2;
+                    filtered = placed.0;
                     &filtered
                 } else {
                     o
@@ -2738,14 +2776,17 @@ impl Dp {
         for &x in &need {
             ctx.check()?;
             let e = self.ents[x as usize];
-            let (n, f) = if e.mask.is_power_of_two() {
+            let (n, f, kept) = if e.mask.is_power_of_two() {
                 let leaf = std::mem::replace(&mut items[e.a as usize][e.b as usize], Node::unit());
-                place_masked(pl, leaf, 0, filters, fvars)
+                place_masked(pl, leaf, 0, filters, fvars)?
             } else {
                 let (na, fa) = built.remove(&e.a).unwrap();
                 let (nb, fb) = built.remove(&e.b).unwrap();
-                place_masked(pl, build_join(na, nb, e.how, pl)?, fa | fb, filters, fvars)
+                place_masked(pl, build_join(na, nb, e.how, pl)?, fa | fb, filters, fvars)?
             };
+            if let Some(kept) = kept {
+                pl.retain_planning(kept);
+            }
             debug_assert!(
                 n.cost.to_bits() == e.sum.cost.to_bits() && n.est.to_bits() == e.sum.est.to_bits(),
                 "summary {:?} differs from its plan ({}, {})",

@@ -120,7 +120,7 @@ thread_local! {
         const { Cell::new((0, usize::MAX, 0, 0, [0; STAGES])) };
 }
 
-pub(crate) const STAGES: usize = 9;
+pub(crate) const STAGES: usize = 10;
 
 /// The largest excess, per stage, of bytes a planner stage allocated and still holds
 /// over the Preparation credit it acquired meanwhile, while `f` runs on this thread.
@@ -150,6 +150,20 @@ fn used_at(counter: usize) -> u64 {
 }
 
 impl Stage {
+    /// [`Stage::enter`], unless `stage` is the active stage already, which then goes on
+    /// unpaused: a stage reached from within itself is observed once, as a whole.
+    pub(crate) fn within(stage: usize) -> Self {
+        let active = EXCESS.try_with(|cell| {
+            let (counter, active, ..) = cell.get();
+            counter != 0 && active == stage
+        });
+        if active.unwrap_or(false) {
+            Self(None)
+        } else {
+            Self::enter(stage)
+        }
+    }
+
     pub(crate) fn enter(stage: usize) -> Self {
         let outer = EXCESS.try_with(|cell| {
             let (counter, active, live, base, max) = cell.get();
@@ -167,10 +181,13 @@ impl Drop for Stage {
     fn drop(&mut self) {
         if let Some((active, live, base)) = self.0 {
             let _ = EXCESS.try_with(|cell| {
-                let (counter, _, _, inner, max) = cell.get();
-                // The outer stage sees only the credit the inner stage acquired.
+                let (counter, _, inner_live, inner, max) = cell.get();
+                // The outer stage sees the inner stage's storage only as far as the
+                // credit the inner stage acquired covers it, and so neither its
+                // unadmitted bytes nor, when the outer stage releases the credit with
+                // the storage, the inner stage's excess credit.
                 let admitted = used_at(counter) as i64 - inner as i64;
-                cell.set((counter, active, live + admitted, base, max));
+                cell.set((counter, active, live + admitted.min(inner_live), base, max));
             });
         }
     }
