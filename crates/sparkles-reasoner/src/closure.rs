@@ -253,24 +253,37 @@ fn push<T>(v: &mut Vec<T>, x: T, held: &mut Held) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Make room in `map` for one more entry, charging a growth of its table to `held` before
-/// it is reserved.
+/// Make room in `map` for one more entry. A growth charges the new table to `held` before
+/// it is reserved, beside the old one that the move reads from, and gives the old one's
+/// charge back after it.
 fn reserve_one<V>(map: &mut FxHashMap<u64, V>, held: &mut Held) -> Result<(), BudgetFailure> {
     if map.len() == map.capacity() {
+        let bytes = |cap: usize| table_bytes(cap, size_of::<(u64, V)>());
         let before = map.capacity();
         let want = (before * 2).max(16);
-        held.try_grow(
-            table_bytes(want, size_of::<(u64, V)>())
-                .saturating_sub(table_bytes(before, size_of::<(u64, V)>())),
-        )?;
+        held.try_grow(bytes(want))?;
         map.reserve(want - map.len());
         if map.capacity() > want {
-            held.try_grow(
-                table_bytes(map.capacity(), size_of::<(u64, V)>())
-                    .saturating_sub(table_bytes(want, size_of::<(u64, V)>())),
-            )?;
+            held.try_grow(bytes(map.capacity()) - bytes(want))?;
         }
+        held.shrink(bytes(before));
     }
+    Ok(())
+}
+
+/// Push `x` onto `v`, charging a growth of its buffer as [`reserve_one`] charges a table.
+fn push_moved<T>(v: &mut Vec<T>, x: T, held: &mut Held) -> Result<(), BudgetFailure> {
+    if v.len() == v.capacity() {
+        let before = v.capacity();
+        let want = (before * 2).max(4);
+        held.try_grow(want * size_of::<T>())?;
+        v.reserve_exact(want - v.len());
+        if v.capacity() > want {
+            held.try_grow((v.capacity() - want) * size_of::<T>())?;
+        }
+        held.shrink(before * size_of::<T>());
+    }
+    v.push(x);
     Ok(())
 }
 
@@ -455,7 +468,7 @@ impl Ledger {
         let rs = self.merged.entry(q).or_default();
         match rs.last_mut() {
             Some(last) if last.1 == lo => last.1 = hi,
-            _ => push(rs, (lo, hi), held)?,
+            _ => push_moved(rs, (lo, hi), held)?,
         }
         Ok(())
     }
@@ -2085,9 +2098,44 @@ mod tests {
         let mut l = Ledger::default();
         l.merge(7, 0, 4, &budget).unwrap();
         let held = l.held.as_ref().unwrap().bytes();
-        assert!(held >= first + 16 * size_of::<(u32, u32)>(), "{held}");
+        assert_eq!(held, first + 4 * size_of::<(u32, u32)>());
         l.merge(7, 4, 9, &budget).unwrap();
         assert_eq!(l.merged[&7], vec![(0, 9)]);
         assert_eq!(l.held.as_ref().unwrap().bytes(), held);
+    }
+
+    /// A growth of a full ledger table charges the old and the new table together, and
+    /// gives the old one's charge back after: a budget one byte short of both refuses it
+    /// and leaves the table as it was.
+    #[test]
+    fn ledger_growth_charges_both_tables() {
+        let bytes = |cap: usize| table_bytes(cap, size_of::<(u64, (u32, bool))>());
+        let fill = |l: &mut Ledger, budget: &Arc<Budget>| {
+            let mut q = 0;
+            while l.closed.is_empty() || l.closed.len() < l.closed.capacity() {
+                l.close(q, 1, false, budget).unwrap();
+                q += 1;
+            }
+            q
+        };
+        let mut l = Ledger::default();
+        let q = fill(&mut l, &Budget::new(None));
+        let cap = l.closed.capacity();
+        assert_eq!(l.held.as_ref().unwrap().bytes(), bytes(cap));
+        let both = bytes(cap) + bytes(2 * cap);
+        let budget = Budget::new(Some(both - 1));
+        let mut l = Ledger::default();
+        assert_eq!(fill(&mut l, &budget), q);
+        let e = l
+            .close(q, 1, false, &budget)
+            .expect_err("both tables do not fit");
+        assert!(anyhow::Error::from(e).is::<crate::budget::MemoryExceeded>());
+        assert_eq!(l.closed.capacity(), cap);
+        let budget = Budget::new(Some(both));
+        let mut l = Ledger::default();
+        fill(&mut l, &budget);
+        l.close(q, 1, false, &budget).expect("both tables fit");
+        assert_eq!(l.closed.capacity(), 2 * cap);
+        assert_eq!(l.held.as_ref().unwrap().bytes(), bytes(2 * cap));
     }
 }
