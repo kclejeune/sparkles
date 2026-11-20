@@ -4469,8 +4469,9 @@ impl<'a> Planner<'a> {
         }
         let mut leaves: Vec<Option<Vec<Node>>> = leaves.into_iter().map(Some).collect();
         let mut group_list: Vec<_> = groups.into_values().collect();
-        // Component member lists are disjoint, so they never tie.
-        group_list.sort_unstable_by(|left, right| (**left).cmp(&**right));
+        // Component member lists are disjoint, nonempty and ascending, so ordering them by
+        // their first member equals the lexicographic order and they never tie.
+        group_list.sort_unstable_by_key(|members| members[0]);
         let _components_out = self.planning_scratch(|layout| {
             layout.slots::<Node>(group_list.len())?;
             // Keep the stable cost sort of components, including equal estimates.
@@ -4542,11 +4543,7 @@ impl<'a> Planner<'a> {
                 .expect("checked scan choice");
             let mut rest = filters.clone();
             let node = self.place_filters(option, &mut rest);
-            let candidate = Choice {
-                node,
-                rest,
-                copy: copy,
-            };
+            let candidate = Choice { node, rest, copy };
             if best
                 .as_ref()
                 .is_none_or(|best| candidate.node.cost.total_cmp(&best.node.cost).is_lt())

@@ -2326,7 +2326,7 @@ pub(super) fn compile_expression<T>(
         E::In(a, l) => Expr::In(
             bx(a)?,
             l.iter()
-                .map(|x| compile(x))
+                .map(&compile)
                 .collect::<std::result::Result<_, T>>()?,
         ),
         E::Add(a, c) => Expr::Arith(bx(a)?, bx(c)?, ArithOp::Add),
@@ -2348,13 +2348,13 @@ pub(super) fn compile_expression<T>(
         E::If(a, c, d) => Expr::If(bx(a)?, bx(c)?, bx(d)?),
         E::Coalesce(l) => Expr::Coalesce(
             l.iter()
-                .map(|x| compile(x))
+                .map(&compile)
                 .collect::<std::result::Result<_, T>>()?,
         ),
         E::FunctionCall(f, args) => {
             let args: Vec<Expr> = args
                 .iter()
-                .map(|x| compile(x))
+                .map(&compile)
                 .collect::<std::result::Result<_, T>>()?;
             let f = match f {
                 Function::Custom(n) if is_cast(n.as_str()) => Func::Cast(n.clone()),
