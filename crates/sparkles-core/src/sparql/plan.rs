@@ -4711,7 +4711,7 @@ impl<'a> Planner<'a> {
                 terms.set(t);
             });
             // The filters placed here move into a list of their own, made to its size,
-            // and the rest stay in the caller's list, whose credit the caller holds.
+            // and the rest stay in the caller's list, which allocates nothing here.
             let partition = self
                 .planning_scratch(|layout| layout.slots::<Expr>(placed))?
                 .expect("checked filter partition");

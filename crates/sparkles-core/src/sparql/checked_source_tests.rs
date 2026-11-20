@@ -2971,6 +2971,18 @@ fn checked_graph_r12_admits_join_order_tables() {
         text
     };
     cases.push((12, bound_filters));
+    // A group of one pattern whose 40 conjuncts the placement of filters moves onto its
+    // scan together, in a list of their own.
+    let placed = {
+        let test = (0..40)
+            .map(|step| format!("?v > -{step}"))
+            .collect::<Vec<_>>()
+            .join(" && ");
+        format!(
+            "SELECT * WHERE {{ GRAPH ?g {{ ?x <urn:v> ?v . FILTER({test}) BIND(?x AS ?first) }} }}"
+        )
+    };
+    cases.push((12, placed));
     let caps = [
         (0, "group", 512),
         (1, "greedy", 1024),
@@ -2996,6 +3008,9 @@ fn checked_graph_r12_admits_join_order_tables() {
             failures.push(format!(
                 "no range scan of 40 conjuncts bounded: {reached:?} {terms:?}"
             ));
+        }
+        if text.contains("{ ?x <urn:v> ?v . FILTER(") && terms[2] < 40 {
+            failures.push(format!("no partition of 40 filters: {terms:?}"));
         }
         if text.contains("CONTAINS(STR(?t)") && (reached.1 < 25 || terms[1] == 0) {
             failures.push(format!(
