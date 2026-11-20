@@ -44,7 +44,8 @@
    "m4.sh.txt",
    "m5.sh.txt",
    "m6.sh.txt",
-   "counters-compare.sh.txt"
+   "counters-compare.sh.txt",
+   "corpus-pairs.sh.txt"
   ]
  },
  "settings": {
@@ -55,7 +56,7 @@
  "results": {
   "insn.txt": "insn.sh lines NAME BIN TAG insn=USER_INSTRUCTIONS tax=TAXONOMY_HASH and the report's counters. The lines after M2-DONE are m6.sh: base def, w2 w0 and w2 def on the six files. The lines before are the base with the EL rules alone (el), the Horn rules alone (horn) and the default pipeline (def).",
   "runs.txt": "run.sh lines: the base's bound sweep on ore_ont_14817 (tags w1000000 to w16000000 are --dl-attempt-work), the four-thread runs of w2, and three interleaved four-thread rounds ab4r1 to ab4r3 of base and w2.",
-  "corpus.txt": "corpus.sh lines NAME SIDE THREADS EXIT TAXONOMY_HASH [tier, dlAttemptOver, dlOverBudget, hornOverBudget, outside, unsatisfiable, consistency, ms]; corpus-compare.txt is corpus-compare.sh's output, 998 pairs with 0 differences once the time is removed. ore_ont_7192 is killed by the memory cap and the reader refuses ore_ont_9881 on both sides.",
+  "corpus.txt": "corpus.sh lines NAME SIDE THREADS EXIT TAXONOMY_HASH [tier, dlAttemptOver, dlOverBudget, hornOverBudget, outside, unsatisfiable, consistency, ms], the base line and then the w2 line of each file and thread count. corpus-pairs.txt is corpus-pairs.sh's output: 1,014 pairs, 1,010 that both sides classified, 0 differences once the time is removed. ore_ont_7192 is killed by the memory cap (137) and the reader refuses ore_ont_9881 (101) on both sides and both thread counts. corpus-compare.txt, from the lane's first comparison, keyed the pairs by file name and so merged the eight names that occur in both the EL and the DL directories into 998 keys; it is kept as run, and corpus-pairs.txt supersedes it.",
   "dsweep-d0..d3.txt": "dsweep.sh over the 96 disjunctive development files on one thread: d0 diag, d1 a23d, d2 w1d, d3 w2. Each line: NAME exit taxonomy [ms, tier, dlAttemptOver, dlOverBudget, dlWork, dlContexts, dlStored, dlTests, conclusions, estimatedBytes, peakEstimatedBytes]. Once the time is removed d0 and d1 give the same lines, and d2 and d3 differ from them only in the peak estimated bytes of ore_ont_14817, 557,619,643 against 988,372,022, since the width limit ends its attempt early.",
   "gsweep-g0..g4.txt": "gsweep.sh over the 3,000 generated files: g0 diag, g1 a23d, g2 w1d on one thread, g3 w1d on four threads, g4 w2 on one thread. Each line ends with the last DLDIAG counters, maxProd the widest product.",
   "maxprod-d1.txt": "the widest product of each finishing development attempt on one thread from the d1 counters",

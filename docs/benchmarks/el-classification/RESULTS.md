@@ -1807,7 +1807,7 @@ All three give the same taxonomy on each file. The attempts of `ore_ont_14817` a
 `ore_ont_9663` fail on every build, and the limit ends them after 0.5 and 4 million
 conclusions instead of 22.4 million. The attempt of `ore_ont_3215` fails by its count, and
 the other three finish. A sweep classified GO, ChEBI lite, the 298 ORE 2015 EL files and
-the 207 DL development files once per build on one and four threads, and the 998 pairs
+the 207 DL development files once per build on one and four threads, and the 1,010 pairs
 that both builds classified gave the same tier, flags, classes outside the rules, count of unsatisfiable classes,
 consistency and taxonomy bytes. On one thread the 96 disjunctive development files derive the same
 conclusions with the pruning change, and the counters of products and clauses of the 15
