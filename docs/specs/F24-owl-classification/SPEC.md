@@ -192,7 +192,8 @@ fixture ontologies built around the loss and on the selection's sets, on one and
 threads with both strategies, every run that answers in full, with nothing left out
 and no fallback, agrees with HermiT wherever HermiT gives a taxonomy, and the cautious and
 eager runs that both answer in full give the same taxonomy.
-On the runs that answer in full with and without it, the replay adds 0.29% to the derived
+On the runs that answer in full with and without it, and where the run without it agrees
+with HermiT, the replay adds 0.29% to the derived
 conclusions of rooted runs that count, 0.47% to rooted runs without counting and 0.90% to
 runs that count without the root, because it charges its products before the redundancy check. Three
 generated ontologies that finished close to the bound now exceed it and give the answer
