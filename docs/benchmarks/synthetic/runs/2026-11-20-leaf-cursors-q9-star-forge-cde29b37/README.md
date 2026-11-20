@@ -46,3 +46,8 @@ and server kind, and `placement-corr.txt` gives the coefficients, which lie betw
 and 0.03. The P-core share shows no relation to a server's median. With at most two
 servers per cell in the fast mode, under 22 ms, the samples cannot say what causes that
 mode.
+
+`fastmode.py.txt` splits every build's requests at 22 ms and compares the builds within
+the slow mode alone, with the same bootstrap over server processes, and
+`fastmode.txt` and `fastmode-plain.txt` give its output for the two servers. It also gives
+each server's share of fast requests.

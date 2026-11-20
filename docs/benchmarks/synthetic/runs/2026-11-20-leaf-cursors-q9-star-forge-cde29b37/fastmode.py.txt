@@ -1,0 +1,30 @@
+# Splits each build's q9-star requests at 22 ms, the fast mode of analyze_q9.py, and
+# compares the builds within the slow mode alone, with a 95% bootstrap over server
+# processes, beside the share of fast requests per server process.
+#   fastmode.py OUT_DIR [ENGINE]
+import json, random, statistics as st, sys
+from pathlib import Path
+BUILDS = ("base", "main", "tip"); FAST = 0.022
+out = Path(sys.argv[1]); eng = sys.argv[2] if len(sys.argv) > 2 else "sparkles"
+rounds = sorted((p for p in out.glob("r*") if p.is_dir()), key=lambda p: int(p.name[1:]))
+def times(d):
+    j = json.loads((d / "geo-q9-star.json").read_text())
+    return [r for r in j["results"] if r["command"] == eng][0]["times"]
+for mode in ("streaming", "eager"):
+    procs = {b: [times(r / "results" / f"geo-{b}{s}-{mode}-t12") for r in rounds for s in ("", "2")] for b in BUILDS}
+    print(f"## {mode} t12, engine {eng}")
+    for b in BUILDS:
+        shares = [sum(t < FAST for t in p) / len(p) for p in procs[b]]
+        slow = [t for p in procs[b] for t in p if t >= FAST]
+        print(f"- {b}: fast share per process {' '.join(f'{s:.2f}' for s in shares)}; "
+              f"processes with any fast request {sum(s > 0 for s in shares)}/{len(shares)}; "
+              f"slow-mode median {st.median(slow) * 1e3:.2f} ms over {len(slow)} requests")
+    rng = random.Random(829)
+    def ratio(y, x, py, px):
+        sy = [t for p in py for t in p if t >= FAST]; sx = [t for p in px for t in p if t >= FAST]
+        return st.median(sy) / st.median(sx)
+    for y, x in (("main", "base"), ("tip", "main"), ("tip", "base")):
+        r0 = ratio(y, x, procs[y], procs[x])
+        bs = sorted(ratio(y, x, [rng.choice(procs[y]) for _ in procs[y]], [rng.choice(procs[x]) for _ in procs[x]]) for _ in range(2000))
+        print(f"- {y}/{x} slow mode only: {r0:.3f} (95% over processes {bs[50]:.3f} to {bs[1949]:.3f})")
+    print()

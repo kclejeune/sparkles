@@ -887,13 +887,18 @@ for each of 12 server processes per build and mode. Its ratios have a 95% bootst
 interval over server processes. The tip against main, item 829's own cost, reads 0.966
 streamed, with an interval of 0.944 to 0.991, and 1.006 eager, with an interval of 0.975 to
 1.044, so the item adds no cost to the query. The server without the spatial rewrites
-runs the same plan and reads 0.971 and 0.982. Main against the base reads 1.078 streamed,
-with an interval of 1.011 to 1.134, but its twelve pairs run from 0.909 to 1.362 and the
-base's servers differ from each other by up to 40.7%, so by the rule that a difference
-not above 1 in every pair is noise it needs no item. The tip against the base reads 1.042
-streamed, with pairs from 0.834 to 1.376, and 0.997 eager. The requests of every build
-split between under 22 ms and 26 to 30 ms, in shares that vary between servers, and the
-run's CPU samples show no relation between a server's median and its share of P cores.
+runs the same plan and reads 0.971 and 0.982.
+
+Main against the base reads 1.078 streamed, with an interval of 1.011 to 1.134 that
+excludes 1.0, so main's changes since bccc5f7b slow the streamed query, and item 1235
+investigates it. The requests of every build split between a fast mode under 22 ms and
+a slow mode of 26 to 30 ms. Streamed, 70 of the base's 300 requests take the fast mode
+against 22 of main's, and the base's servers differ from each other by up to 40.7%.
+Within the slow mode alone main reads 1.031 of the base, with an interval of 0.993 to
+1.080, so most of the difference is how often main's servers reach the fast mode. The
+run's CPU samples show no relation between a server's median and its share of P cores,
+so thread placement does not explain the fast mode. The tip against the base reads 1.042
+streamed, with pairs from 0.834 to 1.376, and 0.997 eager.
 
 The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
 The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two
