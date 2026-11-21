@@ -8,6 +8,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub mod bcp47;
+pub mod comp;
 pub mod range;
 pub mod rule;
 pub mod sets;
