@@ -1,0 +1,62 @@
+A class-predicate-list   base  10.0820 | b47b med 1.034 min 1.018 max 1.061 ALL>1 | 0779 med 1.035 min 0.979 max 1.098 
+A class-predicates       base  10.1275 | b47b med 1.026 min 1.018 max 1.039 ALL>1 | 0779 med 1.022 min 1.010 max 1.039 ALL>1
+A contains               base   4.1585 | b47b med 1.023 min 0.998 max 1.024  | 0779 med 1.024 min 1.000 max 1.033 
+A count-all              base   0.0094 | b47b med 1.083 min 0.699 max 1.211  | 0779 med 1.022 min 0.964 max 1.192 
+A distinct-join          base  38.2922 | b47b med 1.015 min 1.001 max 1.030 ALL>1 | 0779 med 1.014 min 0.993 max 1.021 
+A distinct-obj           base   0.0070 | b47b med 1.101 min 1.028 max 1.137 ALL>1 | 0779 med 1.042 min 0.892 max 1.150 
+A employee-docs          base   0.0701 | b47b med 1.014 min 0.901 max 1.087  | 0779 med 0.982 min 0.912 max 1.160 
+A exists-join            base   9.7439 | b47b med 0.984 min 0.956 max 1.042  | 0779 med 0.915 min 0.914 max 0.999 ALL<1
+A export-500k            base   2.3202 | b47b med 1.066 min 0.832 max 1.173  | 0779 med 1.010 min 0.965 max 1.037 
+A expr-agg-arg           base  24.2169 | b47b med 1.016 min 1.001 max 1.019 ALL>1 | 0779 med 1.009 min 0.991 max 1.044 
+A expr-bind-group        base   3.6589 | b47b med 1.034 min 0.995 max 1.047  | 0779 med 1.020 min 1.002 max 1.036 ALL>1
+A expr-order-key         base  10.0631 | b47b med 0.988 min 0.967 max 0.995 ALL<1 | 0779 med 0.990 min 0.972 max 1.026 
+A group-avg              base  41.3565 | b47b med 0.987 min 0.978 max 0.993 ALL<1 | 0779 med 0.980 min 0.976 max 0.991 ALL<1
+A knows-reach            base 139.5524 | b47b med 0.998 min 0.993 max 1.005  | 0779 med 0.999 min 0.990 max 1.002 
+A lang-filter            base   2.3229 | b47b med 0.998 min 0.990 max 1.001  | 0779 med 1.009 min 1.003 max 1.038 ALL>1
+A minus                  base   3.9092 | b47b med 1.015 min 0.960 max 1.035  | 0779 med 1.012 min 0.951 max 1.034 
+A not-exists             base  10.4622 | b47b med 1.032 min 1.009 max 1.046 ALL>1 | 0779 med 0.893 min 0.876 max 0.933 ALL<1
+A optional-chain         base  25.1008 | b47b med 0.993 min 0.941 max 1.024  | 0779 med 1.006 min 0.986 max 1.029 
+A optional-count         base   4.6334 | b47b med 1.036 min 0.998 max 1.069  | 0779 med 1.004 min 0.994 max 1.024 
+A order-by-full          base 108.5002 | b47b med 0.937 min 0.892 max 1.088  | 0779 med 0.953 min 0.888 max 1.030 
+A path-plus              base   0.0161 | b47b med 1.063 min 0.952 max 1.257  | 0779 med 1.086 min 1.032 max 1.127 ALL>1
+A predicate-counts       base   0.0074 | b47b med 1.175 min 1.063 max 1.283 ALL>1 | 0779 med 1.134 min 0.975 max 1.325 
+A predicate-subjects     base   0.0096 | b47b med 1.243 min 1.049 max 1.397 ALL>1 | 0779 med 1.010 min 0.934 max 1.423 
+A range-topk             base   2.1526 | b47b med 1.009 min 0.935 max 1.062  | 0779 med 0.980 min 0.900 max 1.189 
+A regex-iri              base   5.2098 | b47b med 0.998 min 0.992 max 1.013  | 0779 med 1.000 min 0.988 max 1.006 
+A star-join              base  13.2647 | b47b med 0.995 min 0.975 max 1.006  | 0779 med 0.987 min 0.972 max 1.012 
+A star-lookup            base   0.0736 | b47b med 0.996 min 0.988 max 1.044  | 0779 med 0.996 min 0.941 max 1.066 
+A subquery-agg           base   0.7638 | b47b med 1.034 min 0.908 max 1.092  | 0779 med 1.026 min 0.910 max 1.047 
+A two-hop-count          base  11.3681 | b47b med 0.998 min 0.960 max 1.005  | 0779 med 0.986 min 0.972 max 0.993 ALL<1
+A types-grouped          base   0.0124 | b47b med 1.120 min 1.053 max 1.130 ALL>1 | 0779 med 1.053 min 0.882 max 1.213 
+A values-star            base   0.0224 | b47b med 0.982 min 0.952 max 1.022  | 0779 med 0.994 min 0.973 max 1.052 
+B class-predicate-list   base  10.6045 | b47b med 1.033 min 1.011 max 1.039 ALL>1 | 0779 med 1.026 min 1.019 max 1.030 ALL>1
+B class-predicates       base  10.5442 | b47b med 1.025 min 1.017 max 1.031 ALL>1 | 0779 med 1.033 min 1.012 max 1.041 ALL>1
+B contains               base   4.2613 | b47b med 1.002 min 0.989 max 1.016  | 0779 med 0.995 min 0.988 max 1.005 
+B count-all              base   0.0117 | b47b med 1.097 min 0.797 max 1.410  | 0779 med 1.049 min 0.789 max 1.139 
+B distinct-join          base  37.9880 | b47b med 1.010 min 1.003 max 1.011 ALL>1 | 0779 med 1.002 min 0.998 max 1.003 
+B distinct-obj           base   0.0095 | b47b med 1.097 min 0.925 max 1.258  | 0779 med 1.333 min 1.017 max 1.825 ALL>1
+B employee-docs          base   0.0833 | b47b med 1.040 min 0.852 max 1.156  | 0779 med 1.073 min 0.947 max 1.254 
+B exists-join            base   9.3633 | b47b med 1.004 min 0.992 max 1.016  | 0779 med 0.963 min 0.952 max 0.971 ALL<1
+B export-500k            base   0.3843 | b47b med 1.000 min 0.995 max 1.020  | 0779 med 1.000 min 0.993 max 1.004 
+B expr-agg-arg           base  22.8639 | b47b med 1.008 min 0.996 max 1.016  | 0779 med 1.004 min 0.994 max 1.007 
+B expr-bind-group        base   3.3687 | b47b med 1.034 min 1.016 max 1.045 ALL>1 | 0779 med 1.014 min 0.996 max 1.030 
+B expr-order-key         base  11.2032 | b47b med 0.936 min 0.927 max 0.937 ALL<1 | 0779 med 0.968 min 0.942 max 0.986 ALL<1
+B group-avg              base  39.4315 | b47b med 0.986 min 0.975 max 0.997 ALL<1 | 0779 med 0.979 min 0.965 max 0.998 ALL<1
+B knows-reach            base 139.4584 | b47b med 0.996 min 0.993 max 1.001  | 0779 med 0.995 min 0.987 max 1.001 
+B lang-filter            base   2.2985 | b47b med 1.021 min 0.972 max 1.043  | 0779 med 1.002 min 0.994 max 1.041 
+B minus                  base   2.5844 | b47b med 1.009 min 0.994 max 1.045  | 0779 med 1.012 min 0.967 max 1.018 
+B not-exists             base  10.3702 | b47b med 1.016 min 0.964 max 1.045  | 0779 med 0.892 min 0.873 max 0.899 ALL<1
+B optional-chain         base  26.5147 | b47b med 1.010 min 0.988 max 1.028  | 0779 med 0.991 min 0.976 max 1.034 
+B optional-count         base   5.4737 | b47b med 1.013 min 0.998 max 1.019  | 0779 med 1.011 min 1.009 max 1.033 ALL>1
+B order-by-full          base 106.9929 | b47b med 0.996 min 0.912 max 1.053  | 0779 med 0.997 min 0.914 max 1.045 
+B path-plus              base   0.0161 | b47b med 1.090 min 0.920 max 1.272  | 0779 med 0.941 min 0.787 max 1.172 
+B predicate-counts       base   0.0165 | b47b med 0.783 min 0.689 max 1.030  | 0779 med 0.833 min 0.525 max 0.966 ALL<1
+B predicate-subjects     base   0.0198 | b47b med 0.817 min 0.720 max 1.113  | 0779 med 0.818 min 0.637 max 1.316 
+B range-topk             base   2.0691 | b47b med 1.023 min 0.883 max 1.224  | 0779 med 1.011 min 0.892 max 1.080 
+B regex-iri              base   5.2160 | b47b med 1.006 min 0.988 max 1.014  | 0779 med 1.014 min 1.001 max 1.038 ALL>1
+B star-join              base  13.8700 | b47b med 0.975 min 0.970 max 0.996 ALL<1 | 0779 med 0.980 min 0.969 max 1.015 
+B star-lookup            base   0.0834 | b47b med 1.010 min 0.817 max 1.044  | 0779 med 1.030 min 0.891 max 1.235 
+B subquery-agg           base   0.8378 | b47b med 0.979 min 0.979 max 1.043  | 0779 med 1.000 min 0.939 max 1.011 
+B two-hop-count          base  11.2131 | b47b med 0.995 min 0.967 max 1.007  | 0779 med 0.983 min 0.978 max 1.013 
+B types-grouped          base   0.0226 | b47b med 0.860 min 0.847 max 1.531  | 0779 med 1.197 min 0.847 max 1.265 
+B values-star            base   0.0315 | b47b med 0.900 min 0.661 max 1.044  | 0779 med 1.088 min 0.706 max 1.300 

@@ -1330,3 +1330,72 @@ same time. On Namespace, the wally builds of 125edd41 and 6b8f86e6 ran in 4 roun
 timed requests over all 30 queries. The fix ran `expr-bind-group` at 0.852 of 125edd41 and
 the 30 queries at a geometric mean of 0.956. The first pass flagged `not-exists` at 1.119
 and `star-lookup` at 1.232, and the rerun in 8 rounds of 40 read them at 1.010 and 0.985.
+
+### Matrix flags at batches 49 and 50
+
+The forge matrices of b47b582b and 0779d666 ran `order-by-full` and `optional-chain` far
+slower than the matrix of 6dbf2a08 in the 10.5M cell with 12 threads, as the table shows.
+The range from 6dbf2a08 to b47b582b holds item 1136's admission before construction, and
+the range to 0779d666 adds batch 50. The matrix of 0779d666 also flagged eager
+`export-500k` at 1.94 in that cell. The same matrices flagged these queries above 0.3 ms in
+the other cells, as ratios to the 6dbf2a08 matrix.
+
+| query | mode | cell | b47b582b | 0779d666 |
+|---|---|---|--:|--:|
+| `order-by-full` | eager | 10.5M, one thread | 1.145 | 1.260 |
+| `order-by-full` | streaming | 10.5M, one thread | 1.119 | 1.283 |
+| `optional-chain` | streaming | 10.5M, one thread | | 1.129 |
+| `order-by-full` | eager | 1.05M, 12 threads | 1.144 | 1.106 |
+| `order-by-full` | streaming | 1.05M, 12 threads | 1.215 | 1.127 |
+| `export-500k` | eager | 1.05M, 12 threads | | 1.802 |
+| `export-500k` | streaming | 1.05M, 12 threads | | 1.056 |
+| `optional-chain` | streaming | 1.05M, 12 threads | 1.065 | 1.086 |
+| `expr-bind-group` | streaming | 1.05M, 12 threads | 1.073 | |
+| `expr-agg-arg` | streaming | 1.05M, 12 threads | | 1.061 |
+| `expr-order-key` | streaming | 1.05M, 12 threads | | 1.087 |
+| `regex-iri` | eager | 1.05M, 12 threads | 1.082 | 1.067 |
+| `export-500k` | eager | 1.05M, one thread | | 1.081 |
+
+An empty cell is a ratio that the matrix comparison did not flag.
+
+A [same-day run](runs/2026-11-21-matrix-flags-forge-full3/README.md) of the three matrix
+binaries reran the 10.5M cell with 12 threads through the unmodified matrix harness, in six
+invocations in the order 6dbf2a08, b47b582b, 0779d666, 0779d666, b47b582b, 6dbf2a08. Each
+build had four eager and four streaming server epochs of all 31 queries on a shared store,
+and every invocation returned the same answers.
+
+| query | mode | 6dbf2a08 matrix ms | b47b582b matrix ms | 0779d666 matrix ms | same-day 6dbf2a08 ms | same-day b47b582b ms | same-day 0779d666 ms |
+|---|---|--:|--:|--:|--:|--:|--:|
+| `order-by-full` | eager | 124.6 | 181.5 | 195.1 | 108.5 | 103.2 | 103.6 |
+| `order-by-full` | streaming | 114.2 | 197.8 | 209.4 | 107.0 | 106.6 | 106.5 |
+| `optional-chain` | eager | 26.2 | 37.3 | 42.4 | 25.1 | 24.9 | 25.3 |
+| `optional-chain` | streaming | 26.4 | 34.9 | 38.4 | 26.5 | 26.6 | 26.6 |
+| `export-500k` | eager | 2.41 | 2.40 | 4.68 | 2.32 | 2.38 | 2.38 |
+
+In the same-day run the three builds agree on these queries within the spread of their
+epochs, and every build runs at or below the times of the 6dbf2a08 matrix. The flags in
+this cell therefore do not come from the code of either range. Their cause is not known.
+The same-day run held the same locks and the same data as the matrices, with the disk 96%
+to 97% full, its throttle counters did not change, and `knows-reach` stayed within 3% of the
+6dbf2a08 matrix in both slow matrices. The other cells have no same-day run, and roadmap
+item 1267 holds their flags.
+
+Paired epoch by epoch with its neighbour in the run order, b47b582b is slower than 6dbf2a08
+in all four paired epochs of a mode on nine query and mode pairs above 0.3 ms, and faster in
+all four on five, so most of these single directions are within what four pairs give by
+chance. `class-predicate-list` and `class-predicates` are slower in both modes, by 2.5% to
+3.4%, and also in the 0779d666 arm and in both matrices at 1.006 to 1.022, so roadmap item
+1255 records them as costs of item 1136.
+
+| query | mode | 6dbf2a08 ms | median ratio | lowest ratio |
+|---|---|--:|--:|--:|
+| `class-predicate-list` | eager | 10.08 | 1.034 | 1.018 |
+| `class-predicate-list` | streaming | 10.60 | 1.033 | 1.011 |
+| `class-predicates` | eager | 10.13 | 1.026 | 1.018 |
+| `class-predicates` | streaming | 10.54 | 1.025 | 1.017 |
+
+The other pairs slower in all four epochs are leads that need an interleaved A/B before
+they count as costs. They are eager `not-exists` at 1.032, streamed `expr-bind-group` at
+1.034, eager `expr-agg-arg` at 1.016, and `distinct-join` at 1.015 eager and 1.010 streamed,
+with lowest ratios of 1.001 to 1.016. Streamed `order-by-full` reads 0.996 here. Queries
+under 0.3 ms are not judged from these epochs.
