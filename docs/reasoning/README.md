@@ -670,12 +670,33 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   does not cap combined live RSS. Bounded pages limit output/name buffers, not server
   scans or arbitrary scalar sizes. See [API.md](../API.md#ontology) for the read states,
   typed sources, pins and projection selectors.
+* `complete` means that the taxonomy holds every subsumption between named classes and
+  every unsatisfiable class that the whole input ontology entails, as a complete OWL
+  reasoner such as HermiT answers. It is false when the run left out or used only in part
+  an axiom that `excluded` lists, and for a partial answer. `completeForTaken` is true
+  when the answer is complete for the axioms the run took, which is what a profile
+  reasoner such as ELK reports. A class outside `incomplete` has its exact superclasses,
+  equivalent classes and satisfiability even when axioms are left out, since its
+  bottom-locality module holds none of them, but its subclasses can be missed. The test
+  over-approximates, so a class in `incomplete` can still have its exact answer. When a
+  left-out axiom could make the ontology inconsistent, `consistency` is `unknown` and every
+  class is incomplete. A classification without `assertions` reads the terminology alone,
+  and the file's assertions count as left out under the rule `assertion-not-read` unless
+  they cannot change an answer, as for an ontology whose disjoint classes they could
+  contradict. `strict` on the request, `--strict` on `sparkles ontology classify` and
+  `--strict true` on ROBOT's `reason`, `reduce` and `materialize` refuse such a run with
+  the error `classification-incomplete`, HTTP 422, naming the axioms. The pass that decides
+  `incomplete` costs nothing when nothing is left out, has a bound on its work that
+  `coverageOver` reports, and answers with every class incomplete and `coverageStopped` set
+  when the deadline stops it. The
+  [F24 outcome](../specs/F24-owl-classification/SPEC.md#completeness-for-the-whole-ontology)
+  gives the argument and its cost.
 * Every classification answer gives `tier`, the rules the axioms need, and `consistency`,
   which is `consistent`, `inconsistent` or `unknown`. `partial` on the request, `--partial`
   on the command line and the bindings' `partial` option ask a run of the disjunctive rules
   that its deadline or cancellation stops to answer what it proved. Such an answer has
   `partial` true and `complete` false, lists the classes whose superclasses it may miss
-  under `incomplete` and gives every other class its full answer. Its consistency is
+  under `incomplete` and gives every other class its full answer for the axioms it took. Its consistency is
   `unknown` when the run stopped before deciding it, and then every class is incomplete.
   After a stopped run, immutable source hashing and response serialization finish over
   its already produced partial result without resuming classification or resetting shared

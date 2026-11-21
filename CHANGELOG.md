@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### A classification is complete only for the whole ontology
+
+`complete` in a classification answer now means complete for the whole input ontology, as
+HermiT and the OWL API read an answer. It was true before when the run left axioms out
+that `excluded` listed, which is ELK's convention, and that meaning moves to
+`completeForTaken` in the wire answers and `Classification::complete_for_taken` in Rust.
+`partial` and the dataset's retention now follow `completeForTaken`. `incomplete` and a
+`consistency` of `unknown` no longer imply a stopped run. A run that left axioms out lists
+the classes whose bottom-locality module holds one of them in `incomplete`, keeps every
+other class's exact superclasses, and makes the consistency `unknown` with every class
+incomplete when a left-out axiom could make the ontology inconsistent. A classification
+without `assertions` counts the file's assertions as left out under the rule
+`assertion-not-read` unless they cannot change an answer, so an ontology with disjoint
+classes and typed individuals answers `unknown` until it is classified with them. The
+new `strict` option, `--strict` on `sparkles ontology classify` and `--strict true` on
+ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the error
+`classification-incomplete`, HTTP 422. The answers' stats gain `coverageMs`,
+`coverageOver` and `coverageStopped`, and the content fingerprint of a retained
+classification is version 2, as roadmap item 1271.
+
 ### A kept EL classification over its memory budget starts again in full
 
 A kept OWL 2 EL run counts the contexts it keeps and its own new state against

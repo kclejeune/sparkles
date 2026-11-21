@@ -4573,6 +4573,84 @@ statements. Sparkles' rule parser refuses the adapter's file at its first line, 
 the brackets added it derives exactly Jena's 321 facts. Item 1020 takes the bare
 namespace IRIs.
 
+### Completeness for the whole ontology
+
+Item 1271 aligns `complete` with complete OWL reasoners. HermiT, Pellet, FaCT++ and
+Konclude either answer for the whole ontology or refuse it, and the OWL API's reasoner
+interface has no completeness flag, so its callers read every answer as complete. A
+profile reasoner such as ELK ignores the axioms outside its fragment and warns. Before
+this item `complete` was ELK's weaker statement, true while `outside` listed axioms the run
+left out. It now means that every subsumption between named classes and every
+unsatisfiable class that the whole input ontology entails is in the taxonomy. It is false
+when the run left out or used only in part an axiom, which `excluded` lists, and for the
+partial answer of a stopped run. `completeForTaken` in the wire answers and
+`Classification::complete_for_taken` in Rust keep the old meaning, false only for a
+partial answer. `partial` is its negation, and the dataset retains a run by it.
+
+A class outside `incomplete` keeps its exact answer when axioms are left out. The
+classifier extracts the syntactic bottom-locality module of the class, after Cuenca Grau,
+Horrocks, Kazakov and Sattler, and the class is complete when the module holds no axiom
+the run left out. Let `O` be the ontology, `L` the axioms left out and `T = O \ L`. A model
+of the module `M_C` of `{C}` in `O` extends to a model of `O` that agrees with it on the
+module's signature and makes every other class empty, so the named superclasses of `C`
+that `O` entails are those that `M_C` entails. When `L` misses `M_C`, `M_C` is inside `T`,
+and the run, which is complete for `T`, finds them all. Equivalent classes and
+unsatisfiability follow. A satisfiable class equivalent to such a class is in its module's
+signature, so its own module is inside `M_C`. The answer is exact for the superclasses,
+equivalents and satisfiability of a class outside `incomplete`, and not for its
+subclasses. A class can be complete while a subclass of it is missed, since the subclass's
+module can hold a left-out axiom. On item 1271's `irl1`, which a plain run classifies
+without `K ⊑ Ans`, `Ans` is complete and its children are not.
+
+The consistency verdict needs its own condition, since an inconsistent ontology makes
+every class unsatisfiable. A verdict of inconsistent is sound for `O`. When the run finds
+`T` consistent, `O` is consistent if `L` misses the bottom module of the empty signature in
+`O` or its top module, whose models extend to models of `O` with every class outside the
+signature empty or the whole domain. Otherwise `consistency` is `unknown` and every class is
+incomplete. A third layer decides more classes. Without nominals or `ObjectHasValue`
+outside the assertions and keys, and without the universal object property, a model of
+the terminology's module joins a model of `O` in a disjoint union, so the module of a class
+in `O` without its assertions and keys is enough. The module documentation of
+`transform/module.rs` gives the three arguments in full, and a rule unsure of an axiom's
+locality calls it non-local, which only makes a module larger. The test is syntactic and
+over-approximates, so it can list a class whose answer is exact, such as `S` in `irl1`, and
+never omits a class whose answer can be missed. `dl_fixtures` checks every complete class
+against HermiT on the 640 cases of item 603 with and without the EL-only rules. In 1009
+runs that left axioms out, the consistency stayed known in 379 and 1486 of 5914 classes
+were complete, with no mismatch.
+
+A classification of the terminology alone, which is the default of `ontology classify`,
+HTTP and the bindings without `assertions`, does not read the file's assertions, which are
+part of its ontology. They count as left out unless the same layers show that they cannot
+change an answer, which needs a consistency known for the whole ontology and the
+third layer's gates. A run then streams the assertions after the terminology's modules,
+stops at the first that matters, and reports it in `excluded` under the rule
+`assertion-not-read`, with one entry for all of them. Class and property assertions over a
+terminology of subclass axioms and existential restrictions, which nothing in it can
+contradict, change nothing and leave the run complete. An ontology with disjoint classes and typed individuals answers with
+`consistency` `unknown` and every class incomplete, since its assertions could make it
+inconsistent, and `assertions` true then gives the complete answer.
+
+The pass costs nothing when nothing is left out. Its extractions share one bound on the
+axioms they examine, 1024 for each axiom of the input and at least about a million, past
+which the classes not yet decided are incomplete, so an answer depends on the input
+alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
+deadline or cancellation during the pass leaves every class incomplete and the
+consistency unknown with `coverageStopped` set, rather than discard the saturation, and the
+dataset retains the saturation but publishes no such answer. On a loaded laptop with four
+threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI lite with the
+EL-only rules, which leave axioms of both out. These are single approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
+do since they read only the taxonomy.
+
+`strict` on the request, `--strict` on `ontology classify` and `--strict true` on ROBOT's
+`reason`, `reduce` and `materialize` refuse a run that is not complete for the whole
+ontology. The refusal is the component error `classification-incomplete`, HTTP 422, which
+names the axioms and the rule each breaks, `UnsupportedError` in Python and Node.js, an
+unsupported error in the JVM and the FFI, and ROBOT's `INCOMPLETE REASONING ERROR`. The
+default stays non-strict. The content fingerprint of a retained classification is
+version 2, since it now covers both flags. The server computes it in memory and stores it
+nowhere, so only a client that kept an older fingerprint sees a new value.
+
 ### Roadmap follow-ups
 
 #### Incremental native DL classification

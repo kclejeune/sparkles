@@ -123,6 +123,10 @@ functional-style forms with `el_classify --ofn-out FILE INPUT`, and run
 quiet host. For ELK, run `ELK_HEAP=4g scripts/elk-compare/elk.sh run --threads N
 --repeat 5 --taxonomy OUT.ofn INPUT.ofn`, and compare the two taxonomies with
 `scripts/el-oracle.py OUT.ofn OURS.txt`. Each record's `run.sh.txt` is the exact script.
+A run that leaves axioms out, such as one with `--el-only`, also decides which classes keep
+their complete answer, and its `classifyMs` includes that pass, which `coverageMs` reports.
+`--no-coverage` turns the pass off for a comparison with ELK, which has no such pass. A run
+that leaves nothing out takes no pass.
 The ORE 2015 sample is `ore2015_sample.zip` of the ORE 2015 Reasoner Competition
 Corpus, Zenodo record 18578. The 298 ontologies that
 `pool_sample/el/classification/fileorder.txt` lists are functional-style files under
