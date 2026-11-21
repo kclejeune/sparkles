@@ -215,6 +215,25 @@ pub type Mapped = (Vec<Ex>, Vec<Role>);
 /// The names and expressions a merge of chunks takes between two calls of its poll.
 pub const POLL_MERGE: usize = if cfg!(test) { 64 } else { 65_536 };
 
+/// The hash of a role's name that [`Interner`] keys by, which [`object_hash`] gives an
+/// object property from its IRI alone.
+fn role_hash(r: &RoleName) -> u64 {
+    use std::hash::BuildHasher;
+    let fx = rustc_hash::FxBuildHasher;
+    match r {
+        RoleName::Object(p) => object_hash(p.as_str()),
+        RoleName::Data(p) => fx.hash_one((1u8, p.as_str())),
+        RoleName::Fresh(n) => fx.hash_one((2u8, *n)),
+        RoleName::Inverse(p) => fx.hash_one((3u8, p.as_str())),
+    }
+}
+
+#[inline]
+fn object_hash(iri: &str) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one((0u8, iri))
+}
+
 /// The name of a role.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RoleName {
@@ -250,7 +269,9 @@ pub struct Interner {
     /// the opaque data atoms and the datatype definitions of the run
     pub ranges: Ranges,
     pub roles: Vec<RoleName>,
-    role_ids: FxHashMap<RoleName, Role>,
+    /// the id of each name in [`Interner::roles`], by [`role_hash`], so that an object
+    /// property is looked up without a copy of its IRI
+    role_ids: hashbrown::HashTable<Role>,
     fresh: u32,
     /// the fresh classes of the Horn normalization
     fresh_classes: u32,
@@ -532,7 +553,9 @@ impl Interner {
 
     /// The role of a name, if the interner has it.
     pub fn role_id(&self, name: &RoleName) -> Option<Role> {
-        self.role_ids.get(name).copied()
+        self.role_ids
+            .find(role_hash(name), |&id| self.roles[id as usize] == *name)
+            .copied()
     }
 
     pub fn len(&self) -> usize {
@@ -770,13 +793,28 @@ impl Interner {
     }
 
     pub fn role(&mut self, r: RoleName) -> Role {
-        if let Some(&id) = self.role_ids.get(&r) {
+        if let Some(id) = self.role_id(&r) {
             return id;
         }
         let id = self.roles.len() as Role;
-        self.roles.push(r.clone());
-        self.role_ids.insert(r, id);
+        let h = role_hash(&r);
+        self.roles.push(r);
+        let roles = &self.roles;
+        self.role_ids
+            .insert_unique(h, id, |&i| role_hash(&roles[i as usize]));
         id
+    }
+
+    /// The role of an object property, which copies its IRI only when it is new.
+    pub fn object_role(&mut self, p: &ObjectProperty) -> Role {
+        let found = self.role_ids.find(
+            object_hash(p.as_str()),
+            |&id| matches!(&self.roles[id as usize], RoleName::Object(q) if q == p),
+        );
+        match found {
+            Some(&id) => id,
+            None => self.role(RoleName::Object(p.clone())),
+        }
     }
 
     pub fn fresh_role(&mut self) -> Role {
@@ -1677,7 +1715,7 @@ pub const OPAQUE: &str = "literals and datatypes without values the classifier c
 
 fn object_role(p: &ObjectPropertyExpression, it: &mut Interner) -> Option<Role> {
     match p {
-        ObjectPropertyExpression::Property(p) => Some(it.role(RoleName::Object(p.clone()))),
+        ObjectPropertyExpression::Property(p) => Some(it.object_role(p)),
         ObjectPropertyExpression::InverseOf(_) => None,
     }
 }
@@ -1734,7 +1772,7 @@ pub fn class_expression(
                     (BOTTOM, partial)
                 }
                 ObjectPropertyExpression::Property(p) => {
-                    let r = it.role(RoleName::Object(p.clone()));
+                    let r = it.object_role(p);
                     if f == BOTTOM {
                         return Ok((BOTTOM, partial));
                     }
@@ -1750,7 +1788,7 @@ pub fn class_expression(
             };
             match p {
                 ObjectPropertyExpression::Property(p) => {
-                    let r = it.role(RoleName::Object(p.clone()));
+                    let r = it.object_role(p);
                     (it.node(Node::Exist(r, f)), None)
                 }
                 ObjectPropertyExpression::InverseOf(_) => return Err("inverse properties"),
@@ -1761,7 +1799,7 @@ pub fn class_expression(
             _ => return Err("anonymous individuals"),
         },
         C::ObjectHasSelf(ObjectPropertyExpression::Property(p)) => {
-            let r = it.role(RoleName::Object(p.clone()));
+            let r = it.object_role(p);
             (it.node(Node::SelfLoop(r)), None)
         }
         C::DataSomeValuesFrom(ps, r) if ps.len() == 1 => {
@@ -3272,14 +3310,14 @@ fn roles(
     }
     // every object property is a subproperty of the top object property, and every
     // data property of the top data property
-    if let Some(&top) = it.role_ids.get(&RoleName::Object(ObjectProperty::top())) {
+    if let Some(top) = it.role_id(&RoleName::Object(ObjectProperty::top())) {
         for (r, name) in it.roles.iter().enumerate() {
             if matches!(name, RoleName::Object(_)) && r as Role != top {
                 direct[r].push(top);
             }
         }
     }
-    if let Some(&top) = it.role_ids.get(&RoleName::Data(DataProperty::top())) {
+    if let Some(top) = it.role_id(&RoleName::Data(DataProperty::top())) {
         for (r, name) in it.roles.iter().enumerate() {
             if matches!(name, RoleName::Data(_)) && r as Role != top {
                 direct[r].push(top);
@@ -3396,7 +3434,7 @@ fn roles(
         RoleName::Object(ObjectProperty::bottom()),
         RoleName::Data(DataProperty::bottom()),
     ] {
-        if let Some(&b) = it.role_ids.get(&bottom) {
+        if let Some(b) = it.role_id(&bottom) {
             for (r, ss) in sup.iter().enumerate() {
                 if ss.binary_search(&b).is_ok() {
                     empty[r] = true;
