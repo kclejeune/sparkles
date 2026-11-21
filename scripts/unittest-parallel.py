@@ -15,10 +15,13 @@ import-time skips, custom suites and class and module fixtures behave as they do
 An entry made only of default suites with no test does nothing and gets no process. The
 whole suite runs in one process instead, and the runner says why, when test classes of one
 module run in more than one entry, as when one test module imports another's class, since
-they can share that module's state, or when any entry has a suite of a kind of its own,
-since its run() can depend on everything run before it. State that test modules share in
-some other way, such as through a helper module's globals, is not detected, so a test that
-depends on another module's tests having run first can pass here and fail serially.
+they can share that module's state, or when any entry has a suite of a kind of its own, a
+default suite with attributes of its own such as a run() given to the instance, or a test
+that is not a TestCase, or when a test module has changed unittest's suite classes, since
+such a run() can depend on everything run before it. State that tests share in some other
+way, such as through a helper module's globals, is not detected, so a test that depends on
+a test in another unit having run first can pass or skip here and fail serially. The same
+holds for the tests of a split module, which each run in a unit of their own.
 
 A module named with --split runs one process per test instead, for modules whose few tests
 take most of the suite's time. The split is taken only when the module's entry is plain,
@@ -72,6 +75,12 @@ from pathlib import Path
 
 RUNNER = os.path.abspath(__file__)
 
+# The attributes a default suite instance has, and the suite classes as they were before any
+# test module was imported, so that a suite that can behave other than a default one is found.
+_SUITE_KEYS = {"_tests", "_removed_tests"}
+_SUITE_CLASSES = (unittest.suite.BaseTestSuite, unittest.TestSuite)
+_SUITE_DICTS = {cls: dict(vars(cls)) for cls in _SUITE_CLASSES}
+
 
 # ----- discovery, in the discovery child and in every unit ---------------------------------
 
@@ -93,7 +102,41 @@ def _tree(node):
     if isinstance(node, unittest.TestSuite):
         cls = type(node)
         return {"suite": f"{cls.__module__}.{cls.__qualname__}", "tests": [_tree(t) for t in node]}
-    return node.id()
+    return _id(node)
+
+
+def _id(test):
+    """TEST's id, or for a callable that is not a TestCase, a name for its kind."""
+    if isinstance(test, unittest.TestCase) or callable(getattr(test, "id", None)):
+        return test.id()
+    return f"<{type(test).__module__}.{type(test).__qualname__}>"
+
+
+def _custom(node):
+    """Why NODE alone, not counting what it holds, can behave other than a default suite or a
+    TestCase does, or None. A suite of a kind of its own, a default suite with attributes of
+    its own, such as a run() given to the instance, and a test that is not a TestCase can
+    each do anything when they run, including depend on the result of what ran before."""
+    if isinstance(node, unittest.TestSuite):
+        if type(node) is not unittest.TestSuite:
+            return f"has a suite of kind {type(node).__module__}.{type(node).__qualname__}"
+        own = sorted(set(vars(node)) - _SUITE_KEYS)
+        if own:
+            return f"has a suite with attributes of its own: {', '.join(own)}"
+        return None
+    if not isinstance(node, unittest.TestCase):
+        return f"has a test of kind {type(node).__module__}.{type(node).__qualname__}"
+    return None
+
+
+def _changed_suite_classes():
+    """Which attribute of unittest's suite classes a test module changed, or None."""
+    for cls, before in _SUITE_DICTS.items():
+        now = vars(cls)
+        for name in sorted(set(before) | set(now)):
+            if before.get(name) is not now.get(name):
+                return f"unittest.{cls.__qualname__}.{name} was changed"
+    return None
 
 
 def _leaves(node):
@@ -111,8 +154,8 @@ def _label(loader, entry, index):
         # Import failures and import-time skips stand in as unittest.loader._FailedTest.MODULE
         # and unittest.loader.ModuleSkipped.MODULE.
         if type(t).__module__ == "unittest.loader":
-            return t.id().rsplit(".", 1)[-1]
-        return t.id().rsplit(".", 2)[0]
+            return _id(t).rsplit(".", 1)[-1]
+        return _id(t).rsplit(".", 2)[0]
     return f"entry-{index}"
 
 
@@ -138,9 +181,10 @@ def _plain(label, entry):
     seen = set()
 
     def walk(node):
+        why = _custom(node)
+        if why:
+            return f"it {why}"
         if isinstance(node, unittest.TestSuite):
-            if type(node) is not unittest.TestSuite:
-                return f"it has a suite of kind {type(node).__qualname__}"
             for t in node:
                 why = walk(t)
                 if why:
@@ -180,7 +224,7 @@ def discover(directory):
         units.append({
             "label": label,
             "tree": _tree(entry),
-            "leaves": [t.id() for t in _leaves(entry)],
+            "leaves": [_id(t) for t in _leaves(entry)],
             "split": _plain(label, entry),
             "size": os.path.getsize(f) if f and os.path.exists(f) else 0,
             "absorb": callable(getattr(module, "parallel_absorb", None)),
@@ -194,14 +238,17 @@ def discover(directory):
 
 def _inert(node):
     """Whether NODE is default suites only, with no test, so running it does nothing."""
-    return type(node) is unittest.TestSuite and all(_inert(t) for t in node)
+    return (isinstance(node, unittest.TestSuite) and _custom(node) is None
+            and all(_inert(t) for t in node))
 
 
 def _shared(entries, units):
     """Why the entries cannot run in separate processes, or None. Test classes of one module
     that run in more than one entry, as when one test module imports another's class, can
     share that module's state and fixtures, which only one process keeps. A suite of a kind
-    of its own can depend on the result of everything run before it."""
+    of its own, or any other node that _custom names, can depend on the result of everything
+    run before it, and so can every suite once a test module has changed unittest's suite
+    classes."""
     where = {}
     for i, entry in enumerate(entries):
         for t in _leaves(entry):
@@ -210,22 +257,26 @@ def _shared(entries, units):
                 where.setdefault(module, set()).add(i)
 
     def custom(node):
-        if isinstance(node, unittest.TestSuite):
-            if type(node) is not unittest.TestSuite:
-                return type(node)
-            for t in node:
-                kind = custom(t)
-                if kind:
-                    return kind
+        why = _custom(node)
+        if why or not isinstance(node, unittest.TestSuite):
+            return why
+        for t in node:
+            why = custom(t)
+            if why:
+                return why
         return None
+
+    changed = _changed_suite_classes()
+    if changed:
+        return changed
 
     for module, found in where.items():
         if len(found) > 1:
             return f"test classes of {module} run in {len(found)} top-level entries"
     for u, entry in zip(units, entries):
-        kind = custom(entry)
-        if kind:
-            return f"{u['label']} has a suite of kind {kind.__module__}.{kind.__qualname__}"
+        why = custom(entry)
+        if why:
+            return f"{u['label']} {why}"
     return None
 
 
@@ -279,7 +330,7 @@ def worker_main(directory, plan_path, index, split, record_path, absorb_path):
         label = plan["units"][index]["label"]
         sys.modules[label].parallel_absorb(exports.get(label, []))
     # A suite drops each test once it has run, so the occurrences are listed first.
-    ran = [t.id() for t in _leaves(entry)]
+    ran = [_id(t) for t in _leaves(entry)]
     warnings = None if sys.warnoptions else "default"
     result = unittest.TextTestRunner(stream=sys.stderr, warnings=warnings).run(entry)
     record.update(

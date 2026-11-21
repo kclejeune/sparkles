@@ -372,19 +372,23 @@ details.
 The Python tests of the CI, gate and benchmark scripts live in `scripts/bench-tests`, and
 `mise run test:bench-scripts` runs them with `scripts/unittest-parallel.py`, eight
 processes at a time. `python3 -m unittest discover -s scripts/bench-tests` runs the same
-tests serially and reaches the same verdict. The runner discovers the suite once in a
-child process and then starts one process per module or package that discovery loads. Each
+tests serially, and the runner reaches the same verdict under the condition given below. It
+discovers the suite once in a child process and then starts one process per module or
+package that discovery loads. Each
 process discovers the whole suite again, checks that it found the same tests in the same
 order, and runs its own part exactly as discovered. Import errors, import-time skips,
 `load_tests` hooks and class and module fixtures therefore behave as they do serially.
 The whole suite runs in one process, and the runner says why, when test classes of one
 module run under more than one module, as when one test module imports another's class,
-or when a `load_tests` hook returns a suite of its own kind, since such tests can depend on
-what ran before them. Tests that share state in another way, such as a helper module's
-globals, are not detected, so each test module must pass on its own. The three long tests of `test_x08_latency`
-run one per process. A module named with `--split` is split this way only when it has no
-fixtures, custom suites, imported classes or repeated tests, and otherwise runs whole with
-a note that says why.
+when a `load_tests` hook returns a suite of its own kind or a suite given its own `run`, or
+when a test module changes unittest's suite classes, since such tests can depend on what ran
+before them. Tests that share state in another way, such as a helper module's globals, are
+not detected. The runner therefore reaches the serial verdict only when no test depends on
+state that a test in another process left behind, and passing alone does not show this,
+since such a test can skip instead of fail. The same holds for the tests of a split module.
+The three long tests of `test_x08_latency` run one per process. A module named with
+`--split` is split this way only when it has no fixtures, custom suites, imported classes or
+repeated tests, and otherwise runs whole with a note that says why.
 
 Each process writes a result record, and the runner takes its verdict from those records
 and from unittest's own results, never from the printed output. A process that ends without

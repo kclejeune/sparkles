@@ -330,6 +330,67 @@ class Discovery(Base):
             """)
         self.same_verdict(d, expect=1)
 
+    def test_a_default_suite_with_a_run_of_its_own_still_runs(self):
+        # Validation finding F1: an ordinary TestSuite given its own run() is not inert.
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            def fail():
+                raise AssertionError("generated check must run")
+
+            def load_tests(loader, tests, pattern):
+                suite = unittest.TestSuite()
+                def run(result, debug=False):
+                    return unittest.TestSuite([unittest.FunctionTestCase(fail)]).run(result)
+                suite.run = run
+                return suite
+            """)
+        s, p = self.same_verdict(d, expect=1)
+        self.assertIn("Ran 2 tests", s.stderr)
+        self.assertIn("the whole suite runs in one process, since test_z has a suite with attributes of its own: run", p.stdout)
+        self.assertIn("2 tests in 1 processes", p.stdout)
+
+    def test_a_nonempty_default_suite_with_a_run_of_its_own_sees_the_tests_before_it(self):
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            class T(unittest.TestCase):
+                def test_x(self):
+                    pass
+
+            def load_tests(loader, tests, pattern):
+                suite = unittest.TestSuite(tests)
+                plain = suite.run
+                def run(result, debug=False):
+                    if result.testsRun == 0:
+                        result.addError(suite, (RuntimeError, RuntimeError("ran first"), None))
+                    return plain(result, debug)
+                suite.run = run
+                return suite
+            """)
+        # Serial discovery runs test_a first, so the hook sees one test and passes.
+        s, p = self.same_verdict(d, expect=0)
+        self.assertIn("the whole suite runs in one process", p.stdout)
+
+    def test_a_suite_class_changed_at_import_runs_as_serial_discovery_does(self):
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            plain = unittest.TestSuite.run
+
+            def run(self, result, debug=False):
+                if not self._tests:
+                    result.addError(self, (RuntimeError, RuntimeError("an empty suite ran"), None))
+                return plain(self, result, debug)
+
+            unittest.TestSuite.run = run
+
+            def load_tests(loader, tests, pattern):
+                return unittest.TestSuite()
+            """)
+        s, p = self.same_verdict(d, expect=1)
+        self.assertIn("the whole suite runs in one process, since unittest.TestSuite.run was changed", p.stdout)
+
     def test_a_repeated_occurrence_runs_each_time(self):
         d = self.suite(test_rep="""
             import unittest
