@@ -4785,7 +4785,7 @@ consistency. The six files with top-property inclusions leave out what they left
 before, since their data properties, datatypes and, in the default run, individuals keep
 the disjunctive rules closed too, which items 768, 972 and 823 follow. Item 1272's
 ablation without those axioms showed that the inclusions then no longer close the gate
-and the files reach the rooted run's bound, which item 1061 follows. The peak
+and the files reach the rooted run's bound, which item 1284 follows. The peak
 resident memory of a census process, which reads the file and runs both, falls from 752
 to 196 MiB on `ore_ont_10073` and `ore_ont_5481`, from 1,674 to 501 MiB on
 `ore_ont_5857` and by a sixth to two thirds on the other files above 400 MiB. It rises
