@@ -50,8 +50,8 @@
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
     DlIx, DlSt, Found, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN, MREPAIR_ON,
-    MREPAIR_UNITS, MREPAIR_WIDE, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id,
-    restricted, side, unit, with,
+    MREPAIR_RSUB, MREPAIR_UNITS, MREPAIR_WIDE, Side, WORK_READS, alls, dix, dl, drain, drain_with,
+    ds, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -1812,6 +1812,21 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
     }
     mrep_new(r, out);
     let c = out.dl().table.get(cid).clone();
+    if out.dl().mrepair & MREPAIR_RSUB != 0 {
+        // a returned clause taken before with a body within c's and a head within c's has
+        // products that subsume each of c's: it is kept under one of c's body literals
+        let mut read = 0;
+        let subsumed = c.body().iter().any(|l| {
+            r.mr().rets.get(l).into_iter().flatten().any(|&d| {
+                read += 1;
+                out.dl().table.get(d).subsumes(&c)
+            })
+        });
+        out.worked(1 + read / WORK_READS);
+        if subsumed {
+            return true;
+        }
+    }
     let mut grown = 0;
     for &l in c.body() {
         grown += RootSt::push(&mut r.mw().rets, l, cid);
