@@ -192,9 +192,11 @@
   let summary = $state<OntologyHead | null>(null);
   // the full summary, whose axiom counts and diagnostics map the whole ontology, read only for
   // the Header tab or when asked
-  let full = $state<OntologySummary | null>(null);
-  let fullLoading = $state(false);
-  let fullError = $state<Error | null>(null);
+  // the full summary, the read in flight and the last failure, each with the key of the head
+  // they belong to: its target, graph, imports switch, import map revision and commit
+  let full = $state<{ key: string; summary: OntologySummary } | null>(null);
+  let fullLoadingKey = $state<string | null>(null);
+  let fullError = $state<{ key: string; error: Error } | null>(null);
   let fullSeq = 0;
   const inferredPins = $derived(
     new InferredPins(JSON.stringify([target, graph, sel.imports, summary?.commit])),
@@ -303,37 +305,50 @@
    * again, so the page never shows the counts of two commits.
    */
   async function loadFull() {
-    const t = target;
-    const s = sel;
+    const key = headKey;
     const head = summary;
-    if (!name || !head) return;
+    if (!name || !head || !key) return;
+    const t = target;
+    const s = { ...sel };
+    const scope = scopeKey();
     const my = ++fullSeq;
-    fullLoading = true;
+    fullLoadingKey = key;
     fullError = null;
+    let behind = false;
     try {
       const r = await ontologySummary(t, s);
       if (my !== fullSeq) return;
-      full = r.summary;
-      if (r.summary.commit !== head.commit) void loadAll();
+      full = { key: JSON.stringify([scope, r.summary.commit]), summary: r.summary };
+      // a newer commit: the head is read again, and the read stays pending until it lands
+      behind = r.summary.commit !== head.commit;
+      if (behind) void loadAll();
     } catch (e) {
-      if (my === fullSeq) fullError = e as Error;
+      if (my === fullSeq) fullError = { key, error: e as Error };
     } finally {
-      if (my === fullSeq) fullLoading = false;
+      if (my === fullSeq && !behind) fullLoadingKey = null;
     }
   }
   /** Forget the full summary, which belongs to a scope the page left. */
   function forgetFull() {
     full = null;
     fullError = null;
-    fullLoading = false;
+    fullLoadingKey = null;
     fullSeq++;
   }
-  /** The full summary when it was read at the commit of the head on screen. */
-  const fullShown = $derived(full && summary && full.commit === summary.commit ? full : null);
+  /** The scope the page reads: target, graph, imports switch and import map revision. */
+  const scopeKey = () => JSON.stringify([target, sel.graph ?? null, sel.imports, importsRev]);
+  /** The key of the head on screen, or `null` while a new scope's head is read. */
+  const headKey = $derived(
+    summary && !summaryStale ? JSON.stringify([scopeKey(), summary.commit]) : null,
+  );
+  /** The full summary when it was read for the head on screen. */
+  const fullShown = $derived(full && headKey && full.key === headKey ? full.summary : null);
+  const fullLoading = $derived(fullLoadingKey != null && fullLoadingKey === headKey);
+  const fullFailed = $derived(fullError && fullError.key === headKey ? fullError.error : null);
   $effect(() => {
-    if (tab !== 'header' || !summary || summaryStale) return;
-    if (untrack(() => fullShown || fullLoading || fullError)) return;
-    void untrack(() => loadFull());
+    if (tab !== 'header' || !headKey) return;
+    if (fullShown || fullLoadingKey === headKey || fullError?.key === headKey) return;
+    untrack(() => void loadFull());
   });
 
   /** Forget the lists and labels read, which belong to a commit or graph the page left. */
@@ -1603,7 +1618,7 @@
             {summary}
             full={fullShown}
             {fullLoading}
-            {fullError}
+            fullError={fullFailed}
             onfull={loadFull}
             name={nameOf}
             {prefixes}
@@ -1935,7 +1950,7 @@
                   {summary}
                   full={fullShown}
                   {fullLoading}
-                  {fullError}
+                  fullError={fullFailed}
                   onfull={loadFull}
                   name={nameOf}
                   {prefixes}

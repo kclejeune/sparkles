@@ -122,6 +122,34 @@ test('the editor opens on the head and maps the ontology only for the axiom coun
   ).toBeHidden();
 });
 
+test('the axiom counts never pair with the head of another import scope', async ({ page }) => {
+  // the head of the scope without imports is held back, and Count the axioms waits for it
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  const fulls: string[] = [];
+  await page.route('**/$/ontology/uni?*', async (route) => {
+    const u = new URL(route.request().url());
+    if (u.searchParams.get('view') !== 'head') fulls.push(u.searchParams.get('imports') ?? 'true');
+    if (u.searchParams.get('view') === 'head' && u.searchParams.get('imports') === 'false')
+      await held;
+    await route.continue();
+  });
+  await page.goto('/ui/workbench/ontology?ds=uni');
+  const contents = page.getByRole('region', { name: 'Contents' });
+  const count = contents.getByRole('button', { name: 'Count the axioms' });
+  await expect(count).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('checkbox', { name: 'Imported axioms' }).uncheck();
+  await expect(page).toHaveURL(/imports=0/);
+  await count.click();
+  await expect(contents).not.toContainText('triples read');
+  expect(fulls).toEqual([]);
+  release();
+  await expect(count).toBeVisible();
+  await count.click();
+  await expect(contents).toContainText('triples read');
+  expect(fulls).toEqual(['false']);
+});
+
 test('the inferred class tree sits beside the asserted one', async ({ page }) => {
   await page.goto('/ui/workbench/ontology?ds=uni&inferred=1');
   await page.getByRole('button', { name: 'Classify tree', exact: true }).click();
