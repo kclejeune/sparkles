@@ -601,6 +601,10 @@ impl Classification {
         self.complete = false;
         let start = Instant::now();
         let left: Vec<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
+        // an inconsistency is sound, and every class's answer is then complete
+        if self.consistency == Consistency::Inconsistent {
+            return Ok(());
+        }
         // A partial answer that left the consistency unknown has every class open, and
         // one that stopped is past its deadline, so neither takes the modules' pass,
         // and neither does a run that asks for none: every class is then incomplete.
