@@ -1267,13 +1267,13 @@ pub trait Sink {
     fn keep_data(&mut self, bytes: usize) {
         let _ = self.reserve_data(bytes);
     }
+    /// Charges bytes that the rules keep in tables the whole run shares, such as the
+    /// datatype checker's cache, which outlive the states the rules run on.
+    fn keep_shared(&mut self, bytes: usize) {
+        self.keep_data(bytes);
+    }
     fn release_data(&mut self, _bytes: usize) {}
     fn data_overflow(&mut self) {}
-    /// whether the states the rules run on are the run's own contexts, which the run
-    /// reads after the saturation, and not copies such as a world's
-    fn keeps_states(&self) -> bool {
-        false
-    }
 
     /// sends a conclusion to a context, which may be the one the rules run in
     fn send(&mut self, to: Ex, c: Concl);
@@ -1336,10 +1336,6 @@ pub trait Sink {
 }
 
 impl Sink for Out<'_, '_> {
-    fn keeps_states(&self) -> bool {
-        true
-    }
-
     fn reserve_data(&mut self, bytes: usize) -> bool {
         if bytes > isize::MAX as usize
             || self

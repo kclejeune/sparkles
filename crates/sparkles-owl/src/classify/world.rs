@@ -770,6 +770,15 @@ impl Sink for WorldSink<'_> {
         self.halted.set(true);
         self.overflow.set(true);
     }
+    // what the run's tables keep stays charged after the world's copies go, until the
+    // worlds end
+    fn keep_shared(&mut self, bytes: usize) {
+        if bytes > isize::MAX as usize {
+            self.data_overflow();
+        } else if !(self.bound)(bytes as isize) {
+            self.halted.set(true);
+        }
+    }
     fn release_data(&mut self, bytes: usize) {
         self.data_growth
             .set(self.data_growth.get() - bytes as isize);
@@ -1245,6 +1254,9 @@ impl<'a> World<'a> {
             found.bottom |= st.bottom;
             found.subs = st.subs.iter().copied().collect();
         });
+        if !found.bottom {
+            super::dt_sat::world(self.ix, self.slots.values().filter_map(|s| s.st.as_ref()));
+        }
         // the world's copies go when it does
         Ok(found)
     }

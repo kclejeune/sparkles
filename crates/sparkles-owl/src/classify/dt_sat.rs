@@ -55,8 +55,8 @@ pub struct DtIx {
     pub comps: Comps,
     /// for each told subsumer of a body atom, the components it re-evaluates
     refire: FxHashMap<Ex, Vec<u32>>,
-    /// the worst evaluation of each component in states that the run does not keep,
-    /// such as those of worlds, which no last evaluation stands for
+    /// the worst last evaluation of each component in the states of worlds, which go
+    /// when their world does
     sticky: Mutex<Vec<u8>>,
 }
 
@@ -240,7 +240,7 @@ fn evaluate<S: Sink>(ix: &Index, dt: &DtIx, st: &mut State, at: usize, out: &mut
             if a != Err(Why::Stopped) {
                 let bytes = key_bytes(&key);
                 dt.cache.lock().insert(key.clone(), a.clone());
-                out.keep_data(bytes);
+                out.keep_shared(bytes);
             }
             a
         }
@@ -265,10 +265,6 @@ fn evaluate<S: Sink>(ix: &Index, dt: &DtIx, st: &mut State, at: usize, out: &mut
     };
     if let Some(x) = st.extra.as_mut() {
         x.dt[at].last = last;
-    }
-    if last != FINE && !out.keeps_states() {
-        let mut s = dt.sticky.lock();
-        s[comp as usize] = s[comp as usize].max(last);
     }
 }
 
@@ -353,7 +349,7 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> Result<Units
     let out = out.into_inner();
     let grown = ranges.bytes().saturating_sub(before);
     drop(ranges);
-    out.keep_data(grown);
+    out.keep_shared(grown);
     a
 }
 
@@ -361,6 +357,27 @@ fn key_of(ix: &Index, dt: &DtIx, e: Ex) -> Option<DtKey> {
     match ix.head(e).node {
         Node::DtAtom(id) => dt.keys.get(id as usize).copied(),
         _ => None,
+    }
+}
+
+/// A world's last evaluations, read once its fixpoint is reached, from the states that
+/// it copied. A world whose class has no instance leaves nothing out, and neither does
+/// an unsatisfiable state, so that what a world reports does not depend on the order in
+/// which it reached its fixpoint.
+pub fn world<'s>(ix: &Index, states: impl Iterator<Item = &'s State>) {
+    let Some(dt) = ix.dt.as_deref() else {
+        return;
+    };
+    let mut sticky = None;
+    for st in states.filter(|st| !st.bottom) {
+        let Some(x) = &st.extra else {
+            continue;
+        };
+        for s in x.dt.iter().filter(|s| s.last != FINE) {
+            let w = sticky.get_or_insert_with(|| dt.sticky.lock());
+            let w = &mut w[s.comp as usize];
+            *w = (*w).max(s.last);
+        }
     }
 }
 

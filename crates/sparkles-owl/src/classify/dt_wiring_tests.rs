@@ -577,3 +577,220 @@ fn data_disjunctions_inside_atoms_stay_with_the_horn_tier() {
         assert!(sat.excluded().is_empty(), "{body}: {:?}", sat.excluded());
     }
 }
+
+fn int(v: u32) -> String {
+    format!("\"{v}\"^^xsd:int")
+}
+
+/// Two classes that hold only of `a`, and a class C whose instances reach both, so
+/// that `a` has the atoms of both only in C's world.
+fn witnesses(d1: &str, d2: &str) -> String {
+    format!(
+        "SubClassOf(:D1 ObjectOneOf(:a))\nSubClassOf(:D2 ObjectOneOf(:a))\n\
+         SubClassOf(:D1 {d1})\nSubClassOf(:D2 {d2})\n\
+         SubClassOf(:C ObjectSomeValuesFrom(:r :D1))\nSubClassOf(:C ObjectSomeValuesFrom(:s :D2))\n"
+    )
+}
+
+#[test]
+fn a_world_joins_the_atoms_of_an_individual_and_two_witnesses() {
+    // `a` has the value 1, D1 allows one value and D2 has the value 2: each pair is
+    // satisfiable, the three are not, and only C's world holds them together
+    let body = format!(
+        "DataPropertyAssertion(:d :a {})\n{}",
+        int(1),
+        witnesses(
+            "DataMaxCardinality(1 :d)",
+            &format!("DataHasValue(:d {})", int(2))
+        )
+    );
+    let (sat, _) = run(&body);
+    assert!(!sat.interner.dt.is_empty());
+    for (c, satisfiable) in [("C", false), ("D1", true), ("D2", true)] {
+        let d = sat.describe(&Class::new(format!("urn:dt:{c}"))).unwrap();
+        assert_eq!(d.satisfiable, satisfiable, "{c}");
+    }
+    assert!(sat.excluded().is_empty(), "{:?}", sat.excluded());
+}
+
+/// D1 gives `a` a value in {1, 2, 3} and D2 takes 3 away, so in C's world `a` has 1 or 2,
+/// which give E or F, both G, and C ⊑ H follows by a case analysis that the Horn tier
+/// does not make. No context of the global saturation holds both atoms.
+fn world_cover() -> String {
+    format!(
+        "{}SubClassOf(DataHasValue(:d {}) :E)\nSubClassOf(DataHasValue(:d {}) :F)\n\
+         SubClassOf(:E :G)\nSubClassOf(:F :G)\n\
+         SubClassOf(ObjectSomeValuesFrom(:r :G) :H)\n",
+        witnesses(
+            &format!(
+                "DataSomeValuesFrom(:d DataOneOf({} {} {}))",
+                int(1),
+                int(2),
+                int(3)
+            ),
+            &format!("DataMaxCardinality(0 :d DataOneOf({}))", int(3))
+        ),
+        int(1),
+        int(2)
+    )
+}
+
+#[test]
+fn a_cover_found_only_in_a_world_is_used_in_part() {
+    let (sat, ax) = run(&world_cover());
+    assert!(!sub(&sat, "C", "H"));
+    // the axioms of d's component, and none of the others
+    for (i, k) in ax.iter().enumerate() {
+        let touched = matches!(i, 2 | 3 | 6 | 7);
+        assert_eq!(
+            matches!(gap_of(&sat, k), Some(Gap::Partial(_))),
+            touched,
+            "{k:?}: {:?}",
+            sat.excluded()
+        );
+    }
+}
+
+#[test]
+fn a_cover_in_a_world_without_an_instance_leaves_nothing_out() {
+    // D3 makes every value of `a` a string, so C's world has a clash after, or before,
+    // its cover, and C is unsatisfiable
+    let body = format!(
+        "{}SubClassOf(:D3 ObjectOneOf(:a))\nSubClassOf(:D3 DataAllValuesFrom(:d xsd:string))\n\
+         SubClassOf(:C ObjectSomeValuesFrom(:u :D3))\n",
+        world_cover()
+    );
+    let (sat, _) = run(&body);
+    for (c, satisfiable) in [("C", false), ("D1", true), ("D2", true), ("D3", true)] {
+        let d = sat.describe(&Class::new(format!("urn:dt:{c}"))).unwrap();
+        assert_eq!(d.satisfiable, satisfiable, "{c}");
+    }
+    assert!(sat.excluded().is_empty(), "{:?}", sat.excluded());
+}
+
+#[test]
+fn a_parallel_run_with_worlds_reports_what_one_thread_reports() {
+    let mut body = world_cover();
+    // a second component whose cover is decided: both values give K
+    body.push_str(&format!(
+        "SubClassOf(:B1 ObjectOneOf(:b))\nSubClassOf(:B2 ObjectOneOf(:b))\n\
+         SubClassOf(:B1 DataSomeValuesFrom(:e DataOneOf({} {} {})))\n\
+         SubClassOf(:B2 DataMaxCardinality(0 :e DataOneOf({})))\n\
+         SubClassOf(DataHasValue(:e {}) :K)\nSubClassOf(DataHasValue(:e {}) :K)\n\
+         SubClassOf(:C ObjectSomeValuesFrom(:r :B1))\nSubClassOf(:C ObjectSomeValuesFrom(:s :B2))\n",
+        int(1),
+        int(2),
+        int(3),
+        int(3),
+        int(1),
+        int(2)
+    ));
+    for i in 0..2 * MIN_CLASSES {
+        body.push_str(&format!("SubClassOf(:C{i} :C)\n"));
+    }
+    let ax = axioms(&body);
+    let all: Vec<&AxiomKind> = ax.iter().collect();
+    let on = |threads: usize| {
+        let mut sat = Saturation::new();
+        let out = sat
+            .classify(
+                &all,
+                None,
+                &Limits {
+                    threads,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        (out.taxonomy, sat.excluded().to_vec())
+    };
+    let one = on(1);
+    assert_eq!(one, on(4));
+    assert!(!one.1.is_empty());
+    // e's axioms are decided
+    assert!(
+        one.1
+            .iter()
+            .all(|x| !format!("{:?}", x.axiom).contains("urn:dt:e")),
+        "{:?}",
+        one.1
+    );
+}
+
+#[test]
+fn a_functional_link_joins_the_atoms_of_its_targets() {
+    // the Horn analogue of the counting examples of F24 Completeness: C's two r
+    // successors are one, which has the atoms of both
+    let pre = "FunctionalObjectProperty(:r)\n\
+               SubClassOf(:C ObjectSomeValuesFrom(:r :D1))\n\
+               SubClassOf(:C ObjectSomeValuesFrom(:r :D2))\n";
+    let conflict = format!(
+        "{pre}SubClassOf(:D1 DataHasValue(:d {}))\nSubClassOf(:D2 DataAllValuesFrom(:d xsd:string))",
+        int(1)
+    );
+    let (sat, _) = run(&conflict);
+    assert!(!sat.describe(&Class::new("urn:dt:C")).unwrap().satisfiable);
+    assert!(sat.describe(&Class::new("urn:dt:D1")).unwrap().satisfiable);
+    assert!(sat.excluded().is_empty(), "{:?}", sat.excluded());
+
+    let entailed = format!(
+        "{pre}SubClassOf(:D1 DataSomeValuesFrom(:d DataOneOf({} {})))\n\
+         SubClassOf(:D2 DataMaxCardinality(0 :d DataOneOf({})))\n\
+         SubClassOf(DataHasValue(:d {}) :E)\nSubClassOf(ObjectSomeValuesFrom(:r :E) :H)",
+        int(1),
+        int(2),
+        int(2),
+        int(1)
+    );
+    let (sat, _) = run(&entailed);
+    assert!(sub(&sat, "C", "H") && !sub(&sat, "D1", "E"));
+    assert!(sat.excluded().is_empty(), "{:?}", sat.excluded());
+
+    let cover = format!(
+        "{pre}SubClassOf(:D1 DataSomeValuesFrom(:d DataOneOf({} {} {})))\n\
+         SubClassOf(:D2 DataMaxCardinality(0 :d DataOneOf({})))\n\
+         SubClassOf(DataHasValue(:d {}) :E)\nSubClassOf(DataHasValue(:d {}) :F)",
+        int(1),
+        int(2),
+        int(3),
+        int(3),
+        int(1),
+        int(2)
+    );
+    let (sat, ax) = run(&cover);
+    assert!(!sub(&sat, "C", "E") && !sub(&sat, "C", "F"));
+    for k in &ax[3..] {
+        assert!(
+            matches!(gap_of(&sat, k), Some(Gap::Partial(_))),
+            "{k:?}: {:?}",
+            sat.excluded()
+        );
+    }
+
+    // with individuals: x's two r values are one individual, which has 1 and not 1
+    let (_, _, consistent) = run_consistent(
+        &format!(
+            "FunctionalObjectProperty(:r)\nObjectPropertyAssertion(:r :x :b)\n\
+             ObjectPropertyAssertion(:r :x :c)\nDataPropertyAssertion(:d :b {})\n\
+             NegativeDataPropertyAssertion(:d :c {})",
+            int(1),
+            int(1)
+        ),
+        1,
+    );
+    assert!(!consistent);
+}
+
+#[test]
+fn a_zero_minimum_in_a_body_holds_of_every_class() {
+    let (sat, ax) = run("SubClassOf(DataMinCardinality(0 :d xsd:int) :E)\n\
+         SubClassOf(:A DataAllValuesFrom(:d xsd:int))\n\
+         SubClassOf(:B :Z)");
+    assert!(sub(&sat, "A", "E") && sub(&sat, "B", "E"));
+    assert!(gap_of(&sat, &ax[0]).is_none(), "{:?}", sat.excluded());
+    // an exact zero in a body is an at-most, which the Horn tier leaves out
+    let (sat, ax) = run("SubClassOf(DataExactCardinality(0 :d xsd:int) :E)\n\
+         SubClassOf(:A DataAllValuesFrom(:d xsd:int))");
+    assert!(gap_of(&sat, &ax[0]).is_some(), "{:?}", sat.excluded());
+    assert!(!sub(&sat, "A", "E"));
+}
