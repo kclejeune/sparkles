@@ -2566,3 +2566,6 @@ mod individual_lookup_tests;
 
 #[cfg(test)]
 mod head_tests;
+
+#[cfg(test)]
+mod head_gen_tests;
