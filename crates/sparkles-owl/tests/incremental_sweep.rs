@@ -257,14 +257,19 @@ struct Count {
     /// the runs whose axioms changed, and those of them that kept contexts
     changed: usize,
     kept_changed: usize,
+    /// the kept runs whose changed axioms name the top or the bottom object property
+    kept_top: usize,
+    kept_bottom: usize,
 }
 
 impl Count {
-    fn add(&mut self, kept: bool, changed: bool) {
+    fn add(&mut self, kept: bool, changed: bool, (top, bottom): (bool, bool)) {
         self.runs += 1;
         self.kept += kept as usize;
         self.changed += changed as usize;
         self.kept_changed += (kept && changed) as usize;
+        self.kept_top += (kept && top) as usize;
+        self.kept_bottom += (kept && bottom) as usize;
     }
 }
 
@@ -331,10 +336,23 @@ fn sweep_one(
         let add: Vec<&AxiomKind> = now.difference(&before).collect();
         let rem: Vec<&AxiomKind> = before.difference(&now).collect();
         let changed = !add.is_empty() || !rem.is_empty();
-        counts
-            .entry((family, "classifier"))
-            .or_default()
-            .add(inc.stats.incremental, changed);
+        let names = |p: ObjectProperty| {
+            add.iter().chain(&rem).any(|k| {
+                ax((*k).clone())
+                    .signature_and_shape()
+                    .0
+                    .contains(&Entity::ObjectProperty(p.clone()))
+            })
+        };
+        let builtins = (
+            names(ObjectProperty::top()),
+            names(ObjectProperty::bottom()),
+        );
+        counts.entry((family, "classifier")).or_default().add(
+            inc.stats.incremental,
+            changed,
+            builtins,
+        );
         let held: Vec<&AxiomKind> = now.iter().collect();
         let out = sat
             .classify(
@@ -348,10 +366,11 @@ fn sweep_one(
             .unwrap();
         assert_eq!(out.taxonomy, fresh.taxonomy, "saturation: {}", what());
         assert_eq!(out.consistent, fresh.consistent, "saturation: {}", what());
-        counts
-            .entry((family, "saturation"))
-            .or_default()
-            .add(out.stats.incremental, changed);
+        counts.entry((family, "saturation")).or_default().add(
+            out.stats.incremental,
+            changed,
+            builtins,
+        );
         before = now;
     }
 }
@@ -372,8 +391,9 @@ fn incremental_runs_agree_with_fresh_ones_across_constructors() {
     }
     for ((family, path), n) in &counts {
         eprintln!(
-            "sweep {family:?} {path}: {} runs, {} kept, {} changed, {} kept of those",
-            n.runs, n.kept, n.changed, n.kept_changed
+            "sweep {family:?} {path}: {} runs, {} kept, {} changed, {} kept of those, \
+             {} kept with the top property, {} with the bottom property",
+            n.runs, n.kept, n.changed, n.kept_changed, n.kept_top, n.kept_bottom
         );
     }
     // the sweep tests the kept path only when changed axioms reach it, through both
@@ -387,5 +407,53 @@ fn incremental_runs_agree_with_fresh_ones_across_constructors() {
             n.kept_changed,
             n.changed
         );
+        if *family == Family::TopBottom {
+            assert!(
+                n.kept_top > 0 && n.kept_bottom > 0,
+                "{path} kept no edit of the top or the bottom property: {n:?}"
+            );
+        }
     }
+}
+
+/// A merge with an individual ties the contexts together, so the next edit starts again,
+/// and its answer is that of a fresh run.
+#[test]
+fn an_edit_after_a_merge_with_an_individual_starts_again() {
+    let one = ClassExpression::ObjectOneOf([ind("i")].into_iter().collect());
+    let held = vec![
+        Axiom::sub_class_of(ce("A"), one.clone()),
+        Axiom::sub_class_of(ce("B"), one),
+        Axiom::sub_class_of(ce("A"), ce("X")),
+    ];
+    follows_with_restart(held, Axiom::sub_class_of(ce("X"), ce("Y")));
+}
+
+/// A fact of the universal role reaches every context, so the next edit starts again,
+/// and its answer is that of a fresh run.
+#[test]
+fn an_edit_after_a_fact_of_the_universal_role_starts_again() {
+    let held = vec![
+        ax(AxiomKind::ClassAssertion(ce("C"), ind("i"))),
+        Axiom::sub_class_of(
+            ClassExpression::some(ObjectProperty::top(), ce("C")),
+            ce("D"),
+        ),
+        Axiom::declaration(Entity::Class(c("A"))),
+    ];
+    follows_with_restart(held, Axiom::sub_class_of(ce("D"), ce("E")));
+}
+
+fn follows_with_restart(held: Vec<Axiom>, edit: Axiom) {
+    let limits = Limits::default();
+    let mut k = Classifier::of(&held);
+    k.classify(&limits).unwrap();
+    k.add([&edit]);
+    let out = k.classify(&limits).unwrap();
+    assert!(!out.stats.incremental, "{:?}", out.stats);
+    let mut all = held;
+    all.push(edit);
+    let fresh = Classifier::of(&all).classify(&limits).unwrap();
+    assert_eq!(out.taxonomy, fresh.taxonomy);
+    assert_eq!(out.consistent, fresh.consistent);
 }
