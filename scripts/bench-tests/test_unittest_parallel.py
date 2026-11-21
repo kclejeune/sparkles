@@ -522,6 +522,79 @@ class Discovery(Base):
         s, p = self.same_verdict(d, expect=0)
         self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
 
+    def test_a_callable_test_with_no_id_from_a_hook_runs_as_serial_discovery_does(self):
+        # Review r8 finding 1: a test that is not a TestCase need not have an id().
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            class Check:
+                def __call__(self, result):
+                    result.startTest(self)
+                    result.addSuccess(self)
+                    result.stopTest(self)
+
+            def load_tests(loader, tests, pattern):
+                return unittest.TestSuite([Check()])
+            """)
+        for args in ((), ("--split", "test_z")):
+            s, p = self.same_verdict(d, *args, expect=0)
+            self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
+
+    HOOK_BY_LOOKUP = """
+        import unittest
+
+        LOOKUPS = 0
+
+        class Z(unittest.TestCase):
+            def test_ok(self):
+                pass
+
+        def fail():
+            raise AssertionError("the hook must run")
+
+        def hook(loader, tests, pattern):
+            return unittest.TestSuite([unittest.FunctionTestCase(fail)])
+
+        def __getattr__(name):
+            global LOOKUPS
+            if name == "load_tests":
+                LOOKUPS += 1
+                return hook if LOOKUPS == FIRST else None
+            raise AttributeError(name)
+        """
+
+    def test_a_hook_that_a_module_getattr_gives_is_looked_up_as_serial_discovery_does(self):
+        # Review r8 finding 2: the runner adds no lookup of its own, and a module that can
+        # answer the lookup with code sends the whole suite to one process.
+        for first, expect in ((1, 1), (2, 0)):
+            with self.subTest(first=first):
+                d = self.suite(test_a=ONE, test_z=self.HOOK_BY_LOOKUP.replace("FIRST", str(first)))
+                s, p = self.same_verdict(d, expect=expect)
+                self.assertIn("the whole suite runs in one process, since test_z defines __getattr__", p.stdout)
+
+    def test_a_rebound_suite_class_runs_as_serial_discovery_does(self):
+        # Review r8 finding 3: a suite of another kind under unittest's own name is custom.
+        d = self.suite(test_a="""
+            import unittest
+
+            class Checking(unittest.TestSuite):
+                def run(self, result, debug=False):
+                    if result.testsRun > 0 and any(True for _ in self):
+                        case = unittest.FunctionTestCase(lambda: None, description="suite check")
+                        result.addFailure(case, (AssertionError, AssertionError("ran after others"), None))
+                    return super().run(result, debug)
+
+            unittest.TestSuite = Checking
+            unittest.TestLoader.suiteClass = Checking
+
+            class A(unittest.TestCase):
+                def test_a(self):
+                    pass
+            """, test_b=ONE)
+        for args in ((), ("--split", "test_a")):
+            s, p = self.same_verdict(d, *args, expect=1)
+            self.assertIn("the whole suite runs in one process, since unittest.TestSuite was rebound", p.stdout)
+
     def test_a_repeated_occurrence_runs_each_time(self):
         d = self.suite(test_rep="""
             import unittest

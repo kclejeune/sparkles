@@ -379,9 +379,10 @@ process discovers the whole suite again, checks that it found the same tests in 
 order, and runs its own part exactly as discovered. Import errors, import-time skips and
 class and module fixtures therefore behave as they do serially. The whole suite runs in one
 process, as discovery returned it, and the runner says why, when any module or package
-defines a `load_tests` hook, when the suite holds anything other than default suites and
-`TestCase` tests, including a suite given its own `run`, when a test module changes
-unittest's suite classes, or when test classes of one module run under more than one module,
+defines a `load_tests` hook or a module `__getattr__` that could give one, when the suite
+holds anything other than default suites and `TestCase` tests, including a suite given its
+own `run`, when a test module changes unittest's suite classes or rebinds their names, or
+when test classes of one module run under more than one module,
 as when one test module imports another's class. Such a suite or test can depend on what ran
 before it, and the runner does not try to tell whether it does. Tests that share state in
 another way, such as a helper module's globals, are not detected, and the runner assumes that

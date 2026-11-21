@@ -16,10 +16,11 @@ test does nothing and gets no process.
 
 The whole suite runs in one process instead, as discovery returned it, and the runner says
 why, when anything in it could make a part of the suite depend on what ran before it. That
-is the case when a module or package that discovery loads defines a load_tests hook, when
-the suite holds anything other than default suites and TestCase tests, including a default
-suite with attributes of its own such as a run() given to the instance, when a test module
-has changed unittest's suite classes, and when test classes of one module run in more than
+is the case when a module or package that discovery loads defines a load_tests hook or a
+module __getattr__ that could give one, when the suite holds anything other than default
+suites and TestCase tests, including a default suite with attributes of its own such as a
+run() given to the instance, when a test module has changed unittest's suite classes or put
+other classes under their names, and when test classes of one module run in more than
 one entry, as when one test module imports another's class, since they can share that
 module's state. The runner does not ask what such a hook or suite does. State that tests
 share in some other way, such as through a helper module's globals, is not detected, so a
@@ -79,23 +80,29 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 
 RUNNER = os.path.abspath(__file__)
 
-# The attributes a default suite instance has, and the suite classes as they were before any
-# test module was imported, so that a suite that can behave other than a default one is found.
+# The attributes a default suite instance has, and unittest's suite and test classes as they
+# were before any test module was imported, so that a suite that can behave other than a
+# default one is found even when a test module puts another class under unittest's names.
 _SUITE_KEYS = {"_tests", "_removed_tests"}
-_SUITE_CLASSES = (unittest.suite.BaseTestSuite, unittest.TestSuite)
+_BASE_SUITE, _SUITE, _CASE = unittest.suite.BaseTestSuite, unittest.suite.TestSuite, unittest.case.TestCase
+_SUITE_CLASSES = (_BASE_SUITE, _SUITE)
 _SUITE_DICTS = {cls: dict(vars(cls)) for cls in _SUITE_CLASSES}
+_SUITE_NAMES = [(unittest, "unittest", "TestSuite", _SUITE), (unittest.suite, "unittest.suite", "TestSuite", _SUITE),
+                (unittest, "unittest", "BaseTestSuite", _BASE_SUITE),
+                (unittest.suite, "unittest.suite", "BaseTestSuite", _BASE_SUITE)]
 
 
 # ----- discovery, in the discovery child and in every unit ---------------------------------
 
 class _TaggingLoader(unittest.TestLoader):
     """A loader that remembers which module produced each suite, to name the units, and
-    which modules had a load_tests hook when unittest looked for one."""
+    which modules can give unittest a load_tests hook."""
 
     def __init__(self):
         super().__init__()
@@ -103,9 +110,17 @@ class _TaggingLoader(unittest.TestLoader):
         self.hooks = []
 
     def loadTestsFromModule(self, module, *args, **kwargs):
-        # unittest reads the hook here, for test modules and packages alike.
-        if getattr(module, "load_tests", None) is not None:
-            self.hooks.append(module.__name__)
+        # unittest looks for the hook here, for test modules and packages alike. The module's
+        # dictionary is read directly, so the runner adds no lookup that code could answer, and
+        # a module that can answer unittest's own lookup with code counts as having a hook.
+        own = vars(module)
+        name = own.get("__name__")
+        if "load_tests" in own:
+            self.hooks.append(f"{name} defines load_tests")
+        elif "__getattr__" in own:
+            self.hooks.append(f"{name} defines __getattr__")
+        elif type(module) is not types.ModuleType:
+            self.hooks.append(f"{name} is a module of kind {type(module).__module__}.{type(module).__qualname__}")
         suite = super().loadTestsFromModule(module, *args, **kwargs)
         # The suite is kept with its name, so that its id is not reused by another.
         self.labels.setdefault(id(suite), (suite, module.__name__))
@@ -113,7 +128,7 @@ class _TaggingLoader(unittest.TestLoader):
 
 
 def _tree(node, deep=True):
-    if isinstance(node, unittest.TestSuite):
+    if isinstance(node, _SUITE):
         cls = type(node)
         tree = {"suite": f"{cls.__module__}.{cls.__qualname__}", "own": sorted(set(vars(node)) - _SUITE_KEYS)}
         if deep:
@@ -122,9 +137,19 @@ def _tree(node, deep=True):
     return _id(node)
 
 
+def _own(module, name):
+    """MODULE's attribute NAME from its dictionary, or None. The runner reads test modules'
+    attributes this way, so that no lookup it makes reaches a module's own __getattr__."""
+    try:
+        return vars(module).get(name)
+    except TypeError:
+        return None
+
+
 def _id(test):
-    """TEST's id, or for a callable that is not a TestCase, a name for its kind."""
-    if isinstance(test, unittest.TestCase) or callable(getattr(test, "id", None)):
+    """TEST's id, or for a test that is not a TestCase, a name for its kind, which the runner
+    finds without asking the test anything."""
+    if isinstance(test, _CASE):
         return test.id()
     return f"<{type(test).__module__}.{type(test).__qualname__}>"
 
@@ -134,20 +159,24 @@ def _custom(node):
     TestCase does, or None. A suite of a kind of its own, a default suite with attributes of
     its own, such as a run() given to the instance, and a test that is not a TestCase can
     each do anything when they run, including depend on the result of what ran before."""
-    if isinstance(node, unittest.TestSuite):
-        if type(node) is not unittest.TestSuite:
+    if isinstance(node, _SUITE):
+        if type(node) is not _SUITE:
             return f"has a suite of kind {type(node).__module__}.{type(node).__qualname__}"
         own = sorted(set(vars(node)) - _SUITE_KEYS)
         if own:
             return f"has a suite with attributes of its own: {', '.join(own)}"
         return None
-    if not isinstance(node, unittest.TestCase):
+    if not isinstance(node, _CASE):
         return f"has a test of kind {type(node).__module__}.{type(node).__qualname__}"
     return None
 
 
 def _changed_suite_classes():
-    """Which attribute of unittest's suite classes a test module changed, or None."""
+    """Which attribute of unittest's suite classes a test module changed, or which of their
+    names it bound to something else, or None."""
+    for module, prefix, name, cls in _SUITE_NAMES:
+        if vars(module).get(name) is not cls:
+            return f"{prefix}.{name} was rebound"
     for cls, before in _SUITE_DICTS.items():
         now = vars(cls)
         for name in sorted(set(before) | set(now)):
@@ -157,7 +186,7 @@ def _changed_suite_classes():
 
 
 def _leaves(node):
-    if isinstance(node, unittest.TestSuite):
+    if isinstance(node, _SUITE):
         for t in node:
             yield from _leaves(t)
     else:
@@ -178,7 +207,7 @@ def _label(loader, entry, index):
 
 def _overridden(cls, name):
     for k in cls.__mro__:
-        if k is unittest.TestCase:
+        if k is _CASE:
             return False
         if name in vars(k):
             return True
@@ -191,14 +220,14 @@ def _plain(label, entry):
     if module is None:
         return "it is not a module of its own"
     for hook in ("setUpModule", "tearDownModule", "parallel_absorb"):
-        if hasattr(module, hook):
+        if hook in vars(module):
             return f"it defines {hook}"
     if unittest.case._module_cleanups:
         return "a module cleanup is registered"
     seen = set()
 
     def walk(node):
-        if isinstance(node, unittest.TestSuite):
+        if isinstance(node, _SUITE):
             for t in node:
                 why = walk(t)
                 if why:
@@ -230,29 +259,31 @@ def discover(directory):
     loader = _TaggingLoader()
     suite = loader.discover(str(directory))
     entries = list(suite)
+    changed = _changed_suite_classes()
+    serial = _serial(loader, suite, entries, changed)
     units = []
     for i, entry in enumerate(entries):
         label = _label(loader, entry, i)
         module = sys.modules.get(label)
-        f = getattr(module, "__file__", None)
+        f = _own(module, "__file__")
         units.append({
             "label": label,
             "tree": _tree(entry),
             "leaves": [_id(t) for t in _leaves(entry)],
-            "split": _plain(label, entry),
+            # A split check needs default suites and TestCase tests, which the fallback does not.
+            "split": "the whole suite runs in one process" if serial else _plain(label, entry),
             "size": os.path.getsize(f) if f and os.path.exists(f) else 0,
-            "absorb": callable(getattr(module, "parallel_absorb", None)),
+            "absorb": callable(_own(module, "parallel_absorb")),
             # With no custom node anywhere, a part with no test does nothing when it runs.
             "inert": not any(True for _ in _leaves(entry)),
         })
     exports = sorted(m for m in set(sys.modules) - before
-                     if callable(getattr(sys.modules[m], "parallel_export", None)))
-    changed = _changed_suite_classes()
+                     if callable(_own(sys.modules[m], "parallel_export")))
     # The hooks, the root and each suite's own attributes are part of the description, so a
     # unit whose discovery made them differently fails its comparison with the runner's.
     return suite, entries, {"root": _tree(suite, deep=False), "changed": changed,
                             "hooks": loader.hooks, "units": units, "exports": exports,
-                            "serial": _serial(loader, suite, entries, changed)}
+                            "serial": serial}
 
 
 def _serial(loader, suite, entries, changed):
@@ -264,7 +295,7 @@ def _serial(loader, suite, entries, changed):
     in more than one entry, as when one test module imports another's class, can share that
     module's state and fixtures, which only one process keeps."""
     if loader.hooks:
-        return f"{loader.hooks[0]} defines load_tests"
+        return loader.hooks[0]
     if changed:
         return changed
 
@@ -272,7 +303,7 @@ def _serial(loader, suite, entries, changed):
         why = _custom(node)
         if why:
             return f"{where} {why}"
-        if isinstance(node, unittest.TestSuite):
+        if isinstance(node, _SUITE):
             for t in node:
                 why = custom(t, where)
                 if why:
@@ -342,7 +373,7 @@ def worker_main(directory, plan_path, index, split, record_path, absorb_path):
     # The whole suite runs as discovery returned it, which may have behaviour of its own.
     entry = suite if index < 0 else entries[index]
     if split >= 0:
-        entry = unittest.TestSuite([list(_leaves(entry))[split]])
+        entry = _SUITE([list(_leaves(entry))[split]])
     if absorb_path:
         with open(absorb_path) as f:
             exports = json.load(f)
