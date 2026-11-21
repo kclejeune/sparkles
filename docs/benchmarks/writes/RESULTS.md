@@ -1021,7 +1021,7 @@ pass of `oldest` and `oldest-page-5` is a refill, which evaluates the window's i
 again, here a scan of the 200,000 ages, at about 50 ms. The 200 deletions at the front run
 the reserve of 100 rows out twice, so two of the 400 commits pay it. The engine answers
 the query itself from a bounded top-k in about 2 ms, and a refill that read the engine's
-answer instead would cost that, which roadmap item 1265 takes up for inputs whose
+answer instead would cost that, which roadmap item 1294 takes up for inputs whose
 evaluation gives the same ids as the circuit.
 
 ### Incremental view gate baseline

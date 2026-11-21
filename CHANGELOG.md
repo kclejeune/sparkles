@@ -12,7 +12,8 @@ rows now carry a `position`, its diffs list the rows that leave with their old p
 and the rows that enter with their new ones, and `view:read` returns the window in order.
 Ordered live queries no longer merge diffs under `coalesceMs` and resume with a `reset`.
 The view compiler's version changed, so every existing view is built again once after the
-upgrade.
+upgrade. The inner nodes of a view's property paths now take hidden names that no query
+variable can spell, so a query variable named `?__incr1` keeps its own binding (item 549).
 
 ### A kept EL classification over its memory budget starts again in full
 

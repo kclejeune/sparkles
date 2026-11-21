@@ -173,8 +173,8 @@ fn event_py<'py>(py: Python<'py>, e: &LiveEvent) -> PyResult<Bound<'py, PyDict>>
             d.set_item("added", rows_py(py, added)?)?;
             let (r, a) = (positions(removed), positions(added));
             if r.is_some() || a.is_some() {
-                d.set_item("removedPositions", r.unwrap_or_default())?;
-                d.set_item("addedPositions", a.unwrap_or_default())?;
+                d.set_item("removed_positions", r.unwrap_or_default())?;
+                d.set_item("added_positions", a.unwrap_or_default())?;
             }
         }
         LiveEvent::Value {

@@ -1070,6 +1070,21 @@ fn edge_cases_follow_the_oracle() {
     assert_eq!(result(&c).len(), 2);
 }
 
+/// The inner node of a path takes a hidden name that no query variable can take, so a
+/// query variable named like the compiler's old prefix keeps its own binding.
+#[test]
+fn a_path_node_never_meets_a_query_variable() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, "INSERT DATA { :a :p :m . :m :q :o . :a :r :z }").expect("update");
+    let q = "SELECT ?s ?__incr1 WHERE { ?s :p/:q ?o . ?s :r ?__incr1 }";
+    let mut c = circuit(&s, q);
+    check(&s, &c, q, "build");
+    assert_eq!(result(&c), ["<http://ex/a> <http://ex/z>"]);
+    upd(&s, "INSERT DATA { :b :p :n . :n :q :o . :b :r :y }").expect("update");
+    step(&s, &mut c);
+    check(&s, &c, q, "after an insert");
+}
+
 /// A zero-length path from a term an outer pattern binds matches that term, even when
 /// it is no node of the active graph. `EXISTS` substitutes the outer row, so its
 /// answer differs from a join of the pattern evaluated alone. `OPTIONAL` joins, so a

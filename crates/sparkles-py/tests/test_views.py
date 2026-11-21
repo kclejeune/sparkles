@@ -46,9 +46,9 @@ def test_ordered_live_queries_send_positions() -> None:
         diff = live.next(timeout=10)
         assert diff is not None and diff["event"] == "diff"
         assert [str(t[0][0]) for t in diff["removed"]] == ["<urn:b>"]
-        assert diff["removedPositions"] == [1]
+        assert diff["removed_positions"] == [1]
         assert [str(t[0][0]) for t in diff["added"]] == ["<urn:d>"]
-        assert diff["addedPositions"] == [0]
+        assert diff["added_positions"] == [0]
 
 
 def test_close_wakes_a_waiting_iterator() -> None:

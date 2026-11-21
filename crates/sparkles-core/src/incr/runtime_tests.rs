@@ -1012,6 +1012,39 @@ fn service_view_read_reads_rows() {
     assert!(sparql::query(s.snapshot(), &bad, &o).is_err());
 }
 
+/// `SERVICE view:read` returns an ordered window's rows in the window's order, and two
+/// rows with the same projected terms stay two rows at their own places.
+#[test]
+fn service_view_read_keeps_a_window_in_order() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :p1 :name \"x\" ; :age 40 . :p2 :name \"y\" ; :age 30 . \
+         :p3 :name \"x\" ; :age 20 . :p4 :name \"z\" ; :age 10 }",
+    );
+    let rt = runtime(&s, None);
+    let def = "SELECT ?name WHERE { ?p :name ?name ; :age ?age } ORDER BY DESC(?age) LIMIT 3";
+    rt.put(&s, "oldest", ViewDef::table(q(def))).unwrap();
+    rt.round(&s);
+    let text = q("PREFIX view: <urn:x-sparkles:view#> SELECT ?name WHERE { \
+                  SERVICE view:read { [] view:name \"oldest\" ; view:bind ?name } }");
+    let o = QueryOptions {
+        views: Some(rt.clone()),
+        ..Default::default()
+    };
+    let read = |s: &Store| -> Vec<String> {
+        let r = sparql::query(s.snapshot(), &text, &o).unwrap();
+        r.test_application_rows()
+            .iter()
+            .map(|r| show(&r[0]))
+            .collect()
+    };
+    assert_eq!(read(&s), ["x", "y", "x"]);
+    upd(&s, "INSERT DATA { :p5 :name \"w\" ; :age 35 }");
+    rt.round(&s);
+    assert_eq!(read(&s), ["x", "w", "y"]);
+}
+
 struct Fixed(Vec<String>);
 
 impl crate::access::GuardDecision for Fixed {

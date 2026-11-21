@@ -5,12 +5,12 @@
 //! patterns, `GRAPH`, `FILTER`, `BIND`, `UNION`, `OPTIONAL`, `MINUS`, `EXISTS` with and
 //! without correlation, `VALUES`, `DISTINCT`, `REDUCED`, projection, subqueries,
 //! `GROUP BY` with `COUNT`, `SUM`, `AVG`, `MIN` and `MAX`, `HAVING` and paths with `+`
-//! and `*`) and from the operators that compile to `recompute` nodes (`ORDER BY` with
-//! `LIMIT`). They read the vocabulary the histories write, so most commits touch most
-//! queries. Each query is deterministic: it has one answer per snapshot, so the circuit
-//! and the engine can be compared row for row. `SAMPLE`, `GROUP_CONCAT` and an
-//! `ORDER BY` that leaves ties under its `LIMIT` are left out, since the engine may
-//! answer them either way.
+//! and `*`), from `ORDER BY` with `LIMIT` and `OFFSET`, which compiles to an ordered
+//! window, and from the operators that compile to `recompute` nodes. They read the
+//! vocabulary the histories write, so most commits touch most queries. Each query is
+//! deterministic: it has one answer per snapshot, so the circuit and the engine can be
+//! compared row for row. `SAMPLE`, `GROUP_CONCAT` and an `ORDER BY` that leaves ties
+//! under its `LIMIT` are left out, since the engine may answer them either way.
 //!
 //! The text uses the prefixes `:` (`http://ex/`) and `rdfs:`, which the tests declare.
 //! Everything is drawn from one seeded generator, so a seed names a case.

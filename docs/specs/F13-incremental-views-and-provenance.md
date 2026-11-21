@@ -1591,8 +1591,11 @@ of the `recompute` node it was before.
   the kept ones. A row enters when it orders no later than the last kept row or when the
   kept rows hold the whole input. Removals subtract from the row's entry.
 - When the kept rows fall below `k + m` while the input holds more, the operator runs its
-  input's `init` at the new snapshot and refills from those rows, keeping its own rows
-  and their order first. The spec's refill by the query engine was not used, because the
+  input's `init` at the new snapshot and refills from those rows. The kept rows that the
+  input still holds stay in their order, with no more copies than the input has, and the
+  input's other best rows join them at their places. An operator evaluated again can give
+  other rows than its maintained state, since a maintained `SAMPLE` keeps its value while
+  the group holds it, so a kept row the input no longer gives is dropped. The spec's refill by the query engine was not used, because the
   circuit's floating-point sums and its `GROUP_CONCAT` and `SAMPLE` can differ from a
   one-off evaluation, so the engine's rows would not match the input's rows by id. The
   cost is one evaluation of the input per refill, which a run of deletions at the front
@@ -1614,7 +1617,7 @@ of the `recompute` node it was before.
   an ordered query sends a `reset`. The live-query wire format gains an optional
   `position` and no version, since a client that ignores it reads a correct multiset
   change, as the format's other optional fields do. Python's events add `positions`,
-  `removedPositions` and `addedPositions`.
+  `removed_positions` and `added_positions`.
 - `ops::Op` gained a variant, so `COMPILER` is `f13-phase2-3` and every view
   checkpointed by an earlier compiler is refused by its fingerprint and built again
   once. The window's state is its input's total weight and its rows with their copies,

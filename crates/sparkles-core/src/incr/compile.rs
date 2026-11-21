@@ -30,8 +30,9 @@ use spargebra::algebra::{
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-/// The prefix of the variables the compiler adds for the inner nodes of paths.
-const HIDDEN: &str = "__incr";
+/// The prefix of the variables the compiler adds for the inner nodes of paths. A SPARQL
+/// variable name cannot hold `#`, so no query variable takes one of these names.
+const HIDDEN: &str = "#incr";
 /// The most alternatives a path expands to before it is recomputed instead.
 const MAX_PATH_ALTERNATIVES: usize = 16;
 
