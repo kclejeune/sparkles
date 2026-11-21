@@ -57,6 +57,8 @@ pub enum Why {
     Bound,
     /// the answer turns on the size of a cell the checker has not counted exactly
     Uncounted,
+    /// the caller's stop flag was set: its deadline, cancellation or memory budget
+    Stopped,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,10 +100,14 @@ enum Run {
     Sat,
     Unsat,
     Bound,
+    Stopped,
 }
 
+/// How many search nodes pass between two reads of the stop flag.
+const POLL: u64 = 1024;
+
 /// Whether the integer program has a solution, by preprocessing and a bounded search.
-fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64) -> Run {
+fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64, stop: &dyn Fn() -> bool) -> Run {
     const INF: u128 = u128::MAX;
     // a count fixed at zero by a maximum of zero
     let mut ub = vec![INF; nvars];
@@ -183,9 +189,11 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64) -> Run {
         &mut val,
         &mut assigned,
         &mut budget,
+        stop,
     ) {
         Some(true) => Run::Sat,
         Some(false) => Run::Unsat,
+        None if stop() => Run::Stopped,
         None => Run::Bound,
     }
 }
@@ -236,8 +244,9 @@ fn search(
     val: &mut [u128],
     assigned: &mut [bool],
     budget: &mut u64,
+    stop: &dyn Fn() -> bool,
 ) -> Option<bool> {
-    if *budget == 0 {
+    if *budget == 0 || (*budget % POLL == 0 && stop()) {
         return None;
     }
     *budget -= 1;
@@ -274,7 +283,7 @@ fn search(
     let mut x = hi;
     while x >= lo && hi >= lo {
         val[v] = x;
-        match search(vars, i + 1, cons, pairs, ub, val, assigned, budget) {
+        match search(vars, i + 1, cons, pairs, ub, val, assigned, budget, stop) {
             Some(true) => {
                 out = Some(true);
                 break;
@@ -298,6 +307,15 @@ fn search(
 
 /// Decides the problem.
 pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
+    check_stopping(r, p, b, &|| false)
+}
+
+/// Decides the problem, answering [`Why::Stopped`] once `stop` returns true. The flag is
+/// read between cells and every [`POLL`] search nodes.
+pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -> bool) -> Answer {
+    if stop() {
+        return Answer::Unknown(Why::Stopped);
+    }
     let np = p.props.len();
     // sets of properties are bit sets of a u64
     if np > b.props.min(63) {
@@ -356,6 +374,9 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     // different parents are disjoint, so no two are the same set.
     let mut cells: Vec<(Rid, Vec<bool>)> = vec![(Ranges::FULL, Vec::new())];
     for &x in &ranges {
+        if stop() {
+            return Answer::Unknown(Why::Stopped);
+        }
         let nx = r.not(x);
         let mut next = Vec::with_capacity(cells.len() * 2);
         for (c, sides) in &cells {
@@ -435,12 +456,14 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
                 });
             }
         }
-        solve(types.len(), all, b.nodes)
+        solve(types.len(), all, b.nodes, stop)
     };
     // at most the upper bound of each cell: unsatisfiable here is unsatisfiable
     let opt = with_caps(&|ci| sizes[ci].hi);
-    if let Run::Unsat = opt {
-        return Answer::Unsat;
+    match opt {
+        Run::Unsat => return Answer::Unsat,
+        Run::Stopped => return Answer::Unknown(Why::Stopped),
+        _ => {}
     }
     if exact {
         return match opt {
@@ -452,6 +475,7 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     let pes = with_caps(&|ci| (sizes[ci].lo < CAP).then_some(sizes[ci].lo));
     match (opt, pes) {
         (_, Run::Sat) => Answer::Sat,
+        (_, Run::Stopped) => Answer::Unknown(Why::Stopped),
         (Run::Bound, _) | (_, Run::Bound) => Answer::Unknown(Why::Bound),
         _ => Answer::Unknown(Why::Uncounted),
     }
@@ -512,10 +536,10 @@ mod tests {
         ) {
             let most = cons.iter().filter(|c| c.at_least).map(|c| c.n).max().unwrap_or(0);
             let want = brute(nvars, &cons, most);
-            let got = match solve(nvars, cons.clone(), 1_000_000) {
+            let got = match solve(nvars, cons.clone(), 1_000_000, &|| false) {
                 Run::Sat => true,
                 Run::Unsat => false,
-                Run::Bound => panic!("bound on a small system"),
+                Run::Bound | Run::Stopped => panic!("bound on a small system"),
             };
             prop_assert_eq!(got, want);
         }

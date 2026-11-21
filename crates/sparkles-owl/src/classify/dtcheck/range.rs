@@ -1232,12 +1232,25 @@ impl Ranges {
     }
     /// The range of a data range of the ontology.
     pub fn of(&mut self, r: &DataRange) -> Result<Rid, Unsupported> {
+        match self.of_stopping(r, &|| false) {
+            Ok(x) => Ok(x),
+            Err(Fail::Unsupported(u)) => Err(u),
+            Err(Fail::Stopped) => unreachable!("the flag is never set"),
+        }
+    }
+
+    /// The range of a data range of the ontology, stopping once `stop` returns true. The
+    /// flag is read before each operand, since an enumeration of n literals costs n joins.
+    pub fn of_stopping(&mut self, r: &DataRange, stop: &dyn Fn() -> bool) -> Result<Rid, Fail> {
+        if stop() {
+            return Err(Fail::Stopped);
+        }
         Ok(match r {
             DataRange::Datatype(d) => self.datatype(d.0.as_str())?,
             DataRange::IntersectionOf(rs) => {
                 let mut acc = Ranges::FULL;
                 for x in rs {
-                    let x = self.of(x)?;
+                    let x = self.of_stopping(x, stop)?;
                     acc = self.meet(acc, x);
                 }
                 acc
@@ -1245,18 +1258,21 @@ impl Ranges {
             DataRange::UnionOf(rs) => {
                 let mut acc = Ranges::EMPTY;
                 for x in rs {
-                    let x = self.of(x)?;
+                    let x = self.of_stopping(x, stop)?;
                     acc = self.join(acc, x);
                 }
                 acc
             }
             DataRange::ComplementOf(x) => {
-                let x = self.of(x)?;
+                let x = self.of_stopping(x, stop)?;
                 self.not(x)
             }
             DataRange::OneOf(ls) => {
                 let mut acc = Ranges::EMPTY;
                 for l in ls {
+                    if stop() {
+                        return Err(Fail::Stopped);
+                    }
                     let x = self.literal(l)?;
                     acc = self.join(acc, x);
                 }
@@ -1272,12 +1288,27 @@ impl Ranges {
                         // with a parser that refuses fractions past eighteen digits
                         time_facet(dt, facet, &f.value)?;
                     } else if let Some(p) = datatypes::facet_problem(dt, facet, &f.value) {
-                        return Err(Unsupported::Facet(p));
+                        return Err(Fail::Unsupported(Unsupported::Facet(p)));
                     }
                     n = n.meet(&facet_nf(fam, facet, &f.value)?);
                 }
                 self.intern(n)
             }
         })
+    }
+}
+
+/// Why [`Ranges::of_stopping`] gave no range.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Fail {
+    /// the range is outside the checker, and its axiom is used in part
+    Unsupported(Unsupported),
+    /// the caller's stop flag was set
+    Stopped,
+}
+
+impl From<Unsupported> for Fail {
+    fn from(u: Unsupported) -> Fail {
+        Fail::Unsupported(u)
     }
 }

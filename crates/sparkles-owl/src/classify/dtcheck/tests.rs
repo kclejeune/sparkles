@@ -1511,3 +1511,114 @@ fn unbounded_length_families_are_infinite() {
     p.min(0, (CAP - 2) as u64, &x);
     assert_eq!(p.check(), Answer::Sat);
 }
+
+// ------------------------------------------------------- the rule on units ----
+
+mod units_rule {
+    use super::*;
+    use crate::classify::dtcheck::range::Fail;
+    use crate::classify::dtcheck::rule::{Group, Units, units};
+    use crate::classify::dtcheck::solve::{Why, check_stopping};
+
+    fn atom(p: &mut P, d: usize, n: u64, r: &DataRange) -> Atom {
+        let r = p.t.of(r);
+        Atom::AtLeast(d, n, r)
+    }
+    fn run(p: &mut P, body: &[(Atom, Group)]) -> Units {
+        units(&mut p.t.r, &p.p, body, &Bounds::default(), &|| false).unwrap()
+    }
+    fn b(s: &str) -> Literal {
+        lit(s, "boolean")
+    }
+
+    #[test]
+    fn conflict_and_entailment() {
+        // ≥2 d.boolean entails ∃d.{true}
+        let mut p = P::new(1);
+        p.min(0, 2, &dt("boolean"));
+        let t = atom(&mut p, 0, 1, &one(&[b("true")]));
+        let u = run(&mut p, &[(t, Group::Other)]);
+        assert_eq!(u.entailed, vec![0]);
+        assert!(!u.conflict && !u.cover);
+        // ≥3 d.boolean is a conflict
+        p.min(0, 3, &dt("boolean"));
+        assert!(run(&mut p, &[]).conflict);
+    }
+
+    #[test]
+    fn covers_and_classes() {
+        // ∃d.boolean with ∃d.{true} and ∃d.{false} as body atoms
+        let mut p = P::new(1);
+        p.min(0, 1, &dt("boolean"));
+        let t = atom(&mut p, 0, 1, &one(&[b("true")]));
+        let f = atom(&mut p, 0, 1, &one(&[b("false")]));
+        // two classes: a cover remains
+        let u = run(&mut p, &[(t, Group::Only(1)), (f, Group::Only(2))]);
+        assert!(u.cover && u.classes.is_empty() && u.entailed.is_empty());
+        // one class for both: the class is given and no cover remains
+        let u = run(&mut p, &[(t, Group::Only(7)), (f, Group::Only(7))]);
+        assert_eq!(u.classes, vec![7]);
+        assert!(!u.cover);
+        // a free atom takes no part
+        let u = run(&mut p, &[(t, Group::Free), (f, Group::Other)]);
+        assert!(!u.cover && u.classes.is_empty());
+        // Neon's cover, whose first disjunct's range contains the others:
+        // ∃d.int[1,2] ⊓ ∃d.int[2,3] ⊑ ≥2 d.integer ⊔ ∃d.{2}
+        let i = |s: &str| lit(s, "int");
+        let mut p = P::new(1);
+        p.min(
+            0,
+            1,
+            &restr("int", &[("minInclusive", i("1")), ("maxInclusive", i("2"))]),
+        )
+        .min(
+            0,
+            1,
+            &restr("int", &[("minInclusive", i("2")), ("maxInclusive", i("3"))]),
+        );
+        let two = atom(&mut p, 0, 2, &dt("integer"));
+        let v2 = atom(&mut p, 0, 1, &one(&[i("2")]));
+        let u = run(&mut p, &[(two, Group::Other), (v2, Group::Other)]);
+        assert!(u.cover && u.entailed.is_empty());
+    }
+
+    #[test]
+    fn negative_assertions_are_conflicts() {
+        // ∃d.boolean with ∀d.¬{true} and ∀d.¬{false} on one constant
+        let mut p = P::new(1);
+        p.min(0, 1, &dt("boolean"))
+            .all(0, &not(one(&[b("true")])))
+            .all(0, &not(one(&[b("false")])));
+        assert!(run(&mut p, &[]).conflict);
+    }
+
+    #[test]
+    fn stop_flag() {
+        let mut p = P::new(1);
+        p.min(0, 1, &dt("boolean"));
+        assert_eq!(
+            check_stopping(&mut p.t.r, &p.p, &Bounds::default(), &|| true),
+            Answer::Unknown(Why::Stopped)
+        );
+        assert_eq!(
+            units(&mut p.t.r, &p.p, &[], &Bounds::default(), &|| true),
+            Err(Why::Stopped)
+        );
+        let r = one(&[b("true"), b("false")]);
+        assert_eq!(p.t.r.of_stopping(&r, &|| true), Err(Fail::Stopped));
+        // the flag set after the search starts still stops it: a pigeonhole over many
+        // types that needs more than one poll interval
+        let n = std::cell::Cell::new(0u32);
+        let stop = || {
+            n.set(n.get() + 1);
+            n.get() > 3
+        };
+        let mut p = P::new(3);
+        for d in 0..3 {
+            p.min(d, 40, &dt("integer"));
+        }
+        p.max(0, 100, &dt("integer"));
+        let got = check_stopping(&mut p.t.r, &p.p, &Bounds::default(), &stop);
+        assert!(matches!(got, Answer::Sat | Answer::Unknown(Why::Stopped)));
+    }
+}

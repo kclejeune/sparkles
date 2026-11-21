@@ -9,6 +9,7 @@
 
 pub mod bcp47;
 pub mod range;
+pub mod rule;
 pub mod sets;
 pub mod solve;
 pub mod value;
