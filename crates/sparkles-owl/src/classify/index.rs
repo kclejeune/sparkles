@@ -2413,6 +2413,16 @@ impl Index {
                 }
             }
         }
+        // A loop by a role is a link from a context to itself, so the context takes the
+        // role's range (saturate.rs, `Concl::Loop`). Loops come from self restrictions,
+        // from chains that compose loops, from individuals linked to themselves and from
+        // the Horn rules, by roles that need not occur in any positive existential, so
+        // every range occurs positively (roadmap item 1262). A range that no context
+        // takes costs its successor entries only.
+        let ranges: Vec<Ex> = ix.roles.range.iter().flatten().copied().collect();
+        for c in ranges {
+            b.positive(c, it, &mut ix);
+        }
         // a reflexive role links every individual to itself, and a universal role every
         // individual to every one, so their ranges hold everywhere
         let mut everywhere: Vec<Ex> = ix

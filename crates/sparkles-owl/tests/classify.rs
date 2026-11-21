@@ -2109,3 +2109,259 @@ fn describe_answers_for_individuals_and_nominals() {
     assert_eq!(b.subclasses, named(&["W"]));
     assert_eq!(b.instances, vec![NamedIndividual::new("http://ex.org/d")]);
 }
+
+// ---------------------------------------------------------------------------------
+// Ranges that a loop reaches (roadmap item 1262). A loop by a role is a link from a
+// context to itself, so the context takes the role's range. The index has to register
+// that range as a positive occurrence, with the successors of its existentials, even
+// when no existential restriction on the role occurs positively.
+
+fn ofn(body: &str) -> Vec<Axiom> {
+    sparkles_owl::ofn_read::parse(&format!(
+        "Prefix(:=<http://ex.org/>) Prefix(owl:=<http://www.w3.org/2002/07/owl#>) \
+         Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>) Ontology({body})"
+    ))
+    .unwrap()
+    .axioms
+}
+
+/// The answer a range case asks for: A below G, or A unsatisfiable.
+fn range_answer(o: &sparkles_owl::classify::Classification, empty: bool) -> bool {
+    if empty {
+        o.taxonomy.is_unsatisfiable(&c("A"))
+    } else {
+        o.taxonomy.is_subclass(&c("A"), &c("G"))
+    }
+}
+
+/// The cases of ranges reached through loops: a name, the ontology, whether the answer
+/// is that A is unsatisfiable (else that A is below G), and the edits, each added to a
+/// kept run and then removed again.
+const LOOP_RANGES: &[(&str, &str, bool, &[&str])] = &[
+    (
+        "nested",
+        "ObjectPropertyRange(:r ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) \
+         SubClassOf(:A ObjectHasSelf(:r)) SubClassOf(ObjectIntersectionOf(:X :Y) :Z) \
+         SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &[
+            "SubClassOf(:P ObjectSomeValuesFrom(:r :Q))",
+            "SubClassOf(:P ObjectSomeValuesFrom(:s :Q))",
+            "ObjectPropertyRange(:r :W)",
+            "SubObjectPropertyOf(:r :s)",
+        ],
+    ),
+    (
+        "empty",
+        "SubObjectPropertyOf(:s owl:bottomObjectProperty) \
+         ObjectPropertyRange(:r ObjectSomeValuesFrom(:s :X)) SubClassOf(:A ObjectHasSelf(:r))",
+        true,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:r :Q))"],
+    ),
+    (
+        "data value",
+        "ObjectPropertyRange(:r DataHasValue(:d \"1\"^^xsd:integer)) \
+         SubClassOf(DataHasValue(:d \"1.0\"^^xsd:decimal) :G) SubClassOf(:A ObjectHasSelf(:r))",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:r :Q))"],
+    ),
+    (
+        "data range",
+        "ObjectPropertyRange(:r DataHasValue(:d \"5\"^^xsd:integer)) \
+         SubClassOf(DataSomeValuesFrom(:d xsd:integer) :G) SubClassOf(:A ObjectHasSelf(:r))",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:r :Q))"],
+    ),
+    (
+        "superrole",
+        "SubObjectPropertyOf(:r :t) ObjectPropertyRange(:t ObjectSomeValuesFrom(:s :X)) \
+         ObjectPropertyRange(:s :Y) SubClassOf(:A ObjectHasSelf(:r)) \
+         SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &[
+            "SubClassOf(:P ObjectSomeValuesFrom(:t :Q))",
+            "SubClassOf(:P ObjectSomeValuesFrom(:r :Q))",
+            "ObjectPropertyRange(:t :W)",
+            "SubObjectPropertyOf(:q :r)",
+        ],
+    ),
+    (
+        "chain",
+        "SubClassOf(:A ObjectHasSelf(:r)) SubClassOf(:A ObjectHasSelf(:q)) \
+         SubObjectPropertyOf(ObjectPropertyChain(:r :q) :t) \
+         ObjectPropertyRange(:t ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) \
+         SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:t :Q))"],
+    ),
+    (
+        "inverse",
+        "InverseObjectProperties(:r :ri) SubClassOf(:A ObjectHasSelf(:r)) \
+         ObjectPropertyRange(:ri ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) \
+         SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:ri :Q))"],
+    ),
+    (
+        "nominal loop",
+        "SubClassOf(:A ObjectOneOf(:a)) SubClassOf(:B ObjectSomeValuesFrom(:t :A)) \
+         SubClassOf(ObjectOneOf(:a) :B) \
+         ObjectPropertyRange(:u ObjectSomeValuesFrom(:s :X)) SubObjectPropertyOf(:t :u) \
+         ObjectPropertyRange(:s :Y) SubClassOf(ObjectIntersectionOf(:X :Y) :Z) \
+         SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:u :Q))"],
+    ),
+];
+
+/// Whether a run took every axiom, so that its answer is the ontology's: a run leaves
+/// out the axioms outside OWL 2 EL that its rules do not take, and reports them.
+fn took_all(o: &sparkles_owl::classify::Classification) -> bool {
+    let out = &o.stats.outside_el;
+    o.complete && out.horn + out.disjunctive <= out.taken
+}
+
+#[test]
+fn a_range_that_a_loop_reaches_is_indexed() {
+    let mut bad = Vec::new();
+    for (name, body, empty, edits) in LOOP_RANGES {
+        for threads in [1, 4] {
+            for el_only in [false, true] {
+                let limits = Limits {
+                    threads,
+                    el_only,
+                    ..Limits::default()
+                };
+                let name = format!("{name} threads={threads} el_only={el_only}");
+                let check = |bad: &mut Vec<String>,
+                             o: &sparkles_owl::classify::Classification,
+                             what: &str| {
+                    if took_all(o) && !range_answer(o, *empty) {
+                        bad.push(format!("{name}: {what} answer"));
+                    }
+                };
+                let mut axioms = ofn(body);
+                let mut kept = Classifier::of(&axioms);
+                let first = kept.classify(&limits).unwrap();
+                check(&mut bad, &first, "cold");
+                for text in *edits {
+                    let edit = ofn(text).remove(0);
+                    // added to a kept run
+                    kept.add([&edit]);
+                    axioms.push(edit.clone());
+                    let inc = kept.classify(&limits).unwrap();
+                    let fresh = Classifier::of(&axioms).classify(&limits).unwrap();
+                    check(&mut bad, &fresh, &format!("fresh with {text}"));
+                    if inc.taxonomy != fresh.taxonomy || inc.complete != fresh.complete {
+                        bad.push(format!("{name}: kept run after adding {text}"));
+                    }
+                    // removed from a kept run that started cold with it
+                    let mut reverse = Classifier::of(&axioms);
+                    reverse.classify(&limits).unwrap();
+                    reverse.remove([&edit]);
+                    axioms.pop();
+                    let back = reverse.classify(&limits).unwrap();
+                    let fresh = Classifier::of(&axioms).classify(&limits).unwrap();
+                    if back.taxonomy != fresh.taxonomy {
+                        bad.push(format!("{name}: kept run after removing {text}"));
+                    }
+                    // and removed from the first kept run
+                    kept.remove([&edit]);
+                    let again = kept.classify(&limits).unwrap();
+                    if again.taxonomy != fresh.taxonomy {
+                        bad.push(format!("{name}: first kept run after removing {text}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Ranges on links that are not loops: a link to an inverse role's successor, a link a
+/// chain composes and a link to an individual, each of which takes the range by another
+/// rule, and data restrictions that the run leaves out and reports.
+#[test]
+fn a_range_on_links_that_are_not_loops() {
+    // the name, the ontology, and the subsumption the run derives when it takes every axiom
+    let cases = [
+        (
+            "inverse succ",
+            "ObjectPropertyRange(:r :G) SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) :B))",
+            "A",
+            "G",
+        ),
+        (
+            "compose",
+            "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t) ObjectPropertyRange(:t :G) SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B))) SubClassOf(ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :G)) :H)",
+            "A",
+            "H",
+        ),
+        (
+            "compose range on last",
+            "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t) ObjectPropertyRange(:t :G) ObjectPropertyRange(:s :G) SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B))) SubClassOf(ObjectSomeValuesFrom(:t :G) :H)",
+            "A",
+            "H",
+        ),
+        (
+            "transitive",
+            "TransitiveObjectProperty(:t) ObjectPropertyRange(:t :G) SubClassOf(:A ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:t :B))) SubClassOf(ObjectSomeValuesFrom(:t :B) :H)",
+            "A",
+            "H",
+        ),
+        (
+            "link to nominal",
+            "ObjectPropertyRange(:r :G) SubClassOf(:A ObjectSomeValuesFrom(:r :B)) SubClassOf(:B ObjectOneOf(:b)) ClassAssertion(:A :a)",
+            "B",
+            "G",
+        ),
+        (
+            "link to nominal 2",
+            "ObjectPropertyRange(:r :G) SubClassOf(ObjectOneOf(:a) ObjectSomeValuesFrom(:r :B)) SubClassOf(:B ObjectOneOf(:b)) SubClassOf(:C ObjectOneOf(:b))",
+            "C",
+            "G",
+        ),
+        (
+            "data told",
+            "SubClassOf(:A DataHasValue(:d \"5\"^^xsd:integer)) SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)) :G)",
+            "A",
+            "G",
+        ),
+        (
+            "data told int",
+            "SubClassOf(:A DataHasValue(:d \"5\"^^xsd:integer)) SubClassOf(DataSomeValuesFrom(:d xsd:integer) :G)",
+            "A",
+            "G",
+        ),
+        (
+            "data range exist",
+            "ObjectPropertyRange(:r DataHasValue(:d \"5\"^^xsd:integer)) SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)) :G) SubClassOf(:B ObjectSomeValuesFrom(:r :A)) SubClassOf(ObjectSomeValuesFrom(:r :G) :H)",
+            "B",
+            "H",
+        ),
+        (
+            "assert self",
+            "ObjectPropertyRange(:r ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G) ObjectPropertyAssertion(:r :a :a) SubClassOf(:A ObjectOneOf(:a))",
+            "A",
+            "G",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (name, body, a, g) in cases {
+        for el_only in [false, true] {
+            for threads in [1, 4] {
+                let limits = Limits {
+                    threads,
+                    el_only,
+                    ..Limits::default()
+                };
+                let o = Classifier::of(&ofn(body)).classify(&limits).unwrap();
+                let ok = o.taxonomy.is_subclass(&c(a), &c(g));
+                if took_all(&o) && !ok {
+                    bad.push(format!("{name} el_only={el_only} threads={threads}"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:?}");
+}
