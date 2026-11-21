@@ -1832,6 +1832,15 @@ export async function handleOntology(req, res, url, seg, ctx) {
       closure: p.get('imports') === 'false' ? [] : closureOf(ds, graph).edges,
       cached: false,
     };
+    const view = p.get('view') ?? 'full';
+    if (view !== 'full' && view !== 'head')
+      return (fail(res, 400, `view must be full or head, not '${view}'`), true);
+    if (view === 'head') {
+      // the head (ROADMAP item 735) leaves out what the mapping of the whole graph counts
+      for (const k of ['axioms', 'axiomCount', 'triples', 'unmapped', 'diagnostics', 'cached'])
+        delete body[k];
+      body.view = 'head';
+    }
     send(res, 200, body, 'application/json', { ETag: etag(ds, head()) });
     return true;
   }

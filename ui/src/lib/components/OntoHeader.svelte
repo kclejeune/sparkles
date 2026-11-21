@@ -1,7 +1,8 @@
 <script lang="ts">
   // The ontology header in the editor (docs/specs/U12-ontology-workbench/SPEC.md): the
   // ontology IRI, the version IRI, the imports and the header's annotations of the graph
-  // the editor reads, with the counts of the summary. The axiom edits do not cover the
+  // the editor reads, with the entity counts of the head and, once the full summary is read,
+  // its axiom counts and diagnostics (ROADMAP item 735). The axiom edits do not cover the
   // header, so its changes are SPARQL updates of ground triples, previewed like the rest.
   import * as api from '$lib/api';
   import { fmtInt } from '$lib/format';
@@ -15,6 +16,7 @@
     type HeaderValue,
     type Lit,
     type Op,
+    type OntologyHead,
     type OntologySummary,
     type Selection,
   } from '$lib/ontology';
@@ -30,6 +32,10 @@
     target,
     sel,
     summary,
+    full = null,
+    fullLoading = false,
+    fullError = null,
+    onfull,
     name,
     prefixes,
     annotationProperties,
@@ -39,7 +45,13 @@
   }: {
     target: string;
     sel: Selection;
-    summary: OntologySummary;
+    summary: OntologyHead;
+    /** The full summary at the head's commit, when it was read. */
+    full?: OntologySummary | null;
+    fullLoading?: boolean;
+    fullError?: Error | null;
+    /** Read the full summary, which maps the whole ontology. */
+    onfull?: () => void;
     name: (iri: string) => string;
     prefixes: PrefixMap;
     annotationProperties: string[];
@@ -152,7 +164,7 @@
   }
 
   const counts = $derived(Object.entries(summary.entities).sort((a, b) => b[1] - a[1]));
-  const axiomCounts = $derived(Object.entries(summary.axioms).sort((a, b) => b[1] - a[1]));
+  const axiomCounts = $derived(full ? Object.entries(full.axioms).sort((a, b) => b[1] - a[1]) : []);
 </script>
 
 <div class="header-ed">
@@ -273,25 +285,42 @@
           {#each counts as [k, n] (k)}<tr><th>{k}</th><td class="num">{fmtInt(n)}</td></tr>{/each}
         </tbody>
       </table>
-      <table>
-        <tbody>
-          {#each axiomCounts as [k, n] (k)}<tr><th>{k}</th><td class="num">{fmtInt(n)}</td></tr
-            >{/each}
-        </tbody>
-      </table>
-    </div>
-    <p class="faint">
-      {fmtInt(summary.triples)} triples read, {fmtInt(summary.unmapped)} outside the OWL 2 mapping.
-      {#if summary.diagnostics.warnings || summary.diagnostics.errors}
-        {fmtInt(summary.diagnostics.warnings)} warnings and {fmtInt(summary.diagnostics.errors)} errors.
+      {#if full}
+        <table>
+          <tbody>
+            {#each axiomCounts as [k, n] (k)}<tr><th>{k}</th><td class="num">{fmtInt(n)}</td></tr
+              >{/each}
+          </tbody>
+        </table>
       {/if}
-    </p>
-    {#if summary.diagnostics.list.length}
-      <ul class="diag">
-        {#each summary.diagnostics.list.slice(0, 20) as d, i (i)}
-          <li class:err={d.severity === 'error'}><span class="mono">{d.code}</span> {d.message}</li>
-        {/each}
-      </ul>
+    </div>
+    {#if full}
+      <p class="faint">
+        {fmtInt(full.triples)} triples read, {fmtInt(full.unmapped)} outside the OWL 2 mapping.
+        {#if full.diagnostics.warnings || full.diagnostics.errors}
+          {fmtInt(full.diagnostics.warnings)} warnings and {fmtInt(full.diagnostics.errors)} errors.
+        {/if}
+      </p>
+      {#if full.diagnostics.list.length}
+        <ul class="diag">
+          {#each full.diagnostics.list.slice(0, 20) as d, i (i)}
+            <li class:err={d.severity === 'error'}>
+              <span class="mono">{d.code}</span>
+              {d.message}
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    {:else if fullLoading}
+      <p class="faint"><span class="spinner"></span> Counting the axioms…</p>
+    {:else}
+      {#if fullError}<p class="error-box" role="alert">{fullError.message}</p>{/if}
+      {#if onfull}
+        <p class="faint">
+          The axiom counts and the diagnostics of the read map the whole ontology.
+          <button type="button" class="btn sm" onclick={() => onfull?.()}>Count the axioms</button>
+        </p>
+      {/if}
     {/if}
   </section>
 </div>

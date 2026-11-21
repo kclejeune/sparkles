@@ -273,9 +273,10 @@ test('the switch and a map change read the tree and the frame again', async ({ p
       mimeType: 'application/xml',
       buffer: Buffer.from(mapOnly),
     });
+    // the reads may start before the status shows, so the list is cleared before the load
+    reads.length = 0;
     await form.getByRole('button', { name: 'Load catalog' }).click();
     await expect(page.getByRole('status').filter({ hasText: 'mapped 1 import' })).toBeVisible();
-    reads.length = 0;
     await page.getByRole('tab', { name: 'Tree' }).click();
     await expect(agent).toBeVisible();
     await expect.poll(() => reads.some((u) => u.includes('/entity?'))).toBe(true);
