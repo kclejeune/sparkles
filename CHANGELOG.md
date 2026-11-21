@@ -55,6 +55,18 @@ differential sweep, `tests/incremental_sweep.rs`, compares kept runs with fresh 
 edits of class axioms beside fixed self restrictions, reflexive roles, chains, ranges,
 individuals and the top and bottom properties.
 
+### FILTER NOT EXISTS builds its mask in one pass again
+
+When the key set of a FILTER NOT EXISTS or FILTER EXISTS answers every row, the filter
+maps the probe's answers to its mask in one branch-free pass, as roadmap item 1249's
+repair. The probe and the mask were split in item 7's first phase, whose second loop
+took a branch per row and made `not-exists` 15 to 21% slower in execution on forge
+between bccc5f7b and 23626cdc. On `atlas`, a9a237b7 against 6dbf2a08, `not-exists`
+executes in 0.87 to 0.90 times the base's time in every cell, by default and streamed, and
+streamed `exists-join` in 0.95 to 0.99 times. Item 1252 bisects the eager `minus` and
+streamed `optional-chain` readings against cc94ac7f, and item 1253 holds the small
+costs that the counts and the timing found.
+
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
 Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
