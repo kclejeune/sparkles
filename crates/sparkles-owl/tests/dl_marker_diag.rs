@@ -98,8 +98,28 @@ fn deficits(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> [usize
     out.stats.dl_marker_deficits
 }
 
+/// The deficits of a saturation of `body` with the mode `mode`, and whether it found a model.
+fn saturated(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> ([usize; 3], bool) {
+    marker_test_mode(mode, true);
+    let mut k = Classifier::of(&axioms(body));
+    let out = k
+        .saturate(&Limits {
+            threads,
+            expansion,
+            rooted: true,
+            rooted_decline: false,
+            rooted_marker_repair: mode != OFF,
+            dl_steps,
+            ..Limits::default()
+        })
+        .unwrap();
+    marker_test_mode(0, false);
+    (out.stats.dl_marker_deficits, out.consistent)
+}
+
 /// With the repair each fixture is owed nothing; a run without returns is owed a return
-/// product, and a run without the replay or without the repair is owed markers.
+/// product, and a run without the replay or without the repair is owed markers. A
+/// saturation of the regression is owed markers without the repair and nothing with it.
 #[test]
 fn the_deficits_find_a_missing_marker_and_a_missing_return_product() {
     for (name, body) in FIXTURES {
@@ -115,5 +135,13 @@ fn the_deficits_find_a_missing_marker_and_a_missing_return_product() {
             let d = deficits(body, OFF, cfg);
             assert!(d[0] > 0, "{at}: off {d:?}");
         }
+    }
+    // a saturation takes the same deficits: the regression's are owed markers without the
+    // repair and nothing with it, though no answer of a saturation shows them
+    for cfg in CFGS {
+        let (on, model) = saturated(FIXTURES[0].1, ON, cfg);
+        assert!(model && on == [0, 0, 0], "saturation, {cfg:?}: on {on:?}");
+        let (off, _) = saturated(FIXTURES[0].1, OFF, cfg);
+        assert!(off[0] > 0, "saturation, {cfg:?}: off {off:?}");
     }
 }
