@@ -96,6 +96,31 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
+Item 972 is the second phase of [the datatype checker](#the-datatype-checker). A data
+property whose component has a universal restriction, a cardinality, an enumeration of
+several values, a facet, a union, a complement, a datatype outside OWL 2 EL or a
+`DisjointDataProperties` axiom has its restrictions, ranges, assertions and functional
+axioms taken as the checker's atoms, and the Horn tier decides them in each context by
+the theory rule, as [the EL and Horn tiers](#the-datatype-checker) paragraph describes.
+An ontology whose data stays within OWL 2 EL builds no atoms and runs the EL lattice as
+before. A value outside an `xsd:int` range, two values of a functional `xsd:double`
+property and a string in an `xsd:boolean` range now make an ontology inconsistent, as
+they do under HermiT. Three other answers change. A `DatatypeDefinition` outside OWL 2
+EL that the checker converts and a `DisjointDataProperties` axiom over checker
+properties are used and no longer reported as left out. A cover found in a context that
+the run finds unsatisfiable, or in a world whose class has no instance, is not reported.
+`Stats::tier` reads `Disjunctive` for a run whose only axioms outside the Horn rules are
+data unions or enumerations, which the Horn tier now decides. A cover over the values of
+a property that gives different classes, a key over a checker property and a universal
+or maximum data restriction on the left are reported as used in part, and item 768 takes
+them in Tier D and the rooted run. HermiT 1.4.5 gives the checker's answer on 34 of the
+35 claims of the 22 test ontologies checked against it. The other is a
+`NegativeDataPropertyAssertion` of `"3"^^xsd:integer` beside the assertion of
+`"3"^^xsd:int`, which HermiT finds consistent, while it finds the same negation written as
+a class assertion of a complement inconsistent, as the shared numeric value space of
+OWL 2 requires. Item 1303 records that one axiom needing case analysis sends an ontology
+to Tier D, which leaves out every data axiom.
+
 Item 1256 changes the invalidation of a run kept by the EL rules. It recomputed what
 every kept context takes from the index and read every subsumer of every context with
 hash sets, which on `ore_ont_13482` on `wally` took about 105 ms of a 433 ms index stage
@@ -4091,9 +4116,21 @@ that the census found leaving axioms out for 768 or 972, all 27 files with data
 restrictions outside OWL 2 EL have them only in positive positions, so no negative
 universal or cardinality keeps them from the Horn tier. Covers can still arise from
 values on the left, such as a Boolean property whose two values define different
-classes, and phase 2 counts the files where a property with a finite range has two or
-more such values with different classes. The worlds of the Horn rules with individuals compare key values
-and functional values by identity through the checker.
+classes, and the Horn tier reports such a cover as used in part. A context that the run
+finds unsatisfiable reports no cover, since it has every subsumer. A functional object
+property joins the atoms of its successors in the context of their conjunction, so a
+conflict, an entailment or a cover between atoms that different classes give is found
+there. The worlds of the Horn rules with individuals apply the same rule to the copies of
+the contexts they change. A world reads the last evaluation of each copy once it reaches
+its fixpoint, and it skips unsatisfiable copies and every copy when its class has no
+instance, so that what it reports does not depend on the order of its derivations. A
+`DisjointDataProperties` axiom over properties of a checker component is a pair of
+disjoint properties of the local problem. A `DatatypeDefinition` outside OWL 2 EL is
+taken when the checker converts its range, since every property its datatype is used on
+is then in a checker component and reads the definition through its atoms. `Stats::tier`
+still counts a data union or an enumeration of several values as disjunctive, so it reads
+`Disjunctive` for a run whose only such axioms are data restrictions, while Tier D, which
+refuses every data restriction, takes no axiom of the run and the Horn tier decides it.
 
 **Tier D.** Tier D's eligibility drops its refusal of data roles and keeps its refusal of
 the top data property. Data atoms are atoms of the index like named classes, ordered
@@ -4111,8 +4148,8 @@ other than a single value, so that a shared value is the same value on both side
 the worlds take today. A hash of the constants by their key values finds the pairs.
 Every other key is reported as used in part, since a range such as `xsd:int[5, 6]` on
 one side could need the cover `∃d.{5} ⊔ ∃d.{6}` to decide the pair. The worlds of
-the Horn rules with individuals take the same condition, so a key over a data property
-outside it is reported as used in part there too.
+the Horn rules with individuals report every key over a property of a checker component
+as used in part, and the singleton case waits for the rooted run of item 768.
 
 **The rooted run.** A data assertion `DataPropertyAssertion(d a v)` is the atom
 `∃d.{v}` on the constant a, and its negative form is the atom `∀d.¬{v}` on a, as the
