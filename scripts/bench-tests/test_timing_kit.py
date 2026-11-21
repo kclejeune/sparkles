@@ -610,12 +610,35 @@ class ShadowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=("median",))
 
+    def test_an_every_round_rule_without_a_paired_round_decides_no(self):
+        # A's requests to q fail in the even rounds and B's in the odd ones, so no round has
+        # both, and the every-round question has no round to judge and cannot flag
+        d = write_samples(self.d / "unpaired", 1.3)
+        t = d / "results" / "samples.tsv"
+        lines = t.read_text().splitlines()
+        out = [lines[0]]
+        for line in lines[1:]:
+            x = line.split("\t")
+            if x[3] == "q" and (x[2] == "A") == (int(x[0]) % 2 == 0):
+                x[5] = x[6] = "error"
+            out.append("\t".join(x))
+        t.write_text("\n".join(out) + "\n")
+        for rules in (("every-round",), ("bound", "every-round")):
+            s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
+            m = s["queries"]["q"]["metrics"]["exec_ms every-round"]
+            self.assertEqual((m["how"], m["flagged"], m["flagged_all_rounds"]), ("unjudged", False, False), rules)
+            self.assertEqual(s["queries"]["q"]["stop_round"], 8)
+
     def test_shadow_falls_back_in_the_band_and_judges_validity_by_the_controls(self):
         d = write_samples(self.d / "band", 1.0, spread=0.025)
         s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
         self.assertTrue(s["validity"]["fallback"])
         self.assertEqual(s["request_share"], 1.0)
         self.assertTrue(s["agree"])
+        # the fallback keeps the pair's identity and sends every metric back to all rounds
+        self.assertEqual(s["pair"], {"A": "A", "B": "B"})
+        for m in s["queries"]["q"]["metrics"].values():
+            self.assertEqual(m["stop_round"], 8)
         d = write_samples(self.d / "noisy", 1.0, spread=0.05)
         s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
         self.assertEqual((s["validity"]["all_rounds"], s["validity"]["shadow"], s["agree"]), (False, False, True))

@@ -787,6 +787,8 @@ def decide(rounds, rule, bound, upto):
     if rule == "bound":
         return statistics.median(b) / statistics.median(a) >= bound
     per = [statistics.median(v["B"]) / statistics.median(v["A"]) for v in kept.values() if v.get("A") and v.get("B")]
+    if not per:
+        return False  # no round has both variants, so none can show a cost in every round
     return min(per) > 1 and (statistics.median(b) - statistics.median(a)) * 1000 > EVERY_ROUND_ADDED_US
 
 
@@ -931,8 +933,8 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",)):
     if fallback:
         for m in queries.values():
             m.update(stop_round=m["rounds"], flagged=m["flagged_all_rounds"])
-            for x in m["metrics"].values():
-                x.update(flagged=x["flagged_all_rounds"])
+            for dec in m["metrics"].values():
+                dec.update(stop_round=m["rounds"], flagged=dec["flagged_all_rounds"])
     valid_all = full_ok
     valid_shadow = valid_all if fallback else bool(ctl and ctl["valid"]) and not problems
     total = sum(sent.values()) or 1
