@@ -832,6 +832,7 @@ fn ontology(p: &mut Paths) {
                         "offset": { "type": "integer", "minimum": 0, "description": "The first node listed." },
                         "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads, within the algorithm pool's grant (0 for the grant)." },
                         "partial": { "type": "boolean", "description": "Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before." },
+                        "strict": { "type": "boolean", "description": "Refuse with `422` and code `classification-incomplete` when the classifier would leave an axiom out or use one only in part, or the run stopped, so that an answer is always complete for the whole ontology, as HermiT refuses what it does not support. The message names the axioms and the rules they break." },
                         "expansion": { "type": "string", "enum": ["cautious", "eager"], "description": "The expansion strategy of the disjunctive rules, `cautious` by default. Both give the same answer." }
                     }
                 } } }),
@@ -840,11 +841,11 @@ fn ontology(p: &mut Paths) {
                 "200",
                 "The classification, with the receipt when a write asked for one.",
                 Some(json!({
-                    "application/json": { "schema": { "oneOf": [{ "type": "object", "required": ["consistent","complete","classes"], "properties": {"consistent":{"type":"boolean"},"complete":{"type":"boolean"},"classes":{"type":"integer"}} }, sref("OntologyFrameClassification")] } },
+                    "application/json": { "schema": { "oneOf": [{ "type": "object", "required": ["consistent","complete","completeForTaken","classes"], "properties": {"consistent":{"type":"boolean"},"complete":{"type":"boolean","description":"Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way."},"completeForTaken":{"type":"boolean","description":"Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer."},"classes":{"type":"integer"}} }, sref("OntologyFrameClassification")] } },
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )
-            .errors(&[400, 403, 404, 408, 409, 507]),
+            .errors(&[400, 403, 404, 408, 409, 422, 507]),
     );
     p.add(
         op(POST, "/$/ontology/{ds}/parse", "parseManchester", "Ontology", "Read Manchester syntax")

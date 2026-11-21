@@ -2121,11 +2121,11 @@ mod classification {
             "a partial answer has more"
         );
         assert_eq!(j["tier"], json!("disjunctive"));
-        assert_eq!(j["partial"], json!(!cl.complete));
+        assert_eq!(j["partial"], json!(!cl.complete_for_taken));
         assert_eq!(j["complete"], json!(part.complete()));
         assert_eq!(j["incompleteCount"], json!(cl.incomplete.len()));
         let consistency = j["consistency"].as_str().unwrap();
-        if cl.complete {
+        if cl.complete_for_taken {
             assert!(everything || got == want);
             assert!(part.complete());
             assert_eq!(j["incomplete"], json!([]));
@@ -2431,7 +2431,7 @@ mod classification {
                     ..opts()
                 };
                 match ds.ontology().classify(&req, &partial_request(), &o) {
-                    Ok(c) if !c.classification.complete => Some((ds, c)),
+                    Ok(c) if !c.classification.complete_for_taken => Some((ds, c)),
                     _ => None,
                 }
             })

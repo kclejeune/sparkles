@@ -223,7 +223,7 @@ pub(super) fn content_fingerprint(
     excluded: &[Excluded],
     opts: &QueryOptions,
 ) -> Result<String> {
-    let mut hash = start_hash(b"sparkles-classification-content-v1\n");
+    let mut hash = start_hash(b"sparkles-classification-content-v2\n");
     hash_json(
         &mut hash,
         &(
@@ -231,6 +231,7 @@ pub(super) fn content_fingerprint(
             cl.consistent,
             consistency(cl),
             cl.complete,
+            cl.complete_for_taken,
             ClassNames(&cl.incomplete),
         ),
     )?;
@@ -284,7 +285,7 @@ impl KeptClassification {
         excluded: Arc<Vec<Excluded>>,
         opts: &QueryOptions,
     ) -> Result<Arc<Self>> {
-        let controls = super::classify::result_options(opts, classification.complete);
+        let controls = super::classify::result_options(opts, classification.complete_for_taken);
         let opts = &controls;
         let source = Arc::new(Provenance::capture(h, req, c, o, opts)?);
         let content_fingerprint = content_fingerprint(&classification, &excluded, opts)?;
@@ -589,7 +590,7 @@ impl KeptClassification {
         let c = &self.classification;
         Outcome {
             tier: c.stats.tier.as_str(),
-            partial: !c.complete,
+            partial: !c.complete_for_taken,
             complete: c.complete && self.excluded.is_empty(),
             consistency: consistency(c),
             excluded_count: self.excluded.len(),

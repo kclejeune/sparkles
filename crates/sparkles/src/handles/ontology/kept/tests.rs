@@ -563,7 +563,7 @@ fn stopped_frame_control(partial: bool, composite: bool) {
             &options,
         )
         .unwrap();
-    assert_eq!(classified.classification.complete, !partial);
+    assert_eq!(classified.classification.complete_for_taken, !partial);
     stopped.store(true, Ordering::Relaxed);
     let response = super::super::wire::classify_body(
         "fixture",
@@ -858,7 +858,7 @@ fn stopped_partial_and_oversized_outcomes_drop_both_retained_owners() {
         let restore = CapRestore(cap);
         super::super::classify::FORCE_PARTIAL.with(|f| f.set(partial));
         let terminal = classify(&ds);
-        assert_eq!(!terminal.classification.complete, partial);
+        assert_eq!(!terminal.classification.complete_for_taken, partial);
         empty_slot(&ds);
         assert_eq!(
             read(&ds, &req(), &KeptQuery::default()).status,
@@ -1215,6 +1215,7 @@ fn isolated_names_never_redecide_graph_guards_after_triple_masking() {
     c.read_options = super::super::classify::result_options(&stopped_options, false);
     let mut partial = (*c.classification).clone();
     partial.complete = false;
+    partial.complete_for_taken = false;
     partial.consistency = sparkles_owl::classify::Consistency::Unknown;
     c.classification = Arc::new(partial);
     c.publication = KeptClassification::capture(

@@ -102,6 +102,9 @@ impl From<sparkles::Error> for FfiError {
                 };
             }
             E::Unsupported(_) => ErrorKind::Unsupported,
+            // a strict classification that would leave axioms out, as an OWL API
+            // reasoner throws on what it does not support
+            E::Component(c) if c.component == "classifier" => ErrorKind::Unsupported,
             E::Locked { .. } => ErrorKind::Locked,
             E::Invalid(_) => ErrorKind::Invalid,
             E::Corrupt(_) => ErrorKind::Corrupt,

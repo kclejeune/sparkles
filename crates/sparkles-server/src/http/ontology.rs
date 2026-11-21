@@ -1518,6 +1518,7 @@ pub(super) async fn classify(
             "offset",
             "threads",
             "partial",
+            "strict",
             "expansion",
             "projection",
             "lang",
@@ -1559,6 +1560,7 @@ pub(super) async fn classify(
         about: about.clone(),
         el_only: false,
         partial: flag("partial")?,
+        strict: flag("strict")?,
         expansion: expansion_of(text("expansion")?.as_deref()).map_err(ontology_error)?,
     };
     let projection =
@@ -1572,6 +1574,7 @@ pub(super) async fn classify(
             "offset",
             "threads",
             "partial",
+            "strict",
             "expansion",
             "target",
             "message",
@@ -1597,7 +1600,7 @@ pub(super) async fn classify(
                 return Err(bad(format!("'{key}' appears in both query and body")));
             }
         }
-        for key in ["inferences", "assertions", "nodes", "partial"] {
+        for key in ["inferences", "assertions", "nodes", "partial", "strict"] {
             if params
                 .get(key)
                 .is_some_and(|value| !matches!(value, "true" | "false"))

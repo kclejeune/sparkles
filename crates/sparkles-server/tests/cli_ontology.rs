@@ -487,3 +487,118 @@ fn classify_leaves_the_consistency_unknown_when_stopped_early() {
     let seen = partial_on_the_command_line(true);
     assert!(seen.iter().any(|c| c == "unknown"), "{seen:?}");
 }
+
+/// An ontology where a run with its assertion and without the rooted rules leaves the union
+/// out and misses K ⊑ Ans (roadmap item 1271). ROBOT's commands classify the assertions too.
+const IRL1: &str = "Prefix(:=<http://example.org/irl#>)
+Ontology(<http://example.org/irl#irl1>
+Declaration(Class(:K)) Declaration(Class(:S)) Declaration(Class(:D1)) Declaration(Class(:D2)) Declaration(Class(:Ans))
+Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:s)) Declaration(NamedIndividual(:a))
+SubObjectPropertyOf(:r :s)
+SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+SubClassOf(:S ObjectUnionOf(:D1 :D2))
+SubClassOf(:D1 ObjectAllValuesFrom(ObjectInverseOf(:s) :Ans))
+SubClassOf(:D2 ObjectAllValuesFrom(ObjectInverseOf(:s) :Ans))
+ClassAssertion(:K :a)
+)
+";
+
+#[test]
+fn a_classification_that_leaves_an_axiom_out_is_incomplete_or_refused() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(dir.join("irl1.ofn"), IRL1).unwrap();
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "irl1.ofn",
+            "--assertions",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["complete"], false, "{j}");
+    assert_eq!(j["completeForTaken"], true, "{j}");
+    assert_eq!(j["partial"], false, "{j}");
+    assert_eq!(j["consistency"], "consistent", "{j}");
+    assert_eq!(
+        j["incomplete"],
+        serde_json::json!(["http://example.org/irl#K", "http://example.org/irl#S"]),
+        "{j}"
+    );
+    assert!(err(&o).contains("incomplete answer"), "{}", err(&o));
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "irl1.ofn",
+            "--assertions",
+            "--format",
+            "text",
+        ],
+    );
+    assert!(
+        out(&o).contains("incomplete http://example.org/irl#K"),
+        "{}",
+        out(&o)
+    );
+    // strict: no answer, and the error names the axiom and the rule
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "irl1.ofn",
+            "--assertions",
+            "--strict",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(1), "{}", out(&o));
+    assert!(out(&o).is_empty(), "{}", out(&o));
+    let e = err(&o);
+    assert!(e.contains("would not be complete"), "{e}");
+    assert!(e.contains("ObjectUnionOf"), "{e}");
+    assert!(e.contains("OWL 2 Profiles"), "{e}");
+    // ROBOT's reason with --strict true fails as ROBOT does, and writes nothing
+    let o = sparkles(
+        dir,
+        &[
+            "ontology", "reason", "--input", "irl1.ofn", "--strict", "true", "--output", "out.ofn",
+        ],
+    );
+    assert_ne!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(
+        err(&o).contains("INCOMPLETE REASONING ERROR"),
+        "{}",
+        err(&o)
+    );
+    assert!(!dir.join("out.ofn").exists());
+    let o = sparkles(
+        dir,
+        &[
+            "ontology", "reason", "--input", "irl1.ofn", "--output", "out.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("--strict true refuses"), "{}", err(&o));
+    // an ontology the classifier takes whole is complete, strict or not
+    std::fs::write(
+        dir.join("el.ofn"),
+        "Prefix(:=<http://ex.org/>)\nOntology(SubClassOf(:A :B))\n",
+    )
+    .unwrap();
+    let o = sparkles(
+        dir,
+        &[
+            "ontology", "classify", "el.ofn", "--strict", "--format", "json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["complete"], true, "{j}");
+}

@@ -52,6 +52,8 @@ fn err(e: EngineError) -> napi::Error {
         EngineError::Rejected(_) | EngineError::GuardMissing(_) => "WriteRejectedError",
         EngineError::Service(_) => "ServiceError",
         EngineError::Component(c) if c.code == "invalid-manchester" => "InvalidInputError",
+        // a strict classification that would leave axioms out
+        EngineError::Component(c) if c.component == "classifier" => "UnsupportedError",
         _ => "StorageError",
     };
     let details = match &e {
@@ -73,6 +75,7 @@ fn err(e: EngineError) -> napi::Error {
             })
             .map(|f| f.json())
             .unwrap_or_else(|| json!({})),
+        EngineError::Component(c) if c.component == "classifier" => json!({ "code": c.code }),
         EngineError::Io(io) => json!({
             "errno": io.raw_os_error(),
             "code": if io.kind() == std::io::ErrorKind::NotFound {"ENOENT"} else {"EIO"},

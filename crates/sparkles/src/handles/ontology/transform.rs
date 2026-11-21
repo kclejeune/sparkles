@@ -164,7 +164,8 @@ impl WorkingOntology {
 
 /// The classification of a transformation: the classifier with the request's threads
 /// and the options' deadline and budgets. A transformation asserts what the taxonomy
-/// says, so it never takes a partial answer, and a stopped run fails.
+/// says, so it never takes a partial answer, and a stopped run fails. A strict request
+/// fails when the classification leaves an axiom out.
 fn classifier<'a>(
     c: &'a ClassifyRequest,
     opts: &'a QueryOptions,
@@ -173,7 +174,13 @@ fn classifier<'a>(
         partial: false,
         ..c.clone()
     };
-    move |kinds: &[&AxiomKind]| classify_once(kinds, &c, opts)
+    move |kinds: &[&AxiomKind]| {
+        let (classification, excluded) = classify_once(kinds, &c, opts)?;
+        if c.strict && !classification.complete {
+            return Err(super::classify::strict_refusal(&classification, &excluded));
+        }
+        Ok((classification, excluded))
+    }
 }
 
 /// The syntaxes the writers write, by the extensions ROBOT reads them from.

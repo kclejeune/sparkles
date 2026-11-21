@@ -99,6 +99,11 @@ pub struct ReasonArgs {
     /// true is not supported: the invalid reference check is not implemented
     #[arg(long, default_value = "false")]
     pub prevent_invalid_references: String,
+    /// true: refuse with an error naming the axioms when the classifier would leave an
+    /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
+    /// not support, so that the output is complete for the whole ontology
+    #[arg(long, default_value = "false")]
+    pub strict: String,
     #[command(flatten)]
     pub io: Io,
 }
@@ -118,6 +123,11 @@ pub struct ReduceArgs {
     /// true: take subproperties and property chains into account
     #[arg(short = 's', long, default_value = "false")]
     pub include_subproperties: String,
+    /// true: refuse with an error naming the axioms when the classifier would leave an
+    /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
+    /// not support, so that the output is complete for the whole ontology
+    #[arg(long, default_value = "false")]
+    pub strict: String,
     #[command(flatten)]
     pub io: Io,
 }
@@ -160,6 +170,11 @@ pub struct MaterializeArgs {
     /// Accepted and ignored, as ROBOT's materialize ignores it
     #[arg(short = 'a', long, default_value = "false")]
     pub annotate_inferred_axioms: String,
+    /// true: refuse with an error naming the axioms when the classifier would leave an
+    /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
+    /// not support, so that the output is complete for the whole ontology
+    #[arg(long, default_value = "false")]
+    pub strict: String,
     #[command(flatten)]
     pub io: Io,
 }
@@ -176,6 +191,9 @@ pub struct ClassifyStep {
     /// Exit with status 0 when classes are unsatisfiable but the ontology is consistent
     #[arg(long)]
     pub allow_unsatisfiable: bool,
+    /// Refuse when the classifier would leave an axiom out, as `classify --strict`
+    #[arg(long)]
+    pub strict: bool,
     /// ofn (the taxonomy as a functional-style document), json or text
     #[arg(long, default_value = "ofn")]
     pub format: String,
@@ -319,6 +337,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             let o = reason_options(&a)?;
             let c = ClassifyRequest {
                 el_only: reasoner(a.reasoner.as_deref(), true)?,
+                strict: boolean(&a.strict, "strict")?,
                 ..c.clone()
             };
             match w.reason(&o, &c, &q) {
@@ -329,6 +348,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
         Step::Reduce(a) => {
             let c = ClassifyRequest {
                 el_only: reasoner(a.reasoner.as_deref(), false)?,
+                strict: boolean(&a.strict, "strict")?,
                 ..c.clone()
             };
             let o = ReduceOptions {
@@ -353,6 +373,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             // ELK by default, as ROBOT's materialize, so the EL rules alone
             let c = ClassifyRequest {
                 el_only: reasoner(Some(&a.reasoner), false)?,
+                strict: boolean(&a.strict, "strict")?,
                 ..c.clone()
             };
             let o = materialize_options(&a)?;
@@ -369,6 +390,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             let c = ClassifyRequest {
                 about: about.clone(),
                 assertions: a.assertions,
+                strict: a.strict,
                 ..c.clone()
             };
             let file = w.to_file()?;
@@ -552,7 +574,7 @@ fn log(r: &Report) {
     }
     if !r.excluded.is_empty() {
         eprintln!(
-            "WARN the classifier left out {} axioms outside OWL 2 EL or used them only in part",
+            "WARN the classifier left out {} axioms outside OWL 2 EL or used them only in part, so the inferred axioms may be incomplete; --strict true refuses instead",
             r.excluded.len()
         );
     }
@@ -589,6 +611,12 @@ fn failed(e: TransformError, dump: Option<&Path>, w: &WorkingOntology) -> anyhow
         }
     }
     match e {
+        // ROBOT's style of error for a strict run's refusal
+        TError::Classifier(sparkles::Error::Component(c))
+            if c.code == sparkles::handles::ontology::classify::STRICT_CODE =>
+        {
+            anyhow!("INCOMPLETE REASONING ERROR {}", c.message)
+        }
         TError::Classifier(e) => anyhow::Error::from(e),
         e => anyhow!("{e}"),
     }

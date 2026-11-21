@@ -2806,3 +2806,50 @@ async fn the_outbound_policy_refuses_a_fetch_and_nothing_changes() {
     );
     assert_eq!(get(&s.app, "/$/ontology/t").await.json()["commit"], commit);
 }
+
+/// A classification that leaves an axiom out is not complete, names the classes it may
+/// miss, and is refused when strict (roadmap item 1271).
+#[tokio::test]
+async fn classify_reports_what_a_left_out_axiom_reaches_and_strict_refuses_it() {
+    let s = server_of(
+        r#"@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :X a owl:Class . :Y a owl:Class .
+:A rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :B :C ) ] .
+:X rdfs:subClassOf :Y .
+:k a owl:NamedIndividual , :A .
+"#,
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["complete"], false, "{j}");
+    assert_eq!(j["completeForTaken"], true, "{j}");
+    assert_eq!(j["partial"], false, "{j}");
+    assert_eq!(j["incomplete"], json!(["http://ex.org/A"]), "{j}");
+    assert_eq!(j["consistency"], "consistent", "{j}");
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true, "strict": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    assert!(
+        j["error"].as_str().unwrap().contains("ObjectUnionOf"),
+        "{j}"
+    );
+    // strict as a query parameter, on an answer that is complete
+    let r = post(&s.app, "/$/ontology/t/classify?strict=true", json!({})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["complete"], true);
+}

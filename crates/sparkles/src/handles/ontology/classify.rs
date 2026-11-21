@@ -99,6 +99,38 @@ pub struct ClassifyRequest {
     /// the expansion strategy of the disjunctive rules, which gives the same answer
     /// either way ([`sparkles_owl::classify::Limits::expansion`])
     pub expansion: Expansion,
+    /// refuse the classification when it leaves an axiom out or uses one only in part,
+    /// or stopped part way, as a complete reasoner such as HermiT refuses what it does
+    /// not support, with [`STRICT_CODE`] and the axioms in the message. The check reads
+    /// the final answer, a kept one included, and comes before a taxonomy is written.
+    /// It does not change what the dataset keeps.
+    pub strict: bool,
+}
+
+/// The code of a strict classification's refusal ([`ClassifyRequest::strict`]), whose
+/// component is `classifier`.
+pub const STRICT_CODE: &str = "classification-incomplete";
+
+/// The refusal of a strict classification whose answer is not complete for the whole
+/// ontology: the axioms left out, which the error's source holds as
+/// [`sparkles_owl::classify::Error::Incomplete`], or the run that stopped.
+pub fn strict_refusal(classification: &Classification, excluded: &[Excluded]) -> Error {
+    let message = if excluded.is_empty() {
+        format!(
+            "the classification would not be complete: the run stopped before it decided {} classes",
+            classification.incomplete.len()
+        )
+    } else {
+        sparkles_owl::classify::refusal(excluded)
+    };
+    incomplete(message, excluded)
+}
+
+fn incomplete(message: String, excluded: &[Excluded]) -> Error {
+    Error::Component(Box::new(
+        crate::error::ComponentError::new("classifier", STRICT_CODE, message)
+            .with_source(sparkles_owl::classify::Error::Incomplete(excluded.to_vec())),
+    ))
 }
 
 /// The opening of the comment the classifier writes on a taxonomy graph's header, by
@@ -321,6 +353,12 @@ impl Ontologies {
                 false,
             )
         };
+        if c.strict && !publication.classification.complete {
+            return Err(strict_refusal(
+                &publication.classification,
+                &publication.excluded,
+            ));
+        }
         if let Some(about) = &c.about
             && publication
                 .classification
@@ -341,7 +379,7 @@ impl Ontologies {
                 .publication
                 .as_ref()
                 .is_some_and(|p| p.id == publication.id);
-        let classified_complete = publication.classification.complete;
+        let classified_complete = publication.classification.complete_for_taken;
         let mut classified = Classified {
             opened: o,
             classification: publication.classification.clone(),
@@ -402,6 +440,7 @@ impl Ontologies {
             let out = if FORCE_PARTIAL.with(|f| f.replace(false)) {
                 let mut partial = out;
                 partial.complete = false;
+                partial.complete_for_taken = false;
                 partial.consistency = sparkles_owl::classify::Consistency::Unknown;
                 partial.incomplete = partial.taxonomy.classes().cloned().collect();
                 partial
@@ -417,7 +456,7 @@ impl Ontologies {
                 Arc::new(e.saturation.excluded().to_vec()),
                 opts,
             )?;
-            let keep = p.classification.complete
+            let keep = p.classification.complete_for_taken
                 && classification_retained_bytes(e, &p) <= retention_cap();
             e.result = keep.then(|| p.clone());
             Ok(((p, false), keep))
@@ -753,6 +792,9 @@ fn bounded<T>(
     out.map_err(|e| match e {
         sparkles_owl::classify::Error::Cancelled => Error::Cancelled,
         sparkles_owl::classify::Error::Timeout => Error::Timeout,
+        sparkles_owl::classify::Error::Incomplete(excluded) => {
+            incomplete(sparkles_owl::classify::refusal(&excluded), &excluded)
+        }
         sparkles_owl::classify::Error::Memory { limit, used } => {
             let over_budget = opts.max_memory_bytes.is_some_and(|m| used as u64 > m);
             Error::BudgetExceeded(Budget {

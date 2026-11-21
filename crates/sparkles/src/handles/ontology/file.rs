@@ -380,6 +380,9 @@ impl OntologyFile {
             axioms.extend(owned.iter().map(|a| &a.kind).filter(|k| logical(k)));
         }
         let (classification, excluded) = classify_once(&axioms, c, &opts)?;
+        if c.strict && !classification.complete {
+            return Err(super::classify::strict_refusal(&classification, &excluded));
+        }
         if let Some(about) = &c.about
             && classification
                 .taxonomy

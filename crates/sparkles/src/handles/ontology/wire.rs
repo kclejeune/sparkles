@@ -726,6 +726,7 @@ fn members(op: &str) -> &'static [&'static str] {
             "offset",
             "threads",
             "partial",
+            "strict",
             "expansion",
             "projection",
             "lang",
@@ -1109,6 +1110,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 about: about.clone(),
                 el_only: false,
                 partial: boolean(a, "partial")?.unwrap_or(false),
+                strict: boolean(a, "strict")?.unwrap_or(false),
                 expansion: expansion_of(string(a, "expansion")?)?,
             };
             let q = ClassifyQuery {
@@ -1599,9 +1601,11 @@ pub fn classification_body(
         Consistency::Inconsistent => "inconsistent",
         Consistency::Unknown => "unknown",
     });
-    // a partial answer is never complete, whatever it left out
+    // complete for the whole ontology: nothing left out and the run not stopped, and
+    // completeForTaken, as a profile reasoner such as ELK reports, only the second
     j["complete"] = json!(c.excluded.is_empty() && cl.complete);
-    j["partial"] = json!(!cl.complete);
+    j["completeForTaken"] = json!(cl.complete_for_taken);
+    j["partial"] = json!(!cl.complete_for_taken);
     j["tier"] = json!(s.tier.as_str());
     j["incompleteCount"] = json!(cl.incomplete.len());
     j["incomplete"] = json!(

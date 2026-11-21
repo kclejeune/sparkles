@@ -694,6 +694,13 @@ public data class ClassifyQuery @JvmOverloads public constructor(
     /** `frame` returns bounded direct-parent/equivalence clauses instead of legacy arrays. */
     public val projection: String? = null,
     public val languages: List<String> = emptyList(),
+    /**
+     * refuse with [SparklesUnsupportedException], whose message names the axioms, when the
+     * classifier would leave an axiom out or use one only in part, as an OWL API reasoner
+     * such as HermiT throws on what it does not support; the answer's `complete` is then
+     * true whenever there is one
+     */
+    public val strict: Boolean = false,
 ) {
     init {
         require(limit > 0 && offset >= 0 && threads >= 0)
@@ -710,6 +717,7 @@ public data class ClassifyQuery @JvmOverloads public constructor(
         target?.let { j.put("target", it) }
         message?.let { j.put("message", it) }
         if (partial) j.put("partial", true)
+        if (strict) j.put("strict", true)
         expansion?.let { j.put("expansion", it) }
         projection?.let { j.put("projection", it) }
         if (languages.isNotEmpty()) j.put("lang", languages.joinToString(","))
