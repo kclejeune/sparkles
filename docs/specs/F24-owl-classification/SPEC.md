@@ -123,6 +123,16 @@ in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803
 same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
 Item 1061 follows that cost.
 
+Item 1265 closes a crash of the keys that the rewriting declines. When an ontology's only
+individuals were in axioms outside OWL 2 EL, the disjunctive rules took the run, the
+normalization made it rooted, and a key left in the EL part marked the contexts real in
+rules that do not take those marks, so the run panicked. A run of Tier D is now rooted only
+when the EL part has no keys, as the check for individuals in the EL part already required,
+and such a run answers as a run without the option. Each reason the rewriting declines a
+key, its bound, data, the bottom property, a construct without a reduction and the reserved
+prefix, has a regression test. The rooted taxonomies and statistics of 198 fixture and
+generated ontologies, 62 of them with keys, are unchanged.
+
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
 1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`
