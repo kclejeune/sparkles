@@ -158,6 +158,10 @@ fn days_in_month(y: i64, m: i64) -> i64 {
 /// of any precision, or why it has none.
 pub fn date_time(lex: &str) -> Result<DVal, Unsupported> {
     let bad = Unsupported::IllTyped;
+    // every form is ASCII, which also keeps the slices below on character boundaries
+    if !lex.is_ascii() {
+        return Err(bad);
+    }
     let (neg, s) = match lex.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, lex),

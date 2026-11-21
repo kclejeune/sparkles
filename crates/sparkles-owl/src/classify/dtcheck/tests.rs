@@ -416,6 +416,25 @@ fn opaque_and_complement() {
     assert_eq!(t.r.join(x, nx), lit_all);
     assert_eq!(t.r.meet(x, nx), Ranges::EMPTY);
     assert!(t.r.bytes() > 0);
+    // the dense strata keep no breakpoint outside the stratum, so a range and its
+    // complement join to one id
+    for r in [
+        restr("decimal", &[("minInclusive", lit("5", "integer"))]),
+        DataRange::DatatypeRestriction(
+            Datatype::new(vocab::OWL_REAL),
+            [FacetRestriction {
+                facet: iri(xsd("minInclusive")),
+                value: Literal::typed("1/3", vocab::OWL_RATIONAL),
+            }]
+            .into_iter()
+            .collect(),
+        ),
+    ] {
+        let x = t.of(&r);
+        let nx = t.r.not(x);
+        assert_eq!(t.r.join(x, nx), Ranges::FULL, "{r:?}");
+        assert_eq!(t.r.meet(x, nx), Ranges::EMPTY);
+    }
     assert!(!t.has(&dt_iri(vocab::RDF_XML_LITERAL), &lit("a", "string")));
     // the string-integer-clash case
     assert!(t.empty(&and(vec![dt("integer"), one(&[lit("aString", "string")])])));
@@ -917,6 +936,8 @@ fn date_time_lexical_forms() {
         "02000-01-01T00:00:00",
         "2000-01-01T00:00:00.",
         "2000-01-01T00:00",
+        "2000-01-01T00:00:00+1\u{e9}2a",
+        "2000-01-01T00:00:00\u{e9}+01:00",
     ] {
         assert_eq!(d(bad), Err(Unsupported::IllTyped), "{bad}");
     }

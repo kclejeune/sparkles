@@ -358,7 +358,8 @@ impl Dense {
             let a = self.at[i] && member(q);
             let after = self.gap[i + 1];
             let before = *gap.last().expect("a gap precedes every point");
-            if a == before && a == after {
+            // a point outside the stratum is no value, so it separates nothing
+            if before == after && (a == before || !member(q)) {
                 continue;
             }
             pts.push(q.clone());
