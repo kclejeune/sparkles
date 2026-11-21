@@ -1135,7 +1135,7 @@ annotation triples. A reifier is a blank node with exactly one type, `owl:Annota
 `owl:Axiom` when it annotates a root triple, with its source, property, target and
 annotations, and only the reifiers of its own annotations may name it. A reified property is
 an annotation property, `owl:imports` or `owl:versionIRI` on an ontology node, or
-`rdf:type` with an OWL or RDF Schema type. The ontology also opens when a graph types
+`rdf:type` with a structural OWL, RDF Schema or RDF type on a root triple. The ontology also opens when a graph types
 `rdf:type` or another structural predicate as an OWL property, when an IRI the header uses
 has an annotated declaration, and past the head's bounds of 1,000 ontology nodes, 100,000
 fragment quads and 10,000 reified type triples. The argument walks each step of the full

@@ -1875,7 +1875,7 @@ annotations may name it. Any other part in the
 mapping opens the ontology and answers from the mapping. Examples are an
 `owl:AllDisjointClasses` type on an ontology or annotation node, an `owl:Axiom` node that
 annotates another annotation node, and the reification of a predicate other than an
-annotation property, `owl:imports`, `owl:versionIRI`, or `rdf:type` with an OWL or RDF Schema type. The ontology also opens when a graph types `rdf:type` or another
+annotation property, `owl:imports` or `owl:versionIRI` on an ontology node, or `rdf:type` with a structural OWL, RDF Schema or RDF type on a root triple. The ontology also opens when a graph types `rdf:type` or another
 structural predicate as an OWL property, when an IRI the header uses has an annotated
 declaration, and past the head's bounds, such as more than 1,000 ontology nodes or 10,000
 reified type triples.

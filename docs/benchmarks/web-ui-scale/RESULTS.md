@@ -131,7 +131,7 @@ Item 736 of the [roadmap](../../ROADMAP.md) speeds up the mapping itself.
 `GET /$/ontology/{ds}?view=head` answers the header, the entity counts, the graphs and the
 imports from index reads without the mapping, and the ontology editor reads it when it opens.
 A run on `wally` measured the head of bd3bcea4 against the full summary of 0779d666, the
-commit before it. The host is a 12th Gen Intel Core i7-12800H with 20 threads and 31 GiB of
+commit before item 735. The host is a 12th Gen Intel Core i7-12800H with 20 threads and 31 GiB of
 memory. Each cell is the median of three fresh servers, and the head's warm time is its
 second call. The server's resident memory is read after the first call, and a server holds about
 164 MB after it starts. The records give the resident memory in KiB, and the table
