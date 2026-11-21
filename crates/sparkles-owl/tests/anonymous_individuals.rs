@@ -460,3 +460,56 @@ fn the_peak_counts_the_scan_for_shared_individuals_without_a_pool() {
         out.stats.peak_memory
     );
 }
+
+/// Limits whose pool refuses the first grant, which is the scan for shared individuals
+/// when the axioms hold two of them, so that the run reads every assertion.
+fn refusing_the_scan() -> Limits {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    Limits {
+        charge: Some(std::sync::Arc::new(move |_| {
+            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) > 0
+        })),
+        ..Limits::default()
+    }
+}
+
+fn same_answer(a: &Classification, b: &Classification, what: &str) {
+    assert_eq!(a.consistent, b.consistent, "{what}");
+    let classes: Vec<Class> = b.taxonomy.classes().cloned().collect();
+    for x in &classes {
+        for y in &classes {
+            assert_eq!(
+                a.taxonomy.is_subclass(x, y),
+                b.taxonomy.is_subclass(x, y),
+                "{what}: {x:?} {y:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn an_edit_between_runs_that_share_and_do_not_share_individuals_answers_as_a_fresh_run() {
+    // the advisor's check on item 1281: whether the scan runs depends on the limits, so
+    // two runs of one classifier can read lists that differ by assertions no change names
+    let base = "SubClassOf(:C :D) DisjointClasses(:D :E) SubClassOf(:F :E) \
+                ClassAssertion(:C _:x) ClassAssertion(:C _:y) ClassAssertion(:C _:z)";
+    for edit in ["SubClassOf(:A :B)", "SubClassOf(:C :F)"] {
+        for merge_first in [true, false] {
+            let (one, two) = if merge_first {
+                (Limits::default(), refusing_the_scan())
+            } else {
+                (refusing_the_scan(), Limits::default())
+            };
+            let ax = axioms(base);
+            let mut k = Classifier::of(&ax);
+            k.classify(&one).unwrap();
+            k.add(&axioms(edit));
+            let after = k.classify(&two).unwrap();
+            let mut fresh = Classifier::of(&axioms(&format!("{base} {edit}")));
+            let expected = fresh.classify(&Limits::default()).unwrap();
+            let what = format!("{edit}, merge first {merge_first}");
+            same_answer(&after, &expected, &what);
+            assert_eq!(k.excluded(), fresh.excluded(), "{what}");
+        }
+    }
+}
