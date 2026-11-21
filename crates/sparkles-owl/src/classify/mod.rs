@@ -419,9 +419,11 @@ pub struct Stats {
     pub threads: usize,
     pub index: Duration,
     pub saturation: Duration,
-    /// the part of [`saturation`](Stats::saturation) after the first saturation: the
-    /// marking of real contexts with its rounds, the facts of universal roles, the merges
-    /// of keys, the witnesses and the worlds
+    /// the part of [`saturation`](Stats::saturation) from the end of the first
+    /// saturation and of Tier D's tests to the end of the stage: the marking of real
+    /// contexts with its rounds, the facts of universal roles, the merges of keys, the
+    /// witnesses and the worlds, and the counts of the contexts and the diagnostics of a
+    /// rooted run that close the stage
     pub marking: Duration,
     pub taxonomy: Duration,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
@@ -1579,6 +1581,7 @@ impl Saturation {
         self.interner = Interner::new();
         self.stale_tier = false;
         self.ctx = Vec::new();
+        self.disjoint = Vec::new();
         self.dynamic = None;
         self.dl_run = None;
     }
@@ -2140,15 +2143,15 @@ impl Saturation {
         // The old index is no longer read. Drop its handles before constructing the
         // replacement, while cached contexts retain their shared numeric ledger.
         self.index = None;
-        let (ax, mut ix, mut normalized_peak, outside_el) =
+        let (mut ax, mut ix, mut normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes + old_bytes, limits)?;
         drop(outside);
         // the disjointness sets by their numbers in this index, beside those of the
-        // last run's, by which the contexts it leaves number the sets they meet
+        // last run's, by which the contexts it leaves number the sets they meet; the run
+        // reads them only in the build, so they move from the axioms, which the budget
+        // counted, and the last run's are freed
         let renumbered = self.disjoint != ax.disjoint;
-        if renumbered {
-            self.disjoint = ax.disjoint.clone();
-        }
+        self.disjoint = std::mem::take(&mut ax.disjoint);
         stats.outside_el = outside_el;
         stats.tier = stats.outside_el.tier();
         poll(limits)?;
@@ -2281,6 +2284,28 @@ impl Saturation {
         });
         if let Some(scratch) = premises {
             stats.incremental = true;
+            // the invalidation's bit sets, one bit for each expression and each context,
+            // beside the kept contexts, the index and the normalized axioms
+            let bits = (self.interner.len() + self.ctx.len()).div_ceil(8);
+            let held = self.index_bytes(&ix)
+                + held_bytes
+                + ax.bytes()
+                + self.context_bytes()
+                + scratch.rough_bytes()
+                + bits;
+            let more = held.saturating_sub(normalized_peak);
+            if limits.max_memory.is_some_and(|m| held > m)
+                || limits
+                    .charge
+                    .as_deref()
+                    .is_some_and(|f| more > 0 && !f(more))
+            {
+                return Err(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(held),
+                    used: held,
+                });
+            }
+            normalized_peak = normalized_peak.max(held);
             stats.cleared = self.invalidate(&scratch, &ix, renumbered);
             poll(limits)?;
         }
