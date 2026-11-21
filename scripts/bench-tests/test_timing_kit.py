@@ -778,6 +778,41 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual((s["queries"]["q"]["rounds"], s["undecidable"]),
                          (9, [f"q {m} every-round" for m in self.kit.STOP_METRICS]))
 
+    def test_a_rerun_replayed_from_its_parent_takes_the_rerun_schedule(self):
+        # a rerun pass without its own run.env ran RERUN_ROUNDS, not ROUNDS, so a missing round
+        # past ROUNDS still counts; rounds past the schedule mean the schedule is not the
+        # pass's, so no cost is claimed
+        for k in (12, 16):
+            out = self.d / f"rr{k}"
+            d = self.drop_round(write_samples(out / "rerun", 1.3, rounds=16, schedule=False), k)
+            (out / "run.env").write_text("ROUNDS=8\nRERUN_ROUNDS=16\n")
+            for rules in (("every-round",), ("bound", "every-round")):
+                s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
+                self.assertEqual(s["schedule"], 16, (k, rules))
+                self.assertEqual(s["queries"]["q"]["rounds"], 16, (k, rules))
+                self.assertEqual(s["undecidable"], [f"q {m} every-round" for m in self.kit.STOP_METRICS], (k, rules))
+        out = self.d / "over"
+        d = write_samples(out / "pass1", 1.3, rounds=10, schedule=False)
+        (out / "run.env").write_text("ROUNDS=8\n")
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=("every-round",))
+        self.assertFalse(s["schedule_complete"])
+        self.assertEqual(s["undecidable"], [f"q {m} every-round" for m in self.kit.STOP_METRICS])
+        self.assertIn("does not give the rounds it ran", self.kit.shadow_line("x", s))
+
+    def test_a_bound_rule_that_ran_to_a_missing_final_round_did_not_stop_early(self):
+        # rounds that swing across the bound never stop; with the final scheduled round gone,
+        # the query still ran every round it had, so it does not count as stopped early, and
+        # the bound's flag is the one of the rounds it has
+        noise = [1, 1.5, 0.8, 1.4, 0.9, 1.3, 1.0, 1.2]
+        d = self.drop_round(write_samples(self.d / "swing", 1.3, noise=noise), 8)
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+        q = s["queries"]["q"]
+        self.assertEqual((q["stop_round"], q["rounds"], q["how"]), (8, 8, "all"))
+        for m in self.kit.STOP_METRICS:
+            dec = q["metrics"][f"{m} bound"]
+            self.assertEqual((dec["stop_round"], dec["flagged"], dec["flagged_all_rounds"]), (8, True, True), m)
+        self.assertIn("0 of 4 queries would stop early", self.kit.shadow_line("x", s))
+
     def test_shadow_command_takes_the_schedule_from_the_pass_or_its_parent(self):
         for where in ("pass", "parent"):
             for rules in ("every-round", "bound,every-round"):

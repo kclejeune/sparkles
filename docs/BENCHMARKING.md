@@ -1260,10 +1260,11 @@ whether every round is above 1, so `EARLY_STOP_RULES=every-round`, which `stage
 at its first round at or below 1, where the answer is no whatever the later rounds hold, and
 otherwise runs every round, and a cost is flagged when every round is above 1 and the median
 adds more than 0.5 µs. A cost in every round needs timings of both variants in every round
-that the pass's `ROUNDS` scheduled, including a round that left no samples at all. When a
-round lacks them, or the pass and its parent have no run.env that gives `ROUNDS`, and no round
-is at or below 1, the question cannot be decided, so no cost is flagged and the record lists
-the query's metric as undecidable. The
+that the pass scheduled, including a round that left no samples at all. The schedule is
+`ROUNDS` in the pass's run.env, or in its parent's when the pass has none, where a rerun takes
+`RERUN_ROUNDS`. When a round lacks timings, the run.env that decides gives no count, or the
+pass ran rounds past it, and no round is at or below 1, the question cannot be decided, so no
+cost is flagged and the record lists the query's metric as undecidable. The
 bound's pooled flag is unaffected. `EARLY_STOP_RULES=bound,every-round` answers both questions, and the
 query stops at the later of the two stops. The default is `bound`. The controls run every
 round and judge the host's spread and drift, while the checks of answers, missing timings

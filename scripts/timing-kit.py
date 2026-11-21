@@ -904,11 +904,13 @@ def pass_check(d, pair):
 
 def pass_schedule(d):
     """The number of rounds the pass d scheduled, from ROUNDS in its run.env, which run_pass
-    writes, or in its parent's when the pass has none, as a replay of a stage finds it. None
-    when neither file exists or the first that exists gives no plain positive ROUNDS."""
-    for f in (Path(d) / "run.env", Path(d).parent / "run.env"):
+    writes, or in its parent's when the pass has none, as a replay of a stage finds it. A
+    rerun pass read from its parent takes RERUN_ROUNDS, which cmd_run gives it. None when
+    neither file exists or the first that exists gives no plain positive count."""
+    d = Path(d)
+    for f, key in ((d / "run.env", "ROUNDS"), (d.parent / "run.env", "RERUN_ROUNDS" if d.name == "rerun" else "ROUNDS")):
         if f.is_file():
-            v = read_env(f, []).get("ROUNDS", "")
+            v = read_env(f, []).get(key, "")
             return int(v) if v.isdigit() and int(v) > 0 else None
     return None
 
@@ -958,8 +960,10 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), sche
     if not order:
         raise ValueError(f"no samples of {x} and {y} in {path}")
     controls = [q for q in (controls if controls is not None else CONTROLS) if q in order]
-    # every scheduled round, and any round the pair ran past it
-    scheduled = sorted({k for (_q, k) in sent} | set(range(1, (schedule or 0) + 1)))
+    # every scheduled round; a round past the schedule means the schedule is not the pass's
+    ran = {k for (_q, k) in sent}
+    complete = schedule is not None and max(ran) <= schedule
+    scheduled = sorted(ran | set(range(1, (schedule or 0) + 1)))
     summary = load_summary_module()
     full = summary.validity(samples, order)
     full_ok, problems = pass_check(d, pair)
@@ -975,8 +979,14 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), sche
                 for k, _e, ms in xs:
                     rounds[k][v].append(ms)
             per_metric[metric] = dict(rounds)
-        stop, metrics = combined_stop(per_metric, bound, rules, scheduled, complete=schedule is not None)
+        stop, metrics = combined_stop(per_metric, bound, rules, scheduled, complete=complete)
         last = max(max(per_metric["exec_ms"]), stop, schedule or 0)
+        # a metric that ran every round it had ran to the end of the schedule, even when the
+        # schedule's last rounds left no rows, and no rows past them change its decisions
+        for dec in metrics.values():
+            if dec["how"] in ("all", "unjudged"):
+                dec["stop_round"] = last
+        stop = max(dec["stop_round"] for dec in metrics.values())
         if q in controls:  # a control runs every round, and all rounds decide
             stop = last
             for dec in metrics.values():
@@ -1013,7 +1023,7 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), sche
         "rule": {"kmin": EARLY_KMIN, "conf": EARLY_CONF, "bound": bound, "fallback_spread": FALLBACK_SPREAD,
                  "max_spread": summary.MAX_SPREAD, "metrics": list(STOP_METRICS), "rules": list(rules),
                  "every_round_added_us": EVERY_ROUND_ADDED_US},
-        "controls": controls, "schedule": schedule,
+        "controls": controls, "schedule": schedule, "schedule_complete": complete,
         "validity": {"all_rounds": valid_all, "shadow": valid_shadow, "controls": ctl, "fallback": fallback,
                      "all_rounds_spread": full and full["spread"], "pass_problems": problems},
         "queries": queries, "flags_differ": differ, "decisions_differ": decisions, "undecidable": unknown,
@@ -1032,7 +1042,8 @@ def shadow_line(label, s):
             f"{stopped} of {len(s['queries'])} queries would stop early, "
             + (f"flags differ for {', '.join(s['decisions_differ'])}, " if s["decisions_differ"] else "")
             + (f"the every-round question cannot decide {', '.join(s['undecidable'])}, since "
-               + ("a round has no usable pair" if s.get("schedule") else "the pass does not say how many rounds it scheduled")
+               + ("a round has no usable pair" if s.get("schedule_complete")
+                  else "the pass's run.env does not give the rounds it ran")
                + ", and flags no cost there, " if s.get("undecidable") else "")
             + f"{s['request_share']:.0%} of requests and {s['wall_share']:.0%} of client wall time would run.")
 
