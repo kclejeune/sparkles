@@ -411,6 +411,24 @@ class KitTests(unittest.TestCase):
 
     @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
                          and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")
+    def test_shadow_mode_works_where_launch_runs_the_kit(self):
+        # launch sends timing-kit.py and the stages to the host, and nothing else beside the
+        # kit, so shadow mode must take the summary script from the stage as the verdict does
+        r, s = self.stage(tips=(("slow", 1.3),))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        remote = self.d / "remote"
+        remote.mkdir()
+        shutil.copy(KIT, remote / "timing-kit.py")
+        shutil.move(s, remote / s.name)
+        s = remote / s.name
+        r = subprocess.run([sys.executable, "timing-kit.py", "run", s.name], capture_output=True, text=True,
+                           cwd=remote, env={**os.environ, **self.env}, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn("shadow mode failed", (s / "run.log").read_text())
+        self.assertIn("slow (B) against base (A): agrees with all rounds", (s / "shadow.md").read_text())
+
+    @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
+                         and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")
     def test_an_expected_answer_change_decides_for_the_listed_queries_only(self):
         why = "the fix returns the rows the old join lost"
         every = ",".join(sorted(CONTROLS + ["tiny"]))

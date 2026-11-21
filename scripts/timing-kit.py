@@ -862,14 +862,16 @@ def combined_stop(per_metric, bound, rules=("bound",), *, scheduled, complete):
     return stop, out
 
 
-def load_summary_module():
-    spec = importlib.util.spec_from_file_location("nsc_bench_summary", HERE / "nsc-bench-summary.py")
+def load_summary_module(script=None):
+    """nsc-bench-summary.py as a module, from script or else beside this kit. A run passes the
+    stage's copy, since launch sends only timing-kit.py beside the stages."""
+    spec = importlib.util.spec_from_file_location("nsc_bench_summary", script or HERE / "nsc-bench-summary.py")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-def pass_check(d, pair):
+def pass_check(d, pair, script=None):
     """The full-pass check of the pair on the finished pass d: whether nsc-bench-summary.py
     --check lets it decide, and what stops it apart from the host's spread and drift, which
     early stopping judges by the controls instead. The pair's summary is written to a
@@ -877,13 +879,14 @@ def pass_check(d, pair):
     import contextlib
     import io
     import tempfile
-    summary = load_summary_module()
+    script = Path(script or HERE / "nsc-bench-summary.py")
+    summary = load_summary_module(script)
     x, y = pair
     with tempfile.TemporaryDirectory() as tmp:
         for f in ("results", "run.env", "queries", "manifest.txt"):
             if (d / f).exists():
                 os.symlink((d / f).resolve(), Path(tmp) / f)
-        subprocess.run([sys.executable, str(HERE / "nsc-bench-summary.py"), "--pair", f"{x},{y}", tmp],
+        subprocess.run([sys.executable, str(script), "--pair", f"{x},{y}", tmp],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         j = Path(tmp) / f"summary-{x}-{y}.json"
         with contextlib.redirect_stderr(io.StringIO()):
@@ -917,7 +920,7 @@ def pass_schedule(d):
     return None
 
 
-def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), schedule=None):
+def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), schedule=None, script=None):
     """The early-stopping rule's decisions on the finished pass d beside those of all rounds.
 
     A query stops only once every rule in rules has stopped on both execution and wall time,
@@ -930,7 +933,9 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), sche
 
     The every-round question judges each of rounds 1..schedule, ROUNDS of the pass's run.env
     when schedule is None (pass_schedule), so a round that left no rows counts as a round
-    without a pair. When the schedule is unknown, that question cannot claim a cost."""
+    without a pair. When the schedule is unknown, that question cannot claim a cost.
+    script is the nsc-bench-summary.py that judges validity, the stage's copy in a run and
+    the one beside this kit when None."""
     d = Path(d)
     if schedule is None:
         schedule = pass_schedule(d)
@@ -966,9 +971,9 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), sche
     ran = {k for (_q, k) in sent}
     complete = schedule is not None and max(ran) <= schedule
     scheduled = sorted(ran | set(range(1, (schedule or 0) + 1)))
-    summary = load_summary_module()
+    summary = load_summary_module(script)
     full = summary.validity(samples, order)
-    full_ok, problems = pass_check(d, pair)
+    full_ok, problems = pass_check(d, pair, script)
     ctl = summary.validity(samples, controls) if len(controls) >= MIN_CONTROLS else None
     queries = {}
     for q in order:
@@ -1062,12 +1067,13 @@ def write_shadow(stage):
                  "The rule did not act. Every round ran, and verdict.md comes from all of them.", ""]
         for x, y in pairs_of(stage):
             s = shadow(stage / "pass1", (x, y), env.get("CONTROLS", " ".join(CONTROLS)).split(),
-                       float(env.get("FLAG_RATIO", "1.10")), env.get("EARLY_STOP_RULES", "bound").split(","))
+                       float(env.get("FLAG_RATIO", "1.10")), env.get("EARLY_STOP_RULES", "bound").split(","),
+                       script=stage / "nsc-bench-summary.py")
             (stage / "pass1" / f"shadow-{x}-{y}.json").write_text(json.dumps(s, indent=1) + "\n")
             lines.append(shadow_line(f"{label.get(y, y)} ({y}) against {label.get(x, x)} ({x})", s))
         (stage / "shadow.md").write_text("\n".join(lines) + "\n")
     except Exception as e:  # noqa: BLE001 - shadow mode must not change the run's result
-        log(stage, f"shadow mode failed, which changes nothing else: {e!r}")
+        log(stage, f"shadow mode failed, which changes nothing else: {type(e).__name__}: {e}")
 
 
 def cmd_shadow(a):
