@@ -178,7 +178,7 @@ fn generate(seed: u64) -> Case {
             add(&mut r, &mut st, format!("{n} rdfs:subClassOf :B ."));
         }
         if r.p(0.04) {
-            add(&mut r, &mut st, format!("{n} a :Custom ."));
+            triple(&mut r, &mut st, &mut reifiable, n, "rdf:type", ":Custom");
         }
         if r.p(0.05) {
             add(&mut r, &mut st, format!(":C rdfs:subClassOf {n} ."));
@@ -190,6 +190,30 @@ fn generate(seed: u64) -> Case {
             &mut st,
             format!("{} owl:priorVersion {} .", onodes[0], onodes[1]),
         );
+    }
+
+    // an ontology node typed with another one, which points to it when the full read
+    // reads the triple
+    if onodes.len() > 1 && r.p(0.4) {
+        let (a, b) = (onodes[0], onodes[1]);
+        let (a, b) = if r.p(0.5) { (a, b) } else { (b, a) };
+        triple(&mut r, &mut st, &mut reifiable, a, "rdf:type", b);
+    }
+    // vocabulary in other roles
+    if r.p(0.02) {
+        add(&mut r, &mut st, "rdf:type a owl:ObjectProperty .".into());
+    }
+    if r.p(0.03) {
+        add(&mut r, &mut st, "rdfs:label a owl:ObjectProperty .".into());
+    }
+    if r.p(0.04) && !onodes.is_empty() {
+        add(
+            &mut r,
+            &mut st,
+            "xsd:minLength a owl:AnnotationProperty .".into(),
+        );
+        let n = onodes[0];
+        triple(&mut r, &mut st, &mut reifiable, n, "xsd:minLength", "\"1\"");
     }
 
     // declarations, some of them counted through reifications
@@ -298,7 +322,7 @@ fn generate(seed: u64) -> Case {
         };
         let on_header: Vec<Triple> = reifiable
             .iter()
-            .filter(|t| onodes.contains(&t.0.as_str()) && t.1 != "rdf:type")
+            .filter(|t| onodes.contains(&t.0.as_str()) && t.2 != "owl:Ontology")
             .cloned()
             .collect();
         let (s, p, o) = if !on_header.is_empty() && r.p(0.5) {

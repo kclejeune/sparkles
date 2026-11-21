@@ -438,7 +438,8 @@ impl<'a> Reader<'a> {
                     }
                 }
             }
-            let Some(qs) = self.kept_quads(Perm::Spo, &[id.0, t.0], MAX_FRAGMENT)? else {
+            let room = MAX_FRAGMENT.saturating_sub(f.quads.len());
+            let Some(qs) = self.kept_quads(Perm::Spo, &[id.0, t.0], room)? else {
                 return Ok(false);
             };
             for q in qs {
@@ -489,7 +490,8 @@ impl<'a> Reader<'a> {
             if !self.ontology_node(*n, onto)? {
                 return Ok(None);
             }
-            let Some(qs) = self.kept_quads(Perm::Spo, &[n.0], MAX_FRAGMENT)? else {
+            let room = MAX_FRAGMENT.saturating_sub(f.quads.len());
+            let Some(qs) = self.kept_quads(Perm::Spo, &[n.0], room)? else {
                 return Ok(None);
             };
             for q in qs {
@@ -552,8 +554,9 @@ impl<'a> Reader<'a> {
     /// reifier (`None`). `r` is a blank node with one source that nothing else names, typed
     /// `owl:Annotation`, or `owl:Axiom` when it reifies a root's triple, and nothing else.
     /// Its other triples that the full read reads are annotations, and the property it
-    /// reifies is an annotation predicate, `rdf:type` of a root, or `owl:imports` or
-    /// `owl:versionIRI` of an ontology node.
+    /// reifies is an annotation predicate, `rdf:type` of a root with a structural type, or
+    /// `owl:imports` or `owl:versionIRI` of an ontology node, so that its main triple is
+    /// one the fragment holds.
     fn reifier(&self, r: Id, root: Option<Root>) -> Result<bool> {
         if !self.is_bnode(r) || !self.unreferenced(r)? {
             return Ok(false);
@@ -570,6 +573,8 @@ impl<'a> Reader<'a> {
             .collect();
         let mut types: FxHashSet<Id> = FxHashSet::default();
         let mut sources: FxHashSet<Id> = FxHashSet::default();
+        let mut targets: Vec<Id> = Vec::new();
+        let mut typing = false;
         let mut ok = true;
         self.each(Perm::Spo, &[r.0], |q| {
             ok = if Some(q[1]) == self.rdf_type {
@@ -585,10 +590,12 @@ impl<'a> Reader<'a> {
                 sources.insert(q[2]);
                 true
             } else if Some(q[1]) == prop {
+                typing |= Some(q[2]) == self.rdf_type;
                 self.annotation_predicate(q[2])
                     || (root.is_some() && Some(q[2]) == self.rdf_type)
                     || (root == Some(Root::Ontology) && header_roles.contains(&q[2]))
             } else if Some(q[1]) == tgt {
+                targets.push(q[2]);
                 true
             } else {
                 !self.kept(&q) || self.annotation_predicate(q[1])
@@ -596,6 +603,12 @@ impl<'a> Reader<'a> {
             Ok(ok)
         })?;
         if !ok || sources.len() != 1 || types.len() != 1 {
+            return Ok(false);
+        }
+        // a reified type triple whose type is not structural is a main triple that
+        // `read_store` reads outside the fragment, and the choice of the header reads every
+        // triple of an ontology node
+        if typing && !targets.iter().all(|t| self.structural.contains(t)) {
             return Ok(false);
         }
         let ty = types.into_iter().next();
@@ -636,7 +649,8 @@ impl<'a> Reader<'a> {
                 if !self.reifier(r, roots.get(&x).copied())? {
                     return Ok(false);
                 }
-                let Some(qs) = self.kept_quads(Perm::Spo, &[r.0], MAX_FRAGMENT)? else {
+                let room = MAX_FRAGMENT.saturating_sub(f.quads.len());
+                let Some(qs) = self.kept_quads(Perm::Spo, &[r.0], room)? else {
                     return Ok(false);
                 };
                 for q in qs {
@@ -709,7 +723,8 @@ impl<'a> Reader<'a> {
             let mut f = Fragment::default();
             for s in &reified {
                 let Some(t) = self.rdf_type else { break };
-                let Some(qs) = self.kept_quads(Perm::Spo, &[s.0, t.0], MAX_FRAGMENT)? else {
+                let room = MAX_FRAGMENT.saturating_sub(f.quads.len());
+                let Some(qs) = self.kept_quads(Perm::Spo, &[s.0, t.0], room)? else {
                     return Ok(None);
                 };
                 for q in qs {

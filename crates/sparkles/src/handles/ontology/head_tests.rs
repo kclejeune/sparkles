@@ -185,6 +185,17 @@ const REIFIER_DISJOINT_HEADER: &str = ":o a owl:Ontology ; rdfs:label \"title\" 
         owl:members (:A :B) ; rdfs:comment \"nested\" .
     :A rdfs:subClassOf :B .";
 
+const HEADER_CHOICE: &str = ":a a owl:Ontology ; rdfs:label \"a\" .
+    :z a owl:Ontology, :a ; rdfs:label \"z\" .
+    _:r a owl:Annotation ; owl:annotatedSource :z ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget :a .";
+
+const HEADER_CHOICE_G1: &str = "GRAPH <http://ex.org/g1> {
+    :a a owl:Ontology ; rdfs:label \"a\" .
+    :z a owl:Ontology, :a ; rdfs:label \"z\" .
+    _:r a owl:Annotation ; owl:annotatedSource :z ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget :a . }";
+
 pub(super) const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "basic",
@@ -376,6 +387,21 @@ pub(super) const FIXTURES: &[Fixture] = &[
         data: REIFIER_DISJOINT_HEADER,
         args: strict,
     },
+    Fixture {
+        name: "header-choice",
+        data: HEADER_CHOICE,
+        args: default_args,
+    },
+    Fixture {
+        name: "header-choice-strict",
+        data: HEADER_CHOICE,
+        args: strict,
+    },
+    Fixture {
+        name: "header-choice-g1",
+        data: HEADER_CHOICE_G1,
+        args: g1,
+    },
 ];
 
 /// The fixtures whose reading needs the whole mapping, so that the head opens the ontology.
@@ -400,6 +426,9 @@ const OPENED: &[&str] = &[
     "disjoint-header-strict",
     "reifier-disjoint-header",
     "reifier-disjoint-header-strict",
+    "header-choice",
+    "header-choice-strict",
+    "header-choice-g1",
 ];
 
 fn g1_g1() -> J {

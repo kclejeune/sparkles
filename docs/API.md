@@ -1870,11 +1870,12 @@ declarations and not with the axioms, which the full summary maps first. Its val
 the full summary's. The server answers from these reads only when no other triple can
 change the answer. An ontology node may hold its type, `owl:imports`, `owl:versionIRI` and
 annotations. An annotation node may hold one type, one source, the property and target it
-annotates and its own annotations, and no other triple may name it. Any other part in the
+annotates and its own annotations, and only the annotation nodes that annotate its own
+annotations may name it. Any other part in the
 mapping opens the ontology and answers from the mapping. Examples are an
 `owl:AllDisjointClasses` type on an ontology or annotation node, an `owl:Axiom` node that
-annotates another annotation node, and the reification of a predicate that is not an
-annotation property. The ontology also opens when a graph types `rdf:type` or another
+annotates another annotation node, and the reification of a predicate other than an
+annotation property, `owl:imports`, `owl:versionIRI`, or `rdf:type` with an OWL or RDF Schema type. The ontology also opens when a graph types `rdf:type` or another
 structural predicate as an OWL property, when an IRI the header uses has an annotated
 declaration, and past the head's bounds, such as more than 1,000 ontology nodes or 10,000
 reified type triples.

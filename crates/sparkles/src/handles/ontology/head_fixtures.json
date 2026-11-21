@@ -760,6 +760,135 @@
       "owl:imports <http://ex.org/missing> did not resolve to a graph"
     ]
   },
+  "header-choice": {
+    "axiomCount": 1,
+    "axioms": {
+      "ClassAssertion": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/a> is not declared and was read as Class from its use",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"z\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/z",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 9,
+    "unmapped": 4,
+    "warnings": []
+  },
+  "header-choice-g1": {
+    "axiomCount": 1,
+    "axioms": {
+      "ClassAssertion": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/a> is not declared and was read as Class from its use",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {},
+    "graphs": [
+      "http://ex.org/g1"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"z\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/z",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 9,
+    "unmapped": 4,
+    "warnings": []
+  },
+  "header-choice-strict": {
+    "axiomCount": 0,
+    "axioms": {},
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 5,
+      "list": [
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedSource> <http://ex.org/z> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedProperty> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedTarget> <http://ex.org/a> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Annotation> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/z> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://ex.org/a> maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 0
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"z\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/z",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 9,
+    "unmapped": 5,
+    "warnings": []
+  },
   "header-strict": {
     "axiomCount": 4,
     "axioms": {
