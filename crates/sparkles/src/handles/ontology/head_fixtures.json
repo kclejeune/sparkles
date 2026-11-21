@@ -1,0 +1,723 @@
+{
+  "annotated": {
+    "axiomCount": 3,
+    "axioms": {
+      "Declaration": 3
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "missing-main",
+          "message": "the owl:Axiom node _:b1 annotates a triple the graph does not hold",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {
+      "Class": 3
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 23,
+    "unmapped": 5,
+    "warnings": []
+  },
+  "annotated-strict": {
+    "axiomCount": 3,
+    "axioms": {
+      "Declaration": 3
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 5,
+      "list": [
+        {
+          "code": "missing-main",
+          "message": "the owl:Axiom node _:b1 annotates a triple the graph does not hold",
+          "severity": "warning"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/2002/07/owl#annotatedSource> <http://ex.org/Z> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/2002/07/owl#annotatedProperty> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/2002/07/owl#annotatedTarget> <http://www.w3.org/2002/07/owl#Class> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/2000/01/rdf-schema#comment> \"reified only\" maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Axiom> maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {
+      "Class": 3
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 23,
+    "unmapped": 5,
+    "warnings": []
+  },
+  "basic": {
+    "axiomCount": 9,
+    "axioms": {
+      "Declaration": 8,
+      "SubClassOf": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "AnnotationProperty": 1,
+      "Class": 3,
+      "DataProperty": 1,
+      "Datatype": 1,
+      "NamedIndividual": 1,
+      "ObjectProperty": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 14,
+    "unmapped": 1,
+    "warnings": []
+  },
+  "basic-strict": {
+    "axiomCount": 9,
+    "axioms": {
+      "Declaration": 8,
+      "SubClassOf": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 1,
+      "list": [
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Class> maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 0
+    },
+    "entities": {
+      "AnnotationProperty": 1,
+      "Class": 3,
+      "DataProperty": 1,
+      "Datatype": 1,
+      "NamedIndividual": 1,
+      "ObjectProperty": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 14,
+    "unmapped": 1,
+    "warnings": []
+  },
+  "blank-node": {
+    "axiomCount": 1,
+    "axioms": {
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"anonymous\")"
+      ],
+      "imports": [],
+      "iri": null,
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 4,
+    "unmapped": 1,
+    "warnings": []
+  },
+  "graphs-imports": {
+    "axiomCount": 5,
+    "axioms": {
+      "Declaration": 5
+    },
+    "closure": [
+      {
+        "cycle": false,
+        "from": "http://ex.org/g1",
+        "graphs": [
+          "http://ex.org/g2"
+        ],
+        "iri": "http://ex.org/g2",
+        "via": "graph"
+      }
+    ],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 4,
+      "ObjectProperty": 1
+    },
+    "graphs": [
+      "http://ex.org/g1",
+      "http://ex.org/g2"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"one\")"
+      ],
+      "imports": [
+        "http://ex.org/g2"
+      ],
+      "iri": "http://ex.org/g1",
+      "versionIri": null
+    },
+    "imports": [
+      {
+        "graph": "http://ex.org/g2",
+        "iri": "http://ex.org/g2"
+      }
+    ],
+    "mode": "lenient",
+    "triples": 16,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "graphs-no-imports": {
+    "axiomCount": 2,
+    "axioms": {
+      "Declaration": 2
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 2
+    },
+    "graphs": [
+      "http://ex.org/g1"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"one\")"
+      ],
+      "imports": [
+        "http://ex.org/g2"
+      ],
+      "iri": "http://ex.org/g1",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 10,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "graphs-two": {
+    "axiomCount": 5,
+    "axioms": {
+      "Declaration": 5
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 4,
+      "ObjectProperty": 1
+    },
+    "graphs": [
+      "http://ex.org/g1",
+      "http://ex.org/g2"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"one\")"
+      ],
+      "imports": [
+        "http://ex.org/g2"
+      ],
+      "iri": "http://ex.org/g1",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 16,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "header": {
+    "axiomCount": 4,
+    "axioms": {
+      "AnnotationAssertion": 2,
+      "Declaration": 2
+    },
+    "closure": [
+      {
+        "cycle": false,
+        "from": "default",
+        "graphs": [],
+        "iri": "http://ex.org/missing",
+        "via": null
+      }
+    ],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "AnnotationProperty": 1,
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(<http://ex.org/ann> \"declared\")",
+        "Annotation(rdfs:label \"Onto\"@en)",
+        "Annotation(rdfs:seeAlso _:b0)",
+        "Annotation(owl:priorVersion <http://ex.org/o0>)"
+      ],
+      "imports": [
+        "http://ex.org/missing"
+      ],
+      "iri": "http://ex.org/o",
+      "versionIri": "http://ex.org/v1"
+    },
+    "imports": [
+      {
+        "graph": null,
+        "iri": "http://ex.org/missing"
+      }
+    ],
+    "mode": "lenient",
+    "triples": 18,
+    "unmapped": 0,
+    "warnings": [
+      "owl:imports <http://ex.org/missing> did not resolve to a graph"
+    ]
+  },
+  "header-strict": {
+    "axiomCount": 4,
+    "axioms": {
+      "AnnotationAssertion": 2,
+      "Declaration": 2
+    },
+    "closure": [
+      {
+        "cycle": false,
+        "from": "default",
+        "graphs": [],
+        "iri": "http://ex.org/missing",
+        "via": null
+      }
+    ],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "AnnotationProperty": 1,
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(<http://ex.org/ann> \"declared\")",
+        "Annotation(rdfs:label \"Onto\"@en)",
+        "Annotation(rdfs:seeAlso _:b0)",
+        "Annotation(owl:priorVersion <http://ex.org/o0>)"
+      ],
+      "imports": [
+        "http://ex.org/missing"
+      ],
+      "iri": "http://ex.org/o",
+      "versionIri": "http://ex.org/v1"
+    },
+    "imports": [
+      {
+        "graph": null,
+        "iri": "http://ex.org/missing"
+      }
+    ],
+    "mode": "strict",
+    "triples": 18,
+    "unmapped": 0,
+    "warnings": [
+      "owl:imports <http://ex.org/missing> did not resolve to a graph"
+    ]
+  },
+  "no-header": {
+    "axiomCount": 2,
+    "axioms": {
+      "Declaration": 2
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 2
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": null,
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 2,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "owl1": {
+    "axiomCount": 14,
+    "axioms": {
+      "Declaration": 8,
+      "FunctionalObjectProperty": 1,
+      "InverseFunctionalObjectProperty": 1,
+      "SubClassOf": 1,
+      "SymmetricObjectProperty": 1,
+      "TransitiveObjectProperty": 2
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/X> is not declared and was read as Class from its use",
+          "severity": "warning"
+        },
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/u> is not declared and was read as Class from its use",
+          "severity": "warning"
+        },
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/fp> is not declared and was read as ObjectProperty from its characteristic",
+          "severity": "warning"
+        },
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/X> is typed rdfs:Class and was read as a class declaration",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 4
+    },
+    "entities": {
+      "AnnotationProperty": 1,
+      "Class": 2,
+      "Datatype": 1,
+      "ObjectProperty": 4
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 20,
+    "unmapped": 4,
+    "warnings": []
+  },
+  "owl1-strict": {
+    "axiomCount": 11,
+    "axioms": {
+      "Declaration": 7,
+      "InverseFunctionalObjectProperty": 1,
+      "SymmetricObjectProperty": 1,
+      "TransitiveObjectProperty": 2
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 7,
+      "list": [
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/u> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/X> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/V> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Restriction> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/R> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Restriction> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/dr> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#DataRange> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/fp> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#FunctionalProperty> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/X> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2000/01/rdf-schema#Class> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/rp> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 0
+    },
+    "entities": {
+      "AnnotationProperty": 1,
+      "Class": 1,
+      "Datatype": 1,
+      "ObjectProperty": 4
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 20,
+    "unmapped": 7,
+    "warnings": []
+  },
+  "punning": {
+    "axiomCount": 12,
+    "axioms": {
+      "Declaration": 12
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "AnnotationProperty": 2,
+      "Class": 3,
+      "DataProperty": 1,
+      "Datatype": 1,
+      "NamedIndividual": 1,
+      "ObjectProperty": 4
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 13,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "punning-strict": {
+    "axiomCount": 12,
+    "axioms": {
+      "Declaration": 12
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "AnnotationProperty": 2,
+      "Class": 3,
+      "DataProperty": 1,
+      "Datatype": 1,
+      "NamedIndividual": 1,
+      "ObjectProperty": 4
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 13,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "two-nodes": {
+    "axiomCount": 1,
+    "axioms": {
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "header",
+          "message": "2 ontology nodes in the graphs read; the header is <http://ex.org/b>",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"b\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/b",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 5,
+    "unmapped": 0,
+    "warnings": []
+  }
+}
