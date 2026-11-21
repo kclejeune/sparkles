@@ -2113,6 +2113,7 @@ impl Saturation {
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
+            self.disjoint = Vec::new();
             self.dynamic = None;
             self.dl_run = None;
         }
@@ -2145,13 +2146,21 @@ impl Saturation {
         // The old index is no longer read. Drop its handles before constructing the
         // replacement, while cached contexts retain their shared numeric ledger.
         self.index = None;
-        // the kept contexts, which stay as they are until the invalidation
+        // the kept contexts, which stay as they are until the invalidation, and the last
+        // run's disjointness sets, which stay until the comparison below
         let kept_bytes = self.context_bytes();
+        let kept_capacity = self.ctx.capacity();
+        let sets_bytes = self.disjoint.capacity() * 24
+            + self
+                .disjoint
+                .iter()
+                .map(|d| d.capacity() * 4)
+                .sum::<usize>();
         let (mut ax, mut ix, mut normalized_peak, outside_el) = self.build(
             axioms,
             &outside,
             threads,
-            held_bytes + old_bytes,
+            held_bytes + old_bytes + sets_bytes,
             kept_bytes,
             limits,
         )?;
@@ -2296,7 +2305,10 @@ impl Saturation {
             stats.incremental = true;
             // the invalidation's bit sets, one bit for each expression and each context,
             // beside the kept contexts, the index and the normalized axioms
-            let bits = (self.interner.len() + self.ctx.len()).div_ceil(8);
+            let bits = 8 * (self.interner.len().div_ceil(64) + self.ctx.len().div_ceil(64));
+            // the context table may have grown for the expressions the edit added
+            let slot = std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
+            let kept_bytes = kept_bytes + self.ctx.capacity().saturating_sub(kept_capacity) * slot;
             let held = self.index_bytes(&ix)
                 + held_bytes
                 + ax.bytes()

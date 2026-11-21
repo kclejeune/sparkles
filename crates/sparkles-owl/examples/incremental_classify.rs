@@ -16,8 +16,10 @@
 //! index with the normalization, of the saturation and of the taxonomy in the kept and
 //! in the full runs, and the classifier's estimate of the bytes it keeps and of its
 //! peak, with the steps of the kept runs that started again and of the cold run. The
-//! steps also give the part of the saturation after its first pass, the
-//! marking of real contexts with the facts, the key merges and the worlds. With `--abox`
+//! steps also give `Stats::marking`, the part of the saturation from the end of the
+//! first saturation and of Tier D's tests to the end of the stage: the marking of real
+//! contexts with the facts, the key merges, the witnesses and the worlds, and the counts
+//! and diagnostics that close the stage. With `--abox`
 //! the edited axiom is chosen among the assertions about individuals instead. On Linux
 //! the line also gives the resident bytes of the process before the first edit's run
 //! and their peak during it, which no full run beside it has touched, and the peak
