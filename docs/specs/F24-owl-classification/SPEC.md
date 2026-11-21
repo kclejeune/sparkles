@@ -221,31 +221,33 @@ literals to the contexts that hold them, and each holder resolves a returned cla
 its own premises for the body, again when a premise comes later. The sends and the returns
 count against the work bound. With the repair on and the check off, the two generated
 corpora built around the loss lose 1,168 and 262 entailments without the repair and none
-with it, the fixtures built for each order of arrival fail without it and pass with it,
-and no run that finishes on the other generated corpora, with or without counting and on
-one and four threads, differs from HermiT apart from g2-150. With the repair off, every
-corpus gives the same answers and the same counts of derived conclusions as before. With
-the diagnostic `SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in
-`Stats::dl_marker_deficits` the markers and returned products that its quiescent contexts
-still owe, and every finished run on the corpora owes none with the repair. The repair
-derives 1.02 to 1.12 times the conclusions on the generated corpora, and 1.4 to 1.6 times
-on the two built around the loss, which now derive the missing entailments, so a few runs
-near the bound pass it and give their default answer.
+with it. Twelve fixtures built for particular orders of arrival fail without it and pass
+with it, although no fixture isolates a returned clause that the root subsumes later or a
+return followed by a late premise that it misses. No run that finishes on the other
+generated corpora, with or without counting and on one and four threads, differs from
+HermiT apart from g2-150. With the repair off, every corpus gives the same answers and the
+same counts of derived conclusions as before. With the diagnostic
+`SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in `Stats::dl_marker_deficits` the markers
+and returned products that its quiescent contexts still owe, and every finished run on the
+corpora owes none with the repair. The repair derives 1.02 to 1.12 times the conclusions
+on the generated corpora, and 1.4 to 1.6 times on the two built around the loss, which now
+derive the missing entailments, so a few runs near the bound pass it and give their
+default answer.
 
 With the selection of ground body literals off, the setting of item 1220's measurements,
 the repair's returns derive more. On one purpose-built ontology they add 24% to the
-derived conclusions,
-and on the generated ontology g1-051_p0012 the run passes the work bound at 4 million
-conclusions and the memory budget of 1 GiB at 400 million, against 455,967 conclusions
-without the repair. `SPARKLES_ROOTED_MARKER_REPAIR=129` resolves a returned clause only
-with premises whose body has no ground literal. It loses no answer on the corpora, takes
-that ontology's cost to 10.5% and finishes ten runs that the repair alone takes past the bound,
-but g1-051_p0012 still passes the bound, where the growth is in Pred over successor terms
-of constants and in Join, which item 1250 follows, and g1-051_p0121 derives 1.42 million
-conclusions against 1.17 million with the repair alone. The repair's state costs 8 bytes
-per context with the repair off, which item 1247 removes, and a synthetic family whose
-conditions nest two or more deep grows with the repair's sends, which is item 1251. The
-repair's completeness is not proved, and the check stays on by default.
+derived conclusions, and on the generated ontology g1-051_p0012 the run passes the work
+bound at 4 million conclusions and the memory budget of 1 GiB at 400 million, against
+455,967 conclusions without the repair. `SPARKLES_ROOTED_MARKER_REPAIR=129` resolves a
+returned clause only with premises whose body has no ground literal. It loses no answer on
+the corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten
+runs that the repair alone takes past the bound, but g1-051_p0012 still passes the bound,
+where the growth is in Pred over successor terms of constants and in Join, which item 1250
+follows, and g1-051_p0121 derives 1.42 million conclusions against 1.17 million with the
+repair alone. The repair's state costs 8 bytes per context with the repair off, which item
+1247 removes, and a synthetic family whose conditions nest two or more deep grows with the
+repair's sends, which is item 1251. The repair's completeness is not proved, and the check
+stays on by default.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
