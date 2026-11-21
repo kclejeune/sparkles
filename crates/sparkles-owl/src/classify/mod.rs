@@ -296,7 +296,7 @@ pub struct Limits {
     /// unproved. A run with the option off keeps the rooted answer, for measurements.
     pub rooted_decline: bool,
     /// whether a rooted run repairs the delivery of conditional ground facts (roadmap item
-    /// 1231, PLAN v3.1's rule M), a prototype that is off by default and changes nothing
+    /// 1231), a prototype that is off by default and changes nothing
     /// without [`rooted`](Limits::rooted). A context that holds a ground literal as a
     /// condition tells the root, which sends the literal's marker to the contexts
     /// registered for its individuals, and the root returns its clauses whose bodies are

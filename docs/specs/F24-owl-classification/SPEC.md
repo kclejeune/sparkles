@@ -220,17 +220,18 @@ registers or becomes reachable later. The root returns its clauses whose bodies 
 literals to the contexts that hold them, and each holder resolves a returned clause with
 its own premises for the body, again when a premise comes later. The sends and the returns
 count against the work bound. With the repair on and the check off, the two generated
-corpora built around the loss lose 1,168 and 262 entailments without the repair and none
-with it. Twelve fixtures built for particular orders of arrival fail without it and pass
-with it, although no fixture isolates a returned clause that the root subsumes later or a
-return followed by a late premise that it misses. No run that finishes on the other
-generated corpora, with or without counting and on one and four threads, differs from
-HermiT apart from g2-150. With the repair off, every corpus gives the same answers and the
-same counts of derived conclusions as before. With the diagnostic
+corpora built around the loss give 1,168 and 262 runs that differ from HermiT without the
+repair and none with it. Twelve fixtures built for particular orders of arrival fail
+without it and pass with it, although no fixture isolates a returned clause that the root
+subsumes later or a return followed by a late premise that it misses. No run that finishes
+on the other generated corpora, with or without counting and on one and four threads,
+differs from HermiT apart from g2-150. With the repair off, every corpus gives the same
+answers and the same counts of derived conclusions as before. With the diagnostic
 `SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in `Stats::dl_marker_deficits` the markers
 and returned products that its quiescent contexts still owe, and every finished run on the
 corpora owes none with the repair. The repair derives 1.02 to 1.12 times the conclusions
-on the generated corpora, and 1.4 to 1.6 times on the two built around the loss, which now
+on the larger generated corpora, up to 1.39 times on corpora of small files, up to 1.28
+times with counting and 1.4 to 1.6 times on the two built around the loss, which now
 derive the missing entailments, so a few runs near the bound pass it and give their
 default answer.
 
