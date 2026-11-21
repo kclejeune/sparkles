@@ -246,7 +246,7 @@ fn search(
     budget: &mut u64,
     stop: &dyn Fn() -> bool,
 ) -> Option<bool> {
-    if *budget == 0 || (*budget % POLL == 0 && stop()) {
+    if *budget == 0 || (budget.is_multiple_of(POLL) && stop()) {
         return None;
     }
     *budget -= 1;
