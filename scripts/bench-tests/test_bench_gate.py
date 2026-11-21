@@ -5,6 +5,7 @@
 
 import copy
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -798,6 +799,310 @@ class GateTests(unittest.TestCase):
                                capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertIn("Answers differ or failed for: sorted", r.stdout)
+
+    def test_cell_summary_reads_one_pair_of_a_queue(self):
+        # a base A and two tips B and C, with C 20% slower than A and B as fast as A
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            epoch = 0
+            for rnd in (1, 2):
+                for v in "ABCCBA":
+                    epoch += 1
+                    for rep in (1, 2):
+                        x = {"A": 1.0, "B": 1.0, "C": 1.2}[v] * (1 + 0.001 * epoch)
+                        lines.append(f"{rnd}\t{epoch}\t{v}\tq\t{rep}\t{x}\t{x + 1}")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            res.joinpath("answers.tsv").write_text("A\tq\t1\tx\nB\tq\t1\tx\nC\tq\t1\ty\n")
+            summary = SCRIPTS / "nsc-bench-summary.py"
+            r = subprocess.run([sys.executable, str(summary), "--pair", "A,C", d], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("Variant A is A and variant C is B", r.stdout)
+            self.assertIn("Answers differ or failed for: q", r.stdout)
+            s = json.loads((Path(d) / "summary-A-C.json").read_text())
+            self.assertAlmostEqual(s["queries"]["q"]["exec_ms"]["ratio"], 1.2, places=2)
+            self.assertTrue(s["validity"]["valid"])
+            self.assertEqual(s["pair"], {"A": "A", "B": "C"})
+            r = subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, text=True)
+            self.assertIn("same sorted TSV answers", r.stdout)
+            s = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertAlmostEqual(s["queries"]["q"]["exec_ms"]["ratio"], 1.0, places=2)
+            # C's other answer to q stops the pair A,B too, since every arm of a run must agree
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check",
+                                             str(Path(d) / "summary-A-B.json"), "first"]).returncode, 1)
+            r = subprocess.run([sys.executable, str(summary), "--pair", "A,A", d], capture_output=True, text=True)
+            self.assertIn("two different variants", r.stderr)
+
+    def test_cell_summary_refuses_incomplete_comparisons(self):
+        summary = SCRIPTS / "nsc-bench-summary.py"
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            res.joinpath("answers.tsv").write_text(
+                "".join(f"{v}\t{q}\t1\tx\n" for v in "AB" for q in ("q", "r", "control", "tiny")))
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            for epoch, v in enumerate("ABBA", 1):
+                lines.append(f"1\t{epoch}\t{v}\tq\t1\t1.0\t2")
+                # every B request of r failed
+                lines.append(f"1\t{epoch}\t{v}\tr\t1\t" + ("error\terror" if v == "B" else "1.0\t2"))
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            out = subprocess.run([sys.executable, str(summary), d], capture_output=True, text=True).stdout
+            self.assertIn("No timings of both variants for: r", out)
+            s = json.loads((Path(d) / "summary.json").read_text())
+            self.assertEqual(s["missing"], ["r"])
+            self.assertEqual(s["errors"], {"r B": 2})
+            self.assertTrue(s["validity"]["valid"])
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                             "first"]).returncode, 1)
+            # one server process of B gives no spread to judge
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            for epoch, v in enumerate("ABA", 1):
+                lines.append(f"1\t{epoch}\t{v}\tq\t1\t1.0\t2")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            out = subprocess.run([sys.executable, str(summary), d], capture_output=True, text=True).stdout
+            self.assertIn("INVALID: a query has a variant with one server process", out)
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                             "first"]).returncode, 1)
+            # a query under 0.3 ms takes no part in the spread, but with every request but one
+            # of each variant failed, one server process per variant still cannot decide it
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            for rnd in (1, 2):
+                for i, v in enumerate("ABBA"):
+                    epoch = 4 * (rnd - 1) + i + 1
+                    lines.append(f"{rnd}\t{epoch}\t{v}\tcontrol\t1\t1.0\t2")
+                    lines.append(f"{rnd}\t{epoch}\t{v}\ttiny\t1\t" + ("0.1\t0.2" if epoch in (1, 2) else "error\terror"))
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            out = subprocess.run([sys.executable, str(summary), d], capture_output=True, text=True).stdout
+            s = json.loads((Path(d) / "summary.json").read_text())
+            self.assertTrue(s["validity"]["valid"])
+            self.assertEqual(s["thin"], ["tiny"])
+            self.assertIn("fewer than two server processes of a variant for: tiny", out)
+            for kind, flagged in (("first", ""), ("rerun", "tiny")):
+                self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                                 kind, flagged]).returncode, 1, kind)
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                             "rerun", "control"]).returncode, 0)
+            # a summary written before the epoch counts is refused with a way out
+            old = json.loads((Path(d) / "summary.json").read_text())
+            for q in old["queries"].values():
+                for m in q.values():
+                    m.pop("epochs_a"), m.pop("epochs_b")
+            (Path(d) / "old.json").write_text(json.dumps(old))
+            r = subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "old.json"), "rerun", "control"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("Regenerate it with nsc-bench-summary.py", r.stderr)
+
+    def test_cell_summary_refuses_answers_that_differ_fail_or_are_missing(self):
+        summary = SCRIPTS / "nsc-bench-summary.py"
+
+        def check(d, name, kind, flagged=""):
+            return subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / name), kind, flagged],
+                                  capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            # a quiet run of A, B and C, where every query takes 1 ms in each
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            epoch = 0
+            for rnd in (1, 2):
+                for v in "ABCCBA":
+                    epoch += 1
+                    for q in ("p", "q"):
+                        lines.append(f"{rnd}\t{epoch}\t{v}\t{q}\t1\t1.0\t2")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            cases = {
+                # the equal-answer control decides
+                "same": ("A\tp\t1\tx\nA\tq\t1\ty\nB\tp\t1\tx\nB\tq\t1\ty\n", {"p": "same", "q": "same"}, 0),
+                # one COUNT(*) answer of B differs
+                "differ": ("A\tp\t1\tx\nA\tq\t1\ty\nB\tp\t1\tx\nB\tq\t1\tz\n", {"p": "same", "q": "differ"}, 1),
+                # every answer check failed
+                "failed": ("A\tp\terror\terror\nA\tq\terror\terror\nB\tp\terror\terror\nB\tq\terror\terror\n",
+                           {"p": "failed", "q": "failed"}, 1),
+                # an empty order digest of both variants is a failed check, not an equal answer
+                "empty": ("A\tp\t1\tx\t\nA\tq\t1\ty\t-\nB\tp\t1\tx\t\nB\tq\t1\ty\t-\n", {"p": "failed", "q": "same"}, 1),
+                # B's answer rows are absent
+                "missing": ("A\tp\t1\tx\nA\tq\t1\ty\n", {"p": "missing", "q": "missing"}, 1),
+                # an empty TSV response counts -1 rows, and the same malformed record of both
+                # variants is a failed check
+                "negative": ("A\tp\t-1\te3b0\nA\tq\t1\ty\nB\tp\t-1\te3b0\nB\tq\t1\ty\n", {"p": "failed", "q": "same"}, 1),
+                "nonnumeric": ("A\tp\tmany\tx\nA\tq\t1\ty\nB\tp\tmany\tx\nB\tq\t1\ty\n", {"p": "failed", "q": "same"}, 1),
+                "extra": ("A\tp\t1\tx\t-\tz\nA\tq\t1\ty\nB\tp\t1\tx\t-\tz\nB\tq\t1\ty\n", {"p": "failed", "q": "same"}, 1),
+            }
+            for name, (rows, status, rc) in cases.items():
+                # C answers as A does, so that only the pair decides here
+                c = "".join("C" + line[1:] + "\n" for line in rows.splitlines() if line.startswith("A"))
+                res.joinpath("answers.tsv").write_text(rows + c)
+                out = subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, text=True)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                s = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertTrue(s["validity"]["valid"], name)
+                self.assertEqual(s["answers"], status, name)
+                self.assertEqual("same sorted TSV answers" in out.stdout, rc == 0, name)
+                r = check(d, "summary-A-B.json", "first")
+                self.assertEqual(r.returncode, rc, name)
+                if rc:
+                    self.assertIn("answer", r.stderr, name)
+                # a rerun of q is judged by q's answers, and a rerun of p by p's
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "q").returncode, int(status["q"] != "same"), name)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, int(status["p"] != "same"), name)
+            # in the same multi-variant run, C's other answer to p stops every pair, since the
+            # arms of one run must all answer alike, and the pair with C names its own reason
+            res.joinpath("answers.tsv").write_text(cases["same"][0] + "C\tp\t1\tother\nC\tq\t1\ty\n")
+            for pair in ("A,B", "A,C"):
+                subprocess.run([sys.executable, str(summary), "--pair", pair, d], capture_output=True, check=True)
+            ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual((ab["answers"], ab["answers_all_arms"]), ({"p": "same", "q": "same"}, {"p": "differ", "q": "same"}))
+            r = check(d, "summary-A-B.json", "first")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("the answers of the run's arms differ for p", r.stderr)
+            self.assertEqual(check(d, "summary-A-B.json", "rerun", "q").returncode, 0)
+            self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, 1)
+            self.assertEqual(json.loads((Path(d) / "summary-A-C.json").read_text())["answers"], {"p": "differ", "q": "same"})
+            self.assertEqual(check(d, "summary-A-C.json", "first").returncode, 1)
+            self.assertEqual(check(d, "summary-A-C.json", "rerun", "q").returncode, 0)
+            # a staged query without a sample is still required, by its answers and timings
+            (Path(d) / "queries").mkdir()
+            for q in ("p", "q", "r"):
+                (Path(d) / "queries" / f"{q}.rq").write_text("ASK {}\n")
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\n")
+            for extra in ("", "A\tr\terror\terror\nB\tr\terror\terror\nC\tr\terror\terror\n"):
+                same = "".join(f"{v}\t{q}\t1\tx\n" for v in "ABC" for q in "pq")
+                res.joinpath("answers.tsv").write_text(same + extra)
+                subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+                ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertEqual(ab["answers"]["r"], "failed" if extra else "missing")
+                self.assertEqual(ab["missing"], ["r"])
+                self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 1)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, 0)
+            # the harness's own list of the queries it timed decides, as in nsc-bench.sh's layout,
+            # whose staged queries are not in the summarized directory
+            shutil.rmtree(Path(d) / "queries")
+            res.joinpath("queries.txt").write_text("p\nq\nr\n")
+            res.joinpath("answers.tsv").write_text(same + "A\tr\terror\terror\nB\tr\terror\terror\nC\tr\terror\terror\n")
+            subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+            ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual((ab["answers"]["r"], ab["missing"]), ("failed", ["r"]))
+            self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 1)
+            res.joinpath("queries.txt").unlink()
+            # the last VARIANTS assignment counts, as in Bash, so a third arm that answers
+            # differently is not hidden by an earlier one, and an arm with samples counts even
+            # when run.env leaves it out
+            res.joinpath("answers.tsv").write_text(cases["same"][0] + "C\tp\t1\tother\nC\tq\t1\ty\n")
+            for env in ("VARIANTS='A B'\nVARIANTS='A B C'\n", "VARIANTS='A B'\n"):
+                (Path(d) / "run.env").write_text(env)
+                subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+                ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertEqual(ab["answers_all_arms"]["p"], "differ", env)
+                self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 1, env)
+            # a summary written before the answer statuses is refused with a way out
+            old = json.loads((Path(d) / "summary-A-B.json").read_text())
+            old.pop("answers")
+            (Path(d) / "old.json").write_text(json.dumps(old))
+            r = check(d, "old.json", "first")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("Regenerate it with nsc-bench-summary.py", r.stderr)
+
+    def test_cell_summary_reports_an_expected_answer_change_of_listed_queries_only(self):
+        summary = SCRIPTS / "nsc-bench-summary.py"
+
+        def check(d, name, kind, flagged=""):
+            return subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / name), kind, flagged],
+                                  capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            # a quiet run of A, B and C, where C runs A's binary under another client
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            epoch = 0
+            for rnd in (1, 2):
+                for v in "ABCCBA":
+                    epoch += 1
+                    for q in ("p", "q"):
+                        lines.append(f"{rnd}\t{epoch}\t{v}\t{q}\t1\t1.0\t2")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            res.joinpath("queries.txt").write_text("p\nq\n")
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\nBINARY_OF_C=A\n")
+            listed = "queries\tq\nreason\tthe fix of q's join returns the rows it lost\n"
+            same_p = "A\tp\t1\tx\nB\tp\t1\tx\nC\tp\t1\tx\n"
+            cases = {
+                # B's answer to the listed query changes, and C, on A's binary, answers as A
+                "changed": (listed, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n", "changed", "changed", 0),
+                # with no list, the same answers stop the run
+                "unlisted": (None, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n", "differ", "differ", 1),
+                # a list without a reason excuses nothing
+                "no reason": ("queries\tq\nreason\t\n", same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n", "differ", "differ", 1),
+                # a listed query whose check failed is not a change
+                "failed": (listed, same_p + "A\tq\t1\ty\nB\tq\terror\terror\nC\tq\t1\ty\n", "failed", "failed", 1),
+                # a binary that gives two answers to the listed query disagrees with itself
+                "unstable": (listed, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nB\tq\t3\tw\nC\tq\t1\ty\n", "differ", "differ", 1),
+                # C runs A's binary, so its other answer is not the expected change
+                "client": (listed, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t2\tz\n", "changed", "differ", 1),
+                # a listed query whose answers stay the same is reported and decides
+                "unchanged": (listed, same_p + "A\tq\t1\ty\nB\tq\t1\ty\nC\tq\t1\ty\n", "same", "same", 0),
+            }
+            for name, (expected, rows, pair_status, arms_status, rc) in cases.items():
+                f = res / "expected-answer-change.txt"
+                f.unlink(missing_ok=True)
+                if expected is not None:
+                    f.write_text(expected)
+                res.joinpath("answers.tsv").write_text(rows)
+                out = subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, text=True)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                s = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertEqual(s["answers"], {"p": "same", "q": pair_status}, name)
+                self.assertEqual(s["answers_all_arms"], {"p": "same", "q": arms_status}, name)
+                self.assertEqual(check(d, "summary-A-B.json", "first").returncode, rc, name)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "q").returncode, rc, name)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, 0, name)
+                if name == "changed":
+                    self.assertEqual(s["expected_answer_change"], {"queries": ["q"], "reason": "the fix of q's join returns the rows it lost",
+                                                                   "changed": ["q"], "unchanged": []})
+                    self.assertIn("Answers changed for q (A 1/y, B 2/z) as run.env expects: the fix of q's join returns the rows it lost.", out.stdout)
+                if name == "no reason":
+                    self.assertIn("gives no reason", out.stdout)
+                    self.assertNotIn("expected_answer_change", s)
+                if name == "unchanged":
+                    self.assertEqual(s["expected_answer_change"]["unchanged"], ["q"])
+                    self.assertIn("run.env expects the answers of q to change, but A and B answered them the same", out.stdout)
+                # the pair of A with C, which runs A's binary, never excuses a difference
+                subprocess.run([sys.executable, str(summary), "--pair", "A,C", d], capture_output=True, check=True)
+                ac = json.loads((Path(d) / "summary-A-C.json").read_text())
+                self.assertEqual(ac["answers"]["q"], "differ" if name == "client" else "same", name)
+            # an unlisted query that also changes still stops the run, and a listed query
+            # that the pass did not time is not reported
+            res.joinpath("expected-answer-change.txt").write_text("queries\tq r\nreason\tthe fix\n")
+            res.joinpath("answers.tsv").write_text("A\tp\t1\tx\nB\tp\t1\tw\nC\tp\t1\tx\nA\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n")
+            subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+            s = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual((s["answers"]["p"], s["answers"]["q"]), ("differ", "changed"))
+            self.assertEqual(s["expected_answer_change"]["queries"], ["q"])
+            r = check(d, "summary-A-B.json", "first")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("differ for p, so", r.stderr)
+            # an empty BINARY_OF runs the variant's own binary, as in the harness, so C still
+            # runs A's binary and its other answer is no expected change, first or on a rerun
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\nBINARY_OF_A=''\nBINARY_OF_C=A\n")
+            res.joinpath("expected-answer-change.txt").write_text(listed)
+            res.joinpath("answers.tsv").write_text(same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t2\tz\n")
+            for pair in ("A,B", "A,C"):
+                subprocess.run([sys.executable, str(summary), "--pair", pair, d], capture_output=True, check=True)
+            ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual(ab["answers_all_arms"]["q"], "differ")
+            self.assertEqual(json.loads((Path(d) / "summary-A-C.json").read_text())["answers"]["q"], "differ")
+            for name in ("summary-A-B.json", "summary-A-C.json"):
+                self.assertEqual(check(d, name, "first").returncode, 1, name)
+                self.assertEqual(check(d, name, "rerun", "q").returncode, 1, name)
+            # the reason reaches the summary as the harness wrote it, quotes and all
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\nBINARY_OF_C=A\n")
+            why = '"JOIN" now returns the missing rows'
+            res.joinpath("expected-answer-change.txt").write_text(f"queries\tq\nreason\t{why}\n")
+            res.joinpath("answers.tsv").write_text(same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n")
+            subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+            self.assertEqual(json.loads((Path(d) / "summary-A-B.json").read_text())["expected_answer_change"]["reason"], why)
 
 
 if __name__ == "__main__":

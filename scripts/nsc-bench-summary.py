@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Summarize an interleaved A/B run of scripts/nsc-bench.sh.
+"""Summarize an interleaved A/B run of scripts/nsc-bench-remote.sh.
 
-    scripts/nsc-bench-summary.py OUT
+    scripts/nsc-bench-summary.py [--pair X,Y] OUT
+    scripts/nsc-bench-summary.py --check SUMMARY_JSON first|rerun [FLAGGED]
 
 Reads OUT/manifest.txt and OUT/results/{samples,answers,load}.tsv and env.txt, prints a
 Markdown summary and writes OUT/summary.json. For each query and metric (the server's
@@ -9,10 +10,47 @@ execution time and the client's wall time), the summary gives the median of ever
 request of A and of B, their ratio B/A, the ratio within each A,B,B,A round, and the spread
 of each variant between server processes (the largest median of one process over the
 smallest, minus one). The last row is the geometric mean of the ratios.
+
+With --pair X,Y, a run of more variants is read as the A/B run of variant X against
+variant Y, as if X were A and Y were B, and the other variants are left out. The summary
+then goes to OUT/summary-X-Y.json. A queue of several tips against one base is summarized
+this way, one pair at a time. Pairs that share the base's server processes are not
+independent of each other.
+
+The run's validity is judged by how far one binary's speed moves between server processes,
+which a quiet host keeps near 1 to 2%. The same-binary spread is the median, over the queries
+whose A median takes at least 0.3 ms, of the larger of their A and B spreads, and it must be
+at most 3%. The machine speed of each server process is the geometric mean, over all queries,
+of the process's median over the median of the query's requests to the same binary in the
+whole run, and every process must be within 5% of the median process. A variant of a
+query with only one server process gives no spread, and the run is then not valid. summary.json gets them
+under "validity", with "valid" false when either bound fails, and the summary says so in its
+first lines.
+
+The answer check of each query compares the sorted TSV answer of A with that of B, and
+summary.json gets its status under "answers": "same", "differ" when the answers differ,
+"failed" when either variant's check failed or its record is malformed, or "missing" when a
+variant has no answer row. Every query that OUT/results/queries.txt names, or else every
+query staged in OUT/queries, is required, whether or not its requests left a sample. "answers_all_arms" holds the same check across every variant of
+the run, so that one pair of a multi-variant run cannot decide while another arm answers
+differently.
+
+OUT/results/expected-answer-change.txt, which the harness writes from EXPECTED_ANSWER_CHANGE
+and EXPECTED_ANSWER_CHANGE_REASON, names queries whose answers the run expects to change and
+why. A listed query whose binaries each give one answer, with the variants of one binary
+(BINARY_OF_<v> in run.env) agreeing, gets the status "changed" in place of "differ", and
+summary.json lists the changed and unchanged ones under "expected_answer_change". A list
+without a reason excuses nothing, and a failed or missing check is never a change.
+
+--check exits 0 when a pass may decide and 1 when it may not. A first pass needs a valid
+run with timings of both variants for every query, each from at least two server processes
+of each variant, and the same answers of both variants to every query, or a change that run.env expects. A rerun needs the
+same of every flagged query, and a valid run unless all of them take under 0.3 ms.
 """
 
 import csv
 import json
+import os
 import math
 import statistics
 import sys
@@ -27,12 +65,189 @@ def read_tsv(path):
         return list(csv.reader(f, delimiter="\t"))
 
 
+MIN_MS = 0.3
+MAX_SPREAD = float(os.environ.get("SPARKLES_SCREEN_MAX_SPREAD", "0.03"))
+MAX_DRIFT = float(os.environ.get("SPARKLES_SCREEN_MAX_DRIFT", "0.05"))
+
+
+def validity(samples, order):
+    """The same-binary spread and the per-process machine speed of the execution times."""
+    # Each server process (epoch) runs one variant, and it is compared with that variant's
+    # median, so that a binary that is uniformly faster or slower than the other reads as no
+    # drift at all.
+    meds = {}  # (query, epoch) -> (variant, median)
+    per_query = {}  # (query, variant) -> median
+    for q in order:
+        for v in ("A", "B"):
+            epochs = defaultdict(list)
+            for _round, epoch, x in samples[q].get(v, []):
+                epochs[epoch].append(x)
+            if not epochs:
+                continue
+            per_query[(q, v)] = statistics.median(x for xs in epochs.values() for x in xs)
+            for e, xs in epochs.items():
+                meds[(q, e)] = (v, statistics.median(xs))
+
+    def spread(xs):
+        by = defaultdict(list)
+        for _round, epoch, x in xs:
+            by[epoch].append(x)
+        m = [statistics.median(v) for v in by.values()]
+        # one server process gives no spread to judge
+        return max(m) / min(m) - 1 if len(m) >= 2 and min(m) > 0 else float("nan")
+
+    big = [q for q in order if samples[q].get("A") and statistics.median(x[2] for x in samples[q]["A"]) >= MIN_MS]
+    def both(q):
+        a, b = spread(samples[q]["A"]), spread(samples[q]["B"])
+        return float("nan") if math.isnan(a) or math.isnan(b) else max(a, b)
+
+    spreads = [both(q) for q in big if samples[q].get("B")]
+    epochs = sorted({e for _q, e in meds})
+    speed = []
+    for e in epochs:
+        r = [m / per_query[(q, v)] for (q, ee), (v, m) in meds.items() if ee == e and per_query[(q, v)] > 0]
+        if r:
+            speed.append(math.exp(sum(math.log(x) for x in r) / len(r)))
+    if not spreads or not speed:
+        return None
+    mid = statistics.median(speed)
+    rel = [x / mid for x in speed]
+    unjudged = sum(1 for x in spreads if math.isnan(x))
+    sp = statistics.median(spreads) if not unjudged else float("nan")
+    return {"spread": sp, "queries": len(spreads), "unjudged": unjudged, "speed_min": min(rel), "speed_max": max(rel),
+            "max_spread": MAX_SPREAD, "max_drift": MAX_DRIFT,
+            "valid": not unjudged and sp <= MAX_SPREAD and min(rel) >= 1 - MAX_DRIFT and max(rel) <= 1 + MAX_DRIFT}
+
+
+MIN_EPOCHS = 2
+
+
+def thin(m):
+    """Whether a query's timings come from fewer than two server processes of either variant.
+
+    One process per variant cannot tell the binary from that process's luck, whatever the
+    query's speed and whatever the controls say about the host."""
+    return min(m.get("epochs_a", 0), m.get("epochs_b", 0)) < MIN_EPOCHS
+
+
+def answer_record_ok(r):
+    """Whether the fields after variant and query are a successful answer check: a row count
+    of zero or more, a digest and, with ORDER_DIGEST, an order digest, none of them empty."""
+    return len(r) in (2, 3) and r[0].isdigit() and all(x and x != "error" for x in r)
+
+
+def answer_status(queries, answers, variants=("A", "B"), expected=(), binary_of=None):
+    """The answer check of each query across variants, from rows of variant, query, rows,
+    digest and an optional order digest: same, differ, failed or missing.
+
+    A query in expected whose answers differ only between binaries is "changed": each
+    variant gave one answer, and the variants that run one binary, which binary_of maps
+    each variant to, gave the same one. A failed or missing check is never a change."""
+    binary_of = binary_of or {}
+    by_q = defaultdict(lambda: defaultdict(set))
+    for row in answers:
+        if len(row) >= 2:
+            by_q[row[1]][row[0]].add(tuple(row[2:]))
+    status = {}
+    for q in queries:
+        recs = [by_q[q].get(v) for v in variants]
+        if not all(recs):
+            status[q] = "missing"
+        elif not all(answer_record_ok(r) for rs in recs for r in rs):
+            status[q] = "failed"
+        elif len(set().union(*recs)) == 1:
+            status[q] = "same"
+        else:
+            # a variant with two different answers to one query differs from itself, and
+            # so do two variants of one binary, whatever change the run expects
+            by_bin = defaultdict(set)
+            for v, rs in zip(variants, recs):
+                by_bin[binary_of.get(v, v)] |= rs
+            own = all(len(rs) == 1 for rs in recs) and all(len(rs) == 1 for rs in by_bin.values())
+            status[q] = "changed" if q in expected and own and len(by_bin) > 1 else "differ"
+    return status
+
+
+def answer_problems(answers, queries):
+    """The queries whose answer check is not "same", as text such as "differ for p, q"."""
+    bad = defaultdict(list)
+    for q in queries:
+        st = answers.get(q, "missing")
+        if st not in ("same", "changed"):
+            bad[st].append(q)
+    words = {"differ": "differ for", "failed": "failed for", "missing": "are missing for"}
+    return "; ".join(f"{words[st]} {', '.join(qs)}" for st, qs in sorted(bad.items()))
+
+
+def check(path, kind, flagged):
+    """The exit status of a host screen's pass: 0 when it may decide, 1 when it may not.
+
+    A first pass needs a valid run and the same answers of both binaries to every query. A
+    rerun needs timings and the same answers of both binaries for every flagged query, and a
+    valid run unless all of them take under 0.3 ms, when there is no spread to judge."""
+    s = json.load(open(path))
+    v = s.get("validity")
+    if "answers" not in s or "answers_all_arms" not in s:
+        print(f"{path} has no answer checks, since an older nsc-bench-summary.py wrote it. "
+              f"Regenerate it with nsc-bench-summary.py on its run directory.", file=sys.stderr)
+        return 1
+    need = flagged.split() if kind == "rerun" else list(s["answers"])
+    bad = answer_problems(s["answers"], need)
+    if bad:
+        # a timing of two binaries that answer differently, or of answers nobody checked,
+        # compares different work, so it cannot decide whatever the timings say
+        print(f"{path}: the answers of the two variants {bad}, so the pass cannot decide.", file=sys.stderr)
+        return 1
+    bad = answer_problems(s["answers_all_arms"], need)
+    if bad:
+        # every arm of one run times the same queries, so an arm that answers differently
+        # from the others shows that the run did not compare like with like
+        print(f"{path}: the answers of the run's arms {bad}, so the pass cannot decide.", file=sys.stderr)
+        return 1
+    if any("exec_ms" in q and "epochs_a" not in q["exec_ms"] for q in s.get("queries", {}).values()):
+        # a summary written before the epoch counts cannot show that a query has two server
+        # processes of each variant, so it may not decide
+        print(f"{path} has no epoch counts, since an older nsc-bench-summary.py wrote it. "
+              f"Regenerate it with nsc-bench-summary.py on its run directory.", file=sys.stderr)
+        return 1
+    if kind == "rerun":
+        for q in flagged.split():
+            m = s["queries"].get(q, {}).get("exec_ms")
+            if not m or not m.get("n_a") or not m.get("n_b") or thin(m) or (not v and m["a"] >= MIN_MS):
+                return 1
+        return 0 if not v or v["valid"] else 1
+    # every query needs timings of both variants from at least two server processes of each
+    thin_any = any(thin(q["exec_ms"]) for q in s["queries"].values() if "exec_ms" in q)
+    return 0 if v and v["valid"] and not s.get("missing") and not thin_any else 1
+
+
 def main():
-    out = Path(sys.argv[1])
+    if sys.argv[1] == "--check":
+        sys.exit(check(sys.argv[2], sys.argv[3], sys.argv[4] if len(sys.argv) > 4 else ""))
+    args = sys.argv[1:]
+    pair = None
+    if args[0] == "--pair":
+        x, _, y = args[1].partition(",")
+        if not x or not y or x == y:
+            sys.exit(f"--pair takes two different variants, such as A,C, not {args[1]}")
+        pair = {x: "A", y: "B"}
+        args = args[2:]
+    out = Path(args[0])
     res = out / "results"
     rows = read_tsv(res / "samples.tsv")
     header, rows = rows[0], rows[1:]
     col = {name: i for i, name in enumerate(header)}
+    run_env = (out / "run.env").read_text() if (out / "run.env").exists() else ""
+    # the last assignment counts, as in Bash, and an arm with samples is an arm whatever
+    # run.env says
+    named = [line.partition("=")[2].strip("'\"").split() for line in run_env.splitlines() if line.startswith("VARIANTS=")]
+    seen = sorted({r[col["variant"]] for r in rows})
+    arms = (named[-1] if named else []) + [v for v in seen if not named or v not in named[-1]]
+    if pair:
+        rows = [r[:col["variant"]] + [pair[r[col["variant"]]]] + r[col["variant"] + 1:]
+                for r in rows if r[col["variant"]] in pair]
+        if not rows:
+            sys.exit(f"no samples of {', '.join(pair)} in {res / 'samples.tsv'}")
 
     # samples[metric][query][variant] -> list of (round, epoch, value)
     samples = {m: defaultdict(lambda: defaultdict(list)) for m in ("exec_ms", "wall_ms")}
@@ -47,6 +262,13 @@ def main():
             continue
         for m in samples:
             samples[m][q][v].append((int(r[col["round"]]), int(r[col["epoch"]]), float(r[col["exec_ms"] if m == "exec_ms" else col["wall_ms"]])))
+    # the queries the harness timed, or else the staged queries, are required even when none
+    # of their requests left a sample
+    if (res / "queries.txt").exists():
+        staged = (res / "queries.txt").read_text().split()
+    else:
+        staged = sorted(f.stem for f in (out / "queries").glob("*.rq")) if (out / "queries").is_dir() else []
+    required = order + [q for q in staged if q not in order]
 
     def stats(per_variant):
         a, b = per_variant.get("A", []), per_variant.get("B", [])
@@ -64,46 +286,125 @@ def main():
             return max(meds) / min(meds) - 1 if min(meds) > 0 else float("nan")
 
         ma, mb = med(a), med(b)
-        return {"a": ma, "b": mb, "ratio": mb / ma, "rounds": per_round, "spread_a": spread(a), "spread_b": spread(b), "n_a": len(a), "n_b": len(b)}
+        return {"a": ma, "b": mb, "ratio": mb / ma, "rounds": per_round, "spread_a": spread(a), "spread_b": spread(b), "n_a": len(a), "n_b": len(b),
+                "epochs_a": len({x[1] for x in a}), "epochs_b": len({x[1] for x in b})}
 
-    summary = {"queries": {}, "geomean": {}}
+    summary = {"queries": {}, "geomean": {}, "validity": validity(samples["exec_ms"], order),
+               "errors": {f"{q} {v}": n for (q, v), n in sorted(errors.items())}}
     for m in samples:
         for q in order:
             s = stats(samples[m][q])
             if s:
                 summary["queries"].setdefault(q, {})[m] = s
+        if m == "exec_ms":
+            summary["missing"] = [q for q in required if m not in summary["queries"].get(q, {})]
+            summary["thin"] = [q for q in order if m in summary["queries"].get(q, {}) and thin(summary["queries"][q][m])]
         ratios = [summary["queries"][q][m]["ratio"] for q in order if m in summary["queries"].get(q, {})]
         if ratios:
             summary["geomean"][m] = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
 
     p = print
     manifest = (out / "manifest.txt").read_text().splitlines() if (out / "manifest.txt").exists() else []
-    p("# Interleaved A/B on Namespace")
+    p("# Interleaved A/B on " + __import__("socket").gethostname())
     p()
+    if pair:
+        p(f"Variant {x} is A and variant {y} is B in this summary.")
+        p()
     for line in manifest:
         p(f"- {line}")
     env = (res / "env.txt").read_text().splitlines() if (res / "env.txt").exists() else []
     for line in env:
         p(f"- {line}")
     p()
+    v = summary["validity"]
+    if v:
+        verdict = ("valid" if v["valid"] else "INVALID: a query has a variant with one server process"
+                   if v.get("unjudged") else "INVALID: the host was not quiet enough for a timing comparison")
+        p(f"Validity: {verdict}. Same-binary spread {v['spread'] * 100:.1f}% over {v['queries']} queries of at least {MIN_MS} ms (at most {MAX_SPREAD * 100:.0f}%), server-process speed {v['speed_min']:.3f} to {v['speed_max']:.3f} of the median (within {MAX_DRIFT * 100:.0f}%).")
+        p()
 
+    # the queries whose answers run.env expects to change, with its reason, as the harness
+    # wrote them after sourcing run.env; a list without a reason excuses nothing
+    listed, reason = [], ""
+    # the file holds literal text after one tab, so it is split without CSV quoting
+    meta = res / "expected-answer-change.txt"
+    for line in meta.read_text().splitlines() if meta.exists() else []:
+        key, _, value = line.partition("\t")
+        if key == "queries":
+            listed = value.split()
+        elif key == "reason":
+            reason = value.strip()
+    if listed and not reason:
+        p(f"run.env lists {', '.join(listed)} as expected answer changes but gives no reason, so none is excused.")
+        p()
+        listed = []
+    listed = [q for q in required if q in listed]
+    # the variant whose binary each variant runs, the last assignment counting as in Bash
+    binary_of = {}
+    for line in run_env.splitlines():
+        k, eq, val = line.partition("=")
+        if eq and k.startswith("BINARY_OF_"):
+            # an empty value runs the variant's own binary, as the harness's ${!b:-$v} does
+            binary_of[k[len("BINARY_OF_"):]] = val.strip("'\"") or k[len("BINARY_OF_"):]
     answers = read_tsv(res / "answers.tsv")
-    by_q = defaultdict(dict)
+    summary["answers_all_arms"] = answer_status(required, answers, arms, listed, binary_of)
+    if pair:
+        answers = [[pair[r[0]]] + r[1:] for r in answers if r and r[0] in pair]
+        binary_of = {pair[v]: binary_of.get(v, v) for v in pair}
+    by_q = defaultdict(lambda: defaultdict(list))
     for row in answers:
         # variant, query, rows, digest and, with ORDER_DIGEST, an order digest
-        v, q = row[:2]
-        by_q[q][v] = tuple(row[2:])
-    diff = [q for q in order if len(set(by_q[q].values())) != 1 or "error" in str(by_q[q])]
-    if answers:
-        if diff:
-            p("Answers differ or failed for: " + ", ".join(f"{q} (A {by_q[q].get('A')}, B {by_q[q].get('B')})" for q in diff) + ".")
+        if len(row) >= 2:
+            by_q[row[1]][row[0]].append(tuple(row[2:]))
+    summary["answers"] = answer_status(required, answers, ("A", "B"), listed, binary_of)
+    changed = [q for q in listed if summary["answers"][q] == "changed"]
+    if listed:
+        summary["expected_answer_change"] = {"queries": listed, "reason": reason, "changed": changed,
+                                             "unchanged": [q for q in listed if summary["answers"][q] == "same"]}
+    diff = [q for q in required if summary["answers"][q] in ("differ", "failed")]
+    lost = [q for q in required if summary["answers"][q] == "missing"]
+    arm_bad = [q for q in required if summary["answers_all_arms"][q] not in ("same", "changed")]
+    show = lambda rs: " ".join("/".join(r) for r in rs) if rs else "none"
+    if diff:
+        p("Answers differ or failed for: " + ", ".join(f"{q} (A {show(by_q[q].get('A'))}, B {show(by_q[q].get('B'))})" for q in diff)
+          + ", so the run cannot decide.")
+        p()
+    if lost:
+        p("No answer check of both variants for: " + ", ".join(lost) + ", so the run cannot decide.")
+        p()
+    if changed:
+        p("Answers changed for " + ", ".join(f"{q} (A {show(by_q[q].get('A'))}, B {show(by_q[q].get('B'))})" for q in changed)
+          + f" as run.env expects: {reason}.")
+        p()
+    if listed and summary["expected_answer_change"]["unchanged"]:
+        p(f"run.env expects the answers of {', '.join(summary['expected_answer_change']['unchanged'])} to change, "
+          "but A and B answered them the same.")
+        p()
+    if not diff and not lost and not changed:
+        p(f"A and B returned the same sorted TSV answers to all {len(required)} queries.")
+        p()
+    elif not diff and not lost:
+        p(f"A and B returned the same sorted TSV answers to the other {len(required) - len(changed)} queries.")
+        p()
+    if len(arms) > 2:
+        if arm_bad:
+            p(f"The answers of the run's arms {', '.join(arms)} disagree or are incomplete for: " + ", ".join(arm_bad)
+              + ", so the run cannot decide.")
         else:
-            p(f"A and B returned the same sorted TSV answers to all {len(by_q)} queries.")
+            p(f"All {len(arms)} arms of the run returned the same answers to all {len(required)} queries.")
+        p()
+    if summary["missing"]:
+        p("No timings of both variants for: " + ", ".join(summary["missing"]) + ", so the run cannot decide.")
+        p()
+    if summary["thin"]:
+        p("Timings from fewer than two server processes of a variant for: " + ", ".join(summary["thin"]) + ", so the run cannot decide them.")
         p()
     if errors:
         p("Failed timed requests: " + ", ".join(f"{q} {v} {n}" for (q, v), n in sorted(errors.items())) + ".")
         p()
     load = read_tsv(res / "load.tsv")
+    if pair:
+        load = [[pair[r[0]]] + r[1:] for r in load if r and r[0] in pair]
     try:
         (_, ta, ka), (_, tb, kb) = load
         ta, tb = float(ta), float(tb)
@@ -112,7 +413,7 @@ def main():
     except (ValueError, ZeroDivisionError):
         pass
 
-    titles = {"exec_ms": "Server execution time (execMs, ms)", "wall_ms": "Client wall time (curl time_total, ms)"}
+    titles = {"exec_ms": "Server execution time (execMs, ms)", "wall_ms": "Client wall time (ms)"}
     for m, title in titles.items():
         p(f"## {title}")
         p()
@@ -130,7 +431,9 @@ def main():
             p(f"| **geometric mean** | | | {g:.3f} | {(g - 1) * 100:+.1f}% | | | |")
         p()
     p("The ratios are medians of all timed requests of B over those of A. Per-round B/A uses the requests of one A,B,B,A round. A spread and B spread compare the medians of the same binary in different server processes.")
-    (out / "summary.json").write_text(json.dumps(summary, indent=1))
+    if pair:
+        summary["pair"] = {"A": x, "B": y}
+    (out / (f"summary-{x}-{y}.json" if pair else "summary.json")).write_text(json.dumps(summary, indent=1))
 
 
 if __name__ == "__main__":
