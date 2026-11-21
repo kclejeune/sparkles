@@ -562,10 +562,6 @@ pub const MREPAIR_UNITS: u8 = 4;
 /// [`DlRun::mrepair`]: M-send sends the marker to every registered context, the wide arm,
 /// and not only to those that the root reaches by successors, the pair set P_R of PLAN v3.1.
 pub const MREPAIR_WIDE: u8 = 8;
-/// [`DlRun::mrepair`]: a context drops a clause the root returns when a returned clause it
-/// took already subsumes it, whose products subsume the new one's, a candidate narrowing of
-/// M-return's cost for measurements, off by default.
-pub const MREPAIR_RSUB: u8 = 16;
 /// [`DlRun::mrepair`], for the deficits' tests only: the root returns no clause (M-return),
 /// so that a missing product shows in the diagnostic's second deficit.
 pub const MREPAIR_NO_RETURN: u8 = 32;
@@ -2181,7 +2177,7 @@ fn again(ix: &Index, st: &State, id: u32, c: &Clause, found: &mut Found) {
 }
 
 /// The clauses read that count as one derived conclusion for the work bound.
-pub(super) const WORK_READS: usize = 16;
+const WORK_READS: usize = 16;
 
 /// A class of `a` and one of `b` in a disjointness set, with the clauses that give them.
 fn disjoint(ix: &Index, a: &[(Ex, u32)], b: &[(Ex, u32)]) -> Option<(u32, u32)> {
