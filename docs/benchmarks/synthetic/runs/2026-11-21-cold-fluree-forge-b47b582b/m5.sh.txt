@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# m5: io profile of cold count-all at 0 and 1 s after ready, and an strace of one delayed run.
+set -uo pipefail
+L=$HOME/lanes/cold-scan
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+W=$L/work
+rm -rf $L/m5 && mkdir -p $L/m5 && cp -r $W/sparkles.db $L/m5/db
+for d in 0 1; do
+  COLD_DELAY=$d python3 $L/srcd/scripts/br-delay.py --binary $L/bin/sparkles --db $L/m5/db --queries $W/queries \
+    --names count-all --out $L/m5/io$d.json --runs 5 --cold --io --port 4374 > $L/m5/io$d.log 2>&1
+done
+# strace: one delayed cold count-all
+python3 - "$L" "$W" > $L/m5/strace-run.log 2>&1 <<'PY'
+import os, subprocess, sys, time, urllib.request
+L, W = sys.argv[1:]
+db = f"{L}/m5/db"
+for root, _, files in os.walk(db):
+    for n in files:
+        fd = os.open(os.path.join(root, n), os.O_RDONLY); os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED); os.close(fd)
+p = subprocess.Popen(["strace", "-f", "-tt", "-T", "-o", f"{L}/m5/strace.txt", f"{L}/bin/sparkles", "--result-cache-mb", "0", "serve",
+    "--data", f"{L}/m5/server", "--loc", f"bench={db}", "--port", "4375", "--read-only"], stdout=open(f"{L}/m5/srv.log","wb"), stderr=subprocess.STDOUT)
+for _ in range(400):
+    try:
+        urllib.request.urlopen("http://127.0.0.1:4375/$/ready", timeout=1).close(); break
+    except Exception: time.sleep(.05)
+time.sleep(1)
+q = open(f"{W}/queries/count-all.rq","rb").read()
+print("mark", time.time())
+t = time.perf_counter()
+urllib.request.urlopen(urllib.request.Request("http://127.0.0.1:4375/bench/sparql", data=q,
+    headers={"Content-Type": "application/sparql-query", "Accept": "application/x-sparkles+json"}), timeout=60).read()
+print("ms", (time.perf_counter()-t)*1000)
+p.terminate(); p.wait()
+PY
+echo M5-DONE

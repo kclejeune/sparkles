@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Cold small scans at 1.05M measured again against Fluree
+
+Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
+triples, as roadmap item 1270. Sparkles leads all eight measured cold queries, including
+the five that the October run counted as losses to Fluree, with `count-all` at 2.1 against
+19.2 ms and `distinct-obj` at 1.8 against 19.3 ms. With a 1 s pause between readiness and
+the request, Fluree leads `count-all` at 2.8 against 10.1 ms. After the pause Sparkles' one
+vocabulary read takes about 8 ms, which is consistent with forge's NVMe drive waking from a
+low-power state, and item 572 now records it beside the 10.5M case. Fluree's first
+request is fast on the restarts where its readiness check answers 0.05 s or more after the
+start, as nearly every restart of the October run did, which is consistent with its October
+`count-all` and `distinct-obj` medians of 2.2 and 1.6 ms. Its October `contains` and
+`employee-docs` medians of 12.1 and 8.5 ms were not reproduced.
 ### The EL index stage checks the profile without allocating
 
 Roadmap item 1269 removes allocations from the index stage of OWL 2 EL classification.
