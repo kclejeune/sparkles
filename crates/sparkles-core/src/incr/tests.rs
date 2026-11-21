@@ -272,10 +272,8 @@ fn plans_mark_their_modes() {
         .filter(|q| compile(&parse(q), None).unwrap().root.has_recompute())
         .copied()
         .collect();
-    assert_eq!(
-        recomputed,
-        vec!["SELECT ?t ?n WHERE { ?p :memberOf ?t } ORDER BY ?t LIMIT 1"]
-    );
+    // ORDER BY with LIMIT is an ordered window (item 419)
+    assert_eq!(recomputed, Vec::<&str>::new());
 }
 
 #[test]

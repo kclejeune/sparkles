@@ -162,7 +162,8 @@ impl Runtime {
         if after == applied {
             return None;
         }
-        if after > applied {
+        // an ordered window keeps no positions for past commits
+        if after > applied || st.circuit.ordered() {
             return Some(st.event(true));
         }
         let ask = st.circuit.kind == Kind::Ask;

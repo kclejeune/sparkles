@@ -2136,3 +2136,91 @@ fn views_recover_from_crashes() {
         crash_and_recover(TEST, name);
     }
 }
+
+/// Item 419: a live query with ORDER BY and LIMIT streams its rows with positions, a
+/// client that applies them keeps the window in order, its diffs do not merge, and a
+/// resume starts with a reset.
+#[test]
+fn an_ordered_live_query_streams_positions() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let query = "SELECT ?p ?a WHERE { ?p :age ?a } ORDER BY DESC(?a) LIMIT 2";
+    let live = rt
+        .live(&s, &q(query), None, &LiveOptions::default())
+        .unwrap();
+    let one = |r: &super::live::LiveRow| r.terms.iter().map(show).collect::<Vec<_>>().join(" ");
+    let mut client: Vec<String> = Vec::new();
+    let apply = |client: &mut Vec<String>, e: &LiveEvent| match e {
+        LiveEvent::Snapshot { rows, .. } => {
+            *client = rows.iter().map(one).collect();
+            let at: Vec<Option<u64>> = rows.iter().map(|r| r.position).collect();
+            assert_eq!(at, (0..rows.len() as u64).map(Some).collect::<Vec<_>>());
+        }
+        LiveEvent::Diff { removed, added, .. } => {
+            let mut gone: Vec<u64> = removed
+                .iter()
+                .map(|r| r.position.expect("a position"))
+                .collect();
+            gone.sort_unstable_by(|a, b| b.cmp(a));
+            for p in gone {
+                client.remove(p as usize);
+            }
+            let mut came: Vec<(u64, String)> = added
+                .iter()
+                .map(|r| (r.position.expect("a position"), one(r)))
+                .collect();
+            came.sort();
+            for (p, r) in came {
+                client.insert(p as usize, r);
+            }
+        }
+        other => panic!("{other:?}"),
+    };
+    let first = live.try_next().unwrap();
+    apply(&mut client, &first);
+    assert_eq!(client, ["c 50", "b 40"]);
+    upd(&s, "INSERT DATA { :d :age 45 }");
+    rt.round(&s);
+    let e = live.try_next().expect("a row entered");
+    assert!(e.merge(&e).is_none(), "positioned diffs do not merge");
+    apply(&mut client, &e);
+    assert_eq!(client, ["c 50", "d 45"]);
+    // a row that moves inside the window and keeps its terms
+    upd(
+        &s,
+        "DELETE DATA { :d :age 45 } ; INSERT DATA { :d :age 55 }",
+    );
+    rt.round(&s);
+    apply(&mut client, &live.try_next().expect("a row moved"));
+    assert_eq!(client, ["d 55", "c 50"]);
+    upd(&s, "DELETE DATA { :c :age 50 }");
+    rt.round(&s);
+    apply(&mut client, &live.try_next().expect("a row left"));
+    assert_eq!(client, ["d 55", "b 40"]);
+    // a commit after the window sends nothing
+    upd(&s, "INSERT DATA { :e :age 1 }");
+    rt.round(&s);
+    assert!(live.try_next().is_none());
+    let before = s.snapshot().commit;
+    upd(&s, "INSERT DATA { :f :age 60 }");
+    rt.round(&s);
+    let resumed = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                after: Some(before),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    match resumed.try_next().unwrap() {
+        LiveEvent::Snapshot { reset, rows, .. } => {
+            assert!(reset);
+            assert_eq!(rows.iter().map(one).collect::<Vec<_>>(), ["f 60", "d 55"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}

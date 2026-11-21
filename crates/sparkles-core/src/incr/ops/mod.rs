@@ -15,6 +15,7 @@ pub mod matching;
 pub mod path;
 pub mod recompute;
 pub mod template;
+pub mod window;
 
 use super::pass::Pass;
 use super::persist::{Reader, Writer};
@@ -78,6 +79,7 @@ pub enum Op {
     Recompute(Box<recompute::Recompute>),
     Template(Box<template::Template>),
     Path(Box<path::PathOp>),
+    Window(Box<window::Window>),
 }
 
 impl Node {
@@ -99,6 +101,7 @@ impl Node {
             Op::Recompute(o) => o.init(p, &schema),
             Op::Template(o) => o.init(p),
             Op::Path(o) => o.init(p, &schema),
+            Op::Window(o) => o.init(p),
         }
     }
 
@@ -120,6 +123,7 @@ impl Node {
             Op::Recompute(o) => o.delta(p, &schema),
             Op::Template(o) => o.delta(p),
             Op::Path(o) => o.delta(p, &schema),
+            Op::Window(o) => o.delta(p),
         }
     }
 
@@ -143,6 +147,7 @@ impl Node {
             Op::Recompute(o) => o.init_a(p, &schema),
             Op::Template(o) => o.init_a(p),
             Op::Path(o) => o.init_a(p, &schema),
+            Op::Window(o) => o.init_a(p),
         }
     }
 
@@ -166,6 +171,7 @@ impl Node {
             Op::Recompute(o) => o.delta_a(p, &schema),
             Op::Template(o) => o.delta_a(p),
             Op::Path(o) => o.delta_a(p, &schema),
+            Op::Window(o) => o.delta_a(p),
         }
     }
 
@@ -263,6 +269,7 @@ impl Node {
             Op::Exists(o) => vec![&o.inner],
             Op::Group(o) => vec![&o.inner],
             Op::Template(o) => vec![&o.inner],
+            Op::Window(o) => vec![&o.inner],
         }
     }
 
@@ -279,6 +286,7 @@ impl Node {
             Op::Exists(o) => vec![&mut o.inner],
             Op::Group(o) => vec![&mut o.inner],
             Op::Template(o) => vec![&mut o.inner],
+            Op::Window(o) => vec![&mut o.inner],
         }
     }
 
@@ -293,6 +301,7 @@ impl Node {
             Op::Recompute(o) => o.bytes(self.schema.len()),
             Op::Template(o) => o.bytes(),
             Op::Path(o) => o.bytes(),
+            Op::Window(o) => o.bytes(),
             _ => 0,
         };
         own + self.children().iter().map(|c| c.bytes()).sum::<u64>()
@@ -309,6 +318,7 @@ impl Node {
             Op::Recompute(o) => o.save(w)?,
             Op::Template(o) => o.save(w)?,
             Op::Path(o) => o.save(w)?,
+            Op::Window(o) => o.save(w)?,
             _ => {}
         }
         for c in self.children() {
@@ -328,6 +338,7 @@ impl Node {
             Op::Recompute(o) => o.load(r)?,
             Op::Template(o) => o.load(r)?,
             Op::Path(o) => o.load(r)?,
+            Op::Window(o) => o.load(r)?,
             _ => {}
         }
         for c in self.children_mut() {
@@ -388,6 +399,7 @@ impl Node {
             Op::Recompute(o) => ("Recompute", Some(o.reason.clone()), Mode::Recompute),
             Op::Template(_) => ("Template", None, Mode::Incremental),
             Op::Path(o) => ("FixedPoint", Some(o.describe()), Mode::Incremental),
+            Op::Window(o) => ("Window", Some(o.describe(vars)), Mode::Incremental),
         };
         PlanNode {
             operator: operator.to_string(),
@@ -395,6 +407,30 @@ impl Node {
             vars: names(&self.schema),
             detail,
             children: self.children().iter().map(|c| c.plan(vars)).collect(),
+        }
+    }
+
+    /// The window that orders the node's rows: the node itself, or the window under a
+    /// projection that drops the window's key columns.
+    pub fn result_window(&self) -> Option<(&window::Window, Option<&[Option<usize>]>)> {
+        match &self.op {
+            Op::Window(w) => Some((w, None)),
+            Op::Project(p) => match &p.inner.op {
+                Op::Window(w) => Some((w, Some(&p.cols))),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    pub fn result_window_mut(&mut self) -> Option<&mut window::Window> {
+        match &mut self.op {
+            Op::Window(w) => Some(w),
+            Op::Project(p) => match &mut p.inner.op {
+                Op::Window(w) => Some(w),
+                _ => None,
+            },
+            _ => None,
         }
     }
 

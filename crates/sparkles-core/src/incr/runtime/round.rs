@@ -263,9 +263,24 @@ impl Runtime {
                 from,
                 value: now > 0,
             }
-        } else if reset && c.len() > self.opts.read().reset_rows {
-            st.clear_history();
+        } else if reset && (c.len() > self.opts.read().reset_rows || st.circuit.ordered()) {
+            // an ordered window's evaluation has no positions to diff: the subscribers
+            // replace their copy
+            if c.len() > self.opts.read().reset_rows {
+                st.clear_history();
+            } else {
+                let rows = st.circuit.decode_rows(&c).into();
+                st.remember(from, to, rows, max);
+            }
             st.event(true)
+        } else if st.circuit.ordered() {
+            // the positions come from the window: a row that moves nets out of `c`
+            let rows: Arc<[(Vec<Option<Term>>, i64)]> = st.circuit.decode_rows(&c).into();
+            st.remember(from, to, rows, max);
+            match st.moves_event(from, to) {
+                Some(e) => e,
+                None => return,
+            }
         } else {
             let rows: Arc<[(Vec<Option<Term>>, i64)]> = st.circuit.decode_rows(&c).into();
             st.remember(from, to, rows.clone(), max);
