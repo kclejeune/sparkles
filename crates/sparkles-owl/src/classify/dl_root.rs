@@ -2070,13 +2070,16 @@ const DEF_CHOICES: usize = 1 << 16;
 /// context holds every body literal, is satisfiable, and lacks one of the products that
 /// M-return derives from it, each choice of a live premise with each body literal maximal
 /// merged with the clause's head: the product is neither a tautology, after the sorting and
-/// the tests that `derive` applies first, nor subsumed by a live clause of the context.
-/// derive's other simplifications are not replayed, so a product they drop can count.
+/// the tests that `derive` applies first in a rooted run (owl:Thing and owl:Nothing over
+/// constants, a head literal in the body, an equality beside its inequality), nor subsumed
+/// by a live clause of the context. derive's other simplifications are not replayed, so a
+/// product they drop can count.
 pub(super) fn marker_def(
     ix: &Index,
     m: &MarkerCtx,
     st: &State,
     rg: &[Clause],
+    lits: &super::dl_clause::Lits,
 ) -> Option<MarkerDef> {
     let x = dl(st)?;
     let is_root = is_root(ix, m.me);
@@ -2115,7 +2118,7 @@ pub(super) fn marker_def(
                 unchecked += 1;
                 continue;
             }
-            if n > 0 && !products_held(st, &lists, c.head()) {
+            if n > 0 && !products_held(ix, st, &lists, c.head(), lits) {
                 owed += 1;
             }
         }
@@ -2130,9 +2133,18 @@ pub(super) fn marker_def(
 
 /// Whether the context holds every product of `lists` with the head `head`: each is a
 /// tautology or a live clause of the context subsumes it.
-fn products_held(st: &State, lists: &[Vec<Side>], head: &[Lit]) -> bool {
+fn products_held(
+    ix: &Index,
+    st: &State,
+    lists: &[Vec<Side>],
+    head: &[Lit],
+    lits: &super::dl_clause::Lits,
+) -> bool {
     use super::dl_clause::X;
     let Some(x) = dl(st) else { return false };
+    let inv = inv_of(ix, dix(ix));
+    let is =
+        |l: Lit, a: Ex| l.kind() == XL && matches!(lits.view(l, inv), XLit::Atom(b, _) if b == a);
     let mut at = vec![0usize; lists.len()];
     loop {
         let mut body: Vec<Lit> = Vec::new();
@@ -2142,14 +2154,18 @@ fn products_held(st: &State, lists: &[Vec<Side>], head: &[Lit]) -> bool {
             hd.extend_from_slice(&l[i].1);
         }
         body.retain(|l| !(l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom()))));
+        body.retain(|&l| !is(l, TOP));
+        hd.retain(|&l| !is(l, BOTTOM));
         body.sort_unstable();
         body.dedup();
         hd.sort_unstable();
         hd.dedup();
-        let taut = hd.iter().any(|&l| {
-            (l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom())))
-                || body.binary_search(&l).is_ok()
-        });
+        let taut = lits.complementary(&hd, inv)
+            || hd.iter().any(|&l| {
+                (l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom())))
+                    || is(l, TOP)
+                    || body.binary_search(&l).is_ok()
+            });
         if !taut {
             let c = Clause::new(body, hd);
             if !x.store.subsumed(&c, c.sig()) {
