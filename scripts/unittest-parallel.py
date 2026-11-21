@@ -16,28 +16,27 @@ test does nothing and gets no process.
 
 The whole suite runs in one process instead, as discovery returned it, and the runner says
 why, when anything in it could make a part of the suite depend on what ran before it. That
-is the case when a module or package that discovery loads defines a load_tests hook or a
-module __getattr__ that could give one, when the suite holds anything other than default
-suites and TestCase tests, including a default suite with attributes of its own such as a
-run() given to the instance, when a test module has changed unittest's suite classes or put
-other classes under their names, and when test classes of one module run in more than
-one entry, as when one test module imports another's class, since they can share that
-module's state. The runner does not ask what such a hook or suite does, reads modules'
-attributes from their own dictionaries, and counts a suite of a kind of its own as one
-occurrence without listing what it holds. State that tests
-share in some other way, such as through a helper module's globals, is not detected, so a
-test that depends on a test in another unit having run first can pass or skip here and fail
-serially. The same holds for the tests of a split module, which each run in a unit of their
-own. The runner also assumes that a test's run(), when a TestCase defines its own, reads
-only its own test's result.
+is the case when a module or package that discovery loads defines a load_tests hook, a
+module __getattr__ that could give one or a module class of its own, when the suite holds
+anything other than default suites and TestCase tests, including a default suite with
+attributes of its own such as a run() given to the instance, when a test module has changed
+unittest's suite classes or put other classes under their names, and when test classes of
+one module run in more than one entry, as when one test module imports another's class,
+since they can share that module's state. The runner does not ask what such a hook or suite
+does, reads modules' attributes from their own dictionaries, and counts a suite of a kind of
+its own as one occurrence without listing what it holds. State that tests share in some
+other way, such as through a helper module's globals, is not detected, so a test that
+depends on a test in another unit having run first can pass or skip here and fail serially.
+The same holds for the tests of a split module, which each run in a unit of their own. The
+runner also assumes that a test's run(), when a TestCase defines its own, reads only its own
+test's result.
 
 A module named with --split runs one process per test instead, for modules whose few tests
 take most of the suite's time. The split is taken only when the module's entry is plain,
 which means default suites holding only the module's own test classes, with no class or
-module fixtures and no repeated test. Otherwise the
-module runs whole and the runner says why. Units start longest first, using the split tests
-and then the modules by file size as the estimate, and each unit's output is printed whole
-when it ends.
+module fixtures and no repeated test. Otherwise the module runs whole and the runner says
+why. Units start longest first, using the split tests and then the modules by file size as
+the estimate, and each unit's output is printed whole when it ends.
 
 Each unit writes a result record beside its output: the occurrences it ran, unittest's
 counts and verdict, and a completion mark. A unit fails when its exit status is not 0, its
