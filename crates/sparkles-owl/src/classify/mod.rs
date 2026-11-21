@@ -1589,18 +1589,20 @@ impl Saturation {
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
     /// axioms the profile check leaves out.
     /// The answer's last part is the estimated peak of a parallel normalization, with
-    /// `held_bytes`, which the pool has been charged for, or 0.
+    /// `held_bytes`, which the pool has been charged for, or 0. `kept_bytes` are those of
+    /// the contexts the run keeps, [`Saturation::context_bytes`].
     fn build(
         &mut self,
         axioms: &[&AxiomKind],
         outside: &[(usize, (String, String))],
         threads: usize,
         held_bytes: usize,
+        kept_bytes: usize,
         limits: &Limits,
     ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
         let budget = numeric::Budget::new(
             limits,
-            held_bytes + self.context_bytes(),
+            held_bytes + kept_bytes,
             self.interner.ranges.ledger.clone(),
         );
         budget.baseline(self.interner.bytes())?;
@@ -2143,8 +2145,16 @@ impl Saturation {
         // The old index is no longer read. Drop its handles before constructing the
         // replacement, while cached contexts retain their shared numeric ledger.
         self.index = None;
-        let (mut ax, mut ix, mut normalized_peak, outside_el) =
-            self.build(axioms, &outside, threads, held_bytes + old_bytes, limits)?;
+        // the kept contexts, which stay as they are until the invalidation
+        let kept_bytes = self.context_bytes();
+        let (mut ax, mut ix, mut normalized_peak, outside_el) = self.build(
+            axioms,
+            &outside,
+            threads,
+            held_bytes + old_bytes,
+            kept_bytes,
+            limits,
+        )?;
         drop(outside);
         // the disjointness sets by their numbers in this index, beside those of the
         // last run's, by which the contexts it leaves number the sets they meet; the run
@@ -2290,7 +2300,7 @@ impl Saturation {
             let held = self.index_bytes(&ix)
                 + held_bytes
                 + ax.bytes()
-                + self.context_bytes()
+                + kept_bytes
                 + scratch.rough_bytes()
                 + bits;
             let more = held.saturating_sub(normalized_peak);
@@ -4329,7 +4339,7 @@ mod tests {
             .collect();
         let mut s = Saturation::default();
         let (_, ix, _, _) = s
-            .build(&axioms, &outside, 1, 0, &Limits::default())
+            .build(&axioms, &outside, 1, 0, 0, &Limits::default())
             .unwrap();
         assert!(ix.horn.is_some());
         ix
