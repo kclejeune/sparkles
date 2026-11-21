@@ -574,6 +574,22 @@ results on the 1,010 pairs that both classified. On
 one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
 0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1234 follows.
 
+Item 693 leaves out the universal restriction on `owl:Thing` of a range of a property that
+chains reach when the told ranges of the links that end the property's paths already give
+it, as [the Horn rules](#the-horn-rules) argue. The rule leaves out all 6 such universals
+of ore_ont_14817 and 13 of the 16 of ore_ont_9663, which then derive 8.2% and 7.1% fewer
+conclusions and take 7.4% and 6.5% fewer instructions per classification on the laptop.
+On `atlas`, without their disjunctive attempt and against the same binary with every
+universal kept, they classify in 0.942 and 0.955 times the time on one thread and 0.927 and
+0.960 times on four, with peak resident sets of 638 against 697 MiB and 910 against
+959 MiB on one thread. GO has no such universal and takes the same time. The taxonomies
+are equal on the 389 development and final-set files of the ORE 2015 DL sample that both
+sides classify, and on 3,537 generated Horn ontologies, of which the 853 that leave a
+universal out and that HermiT accepts give HermiT's taxonomy. `ore_ont_7646` now
+classifies within 8 GiB on one thread, with 219.2 million conclusions against 398.7
+million. The [benchmark report](../../benchmarks/el-classification/RESULTS.md#range-universals-that-the-links-cover)
+holds the rounds and the sweeps.
+
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
 timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
@@ -1390,8 +1406,9 @@ successor, so the index gives those properties the same rule (item 693). The
 automaton's reductions and pruning do not affect the test, which reads the closure
 over the ε-transitions before them. When the left-out universals were a run's only
 universal restrictions and no other Horn rule can fire, the run takes the EL rules, which
-compose every chain, as for any such run. A change to a property axiom or a range starts
-the run again, so a removed range that covered a universal brings the universal back.
+compose every chain, as for any such run. A change to the axioms after a run with the
+Horn rules normalizes them again, so a removed range that covered a universal brings the
+universal back.
 Tier D makes its own range universals and keeps them all. `SPARKLES_HORN_RANGES=keep`
 keeps every range universal for a comparison.
 

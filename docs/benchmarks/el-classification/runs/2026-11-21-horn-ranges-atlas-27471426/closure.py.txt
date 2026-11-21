@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+"""closure.py OURS HERMIT: compares a taxonomy of el_classify (EQ and SUB lines) with HermiT's
+functional-syntax taxonomy over the classes both name. Prints sound and equal flags."""
+import sys, re
+T, N = "http://www.w3.org/2002/07/owl#Thing", "http://www.w3.org/2002/07/owl#Nothing"
+def close(up, classes):
+    out = set()
+    for a in classes:
+        seen, st = {a, T}, [a]
+        while st:
+            x = st.pop()
+            for y in up.get(x, ()):
+                if y not in seen: seen.add(y); st.append(y)
+        uns = N in seen
+        for b in classes:
+            if uns or b in seen: out.add((a, b))
+    return out
+up, cl = {}, set()
+for line in open(sys.argv[1]):
+    w = line.split()
+    if not w: continue
+    if w[0] == "EQ":
+        cl.update(w[1:])
+        for a in w[1:]:
+            for b in w[1:]: up.setdefault(a, set()).add(b)
+    elif w[0] == "SUB":
+        cl.update(w[1:]); up.setdefault(w[1], set()).add(w[2])
+hup, hcl = {}, set()
+for line in open(sys.argv[2]):
+    ns = re.findall(r"<([^>]*)>", line)
+    hcl.update(ns)
+    if line.startswith("SubClassOf(") and len(ns) == 2: hup.setdefault(ns[0], set()).add(ns[1])
+    elif line.startswith("EquivalentClasses("):
+        for a in ns:
+            for b in ns: hup.setdefault(a, set()).add(b)
+cs = (cl & hcl) | {T, N}
+a, b = close(up, cs), close(hup, cs)
+print("sound" if a <= b else "UNSOUND", "equal" if a == b else "differs", len(b - a))

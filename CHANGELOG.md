@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+### The Horn rules leave out range universals that the links cover
+
+A range of a property that chains reach became a universal restriction on `owl:Thing`,
+which every context of a run with the Horn rules held and unfolded. Roadmap item 693 leaves
+it out when every path of the property ends with a link whose property or a property above
+it has the same range, since the ranges on the links then give it, as F24 argues. On
+`ore_ont_14817` and `ore_ont_9663` the rule leaves out 6 of 6 and 13 of 16 such universals,
+and on `atlas`, without the disjunctive attempt and against the same binary with every
+universal kept, the two files classify in 0.942 and 0.955 times the time on one thread and
+0.927 and 0.960 on four, with 8.2% and 7.1% fewer conclusions and about 60 and 50 MiB
+less memory. GO is unchanged. `ore_ont_7646` classifies within 8 GiB on one thread, with
+219.2 million conclusions against 398.7 million. The index also gives the sources of the
+links of negative existential restrictions that an unfolding makes positive the ranges of
+their properties' inverses, which the argument needs and which changed no conclusion count
+on these files. `Stats::horn_ranges_left_out` and the `hornRangesLeftOut` field of
+`el_classify` count the universals left out, and `SPARKLES_HORN_RANGES=keep` keeps them
+for a comparison.
+
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
