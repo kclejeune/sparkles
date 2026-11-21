@@ -4623,20 +4623,33 @@ were complete, with no mismatch.
 
 A classification of the terminology alone, which is the default of `ontology classify`,
 HTTP and the bindings without `assertions`, does not read the file's assertions, which are
-part of its ontology. They count as left out unless the same layers show that they cannot
-change an answer, which needs a consistency known for the whole ontology and the
-third layer's gates. A run then streams the assertions after the terminology's modules,
-stops at the first that matters, and reports it in `excluded` under the rule
-`assertion-not-read`, with one entry for all of them. An assertion of a class that the
-terminology does not name counts too, since the taxonomy lacks that class. Class and property assertions over a
-terminology of subclass axioms and existential restrictions, which nothing in it can
-contradict, change nothing and leave the run complete. An ontology with disjoint classes and typed individuals answers with
-`consistency` `unknown` and every class incomplete, since its assertions could make it
-inconsistent, and `assertions` true then gives the complete answer.
+part of its ontology. Any assertion with logical content among them counts as left out,
+whether or not it could change an answer. The run reads the assertions up to the first
+such one and reports it in `excluded` under the rule `assertion-not-read`, with one entry
+for all of them. The answer is then not complete, every class of the taxonomy is
+incomplete, and a consistency the run found becomes `unknown`, while an inconsistency
+stays, since it holds for the whole ontology too. A class that only an unread assertion
+names is in no taxonomy, so `incomplete` cannot list it, and it shows through `complete`
+and the `assertion-not-read` entry, and as a class that is not found. An earlier design
+let assertions that the module layers proved harmless leave the run complete. Three
+review rounds each found a case it missed, all of the kind of a class that only an
+assertion names, so it was removed, and roadmap item 1293 records a sound replacement.
+`assertions` true gives the complete answer, and roadmap item 1279 makes it the default.
+
+A triple that maps to no axiom, such as a SWRL rule in RDF, an assertion that a strict
+read cannot map or the domain of a property that is not declared, may carry any logical
+content. Every classification counts such triples, of the terminology and of the
+assertions, in `Stats::unmapped`, and with any of them the answer is not complete, every
+class is incomplete and a consistency found is `unknown`. No `excluded` entry names them,
+since an entry names an axiom, so the wire answers report the count as `stats.unmapped`,
+the CLI notes it and a strict run's refusal names it. A file in functional-style syntax
+whose entities are all declared reads without the store and has no unmapped triples. One
+with an undeclared entity takes the store's reading, in which a domain or range of an
+undeclared property is such a triple.
 
 The pass costs nothing when nothing is left out and nothing is dropped. A classification of
-the terminology alone over a store or file with assertions extracts the two modules of the
-empty signature and scans the assertions, as roadmap item 1279 records. Its extractions share one bound on the
+the terminology alone reads the assertions only up to the first with logical content, and
+takes no extraction for them. The pass's extractions share one bound on the
 axioms they examine, 1024 for each axiom of the input and at least about a million, past
 which the classes not yet decided are incomplete, so an answer depends on the input
 alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
@@ -4654,7 +4667,11 @@ names the axioms and the rule each breaks, `UnsupportedError` in Python and Node
 unsupported error in the JVM and the FFI, and ROBOT's `INCOMPLETE REASONING ERROR`. The
 default stays non-strict, except that ROBOT's commands are strict when they name HermiT
 or JFact as the reasoner, since a caller who asks for those expects a complete answer or
-an error. `--strict false` turns that off, and ELK and the other names keep the warning. The content fingerprint of a retained classification is
+an error. `--strict false` turns that off, and ELK and the other names keep the warning.
+`reduce` classifies ROBOT's subset of the subclass axioms and the property
+characteristics, so its refusal concerns the axioms of that subset. The JVM binding has
+no OWL API reasoner adapter and its `ClassifyQuery` names no reasoner, so its `strict`
+stays off by default as the opt-in. The content fingerprint of a retained classification is
 version 2, since it now covers both flags. The server computes it in memory and stores it
 nowhere, so only a client that kept an older fingerprint sees a new value.
 

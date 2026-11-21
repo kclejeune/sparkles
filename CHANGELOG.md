@@ -13,14 +13,18 @@ that `excluded` listed, which is ELK's convention, and that meaning moves to
 the classes whose bottom-locality module holds one of them in `incomplete`, keeps every
 other class's exact superclasses, and makes the consistency `unknown` with every class
 incomplete when a left-out axiom could make the ontology inconsistent. A classification
-without `assertions` counts the file's assertions as left out under the rule
-`assertion-not-read` unless they cannot change an answer, so an ontology with disjoint
-classes and typed individuals answers `unknown` until it is classified with them. The
+without `assertions` counts any assertion with logical content that it did not read as
+left out under the rule `assertion-not-read`, so an ontology with individuals answers
+incomplete, with every class incomplete and the consistency `unknown`, until it is
+classified with them. A class that only such an assertion names shows only through
+`complete` and that entry. A triple that maps to no axiom, such as a SWRL rule in RDF or
+the domain of an undeclared property, is counted in the new `unmapped` statistic and
+leaves the answer incomplete in the same way (roadmap item 1276). The
 new `strict` option, `--strict` on `sparkles ontology classify` and `--strict true` on
 ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the error
 `classification-incomplete`, HTTP 422. ROBOT's commands are strict by default with
 `--reasoner hermit` or `jfact`, and `--strict false` turns that off. The answers' stats gain `coverageMs`,
-`coverageOver` and `coverageStopped`, and the content fingerprint of a retained
+`coverageOver`, `coverageStopped` and `unmapped`, and the content fingerprint of a retained
 classification is version 2, as roadmap item 1271.
 
 ### A kept EL classification over its memory budget starts again in full

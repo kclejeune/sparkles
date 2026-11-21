@@ -681,13 +681,22 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   over-approximates, so a class in `incomplete` can still have its exact answer. When a
   left-out axiom could make the ontology inconsistent, `consistency` is `unknown` and every
   class is incomplete. A classification without `assertions` reads the terminology alone,
-  and the file's assertions count as left out under the rule `assertion-not-read` unless
-  they cannot change an answer, as for an ontology whose disjoint classes they could
-  contradict. `strict` on the request, `--strict` on `sparkles ontology classify` and
+  and any assertion with logical content that it did not read counts as left out under
+  the rule `assertion-not-read`, whether or not it could change an answer. The answer is
+  then not complete, every class is incomplete and the consistency is `unknown`, while an
+  inconsistent terminology stays `inconsistent`. A class that only such an assertion
+  names is in no taxonomy, so it is not listed in `incomplete` and shows only through
+  `complete` and the `assertion-not-read` entry. A triple that maps to no axiom, such as
+  a SWRL rule in RDF or the domain of a property that is not declared, is counted in the
+  `unmapped` statistic and leaves the answer incomplete in the same way, with or without
+  `assertions`. `strict` on the request, `--strict` on `sparkles ontology classify` and
   `--strict true` on ROBOT's `reason`, `reduce` and `materialize`, which is their default
   with `--reasoner hermit` or `jfact`, refuse such a run with
-  the error `classification-incomplete`, HTTP 422, naming the axioms. The pass that decides
-  `incomplete` costs nothing when nothing is left out and no assertion goes unread, has a bound on its work that
+  the error `classification-incomplete`, HTTP 422, naming the axioms and the count of
+  unmapped triples. The JVM binding's `ClassifyQuery` has no reasoner to name, so its
+  `strict` stays off by default. The pass that decides `incomplete` costs nothing when
+  nothing is left out, reads the unread assertions only up to the first with logical
+  content, has a bound on its work that
   `coverageOver` reports, and answers with every class incomplete and `coverageStopped` set
   when the deadline stops it. The
   [F24 outcome](../specs/F24-owl-classification/SPEC.md#completeness-for-the-whole-ontology)
