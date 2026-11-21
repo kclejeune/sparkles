@@ -33,6 +33,15 @@ use std::cmp::Ordering;
 /// The least reserve of a window, in rows.
 pub const MIN_RESERVE: usize = 100;
 
+#[cfg(test)]
+thread_local! {
+    /// the comparisons of [`Window::cmp`] on this thread, for tests of the work
+    static CMPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// the most rows a refill's reconciliation tracked on this thread, for tests of
+    /// its memory
+    static RECONCILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Rows of the window that entered or left it in a pass, each with the position of its
 /// first copy (0 is the first row the query returns) and the number of copies, which
 /// stand at consecutive positions. Removed rows carry their position before the pass and
@@ -131,6 +140,8 @@ impl Window {
     }
 
     fn cmp(&self, a: &[SortKey], b: &[SortKey]) -> Ordering {
+        #[cfg(test)]
+        CMPS.with(|c| c.set(c.get() + 1));
         cmp_keys(a, b, &self.asc)
     }
 
@@ -139,12 +150,22 @@ impl Window {
         self.serial
     }
 
-    /// Compute the keys of rows loaded from a checkpoint.
-    fn refresh(&mut self, p: &Pass) {
+    /// Compute the keys of rows loaded from a checkpoint. The rows stay stale until
+    /// every key is computed.
+    fn refresh(&mut self, p: &mut Pass) -> Result<()> {
         if !self.stale {
-            return;
+            return Ok(());
         }
-        let keys: Vec<Vec<SortKey>> = self.kept.iter().map(|e| self.key_of(p, &e.row)).collect();
+        p.control.check()?;
+        let mut used = self.bytes();
+        let mut keys = Vec::with_capacity(self.kept.len());
+        for e in &self.kept {
+            p.tick()?;
+            let k = self.key_of(p, &e.row);
+            used = used.saturating_add(key_bytes(&k));
+            charge(p, used)?;
+            keys.push(k);
+        }
         for (e, k) in self.kept.iter_mut().zip(keys) {
             e.keys = k;
         }
@@ -153,6 +174,27 @@ impl Window {
             .iter()
             .any(|e| e.keys.iter().any(|k| !k.totally_ordered()));
         self.stale = false;
+        Ok(())
+    }
+
+    /// The changes with their rows' keys.
+    #[allow(clippy::type_complexity)]
+    fn keyed(&self, p: &mut Pass, c: Changes) -> Result<Vec<(Row, i64, Vec<SortKey>)>> {
+        p.control.check()?;
+        let width = self.inner.schema.len();
+        let slot = std::mem::size_of::<(Row, i64, Vec<SortKey>)>() as u64;
+        let mut used = self
+            .bytes()
+            .saturating_add((c.len() as u64).saturating_mul(slot));
+        let mut out = Vec::with_capacity(c.len());
+        for (r, w) in c {
+            p.tick()?;
+            let k = self.key_of(p, &r);
+            used = used.saturating_add(heap_bytes(&k, width));
+            charge(p, used)?;
+            out.push((r, w, k));
+        }
+        Ok(out)
     }
 
     /// The index of `row`, whose keys are `keys`, among the kept rows.
@@ -278,88 +320,169 @@ impl Window {
     /// `SAMPLE` keeps its value while the group holds it, and a fresh one takes the
     /// smallest). The other rows of the best `cap` then join them at their places, and
     /// copies of a row that is kept already join its entry.
+    ///
+    /// Only the kept rows are reconciled, so the bookkeeping is bounded by the window and
+    /// not by the input. The heap, its keys' strings, the kept rows a refill still holds
+    /// and the reconciliation are charged to the pass's memory budget at every row. A
+    /// pass that fails while the rows are placed leaves the window empty with the input's
+    /// total, which the next changing pass refills.
     fn fill(&mut self, p: &mut Pass, rows: Changes, keep: bool) -> Result<()> {
-        self.total = rows.iter().map(|(_, w)| *w).sum();
+        p.control.check()?;
         let cap = usize::try_from(self.cap()).unwrap_or(usize::MAX);
-        let mut top: TopK<(Row, i64)> = TopK::new(cap, self.asc.clone());
+        let width = self.inner.schema.len();
+        let mut top: TopK<(Row, i64, Option<usize>)> = TopK::new(cap, self.asc.clone());
         let mut partial = false;
-        let mut left: FxHashMap<Row, i64> = FxHashMap::default();
-        let per = self.per_row();
-        for (i, (r, w)) in rows.into_iter().enumerate() {
+        let mut total = 0i64;
+        // a refill tracks each kept row's copies in the input, and nothing else
+        let index: FxHashMap<&[crate::id::Id], usize> = if keep {
+            self.kept
+                .iter()
+                .enumerate()
+                .map(|(i, e)| (&*e.row, i))
+                .collect()
+        } else {
+            FxHashMap::default()
+        };
+        let mut counts = vec![0i64; index.len()];
+        let base = if keep {
+            let per = std::mem::size_of::<(&[crate::id::Id], usize)>() as u64 + 16;
+            self.bytes()
+                .saturating_add((index.capacity() as u64).saturating_mul(per))
+        } else {
+            0
+        };
+        let slot = std::mem::size_of::<HeapEntry>() as u64;
+        let mut payloads = 0u64;
+        for (r, w) in rows {
+            total = total.saturating_add(w);
             if w <= 0 {
                 continue;
             }
             p.tick()?;
-            // the heap is the operator's state to be, charged as it grows
-            if i % 4096 == 4095
-                && let Some(max) = p.max_memory_bytes
-            {
-                let used = (top.kept() as u64).saturating_mul(per);
-                if used > max {
-                    return Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
-                        kind: crate::error::BudgetKind::Memory,
-                        limit: max,
-                        requested: used,
-                    }));
-                }
-            }
             let keys = self.key_of(p, &r);
             partial |= keys.iter().any(|k| !k.totally_ordered());
-            if keep {
-                left.insert(r.clone(), w);
+            let at = index.get(&*r).copied();
+            if let Some(i) = at {
+                counts[i] = counts[i].saturating_add(w);
             }
-            top.offer(keys, (r, w));
+            payloads = payloads.saturating_add(heap_bytes(&keys, width));
+            if let Some(out) = top.offer(keys, (r, w, at)) {
+                payloads = payloads.saturating_sub(heap_bytes(&out.keys, width));
+            }
+            // the heap is the operator's state to be, charged as it grows; a vector
+            // doubles, so its slots are charged at the next power of two
+            let slots = (top.kept().max(1).next_power_of_two() as u64).saturating_mul(slot);
+            charge(p, base.saturating_add(payloads).saturating_add(slots))?;
         }
-        if keep && !partial {
-            let mut kept = std::mem::take(&mut self.kept);
-            self.held = 0;
-            kept.retain_mut(|e| {
-                let n = left.get_mut(&e.row).map_or(0, |n| {
-                    let k = (*n).min(e.w);
-                    *n -= k;
-                    k
-                });
-                e.w = n;
-                self.held += n;
-                n > 0
-            });
-            self.kept = kept;
+        drop(index);
+        #[cfg(test)]
+        RECONCILED.with(|c| c.set(c.get().max(counts.len())));
+        // the sort's positions and slots, and the empty input's state
+        let slots = (top.kept().max(1).next_power_of_two() as u64).saturating_mul(slot);
+        let sorting = (top.kept() as u64).saturating_mul(slot + 24);
+        charge(
+            p,
+            base.saturating_add(payloads)
+                .saturating_add(slots)
+                .saturating_add(sorting),
+        )?;
+        p.control.check()?;
+        let sorted = top.into_sorted();
+        p.control.check()?;
+        let placed = if keep && !partial {
+            self.reconcile(p, sorted, &counts)
         } else {
             self.kept.clear();
             self.held = 0;
-            left.clear();
+            self.place(p, sorted)
+        };
+        if let Err(e) = placed {
+            self.kept.clear();
+            self.held = 0;
+            self.total = total;
+            return Err(e);
         }
-        for e in top.into_sorted() {
-            let (row, full) = e.payload;
-            let w = if keep && !partial {
-                left.remove(&row).unwrap_or(0)
-            } else {
-                full
-            };
+        self.total = total;
+        self.partial = partial;
+        self.trim();
+        Ok(())
+    }
+
+    /// The heap's rows in order as the kept rows, each with all its copies.
+    fn place(&mut self, p: &mut Pass, sorted: Vec<HeapEntry>) -> Result<()> {
+        let mut kept = Vec::with_capacity(sorted.len());
+        let mut held = 0i64;
+        for e in sorted {
+            p.tick()?;
+            let (row, w, _) = e.payload;
+            held = held.saturating_add(w);
+            kept.push(Entry {
+                row,
+                w,
+                keys: e.keys,
+                serial: self.next_serial(),
+            });
+        }
+        self.kept = kept;
+        self.held = held;
+        Ok(())
+    }
+
+    /// Merge the heap's rows into the kept rows that the input still holds, whose copies
+    /// in the input are `counts`. A kept row keeps at most its input's copies, its other
+    /// copies in the heap join its entry, and the heap's other rows take their places
+    /// after the kept rows they tie with.
+    fn reconcile(&mut self, p: &mut Pass, sorted: Vec<HeapEntry>, counts: &[i64]) -> Result<()> {
+        let mut extra = vec![0i64; counts.len()];
+        let mut fresh = Vec::new();
+        for e in sorted {
+            p.tick()?;
+            let (row, full, at) = e.payload;
+            match at {
+                Some(i) => {
+                    let retained = counts[i].min(self.kept[i].w);
+                    extra[i] = extra[i].saturating_add(full - retained);
+                }
+                None => fresh.push((row, full, e.keys)),
+            }
+        }
+        let old = std::mem::take(&mut self.kept);
+        self.held = 0;
+        let mut kept = Vec::with_capacity(old.len().saturating_add(fresh.len()));
+        let mut held = 0i64;
+        let mut fresh = fresh.into_iter().peekable();
+        for (i, mut e) in old.into_iter().enumerate() {
+            let w = counts[i].min(e.w).saturating_add(extra[i]);
             if w <= 0 {
                 continue;
             }
-            self.held += w;
-            if let Some(i) = self.find(&row, &e.keys) {
-                self.kept[i].w += w;
-                continue;
+            while let Some(f) = fresh.next_if(|f| self.cmp(&f.2, &e.keys) == Ordering::Less) {
+                p.tick()?;
+                held = held.saturating_add(f.1);
+                kept.push(Entry {
+                    row: f.0,
+                    w: f.1,
+                    keys: f.2,
+                    serial: self.next_serial(),
+                });
             }
-            let at = self
-                .kept
-                .partition_point(|k| self.cmp(&k.keys, &e.keys) != Ordering::Greater);
-            let serial = self.next_serial();
-            self.kept.insert(
-                at,
-                Entry {
-                    row,
-                    w,
-                    keys: e.keys,
-                    serial,
-                },
-            );
+            p.tick()?;
+            e.w = w;
+            held = held.saturating_add(w);
+            kept.push(e);
         }
-        self.partial = partial;
-        self.trim();
+        for f in fresh {
+            p.tick()?;
+            held = held.saturating_add(f.1);
+            kept.push(Entry {
+                row: f.0,
+                w: f.1,
+                keys: f.2,
+                serial: self.next_serial(),
+            });
+        }
+        self.kept = kept;
+        self.held = held;
         Ok(())
     }
 
@@ -400,15 +523,9 @@ impl Window {
             }
             return Ok(Vec::new());
         }
-        self.refresh(p);
+        self.refresh(p)?;
         let old = self.segments();
-        let keyed: Vec<(Row, i64, Vec<SortKey>)> = c
-            .into_iter()
-            .map(|(r, w)| {
-                let k = self.key_of(p, &r);
-                (r, w, k)
-            })
-            .collect();
+        let keyed = self.keyed(p, c)?;
         let partial = self.partial
             || keyed
                 .iter()
@@ -522,6 +639,18 @@ impl Window {
         )
     }
 
+    /// Whether the keys are not computed.
+    #[cfg(test)]
+    pub(crate) fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Mark the keys as not computed, as a load does.
+    #[cfg(test)]
+    pub(crate) fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
     /// Whether the window holds a key without a total order and so rebuilds its rows.
     #[cfg(test)]
     pub(crate) fn partial(&self) -> bool {
@@ -589,6 +718,38 @@ impl Window {
     }
 }
 
+/// A row in the heap of a fill: the row, its copies in the input and its index among
+/// the kept rows.
+type HeapEntry = crate::sparql::sortkey::Entry<(Row, i64, Option<usize>)>;
+
+/// The memory a heap entry holds besides its slot: its keys and their strings and its
+/// row's ids.
+fn heap_bytes(keys: &[SortKey], width: usize) -> u64 {
+    key_bytes(keys).saturating_add(row_bytes(width))
+}
+
+/// The memory of a row's keys: their vector and their strings.
+fn key_bytes(keys: &[SortKey]) -> u64 {
+    let strings: u64 = keys.iter().map(SortKey::payload_bytes).sum();
+    (std::mem::size_of_val(keys) as u64).saturating_add(strings)
+}
+
+/// Fail with a memory budget error when `used` passes the pass's budget.
+fn charge(p: &Pass, used: u64) -> Result<()> {
+    match p.max_memory_bytes {
+        Some(max) if used > max => Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+            kind: crate::error::BudgetKind::Memory,
+            limit: max,
+            requested: used,
+        })),
+        _ => Ok(()),
+    }
+}
+
 fn strip(c: AChanges) -> Changes {
     consolidate(c.into_iter().map(|(r, w, _)| (r, w)).collect())
 }
+
+#[cfg(test)]
+#[path = "window_unit_tests.rs"]
+mod tests;
