@@ -4441,13 +4441,16 @@ by 6 to 7% on `ore_ont_4510` and `ore_ont_9654`, whose anonymous individuals occ
 other axioms and become individuals of the run, and by 4 to 5 MiB on six files of about
 22 MiB. On `atlas`
 with four threads, in three alternating rounds of three classifications a side of
-781da4c8, before the review fixes, against 0779d666, 34 of the 118 file and run cells are faster in every
-classification and 6 slower. The tip classifies `ore_ont_10073` and `ore_ont_5481` in 88
-to 90 ms against 756 to 774 ms, `ore_ont_5857` in 242 against 1,392 ms by default and in
-1,930 against 3,387 ms rooted, and the other files above 100 ms in 0.16 to 0.80 times the
-base's time. `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_9654` take 1.18
-to 1.23 times as long while they take the 479 to 3,981 axioms that the base left out,
-since their anonymous individuals occur in several axioms, which item 1300 follows. HermiT
+3c7d0eb0 against 0779d666, 34 of the 118 file and run cells are faster in every
+classification and 7 slower. The tip classifies `ore_ont_10073` and `ore_ont_5481` in 105
+to 107 ms against 761 to 775 ms, `ore_ont_5857` in 312 against 1,388 ms by default and in
+2,045 against 3,398 ms rooted, and the other files above 100 ms in 0.17 to 0.80 times the
+base's time. `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_9654` take 1.21
+to 1.27 times as long while they take the 479 to 3,981 axioms that the base left out,
+since their anonymous individuals occur in several axioms, which item 1293 follows. The
+same rounds at 781da4c8, before the review fixes, classified `ore_ont_10073` and
+`ore_ont_5481` in 88 to 90 ms and `ore_ont_5857` in 242 ms by default, so the review fixes
+cost 16 to 18 ms and 70 ms there, and item 1293 also follows that cost. HermiT
 1.4.5.519 references exist for 29 of the 31 files that anonymous individuals alone kept
 from a full answer, and the tip's taxonomy equals HermiT's on all 29 in both runs on four
 threads, with the same consistency. The hand cases of `tests/anonymous_individuals.rs`
@@ -4461,10 +4464,11 @@ same left-out axioms, tiers and consistency in all 118 cells and HermiT's taxono
 58 runs, as its
 [record](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-laptop-3c7d0eb0/record.json)
 shows. The
-[record of 781da4c8](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
-holds the timings, the census and the judgements, which the
-[benchmark report](../../benchmarks/el-classification/RESULTS.md#anonymous-individuals-and-top-property-inclusions)
-discusses.
+[record of 3c7d0eb0's timings](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-3c7d0eb0/record.json)
+and the
+[record of 781da4c8](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json),
+which holds the earlier timings, the census and the judgements, are discussed in the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#anonymous-individuals-and-top-property-inclusions).
 
 ### ROBOT-compatible commands
 

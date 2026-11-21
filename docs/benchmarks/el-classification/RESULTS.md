@@ -1955,50 +1955,65 @@ Roadmap items 1281 and 1282 take the axioms with anonymous individuals and the
 inclusions in a top property that the classifier left out, as
 [F24](../../specs/F24-owl-classification/SPEC.md#anonymous-individuals-and-top-property-inclusions)
 describes. On `atlas` three rounds of alternating order compared the base, commit
-0779d666, with commit 781da4c8, before the review fixes, on the 59 files of the ORE 2015 DL development set that
+0779d666, with commit 3c7d0eb0 on the 59 files of the ORE 2015 DL development set that
 hold either, one process per side, file and run with three classifications each on four
 threads. Each time is the median of a side's nine classifications. Of the 118 cells, 34
-are faster in every classification and 6 slower, and the rest overlap. The table gives
+are faster in every classification and 7 slower, and the rest overlap. The table gives
 the files above 100 ms and the files that are slower.
 
 | Ontology | Run | Base ms | Tip ms | Ratio | Left out before | Left out after |
 |---|---|---:|---:|---:|---:|---:|
-| `ore_ont_10073` | default | 756.4 | 87.7 | 0.116 | 457,662 | 0 |
-| `ore_ont_10073` | rooted | 774.4 | 89.5 | 0.116 | 457,662 | 0 |
-| `ore_ont_5481` | default | 759.5 | 89.9 | 0.118 | 457,662 | 0 |
-| `ore_ont_5481` | rooted | 774.3 | 89.4 | 0.116 | 457,662 | 0 |
-| `ore_ont_1370` | default | 420.8 | 67.0 | 0.159 | 243,972 | 0 |
-| `ore_ont_1370` | rooted | 426.8 | 69.1 | 0.162 | 243,972 | 0 |
-| `ore_ont_4755` | default | 383.2 | 78.5 | 0.205 | 244,174 | 0 |
-| `ore_ont_4755` | rooted | 389.1 | 81.7 | 0.210 | 244,174 | 0 |
-| `ore_ont_5857` | default | 1,392.2 | 241.7 | 0.174 | 723,843 | 38 |
-| `ore_ont_5857` | rooted | 3,386.5 | 1,930.3 | 0.570 | 723,805 | 0 |
-| `ore_ont_12414` | default | 228.0 | 49.4 | 0.217 | 163,237 | 0 |
-| `ore_ont_12414` | rooted | 235.3 | 48.9 | 0.208 | 163,237 | 0 |
-| `ore_ont_7914` | default | 351.8 | 237.4 | 0.675 | 108,542 | 41 |
-| `ore_ont_7914` | rooted | 1,128.3 | 904.0 | 0.801 | 108,542 | 41 |
-| `ore_ont_9654` | default | 324.8 | 394.4 | 1.214 | 3,993 | 12 |
-| `ore_ont_9654` | rooted | 321.3 | 385.1 | 1.199 | 3,993 | 12 |
-| `ore_ont_4510` | default | 122.3 | 145.8 | 1.193 | 2,505 | 0 |
-| `ore_ont_4510` | rooted | 124.9 | 148.5 | 1.189 | 2,505 | 0 |
-| `ore_ont_12901` | default | 97.1 | 115.4 | 1.188 | 975 | 0 |
-| `ore_ont_12901` | rooted | 99.7 | 118.1 | 1.184 | 975 | 0 |
-| `ore_ont_14375` | default | 20.7 | 25.4 | 1.226 | 479 | 0 |
-| `ore_ont_14375` | rooted | 21.1 | 25.2 | 1.194 | 479 | 0 |
+| `ore_ont_10073` | default | 769.8 | 105.8 | 0.137 | 457,662 | 0 |
+| `ore_ont_10073` | rooted | 770.9 | 105.3 | 0.137 | 457,662 | 0 |
+| `ore_ont_5481` | default | 760.6 | 106.6 | 0.140 | 457,662 | 0 |
+| `ore_ont_5481` | rooted | 774.9 | 106.9 | 0.138 | 457,662 | 0 |
+| `ore_ont_1370` | default | 420.9 | 70.9 | 0.168 | 243,972 | 0 |
+| `ore_ont_1370` | rooted | 423.5 | 70.3 | 0.166 | 243,972 | 0 |
+| `ore_ont_4755` | default | 382.3 | 85.6 | 0.224 | 244,174 | 0 |
+| `ore_ont_4755` | rooted | 386.8 | 86.0 | 0.222 | 244,174 | 0 |
+| `ore_ont_5857` | default | 1,388.3 | 311.6 | 0.224 | 723,843 | 38 |
+| `ore_ont_5857` | rooted | 3,398.2 | 2,045.1 | 0.602 | 723,805 | 0 |
+| `ore_ont_12414` | default | 227.2 | 54.6 | 0.240 | 163,237 | 0 |
+| `ore_ont_12414` | rooted | 235.1 | 52.6 | 0.224 | 163,237 | 0 |
+| `ore_ont_7914` | default | 356.0 | 247.0 | 0.694 | 108,542 | 41 |
+| `ore_ont_7914` | rooted | 1,135.0 | 901.9 | 0.795 | 108,542 | 41 |
+| `ore_ont_9654` | default | 330.1 | 405.2 | 1.228 | 3,993 | 12 |
+| `ore_ont_9654` | rooted | 316.0 | 402.0 | 1.272 | 3,993 | 12 |
+| `ore_ont_4510` | default | 124.6 | 155.0 | 1.244 | 2,505 | 0 |
+| `ore_ont_4510` | rooted | 125.1 | 153.0 | 1.223 | 2,505 | 0 |
+| `ore_ont_12901` | default | 97.2 | 121.1 | 1.246 | 975 | 0 |
+| `ore_ont_12901` | rooted | 100.3 | 125.0 | 1.247 | 975 | 0 |
+| `ore_ont_14375` | default | 21.6 | 26.5 | 1.228 | 479 | 0 |
+| `ore_ont_14375` | rooted | 21.4 | 25.8 | 1.209 | 479 | 0 |
 
 The files whose anonymous individuals are reifications that occur in one class assertion
-each classify in 0.12 to 0.29 times the base's time, since one individual stands for
+each classify in 0.14 to 0.31 times the base's time, since one individual stands for
 each class and the EL rules take them. `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375`
-and `ore_ont_9654` take 1.18 to 1.23 times as long while they take the 479 to 3,981 axioms
-that the base left out, which roadmap item 1300 follows. On the 29 files with a HermiT
+and `ore_ont_9654` take 1.21 to 1.27 times as long while they take the 479 to 3,981 axioms
+that the base left out, which roadmap item 1293 follows. On the 29 files with a HermiT
 reference whose anonymous individuals were all they left out, the tip's taxonomy equals
-HermiT's in both runs. A rerun of the census and the HermiT comparison with commit
-3c7d0eb0, after the review fixes, gives the same result in every cell.
+HermiT's in both runs.
+
+The same rounds with commit 781da4c8, before the review fixes, measured the tip faster on
+the largest files. The review fixes change rooted detection, the Horn rules with
+individuals and chain deferral, and they bound the scan for shared individuals and count
+it in the peak memory. Against
+781da4c8 they take 1.18 to 1.21 times as long on `ore_ont_10073` and `ore_ont_5481`, 88 to
+90 ms then and 105 to 107 ms now, 1.29 times as long on `ore_ont_5857` by default, 242 ms
+then and 312 ms now, and 1.00 to 1.10 times as long on the other files above 100 ms. The
+four slower files moved from 1.18 to 1.23 times the base's time to 1.21 to 1.27. The
+base's times agree between the two runs within a few percent. Every cell has the same
+left-out axioms, tier and consistency in both runs, and the census and the HermiT
+comparison of 3c7d0eb0 give the same result in every cell as those of 781da4c8.
 
 ## Records
 
-The [record of items 1281 and 1282](runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
+The [record of items 1281 and 1282 at 3c7d0eb0](runs/2026-11-21-anonymous-individuals-atlas-3c7d0eb0/record.json)
 holds every classification of the rounds on `atlas` with its report, the binary hashes,
+the host's state before and after, each cell's ratio to the run at 781da4c8 and the
+script that ran. The
+[record of 781da4c8](runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
+holds every classification of its rounds on `atlas` with its report, the binary hashes,
 the host's state before and after, the census of both builds on the laptop with its
 left-out counts and peak memory, the HermiT judgements and the scripts that ran. The
 [record of the rerun at 3c7d0eb0](runs/2026-11-21-anonymous-individuals-laptop-3c7d0eb0/record.json)
