@@ -140,6 +140,16 @@ in 0.3 to 1 s against 16 ms without the option on a shared laptop. ore_ont_15803
 same in 1.7 s against 0.7 s on four threads, with the same taxonomy as before item 805.
 Item 1061 follows that cost.
 
+Item 1304 keeps the disjointness of members that the rewriting merges. Two members such
+as `∃top.A` and `≥1 top.A`, or `owl:Thing` and `≥0 top.X`, have one image, and the set of
+images held one member, which the normaliser drops, so a rooted run lost the disjointness
+and could answer a class satisfiable or an inconsistent ontology consistent while it
+reported itself complete. The members are equivalent, so their disjointness makes the
+image empty. The rewriting now adds `D ⊑ ⊥` for each image `D` of more than one member,
+keeps the disjointness of the distinct images when two or more remain, and keeps the union
+of a `DisjointUnion` over the set of images. Intersections, unions and equivalences keep
+the set of images, since a repeated member does not change their meaning.
+
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
 1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`

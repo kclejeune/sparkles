@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Rooted runs keep the disjointness of members that the rewriting merges
+
+The rewriting of item 805 gives `∃top.A` and `≥1 top.A` the same image, and `≥0 top.X`
+the image `owl:Thing`, so two members of a `DisjointClasses` or `DisjointUnion` axiom
+could become one and the axiom was dropped. A rooted run of `DisjointClasses(∃top.A,
+≥1 top.A)` with `K ⊑ A` answered A and K satisfiable where HermiT finds them empty, and
+`DisjointClasses(owl:Thing, ≥0 top.X)` came out consistent, with each run reporting itself
+complete. The rewriting now makes an image of more than one member empty and keeps the
+disjointness of the distinct images, as roadmap item 1304. Runs without `Limits::rooted`
+were not affected.
+
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
