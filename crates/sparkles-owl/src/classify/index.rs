@@ -1675,6 +1675,10 @@ fn normalize_axiom(
         }
         K::HasKey(c, ops, dps) => {
             let class = ce(c, it, &mut partial)?;
+            // the keys read the lattice's values, not the checker's atoms
+            if dps.iter().any(|d| it.dt_checker(d)) {
+                partial = Some(DT_KEY);
+            }
             let mut objects = Vec::with_capacity(ops.len());
             for p in ops {
                 let Some(r) = object_role(p, it) else {
@@ -1816,6 +1820,8 @@ const NUMERIC_HALTED: &str = "numeric construction halted";
 /// reaches each component, which the checker reads one at a time.
 pub const DT_TOP: &str =
     "a data restriction or axiom over the top or bottom data property beside the datatype checker";
+/// A key over a property of a checker component, whose values the worlds do not compare.
+pub const DT_KEY: &str = "a key over a data property that the datatype checker takes";
 /// A data atom of the checker before the saturation reads it.
 pub const DT_UNWIRED: &str =
     "a data restriction that the datatype checker takes, which the saturation does not read";

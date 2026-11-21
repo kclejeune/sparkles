@@ -17,6 +17,10 @@ fn axioms(body: &str) -> Vec<AxiomKind> {
 }
 
 fn run(body: &str) -> (Saturation, Vec<AxiomKind>) {
+    run_on(body, 1)
+}
+
+fn run_on(body: &str, threads: usize) -> (Saturation, Vec<AxiomKind>) {
     let ax = axioms(body);
     let mut sat = Saturation::new();
     let all: Vec<&AxiomKind> = ax.iter().collect();
@@ -24,7 +28,7 @@ fn run(body: &str) -> (Saturation, Vec<AxiomKind>) {
         &all,
         None,
         &Limits {
-            threads: 1,
+            threads,
             ..Limits::default()
         },
     )
@@ -123,4 +127,32 @@ fn a_faceted_definition_outside_the_profile_reaches_the_checker() {
     );
     // the definition makes `d` a checker property, so the in-profile axiom is an atom
     assert!(!sat.interner.dt.is_empty());
+}
+
+#[test]
+fn a_parallel_run_reports_what_one_thread_reports() {
+    // role axioms over a checker property intern no data value, so that only the
+    // checker components keep the run from its chunks
+    let mut body = String::from(
+        "FunctionalDataProperty(:d)\n\
+         SubDataPropertyOf(:d owl:bottomDataProperty)\n\
+         HasKey(:K () (:d))\n\
+         SubClassOf(:B DataAllValuesFrom(:d xsd:int))\n",
+    );
+    for i in 0..4 * PARALLEL_AXIOMS {
+        body.push_str(&format!("SubClassOf(:C{i} :D)\n"));
+    }
+    let (one, _) = run_on(&body, 1);
+    let (many, _) = run_on(&body, 4);
+    assert_eq!(one.excluded(), many.excluded());
+    assert_eq!(one.excluded().len(), 4);
+}
+
+#[test]
+fn a_key_over_a_checker_property_is_used_in_part() {
+    let (sat, ax) = run("HasKey(:K () (:d))\n\
+         SubClassOf(:B DataAllValuesFrom(:d xsd:int))\n\
+         HasKey(:K () (:e))");
+    assert_eq!(gap_of(&sat, &ax[0]), Some(&Gap::Partial(index::DT_KEY)));
+    assert!(gap_of(&sat, &ax[2]).is_none());
 }

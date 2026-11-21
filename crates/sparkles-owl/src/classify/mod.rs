@@ -1699,7 +1699,9 @@ impl Saturation {
         // grant, since each chunk holds the names it meets and the merge copies them.
         let mut merged = false;
         let mut peak = 0;
-        if threads > 1 && axioms.len() >= PARALLEL_AXIOMS {
+        // A chunk's interner has no checker components, so a run with them normalizes on
+        // one thread, where each axiom over a checker property gets its atoms or report.
+        if threads > 1 && axioms.len() >= PARALLEL_AXIOMS && self.interner.dt_run.is_none() {
             let gauge = Gauge {
                 limits,
                 numeric: self.interner.ranges.budget.clone(),
