@@ -2009,44 +2009,54 @@ mod classification {
         );
     }
 
+    /// Any assertion the terminology alone did not read leaves the answer incomplete, even
+    /// one that cannot change an answer, and a commit that adds the first one makes the
+    /// kept answer incomplete too.
     #[test]
-    fn assertions_that_cannot_change_an_answer_leave_the_terminology_complete() {
-        let ds = dataset(&format!(
-            "{ONTO} :Cell rdfs:subClassOf :Thing2 . :x a :Cell ; :partOf :y . :y :size 3 ."
-        ));
+    fn any_assertion_not_read_leaves_the_terminology_incomplete() {
+        use sparkles_owl::classify::{Consistency, Gap, NOT_READ};
+        let ds = dataset(&format!("{ONTO} :Cell rdfs:subClassOf :Thing2 ."));
         let h = ds.ontology();
-        let c = h
-            .classify(
-                &OntologyRequest::default(),
-                &ClassifyRequest::default(),
-                &opts(),
-            )
+        let req = OntologyRequest::default();
+        let first = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
             .unwrap();
-        assert!(c.classification.complete, "{:?}", c.excluded);
-        assert!(c.excluded.is_empty() && c.classification.incomplete.is_empty());
+        assert!(first.classification.complete, "{:?}", first.excluded);
+        assert!(first.excluded.is_empty());
+        ds.update(&format!(
+            "{PREFIXES} INSERT DATA {{ :size a owl:DatatypeProperty . :x a :Cell ; :partOf :y . :y :size 3 . }}"
+        ))
+        .unwrap();
+        let c = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(!c.reused);
+        assert!(!c.classification.complete && c.classification.complete_for_taken);
+        assert_eq!(c.classification.consistency, Consistency::Unknown);
+        assert!(
+            matches!(&c.excluded[..], [e] if matches!(&e.gap, Gap::Outside { rule, .. } if rule == NOT_READ)),
+            "{:?}",
+            c.excluded
+        );
+        assert!(
+            c.classification
+                .incomplete
+                .iter()
+                .any(|k| k == &self::c("Cell"))
+        );
         let strict = ClassifyRequest {
             strict: true,
             ..Default::default()
         };
-        assert!(
-            h.classify(&OntologyRequest::default(), &strict, &opts())
-                .is_ok()
-        );
-        // a run that skips the modules' pass is not kept for the next caller
-        let skip = ClassifyRequest {
-            skip_coverage: true,
+        assert!(h.classify(&req, &strict, &opts()).is_err());
+        // with the assertions the same store is complete
+        let all = ClassifyRequest {
+            assertions: true,
+            strict: true,
             ..Default::default()
         };
-        let fresh = dataset(&format!(
-            "{ONTO} :Cell rdfs:subClassOf :Thing2 . :x a :Cell ; :partOf :y . :y :size 3 ."
-        ));
-        let f = fresh.ontology();
-        f.classify(&OntologyRequest::default(), &skip, &opts())
-            .unwrap();
-        let after = f
-            .classify(&OntologyRequest::default(), &strict, &opts())
-            .unwrap();
-        assert!(after.classification.complete && !after.reused);
+        let a = h.classify(&req, &all, &opts()).unwrap();
+        assert!(a.classification.complete, "{:?}", a.excluded);
     }
 
     #[test]

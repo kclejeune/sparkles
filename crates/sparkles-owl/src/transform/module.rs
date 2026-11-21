@@ -103,19 +103,14 @@ pub struct Coverage {
     /// the extraction passed its work bound, and the classes it had not decided are
     /// incomplete
     pub over_budget: bool,
-    /// one of the axioms the run was not given at all, when they count as left out
-    /// because they could change an answer: they could make the ontology inconsistent, or
-    /// the terminology names individuals
-    pub dropped: Option<AxiomKind>,
 }
 
 /// A stream of the axioms of an ontology that a run was not given at all, for
 /// [`Classification::cover`](crate::classify::Classification::cover): it calls its
 /// argument on each until that answers false, and answers false itself only when it
-/// could not finish, such as at its caller's deadline. The pass can read it more than
-/// once, and each call starts again from the first axiom, as a scan of a store's or a
-/// file's assertions does. The stream polls its own deadline, since the pass asks its
-/// stop only between the axioms it counts.
+/// could not finish, such as at its caller's deadline. Each call starts again from the
+/// first axiom, as a scan of a store's or a file's assertions does. The stream polls its
+/// own deadline.
 pub type Dropped<'d> = dyn FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'd;
 
 /// Why [`coverage`] stopped before an answer: its caller's stop said so.
@@ -130,17 +125,9 @@ const POLL_EVERY: usize = 4096;
 /// [module documentation](self) for the argument. `owl:Thing` and `owl:Nothing` are never
 /// listed. A left-out axiom that is not among `axioms` leaves the consistency unknown.
 ///
-/// `dropped`, when given, streams the axioms of the ontology that the run was not given
-/// at all, such as the assertions of a classification of the terminology alone: it calls
-/// its argument on each until that answers false, and answers false itself when it could
-/// not finish, which ends the pass with [`Stopped`]. They count as left out only when they
-/// can change an answer, and then [`Coverage::dropped`] holds one of them. The pass reads
-/// them only after the terminology's own modules, and stops at the first that matters.
-///
-/// The extractions look at no more than `budget` axioms in all, the dropped ones
-/// included, after which the classes not yet decided are incomplete, so that the answer
-/// depends on the input alone. `stop` is asked every few thousand axioms, and true ends
-/// the pass with [`Stopped`].
+/// The extractions look at no more than `budget` axioms in all, after which the classes
+/// not yet decided are incomplete, so that the answer depends on the input alone. `stop`
+/// is asked every few thousand axioms, and true ends the pass with [`Stopped`].
 pub(crate) fn coverage<'c>(
     axioms: &[&AxiomKind],
     left_out: &[&AxiomKind],
@@ -148,7 +135,6 @@ pub(crate) fn coverage<'c>(
     classes: impl IntoIterator<Item = &'c Class>,
     budget: usize,
     stop: &dyn Fn() -> bool,
-    mut dropped: Option<&mut Dropped<'_>>,
 ) -> Result<Coverage, Stopped> {
     let classes: Vec<&Class> = classes
         .into_iter()
@@ -160,33 +146,13 @@ pub(crate) fn coverage<'c>(
         v.dedup();
         v
     };
-    if !consistent || left_out.is_empty() && dropped.is_none() {
+    if !consistent || left_out.is_empty() {
         // nothing left out, or an inconsistency, which is sound and makes every class
         // unsatisfiable whatever was left out
         return Ok(Coverage {
             consistency_known: true,
             ..Coverage::default()
         });
-    }
-    // nothing left out and no dropped axiom with logical content, such as a terminology
-    // without assertions, which then costs one look at the stream
-    if left_out.is_empty()
-        && let Some(d) = dropped.as_deref_mut()
-    {
-        let mut any = false;
-        let finished = d(&mut |k| {
-            any = Index::indexed(k);
-            !any
-        });
-        if !finished {
-            return Err(Stopped);
-        }
-        if !any {
-            return Ok(Coverage {
-                consistency_known: true,
-                ..Coverage::default()
-            });
-        }
     }
     let mut ix = Index::new(axioms);
     let wanted: FxHashSet<&AxiomKind> = left_out.iter().copied().collect();
@@ -210,64 +176,18 @@ pub(crate) fn coverage<'c>(
         stop,
         halted: std::cell::Cell::new(None),
     };
-    let has_dropped = dropped.is_some();
-    // the first dropped axiom with logical content, which a pass that counts the
-    // dropped axioms as left out names
-    let mut witness: Option<AxiomKind> = None;
-    // Reads the dropped axioms while `keep` says one of them may still not matter, and
-    // `look` whether one does; false when the stream or the pass stopped.
-    let mut read = |witness: &mut Option<AxiomKind>,
-                    look: &mut dyn FnMut(&AxiomKind) -> bool|
-     -> Result<(), Stopped> {
-        let Some(d) = dropped.as_deref_mut() else {
-            return Ok(());
-        };
-        let mut halted = false;
-        let finished = d(&mut |k| {
-            if !Index::indexed(k) {
-                return true;
-            }
-            if witness.is_none() {
-                *witness = Some(k.clone());
-            }
-            if !work.step() {
-                halted = true;
-                return false;
-            }
-            look(k)
-        });
-        if !finished && !halted {
-            return Err(Stopped);
-        }
-        if work.halted.get() == Some(Halt::Stopped) {
-            return Err(Stopped);
-        }
-        Ok(())
-    };
-    // the answer when the consistency is not known: every class incomplete, and the
-    // dropped axioms, when one has logical content, left out
-    let unknown = |over_budget, witness: Option<AxiomKind>| Coverage {
+    // the answer when the consistency is not known: every class incomplete
+    let unknown = |over_budget| Coverage {
         consistency_known: false,
         incomplete: all(&classes),
         over_budget,
-        dropped: witness,
     };
-    // the first dropped axiom with logical content, for an answer that is already
-    // decided
-    macro_rules! first {
-        () => {
-            if witness.is_none() {
-                read(&mut witness, &mut |_| false)?;
-            }
-        };
-    }
     // a left-out declaration or annotation is no logical content
     let missing = wanted
         .iter()
         .any(|a| !found.contains(a) && Index::indexed(a));
     if missing {
-        first!();
-        return Ok(unknown(false, witness));
+        return Ok(unknown(false));
     }
     // whether the extraction reached a left-out axiom, or None when it halted
     let hits = |x: &mut Extraction<'_>| -> Option<bool> {
@@ -292,93 +212,32 @@ pub(crate) fn coverage<'c>(
     };
     // the answer of a pass that halted: every class incomplete, after the caller's stop
     // an error
-    let halted = |witness: Option<AxiomKind>| match work.halted.get() {
+    let halted = || match work.halted.get() {
         Some(Halt::Stopped) => Err(Stopped),
-        _ => Ok(unknown(true, witness)),
+        _ => Ok(unknown(true)),
     };
     // layer 1's base, which is also the first test of layer 2
     let mut bottom = Extraction::new(&ix, Mode::Bottom, None, &work);
     let Some(bottom_hit) = hits(&mut bottom) else {
-        first!();
-        return halted(witness);
+        return halted();
     };
-    let mut top = None;
-    if bottom_hit || has_dropped {
+    if bottom_hit {
         let mut t = Extraction::new(&ix, Mode::Top, None, &work);
         let Some(top_hit) = hits(&mut t) else {
-            first!();
-            return halted(witness);
+            return halted();
         };
-        top = Some((t, top_hit));
-    }
-    // Layer 2 over the whole ontology. The empty signature's module in the terminology
-    // and the dropped axioms takes a dropped axiom exactly when one is not local for the
-    // signature of the terminology's module, so each branch that the terminology leaves
-    // alive survives while every dropped axiom is local for its signature.
-    let mut bottom_alive = !bottom_hit;
-    let mut top_alive = top.as_ref().is_some_and(|(_, hit)| !hit);
-    // layer 3 needs no universal object property anywhere in the ontology, and dropped
-    // axioms that are all assertions or keys
-    let mut universal = false;
-    if has_dropped && (bottom_alive || top_alive) {
-        let b = &bottom;
-        let t = top.as_ref().map(|(t, _)| t);
-        let has = |x: &Extraction<'_>, iri: &str| ix.id(iri).is_some_and(|e| x.has_id(e));
-        let r = read(&mut witness, &mut |k| {
-            if bottom_alive && !bottom_local(k, &Sig(&|iri| has(b, iri))) {
-                bottom_alive = false;
-            }
-            if top_alive && !t.is_some_and(|t| top_local(k, &Sig(&|iri| has(t, iri)))) {
-                top_alive = false;
-            }
-            // layer 3 leaves out only assertions and keys
-            let mut s = Signature::default();
-            s.axiom(k);
-            if !assertion_or_key(k)
-                || s.0
-                    .iter()
-                    .any(|e| e.iri().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY)
-            {
-                universal = true;
-            }
-            bottom_alive || top_alive
-        });
-        r?;
-        if work.halted.get().is_some() {
-            return halted(witness);
+        if top_hit {
+            return Ok(unknown(false));
         }
-    } else if has_dropped {
-        first!();
     }
-    let consistency_known = bottom_alive || top_alive;
-    if !consistency_known {
-        return Ok(unknown(false, witness));
-    }
+    let consistency_known = true;
     // layer 3 when its gates hold, which decides every class layer 1 decides and more
-    let terminology = ix.terminology_gate().filter(|_| !universal);
-    if terminology.is_none() && witness.is_some() {
-        // a dropped assertion is in the bottom module of every class
-        return Ok(Coverage {
-            consistency_known,
-            incomplete: all(&classes),
-            over_budget: false,
-            dropped: witness,
-        });
-    }
-    // the dropped axioms are now assertions and keys that layer 3 leaves out, or none
-    // with logical content, so with nothing left out of the terminology every class is
-    // complete
-    if left_out.is_empty() && terminology.is_some() {
-        return Ok(Coverage {
-            consistency_known,
-            ..Coverage::default()
-        });
-    }
+    let terminology = ix.terminology_gate();
     let (mut base, base_hit) = match &terminology {
         Some(mask) => {
             let mut t = Extraction::new(&ix, Mode::Bottom, Some(mask), &work);
             let Some(hit) = hits(&mut t) else {
-                return halted(witness);
+                return halted();
             };
             (t, hit)
         }
@@ -465,7 +324,6 @@ pub(crate) fn coverage<'c>(
         consistency_known,
         incomplete,
         over_budget,
-        dropped: None,
     })
 }
 
