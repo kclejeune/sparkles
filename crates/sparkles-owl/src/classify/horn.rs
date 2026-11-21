@@ -889,6 +889,51 @@ impl Norm<'_> {
         }
     }
 
+    /// Whether the run's checker takes the property of a data restriction.
+    fn dt_checker(&self, c: &ClassExpression) -> bool {
+        use ClassExpression as C;
+        match c {
+            C::DataAllValuesFrom(ps, _) if ps.len() == 1 => self.it.dt_checker(&ps[0]),
+            C::DataMinCardinality(_, d, _)
+            | C::DataMaxCardinality(_, d, _)
+            | C::DataExactCardinality(_, d, _) => self.it.dt_checker(d),
+            _ => false,
+        }
+    }
+
+    /// The checker's atom of a universal or cardinality data restriction, in a positive
+    /// position or, for a minimum, in a negative one. A universal or a maximum in a
+    /// negative position is not Horn, and is left out with its axiom.
+    fn dt(&mut self, c: &ClassExpression, positive: bool) -> Result<Ex, Why> {
+        use ClassExpression as C;
+        let range = |it: &mut Interner, r: &Option<DataRange>| match r {
+            Some(r) => it.dt_range(r),
+            None => Ok(super::dtcheck::range::Ranges::FULL),
+        };
+        let e = match c {
+            C::DataAllValuesFrom(ps, r) if positive => self.it.dt_universal(&ps[0], r)?,
+            C::DataMinCardinality(n, d, r) => {
+                let x = range(self.it, r)?;
+                self.it.dt_node(d, true, u64::from(*n), x)
+            }
+            C::DataMaxCardinality(n, d, r) if positive => {
+                let x = range(self.it, r)?;
+                self.it.dt_node(d, false, u64::from(*n), x)
+            }
+            C::DataExactCardinality(n, d, r) if positive => {
+                let x = range(self.it, r)?;
+                let a = self.it.dt_node(d, true, u64::from(*n), x);
+                let b = self.it.dt_node(d, false, u64::from(*n), x);
+                self.conj(vec![a, b])
+            }
+            _ => return Err("a universal or maximum data restriction in a negative position"),
+        };
+        // the atom is interned, so that its axiom keeps its ids across runs, and the
+        // axiom stays out until the saturation reads the checker's atoms
+        let _ = e;
+        Err(super::index::DT_UNWIRED)
+    }
+
     /// `x` with `x ⊑ c`.
     fn pos(&mut self, c: &ClassExpression, depth: usize) -> Result<Ex, Why> {
         use ClassExpression as C;
@@ -971,6 +1016,14 @@ impl Norm<'_> {
             }
             C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
+            C::DataAllValuesFrom(..)
+            | C::DataMinCardinality(..)
+            | C::DataMaxCardinality(..)
+            | C::DataExactCardinality(..)
+                if self.dt_checker(c) =>
+            {
+                self.dt(c, true)?
+            }
             _ => return Err("a data restriction outside OWL 2 EL"),
         })
     }
@@ -1143,6 +1196,7 @@ impl Norm<'_> {
             }
             C::ObjectHasValue(p, a) => self.has_value(p, a)?,
             C::DataSomeValuesFrom(..) | C::DataHasValue(..) => self.el(c)?,
+            C::DataMinCardinality(..) if self.dt_checker(c) => self.dt(c, false)?,
             C::DataAllValuesFrom(..)
             | C::DataMinCardinality(..)
             | C::DataMaxCardinality(..)

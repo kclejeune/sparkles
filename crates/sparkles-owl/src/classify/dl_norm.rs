@@ -130,7 +130,7 @@ pub fn eligible(it: &Interner, ax: &Axioms, rooted: bool) -> bool {
         })
         && !it.nodes.iter().any(|n| match n {
             Node::Nominal(_) => !rooted,
-            Node::SelfLoop(_) | Node::DataSome(..) | Node::AtMost1(..) => true,
+            Node::SelfLoop(_) | Node::DataSome(..) | Node::DtAtom(_) | Node::AtMost1(..) => true,
             _ => false,
         })
 }

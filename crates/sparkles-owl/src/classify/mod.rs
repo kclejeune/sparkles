@@ -79,6 +79,8 @@ mod dl_norm;
 mod dl_reduce;
 mod dl_root;
 mod dl_rules;
+#[cfg(test)]
+mod dt_wiring_tests;
 mod dtcheck;
 mod horn;
 mod horn_rules;
@@ -842,7 +844,11 @@ impl TierMark {
             || it.nodes[self.nodes..].iter().any(|n| {
                 matches!(
                     n,
-                    Node::Nominal(_) | Node::SelfLoop(_) | Node::DataSome(..) | Node::AtMost1(..)
+                    Node::Nominal(_)
+                        | Node::SelfLoop(_)
+                        | Node::DataSome(..)
+                        | Node::DtAtom(_)
+                        | Node::AtMost1(..)
                 )
             })
     }
@@ -1655,6 +1661,36 @@ impl Saturation {
                     .insert(d.clone(), r.clone());
             }
         }
+        // The components of the data properties, and which of them the datatype checker
+        // takes, are chosen once from every axiom, inside the profile or outside it
+        // (F24, "The EL and Horn tiers"). The checker reads every datatype definition,
+        // since a definition with a facet is outside the profile and still names the
+        // range its uses stand for. The components are kept by property, so that no role
+        // is interned before the tier is chosen.
+        self.interner.dt_run = None;
+        let mut dt_defs: FxHashMap<Datatype, DataRange> = FxHashMap::default();
+        for &k in axioms {
+            if let AxiomKind::DatatypeDefinition(d, r) = k {
+                dt_defs.insert(d.clone(), r.clone());
+            }
+        }
+        let dt_defs = dtcheck::range::Defs::new(dt_defs);
+        let comps = dtcheck::comp::Comps::of(axioms, &dt_defs, &|| poll(limits).is_err());
+        let Some(comps) = comps else {
+            poll(limits)?;
+            return Err(Error::Cancelled);
+        };
+        if comps.any() {
+            self.interner.dt_run = Some(Box::new(dtcheck::atoms::DtRun {
+                comps,
+                defs: dt_defs,
+                stop: dtcheck::atoms::Stop {
+                    deadline: limits.deadline,
+                    cancelled: limits.cancelled.clone(),
+                },
+            }));
+        }
+        let dt_mark = self.interner.nodes.len();
         // Chunks of the axioms normalize on the run's threads into interners of their
         // own, which merge in order into the run's, so that every id is the one a
         // normalization on one thread gives. Data ranges and literals have ids inside
@@ -1882,7 +1918,27 @@ impl Saturation {
         if let Some(b) = &self.interner.ranges.budget {
             b.baseline(self.interner.bytes() + ax.bytes())?;
         }
+        if cfg!(debug_assertions)
+            && let Some(run) = &self.interner.dt_run
+        {
+            let checker = |r: index::Role| match &self.interner.roles[r as usize] {
+                index::RoleName::Data(d) => run.comps.checker(d),
+                _ => false,
+            };
+            for n in &self.interner.nodes[dt_mark..] {
+                if let Node::DataSome(r, _) = n {
+                    debug_assert!(
+                        !checker(*r),
+                        "a lattice data restriction over a checker property"
+                    );
+                }
+            }
+            for &(r, _) in &ax.data_ranges {
+                debug_assert!(!checker(r), "a lattice data range over a checker property");
+            }
+        }
         let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
+        self.interner.dt_run = None;
         self.interner.end_run();
         let mut excluded: Vec<Excluded> = Vec::new();
         for (i, (rule, message)) in outside {

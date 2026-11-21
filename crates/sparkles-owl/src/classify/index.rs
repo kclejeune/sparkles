@@ -11,6 +11,8 @@
 //! incremental run can keep the contexts it does not touch.
 
 use super::data::{DataVal, Ranges};
+use super::dtcheck::atoms::{DtKey, DtRun, DtTable};
+use super::dtcheck::range::{Ranges as DtRanges, Rid};
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -44,6 +46,9 @@ pub enum Node {
     /// [`Interner::vals`]. A data value has no successors, so it needs no context: the
     /// index gives a positive restriction its consequences as told subsumers.
     DataSome(Role, u32),
+    /// a data restriction over a property of a checker component, by its index in the
+    /// atoms of [`Interner::dt`] (F24, "The datatype checker")
+    DtAtom(u32),
     /// Only in the interner of a chunk of a parallel normalization: an intersection, by
     /// its index in [`Interner::ands`]. Its binary form depends on the order of the
     /// operands' ids, so it waits for the ids of the merged interner.
@@ -249,6 +254,11 @@ pub struct Interner {
     val_opaque_bytes: usize,
     /// the opaque data atoms and the datatype definitions of the run
     pub ranges: Ranges,
+    /// the checker's data atoms, kept across runs like [`Interner::vals`]
+    pub dt: DtTable,
+    /// the run's checker components and definitions, while it normalizes, when one
+    /// component is the checker's
+    pub dt_run: Option<Box<DtRun>>,
     pub roles: Vec<RoleName>,
     role_ids: FxHashMap<RoleName, Role>,
     fresh: u32,
@@ -380,12 +390,14 @@ impl Interner {
             + self.and_ops * 4
             + self.scope_bytes()
             + self.prefix_roles.capacity() * 16
+            + self.dt.bytes()
+            + self.dt_run.as_ref().map_or(0, |r| r.bytes())
     }
 
     /// Whether a chunk met data ranges or literals, whose ids its merge does not map, so
     /// that the run normalizes on one thread instead.
     pub fn chunk_has_data(&self) -> bool {
-        !self.vals.is_empty() || !self.ranges.opaque.is_empty()
+        !self.vals.is_empty() || !self.ranges.opaque.is_empty() || !self.dt.is_empty()
     }
 
     /// An intersection kept whole in a chunk's interner.
@@ -477,7 +489,9 @@ impl Interner {
                     Node::Conj(a, b) => self.conj(map[a as usize], map[b as usize]),
                     Node::Exist(r, f) => self.node(Node::Exist(roles[r as usize], map[f as usize])),
                     Node::SelfLoop(r) => self.node(Node::SelfLoop(roles[r as usize])),
-                    Node::DataSome(..) => unreachable!("a chunk with data merges on one thread"),
+                    Node::DataSome(..) | Node::DtAtom(_) => {
+                        unreachable!("a chunk with data merges on one thread")
+                    }
                     Node::Forall(..) | Node::AtMost1(..) | Node::Fresh(_) => {
                         unreachable!("the Horn normalization runs on the merged interner")
                     }
@@ -887,6 +901,52 @@ impl Interner {
         self.scope_bytes = self.scope_bytes.saturating_sub(freed);
     }
 
+    /// Whether the run's checker takes the data property's component.
+    pub fn dt_checker(&self, d: &DataProperty) -> bool {
+        self.dt_run.as_ref().is_some_and(|r| r.comps.checker(d))
+    }
+
+    /// The checker's atom `≥ n d.R` or `≤ n d.R` over a property of a checker component,
+    /// with the forms that always or never hold folded to `owl:Thing` and `owl:Nothing`.
+    /// Only the interned empty range folds, since another empty form can have another id.
+    pub fn dt_node(&mut self, d: &DataProperty, at_least: bool, n: u64, range: Rid) -> Ex {
+        match (at_least, n, range) {
+            (true, 0, _) => return TOP,
+            (true, _, DtRanges::EMPTY) => return BOTTOM,
+            (false, _, DtRanges::EMPTY) | (false, u64::MAX, _) => return TOP,
+            _ => {}
+        }
+        let role = self.role(RoleName::Data(d.clone()));
+        let id = self.dt.id(DtKey {
+            role,
+            at_least,
+            n,
+            range,
+        });
+        self.node(Node::DtAtom(id))
+    }
+
+    /// The checker's range of a data range, with the run's definitions.
+    pub fn dt_range(&mut self, r: &DataRange) -> Result<Rid, &'static str> {
+        let run = self
+            .dt_run
+            .as_deref_mut()
+            .expect("a checker range in a run with checker components");
+        run.range(&mut self.dt.ranges, r)
+    }
+
+    /// The checker's point range of a literal.
+    pub fn dt_literal(&mut self, l: &Literal) -> Result<Rid, &'static str> {
+        DtRun::literal(&mut self.dt.ranges, l)
+    }
+
+    /// `∀d.R`, which is `≤ 0 d.¬R`.
+    pub fn dt_universal(&mut self, d: &DataProperty, r: &DataRange) -> Result<Ex, &'static str> {
+        let x = self.dt_range(r)?;
+        let not = self.dt.ranges.not(x);
+        Ok(self.dt_node(d, false, 0, not))
+    }
+
     /// The binary intersection of two expressions, with its operands ordered.
     pub fn conj(&mut self, a: Ex, b: Ex) -> Ex {
         if a == b {
@@ -1216,6 +1276,8 @@ pub struct Axioms {
     pub data_ranges: Vec<(Role, u32)>,
     /// the functional data roles
     pub functional: Vec<Role>,
+    /// `range(d) = R`, for a data role of a checker component and the checker's range
+    pub dt_ranges: Vec<(Role, Rid)>,
     /// `HasKey(c (p…) (d…))`
     pub keys: Vec<Key>,
     /// the individuals of assertions, which classification checks for consistency
@@ -1235,7 +1297,7 @@ impl Axioms {
     pub fn append_mapped(&mut self, chunk: Axioms, nodes: &[Ex], roles: &[Role]) {
         let n = |e: Ex| nodes[e as usize];
         let r = |x: Role| roles[x as usize];
-        debug_assert!(chunk.data_ranges.is_empty());
+        debug_assert!(chunk.data_ranges.is_empty() && chunk.dt_ranges.is_empty());
         self.subs
             .extend(chunk.subs.into_iter().map(|(a, b)| (n(a), n(b))));
         for mut d in chunk.disjoint {
@@ -1287,6 +1349,7 @@ impl Axioms {
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
+            + self.dt_ranges.capacity() * 8
             + self.functional.capacity() * 4
             + self.keys.capacity() * 72
             + self.individuals.capacity() * 4
@@ -1311,6 +1374,7 @@ impl Axioms {
             + self.reflexive.capacity() * 4
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
+            + self.dt_ranges.capacity() * 8
             + self.functional.capacity() * 4
             + self
                 .keys
@@ -1500,6 +1564,67 @@ fn normalize_axiom(
                 whole = false;
             }
         }
+        K::SubDataPropertyOf(a, b)
+            if (b.as_str() == vocab::OWL_BOTTOM_DATA_PROPERTY && it.dt_checker(a))
+                || (a.as_str() == vocab::OWL_TOP_DATA_PROPERTY && it.dt_checker(b)) =>
+        {
+            return Err(DT_TOP);
+        }
+        K::EquivalentDataProperties(ps)
+            if it.dt_run.is_some()
+                && ps.iter().any(|p| it.dt_checker(p))
+                && ps.iter().any(|p| {
+                    matches!(
+                        p.as_str(),
+                        vocab::OWL_TOP_DATA_PROPERTY | vocab::OWL_BOTTOM_DATA_PROPERTY
+                    )
+                }) =>
+        {
+            return Err(DT_TOP);
+        }
+        K::DataPropertyDomain(d, _)
+        | K::DataPropertyRange(d, _)
+        | K::FunctionalDataProperty(d)
+        | K::DataPropertyAssertion(d, _, _)
+        | K::NegativeDataPropertyAssertion(d, _, _)
+            if it.dt_run.is_some() && d.as_str() == vocab::OWL_TOP_DATA_PROPERTY =>
+        {
+            return Err(DT_TOP);
+        }
+        K::DataPropertyDomain(d, c) if it.dt_checker(d) => {
+            let c = ce(c, it, &mut partial)?;
+            let e = it.dt_node(d, true, 1, DtRanges::FULL);
+            out.subs.push((e, c));
+            partial = Some(DT_UNWIRED);
+        }
+        K::DataPropertyRange(d, range) if it.dt_checker(d) => {
+            let x = it.dt_range(range)?;
+            let r = it.role(RoleName::Data(d.clone()));
+            out.dt_ranges.push((r, x));
+            partial = Some(DT_UNWIRED);
+        }
+        K::FunctionalDataProperty(d) if it.dt_checker(d) => {
+            let r = it.role(RoleName::Data(d.clone()));
+            out.functional.push(r);
+            partial = Some(DT_UNWIRED);
+        }
+        K::DataPropertyAssertion(d, Individual::Named(a), v) if it.dt_checker(d) => {
+            let x = it.dt_literal(v)?;
+            let e = it.dt_node(d, true, 1, x);
+            let a = it.nominal(a);
+            out.individuals.push(a);
+            out.subs.push((a, e));
+            partial = Some(DT_UNWIRED);
+        }
+        // ¬d(a, v) is `{a} ⊑ ∀d.¬{v}`, which is `{a} ⊑ ≤ 0 d.{v}`
+        K::NegativeDataPropertyAssertion(d, Individual::Named(a), v) if it.dt_checker(d) => {
+            let x = it.dt_literal(v)?;
+            let e = it.dt_node(d, false, 0, x);
+            let a = it.nominal(a);
+            out.individuals.push(a);
+            out.subs.push((a, e));
+            partial = Some(DT_UNWIRED);
+        }
         K::SubDataPropertyOf(a, b) => {
             let a = it.role(RoleName::Data(a.clone()));
             let b = it.role(RoleName::Data(b.clone()));
@@ -1686,6 +1811,14 @@ fn object_role(p: &ObjectPropertyExpression, it: &mut Interner) -> Option<Role> 
 /// mapping bounds it.
 const MAX_DEPTH: usize = 256;
 const NUMERIC_HALTED: &str = "numeric construction halted";
+/// A restriction over the top data property, or an axiom that makes a checker property
+/// universal or empty, in a run with checker components. The top data property
+/// reaches each component, which the checker reads one at a time.
+pub const DT_TOP: &str =
+    "a data restriction or axiom over the top or bottom data property beside the datatype checker";
+/// A data atom of the checker before the saturation reads it.
+pub const DT_UNWIRED: &str =
+    "a data restriction that the datatype checker takes, which the saturation does not read";
 
 /// The interned form of a class expression and, when the classifier may miss some of
 /// its consequences, why. An expression the classifier cannot represent is an error
@@ -1763,6 +1896,26 @@ pub fn class_expression(
         C::ObjectHasSelf(ObjectPropertyExpression::Property(p)) => {
             let r = it.role(RoleName::Object(p.clone()));
             (it.node(Node::SelfLoop(r)), None)
+        }
+        C::DataSomeValuesFrom(ps, _) | C::DataAllValuesFrom(ps, _)
+            if ps.len() == 1
+                && it.dt_run.is_some()
+                && ps[0].as_str() == vocab::OWL_TOP_DATA_PROPERTY =>
+        {
+            return Err(DT_TOP);
+        }
+        C::DataHasValue(d, _)
+            if it.dt_run.is_some() && d.as_str() == vocab::OWL_TOP_DATA_PROPERTY =>
+        {
+            return Err(DT_TOP);
+        }
+        C::DataSomeValuesFrom(ps, r) if ps.len() == 1 && it.dt_checker(&ps[0]) => {
+            let x = it.dt_range(r)?;
+            (it.dt_node(&ps[0], true, 1, x), Some(DT_UNWIRED))
+        }
+        C::DataHasValue(d, l) if it.dt_checker(d) => {
+            let x = it.dt_literal(l)?;
+            (it.dt_node(d, true, 1, x), Some(DT_UNWIRED))
         }
         C::DataSomeValuesFrom(ps, r) if ps.len() == 1 => {
             let role = it.role(RoleName::Data(ps[0].clone()));
@@ -1852,6 +2005,8 @@ pub struct Index {
     pub horn: Option<Box<super::horn::HornIx>>,
     /// what the rules of Tier D read, when the run takes disjunctive axioms
     pub dl: Option<Box<super::dl_rules::DlIx>>,
+    /// whether the run has checker components, whose atoms no other run's contexts read
+    pub dt: bool,
 }
 
 impl Index {
@@ -1883,6 +2038,7 @@ impl Index {
             tops: a_tops,
             horn: a_horn,
             dl: a_dl,
+            dt: a_dt,
         } = self;
         let Index {
             numeric_ledger: b_ledger,
@@ -1902,7 +2058,9 @@ impl Index {
             tops: b_tops,
             horn: b_horn,
             dl: b_dl,
+            dt: b_dt,
         } = expected;
+        assert_eq!(a_dt, b_dt);
         match (a_ledger, b_ledger) {
             (None, None) => {}
             (Some(a), Some(b)) => {
@@ -2132,6 +2290,7 @@ impl Index {
         self.roles.data_range.iter().all(|r| r.is_none())
             && self.roles.functional.iter().all(|f| f.is_empty())
             && self.vals.is_empty()
+            && !self.dt
             && self.neg_data.is_empty()
             && self.universal.is_empty()
             && self.keys.is_empty()
@@ -2183,6 +2342,8 @@ impl Index {
             && sorted(&old.selfs) == sorted(&self.selfs)
             && old.vals.is_empty()
             && self.vals.is_empty()
+            && !old.dt
+            && !self.dt
             && old.neg_data.is_empty()
             && self.neg_data.is_empty()
             && old.universal.is_empty()
@@ -2345,6 +2506,7 @@ impl Index {
     ) -> Result<Index, Halt> {
         let mut ix = Index {
             roles: roles(ax, it, limit, stop)?,
+            dt: it.dt_run.is_some(),
             ..Index::default()
         };
         let mut b = Builder::default();
