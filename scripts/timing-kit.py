@@ -35,8 +35,11 @@ in order. --dry-run prints the commands instead of running them.
 `run` times each stage in turn. A first pass runs every query. The queries whose ratio of
 execution times is at FLAG_RATIO or more in any pair then run again with RERUN_ROUNDS
 rounds of RERUN_REPS requests. Each pair gets its own summary and validity from
-nsc-bench-summary.py --pair, and verdict.md lists them. DONE gets the exit status, which
-is 3 when a pass that decides is invalid.
+nsc-bench-summary.py --pair, and verdict.md lists them. A pass is invalid when its host
+was not quiet, when a query lacks timings, or when the two arms of a pair answer a query
+differently, fail its answer check or lack an answer to it, and verdict.md names the
+queries whose answers stopped it. DONE gets the exit status, which is 3 when a pass that
+decides is invalid.
 """
 
 import argparse
@@ -585,6 +588,18 @@ def cmd_run(a):
     return rc
 
 
+def answer_problems(answers, queries):
+    """The queries of a pair summary whose answer check is not "same", as text such as
+    "differ for p, q", or every query when the summary has no answer checks."""
+    if answers is None:
+        return "were not checked"
+    bad = {}
+    for q in queries:
+        bad.setdefault(answers.get(q, "missing"), []).append(q)
+    words = {"differ": "differ for", "failed": "failed for", "missing": "are missing for"}
+    return "; ".join(f"{words.get(st, st)} {', '.join(qs)}" for st, qs in sorted(bad.items()) if st != "same")
+
+
 def write_verdict(stage, flagged):
     """verdict.md for each pair; True when a pass that decides is invalid."""
     stage = Path(stage)
@@ -601,17 +616,22 @@ def write_verdict(stage, flagged):
         own = [q for q in mine if p1["queries"][q]["exec_ms"]["ratio"] >= flag]
         slower = []
         rerun_ok = 0
+        rerun_answers = ""
         if own:
             j = stage / "rerun" / f"summary-{x}-{y}.json"
             rerun_ok = subprocess.run([sys.executable, str(summary), "--check", str(j), "rerun", " ".join(own)]).returncode
             r = json.loads(j.read_text())
             slower = [(q, r["queries"][q]["exec_ms"]["ratio"]) for q in own if r["queries"].get(q, {}).get("exec_ms", {}).get("ratio", 0) >= flag]
+            rerun_answers = answer_problems(r.get("answers"), own)
         invalid |= bool(first or rerun_ok)
         v = p1.get("validity") or {}
+        first_answers = answer_problems(p1.get("answers"), list(p1.get("answers") or p1["queries"]))
         lines.append(f"- {label.get(y, y)} ({y}) against {label.get(x, x)} ({x}): first pass "
-                     f"{'valid' if not first else 'INVALID'} (spread {v.get('spread', float('nan')) * 100:.1f}%), "
+                     f"{'valid' if not first else 'INVALID'} (spread {v.get('spread', float('nan')) * 100:.1f}%"
+                     + (f", answers {first_answers}" if first_answers else "") + "), "
                      f"flagged {', '.join(own) or 'none'}, "
-                     + (f"rerun {'valid' if not rerun_ok else 'INVALID'}, " if own else "")
+                     + (f"rerun {'valid' if not rerun_ok else 'INVALID'}"
+                        + (f" (answers {rerun_answers})" if rerun_answers else "") + ", " if own else "")
                      + (f"slower after the rerun: {', '.join(f'{q} {r:.3f}' for q, r in slower)}" if slower else "none slower after the rerun"))
     lines += ["", "Pairs that share the base's server processes are not independent of each other."]
     (stage / "verdict.md").write_text("\n".join(lines) + "\n")

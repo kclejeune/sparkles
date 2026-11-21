@@ -27,10 +27,14 @@ query with only one server process gives no spread, and the run is then not vali
 under "validity", with "valid" false when either bound fails, and the summary says so in its
 first lines.
 
+The answer check of each query compares the sorted TSV answer of A with that of B, and
+summary.json gets its status under "answers": "same", "differ" when the answers differ,
+"failed" when either variant's check failed, or "missing" when a variant has no answer row.
+
 --check exits 0 when a pass may decide and 1 when it may not. A first pass needs a valid
 run with timings of both variants for every query, each from at least two server processes
-of each variant. A rerun needs the same of every flagged query, and a valid run unless all
-of them take under 0.3 ms.
+of each variant, and the same answers of both variants to every query. A rerun needs the
+same of every flagged query, and a valid run unless all of them take under 0.3 ms.
 """
 
 import csv
@@ -115,14 +119,55 @@ def thin(m):
     return min(m.get("epochs_a", 0), m.get("epochs_b", 0)) < MIN_EPOCHS
 
 
+def answer_status(order, answers):
+    """The answer check of each query, from rows of variant, query, rows, digest and an
+    optional order digest: same, differ, failed or missing."""
+    by_q = defaultdict(lambda: defaultdict(set))
+    for row in answers:
+        if len(row) >= 2:
+            by_q[row[1]][row[0]].add(tuple(row[2:]))
+    status = {}
+    for q in order:
+        a, b = by_q[q].get("A"), by_q[q].get("B")
+        if not a or not b:
+            status[q] = "missing"
+        elif any("error" in r or "" in r or len(r) < 2 for r in a | b):
+            status[q] = "failed"
+        else:
+            # a variant with two different answers to one query differs from itself
+            status[q] = "same" if len(a | b) == 1 else "differ"
+    return status
+
+
+def answer_problems(answers, queries):
+    """The queries whose answer check is not "same", as text such as "differ for p, q"."""
+    bad = defaultdict(list)
+    for q in queries:
+        st = answers.get(q, "missing")
+        if st != "same":
+            bad[st].append(q)
+    words = {"differ": "differ for", "failed": "failed for", "missing": "are missing for"}
+    return "; ".join(f"{words[st]} {', '.join(qs)}" for st, qs in sorted(bad.items()))
+
+
 def check(path, kind, flagged):
     """The exit status of a host screen's pass: 0 when it may decide, 1 when it may not.
 
-    A first pass needs a valid run. A rerun needs timings of both binaries for every flagged
-    query, and a valid run unless all of them take under 0.3 ms, when there is no spread to
-    judge."""
+    A first pass needs a valid run and the same answers of both binaries to every query. A
+    rerun needs timings and the same answers of both binaries for every flagged query, and a
+    valid run unless all of them take under 0.3 ms, when there is no spread to judge."""
     s = json.load(open(path))
     v = s.get("validity")
+    if "answers" not in s:
+        print(f"{path} has no answer checks, since an older nsc-bench-summary.py wrote it. "
+              f"Regenerate it with nsc-bench-summary.py on its run directory.", file=sys.stderr)
+        return 1
+    bad = answer_problems(s["answers"], flagged.split() if kind == "rerun" else list(s["answers"]))
+    if bad:
+        # a timing of two binaries that answer differently, or of answers nobody checked,
+        # compares different work, so it cannot decide whatever the timings say
+        print(f"{path}: the answers of the two variants {bad}, so the pass cannot decide.", file=sys.stderr)
+        return 1
     if any("exec_ms" in q and "epochs_a" not in q["exec_ms"] for q in s.get("queries", {}).values()):
         # a summary written before the epoch counts cannot show that a query has two server
         # processes of each variant, so it may not decide
@@ -232,17 +277,24 @@ def main():
     answers = read_tsv(res / "answers.tsv")
     if pair:
         answers = [[pair[r[0]]] + r[1:] for r in answers if r and r[0] in pair]
-    by_q = defaultdict(dict)
+    by_q = defaultdict(lambda: defaultdict(list))
     for row in answers:
         # variant, query, rows, digest and, with ORDER_DIGEST, an order digest
-        v, q = row[:2]
-        by_q[q][v] = tuple(row[2:])
-    diff = [q for q in order if len(set(by_q[q].values())) != 1 or "error" in str(by_q[q])]
-    if answers:
-        if diff:
-            p("Answers differ or failed for: " + ", ".join(f"{q} (A {by_q[q].get('A')}, B {by_q[q].get('B')})" for q in diff) + ".")
-        else:
-            p(f"A and B returned the same sorted TSV answers to all {len(by_q)} queries.")
+        if len(row) >= 2:
+            by_q[row[1]][row[0]].append(tuple(row[2:]))
+    summary["answers"] = answer_status(order, answers)
+    diff = [q for q in order if summary["answers"][q] in ("differ", "failed")]
+    lost = [q for q in order if summary["answers"][q] == "missing"]
+    show = lambda rs: " ".join("/".join(r) for r in rs) if rs else "none"
+    if diff:
+        p("Answers differ or failed for: " + ", ".join(f"{q} (A {show(by_q[q].get('A'))}, B {show(by_q[q].get('B'))})" for q in diff)
+          + ", so the run cannot decide.")
+        p()
+    if lost:
+        p("No answer check of both variants for: " + ", ".join(lost) + ", so the run cannot decide.")
+        p()
+    if not diff and not lost:
+        p(f"A and B returned the same sorted TSV answers to all {len(order)} queries.")
         p()
     if summary["missing"]:
         p("No timings of both variants for: " + ", ".join(summary["missing"]) + ", so the run cannot decide.")

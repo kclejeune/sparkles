@@ -837,6 +837,8 @@ class GateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             res = Path(d) / "results"
             res.mkdir()
+            res.joinpath("answers.tsv").write_text(
+                "".join(f"{v}\t{q}\t1\tx\n" for v in "AB" for q in ("q", "r", "control", "tiny")))
             lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
             for epoch, v in enumerate("ABBA", 1):
                 lines.append(f"1\t{epoch}\t{v}\tq\t1\t1.0\t2")
@@ -887,6 +889,69 @@ class GateTests(unittest.TestCase):
             (Path(d) / "old.json").write_text(json.dumps(old))
             r = subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "old.json"), "rerun", "control"],
                                capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("Regenerate it with nsc-bench-summary.py", r.stderr)
+
+    def test_cell_summary_refuses_answers_that_differ_fail_or_are_missing(self):
+        summary = SCRIPTS / "nsc-bench-summary.py"
+
+        def check(d, name, kind, flagged=""):
+            return subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / name), kind, flagged],
+                                  capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            # a quiet run of A, B and C, where every query takes 1 ms in each
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            epoch = 0
+            for rnd in (1, 2):
+                for v in "ABCCBA":
+                    epoch += 1
+                    for q in ("p", "q"):
+                        lines.append(f"{rnd}\t{epoch}\t{v}\t{q}\t1\t1.0\t2")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            cases = {
+                # the equal-answer control decides
+                "same": ("A\tp\t1\tx\nA\tq\t1\ty\nB\tp\t1\tx\nB\tq\t1\ty\n", {"p": "same", "q": "same"}, 0),
+                # one COUNT(*) answer of B differs
+                "differ": ("A\tp\t1\tx\nA\tq\t1\ty\nB\tp\t1\tx\nB\tq\t1\tz\n", {"p": "same", "q": "differ"}, 1),
+                # every answer check failed
+                "failed": ("A\tp\terror\terror\nA\tq\terror\terror\nB\tp\terror\terror\nB\tq\terror\terror\n",
+                           {"p": "failed", "q": "failed"}, 1),
+                # an empty order digest of both variants is a failed check, not an equal answer
+                "empty": ("A\tp\t1\tx\t\nA\tq\t1\ty\t-\nB\tp\t1\tx\t\nB\tq\t1\ty\t-\n", {"p": "failed", "q": "same"}, 1),
+                # B's answer rows are absent
+                "missing": ("A\tp\t1\tx\nA\tq\t1\ty\n", {"p": "missing", "q": "missing"}, 1),
+            }
+            for name, (rows, status, rc) in cases.items():
+                res.joinpath("answers.tsv").write_text(rows + "C\tp\t1\tother\nC\tq\t1\ty\n")
+                out = subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, text=True)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                s = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertTrue(s["validity"]["valid"], name)
+                self.assertEqual(s["answers"], status, name)
+                self.assertEqual("same sorted TSV answers" in out.stdout, rc == 0, name)
+                r = check(d, "summary-A-B.json", "first")
+                self.assertEqual(r.returncode, rc, name)
+                if rc:
+                    self.assertIn("answer", r.stderr, name)
+                # a rerun of q is judged by q's answers, and a rerun of p by p's
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "q").returncode, int(status["q"] != "same"), name)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, int(status["p"] != "same"), name)
+            # in the same multi-variant run, C's other answer to p reaches only the pair with C
+            res.joinpath("answers.tsv").write_text(cases["same"][0] + "C\tp\t1\tother\nC\tq\t1\ty\n")
+            for pair in ("A,B", "A,C"):
+                subprocess.run([sys.executable, str(summary), "--pair", pair, d], capture_output=True, check=True)
+            self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 0)
+            self.assertEqual(json.loads((Path(d) / "summary-A-C.json").read_text())["answers"], {"p": "differ", "q": "same"})
+            self.assertEqual(check(d, "summary-A-C.json", "first").returncode, 1)
+            self.assertEqual(check(d, "summary-A-C.json", "rerun", "q").returncode, 0)
+            # a summary written before the answer statuses is refused with a way out
+            old = json.loads((Path(d) / "summary-A-B.json").read_text())
+            old.pop("answers")
+            (Path(d) / "old.json").write_text(json.dumps(old))
+            r = check(d, "old.json", "first")
             self.assertEqual(r.returncode, 1)
             self.assertIn("Regenerate it with nsc-bench-summary.py", r.stderr)
 

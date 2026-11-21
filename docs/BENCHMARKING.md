@@ -1224,7 +1224,9 @@ or not performance cores, a port in use, missing locks or runtime paths, and a s
 the host's locks and queues a systemd user unit that takes `~/lanes/.bench.lock` and then
 `~/lanes/.heavy.lock`, and `--dry-run` prints those commands instead. The unit's `run`
 checks again under the locks, times a first pass, reruns the queries flagged in any pair
-with more rounds and writes `verdict.md`.
+with more rounds and writes `verdict.md`. A pass cannot decide a pair when the two arms
+answer a query differently, when either arm's answer check fails or when an arm has no
+answer to a query, and `verdict.md` marks that pass invalid and names those queries.
 
 The harness forks curl, grep and awk for every request. `REQUEST_CLIENT=persistent` sends
 the same requests from one process over one kept-alive connection, without those processes.

@@ -27,10 +27,13 @@ def free_port():
         return s.getsockname()[1]
 
 
-def stub(d, identity, exec_ms):
+def stub(d, identity, exec_ms, answer="1"):
+    """A stub binary of this identity and execution time, whose every answer is the value answer."""
     path = Path(d) / f"{identity}.bin"
     path.write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{identity}"')
-                    .replace("EXEC_MS = 1.0", f"EXEC_MS = {exec_ms}"))
+                    .replace("EXEC_MS = 1.0", f"EXEC_MS = {exec_ms}")
+                    .replace('out = b"?c\\n1\\n"', f'out = b"?c\\n{answer}\\n"')
+                    .replace('"value": "1"', f'"value": "{answer}"'))
     path.chmod(0o755)
     return path
 
@@ -77,8 +80,8 @@ class KitTests(unittest.TestCase):
                 "--queries", self.d / "queries", "--controls", ",".join(CONTROLS), "--rounds", "2", "--reps", "2",
                 "--warmup", "1", "--server-cpu", "0", "--client-cpu", "1", "--port", free_port(),
                 "--rerun-rounds", "2", "--rerun-reps", "3"]
-        for label, ms in tips:
-            args += ["--tip", f"{label}={stub(self.d, label, ms)}"]
+        for label, ms, *answer in tips:
+            args += ["--tip", f"{label}={stub(self.d, label, ms, *answer)}"]
         return kit(*args, *extra), self.d / name
 
     def test_stage_writes_one_interleaved_run_for_a_shared_base(self):
@@ -295,6 +298,29 @@ class KitTests(unittest.TestCase):
             if not epochs or epochs[-1][0] != p[1]:
                 epochs.append((p[1], p[2]))
         self.assertEqual("".join(v for _, v in epochs), "ABCCBA" * 2)
+
+    @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
+                         and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")
+    def test_a_tip_with_different_answers_cannot_decide(self):
+        # B answers as the base does, C is as fast as the base and gives other answers, and D
+        # is 30% slower with other answers, so that its flagged rerun is judged too
+        r, s = self.stage(tips=(("same", 1.0), ("wrong", 1.0, "2"), ("slowwrong", 1.3, "3")))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = kit("run", s, env=self.env, timeout=600)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        verdict = (s / "verdict.md").read_text()
+        self.assertIn("same (B) against base (A): first pass valid", verdict)
+        self.assertIn("wrong (C) against base (A): first pass INVALID", verdict)
+        self.assertIn("slowwrong (D) against base (A): first pass INVALID", verdict)
+        for line in verdict.splitlines():
+            if "wrong" in line:
+                self.assertIn("answers differ for " + ", ".join(sorted(CONTROLS + ["tiny"])), line)
+            if "slowwrong" in line:
+                self.assertIn("rerun INVALID", line)
+        for pair, status in (("A-B", "same"), ("A-C", "differ"), ("A-D", "differ")):
+            p1 = json.loads((s / "pass1" / f"summary-{pair}.json").read_text())
+            self.assertEqual(set(p1["answers"].values()), {status}, pair)
+        self.assertEqual(set(json.loads((s / "rerun" / "summary-A-D.json").read_text())["answers"].values()), {"differ"})
 
 
 if __name__ == "__main__":
