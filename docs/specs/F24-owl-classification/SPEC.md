@@ -4633,7 +4633,7 @@ names is in no taxonomy, so `incomplete` cannot list it, and it shows through `c
 and the `assertion-not-read` entry, and as a class that is not found. An earlier design
 let assertions that the module layers proved harmless leave the run complete. Three
 review rounds each found a case it missed, all of the kind of a class that only an
-assertion names, so it was removed, and roadmap item 1293 records a sound replacement.
+assertion names, so it was removed, and roadmap item 1301 records a sound replacement.
 `assertions` true gives the complete answer, and roadmap item 1279 makes it the default.
 
 A triple that maps to no axiom, such as an assertion that a strict read cannot map or
@@ -4645,7 +4645,10 @@ since an entry names an axiom, so the wire answers report the count as `stats.un
 the CLI notes it and a strict run's refusal names it. A file in functional-style syntax
 whose entities are all declared reads without the store and has no unmapped triples. One
 with an undeclared entity takes the store's reading, in which a domain or range of an
-undeclared property is such a triple.
+undeclared property is such a triple. The triples of a SWRL rule are not unmapped, since
+the RDF reader maps a rule and its atoms to assertions about anonymous individuals, so a
+classification with `assertions` reads them as assertions and can answer complete while
+it ignores the rule. Roadmap item 1302 records this.
 
 The pass costs nothing when nothing is left out and nothing is dropped. A classification of
 the terminology alone reads the assertions only up to the first with logical content, and

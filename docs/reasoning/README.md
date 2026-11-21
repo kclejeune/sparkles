@@ -1256,7 +1256,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   dataset keeps only classifications of the terminology. Roadmap item 590.
 * The ontology readers map SWRL rules in RDF to assertions about anonymous individuals,
   and their variables to named individuals. Roadmap item 970. DL-safe SWRL rules do not
-  run in materialization, query-time reasoning or the classifier. Roadmap item 971.
+  run in materialization, query-time reasoning or the classifier. Roadmap item 971. A
+  classification with the assertions reads a rule's triples as assertions, so it can
+  answer complete while it ignores the rule. Roadmap item 1302.
 * A rooted run refuses keys over data properties and functional data properties, which
   OML vocabularies declare for their identifiers, as the Kepler16b sample and its
   metrology library do. Roadmap item 768. The classifier leaves out the literals and
