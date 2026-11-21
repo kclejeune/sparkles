@@ -281,8 +281,9 @@ g1-051_p0012 at 4 million conclusions, and on g1-051_p0012 with
 `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, no reservation is refused and the runs
 end as before. Without the reservation, the same run
 under the default budget of 1 GiB reaches a heap of 1.29 GB. The rules of the default
-path leave the same tables uncharged, but with the repair off these tables stay at or
-below 50 KB on these files and on ore_ont_14817, and item 1291 covers them.
+path leave the same tables uncharged. With the repair off these tables stay at or below
+6.3 KB on these files and at 50 KB on ore_ont_14817 until its Tier D attempt passes its
+bound, and item 1291 covers them.
 
 Some steps of the repair and of the rooted rules read between two checks without counting
 what they read. The steps named here are the ones that were measured or reproduced, and
