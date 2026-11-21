@@ -175,6 +175,10 @@ const DECLARED_AND_REIFIED: &str = ":o a owl:Ontology ; :p \"x\" .
         owl:annotatedTarget owl:DatatypeProperty ; rdfs:comment \"also data\" .
     :A a owl:Class .";
 
+const DISJOINT_HEADER: &str = "_:o a owl:Ontology, owl:AllDisjointClasses ;
+        owl:members (:A :B) ; rdfs:label \"title\" .
+    :A rdfs:subClassOf :B .";
+
 pub(super) const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "basic",
@@ -346,6 +350,16 @@ pub(super) const FIXTURES: &[Fixture] = &[
         data: DECLARED_AND_REIFIED,
         args: strict,
     },
+    Fixture {
+        name: "disjoint-header",
+        data: DISJOINT_HEADER,
+        args: default_args,
+    },
+    Fixture {
+        name: "disjoint-header-strict",
+        data: DISJOINT_HEADER,
+        args: strict,
+    },
 ];
 
 /// The fixtures whose reading needs the whole mapping, so that the head opens the ontology.
@@ -366,6 +380,8 @@ const OPENED: &[&str] = &[
     "typed-reified-annotation-property-strict",
     "declared-and-reified",
     "declared-and-reified-strict",
+    "disjoint-header",
+    "disjoint-header-strict",
 ];
 
 fn g1_g1() -> J {

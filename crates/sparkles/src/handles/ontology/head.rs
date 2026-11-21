@@ -586,6 +586,11 @@ impl<'a> Reader<'a> {
         };
         let mut nodes: Vec<Id> = typed.iter().map(|q| q[0]).collect();
         nodes.dedup();
+        for n in &nodes {
+            if !self.plain(*n, onto)? {
+                return Ok(None);
+            }
+        }
         let mut f = Fragment::default();
         for n in nodes {
             if !self.add_node(&mut f, n)? {
@@ -596,6 +601,43 @@ impl<'a> Reader<'a> {
             return Ok(None);
         }
         Ok(Some(self.map(&f).header))
+    }
+
+    /// Whether the ontology node `n` has no other part in the mapping: no structural type
+    /// beside `owl:Ontology` and no structural predicate beside `owl:imports` and
+    /// `owl:versionIRI`, and, for a blank node, no use as an object other than the source of
+    /// a reification. Another part, such as an `owl:AllDisjointClasses` node, can take the
+    /// node's annotations for an axiom's on triples outside the head's reads.
+    fn plain(&self, n: Id, onto: Id) -> Result<bool> {
+        let allowed: FxHashSet<Id> = [vocab::OWL_IMPORTS, vocab::OWL_VERSION_IRI]
+            .iter()
+            .filter_map(|p| self.id(p))
+            .collect();
+        let mut plain = true;
+        self.each(Perm::Spo, &[n.0], |q| {
+            if !self.kept(&q) {
+                return Ok(true);
+            }
+            plain = if Some(q[1]) == self.rdf_type {
+                q[2] == onto
+            } else {
+                !vocab::STRUCTURAL_PREDICATES
+                    .iter()
+                    .filter_map(|p| self.id(p))
+                    .any(|p| p == q[1])
+                    || allowed.contains(&q[1])
+            };
+            Ok(plain)
+        })?;
+        if !plain || !self.is_bnode(n) {
+            return Ok(plain);
+        }
+        let src = self.id(vocab::OWL_ANNOTATED_SOURCE);
+        self.each(Perm::Osp, &[n.0], |q| {
+            plain = Some(q[1]) == src || !self.kept(&q);
+            Ok(plain)
+        })?;
+        Ok(plain)
     }
 
     /// The distinct IRI subjects of `rdf:type ty` in the graphs read, in order, each
