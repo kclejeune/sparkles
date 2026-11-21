@@ -1252,7 +1252,9 @@ default, `run` replays a stopping rule on the finished first pass and writes `sh
 for any finished pass of the harness, such as a batch screen's. The rule ends a query that is
 not a control once a 99.5% t interval of its per-round log ratios, after at least three
 rounds, lies wholly below the flag bound with the pooled ratio below it too, or lies at or
-above the bound. The controls run every round and decide validity. When their same-binary
+above the bound. The controls run every round and judge the host's spread and drift, while
+the checks of answers, missing timings and server processes per query apply to the shadow
+as they do to all rounds. When their same-binary
 spread is between 2.2% and the 3% bound, the stopped queries would run their remaining rounds
 and the rule of all rounds would decide. The record gives each query's stop round and flag
 beside those of all rounds, both validities, the share of requests that would have run and a

@@ -50,7 +50,8 @@ decides is invalid.
 records what the rule would have decided beside the verdict of all rounds. Each query that
 is not a control stops once a t interval at 99.5% of its per-round log ratios, after at
 least three rounds, lies below the flag bound with the pooled ratio so far below it too, or
-lies at or above the bound. The controls run every round and carry the validity check, and
+lies at or above the bound. The controls run every round and carry the host's validity check,
+the pass's checks of answers, timings and server processes apply to both alike, and
 when their same-binary spread is 2.2% or more but within the 3% bound, the stopped queries
 would run their remaining rounds and the rule of all rounds would decide. PASS_DIR/shadow-X-Y.json
 gets each query's stop round, its decision and that of all rounds, the validity of both, the
@@ -751,8 +752,49 @@ def load_summary_module():
     return mod
 
 
+def pass_check(d, pair):
+    """The full-pass check of the pair on the finished pass d: whether nsc-bench-summary.py
+    --check lets it decide, and what stops it apart from the host's spread and drift, which
+    early stopping judges by the controls instead. The pair's summary is written to a
+    scratch directory, so that the pass is left as it was."""
+    import contextlib
+    import io
+    import tempfile
+    summary = load_summary_module()
+    x, y = pair
+    with tempfile.TemporaryDirectory() as tmp:
+        for f in ("results", "run.env", "queries", "manifest.txt"):
+            if (d / f).exists():
+                os.symlink((d / f).resolve(), Path(tmp) / f)
+        subprocess.run([sys.executable, str(HERE / "nsc-bench-summary.py"), "--pair", f"{x},{y}", tmp],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        j = Path(tmp) / f"summary-{x}-{y}.json"
+        with contextlib.redirect_stderr(io.StringIO()):
+            ok = summary.check(str(j), "first", "") == 0
+        s = json.loads(j.read_text())
+    problems = []
+    if "answers" not in s or "answers_all_arms" not in s:
+        problems.append("no answer checks")
+    else:
+        for name, key in (("the pair's", "answers"), ("the run's arms'", "answers_all_arms")):
+            bad = summary.answer_problems(s[key], list(s["answers"]))
+            if bad:
+                problems.append(f"{name} answers {bad}")
+    if s.get("missing"):
+        problems.append("no timings of both variants for " + ", ".join(s["missing"]))
+    if s.get("thin"):
+        problems.append("timings from one server process of a variant for " + ", ".join(s["thin"]))
+    return ok, problems
+
+
 def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
-    """The early-stopping rule's decisions on the finished pass d beside those of all rounds."""
+    """The early-stopping rule's decisions on the finished pass d beside those of all rounds.
+
+    The validity of all rounds is the full-pass check. The shadow's validity is the same
+    check with the host's spread and drift judged by the controls, so that answers, missing
+    timings and queries with one server process stop both alike. A query stopped after its
+    first rounds keeps two server processes of each variant a round, so stopping cannot
+    thin it below the check's minimum."""
     d = Path(d)
     path = d / "results" / "samples.tsv"
     with path.open() as f:
@@ -779,6 +821,7 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
     controls = [q for q in (controls if controls is not None else CONTROLS) if q in order]
     summary = load_summary_module()
     full = summary.validity(samples, order)
+    full_ok, problems = pass_check(d, pair)
     ctl = summary.validity(samples, controls) if len(controls) >= MIN_CONTROLS else None
     queries = {}
     for q in order:
@@ -802,8 +845,8 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
     if fallback:
         for m in queries.values():
             m.update(stop_round=m["rounds"], flagged=m["flagged_all_rounds"])
-    valid_all = bool(full and full["valid"])
-    valid_shadow = valid_all if fallback else bool(ctl and ctl["valid"])
+    valid_all = full_ok
+    valid_shadow = valid_all if fallback else bool(ctl and ctl["valid"]) and not problems
     total = sum(sent.values()) or 1
     kept = sum(n for (q, k), n in sent.items() if k <= queries[q]["stop_round"])
     wall_all = sum(walls.values()) or 1
@@ -815,7 +858,7 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
                  "max_spread": summary.MAX_SPREAD},
         "controls": controls,
         "validity": {"all_rounds": valid_all, "shadow": valid_shadow, "controls": ctl, "fallback": fallback,
-                     "all_rounds_spread": full and full["spread"]},
+                     "all_rounds_spread": full and full["spread"], "pass_problems": problems},
         "queries": queries, "flags_differ": differ,
         "request_share": kept / total, "wall_share": wall_kept / wall_all,
         "agree": not differ and valid_all == valid_shadow,
@@ -827,7 +870,8 @@ def shadow_line(label, s):
     stopped = sum(1 for m in s["queries"].values() if m["stop_round"] < m["rounds"])
     return (f"- {label}: {'agrees' if s['agree'] else 'DISAGREES'} with all rounds. "
             f"Validity {'valid' if v['shadow'] else 'INVALID'} against {'valid' if v['all_rounds'] else 'INVALID'}"
-            + (", with the controls' spread in the fallback band" if v["fallback"] else "") + ". "
+            + (", with the controls' spread in the fallback band" if v["fallback"] else "")
+            + (f", since the pass cannot decide: {'; '.join(v['pass_problems'])}" if v.get("pass_problems") else "") + ". "
             f"{stopped} of {len(s['queries'])} queries would stop early, "
             + (f"flags differ for {', '.join(s['flags_differ'])}, " if s["flags_differ"] else "")
             + f"{s['request_share']:.0%} of requests and {s['wall_share']:.0%} of client wall time would run.")

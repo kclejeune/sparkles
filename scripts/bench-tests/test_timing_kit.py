@@ -403,12 +403,16 @@ def load_kit():
     return mod
 
 
-def write_samples(d, ratio, rounds=8, noise=None, controls=CONTROLS, query="q", spread=0.0):
+def write_samples(d, ratio, rounds=8, noise=None, controls=CONTROLS, query="q", spread=0.0, answers=None):
     """A pass of A,B,B,A rounds of 2 requests, where B takes ratio times A's 1 ms on query,
     with noise[k] scaling B in round k, and B is as fast as A on the controls. With spread,
-    the second server process of each variant in a round is that much slower on every query."""
+    the second server process of each variant in a round is that much slower on every query.
+    Both variants give the same answer to every query, unless answers gives answers.tsv."""
     res = Path(d) / "results"
     res.mkdir(parents=True)
+    (res / "queries.txt").write_text("".join(f"{q}\n" for q in [query, *controls]))
+    (res / "answers.tsv").write_text(answers if answers is not None else
+                                     "".join(f"{v}\t{q}\t1\tx\n" for v in "AB" for q in [query, *controls]))
     lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
     epoch = 0
     for k in range(1, rounds + 1):
@@ -483,6 +487,35 @@ class ShadowTests(unittest.TestCase):
         d = write_samples(self.d / "bare", 1.0, controls=["class-predicates"])
         s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
         self.assertEqual((s["validity"]["all_rounds"], s["validity"]["shadow"], s["agree"]), (True, False, False))
+
+    def test_shadow_is_invalid_wherever_the_pass_cannot_decide(self):
+        same = "".join(f"{v}\t{q}\t1\tx\n" for v in "AB" for q in ["q", *CONTROLS])
+        cases = {"wrong answers": write_samples(self.d / "wrong", 1.0, answers=same.replace("B\tq\t1\tx", "B\tq\t2\ty")),
+                 "no answers": write_samples(self.d / "none", 1.0, answers="")}
+        # a required query that left no sample
+        d = write_samples(self.d / "absent", 1.0)
+        (d / "results" / "queries.txt").write_text("q\nr\n" + "".join(f"{c}\n" for c in CONTROLS))
+        (d / "results" / "answers.tsv").write_text(same + "A\tr\t1\tx\nB\tr\t1\tx\n")
+        cases["absent query"] = d
+        # B has no timings of q
+        d = write_samples(self.d / "nob", 1.0)
+        t = d / "results" / "samples.tsv"
+        t.write_text("".join(line + "\n" for line in t.read_text().splitlines() if "\tB\tq\t" not in line))
+        cases["no B timings"] = d
+        # a short query whose B timings come from one server process
+        d = write_samples(self.d / "thin", 1.0, query="tiny")
+        t = d / "results" / "samples.tsv"
+        lines = t.read_text().splitlines()
+        t.write_text("".join(line.replace("\t1.0\t2.0", "\t0.1\t1.1") + "\n" for line in lines
+                             if "\ttiny\t" not in line or "\tB\t" not in line or line.split("\t")[1] == "2"))
+        cases["one process"] = d
+        for name, d in cases.items():
+            s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+            v = s["validity"]
+            self.assertEqual((v["all_rounds"], v["shadow"], s["agree"]), (False, False, True), name)
+            self.assertTrue(v["pass_problems"], name)
+            # the pass's own files are left as they were
+            self.assertFalse(list(d.glob("summary*")), name)
 
     def test_shadow_command_reads_a_screen_pass(self):
         d = write_samples(self.d / "out" / "pass1", 1.0)
