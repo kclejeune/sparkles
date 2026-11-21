@@ -1053,8 +1053,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   outside the supported OWL 2 datatype map and chains through the top object property
   remain partial. XML namespace conformance preserves lexical spellings and does not
   provide canonical value equality. Roadmap item 663.
-* An EL classification after a change to an axiom with an individual, a data property
-  or a key saturates everything again, and so does any change after a run that merged
+* An EL classification after a change to an axiom with an individual, a data property,
+  a key or a self restriction saturates everything again, and so does any change after a run that merged
   a context with an individual.
   Roadmap item 664.
 * In an ontology with individuals, the Horn rules leave out an at-least restriction
