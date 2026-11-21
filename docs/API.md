@@ -1871,8 +1871,9 @@ the head's bounds, such as more than 1,000 ontology nodes or 10,000 reified type
 triples, opens the ontology and answers from the mapping. The server also opens the
 ontology when a graph types `rdf:type` or another structural predicate as an OWL property,
 when the main triple of a reified header annotation uses a predicate that is not built in
-and not declared an annotation property directly, and when an IRI the header uses has an
-annotated declaration, since the mapping then reads triples outside the head's reads.
+and not declared an annotation property directly, when an IRI the header uses has an
+annotated declaration, and when an ontology node also has another part in the mapping,
+such as a blank node that is also an `owl:AllDisjointClasses` node, since the mapping then reads triples outside the head's reads.
 The head has its own entity tag, which an edit's `If-Match` can name as it names the
 summary's. `view=full` is the default, and `view=head` refuses `metrics`. The Rust JSON `summary` operation and the
 Python `summary()` take the same `view`.
