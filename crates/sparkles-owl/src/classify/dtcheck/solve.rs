@@ -11,6 +11,7 @@
 
 use super::range::{Ranges, Rid};
 use super::sets::CAP;
+use rustc_hash::FxHashMap;
 
 /// A data property of the problem: the indices of its superproperties, which need not
 /// be closed, and its ranges.
@@ -32,12 +33,13 @@ pub enum Atom {
 impl Atom {
     /// The negation of the atom, which the at-least and at-most kinds are closed under.
     /// The negation of `≥ 0 d.R`, which always holds, is `≥ 1 d.∅`, which never does.
-    pub fn negate(self) -> Atom {
-        match self {
+    /// The negation of `≤ u64::MAX d.R` is past the counts an atom holds, so it is `None`.
+    pub fn negate(self) -> Option<Atom> {
+        Some(match self {
             Atom::AtLeast(d, 0, _) => Atom::AtLeast(d, 1, Ranges::EMPTY),
             Atom::AtLeast(d, n, r) => Atom::AtMost(d, n - 1, r),
-            Atom::AtMost(d, n, r) => Atom::AtLeast(d, n + 1, r),
-        }
+            Atom::AtMost(d, n, r) => Atom::AtLeast(d, n.checked_add(1)?, r),
+        })
     }
 }
 
@@ -160,37 +162,76 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64) -> Run {
             .unwrap_or(0);
         ub[v] = ub[v].min(most);
     }
+    // each minimum whose counts are all among those of a maximum
+    let mut pairs = Vec::new();
+    for (a, ca) in cons.iter().enumerate().filter(|(_, c)| c.at_least) {
+        for (b, cb) in cons.iter().enumerate().filter(|(_, c)| !c.at_least) {
+            if ca.vars.iter().all(|v| cb.vars.contains(v)) {
+                pairs.push((a, b));
+            }
+        }
+    }
     let mut val = vec![0u128; nvars];
     let mut assigned = vec![false; nvars];
     let mut budget = nodes;
-    match search(&vars, 0, &cons, &ub, &mut val, &mut assigned, &mut budget) {
+    match search(
+        &vars,
+        0,
+        &cons,
+        &pairs,
+        &ub,
+        &mut val,
+        &mut assigned,
+        &mut budget,
+    ) {
         Some(true) => Run::Sat,
         Some(false) => Run::Unsat,
         None => Run::Bound,
     }
 }
 
-/// Whether a partial assignment can still satisfy every constraint.
-fn feasible(cons: &[Lin], ub: &[u128], val: &[u128], assigned: &[bool]) -> bool {
-    cons.iter().all(|c| {
-        let mut sum: u128 = 0;
-        let mut most: u128 = 0;
-        for &v in &c.vars {
-            if assigned[v] {
-                sum += val[v];
-                most += val[v];
-            } else {
-                most = most.saturating_add(ub[v]);
+/// Whether a partial assignment can still satisfy every constraint, each alone and each
+/// minimum together with a maximum over a superset of its counts.
+fn feasible(
+    cons: &[Lin],
+    pairs: &[(usize, usize)],
+    ub: &[u128],
+    val: &[u128],
+    assigned: &[bool],
+) -> bool {
+    // a minimum `a` within a maximum `b`: `a`'s sum is at most `b`'s bound less the
+    // assigned counts of `b` outside `a`
+    let paired = pairs.iter().all(|&(a, b)| {
+        let outside: u128 = cons[b]
+            .vars
+            .iter()
+            .filter(|&&v| assigned[v] && !cons[a].vars.contains(&v))
+            .map(|&v| val[v])
+            .sum();
+        cons[a].n <= cons[b].n.saturating_sub(outside)
+    });
+    paired
+        && cons.iter().all(|c| {
+            let mut sum: u128 = 0;
+            let mut most: u128 = 0;
+            for &v in &c.vars {
+                if assigned[v] {
+                    sum += val[v];
+                    most += val[v];
+                } else {
+                    most = most.saturating_add(ub[v]);
+                }
             }
-        }
-        if c.at_least { most >= c.n } else { sum <= c.n }
-    })
+            if c.at_least { most >= c.n } else { sum <= c.n }
+        })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search(
     vars: &[usize],
     i: usize,
     cons: &[Lin],
+    pairs: &[(usize, usize)],
     ub: &[u128],
     val: &mut [u128],
     assigned: &mut [bool],
@@ -200,18 +241,40 @@ fn search(
         return None;
     }
     *budget -= 1;
-    if !feasible(cons, ub, val, assigned) {
+    if !feasible(cons, pairs, ub, val, assigned) {
         return Some(false);
     }
     let Some(&v) = vars.get(i) else {
         return Some(true);
     };
+    // the counts of `v` that the constraints allow given the others: at most what each
+    // maximum has left, and at least what each minimum still needs beyond the most the
+    // other unassigned counts give
+    let mut hi = ub[v];
+    let mut lo: u128 = 0;
+    for c in cons.iter().filter(|c| c.vars.contains(&v)) {
+        let mut sum: u128 = 0;
+        let mut rest: u128 = 0;
+        for &w in c.vars.iter().filter(|&&w| w != v) {
+            if assigned[w] {
+                sum += val[w];
+            } else {
+                rest = rest.saturating_add(ub[w]);
+            }
+        }
+        if c.at_least {
+            lo = lo.max(c.n.saturating_sub(sum.saturating_add(rest)));
+        } else {
+            hi = hi.min(c.n.saturating_sub(sum));
+        }
+    }
+    let last = i + 1 == vars.len();
     assigned[v] = true;
-    let mut x = ub[v];
     let mut out = Some(false);
-    loop {
+    let mut x = hi;
+    while x >= lo && hi >= lo {
         val[v] = x;
-        match search(vars, i + 1, cons, ub, val, assigned, budget) {
+        match search(vars, i + 1, cons, pairs, ub, val, assigned, budget) {
             Some(true) => {
                 out = Some(true);
                 break;
@@ -222,7 +285,8 @@ fn search(
             }
             Some(false) => {}
         }
-        if x == 0 {
+        // with every other count fixed, the bounds above are exact, so one value decides
+        if last || x == 0 {
             break;
         }
         x -= 1;
@@ -235,7 +299,8 @@ fn search(
 /// Decides the problem.
 pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     let np = p.props.len();
-    if np > b.props {
+    // sets of properties are bit sets of a u64
+    if np > b.props.min(63) {
         return Answer::Unknown(Why::Bound);
     }
     // Sizes saturate at 2^63, which is exact only while the counts asked for stay below
@@ -268,32 +333,46 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
             break;
         }
     }
-    // the cells of every range involved
-    let mut ranges: Vec<Rid> = p
+    // the distinct ranges involved, by index
+    let mut ranges: Vec<Rid> = Vec::new();
+    let mut index: FxHashMap<Rid, usize> = FxHashMap::default();
+    let atom_ranges = p.atoms.iter().map(|a| {
+        let (Atom::AtLeast(_, _, x) | Atom::AtMost(_, _, x)) = *a;
+        x
+    });
+    for x in p
         .props
         .iter()
         .flat_map(|q| q.ranges.iter().copied())
-        .collect();
-    for a in &p.atoms {
-        let (Atom::AtLeast(_, _, x) | Atom::AtMost(_, _, x)) = *a;
-        ranges.push(x);
+        .chain(atom_ranges)
+    {
+        index.entry(x).or_insert_with(|| {
+            ranges.push(x);
+            ranges.len() - 1
+        });
     }
-    let mut cells = vec![Ranges::FULL];
+    // The cells, each with the side of every range it lies on, which its construction
+    // decides: whether a cell is within a range never rests on comparing ids. Cells of
+    // different parents are disjoint, so no two are the same set.
+    let mut cells: Vec<(Rid, Vec<bool>)> = vec![(Ranges::FULL, Vec::new())];
     for &x in &ranges {
         let nx = r.not(x);
         let mut next = Vec::with_capacity(cells.len() * 2);
-        for &c in &cells {
-            for part in [r.meet(c, x), r.meet(c, nx)] {
-                if r.is_empty(part) != Some(true) && !next.contains(&part) {
-                    next.push(part);
+        for (c, sides) in &cells {
+            for (part, inside) in [(r.meet(*c, x), true), (r.meet(*c, nx), false)] {
+                if r.is_empty(part) != Some(true) {
+                    let mut s = sides.clone();
+                    s.push(inside);
+                    next.push((part, s));
+                    if next.len() > b.types {
+                        return Answer::Unknown(Why::Bound);
+                    }
                 }
             }
         }
         cells = next;
-        if cells.len() > b.types {
-            return Answer::Unknown(Why::Bound);
-        }
     }
+    let within = |ci: usize, x: Rid| cells[ci].1[index[&x]];
     // the upward-closed sets of properties without a disjoint pair
     let mut sets = Vec::new();
     for s in 1u64..(1 << np) {
@@ -306,17 +385,20 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
             sets.push(s);
         }
     }
+    if cells.len().saturating_mul(sets.len()) > b.types.saturating_mul(64) {
+        return Answer::Unknown(Why::Bound);
+    }
     let mut types = Vec::new();
-    for (ci, &c) in cells.iter().enumerate() {
+    for ci in 0..cells.len() {
         for &s in &sets {
             let ok = (0..np)
                 .filter(|i| s & (1 << i) != 0)
-                .all(|i| p.props[i].ranges.iter().all(|&x| r.meet(c, x) == c));
+                .all(|i| p.props[i].ranges.iter().all(|&x| within(ci, x)));
             if ok {
                 types.push((ci, s));
-            }
-            if types.len() > b.types {
-                return Answer::Unknown(Why::Bound);
+                if types.len() > b.types {
+                    return Answer::Unknown(Why::Bound);
+                }
             }
         }
     }
@@ -326,7 +408,7 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
         let vars = types
             .iter()
             .enumerate()
-            .filter(|(_, (ci, s))| s & (1 << d) != 0 && r.meet(cells[*ci], x) == cells[*ci])
+            .filter(|(_, (ci, s))| s & (1 << d) != 0 && within(*ci, x))
             .map(|(t, _)| t)
             .collect();
         cons.push(Lin {
@@ -335,6 +417,11 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
             n: u128::from(n),
         });
     }
+    let mut by_cell: Vec<Vec<usize>> = vec![Vec::new(); cells.len()];
+    for (t, (ci, _)) in types.iter().enumerate() {
+        by_cell[*ci].push(t);
+    }
+    let cells: Vec<Rid> = cells.into_iter().map(|(c, _)| c).collect();
     let sizes: Vec<_> = cells.iter().map(|&c| r.size(c)).collect();
     let exact = sizes.iter().all(|s| s.is_exact());
     let with_caps = |cap: &dyn Fn(usize) -> Option<u128>| {
@@ -342,12 +429,7 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
         for ci in 0..cells.len() {
             if let Some(n) = cap(ci) {
                 all.push(Lin {
-                    vars: types
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, (c, _))| *c == ci)
-                        .map(|(t, _)| t)
-                        .collect(),
+                    vars: by_cell[ci].clone(),
                     at_least: false,
                     n,
                 });

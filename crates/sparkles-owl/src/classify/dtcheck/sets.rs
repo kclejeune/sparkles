@@ -79,21 +79,46 @@ impl PartialOrd for Rat {
 }
 
 /// The count of a set, with a lower bound and an upper bound, both saturating: `lo` at
-/// [`CAP`], and `hi` as `None` when it is infinite or not known.
+/// [`CAP`], and `hi` as `None` when it is infinite or not known. `inf` says the set is
+/// infinite, which only an unbounded source sets: a count that saturates is a lower bound
+/// that removing members still lowers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
     pub lo: u128,
     pub hi: Option<u128>,
+    pub inf: bool,
 }
 
 impl Size {
-    pub const ZERO: Size = Size { lo: 0, hi: Some(0) };
-    pub const INFINITE: Size = Size { lo: CAP, hi: None };
+    pub const ZERO: Size = Size {
+        lo: 0,
+        hi: Some(0),
+        inf: false,
+    };
+    pub const INFINITE: Size = Size {
+        lo: CAP,
+        hi: None,
+        inf: true,
+    };
+    /// A count the checker cannot bound.
+    pub const UNKNOWN: Size = Size {
+        lo: 0,
+        hi: None,
+        inf: false,
+    };
     pub fn exact(n: u128) -> Size {
         if n >= CAP {
-            Size::INFINITE
+            Size {
+                lo: CAP,
+                hi: None,
+                inf: false,
+            }
         } else {
-            Size { lo: n, hi: Some(n) }
+            Size {
+                lo: n,
+                hi: Some(n),
+                inf: false,
+            }
         }
     }
     pub fn add(self, o: Size) -> Size {
@@ -102,21 +127,28 @@ impl Size {
             (Some(a), Some(b)) if a + b < CAP => Some(a + b),
             _ => None,
         };
-        Size { lo, hi }
+        Size {
+            lo,
+            hi,
+            inf: self.inf || o.inf,
+        }
     }
     /// The size after removing `k` members of the set.
     pub fn minus(self, k: u128) -> Size {
         Size {
-            lo: if self.lo >= CAP && self.hi.is_none() {
+            lo: if self.inf {
                 CAP
             } else {
                 self.lo.saturating_sub(k)
             },
             hi: self.hi.map(|h| h - k.min(h)),
+            inf: self.inf,
         }
     }
+    /// Whether the count is known: exactly, or as at least [`CAP`], which no demand of a
+    /// problem reaches.
     pub fn is_exact(self) -> bool {
-        self.hi == Some(self.lo) || (self.lo >= CAP && self.hi.is_none())
+        self.hi == Some(self.lo) || self.lo >= CAP
     }
 }
 
@@ -126,6 +158,8 @@ pub trait Step: Clone + Ord + std::hash::Hash + std::fmt::Debug {
     fn succ(&self) -> Self;
     fn pred(&self) -> Self;
     fn span(lo: &Self, hi: &Self) -> u128;
+    /// The heap bytes of a point.
+    fn heap(&self) -> usize;
 }
 
 impl Step for BigInt {
@@ -139,6 +173,9 @@ impl Step for BigInt {
         let n: BigInt = hi - lo + 1;
         u128::try_from(n).map_or(CAP, |n| n.min(CAP))
     }
+    fn heap(&self) -> usize {
+        (self.bits() as usize).div_ceil(8)
+    }
 }
 
 impl Step for u64 {
@@ -150,6 +187,9 @@ impl Step for u64 {
     }
     fn span(lo: &Self, hi: &Self) -> u128 {
         (u128::from(*hi - *lo) + 1).min(CAP)
+    }
+    fn heap(&self) -> usize {
+        0
     }
 }
 
@@ -256,6 +296,18 @@ impl<T: Step> Disc<T> {
             out.push((c, dhi.clone()));
         }
         Disc { iv: out }
+    }
+    pub fn bytes(&self) -> usize {
+        let heap = |e: &End<T>| match e {
+            End::At(x) => x.heap(),
+            _ => 0,
+        };
+        self.iv.capacity() * size_of::<(End<T>, End<T>)>()
+            + self
+                .iv
+                .iter()
+                .map(|(l, h)| heap(l) + heap(h))
+                .sum::<usize>()
     }
     pub fn size(&self) -> Size {
         let mut s = Size::ZERO;

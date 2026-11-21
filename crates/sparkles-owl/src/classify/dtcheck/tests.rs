@@ -106,7 +106,7 @@ fn numeric_tower_nests() {
     assert!(!t.within(&dt_iri(vocab::OWL_REAL), &dt_iri(vocab::OWL_RATIONAL)));
     assert_eq!(t.size(&dt("byte")), Size::exact(256));
     assert_eq!(t.size(&dt("int")), Size::exact(1 << 32));
-    assert_eq!(t.size(&dt("unsignedLong")), Size::INFINITE);
+    assert_eq!(t.size(&dt("unsignedLong")), Size::exact(CAP));
     for d in ["double", "float"] {
         let m = and(vec![dt(d), dt_iri(vocab::OWL_REAL)]);
         assert!(t.empty(&m), "{d} is disjoint from owl:real");
@@ -699,7 +699,7 @@ fn counting() {
     let mut p = P::new(1);
     p.min(0, 0, &not(lit_top()));
     assert_eq!(p.check(), Sat);
-    p.p.atoms[0] = p.p.atoms[0].negate();
+    p.p.atoms[0] = p.p.atoms[0].negate().unwrap();
     assert_eq!(p.check(), Unsat);
     // an uncounted cell: tokens of length 2 against a large maximum and minimum
     let mut p = P::new(1);
@@ -958,4 +958,243 @@ fn data_domain_beyond_the_map() {
     let mut p = P::new(1);
     p.min(0, 1, &outside);
     assert_eq!(p.check(), Answer::Sat);
+}
+
+// ------------------------------------------------- regressions of the reviews ----
+
+fn lang_range(r: &str) -> (&'static str, Literal) {
+    (vocab::RDF_LANG_RANGE, lit(r, "string"))
+}
+fn nn(n: u64) -> Literal {
+    lit(&n.to_string(), "nonNegativeInteger")
+}
+
+#[test]
+fn language_ranges_count_well_formed_tags() {
+    let mut t = T::new();
+    // no well-formed tag has the primary subtag `a`
+    let a = plain_restr(&[lang_range("a")]);
+    assert!(t.empty(&a));
+    let mut p = P::new(1);
+    p.min(0, 1, &a);
+    assert_eq!(p.check(), Answer::Unsat);
+    // `i-klingon` is a whole irregular tag, so with length 0 it has one value
+    let k = plain_restr(&[
+        lang_range("i-klingon"),
+        ("http://www.w3.org/2001/XMLSchema#length", nn(0)),
+    ]);
+    assert_eq!(t.size(&k), Size::exact(1));
+    let mut p = P::new(1);
+    p.min(0, 2, &k);
+    assert_eq!(p.check(), Answer::Unsat);
+    // `i` matches the thirteen irregular tags that start with it
+    let i = plain_restr(&[
+        lang_range("i"),
+        ("http://www.w3.org/2001/XMLSchema#length", nn(0)),
+    ]);
+    assert_eq!(t.size(&i), Size::exact(13));
+    // `en-a` is no tag, but `en-a-bb` is, so the range is infinite
+    let ea = plain_restr(&[
+        lang_range("en-a"),
+        ("http://www.w3.org/2001/XMLSchema#length", nn(0)),
+    ]);
+    assert_eq!(t.size(&ea), Size::INFINITE);
+    // a range less a longer one still governs infinitely many tags
+    let en = plain_restr(&[lang_range("en")]);
+    let enus = plain_restr(&[lang_range("en-us")]);
+    assert_eq!(t.size(&and(vec![en, not(enus)])), Size::INFINITE);
+}
+
+#[test]
+fn tagged_literals_are_checked() {
+    let bad = Literal::lang("\u{0}", "en").unwrap();
+    assert_eq!(of_literal(&bad), Err(Unsupported::IllTyped));
+    // the typed form reads its tag by the same rule
+    let typed = Literal::typed("s@a", vocab::RDF_PLAIN_LITERAL);
+    assert_eq!(of_literal(&typed), Err(Unsupported::IllTyped));
+    let typed = Literal::typed("s@en-gb-oed", vocab::RDF_PLAIN_LITERAL);
+    assert!(of_literal(&typed).is_ok());
+}
+
+#[test]
+fn saturated_sizes_subtract() {
+    assert!(Size::exact(CAP).minus(1).lo < CAP);
+    assert_eq!(Size::INFINITE.minus(1), Size::INFINITE);
+    // (integer[0, CAP-4] ∪ the three strings of cell 0) less those three strings has
+    // CAP-3 values
+    let mut p = P::new(1);
+    let ints = restr(
+        "integer",
+        &[
+            ("minInclusive", lit("0", "integer")),
+            ("maxInclusive", lit(&(CAP - 4).to_string(), "integer")),
+        ],
+    );
+    let three = and(vec![
+        restr("string", &[("length", nn(1))]),
+        not(dt("normalizedString")),
+    ]);
+    let gone = one(&[
+        lit("\t", "string"),
+        lit("\n", "string"),
+        lit("\r", "string"),
+    ]);
+    let x = and(vec![or(vec![ints.clone(), three]), not(gone)]);
+    p.min(0, (CAP - 2) as u64, &x);
+    assert_ne!(p.check(), Answer::Sat);
+    // and the same with 256 bytes of hexBinary removed from a saturated union
+    let big = restr(
+        "integer",
+        &[
+            ("minInclusive", lit("0", "integer")),
+            ("maxInclusive", lit("9223372036854775708", "integer")),
+        ],
+    );
+    let hex1 = restr("hexBinary", &[("length", nn(1))]);
+    let all: Vec<Literal> = (0u8..=255)
+        .map(|b| lit(&format!("{b:02X}"), "hexBinary"))
+        .collect();
+    let x = and(vec![or(vec![big, hex1]), not(one(&all))]);
+    let mut t = T::new();
+    assert!(t.size(&x).lo <= CAP - 99);
+    let mut p = P::new(1);
+    p.min(0, (1u64 << 63) - 50, &x);
+    assert_ne!(p.check(), Answer::Sat);
+}
+
+#[test]
+fn short_strings_have_one_form() {
+    let mut t = T::new();
+    let z = nn(0);
+    assert_eq!(
+        t.of(&restr("NMTOKEN", &[("length", z.clone())])),
+        Ranges::EMPTY
+    );
+    assert_eq!(
+        t.of(&restr("language", &[("length", z.clone())])),
+        Ranges::EMPTY
+    );
+    let s0 = t.of(&restr("string", &[("length", z.clone())]));
+    assert_eq!(s0, t.of(&one(&[lit("", "string")])));
+    assert_eq!(s0, t.of(&restr("token", &[("length", z.clone())])));
+    assert_eq!(
+        t.of(&and(vec![
+            restr("string", &[("length", z.clone())]),
+            not(one(&[lit("", "string")]))
+        ])),
+        Ranges::EMPTY
+    );
+    for d in ["hexBinary", "base64Binary", "anyURI"] {
+        assert_eq!(
+            t.of(&restr(d, &[("length", z.clone())])),
+            t.of(&one(&[lit("", d)]))
+        );
+    }
+    assert_eq!(
+        t.of(&and(vec![
+            restr("normalizedString", &[("length", nn(1))]),
+            not(dt("token"))
+        ])),
+        t.of(&one(&[lit(" ", "string")]))
+    );
+    assert_eq!(
+        t.of(&and(vec![
+            restr("Name", &[("length", nn(1))]),
+            not(dt("NCName"))
+        ])),
+        t.of(&one(&[lit(":", "string")]))
+    );
+    // complements keep them
+    let e = t.r.not(Ranges::EMPTY);
+    assert_eq!(e, Ranges::FULL);
+    assert!(t.has(&not(dt("integer")), &lit("", "string")));
+    assert!(!t.has(&not(dt("token")), &lit("", "string")));
+}
+
+#[test]
+fn dense_forms_are_unique() {
+    let mut t = T::new();
+    let x = t.of(&restr("decimal", &[("minInclusive", lit("3", "integer"))]));
+    let nx = t.r.not(x);
+    let u = t.r.join(x, nx);
+    assert_eq!(u, Ranges::FULL);
+    assert_eq!(t.r.not(u), Ranges::EMPTY);
+    assert_eq!(t.r.not(Ranges::EMPTY), Ranges::FULL);
+    let d = t.of(&dt("decimal"));
+    let split = t.of(&or(vec![
+        restr("decimal", &[("maxInclusive", lit("1", "integer"))]),
+        restr("decimal", &[("minInclusive", lit("1", "integer"))]),
+    ]));
+    assert_eq!(d, split);
+}
+
+#[test]
+fn time_facets_read_long_fractions() {
+    let mut r = Ranges::new();
+    let x = restr(
+        "dateTimeStamp",
+        &[(
+            "minInclusive",
+            lit("2000-01-01T00:00:00.1234567890123456789Z", "dateTimeStamp"),
+        )],
+    );
+    assert!(r.of(&x).is_ok());
+    // a bound without an offset cannot restrict dateTimeStamp
+    let x = restr(
+        "dateTimeStamp",
+        &[("minInclusive", lit("2000-01-01T00:00:00", "dateTime"))],
+    );
+    assert!(matches!(r.of(&x), Err(Unsupported::Facet(_))));
+    let x = restr("dateTime", &[("minInclusive", lit("1", "integer"))]);
+    assert!(matches!(r.of(&x), Err(Unsupported::Facet(_))));
+}
+
+#[test]
+fn long_lexical_forms_are_left_out() {
+    let long = format!("0.{}1", "0".repeat(super::value::MAX_DIGITS));
+    assert_eq!(of_literal(&lit(&long, "decimal")), Err(Unsupported::Large));
+    let t = format!(
+        "2000-01-01T00:00:00.{}1Z",
+        "0".repeat(super::value::MAX_DIGITS)
+    );
+    assert_eq!(of_literal(&lit(&t, "dateTime")), Err(Unsupported::Large));
+    let ok = format!("0.{}1", "0".repeat(100));
+    assert!(of_literal(&lit(&ok, "decimal")).is_ok());
+    // a long string is no number
+    assert!(of_literal(&lit(&"a".repeat(10_000), "string")).is_ok());
+}
+
+#[test]
+fn large_counts_with_several_cells() {
+    let mut p = P::new(1);
+    p.min(0, 1_000_000, &dt("int"))
+        .max(0, 999_999, &dt("int"))
+        .min(0, 1, &dt("short"));
+    assert_eq!(p.check(), Answer::Unsat);
+    let mut p = P::new(1);
+    let nonneg = restr("int", &[("minInclusive", lit("0", "int"))]);
+    p.min(0, 1_000_000, &dt("int"))
+        .max(0, 1_000_000, &dt("int"))
+        .min(0, 500_000, &nonneg)
+        .max(0, 500_000, &nonneg);
+    assert_eq!(p.check(), Answer::Sat);
+}
+
+#[test]
+fn edge_api() {
+    let mut r = Ranges::default();
+    assert!(r.of(&and(vec![dt("boolean")])).is_ok());
+    assert_eq!(Atom::AtMost(0, u64::MAX, Ranges::FULL).negate(), None);
+    let p = Problem {
+        props: vec![Prop::default(); 64],
+        ..Problem::default()
+    };
+    let b = Bounds {
+        props: 64,
+        ..Bounds::default()
+    };
+    assert_eq!(
+        check(&mut r, &p, &b),
+        Answer::Unknown(super::solve::Why::Bound)
+    );
 }

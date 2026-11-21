@@ -3,10 +3,14 @@
 //! A normal form is a base, a union over the families of the map of sets that each
 //! family represents exactly, together with finite sets of values included beyond the
 //! base and excluded from it. Values that a family's base represents as points, the
-//! numbers, the floating-point and Boolean values and the date-times without an offset,
-//! are never held in the exceptions, which makes the form unique, so equal ranges intern
-//! to one id.
+//! numbers, the floating-point and Boolean values, the date-times without an offset and
+//! the strings of the classes with at most three members, are never held in the
+//! exceptions. Equal ranges then intern to one id except when a larger finite class,
+//! such as `xsd:hexBinary` of length 1, is held in the base by one and in the exceptions
+//! by the other. Ids are therefore cache keys: whether one range is within another is
+//! decided through sizes, never by comparing ids.
 
+use super::bcp47;
 use super::sets::{CAP, Dense, Disc, End, Rat, Size, Step};
 use super::value::{self, DVal, NAN, Unsupported, double_key, float_key};
 use crate::datatypes;
@@ -33,10 +37,77 @@ const FOURTEEN_HOURS: i64 = 14 * 3600;
 type Len = Disc<u64>;
 
 fn len_all() -> Len {
-    Disc::range(End::At(0), End::Max)
+    len_from(0)
 }
 fn len_not(l: &Len) -> Len {
     l.not(&End::At(0), &End::Max)
+}
+fn len_from(lo: u64) -> Len {
+    Disc::range(End::At(lo), End::Max)
+}
+fn len_not_from(l: &Len, lo: u64) -> Len {
+    l.not(&End::At(lo), &End::Max)
+}
+
+/// The shortest length that each cell of the string chain holds in its base. The
+/// shorter strings of a cell are a class of at most three members held as [`Tiny`]
+/// bits: the tab, line feed and carriage return in cell 0, the space in cell 1, the
+/// empty string in cell 2 and `:` in cell 4. The cells with no string of length 0 or 1
+/// start where their strings do.
+const CELL_MIN: [u64; CELLS] = [2, 2, 1, 1, 2, 1, 1];
+
+/// The shortest length of `xsd:anyURI`, `xsd:hexBinary` and `xsd:base64Binary` in the
+/// base, whose single values of length 0 are [`Tiny`] bits.
+const BIN_MIN: u64 = 1;
+
+/// The members of the classes of at most three values, one bit each.
+struct Tiny;
+
+impl Tiny {
+    const TAB: u16 = 1 << 0;
+    const LF: u16 = 1 << 1;
+    const CR: u16 = 1 << 2;
+    const SPACE: u16 = 1 << 3;
+    const EMPTY: u16 = 1 << 4;
+    const COLON: u16 = 1 << 5;
+    const URI: u16 = 1 << 6;
+    const HEX: u16 = 1 << 7;
+    const B64: u16 = 1 << 8;
+    const ALL: u16 = (1 << 9) - 1;
+    /// the bits of the plain strings, by cell and length
+    const STR: [(u16, usize, u64); 6] = [
+        (Tiny::TAB, 0, 1),
+        (Tiny::LF, 0, 1),
+        (Tiny::CR, 0, 1),
+        (Tiny::SPACE, 1, 1),
+        (Tiny::EMPTY, 2, 0),
+        (Tiny::COLON, 4, 1),
+    ];
+    const PLAIN: u16 = Tiny::TAB | Tiny::LF | Tiny::CR | Tiny::SPACE | Tiny::EMPTY | Tiny::COLON;
+    fn of(v: &DVal) -> Option<u16> {
+        Some(match v {
+            DVal::Str(s) => match s.as_str() {
+                "\t" => Tiny::TAB,
+                "\n" => Tiny::LF,
+                "\r" => Tiny::CR,
+                " " => Tiny::SPACE,
+                "" => Tiny::EMPTY,
+                ":" => Tiny::COLON,
+                _ => return None,
+            },
+            DVal::Uri(s) if s.is_empty() => Tiny::URI,
+            DVal::Hex(b) if b.is_empty() => Tiny::HEX,
+            DVal::B64(b) if b.is_empty() => Tiny::B64,
+            _ => return None,
+        })
+    }
+    /// The plain string bits of the cells from `k` on.
+    fn from_level(k: usize) -> u16 {
+        Tiny::STR
+            .iter()
+            .filter(|(_, c, _)| *c >= k)
+            .fold(0, |a, (b, _, _)| a | b)
+    }
 }
 
 fn dec_m(q: &Rat) -> bool {
@@ -132,8 +203,42 @@ impl Tags {
             self.over.remove(&k);
         }
     }
-    fn any(&self) -> bool {
-        !self.default.is_empty() || self.over.values().any(|l| !l.is_empty())
+    /// The number of tagged strings. A tag is one of the irregular grandfathered tags,
+    /// which are counted one by one, or one of the infinitely many others. The tags that
+    /// no key matches include infinitely many others while there are fewer keys than
+    /// primary subtags of two letters, and a key whose range matches other tags governs
+    /// infinitely many of them unless longer keys cover the extensions of its
+    /// [`bcp47::open_completion`], which the count of fewer than 36 keys rules out. A
+    /// case outside these is not known.
+    fn size(&self) -> Size {
+        let mut s = Size::ZERO;
+        for g in bcp47::IRREGULAR {
+            s = s.add(sum_lengths(self.eff(g, false), |n| exact_pow(XML_CHARS, n)));
+        }
+        if !self.default.is_empty() {
+            s = s.add(if self.over.len() < 26 * 26 {
+                Size::INFINITE
+            } else {
+                Size::UNKNOWN
+            });
+        }
+        for (k, l) in &self.over {
+            if l.is_empty() {
+                continue;
+            }
+            let Some(c) = bcp47::open_completion(k) else {
+                continue;
+            };
+            let longer = self.over.keys().filter(|o| *o != k && bcp47::prefix(k, o));
+            let between = longer.clone().any(|o| bcp47::prefix(o, &c));
+            let beyond = longer.filter(|o| bcp47::prefix(&c, o)).count();
+            s = s.add(if !between && beyond < 36 {
+                Size::INFINITE
+            } else {
+                Size::UNKNOWN
+            });
+        }
+        s
     }
 }
 
@@ -155,6 +260,8 @@ pub struct Nf {
     b64: Len,
     /// bit 0 for false, bit 1 for true
     boolean: u8,
+    /// the members of the classes of at most three values, by [`Tiny`] bit
+    tiny: u16,
     /// date-times with an offset, by the instant
     toff: Dense,
     /// date-times without an offset, by the local time read as UTC
@@ -231,6 +338,7 @@ impl Nf {
             hex: Disc::empty(),
             b64: Disc::empty(),
             boolean: 0,
+            tiny: 0,
             toff: Dense::empty(),
             tloc: Dense::empty(),
             xml: false,
@@ -253,12 +361,13 @@ impl Nf {
             float_nan: true,
             double: Disc::range(dlo, dhi),
             double_nan: true,
-            cells: std::array::from_fn(|_| len_all()),
+            cells: std::array::from_fn(|i| len_from(CELL_MIN[i])),
             tags: Tags::uniform(len_all()),
-            uri: len_all(),
-            hex: len_all(),
-            b64: len_all(),
+            uri: len_from(BIN_MIN),
+            hex: len_from(BIN_MIN),
+            b64: len_from(BIN_MIN),
             boolean: 3,
+            tiny: Tiny::ALL,
             toff: Dense::full(),
             tloc: Dense::full(),
             xml: true,
@@ -269,6 +378,9 @@ impl Nf {
     }
 
     fn base_contains(&self, v: &DVal) -> bool {
+        if let Some(b) = Tiny::of(v) {
+            return self.tiny & b != 0;
+        }
         match v {
             DVal::Real(q) => {
                 if q.is_int() {
@@ -333,6 +445,7 @@ impl Nf {
             DVal::Double(k) => n.double = Disc::point(*k),
             DVal::Bool(b) => n.boolean = 1 << u8::from(*b),
             DVal::Time(q, None) => n.tloc = Dense::point(q.clone(), time_m),
+            _ if Tiny::of(v).is_some() => n.tiny = Tiny::of(v).expect("a tiny value"),
             _ => {
                 n.inc.insert(v.clone());
             }
@@ -358,6 +471,10 @@ impl Nf {
             boolean: match op {
                 Op::Meet => self.boolean & o.boolean,
                 Op::Join => self.boolean | o.boolean,
+            },
+            tiny: match op {
+                Op::Meet => self.tiny & o.tiny,
+                Op::Join => self.tiny | o.tiny,
             },
             toff: op.dense(&self.toff, &o.toff, time_m),
             tloc: op.dense(&self.tloc, &o.tloc, time_m),
@@ -409,12 +526,13 @@ impl Nf {
             float_nan: !self.float_nan,
             double: self.double.not(&dlo, &dhi),
             double_nan: !self.double_nan,
-            cells: std::array::from_fn(|i| len_not(&self.cells[i])),
+            cells: std::array::from_fn(|i| len_not_from(&self.cells[i], CELL_MIN[i])),
             tags: self.tags.map1(len_not),
-            uri: len_not(&self.uri),
-            hex: len_not(&self.hex),
-            b64: len_not(&self.b64),
+            uri: len_not_from(&self.uri, BIN_MIN),
+            hex: len_not_from(&self.hex, BIN_MIN),
+            b64: len_not_from(&self.b64, BIN_MIN),
             boolean: !self.boolean & 3,
+            tiny: !self.tiny & Tiny::ALL,
             toff: self.toff.not(time_m),
             tloc: self.tloc.not(time_m),
             xml: !self.xml,
@@ -438,14 +556,13 @@ impl Nf {
         for (i, c) in self.cells.iter().enumerate() {
             s = s.add(sum_lengths(c, |n| string_cell(i, n)));
         }
-        if self.tags.any() {
-            s = s.add(Size::INFINITE);
-        }
+        s = s.add(self.tags.size());
         s = s.add(sum_lengths(&self.uri, uri_length));
         for b in [&self.hex, &self.b64] {
             s = s.add(sum_lengths(b, |n| exact_pow(256, n)));
         }
         s = s.add(Size::exact(u128::from(self.boolean.count_ones())));
+        s = s.add(Size::exact(u128::from(self.tiny.count_ones())));
         s = s.add(self.toff.size(OFFSETS)).add(self.tloc.size(1));
         if self.xml || self.other {
             s = s.add(Size::INFINITE);
@@ -454,8 +571,20 @@ impl Nf {
             .add(Size::exact(self.inc.len() as u128))
     }
 
+    /// The heap and inline bytes of the form, for the run's memory budget.
     pub fn bytes(&self) -> usize {
+        let lens = self
+            .cells
+            .iter()
+            .chain([&self.uri, &self.hex, &self.b64, &self.tags.default])
+            .chain(self.tags.over.values())
+            .map(Disc::bytes)
+            .sum::<usize>();
         size_of::<Nf>()
+            + self.int.bytes()
+            + self.float.bytes()
+            + self.double.bytes()
+            + lens
             + [&self.dec, &self.rat, &self.irr, &self.toff, &self.tloc]
                 .iter()
                 .map(|d| d.bytes())
@@ -464,7 +593,7 @@ impl Nf {
                 .inc
                 .iter()
                 .chain(&self.exc)
-                .map(DVal::bytes)
+                .map(|v| DVal::bytes(v) + 32)
                 .sum::<usize>()
             + self.tags.over.keys().map(|k| k.len() + 64).sum::<usize>()
     }
@@ -490,6 +619,7 @@ fn bounds(lo: u128, hi: u128) -> Size {
     Size {
         lo: lo.min(CAP),
         hi: (hi < CAP).then_some(hi),
+        inf: false,
     }
 }
 
@@ -662,6 +792,7 @@ fn datatype_nf(iri: &str) -> Result<(Nf, Fam), Unsupported> {
     if iri == vocab::RDF_PLAIN_LITERAL {
         n.cells = f.cells;
         n.tags = f.tags;
+        n.tiny = Tiny::PLAIN;
         return Ok((n, Fam::Plain));
     }
     if iri == vocab::RDF_LANG_STRING {
@@ -680,7 +811,13 @@ fn datatype_nf(iri: &str) -> Result<(Nf, Fam), Unsupported> {
         return Ok((n, Fam::Real));
     }
     let level = |k: usize| -> [Len; CELLS] {
-        std::array::from_fn(|i| if i >= k { len_all() } else { Disc::empty() })
+        std::array::from_fn(|i| {
+            if i >= k {
+                f.cells[i].clone()
+            } else {
+                Disc::empty()
+            }
+        })
     };
     let fam = match l {
         "decimal" => {
@@ -700,42 +837,52 @@ fn datatype_nf(iri: &str) -> Result<(Nf, Fam), Unsupported> {
         }
         "string" => {
             n.cells = level(0);
+            n.tiny = Tiny::from_level(0);
             Fam::Plain
         }
         "normalizedString" => {
             n.cells = level(1);
+            n.tiny = Tiny::from_level(1);
             Fam::Plain
         }
         "token" => {
             n.cells = level(2);
+            n.tiny = Tiny::from_level(2);
             Fam::Plain
         }
         "NMTOKEN" => {
             n.cells = level(3);
+            n.tiny = Tiny::from_level(3);
             Fam::Plain
         }
         "Name" => {
             n.cells = level(4);
+            n.tiny = Tiny::from_level(4);
             Fam::Plain
         }
         "NCName" => {
             n.cells = level(5);
+            n.tiny = Tiny::from_level(5);
             Fam::Plain
         }
         "language" => {
             n.cells = level(6);
+            n.tiny = Tiny::from_level(6);
             Fam::Plain
         }
         "anyURI" => {
             n.uri = f.uri;
+            n.tiny = Tiny::URI;
             Fam::Uri
         }
         "hexBinary" => {
             n.hex = f.hex;
+            n.tiny = Tiny::HEX;
             Fam::Binary
         }
         "base64Binary" => {
             n.b64 = f.b64;
+            n.tiny = Tiny::B64;
             Fam::Binary
         }
         "boolean" => {
@@ -889,15 +1036,26 @@ fn facet_nf(fam: Fam, facet: &str, value: &Literal) -> Result<Nf, Unsupported> {
                 "minLength" => Disc::range(End::At(k), End::Max),
                 _ => Disc::range(End::At(0), End::At(k)),
             };
+            let zero = |bit: u16| if l.contains(&0) { bit } else { 0 };
             match fam {
                 Fam::Plain => {
-                    n.cells = std::array::from_fn(|_| l.clone());
+                    n.cells = std::array::from_fn(|i| l.meet(&len_from(CELL_MIN[i])));
+                    let strs = Tiny::STR
+                        .iter()
+                        .filter(|(_, _, len)| l.contains(len))
+                        .fold(0, |a, (b, _, _)| a | b);
+                    n.tiny = (n.tiny & !Tiny::PLAIN) | strs;
                     n.tags = Tags::uniform(l);
                 }
-                Fam::Uri => n.uri = l,
+                Fam::Uri => {
+                    n.uri = l.meet(&len_from(BIN_MIN));
+                    n.tiny = (n.tiny & !Tiny::URI) | zero(Tiny::URI);
+                }
                 Fam::Binary => {
-                    n.hex = l.clone();
-                    n.b64 = l;
+                    n.hex = l.meet(&len_from(BIN_MIN));
+                    n.b64 = n.hex.clone();
+                    let bits = Tiny::HEX | Tiny::B64;
+                    n.tiny = (n.tiny & !bits) | zero(bits);
                 }
                 _ => return Err(Unsupported::Facet(facet.to_string())),
             }
@@ -910,6 +1068,7 @@ fn facet_nf(fam: Fam, facet: &str, value: &Literal) -> Result<Nf, Unsupported> {
                 _ => return Err(Unsupported::Facet(facet.to_string())),
             };
             n.cells = std::array::from_fn(|_| Disc::empty());
+            n.tiny &= !Tiny::PLAIN;
             if r == "*" {
                 n.tags = Tags::uniform(len_all());
             } else if r.contains('*') {
@@ -926,12 +1085,31 @@ fn facet_nf(fam: Fam, facet: &str, value: &Literal) -> Result<Nf, Unsupported> {
     }
 }
 
+/// Whether a facet pair can restrict `xsd:dateTime` or `xsd:dateTimeStamp`: a bound
+/// whose value is a date-time, with an offset when it restricts `xsd:dateTimeStamp`.
+fn time_facet(dt: &str, facet: &str, value: &Literal) -> Result<(), Unsupported> {
+    let bad = || Unsupported::Facet(facet.to_string());
+    let name = facet.strip_prefix(vocab::XSD).ok_or_else(bad)?;
+    let vt = value.datatype();
+    let time = |l: &str| vt.strip_prefix(vocab::XSD) == Some(l);
+    if !matches!(
+        name,
+        "minInclusive" | "minExclusive" | "maxInclusive" | "maxExclusive"
+    ) || !(time("dateTime") || time("dateTimeStamp"))
+    {
+        return Err(bad());
+    }
+    match value::of_literal(value)? {
+        DVal::Time(_, None) if dt.ends_with("#dateTimeStamp") => Err(bad()),
+        _ => Ok(()),
+    }
+}
+
 /// An interned range.
 pub type Rid = u32;
 
 /// The interned ranges of one run, with the meets, joins and complements already
 /// computed.
-#[derive(Default)]
 pub struct Ranges {
     nfs: Vec<Nf>,
     ids: FxHashMap<Nf, Rid>,
@@ -947,7 +1125,15 @@ impl Ranges {
     pub const FULL: Rid = 1;
 
     pub fn new() -> Ranges {
-        let mut r = Ranges::default();
+        let mut r = Ranges {
+            nfs: Vec::new(),
+            ids: FxHashMap::default(),
+            meets: FxHashMap::default(),
+            joins: FxHashMap::default(),
+            nots: FxHashMap::default(),
+            sizes: FxHashMap::default(),
+            bytes: 0,
+        };
         r.intern(Nf::empty());
         r.intern(Nf::full());
         r
@@ -962,6 +1148,15 @@ impl Ranges {
         self.ids.insert(nf, id);
         id
     }
+}
+
+impl Default for Ranges {
+    fn default() -> Ranges {
+        Ranges::new()
+    }
+}
+
+impl Ranges {
     pub fn nf(&self, id: Rid) -> &Nf {
         &self.nfs[id as usize]
     }
@@ -1075,7 +1270,11 @@ impl Ranges {
                 let (mut n, fam) = datatype_nf(dt)?;
                 for f in fs {
                     let facet = f.facet.as_str();
-                    if let Some(p) = datatypes::facet_problem(dt, facet, &f.value) {
+                    if fam == Fam::Time {
+                        // checked here, since `datatypes::facet_problem` reads date-times
+                        // with a parser that refuses fractions past eighteen digits
+                        time_facet(dt, facet, &f.value)?;
+                    } else if let Some(p) = datatypes::facet_problem(dt, facet, &f.value) {
                         return Err(Unsupported::Facet(p));
                     }
                     n = n.meet(&facet_nf(fam, facet, &f.value)?);

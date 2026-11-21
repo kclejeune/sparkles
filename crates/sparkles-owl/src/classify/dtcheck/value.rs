@@ -6,6 +6,7 @@
 //! (§4.2 and §4.7). The order that facets use is kept beside identity in the range
 //! normal forms.
 
+use super::bcp47;
 use super::sets::Rat;
 use crate::datatypes;
 use crate::model::Literal;
@@ -104,12 +105,36 @@ pub fn decimal(s: &str) -> Rat {
     Rat::new(n, BigInt::from(10u32).pow(f.len() as u32))
 }
 
+/// Whether the `xsd:` datatype with local name `l` is `xsd:decimal` or an integer type.
+fn real_value_name(l: &str) -> bool {
+    matches!(
+        l,
+        "decimal"
+            | "integer"
+            | "nonNegativeInteger"
+            | "nonPositiveInteger"
+            | "positiveInteger"
+            | "negativeInteger"
+            | "long"
+            | "int"
+            | "short"
+            | "byte"
+            | "unsignedLong"
+            | "unsignedInt"
+            | "unsignedShort"
+            | "unsignedByte"
+    )
+}
+
 fn real_value(dt: &str, lex: &str) -> Option<Rat> {
     if dt == vocab::OWL_RATIONAL {
         let (n, d) = lex.split_once('/')?;
         return Some(Rat::new(integer(n), integer(d)));
     }
     let l = dt.strip_prefix(vocab::XSD)?;
+    if !real_value_name(l) {
+        return None;
+    }
     match l {
         "decimal" => Some(decimal(lex)),
         "integer" | "nonNegativeInteger" | "nonPositiveInteger" | "positiveInteger"
@@ -255,13 +280,35 @@ fn base64(lex: &str) -> Vec<u8> {
     out
 }
 
+/// The longest lexical form of a number or a date-time that the checker reads exactly.
+/// A longer one makes the axioms that use it used in part, which bounds the cost of the
+/// exact arithmetic on it.
+pub const MAX_DIGITS: usize = 4096;
+
+/// A string with a language tag, when the string is of XML characters and the tag is a
+/// well-formed language tag (RDF 1.1 §3.3 and BCP 47).
+fn tagged(text: &str, tag: &str) -> Result<DVal, Unsupported> {
+    if datatypes::xml_chars(text) && bcp47::well_formed(tag) {
+        Ok(DVal::Lang(text.to_string(), tag.to_ascii_lowercase()))
+    } else {
+        Err(Unsupported::IllTyped)
+    }
+}
+
 /// The value of a literal, or why the checker keeps it opaque.
 pub fn of_literal(l: &Literal) -> Result<DVal, Unsupported> {
     let lex = l.value();
     if let Some(tag) = l.language() {
-        return Ok(DVal::Lang(lex.to_string(), tag.to_ascii_lowercase()));
+        return tagged(lex, tag);
     }
     let dt = l.datatype();
+    let numeric = dt == vocab::OWL_RATIONAL
+        || dt
+            .strip_prefix(vocab::XSD)
+            .is_some_and(|l| matches!(l, "dateTime" | "dateTimeStamp") || real_value_name(l));
+    if numeric && lex.len() > MAX_DIGITS {
+        return Err(Unsupported::Large);
+    }
     if dt == vocab::RDF_XML_LITERAL {
         return Err(Unsupported::XmlLiteral);
     }
@@ -281,11 +328,11 @@ pub fn of_literal(l: &Literal) -> Result<DVal, Unsupported> {
     }
     if dt == vocab::RDF_PLAIN_LITERAL {
         let (text, tag) = lex.rsplit_once('@').ok_or(Unsupported::IllTyped)?;
-        return Ok(if tag.is_empty() {
-            DVal::Str(text.to_string())
+        return if tag.is_empty() {
+            Ok(DVal::Str(text.to_string()))
         } else {
-            DVal::Lang(text.to_string(), tag.to_ascii_lowercase())
-        });
+            tagged(text, tag)
+        };
     }
     if dt == vocab::RDF_LANG_STRING {
         // a langString without a tag has no value

@@ -7,6 +7,7 @@
 //! so until then only its tests use it.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub mod bcp47;
 pub mod range;
 pub mod sets;
 pub mod solve;
