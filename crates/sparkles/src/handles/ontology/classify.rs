@@ -105,6 +105,11 @@ pub struct ClassifyRequest {
     /// the final answer, a kept one included, and comes before a taxonomy is written.
     /// It does not change what the dataset keeps.
     pub strict: bool,
+    /// skip the bottom-locality modules that decide, when axioms are left out, which
+    /// classes keep their complete answer, for a caller that reads only the taxonomy:
+    /// every class is then incomplete and the consistency unknown when something is left
+    /// out ([`sparkles_owl::classify::Limits::coverage`])
+    pub skip_coverage: bool,
 }
 
 /// The code of a strict classification's refusal ([`ClassifyRequest::strict`]), whose
@@ -743,6 +748,7 @@ fn run(
             el_only: c.el_only,
             partial: c.partial,
             expansion: c.expansion,
+            coverage: !c.skip_coverage,
             ..limits.clone()
         };
         k.classify(axioms, changes, &limits)

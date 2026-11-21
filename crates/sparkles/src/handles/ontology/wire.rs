@@ -1111,6 +1111,7 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 el_only: false,
                 partial: boolean(a, "partial")?.unwrap_or(false),
                 strict: boolean(a, "strict")?.unwrap_or(false),
+                skip_coverage: false,
                 expansion: expansion_of(string(a, "expansion")?)?,
             };
             let q = ClassifyQuery {

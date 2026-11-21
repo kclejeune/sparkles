@@ -139,3 +139,28 @@ fn an_el_only_run_reports_its_coverage() {
     assert_eq!(out.incomplete, [c("A")]);
     assert!(out.taxonomy.is_subclass(&c("X"), &c("Y")));
 }
+
+#[test]
+fn a_run_without_the_modules_pass_leaves_every_class_incomplete() {
+    let mut k = Classifier::of(&axioms(M1));
+    let out = k
+        .classify(&Limits {
+            coverage: false,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(!out.complete && out.complete_for_taken);
+    assert_eq!(out.consistency, Consistency::Unknown);
+    assert_eq!(out.incomplete.len(), 7);
+    assert_eq!(out.stats.coverage, std::time::Duration::ZERO);
+    // a bound of no work decides nothing, and says so
+    let out = k
+        .classify(&Limits {
+            coverage_work: Some(0),
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.stats.coverage_over);
+    assert_eq!(out.consistency, Consistency::Unknown);
+    assert_eq!(out.incomplete.len(), 7);
+}

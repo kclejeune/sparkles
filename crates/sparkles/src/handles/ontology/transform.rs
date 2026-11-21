@@ -170,8 +170,11 @@ fn classifier<'a>(
     c: &'a ClassifyRequest,
     opts: &'a QueryOptions,
 ) -> impl FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>)> + 'a {
+    // a transformation reads the taxonomy and what was left out, not which classes keep
+    // their answer
     let c = ClassifyRequest {
         partial: false,
+        skip_coverage: true,
         ..c.clone()
     };
     move |kinds: &[&AxiomKind]| {

@@ -226,6 +226,16 @@ pub struct Limits {
     /// [`Error::Incomplete`], after the run, as a complete reasoner such as HermiT
     /// refuses what it does not support. The classifier keeps the run's state.
     pub strict: bool,
+    /// decide, for a run that leaves axioms out, which classes keep their complete
+    /// answer, from their bottom-locality modules
+    /// ([`Classification::incomplete`]); false leaves every class incomplete and the
+    /// consistency unknown instead, for a caller that reads only the taxonomy, such as
+    /// ROBOT's commands. On by default.
+    pub coverage: bool,
+    /// the most axioms the modules' pass may look at, past which the classes it has not
+    /// decided are incomplete ([`Stats::coverage_over`]); by default
+    /// [`COVERAGE_WORK_PER_AXIOM`] for each axiom of the input
+    pub coverage_work: Option<usize>,
     /// the expansion strategy of Tier D's Succ rule
     pub expansion: Expansion,
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
@@ -343,6 +353,8 @@ impl Default for Limits {
             charge: None,
             partial: false,
             strict: false,
+            coverage: true,
+            coverage_work: None,
             expansion: Expansion::default(),
             dl_work: None,
             dl_attempt_work: None,
@@ -432,6 +444,9 @@ pub struct Stats {
     /// the time the locality modules of a run that left axioms out took to decide which
     /// classes keep their complete answer, 0 for a run that left nothing out
     pub coverage: Duration,
+    /// the modules' pass passed its bound on work ([`Limits::coverage_work`]), so the
+    /// classes it had not decided are incomplete
+    pub coverage_over: bool,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
     pub outside_el: OutsideEl,
@@ -574,36 +589,114 @@ impl Classification {
     /// holds one of them, or every class when the consistency is no longer known, join
     /// [`incomplete`](Classification::incomplete). Costs nothing when nothing is left
     /// out.
-    fn cover(&mut self, axioms: &[&AxiomKind], excluded: &[Excluded]) {
+    fn cover(
+        &mut self,
+        axioms: &[&AxiomKind],
+        excluded: &[Excluded],
+        limits: &Limits,
+    ) -> Result<(), Error> {
         if excluded.is_empty() {
-            return;
+            return Ok(());
         }
         self.complete = false;
-        let start = std::time::Instant::now();
+        let start = Instant::now();
         let left: Vec<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
-        // a partial answer that left the consistency unknown has every class open
-        if self.consistency == Consistency::Unknown {
-            return;
+        // A partial answer that left the consistency unknown has every class open, and
+        // one that stopped is past its deadline, so neither takes the modules' pass,
+        // and neither does a run that asks for none: every class is then incomplete.
+        if self.consistency == Consistency::Unknown || !self.complete_for_taken || !limits.coverage
+        {
+            self.all_incomplete();
+            if self.consistency == Consistency::Consistent {
+                self.consistency = Consistency::Unknown;
+            }
+            return Ok(());
         }
-        let c = crate::transform::coverage(
+        let budget = limits.coverage_work.unwrap_or_else(|| {
+            COVERAGE_WORK_PER_AXIOM
+                .saturating_mul(axioms.len())
+                .max(COVERAGE_WORK_MIN)
+        });
+        let stop = || poll(limits).is_err();
+        let Ok(c) = crate::transform::coverage(
             axioms,
             &left,
             self.consistency == Consistency::Consistent,
-            self.taxonomy.classes(),
-        );
+            by_depth(&self.taxonomy),
+            budget,
+            &stop,
+        ) else {
+            return poll(limits).and(Err(Error::Cancelled));
+        };
         if !c.consistency_known {
             self.consistency = Consistency::Unknown;
         }
         self.stats.coverage = start.elapsed();
+        self.stats.coverage_over = c.over_budget;
         if c.incomplete.is_empty() {
-            return;
+            return Ok(());
         }
         let mut all = std::mem::take(&mut self.incomplete);
         all.extend(c.incomplete);
         all.sort();
         all.dedup();
         self.incomplete = all;
+        Ok(())
     }
+
+    /// Every class but owl:Thing and owl:Nothing incomplete, in IRI order.
+    fn all_incomplete(&mut self) {
+        let mut all: Vec<Class> = self
+            .taxonomy
+            .classes()
+            .filter(|c| {
+                !matches!(
+                    c.as_str(),
+                    crate::vocab::OWL_THING | crate::vocab::OWL_NOTHING
+                )
+            })
+            .cloned()
+            .collect();
+        all.sort();
+        all.dedup();
+        self.incomplete = all;
+    }
+}
+
+/// The axioms the modules' pass of a run that left axioms out may look at for each axiom
+/// of the input by default ([`Limits::coverage_work`]), and the fewest the default allows
+/// in all.
+pub const COVERAGE_WORK_PER_AXIOM: usize = 1024;
+pub const COVERAGE_WORK_MIN: usize = 1 << 20;
+
+/// The classes of a taxonomy by the depth of their node, each node after its parents, and
+/// by IRI within a depth, so that the order depends on the taxonomy alone.
+fn by_depth(t: &Taxonomy) -> Vec<&Class> {
+    let nodes = t.nodes();
+    let mut waiting: Vec<usize> = nodes.iter().map(|n| n.parents.len()).collect();
+    let mut depth = vec![usize::MAX; nodes.len()];
+    let mut queue: std::collections::VecDeque<usize> =
+        (0..nodes.len()).filter(|&i| waiting[i] == 0).collect();
+    for &i in &queue {
+        depth[i] = 0;
+    }
+    while let Some(i) = queue.pop_front() {
+        for &c in &nodes[i].children {
+            waiting[c] = waiting[c].saturating_sub(1);
+            if waiting[c] == 0 {
+                depth[c] = depth[i] + 1;
+                queue.push_back(c);
+            }
+        }
+    }
+    let mut out: Vec<(usize, &Class)> = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, n)| n.classes.iter().map(move |c| (i, c)))
+        .map(|(i, c)| (depth[i], c))
+        .collect();
+    out.sort();
+    out.into_iter().map(|(_, c)| c).collect()
 }
 
 /// The message of a strict run's refusal ([`Error::Incomplete`]): how many axioms were
@@ -1157,7 +1250,7 @@ impl Classifier {
                 .filter(|(_, h)| h.count > 0)
                 .map(|(k, _)| k)
                 .collect();
-            out.cover(&held, excluded);
+            out.cover(&held, excluded, limits)?;
         }
         Ok(out)
     }
@@ -1287,7 +1380,7 @@ impl Saturation {
             if limits.strict {
                 return Err(Error::Incomplete(self.excluded.clone()));
             }
-            out.cover(axioms, &self.excluded);
+            out.cover(axioms, &self.excluded, limits)?;
         }
         Ok(out)
     }

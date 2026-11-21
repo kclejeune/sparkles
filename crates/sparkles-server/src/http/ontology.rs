@@ -1561,6 +1561,7 @@ pub(super) async fn classify(
         el_only: false,
         partial: flag("partial")?,
         strict: flag("strict")?,
+        skip_coverage: false,
         expansion: expansion_of(text("expansion")?.as_deref()).map_err(ontology_error)?,
     };
     let projection =

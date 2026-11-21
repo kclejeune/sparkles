@@ -72,7 +72,7 @@ pub fn bottom_module<'a>(
     let axioms: Vec<&Axiom> = axioms.into_iter().collect();
     let kinds: Vec<&AxiomKind> = axioms.iter().map(|a| &a.kind).collect();
     let ix = Index::new(&kinds);
-    let mut x = Extraction::new(&ix, Mode::Bottom, None);
+    let mut x = Extraction::new(&ix, Mode::Bottom, None, None);
     let seed: Vec<&Class> = seed.into_iter().collect();
     let ids: Vec<u32> = seed.iter().filter_map(|c| ix.id(c.as_str())).collect();
     x.extend(&ids, &mut |_| Step::Go, &mut |_| Step::Go);
@@ -98,18 +98,34 @@ pub struct Coverage {
     /// the classes whose answer may miss entailments, in IRI order: every class when the
     /// consistency is not known
     pub incomplete: Vec<Class>,
+    /// the extraction passed its work bound, and the classes it had not decided are
+    /// incomplete
+    pub over_budget: bool,
 }
+
+/// Why [`coverage`] stopped before an answer: its caller's stop said so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Stopped;
+
+/// How often an extraction asks its caller whether to stop, in axioms it looks at.
+const POLL_EVERY: usize = 4096;
 
 /// Which of `classes` keep their complete answer when a run over `axioms` left out or
 /// used only in part the axioms `left_out`, and found the rest consistent or not. See the
 /// [module documentation](self) for the argument. `owl:Thing` and `owl:Nothing` are never
 /// listed. A left-out axiom that is not among `axioms` leaves the consistency unknown.
+///
+/// The extractions look at no more than `budget` axioms in all, after which the classes
+/// not yet decided are incomplete, so that the answer depends on the input alone. `stop`
+/// is asked every few thousand axioms, and true ends the pass with [`Stopped`].
 pub(crate) fn coverage<'c>(
     axioms: &[&AxiomKind],
     left_out: &[&AxiomKind],
     consistent: bool,
     classes: impl IntoIterator<Item = &'c Class>,
-) -> Coverage {
+    budget: usize,
+    stop: &dyn Fn() -> bool,
+) -> Result<Coverage, Stopped> {
     let classes: Vec<&Class> = classes
         .into_iter()
         .filter(|c| c.as_str() != vocab::OWL_THING && c.as_str() != vocab::OWL_NOTHING)
@@ -123,12 +139,13 @@ pub(crate) fn coverage<'c>(
     if left_out.is_empty() || !consistent {
         // nothing left out, or an inconsistency, which is sound and makes every class
         // unsatisfiable whatever was left out
-        return Coverage {
+        return Ok(Coverage {
             consistency_known: true,
             incomplete: Vec::new(),
-        };
+            over_budget: false,
+        });
     }
-    let ix = Index::new(axioms);
+    let mut ix = Index::new(axioms);
     let wanted: FxHashSet<&AxiomKind> = left_out.iter().copied().collect();
     let mut left = vec![false; ix.axioms.len()];
     let mut found: FxHashSet<&AxiomKind> = FxHashSet::default();
@@ -138,18 +155,32 @@ pub(crate) fn coverage<'c>(
             found.insert(a);
         }
     }
+    // the left-out axioms first in each list, so that an extension that reaches one
+    // stops before it checks the others
+    for list in ix.by_trigger.iter_mut().chain(ix.by_entity.iter_mut()) {
+        list.sort_by_key(|&j| !left[j as usize]);
+    }
+    let ix = ix;
     // a left-out declaration or annotation is no logical content
     let missing = wanted
         .iter()
         .any(|a| !found.contains(a) && Index::indexed(a));
-    let unknown = Coverage {
+    let unknown = |over_budget| Coverage {
         consistency_known: false,
         incomplete: all(&classes),
+        over_budget,
     };
     if missing {
-        return unknown;
+        return Ok(unknown(false));
     }
-    let hits = |x: &mut Extraction<'_>| {
+    let work = Work {
+        done: std::cell::Cell::new(0),
+        budget,
+        stop,
+        halted: std::cell::Cell::new(None),
+    };
+    // whether the extraction reached a left-out axiom, or None when it halted
+    let hits = |x: &mut Extraction<'_>| -> Option<bool> {
         let mut hit = false;
         x.extend(
             &[],
@@ -163,30 +194,50 @@ pub(crate) fn coverage<'c>(
             },
             &mut |_| Step::Go,
         );
-        hit
+        if !hit && work.halted.get().is_some() {
+            None
+        } else {
+            Some(hit)
+        }
+    };
+    // the answer of a pass that halted: every class incomplete, after the caller's stop
+    // an error
+    let halted = || match work.halted.get() {
+        Some(Halt::Stopped) => Err(Stopped),
+        _ => Ok(unknown(true)),
     };
     // layer 1's base, which is also the first test of layer 2
-    let mut bottom = Extraction::new(&ix, Mode::Bottom, None);
-    let bottom_hit = hits(&mut bottom);
-    let consistency_known = !bottom_hit || !hits(&mut Extraction::new(&ix, Mode::Top, None));
+    let mut bottom = Extraction::new(&ix, Mode::Bottom, None, &work);
+    let Some(bottom_hit) = hits(&mut bottom) else {
+        return halted();
+    };
+    let consistency_known = !bottom_hit || {
+        let Some(top_hit) = hits(&mut Extraction::new(&ix, Mode::Top, None, &work)) else {
+            return halted();
+        };
+        !top_hit
+    };
     if !consistency_known {
-        return unknown;
+        return Ok(unknown(false));
     }
     // layer 3 when its gates hold, which decides every class layer 1 decides and more
     let terminology = ix.terminology_gate();
     let (mut base, base_hit) = match &terminology {
         Some(mask) => {
-            let mut t = Extraction::new(&ix, Mode::Bottom, Some(mask));
-            let hit = hits(&mut t);
+            let mut t = Extraction::new(&ix, Mode::Bottom, Some(mask), &work);
+            let Some(hit) = hits(&mut t) else {
+                return halted();
+            };
             (t, hit)
         }
         None => (bottom, bottom_hit),
     };
     if base_hit {
-        return Coverage {
+        return Ok(Coverage {
             consistency_known,
             incomplete: all(&classes),
-        };
+            over_budget: false,
+        });
     }
     base.freeze();
     // what is known of each entity's module: 1 holds no left-out axiom, 2 holds one
@@ -195,7 +246,15 @@ pub(crate) fn coverage<'c>(
         status[e as usize] = 1;
     }
     let mut incomplete: Vec<Class> = Vec::new();
+    let mut over_budget = false;
     for c in &classes {
+        if over_budget {
+            // past the bound, a class no clean module covered is incomplete
+            if ix.id(c.as_str()).is_some_and(|id| status[id as usize] != 1) {
+                incomplete.push((*c).clone());
+            }
+            continue;
+        }
         let Some(id) = ix.id(c.as_str()) else {
             // named by no axiom: its module is the base's
             continue;
@@ -229,7 +288,15 @@ pub(crate) fn coverage<'c>(
                 }
             },
         );
-        if dirty.get() {
+        if let Some(h) = work.halted.get()
+            && !dirty.get()
+        {
+            if h == Halt::Stopped {
+                return Err(Stopped);
+            }
+            over_budget = true;
+            incomplete.push((*c).clone());
+        } else if dirty.get() {
             status[id as usize] = 2;
             incomplete.push((*c).clone());
         } else {
@@ -242,9 +309,45 @@ pub(crate) fn coverage<'c>(
     }
     incomplete.sort();
     incomplete.dedup();
-    Coverage {
+    Ok(Coverage {
         consistency_known,
         incomplete,
+        over_budget,
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Halt {
+    Budget,
+    Stopped,
+}
+
+/// The work of a pass: the axioms its extractions looked at, the bound on them and the
+/// caller's stop, which every extraction of the pass shares.
+struct Work<'s> {
+    done: std::cell::Cell<usize>,
+    budget: usize,
+    stop: &'s dyn Fn() -> bool,
+    halted: std::cell::Cell<Option<Halt>>,
+}
+
+impl Work<'_> {
+    /// Counts one axiom looked at; false when the pass halts.
+    fn step(&self) -> bool {
+        if self.halted.get().is_some() {
+            return false;
+        }
+        let n = self.done.get() + 1;
+        self.done.set(n);
+        if n > self.budget {
+            self.halted.set(Some(Halt::Budget));
+            return false;
+        }
+        if n.is_multiple_of(POLL_EVERY) && (self.stop)() {
+            self.halted.set(Some(Halt::Stopped));
+            return false;
+        }
+        true
     }
 }
 
@@ -258,6 +361,12 @@ struct Index<'a> {
     sigs: Vec<Vec<u32>>,
     /// the axioms of each entity
     by_entity: Vec<Vec<u32>>,
+    /// the axioms whose bottom-locality each entity can change ([`bottom_deps`]): an
+    /// entity outside this list enters the signature without changing it
+    by_trigger: Vec<Vec<u32>>,
+    /// for each axiom, the sets of entities one of which must lie in the signature for
+    /// the axiom not to be bottom-local ([`bottom_needs`]), or None when there are none
+    needs: Vec<Option<Vec<Vec<u32>>>>,
     ids: FxHashMap<String, u32>,
     names: Vec<String>,
 }
@@ -273,6 +382,8 @@ impl<'a> Index<'a> {
             place: Vec::with_capacity(given.len()),
             sigs: Vec::new(),
             by_entity: Vec::new(),
+            by_trigger: Vec::new(),
+            needs: Vec::new(),
             ids: FxHashMap::default(),
             names: Vec::new(),
         };
@@ -296,6 +407,7 @@ impl<'a> Index<'a> {
                         ix.ids.insert(iri.to_string(), id);
                         ix.names.push(iri.to_string());
                         ix.by_entity.push(Vec::new());
+                        ix.by_trigger.push(Vec::new());
                         id
                     }
                 };
@@ -306,6 +418,29 @@ impl<'a> Index<'a> {
                 }
             }
             ix.sigs.push(sig);
+            // an IRI without a number is in no signature, so a set holding it is never
+            // inside one and drops out
+            let needs = bottom_needs(k).map(|alts| {
+                alts.into_iter()
+                    .filter_map(|set| {
+                        set.into_iter()
+                            .map(|iri| ix.ids.get(iri).copied())
+                            .collect::<Option<Vec<u32>>>()
+                    })
+                    .collect()
+            });
+            ix.needs.push(needs);
+            let mut deps: Vec<&str> = Vec::new();
+            bottom_deps(k, &mut deps);
+            deps.sort_unstable();
+            deps.dedup();
+            for iri in deps {
+                // an entity the signature walk does not name, such as owl:Thing, is never
+                // in a signature that the extraction grows
+                if let Some(&id) = ix.ids.get(iri) {
+                    ix.by_trigger[id as usize].push(j);
+                }
+            }
         }
         ix
     }
@@ -401,6 +536,7 @@ enum Step {
 /// adds to it by stamps that the next one forgets.
 struct Extraction<'i> {
     ix: &'i Index<'i>,
+    work: Option<&'i Work<'i>>,
     mode: Mode,
     include: Option<&'i [bool]>,
     base_sig: Vec<bool>,
@@ -413,9 +549,15 @@ struct Extraction<'i> {
 }
 
 impl<'i> Extraction<'i> {
-    fn new(ix: &'i Index<'i>, mode: Mode, include: Option<&'i Vec<bool>>) -> Extraction<'i> {
+    fn new(
+        ix: &'i Index<'i>,
+        mode: Mode,
+        include: Option<&'i Vec<bool>>,
+        work: impl Into<Option<&'i Work<'i>>>,
+    ) -> Extraction<'i> {
         Extraction {
             ix,
+            work: work.into(),
             mode,
             include: include.map(|v| v.as_slice()),
             base_sig: vec![false; ix.names.len()],
@@ -520,11 +662,15 @@ impl<'i> Extraction<'i> {
                 }
             }
         }
+        // an axiom whose locality the new entity cannot change needs no check
+        let ix: &'i Index<'i> = self.ix;
+        let lists = match self.mode {
+            Mode::Bottom => &ix.by_trigger,
+            Mode::Top => &ix.by_entity,
+        };
         while let Some(e) = queue.pop() {
-            let list = &self.ix.by_entity[e as usize];
-            for i in 0..list.len() {
-                let j = self.ix.by_entity[e as usize][i] as usize;
-                if !self.take(j, axiom, entity, &mut queue) {
+            for &j in &lists[e as usize] {
+                if !self.take(j as usize, axiom, entity, &mut queue) {
                     return;
                 }
             }
@@ -540,7 +686,22 @@ impl<'i> Extraction<'i> {
         entity: &mut dyn FnMut(u32) -> Step,
         queue: &mut Vec<u32>,
     ) -> bool {
-        if self.include.is_some_and(|m| !m[j]) || self.in_module(j) || self.local(j) {
+        if self.include.is_some_and(|m| !m[j]) || self.in_module(j) {
+            return true;
+        }
+        if let Some(w) = self.work
+            && !w.step()
+        {
+            return false;
+        }
+        // the cheap necessary condition first, then the rules
+        if self.mode == Mode::Bottom
+            && let Some(alts) = &self.ix.needs[j]
+            && !alts.iter().any(|set| set.iter().all(|&e| self.has_id(e)))
+        {
+            return true;
+        }
+        if self.local(j) {
             return true;
         }
         if let Step::Stop = axiom(j) {
@@ -691,6 +852,254 @@ impl Sig<'_> {
             C::ObjectOneOf(is) => is.is_empty(),
             _ => false,
         }
+    }
+}
+
+/// The IRIs whose presence in the signature [`bottom_local`] can read for the axiom, in
+/// any branch: its answer is a function of them alone, so an entity outside them enters
+/// the signature without changing it. Each case mirrors one of [`bottom_local`].
+fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut Vec<&'k str>) {
+    use AxiomKind as K;
+    let ope =
+        |p: &'k ObjectPropertyExpression, out: &mut Vec<&'k str>| out.push(p.named().as_str());
+    match k {
+        K::SubClassOf(a, b) => {
+            ce_bottom_deps(a, out);
+            ce_top_deps(b, out);
+        }
+        K::EquivalentClasses(cs) => {
+            for c in cs {
+                ce_bottom_deps(c, out);
+                ce_top_deps(c, out);
+            }
+        }
+        K::DisjointClasses(cs) => cs.iter().for_each(|c| ce_bottom_deps(c, out)),
+        K::DisjointUnion(c, cs) => {
+            out.push(c.as_str());
+            cs.iter().for_each(|c| ce_bottom_deps(c, out));
+        }
+        K::SubObjectPropertyOf(p, _) => match p {
+            SubObjectPropertyExpression::Expression(p) => ope(p, out),
+            SubObjectPropertyExpression::Chain(ps) => ps.iter().for_each(|p| ope(p, out)),
+        },
+        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
+            ps.iter().for_each(|p| ope(p, out))
+        }
+        K::InverseObjectProperties(p, q) => {
+            ope(p, out);
+            ope(q, out);
+        }
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+            ope(p, out);
+            ce_top_deps(c, out);
+        }
+        K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p)
+        | K::NegativeObjectPropertyAssertion(p, _, _) => ope(p, out),
+        K::SubDataPropertyOf(p, _)
+        | K::DataPropertyRange(p, _)
+        | K::FunctionalDataProperty(p)
+        | K::NegativeDataPropertyAssertion(p, _, _) => out.push(p.as_str()),
+        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
+            out.extend(ps.iter().map(|p| p.as_str()))
+        }
+        K::DataPropertyDomain(p, c) => {
+            out.push(p.as_str());
+            ce_top_deps(c, out);
+        }
+        K::ClassAssertion(c, _) => ce_top_deps(c, out),
+        K::HasKey(c, ps, ds) => {
+            ce_bottom_deps(c, out);
+            ps.iter().for_each(|p| ope(p, out));
+            out.extend(ds.iter().map(|p| p.as_str()));
+        }
+        // local for every signature, or for none
+        _ => {}
+    }
+}
+
+/// Sets of IRIs one of which must lie wholly in the signature for the axiom not to be
+/// bottom-local, or None when [`bottom_local`] can call it non-local whatever the
+/// signature holds. Each case follows from one of [`bottom_local`]: an axiom about classes
+/// needs a class expression that is not empty, and one about properties a property that
+/// is not. An empty list means the axiom is local for every signature.
+fn bottom_needs(k: &AxiomKind) -> Option<Vec<Vec<&str>>> {
+    use AxiomKind as K;
+    fn ope(p: &ObjectPropertyExpression) -> Vec<&str> {
+        named_ope(p).into_iter().collect()
+    }
+    fn dp(p: &DataProperty) -> Vec<&str> {
+        named_dp(p).into_iter().collect()
+    }
+    fn each(sets: Vec<Option<Vec<&str>>>) -> Vec<Vec<&str>> {
+        sets.into_iter().flatten().collect()
+    }
+    Some(match k {
+        K::SubClassOf(a, _) => each(vec![nonempty_needs(a)]),
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
+            each(cs.iter().map(nonempty_needs).collect())
+        }
+        K::DisjointUnion(c, cs) => {
+            let mut sets = vec![class_needs(c)];
+            sets.extend(cs.iter().map(nonempty_needs));
+            each(sets)
+        }
+        K::SubObjectPropertyOf(p, _) => vec![match p {
+            SubObjectPropertyExpression::Expression(p) => ope(p),
+            SubObjectPropertyExpression::Chain(ps) => ps.iter().flat_map(ope).collect(),
+        }],
+        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
+            ps.iter().map(ope).collect()
+        }
+        K::InverseObjectProperties(p, q) => vec![ope(p), ope(q)],
+        K::ObjectPropertyDomain(p, _)
+        | K::ObjectPropertyRange(p, _)
+        | K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p)
+        | K::NegativeObjectPropertyAssertion(p, _, _) => vec![ope(p)],
+        K::SubDataPropertyOf(p, _)
+        | K::DataPropertyDomain(p, _)
+        | K::DataPropertyRange(p, _)
+        | K::FunctionalDataProperty(p)
+        | K::NegativeDataPropertyAssertion(p, _, _) => vec![dp(p)],
+        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
+            ps.iter().map(dp).collect()
+        }
+        K::HasKey(c, ps, ds) => each(vec![nonempty_needs(c).map(|mut set| {
+            set.extend(ps.iter().flat_map(ope));
+            set.extend(ds.iter().flat_map(dp));
+            set
+        })]),
+        K::Declaration(_)
+        | K::AnnotationAssertion(..)
+        | K::SubAnnotationPropertyOf(..)
+        | K::AnnotationPropertyDomain(..)
+        | K::AnnotationPropertyRange(..) => Vec::new(),
+        _ => return None,
+    })
+}
+
+/// The property's IRI, which a signature must hold for the property not to be empty, or
+/// None for the universal property, which never is.
+fn named_ope(p: &ObjectPropertyExpression) -> Option<&str> {
+    let n = p.named().as_str();
+    (n != vocab::OWL_TOP_OBJECT_PROPERTY).then_some(n)
+}
+
+fn named_dp(p: &DataProperty) -> Option<&str> {
+    let n = p.as_str();
+    (n != vocab::OWL_TOP_DATA_PROPERTY).then_some(n)
+}
+
+/// The IRIs that must all lie in the signature for [`Sig::bottom`] to be false of the
+/// expression, or None when it is true whatever the signature, as for owl:Nothing.
+fn nonempty_needs(c: &ClassExpression) -> Option<Vec<&str>> {
+    use ClassExpression as C;
+    Some(match c {
+        C::Class(c) => return class_needs(c),
+        C::ObjectIntersectionOf(cs) => {
+            let mut set = Vec::new();
+            for c in cs {
+                set.extend(nonempty_needs(c)?);
+            }
+            set
+        }
+        C::ObjectSomeValuesFrom(p, c) => {
+            let mut set = nonempty_needs(c)?;
+            set.extend(named_ope(p));
+            set
+        }
+        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => named_ope(p).into_iter().collect(),
+        C::ObjectMinCardinality(n, p, c) | C::ObjectExactCardinality(n, p, c) if *n > 0 => {
+            let mut set = match c {
+                Some(c) => nonempty_needs(c)?,
+                None => Vec::new(),
+            };
+            set.extend(named_ope(p));
+            set
+        }
+        C::DataSomeValuesFrom(ps, _) => ps.iter().filter_map(named_dp).collect(),
+        C::DataHasValue(p, _) => named_dp(p).into_iter().collect(),
+        C::DataMinCardinality(n, p, _) | C::DataExactCardinality(n, p, _) if *n > 0 => {
+            named_dp(p).into_iter().collect()
+        }
+        C::ObjectOneOf(is) if is.is_empty() => return None,
+        // a union, a complement, a universal or an upper bound can be non-empty with no
+        // entity of its own in the signature
+        _ => Vec::new(),
+    })
+}
+
+/// [`nonempty_needs`] of a class.
+fn class_needs(c: &Class) -> Option<Vec<&str>> {
+    match c.as_str() {
+        vocab::OWL_NOTHING => None,
+        vocab::OWL_THING => Some(Vec::new()),
+        iri => Some(vec![iri]),
+    }
+}
+
+/// The IRIs [`Sig::bottom`] can read for the expression.
+fn ce_bottom_deps<'k>(c: &'k ClassExpression, out: &mut Vec<&'k str>) {
+    use ClassExpression as C;
+    match c {
+        C::Class(c) => out.push(c.as_str()),
+        C::ObjectComplementOf(c) => ce_top_deps(c, out),
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            cs.iter().for_each(|c| ce_bottom_deps(c, out))
+        }
+        C::ObjectSomeValuesFrom(p, c) => {
+            out.push(p.named().as_str());
+            ce_bottom_deps(c, out);
+        }
+        C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => out.push(p.named().as_str()),
+        C::ObjectMinCardinality(_, p, c) | C::ObjectExactCardinality(_, p, c) => {
+            out.push(p.named().as_str());
+            if let Some(c) = c {
+                ce_bottom_deps(c, out);
+            }
+        }
+        C::DataSomeValuesFrom(ps, _) => out.extend(ps.iter().map(|p| p.as_str())),
+        C::DataHasValue(p, _)
+        | C::DataMinCardinality(_, p, _)
+        | C::DataExactCardinality(_, p, _) => out.push(p.as_str()),
+        C::ObjectOneOf(_)
+        | C::ObjectAllValuesFrom(..)
+        | C::ObjectMaxCardinality(..)
+        | C::DataAllValuesFrom(..)
+        | C::DataMaxCardinality(..) => {}
+    }
+}
+
+/// The IRIs [`Sig::top`] can read for the expression.
+fn ce_top_deps<'k>(c: &'k ClassExpression, out: &mut Vec<&'k str>) {
+    use ClassExpression as C;
+    match c {
+        C::ObjectComplementOf(c) => ce_bottom_deps(c, out),
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            cs.iter().for_each(|c| ce_top_deps(c, out))
+        }
+        C::ObjectAllValuesFrom(p, c) => {
+            out.push(p.named().as_str());
+            ce_top_deps(c, out);
+        }
+        C::ObjectMaxCardinality(_, p, c) => {
+            out.push(p.named().as_str());
+            if let Some(c) = c {
+                ce_bottom_deps(c, out);
+            }
+        }
+        C::DataAllValuesFrom(ps, _) => out.extend(ps.iter().map(|p| p.as_str())),
+        C::DataMaxCardinality(_, p, _) => out.push(p.as_str()),
+        _ => {}
     }
 }
 

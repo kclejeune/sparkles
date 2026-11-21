@@ -492,6 +492,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 el_only: false,
                 partial,
                 strict,
+                skip_coverage: false,
                 expansion,
             };
             let q = ClassifyQuery {
