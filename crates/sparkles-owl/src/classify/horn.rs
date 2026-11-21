@@ -253,14 +253,26 @@ pub struct EpsFree {
 
 impl Nfa {
     /// The labels of the transitions into the final states of [`Nfa::eps_free`], sorted,
-    /// or `None` when its start is final, found in time linear in the automaton without
-    /// building the closure: a labelled transition from a state that the start reaches to
-    /// one whose ε-transitions reach the end.
-    pub fn final_labels(&self) -> Option<Vec<Role>> {
+    /// or `None` when its start is final, found without building the closure: a labelled
+    /// transition from a state that the start reaches to one whose ε-transitions reach the
+    /// end. The work is linear in the automaton up to the sort of the labels, its scratch
+    /// is a few words for each state and transition the automaton holds already, and it
+    /// polls `stop` every [`POLL_WORK`] steps.
+    pub fn final_labels(&self, stop: &dyn Fn() -> bool) -> Result<Option<Vec<Role>>, Halt> {
+        let mut work = 0usize;
+        let mut tick = || {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                Err(Halt::Stopped)
+            } else {
+                Ok(())
+            }
+        };
         let n = self.states as usize;
         let mut back: Vec<Vec<u32>> = vec![Vec::new(); n];
         let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
         for &(p, l, q) in &self.trans {
+            tick()?;
             out[p as usize].push(q);
             if l.is_none() {
                 back[q as usize].push(p);
@@ -269,16 +281,18 @@ impl Nfa {
         let mut ends = vec![false; n];
         let mut stack = vec![self.end];
         while let Some(x) = stack.pop() {
+            tick()?;
             if !std::mem::replace(&mut ends[x as usize], true) {
                 stack.extend(back[x as usize].iter().copied());
             }
         }
         if ends[self.start as usize] {
-            return None;
+            return Ok(None);
         }
         let mut reached = vec![false; n];
         let mut stack = vec![self.start];
         while let Some(x) = stack.pop() {
+            tick()?;
             if !std::mem::replace(&mut reached[x as usize], true) {
                 stack.extend(out[x as usize].iter().copied());
             }
@@ -290,7 +304,7 @@ impl Nfa {
             .collect();
         ls.sort_unstable();
         ls.dedup();
-        Some(ls)
+        Ok(Some(ls))
     }
 
     /// The automaton with its ε-transitions closed over: a state takes the transitions of
@@ -424,23 +438,31 @@ fn ends_in_range(
     told: &[Role],
     tops: &[Role],
     r: Role,
-) -> bool {
+    stop: &dyn Fn() -> bool,
+) -> Result<bool, Halt> {
     if tops.contains(&r) {
-        return false;
+        return Ok(false);
     }
     // the labels into final states, once for each role whatever its ranges
-    let ls = labels.entry(r).or_insert_with(|| {
-        let ls = match rb.autos.get(&r) {
-            Some(a) => a.final_labels()?,
-            None => rb.auto(r, &mut Vec::new())?.final_labels()?,
-        };
-        Some(ls).filter(|ls| !ls.is_empty())
-    });
-    let Some(ls) = ls else {
-        return false;
+    let ls = match labels.entry(r) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let ls = match rb.autos.get(&r) {
+                Some(a) => a.final_labels(stop)?,
+                None => match rb.auto(r, &mut Vec::new()) {
+                    Some(a) => a.final_labels(stop)?,
+                    None => None,
+                },
+            };
+            e.insert(ls.filter(|ls| !ls.is_empty()))
+        }
     };
-    ls.iter()
-        .all(|&l| !tops.contains(&l) && told.iter().any(|&l2| rb.sub(l, l2)))
+    let Some(ls) = ls else {
+        return Ok(false);
+    };
+    Ok(ls
+        .iter()
+        .all(|&l| !tops.contains(&l) && told.iter().any(|&l2| rb.sub(l, l2))))
 }
 
 /// How far a run reduces the automata that unfold its universals (roadmap item 693):
@@ -1778,12 +1800,11 @@ pub fn normalize(
             return Err(Halt::Stopped);
         }
         let skip = match mode {
-            RangeUniversals::Covered => {
-                c != TOP && {
-                    let told = by_filler.get(&c).map_or(&[][..], |v| v.as_slice());
-                    ends_in_range(&mut rb, &mut labels, told, &tops, r)
-                }
+            RangeUniversals::Covered if c != TOP => {
+                let told = by_filler.get(&c).map_or(&[][..], |v| v.as_slice());
+                ends_in_range(&mut rb, &mut labels, told, &tops, r, stop)?
             }
+            RangeUniversals::Covered => false,
             RangeUniversals::Keep => false,
             #[cfg(test)]
             RangeUniversals::Drop => true,
@@ -1842,7 +1863,7 @@ mod reduction_tests {
                 ls.dedup();
                 Some(ls)
             };
-            assert_eq!(a.final_labels(), want, "{a:?}");
+            assert_eq!(a.final_labels(&|| false).unwrap(), want, "{a:?}");
         }
     }
 
