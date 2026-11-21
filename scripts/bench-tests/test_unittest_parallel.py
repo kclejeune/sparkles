@@ -283,6 +283,7 @@ class Discovery(Base):
         self.same_verdict(d, expect=1)
 
     def test_a_custom_suite_sees_the_tests_run_before_it(self):
+        # Review r3 finding 2: a custom suite keeps its run(), with what ran before it.
         d = self.suite(test_a=ONE, test_gen="""
             import unittest
 
@@ -307,6 +308,7 @@ class Discovery(Base):
         self.same_verdict(d, expect=1)
 
     def test_an_empty_custom_suite_still_runs(self):
+        # Review r2 finding 2: a custom suite keeps its run(), with what ran before it.
         d = self.suite(test_a=ONE, test_gen="""
             import unittest
 
@@ -347,7 +349,7 @@ class Discovery(Base):
             """)
         s, p = self.same_verdict(d, expect=1)
         self.assertIn("Ran 2 tests", s.stderr)
-        self.assertIn("the whole suite runs in one process, since test_z has a suite with attributes of its own: run", p.stdout)
+        self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
         self.assertIn("2 tests in 1 processes", p.stdout)
 
     def test_a_nonempty_default_suite_with_a_run_of_its_own_sees_the_tests_before_it(self):
@@ -401,13 +403,13 @@ class Discovery(Base):
         d = self.suite(test_a=ONE, test_z=self.ROOT_RUN)
         for args in ((), ("--split", "test_a")):
             s, p = self.same_verdict(d, *args, expect=1)
-            self.assertIn("the whole suite runs in one process, since the suite that discovery returns has a suite with attributes of its own: run", p.stdout)
+            self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
 
     def test_a_discovered_root_with_a_run_of_its_own_runs_in_the_fallback_too(self):
-        # test_b imports test_a's class, which sends the whole suite to one process first.
+        # test_b imports test_a's class, which also sends the whole suite to one process.
         d = self.suite(test_a=ONE, test_b="from test_a import One\n", test_z=self.ROOT_RUN)
         s, p = self.same_verdict(d, expect=1)
-        self.assertIn("since test classes of test_a run in 2 top-level entries", p.stdout)
+        self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
 
     def test_a_root_that_changes_between_discoveries_fails_the_unit(self):
         # Review r6 finding 1: the root's own behaviour is part of what each unit compares,
@@ -445,7 +447,80 @@ class Discovery(Base):
                 return unittest.TestSuite()
             """)
         s, p = self.same_verdict(d, expect=1)
+        self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
+
+    def test_a_suite_class_changed_at_import_with_no_hook_runs_as_serial_discovery_does(self):
+        # Serial discovery runs test_a first, so the changed run() sees one test and fails.
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            plain = unittest.TestSuite.run
+
+            def run(self, result, debug=False):
+                if result.testsRun > 0:
+                    result.addError(self, (RuntimeError, RuntimeError("ran after others"), None))
+                return plain(self, result, debug)
+
+            unittest.TestSuite.run = run
+
+            class T(unittest.TestCase):
+                def test_x(self):
+                    pass
+            """)
+        s, p = self.same_verdict(d, expect=1)
         self.assertIn("the whole suite runs in one process, since unittest.TestSuite.run was changed", p.stdout)
+
+    def test_a_suite_kind_set_on_the_loader_class_with_no_hook_runs_as_serial_discovery_does(self):
+        # The suites made after test_z's import are of its kind, which checks what ran before.
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            class Checking(unittest.TestSuite):
+                def run(self, result, debug=False):
+                    if result.testsRun > 0 and any(True for _ in self):
+                        case = unittest.FunctionTestCase(lambda: None, description="kind check")
+                        result.addFailure(case, (AssertionError, AssertionError("ran after others"), None))
+                    return super().run(result, debug)
+
+            unittest.TestLoader.suiteClass = Checking
+
+            class T(unittest.TestCase):
+                def test_x(self):
+                    pass
+            """)
+        s, p = self.same_verdict(d, expect=1)
+        self.assertIn("ran after others", s.stderr)
+        self.assertIn("the whole suite runs in one process, since the suite that discovery returns has a suite of kind test_z.Checking", p.stdout)
+        self.assertNotIn("Traceback", p.stdout)
+
+    def test_a_hook_that_returns_its_tests_unchanged_sends_the_whole_suite_to_one_process(self):
+        d = self.suite(test_a=ONE, test_b=PASS.replace("import helper", "import helper\n\n\ndef load_tests(loader, tests, pattern):\n    return tests"))
+        s, p = self.same_verdict(d, expect=0)
+        self.assertIn("the whole suite runs in one process, since test_b defines load_tests", p.stdout)
+        self.assertIn("3 tests in 1 processes", p.stdout)
+
+    def test_a_test_with_a_run_of_its_own_from_a_hook_sees_the_tests_before_it(self):
+        # A hook can give one test instance a run() that reads the shared result. Serial
+        # discovery runs test_a first, so the check sees one test and passes.
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            class T(unittest.TestCase):
+                def test_x(self):
+                    pass
+
+            def load_tests(loader, tests, pattern):
+                case = T("test_x")
+                plain = case.run
+                def run(result=None):
+                    if result.testsRun == 0:
+                        result.addError(case, (RuntimeError, RuntimeError("ran first"), None))
+                    return plain(result)
+                case.run = run
+                return unittest.TestSuite([case])
+            """)
+        s, p = self.same_verdict(d, expect=0)
+        self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
 
     def test_a_repeated_occurrence_runs_each_time(self):
         d = self.suite(test_rep="""
@@ -507,7 +582,7 @@ class Discovery(Base):
                 return Ready(loader.loadTestsFromTestCase(T))
             """)
         s, p = self.same_verdict(d, "--split", "test_custom", expect=0)
-        self.assertIn("the whole suite runs in one process, since test_custom has a suite of kind", p.stdout)
+        self.assertIn("the whole suite runs in one process, since test_custom defines load_tests", p.stdout)
 
     def test_a_split_module_with_a_class_fixture_runs_whole(self):
         d = self.suite(test_fix="""

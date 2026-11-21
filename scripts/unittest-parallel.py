@@ -10,24 +10,28 @@ one top-level entry for each module or package that discovery loads, and the id 
 test occurrence in order. The runner's own process imports no test module. Each unit then
 runs in its own process, which discovers the whole suite again, checks that its tree matches
 the recorded one, and runs one top-level entry exactly as discovered. So every module is
-imported in every unit, as in serial discovery, and load_tests hooks, import errors and
-import-time skips, custom suites and class and module fixtures behave as they do serially.
-An entry made only of default suites with no test does nothing and gets no process. The
-whole suite runs in one process instead, and the runner says why, when test classes of one
-module run in more than one entry, as when one test module imports another's class, since
-they can share that module's state, or when any entry has a suite of a kind of its own, a
-default suite with attributes of its own such as a run() given to the instance, or a test
-that is not a TestCase, when the suite that discovery returns is one of these, or when a
-test module has changed unittest's suite classes, since such a run() can depend on
-everything run before it. That suite then runs as discovery returned it. State that tests share in some other
-way, such as through a helper module's globals, is not detected, so a test that depends on
-a test in another unit having run first can pass or skip here and fail serially. The same
-holds for the tests of a split module, which each run in a unit of their own.
+imported in every unit, as in serial discovery, and import errors, import-time skips and class
+and module fixtures behave as they do serially. An entry made only of default suites with no
+test does nothing and gets no process.
+
+The whole suite runs in one process instead, as discovery returned it, and the runner says
+why, when anything in it could make a part of the suite depend on what ran before it. That
+is the case when a module or package that discovery loads defines a load_tests hook, when
+the suite holds anything other than default suites and TestCase tests, including a default
+suite with attributes of its own such as a run() given to the instance, when a test module
+has changed unittest's suite classes, and when test classes of one module run in more than
+one entry, as when one test module imports another's class, since they can share that
+module's state. The runner does not ask what such a hook or suite does. State that tests
+share in some other way, such as through a helper module's globals, is not detected, so a
+test that depends on a test in another unit having run first can pass or skip here and fail
+serially. The same holds for the tests of a split module, which each run in a unit of their
+own. The runner also assumes that a test's run(), when a TestCase defines its own, reads
+only its own test's result.
 
 A module named with --split runs one process per test instead, for modules whose few tests
 take most of the suite's time. The split is taken only when the module's entry is plain,
 which means default suites holding only the module's own test classes, with no class or
-module fixtures, no load_tests suite of its own kind and no repeated test. Otherwise the
+module fixtures and no repeated test. Otherwise the
 module runs whole and the runner says why. Units start longest first, using the split tests
 and then the modules by file size as the estimate, and each unit's output is printed whole
 when it ends.
@@ -90,13 +94,18 @@ _SUITE_DICTS = {cls: dict(vars(cls)) for cls in _SUITE_CLASSES}
 # ----- discovery, in the discovery child and in every unit ---------------------------------
 
 class _TaggingLoader(unittest.TestLoader):
-    """A loader that remembers which module produced each suite, to name the units."""
+    """A loader that remembers which module produced each suite, to name the units, and
+    which modules had a load_tests hook when unittest looked for one."""
 
     def __init__(self):
         super().__init__()
         self.labels = {}
+        self.hooks = []
 
     def loadTestsFromModule(self, module, *args, **kwargs):
+        # unittest reads the hook here, for test modules and packages alike.
+        if getattr(module, "load_tests", None) is not None:
+            self.hooks.append(module.__name__)
         suite = super().loadTestsFromModule(module, *args, **kwargs)
         # The suite is kept with its name, so that its id is not reused by another.
         self.labels.setdefault(id(suite), (suite, module.__name__))
@@ -189,9 +198,6 @@ def _plain(label, entry):
     seen = set()
 
     def walk(node):
-        why = _custom(node)
-        if why:
-            return f"it {why}"
         if isinstance(node, unittest.TestSuite):
             for t in node:
                 why = walk(t)
@@ -236,60 +242,59 @@ def discover(directory):
             "split": _plain(label, entry),
             "size": os.path.getsize(f) if f and os.path.exists(f) else 0,
             "absorb": callable(getattr(module, "parallel_absorb", None)),
+            # With no custom node anywhere, a part with no test does nothing when it runs.
+            "inert": not any(True for _ in _leaves(entry)),
         })
-    for u, entry in zip(units, entries):
-        u["inert"] = _inert(entry)
     exports = sorted(m for m in set(sys.modules) - before
                      if callable(getattr(sys.modules[m], "parallel_export", None)))
-    root = _custom(suite)
-    serial = _shared(entries, units) or (f"the suite that discovery returns {root}" if root else None)
-    # The root and each suite's own attributes are part of the description, so a unit whose
-    # discovery made them differently fails its comparison with the runner's.
-    return suite, entries, {"root": _tree(suite, deep=False), "changed": _changed_suite_classes(),
-                            "units": units, "exports": exports, "serial": serial}
+    changed = _changed_suite_classes()
+    # The hooks, the root and each suite's own attributes are part of the description, so a
+    # unit whose discovery made them differently fails its comparison with the runner's.
+    return suite, entries, {"root": _tree(suite, deep=False), "changed": changed,
+                            "hooks": loader.hooks, "units": units, "exports": exports,
+                            "serial": _serial(loader, suite, entries, changed)}
 
 
-def _inert(node):
-    """Whether NODE is default suites only, with no test, so running it does nothing."""
-    return (isinstance(node, unittest.TestSuite) and _custom(node) is None
-            and all(_inert(t) for t in node))
-
-
-def _shared(entries, units):
-    """Why the entries cannot run in separate processes, or None. Test classes of one module
-    that run in more than one entry, as when one test module imports another's class, can
-    share that module's state and fixtures, which only one process keeps. A suite of a kind
-    of its own, or any other node that _custom names, can depend on the result of everything
+def _serial(loader, suite, entries, changed):
+    """Why the whole suite runs in one process, or None. A load_tests hook can build any
+    suite, and a custom suite, which _custom names, can depend on the result of everything
     run before it, and so can every suite once a test module has changed unittest's suite
-    classes."""
+    classes. So any of these, anywhere in the suite that discovery returns, sends the whole
+    suite to one process, without asking what it does. Test classes of one module that run
+    in more than one entry, as when one test module imports another's class, can share that
+    module's state and fixtures, which only one process keeps."""
+    if loader.hooks:
+        return f"{loader.hooks[0]} defines load_tests"
+    if changed:
+        return changed
+
+    def custom(node, where):
+        why = _custom(node)
+        if why:
+            return f"{where} {why}"
+        if isinstance(node, unittest.TestSuite):
+            for t in node:
+                why = custom(t, where)
+                if why:
+                    return why
+        return None
+
+    why = _custom(suite)
+    if why:
+        return f"the suite that discovery returns {why}"
+    for i, entry in enumerate(entries):
+        why = custom(entry, _label(loader, entry, i))
+        if why:
+            return why
     where = {}
     for i, entry in enumerate(entries):
         for t in _leaves(entry):
             module = type(t).__module__
             if module != "unittest.loader":
                 where.setdefault(module, set()).add(i)
-
-    def custom(node):
-        why = _custom(node)
-        if why or not isinstance(node, unittest.TestSuite):
-            return why
-        for t in node:
-            why = custom(t)
-            if why:
-                return why
-        return None
-
-    changed = _changed_suite_classes()
-    if changed:
-        return changed
-
     for module, found in where.items():
         if len(found) > 1:
             return f"test classes of {module} run in {len(found)} top-level entries"
-    for u, entry in zip(units, entries):
-        why = custom(entry)
-        if why:
-            return f"{u['label']} {why}"
     return None
 
 

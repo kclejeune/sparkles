@@ -376,18 +376,21 @@ tests serially, and the runner reaches the same verdict under the condition give
 discovers the suite once in a child process and then starts one process per module or
 package that discovery loads. Each
 process discovers the whole suite again, checks that it found the same tests in the same
-order, and runs its own part exactly as discovered. Import errors, import-time skips,
-`load_tests` hooks and class and module fixtures therefore behave as they do serially.
-The whole suite runs in one process, and the runner says why, when test classes of one
-module run under more than one module, as when one test module imports another's class,
-when a `load_tests` hook makes a suite of its own kind or a suite given its own `run`, which
-can also be the suite that discovery returns, or when a test module changes unittest's suite
-classes, since such tests can depend on what ran before them. Tests that share state in another way, such as a helper module's globals, are
-not detected. The runner therefore reaches the serial verdict only when no test depends on
-state that a test in another process left behind, and passing alone does not show this,
-since such a test can skip instead of fail. The same holds for the tests of a split module.
+order, and runs its own part exactly as discovered. Import errors, import-time skips and
+class and module fixtures therefore behave as they do serially. The whole suite runs in one
+process, as discovery returned it, and the runner says why, when any module or package
+defines a `load_tests` hook, when the suite holds anything other than default suites and
+`TestCase` tests, including a suite given its own `run`, when a test module changes
+unittest's suite classes, or when test classes of one module run under more than one module,
+as when one test module imports another's class. Such a suite or test can depend on what ran
+before it, and the runner does not try to tell whether it does. Tests that share state in
+another way, such as a helper module's globals, are not detected, and the runner assumes that
+a test's own `run` method reads only its own test's result. The runner therefore reaches the
+serial verdict only when no test depends on state that a test in another process left
+behind, and passing alone does not show this, since such a test can skip instead of fail.
+The same holds for the tests of a split module.
 The three long tests of `test_x08_latency` run one per process. A module named with
-`--split` is split this way only when it has no fixtures, custom suites, imported classes or
+`--split` is split this way only when it has no fixtures, imported classes or
 repeated tests, and otherwise runs whole with a note that says why.
 
 Each process writes a result record, and the runner takes its verdict from those records
