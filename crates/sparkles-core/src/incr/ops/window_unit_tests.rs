@@ -1,7 +1,7 @@
 //! The window's construction, refill and refresh under the pass's work, memory and
 //! control (spec F13 §4.4, review of item 419).
 
-use super::{CMPS, RECONCILED, Window};
+use super::{CANCEL_AFTER, CMPS, RECONCILED, Window};
 use crate::error::{BudgetKind, Error};
 use crate::incr::circuit::{Circuit, DeltaSet};
 use crate::incr::compile::compile;
@@ -57,6 +57,16 @@ fn over_memory(r: crate::error::Result<()>) -> bool {
 /// under `control`, with a pass built here so that nothing above the window looks at
 /// the control first.
 fn window_delta(s: &Store, c: &mut Circuit, control: &Control) -> crate::error::Result<()> {
+    window_delta_within(s, c, control, None)
+}
+
+/// [`window_delta`] with a memory budget.
+fn window_delta_within(
+    s: &Store,
+    c: &mut Circuit,
+    control: &Control,
+    budget: Option<u64>,
+) -> crate::error::Result<()> {
     let d = DeltaSet::read(s, c.applied, &Control::none());
     let old = d.old().expect("old snapshot");
     let vis = Vis::new(None, &d.snapshot);
@@ -74,8 +84,16 @@ fn window_delta(s: &Store, c: &mut Circuit, control: &Control) -> crate::error::
         control,
         vars,
     );
+    p.max_memory_bytes = budget;
     let w = root.result_window_mut().expect("a window");
     w.delta(&mut p).map(|_| ())
+}
+
+/// A control whose flag [`Window::key_of`] raises after `n` keys on this thread.
+fn cancel_after(n: u64) -> Control {
+    let flag = Arc::new(AtomicBool::new(false));
+    CANCEL_AFTER.with(|c| *c.borrow_mut() = Some((n, flag.clone())));
+    Control::with_cancel(flag)
 }
 
 fn cancelled() -> Control {
@@ -338,4 +356,98 @@ fn a_refresh_keeps_the_rows_and_their_ties() {
     assert_eq!(moves.removed.len(), 1);
     assert_eq!(moves.removed[0].0, 4);
     assert_eq!(moves.removed[0].1, before[4].0);
+}
+
+/// A cancellation that arrives while the keys of a pass's changes are computed fails
+/// the phase, though too few rows follow for a periodic check.
+#[test]
+fn keying_notices_a_cancellation_during_the_phase() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 10, i64::from)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 20");
+    let control = cancel_after(5);
+    let r = with_pass(&mut c, &control, None, |w, p| {
+        let rows: Vec<_> = w.kept.iter().map(|e| (e.row.clone(), 1)).collect();
+        w.keyed(p, rows).map(|_| ())
+    });
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+}
+
+/// The same while the keys of loaded rows are computed, which leaves them stale.
+#[test]
+fn a_refresh_notices_a_cancellation_during_the_phase() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 10, i64::from)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 20");
+    window(&mut c).mark_stale();
+    let control = cancel_after(3);
+    let r = with_pass(&mut c, &control, None, |w, p| w.refresh(p));
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert!(window(&mut c).stale());
+}
+
+/// A window without a total order that rebuilds holds its old rows while it builds the
+/// new ones, and both are charged.
+#[test]
+fn a_rebuild_charges_the_rows_it_replaces() {
+    const DT: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+    let s = Store::in_memory(StoreOptions::default());
+    let pad = "x".repeat(80 << 10);
+    let row =
+        |i: u32| format!(":s{i} :d \"2026-01-01T12:{i:02}:00\"^^<{DT}> . :s{i} :t \"{i:03}{pad}\"");
+    let d: Vec<String> = (0..8).map(row).collect();
+    upd(&s, &format!("INSERT DATA {{ {} }}", d.join(" . ")));
+    let q = "SELECT ?s WHERE { ?s :d ?d ; :t ?t } ORDER BY ?d ?t LIMIT 10";
+    let mut c = circuit(&s, q);
+    assert!(window(&mut c).partial());
+    let before = window(&mut c).bytes();
+    assert!(before < 1 << 20 && before > 600 << 10, "{before} bytes");
+    upd(&s, &format!("INSERT DATA {{ {} }}", row(8)));
+    let r = window_delta_within(&s, &mut c, &Control::none(), Some(1 << 20));
+    assert!(over_memory(r), "the rebuild passed its budget");
+}
+
+/// A guard: a pass's changes whose slots alone pass the budget fail before any long key.
+#[test]
+fn keying_many_changes_charges_their_slots() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        &format!("INSERT DATA {{ {} }}", ints(0, 20_000, i64::from)),
+    );
+    let all = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 20000");
+    let rows: Vec<_> = all
+        .root
+        .result_window()
+        .expect("a window")
+        .0
+        .kept
+        .iter()
+        .map(|e| (e.row.clone(), 1))
+        .collect();
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 2");
+    let r = with_pass(&mut c, &Control::none(), Some(256 << 10), |w, p| {
+        w.keyed(p, rows).map(|_| ())
+    });
+    assert!(over_memory(r), "the slots passed the budget");
+}
+
+/// A checkpoint whose window holds a row twice is refused as corrupt.
+#[test]
+fn a_window_that_holds_a_row_twice_does_not_load() {
+    use crate::incr::persist::{Reader, Writer};
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 10, i64::from)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 5");
+    let snap = c.snap.clone().expect("built");
+    let mut w = window(&mut c).clone();
+    let first = w.kept[0].clone();
+    w.kept[1] = first;
+    let mut out = Writer::new(&snap, &c.terms);
+    w.save(&mut out).expect("save");
+    let data = out.finish();
+    let mut terms = c.terms.clone();
+    let mut r = Reader::new(&data, &snap, &mut terms).expect("reader");
+    let r = window(&mut c).load(&mut r);
+    assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
 }

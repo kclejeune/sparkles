@@ -40,6 +40,10 @@ thread_local! {
     /// the most rows a refill's reconciliation tracked on this thread, for tests of
     /// its memory
     static RECONCILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// a flag that [`Window::key_of`] raises once it has computed this many keys, for
+    /// tests of a cancellation that arrives during a phase
+    pub(crate) static CANCEL_AFTER: std::cell::RefCell<Option<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Rows of the window that entered or left it in a pass, each with the position of its
@@ -133,6 +137,15 @@ impl Window {
     }
 
     fn key_of(&self, p: &Pass, r: &[crate::id::Id]) -> Vec<SortKey> {
+        #[cfg(test)]
+        CANCEL_AFTER.with(|c| {
+            if let Some((n, flag)) = c.borrow_mut().as_mut() {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
         self.keys
             .iter()
             .map(|&(c, _)| SortKey::new(p.value(r[c])))
@@ -166,6 +179,7 @@ impl Window {
             charge(p, used)?;
             keys.push(k);
         }
+        p.control.check()?;
         for (e, k) in self.kept.iter_mut().zip(keys) {
             e.keys = k;
         }
@@ -186,6 +200,7 @@ impl Window {
         let mut used = self
             .bytes()
             .saturating_add((c.len() as u64).saturating_mul(slot));
+        charge(p, used)?;
         let mut out = Vec::with_capacity(c.len());
         for (r, w) in c {
             p.tick()?;
@@ -194,6 +209,7 @@ impl Window {
             charge(p, used)?;
             out.push((r, w, k));
         }
+        p.control.check()?;
         Ok(out)
     }
 
@@ -343,14 +359,12 @@ impl Window {
         } else {
             FxHashMap::default()
         };
-        let mut counts = vec![0i64; index.len()];
-        let base = if keep {
-            let per = std::mem::size_of::<(&[crate::id::Id], usize)>() as u64 + 16;
-            self.bytes()
-                .saturating_add((index.capacity() as u64).saturating_mul(per))
-        } else {
-            0
-        };
+        let mut counts = vec![0i64; if keep { self.kept.len() } else { 0 }];
+        // the window's rows stay allocated until the new ones replace them
+        let per = std::mem::size_of::<(&[crate::id::Id], usize)>() as u64 + 16;
+        let base = self
+            .bytes()
+            .saturating_add((index.capacity() as u64).saturating_mul(per));
         let slot = std::mem::size_of::<HeapEntry>() as u64;
         let mut payloads = 0u64;
         for (r, w) in rows {
@@ -371,14 +385,18 @@ impl Window {
             }
             // the heap is the operator's state to be, charged as it grows; a vector
             // doubles, so its slots are charged at the next power of two
-            let slots = (top.kept().max(1).next_power_of_two() as u64).saturating_mul(slot);
+            let slots = (top.kept().next_power_of_two() as u64).saturating_mul(slot);
             charge(p, base.saturating_add(payloads).saturating_add(slots))?;
         }
         drop(index);
         #[cfg(test)]
         RECONCILED.with(|c| c.set(c.get().max(counts.len())));
         // the sort's positions and slots, and the empty input's state
-        let slots = (top.kept().max(1).next_power_of_two() as u64).saturating_mul(slot);
+        let slots = if top.kept() == 0 {
+            0
+        } else {
+            (top.kept().next_power_of_two() as u64).saturating_mul(slot)
+        };
         let sorting = (top.kept() as u64).saturating_mul(slot + 24);
         charge(
             p,
@@ -423,6 +441,7 @@ impl Window {
                 serial: self.next_serial(),
             });
         }
+        p.control.check()?;
         self.kept = kept;
         self.held = held;
         Ok(())
@@ -481,6 +500,7 @@ impl Window {
                 serial: self.next_serial(),
             });
         }
+        p.control.check()?;
         self.kept = kept;
         self.held = held;
         Ok(())
@@ -532,6 +552,7 @@ impl Window {
                 .any(|(_, _, k)| k.iter().any(|k| !k.totally_ordered()));
         if partial {
             // no sorted vector without a total order: the input's rows again
+            drop(keyed);
             let rows = self.inner_init(p)?;
             self.fill(p, rows, false)?;
             return Ok(self.diff(old));
@@ -709,6 +730,13 @@ impl Window {
                 "a view's window holds more rows than its input".into(),
             ));
         }
+        let mut seen = rustc_hash::FxHashSet::default();
+        if !kept.iter().all(|e| seen.insert(&*e.row)) {
+            return Err(crate::error::Error::Corrupt(
+                "a view's window holds a row twice".into(),
+            ));
+        }
+        drop(seen);
         self.kept = kept;
         self.held = held;
         self.total = total;
