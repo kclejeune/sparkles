@@ -252,6 +252,47 @@ pub struct EpsFree {
 }
 
 impl Nfa {
+    /// The labels of the transitions into the final states of [`Nfa::eps_free`], sorted,
+    /// or `None` when its start is final, found in time linear in the automaton without
+    /// building the closure: a labelled transition from a state that the start reaches to
+    /// one whose ε-transitions reach the end.
+    pub fn final_labels(&self) -> Option<Vec<Role>> {
+        let n = self.states as usize;
+        let mut back: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &(p, l, q) in &self.trans {
+            out[p as usize].push(q);
+            if l.is_none() {
+                back[q as usize].push(p);
+            }
+        }
+        let mut ends = vec![false; n];
+        let mut stack = vec![self.end];
+        while let Some(x) = stack.pop() {
+            if !std::mem::replace(&mut ends[x as usize], true) {
+                stack.extend(back[x as usize].iter().copied());
+            }
+        }
+        if ends[self.start as usize] {
+            return None;
+        }
+        let mut reached = vec![false; n];
+        let mut stack = vec![self.start];
+        while let Some(x) = stack.pop() {
+            if !std::mem::replace(&mut reached[x as usize], true) {
+                stack.extend(out[x as usize].iter().copied());
+            }
+        }
+        let mut ls: Vec<Role> = self
+            .trans
+            .iter()
+            .filter_map(|&(p, l, q)| l.filter(|_| reached[p as usize] && ends[q as usize]))
+            .collect();
+        ls.sort_unstable();
+        ls.dedup();
+        Some(ls)
+    }
+
     /// The automaton with its ε-transitions closed over: a state takes the transitions of
     /// the states its ε-transitions reach, and is final when one of them is the end.
     pub fn eps_free(&self) -> EpsFree {
@@ -389,18 +430,10 @@ fn ends_in_range(
     }
     // the labels into final states, once for each role whatever its ranges
     let ls = labels.entry(r).or_insert_with(|| {
-        let a = rb.auto(r, &mut Vec::new())?.eps_free();
-        if a.finals[a.start as usize] {
-            return None;
-        }
-        let mut ls: Vec<Role> = a
-            .trans
-            .iter()
-            .filter(|t| a.finals[t.2 as usize])
-            .map(|t| t.1)
-            .collect();
-        ls.sort_unstable();
-        ls.dedup();
+        let ls = match rb.autos.get(&r) {
+            Some(a) => a.final_labels()?,
+            None => rb.auto(r, &mut Vec::new())?.final_labels()?,
+        };
         Some(ls).filter(|ls| !ls.is_empty())
     });
     let Some(ls) = ls else {
@@ -1771,6 +1804,47 @@ pub fn normalize(
 #[cfg(test)]
 mod reduction_tests {
     use super::*;
+
+    /// The labels into final states read from the automaton equal those of its closure
+    /// over the ε-transitions, on the automata of random role boxes.
+    #[test]
+    fn final_labels_match_the_closure() {
+        let mut seed = 693u64;
+        let mut next = |m: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % m as u64) as u32
+        };
+        for _ in 0..2000 {
+            let states = 2 + next(7);
+            let mut a = Nfa {
+                states,
+                start: 0,
+                end: 1 + next(states - 1),
+                trans: Vec::new(),
+            };
+            for _ in 0..next(14) {
+                let l = if next(3) == 0 { None } else { Some(next(4)) };
+                a.trans.push((next(states), l, next(states)));
+            }
+            let e = a.eps_free();
+            let want = if e.finals[e.start as usize] {
+                None
+            } else {
+                let mut ls: Vec<Role> = e
+                    .trans
+                    .iter()
+                    .filter(|t| e.finals[t.2 as usize])
+                    .map(|t| t.1)
+                    .collect();
+                ls.sort_unstable();
+                ls.dedup();
+                Some(ls)
+            };
+            assert_eq!(a.final_labels(), want, "{a:?}");
+        }
+    }
 
     fn auto(states: u32, finals: &[u32], trans: &[(u32, Role, u32)]) -> EpsFree {
         let mut a = EpsFree {

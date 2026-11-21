@@ -1405,8 +1405,10 @@ a negative existential restriction made positive by its unfolding links to its
 successor, so the index gives those properties the same rule (item 693). Those rules
 add conclusions on 27 of 3,537 generated ontologies, on none of the 389 files of the ORE
 2015 sweep and on no file of the benchmark, and change no taxonomy. The
-automaton's reductions and pruning do not affect the test, which reads the closure
-over the ε-transitions before them. When the left-out universals were a run's only
+automaton's reductions and pruning do not affect the test, which reads the labels into
+the final states of the closure over the ε-transitions before them. It finds them in
+time linear in the automaton, from the transitions between a state that the start
+reaches and one whose ε-transitions reach the end, without building the closure. When the left-out universals were a run's only
 universal restrictions and no other Horn rule can fire, the run takes the EL rules, which
 compose every chain, as for any such run. A change to the axioms after a run with the
 Horn rules normalizes them again, so a removed range that covered a universal brings the
