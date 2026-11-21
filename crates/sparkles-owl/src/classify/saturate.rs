@@ -3506,6 +3506,105 @@ mod horn_accounting_tests {
         }
     }
 
+    /// Row 1231's repair after a stop of the run: an activation of the root that holds
+    /// 4,096 notices of M-send, each of whose markers goes to 65 reached contexts, ends
+    /// its sends within the first notice's polls whatever stopped the run, since the
+    /// repair's handlers take no notice once it stopped.
+    #[test]
+    fn the_marker_repair_sends_nothing_once_the_run_stopped() {
+        use crate::classify::dl_clause::{Made, RTerm, XLit};
+        use crate::classify::dl_norm::DlAx;
+        use crate::classify::dl_rules::{DlRun, MREPAIR_CF, MREPAIR_ON};
+        use crate::model::NamedIndividual;
+        for mode in [MREPAIR_ON, MREPAIR_ON | MREPAIR_CF] {
+            for reason in [STOP_CANCEL, STOP_TIMEOUT, STOP_WORK, STOP_MEMORY] {
+                let mut it = Interner::new();
+                let root = it.class(&Class::new("urn:t:root"));
+                let holder = it.class(&Class::new("urn:t:holder"));
+                let nominal = it.nominal(&NamedIndividual::new("urn:t:u"));
+                let dest: Vec<_> = (0..65)
+                    .map(|i| it.class(&Class::new(format!("urn:t:dst{i}"))))
+                    .collect();
+                let atoms: Vec<_> = (0..4096)
+                    .map(|i| it.class(&Class::new(format!("urn:t:A{i}"))))
+                    .collect();
+                let ax = Axioms {
+                    dl: Some(Box::new(DlAx {
+                        root: Some(root),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                };
+                let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+                let dx = ix.dl.as_deref().unwrap();
+                let cu = dx.consts.iter().find(|(_, n)| *n == nominal).unwrap().0;
+                let mut dl = DlRun::new(false, Default::default());
+                dl.mrepair = mode;
+                struct Prep<'a>(&'a DlRun);
+                impl Sink for Prep<'_> {
+                    fn send(&mut self, _: Ex, _: Concl) {}
+                    fn me(&mut self, _: Concl) {}
+                    fn dl(&self) -> &DlRun {
+                        self.0
+                    }
+                }
+                let ctx: Contexts = (0..it.len()).map(|_| OnceLock::new()).collect();
+                let context = ctx[root as usize].get_or_init(Box::default);
+                context.st.lock().init = true;
+                {
+                    let mut prep = Prep(&dl);
+                    let mut st = context.st.lock();
+                    for &d in &dest {
+                        dl_root::redge(&mut st, d, cu, &mut prep);
+                        dl_root::rreach(&ix, root, &mut st, d, &mut prep);
+                    }
+                }
+                let msgs: Vec<Concl> = atoms
+                    .iter()
+                    .map(|&a| {
+                        let Made::Lit(l) =
+                            dl.lits.lit(XLit::Atom(a, RTerm::C(cu)), |r| dx.inv(&ix, r))
+                        else {
+                            panic!()
+                        };
+                        Concl::RMark(holder, l.xid())
+                    })
+                    .collect();
+                context.todo.lock().extend(msgs);
+                let cancel = || true;
+                let mut b = bounds(false);
+                b.dl = Some(&dl);
+                match reason {
+                    STOP_TIMEOUT => b.deadline = Some(Instant::now()),
+                    STOP_WORK => dl.set_work_limit(1),
+                    STOP_MEMORY => b.max_memory = Some(1),
+                    _ => b.cancelled = Some(&cancel),
+                }
+                let mut r = run(&ix, &ctx, &b);
+                r.disj = true;
+                r.horn = false;
+                r.queued.store(4096, Ordering::Relaxed);
+                let mut tally = Tally::default();
+                r.process::<Disj>(
+                    root,
+                    &mut VecDeque::new(),
+                    &mut tally,
+                    &mut Vec::new(),
+                    &mut Outbox::default(),
+                    &mut Marks::default(),
+                );
+                let notices = dl.mcount[0].load(Ordering::Relaxed);
+                let sends = dl.mcount[1].load(Ordering::Relaxed);
+                assert!(r.stopped(), "mode {mode} reason {reason}");
+                assert_eq!(r.stop.load(Ordering::Relaxed), reason, "mode {mode}");
+                assert!(
+                    notices <= 2 && sends <= 2 * 64,
+                    "mode {mode} reason {reason}: {notices} notices, {sends} sends"
+                );
+            }
+        }
+    }
+
     /// A congested delivery drops every kind of conclusion the context holds, the forward
     /// links and loops of chains included, and keeps the ones it does not (roadmap item
     /// 818).

@@ -2904,6 +2904,14 @@ impl Saturation {
                 // sets are: the root's live clauses with ground bodies first, which each
                 // holder's copy reads
                 let mut defs = Vec::new();
+                // the deficits' work counts as the run's, and the run's deadline and
+                // cancellation stop it
+                let stop = std::cell::Cell::new(None);
+                let mut dpoll = |n: usize| {
+                    d.count(n);
+                    poll(limits).map_err(|e| stop.set(Some(e))).is_ok()
+                };
+                let cf = dl_root::marker_def_cf(d.mrepair);
                 if diag && ok {
                     let rg = cs
                         .iter()
@@ -2912,15 +2920,22 @@ impl Saturation {
                         .map(|(m, c)| dl_root::marker_root_gbody(&ix, m.me, &c.st.lock(), &d.lits))
                         .unwrap_or_default();
                     for (m, c) in cs.iter().zip(&refs) {
-                        defs.push(dl_root::marker_def(
+                        match dl_root::marker_def(
                             &ix,
                             m,
                             &c.st.lock(),
                             &rg,
                             &d.lits,
-                            d.mrepair & dl_rules::MREPAIR_CF != 0,
-                        ));
+                            cf,
+                            &mut dpoll,
+                        ) {
+                            Ok(def) => defs.push(def),
+                            Err(()) => break,
+                        }
                     }
+                }
+                if let Some(e) = stop.take() {
+                    return Err(e);
                 }
                 if !ok {
                     return Err(Error::Memory {
@@ -2939,7 +2954,10 @@ impl Saturation {
                         .mcount
                         .each_ref()
                         .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
-                    let def = dl_root::marker_deficits(&ix, &cs, &defs, &d.lits);
+                    let Some(def) = dl_root::marker_deficits(&ix, &cs, &defs, &d.lits, &mut dpoll)
+                    else {
+                        return Err(stop.take().unwrap_or(Error::Cancelled));
+                    };
                     stats.dl_marker_deficits = def;
                     eprintln!(
                         "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}/{}",

@@ -50,8 +50,8 @@
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
     DlIx, DlSt, Found, MREPAIR_CF, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN,
-    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, RECORD_SLACK, Side, alls, dix, dl, drain, drain_with,
-    ds, merge, pred_id, restricted, side, unit, with,
+    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, RECORD_SLACK, Side, WORK_READS, alls, dix, dl, drain,
+    drain_with, ds, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -122,6 +122,11 @@ struct MRep {
     /// told it so, and the constants each context registered for
     reach_set: FxHashSet<Ex>,
     regs: FxHashMap<Ex, Vec<u32>>,
+    /// with the repair's pair set, in a context the root reaches, the successors it told
+    told: FxHashSet<Ex>,
+    /// with the repair, in the root, the ids of its processed clauses with an empty body
+    /// and one ground literal in the head, under that literal
+    units: FxHashMap<Lit, Vec<u32>>,
 }
 
 impl MRep {
@@ -138,6 +143,8 @@ impl MRep {
             + lists(&self.gbody)
             + table_bytes(self.reach_set.capacity(), 4)
             + lists(&self.regs)
+            + table_bytes(self.told.capacity(), 4)
+            + lists(&self.units)
     }
 }
 
@@ -1016,9 +1023,13 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
     for &u in &us {
         if let Some(b) = RootSt::ins(&mut r.edge_set, (v, u), 8) {
             grown += b + RootSt::push(&mut r.edges, u, v);
+            // a context the root reaches already takes its markers below, so only one
+            // that it does not reach yet waits for its reach
             if pairs {
                 mrep_new(r, out);
-                grown += RootSt::push(&mut r.mw().regs, v, u);
+                if !r.mr().reach_set.contains(&v) {
+                    grown += RootSt::push(&mut r.mw().regs, v, u);
+                }
             }
             new.push(u);
         }
@@ -1206,8 +1217,7 @@ pub(super) fn new_succ<S: Sink>(st: &mut State, w: Ex, out: &mut S) {
             .and_then(|r| r.m.as_deref())
             .is_some_and(|m| m.reached)
     {
-        out.send(w, Concl::RReach(TOP));
-        out.worked(1);
+        m_tell(st, w, out);
     }
     let Some(ls) = dl(st)
         .and_then(|x| x.root.as_deref())
@@ -1515,6 +1525,9 @@ fn m_note<S: Sink>(
     prem: &Side,
     out: &mut S,
 ) -> bool {
+    if m_stopped(st, out) {
+        return false;
+    }
     let r = rst(st, out);
     mrep_new(r, out);
     if let Some(b) = RootSt::ins(&mut r.mw().mheld, l, 8) {
@@ -1594,9 +1607,12 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
     let Some(root) = dix(ix).root else {
         return false;
     };
+    if m_stopped(st, out) {
+        return false;
+    }
     if me == root {
         let bottom = st.bottom;
-        let x = ds(st);
+        let x = m_dl(st, out);
         let r = root_of(x, out);
         mrep_new(r, out);
         let Some(b) = RootSt::ins(&mut r.mw().reach_set, e, 4) else {
@@ -1606,11 +1622,13 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
         if bottom {
             return true;
         }
-        let us = r.mr().regs.get(&e).cloned().unwrap_or_default();
+        // the registrations that waited for the reach are replayed once, and the ones
+        // that come later go to the context as they come ([`register`])
+        let us = r.mw().regs.remove(&e).unwrap_or_default();
         m_registered(x, e, &us, out);
         return true;
     }
-    let r = rst(st, out);
+    let r = root_of(m_dl(st, out), out);
     mrep_new(r, out);
     if r.mr().reached {
         return false;
@@ -1622,10 +1640,84 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
         if !m_poll(k, st, out) {
             break;
         }
+        m_tell(st, w, out);
+    }
+    true
+}
+
+/// A context that the root reaches tells its successor `w` so, once.
+fn m_tell<S: Sink>(st: &mut State, w: Ex, out: &mut S) {
+    let m = rst(st, out).mw();
+    if let Some(b) = RootSt::ins(&mut m.told, w, 4) {
+        out.dl().grow(b);
         out.send(w, Concl::RReach(TOP));
         out.worked(1);
     }
+}
+
+/// The repair's handlers take no notice once the run has stopped, which ends it without a
+/// claim: the context's store, when it has one, is interrupted, as [`drain`] leaves it, and
+/// the handler makes nothing, so that a stopped run's queued messages cost no more than
+/// this test.
+fn m_stopped<S: Sink>(st: &mut State, out: &S) -> bool {
+    if !out.stopped() {
+        return false;
+    }
+    if let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) {
+        x.store.interrupted = true;
+    }
     true
+}
+
+/// The context's state for Tier D, which the repair's reach makes in a context that has
+/// none, such as one of the EL rules only: the run's memory takes the parts it makes.
+fn m_dl<'a, S: Sink>(st: &'a mut State, out: &S) -> &'a mut DlSt {
+    let mut made = 0;
+    if st.extra.is_none() {
+        made += std::mem::size_of::<super::saturate::Extra>();
+    }
+    if dl(st).is_none() {
+        made += std::mem::size_of::<DlSt>();
+    }
+    if made > 0 {
+        out.dl().grow(made);
+    }
+    ds(st)
+}
+
+/// A scan of the repair whose reads mostly send nothing: it counts them, charges a
+/// conclusion for each [`WORK_READS`] of them and checks the run's bounds after every
+/// [`M_SCAN`] of them.
+struct Scan(usize);
+
+impl Scan {
+    /// Counts `n` reads, false when a check of the bounds stopped the scan.
+    fn read<S: Sink>(&mut self, n: usize, out: &mut S) -> bool {
+        let before = self.0 / M_SCAN;
+        self.0 += n;
+        let polls = self.0 / M_SCAN - before;
+        if polls == 0 {
+            return true;
+        }
+        out.worked(polls * (M_SCAN / WORK_READS));
+        out.go_on()
+    }
+
+    /// Charges the reads since the last check.
+    fn end<S: Sink>(self, out: &mut S) {
+        out.worked(self.0 % M_SCAN / WORK_READS);
+    }
+}
+
+/// Admits `bytes` of a handler's scratch before the handler builds it, false when the run
+/// refused them, which marks the store `x` interrupted. The caller releases the bytes
+/// either way.
+fn m_admit<S: Sink>(x: &mut DlSt, bytes: usize, out: &mut S) -> bool {
+    if out.reserve_data(bytes) {
+        return true;
+    }
+    x.store.interrupted = true;
+    false
 }
 
 /// The repair's sends poll the run's bounds after every [`M_POLL`] of them, as a rule whose
@@ -1634,7 +1726,13 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
 /// run has stopped or an activation of a run in steps is past the bound, which both end the
 /// run without a claim, so a send left undone never hides behind a complete answer.
 fn m_poll<S: Sink>(k: usize, st: &mut State, out: &mut S) -> bool {
-    if k == 0 || !k.is_multiple_of(M_POLL) || out.sent_go_on() {
+    let go = if k == 0 {
+        // the first send of a loop tests the stop without a check of the bounds
+        !out.stopped()
+    } else {
+        !k.is_multiple_of(M_POLL) || out.sent_go_on()
+    };
+    if go {
         return true;
     }
     ds(st).store.interrupted = true;
@@ -1644,6 +1742,9 @@ fn m_poll<S: Sink>(k: usize, st: &mut State, out: &mut S) -> bool {
 /// The sends between two polls of the run's bounds in the repair's loops.
 const M_POLL: usize = 64;
 
+/// The reads between two polls of the run's bounds in the repair's scans.
+const M_SCAN: usize = 1024;
+
 /// Makes the repair's state of a context with its first use, and counts it.
 fn mrep_new<S: Sink>(r: &mut RootSt, out: &S) {
     if r.m.is_none() {
@@ -1652,15 +1753,14 @@ fn mrep_new<S: Sink>(r: &mut RootSt, out: &S) {
     }
 }
 
-/// Whether the ground literal `l`, with the constant `u`, is a live unit of the root.
-fn root_unit(x: &DlSt, l: Lit, u: u32) -> bool {
-    let Some(r) = x.root.as_deref() else {
-        return false;
-    };
-    r.ready.get(&u).into_iter().flatten().any(|&i| {
-        let s = &x.store.clauses[i as usize];
-        !s.dead && s.c.body().is_empty() && s.c.head() == [l]
-    })
+/// Whether the ground literal `l` is a live unit of the root, by the index of units that
+/// [`m_offer`] keeps.
+fn root_unit(x: &DlSt, l: Lit) -> bool {
+    x.root
+        .as_deref()
+        .and_then(|r| r.m.as_deref())
+        .and_then(|m| m.units.get(&l))
+        .is_some_and(|v| v.iter().any(|&i| !x.store.clauses[i as usize].dead))
 }
 
 /// The root sends the marker of `l` to the context `d`, once.
@@ -1692,7 +1792,7 @@ fn ret_id<S: Sink>(x: &mut DlSt, i: u32, out: &mut S) -> u32 {
 /// unit of the root, which they take as a fact already, and `h` takes the root's clauses
 /// whose ground bodies it now holds every literal of (M-return).
 pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) -> bool {
-    if st.bottom {
+    if st.bottom || m_stopped(st, out) {
         return false;
     }
     let dx = dix(ix);
@@ -1723,9 +1823,17 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         }
     }
     out.dl().grow(grown);
-    let unit = mode & MREPAIR_UNITS == 0 && us.first().is_some_and(|&u| root_unit(x, l, u));
-    let r = x.root.as_deref_mut().expect("made above");
+    let unit = mode & MREPAIR_UNITS == 0 && root_unit(x, l);
     if !unit {
+        // the destinations, admitted before they are listed
+        let r = x.root.as_deref().expect("made above");
+        let n: usize = us.iter().map(|u| r.edges.get(u).map_or(0, Vec::len)).sum();
+        let bytes = n * std::mem::size_of::<Ex>();
+        if !m_admit(x, bytes, out) {
+            out.release_data(bytes);
+            return true;
+        }
+        let r = x.root.as_deref_mut().expect("made above");
         let mut to: Vec<Ex> = us
             .iter()
             .flat_map(|u| r.edges.get(u).into_iter().flatten().copied())
@@ -1734,33 +1842,58 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
             .collect();
         to.sort_unstable();
         to.dedup();
+        let mut cut = false;
         for (k, d) in to.into_iter().enumerate() {
             if k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on() {
-                x.store.interrupted = true;
-                return true;
+                cut = true;
+                break;
             }
             m_fwd(r, d, l, out);
+        }
+        out.release_data(bytes);
+        if cut {
+            x.store.interrupted = true;
+            return true;
         }
     }
     if mode & MREPAIR_NO_RETURN != 0 {
         return true;
     }
-    // the returns: the root's clauses with l in the body whose other body literals h holds
-    let ids: Vec<u32> = r
-        .mr()
-        .gbody
-        .get(&l)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|&i| {
-            x.store.clauses[i as usize]
-                .c
-                .body()
-                .iter()
-                .all(|&m| m == l || r.mr().hold_set.contains(&(h, m)))
-        })
-        .collect();
+    // the returns: the root's clauses with l in the body whose other body literals h
+    // holds, their ids admitted before they are listed and the scan charged and polled
+    let g = x
+        .root
+        .as_deref()
+        .and_then(|r| r.mr().gbody.get(&l))
+        .map_or(0, Vec::len);
+    let bytes = g * 4;
+    if !m_admit(x, bytes, out) {
+        out.release_data(bytes);
+        return true;
+    }
+    let r = x.root.as_deref().expect("made above");
+    let mut scan = Scan(0);
+    let mut ids: Vec<u32> = Vec::new();
+    let mut cut = false;
+    for &i in r.mr().gbody.get(&l).into_iter().flatten() {
+        if !scan.read(1, out) {
+            cut = true;
+            break;
+        }
+        if x.store.clauses[i as usize]
+            .c
+            .body()
+            .iter()
+            .all(|&m| m == l || r.mr().hold_set.contains(&(h, m)))
+        {
+            ids.push(i);
+        }
+    }
+    scan.end(out);
+    if cut {
+        x.store.interrupted = true;
+        ids.clear();
+    }
     for (k, i) in ids.into_iter().enumerate() {
         if !m_poll(k, st, out) {
             break;
@@ -1770,6 +1903,7 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         out.worked(1);
         out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    out.release_data(bytes);
     true
 }
 
@@ -1780,10 +1914,25 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     if mode & MREPAIR_NO_REPLAY != 0 {
         return;
     }
+    if out.stopped() {
+        x.store.interrupted = true;
+        return;
+    }
     let Some(r) = x.root.as_deref().filter(|r| r.m.is_some()) else {
         return;
     };
-    let mut ls: Vec<(u32, u32)> = Vec::new();
+    // the held literals over the constants, admitted before they are listed
+    let n: usize = new
+        .iter()
+        .map(|u| r.mr().held_at.get(u).map_or(0, Vec::len))
+        .sum();
+    let bytes = n * std::mem::size_of::<(u32, u32)>();
+    if !m_admit(x, bytes, out) {
+        out.release_data(bytes);
+        return;
+    }
+    let r = x.root.as_deref().expect("read above");
+    let mut ls: Vec<(u32, u32)> = Vec::with_capacity(n);
     for &u in new {
         for &i in r.mr().held_at.get(&u).into_iter().flatten() {
             ls.push((i, u));
@@ -1791,20 +1940,27 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     }
     ls.sort_unstable();
     ls.dedup_by_key(|p| p.0);
-    for (k, (i, u)) in ls.into_iter().enumerate() {
-        if k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on() {
-            x.store.interrupted = true;
-            return;
+    let mut scan = Scan(0);
+    let mut cut = false;
+    for (k, (i, _)) in ls.into_iter().enumerate() {
+        if (k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on()) || !scan.read(1, out) {
+            cut = true;
+            break;
         }
         let l = Lit::xl(i);
         let r = x.root.as_deref().expect("read above");
         let held = r.mr().holders.get(&l).is_some_and(|hs| {
             hs.iter().any(|&h| h != v) || (mode & MREPAIR_HOLDER != 0 && !hs.is_empty())
         });
-        if !held || (mode & MREPAIR_UNITS == 0 && root_unit(x, l, u)) {
+        if !held || (mode & MREPAIR_UNITS == 0 && root_unit(x, l)) {
             continue;
         }
         m_fwd(x.root.as_deref_mut().expect("read above"), v, l, out);
+    }
+    scan.end(out);
+    out.release_data(bytes);
+    if cut {
+        x.store.interrupted = true;
     }
 }
 
@@ -1813,7 +1969,22 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
 /// holders that come later. The head may be empty, so a denial returns too.
 fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S) {
     let mode = out.dl().mrepair;
-    if mode & MREPAIR_ON == 0 || mode & MREPAIR_NO_RETURN != 0 || st.bottom || c.body().is_empty() {
+    if mode & MREPAIR_ON == 0 || st.bottom || m_stopped(st, out) {
+        return;
+    }
+    if c.body().is_empty() {
+        // a unit of the root, for [`root_unit`]
+        if let &[l] = c.head()
+            && l.kind() == XL
+        {
+            let r = root_of(ds(st), out);
+            mrep_new(r, out);
+            let b = RootSt::push(&mut r.mw().units, l, id);
+            out.dl().grow(b);
+        }
+        return;
+    }
+    if mode & MREPAIR_NO_RETURN != 0 {
         return;
     }
     let inv = inv_of(ix, dix(ix));
@@ -1831,29 +2002,49 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
     for &l in c.body() {
         grown += RootSt::push(&mut r.mw().gbody, l, id);
     }
-    let (first, rest) = c.body().split_first().expect("a body");
-    let hs: Vec<Ex> = r
-        .mr()
-        .holders
-        .get(first)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|&h| rest.iter().all(|&m| r.mr().hold_set.contains(&(h, m))))
-        .collect();
     out.dl().grow(grown);
-    if hs.is_empty() {
+    // the holders of the body literal with the fewest, admitted before they are listed,
+    // and the scan of the others' charged and polled
+    let len = |l: &Lit| r.mr().holders.get(l).map_or(0, Vec::len);
+    let first = *c.body().iter().min_by_key(|l| len(l)).expect("a body");
+    let bytes = len(&first) * std::mem::size_of::<Ex>();
+    if !m_admit(x, bytes, out) {
+        out.release_data(bytes);
         return;
     }
-    let cid = ret_id(x, id, out);
-    for (k, h) in hs.into_iter().enumerate() {
-        if !m_poll(k, st, out) {
+    let r = x.root.as_deref().expect("made above");
+    let mut scan = Scan(0);
+    let mut hs: Vec<Ex> = Vec::new();
+    let mut cut = false;
+    for &h in r.mr().holders.get(&first).into_iter().flatten() {
+        if !scan.read(1, out) {
+            cut = true;
             break;
         }
-        out.send(h, Concl::RRet(cid));
-        out.worked(1);
-        out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if c.body()
+            .iter()
+            .all(|&m| m == first || r.mr().hold_set.contains(&(h, m)))
+        {
+            hs.push(h);
+        }
     }
+    scan.end(out);
+    if cut {
+        x.store.interrupted = true;
+        hs.clear();
+    }
+    if !hs.is_empty() {
+        let cid = ret_id(x, id, out);
+        for (k, h) in hs.into_iter().enumerate() {
+            if !m_poll(k, st, out) {
+                break;
+            }
+            out.send(h, Concl::RRet(cid));
+            out.worked(1);
+            out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    out.release_data(bytes);
 }
 
 /// A context other than the root takes a clause the root returned (M-return), once: each
@@ -1862,10 +2053,10 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
 /// bodies and residual heads. The clause is kept under its body literals for the premises
 /// that come later.
 pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool {
-    if st.bottom {
+    if st.bottom || m_stopped(st, out) {
         return false;
     }
-    let r = root_of(ds(st), out);
+    let r = root_of(m_dl(st, out), out);
     match RootSt::ins(&mut r.seen, cid, 4) {
         Some(b) => out.dl().grow(b),
         None => return false,
@@ -2163,7 +2354,11 @@ const DEF_CHOICES: usize = 1 << 16;
 /// by a live clause of the context. derive's other simplifications are not replayed, so a
 /// product they drop can count. With `cf`, the run's M-return-cf ([`MREPAIR_CF`]), the
 /// products take only the premises that M-return-cf takes, so the deficit checks the
-/// delivery of the rule the run applies, not what M-return-cf leaves out.
+/// delivery of the rule the run applies, not what M-return-cf leaves out. A product that
+/// derive promoted to the root as a fact ([`super::dl_rules::DlSt`]'s promoted heads) is
+/// held. The copy charges `poll` with its reads and choices, after every [`DIAG_POLL`] of
+/// them, and is `Err` once poll answers false, so that the run's deadline and
+/// cancellation bound it.
 pub(super) fn marker_def(
     ix: &Index,
     m: &MarkerCtx,
@@ -2171,14 +2366,18 @@ pub(super) fn marker_def(
     rg: &[Clause],
     lits: &super::dl_clause::Lits,
     cf: bool,
-) -> Option<MarkerDef> {
-    let x = dl(st)?;
+    poll: &mut dyn FnMut(usize) -> bool,
+) -> Result<Option<MarkerDef>, ()> {
+    let Some(x) = dl(st) else { return Ok(None) };
     let is_root = is_root(ix, m.me);
     let mut marks = Vec::new();
     if let Some(r) = x.root.as_deref() {
         marks.extend(r.gmarks.iter().copied());
     }
-    for s in &x.store.clauses {
+    for (k, s) in x.store.clauses.iter().enumerate() {
+        if k > 0 && k.is_multiple_of(DIAG_POLL) && !poll(DIAG_POLL / WORK_READS) {
+            return Err(());
+        }
         if s.dead {
             continue;
         }
@@ -2197,6 +2396,9 @@ pub(super) fn marker_def(
     let (mut owed, mut unchecked) = (0, 0);
     if !is_root && !st.bottom {
         for c in rg {
+            if !poll(1) {
+                return Err(());
+            }
             if !c.body().iter().all(|l| m.held.contains(l)) {
                 continue;
             }
@@ -2209,18 +2411,28 @@ pub(super) fn marker_def(
                 unchecked += 1;
                 continue;
             }
-            if n > 0 && !products_held(ix, st, &lists, c.head(), lits) {
+            if n > 0 && !products_held(ix, st, &lists, c.head(), lits, poll).ok_or(())? {
                 owed += 1;
             }
         }
     }
-    Some(MarkerDef {
+    Ok(Some(MarkerDef {
         bottom: st.bottom,
         marks,
         owed,
         unchecked,
-    })
+    }))
 }
+
+/// Whether [`marker_def`] takes M-return-cf's premises for the repair's mode `mode`: only
+/// where M-return ran with [`MREPAIR_CF`], since without [`MREPAIR_ON`] no rule restricted
+/// them.
+pub(super) fn marker_def_cf(mode: u8) -> bool {
+    mode & (MREPAIR_ON | MREPAIR_CF) == MREPAIR_ON | MREPAIR_CF
+}
+
+/// The reads or choices of the diagnostic between two of its polls.
+const DIAG_POLL: usize = 4096;
 
 /// Whether the context holds every product of `lists` with the head `head`: each is a
 /// tautology or a live clause of the context subsumes it.
@@ -2230,14 +2442,20 @@ fn products_held(
     lists: &[Vec<Side>],
     head: &[Lit],
     lits: &super::dl_clause::Lits,
-) -> bool {
+    poll: &mut dyn FnMut(usize) -> bool,
+) -> Option<bool> {
     use super::dl_clause::X;
-    let Some(x) = dl(st) else { return false };
+    let Some(x) = dl(st) else { return Some(false) };
     let inv = inv_of(ix, dix(ix));
     let is =
         |l: Lit, a: Ex| l.kind() == XL && matches!(lits.view(l, inv), XLit::Atom(b, _) if b == a);
     let mut at = vec![0usize; lists.len()];
+    let mut choices = 0usize;
     loop {
+        choices += 1;
+        if choices.is_multiple_of(DIAG_POLL) && !poll(DIAG_POLL) {
+            return None;
+        }
         let mut body: Vec<Lit> = Vec::new();
         let mut hd: Vec<Lit> = head.to_vec();
         for (l, &i) in lists.iter().zip(&at) {
@@ -2257,16 +2475,18 @@ fn products_held(
                     || is(l, TOP)
                     || body.binary_search(&l).is_ok()
             });
-        if !taut {
+        // a fact that derive sent the root ([`super::dl_rules::derive`]) is held
+        let promoted = body.is_empty() && x.promoted.contains(hd.as_slice());
+        if !taut && !promoted {
             let c = Clause::new(body, hd);
             if !x.store.subsumed(&c, c.sig()) {
-                return false;
+                return Some(false);
             }
         }
         let mut k = lists.len();
         loop {
             if k == 0 {
-                return true;
+                return Some(true);
             }
             k -= 1;
             at[k] += 1;
@@ -2434,19 +2654,25 @@ pub(super) fn marker_trips(
 /// pairs of a live root clause whose body is ground triggers and a context that holds every
 /// body literal and lacks one of the clause's M-return products ([`marker_def`]), and the
 /// pairs whose products are too many to check. `defs` holds marker_def's copy of each
-/// context of `cs`, in its order.
+/// context of `cs`, in its order. The count charges `poll` with the contexts and literals
+/// it reads, for each context, and is `None` once poll answers false.
 pub(super) fn marker_deficits(
     ix: &Index,
     cs: &[MarkerCtx],
     defs: &[Option<MarkerDef>],
     lits: &super::dl_clause::Lits,
-) -> [usize; 3] {
+    poll: &mut dyn FnMut(usize) -> bool,
+) -> Option<[usize; 3]> {
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let mut out = [0usize; 3];
-    let Some(root) = dx.root else { return out };
+    let Some(root) = dx.root else {
+        return Some(out);
+    };
     let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
-    let Some(&ri) = by.get(&root) else { return out };
+    let Some(&ri) = by.get(&root) else {
+        return Some(out);
+    };
     let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
     let edges: FxHashMap<u32, &[Ex]> = cs[ri].edges.iter().map(|(u, v)| (*u, &v[..])).collect();
     let reach = |from: Ex| {
@@ -2464,6 +2690,9 @@ pub(super) fn marker_deficits(
     };
     let from_root = reach(root);
     for c in cs {
+        if !poll(1 + c.held.len() + cs.len() / WORK_READS) {
+            return None;
+        }
         if c.me == root || c.held.is_empty() {
             continue;
         }
@@ -2496,7 +2725,7 @@ pub(super) fn marker_deficits(
         out[1] += d.owed;
         out[2] += d.unchecked;
     }
-    out
+    Some(out)
 }
 
 #[cfg(test)]
@@ -2689,6 +2918,438 @@ mod tests {
             );
             assert!(cut.peak <= 2 * RECORD_SLACK, "mode {mode}: {cut:?}");
         }
+    }
+
+    /// The repair's modes that the bounds tests run: M-return alone and with M-return-cf.
+    const MODES: [u8; 2] = [MREPAIR_ON, MREPAIR_ON | MREPAIR_CF];
+
+    /// A sink for the repair's bounds: it records what the rules send, counts the checks
+    /// of the run's bounds, answers each with `refuse` unset, and stays stopped after a
+    /// refusal or once `stop` is set, as a run does. It tracks the bytes reserved.
+    struct Stops<'a> {
+        run: &'a DlRun,
+        polls: std::cell::Cell<usize>,
+        stop: std::cell::Cell<bool>,
+        refuse: bool,
+        sent: Vec<(Ex, Concl)>,
+        asked: usize,
+        held: usize,
+        peak: usize,
+    }
+
+    impl<'a> Stops<'a> {
+        fn new(run: &'a DlRun) -> Self {
+            Stops {
+                run,
+                polls: Default::default(),
+                stop: Default::default(),
+                refuse: false,
+                sent: Vec::new(),
+                asked: 0,
+                held: 0,
+                peak: 0,
+            }
+        }
+    }
+
+    impl Sink for Stops<'_> {
+        fn send(&mut self, e: Ex, c: Concl) {
+            self.sent.push((e, c));
+        }
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn go_on(&self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            if self.refuse {
+                self.stop.set(true);
+            }
+            !self.stop.get()
+        }
+        fn stopped(&self) -> bool {
+            self.stop.get()
+        }
+        fn reserve_data(&mut self, n: usize) -> bool {
+            self.asked += n;
+            self.held += n;
+            self.peak = self.peak.max(self.held);
+            self.go_on()
+        }
+        fn release_data(&mut self, n: usize) {
+            self.held -= n;
+        }
+    }
+
+    /// The literal `a(u)` of the run.
+    fn glit(run: &DlRun, ix: &Index, a: Ex, u: Ex) -> Lit {
+        match run.lits.lit(XLit::Atom(a, c(u, ix)), inv_of(ix, dix(ix))) {
+            Made::Lit(l) => l,
+            _ => panic!("a literal"),
+        }
+    }
+
+    #[test]
+    fn the_repair_s_handlers_do_nothing_once_the_run_stopped() {
+        // a run that stopped takes no further notice, reach or return: the handlers neither
+        // record, allocate, charge nor send, and M-send's replay is cut off at its entry
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let [a, b, k] = ["A", "B", "K"].map(|n| sig.class(n));
+            let u = sig.ind("u");
+            let (ix, root) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let (ga, gb) = (glit(&run, &ix, a, u), glit(&run, &ix, b, u));
+            let RTerm::C(cu) = c(u, &ix) else { panic!() };
+            let mut st = State::default();
+            let mut out = Stops::new(&run);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            r.edges.insert(cu, vec![500]);
+            r.mw().reach_set.insert(500);
+            r.mw().holders.insert(ga, vec![501]);
+            r.mw().hold_set.insert((501, ga));
+            r.mw().held_at.insert(cu, vec![ga.xid()]);
+            let cid = run.table.push(Clause::new(vec![ga], vec![gb]));
+            out.stop.set(true);
+            let (work, bytes) = (run.work(), run.bytes());
+            assert!(!rmark(&ix, &mut st, k, gb.xid(), &mut out), "mode {mode}");
+            assert!(!rreach(&ix, root, &mut st, 600, &mut out), "mode {mode}");
+            m_offer(&ix, &mut st, 0, &Clause::new(vec![ga], vec![gb]), &mut out);
+            m_registered(ds(&mut st), 500, &[cu], &mut out);
+            let m = dl(&st).unwrap().root.as_deref().unwrap().mr();
+            assert!(!m.hold_set.contains(&(k, gb)), "mode {mode}");
+            assert!(
+                m.gbody.is_empty() && !m.reach_set.contains(&600),
+                "mode {mode}"
+            );
+            assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
+            // a context other than the root that the stop finds without state keeps none
+            let mut other = State::default();
+            assert!(!rreach(&ix, k, &mut other, TOP, &mut out), "mode {mode}");
+            assert!(!rret(&ix, &mut other, cid, &mut out), "mode {mode}");
+            assert!(other.extra.is_none(), "mode {mode}");
+            // M-send's notice and its late replay
+            let mut other = State::default();
+            ds(&mut other);
+            let premise = Clause::new(vec![Lit::x(k)], vec![ga]);
+            let prem = side(&premise, ga);
+            assert!(
+                !m_note(&ix, root, k, &mut other, ga, &prem, &mut out),
+                "mode {mode}"
+            );
+            assert!(dl(&other).unwrap().root.is_none(), "mode {mode}");
+            assert!(!m_poll(0, &mut other, &mut out), "mode {mode}");
+            assert!(out.sent.is_empty(), "mode {mode}: {:?}", out.sent);
+            assert_eq!((run.work(), run.bytes()), (work, bytes), "mode {mode}");
+        }
+    }
+
+    /// A root whose repair state lists 256 constants, each with 256 ground literals that
+    /// the context `k` alone holds, for [`m_registered`]'s scratch.
+    fn many_held(mode: u8) -> (Index, DlRun, State, Ex, Vec<u32>) {
+        let mut sig = Sig::new();
+        let k = sig.class("K");
+        let atoms: Vec<Ex> = (0..256).map(|i| sig.class(&format!("S{i}"))).collect();
+        let inds: Vec<Ex> = (0..256).map(|i| sig.ind(&format!("v{i}"))).collect();
+        let (ix, _) = probe_ix(sig);
+        let mut run = DlRun::new(false, Default::default());
+        run.mrepair = mode;
+        let mut st = State::default();
+        let mut us = Vec::new();
+        {
+            let out = Stops::new(&run);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            for &ind in &inds {
+                let RTerm::C(cu) = c(ind, &ix) else { panic!() };
+                us.push(cu);
+                let mut held = Vec::new();
+                for &a in &atoms {
+                    let l = glit(&run, &ix, a, ind);
+                    held.push(l.xid());
+                    r.mw().holders.insert(l, vec![k]);
+                    r.mw().hold_set.insert((k, l));
+                }
+                r.mw().held_at.insert(cu, held);
+            }
+        }
+        (ix, run, st, k, us)
+    }
+
+    #[test]
+    fn the_repair_s_scratch_is_admitted_before_it_is_built() {
+        // the replay of a context's registrations admits the pairs it lists before it lists
+        // them, so a refusal stops it before the scratch is built, and with every check
+        // passed it charges and polls the scan of pairs it sends nothing for
+        for mode in MODES {
+            let (_ix, run, mut st, k, us) = many_held(mode);
+            let mut out = Stops::new(&run);
+            out.refuse = true;
+            let ((), alloc) = super::super::numeric::tests::measure(|| {
+                m_registered(ds(&mut st), k, &us, &mut out)
+            });
+            assert!(out.stopped() && out.asked >= 65_536 * 8, "mode {mode}");
+            assert!(alloc.peak < 65_536, "mode {mode}: {alloc:?}");
+            assert!(
+                ds(&mut st).store.interrupted && out.held == 0,
+                "mode {mode}"
+            );
+            let (_ix, run, mut st, k, us) = many_held(mode);
+            let mut out = Stops::new(&run);
+            let work = run.work();
+            m_registered(ds(&mut st), k, &us, &mut out);
+            assert!(out.sent.is_empty() && out.held == 0, "mode {mode}");
+            assert!(out.asked >= 65_536 * 8, "mode {mode}");
+            assert!(run.work() - work >= 65_536 / 16 - 1, "mode {mode}");
+            assert!(out.polls.get() >= 65_536 / M_SCAN, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn the_repair_s_scans_without_output_are_charged_and_polled() {
+        // a notice whose literal is in the bodies of 50,000 root clauses that the holder
+        // holds no other literal of, and a root clause offered to the holders of its body,
+        // which share none, each charge their reads and check the run's bounds
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let [a, b, k] = ["A", "B", "K"].map(|n| sig.class(n));
+            let u = sig.ind("u");
+            let heads: Vec<Ex> = (0..64).map(|i| sig.class(&format!("H{i}"))).collect();
+            let (ix, _) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let (ga, gb) = (glit(&run, &ix, a, u), glit(&run, &ix, b, u));
+            let mut st = State::default();
+            let out = Stops::new(&run);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            ds(&mut st).store.add(Clause::new(
+                vec![ga, gb],
+                vec![glit(&run, &ix, heads[0], u)],
+            ));
+            let sample = ds(&mut st).store.clauses[0].clone();
+            for _ in 1..50_000 {
+                ds(&mut st).store.clauses.push(sample.clone());
+            }
+            let r = ds(&mut st).root.as_deref_mut().unwrap();
+            r.mw().gbody.insert(ga, (0..50_000).collect());
+            let mut out = Stops::new(&run);
+            let work = run.work();
+            assert!(rmark(&ix, &mut st, k, ga.xid(), &mut out), "mode {mode}");
+            let notice = run.work() - work;
+            assert!(notice >= 50_000 / 16 - 1, "mode {mode}: {notice}");
+            assert!(out.polls.get() >= 50_000 / M_SCAN, "mode {mode}");
+            assert_eq!(out.held, 0, "mode {mode}");
+            assert!(
+                out.asked >= 50_000 * 4,
+                "mode {mode}: the returns' ids admitted"
+            );
+            // two body literals held by 50,000 contexts each, none by both
+            let r = ds(&mut st).root.as_deref_mut().unwrap();
+            r.mw().holders.insert(ga, (100..50_100).collect());
+            r.mw().holders.insert(gb, (60_000..110_000).collect());
+            let c = Clause::new(vec![ga, gb], vec![glit(&run, &ix, heads[1], u)]);
+            let mut out = Stops::new(&run);
+            let work = run.work();
+            m_offer(&ix, &mut st, 1, &c, &mut out);
+            assert!(run.work() - work >= 50_000 / 16 - 1, "mode {mode}");
+            assert!(out.polls.get() >= 1 && out.sent.is_empty(), "mode {mode}");
+            assert_eq!(out.held, 0, "mode {mode}");
+            // with one of them held once, the offer reads the shorter list
+            let r = ds(&mut st).root.as_deref_mut().unwrap();
+            r.mw().holders.insert(gb, vec![60_000]);
+            let mut out = Stops::new(&run);
+            let work = run.work();
+            m_offer(&ix, &mut st, 2, &c, &mut out);
+            assert!(run.work() - work <= 1, "mode {mode}: the shorter list");
+        }
+    }
+
+    #[test]
+    fn a_root_unit_is_found_by_its_literal_while_it_lives() {
+        // the root's units are indexed by literal as the root processes them, so the test
+        // reads no list of the root's facts, and a unit that died is no unit
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let [a, b, cc] = ["A", "B", "C"].map(|n| sig.class(n));
+            let u = sig.ind("u");
+            let (ix, _) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let (ga, gb) = (glit(&run, &ix, a, u), glit(&run, &ix, b, u));
+            let gc = glit(&run, &ix, cc, u);
+            let RTerm::C(cu) = c(u, &ix) else { panic!() };
+            let mut st = State::default();
+            let mut out = Stops::new(&run);
+            mrep_new(rst(&mut st, &out), &out);
+            let unit = Clause::new(vec![], vec![ga]);
+            let two = Clause::new(vec![], vec![gb, gc]);
+            ds(&mut st).store.add(unit.clone());
+            ds(&mut st).store.add(two.clone());
+            m_offer(&ix, &mut st, 0, &unit, &mut out);
+            m_offer(&ix, &mut st, 1, &two, &mut out);
+            // facts the index does not list are not read
+            ds(&mut st)
+                .root
+                .as_deref_mut()
+                .unwrap()
+                .ready
+                .insert(cu, vec![0, 1]);
+            assert!(root_unit(dl(&st).unwrap(), ga), "mode {mode}");
+            assert!(!root_unit(dl(&st).unwrap(), gb), "mode {mode}");
+            ds(&mut st).store.clauses[0].dead = true;
+            assert!(!root_unit(dl(&st).unwrap(), ga), "mode {mode}");
+            let mut fresh = State::default();
+            mrep_new(rst(&mut fresh, &out), &out);
+            ds(&mut fresh).store.add(unit.clone());
+            ds(&mut fresh)
+                .root
+                .as_deref_mut()
+                .unwrap()
+                .ready
+                .insert(cu, vec![0]);
+            assert!(
+                !root_unit(dl(&fresh).unwrap(), ga),
+                "mode {mode}: not indexed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reach_charges_the_state_it_makes() {
+        // the first reach of a context that has no state for Tier D makes it, and the run's
+        // memory takes all of it
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let k = sig.class("K");
+            let (ix, _) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let mut out = Stops::new(&run);
+            let mut st = State::default();
+            let (before, held) = (run.bytes(), st.bytes());
+            assert!(rreach(&ix, k, &mut st, TOP, &mut out), "mode {mode}");
+            let (charged, made) = (run.bytes() - before, st.bytes() - held);
+            assert!(
+                charged >= made,
+                "mode {mode}: charged {charged}, made {made}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_reach_replays_registrations_once_and_tells_a_successor_once() {
+        // the registrations that wait for a context's reach go with it, and a reached
+        // context tells each successor of its reach once, however often it meets it
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let k = sig.class("K");
+            let (ix, root) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let mut out = Stops::new(&run);
+            let mut st = State::default();
+            register(&mut st, k, vec![0], &mut out);
+            rreach(&ix, root, &mut st, k, &mut out);
+            register(&mut st, k, vec![1], &mut out);
+            let m = dl(&st).unwrap().root.as_deref().unwrap().mr();
+            assert!(m.regs.get(&k).is_none_or(|v| v.is_empty()), "mode {mode}");
+            let mut st = State::default();
+            rreach(&ix, k, &mut st, TOP, &mut out);
+            out.sent.clear();
+            new_succ(&mut st, 77, &mut out);
+            new_succ(&mut st, 77, &mut out);
+            let n = out
+                .sent
+                .iter()
+                .filter(|(_, c)| matches!(c, Concl::RReach(_)))
+                .count();
+            assert_eq!(n, 1, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn the_deficits_hold_promoted_facts_and_take_cf_only_with_the_repair() {
+        // a product that derive sent the root as a fact is held, and the diagnostic reads
+        // M-return-cf's premises only where M-return ran with them
+        let mut sig = Sig::new();
+        let [b, k] = ["B", "K"].map(|n| sig.class(n));
+        let u = sig.ind("u");
+        let (ix, _) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let gb = glit(&run, &ix, b, u);
+        let mut st = State::default();
+        st.subs.insert(k);
+        ds(&mut st).empty_core = true;
+        let mut out = Stops::new(&run);
+        super::super::dl_rules::derive(&ix, &mut st, (vec![], vec![gb]), &mut out);
+        assert!(dl(&st).unwrap().promoted.contains(&[gb][..]));
+        let lists = [vec![(vec![Lit::x(k)], vec![])]];
+        let held = products_held(&ix, &st, &lists, &[gb], &run.lits, &mut |_| true);
+        assert_eq!(held, Some(true));
+        assert!(!marker_def_cf(MREPAIR_CF) && !marker_def_cf(0));
+        assert!(marker_def_cf(MREPAIR_ON | MREPAIR_CF) && !marker_def_cf(MREPAIR_ON));
+    }
+
+    #[test]
+    fn the_deficits_charge_and_poll_their_products() {
+        // 256 premises on each of two literals give 65,536 products, all tautologies, which
+        // the copy charges and polls as it goes, and a refusal of a poll ends it
+        let mut sig = Sig::new();
+        let [a, b, k, z] = ["A", "B", "K", "Z"].map(|n| sig.class(n));
+        let u = sig.ind("u");
+        let hs: Vec<Ex> = (0..512).map(|i| sig.class(&format!("H{i}"))).collect();
+        let (ix, _) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let (ga, gb) = (glit(&run, &ix, a, u), glit(&run, &ix, b, u));
+        let mut st = State::default();
+        for &h in &hs[..256] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![Lit::x(k)], vec![ga, Lit::x(z), Lit::x(h)]));
+        }
+        for &h in &hs[256..] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![Lit::x(z)], vec![gb, Lit::x(k), Lit::x(h)]));
+        }
+        let inv = inv_of(&ix, dix(&ix));
+        let order = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        let mut max = Vec::new();
+        while ds(&mut st)
+            .store
+            .next(&ix, Some(&order), &mut max)
+            .is_some()
+        {}
+        let m = MarkerCtx {
+            me: k,
+            held: vec![ga, gb],
+            succ: vec![],
+            edges: vec![],
+            units: vec![],
+        };
+        let rg = [Clause::new(vec![ga, gb], vec![])];
+        let (mut polls, mut work) = (0, 0);
+        let def = marker_def(&ix, &m, &st, &rg, &run.lits, false, &mut |n| {
+            polls += 1;
+            work += n;
+            true
+        });
+        let def = def.unwrap().unwrap();
+        assert_eq!((def.owed, def.unchecked), (0, 0));
+        assert!(
+            polls >= 65_536 / DIAG_POLL && work >= 65_536,
+            "{polls} {work}"
+        );
+        let cut = marker_def(&ix, &m, &st, &rg, &run.lits, false, &mut |_| false);
+        assert!(cut.is_err());
     }
 
     /// A small signature: classes, individuals and roles by name.

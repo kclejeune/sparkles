@@ -695,7 +695,7 @@ pub struct DlSt {
     /// in a rooted run, whether the context is taking a fact of the root, which it keeps
     pub taking_fact: bool,
     /// in a rooted run, the heads of the facts a hypothetical successor sent the root
-    promoted: FxHashSet<Box<[Lit]>>,
+    pub(super) promoted: FxHashSet<Box<[Lit]>>,
     /// the clauses over the predecessor that successors sent, by successor
     pub pred_in: FxHashMap<Ex, Vec<u32>>,
     pub(super) pred_seen: FxHashSet<(Ex, u32)>,
@@ -1951,7 +1951,7 @@ fn equality_tautology(head: &[Lit]) -> bool {
 /// Adds a clause the rules derived in this context: a unit over x goes to the EL rules, an
 /// empty clause makes the context unsatisfiable, and any other clause goes to the store
 /// unless it is redundant.
-fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: &mut S) {
+pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: &mut S) {
     if st.bottom {
         return;
     }
@@ -2213,7 +2213,7 @@ fn again(ix: &Index, st: &State, id: u32, c: &Clause, found: &mut Found) {
 }
 
 /// The clauses read that count as one derived conclusion for the work bound.
-const WORK_READS: usize = 16;
+pub(super) const WORK_READS: usize = 16;
 
 /// A class of `a` and one of `b` in a disjointness set, with the clauses that give them.
 fn disjoint(ix: &Index, a: &[(Ex, u32)], b: &[(Ex, u32)]) -> Option<(u32, u32)> {
