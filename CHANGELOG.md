@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Rooted runs with keys left after their rewriting no longer panic
+
+A rooted classification whose only individuals were in axioms outside OWL 2 EL, with a key
+over object properties that item 805's rewriting declined, exited with an internal error
+in the disjunctive rules. The rewriting declines a key past its bound, beside data, the
+bottom property or a construct it cannot rewrite, and in an ontology with a name that has
+the prefix of its made-up names. Such a run is now not rooted and gives the answer of a run
+without the option, which leaves the axioms with individuals out and reports them. Rooted
+runs that completed before give the same answers, except that some now take axioms they
+used to leave out and derive the subsumptions those axioms give. Roadmap item 1265.
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
