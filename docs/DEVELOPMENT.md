@@ -367,6 +367,37 @@ command that itself exits with one of these codes is told apart by the `outcome`
 the job's `progress.log`. The [remote CI section](REMOTE-EXECUTORS.md#remote-ci) gives the
 details.
 
+### Script tests
+
+The Python tests of the CI, gate and benchmark scripts live in `scripts/bench-tests`, and
+`mise run test:bench-scripts` runs them with `scripts/unittest-parallel.py`, eight
+processes at a time. `python3 -m unittest discover -s scripts/bench-tests` runs the same
+tests serially and reaches the same verdict. The runner discovers the suite once in a
+child process and then starts one process per module or package that discovery loads. Each
+process discovers the whole suite again, checks that it found the same tests in the same
+order, and runs its own part exactly as discovered. Import errors, import-time skips,
+`load_tests` hooks, test classes imported into another module and class and module
+fixtures therefore behave as they do serially. The three long tests of `test_x08_latency`
+run one per process. A module named with `--split` is split this way only when it has no
+fixtures, custom suites, imported classes or repeated tests, and otherwise runs whole with
+a note that says why.
+
+Each process writes a result record, and the runner takes its verdict from those records
+and from unittest's own results, never from the printed output. A process that ends without
+a complete record fails, and a run in which no test ran and none was skipped exits 5, as
+unittest does. The process-leak check in `test_zz_process_leaks.py` runs once, after every
+other process, on the unwaited subprocesses that each process reports after its tests and
+teardown. Discovery has a 300 s deadline and each process a 900 s deadline, which
+`--discover-timeout` and `--unit-timeout` change. At a deadline, or on SIGINT or SIGTERM,
+the runner stops the process's group and every descendant it can find, with SIGKILL after
+a grace period that `--grace` sets, and fails the run.
+
+Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
+`test_git_isolation.py` fails when one does not. The import removes the host's `GIT_*`
+variables and global Git configuration, such as hooks, signing and templates, so a fixture
+repository and any script a test runs see only their own settings. A new test module needs
+the same first import, even when it runs Git only through another script.
+
 ### Remote executors
 
 Prefer available local resources before renting another worker. A 16 GiB Boat worker is

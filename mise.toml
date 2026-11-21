@@ -555,8 +555,11 @@ run = "mbx test -p sparkles-core --test csvw_conformance -- --nocapture"
 description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare), and the crash harness's own tests (scripts/crash-harness.rs)"
 run = [
   # One process per test module, up to eight at a time, since the tests mostly wait on
-  # subprocesses and sleeps. The three long x08 latency tests run one per process.
-  # `python3 -m unittest discover -s scripts/bench-tests` still runs the same tests serially.
+  # subprocesses and sleeps. Each process discovers the whole suite and runs its module as
+  # discovered, and the verdict comes from each process's result record. The three long x08
+  # latency tests run one per process, and the process-leak check runs last on every
+  # process's report. `python3 -m unittest discover -s scripts/bench-tests` runs the same
+  # tests serially with the same verdict. docs/DEVELOPMENT.md "Script tests" has the details.
   "python3 scripts/unittest-parallel.py --split test_x08_latency scripts/bench-tests",
   # The test binary is scratch output outside the managed target, which Boxington can
   # collect between commands and leave as a dangling link.
