@@ -10,6 +10,8 @@ which took about half of the invalidation's 105 ms on `ore_ont_13482` on `wally`
 few dozen cleared contexts. A kept context renumbers its disjointness sets only when the
 run's sets differ from the last run's, the invalidation's two reads of every context use
 bit sets, and its scratch counts against the memory budget, as roadmap item 1256 records.
+On `wally` with four threads an edit of `ore_ont_13482` takes 408.1 ms against 485.9 ms
+before, and an edit of `ore_ont_9499` 138.6 ms against 146.6 ms.
 `incremental_classify` also prints the resident bytes of the first edit's run. The
 reasoning guide states the higher peak of a kept run, whose contexts stay live beside the
 second build of the index, and roadmap item 1254 covers incremental normalization and

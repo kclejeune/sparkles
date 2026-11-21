@@ -105,8 +105,12 @@ and the two remaining reads of every context use bit sets. The invalidation admi
 bit sets and the normalized premises of the changed axioms before it starts, and its lists
 of parts, of the walk and of the cleared contexts before each grows. It also admits the
 larger disjointness maps that kept contexts need when they number their sets again,
-before any context changes, and an unsatisfiable context keeps no map. Items 590 and 664 wait for
-item 1254, since on that file the index build and the checks before it are 0.47 of a run
+before any context changes, and an unsatisfiable context keeps no map. On `wally` with four
+threads, in alternating runs of 7885a660 against 3afa8c52 that each passed the check against
+a fresh run, the kept index stage of `ore_ont_13482` fell from 423.5 to 347.6 ms and its edit
+from 485.9 to 408.1 ms, 0.68 of a run that starts again, and the edit of `ore_ont_9499` fell
+from 146.6 to 138.6 ms. Items 590 and 664 wait for item 1254, since on `ore_ont_13482`
+the index build and the checks before it are 0.47 of a run
 that starts again.
 
 Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
