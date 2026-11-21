@@ -175,7 +175,7 @@ def _own(module, name):
 def _id(test):
     """TEST's id, or for a test that is not a TestCase or a suite of a kind of its own, a name
     for its kind, which the runner finds without asking the test anything."""
-    if _is_case(test):
+    if _is_case(test) and not _is_suite(test):
         return test.id()
     return f"<{type(test).__module__}.{type(test).__qualname__}>"
 
@@ -228,7 +228,7 @@ def _label(loader, entry, index):
         # and unittest.loader.ModuleSkipped.MODULE.
         if type(t).__module__ == "unittest.loader":
             return _id(t).rsplit(".", 1)[-1]
-        if not _is_case(t):
+        if _is_suite(t) or not _is_case(t):
             return type(t).__module__
         return _id(t).rsplit(".", 2)[0]
     return f"entry-{index}"

@@ -683,6 +683,29 @@ class Discovery(Base):
         s, p = self.same_verdict(d, "--split", "test_a", expect=0)
         self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
 
+    def test_a_suite_kind_that_is_also_a_testcase_is_one_occurrence(self):
+        # Review r10 finding 1: a suite is named by its kind, even when it is a TestCase too.
+        mixed = """
+            import unittest
+
+            class T(unittest.TestCase):
+                def test_ok(self):
+                    pass
+
+            def load_tests(loader, tests, pattern):
+                # Made here, so that discovery does not load it as a test class.
+                class Mixed(unittest.TestSuite, unittest.TestCase):
+                    pass
+                ROOT
+                return Mixed(tests)
+            """
+        for root in ("pass", "loader.suiteClass = Mixed"):
+            with self.subTest(root=root):
+                d = self.suite(test_a=ONE, test_z=mixed.replace("ROOT", root))
+                for args in ((), ("--split", "test_z")):
+                    s, p = self.same_verdict(d, *args, expect=0)
+                    self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
+
     def test_a_repeated_occurrence_runs_each_time(self):
         d = self.suite(test_rep="""
             import unittest
