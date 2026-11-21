@@ -1985,7 +1985,7 @@ same rules and messages in the same order. Axioms are left out or used in part i
 those pairs. On both builds the reader refuses one DL file for an invalid IRI, and the 10
 GiB cap of its scope ends the process of another. The
 index stage of `ore_ont_13482` on one thread takes 0.625 of the base's time, and the
-whole classification 0.871, below 1 in every round. Against ELK's 2,766 ms in
+whole classification 0.871, the median of the per-round ratios, which is below 1 in every round. The medians of the two builds' times, 898.2 and 999.4 ms, divide to 0.899. Against ELK's 2,766 ms in
 [Against ELK](#against-elk), which was not run again, the tip's 898 ms is 3.08 times
 faster. The base itself takes 999 ms in these rounds, against 897 ms in that table. The
 peak resident set of `ore_ont_13482` falls from 1,304 to 1,289 MiB, and the classifier's
@@ -2003,7 +2003,7 @@ fewer instructions than the check. The saturation's worker function has the same
 base's is 10,848 bytes, since the inlining in the crate moved with the check's change. On `atlas`, a build of the tip that
 copies the IRI at each role it finds, as the base did, ran GO at 1.058 of the check's
 time and the tip at 1.057 in seven rounds, so the move comes from where the code lies
-and not from the heap. Roadmap item 1280 holds GO's 1.0% on one thread, with item 722.
+and not from the heap. Roadmap item 1288 holds GO's 1.0% on one thread, with item 722.
 
 Two further ideas for the index stage were not built. The negative occurrences of the whole index
 took 4 ms on `ore_ont_13482` on the laptop, so a reused stack can save less than that,

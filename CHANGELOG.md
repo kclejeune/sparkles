@@ -19,13 +19,14 @@ start, as nearly every restart of the October run did, which is consistent with 
 
 Roadmap item 1269 removes allocations from the index stage of OWL 2 EL classification.
 The profile check of each axiom walks it without allocating and falls back to the full
-check, which copied each class and property IRI into a signature, only for an axiom that
-may break a rule, so the axioms left out keep their rules and messages. Normalization
+check, which copied each class and property IRI into a signature, only for an axiom the
+walk cannot accept, such as one that may break a rule or one with data restrictions or
+keys, which still allocate in that check, so the axioms left out keep their rules and messages. Normalization
 looks up an object property's role by its IRI in a table of role ids. On forge
-`ore_ont_13482` classifies on one thread in 898 ms against 999 ms, 0.871 of the base's
-time, with its index stage at 0.625, and ChEBI lite takes 0.964 on one and 0.956 on four
+`ore_ont_13482` classifies on one thread in a median of 898 ms against 999 ms, and its paired rounds give a
+median ratio of 0.871 of the base's time, with its index stage at 0.625, and ChEBI lite takes 0.964 on one and 0.956 on four
 threads. GO's index stage is faster too, but its saturation moved with the code's layout
-and the whole classification takes 1.0% longer on one thread, which item 1280 holds.
+and the whole classification takes 1.0% longer on one thread, which item 1288 holds.
 ### The reasoner's random closure sessions run as three tests
 
 `random_sessions_derive_what_the_joins_derive` in sparkles-reasoner derived its six random

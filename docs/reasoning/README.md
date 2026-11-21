@@ -1152,7 +1152,7 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   give the rounds.
 * GO classifies 1.0% slower on one thread on the benchmark host since the index stage
   stopped allocating in its profile check. Its index stage is faster, and its saturation,
-  whose code did not change, moved with the code's layout. Roadmap item 1280 follows it,
+  whose code did not change, moved with the code's layout. Roadmap item 1288 follows it,
   and the
   [EL classification results](../benchmarks/el-classification/RESULTS.md#allocations-of-the-index-stage)
   give the rounds.
