@@ -192,7 +192,9 @@ impl Stream {
                 Some(e) => e,
                 None => self.recv().await?,
             };
+            // positioned diffs do not merge, so waiting for the next would only delay them
             if !self.coalesce.is_zero()
+                && !e.positioned()
                 && matches!(e, LiveEvent::Diff { .. } | LiveEvent::Value { .. })
             {
                 #[cfg(all(test, feature = "auth"))]

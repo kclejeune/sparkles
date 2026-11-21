@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Views keep ORDER BY with LIMIT as an ordered window
+
+A view or live query whose SELECT has `ORDER BY` with `LIMIT` and `OFFSET` no longer
+evaluates its whole query again at every commit that touches it. It keeps the best
+`k + m + max(k, 100)` rows in order, promotes the next row when one leaves the window and
+refills the reserve from its input when it runs out, as roadmap item 419. A live query's
+rows now carry a `position`, its diffs list the rows that leave with their old positions
+and the rows that enter with their new ones, and `view:read` returns the window in order.
+Ordered live queries no longer merge diffs under `coalesceMs` and resume with a `reset`.
+The view compiler's version changed, so every existing view is built again once after the
+upgrade.
+
 ### A kept EL classification over its memory budget starts again in full
 
 A kept OWL 2 EL run counts the contexts it keeps and its own new state against

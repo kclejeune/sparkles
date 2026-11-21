@@ -169,9 +169,10 @@ impl Window {
 
     /// The window as segments of the kept rows.
     fn segments(&self) -> Vec<Segment> {
+        let big = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let (start, end) = (
-            self.offset as i64,
-            (self.offset as i64).saturating_add(self.limit as i64),
+            big(self.offset),
+            big(self.offset).saturating_add(big(self.limit)),
         );
         let mut out = Vec::new();
         let mut at: i64 = 0;
@@ -277,15 +278,30 @@ impl Window {
     /// `SAMPLE` keeps its value while the group holds it, and a fresh one takes the
     /// smallest). The other rows of the best `cap` then join them at their places, and
     /// copies of a row that is kept already join its entry.
-    fn fill(&mut self, p: &Pass, rows: Changes, keep: bool) {
+    fn fill(&mut self, p: &mut Pass, rows: Changes, keep: bool) -> Result<()> {
         self.total = rows.iter().map(|(_, w)| *w).sum();
         let cap = usize::try_from(self.cap()).unwrap_or(usize::MAX);
         let mut top: TopK<(Row, i64)> = TopK::new(cap, self.asc.clone());
         let mut partial = false;
         let mut left: FxHashMap<Row, i64> = FxHashMap::default();
-        for (r, w) in rows {
+        let per = self.per_row();
+        for (i, (r, w)) in rows.into_iter().enumerate() {
             if w <= 0 {
                 continue;
+            }
+            p.tick()?;
+            // the heap is the operator's state to be, charged as it grows
+            if i % 4096 == 4095
+                && let Some(max) = p.max_memory_bytes
+            {
+                let used = (top.kept() as u64).saturating_mul(per);
+                if used > max {
+                    return Err(crate::error::Error::BudgetExceeded(crate::error::Budget {
+                        kind: crate::error::BudgetKind::Memory,
+                        limit: max,
+                        requested: used,
+                    }));
+                }
             }
             let keys = self.key_of(p, &r);
             partial |= keys.iter().any(|k| !k.totally_ordered());
@@ -344,6 +360,13 @@ impl Window {
         }
         self.partial = partial;
         self.trim();
+        Ok(())
+    }
+
+    /// The memory of one kept row besides its keys' strings.
+    fn per_row(&self) -> u64 {
+        (std::mem::size_of::<Entry>() + self.keys.len() * std::mem::size_of::<SortKey>()) as u64
+            + row_bytes(self.inner.schema.len())
     }
 
     fn inner_init(&mut self, p: &mut Pass) -> Result<Changes> {
@@ -364,7 +387,7 @@ impl Window {
         self.moves = None;
         self.stale = false;
         let rows = self.inner_init(p)?;
-        self.fill(p, rows, false);
+        self.fill(p, rows, false)?;
         Ok(self.rows())
     }
 
@@ -393,12 +416,13 @@ impl Window {
         if partial {
             // no sorted vector without a total order: the input's rows again
             let rows = self.inner_init(p)?;
-            self.fill(p, rows, false);
+            self.fill(p, rows, false)?;
             return Ok(self.diff(old));
         }
         // removals first, so that an insert sees the kept rows without them
         let (rem, add): (Vec<_>, Vec<_>) = keyed.into_iter().partition(|(_, w, _)| *w < 0);
         for (r, w, k) in rem {
+            p.tick()?;
             self.total += w;
             if let Some(i) = self.find(&r, &k) {
                 let e = &mut self.kept[i];
@@ -411,6 +435,7 @@ impl Window {
             }
         }
         for (r, w, k) in add {
+            p.tick()?;
             let complete = self.held == self.total;
             self.total += w;
             if let Some(i) = self.find(&r, &k) {
@@ -450,7 +475,7 @@ impl Window {
             // the reserve ran out: the input's own operators give its rows again
             self.refills += 1;
             let rows = self.inner_init(p)?;
-            self.fill(p, rows, true);
+            self.fill(p, rows, true)?;
         }
         Ok(self.diff(old))
     }
@@ -498,10 +523,9 @@ impl Window {
     }
 
     pub fn bytes(&self) -> u64 {
-        let width = self.inner.schema.len();
         // the vector's slots, whether used or not, then each row's ids and keys
         let slots = self.kept.capacity() as u64 * std::mem::size_of::<Entry>() as u64;
-        let per = row_bytes(width) + (self.keys.len() * std::mem::size_of::<SortKey>()) as u64;
+        let per = self.per_row() - std::mem::size_of::<Entry>() as u64;
         slots
             + self
                 .kept
@@ -534,7 +558,9 @@ impl Window {
                     "a view's window holds a row of another width or weight".into(),
                 ));
             }
-            held += w;
+            held = held.checked_add(w).ok_or_else(|| {
+                crate::error::Error::Corrupt("a view's window holds too many rows".into())
+            })?;
             self.serial += 1;
             kept.push(Entry {
                 row,

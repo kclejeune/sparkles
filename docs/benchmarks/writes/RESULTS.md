@@ -993,6 +993,37 @@ Namespace instance for the build before item 418 and the build with it. The medi
 0.85, 1.23 and 0.94 of the base's transactions per second, with every range overlapping,
 and item 907 pins them on the batch screen and forge.
 
+### Ordered windows in views
+
+The ignored test `window_against_recompute` of `crates/sparkles-core/tests/incr_bench.rs`
+measures the ordered windows of
+[F13 §4.4](../../specs/F13-incremental-views-and-provenance.md#ordered-windows) on the
+people data of the other view tests. Its 400 commits are small. Half of them remove the
+age of the oldest person, so the window loses its first row and the reserve runs out, a
+quarter change one person's age and a quarter add a member with an age. Before item 419
+each such view was a `recompute` node that evaluated the query at every commit that
+touched it, so the query time is what each commit cost then. `oldest` and
+`oldest-page-5` order the ages with the person as a tie-breaker, the second at offset 40,
+and `largest-teams` orders the team sizes of a grouped count.
+
+The run below used a release build of commit TIP on wally, an Intel Core i7-12800H
+with 20 threads, under the host's heavy lock, with 200,000 people. Every view's
+maintained rows matched its query evaluated again at the end. The raw output is the
+lane's `window_against_recompute-wally-TIP.log`. The numbers are a development-host
+measurement for the design, not a published result.
+
+| View | Build ms | Query ms | Pass median ms | Pass p95 ms | Pass max ms | Query / pass | State MiB |
+|---|--:|--:|--:|--:|--:|--:|--:|
+ROWS
+
+A pass costs 14 to 18 µs at the median against 0.8 to 2.2 ms for the query. The largest
+pass of `oldest` and `oldest-page-5` is a refill, which evaluates the window's input
+again, here a scan of the 200,000 ages, at about 50 ms. The 200 deletions at the front run
+the reserve of 100 rows out twice, so two of the 400 commits pay it. The engine answers
+the query itself from a bounded top-k in about 2 ms, and a refill that read the engine's
+answer instead would cost that, which roadmap item 1265 takes up for inputs whose
+evaluation gives the same ids as the circuit.
+
 ### Incremental view gate baseline
 
 `mise run bench:incr` is the rewrite gate of incremental view maintenance, as

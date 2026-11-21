@@ -656,3 +656,46 @@ fn a_hidden_key_never_meets_a_query_variable() {
     let c = circuit(&s, q);
     assert_eq!(window(&c), ["2"]);
 }
+
+/// Review of item 419: a refill whose evaluation changes a kept row's key drops the
+/// stale row and places the new one in order.
+#[test]
+fn a_refill_reorders_rows_its_input_changed() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut data = vec![format!(":g0 :w \"300\"^^<{INT}>")];
+    data.extend((1..=102).map(|i| format!(":g{i} :w \"{}\"^^<{INT}>", 100 + i)));
+    upd(&s, &format!("INSERT DATA {{ {} }}", data.join(" . ")));
+    let q = "SELECT ?g ?x WHERE { { SELECT ?g (SAMPLE(?v) AS ?x) WHERE { ?g :w ?v } GROUP BY ?g } } ORDER BY DESC(?x) LIMIT 2";
+    let mut c = circuit(&s, q);
+    assert_eq!(window(&c), ["g0 300", "g102 202"]);
+    // the maintained sample of g0 stays 300, and an evaluation takes the smallest, 1
+    upd(&s, &format!("INSERT DATA {{ :g0 :w \"1\"^^<{INT}> }}"));
+    step(&s, &mut c);
+    assert_eq!(window(&c), ["g0 300", "g102 202"]);
+    let d: Vec<String> = (2..=102)
+        .map(|i| format!(":g{i} :w \"{}\"^^<{INT}>", 100 + i))
+        .collect();
+    upd(&s, &format!("DELETE DATA {{ {} }}", d.join(" . ")));
+    step(&s, &mut c);
+    assert_eq!(window_op(&c).refills, 1);
+    assert_eq!(window(&c), ["g1 101", "g0 1"]);
+}
+
+/// Review of item 419: a LIMIT or OFFSET beyond the 64-bit signed range neither wraps
+/// nor loses rows.
+#[test]
+fn huge_limits_and_offsets_do_not_wrap() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data: Vec<String> = (1..=10).map(|i| triple(i, i as i64)).collect();
+    upd(&s, &format!("INSERT DATA {{ {} }}", data.join(" . ")));
+    let all = circuit(
+        &s,
+        "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 10000000000000000000",
+    );
+    assert_eq!(window(&all).len(), 10);
+    let none = circuit(
+        &s,
+        "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 10 OFFSET 18446744073709551615",
+    );
+    assert!(window(&none).is_empty());
+}

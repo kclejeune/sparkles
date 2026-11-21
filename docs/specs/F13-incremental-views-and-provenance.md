@@ -876,8 +876,9 @@ records it. The fixed-point operator of item 417 was delivered on 2026-11-01, an
 [Fixed-point operator](#fixed-point-operator) records it. The aggregates and the
 correlated `EXISTS` of item 418 were delivered on 2026-11-10, and
 [Aggregates and correlated EXISTS](#aggregates-and-correlated-exists) records them. The
-rest of Phases 2 and 3 is not built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as
-items 416 and 419 to 429.
+ordered windows of item 419 were delivered on 2026-11-21, and
+[Ordered windows](#ordered-windows) records them. The rest of Phases 2 and 3 is not
+built, and [ROADMAP](../ROADMAP.md) item 17 tracks it as items 416 and 420 to 429.
 
 - `crates/sparkles-core/src/incr/` holds the core. `zset.rs` keeps rows of ids with
   `i64` weights. `compile.rs` compiles the spargebra algebra into a circuit of the
@@ -1568,6 +1569,69 @@ The writes screen with four table views, which [ROADMAP](../ROADMAP.md) item 17 
 ran three rounds on a Namespace instance with `serial-literal` at 0.85 of the base's
 transactions per second, `mixed` at 0.94 and `writers` at 1.23, with every range
 overlapping, which item 907 pins on the batch screen and forge.
+
+### Ordered windows
+
+Item 419 delivered the ordered windows of §4.4 on 2026-11-21. A SELECT with `ORDER BY`
+and `LIMIT k OFFSET m` compiles to the window operator of `incr/ops/window.rs` in place
+of the `recompute` node it was before.
+
+- The compiler peels the algebra's `Slice`, `Distinct`, `Project` and `OrderBy`. Each
+  order expression that is not a variable becomes a hidden variable bound by an `Extend`
+  below the projection, the projection keeps the key variables, and a projection above
+  the window drops them again. A `DISTINCT` ordered by a variable it does not project
+  stays a `recompute` node, since its rows are not the distinct projected rows. So do
+  `LIMIT` without `ORDER BY`, which §4.4 leaves out, `OFFSET` without `LIMIT`, an
+  `EXISTS` in an order key and a window under `GRAPH ?g`.
+- The operator keeps the best `k + m + max(k, 100)` copies of its input in a vector
+  sorted by the engine's sort keys (`sparql::sortkey`), which reproduce `order_cmp`. Every
+  row it does not keep orders at or after every row it keeps, and it may keep only some
+  copies of a row, which is what lets a trim and a refill cut through ties and
+  duplicates. It also keeps the input's total weight, so it knows when rows exist beyond
+  the kept ones. A row enters when it orders no later than the last kept row or when the
+  kept rows hold the whole input. Removals subtract from the row's entry.
+- When the kept rows fall below `k + m` while the input holds more, the operator runs its
+  input's `init` at the new snapshot and refills from those rows, keeping its own rows
+  and their order first. The spec's refill by the query engine was not used, because the
+  circuit's floating-point sums and its `GROUP_CONCAT` and `SAMPLE` can differ from a
+  one-off evaluation, so the engine's rows would not match the input's rows by id. The
+  cost is one evaluation of the input per refill, which a run of deletions at the front
+  pays once per `max(k, 100)` of them.
+- Rows that the order does not tell apart keep the order in which they entered the kept
+  rows. The vector is saved in order and the keys depend on the terms, so a checkpoint
+  and a generation switch keep it. Keys whose order is not total, such as dates with and
+  without a timezone or NaN, make a sorted vector unsound, so a window that holds or
+  receives one rebuilds its rows from its input at each pass that changes it.
+- Each kept row has a serial that lives in memory, and its copies are numbered. The
+  window before and after a pass is a list of copies, and the copies in one list and not
+  the other are the moves. The window at a SELECT's root reports them, with positions
+  counted from the first row the query returns, as `LiveRow::position`. A row that moves
+  with the same projected values appears in both lists, which is why a positioned diff
+  comes from the operator and not from the result's consolidated change. The result and
+  its history stay a Z-set, so views read at past commits as before, without the order.
+  A live query's snapshot lists the window in order, `view:read` returns it in order, a
+  positioned diff does not merge under `coalesceMs`, and a resume or a re-evaluation of
+  an ordered query sends a `reset`. The live-query wire format gains an optional
+  `position` and no version, since a client that ignores it reads a correct multiset
+  change, as the format's other optional fields do. Python's events add `positions`,
+  `removedPositions` and `addedPositions`.
+- `ops::Op` gained a variant, so `COMPILER` is `f13-phase2-3` and every view
+  checkpointed by an earlier compiler is refused by its fingerprint and built again
+  once. The window's state is its input's total weight and its rows with their copies,
+  in order.
+- Under a provenance setting a window's rows carry unknown witnesses, as the `recompute`
+  node did, while its input keeps its annotations current.
+
+The window's differential tests in `incr/window_tests.rs` check eight windows through
+random histories against a model of the data, with ties, duplicates, an offset, an
+expression key, a key outside the projection, `DISTINCT`, a grouped count and `LIMIT 0`.
+They compare the keys position by position and the rows of each key, allowing any choice
+among ties at the window's edges, and a client that applies every pass's moves must hold
+the window in order. Further tests cover changes above, inside and below a window, a row
+that moves, duplicates that a window cuts, the number of refills over 250 deletions, the
+compiler's fallbacks and a window in a subquery against the engine.
+
+BENCH_SUMMARY
 
 ### Maintained assessments and conservative dependencies
 

@@ -69,8 +69,9 @@ impl LiveEvent {
         }
     }
 
-    /// Whether the event's rows carry positions.
-    fn positioned(&self) -> bool {
+    /// Whether the event's rows carry positions, which an ordered window's do. Such
+    /// events do not [`merge`](Self::merge).
+    pub fn positioned(&self) -> bool {
         let any = |rows: &[LiveRow]| rows.iter().any(|r| r.position.is_some());
         match self {
             LiveEvent::Snapshot { rows, .. } => any(rows),

@@ -1192,9 +1192,9 @@ fn window_against_recompute() {
         ),
     ];
     println!(
-        "| view | build ms | query ms | pass median ms | pass p95 ms | query / pass | state MiB |"
+        "| view | build ms | query ms | pass median ms | pass p95 ms | pass max ms | query / pass | state MiB |"
     );
-    println!("|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|");
     for (name, q) in windows {
         let text = format!("{PREFIX}{q}");
         let t = Instant::now();
