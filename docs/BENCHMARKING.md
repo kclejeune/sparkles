@@ -1226,7 +1226,10 @@ the host's locks and queues a systemd user unit that takes `~/lanes/.bench.lock`
 checks again under the locks, times a first pass, reruns the queries flagged in any pair
 with more rounds and writes `verdict.md`. A pass cannot decide a pair when the two arms
 answer a query differently, when either arm's answer check fails or when an arm has no
-answer to a query, and `verdict.md` marks that pass invalid and names those queries.
+answer to a query, and `verdict.md` marks that pass invalid and names those queries. Every
+staged query needs these answers, whether or not its requests left a timing. In a run of
+several tips or clients, every arm must give the same answers, so one arm that answers
+differently stops every pair of the run.
 
 The harness forks curl, grep and awk for every request. `REQUEST_CLIENT=persistent` sends
 the same requests from one process over one kept-alive connection, without those processes.

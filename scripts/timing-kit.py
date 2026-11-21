@@ -37,8 +37,9 @@ execution times is at FLAG_RATIO or more in any pair then run again with RERUN_R
 rounds of RERUN_REPS requests. Each pair gets its own summary and validity from
 nsc-bench-summary.py --pair, and verdict.md lists them. A pass is invalid when its host
 was not quiet, when a query lacks timings, or when the two arms of a pair answer a query
-differently, fail its answer check or lack an answer to it, and verdict.md names the
-queries whose answers stopped it. DONE gets the exit status, which is 3 when a pass that
+differently, fail its answer check or lack an answer to it, or when any arm of the run
+answers a query differently from the others, and verdict.md names the queries whose
+answers stopped it. DONE gets the exit status, which is 3 when a pass that
 decides is invalid.
 """
 
@@ -622,10 +623,15 @@ def write_verdict(stage, flagged):
             rerun_ok = subprocess.run([sys.executable, str(summary), "--check", str(j), "rerun", " ".join(own)]).returncode
             r = json.loads(j.read_text())
             slower = [(q, r["queries"][q]["exec_ms"]["ratio"]) for q in own if r["queries"].get(q, {}).get("exec_ms", {}).get("ratio", 0) >= flag]
-            rerun_answers = answer_problems(r.get("answers"), own)
+            rerun_answers = "; ".join(x for x in (answer_problems(r.get("answers"), own),
+                                                  "of the run's arms " + answer_problems(r.get("answers_all_arms"), own)
+                                                  if answer_problems(r.get("answers_all_arms"), own) else "") if x)
         invalid |= bool(first or rerun_ok)
         v = p1.get("validity") or {}
         first_answers = answer_problems(p1.get("answers"), list(p1.get("answers") or p1["queries"]))
+        arms = answer_problems(p1.get("answers_all_arms"), list(p1.get("answers") or p1["queries"]))
+        if arms:
+            first_answers = "; ".join(x for x in (first_answers, f"of the run's arms {arms}") if x)
         lines.append(f"- {label.get(y, y)} ({y}) against {label.get(x, x)} ({x}): first pass "
                      f"{'valid' if not first else 'INVALID'} (spread {v.get('spread', float('nan')) * 100:.1f}%"
                      + (f", answers {first_answers}" if first_answers else "") + "), "

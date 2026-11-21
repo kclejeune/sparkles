@@ -309,7 +309,8 @@ class KitTests(unittest.TestCase):
         r = kit("run", s, env=self.env, timeout=600)
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
         verdict = (s / "verdict.md").read_text()
-        self.assertIn("same (B) against base (A): first pass valid", verdict)
+        # B answers as A does, but the other arms of its run do not, so it cannot decide either
+        self.assertIn("same (B) against base (A): first pass INVALID (spread 0.0%, answers of the run's arms differ for", verdict)
         self.assertIn("wrong (C) against base (A): first pass INVALID", verdict)
         self.assertIn("slowwrong (D) against base (A): first pass INVALID", verdict)
         for line in verdict.splitlines():
@@ -320,6 +321,7 @@ class KitTests(unittest.TestCase):
         for pair, status in (("A-B", "same"), ("A-C", "differ"), ("A-D", "differ")):
             p1 = json.loads((s / "pass1" / f"summary-{pair}.json").read_text())
             self.assertEqual(set(p1["answers"].values()), {status}, pair)
+            self.assertEqual(set(p1["answers_all_arms"].values()), {"differ"}, pair)
         self.assertEqual(set(json.loads((s / "rerun" / "summary-A-D.json").read_text())["answers"].values()), {"differ"})
 
 

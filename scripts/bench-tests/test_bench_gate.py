@@ -827,8 +827,9 @@ class GateTests(unittest.TestCase):
             self.assertIn("same sorted TSV answers", r.stdout)
             s = json.loads((Path(d) / "summary-A-B.json").read_text())
             self.assertAlmostEqual(s["queries"]["q"]["exec_ms"]["ratio"], 1.0, places=2)
+            # C's other answer to q stops the pair A,B too, since every arm of a run must agree
             self.assertEqual(subprocess.run([sys.executable, str(summary), "--check",
-                                             str(Path(d) / "summary-A-B.json"), "first"]).returncode, 0)
+                                             str(Path(d) / "summary-A-B.json"), "first"]).returncode, 1)
             r = subprocess.run([sys.executable, str(summary), "--pair", "A,A", d], capture_output=True, text=True)
             self.assertIn("two different variants", r.stderr)
 
@@ -923,9 +924,16 @@ class GateTests(unittest.TestCase):
                 "empty": ("A\tp\t1\tx\t\nA\tq\t1\ty\t-\nB\tp\t1\tx\t\nB\tq\t1\ty\t-\n", {"p": "failed", "q": "same"}, 1),
                 # B's answer rows are absent
                 "missing": ("A\tp\t1\tx\nA\tq\t1\ty\n", {"p": "missing", "q": "missing"}, 1),
+                # an empty TSV response counts -1 rows, and the same malformed record of both
+                # variants is a failed check
+                "negative": ("A\tp\t-1\te3b0\nA\tq\t1\ty\nB\tp\t-1\te3b0\nB\tq\t1\ty\n", {"p": "failed", "q": "same"}, 1),
+                "nonnumeric": ("A\tp\tmany\tx\nA\tq\t1\ty\nB\tp\tmany\tx\nB\tq\t1\ty\n", {"p": "failed", "q": "same"}, 1),
+                "extra": ("A\tp\t1\tx\t-\tz\nA\tq\t1\ty\nB\tp\t1\tx\t-\tz\nB\tq\t1\ty\n", {"p": "failed", "q": "same"}, 1),
             }
             for name, (rows, status, rc) in cases.items():
-                res.joinpath("answers.tsv").write_text(rows + "C\tp\t1\tother\nC\tq\t1\ty\n")
+                # C answers as A does, so that only the pair decides here
+                c = "".join("C" + line[1:] + "\n" for line in rows.splitlines() if line.startswith("A"))
+                res.joinpath("answers.tsv").write_text(rows + c)
                 out = subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, text=True)
                 self.assertEqual(out.returncode, 0, out.stderr)
                 s = json.loads((Path(d) / "summary-A-B.json").read_text())
@@ -939,14 +947,35 @@ class GateTests(unittest.TestCase):
                 # a rerun of q is judged by q's answers, and a rerun of p by p's
                 self.assertEqual(check(d, "summary-A-B.json", "rerun", "q").returncode, int(status["q"] != "same"), name)
                 self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, int(status["p"] != "same"), name)
-            # in the same multi-variant run, C's other answer to p reaches only the pair with C
+            # in the same multi-variant run, C's other answer to p stops every pair, since the
+            # arms of one run must all answer alike, and the pair with C names its own reason
             res.joinpath("answers.tsv").write_text(cases["same"][0] + "C\tp\t1\tother\nC\tq\t1\ty\n")
             for pair in ("A,B", "A,C"):
                 subprocess.run([sys.executable, str(summary), "--pair", pair, d], capture_output=True, check=True)
-            self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 0)
+            ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual((ab["answers"], ab["answers_all_arms"]), ({"p": "same", "q": "same"}, {"p": "differ", "q": "same"}))
+            r = check(d, "summary-A-B.json", "first")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("the answers of the run's arms differ for p", r.stderr)
+            self.assertEqual(check(d, "summary-A-B.json", "rerun", "q").returncode, 0)
+            self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, 1)
             self.assertEqual(json.loads((Path(d) / "summary-A-C.json").read_text())["answers"], {"p": "differ", "q": "same"})
             self.assertEqual(check(d, "summary-A-C.json", "first").returncode, 1)
             self.assertEqual(check(d, "summary-A-C.json", "rerun", "q").returncode, 0)
+            # a staged query without a sample is still required, by its answers and timings
+            (Path(d) / "queries").mkdir()
+            for q in ("p", "q", "r"):
+                (Path(d) / "queries" / f"{q}.rq").write_text("ASK {}\n")
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\n")
+            for extra in ("", "A\tr\terror\terror\nB\tr\terror\terror\nC\tr\terror\terror\n"):
+                same = "".join(f"{v}\t{q}\t1\tx\n" for v in "ABC" for q in "pq")
+                res.joinpath("answers.tsv").write_text(same + extra)
+                subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+                ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertEqual(ab["answers"]["r"], "failed" if extra else "missing")
+                self.assertEqual(ab["missing"], ["r"])
+                self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 1)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, 0)
             # a summary written before the answer statuses is refused with a way out
             old = json.loads((Path(d) / "summary-A-B.json").read_text())
             old.pop("answers")

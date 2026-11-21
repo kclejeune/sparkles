@@ -29,7 +29,11 @@ first lines.
 
 The answer check of each query compares the sorted TSV answer of A with that of B, and
 summary.json gets its status under "answers": "same", "differ" when the answers differ,
-"failed" when either variant's check failed, or "missing" when a variant has no answer row.
+"failed" when either variant's check failed or its record is malformed, or "missing" when a
+variant has no answer row. Every query staged in OUT/queries is required, whether or not
+its requests left a sample. "answers_all_arms" holds the same check across every variant of
+the run, so that one pair of a multi-variant run cannot decide while another arm answers
+differently.
 
 --check exits 0 when a pass may decide and 1 when it may not. A first pass needs a valid
 run with timings of both variants for every query, each from at least two server processes
@@ -119,23 +123,29 @@ def thin(m):
     return min(m.get("epochs_a", 0), m.get("epochs_b", 0)) < MIN_EPOCHS
 
 
-def answer_status(order, answers):
-    """The answer check of each query, from rows of variant, query, rows, digest and an
-    optional order digest: same, differ, failed or missing."""
+def answer_record_ok(r):
+    """Whether the fields after variant and query are a successful answer check: a row count
+    of zero or more, a digest and, with ORDER_DIGEST, an order digest, none of them empty."""
+    return len(r) in (2, 3) and r[0].isdigit() and all(x and x != "error" for x in r)
+
+
+def answer_status(queries, answers, variants=("A", "B")):
+    """The answer check of each query across variants, from rows of variant, query, rows,
+    digest and an optional order digest: same, differ, failed or missing."""
     by_q = defaultdict(lambda: defaultdict(set))
     for row in answers:
         if len(row) >= 2:
             by_q[row[1]][row[0]].add(tuple(row[2:]))
     status = {}
-    for q in order:
-        a, b = by_q[q].get("A"), by_q[q].get("B")
-        if not a or not b:
+    for q in queries:
+        recs = [by_q[q].get(v) for v in variants]
+        if not all(recs):
             status[q] = "missing"
-        elif any("error" in r or "" in r or len(r) < 2 for r in a | b):
+        elif not all(answer_record_ok(r) for rs in recs for r in rs):
             status[q] = "failed"
         else:
             # a variant with two different answers to one query differs from itself
-            status[q] = "same" if len(a | b) == 1 else "differ"
+            status[q] = "same" if len(set().union(*recs)) == 1 else "differ"
     return status
 
 
@@ -158,15 +168,22 @@ def check(path, kind, flagged):
     valid run unless all of them take under 0.3 ms, when there is no spread to judge."""
     s = json.load(open(path))
     v = s.get("validity")
-    if "answers" not in s:
+    if "answers" not in s or "answers_all_arms" not in s:
         print(f"{path} has no answer checks, since an older nsc-bench-summary.py wrote it. "
               f"Regenerate it with nsc-bench-summary.py on its run directory.", file=sys.stderr)
         return 1
-    bad = answer_problems(s["answers"], flagged.split() if kind == "rerun" else list(s["answers"]))
+    need = flagged.split() if kind == "rerun" else list(s["answers"])
+    bad = answer_problems(s["answers"], need)
     if bad:
         # a timing of two binaries that answer differently, or of answers nobody checked,
         # compares different work, so it cannot decide whatever the timings say
         print(f"{path}: the answers of the two variants {bad}, so the pass cannot decide.", file=sys.stderr)
+        return 1
+    bad = answer_problems(s["answers_all_arms"], need)
+    if bad:
+        # every arm of one run times the same queries, so an arm that answers differently
+        # from the others shows that the run did not compare like with like
+        print(f"{path}: the answers of the run's arms {bad}, so the pass cannot decide.", file=sys.stderr)
         return 1
     if any("exec_ms" in q and "epochs_a" not in q["exec_ms"] for q in s.get("queries", {}).values()):
         # a summary written before the epoch counts cannot show that a query has two server
@@ -201,6 +218,9 @@ def main():
     rows = read_tsv(res / "samples.tsv")
     header, rows = rows[0], rows[1:]
     col = {name: i for i, name in enumerate(header)}
+    run_env = (out / "run.env").read_text() if (out / "run.env").exists() else ""
+    arms = next((line.partition("=")[2].strip("'\"").split() for line in run_env.splitlines() if line.startswith("VARIANTS=")),
+                sorted({r[col["variant"]] for r in rows}))
     if pair:
         rows = [r[:col["variant"]] + [pair[r[col["variant"]]]] + r[col["variant"] + 1:]
                 for r in rows if r[col["variant"]] in pair]
@@ -220,6 +240,9 @@ def main():
             continue
         for m in samples:
             samples[m][q][v].append((int(r[col["round"]]), int(r[col["epoch"]]), float(r[col["exec_ms"] if m == "exec_ms" else col["wall_ms"]])))
+    # the staged queries are required even when none of their requests left a sample
+    staged = sorted(f.stem for f in (out / "queries").glob("*.rq")) if (out / "queries").is_dir() else []
+    required = order + [q for q in staged if q not in order]
 
     def stats(per_variant):
         a, b = per_variant.get("A", []), per_variant.get("B", [])
@@ -248,7 +271,7 @@ def main():
             if s:
                 summary["queries"].setdefault(q, {})[m] = s
         if m == "exec_ms":
-            summary["missing"] = [q for q in order if m not in summary["queries"].get(q, {})]
+            summary["missing"] = [q for q in required if m not in summary["queries"].get(q, {})]
             summary["thin"] = [q for q in order if m in summary["queries"].get(q, {}) and thin(summary["queries"][q][m])]
         ratios = [summary["queries"][q][m]["ratio"] for q in order if m in summary["queries"].get(q, {})]
         if ratios:
@@ -275,6 +298,7 @@ def main():
         p()
 
     answers = read_tsv(res / "answers.tsv")
+    summary["answers_all_arms"] = answer_status(required, answers, arms)
     if pair:
         answers = [[pair[r[0]]] + r[1:] for r in answers if r and r[0] in pair]
     by_q = defaultdict(lambda: defaultdict(list))
@@ -282,9 +306,10 @@ def main():
         # variant, query, rows, digest and, with ORDER_DIGEST, an order digest
         if len(row) >= 2:
             by_q[row[1]][row[0]].append(tuple(row[2:]))
-    summary["answers"] = answer_status(order, answers)
-    diff = [q for q in order if summary["answers"][q] in ("differ", "failed")]
-    lost = [q for q in order if summary["answers"][q] == "missing"]
+    summary["answers"] = answer_status(required, answers)
+    diff = [q for q in required if summary["answers"][q] in ("differ", "failed")]
+    lost = [q for q in required if summary["answers"][q] == "missing"]
+    arm_bad = [q for q in required if summary["answers_all_arms"][q] != "same"]
     show = lambda rs: " ".join("/".join(r) for r in rs) if rs else "none"
     if diff:
         p("Answers differ or failed for: " + ", ".join(f"{q} (A {show(by_q[q].get('A'))}, B {show(by_q[q].get('B'))})" for q in diff)
@@ -294,7 +319,14 @@ def main():
         p("No answer check of both variants for: " + ", ".join(lost) + ", so the run cannot decide.")
         p()
     if not diff and not lost:
-        p(f"A and B returned the same sorted TSV answers to all {len(order)} queries.")
+        p(f"A and B returned the same sorted TSV answers to all {len(required)} queries.")
+        p()
+    if len(arms) > 2:
+        if arm_bad:
+            p(f"The answers of the run's arms {', '.join(arms)} disagree or are incomplete for: " + ", ".join(arm_bad)
+              + ", so the run cannot decide.")
+        else:
+            p(f"All {len(arms)} arms of the run returned the same answers to all {len(required)} queries.")
         p()
     if summary["missing"]:
         p("No timings of both variants for: " + ", ".join(summary["missing"]) + ", so the run cannot decide.")
