@@ -1259,7 +1259,10 @@ whether every round is above 1, so `EARLY_STOP_RULES=every-round`, which `stage
 --early-stop-rules` writes, gives that question the exact stop instead. A metric then stops
 at its first round at or below 1, where the answer is no whatever the later rounds hold, and
 otherwise runs every round, and a cost is flagged when every round is above 1 and the median
-adds more than 0.5 µs. `EARLY_STOP_RULES=bound,every-round` answers both questions, and the
+adds more than 0.5 µs. A cost in every round needs timings of both variants in every round
+the pair ran. When a round lacks them and no round is at or below 1, the question cannot be
+decided, so no cost is flagged and the record lists the query's metric as undecidable. The
+bound's pooled flag is unaffected. `EARLY_STOP_RULES=bound,every-round` answers both questions, and the
 query stops at the later of the two stops. The default is `bound`. The controls run every
 round and judge the host's spread and drift, while the checks of answers, missing timings
 and server processes per query apply to the shadow as they do to all rounds. When their

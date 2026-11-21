@@ -626,8 +626,88 @@ class ShadowTests(unittest.TestCase):
         for rules in (("every-round",), ("bound", "every-round")):
             s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
             m = s["queries"]["q"]["metrics"]["exec_ms every-round"]
-            self.assertEqual((m["how"], m["flagged"], m["flagged_all_rounds"]), ("unjudged", False, False), rules)
+            self.assertEqual((m["how"], m["flagged"], m["flagged_all_rounds"], m["undecidable"]),
+                             ("unjudged", False, False, True), rules)
             self.assertEqual(s["queries"]["q"]["stop_round"], 8)
+
+    def unpair(self, d, rounds, variant, drop=False):
+        """Fail variant's requests to q in rounds, or with drop leave q's rows out of them."""
+        t = d / "results" / "samples.tsv"
+        lines = t.read_text().splitlines()
+        out = [lines[0]]
+        for line in lines[1:]:
+            x = line.split("\t")
+            if x[3] == "q" and int(x[0]) in rounds and (drop or x[2] == variant):
+                if drop:
+                    continue
+                x[5] = x[6] = "error"
+            out.append("\t".join(x))
+        t.write_text("\n".join(out) + "\n")
+        return d
+
+    def test_an_every_round_rule_cannot_claim_a_cost_with_an_unpaired_round(self):
+        # B is 30% slower in every round that has both variants, but one scheduled round has
+        # no usable pair: one variant's requests failed, or q has no rows in that round at
+        # all. Every round above 1 is then unestablished, so neither metric may flag a cost,
+        # and the record says the question cannot be decided. The bound rule's pooled flag
+        # does not depend on every round and still flags.
+        cases = [(f"{v}{k}", k, v, False) for v in "AB" for k in (1, 5, 8)] + [("dropped5", 5, None, True),
+                                                                             ("dropped8", 8, None, True)]
+        for name, k, v, drop in cases:
+            d = self.unpair(write_samples(self.d / name, 1.3), {k}, v, drop)
+            for rules in (("every-round",), ("bound", "every-round")):
+                s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
+                q = s["queries"]["q"]
+                self.assertEqual((s["validity"]["all_rounds"], s["validity"]["shadow"]), (True, True), (name, rules))
+                self.assertEqual(q["stop_round"], 8, (name, rules))
+                for m in self.kit.STOP_METRICS:
+                    dec = q["metrics"][f"{m} every-round"]
+                    self.assertEqual((dec["how"], dec["flagged"], dec["flagged_all_rounds"], dec["undecidable"],
+                                      dec["undecidable_all_rounds"]), ("unjudged", False, False, True, True),
+                                     (name, rules, m))
+                    if "bound" in rules:
+                        dec = q["metrics"][f"{m} bound"]
+                        self.assertEqual((dec["flagged"], dec["flagged_all_rounds"], dec["undecidable"]),
+                                         (True, True, False), (name, rules, m))
+                self.assertEqual(s["undecidable"], [f"q {m} every-round" for m in self.kit.STOP_METRICS], (name, rules))
+                self.assertIn("cannot decide q exec_ms every-round, q wall_ms every-round", self.kit.shadow_line("x", s))
+        # the stopping rule alone is unchanged: a bound-only shadow records no undecidable question
+        s = self.kit.shadow(self.unpair(write_samples(self.d / "boundonly", 1.3), {5}, "B"), ("A", "B"), CONTROLS, 1.10)
+        self.assertEqual((s["queries"]["q"]["metrics"]["exec_ms bound"]["flagged"], s["undecidable"]), (True, []))
+
+    def test_an_every_round_rule_still_answers_no_beside_an_unpaired_round(self):
+        # a round at or below 1 answers no whatever the other rounds hold, before or after the
+        # round without a pair
+        noise = [1.0, 1.0, 1.0, 1.0, 0.97, 1.0, 1.0, 1.0]
+        for name, k, stop in (("before", 2, 8), ("after", 7, 5)):
+            d = self.unpair(write_samples(self.d / name, 1.02, noise=noise, wall_noise=noise), {k}, "B")
+            for rules in (("every-round",), ("bound", "every-round")):
+                s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
+                q = s["queries"]["q"]
+                self.assertEqual(q["stop_round"], stop if rules == ("every-round",) else max(stop, q["stop_round"]))
+                for m in self.kit.STOP_METRICS:
+                    dec = q["metrics"][f"{m} every-round"]
+                    self.assertEqual((dec["flagged"], dec["flagged_all_rounds"], dec["undecidable"],
+                                      dec["undecidable_all_rounds"]), (False, False, False, False), (name, rules, m))
+                self.assertEqual(s["undecidable"], [], (name, rules))
+                self.assertTrue(s["agree"], (name, rules))
+
+    def test_the_fallback_and_controls_carry_an_undecidable_every_round_question(self):
+        # in the fallback band every decision returns to all rounds, undecidability with it
+        d = self.unpair(write_samples(self.d / "band", 1.3, spread=0.025), {5}, "B")
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=("bound", "every-round"))
+        self.assertTrue(s["validity"]["fallback"])
+        for m in self.kit.STOP_METRICS:
+            dec = s["queries"]["q"]["metrics"][f"{m} every-round"]
+            self.assertEqual((dec["stop_round"], dec["flagged"], dec["undecidable"]), (8, False, True), m)
+        self.assertEqual(s["undecidable"], [f"q {m} every-round" for m in self.kit.STOP_METRICS])
+        # a control runs every round and is judged the same way
+        d = self.unpair(write_samples(self.d / "ctl", 1.3), {5}, "B")
+        s = self.kit.shadow(d, ("A", "B"), ["q", *CONTROLS], 1.10, rules=("every-round",))
+        for m in self.kit.STOP_METRICS:
+            dec = s["queries"]["q"]["metrics"][f"{m} every-round"]
+            self.assertEqual((dec["how"], dec["flagged"], dec["undecidable"], dec["undecidable_all_rounds"]),
+                             ("control", False, True, True), m)
 
     def test_shadow_falls_back_in_the_band_and_judges_validity_by_the_controls(self):
         d = write_samples(self.d / "band", 1.0, spread=0.025)
