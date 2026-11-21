@@ -2836,10 +2836,13 @@ pub(super) fn marker_deficits(
         seen.insert(from);
         while let Some(e) = todo.pop() {
             let succ = by.get(&e).map_or(&[][..], |&i| &cs[i].succ[..]);
-            if !rd.read(1 + succ.len()) {
+            if !rd.read(1) {
                 return None;
             }
             for &w in succ {
+                if !rd.read(1) {
+                    return None;
+                }
                 if seen.insert(w) {
                     todo.push(w);
                 }
@@ -2895,14 +2898,14 @@ pub(super) fn marker_deficits(
             }
         }
     }
-    if !rd.end() {
-        return None;
-    }
     for d in defs.iter().flatten() {
+        if !rd.read(1) {
+            return None;
+        }
         out[1] += d.owed;
         out[2] += d.unchecked;
     }
-    Some(out)
+    rd.end().then_some(out)
 }
 
 #[cfg(test)]
@@ -3904,16 +3907,22 @@ mod tests {
             Ok(Some((0, 0)))
         );
         assert!(work >= 63 * 65, "{work} work for {} products", 63 * 65);
-        let (ix, run, st, m, rg) = def_ctx(1, 1, 8192);
-        let mut work = 0;
-        let def = marker_def(&ix, &m, &st, &[rg], &run.lits, false, &mut |n| {
-            work += n;
-            true
-        });
-        assert!(def.is_ok_and(|d| d.is_some()));
+        // the dead premises are read twice, as stored clauses and as candidates
+        let read = |dead| {
+            let (ix, run, st, m, rg) = def_ctx(1, 1, dead);
+            let mut work = 0;
+            let def = marker_def(&ix, &m, &st, &[rg], &run.lits, false, &mut |n| {
+                work += n;
+                true
+            });
+            assert!(def.is_ok_and(|d| d.is_some()));
+            work
+        };
+        let (none, dead) = (read(0), read(8192));
         assert!(
-            work >= 8192 / WORK_READS,
-            "{work} work for 8,192 dead premises"
+            dead - none >= 2 * 8192 / WORK_READS - 16,
+            "{} work for 8,192 dead premises",
+            dead - none
         );
         let (ix, run, st, mut m, rg) = def_ctx(1, 1, 0);
         m.held.extend((0..100_000).map(Lit::xl));
