@@ -11,7 +11,8 @@
 # CLIENT_CPU. In each server process every query gets WARMUP untimed requests and REPS timed
 # ones. results/samples.tsv gets one line per timed request with the server's execution time
 # (execMs of application/x-sparkles+json, unrounded) and curl's wall time. results/answers.tsv
-# gets a checksum of each variant's sorted TSV answer to each query, and results/load.tsv the
+# gets a checksum of each variant's sorted TSV answer to each query, results/queries.txt the
+# names of the queries the run times, and results/load.tsv the
 # load times. With ORDER_DIGEST set to a command, such as `python3 scripts/bench-gate.py
 # order-digest`, it is run with the query file and the TSV answer, and its output, a digest
 # of the ORDER BY keys in the returned order or "-", is a fifth column of answers.tsv. With
@@ -440,6 +441,9 @@ fi
 printf 'round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n' > "$R/samples.tsv"
 : > "$R/answers.tsv"
 : > "$R/warm-answers.tsv"
+# the queries this run times, so that a summary requires each of them even when none of
+# its requests leaves a sample
+printf '%s\n' "${QUERIES[@]}" > "$R/queries.txt"
 read -r steal0 total0 < <(stat_cpu)
 epoch=0
 checked=" "

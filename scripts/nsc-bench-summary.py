@@ -30,8 +30,8 @@ first lines.
 The answer check of each query compares the sorted TSV answer of A with that of B, and
 summary.json gets its status under "answers": "same", "differ" when the answers differ,
 "failed" when either variant's check failed or its record is malformed, or "missing" when a
-variant has no answer row. Every query staged in OUT/queries is required, whether or not
-its requests left a sample. "answers_all_arms" holds the same check across every variant of
+variant has no answer row. Every query that OUT/results/queries.txt names, or else every
+query staged in OUT/queries, is required, whether or not its requests left a sample. "answers_all_arms" holds the same check across every variant of
 the run, so that one pair of a multi-variant run cannot decide while another arm answers
 differently.
 
@@ -219,8 +219,11 @@ def main():
     header, rows = rows[0], rows[1:]
     col = {name: i for i, name in enumerate(header)}
     run_env = (out / "run.env").read_text() if (out / "run.env").exists() else ""
-    arms = next((line.partition("=")[2].strip("'\"").split() for line in run_env.splitlines() if line.startswith("VARIANTS=")),
-                sorted({r[col["variant"]] for r in rows}))
+    # the last assignment counts, as in Bash, and an arm with samples is an arm whatever
+    # run.env says
+    named = [line.partition("=")[2].strip("'\"").split() for line in run_env.splitlines() if line.startswith("VARIANTS=")]
+    seen = sorted({r[col["variant"]] for r in rows})
+    arms = (named[-1] if named else []) + [v for v in seen if not named or v not in named[-1]]
     if pair:
         rows = [r[:col["variant"]] + [pair[r[col["variant"]]]] + r[col["variant"] + 1:]
                 for r in rows if r[col["variant"]] in pair]
@@ -240,8 +243,12 @@ def main():
             continue
         for m in samples:
             samples[m][q][v].append((int(r[col["round"]]), int(r[col["epoch"]]), float(r[col["exec_ms"] if m == "exec_ms" else col["wall_ms"]])))
-    # the staged queries are required even when none of their requests left a sample
-    staged = sorted(f.stem for f in (out / "queries").glob("*.rq")) if (out / "queries").is_dir() else []
+    # the queries the harness timed, or else the staged queries, are required even when none
+    # of their requests left a sample
+    if (res / "queries.txt").exists():
+        staged = (res / "queries.txt").read_text().split()
+    else:
+        staged = sorted(f.stem for f in (out / "queries").glob("*.rq")) if (out / "queries").is_dir() else []
     required = order + [q for q in staged if q not in order]
 
     def stats(per_variant):

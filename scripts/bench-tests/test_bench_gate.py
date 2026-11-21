@@ -5,6 +5,7 @@
 
 import copy
 import json
+import shutil
 import os
 import subprocess
 import sys
@@ -976,6 +977,26 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(ab["missing"], ["r"])
                 self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 1)
                 self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, 0)
+            # the harness's own list of the queries it timed decides, as in nsc-bench.sh's layout,
+            # whose staged queries are not in the summarized directory
+            shutil.rmtree(Path(d) / "queries")
+            res.joinpath("queries.txt").write_text("p\nq\nr\n")
+            res.joinpath("answers.tsv").write_text(same + "A\tr\terror\terror\nB\tr\terror\terror\nC\tr\terror\terror\n")
+            subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+            ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual((ab["answers"]["r"], ab["missing"]), ("failed", ["r"]))
+            self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 1)
+            res.joinpath("queries.txt").unlink()
+            # the last VARIANTS assignment counts, as in Bash, so a third arm that answers
+            # differently is not hidden by an earlier one, and an arm with samples counts even
+            # when run.env leaves it out
+            res.joinpath("answers.tsv").write_text(cases["same"][0] + "C\tp\t1\tother\nC\tq\t1\ty\n")
+            for env in ("VARIANTS='A B'\nVARIANTS='A B C'\n", "VARIANTS='A B'\n"):
+                (Path(d) / "run.env").write_text(env)
+                subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+                ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertEqual(ab["answers_all_arms"]["p"], "differ", env)
+                self.assertEqual(check(d, "summary-A-B.json", "first").returncode, 1, env)
             # a summary written before the answer statuses is refused with a way out
             old = json.loads((Path(d) / "summary-A-B.json").read_text())
             old.pop("answers")

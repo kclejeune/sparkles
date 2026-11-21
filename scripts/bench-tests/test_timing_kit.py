@@ -285,6 +285,9 @@ class KitTests(unittest.TestCase):
                 self.assertTrue((s / pas / f"summary-{pair}.json").is_file(), f"{pas} {pair}")
         p1 = json.loads((s / "pass1" / "summary-A-C.json").read_text())
         self.assertAlmostEqual(p1["queries"]["tiny"]["exec_ms"]["ratio"], 1.3, places=2)
+        # the harness lists the queries each pass timed, and the rerun times the flagged ones
+        for pas in ("pass1", "rerun"):
+            self.assertEqual((s / pas / "results" / "queries.txt").read_text().split(), sorted(CONTROLS + ["tiny"]))
         verdict = (s / "verdict.md").read_text()
         self.assertIn("fast (B) against base (A): first pass valid", verdict)
         self.assertIn("flagged none, none slower after the rerun", verdict)
