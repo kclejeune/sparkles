@@ -1,4 +1,5 @@
 """Exercise the batch gate's rerun of failed tests (scripts/gate/remote/test_retry.py)."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import json
 import os

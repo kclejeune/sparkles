@@ -1,4 +1,5 @@
 """scripts/remote-ci.sh and its job script against a fake host; no ssh or provider call runs."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import hashlib
 from pathlib import Path
 import os

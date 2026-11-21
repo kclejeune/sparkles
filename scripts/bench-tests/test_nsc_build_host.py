@@ -6,6 +6,7 @@ directory under hosts/, so the "remote" processes outlive an interrupted ssh as 
 on a real host. A fake systemd-run makes each scope its own process group, which the fake
 systemctl stop kills."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 import ctypes
 import hashlib
