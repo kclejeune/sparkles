@@ -3917,7 +3917,7 @@ family's size function has its own tests at the boundaries.
 **Literals.** A literal of a datatype in the map has the value of its lexical form,
 which `datatypes::lexical` checks. Date-times are checked by the checker's own parser,
 since `datatypes::lexical` refuses fractions of a second past eighteen digits, which
-XML Schema 1.1 allows, and item 1301 corrects it for the other readers. A literal whose lexical form is outside the
+XML Schema 1.1 allows, and item 1289 corrects it for the other readers. A literal whose lexical form is outside the
 lexical space of its datatype violates §5.7, so the ontology is not in OWL 2 DL and the
 Direct Semantics gives the literal no value. Reading it as the empty range would draw
 entailments from an input the semantics does not define, since its complement would hold
