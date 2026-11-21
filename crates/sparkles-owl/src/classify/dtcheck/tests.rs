@@ -1475,3 +1475,39 @@ proptest! {
         prop_assert_eq!(t.r.intern(again), x);
     }
 }
+
+#[test]
+fn unbounded_length_families_are_infinite() {
+    let mut t = T::new();
+    for d in [
+        dt("string"),
+        dt("language"),
+        dt("anyURI"),
+        dt("hexBinary"),
+        dt("base64Binary"),
+        plain_restr(&[lang_range("i-klingon")]),
+        and(vec![
+            dt("hexBinary"),
+            not(restr("hexBinary", &[("length", nn(11))])),
+        ]),
+    ] {
+        assert_eq!(t.size(&d), Size::INFINITE, "{d:?}");
+    }
+    // a saturated bounded length set stays finite
+    let long = restr("hexBinary", &[("maxLength", nn(20))]);
+    let s = t.size(&long);
+    assert!(s.lo == CAP && !s.inf, "{s:?}");
+    // removing values from an infinite range leaves it infinite
+    let x = and(vec![
+        dt("string"),
+        not(one(&[
+            lit("a", "string"),
+            lit("b", "string"),
+            lit("c", "string"),
+        ])),
+    ]);
+    assert_eq!(t.size(&x), Size::INFINITE);
+    let mut p = P::new(1);
+    p.min(0, (CAP - 2) as u64, &x);
+    assert_eq!(p.check(), Answer::Sat);
+}

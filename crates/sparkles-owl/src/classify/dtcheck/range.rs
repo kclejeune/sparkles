@@ -625,25 +625,22 @@ fn bounds(lo: u128, hi: u128) -> Size {
 
 /// The sizes of a set of lengths, summed over the lengths it holds.
 fn sum_lengths(l: &Len, f: impl Fn(u64) -> Size) -> Size {
+    // Every length from the shortest a family holds in its base on has a value, so a
+    // set of lengths without an upper end is infinitely many values.
+    if l.iv.last().is_some_and(|(_, b)| *b == End::Max) {
+        return Size::INFINITE;
+    }
     let mut s = Size::ZERO;
     for (a, b) in &l.iv {
-        let End::At(a) = a else { unreachable!() };
-        let mut n = *a;
-        loop {
-            if let End::At(b) = b
-                && n > *b
-            {
-                break;
-            }
+        let (End::At(a), End::At(b)) = (a, b) else {
+            unreachable!("lengths start at a length and end below the last interval")
+        };
+        for n in *a..=*b {
             s = s.add(f(n));
             if s.lo >= CAP && s.hi.is_none() {
+                // a saturated finite count
                 return s;
             }
-            if *b == End::Max && n > 70 {
-                // every family is past 2^63 values per length here
-                return Size::INFINITE;
-            }
-            n += 1;
         }
     }
     s

@@ -146,3 +146,82 @@ pub fn open_completion(r: &str) -> Option<String> {
         _ => format!("{r}-x"),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{open_completion, prefix, well_formed};
+
+    #[test]
+    fn rfc_5646_productions() {
+        for t in [
+            "en",
+            "EN-us",
+            "zh-yue",
+            "zh-yue-abc-def",
+            "abcd",
+            "abcdefgh",
+            "sr-latn",
+            "sr-latn-rs",
+            "en-001",
+            "de-1996",
+            "sl-rozaj-biske",
+            "en-a-bb",
+            "en-0-ab",
+            "en-a-bb-x-c",
+            "en-x-a",
+            "x-a",
+            "x-a-bcdefgh1",
+            "i-klingon",
+            "en-gb-oed",
+            "sgn-be-fr",
+            "zh-min-nan",
+            "art-lojban",
+        ] {
+            assert!(well_formed(t), "{t}");
+        }
+        for t in [
+            "",
+            "a",
+            "i",
+            "x",
+            "x-",
+            "abcdefghi",
+            "en-",
+            "en--us",
+            "zh-yue-abc-def-ghi",
+            "abcd-abc",
+            "en-latn-latn",
+            "en-us-us",
+            "en-a",
+            "en-a-b",
+            "en-x",
+            "en-x-abcdefghi",
+            "i-klingon-x-a",
+            "en-gb-oed-x-a",
+            "sgn-be-fr-x-a",
+            "1en",
+            "en-ab_c",
+        ] {
+            assert!(!well_formed(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn completions_open_every_matching_range() {
+        assert_eq!(open_completion("en").as_deref(), Some("en-x"));
+        assert_eq!(open_completion("en-a").as_deref(), Some("en-a-aa-x"));
+        assert_eq!(open_completion("x").as_deref(), Some("x"));
+        assert_eq!(open_completion("en-x-a").as_deref(), Some("en-x-a"));
+        assert_eq!(open_completion("a"), None);
+        assert_eq!(open_completion("i"), None);
+        assert_eq!(open_completion("i-klingon"), None);
+        // sgn-BE is a langtag, so its range opens though sgn-BE-FR is irregular
+        assert_eq!(open_completion("sgn-be").as_deref(), Some("sgn-be-x"));
+        for r in ["en", "en-a", "x", "en-x-a", "sgn-be"] {
+            let c = open_completion(r).unwrap();
+            assert!(prefix(r, &c));
+            assert!(well_formed(&format!("{c}-z")), "{c}-z");
+        }
+        assert!(prefix("en", "en-us") && !prefix("en", "eng") && prefix("en", "en"));
+    }
+}
