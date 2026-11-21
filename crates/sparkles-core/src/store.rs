@@ -4062,6 +4062,7 @@ impl Store {
     }
 
     /// Replace the wall clock used for commit timestamps (tests).
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
@@ -4425,7 +4426,7 @@ impl Store {
     }
 
     /// Test hook: make the next full-text update fail.
-    #[cfg(feature = "text")]
+    #[cfg(all(feature = "text", any(test, feature = "failpoints")))]
     #[doc(hidden)]
     pub fn fail_next_text_commit(&self) {
         if let Some(ti) = self.text.load_full() {
@@ -4435,7 +4436,7 @@ impl Store {
 
     /// Test hook: checkpoint the full-text index now, as its background tick does about
     /// once a second, so that a short run writes checkpoints that name its commits.
-    #[cfg(feature = "text")]
+    #[cfg(all(feature = "text", any(test, feature = "failpoints")))]
     #[doc(hidden)]
     pub fn checkpoint_text(&self) -> Result<()> {
         match self.text.load_full() {
@@ -4486,7 +4487,7 @@ impl Store {
 
     /// Test hook: pause (or resume) the full-text index's background tick, so staged
     /// documents stay uncommitted until a search, compaction or close.
-    #[cfg(feature = "text")]
+    #[cfg(all(feature = "text", any(test, feature = "failpoints")))]
     #[doc(hidden)]
     pub fn set_text_ticks(&self, on: bool) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
@@ -6320,6 +6321,7 @@ impl Store {
 
     /// Whether the writer has the current log's write-through handle open, so that
     /// small commits into preallocated space use direct writes (for tests).
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn wal_direct_active(&self) -> bool {
         matches!(self.writer.lock().tail.lock().direct, wal::Direct::Open(_))
@@ -6327,6 +6329,7 @@ impl Store {
 
     /// Whether the current generation's delta vocabulary has its write-through handle
     /// open, so that the terms of small commits use direct writes (for tests).
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn vocab_direct_active(&self) -> bool {
         self.snapshot().generation.dvocab.direct_active()
@@ -6554,7 +6557,6 @@ impl Drop for OrdinarySyncObservation<'_> {
     fn drop(&mut self) {
         if let Some((path, took)) = self.sample.take() {
             self.store.commit_stats.synced(path, took);
-            #[cfg(test)]
             ordinary_sync_probe::published(self.store, path);
         }
     }
@@ -7368,39 +7370,19 @@ impl WriteTxn<'_> {
                     && let Some(direct) = io.direct.handle(path.as_deref(), wal.get_ref())
                 {
                     let t = std::time::Instant::now();
-                    let direct_written = {
-                        #[cfg(not(test))]
-                        {
-                            commit_direct(
-                                direct,
-                                w.wal_len,
-                                &data,
-                                &gen_.dvocab,
-                                &mut w.vocab_sync,
-                                u64::MAX,
-                            )?
-                        }
-                        #[cfg(test)]
-                        {
-                            // Branch-selection control, not a physical EINVAL fault:
-                            // refuse before this helper performs any mutation.
-                            if ordinary_sync_probe::skip_direct(self.store) {
-                                false
-                            } else {
-                                commit_direct(
-                                    direct,
-                                    w.wal_len,
-                                    &data,
-                                    &gen_.dvocab,
-                                    &mut w.vocab_sync,
-                                    u64::MAX,
-                                )?
-                            }
-                        }
-                    };
+                    // A test's branch-selection control, not a physical EINVAL fault,
+                    // refuses before this helper performs any mutation.
+                    let direct_written = !ordinary_sync_probe::skip_direct(self.store)
+                        && commit_direct(
+                            direct,
+                            w.wal_len,
+                            &data,
+                            &gen_.dvocab,
+                            &mut w.vocab_sync,
+                            u64::MAX,
+                        )?;
                     if direct_written {
                         *sync = Some((SyncPath::Direct, t.elapsed()));
-                        #[cfg(test)]
                         ordinary_sync_probe::captured(self.store);
                         return Ok(());
                     }
@@ -7419,7 +7401,6 @@ impl WriteTxn<'_> {
                 let synced =
                     sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync, u64::MAX);
                 *sync = Some((SyncPath::Buffered, t.elapsed()));
-                #[cfg(test)]
                 ordinary_sync_probe::captured(self.store);
                 synced
             });
@@ -9838,7 +9819,24 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
 }
 
 // Private diagnostic probes are scoped to one Store and one calling thread. No timed
-// release build contains the observer, fault selection, or post-capture panic point.
+// release build contains the observer, fault selection, or post-capture panic point:
+// outside tests the three points of `publish_log` call the empty functions below.
+#[cfg(not(test))]
+mod ordinary_sync_probe {
+    use super::{Store, SyncPath};
+
+    #[inline(always)]
+    pub(super) fn published(_: &Store, _: SyncPath) {}
+
+    #[inline(always)]
+    pub(super) fn captured(_: &Store) {}
+
+    #[inline(always)]
+    pub(super) fn skip_direct(_: &Store) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod ordinary_sync_probe {
     use super::*;

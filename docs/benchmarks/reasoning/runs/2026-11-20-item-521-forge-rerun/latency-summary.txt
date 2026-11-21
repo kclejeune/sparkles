@@ -1,0 +1,12 @@
+compare 1-base 2-tip exit 1
+
+100 metrics compared, 4 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.
+compare 6-base 5-tip exit 1
+
+100 metrics compared, 11 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.
+compare 3-off 2-tip exit 1
+
+100 metrics compared, 8 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.
+compare 4-off 5-tip exit 1
+
+100 metrics compared, 9 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.

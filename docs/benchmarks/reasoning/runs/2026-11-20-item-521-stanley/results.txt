@@ -1,0 +1,13 @@
+q2 tip 14.13 s 1116440 KiB  rows 7422
+q2 base 188.41 s 1992864 KiB  rows 7422
+q2 rows equal
+q7 tip 12.02 s 1174528 KiB  rows 1685
+q7 base 177.10 s 2082072 KiB  rows 1685
+q7 rows equal
+q12 tip 12.08 s 1149748 KiB  rows 2495
+q12 base 142.11 s 2035244 KiB  rows 2495
+q12 rows equal
+q19 tip 13.95 s 1134892 KiB  rows 859
+q19 base 152.09 s 1981344 KiB  rows 859
+q19 rows equal
+done

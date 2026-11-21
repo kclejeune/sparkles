@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
+
+Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
+builder's run blocks one zig-zag delta varint coder. The run reader decodes each column in place
+into the keys, which made the run decode about 4% faster on `atlas`. The on-disk bytes did not
+change. The store's test hooks, such as `Store::set_clock`, `Spill::inject_fault` and the
+vector and full-text pause hooks, now build only for tests or with the `failpoints` feature of
+`sparkles-core` and `sparkles`. `parse_source` and `parse_source_into` share their first rungs
+and one whole-slice parser. Before batch 46 two one-thread query cells read slower on `atlas`, while
+on batch 46 the instruction counts of every benchmark query stay within their noise floor, so
+roadmap item 1246 confirms the two cells on the matrix after the push.
+
 ### Late existential restrictions take the clauses their successor already sent
 
 In a run that counts and in a rooted run, an existential restriction that reaches a
@@ -19,6 +31,7 @@ derived conclusions of rooted runs that count, 0.47% to rooted runs without coun
 bound on derived conclusions, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` keeps
 the earlier containment, which now also covers rooted runs without counting, and `=0`
 turns both off, for measurement.
+
 ### Rooted runs withdraw answers that a ground fact under a class may leave incomplete
 
 With `Limits::rooted`, a run could report a complete answer that missed an entailment when
@@ -63,6 +76,7 @@ selection. The completeness of the rooted run is
 still not proved. shoi-005 and shoi-027 now pass the work bound and give the default
 answer, with the axioms it leaves out and the fallback in its statistics, so 46 of the 50
 `shoi` fixtures finish against 48.
+
 ### UTF-8 checks of key filters
 
 The key filters that answer CONTAINS, STRSTARTS, STRENDS, STRLEN, REGEX and LANGMATCHES
@@ -75,6 +89,7 @@ stanley at 1.05M triples, `lang-filter` counts 0.75 of the instructions per requ
 are unchanged. A key that is not ASCII pays one extra scan of its bytes before validation.
 When every name and title of the same data ends in a non-ASCII character, which is the worst
 case, `lang-filter` counts 1.026 of the instructions and `contains` 1.000.
+
 ### Cheaper disjunctive attempts, and a width limit on one thread
 
 The pruning of the disjunctive rules' product lists compares sides by a signature and a
@@ -93,6 +108,7 @@ The rule of the Horn rules for a new universal no longer searches the context's 
 for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
 `ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
 item 1234 follows (item 693).
+
 ### Cursor operators for searches, calls and counts
 
 The first part of roadmap item 829 runs text, hybrid, history, spatial and vector searches
@@ -107,6 +123,34 @@ covers. On forge, the text, geo and vector scripts read within noise of the base
 eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds, and
 streamed `q9-star` with 12 threads, which a rerun against the tip's merge base put at
 0.966.
+
+### Closure operators in query-time reasoning
+
+Demand sessions now close the adorned copies of transitive rules and of `prp-trp` with
+closure operators seeded by their magic facts, the first half of roadmap item 521 and
+Phase 2 of spec F23. A copy whose demand binds the subject walks forward from the values it
+is asked for, one that binds the object walks backward, and one that binds neither closes
+the relation, each emitting the facts its joins would derive. On forge the OWL2Bench(1)
+queries q2, q7, q12 and q19 under `owl-rl` demand took 8.3 to 8.5 s instead of 113 to
+117 s, with the same rows and about half the peak RSS. A run that derives list cells its
+rules read starts again without the operators. `SPARKLES_DEMAND_CLOSURES=0` turns them off.
+Roadmap item 1222 covers pairs derived for values the query did not ask for.
+
+Within a run, an operator no longer walks a relation again for pairs other operators
+merged, or once a copy that binds neither end closed the whole relation and no other edge
+has arrived since, unless that closure left out the pairs from a value to itself and the
+operator does not. At OWL2Bench(1) q12, the walks that merged nothing read 1.3 million edges
+instead of 21 million, with the same rows. Roadmap item 1226 covers the scan of the closed
+relation that a later run of a session still makes.
+
+A demand session now sorts each chunk of derived facts it exports in predicate, object and
+subject order, the order in which joins mostly derive them, because a query that reads a
+cached table inserts its facts into the query's overlay and the operators' own order made
+that slower. A session checks its rules for operators at its first run, so a session served
+from the cache skips the check, and `Closures::detect` passes over adorned copies that
+cannot be transitive before taking them apart. On forge the reasoning latency gate then
+found no metric slower than before the operators in every round, where the first gate had
+found `owl-rl` demand-cached `q11` slower in every round.
 
 ### Targeted checks on a remote host
 
@@ -156,6 +200,7 @@ constants instead. RDFS on read had also refused a written call with a list argu
 or one whose input came from a rewritten pattern, and both now run. A callback reached from an unprepared
 query now fails that query with an error, and the stream and accumulator destructors no
 longer panic. This completes roadmap item 1198.
+
 ### DISTINCT on charged buffers
 
 A cursor DISTINCT keeps its set in `Charged` buffers, which take their memory charge from
