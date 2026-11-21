@@ -91,6 +91,14 @@ pub struct RootSt {
     /// the existential restrictions and constants of the context's edges over `f_e(u)` to
     /// each successor
     by_succ: FxHashMap<Ex, Vec<(Ex, u32)>>,
+    /// row 1231's marker repair state, made with its first use and only with the repair
+    m: Option<Box<MRep>>,
+}
+
+/// What a context keeps for row 1231's marker repair (PLAN v3.1's rule M), apart from
+/// [`RootSt`] so that a run without the repair holds none of it.
+#[derive(Default, Clone)]
+struct MRep {
     /// with row 1231's marker repair, in another context, the ground literals it told the
     /// root it holds (M-send)
     mheld: FxHashSet<Lit>,
@@ -113,6 +121,23 @@ pub struct RootSt {
     /// told it so, and the constants each context registered for
     reach_set: FxHashSet<Ex>,
     regs: FxHashMap<Ex, Vec<u32>>,
+}
+
+impl MRep {
+    fn bytes(&self) -> usize {
+        fn lists<K>(m: &FxHashMap<K, Vec<u32>>) -> usize {
+            table_bytes(m.capacity(), 32) + m.values().map(|v| v.capacity() * 4).sum::<usize>()
+        }
+        std::mem::size_of::<MRep>()
+            + table_bytes(self.mheld.capacity(), 8)
+            + lists(&self.rets)
+            + lists(&self.holders)
+            + table_bytes(self.hold_set.capacity(), 16)
+            + lists(&self.held_at)
+            + lists(&self.gbody)
+            + table_bytes(self.reach_set.capacity(), 4)
+            + lists(&self.regs)
+    }
 }
 
 impl RootSt {
@@ -145,14 +170,15 @@ impl RootSt {
                 .values()
                 .map(|v| v.capacity() * 8)
                 .sum::<usize>()
-            + table_bytes(self.mheld.capacity(), 8)
-            + lists(&self.rets)
-            + lists(&self.holders)
-            + table_bytes(self.hold_set.capacity(), 16)
-            + lists(&self.held_at)
-            + lists(&self.gbody)
-            + table_bytes(self.reach_set.capacity(), 4)
-            + lists(&self.regs)
+            + self.m.as_deref().map_or(0, MRep::bytes)
+    }
+
+    /// The repair's state, which [`mrep_new`] made.
+    fn mr(&self) -> &MRep {
+        self.m.as_deref().expect("made by mrep_new")
+    }
+    fn mw(&mut self) -> &mut MRep {
+        self.m.as_deref_mut().expect("made by mrep_new")
     }
 
     /// Inserts `v` into `set`, whose entries take `size` bytes, and answers the bytes the
@@ -206,7 +232,11 @@ fn atom<S: Sink>(ix: &Index, out: &S, a: Ex, u: u32) -> Lit {
 /// the body `owl:Thing` give u.
 pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     st.init = true;
-    root_of(ds(st), out).reached = true;
+    let r = root_of(ds(st), out);
+    if out.dl().mrepair & MREPAIR_ON != 0 {
+        mrep_new(r, out);
+        r.mw().reached = true;
+    }
     let mut found = Found::default();
     found.root = true;
     found.rule = "init";
@@ -985,7 +1015,8 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
         if let Some(b) = RootSt::ins(&mut r.edge_set, (v, u), 8) {
             grown += b + RootSt::push(&mut r.edges, u, v);
             if pairs {
-                grown += RootSt::push(&mut r.regs, v, u);
+                mrep_new(r, out);
+                grown += RootSt::push(&mut r.mw().regs, v, u);
             }
             new.push(u);
         }
@@ -1021,7 +1052,11 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
         }
     }
     if out.dl().mrepair & MREPAIR_ON != 0
-        && (!pairs || x.root.as_deref().is_some_and(|r| r.reach_set.contains(&v)))
+        && (!pairs
+            || x.root
+                .as_deref()
+                .and_then(|r| r.m.as_deref())
+                .is_some_and(|m| m.reach_set.contains(&v)))
     {
         m_registered(x, v, &new, out);
     }
@@ -1166,7 +1201,8 @@ pub(super) fn new_succ<S: Sink>(st: &mut State, w: Ex, out: &mut S) {
     if out.dl().mrepair & (MREPAIR_ON | MREPAIR_WIDE) == MREPAIR_ON
         && dl(st)
             .and_then(|x| x.root.as_deref())
-            .is_some_and(|r| r.reached)
+            .and_then(|r| r.m.as_deref())
+            .is_some_and(|m| m.reached)
     {
         out.send(w, Concl::RReach(TOP));
     }
@@ -1455,11 +1491,13 @@ fn m_note<S: Sink>(
     out: &mut S,
 ) {
     let r = rst(st, out);
-    if let Some(b) = RootSt::ins(&mut r.mheld, l, 8) {
+    mrep_new(r, out);
+    if let Some(b) = RootSt::ins(&mut r.mw().mheld, l, 8) {
+        out.worked(1);
         out.dl().grow(b);
         out.send(root, Concl::RMark(me, l.xid()));
     }
-    let cids = r.rets.get(&l).cloned().unwrap_or_default();
+    let cids = r.mr().rets.get(&l).cloned().unwrap_or_default();
     for cid in cids {
         let c = out.dl().table.get(cid).clone();
         ret_products(st, &c, Some((l, prem)), found);
@@ -1478,27 +1516,37 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
         let bottom = st.bottom;
         let x = ds(st);
         let r = root_of(x, out);
-        let Some(b) = RootSt::ins(&mut r.reach_set, e, 4) else {
+        mrep_new(r, out);
+        let Some(b) = RootSt::ins(&mut r.mw().reach_set, e, 4) else {
             return false;
         };
         out.dl().grow(b);
         if bottom {
             return true;
         }
-        let us = r.regs.get(&e).cloned().unwrap_or_default();
+        let us = r.mr().regs.get(&e).cloned().unwrap_or_default();
         m_registered(x, e, &us, out);
         return true;
     }
     let r = rst(st, out);
-    if r.reached {
+    mrep_new(r, out);
+    if r.mr().reached {
         return false;
     }
-    r.reached = true;
+    r.mw().reached = true;
     out.send(root, Concl::RReach(me));
     for w in successors(ix, st) {
         out.send(w, Concl::RReach(TOP));
     }
     true
+}
+
+/// Makes the repair's state of a context with its first use, and counts it.
+fn mrep_new<S: Sink>(r: &mut RootSt, out: &S) {
+    if r.m.is_none() {
+        out.dl().grow(std::mem::size_of::<MRep>());
+        r.m = Some(Box::default());
+    }
 }
 
 /// Whether the ground literal `l`, with the constant `u`, is a live unit of the root.
@@ -1517,6 +1565,7 @@ fn m_fwd<S: Sink>(r: &mut RootSt, d: Ex, l: Lit, out: &mut S) {
     if let Some(b) = RootSt::ins(&mut r.gsent, (d, l), 16) {
         out.dl().grow(b);
         out.send(d, Concl::HypL(l.xid()));
+        out.worked(1);
         out.dl().mcount[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -1552,22 +1601,22 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
     us.dedup();
     let mode = out.dl().mrepair;
     let x = ds(st);
-    root_of(x, out);
+    mrep_new(root_of(x, out), out);
     let r = x.root.as_deref_mut().expect("made above");
-    let Some(mut grown) = RootSt::ins(&mut r.hold_set, (h, l), 16) else {
+    let Some(mut grown) = RootSt::ins(&mut r.mw().hold_set, (h, l), 16) else {
         return false;
     };
     out.dl().mcount[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let table = table_bytes(r.holders.capacity(), 32);
-    let first = !r.holders.contains_key(&l);
-    let hs = r.holders.entry(l).or_default();
+    let table = table_bytes(r.mr().holders.capacity(), 32);
+    let first = !r.mr().holders.contains_key(&l);
+    let hs = r.mw().holders.entry(l).or_default();
     let cap = hs.capacity();
     hs.push(h);
-    grown +=
-        (hs.capacity() - cap) * 4 + table_bytes(r.holders.capacity(), 32).saturating_sub(table);
+    grown += (hs.capacity() - cap) * 4
+        + table_bytes(r.mr().holders.capacity(), 32).saturating_sub(table);
     if first {
         for &u in &us {
-            grown += RootSt::push(&mut r.held_at, u, xid);
+            grown += RootSt::push(&mut r.mw().held_at, u, xid);
         }
     }
     out.dl().grow(grown);
@@ -1578,7 +1627,7 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
             .iter()
             .flat_map(|u| r.edges.get(u).into_iter().flatten().copied())
             .filter(|&d| d != root && (d != h || mode & MREPAIR_HOLDER != 0))
-            .filter(|d| mode & MREPAIR_WIDE != 0 || r.reach_set.contains(d))
+            .filter(|d| mode & MREPAIR_WIDE != 0 || r.mr().reach_set.contains(d))
             .collect();
         to.sort_unstable();
         to.dedup();
@@ -1588,6 +1637,7 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
     }
     // the returns: the root's clauses with l in the body whose other body literals h holds
     let ids: Vec<u32> = r
+        .mr()
         .gbody
         .get(&l)
         .into_iter()
@@ -1598,12 +1648,13 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
                 .c
                 .body()
                 .iter()
-                .all(|&m| m == l || r.hold_set.contains(&(h, m)))
+                .all(|&m| m == l || r.mr().hold_set.contains(&(h, m)))
         })
         .collect();
     for i in ids {
         let cid = ret_id(x, i, out);
         out.send(h, Concl::RRet(cid));
+        out.worked(1);
         out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     true
@@ -1613,10 +1664,12 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
 /// literals over them that a context other than v holds, unless they are live units.
 fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     let mode = out.dl().mrepair;
-    let Some(r) = x.root.as_deref() else { return };
+    let Some(r) = x.root.as_deref().filter(|r| r.m.is_some()) else {
+        return;
+    };
     let mut ls: Vec<(u32, u32)> = Vec::new();
     for &u in new {
-        for &i in r.held_at.get(&u).into_iter().flatten() {
+        for &i in r.mr().held_at.get(&u).into_iter().flatten() {
             ls.push((i, u));
         }
     }
@@ -1625,7 +1678,7 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     for (i, u) in ls {
         let l = Lit::xl(i);
         let r = x.root.as_deref().expect("read above");
-        let held = r.holders.get(&l).is_some_and(|hs| {
+        let held = r.mr().holders.get(&l).is_some_and(|hs| {
             hs.iter().any(|&h| h != v) || (mode & MREPAIR_HOLDER != 0 && !hs.is_empty())
         });
         if !held || (mode & MREPAIR_UNITS == 0 && root_unit(x, l, u)) {
@@ -1652,18 +1705,20 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
     }
     let x = ds(st);
     let r = root_of(x, out);
+    mrep_new(r, out);
     let mut grown = 0;
     for &l in c.body() {
-        grown += RootSt::push(&mut r.gbody, l, id);
+        grown += RootSt::push(&mut r.mw().gbody, l, id);
     }
     let (first, rest) = c.body().split_first().expect("a body");
     let hs: Vec<Ex> = r
+        .mr()
         .holders
         .get(first)
         .into_iter()
         .flatten()
         .copied()
-        .filter(|&h| rest.iter().all(|&m| r.hold_set.contains(&(h, m))))
+        .filter(|&h| rest.iter().all(|&m| r.mr().hold_set.contains(&(h, m))))
         .collect();
     out.dl().grow(grown);
     if hs.is_empty() {
@@ -1672,6 +1727,7 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
     let cid = ret_id(x, id, out);
     for h in hs {
         out.send(h, Concl::RRet(cid));
+        out.worked(1);
         out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 }
@@ -1690,10 +1746,11 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
         Some(b) => out.dl().grow(b),
         None => return false,
     }
+    mrep_new(r, out);
     let c = out.dl().table.get(cid).clone();
     let mut grown = 0;
     for &l in c.body() {
-        grown += RootSt::push(&mut r.rets, l, cid);
+        grown += RootSt::push(&mut r.mw().rets, l, cid);
     }
     out.dl().grow(grown);
     let mut found = Found::default();
@@ -1786,14 +1843,22 @@ pub(super) struct MarkerCtx {
     pub(super) edges: Vec<(u32, Vec<Ex>)>,
     /// in the root, the heads of its live facts with one literal
     pub(super) units: Vec<Lit>,
-    /// for the diagnostic's deficits only: in another context, the ground literals whose
-    /// markers it holds or has a live clause that subsumes, and the root's clauses it took
-    /// by table id
-    pub(super) marks: Vec<Lit>,
-    pub(super) took: Vec<u32>,
-    /// for the deficits only: in the root, the bodies and table ids of its live processed
-    /// clauses whose bodies are ground triggers
-    pub(super) gbody: Vec<(Vec<Lit>, Option<u32>)>,
+    /// what the diagnostic's deficits read, only with the diagnostic
+    pub(super) def: Option<Box<MarkerDef>>,
+}
+
+/// What [`marker_deficits`] reads of one context.
+#[derive(Default)]
+pub(super) struct MarkerDef {
+    /// whether the context is unsatisfiable, which discharges what it is owed
+    bottom: bool,
+    /// in another context, the ground literals whose markers it holds or has a live clause
+    /// that subsumes, and the root's clauses it took by table id
+    marks: Vec<Lit>,
+    took: Vec<u32>,
+    /// in the root, the bodies and table ids of its live processed clauses whose bodies
+    /// are ground triggers
+    gbody: Vec<(Vec<Lit>, Option<u32>)>,
 }
 
 /// The factor by which a vector's capacity or a hash table's buckets can pass the
@@ -1887,9 +1952,10 @@ pub(super) fn marker_ctx(
         }
     }
     admit(-scratch);
-    let (mut marks, mut took, mut gbody) = (Vec::new(), Vec::new(), Vec::new());
+    let mut def = None;
     // the deficits' copies, outside the run's memory budget, as the diagnostic's sets are
     if marker_diag() {
+        let (mut marks, mut took, mut gbody) = (Vec::new(), Vec::new(), Vec::new());
         if let Some(r) = x.root.as_deref() {
             marks.extend(r.gmarks.iter().copied());
             took.extend(r.seen.iter().copied());
@@ -1917,6 +1983,12 @@ pub(super) fn marker_ctx(
                 gbody.push((b.to_vec(), s.sent));
             }
         }
+        def = Some(Box::new(MarkerDef {
+            bottom: st.bottom,
+            marks,
+            took,
+            gbody,
+        }));
     }
     Ok(Some(MarkerCtx {
         me,
@@ -1924,9 +1996,7 @@ pub(super) fn marker_ctx(
         held,
         edges,
         units,
-        marks,
-        took,
-        gbody,
+        def,
     }))
 }
 
@@ -2133,17 +2203,25 @@ pub(super) fn marker_deficits(
             to.dedup();
             for d in to {
                 let Some(&i) = by.get(&d) else { continue };
-                if !cs[i].marks.contains(&l) && !cs[i].held.contains(&l) {
+                let Some(dd) = cs[i].def.as_deref() else {
+                    continue;
+                };
+                if !dd.bottom && !dd.marks.contains(&l) {
                     out[0] += 1;
                 }
             }
         }
     }
-    for (b, id) in &cs[ri].gbody {
+    let Some(rd) = cs[ri].def.as_deref() else {
+        return out;
+    };
+    for (b, id) in &rd.gbody {
         for c in cs {
+            let Some(cd) = c.def.as_deref() else { continue };
             if c.me != root
+                && !cd.bottom
                 && b.iter().all(|l| c.held.contains(l))
-                && !id.is_some_and(|id| c.took.contains(&id))
+                && !id.is_some_and(|id| cd.took.contains(&id))
             {
                 out[1] += 1;
             }

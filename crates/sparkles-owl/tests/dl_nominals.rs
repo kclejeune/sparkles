@@ -1890,7 +1890,10 @@ fn repaired(name: &str, out: &Classification) -> bool {
 fn the_marker_repair_delivers_conditional_facts_outside_the_query_successors() {
     for (name, body) in REPAIRS {
         let ax = axioms(body);
-        for (threads, expansion) in CONFIGS {
+        // dl_steps off lets a bounded run saturate on several threads
+        for ((threads, expansion), dl_steps) in
+            CONFIGS.into_iter().flat_map(|c| [(c, true), (c, false)])
+        {
             let mut k = Classifier::of(&ax);
             let out = k
                 .classify(&Limits {
@@ -1899,16 +1902,25 @@ fn the_marker_repair_delivers_conditional_facts_outside_the_query_successors() {
                     rooted: true,
                     rooted_decline: false,
                     rooted_marker_repair: true,
+                    dl_steps,
                     ..Limits::default()
                 })
                 .unwrap();
-            assert!(
-                rooted_claim(&k, &out),
-                "{name}, {threads} threads {expansion:?}: no claim"
-            );
+            let at = format!("{name}, {threads} threads {expansion:?}, steps {dl_steps}");
+            assert!(rooted_claim(&k, &out), "{at}: no claim");
             assert!(
                 repaired(name, &out),
-                "{name}, {threads} threads {expansion:?}: the repair misses the entailment"
+                "{at}: the repair misses the entailment"
+            );
+            // nothing else changes: the linked element's class keeps out of the answer
+            assert!(
+                !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+                "{at}: E ⊑ Ans"
+            );
+            assert_eq!(
+                out.taxonomy.is_subclass(&c("K"), &c("Nothing")),
+                name.starts_with("denial"),
+                "{at}: K's satisfiability"
             );
         }
     }
