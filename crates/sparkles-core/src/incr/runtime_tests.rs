@@ -2202,6 +2202,23 @@ fn an_ordered_live_query_streams_positions() {
     upd(&s, "INSERT DATA { :e :age 1 }");
     rt.round(&s);
     assert!(live.try_next().is_none());
+    // a resume at the circuit's commit starts with a reset as well, since a circuit
+    // built again may order ties otherwise
+    let at = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                after: Some(s.snapshot().commit),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        at.try_next(),
+        Some(LiveEvent::Snapshot { reset: true, .. })
+    ));
     let before = s.snapshot().commit;
     upd(&s, "INSERT DATA { :f :age 60 }");
     rt.round(&s);

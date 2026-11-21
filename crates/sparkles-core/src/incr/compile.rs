@@ -1616,7 +1616,9 @@ impl C {
             let var = match e {
                 Expression::Variable(v) => v.clone(),
                 _ => {
-                    let v = self.fresh();
+                    // a name no query can write, so it never meets a query's variable
+                    self.hidden += 1;
+                    let v = Variable::new_unchecked(format!("#ord{}", self.hidden));
                     keyed = GP::Extend {
                         inner: Box::new(keyed),
                         variable: v.clone(),

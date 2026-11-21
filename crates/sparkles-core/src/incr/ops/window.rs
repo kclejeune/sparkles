@@ -196,6 +196,12 @@ impl Window {
     }
 
     /// The rows of the window in order, each with its copies.
+    /// The slots of the kept rows' vector, for tests of its memory.
+    #[cfg(test)]
+    pub fn slots(&self) -> usize {
+        self.kept.capacity()
+    }
+
     pub fn rows(&self) -> Vec<(Row, i64)> {
         self.segments()
             .into_iter()
@@ -246,6 +252,9 @@ impl Window {
     /// Drop copies from the end until the kept rows fit the cap.
     fn trim(&mut self) {
         let cap = self.cap();
+        if self.held <= cap {
+            return;
+        }
         while self.held > cap {
             let excess = self.held - cap;
             let last = self.kept.last_mut().expect("held copies");
@@ -257,49 +266,81 @@ impl Window {
                 self.held -= excess;
             }
         }
+        if self.kept.capacity() > 2 * self.kept.len() + 64 {
+            self.kept.shrink_to_fit();
+        }
     }
 
-    /// The best rows of `rows`, the input's whole result, after the rows kept now: the
-    /// kept rows stay in their order and the others follow in theirs.
+    /// The best rows of `rows`, the input's whole result. With `keep`, the kept rows that
+    /// the input still holds stay in their order, clipped to the input's copies, since
+    /// an operator evaluated again can give other rows than its maintained state (a
+    /// `SAMPLE` keeps its value while the group holds it, and a fresh one takes the
+    /// smallest). The other rows of the best `cap` then join them at their places, and
+    /// copies of a row that is kept already join its entry.
     fn fill(&mut self, p: &Pass, rows: Changes, keep: bool) {
         self.total = rows.iter().map(|(_, w)| *w).sum();
         let cap = usize::try_from(self.cap()).unwrap_or(usize::MAX);
         let mut top: TopK<(Row, i64)> = TopK::new(cap, self.asc.clone());
         let mut partial = false;
+        let mut left: FxHashMap<Row, i64> = FxHashMap::default();
         for (r, w) in rows {
             if w <= 0 {
                 continue;
             }
             let keys = self.key_of(p, &r);
             partial |= keys.iter().any(|k| !k.totally_ordered());
+            if keep {
+                left.insert(r.clone(), w);
+            }
             top.offer(keys, (r, w));
         }
-        let mut have: FxHashMap<Row, i64> = FxHashMap::default();
         if keep && !partial {
-            for e in &self.kept {
-                *have.entry(e.row.clone()).or_insert(0) += e.w;
-            }
+            let mut kept = std::mem::take(&mut self.kept);
+            self.held = 0;
+            kept.retain_mut(|e| {
+                let n = left.get_mut(&e.row).map_or(0, |n| {
+                    let k = (*n).min(e.w);
+                    *n -= k;
+                    k
+                });
+                e.w = n;
+                self.held += n;
+                n > 0
+            });
+            self.kept = kept;
         } else {
             self.kept.clear();
             self.held = 0;
+            left.clear();
         }
         for e in top.into_sorted() {
-            let (row, mut w) = e.payload;
-            if let Some(h) = have.get_mut(&row) {
-                let k = (*h).min(w);
-                *h -= k;
-                w -= k;
+            let (row, full) = e.payload;
+            let w = if keep && !partial {
+                left.remove(&row).unwrap_or(0)
+            } else {
+                full
+            };
+            if w <= 0 {
+                continue;
             }
-            if w > 0 {
-                let serial = self.next_serial();
-                self.held += w;
-                self.kept.push(Entry {
+            self.held += w;
+            if let Some(i) = self.find(&row, &e.keys) {
+                self.kept[i].w += w;
+                continue;
+            }
+            let at = self
+                .kept
+                .partition_point(|k| self.cmp(&k.keys, &e.keys) != Ordering::Greater);
+            let serial = self.next_serial();
+            self.kept.insert(
+                at,
+                Entry {
                     row,
                     w,
                     keys: e.keys,
                     serial,
-                });
-            }
+                },
+            );
         }
         self.partial = partial;
         self.trim();
@@ -399,6 +440,10 @@ impl Window {
                     serial,
                 },
             );
+            // a large insert into a window that held its whole input stays bounded
+            if self.held > self.cap() {
+                self.trim();
+            }
         }
         self.trim();
         if self.held < self.need() && self.total > self.held {
@@ -454,11 +499,15 @@ impl Window {
 
     pub fn bytes(&self) -> u64 {
         let width = self.inner.schema.len();
-        let per = row_bytes(width) + 16 + (self.keys.len() * std::mem::size_of::<SortKey>()) as u64;
-        self.kept
-            .iter()
-            .map(|e| per + e.keys.iter().map(SortKey::payload_bytes).sum::<u64>())
-            .sum()
+        // the vector's slots, whether used or not, then each row's ids and keys
+        let slots = self.kept.capacity() as u64 * std::mem::size_of::<Entry>() as u64;
+        let per = row_bytes(width) + (self.keys.len() * std::mem::size_of::<SortKey>()) as u64;
+        slots
+            + self
+                .kept
+                .iter()
+                .map(|e| per + e.keys.iter().map(SortKey::payload_bytes).sum::<u64>())
+                .sum::<u64>()
     }
 
     pub fn save(&self, w: &mut Writer) -> Result<()> {

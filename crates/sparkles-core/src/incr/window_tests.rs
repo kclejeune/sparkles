@@ -582,3 +582,77 @@ fn a_window_in_a_subquery_follows_the_engine() {
         assert_eq!(got(&c), oracle(&s), "{u}");
     }
 }
+
+/// Review of item 419: a refill that finds more copies of a kept row adds them to its
+/// entry, so later deletions remove every copy.
+#[test]
+fn a_refill_adds_copies_to_the_kept_entry() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data: Vec<String> = (0..200).map(|i| triple(i, 1)).collect();
+    upd(&s, &format!("INSERT DATA {{ {} }}", data.join(" . ")));
+    let mut c = circuit(&s, "SELECT ?v WHERE { ?s :v ?v } ORDER BY ?v LIMIT 10");
+    let del = |from: u32, to: u32| {
+        let d: Vec<String> = (from..to).map(|i| triple(i, 1)).collect();
+        format!("DELETE DATA {{ {} }}", d.join(" . "))
+    };
+    upd(&s, &del(0, 105));
+    step(&s, &mut c);
+    assert_eq!(window(&c).len(), 10);
+    assert_eq!(window_op(&c).refills, 1);
+    upd(&s, &del(105, 195));
+    step(&s, &mut c);
+    assert_eq!(window(&c), ["1"; 5]);
+    upd(&s, &del(195, 200));
+    step(&s, &mut c);
+    assert!(window(&c).is_empty());
+}
+
+/// Review of item 419: a refill evaluates its input again, whose `SAMPLE` may then take
+/// another value than the maintained one, and the window keeps only rows the input holds.
+#[test]
+fn a_refill_follows_rows_its_input_changed() {
+    let s = Store::in_memory(StoreOptions::default());
+    let data: Vec<String> = (0..200)
+        .map(|i| format!(":g{i:03} :w \"10\"^^<{INT}>"))
+        .collect();
+    upd(&s, &format!("INSERT DATA {{ {} }}", data.join(" . ")));
+    let q = "SELECT ?g (SAMPLE(?x) AS ?s) WHERE { ?g :w ?x } GROUP BY ?g ORDER BY ?g LIMIT 2";
+    let mut c = circuit(&s, q);
+    assert_eq!(window(&c), ["g000 10", "g001 10"]);
+    upd(&s, &format!("INSERT DATA {{ :g000 :w \"1\"^^<{INT}> }}"));
+    step(&s, &mut c);
+    let d: Vec<String> = (1..=101)
+        .map(|i| format!(":g{i:03} :w \"10\"^^<{INT}>"))
+        .collect();
+    upd(&s, &format!("DELETE DATA {{ {} }}", d.join(" . ")));
+    step(&s, &mut c);
+    assert_eq!(window_op(&c).refills, 1);
+    let w = window(&c);
+    assert_eq!(w.len(), 2);
+    assert!(w[0].starts_with("g000 ") && w[1] == "g102 10", "{w:?}");
+}
+
+/// Review of item 419: a large insert into a window that held its whole input keeps the
+/// window's vector, and its charge, near the cap.
+#[test]
+fn a_large_insert_keeps_the_window_bounded() {
+    let s = Store::in_memory(StoreOptions::default());
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 1");
+    let data: Vec<String> = (0..5000).map(|i| triple(i, i as i64)).collect();
+    upd(&s, &format!("INSERT DATA {{ {} }}", data.join(" . ")));
+    step(&s, &mut c);
+    assert_eq!(window(&c), ["s0"]);
+    let w = window_op(&c);
+    assert!(w.slots() <= 2 * 101 + 64, "{} slots", w.slots());
+    assert!(c.root.bytes() < 200_000, "{} bytes", c.root.bytes());
+}
+
+/// Review of item 419: the hidden key of an order expression cannot take the name of a
+/// query's variable.
+#[test]
+fn a_hidden_key_never_meets_a_query_variable() {
+    let s = Store::in_memory(StoreOptions::default());
+    let q = "SELECT ?__incr1 WHERE { VALUES ?__incr1 { 1 2 } } ORDER BY (0 - ?__incr1) LIMIT 1";
+    let c = circuit(&s, q);
+    assert_eq!(window(&c), ["2"]);
+}
