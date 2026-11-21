@@ -49,8 +49,9 @@
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
-    DlIx, DlSt, Found, MREPAIR_HOLDER, MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, Side, alls, dix,
-    dl, drain, drain_with, ds, merge, pred_id, restricted, side, unit, with,
+    DlIx, DlSt, Found, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN, MREPAIR_ON,
+    MREPAIR_UNITS, MREPAIR_WIDE, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id,
+    restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -1474,7 +1475,27 @@ pub(super) fn marker_repair(on: bool) -> u8 {
             .ok()
             .and_then(|v| v.parse().ok())
     });
-    env.unwrap_or(if on { MREPAIR_ON } else { 0 })
+    let test = TEST_MODE.load(std::sync::atomic::Ordering::Relaxed);
+    env.unwrap_or(if test != 0 {
+        test
+    } else if on {
+        MREPAIR_ON
+    } else {
+        0
+    })
+}
+
+/// The repair's mode and the diagnostic that [`marker_test_mode`] sets, for the deficits'
+/// tests, which run in a test binary of their own.
+static TEST_MODE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static TEST_DIAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Sets the repair's mode for the runs that start from here on, which the environment
+/// overrides, `0` for [`Limits::rooted_marker_repair`](super::Limits)'s, and turns on the
+/// diagnostic's deficits in [`Stats::dl_marker_deficits`](super::Stats), for tests.
+pub fn marker_test_mode(mode: u8, diag: bool) {
+    TEST_MODE.store(mode, std::sync::atomic::Ordering::Relaxed);
+    TEST_DIAG.store(diag, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// M-send in the context `me`, other than the root, on its new premise `prem` whose maximal
@@ -1553,7 +1574,7 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
 /// run has stopped or an activation of a run in steps is past the bound, which both end the
 /// run without a claim, so a send left undone never hides behind a complete answer.
 fn m_poll<S: Sink>(k: usize, st: &mut State, out: &mut S) -> bool {
-    if k == 0 || k % M_POLL != 0 || out.sent_go_on() {
+    if k == 0 || !k.is_multiple_of(M_POLL) || out.sent_go_on() {
         return true;
     }
     ds(st).store.interrupted = true;
@@ -1654,12 +1675,15 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         to.sort_unstable();
         to.dedup();
         for (k, d) in to.into_iter().enumerate() {
-            if k > 0 && k % M_POLL == 0 && !out.sent_go_on() {
+            if k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on() {
                 x.store.interrupted = true;
                 return true;
             }
             m_fwd(r, d, l, out);
         }
+    }
+    if mode & MREPAIR_NO_RETURN != 0 {
+        return true;
     }
     // the returns: the root's clauses with l in the body whose other body literals h holds
     let ids: Vec<u32> = r
@@ -1693,6 +1717,9 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
 /// literals over them that a context other than v holds, unless they are live units.
 fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     let mode = out.dl().mrepair;
+    if mode & MREPAIR_NO_REPLAY != 0 {
+        return;
+    }
     let Some(r) = x.root.as_deref().filter(|r| r.m.is_some()) else {
         return;
     };
@@ -1705,7 +1732,7 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     ls.sort_unstable();
     ls.dedup_by_key(|p| p.0);
     for (k, (i, u)) in ls.into_iter().enumerate() {
-        if k > 0 && k % M_POLL == 0 && !out.sent_go_on() {
+        if k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on() {
             x.store.interrupted = true;
             return;
         }
@@ -1725,7 +1752,8 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
 /// context that holds every body literal, and is listed under its body literals for the
 /// holders that come later. The head may be empty, so a denial returns too.
 fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S) {
-    if out.dl().mrepair & MREPAIR_ON == 0 || st.bottom || c.body().is_empty() {
+    let mode = out.dl().mrepair;
+    if mode & MREPAIR_ON == 0 || mode & MREPAIR_NO_RETURN != 0 || st.bottom || c.body().is_empty() {
         return;
     }
     let inv = inv_of(ix, dix(ix));
@@ -1801,15 +1829,7 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
 fn ret_products(st: &State, c: &Clause, fixed: Option<(Lit, &Side)>, found: &mut Found) {
     found.rule = "mret";
     let body = c.body();
-    let free: Vec<Vec<Side>> = body
-        .iter()
-        .map(|&l| {
-            partners_of(st, l, true)
-                .into_iter()
-                .filter(|s| !(s.1.is_empty() && s.0 == [l]))
-                .collect()
-        })
-        .collect();
+    let free = ret_lists(st, body);
     let base: Side = (Vec::new(), c.head().to_vec());
     match fixed {
         None => found.products(free, base),
@@ -1825,6 +1845,19 @@ fn ret_products(st: &State, c: &Clause, fixed: Option<(Lit, &Side)>, found: &mut
     }
 }
 
+/// The premises of M-return's resolution on each literal of `body`: the context's processed
+/// clauses other than markers where it is maximal, selected ones included.
+fn ret_lists(st: &State, body: &[Lit]) -> Vec<Vec<Side>> {
+    body.iter()
+        .map(|&l| {
+            partners_of(st, l, true)
+                .into_iter()
+                .filter(|s| !(s.1.is_empty() && s.0 == [l]))
+                .collect()
+        })
+        .collect()
+}
+
 /// Row 1231's diagnostic, which `SPARKLES_ROOTED_MARKER_DIAG=1` turns on: after a rooted
 /// run saturates, the run reports on stderr how often a context that is registered with the
 /// root for a constant of a conditional ground trigger lies outside the successors of the
@@ -1833,7 +1866,7 @@ pub(super) fn marker_diag() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         std::env::var_os("SPARKLES_ROOTED_MARKER_DIAG").is_some_and(|v| v == "1" || v == "2")
-    })
+    }) || TEST_DIAG.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Whether row 1231's diagnostic also prints each pair, which `SPARKLES_ROOTED_MARKER_DIAG=2`
@@ -1888,12 +1921,12 @@ pub(super) struct MarkerDef {
     /// whether the context is unsatisfiable, which discharges what it is owed
     bottom: bool,
     /// in another context, the ground literals whose markers it holds or has a live clause
-    /// that subsumes, and the root's clauses it took by table id
+    /// that subsumes
     marks: Vec<Lit>,
-    took: Vec<u32>,
-    /// in the root, the bodies and table ids of its live processed clauses whose bodies
-    /// are ground triggers
-    gbody: Vec<(Vec<Lit>, Option<u32>)>,
+    /// in another context, the live root clauses with ground bodies that it holds every body
+    /// literal of and lacks a product of, and those whose products are too many to check
+    owed: usize,
+    unchecked: usize,
 }
 
 /// The factor by which a vector's capacity or a hash table's buckets can pass the
@@ -1996,22 +2029,60 @@ pub(super) fn marker_ctx(
     }))
 }
 
-/// The deficits' copy of the context `me` with the state `st`, for the diagnostic and outside
-/// the run's memory budget, as the diagnostic's sets are.
-pub(super) fn marker_def(
+/// Whether `e` is the root of the rooted run.
+pub(super) fn is_root(ix: &Index, e: Ex) -> bool {
+    dix(ix).root == Some(e)
+}
+
+/// The root's live clauses whose bodies are ground triggers, which [`marker_def`] reads, for
+/// the diagnostic.
+pub(super) fn marker_root_gbody(
     ix: &Index,
     me: Ex,
     st: &State,
     lits: &super::dl_clause::Lits,
+) -> Vec<Clause> {
+    let inv = inv_of(ix, dix(ix));
+    let Some(x) = dl(st).filter(|_| is_root(ix, me)) else {
+        return Vec::new();
+    };
+    x.store
+        .clauses
+        .iter()
+        .filter(|s| {
+            !s.dead
+                && !s.c.body().is_empty()
+                && s.c
+                    .body()
+                    .iter()
+                    .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
+        })
+        .map(|s| s.c.clone())
+        .collect()
+}
+
+/// The choices of one product of [`marker_def`] past which a pair counts as unchecked.
+const DEF_CHOICES: usize = 1 << 16;
+
+/// The deficits' copy of the context `m` with the state `st`, for the diagnostic and outside
+/// the run's memory budget, as the diagnostic's sets are. `rg` holds the root's live clauses
+/// with ground bodies ([`marker_root_gbody`]). A clause is owed to the context when the
+/// context holds every body literal, is satisfiable, and lacks one of the products that
+/// M-return derives from it, each choice of a live premise with each body literal maximal
+/// merged with the clause's head: the product is neither a tautology, after the sorting and
+/// the tests that `derive` applies first, nor subsumed by a live clause of the context.
+/// derive's other simplifications are not replayed, so a product they drop can count.
+pub(super) fn marker_def(
+    ix: &Index,
+    m: &MarkerCtx,
+    st: &State,
+    rg: &[Clause],
 ) -> Option<MarkerDef> {
     let x = dl(st)?;
-    let dx = dix(ix);
-    let inv = inv_of(ix, dx);
-    let is_root = dx.root == Some(me);
-    let (mut marks, mut took, mut gbody) = (Vec::new(), Vec::new(), Vec::new());
+    let is_root = is_root(ix, m.me);
+    let mut marks = Vec::new();
     if let Some(r) = x.root.as_deref() {
         marks.extend(r.gmarks.iter().copied());
-        took.extend(r.seen.iter().copied());
     }
     for s in &x.store.clauses {
         if s.dead {
@@ -2028,20 +2099,76 @@ pub(super) fn marker_def(
         {
             marks.push(l);
         }
-        if is_root
-            && !b.is_empty()
-            && b.iter()
-                .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
-        {
-            gbody.push((b.to_vec(), s.sent));
+    }
+    let (mut owed, mut unchecked) = (0, 0);
+    if !is_root && !st.bottom {
+        for c in rg {
+            if !c.body().iter().all(|l| m.held.contains(l)) {
+                continue;
+            }
+            let lists = ret_lists(st, c.body());
+            let n = lists
+                .iter()
+                .try_fold(1usize, |n, l| n.checked_mul(l.len()))
+                .unwrap_or(usize::MAX);
+            if n > DEF_CHOICES {
+                unchecked += 1;
+                continue;
+            }
+            if n > 0 && !products_held(st, &lists, c.head()) {
+                owed += 1;
+            }
         }
     }
     Some(MarkerDef {
         bottom: st.bottom,
         marks,
-        took,
-        gbody,
+        owed,
+        unchecked,
     })
+}
+
+/// Whether the context holds every product of `lists` with the head `head`: each is a
+/// tautology or a live clause of the context subsumes it.
+fn products_held(st: &State, lists: &[Vec<Side>], head: &[Lit]) -> bool {
+    use super::dl_clause::X;
+    let Some(x) = dl(st) else { return false };
+    let mut at = vec![0usize; lists.len()];
+    loop {
+        let mut body: Vec<Lit> = Vec::new();
+        let mut hd: Vec<Lit> = head.to_vec();
+        for (l, &i) in lists.iter().zip(&at) {
+            body.extend_from_slice(&l[i].0);
+            hd.extend_from_slice(&l[i].1);
+        }
+        body.retain(|l| !(l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom()))));
+        body.sort_unstable();
+        body.dedup();
+        hd.sort_unstable();
+        hd.dedup();
+        let taut = hd.iter().any(|&l| {
+            (l.kind() == X && (l.atom() == TOP || st.subs.contains(&l.atom())))
+                || body.binary_search(&l).is_ok()
+        });
+        if !taut {
+            let c = Clause::new(body, hd);
+            if !x.store.subsumed(&c, c.sig()) {
+                return false;
+            }
+        }
+        let mut k = lists.len();
+        loop {
+            if k == 0 {
+                return true;
+            }
+            k -= 1;
+            at[k] += 1;
+            if at[k] < lists[k].len() {
+                break;
+            }
+            at[k] = 0;
+        }
+    }
 }
 
 /// Counts, for each tier, the conditional ground triggers, their constants and the pairs
@@ -2198,18 +2325,18 @@ pub(super) fn marker_trips(
 /// contexts' clauses and not from the sends: the triples of P_R, holder, trigger and context,
 /// whose context holds neither the trigger's marker nor a clause that subsumes it, and the
 /// pairs of a live root clause whose body is ground triggers and a context that holds every
-/// body literal and did not take it. A run without the repair has no clause to take, so its
-/// second count is every such pair. `defs` holds [`marker_def`]'s copy of each context of
-/// `cs`, in its order.
+/// body literal and lacks one of the clause's M-return products ([`marker_def`]), and the
+/// pairs whose products are too many to check. `defs` holds marker_def's copy of each
+/// context of `cs`, in its order.
 pub(super) fn marker_deficits(
     ix: &Index,
     cs: &[MarkerCtx],
     defs: &[Option<MarkerDef>],
     lits: &super::dl_clause::Lits,
-) -> [usize; 2] {
+) -> [usize; 3] {
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
-    let mut out = [0usize; 2];
+    let mut out = [0usize; 3];
     let Some(root) = dx.root else { return out };
     let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
     let Some(&ri) = by.get(&root) else { return out };
@@ -2258,20 +2385,9 @@ pub(super) fn marker_deficits(
             }
         }
     }
-    let Some(rd) = defs.get(ri).and_then(Option::as_ref) else {
-        return out;
-    };
-    for (b, id) in &rd.gbody {
-        for (c, cd) in cs.iter().zip(defs) {
-            let Some(cd) = cd.as_ref() else { continue };
-            if c.me != root
-                && !cd.bottom
-                && b.iter().all(|l| c.held.contains(l))
-                && !id.is_some_and(|id| cd.took.contains(&id))
-            {
-                out[1] += 1;
-            }
-        }
+    for d in defs.iter().flatten() {
+        out[1] += d.owed;
+        out[2] += d.unchecked;
     }
     out
 }

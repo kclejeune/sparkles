@@ -926,7 +926,7 @@ impl Store {
 
     /// Whether a clause of the store that is not dead subsumes `c`, whose signature is
     /// `sig`: a clause that does has its last head literal in `c`'s head.
-    fn subsumed(&self, c: &Clause, sig: u64) -> bool {
+    pub(super) fn subsumed(&self, c: &Clause, sig: u64) -> bool {
         let check = |ids: &[u32]| {
             ids.iter().any(|&i| {
                 let s = &self.clauses[i as usize];

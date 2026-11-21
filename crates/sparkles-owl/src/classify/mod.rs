@@ -91,6 +91,8 @@ mod taxonomy;
 mod world;
 
 pub use dl::{OutsideEl, Tier};
+#[doc(hidden)]
+pub use dl_root::marker_test_mode;
 pub use index::Gap;
 pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
@@ -462,6 +464,9 @@ pub struct Stats {
     /// classified again without the rooted rules, as past its bound, and left the axioms
     /// outside OWL 2 EL out
     pub dl_rooted_declined: bool,
+    /// with row 1231's diagnostic on, the marker repair's deficits at quiescence: the owed
+    /// marker deliveries, the owed returns, and the returns with too many products to check
+    pub dl_marker_deficits: [usize; 3],
     /// a run of Tier D without counting and without the rooted rules passed its bound on
     /// derived conclusions ([`Limits::dl_attempt_work`]), so the run classified with the
     /// Horn rules and left the disjunctive axioms out
@@ -2867,7 +2872,7 @@ impl Saturation {
                 let mut ok = admit((n * std::mem::size_of::<dl_root::MarkerCtx>()) as isize);
                 let mut cs = Vec::with_capacity(if ok { n } else { 0 });
                 let diag = dl_root::marker_diag();
-                let mut defs = Vec::new();
+                let mut refs = Vec::new();
                 for (e, c) in self
                     .ctx
                     .iter()
@@ -2882,10 +2887,8 @@ impl Saturation {
                     match dl_root::marker_ctx(&ix, e, &st, &d.lits, &mut admit) {
                         Ok(Some(m)) => {
                             cs.push(m);
-                            // the deficits' copy, outside the run's memory budget, as the
-                            // diagnostic's sets are
                             if diag {
-                                defs.push(dl_root::marker_def(&ix, e, &st, &d.lits));
+                                refs.push(c);
                             }
                         }
                         Ok(None) => {}
@@ -2897,6 +2900,21 @@ impl Saturation {
                 }
                 ok = ok && admit(dl_root::marker_search_bytes(&cs) as isize);
                 drop(admit);
+                // the deficits' copies, outside the run's memory budget, as the diagnostic's
+                // sets are: the root's live clauses with ground bodies first, which each
+                // holder's copy reads
+                let mut defs = Vec::new();
+                if diag && ok {
+                    let rg = cs
+                        .iter()
+                        .zip(&refs)
+                        .find(|(m, _)| dl_root::is_root(&ix, m.me))
+                        .map(|(m, c)| dl_root::marker_root_gbody(&ix, m.me, &c.st.lock(), &d.lits))
+                        .unwrap_or_default();
+                    for (m, c) in cs.iter().zip(&refs) {
+                        defs.push(dl_root::marker_def(&ix, m, &c.st.lock(), &rg));
+                    }
+                }
                 if !ok {
                     return Err(Error::Memory {
                         limit: max_memory.unwrap_or(usize::MAX),
@@ -2915,8 +2933,9 @@ impl Saturation {
                         .each_ref()
                         .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
                     let def = dl_root::marker_deficits(&ix, &cs, &defs, &d.lits);
+                    stats.dl_marker_deficits = def;
                     eprintln!(
-                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}",
+                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}/{}",
                         stats.dl_work,
                         pr[0],
                         pr[1],
@@ -2926,7 +2945,8 @@ impl Saturation {
                         m[1],
                         m[2],
                         def[0],
-                        def[1]
+                        def[1],
+                        def[2]
                     );
                 }
                 if let Some(t) = decline

@@ -543,7 +543,8 @@ pub struct DlRun {
     width_limit: AtomicUsize,
     /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
     /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`], with
-    /// [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements
+    /// [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and
+    /// [`MREPAIR_NO_RETURN`] and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests
     pub mrepair: u8,
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
@@ -561,6 +562,12 @@ pub const MREPAIR_UNITS: u8 = 4;
 /// [`DlRun::mrepair`]: M-send sends the marker to every registered context, the wide arm,
 /// and not only to those that the root reaches by successors, the pair set P_R of PLAN v3.1.
 pub const MREPAIR_WIDE: u8 = 8;
+/// [`DlRun::mrepair`], for the deficits' tests only: the root returns no clause (M-return),
+/// so that a missing product shows in the diagnostic's second deficit.
+pub const MREPAIR_NO_RETURN: u8 = 32;
+/// [`DlRun::mrepair`], for the deficits' tests only: a context that the root registers or
+/// reaches late takes no marker sent before, so that a missing marker shows in the first.
+pub const MREPAIR_NO_REPLAY: u8 = 64;
 
 impl DlRun {
     pub fn new(eager: bool, worked: std::sync::Arc<std::sync::atomic::AtomicBool>) -> DlRun {
