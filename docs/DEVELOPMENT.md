@@ -367,6 +367,70 @@ command that itself exits with one of these codes is told apart by the `outcome`
 the job's `progress.log`. The [remote CI section](REMOTE-EXECUTORS.md#remote-ci) gives the
 details.
 
+### Script tests
+
+The Python tests of the CI, gate and benchmark scripts live in `scripts/bench-tests`, and
+`mise run test:bench-scripts` runs them with `scripts/unittest-parallel.py`, eight processes
+at a time. `python3 -m unittest discover -s scripts/bench-tests` runs the same tests
+serially, and the runner reaches the same verdict under the condition given below. It
+discovers the suite once in a child process and then starts one process per module or
+package that discovery loads. Each process discovers the whole suite again, checks that it
+found the same tests in the same order, and runs its own part exactly as discovered. Import
+errors, import-time skips and class and module fixtures therefore behave as they do
+serially. The whole suite runs in one process, as discovery returned it, and the runner says
+why, when any module or package has a `load_tests` hook, when the suite holds anything other
+than default suites and `TestCase` tests, including a suite given its own `run`, when a test
+module changes unittest's suite classes or rebinds their names, or when test classes of one
+module run under more than one module, as when one test module imports another's class. Such
+a suite or test can depend on what ran before it, and the runner does not try to tell
+whether it does. A default suite that replaces both its own `run` and `countTestCases` and
+hides its tests, for instance by setting `_tests` to `None`, is outside what the runner
+supports, and the runner fails the run with exit 1 instead of passing it. Tests that share
+state in another way, such as a helper module's globals, are not detected. The runner
+therefore reaches the serial verdict only when no test depends on state that a test in
+another process left behind, and passing alone does not show this, since such a test can
+skip instead of fail. The same holds for the tests of a split module.
+The runner also assumes that a test's own `run` method reads only its own test's result, and
+that test code does not react to being inspected or imported more than once, since each
+process imports every module and asks each test for its id and attributes again. The
+[nightly gate](#nightly-gate) runs the suite both ways and fails when the two verdicts or
+test counts differ.
+The three long tests of `test_x08_latency` run one per process. A module named with
+`--split` is split this way only when it has no fixtures, imported classes or repeated
+tests, and otherwise runs whole with a note that says why.
+
+Each process writes a result record, and the runner takes its verdict from those records
+and from unittest's own results, never from the printed output. A process that ends without
+a complete record fails, and a run in which no test ran and none was skipped exits 5, as
+unittest does. The process-leak check in `test_zz_process_leaks.py` runs once, after every
+other process, on the unwaited subprocesses that each process reports after its tests and
+teardown. Discovery has a 300 s deadline and each process a 900 s deadline, which
+`--discover-timeout` and `--unit-timeout` change. The one process that runs the whole suite,
+when it does, has a 2400 s deadline, which `--suite-timeout` changes. At a deadline, or on SIGINT, SIGTERM or
+SIGHUP, the runner starts no more processes, stops every active one with its group and the
+descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
+the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
+stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
+host it says so and hands the run to a serial `unittest discover`, which then exits as it
+would on its own. It hands the run over in the same way when the discovery directory, or any
+directory under it, has an entry named as one of the few modules that its processes load
+before discovery and serial discovery does not, such as `json.py`, since a test importing
+`json` would get that file serially and the runner's module in its processes. Serial
+discovery puts the working directory first on the path before it loads `argparse` and
+`unittest`, so an entry there named as any module loaded after interpreter startup, such as
+`locale.py`, also hands the run over. A test that puts a directory outside the discovery
+directory on the path is not checked, and the nightly comparison of the two runs catches a
+module that it shadows. `--keep DIR` keeps the discovery, the plan, each process's output
+and the result records. Discovery and every process get the interpreter's `-W`
+options, so `python3 -Werror scripts/unittest-parallel.py` fails on a warning as serial
+`python3 -Werror -m unittest discover` does.
+
+Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
+`test_git_isolation.py` fails when one does not. The import removes the host's `GIT_*`
+variables and global Git configuration, such as hooks, signing and templates, so a fixture
+repository and any script a test runs see only their own settings. A new test module needs
+the same first import, even when it runs Git only through another script.
+
 ### Remote executors
 
 Prefer available local resources before renting another worker. A 16 GiB Boat worker is
@@ -1205,6 +1269,15 @@ and catches up after the laptop wakes. `--uninstall` removes the timer and
 `--dry-run` prints the commit and the hosts. The timer's service needs the ssh agent that
 the ssh configuration names, so an agent socket at a fixed path, as with an
 `IdentityAgent` setting, works where a per-login agent does not.
+
+A full gate, and so the nightly gate, also runs `mise run test:bench-scripts:compare` after
+its ci step. It runs the script tests serially with `python3 -m unittest discover` and then
+with the parallel runner, one after the other, and fails when their exit statuses or their
+counts of tests run and skipped differ. The parallel runner reaches the serial verdict only
+under assumptions about the tests that it does not check, which
+[Script tests](#script-tests) lists, and this comparison catches a test that breaks one.
+The comparison adds about 13 minutes to a full gate, and it runs only on full and nightly
+gates, not on a batch gate that selects its checks.
 
 Each run writes a log to `.artifacts/gates/nightly/` in the main checkout, and the gate's
 results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. The server artifact link

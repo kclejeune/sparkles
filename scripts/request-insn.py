@@ -351,15 +351,33 @@ def wait_ready(port, proc, timeout=60):
     raise RuntimeError("the server did not become ready")
 
 
+def _die_with(parent):
+    """A preexec function that makes the child get SIGKILL when PARENT exits, and exit at
+    once when PARENT has already gone. The setting survives the exec of taskset, chrt and sh."""
+
+    def setup():
+        try:
+            ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+        except (OSError, AttributeError):
+            pass
+        if os.getppid() != parent:
+            os._exit(1)
+
+    return setup
+
+
 def spinners(cpus, out):
     """Starts an idle-priority busy loop on each CPU, appending each to `out` as soon as it
-    runs, so that the caller's cleanup stops every one even when a later start fails."""
+    runs, so that the caller's cleanup stops every one even when a later start fails. A loop
+    also dies with this process, so a run that is killed outright, whose cleanup never runs,
+    leaves no busy loop behind."""
     for c in cpus:
         out.append(
             subprocess.Popen(
                 ["taskset", "-c", str(c), "chrt", "-i", "0", "sh", "-c", "while :; do :; done"],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                preexec_fn=_die_with(os.getpid()),
             )
         )
 

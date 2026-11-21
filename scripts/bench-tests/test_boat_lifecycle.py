@@ -1,4 +1,5 @@
 """Finite source integration controls; no provider or manager operation runs."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 from pathlib import Path
 import copy
 import ctypes

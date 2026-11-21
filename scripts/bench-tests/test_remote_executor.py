@@ -1,4 +1,5 @@
 """Provider contracts using bounded local fixtures, never provider qualification."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import hashlib
 import ctypes
 import importlib.util
@@ -889,14 +890,17 @@ class LocalTransport(unittest.TestCase):
         for status in (0,17):
             for public_send in (True,False):
                 ready=self.root/f'ready-{status}-{public_send}';pidfile=self.root/f'pid-{status}-{public_send}'
-                child="import signal,time,pathlib;signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path("+repr(str(ready))+").write_text('ready');time.sleep(5)"
-                leader="import sys,subprocess,pathlib,time;sys.stdin.buffer.read();p=subprocess.Popen([sys.executable,'-c',"+repr(child)+"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);pathlib.Path("+repr(str(pidfile))+").write_text(str(p.pid));end=time.monotonic()+1\nwhile not pathlib.Path("+repr(str(ready))+").exists():\n if time.monotonic()>end:raise SystemExit(19)\n time.sleep(.005)\nraise SystemExit("+str(status)+")"
-                foreign=subprocess.Popen(['sleep','5'],start_new_session=True)
+                child="import signal,time,pathlib;signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path("+repr(str(ready))+").write_text('ready')\nwhile True:signal.pause()"
+                leader="import sys,subprocess,pathlib,time;sys.stdin.buffer.read();p=subprocess.Popen([sys.executable,'-c',"+repr(child)+"],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);pathlib.Path("+repr(str(pidfile))+").write_text(str(p.pid));end=time.monotonic()+20\nwhile not pathlib.Path("+repr(str(ready))+").exists():\n if time.monotonic()>end:raise SystemExit(19)\n time.sleep(.005)\nraise SystemExit("+str(status)+")"
+                # Both fixtures stay alive until something ends them, so only the transport's reap
+                # ends the owned child and only the finally ends the unrelated sentinel, however long
+                # a loaded host takes over the exchange.
+                foreign=subprocess.Popen(['sleep','infinity'],start_new_session=True)
                 try:
                     argv=[sys.executable,'-c',leader]
                     with patch.object(RX,'command',return_value=argv),tempfile.TemporaryFile()as output:
-                        if public_send:code=RX.send('boat:bx_test','fixture',io.BytesIO(b'exact input'),time.monotonic()+2)
-                        else:code=RX.exchange(argv,output,source=io.BytesIO(b'exact input'),deadline=time.monotonic()+2)
+                        if public_send:code=RX.send('boat:bx_test','fixture',io.BytesIO(b'exact input'),time.monotonic()+30)
+                        else:code=RX.exchange(argv,output,source=io.BytesIO(b'exact input'),deadline=time.monotonic()+30)
                     self.assertEqual(code,status);self.assertTrue(ready.exists())
                     child_pid=int(pidfile.read_text());self.assertFalse(Path('/proc',str(child_pid)).exists())
                     with self.assertRaises(ChildProcessError):os.waitpid(child_pid,os.WNOHANG)

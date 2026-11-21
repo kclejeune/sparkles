@@ -1,4 +1,5 @@
 """Exercise the report of the GitHub workflow runs on main (scripts/gate/github-runs.py)."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import json
 import tempfile

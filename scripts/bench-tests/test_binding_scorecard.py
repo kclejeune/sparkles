@@ -1,5 +1,6 @@
 """A faster unqualified result must never become a ranked binding result."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import copy
 import importlib.util
 from pathlib import Path
