@@ -179,6 +179,12 @@ const DISJOINT_HEADER: &str = "_:o a owl:Ontology, owl:AllDisjointClasses ;
         owl:members (:A :B) ; rdfs:label \"title\" .
     :A rdfs:subClassOf :B .";
 
+const REIFIER_DISJOINT_HEADER: &str = ":o a owl:Ontology ; rdfs:label \"title\" .
+    _:r a owl:Annotation, owl:AllDisjointClasses ;
+        owl:annotatedSource :o ; owl:annotatedProperty rdfs:label ; owl:annotatedTarget \"title\" ;
+        owl:members (:A :B) ; rdfs:comment \"nested\" .
+    :A rdfs:subClassOf :B .";
+
 pub(super) const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "basic",
@@ -360,6 +366,16 @@ pub(super) const FIXTURES: &[Fixture] = &[
         data: DISJOINT_HEADER,
         args: strict,
     },
+    Fixture {
+        name: "reifier-disjoint-header",
+        data: REIFIER_DISJOINT_HEADER,
+        args: default_args,
+    },
+    Fixture {
+        name: "reifier-disjoint-header-strict",
+        data: REIFIER_DISJOINT_HEADER,
+        args: strict,
+    },
 ];
 
 /// The fixtures whose reading needs the whole mapping, so that the head opens the ontology.
@@ -382,6 +398,8 @@ const OPENED: &[&str] = &[
     "declared-and-reified-strict",
     "disjoint-header",
     "disjoint-header-strict",
+    "reifier-disjoint-header",
+    "reifier-disjoint-header-strict",
 ];
 
 fn g1_g1() -> J {
@@ -464,6 +482,22 @@ fn the_head_answers_what_the_summary_does() {
 
 #[test]
 fn the_head_reads_without_opening_the_ontology() {
+    if std::env::var_os("SPARKLES_BLESS_HEAD").is_some() {
+        let opened: Vec<&str> = FIXTURES
+            .iter()
+            .filter(|f| {
+                let ds = dataset(f.data);
+                let req = super::wire::request_of((f.args)().as_object().unwrap()).unwrap();
+                ds.ontology()
+                    .head(&req, &QueryOptions::default())
+                    .unwrap()
+                    .opened
+            })
+            .map(|f| f.name)
+            .collect();
+        println!("----- opened -----\n{opened:#?}\n----- end -----");
+        return;
+    }
     for f in FIXTURES {
         let ds = dataset(f.data);
         let req = super::wire::request_of((f.args)().as_object().unwrap()).unwrap();

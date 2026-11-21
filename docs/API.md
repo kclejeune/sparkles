@@ -1863,17 +1863,21 @@ the commit it read.
 mapping of the whole graph. These are `dataset`, `commit`, `mode`, `graphs`, `imports`,
 `warnings`, `inferences`, `header`, `entities` and `closure`, with `"view": "head"`, and
 `axioms`, `axiomCount`, `triples`, `unmapped`, `diagnostics` and `cached` are left out.
-The server reads the header from the quads of the ontology nodes and the blank nodes and
-reifications they reach, and the entity counts from the `rdf:type` triples of each
-declaring type, so its time grows with the header and the declarations and not with the
-axioms, which the full summary maps first. Its values equal the full summary's. A read past
-the head's bounds, such as more than 1,000 ontology nodes or 10,000 reified type
-triples, opens the ontology and answers from the mapping. The server also opens the
-ontology when a graph types `rdf:type` or another structural predicate as an OWL property,
-when the main triple of a reified header annotation uses a predicate that is not built in
-and not declared an annotation property directly, when an IRI the header uses has an
-annotated declaration, and when an ontology node also has another part in the mapping,
-such as a blank node that is also an `owl:AllDisjointClasses` node, since the mapping then reads triples outside the head's reads.
+The server reads the header from the quads of the ontology nodes and of the `owl:Axiom`
+and `owl:Annotation` nodes that annotate their triples, and the entity counts from the
+`rdf:type` triples of each declaring type, so its time grows with the header and the
+declarations and not with the axioms, which the full summary maps first. Its values equal
+the full summary's. The server answers from these reads only when no other triple can
+change the answer. An ontology node may hold its type, `owl:imports`, `owl:versionIRI` and
+annotations. An annotation node may hold one type, one source, the property and target it
+annotates and its own annotations, and no other triple may name it. Any other part in the
+mapping opens the ontology and answers from the mapping. Examples are an
+`owl:AllDisjointClasses` type on an ontology or annotation node, an `owl:Axiom` node that
+annotates another annotation node, and the reification of a predicate that is not an
+annotation property. The ontology also opens when a graph types `rdf:type` or another
+structural predicate as an OWL property, when an IRI the header uses has an annotated
+declaration, and past the head's bounds, such as more than 1,000 ontology nodes or 10,000
+reified type triples.
 The head has its own entity tag, which an edit's `If-Match` can name as it names the
 summary's. `view=full` is the default, and `view=head` refuses `metrics`. The Rust JSON `summary` operation and the
 Python `summary()` take the same `view`.

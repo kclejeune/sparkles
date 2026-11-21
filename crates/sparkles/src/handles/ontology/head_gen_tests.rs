@@ -62,7 +62,7 @@ type Statements = Vec<(Option<&'static str>, String)>;
 
 /// The default graph most of the time, otherwise `g1` or `g2`.
 fn graph(r: &mut Rng) -> Option<&'static str> {
-    if r.p(0.75) {
+    if r.p(0.85) {
         None
     } else if r.p(0.6) {
         Some("g1")
@@ -107,7 +107,14 @@ fn generate(seed: u64) -> Case {
         onodes.push(":o2");
     }
     for n in &onodes {
-        triple(&mut r, &mut st, &mut reifiable, n, "a", "owl:Ontology");
+        triple(
+            &mut r,
+            &mut st,
+            &mut reifiable,
+            n,
+            "rdf:type",
+            "owl:Ontology",
+        );
         if r.p(0.1) {
             // typed in a second graph too
             st.push((Some("g2"), format!("{n} a owl:Ontology .")));
@@ -192,7 +199,7 @@ fn generate(seed: u64) -> Case {
             &mut st,
             &mut reifiable,
             ":n",
-            "a",
+            "rdf:type",
             "owl:AnnotationProperty",
         );
     }
@@ -203,12 +210,33 @@ fn generate(seed: u64) -> Case {
         add(&mut r, &mut st, ":n rdfs:subPropertyOf rdfs:label .".into());
     }
     if r.p(0.6) {
-        triple(&mut r, &mut st, &mut reifiable, ":A", "a", "owl:Class");
+        triple(
+            &mut r,
+            &mut st,
+            &mut reifiable,
+            ":A",
+            "rdf:type",
+            "owl:Class",
+        );
     }
     if r.p(0.4) {
-        triple(&mut r, &mut st, &mut reifiable, ":B", "a", "owl:Class");
+        triple(
+            &mut r,
+            &mut st,
+            &mut reifiable,
+            ":B",
+            "rdf:type",
+            "owl:Class",
+        );
     } else if r.p(0.4) {
-        triple(&mut r, &mut st, &mut reifiable, ":B", "a", "rdfs:Class");
+        triple(
+            &mut r,
+            &mut st,
+            &mut reifiable,
+            ":B",
+            "rdf:type",
+            "rdfs:Class",
+        );
     }
     if r.p(0.05) {
         add(&mut r, &mut st, ":A a owl:Restriction .".into());
@@ -219,7 +247,7 @@ fn generate(seed: u64) -> Case {
             &mut st,
             &mut reifiable,
             ":pp",
-            "a",
+            "rdf:type",
             "owl:ObjectProperty",
         );
     }
@@ -229,7 +257,7 @@ fn generate(seed: u64) -> Case {
             &mut st,
             &mut reifiable,
             ":pp",
-            "a",
+            "rdf:type",
             "owl:TransitiveProperty",
         );
     }
@@ -268,7 +296,14 @@ fn generate(seed: u64) -> Case {
         } else {
             format!("_:r{k}")
         };
-        let (s, p, o) = if !reifiable.is_empty() && r.p(0.85) {
+        let on_header: Vec<Triple> = reifiable
+            .iter()
+            .filter(|t| onodes.contains(&t.0.as_str()) && t.1 != "rdf:type")
+            .cloned()
+            .collect();
+        let (s, p, o) = if !on_header.is_empty() && r.p(0.5) {
+            r.pick(&on_header).clone()
+        } else if !reifiable.is_empty() && r.p(0.85) {
             r.pick(&reifiable).clone()
         } else {
             let s = r.pick(&[":o", "_:b", ":A", "_:r0"]).to_string();
@@ -297,7 +332,7 @@ fn generate(seed: u64) -> Case {
             parts.push("owl:annotatedSource :A".into());
         }
         st.push((g, format!("{node} {} .", parts.join(" ; "))));
-        if r.p(0.6) {
+        if r.p(0.7) {
             let c = format!("\"c{k}\"");
             st.push((g, format!("{node} rdfs:comment {c} .")));
             reifiable.push((node.clone(), "rdfs:comment".into(), c));
@@ -307,7 +342,7 @@ fn generate(seed: u64) -> Case {
             st.push((g, format!("{node} :n {d} .")));
             reifiable.push((node.clone(), ":n".into(), d));
         }
-        if r.p(0.12) {
+        if r.p(0.3) {
             add(
                 &mut r,
                 &mut st,
@@ -335,11 +370,11 @@ fn generate(seed: u64) -> Case {
         }
     }
 
-    let args = match r.next() % 6 {
-        0 | 1 => json!({}),
-        2 => json!({ "mode": "strict" }),
-        3 => json!({ "graph": "http://ex.org/g1" }),
-        4 => json!({ "graph": ["http://ex.org/g1", "http://ex.org/g2"], "imports": false }),
+    let args = match r.next() % 7 {
+        0..=2 => json!({}),
+        3 => json!({ "mode": "strict" }),
+        4 => json!({ "graph": "http://ex.org/g1" }),
+        5 => json!({ "graph": ["http://ex.org/g1", "http://ex.org/g2"], "imports": false }),
         _ => json!({ "graph": ["http://ex.org/g2", "http://ex.org/g1"], "mode": "strict" }),
     };
     Case {
@@ -370,7 +405,7 @@ fn env_u64(name: &str, default: u64) -> u64 {
 
 #[test]
 fn the_head_answers_what_the_summary_does_on_generated_ontologies() {
-    let cases = env_u64("SPARKLES_HEAD_GEN_CASES", 2000);
+    let cases = env_u64("SPARKLES_HEAD_GEN_CASES", 6000);
     let first = env_u64("SPARKLES_HEAD_GEN_SEED", 1);
     let mut read = 0u64;
     for seed in first..first + cases {

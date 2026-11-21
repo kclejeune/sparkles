@@ -316,6 +316,112 @@
     "unmapped": 5,
     "warnings": []
   },
+  "disjoint-header": {
+    "axiomCount": 2,
+    "axioms": {
+      "DisjointClasses": 1,
+      "SubClassOf": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/A> is not declared and was read as Class from its use",
+          "severity": "warning"
+        },
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/B> is not declared and was read as Class from its use",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 2
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": null,
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 9,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "disjoint-header-strict": {
+    "axiomCount": 0,
+    "axioms": {},
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 7,
+      "list": [
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <http://ex.org/B> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <http://ex.org/A> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:b0 maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/B> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b2 <http://www.w3.org/2002/07/owl#members> _:b1 maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#AllDisjointClasses> maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 0
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"title\")"
+      ],
+      "imports": [],
+      "iri": null,
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 9,
+    "unmapped": 7,
+    "warnings": []
+  },
   "functional-ranged-header": {
     "axiomCount": 4,
     "axioms": {
@@ -1282,6 +1388,114 @@
     "mode": "strict",
     "triples": 19,
     "unmapped": 6,
+    "warnings": []
+  },
+  "reifier-disjoint-header": {
+    "axiomCount": 2,
+    "axioms": {
+      "DisjointClasses": 1,
+      "SubClassOf": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/A> is not declared and was read as Class from its use",
+          "severity": "warning"
+        },
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/B> is not declared and was read as Class from its use",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 2
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"title\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 14,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "reifier-disjoint-header-strict": {
+    "axiomCount": 0,
+    "axioms": {},
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 7,
+      "list": [
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <http://ex.org/B> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> <http://ex.org/A> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b1 <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> _:b0 maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest> <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/A> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/B> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b2 <http://www.w3.org/2002/07/owl#members> _:b1 maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#AllDisjointClasses> maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 0
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(Annotation(rdfs:comment \"nested\") rdfs:label \"title\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 14,
+    "unmapped": 7,
     "warnings": []
   },
   "two-nodes": {

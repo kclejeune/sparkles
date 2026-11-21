@@ -2,14 +2,23 @@
 //! entities, the commit, the graphs and the imports closure that the summary answers,
 //! read from the index without mapping the whole graph into axioms.
 //!
-//! The header comes from a fragment, the quads of the ontology nodes and the blank nodes
-//! and reifications they reach, with the types of the IRIs it uses, mapped by the same
-//! reverse mapping as the full read. The entity counts come from scans of the `rdf:type`
-//! triples of each declaring type, with the reverse mapping's OWL 1 rules, and the
-//! subjects of reified `rdf:type` triples are counted by mapping their own fragment,
-//! since an annotated declaration is an axiom of its own. Both read only the quads the
-//! full read would read. A read that passes the bounds below opens the ontology instead,
-//! so the head always answers what the summary does.
+//! The header comes from a fragment, the quads of the ontology nodes and of the
+//! `owl:Axiom` and `owl:Annotation` nodes that reify their triples, nested ones included,
+//! with the types of the IRIs it uses, mapped by the same reverse mapping as the full read.
+//! The entity counts come from scans of the `rdf:type` triples of each declaring type, with
+//! the reverse mapping's OWL 1 rules, and the subjects of reified `rdf:type` triples are
+//! counted by mapping their own fragment, since an annotated declaration is an axiom of its
+//! own.
+//!
+//! The head answers only when it can show that the full read's answer is a function of
+//! its fragment, and opens the ontology otherwise. The rule is an allow-list on every node
+//! the answer rests on. An ontology node holds only its type, imports, version IRIs and
+//! annotations (rule A1). A reifier is a blank node with one source and one type, which
+//! nothing else names, holding only its source, property, target and annotations (A2), and
+//! the property it reifies is an annotation predicate or a root's role (A3). Any other
+//! triple on such a node, another type or a reification of another kind opens the
+//! ontology, as do the bounds below. The objects of annotations are not read, since the
+//! full read takes an annotation's value as it is.
 
 use super::{
     GraphRef, INFERRED_GRAPH, Import, ImportEdge, Inferences, Ontologies, OntologyRequest,
@@ -172,6 +181,14 @@ impl Fragment {
     }
 }
 
+/// The kind of a root of a fragment: an ontology node of the header or the subject of a
+/// reified `rdf:type` triple of the counts.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Root {
+    Ontology,
+    Subject,
+}
+
 /// Bounded reads of the quads the full read would read (`read_store`).
 struct Reader<'a> {
     snap: &'a Snapshot,
@@ -185,6 +202,9 @@ struct Reader<'a> {
     terminological: FxHashSet<Id>,
     /// the types whose `rdf:type` triples `read_store` reads
     structural: FxHashSet<Id>,
+    /// the structural predicates and the facets, which are terminological but never
+    /// annotation predicates
+    reserved: FxHashSet<Id>,
     rdf_type: Option<Id>,
     /// the annotation properties declared in the graphs read
     declared: FxHashSet<Id>,
@@ -213,6 +233,7 @@ impl<'a> Reader<'a> {
             opts,
             terminological: FxHashSet::default(),
             structural: FxHashSet::default(),
+            reserved: FxHashSet::default(),
             rdf_type: snap.lookup_iri(vocab::RDF_TYPE),
             declared: FxHashSet::default(),
             n: Cell::new(0),
@@ -224,6 +245,14 @@ impl<'a> Reader<'a> {
         {
             if let Some(id) = snap.lookup_iri(p) {
                 r.terminological.insert(id);
+            }
+        }
+        for p in vocab::STRUCTURAL_PREDICATES
+            .iter()
+            .chain(vocab::FACETS.iter())
+        {
+            if let Some(id) = snap.lookup_iri(p) {
+                r.reserved.insert(id);
             }
         }
         for t in vocab::STRUCTURAL_TYPES {
@@ -279,6 +308,9 @@ impl<'a> Reader<'a> {
                 reifiers.push(q[0]);
                 Ok(reifiers.len() <= MAX_REIFIED)
             })?;
+            if reifiers.len() > MAX_REIFIED {
+                return Ok(false);
+            }
             for r in reifiers {
                 let mut typing = false;
                 let mut target = false;
@@ -293,33 +325,6 @@ impl<'a> Reader<'a> {
             }
         }
         Ok(true)
-    }
-
-    /// Whether the full read could type a predicate of `f` from triples outside it: a
-    /// predicate outside the terminological ones, which only the main triples of
-    /// reifications bring in, that is not built in. Such a predicate is not declared an
-    /// annotation property directly, and its kind can rest on its use elsewhere, on a
-    /// declaration that only an `owl:Axiom` node states or on several declarations, so
-    /// the head opens the ontology for it whatever the graphs say of it.
-    fn undeclared(&self, f: &Fragment) -> Result<bool> {
-        let mut preds: Vec<Id> = f
-            .quads
-            .iter()
-            .map(|q| q[1])
-            .filter(|p| !self.terminological.contains(p) && Some(*p) != self.rdf_type)
-            .collect();
-        preds.sort_unstable();
-        preds.dedup();
-        for p in preds {
-            let builtin = match self.snap.term(p) {
-                Some(Term::NamedNode(n)) => read::builtin_kind(n.as_str()).is_some(),
-                _ => false,
-            };
-            if !builtin {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     fn id(&self, iri: &str) -> Option<Id> {
@@ -390,113 +395,6 @@ impl<'a> Reader<'a> {
             Ok(true)
         })?;
         Ok((!over).then_some(out))
-    }
-
-    /// Add to `f` the kept quads of `node`, of the blank nodes they reach and of the
-    /// `owl:Axiom` and `owl:Annotation` nodes that reify a triple of any of them, nested
-    /// ones included, with the main triples of those reifications that `read_store` reads
-    /// although their predicate is not terminological. `false` past [`MAX_FRAGMENT`].
-    fn add_node(&self, f: &mut Fragment, node: Id) -> Result<bool> {
-        let src = self.id(vocab::OWL_ANNOTATED_SOURCE);
-        let mut stack = vec![node];
-        let mut reifiers: Vec<Id> = Vec::new();
-        while let Some(x) = stack.pop() {
-            if !f.visited.insert(x) {
-                continue;
-            }
-            let Some(qs) = self.kept_quads(Perm::Spo, &[x.0], MAX_FRAGMENT)? else {
-                return Ok(false);
-            };
-            for q in qs {
-                if self.is_bnode(q[2]) {
-                    stack.push(q[2]);
-                }
-                f.add(q);
-            }
-            if let Some(src) = src {
-                let Some(qs) = self.kept_quads(Perm::Pos, &[src.0, x.0], MAX_REIFIED)? else {
-                    return Ok(false);
-                };
-                for q in qs {
-                    reifiers.push(q[0]);
-                    stack.push(q[0]);
-                }
-            }
-            if f.quads.len() > MAX_FRAGMENT {
-                return Ok(false);
-            }
-        }
-        self.add_mains(f, &reifiers)
-    }
-
-    /// The main triples of the reifications `reifiers` whose predicate is not
-    /// terminological, in each graph read that holds them, as `read_store` adds them.
-    fn add_mains(&self, f: &mut Fragment, reifiers: &[Id]) -> Result<bool> {
-        let (Some(src), Some(prop), Some(tgt)) = (
-            self.id(vocab::OWL_ANNOTATED_SOURCE),
-            self.id(vocab::OWL_ANNOTATED_PROPERTY),
-            self.id(vocab::OWL_ANNOTATED_TARGET),
-        ) else {
-            return Ok(true);
-        };
-        let wanted: FxHashSet<Id> = reifiers.iter().copied().collect();
-        // the source, property and target of each reifier in each graph, as read_store
-        // groups them
-        let mut parts: BTreeMap<(Id, Id), [Option<Id>; 3]> = BTreeMap::new();
-        for q in &f.quads {
-            if !wanted.contains(&q[0]) {
-                continue;
-            }
-            let slot = if q[1] == src {
-                0
-            } else if q[1] == prop {
-                1
-            } else if q[1] == tgt {
-                2
-            } else {
-                continue;
-            };
-            parts.entry((q[0], q[3])).or_default()[slot] = Some(q[2]);
-        }
-        for part in parts.into_values() {
-            let [Some(s), Some(p), Some(o)] = part else {
-                continue;
-            };
-            if self.terminological.contains(&p) {
-                continue;
-            }
-            let mut found = Vec::new();
-            self.each(Perm::Spo, &[s.0, p.0, o.0], |q| {
-                found.push(q);
-                Ok(true)
-            })?;
-            for q in found {
-                f.add(q);
-            }
-            if f.quads.len() > MAX_FRAGMENT {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
-
-    /// Add to `f` the reifications whose source is `x`, with what [`add_node`] reads of
-    /// each, without the other quads of `x`. `false` past the bounds.
-    ///
-    /// [`add_node`]: Self::add_node
-    fn add_reifications_of(&self, f: &mut Fragment, x: Id) -> Result<bool> {
-        let Some(src) = self.id(vocab::OWL_ANNOTATED_SOURCE) else {
-            return Ok(true);
-        };
-        let Some(qs) = self.kept_quads(Perm::Pos, &[src.0, x.0], MAX_REIFIED)? else {
-            return Ok(false);
-        };
-        for q in qs {
-            if !self.add_node(f, q[0])? {
-                return Ok(false);
-            }
-        }
-        Ok(true)
     }
 
     /// Add the kept `rdf:type` quads of every IRI the fragment uses, as context, or
@@ -586,58 +484,172 @@ impl<'a> Reader<'a> {
         };
         let mut nodes: Vec<Id> = typed.iter().map(|q| q[0]).collect();
         nodes.dedup();
-        for n in &nodes {
-            if !self.plain(*n, onto)? {
-                return Ok(None);
-            }
-        }
         let mut f = Fragment::default();
-        for n in nodes {
-            if !self.add_node(&mut f, n)? {
+        for n in &nodes {
+            if !self.ontology_node(*n, onto)? {
                 return Ok(None);
             }
+            let Some(qs) = self.kept_quads(Perm::Spo, &[n.0], MAX_FRAGMENT)? else {
+                return Ok(None);
+            };
+            for q in qs {
+                f.add(q);
+            }
         }
-        if !self.add_types(&mut f)? || self.undeclared(&f)? {
+        let roots: FxHashMap<Id, Root> = nodes.iter().map(|n| (*n, Root::Ontology)).collect();
+        if !self.add_reifiers(&mut f, &roots)? || !self.add_types(&mut f)? {
             return Ok(None);
         }
         Ok(Some(self.map(&f).header))
     }
 
-    /// Whether the ontology node `n` has no other part in the mapping: no structural type
-    /// beside `owl:Ontology` and no structural predicate beside `owl:imports` and
-    /// `owl:versionIRI`, and, for a blank node, no use as an object other than the source of
-    /// a reification. Another part, such as an `owl:AllDisjointClasses` node, can take the
-    /// node's annotations for an axiom's on triples outside the head's reads.
-    fn plain(&self, n: Id, onto: Id) -> Result<bool> {
-        let allowed: FxHashSet<Id> = [vocab::OWL_IMPORTS, vocab::OWL_VERSION_IRI]
+    /// An annotation predicate: one the full read reads that is neither structural nor a
+    /// facet, so a built-in annotation property or one declared in the graphs read.
+    fn annotation_predicate(&self, p: Id) -> bool {
+        self.terminological.contains(&p) && !self.reserved.contains(&p)
+    }
+
+    /// Whether `x`, when it is a blank node, is the object of no triple of the graphs read
+    /// other than `owl:annotatedSource`, so that no other axiom reaches it.
+    fn unreferenced(&self, x: Id) -> Result<bool> {
+        if !self.is_bnode(x) {
+            return Ok(true);
+        }
+        let src = self.id(vocab::OWL_ANNOTATED_SOURCE);
+        let mut ok = true;
+        self.each(Perm::Osp, &[x.0], |q| {
+            ok = Some(q[1]) == src;
+            Ok(ok)
+        })?;
+        Ok(ok)
+    }
+
+    /// Rule A1 of the closure: the ontology node `n` has no other part in the mapping. Its
+    /// triples that the full read reads are `rdf:type owl:Ontology`, `owl:imports`,
+    /// `owl:versionIRI` and annotations, and a blank node is the object of nothing but
+    /// `owl:annotatedSource`. A second part, such as an `owl:AllDisjointClasses` node, can
+    /// take its annotations for an axiom's on triples outside the head's reads.
+    fn ontology_node(&self, n: Id, onto: Id) -> Result<bool> {
+        let role: FxHashSet<Id> = [vocab::OWL_IMPORTS, vocab::OWL_VERSION_IRI]
             .iter()
             .filter_map(|p| self.id(p))
             .collect();
-        let mut plain = true;
+        let mut ok = true;
         self.each(Perm::Spo, &[n.0], |q| {
-            if !self.kept(&q) {
-                return Ok(true);
-            }
-            plain = if Some(q[1]) == self.rdf_type {
-                q[2] == onto
+            ok = if Some(q[1]) == self.rdf_type {
+                // a blank class is read as a class assertion's class
+                !self.is_bnode(q[2]) && (!self.kept(&q) || q[2] == onto)
             } else {
-                !vocab::STRUCTURAL_PREDICATES
-                    .iter()
-                    .filter_map(|p| self.id(p))
-                    .any(|p| p == q[1])
-                    || allowed.contains(&q[1])
+                !self.kept(&q) || role.contains(&q[1]) || self.annotation_predicate(q[1])
             };
-            Ok(plain)
+            Ok(ok)
         })?;
-        if !plain || !self.is_bnode(n) {
-            return Ok(plain);
+        Ok(ok && self.unreferenced(n)?)
+    }
+
+    /// Rules A2 and A3 of the closure for `r`, a node that names a root or another
+    /// reifier as `owl:annotatedSource`, whose source is the root of kind `root` or a
+    /// reifier (`None`). `r` is a blank node with one source that nothing else names, typed
+    /// `owl:Annotation`, or `owl:Axiom` when it reifies a root's triple, and nothing else.
+    /// Its other triples that the full read reads are annotations, and the property it
+    /// reifies is an annotation predicate, `rdf:type` of a root, or `owl:imports` or
+    /// `owl:versionIRI` of an ontology node.
+    fn reifier(&self, r: Id, root: Option<Root>) -> Result<bool> {
+        if !self.is_bnode(r) || !self.unreferenced(r)? {
+            return Ok(false);
         }
-        let src = self.id(vocab::OWL_ANNOTATED_SOURCE);
-        self.each(Perm::Osp, &[n.0], |q| {
-            plain = Some(q[1]) == src || !self.kept(&q);
-            Ok(plain)
+        let (src, prop, tgt) = (
+            self.id(vocab::OWL_ANNOTATED_SOURCE),
+            self.id(vocab::OWL_ANNOTATED_PROPERTY),
+            self.id(vocab::OWL_ANNOTATED_TARGET),
+        );
+        let (axiom, annotation) = (self.id(vocab::OWL_AXIOM), self.id(vocab::OWL_ANNOTATION));
+        let header_roles: FxHashSet<Id> = [vocab::OWL_IMPORTS, vocab::OWL_VERSION_IRI]
+            .iter()
+            .filter_map(|p| self.id(p))
+            .collect();
+        let mut types: FxHashSet<Id> = FxHashSet::default();
+        let mut sources: FxHashSet<Id> = FxHashSet::default();
+        let mut ok = true;
+        self.each(Perm::Spo, &[r.0], |q| {
+            ok = if Some(q[1]) == self.rdf_type {
+                if self.is_bnode(q[2]) {
+                    false
+                } else {
+                    if self.kept(&q) {
+                        types.insert(q[2]);
+                    }
+                    true
+                }
+            } else if Some(q[1]) == src {
+                sources.insert(q[2]);
+                true
+            } else if Some(q[1]) == prop {
+                self.annotation_predicate(q[2])
+                    || (root.is_some() && Some(q[2]) == self.rdf_type)
+                    || (root == Some(Root::Ontology) && header_roles.contains(&q[2]))
+            } else if Some(q[1]) == tgt {
+                true
+            } else {
+                !self.kept(&q) || self.annotation_predicate(q[1])
+            };
+            Ok(ok)
         })?;
-        Ok(plain)
+        if !ok || sources.len() != 1 || types.len() != 1 {
+            return Ok(false);
+        }
+        let ty = types.into_iter().next();
+        Ok(ty == annotation && annotation.is_some()
+            || ty == axiom && axiom.is_some() && root.is_some())
+    }
+
+    /// Add to `f` the kept quads of every node that names a root of `roots` or another
+    /// such node as `owl:annotatedSource`, the closure R, or `false` when one of them
+    /// breaks rules A2 and A3 or the bounds pass. The objects of annotations are not
+    /// visited, since the full read takes an annotation's value as it is.
+    fn add_reifiers(&self, f: &mut Fragment, roots: &FxHashMap<Id, Root>) -> Result<bool> {
+        let Some(src) = self.id(vocab::OWL_ANNOTATED_SOURCE) else {
+            return Ok(true);
+        };
+        let mut stack: Vec<Id> = roots.keys().copied().collect();
+        stack.sort_unstable();
+        f.visited.extend(stack.iter().copied());
+        while let Some(x) = stack.pop() {
+            let mut reifiers = Vec::new();
+            self.each(Perm::Pos, &[src.0, x.0], |q| {
+                reifiers.push(q[0]);
+                Ok(reifiers.len() <= MAX_REIFIED)
+            })?;
+            if reifiers.len() > MAX_REIFIED {
+                return Ok(false);
+            }
+            reifiers.sort_unstable();
+            reifiers.dedup();
+            for r in reifiers {
+                if f.visited.contains(&r) {
+                    // a reifier of a root or a reifier of another one, already checked
+                    if roots.contains_key(&r) {
+                        return Ok(false);
+                    }
+                    continue;
+                }
+                if !self.reifier(r, roots.get(&x).copied())? {
+                    return Ok(false);
+                }
+                let Some(qs) = self.kept_quads(Perm::Spo, &[r.0], MAX_FRAGMENT)? else {
+                    return Ok(false);
+                };
+                for q in qs {
+                    f.add(q);
+                }
+                if f.quads.len() > MAX_FRAGMENT {
+                    return Ok(false);
+                }
+                f.visited.insert(r);
+                stack.push(r);
+            }
+        }
+        Ok(true)
     }
 
     /// The distinct IRI subjects of `rdf:type ty` in the graphs read, in order, each
@@ -703,13 +715,11 @@ impl<'a> Reader<'a> {
                 for q in qs {
                     f.add(q);
                 }
-                // the reifications of the subject's triples, nested ones included, which
-                // the visit reads from the subject's own quads as well
-                if !self.add_reifications_of(&mut f, *s)? {
-                    return Ok(None);
-                }
             }
-            if !self.add_types(&mut f)? || self.undeclared(&f)? {
+            // the reifications of the subjects' triples, whose closure rule keeps every
+            // annotation of a declaration inside the fragment
+            let roots: FxHashMap<Id, Root> = reified.iter().map(|s| (*s, Root::Subject)).collect();
+            if !self.add_reifiers(&mut f, &roots)? || !self.add_types(&mut f)? {
                 return Ok(None);
             }
             let own: FxHashSet<String> = reified
