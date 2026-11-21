@@ -731,8 +731,11 @@ too.
 additions and removals clears the contexts that derived the left side of a changed
 subsumption or part of it, the contexts whose links a changed existential restriction
 can use, and every context that links to a cleared one, and saturates those again. The
-other contexts drop their links from cleared contexts and recompute what they take from
-the index, which is rebuilt from the axioms on every run. A change to the property
+other contexts drop their links from cleared contexts and keep what they take from the
+index, which is rebuilt from the axioms on every run. A negative existential restriction
+that an edit adds or removes has its filler among the changed parts, so every context
+that takes it from the index is cleared, and a kept context renumbers the disjointness
+sets it meets only when the run's sets differ from the last run's (item 1256). A change to the property
 hierarchy, chains, reflexivity or ranges saturates everything again, and so does a
 change to an axiom with an individual, a data property, a datatype or a key. So does any
 change after a run that marked the real contexts, which merges, worlds, keys and the
