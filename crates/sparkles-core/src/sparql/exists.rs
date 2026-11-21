@@ -416,9 +416,17 @@ fn answers(
 ) -> Result<Option<Vec<bool>>> {
     // The probe's charge covers `found` and the answers, and it stays held while the
     // rows the key set cannot answer are evaluated.
-    let Some((found, held)) = probe_rows(ctx, t, spec, t.len() as u64, true)? else {
+    let Some((found, held, complete)) = probe_rows(ctx, t, spec, t.len() as u64, true)? else {
         return Ok(None);
     };
+    if complete {
+        // Every row has its answer from the key set, so one branch-free pass maps the
+        // answers in place. The loop below, with its per-row match and evaluation, cost
+        // a plain FILTER NOT EXISTS about 6% more instructions per request.
+        let keep = found.into_iter().map(|f| (f == FOUND) != negated).collect();
+        drop(held);
+        return Ok(Some(keep));
+    }
     let map = t.var_map(ctx.nvars());
     let mut keep = Vec::with_capacity(found.len());
     for (i, f) in found.into_iter().enumerate() {
@@ -454,7 +462,8 @@ const UNKNOWN: u8 = 2;
 /// Whether the pattern of `spec` has a solution that agrees with each row of `t`, from
 /// its key set, if it has (or gets) one, as [`ABSENT`], [`FOUND`] or [`UNKNOWN`], with
 /// the charge that covers the answers and `extra` bytes more for the caller's use of
-/// them. The caller holds it while it uses them. With
+/// them, and whether every row has its answer, so that none is [`UNKNOWN`]. The caller
+/// holds the charge while it uses them. With
 /// `count_unknown`, the rows left to substitution are counted for EXPLAIN here, because
 /// the caller evaluates every one of them. Otherwise the evaluation counts those it
 /// reaches.
@@ -464,7 +473,7 @@ fn probe_rows<'a>(
     spec: &ExistsSpec,
     extra: u64,
     count_unknown: bool,
-) -> Result<Option<(Vec<u8>, Charge<'a>)>> {
+) -> Result<Option<(Vec<u8>, Charge<'a>, bool)>> {
     let Some(build) = prepare(ctx, spec, t)? else {
         return Ok(None);
     };
@@ -508,7 +517,7 @@ fn probe_rows<'a>(
         decor
             .probed
             .fetch_add(found.len() as u64, Ordering::Relaxed);
-        return Ok(Some((found, held)));
+        return Ok(Some((found, held, true)));
     }
     let width = keys.len();
     let all = if width == 64 {
@@ -565,7 +574,7 @@ fn probe_rows<'a>(
     if count_unknown {
         decor.per_row.fetch_add(per_row, Ordering::Relaxed);
     }
-    Ok(Some((found, held)))
+    Ok(Some((found, held, per_row == 0)))
 }
 
 /// The answers of the EXISTS patterns inside larger expressions, such as IF or OR, an
@@ -638,7 +647,7 @@ pub(super) fn nested<'a>(
         if specs.iter().any(|(s, _)| *s == ptr) {
             continue;
         }
-        if let Some((found, charge)) = probe_rows(ctx, t, spec, 0, false)? {
+        if let Some((found, charge, _)) = probe_rows(ctx, t, spec, 0, false)? {
             specs.push((ptr, found));
             held.push(charge);
         }
