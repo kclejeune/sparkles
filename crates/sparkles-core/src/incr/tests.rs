@@ -1075,13 +1075,21 @@ fn edge_cases_follow_the_oracle() {
 #[test]
 fn a_path_node_never_meets_a_query_variable() {
     let s = Store::in_memory(StoreOptions::default());
-    upd(&s, "INSERT DATA { :a :p :m . :m :q :o . :a :r :z }").expect("update");
+    upd(
+        &s,
+        &format!("{PREFIX}INSERT DATA {{ :a :p :m . :m :q :o . :a :r :z }}"),
+    )
+    .expect("update");
     // the parser turns a plain sequence into triples, so an alternative keeps it a path
     let q = "SELECT ?s ?__incr1 WHERE { ?s (:p/:q)|:none ?o . ?s :r ?__incr1 }";
     let mut c = circuit(&s, q);
     check(&s, &c, q, "build");
     assert_eq!(result(&c), ["<http://ex/a> <http://ex/z>"]);
-    upd(&s, "INSERT DATA { :b :p :n . :n :q :o . :b :r :y }").expect("update");
+    upd(
+        &s,
+        &format!("{PREFIX}INSERT DATA {{ :b :p :n . :n :q :o . :b :r :y }}"),
+    )
+    .expect("update");
     step(&s, &mut c);
     check(&s, &c, q, "after an insert");
 }
