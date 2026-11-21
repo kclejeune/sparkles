@@ -1404,8 +1404,16 @@ impl Norm<'_> {
             }
             // a definition outside OWL 2 EL makes every property it is used on a checker
             // property, whose atoms read it in place of its datatype, so the run takes it
-            // when the checker converts it
-            K::DatatypeDefinition(d, _) if self.it.dt_run.is_some() => {
+            // when the checker converts it. Another definition of the same datatype, which
+            // the atoms do not read, and one of a reserved name stay out.
+            K::DatatypeDefinition(d, r)
+                if !vocab::is_reserved(d.as_str())
+                    && self
+                        .it
+                        .dt_run
+                        .as_ref()
+                        .is_some_and(|run| run.defs.map().get(d) == Some(r)) =>
+            {
                 self.it.dt_range(&DataRange::Datatype(d.clone()))?;
                 Ok(())
             }

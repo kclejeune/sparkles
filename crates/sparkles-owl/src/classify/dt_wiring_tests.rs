@@ -418,6 +418,26 @@ fn a_definition_the_checker_cannot_convert_is_reported() {
             sat.excluded()
         );
     }
+    // of two definitions of one datatype the atoms read one, and the other is reported;
+    // a definition of a reserved name is reported too
+    for defs in [
+        "DatatypeDefinition(:t xsd:int)\nDatatypeDefinition(:t DataUnionOf(xsd:boolean xsd:int))",
+        "DatatypeDefinition(xsd:integer DataUnionOf(xsd:boolean xsd:int))",
+    ] {
+        let (sat, ax) = run(&format!(
+            "{defs}\nSubClassOf(:A DataSomeValuesFrom(:d :t))\n\
+             SubClassOf(:B DataAllValuesFrom(:d xsd:int))"
+        ));
+        let defs: Vec<&AxiomKind> = ax
+            .iter()
+            .filter(|k| matches!(k, AxiomKind::DatatypeDefinition(..)))
+            .collect();
+        assert!(
+            defs.iter().any(|k| gap_of(&sat, k).is_some()),
+            "{defs:?}: {:?}",
+            sat.excluded()
+        );
+    }
     // an unused definition beside the checker is taken: it says nothing of a class
     let (sat, ax) = run("DatatypeDefinition(:t DataUnionOf(xsd:boolean xsd:int))\n\
          SubClassOf(:B DataAllValuesFrom(:d xsd:int))");
@@ -534,6 +554,13 @@ fn data_disjunctions_inside_atoms_stay_with_the_horn_tier() {
             "DatatypeDefinition(:bi DataUnionOf(xsd:boolean xsd:int))\n\
              SubClassOf(:A DataSomeValuesFrom(:d xsd:int))\n\
              SubClassOf(DataSomeValuesFrom(:d :bi) :C)",
+            "A",
+            "C",
+        ),
+        (
+            "SubClassOf(:A DataSomeValuesFrom(:d DataUnionOf(xsd:boolean xsd:int)))\n\
+             SubClassOf(DataSomeValuesFrom(:d DataUnionOf(xsd:boolean xsd:int xsd:string)) :C)\n\
+             SubClassOf(:P ObjectAllValuesFrom(:r :Q))\nSubClassOf(:P2 ObjectSomeValuesFrom(:r :P3))",
             "A",
             "C",
         ),
