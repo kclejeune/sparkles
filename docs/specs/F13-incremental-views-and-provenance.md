@@ -1600,6 +1600,17 @@ of the `recompute` node it was before.
   one-off evaluation, so the engine's rows would not match the input's rows by id. The
   cost is one evaluation of the input per refill, which a run of deletions at the front
   pays once per `max(k, 100)` of them.
+- A refill reconciles only the rows the window kept. It counts each kept row's copies in
+  the input as the input streams past, so its bookkeeping is bounded by the window and
+  not by the input. The heap that collects the best rows, its sort keys' strings, the
+  kept rows a refill still holds and that bookkeeping are charged to the pass's memory
+  budget at every row, so a window over long keys fails with a memory error while it
+  builds and not after. A fresh build appends the heap's sorted rows without searching
+  among them, so ties cost no more than other rows. Computing the keys of loaded rows and
+  of a pass's changes, the heap's sort and the placement of its rows all obey the pass's
+  cancellation and deadline. A pass that fails while it places the rows leaves the window
+  empty with the input's total, which the next changing pass refills. Named views build
+  without a memory limit, for this operator as for every other, which item 1298 takes.
 - Rows that the order does not tell apart keep the order in which they entered the kept
   rows. The vector is saved in order and the keys depend on the terms, so a checkpoint
   and a generation switch keep it. Keys whose order is not total, such as dates with and
