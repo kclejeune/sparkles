@@ -1127,7 +1127,7 @@ impl Norm<'_> {
 }
 
 /// What the caller lets the normalization of a Tier D run take.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy)]
 pub struct Allowed {
     /// number restrictions and the other axioms that need counting
     pub counting: bool,
@@ -1135,6 +1135,20 @@ pub struct Allowed {
     pub rooted: bool,
     /// the order between the number restrictions of a run that counts without the root
     pub order: bool,
+    /// how far the automata that unfold the universals are reduced, as
+    /// [`super::horn::dl_reduction`] reads the levels
+    pub automata: u8,
+}
+
+impl Default for Allowed {
+    fn default() -> Self {
+        Allowed {
+            counting: false,
+            rooted: false,
+            order: false,
+            automata: 2,
+        }
+    }
 }
 
 /// The normalization of a Tier D run: the axioms outside OWL 2 EL that it takes, with the
@@ -1317,7 +1331,7 @@ fn normalize_within(
     } else {
         Default::default()
     };
-    unfold(it, ax, &all.clauses, &mut rb);
+    unfold(it, ax, &all.clauses, &mut rb, allowed.automata);
     let mut dl = DlAx {
         clauses: all.clauses,
         atmost: all.atmost,
@@ -1613,7 +1627,19 @@ fn acyclic(edges: &FxHashMap<Ex, Vec<Ex>>) -> bool {
 /// stand for, `∃s.F ⊑ e` being `F ⊑ ∀s⁻.e`. Each state of an automaton without
 /// ε-transitions is a fresh class: `B ⊑ X_start`, `X_p ⊑ ∀l.X_q` for each transition and
 /// `X_final ⊑ C`. The universal itself stays, which is sound on the direct links.
-fn unfold(it: &mut Interner, ax: &mut Axioms, clauses: &[(Vec<Ex>, Vec<Ex>)], rb: &mut RoleBox) {
+///
+/// At `level` 1 and above the automaton first merges the states that accept the same words
+/// by the same transitions, and at 2 it also drops a transition by `l` beside one by a
+/// superrole of `l` from the same state into the same state (roadmap item 712). The rules
+/// apply a universal on a role to every link and backward link under it, so a state stands
+/// for the same universal after either reduction (F24, "The disjunctive rules").
+fn unfold(
+    it: &mut Interner,
+    ax: &mut Axioms,
+    clauses: &[(Vec<Ex>, Vec<Ex>)],
+    rb: &mut RoleBox,
+    level: u8,
+) {
     let inv = super::horn::inverses(it);
     // the expressions in positive and in negative positions
     let mut pos: Vec<Ex> = ax.subs.iter().map(|&(_, c)| c).collect();
@@ -1659,11 +1685,23 @@ fn unfold(it: &mut Interner, ax: &mut Axioms, clauses: &[(Vec<Ex>, Vec<Ex>)], rb
     unfolds.sort_unstable();
     unfolds.dedup();
     let mut autos: FxHashMap<Role, super::horn::EpsFree> = FxHashMap::default();
+    // one bound for every automaton, since it reads the whole role hierarchy
+    let cost = if level > 0 && !unfolds.is_empty() {
+        rb.sub_cost()
+    } else {
+        0
+    };
     for (holder, r, f) in unfolds {
         let Some(nfa) = rb.auto(r, &mut Vec::new()) else {
             continue;
         };
-        let a = autos.entry(r).or_insert_with(|| nfa.eps_free());
+        let a = autos.entry(r).or_insert_with(|| {
+            let mut a = nfa.eps_free();
+            if level > 0 {
+                a.reduce(level > 1, &|x, y| rb.sub(x, y), cost);
+            }
+            a
+        });
         // a universal's holder is the universal, and a negative existential
         // restriction's is its filler, so the restriction names the scope
         let key = match it.nodes[holder as usize] {
@@ -1722,6 +1760,7 @@ mod tests {
             counting,
             rooted: true,
             order: false,
+            ..Allowed::default()
         };
         normalize(&refs, &mut it, &mut ax, None, &|| false, allowed)
             .unwrap()
@@ -1781,6 +1820,7 @@ mod tests {
             counting: true,
             rooted: false,
             order,
+            ..Allowed::default()
         };
         let (taken, d) = normalize_within(
             &kinds,
@@ -2408,5 +2448,53 @@ mod tests {
             .filter(|&&(_, x)| matches!(it.nodes[x as usize], Node::Forall(..)))
             .count();
         assert!(foralls >= 1, "{foralls}");
+    }
+
+    /// The states and transitions of the unfoldings of a run over functional-style axioms
+    /// with the prefix `http://ex.org/` and a union, with the automata reduced to `level`,
+    /// or as by default when it is `None`: the fresh classes of `X ⊑ ∀l.Y` with both fresh, and those axioms.
+    fn unfolding(body: &str, level: Option<u8>) -> (usize, usize) {
+        let doc = crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://ex.org/>)\nOntology(\n{body}\n\
+             SubClassOf(:Z ObjectUnionOf(:Z1 :Z2))\n)"
+        ))
+        .unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut it = Interner::new();
+        let mut ax = Axioms::default();
+        let mut allowed = Allowed::default();
+        if let Some(level) = level {
+            allowed.automata = level;
+        }
+        normalize(&kinds, &mut it, &mut ax, None, &|| false, allowed)
+            .unwrap()
+            .unwrap();
+        let fresh = |e: Ex| matches!(it.nodes[e as usize], Node::Fresh(_));
+        let mut states = FxHashSet::default();
+        let mut transitions = 0;
+        for &(x, a) in &ax.subs {
+            if let Node::Forall(_, y) = it.nodes[a as usize]
+                && fresh(x)
+                && fresh(y)
+            {
+                states.insert(x);
+                states.insert(y);
+                transitions += 1;
+            }
+        }
+        (states.len(), transitions)
+    }
+
+    /// A transitive property under a transitive property, as BioTop's parthood has: the
+    /// closure leaves the transitions of the subproperty beside those of the property and
+    /// states that accept the same words, and the run unfolds by two states and two
+    /// transitions after the reductions (roadmap item 712).
+    #[test]
+    fn tier_d_unfolds_a_universal_by_the_reduced_automaton() {
+        let body = "TransitiveObjectProperty(:r)\nTransitiveObjectProperty(:s)\n\
+                    SubObjectPropertyOf(:s :r)\nSubClassOf(:A ObjectAllValuesFrom(:r :B))";
+        let levels: Vec<(usize, usize)> = (0..3).map(|l| unfolding(body, Some(l))).collect();
+        assert_eq!(levels, [(3, 6), (2, 4), (2, 2)]);
+        assert_eq!(unfolding(body, None), (2, 2));
     }
 }

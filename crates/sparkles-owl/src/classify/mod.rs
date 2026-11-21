@@ -329,6 +329,23 @@ pub struct Limits {
     /// schedule and fall back on another, and an attempt that passed the bound on
     /// several threads is repeated on one.
     pub dl_steps: bool,
+    /// How far Tier D reduces the automata by which it unfolds the universal restrictions
+    /// on properties that chains or transitivity reach (roadmap item 712), for the
+    /// comparison of the forms: 0 not at all, 1 merging the states that accept the same
+    /// words by the same transitions, and 2 also dropping a transition that another from
+    /// the same state into the same state covers by a superproperty. `None` takes
+    /// `SPARKLES_DL_AUTOMATA` when it is set and 2 otherwise, and a level above 2 is 2.
+    /// A run that finishes gives the same taxonomy at every level, and 2 derives the fewest
+    /// conclusions, so an attempt can pass its bound at a lower level where it finishes at 2.
+    pub dl_automata: Option<u8>,
+}
+
+impl Limits {
+    /// The level of [`dl_automata`](Limits::dl_automata) that a run takes.
+    fn dl_automata_level(&self) -> u8 {
+        self.dl_automata
+            .map_or_else(horn::dl_reduction, |l| l.min(2))
+    }
 }
 
 impl Default for Limits {
@@ -350,6 +367,7 @@ impl Default for Limits {
             rooted_decline: true,
             number_order: true,
             dl_steps: true,
+            dl_automata: None,
         }
     }
 }
@@ -702,6 +720,8 @@ struct RuleKey {
     skip_dl: bool,
     no_counting: bool,
     no_rooted: bool,
+    /// the reduction of Tier D's automata, which numbers the fresh classes of an unfolding
+    dl_automata: u8,
 }
 
 /// What a run whose saturation ended leaves for the decision of the next one.
@@ -2043,6 +2063,7 @@ impl Saturation {
                     counting: limits.counting && !self.no_counting,
                     rooted,
                     order: limits.number_order,
+                    automata: limits.dl_automata_level(),
                 },
             )
             .map_err(halt)?
@@ -2292,6 +2313,7 @@ impl Saturation {
             skip_dl: self.skip_dl,
             no_counting: self.no_counting,
             no_rooted: self.no_rooted,
+            dl_automata: limits.dl_automata_level(),
         };
         // what the last run left, when this run may keep its contexts
         let kept = self.kept.take().filter(|k| !again && k.key == key);

@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# timing712.sh: one el_classify binary with SPARKLES_DL_AUTOMATA=0 (A) against =2 (B) on
+# ore_ont_12141, 12 interleaved rounds in ABBA order, 1 and 4 threads, --repeat 5, one process
+# per arm, round and thread count. The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/perf-stuck-measure
+OUT=$D/out/timing712; mkdir -p $OUT; : > $OUT/log.txt
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/dlauto $D/files/ore_ont_12141.owl; } > $OUT/before.txt
+for round in $(seq 1 12); do
+  order="0 2"; [ $((round % 2)) -eq 0 ] && order="2 0"
+  for t in 1 4; do
+    for lv in $order; do
+      SPARKLES_DL_AUTOMATA=$lv timeout 300 $D/bin/dlauto --threads $t --repeat 5 $D/files/ore_ont_12141.owl > $OUT/r$round.l$lv.t$t.json 2> $OUT/r$round.l$lv.t$t.err
+      echo "r$round l$lv t$t status=$?" >> $OUT/log.txt
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

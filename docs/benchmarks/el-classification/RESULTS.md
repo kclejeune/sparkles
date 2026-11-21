@@ -1862,6 +1862,42 @@ search, below 1 in every round. GO takes 0.2% to 0.7% longer in each round, a me
 0.6 ms of 303 ms, although the two arms of one binary on GO range from 0.997 to 1.009.
 Roadmap item 1234 holds that cost. The other files move by less than the spread of their rounds.
 
+### Reduced automata of the disjunctive rules
+
+Roadmap item 712 reduces the automata by which the disjunctive rules unfold their universal
+restrictions, as the Horn rules' first two reductions do. `atlas` ran twelve rounds of one
+binary with `SPARKLES_DL_AUTOMATA` at 0, the automata as the closure over their
+ε-transitions leaves them, and at 2, the default, in alternating order on one and four
+threads, one process per level, round and thread count, with five classifications per
+process. Each time is the median over the rounds of each process's median classification,
+each ratio the median of the rounds' paired ratios, and the range that of the rounds.
+
+| Ontology | Threads | Level 0 ms | Level 2 ms | Ratio | Range of the rounds |
+|---|---:|---:|---:|---:|---|
+| `ore_ont_12141` | 1 | 56.2 | 31.0 | 0.552 | 0.550 to 0.556 |
+| `ore_ont_12141` | 4 | 23.7 | 14.3 | 0.599 | 0.550 to 0.657 |
+
+The 22 unfoldings of BioTop's 11 automata make 62 fresh classes and 77 transition axioms
+at level 2 against 111 and 357 at level 0. On one thread the attempt does 66,200 units of
+work against 136,117 and stores 42,242 clauses against 75,182, and the run derives 118,814
+conclusions against 191,508, with estimated bytes of 12.8 against 21.2 MB. The median
+peak resident set of a process is 34 against 68 MiB on one thread and 74 against 86 MiB on
+four. Every process exited normally with a complete answer from the disjunctive rules,
+and on four threads the work ranged from 138,487 to 154,001 at level 0 and from 67,727 to
+75,976 at level 2. The rounds wrote no taxonomies, which the sweep below compares. A pinned process of the measurement build that counts the automata executes 49%
+fewer user instructions at level 2 on the laptop. The binary of the rounds is the measurement build of
+the same reduction on commit fd47b7ae, and the item's build gives the same work, stored
+clauses, conclusions and taxonomy on one thread.
+
+The laptop classified every development file and every final file of the ORE 2015 DL
+sample, none of the sealed third, once at each level on one thread with the item's build.
+Both levels classify 205 of the 207 development files and 183 of the 187 final files, and
+the other six fail at both, three at the sweep's 8 GiB cap and three refused by the reader for
+an invalid IRI. The taxonomies are equal on every file that both levels classify. BioTop and two other
+releases of it among the final files, `ore_ont_16847` and `ore_ont_9024`, halve their work,
+and `ore_ont_3258` derives 12 fewer conclusions with the same work. No other file changes
+its work, stored clauses, conclusions or outcome.
+
 ## Records
 
 The [record of the guarded Horn rules](runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json) holds the Atlas process reports and taxonomy hashes, the HermiT comparison summary, the original count-only witness diagnostics and the separate four-round Atlas control of the default Uberon attempt. The [same-snapshot witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) holds the later correctness comparison of the named-class sets.
@@ -2081,6 +2117,13 @@ and the sort and deduplication of the told subsumptions took 10 ms, of which per
 sorts could save only part.
 
 ## Records
+
+The [record of item 712's reduced automata](runs/2026-11-21-dl-automata-atlas-fd47b7ae/record.json)
+holds every process of the twelve rounds on `atlas` with its report, the analysis, the hash
+checks of the binary and the input, the host's state before and after, the laptop's corpus
+sweep at both levels with the item's build, its counters and profile of the reduced run,
+the automata and instruction counts of the measurement build at each level and the scripts
+that ran.
 
 The [record of item 1269's index allocations](runs/2026-11-21-el-index-alloc-forge-89deb60f/record.json)
 holds every process of the nine rounds on forge with its report, the analysis, the hash
