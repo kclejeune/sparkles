@@ -879,6 +879,16 @@ class GateTests(unittest.TestCase):
                                                  kind, flagged]).returncode, 1, kind)
             self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
                                              "rerun", "control"]).returncode, 0)
+            # a summary written before the epoch counts is refused with a way out
+            old = json.loads((Path(d) / "summary.json").read_text())
+            for q in old["queries"].values():
+                for m in q.values():
+                    m.pop("epochs_a"), m.pop("epochs_b")
+            (Path(d) / "old.json").write_text(json.dumps(old))
+            r = subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "old.json"), "rerun", "control"],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("Regenerate it with nsc-bench-summary.py", r.stderr)
 
 
 if __name__ == "__main__":

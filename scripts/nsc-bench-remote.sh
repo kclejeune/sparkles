@@ -306,73 +306,83 @@ def connect():
     return http.client.HTTPConnection("localhost", a.port, timeout=LIMIT)
 
 
+def attempt(body, t0):
+    """One try of a request on the current connection: (status, data, got, fired, error).
+
+    A watchdog shuts the socket down at the deadline, so that a server that trickles its
+    headers or its body cannot keep one request alive past MAX_TIME. The socket's own
+    timeout only bounds each read. Each try has its own lock, state and socket, so that a
+    late watchdog of an earlier try can only find that try done and never touches the
+    next one, and the lock makes a try either finish or time out, never both."""
+    lock = threading.Lock()
+    state = {"done": False, "fired": False}
+    timer = None
+    got = False
+    try:
+        if conn.sock is None:
+            conn.connect()
+        sock = conn.sock
+
+        def expire():
+            with lock:
+                if state["done"]:
+                    return
+                state["fired"] = True
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        if LIMIT is not None:
+            left = LIMIT - (time.perf_counter() - t0)
+            if left <= 0:
+                raise TimeoutError("the request took longer than MAX_TIME")
+            sock.settimeout(left)
+            timer = threading.Timer(left, expire)
+            timer.daemon = True
+            timer.start()
+        conn.request("POST", "/bench/sparql", body, HEADERS)
+        r = conn.getresponse()
+        got = True
+        # read() returns the whole body, by its length, its chunks or the server's close,
+        # and leaves a connection that the server closed for the next request to reopen
+        data = r.read()
+        with lock:
+            state["done"] = True
+            fired = state["fired"]
+        if fired:
+            raise TimeoutError("the request took longer than MAX_TIME")
+        return r.status, data, got, False, None
+    except (OSError, http.client.HTTPException) as e:
+        with lock:
+            state["done"] = True
+            fired = state["fired"]
+        return None, None, got, fired, e
+    finally:
+        if timer is not None:
+            timer.cancel()
+
+
 def request(body):
     """(execMs text or None, wall seconds, answer bytes or None)"""
     global conn
     if a.gap_ms > 0:
         time.sleep(a.gap_ms / 1000)
-    for attempt in (1, 2):
+    for n in (1, 2):
         # A request on a reused connection that fails as a stale connection does, before any
         # answer arrives, is sent once more on a new connection and timed from there. Every
         # other failure, a timeout among them, gives an error row as curl's does.
         reused = conn.sock is not None
         t0 = time.perf_counter()
-        got = False
-        # A watchdog shuts the socket down at the deadline, so that a server that trickles
-        # its headers or its body cannot keep one request alive past MAX_TIME. The socket's
-        # own timeout only bounds each read. The lock makes the request either finish or
-        # time out, never both.
-        lock = threading.Lock()
-        state = {"done": False, "fired": False}
-        timer = None
-        try:
-            if conn.sock is None:
-                conn.connect()
-            sock = conn.sock
-
-            def expire():
-                with lock:
-                    if state["done"]:
-                        return
-                    state["fired"] = True
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-
-            if LIMIT is not None:
-                left = LIMIT - (time.perf_counter() - t0)
-                if left <= 0:
-                    raise TimeoutError("the request took longer than MAX_TIME")
-                sock.settimeout(left)
-                timer = threading.Timer(left, expire)
-                timer.daemon = True
-                timer.start()
-            conn.request("POST", "/bench/sparql", body, HEADERS)
-            r = conn.getresponse()
-            got = True
-            # read() returns the whole body, by its length, its chunks or the server's close,
-            # and leaves a connection that the server closed for the next request to reopen
-            data = r.read()
-            with lock:
-                state["done"] = True
-                fired = state["fired"]
-            if fired:
-                raise TimeoutError("the request took longer than MAX_TIME")
+        status, data, got, fired, e = attempt(body, t0)
+        if e is None:
             break
-        except (OSError, http.client.HTTPException) as e:
-            with lock:
-                state["done"] = True
-                fired = state["fired"]
-            conn.close()
-            conn = connect()
-            if fired or got or not reused or attempt == 2 or not isinstance(e, STALE):
-                return None, None, None
-        finally:
-            if timer is not None:
-                timer.cancel()
+        conn.close()
+        conn = connect()
+        if fired or got or not reused or n == 2 or not isinstance(e, STALE):
+            return None, None, None
     w = time.perf_counter() - t0
-    if r.status >= 400:
+    if status >= 400:
         return None, w, None
     m = EXEC.search(data)
     return (m.group(1).decode() if m and m.group(1) else None), w, data

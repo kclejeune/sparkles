@@ -396,17 +396,38 @@ def answer(body=b'{"execMs":1.5}', headers=b"", trickle=None, delay=0.0):
 class RequestClientDeadlineTests(unittest.TestCase):
     """The persistent client of nsc-bench-remote.sh, run directly against scripted servers."""
 
-    def client(self, server, max_time, reps=1):
+    # Runs the client with a threading.Timer whose callbacks never fire on their own. Each
+    # new timer first runs every earlier timer's callback, cancelled or not, as a watchdog
+    # that passed its cancellation check and was then delayed would.
+    LATE_WATCHDOGS = """import runpy, sys, threading
+made = []
+class Timer:
+    def __init__(self, interval, fn):
+        self.fn = fn
+        self.daemon = False
+    def start(self):
+        for t in list(made):
+            t.fn()
+        made.append(self)
+    def cancel(self):
+        pass
+threading.Timer = Timer
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+    def client(self, server, max_time, reps=1, late_watchdogs=False):
         d = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, d, True)
         text = (SCRIPTS / "nsc-bench-remote.sh").read_text()
         start = text.index("cat > bench-client.py << 'PY'\n") + len("cat > bench-client.py << 'PY'\n")
         (d / "bench-client.py").write_text(text[start:text.index("\nPY\n", start) + 1])
+        (d / "late.py").write_text(self.LATE_WATCHDOGS)
         (d / "queries").mkdir()
         (d / "queries" / "q.rq").write_text("SELECT * WHERE { ?s ?p ?o }\n")
         import time
         t0 = time.monotonic()
-        subprocess.run([sys.executable, "bench-client.py", "--port", str(server.port), "--round", "1", "--epoch", "1",
+        subprocess.run([sys.executable] + (["late.py"] if late_watchdogs else []) + ["bench-client.py", "--port", str(server.port), "--round", "1", "--epoch", "1",
                         "--variant", "A", "--warmup", "0", "--reps", str(reps), "--max-time", str(max_time),
                         "--samples", "samples.tsv", "--warm-answers", "warm.tsv", "q"],
                        cwd=d, check=True, timeout=60)
@@ -444,6 +465,15 @@ class RequestClientDeadlineTests(unittest.TestCase):
         rows, took = self.client(s, 0)
         self.assertEqual(rows, ["1.5"])
         self.assertGreater(took, 0.3)
+
+    def test_a_late_watchdog_does_not_reach_the_retry(self):
+        # the server closes each connection after one answer, so every second request finds
+        # a stale connection and is retried on a new one, whose watchdog the first try's
+        # late callback must leave alone
+        s = self.serve(lambda n: answer() + [None])
+        rows, _ = self.client(s, 30, reps=4, late_watchdogs=True)
+        self.assertEqual(rows, ["1.5"] * 4)
+        self.assertEqual(s.requests, 4)
 
     def test_a_timeout_on_a_reused_connection_is_sent_once(self):
         # the first request answers at once, and the second, on the same connection, stalls

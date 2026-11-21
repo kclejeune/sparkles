@@ -64,14 +64,16 @@ def main():
             # blank values are kept, so that an empty execution field differs from none
             form = urllib.parse.parse_qs(body, keep_blank_values=True)
             accept = self.headers.get("Accept", "")
-            if "#sleep" in form.get("query", [""])[0]:
-                # a query with this comment takes two seconds, for tests of request timeouts
-                time.sleep(2)
             mode = form.get("execution", ["-"])[0]
             with open(log, "a") as f:
                 f.write(f"{IDENTITY}\t{owner}\t{store}\t{mode}\t{accept}\n")
             with open(conns, "a") as f:
                 f.write(f"{self.client_address[1]}\t{body}\n")
+            if "#sleep" in form.get("query", [""])[0]:
+                # a query with this comment takes two seconds, for tests of request timeouts,
+                # and is logged when it arrives, so that the log does not depend on whether
+                # the server is stopped before the two seconds pass
+                time.sleep(2)
             ask = "ASK" in form.get("query", [""])[0].upper().split("{")[0]
             if ask and "tab-separated" in accept:
                 out = b"?_askResult\ntrue\n"

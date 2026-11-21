@@ -123,6 +123,12 @@ def check(path, kind, flagged):
     judge."""
     s = json.load(open(path))
     v = s.get("validity")
+    if any("exec_ms" in q and "epochs_a" not in q["exec_ms"] for q in s.get("queries", {}).values()):
+        # a summary written before the epoch counts cannot show that a query has two server
+        # processes of each variant, so it may not decide
+        print(f"{path} has no epoch counts, since an older nsc-bench-summary.py wrote it. "
+              f"Regenerate it with nsc-bench-summary.py on its run directory.", file=sys.stderr)
+        return 1
     if kind == "rerun":
         for q in flagged.split():
             m = s["queries"].get(q, {}).get("exec_ms")

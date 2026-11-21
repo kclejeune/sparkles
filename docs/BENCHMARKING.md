@@ -1226,12 +1226,11 @@ the host's locks and queues a systemd user unit that takes `~/lanes/.bench.lock`
 checks again under the locks, times a first pass, reruns the queries flagged in any pair
 with more rounds and writes `verdict.md`.
 
-The harness forks curl, grep and awk for every request, and that client work takes most
-of a screen's time. `REQUEST_CLIENT=persistent` sends the same requests from one process
-over one kept-alive connection, so a server process's work takes a fraction of the time.
-Back-to-back requests find the server warmer, though, and the shortest queries read faster
-in `execMs` than with curl. The persistent client therefore measures a different regime,
-and no screen uses it until an Intel host run shows that it keeps the screen's verdicts. `REQUEST_GAP_MS` adds a pause before each of its requests, and
+The harness forks curl, grep and awk for every request. `REQUEST_CLIENT=persistent` sends
+the same requests from one process over one kept-alive connection, without those processes.
+Back-to-back requests can find the server's caches and clocks warmer than requests with a
+process start between them, so the persistent client may measure a different regime. No
+screen uses it until an Intel host run shows that it keeps the screen's verdicts. `REQUEST_GAP_MS` adds a pause before each of its requests, and
 `timing-kit.py stage --clients` times every arm under several clients in one run for that
 qualification.
 
