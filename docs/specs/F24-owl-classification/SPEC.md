@@ -96,6 +96,15 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
+Item 1256 changes the invalidation of a run kept by the EL rules. It recomputed what
+every kept context takes from the index and read every subsumer of every context with
+hash sets, which on `ore_ont_13482` on `wally` took about 105 ms of a 433 ms index stage
+to clear 3 to 39 of its 659,580 contexts. Kept contexts now keep their propagations,
+renumber their disjointness sets only when the run's sets differ from the last run's,
+and the two remaining reads of every context use bit sets. Items 590 and 664 wait for
+item 1254, since on that file the index build and the checks before it are 0.47 of a run
+that starts again.
+
 Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
 default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
 [item 804's departures](#item-804s-departures-from-the-journals-rules) describe. With it,

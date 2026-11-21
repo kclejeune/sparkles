@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Kept EL runs keep what their contexts take from the index
+
+After an edit of class axioms, a classification kept by the EL rules no longer recomputes
+the negative existential restrictions and disjointness members of every kept context,
+which took about half of the invalidation's 105 ms on `ore_ont_13482` on `wally` for a
+few dozen cleared contexts. A kept context renumbers its disjointness sets only when the
+run's sets differ from the last run's, the invalidation's two reads of every context use
+bit sets, and its scratch counts against the memory budget, as roadmap item 1256 records.
+`incremental_classify` also prints the resident bytes of the first edit's run. The
+reasoning guide states the higher peak of a kept run, whose contexts stay live beside the
+second build of the index, and roadmap item 1254 covers incremental normalization and
+indexing, which items 590 and 664 now wait for.
+
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
 Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
