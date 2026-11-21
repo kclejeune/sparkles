@@ -1,5 +1,6 @@
 """Independent SP2Bench oracle regressions for DISTINCT pairs and earliest-author years."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import pathlib
 import tempfile

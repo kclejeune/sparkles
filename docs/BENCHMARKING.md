@@ -33,17 +33,18 @@ Each kind of claim needs a host that can resolve it.
 
 Use available local resources for builds and validation first, with Boat for overflow
 and isolation, as described under [remote executors](DEVELOPMENT.md#remote-executors).
-Keep benchmark workers free for measurements. The quick query screen runs on an admitted
-Boat worker. Keep each A/B comparison on one host with matching tools and configuration,
+Keep benchmark workers free for measurements. The batch query screen runs on a quiet
+Intel host, and a Boat worker gives quick approximate checks that decide nothing. Keep
+each A/B comparison on one host with matching tools and configuration,
 retain the actual host identity with its results, and never compare timings from
 different providers.
 
 | Host | Use | Why |
 |---|---|---|
-| Boat worker, `mise run bench:remote --executor boat:bx_ID A B` | Quick A/B screens of changes of about 10% or more, and checks that a change leaves other queries alone | A Boat worker is a shared virtual machine, so it cannot confirm a change of a few percent. |
-| `atlas` or `forge`, Intel Core i5-13500 | Effects under about 5%, queries under 0.3 ms and changes sensitive to code generation | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
-| `forge` | Published reference numbers | The main comparison tables use this host and preserve each run's environment. |
-| `wally`, Intel Core i7-12800H with 32 GiB RAM | Separately qualified memory-heavy query recovery | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
+| Boat worker, `mise run bench:remote --executor boat:bx_ID A B` | Use this worker for quick approximate A/B checks of changes of about 10% or more. | A Boat worker is a shared virtual machine. The same binary's speed moves too much between its server processes for a verdict. |
+| `atlas` or `forge`, Intel Core i5-13500 | Use these hosts for the batch query screen, effects under about 5%, queries under 0.3 ms and changes sensitive to code generation. | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
+| `forge` | Use this host for published reference numbers. | The main comparison tables use this host and preserve each run's environment. |
+| `wally`, Intel Core i7-12800H with 32 GiB RAM | Use this host for separately qualified recovery of memory-heavy queries. | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
 
 The microarchitecture matters. A fix to the merge join's zipper made `optional-count`
 28.5% faster and `minus` 31.9% faster at 1.05M triples on atlas, and the same comparison
@@ -105,7 +106,12 @@ per request, except one at 1.07%, and within 0.17% for larger queries, most with
 The small queries' counts spread by up to 4.1% over processes. A query is therefore
 flagged when its interval does not lie within 1 ± 1% below 2 million instructions per
 request, or within 1 ± 0.25% at or above it, and a lone flag of a small query near the
-threshold is rerun with more rounds. Under automatic execution a query can run on a different executor in different
+threshold is rerun with more rounds. On `wally`, two A-against-A runs of the screen's
+queries on the same store, one of four rounds and one of eight rounds of 50 requests under
+eager and streaming execution, each of a different binary, gave intervals within 1.6% of 1
+for queries under 2 million instructions per request and within 0.32% for larger queries.
+A count on `wally` therefore flags a query outside 1 ± 2% below 2 million instructions per
+request, or outside 1 ± 0.4% at or above it. Under automatic execution a query can run on a different executor in different
 processes, so its counts split into two groups. `str-filter-two` ran 225 or 272 million
 instructions per request in different processes of one binary, and other automatic
 queries spread by 20% to 90%. A flag on such a query is rerun under explicit modes before
@@ -1196,10 +1202,100 @@ without it, and `bench:jena-remote` still falls back to the retired Namespace ex
 of the shared screen script. Small smoke workloads establish transport and correctness only. Published
 numbers still come from the benchmark host.
 
-The batch query screen runs through `bench:remote` on a Boat worker, and it is the only
-screen of record. A small or contested effect is checked on an Intel host. The Boat and
-Namespace screens of the same two batches disagreed by about 10% in their geometric means,
-and item 1133 settles the difference on an Intel host.
+The batch query screen runs on a quiet Intel host, `atlas` or `forge`, under the host's
+locks with nothing beside it, and it is the screen of record. Both arms and the reruns of
+its flagged queries stay on that host. A screen through `bench:remote` on a Boat worker is
+approximate and decides nothing, because one binary timed against itself on a Boat worker
+moves far more between server processes than the screen's 3% same-binary bound allows.
+
+### Timing runs on an Intel host
+
+`scripts/timing-kit.py` stages, checks and queues an interleaved timing run on `atlas` or
+`forge`. `stage` builds one run directory for `scripts/nsc-bench-remote.sh` from a base
+binary and one or more tips. Tips that share the base, the data, the queries and the
+settings are timed in one run, in which every round runs the palindrome of the variants
+and the base's server processes serve every pair. Each pair gets its own summary, its own
+same-binary validity and its own verdict, but pairs that share base processes are not
+independent of each other. Groups with different data or queries are separate stages that
+one unit runs in turn.
+
+`preflight` refuses a stage before the host is booked when its server and client lack
+their own explicit CPUs, when the busy loops that keep those CPUs awake are off, when a
+round runs a variant fewer than twice, when fewer than three control queries of at least
+0.3 ms are staged, when a pair mixes request clients or when a binary does not match its
+hash. With `--host-side` it also refuses CPUs that are offline, SMT siblings of each other
+or not performance cores, a port in use, missing locks or runtime paths, and a set
+`MBX_REMOTE_URL`. `launch` runs the check locally and on the host, copies the stage under
+the host's locks and queues a systemd user unit that takes `~/lanes/.bench.lock` and then
+`~/lanes/.heavy.lock`, and `--dry-run` prints those commands instead. The unit's `run`
+checks again under the locks, times a first pass, reruns the queries flagged in any pair
+with more rounds and writes `verdict.md`. A pass cannot decide a pair when the two arms
+answer a query differently, when either arm's answer check fails or when an arm has no
+answer to a query, and `verdict.md` marks that pass invalid and names those queries. Every
+staged query needs these answers, whether or not its requests left a timing. In a run of
+several tips or clients, every arm must give the same answers, so one arm that answers
+differently stops every pair of the run.
+
+A batch that is meant to change some answers, such as the fix of a wrong result, names
+those queries with `stage --expected-answer-change q1,q2` and says why with
+`--expected-answer-change-reason`, which run.env holds as `EXPECTED_ANSWER_CHANGE` and
+`EXPECTED_ANSWER_CHANGE_REASON`. For those queries alone, answers that differ between the
+binaries no longer stop the pass, and `verdict.md` names the changed queries and the
+reason. Each arm must still give one answer, arms that run the same binary must still
+agree, and a failed or missing answer check still stops the pass. A listed query whose
+answers stay the same is reported without stopping the pass. `preflight` refuses a list
+without a reason and a name that is not a staged query.
+
+Early stopping runs only in shadow mode. With `EARLY_STOP=shadow`, which `stage` writes by
+default, `run` replays a stopping rule on the finished first pass and writes `shadow.md` and
+`pass1/shadow-X-Y.json` beside the verdict, and `timing-kit.py shadow PASS_DIR` does the same
+for any finished pass of the harness, such as a batch screen's. A query that is not a control
+stops only once the rule has stopped on both its execution time and its wall time, since
+the gates score both, and each metric's flag is then taken on the rounds that the query
+keeps. For the flag at the bound, a metric stops once a 99.5% t interval of its per-round
+log ratios, after at least three rounds, lies wholly below the bound with the pooled ratio
+below it too, or lies at or above the bound. An interval cannot answer a rule that asks
+whether every round is above 1, so `EARLY_STOP_RULES=every-round`, which `stage
+--early-stop-rules` writes, gives that question the exact stop instead. A metric then stops
+at its first round at or below 1, where the answer is no whatever the later rounds hold, and
+otherwise runs every round, and a cost is flagged when every round is above 1 and the median
+adds more than 0.5 µs. A cost in every round needs timings of both variants in every round
+that the pass scheduled, including a round that left no samples at all. The schedule is
+`ROUNDS` in the pass's run.env, or in its parent's when the pass has none, where a rerun takes
+`RERUN_ROUNDS`. When a round lacks timings, the run.env that decides gives no count, or the
+pass ran rounds past it, and no round is at or below 1, the question cannot be decided, so no
+cost is flagged and the record lists the query's metric as undecidable. The
+bound's pooled flag is unaffected. `EARLY_STOP_RULES=bound,every-round` answers both questions, and the
+query stops at the later of the two stops. The default is `bound`. The controls run every
+round and judge the host's spread and drift, while the checks of answers, missing timings
+and server processes per query apply to the shadow as they do to all rounds. When their
+same-binary spread is between 2.2% and the 3% bound, the stopped queries would run their
+remaining rounds and the rule of all rounds would decide. The record gives each query's stop
+round and, for each metric and question, its stop and flag beside the flag of all rounds. It
+also gives both validities, the share of requests that would have run and a hash of the
+samples, and a run agrees when every flag and the validity match. Shadow mode never
+changes the verdict, the flagged queries, the rerun or the exit status. It tests the decision
+rule only, since live stopping would also change which queries run between the remaining ones
+and would run a fallback's remaining rounds in new server processes.
+
+The harness forks curl, grep and awk for every request. `REQUEST_CLIENT=persistent` sends
+the same requests from one process over one kept-alive connection, without those processes.
+Back-to-back requests can find the server's caches and clocks warmer than requests with a
+process start between them, so the persistent client may measure a different regime. No
+screen uses it until an Intel host run shows that it keeps the screen's verdicts. `REQUEST_GAP_MS` adds a pause before each of its requests, and
+`timing-kit.py stage --clients` times every arm under several clients in one run for that
+qualification.
+
+The busy loops that keep the timing CPUs awake are shell loops that never enter the kernel.
+Under a kernel with lazy preemption, such as one that logs `Dynamic Preempt: lazy`, a server
+or client that another CPU wakes waits for the next scheduler tick on a CPU that runs such a
+loop. Each request's client wall time then gains up to one millisecond per wake-up, and the
+wall times of a 1000 Hz kernel fall on whole milliseconds. `SPIN_LOOP=syscall`, which
+`timing-kit.py stage --spin-loop syscall` writes, runs a loop of redirections to `/dev/null`
+in their place, whose system calls let the woken task run within microseconds. The default
+stays `SPIN_LOOP=user` until an Intel host run shows that the other loop keeps the screen's
+verdicts, and runs under different loops are never compared. `env.txt` and `verdict.md`
+name the loop.
 
 <a id="namespace-query-screens"></a>
 
@@ -1316,8 +1412,8 @@ read, unless `--allow-mixed-compilers` is given. A revision it builds also gets 
 and the cargo flags. A cache entry that a build outside the shell left behind has to be
 removed before the revision is built again in the shell.
 
-A Boat worker is a shared virtual machine. The screen is therefore suited to changes of
-about 10% or more and to checking that a change leaves the other queries alone. It cannot
+A Boat worker is a shared virtual machine. A screen there is therefore suited only to a
+quick look at changes of about 10% or more. It cannot
 confirm a change of a few percent, and [Choosing a host](#choosing-a-host) says where to
 measure those. Queries under 0.1 ms vary widely between server processes and say little
 on their own.

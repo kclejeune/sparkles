@@ -96,6 +96,23 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
+Item 1256 changes the invalidation of a run kept by the EL rules. It recomputed what
+every kept context takes from the index and read every subsumer of every context with
+hash sets, which on `ore_ont_13482` on `wally` took about 105 ms of a 433 ms index stage
+to clear 3 to 39 of its 659,580 contexts. Kept contexts now keep their propagations,
+renumber their disjointness sets only when the run's sets differ from the last run's,
+and the two remaining reads of every context use bit sets. The invalidation admits its
+bit sets and the normalized premises of the changed axioms before it starts, and its lists
+of parts, of the walk and of the cleared contexts before each grows. It also admits the
+larger disjointness maps that kept contexts need when they number their sets again,
+before any context changes, and an unsatisfiable context keeps no map. On `wally` with four
+threads, in alternating runs of 7885a660 against 3afa8c52 that each passed the check against
+a fresh run, the kept index stage of `ore_ont_13482` fell from 423.5 to 347.6 ms and its edit
+from 485.9 to 408.1 ms, 0.68 of a run that starts again, and the edit of `ore_ont_9499` fell
+from 146.6 to 138.6 ms. Items 590 and 664 wait for item 1254, since on `ore_ont_13482`
+the index build and the checks before it are 0.47 of a run
+that starts again.
+
 Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
 default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
 [item 804's departures](#item-804s-departures-from-the-journals-rules) describe. With it,
@@ -601,7 +618,10 @@ chain of a property with itself. A range is pushed into the filler of each exist
 restriction on the property, which is complete under the range restriction of OWL 2 EL
 (Profiles §2.2.6). A restriction to an individual that an assertion tells is the
 exception, which the paragraph on individuals below describes. A chain that breaks the
-range restriction is left out. The taxonomy groups
+range restriction is left out. A context with a role loop takes the role's range, and the
+index registers every range as a positive occurrence, so the existentials and data
+restrictions of a range that only a loop reaches have their successors and told
+subsumers (item 1262). The taxonomy groups
 the classes by mutual subsumption and computes direct superclasses by transitive
 reduction, by greedy minimization or, for a class with more than 32 direct superclasses,
 by marking the classes above each candidate. The subsumers, the equivalence classes and
@@ -731,15 +751,26 @@ too.
 additions and removals clears the contexts that derived the left side of a changed
 subsumption or part of it, the contexts whose links a changed existential restriction
 can use, and every context that links to a cleared one, and saturates those again. The
-other contexts drop their links from cleared contexts and recompute what they take from
-the index, which is rebuilt from the axioms on every run. A change to the property
+other contexts drop their links from cleared contexts and keep what they take from the
+index, which is rebuilt from the axioms on every run. A negative existential restriction
+that an edit adds or removes has its filler among the changed parts, so every context
+that takes it from the index is cleared, and a kept context renumbers the disjointness
+sets it meets only when the run's sets differ from the last run's (item 1256). A change to the property
 hierarchy, chains, reflexivity or ranges saturates everything again, and so does a
-change to an axiom with an individual, a data property, a datatype or a key. So does any
-change after a run that marked the real contexts, which merges, worlds, keys and the
-facts of universal roles tie together in ways the invalidation does not follow, and a
+change to an axiom with an individual, a data property, a datatype, a key or a self
+restriction. So does any change after a run that marked the real contexts, which
+merges, worlds, keys and the facts of universal roles tie together in ways the
+invalidation does not follow, and a
 run after a run that stopped before its saturation ended. A run that stops later keeps
 its saturated contexts. Property tests check that an incremental run after random
 additions and removals gives the taxonomy of a full run.
+
+A self restriction starts the run again because a context can have a loop by a role
+without holding the self restriction whose subsumer the loop gives. A loop also comes
+from a self restriction on a subrole, a reflexive role or a chain, so the invalidation
+cannot find the contexts that a changed self restriction reaches by the expressions they
+hold. Until item 1258, an added `ObjectHasSelf(s) ⊑ C` beside `r ⊑ s` and
+`owl:Thing ⊑ ObjectHasSelf(r)` cleared no context and left out `owl:Thing ⊑ C`.
 
 This reuse applies to eligible EL edits. Normalization with Horn or disjunctive axioms
 currently clears the contexts and marks the run entangled, so a later edited source
@@ -971,7 +1002,9 @@ report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the r
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
 comparison with an independent naive completion procedure for EL++ on random ontologies
 of up to twenty axioms, incremental against full runs on random changes for both
-`Classifier` and `Saturation`, the same taxonomy on one, two and eight threads for an
+`Classifier` and `Saturation`, and in `tests/incremental_sweep.rs` incremental against
+full runs on edits of class axioms beside fixed self restrictions, reflexive roles,
+chains, ranges, individuals and the top and bottom properties, the same taxonomy on one, two and eight threads for an
 ontology of 3,000 classes, and an estimate that bounds a run with its taxonomy. Unit
 tests of the taxonomy check that the estimate counts every link of a wide hierarchy,
 that an inconsistent ontology's taxonomy asks the budget and that every stage polls the
@@ -4611,7 +4644,9 @@ the options that select rules do. The tables that no expression keys differ. The
 keeps more than twice the expressions, the conjunctions or tests, or the clauses of the
 table that the last full run had, plus 4,096. A kept run that stops on its memory budget
 also starts again in full before a lower tier takes over, since the last index and the
-contexts that nothing reaches count against the budget of a kept run alone. Before the
+contexts that nothing reaches count against the budget of a kept run alone. A run kept
+by the OWL 2 EL rules does the same, with or without `Limits::el_only`, and the run in
+full draws first on what the pool granted the kept attempt (item 1263). Before the
 comparison the run admits both indexes, the kept contexts, the clause table and the
 marks and queue of the invalidation against that budget. A run that
 its deadline or a cancellation stops leaves a classifier whose next run starts again.

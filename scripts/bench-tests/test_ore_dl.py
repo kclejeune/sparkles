@@ -1,5 +1,6 @@
 """The polarity counts and features of the ORE 2015 DL scan (scripts/elk-compare/ore-dl.py)."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 from pathlib import Path
 import unittest

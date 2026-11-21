@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### A kept EL classification over its memory budget starts again in full
+
+A kept OWL 2 EL run counts the contexts it keeps and its own new state against
+`max_memory` and the pool's grants, which a fresh run does not hold. Such a run that
+passed its budget returned a memory error where a fresh run under the same limit
+succeeded, and a repeated call failed the same way. It now starts again in full under the
+same limits, as kept runs with the Horn rules or Tier D do, and charges the pool first
+against what the kept attempt was granted, as roadmap item 1263. A run that a fresh run
+could not finish either still fails with the memory error.
+
+### A range that only a loop reaches is classified in full
+
+A context with a role loop, from a self restriction or the Horn rules, takes the role's
+range. The OWL 2 EL classifier registered a range as a positive
+occurrence only through a positive existential on the role, so the existentials of such a
+range had no successor contexts and its data restrictions no told subsumers. A full run
+could miss a subsumption or an unsatisfiable class while reporting itself complete, and a
+kept run could differ from a fresh one after an unrelated edit. The index now registers
+every range, as roadmap item 1262. The taxonomies of `ore_ont_13482` and `ore_ont_9499`
+are unchanged.
+
+### Kept EL runs keep what their contexts take from the index
+
+After an edit of class axioms, a classification kept by the EL rules no longer recomputes
+the negative existential restrictions and disjointness members of every kept context,
+which took about half of the invalidation's 105 ms on `ore_ont_13482` on `wally` for a
+few dozen cleared contexts. A kept context renumbers its disjointness sets only when the
+run's sets differ from the last run's, the invalidation's two reads of every context use
+bit sets, and its scratch counts against the memory budget, as roadmap item 1256 records.
+On `wally` with four threads an edit of `ore_ont_13482` takes 408.1 ms against 485.9 ms
+before, and an edit of `ore_ont_9499` 138.6 ms against 146.6 ms.
+`incremental_classify` also prints the resident bytes of the first edit's run. The
+reasoning guide states the higher peak of a kept run, whose contexts stay live beside the
+second build of the index, and roadmap item 1254 covers incremental normalization and
+indexing, which items 590 and 664 now wait for.
+
+### Incremental EL classification runs again after a change to a self restriction
+
+An incremental OWL 2 EL classification could miss entailments after an axiom with
+`ObjectHasSelf` was added, as roadmap item 1258 found. A negative self restriction gives
+its class to every context with a loop by the role or a subrole, and a kept context can
+have that loop from a self restriction on a subrole, a reflexive role or a chain without
+holding the restriction that the invalidation looks for. With `r ⊑ s` and
+`owl:Thing ⊑ ObjectHasSelf(r)` fixed, adding `ObjectHasSelf(s) ⊑ C` cleared no context and
+left out `owl:Thing ⊑ C`, and a reflexive `r` with an added `ObjectHasSelf(r) ⊑ C` did the
+same. A change to an axiom with a self restriction now saturates everything again, as a
+change to an axiom with an individual does. Kept runs with the Horn or disjunctive rules
+already started again after such a change, through the check of the tier when axioms
+outside OWL 2 EL are in play and the comparison of the two indexes' tables. A new
+differential sweep, `tests/incremental_sweep.rs`, compares kept runs with fresh ones on
+edits of class axioms beside fixed self restrictions, reflexive roles, chains, ranges,
+individuals and the top and bottom properties.
+
+### FILTER NOT EXISTS builds its mask in one pass again
+
+When the key set of a FILTER NOT EXISTS or FILTER EXISTS answers every row, the filter
+maps the probe's answers to its mask in one branch-free pass, as roadmap item 1249's
+repair. The probe and the mask were split in item 7's first phase, whose second loop
+took a branch per row and made `not-exists` 15 to 21% slower in execution on forge
+between bccc5f7b and 23626cdc. On `atlas`, a9a237b7 against 6dbf2a08, `not-exists`
+executes in 0.87 to 0.90 times the base's time in every cell, by default and streamed, and
+streamed `exists-join` in 0.95 to 0.99 times. Item 1252 bisects the eager `minus` and
+streamed `optional-chain` readings against cc94ac7f, and item 1253 holds the small
+costs that the counts and the timing found.
+
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
 Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the

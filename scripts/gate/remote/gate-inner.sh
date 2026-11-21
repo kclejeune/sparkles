@@ -251,6 +251,12 @@ if [ "$part" != conformance ]; then
       printf '%-20s FLAKY          %s\n' ci "$(tr '\n' ';' < "$out/ci.forgiven")" >> "$out/steps.txt"
     fi
   fi
+  # The full gate also runs the script tests serially and fails when that verdict or its
+  # counts differ from the parallel runner's, since the runner rests on assumptions about
+  # the tests that it does not check. A commit without the comparison skips it.
+  if [ "${GATE_FULL:-0}" = 1 ] && [ -f scripts/unittest-compare.py ]; then
+    step bench-scripts-compare mise run test:bench-scripts:compare
+  fi
 fi
 if [ "$part" != ci ]; then
   for t in w3c shacl shex; do

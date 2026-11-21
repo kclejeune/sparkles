@@ -4,6 +4,7 @@ with a stub server in place of sparkles, and of `bench-gate.py compare --best-of
     python3 -m unittest discover -s scripts/bench-tests -p test_bench_executors.py
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 import os
 import shutil
@@ -207,6 +208,281 @@ class RemoteRunnerTests(unittest.TestCase):
         self.assertEqual((d / "results" / "done").read_text().strip(), "ok")
         loads = [l.split("\t")[0] for l in (d / "results" / "load.tsv").read_text().splitlines()]
         self.assertEqual(loads, ["A", "B", "C"])
+
+
+@unittest.skipUnless(all(shutil.which(t) for t in NEEDS), "needs taskset, zstd and curl")
+class RequestClientTests(unittest.TestCase):
+    """REQUEST_CLIENT=persistent writes what the curl loop writes, over fewer connections."""
+
+    def run_client(self, client, extra="", close_every=0):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        shutil.copy(SCRIPTS / "nsc-bench-remote.sh", d)
+        (d / "queries").mkdir()
+        (d / "queries" / "count.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }\n")
+        (d / "queries" / "ask.rq").write_text("ASK { ?s <http://e/p> \"a b&c=d+é\" }\n")
+        digest = d / "digest.sh"
+        digest.write_text('#!/bin/sh\nshift\nfor f; do if [ -f "$f" ]; then wc -c < "$f"; else echo missing; fi; done\n')
+        digest.chmod(0o755)
+        (d / "run.env").write_text(
+            "SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\nROUNDS=2\nREPS=3\nWARMUP=2\n"
+            f"EXECUTION=,streaming\nREQUEST_CLIENT={client}\nWARM_DIGEST={digest}\nPORT={free_port()}\n" + extra)
+        for v in "AB":
+            (d / f"bin-{v}").write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{v}"')
+                                        .replace("EXEC_MS = 1.0", "EXEC_MS = 2.5")
+                                        .replace("CLOSE_EVERY = 0", f"CLOSE_EVERY = {close_every}"))
+        subprocess.run(["zstd", "-q", "-o", str(d / "data.nt.zst")], input=b"", check=True)
+        r = subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True, timeout=120)
+        self.assertEqual((d / "results" / "done").read_text().strip(), "ok", r.stdout + r.stderr)
+        return d
+
+    def test_persistent_matches_curl(self):
+        c, p = self.run_client("curl"), self.run_client("persistent")
+
+        def samples(d):
+            rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()]
+            for r in rows[1:]:
+                float(r[6])
+            return [r[:6] for r in rows]
+
+        self.assertEqual(samples(c), samples(p))
+        self.assertEqual(len(samples(p)), 1 + 2 * 4 * 2 * 3)
+        self.assertTrue(all(r[5] == "2.5" for r in samples(p)[1:]))
+        for f in ("answers.tsv", "warm-answers.tsv"):
+            self.assertEqual((c / "results" / f).read_text(), (p / "results" / f).read_text(), f)
+        self.assertNotIn("missing", (p / "results" / "warm-answers.tsv").read_text())
+        # the server saw the same requests, with the same form fields and Accept headers
+        self.assertEqual((c / "requests.tsv").read_text(), (p / "requests.tsv").read_text())
+        self.assertIn("request client: A=persistent(gap 0 ms) B=persistent(gap 0 ms) Python", (p / "results" / "env.txt").read_text())
+        # curl opens a connection per request, the persistent client one per server process
+        # beside the answer checks, which run once per variant with curl
+        log = lambda d: [l.split("\t") for l in (d / "connections.tsv").read_text().splitlines()]
+        self.assertEqual([b for _, b in log(c)], [b for _, b in log(p)])
+        self.assertIn("query=ASK+%7B+%3Fs+%3Chttp%3A%2F%2Fe%2Fp%3E+%22a+b%26c%3Dd%2B%C3%A9%22+%7D%0A",
+                      {b for _, b in log(p)})
+        conns = lambda d: len({port for port, _ in log(d)})
+        requests = 2 * 4 * 2 * (2 + 3)
+        self.assertEqual(conns(c), requests + 2 * 2)
+        self.assertEqual(conns(p), 2 * 4 + 2 * 2)
+
+    def test_an_unknown_client_is_refused(self):
+        d = self.run_client("persistent")
+        (d / "results" / "done").unlink()
+        (d / "run.env").write_text((d / "run.env").read_text() + "REQUEST_CLIENT=wget\n")
+        subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True, timeout=60)
+        self.assertIn("REQUEST_CLIENT is curl or persistent, not wget for A", (d / "results" / "done").read_text())
+
+    def test_a_connection_the_server_closed_is_reopened(self):
+        d = self.run_client("persistent", close_every=3)
+        rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()[1:]]
+        self.assertEqual(len(rows), 2 * 4 * 2 * 3)
+        self.assertNotIn("error", {r[5] for r in rows})
+        # each request reached the server once
+        self.assertEqual(len((d / "requests.tsv").read_text().splitlines()), 2 * 4 * 2 * (2 + 3) + 2 * 2)
+
+    def test_timeouts_and_a_missing_digest_command_match_curl(self):
+        extra = "MAX_TIME=1\nWARM_DIGEST=/nonexistent/digest\n"
+        runs = {}
+        for client in ("curl", "persistent"):
+            d = self.run_client(client, extra)
+            # the answer checks use curl in both runs, so only the timed loop differs
+            runs[client] = d
+        for d in runs.values():
+            rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()[1:]]
+            self.assertTrue(all(r[5] == "2.5" for r in rows))
+            self.assertEqual({l.split("\t")[4] for l in (d / "results" / "warm-answers.tsv").read_text().splitlines()},
+                             {"no digest"})
+
+    def test_a_request_past_max_time_is_an_error_and_is_not_retried(self):
+        runs = {}
+        for client in ("curl", "persistent"):
+            d = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, d, True)
+            shutil.copy(SCRIPTS / "nsc-bench-remote.sh", d)
+            (d / "queries").mkdir()
+            (d / "queries" / "slow.rq").write_text("SELECT * WHERE { ?s ?p ?o } #sleep\n")
+            (d / "run.env").write_text("SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\nROUNDS=1\n"
+                                       f"REPS=2\nWARMUP=0\nMAX_TIME=1\nREQUEST_CLIENT={client}\nPORT={free_port()}\n")
+            for v in "AB":
+                (d / f"bin-{v}").write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{v}"'))
+            subprocess.run(["zstd", "-q", "-o", str(d / "data.nt.zst")], input=b"", check=True)
+            r = subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True, timeout=120)
+            self.assertEqual((d / "results" / "done").read_text().strip(), "ok", r.stdout + r.stderr)
+            runs[client] = d
+        for client, d in runs.items():
+            rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()[1:]]
+            self.assertEqual([r[5:] for r in rows], [["error", "error"]] * 8, client)
+        self.assertEqual((runs["curl"] / "requests.tsv").read_text(), (runs["persistent"] / "requests.tsv").read_text())
+
+    def test_one_variant_per_client(self):
+        d = self.run_client("persistent", "REQUEST_CLIENT_A=curl\nREQUEST_GAP_MS_B=1.5\n")
+        self.assertIn("request client: A=curl B=persistent(gap 1.5 ms) Python", (d / "results" / "env.txt").read_text())
+        rows = [l.split("\t") for l in (d / "connections.tsv").read_text().splitlines()]
+        # A's 20 requests per server process each open a connection, B's share one
+        self.assertEqual(len({port for port, _ in rows}), 4 * 2 * (2 + 3) + 4 + 2 * 2)
+
+
+class ScriptedServer:
+    """A raw HTTP server whose answers a test scripts byte by byte.
+
+    Each accepted connection serves requests in turn. For the n-th request over all
+    connections, `answer(n)` gives a list of (delay seconds, bytes) steps to send, and a
+    final None step closes the connection. The server counts the requests it read."""
+
+    def __init__(self, answer):
+        import threading
+        self.answer, self.requests = answer, 0
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        self.port = self.sock.getsockname()[1]
+        self.lock = threading.Lock()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        import threading
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.connection, args=(c,), daemon=True).start()
+
+    def connection(self, c):
+        import time
+        f = c.makefile("rb")
+        try:
+            while True:
+                length = None
+                line = f.readline()
+                if not line:
+                    return
+                while line not in (b"\r\n", b""):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":")[1])
+                    line = f.readline()
+                f.read(length or 0)
+                with self.lock:
+                    self.requests += 1
+                    n = self.requests
+                for step in self.answer(n):
+                    if step is None:
+                        c.close()
+                        return
+                    delay, data = step
+                    time.sleep(delay)
+                    c.sendall(data)
+        except OSError:
+            return
+        finally:
+            c.close()
+
+    def close(self):
+        self.sock.close()
+
+
+def answer(body=b'{"execMs":1.5}', headers=b"", trickle=None, delay=0.0):
+    """The steps of one answer: its headers then its body, optionally trickled one byte at a
+    time with `trickle` seconds between bytes, into "head" or "body"."""
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n" % len(body) + headers + b"\r\n"
+    steps = [(delay, b"")]
+    for part, name in ((head, "head"), (body, "body")):
+        if trickle and trickle[0] == name:
+            steps += [(trickle[1], part[i:i + 1]) for i in range(len(part))]
+        else:
+            steps.append((0, part))
+    return steps
+
+
+class RequestClientDeadlineTests(unittest.TestCase):
+    """The persistent client of nsc-bench-remote.sh, run directly against scripted servers."""
+
+    # Runs the client with a threading.Timer whose callbacks never fire on their own. Each
+    # new timer first runs every earlier timer's callback, cancelled or not, as a watchdog
+    # that passed its cancellation check and was then delayed would.
+    LATE_WATCHDOGS = """import runpy, sys, threading
+made = []
+class Timer:
+    def __init__(self, interval, fn):
+        self.fn = fn
+        self.daemon = False
+    def start(self):
+        for t in list(made):
+            t.fn()
+        made.append(self)
+    def cancel(self):
+        pass
+threading.Timer = Timer
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name="__main__")
+"""
+
+    def client(self, server, max_time, reps=1, late_watchdogs=False):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        text = (SCRIPTS / "nsc-bench-remote.sh").read_text()
+        start = text.index("cat > bench-client.py << 'PY'\n") + len("cat > bench-client.py << 'PY'\n")
+        (d / "bench-client.py").write_text(text[start:text.index("\nPY\n", start) + 1])
+        (d / "late.py").write_text(self.LATE_WATCHDOGS)
+        (d / "queries").mkdir()
+        (d / "queries" / "q.rq").write_text("SELECT * WHERE { ?s ?p ?o }\n")
+        import time
+        t0 = time.monotonic()
+        subprocess.run([sys.executable] + (["late.py"] if late_watchdogs else []) + ["bench-client.py", "--port", str(server.port), "--round", "1", "--epoch", "1",
+                        "--variant", "A", "--warmup", "0", "--reps", str(reps), "--max-time", str(max_time),
+                        "--samples", "samples.tsv", "--warm-answers", "warm.tsv", "q"],
+                       cwd=d, check=True, timeout=60)
+        rows = [l.split("\t") for l in (d / "samples.tsv").read_text().splitlines()]
+        return [r[5] for r in rows], time.monotonic() - t0
+
+    def serve(self, fn):
+        s = ScriptedServer(fn)
+        self.addCleanup(s.close)
+        return s
+
+    def test_an_answer_that_closes_its_connection_is_kept(self):
+        s = self.serve(lambda n: answer(headers=b"Connection: close\r\n") + [None])
+        rows, _ = self.client(s, 5, reps=3)
+        self.assertEqual(rows, ["1.5"] * 3)
+        self.assertEqual(s.requests, 3)
+        # an answer without a length that ends when the server closes is kept too
+        s = self.serve(lambda n: [(0, b'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{"execMs":2}'), None])
+        rows, _ = self.client(s, 5, reps=2)
+        self.assertEqual(rows, ["2"] * 2)
+
+    def test_trickled_headers_and_bodies_end_at_the_deadline(self):
+        for part in ("head", "body"):
+            # each byte arrives well inside any one read's timeout, and the whole answer
+            # would take several seconds
+            s = self.serve(lambda n: answer(body=b'{"execMs":1.5}' + b" " * 40, trickle=(part, 0.1)))
+            rows, took = self.client(s, 0.5, reps=2)
+            self.assertEqual(rows, ["error"] * 2, part)
+            self.assertLess(took, 3, part)
+            # a timed-out request is not sent again
+            self.assertEqual(s.requests, 2, part)
+
+    def test_no_max_time_waits_for_a_slow_answer(self):
+        s = self.serve(lambda n: answer(trickle=("body", 0.05), delay=0.3))
+        rows, took = self.client(s, 0)
+        self.assertEqual(rows, ["1.5"])
+        self.assertGreater(took, 0.3)
+
+    def test_a_late_watchdog_does_not_reach_the_retry(self):
+        # the server closes each connection after one answer, so every second request finds
+        # a stale connection and is retried on a new one, whose watchdog the first try's
+        # late callback must leave alone
+        s = self.serve(lambda n: answer() + [None])
+        rows, _ = self.client(s, 30, reps=4, late_watchdogs=True)
+        self.assertEqual(rows, ["1.5"] * 4)
+        self.assertEqual(s.requests, 4)
+
+    def test_a_timeout_on_a_reused_connection_is_sent_once(self):
+        # the first request answers at once, and the second, on the same connection, stalls
+        s = self.serve(lambda n: answer() if n == 1 else answer(delay=3))
+        rows, took = self.client(s, 0.5, reps=2)
+        self.assertEqual(rows, ["1.5", "error"])
+        self.assertEqual(s.requests, 2)
+        self.assertLess(took, 2.5)
 
 
 class TimedDigestTests(unittest.TestCase):

@@ -1,5 +1,7 @@
 """Bound BSBM driver cells without downloads, engines or a Java installation."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
+import process_checks
 import json
 import os
 from pathlib import Path
@@ -108,12 +110,8 @@ else:
 
         self.addCleanup(cleanup)
         # An orphan can remain a zombie until init reaps it, but it cannot keep running.
-        for _ in range(20):
-            status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
-            if not status.stdout.strip() or status.stdout.lstrip().startswith("Z"):
-                return
-            time.sleep(0.05)
-        self.fail("driver child survived process-group termination")
+        if not process_checks.ended(pid):
+            self.fail("driver child survived process-group termination")
 
     def test_sigkill_cleans_up_a_driver_and_child_that_ignore_term(self):
         entry = self.run_driver("tree", timeout="1")

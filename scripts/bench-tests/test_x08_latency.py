@@ -4,6 +4,7 @@ base-and-tip form, with a stub server in place of sparkles.
     python3 -m unittest discover -s scripts/bench-tests -p test_x08_latency.py
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import os
 import shutil
 import socket
