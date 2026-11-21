@@ -4614,7 +4614,9 @@ the options that select rules do. The tables that no expression keys differ. The
 keeps more than twice the expressions, the conjunctions or tests, or the clauses of the
 table that the last full run had, plus 4,096. A kept run that stops on its memory budget
 also starts again in full before a lower tier takes over, since the last index and the
-contexts that nothing reaches count against the budget of a kept run alone. Before the
+contexts that nothing reaches count against the budget of a kept run alone. A run kept
+by the OWL 2 EL rules does the same, with or without `Limits::el_only`, and the run in
+full draws first on what the pool granted the kept attempt (item 1263). Before the
 comparison the run admits both indexes, the kept contexts, the clause table and the
 marks and queue of the invalidation against that budget. A run that
 its deadline or a cancellation stops leaves a classifier whose next run starts again.

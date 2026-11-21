@@ -2373,3 +2373,147 @@ fn a_range_on_links_that_are_not_loops() {
     }
     assert!(bad.is_empty(), "{bad:?}");
 }
+
+// ---------------------------------------------------------------------------------
+// A kept OWL 2 EL run that passes its memory budget starts again in full under the same
+// limits, as the runs that keep contexts of the Horn rules or Tier D do (roadmap item
+// 1263), so that its answer is that of a fresh run.
+
+/// 5,000 independent subsumptions, and an unrelated one to add.
+fn kept_el_memory_fixture() -> (Vec<Axiom>, Axiom) {
+    let axioms = (0..5000)
+        .map(|i| sub(c(&format!("C{i}")), c(&format!("D{i}"))))
+        .collect();
+    (axioms, sub(c("X"), c("Y")))
+}
+
+#[test]
+fn a_kept_el_run_over_its_memory_limit_starts_again() {
+    let (axioms, edit) = kept_el_memory_fixture();
+    let mut changed = axioms.clone();
+    changed.push(edit.clone());
+    for el_only in [false, true] {
+        let limits = Limits {
+            threads: 1,
+            el_only,
+            ..Limits::default()
+        };
+        let mut kept = Classifier::of(&axioms);
+        let cold = kept.classify(&limits).unwrap();
+        // the kept state and the old index count against the budget, which a fresh run
+        // of the edited axioms does not hold
+        let bounded = Limits {
+            max_memory: Some(cold.stats.peak_memory + 10_000),
+            ..limits.clone()
+        };
+        let fresh = Classifier::of(&changed).classify(&bounded).unwrap();
+        assert!(fresh.taxonomy.is_subclass(&c("X"), &c("Y")));
+        kept.add([&edit]);
+        let out = kept
+            .classify(&bounded)
+            .unwrap_or_else(|e| panic!("el_only={el_only}: {e:?}"));
+        assert!(
+            out.taxonomy.is_subclass(&c("X"), &c("Y")),
+            "el_only={el_only}"
+        );
+        assert_eq!(out.taxonomy, fresh.taxonomy, "el_only={el_only}");
+        assert!(!out.stats.incremental, "el_only={el_only}: a run in full");
+        // a repeated call answers the same, from the contexts of the run in full
+        let again = kept.classify(&bounded).unwrap();
+        assert_eq!(again.taxonomy, fresh.taxonomy, "el_only={el_only}");
+        // and a later edit keeps the contexts again
+        let more = sub(c("X"), c("Z"));
+        kept.add([&more]);
+        let unbounded = kept.classify(&limits).unwrap();
+        assert!(unbounded.stats.incremental, "el_only={el_only}");
+        assert!(unbounded.taxonomy.is_subclass(&c("X"), &c("Z")));
+    }
+}
+
+#[test]
+fn a_kept_el_run_refused_by_its_pool_starts_again_on_the_admitted_credit() {
+    use std::sync::atomic::AtomicUsize;
+    let (axioms, edit) = kept_el_memory_fixture();
+    let mut changed = axioms.clone();
+    changed.push(edit.clone());
+    for el_only in [false, true] {
+        let limits = Limits {
+            threads: 1,
+            el_only,
+            ..Limits::default()
+        };
+        // what a fresh run of the edited axioms asks of a pool
+        let asked = Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        let counting = Limits {
+            charge: Some(Arc::new(move |b| {
+                a.fetch_add(b, Ordering::Relaxed);
+                true
+            })),
+            ..limits.clone()
+        };
+        Classifier::of(&changed).classify(&counting).unwrap();
+        let cap = asked.load(Ordering::Relaxed) + 10_000;
+        let pool = |cap: usize| {
+            let used = Arc::new(AtomicUsize::new(0));
+            Limits {
+                // a refused grant takes nothing from the pool
+                charge: Some(Arc::new(move |b| {
+                    used.try_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                        (u + b <= cap).then_some(u + b)
+                    })
+                    .is_ok()
+                })),
+                ..limits.clone()
+            }
+        };
+        let mut kept = Classifier::of(&axioms);
+        kept.classify(&limits).unwrap();
+        kept.add([&edit]);
+        let out = kept
+            .classify(&pool(cap))
+            .unwrap_or_else(|e| panic!("el_only={el_only}: {e:?}"));
+        assert!(
+            out.taxonomy.is_subclass(&c("X"), &c("Y")),
+            "el_only={el_only}"
+        );
+    }
+}
+
+#[test]
+fn a_kept_el_run_over_a_limit_that_a_fresh_run_passes_too_fails() {
+    let (axioms, edit) = kept_el_memory_fixture();
+    let mut changed = axioms.clone();
+    changed.push(edit.clone());
+    for el_only in [false, true] {
+        let limits = Limits {
+            threads: 1,
+            el_only,
+            ..Limits::default()
+        };
+        let mut kept = Classifier::of(&axioms);
+        let cold = kept.classify(&limits).unwrap();
+        let tight = Limits {
+            max_memory: Some(cold.stats.peak_memory / 2),
+            ..limits.clone()
+        };
+        assert!(matches!(
+            Classifier::of(&changed).classify(&tight),
+            Err(Error::Memory { .. })
+        ));
+        kept.add([&edit]);
+        for _ in 0..2 {
+            assert!(
+                matches!(kept.classify(&tight), Err(Error::Memory { .. })),
+                "el_only={el_only}"
+            );
+        }
+        // the failed runs leave nothing that a run within the budget would read
+        let out = kept.classify(&limits).unwrap();
+        assert!(out.taxonomy.is_subclass(&c("X"), &c("Y")));
+        assert_eq!(
+            out.taxonomy,
+            Classifier::of(&changed).classify(&limits).unwrap().taxonomy
+        );
+    }
+}

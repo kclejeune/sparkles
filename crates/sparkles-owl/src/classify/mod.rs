@@ -653,9 +653,8 @@ pub struct Saturation {
     /// what the last run whose saturation ended was, which decides whether the next
     /// run may keep its contexts (roadmap item 753)
     kept: Option<Kept>,
-    /// whether the current run keeps contexts of a run with the Horn rules or Tier D,
-    /// so that a stop on its memory budget starts again in full before a lower tier
-    /// takes over
+    /// whether the current run keeps contexts of an earlier run, so that a stop on its
+    /// memory budget starts again in full before a lower tier takes over
     reused: bool,
     /// the clause table of the last run of Tier D whose contexts the next run may keep,
     /// which name its clauses by id
@@ -1200,12 +1199,12 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
-        // what a pool admitted for a run that may fall back, so that the EL run charges
-        // only what it needs beyond that
+        // what a pool admitted for a run that may fall back or start again, so that the
+        // later run charges only what it needs beyond that
         let admitted = std::sync::Arc::new(AtomicUsize::new(0));
         let counted;
         let first = match &limits.charge {
-            Some(f) if !limits.el_only => {
+            Some(f) => {
                 let (f, a) = (f.clone(), admitted.clone());
                 counted = Limits {
                     charge: Some(std::sync::Arc::new(move |bytes: usize| {
@@ -1219,7 +1218,7 @@ impl Saturation {
                 };
                 &counted
             }
-            _ => limits,
+            None => limits,
         };
         self.dl_worked.store(false, Ordering::Relaxed);
         self.rooted_declined = false;
@@ -1227,10 +1226,11 @@ impl Saturation {
         if let Err(Error::Memory { .. }) = r
             && self.reused
         {
-            // A run that kept contexts of a run with the Horn rules or Tier D passed its
-            // budget, which a run that starts again may not: the last index, which it
-            // holds until the new one is built, and what it keeps of the contexts that
-            // nothing reaches any more count against the budget too. The run starts
+            // A run that kept contexts passed its budget, which a run that starts again
+            // may not: what it keeps of the contexts that nothing reaches any more, and
+            // for a run with the Horn rules or Tier D the last index, which it holds
+            // until the new one is built, count against the budget too. That holds for
+            // a run kept by the EL rules alone as well (roadmap item 1263). The run starts
             // again in full with the same rules before a lower tier takes over, so that
             // its answer is that of a run without the kept contexts (roadmap item 753).
             // That holds for a stop on the budget of exact numeric values too, which
@@ -2115,8 +2115,8 @@ impl Saturation {
             + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
             + self.dl_run.as_ref().map_or(0, |d| d.bytes());
         // from here on a stop on the memory budget may be the kept state's, which a run
-        // that starts again does not hold
-        self.reused = old_ix.is_some();
+        // that starts again does not hold, whatever the tier of the kept contexts
+        self.reused = kept.is_some();
         // the premises of the changed axioms, read from the interner before the index of
         // the new axioms is built
         let premises = match changes {

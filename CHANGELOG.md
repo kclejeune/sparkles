@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### A kept EL classification over its memory budget starts again in full
+
+A kept OWL 2 EL run counts the contexts it keeps and its own new state against
+`max_memory` and the pool's grants, which a fresh run does not hold. Such a run that
+passed its budget returned a memory error where a fresh run under the same limit
+succeeded, and a repeated call failed the same way. It now starts again in full under the
+same limits, as kept runs with the Horn rules or Tier D do, and charges the pool first
+against what the kept attempt was granted, as roadmap item 1263. A run that a fresh run
+could not finish either still fails with the memory error.
+
 ### A range that only a loop reaches is classified in full
 
 A context with a role loop, from a self restriction or the Horn rules, takes the role's
