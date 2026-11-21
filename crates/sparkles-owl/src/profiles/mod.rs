@@ -118,9 +118,10 @@ pub(crate) fn broken(rule: &'static str, message: impl Into<String>) -> Broken {
 }
 
 /// The rules of OWL 2 EL that one axiom breaks, without the global restriction on the
-/// ranges of property chains.
-pub(crate) fn el_axiom(ax: &AxiomKind) -> Vec<Broken> {
-    el::axiom_kind(ax)
+/// ranges of property chains and without the rule against anonymous individuals, which
+/// the classifier takes as fresh individuals that no answer names (roadmap item 1281).
+pub(crate) fn el_axiom_with_anonymous(ax: &AxiomKind) -> Vec<Broken> {
+    el::axiom_kind_with(ax, true)
 }
 
 /// Checks axioms one at a time against several profiles. The ontology given to

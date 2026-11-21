@@ -481,10 +481,7 @@ impl Norm<'_> {
     fn singletons(&mut self, is: &std::collections::BTreeSet<Individual>) -> Result<Vec<Ex>, Why> {
         let mut es = Vec::with_capacity(is.len());
         for i in is {
-            match i {
-                Individual::Named(n) => es.push(self.it.nominal(n)),
-                Individual::Anonymous(_) => return Err("anonymous individuals"),
-            }
+            es.push(self.it.individual(i));
         }
         es.sort_unstable();
         es.dedup();

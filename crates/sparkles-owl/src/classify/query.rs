@@ -38,6 +38,9 @@ impl Saturation {
     /// of an unsatisfiable class, with every individual as an instance.
     pub fn describe(&self, c: &Class) -> Option<Description> {
         let mut d = self.describe_all(c)?;
+        // an anonymous individual is a fresh individual of the run, which no answer names
+        // (roadmap item 1281)
+        d.instances.retain(|i| !super::index::is_anonymous(i));
         if self.reduced {
             // the names that item 805's reductions made up, such as the hub individual and
             // the classes of the keys, stay out of the answer

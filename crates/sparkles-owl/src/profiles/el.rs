@@ -67,6 +67,12 @@ pub(super) fn axiom(ax: &Axiom) -> Vec<Broken> {
 
 /// The rules of one axiom, without its annotations.
 pub(super) fn axiom_kind(kind: &AxiomKind) -> Vec<Broken> {
+    axiom_kind_with(kind, false)
+}
+
+/// The rules of one axiom, without its annotations, and without the rule against
+/// anonymous individuals when `anonymous` allows them.
+pub(super) fn axiom_kind_with(kind: &AxiomKind, anonymous: bool) -> Vec<Broken> {
     use AxiomKind as K;
     let mut out = Vec::new();
     match kind {
@@ -122,9 +128,10 @@ pub(super) fn axiom_kind(kind: &AxiomKind) -> Vec<Broken> {
             ));
         }
     }
-    if individuals(kind)
-        .iter()
-        .any(|i| matches!(i, Individual::Anonymous(_)))
+    if !anonymous
+        && individuals(kind)
+            .iter()
+            .any(|i| matches!(i, Individual::Anonymous(_)))
     {
         out.push(broken(ENTITIES, "anonymous individuals are not allowed"));
     }
