@@ -51,7 +51,8 @@ enum Family {
     Selfs,
     /// the top and bottom object properties in edited class axioms
     TopBottom,
-    /// individuals, nominals and assertions in the fixed part
+    /// individuals, nominals and assertions in the fixed part, with the top and bottom
+    /// object properties in edited class axioms, which give facts of the universal role
     Nominals,
     /// ranges on the roles of edited existential restrictions
     Ranges,
@@ -59,15 +60,18 @@ enum Family {
     Unsatisfiable,
     /// reflexive roles and chains in the fixed part
     Loops,
+    /// data restrictions, a functional data property and a data range in the fixed part
+    Data,
 }
 
-const FAMILIES: [Family; 6] = [
+const FAMILIES: [Family; 7] = [
     Family::Selfs,
     Family::TopBottom,
     Family::Nominals,
     Family::Ranges,
     Family::Unsatisfiable,
     Family::Loops,
+    Family::Data,
 ];
 
 struct Gen {
@@ -85,7 +89,7 @@ impl Gen {
     }
 
     fn role(&mut self) -> ObjectPropertyExpression {
-        if self.family == Family::TopBottom && self.rng.chance(30) {
+        if matches!(self.family, Family::TopBottom | Family::Nominals) && self.rng.chance(30) {
             if self.rng.chance(50) {
                 ObjectProperty::top().into()
             } else {
@@ -215,6 +219,30 @@ impl Gen {
                     Axiom::sub_class_of(a, s)
                 } else {
                     Axiom::sub_class_of(s, c)
+                });
+            }
+        }
+        if self.family == Family::Data {
+            let xsd = |l: &str| format!("http://www.w3.org/2001/XMLSchema#{l}");
+            let d = |i: usize| DataProperty::new(format!("http://ex.org/d{i}"));
+            let lit = |v: usize| Literal::typed(v.to_string(), &xsd("integer"));
+            out.push(ax(AxiomKind::FunctionalDataProperty(d(0))));
+            out.push(ax(AxiomKind::DataPropertyRange(
+                d(1),
+                DataRange::Datatype(Datatype::new(xsd("integer"))),
+            )));
+            for _ in 0..2 + self.rng.below(4) {
+                let a = ce(&format!("C{}", self.rng.below(CLASSES)));
+                let v = ClassExpression::DataHasValue(d(self.rng.below(2)), lit(self.rng.below(3)));
+                let some = ClassExpression::DataSomeValuesFrom(
+                    vec![d(self.rng.below(2))],
+                    DataRange::Datatype(Datatype::new(xsd("integer"))),
+                );
+                let x = if self.rng.chance(50) { v } else { some };
+                out.push(if self.rng.chance(50) {
+                    Axiom::sub_class_of(a, x)
+                } else {
+                    Axiom::sub_class_of(x, a)
                 });
             }
         }
@@ -401,6 +429,12 @@ fn incremental_runs_agree_with_fresh_ones_across_constructors() {
     // together, so the nominal family keeps fewer
     for ((family, path), n) in &counts {
         let share = if *family == Family::Nominals { 10 } else { 4 };
+        if *family == Family::Data {
+            // the index derives told subsumers from every data axiom, which the kept
+            // contexts then read
+            assert!(n.kept_changed > 0, "{path} kept no data run: {n:?}");
+            continue;
+        }
         assert!(
             n.kept_changed * share >= n.changed,
             "{family:?} {path} kept {} of {} changed runs",
