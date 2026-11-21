@@ -577,7 +577,7 @@ one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster
 Item 693 leaves out the universal restriction on `owl:Thing` of a range of a property that
 chains reach when the told ranges of the links that end the property's paths already give
 it, as [the Horn rules](#the-horn-rules) argue. The rule leaves out all 6 such universals
-of ore_ont_14817 and 13 of the 16 of ore_ont_9663, which then derive 8.2% and 7.1% fewer
+of ore_ont_14817 and 13 of the 16 of ore_ont_9663, which then derive 8.2% and 7.2% fewer
 conclusions and take 7.4% and 6.5% fewer instructions per classification on the laptop.
 On `atlas`, without their disjunctive attempt and against the same binary with every
 universal kept, they classify in 0.942 and 0.955 times the time on one thread and 0.927 and
@@ -586,7 +586,7 @@ universal kept, they classify in 0.942 and 0.955 times the time on one thread an
 are equal on the 389 development and final-set files of the ORE 2015 DL sample that both
 sides classify, and on 3,537 generated Horn ontologies, of which the 853 that leave a
 universal out and that HermiT accepts give HermiT's taxonomy. `ore_ont_7646` now
-classifies within 8 GiB on one thread, with 219.2 million conclusions against 398.7
+classifies within 8 GiB on one thread with the attempt bounded at 1, with 219.2 million conclusions against 398.7
 million. The [benchmark report](../../benchmarks/el-classification/RESULTS.md#range-universals-that-the-links-cover)
 holds the rounds and the sweeps.
 
@@ -1402,7 +1402,9 @@ The argument holds for several universals left out at once, since each one's cas
 only the told ranges on links and not another universal. Its first point needs every
 property that a link can have to count for the rule `∃p⁻.⊤ ⊑ C`. A context that derives
 a negative existential restriction made positive by its unfolding links to its
-successor, so the index gives those properties the same rule (item 693). The
+successor, so the index gives those properties the same rule (item 693). Those rules
+add conclusions on 27 of 3,537 generated ontologies, on none of the 389 files of the ORE
+2015 sweep and on no file of the benchmark, and change no taxonomy. The
 automaton's reductions and pruning do not affect the test, which reads the closure
 over the ε-transitions before them. When the left-out universals were a run's only
 universal restrictions and no other Horn rule can fire, the run takes the EL rules, which

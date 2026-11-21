@@ -372,29 +372,38 @@ pub fn range_universals() -> RangeUniversals {
 /// ([`super::index`]'s `horn_index`), and a loop takes the ranges of its role and its
 /// inverse. The empty word, which a final start would accept, and the top property,
 /// which relates every pair, are left to the universal.
-fn ends_in_range(rb: &mut RoleBox, ranges: &[(Role, Ex)], tops: &[Role], r: Role, c: Ex) -> bool {
+fn ends_in_range(
+    rb: &mut RoleBox,
+    labels: &mut FxHashMap<Role, Option<Vec<Role>>>,
+    ranges: &[(Role, Ex)],
+    tops: &[Role],
+    r: Role,
+    c: Ex,
+) -> bool {
     if tops.contains(&r) {
         return false;
     }
-    let Some(nfa) = rb.auto(r, &mut Vec::new()) else {
+    // the labels into final states, once for each role whatever its ranges
+    let ls = labels.entry(r).or_insert_with(|| {
+        let a = rb.auto(r, &mut Vec::new())?.eps_free();
+        if a.finals[a.start as usize] {
+            return None;
+        }
+        let mut ls: Vec<Role> = a
+            .trans
+            .iter()
+            .filter(|t| a.finals[t.2 as usize])
+            .map(|t| t.1)
+            .collect();
+        ls.sort_unstable();
+        ls.dedup();
+        Some(ls).filter(|ls| !ls.is_empty())
+    });
+    let Some(ls) = ls else {
         return false;
     };
-    let a = nfa.eps_free();
-    if a.finals[a.start as usize] {
-        return false;
-    }
-    let mut labels: Vec<Role> = a
-        .trans
-        .iter()
-        .filter(|t| a.finals[t.2 as usize])
-        .map(|t| t.1)
-        .collect();
-    labels.sort_unstable();
-    labels.dedup();
-    !labels.is_empty()
-        && labels
-            .iter()
-            .all(|&l| !tops.contains(&l) && ranges.iter().any(|&(l2, c2)| c2 == c && rb.sub(l, l2)))
+    ls.iter()
+        .all(|&l| !tops.contains(&l) && ranges.iter().any(|&(l2, c2)| c2 == c && rb.sub(l, l2)))
 }
 
 /// How far a run reduces the automata that unfold its universals (roadmap item 693):
@@ -1718,9 +1727,12 @@ pub fn normalize(
     .iter()
     .filter_map(|n| it.role_id(n))
     .collect();
+    let mut labels: FxHashMap<Role, Option<Vec<Role>>> = FxHashMap::default();
     for (r, c) in ranges {
         let skip = match mode {
-            RangeUniversals::Covered => ends_in_range(&mut rb, &ax.ranges, &tops, r, c),
+            RangeUniversals::Covered => {
+                ends_in_range(&mut rb, &mut labels, &ax.ranges, &tops, r, c)
+            }
             RangeUniversals::Keep => false,
             #[cfg(test)]
             RangeUniversals::Drop => true,

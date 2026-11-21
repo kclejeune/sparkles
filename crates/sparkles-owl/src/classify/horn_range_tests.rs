@@ -117,6 +117,10 @@ const CASES: &[(&str, usize, bool)] = &[
     ("nominal-successor", 1, false),
     // a run whose only universal was the range's
     ("only-ranges", 1, false),
+    // a chain of property assertions whose last link has no range
+    ("chain-individuals", 0, true),
+    // a chain of inverse links, walked forwards and backwards, whose last link has no range
+    ("inverse-path", 0, true),
 ];
 
 #[test]
@@ -180,6 +184,60 @@ fn a_removed_covering_range_brings_the_universal_back() {
     assert_eq!(got, want, "A ⊑ X holds by r's range alone");
 }
 
+/// A test of the axioms an edit takes.
+type Pick = Box<dyn Fn(&AxiomKind) -> bool>;
+
+/// The axioms of a fixture that `pick` selects.
+fn select(axioms: &[Axiom], pick: impl Fn(&AxiomKind) -> bool) -> Vec<Axiom> {
+    axioms.iter().filter(|a| pick(&a.kind)).cloned().collect()
+}
+
+/// An edit of the axioms that cover a universal, after a run that left it out and after
+/// one that kept it, answers as a fresh classifier of the edited axioms does: a domain,
+/// which covers the range universal of a chain whose last operand is the inverse, and the
+/// subproperty whose superproperty's range covers one.
+#[test]
+fn edits_of_the_covering_axioms_answer_as_a_fresh_run() {
+    let ex = |n: &str| format!("http://ex.org/{n}");
+    let cases: Vec<(&str, Pick)> = vec![
+        (
+            "chain-inverse-last",
+            Box::new(move |k: &AxiomKind| {
+                matches!(k, AxiomKind::ObjectPropertyDomain(ObjectPropertyExpression::Property(p), _)
+                    if p.as_str() == ex("q"))
+            }),
+        ),
+        (
+            "superrole",
+            Box::new(move |k: &AxiomKind| {
+                matches!(k, AxiomKind::SubObjectPropertyOf(_, ObjectPropertyExpression::Property(p))
+                    if p.as_str() == ex("t"))
+            }),
+        ),
+    ];
+    let limits = Limits::default();
+    for (name, pick) in &cases {
+        let (axioms, classes, want) = fixture(name);
+        let edit = select(&axioms, |k| pick(k));
+        assert_eq!(edit.len(), 1, "{name}");
+        let rest = select(&axioms, |k| !pick(k));
+        let fresh = |ax: &[Axiom]| {
+            let mut k = Classifier::of(ax);
+            answer(&mut k, &limits, &classes, RangeUniversals::Covered)
+        };
+        let mut k = Classifier::of(&axioms);
+        let (got, n) = answer(&mut k, &limits, &classes, RangeUniversals::Covered);
+        assert_eq!((&got, n), (&want, 1), "{name}");
+        k.remove(&edit);
+        let (got, n) = answer(&mut k, &limits, &classes, RangeUniversals::Covered);
+        assert_eq!((got, n), fresh(&rest), "{name}: after the removal");
+        assert_eq!(n, 0, "{name}: the universal comes back");
+        k.add(&edit);
+        let (got, n) = answer(&mut k, &limits, &classes, RangeUniversals::Covered);
+        assert_eq!((&got, n), (&want, 1), "{name}: after adding it again");
+    }
+}
+
 /// The cases of the differential fixtures, with the disjunctive attempt bounded so that
 /// the Horn rules answer whatever they take.
 #[test]
@@ -223,4 +281,63 @@ fn the_dl603_fixtures_answer_the_same_with_and_without_the_rule() {
     }
     assert!(files > 0, "no fixture exercises the rule");
     eprintln!("{files} fixtures left out {skipped} range universals");
+}
+
+/// A domain written as a class axiom, `∃q.⊤ ⊑ D`, is a range of `q⁻` that covers the
+/// range universal, and a run can keep its contexts across class axioms. Removing the
+/// domain and adding it again answers as fresh classifiers of the same axioms do.
+#[test]
+fn a_domain_as_a_class_axiom_answers_as_a_fresh_run() {
+    let body =
+        "Prefix(:=<http://ex.org/>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(
+SubObjectPropertyOf(ObjectPropertyChain(:a :qi) :s)
+InverseObjectProperties(:q :qi)
+InverseObjectProperties(:s :si)
+ObjectPropertyRange(:s :D)
+ObjectPropertyRange(:s :E)
+SubClassOf(:A ObjectSomeValuesFrom(:a ObjectSomeValuesFrom(:qi :B)))
+EquivalentClasses(:X ObjectSomeValuesFrom(:a ObjectSomeValuesFrom(:qi ObjectIntersectionOf(:B :D))))
+EquivalentClasses(:Y ObjectSomeValuesFrom(:a ObjectSomeValuesFrom(:qi ObjectIntersectionOf(:B :E))))
+SubClassOf(ObjectSomeValuesFrom(:q owl:Thing) :D)
+SubClassOf(:Z :A)
+)";
+    let axioms = ofn_read::parse(body).unwrap().axioms;
+    let classes: BTreeSet<String> = ["A", "B", "D", "E", "X", "Y", "Z"]
+        .iter()
+        .map(|c| format!("http://ex.org/{c}"))
+        .chain([THING.to_string(), NOTHING.to_string()])
+        .collect();
+    let limits = Limits::default();
+    let n = axioms.len();
+    let (domain, unrelated) = (&axioms[n - 2..n - 1], &axioms[n - 1..]);
+    let without = |gone: &[&[Axiom]]| -> Vec<Axiom> {
+        axioms
+            .iter()
+            .filter(|a| !gone.iter().any(|g| g.contains(a)))
+            .cloned()
+            .collect()
+    };
+    let fresh = |ax: &[Axiom]| {
+        let mut k = Classifier::of(ax);
+        answer(&mut k, &limits, &classes, RangeUniversals::Covered)
+    };
+    let mut k = Classifier::of(&axioms);
+    let (all, n0) = answer(&mut k, &limits, &classes, RangeUniversals::Covered);
+    assert_eq!(n0, 1);
+    assert!(all.contains(&("http://ex.org/A".into(), "http://ex.org/X".into())));
+    // an unrelated edit keeps the contexts and the rule
+    k.remove(unrelated);
+    let out = with_range_universals(RangeUniversals::Covered, || k.classify(&limits)).unwrap();
+    assert!(out.stats.incremental);
+    assert_eq!(out.stats.horn_ranges_left_out, 1);
+    k.remove(domain);
+    assert_eq!(
+        answer(&mut k, &limits, &classes, RangeUniversals::Covered),
+        fresh(&without(&[domain, unrelated]))
+    );
+    k.add(domain);
+    assert_eq!(
+        answer(&mut k, &limits, &classes, RangeUniversals::Covered),
+        fresh(&without(&[unrelated]))
+    );
 }

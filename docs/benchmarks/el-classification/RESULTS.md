@@ -1874,9 +1874,9 @@ range universal. The last two are one binary, so their ratio isolates the rule. 
 files ran with `--dl-attempt-work 1`, so that the disjunctive attempt ends at once and the
 Horn rules answer, and three classifications per process. GO ran five per process, with
 the Horn rules as by default and with the EL rules alone. Each time is the median over the
-five processes of a side of the process's median classification, the ratio divides the
-rule's time by the time with every universal kept, and the range is that of the five
-rounds' own ratios. The memory is the median peak resident set. Every taxonomy has the same
+five processes of a side of the process's median classification. Each round divides the
+rule's time by the time with every universal kept, the ratio is the median of the five
+rounds' ratios, and the range is their range. The memory is the median peak resident set. Every taxonomy has the same
 hash on the three sides in every round.
 
 | Ontology | Threads | Base ms | Kept ms | Rule ms | Rule / kept | Range of the rounds | Kept MiB | Rule MiB | Conclusions, kept | Conclusions, rule |
@@ -1891,10 +1891,10 @@ hash on the three sides in every round.
 | | 4 | 92 | 88 | 88 | 1.001 | 0.993 to 1.008 | 224 | 236 | | |
 
 The rule leaves out all 6 range universals of `ore_ont_14817` and 13 of the 16 of
-`ore_ont_9663`, and the Horn rules derive 8.2% and 7.1% fewer conclusions on them. GO has no
-range universal, and its two sides do the same work, so their ratio is the spread of one
-binary. The base differs from the kept side by the commits between 378127e2 and the lane's
-base, which the EL rules' 5% on GO shows. On the laptop the rule takes 7.4% and 6.5% fewer
+`ore_ont_9663`, and the Horn rules derive 8.2% and 7.2% fewer conclusions on them. GO has no
+range universal, so its two sides do the same work on one binary, and their ratio is the
+spread of that binary, at or below 1 in at least one round of each pair. The base differs from the kept side by the commits between 378127e2 and fd47b7ae,
+which the EL rules' 5% on GO shows. On the laptop the rule takes 7.4% and 6.5% fewer
 instructions per classification on the two Uberon files and 0.01% more on GO, counted on
 one P-core as the difference between three classifications and one, halved.
 
@@ -1903,7 +1903,9 @@ development and 187 final-set files of the ORE 2015 DL sample on one thread, wit
 attempt bounded at 1 and an 8 GiB cap. None of them is in the sealed held-out third. The
 taxonomies are equal on the 389 files that both sides classify, and the rule leaves out
 1,086 universals on 135 of them. `ore_ont_7646` classifies within the cap only with the
-rule. With an 18 GiB cap the side with every universal kept gives the same taxonomy, with
+rule, with the attempt bounded at 1 as in the whole sweep. The build before the change,
+commit fd47b7ae, gives the same taxonomy and the same conclusion count as the side with
+every universal kept on each of the 389 files. With an 18 GiB cap the side with every universal kept gives the same taxonomy, with
 398.7 million conclusions, 28.8 s and a peak resident set of 8.0 GiB against 219.2 million,
 24.5 s and 5.6 GiB, and the rule leaves out 25 universals. Four files fail on both sides,
 three refused by the reader and `ore_ont_7192` at the cap. Of 4,000 generated Horn ontologies with chains, transitive,
