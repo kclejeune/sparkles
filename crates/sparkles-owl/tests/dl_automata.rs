@@ -8,7 +8,8 @@
 //! `tests/fixtures/dl712` holds hand-written cases, `hand-NAME.ofn`, in which a merge of a
 //! final state with one that is not, or a dropped transition by the superproperty instead
 //! of the subproperty, changes the taxonomy, through property hierarchies, inverses,
-//! negative existential restrictions, chains, equivalent properties and a nominal, and 200
+//! negative existential restrictions, chains, equivalent properties, a nominal and a qualified
+//! maximum on a subproperty, whose merge of two links needs the reduced universal, and 200
 //! generated ones, `gen-NNN.ofn`, which its `generate.py` writes with its default seed.
 //! HermiT 1.4.5.519 classified each into `NAME.hermit.ofn` and Konclude 0.7.0-1138 into
 //! `NAME.konclude.ofn`, which `reference.py` writes. The expected answer is every
@@ -180,7 +181,7 @@ fn limits(level: u8, threads: usize, rooted: bool) -> Limits {
 #[test]
 fn the_hand_cases_give_the_reference_answer_at_every_level() {
     let cases = cases("dl712", &["hand-"]);
-    assert_eq!(cases.len(), 7);
+    assert_eq!(cases.len(), 8);
     let mut failures = Vec::new();
     for case in &cases {
         let want = case.want.as_ref().unwrap();
@@ -282,7 +283,72 @@ const CHANGED: usize = 107;
 /// and the hand-written ones other than `hand-nominal`, which falls back without the
 /// rooted rules. None of the fixtures of items 603 and 897 has an automaton that the
 /// reduction changes.
-const CORPUS_CHANGED: usize = 113;
+const CORPUS_CHANGED: usize = 114;
+
+/// A classifier kept across runs answers as a fresh one at every level while a universal
+/// is added and removed, reuses its state between runs at one level, and starts afresh when
+/// the level changes, since the unfolding's fresh classes are numbered by the automaton's
+/// states. `hand-nominal` needs the rooted rules and `hand-counting` the counting ones,
+/// which keep no state.
+#[test]
+fn a_kept_classifier_answers_as_a_fresh_one_across_levels() {
+    let edit = ofn_read::parse(
+        "Prefix(:=<http://example.org/h#>) Ontology(SubClassOf(:A ObjectAllValuesFrom(:r :H)))",
+    )
+    .unwrap()
+    .axioms;
+    let mut failures = Vec::new();
+    for case in &cases("dl712", &["hand-"]) {
+        let rooted = case.stem == "hand-nominal";
+        let keeps = !rooted && case.stem != "hand-counting";
+        let mut k = Classifier::of(&case.axioms);
+        let mut previous = None;
+        for (round, level) in [0, 0, 1, 1, 2, 2, 0, 2, 1].into_iter().enumerate() {
+            let limits = limits(level, 1, rooted);
+            let added = round % 2 == 0;
+            if added {
+                k.add(&edit);
+            } else {
+                k.remove(&edit);
+            }
+            let out = k.classify(&limits).unwrap();
+            let mut fresh = Case {
+                stem: case.stem.clone(),
+                axioms: case.axioms.clone(),
+                classes: case.classes.clone(),
+                want: None,
+            };
+            if added {
+                fresh.axioms.extend(edit.iter().cloned());
+            }
+            let want = run(&fresh, &limits).got;
+            let mut got = BTreeSet::new();
+            for a in &case.classes {
+                for b in &case.classes {
+                    if out
+                        .taxonomy
+                        .is_subclass(&Class::new(a.as_str()), &Class::new(b.as_str()))
+                    {
+                        got.insert((a.clone(), b.clone()));
+                    }
+                }
+            }
+            let at = format!("{} round {round} at level {level}", case.stem);
+            if got != want {
+                failures.push(format!("{at}: not the fresh answer"));
+            }
+            let reused = out.stats.incremental;
+            if previous.is_some_and(|p| p != level) && reused {
+                failures.push(format!("{at}: reused the state of another level"));
+            }
+            if previous == Some(level) && keeps && !reused {
+                failures.push(format!("{at}: did not reuse its state"));
+            }
+            previous = Some(level);
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
 
 /// Levels 0 and 2 give one answer on the fixtures of items 603, 897 and 712 on one thread when
 /// neither run falls back, and the run that falls back answers no more than the other.
@@ -291,7 +357,7 @@ fn levels_0_and_2_answer_alike_across_the_fixture_corpus() {
     let mut all = cases("dl603", &[""]);
     all.extend(cases("dl897", &["qz-"]));
     all.extend(cases("dl712", &[""]));
-    assert_eq!(all.len(), 640 + 27 + 207);
+    assert_eq!(all.len(), 640 + 27 + 208);
     let mut failures = Vec::new();
     let mut changed = 0;
     for case in &all {

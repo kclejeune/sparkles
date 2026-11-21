@@ -1691,6 +1691,12 @@ fn unfold(
     unfolds.sort_unstable();
     unfolds.dedup();
     let mut autos: FxHashMap<Role, super::horn::EpsFree> = FxHashMap::default();
+    // one bound for every automaton, since it reads the whole role hierarchy
+    let cost = if level > 0 && !unfolds.is_empty() {
+        rb.sub_cost()
+    } else {
+        0
+    };
     for (holder, r, f) in unfolds {
         let Some(nfa) = rb.auto(r, &mut Vec::new()) else {
             continue;
@@ -1698,7 +1704,7 @@ fn unfold(
         let a = autos.entry(r).or_insert_with(|| {
             let mut a = nfa.eps_free();
             if level > 0 {
-                a.reduce(level > 1, &|x, y| rb.sub(x, y), rb.sub_cost());
+                a.reduce(level > 1, &|x, y| rb.sub(x, y), cost);
             }
             a
         });
