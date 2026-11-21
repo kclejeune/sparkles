@@ -365,6 +365,111 @@ fn incremental_runs_reuse_contexts() {
     );
 }
 
+/// Edits `k`, holding `held`, and checks that the run kept contexts and answers as a
+/// fresh classifier does.
+fn edit_agrees(
+    k: &mut Classifier,
+    held: &mut Vec<Axiom>,
+    add: &[Axiom],
+    remove: &[Axiom],
+) -> sparkles_owl::classify::Classification {
+    held.retain(|a| !remove.contains(a));
+    held.extend(add.iter().cloned());
+    k.remove(remove);
+    k.add(add);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    let full = Classifier::of(held.iter())
+        .classify(&Limits::default())
+        .unwrap();
+    assert_eq!(out.consistent, full.consistent);
+    assert_eq!(out.taxonomy, full.taxonomy);
+    out
+}
+
+/// The disjointness sets are numbered by their place among the run's sets, so removing
+/// one moves the numbers of those after it. A kept context that holds a member of a moved
+/// set must know it by its new number: here `a` keeps `B1` from set 1, which becomes set
+/// 0, and then takes `C1` from `b`, whose set takes number 1. By the old number the two
+/// would clash and make the ontology inconsistent (roadmap item 1256).
+#[test]
+fn a_kept_context_follows_the_new_numbers_of_the_disjointness_sets() {
+    let limits = Limits::default();
+    let disjoint = |a: &str, b: &str| Axiom::disjoint_classes([ce(a), ce(b)]).kind;
+    let gone = disjoint("A1", "A2");
+    let mut held: Vec<AxiomKind> = vec![
+        gone.clone(),
+        disjoint("B1", "B2"),
+        disjoint("C1", "C2"),
+        is_a("B1", "a").kind,
+        is_a("E", "b").kind,
+        sub(c("E"), c("C1")).kind,
+        sub(and([ce("E"), ce("H")]), one("a")).kind,
+    ];
+    // the run numbers the sets in the order of the axioms it is given
+    let mut sat = Saturation::new();
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    assert!(sat.classify(&all, None, &limits).unwrap().consistent);
+    let fresh = |held: &[AxiomKind]| {
+        let all: Vec<&AxiomKind> = held.iter().collect();
+        Saturation::new().classify(&all, None, &limits).unwrap()
+    };
+    held.remove(0);
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let changes = Changes {
+        added: &[],
+        removed: &[&gone],
+    };
+    let out = sat.classify(&all, Some(changes), &limits).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    assert!(out.consistent);
+    let added = sub(c("E"), c("H")).kind;
+    held.push(added.clone());
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let changes = Changes {
+        added: &[&added],
+        removed: &[],
+    };
+    let out = sat.classify(&all, Some(changes), &limits).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    let full = fresh(&held);
+    assert!(full.consistent);
+    assert_eq!(out.consistent, full.consistent);
+    assert_eq!(out.taxonomy, full.taxonomy);
+    assert!(out.taxonomy.is_subclass(&c("E"), &c("B1")));
+}
+
+/// A kept context keeps the negative existential restrictions whose filler it holds,
+/// which reach a context that an edit links to it: `B` holds `B2`, so a new link from
+/// `C` to `B` gives `C` the restriction `∃r.B2` and with it `G`.
+#[test]
+fn a_kept_filler_gives_its_restrictions_to_a_new_predecessor() {
+    let mut held = vec![
+        sub(some("r", c("B2")), c("G")),
+        sub(c("B"), c("B2")),
+        sub(c("C"), c("D")),
+    ];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let out = edit_agrees(&mut k, &mut held, &[sub(c("C"), some("r", c("B")))], &[]);
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("G")));
+    assert_eq!(out.stats.cleared, 1, "{:?}", out.stats);
+}
+
+/// An edit that adds or removes a negative existential restriction clears the
+/// predecessors of the contexts that hold its filler.
+#[test]
+fn a_new_restriction_on_the_left_reaches_the_predecessors_of_its_filler() {
+    let mut held = vec![sub(c("A"), some("r", c("B"))), sub(c("X"), c("Y"))];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let left = sub(some("r", c("B")), c("G"));
+    let out = edit_agrees(&mut k, &mut held, std::slice::from_ref(&left), &[]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    let out = edit_agrees(&mut k, &mut held, &[], &[left]);
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("G")));
+}
+
 fn nested(depth: usize, filler: &str) -> ClassExpression {
     let mut e = ce(filler);
     for _ in 0..depth {

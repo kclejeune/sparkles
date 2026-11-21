@@ -2095,9 +2095,6 @@ impl Index {
     pub fn disjoint_of(&self, h: &Head) -> &[u32] {
         h.disj.of(&self.disjoint)
     }
-    pub fn exist(&self, e: Ex) -> &[(Role, Ex)] {
-        self.exist_of(self.head(e))
-    }
     pub fn disjoint(&self, e: Ex) -> &[u32] {
         self.disjoint_of(self.head(e))
     }

@@ -610,6 +610,9 @@ pub struct Saturation {
     consistent: bool,
     /// the contexts of conjunctions that the last run's Horn rules created
     dynamic: Option<saturate::Dynamic>,
+    /// the disjointness sets of the last run's index, whose place among them numbers
+    /// each set in the contexts that the run leaves
+    disjoint: Vec<Vec<Ex>>,
     /// whether the current run's axioms went to the Horn normalization, from its start
     /// until the normalization took none
     horn_tried: bool,
@@ -1135,6 +1138,7 @@ impl Saturation {
             stale_tier: false,
             consistent: true,
             dynamic: None,
+            disjoint: Vec::new(),
             horn_tried: false,
             dl_tried: false,
             skip_dl: false,
@@ -2139,6 +2143,12 @@ impl Saturation {
         let (ax, mut ix, mut normalized_peak, outside_el) =
             self.build(axioms, &outside, threads, held_bytes + old_bytes, limits)?;
         drop(outside);
+        // the disjointness sets by their numbers in this index, beside those of the
+        // last run's, by which the contexts it leaves number the sets they meet
+        let renumbered = self.disjoint != ax.disjoint;
+        if renumbered {
+            self.disjoint = ax.disjoint.clone();
+        }
         stats.outside_el = outside_el;
         stats.tier = stats.outside_el.tier();
         poll(limits)?;
@@ -2271,7 +2281,7 @@ impl Saturation {
         });
         if let Some(scratch) = premises {
             stats.incremental = true;
-            stats.cleared = self.invalidate(&scratch, &ix);
+            stats.cleared = self.invalidate(&scratch, &ix, renumbered);
             poll(limits)?;
         }
         if let Some(old) = old_ix.filter(|_| reuse) {
@@ -3075,6 +3085,12 @@ impl Saturation {
                 .map_or(0, |l| l.bytes())
             + ix.bytes()
             + self.interner.scope_bytes()
+            + self.disjoint.capacity() * 24
+            + self
+                .disjoint
+                .iter()
+                .map(|d| d.capacity() * 4)
+                .sum::<usize>()
     }
 
     fn retained_bytes(&self, held_bytes: usize, root_bytes: usize, world_bytes: usize) -> usize {
@@ -3260,30 +3276,46 @@ impl Saturation {
     }
 
     /// Clears the contexts that the changed axioms can affect: those that derived the
-    /// left side of a changed subsumption or part of it, those with a link that a
-    /// changed existential restriction can use, and every context with a link to one of
-    /// them. The other contexts drop their links from cleared contexts and recompute
-    /// what they take from the index. The answer is the number cleared.
-    fn invalidate(&mut self, changed: &Axioms, ix: &Index) -> usize {
+    /// left side of a changed subsumption or part of it, and every context with a link
+    /// to one of them. The parts take in the filler of each existential restriction, so
+    /// a context with a link that a changed restriction can use links to a cleared
+    /// context. The other contexts drop their links from cleared contexts. The answer
+    /// is the number cleared.
+    ///
+    /// What a kept context takes from the index stays as it is (roadmap item 1256). Its
+    /// propagations are the negative existential restrictions `∃s.d` of the index for
+    /// each subsumer `d`. The index finds them among the left sides of the subsumptions,
+    /// the members of the disjointness sets and the classes of keys, and a change to a
+    /// key or a role axiom starts again ([`needs_full_run`]). So a restriction that an
+    /// edit adds or removes has its filler `d` among the parts of the changed left sides
+    /// or sets walked below, and every context that holds `d` is cleared. The
+    /// disjointness sets of the index are numbered by their place among the run's sets,
+    /// so `renumbered` says that they are not those of the last run, by which a kept
+    /// context numbers what it holds. Then a kept context that holds a member of one
+    /// numbers them again. One that holds none still holds none: a member of a new set
+    /// is a part of a changed set, which clears the contexts that hold it.
+    ///
+    /// The search for the contexts that hold a changed part still reads every context,
+    /// as does the pass that drops their links from cleared ones, since no table maps
+    /// an expression to the contexts that hold it.
+    fn invalidate(&mut self, changed: &Axioms, ix: &Index, renumbered: bool) -> usize {
         let nodes = &self.interner.nodes;
-        let mut subs: FxHashSet<Ex> = FxHashSet::default();
-        let mut links: Vec<(index::Role, Ex)> = Vec::new();
+        let mut parts = Marks::new(nodes.len());
+        let mut few: Vec<Ex> = Vec::new();
         let mut stack: Vec<Ex> = Vec::new();
         stack.extend(changed.subs.iter().map(|&(a, _)| a));
         stack.extend(changed.disjoint.iter().flatten().copied());
         while let Some(e) = stack.pop() {
-            if !subs.insert(e) {
+            if !parts.insert(e) {
                 continue;
             }
+            few.push(e);
             match nodes[e as usize] {
                 Node::Conj(a, b) => {
                     stack.push(a);
                     stack.push(b);
                 }
-                Node::Exist(r, f) => {
-                    links.push((r, f));
-                    stack.push(f);
-                }
+                Node::Exist(_, f) => stack.push(f),
                 _ => {}
             }
         }
@@ -3294,17 +3326,8 @@ impl Saturation {
             if !st.init {
                 continue;
             }
-            if st.subs.iter().any(|s| subs.contains(s)) {
+            if st.subs.meets(&few, |s| parts.has(s)) {
                 affected.insert(e as Ex);
-            }
-            for &(s, f) in &links {
-                if st.subs.contains(&f) {
-                    for (r, srcs) in &st.back {
-                        if ix.roles.sub(*r, s) {
-                            affected.extend(srcs.list.iter().copied());
-                        }
-                    }
-                }
             }
         }
         // every context with a link into an affected context is affected
@@ -3322,19 +3345,30 @@ impl Saturation {
                 }
             }
         }
+        if affected.is_empty() && !renumbered {
+            return 0;
+        }
+        let mut gone = Marks::new(self.ctx.len());
+        for &e in &affected {
+            gone.insert(e);
+        }
         let mut cleared = 0;
         for (e, c) in self.ctx.iter_mut().enumerate() {
             let Some(c) = c.get_mut() else { continue };
             let st = c.st.get_mut();
-            if affected.contains(&(e as Ex)) {
+            if gone.has(e as Ex) {
                 if st.init {
                     cleared += 1;
                 }
                 *st = saturate::State::default();
                 *c.started.get_mut() = false;
             } else if st.init {
-                st.drop_links_from(&affected);
-                st.reindex(ix);
+                if !affected.is_empty() {
+                    st.drop_links_where(|s| gone.has(s));
+                }
+                if renumbered && !st.disj.is_empty() {
+                    st.reindex_disjoint(ix);
+                }
             }
         }
         cleared
@@ -3360,6 +3394,34 @@ impl Saturation {
             .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
             .collect();
         Some((st.bottom, named))
+    }
+}
+
+/// A set of expressions or contexts by id, one bit each, which the invalidation reads
+/// once for each member of every context it passes.
+struct Marks(Vec<u64>);
+
+impl Marks {
+    fn new(n: usize) -> Marks {
+        Marks(vec![0; n.div_ceil(64)])
+    }
+
+    /// Adds `e`, and answers whether it was new.
+    fn insert(&mut self, e: Ex) -> bool {
+        let (w, b) = (e as usize / 64, 1u64 << (e % 64));
+        if w >= self.0.len() {
+            self.0.resize(w + 1, 0);
+        }
+        let new = self.0[w] & b == 0;
+        self.0[w] |= b;
+        new
+    }
+
+    #[inline]
+    fn has(&self, e: Ex) -> bool {
+        self.0
+            .get(e as usize / 64)
+            .is_some_and(|w| w & (1u64 << (e % 64)) != 0)
     }
 }
 

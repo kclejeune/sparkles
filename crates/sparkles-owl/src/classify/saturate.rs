@@ -250,6 +250,16 @@ impl Subs {
         self.len() == 0
     }
 
+    /// Whether a member is one of `few`, or one that `marked` answers true for, which
+    /// are the same expressions: a set probes for each of a few, and a list, or a set
+    /// that is small beside them, is read once.
+    pub fn meets(&self, few: &[Ex], marked: impl Fn(Ex) -> bool) -> bool {
+        match self {
+            Subs::Set(set) if few.len() * 4 <= set.len() => few.iter().any(|e| set.contains(e)),
+            _ => self.iter().any(|&e| marked(e)),
+        }
+    }
+
     pub fn iter(&self) -> SubsIter<'_> {
         match self {
             Subs::Set(set) => SubsIter::Set(set.iter()),
@@ -464,12 +474,21 @@ impl State {
 
     /// Removes the backward links whose source is in `gone`.
     pub fn drop_links_from(&mut self, gone: &FxHashSet<Ex>) {
+        self.drop_links_where(|e| gone.contains(&e));
+    }
+
+    /// Removes the backward links whose source `gone` answers true for.
+    pub fn drop_links_where(&mut self, gone: impl Fn(Ex) -> bool) {
+        let mut emptied = false;
         for (_, srcs) in &mut self.back {
-            if srcs.list.iter().any(|e| gone.contains(e)) {
-                srcs.retain(|e| !gone.contains(e));
+            if srcs.list.iter().any(|&e| gone(e)) {
+                srcs.retain(|&e| !gone(e));
+                emptied |= srcs.list.is_empty();
             }
         }
-        self.back.retain(|(_, v)| !v.list.is_empty());
+        if emptied {
+            self.back.retain(|(_, v)| !v.list.is_empty());
+        }
     }
 
     /// Removes what the state keeps of the contexts in `gone` as its predecessors,
@@ -563,19 +582,6 @@ impl State {
             }
         };
         &mut self.back[at].1
-    }
-
-    /// Recomputes what depends on the index rather than on the derivations: the
-    /// propagations and the disjointness members of the subsumers.
-    pub fn reindex(&mut self, ix: &Index) {
-        self.props.clear();
-        self.disj.clear();
-        for &d in &self.subs {
-            self.props.extend_from_slice(ix.exist(d));
-            for &s in ix.disjoint(d) {
-                self.disj.entry(s).or_insert(d);
-            }
-        }
     }
 }
 
