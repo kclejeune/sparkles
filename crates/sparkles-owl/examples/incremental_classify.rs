@@ -18,7 +18,10 @@
 //! peak, with the steps of the kept runs that started again and of the cold run. The
 //! steps also give the part of the saturation after its first pass, the
 //! marking of real contexts with the facts, the key merges and the worlds. With `--abox`
-//! the edited axiom is chosen among the assertions about individuals instead.
+//! the edited axiom is chosen among the assertions about individuals instead. On Linux
+//! the line also gives the resident bytes of the process before the first edit's run
+//! and their peak during it, which no full run beside it has touched, and the peak
+//! after the cold run, which takes in the parse.
 
 use sparkles_owl::classify::{Classifier, Limits};
 use sparkles_owl::model::AxiomKind;
@@ -30,6 +33,25 @@ static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
+}
+
+/// The resident bytes of the process and their peak since the last [`reset_peak`], from
+/// `/proc/self/status`, or zeros where it cannot be read.
+fn resident() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map_or(0, |kb| kb * 1024)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// Sets the peak of the resident bytes to what the process holds now.
+fn reset_peak() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
 
 /// The median, the least and the greatest of the times, in milliseconds.
@@ -83,6 +105,8 @@ fn main() {
     let t = Instant::now();
     let cold = kept.classify(&limits).expect("the cold run");
     let cold_ms = ms(t.elapsed());
+    let cold_hwm = resident().1;
+    let mut first_rss: Option<(u64, u64)> = None;
     let candidates: Vec<usize> = held
         .iter()
         .enumerate()
@@ -132,9 +156,12 @@ fn main() {
         let axiom = held[at].clone();
         // the removal
         kept.remove([&axiom]);
+        reset_peak();
+        let before = resident().0;
         let t = Instant::now();
         let out = kept.classify(&limits).expect("the run after a removal");
         removals.push(ms(t.elapsed()));
+        first_rss.get_or_insert((before, resident().1));
         runs += 1;
         incremental += usize::from(out.stats.incremental);
         if out.stats.incremental {
@@ -207,7 +234,7 @@ fn main() {
          \"restart_steps_ms\":[{xi:.3},{xs:.3},{xt:.3},{xm:.3}],\
          \"cold_steps_ms\":[{ci:.3},{cs:.3},{ct:.3},{cmk:.3}],\
          \"cold_memory\":{},\"cold_peak\":{},\"kept_memory\":{memory},\"kept_peak\":{peak},\
-         \"checked\":{check}}}",
+         \"cold_rss_peak\":{cold_hwm},\"first_edit_rss\":[{},{}],\"checked\":{check}}}",
         std::path::Path::new(&input)
             .file_name()
             .and_then(|n| n.to_str())
@@ -217,5 +244,7 @@ fn main() {
         cold.taxonomy.classes().count(),
         cold.stats.memory,
         cold.stats.peak_memory,
+        first_rss.map_or(0, |r| r.0),
+        first_rss.map_or(0, |r| r.1),
     );
 }
