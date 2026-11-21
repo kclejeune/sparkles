@@ -554,7 +554,10 @@ run = "mbx test -p sparkles-core --test csvw_conformance -- --nocapture"
 [tasks."test:bench-scripts"]
 description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare), and the crash harness's own tests (scripts/crash-harness.rs)"
 run = [
-  "python3 -m unittest discover -s scripts/bench-tests",
+  # One process per test module, up to eight at a time, since the tests mostly wait on
+  # subprocesses and sleeps. The three long x08 latency tests run one per process.
+  # `python3 -m unittest discover -s scripts/bench-tests` still runs the same tests serially.
+  "python3 scripts/unittest-parallel.py --split test_x08_latency scripts/bench-tests",
   # The test binary is scratch output outside the managed target, which Boxington can
   # collect between commands and leave as a dangling link.
   'out="{{config_root}}/.artifacts/crash-harness/crash-harness-test" && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
