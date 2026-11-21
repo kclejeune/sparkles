@@ -30,6 +30,8 @@ unit left behind, since such a test can pass or skip here and fail serially, and
 holds for the tests of a split module. A test's own run() reads only its own test's result.
 Test code does not react to being inspected or imported more than once, since each unit
 imports every module and asks each test for its id() and attributes again.
+scripts/unittest-compare.py, which the nightly gate runs, runs a suite both ways and fails
+when the verdicts or counts differ.
 
 A module named with --split runs one process per test instead, for modules whose few tests
 take most of the suite's time. The split is taken only when the module's entry is plain,

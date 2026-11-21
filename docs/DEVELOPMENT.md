@@ -389,7 +389,9 @@ on state that a test in another process left behind, and passing alone does not 
 since such a test can skip instead of fail. The same holds for the tests of a split module.
 The runner also assumes that a test's own `run` method reads only its own test's result, and
 that test code does not react to being inspected or imported more than once, since each
-process imports every module and asks each test for its id and attributes again.
+process imports every module and asks each test for its id and attributes again. The
+[nightly gate](#nightly-gate) runs the suite both ways and fails when the two verdicts or
+test counts differ.
 The three long tests of `test_x08_latency` run one per process. A module named with
 `--split` is split this way only when it has no fixtures, imported classes or repeated
 tests, and otherwise runs whole with a note that says why.
@@ -1253,6 +1255,13 @@ and catches up after the laptop wakes. `--uninstall` removes the timer and
 `--dry-run` prints the commit and the hosts. The timer's service needs the ssh agent that
 the ssh configuration names, so an agent socket at a fixed path, as with an
 `IdentityAgent` setting, works where a per-login agent does not.
+
+A full gate, and so the nightly gate, also runs `mise run test:bench-scripts:compare` after
+its ci step. It runs the script tests serially with `python3 -m unittest discover` and then
+with the parallel runner, one after the other, and fails when their exit statuses or their
+counts of tests run and skipped differ. The parallel runner reaches the serial verdict only
+under assumptions about the tests that it does not check, which
+[Script tests](#script-tests) lists, and this comparison catches a test that breaks one.
 
 Each run writes a log to `.artifacts/gates/nightly/` in the main checkout, and the gate's
 results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. The server artifact link

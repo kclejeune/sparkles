@@ -566,6 +566,10 @@ run = [
   'out="{{config_root}}/.artifacts/crash-harness/crash-harness-test" && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
 ]
 
+[tasks."test:bench-scripts:compare"]
+description = "The script tests serially with unittest discover and then with scripts/unittest-parallel.py, failing when their verdicts or counts differ (scripts/unittest-compare.py; the nightly gate runs it)"
+run = "python3 scripts/unittest-compare.py --split test_x08_latency scripts/bench-tests"
+
 [tasks."test:jena-clients"]
 description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP, QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against a debug server on a temporary directory; Jena and a JDK come from nixpkgs unless JENA_HOME and JAVA are set (not part of ci; also the flake's jena-clients check)"
 run = "mbx sparkles-task -- scripts/test-jena-clients.sh"
