@@ -1205,6 +1205,7 @@ pub(super) fn new_succ<S: Sink>(st: &mut State, w: Ex, out: &mut S) {
             .is_some_and(|m| m.reached)
     {
         out.send(w, Concl::RReach(TOP));
+        out.worked(1);
     }
     let Some(ls) = dl(st)
         .and_then(|x| x.root.as_deref())
@@ -1535,11 +1536,32 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
     }
     r.mw().reached = true;
     out.send(root, Concl::RReach(me));
-    for w in successors(ix, st) {
+    out.worked(1);
+    for (k, w) in successors(ix, st).into_iter().enumerate() {
+        if !m_poll(k, st, out) {
+            break;
+        }
         out.send(w, Concl::RReach(TOP));
+        out.worked(1);
     }
     true
 }
+
+/// The repair's sends poll the run's bounds after every [`M_POLL`] of them, as a rule whose
+/// one inference sends many messages does: `k` counts the loop's sends. A stop ends the
+/// loop and marks the context's store interrupted, as [`drain`] does. It comes only when the
+/// run has stopped or an activation of a run in steps is past the bound, which both end the
+/// run without a claim, so a send left undone never hides behind a complete answer.
+fn m_poll<S: Sink>(k: usize, st: &mut State, out: &mut S) -> bool {
+    if k == 0 || k % M_POLL != 0 || out.sent_go_on() {
+        return true;
+    }
+    ds(st).store.interrupted = true;
+    false
+}
+
+/// The sends between two polls of the run's bounds in the repair's loops.
+const M_POLL: usize = 64;
 
 /// Makes the repair's state of a context with its first use, and counts it.
 fn mrep_new<S: Sink>(r: &mut RootSt, out: &S) {
@@ -1631,7 +1653,11 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
             .collect();
         to.sort_unstable();
         to.dedup();
-        for d in to {
+        for (k, d) in to.into_iter().enumerate() {
+            if k > 0 && k % M_POLL == 0 && !out.sent_go_on() {
+                x.store.interrupted = true;
+                return true;
+            }
             m_fwd(r, d, l, out);
         }
     }
@@ -1651,8 +1677,11 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
                 .all(|&m| m == l || r.mr().hold_set.contains(&(h, m)))
         })
         .collect();
-    for i in ids {
-        let cid = ret_id(x, i, out);
+    for (k, i) in ids.into_iter().enumerate() {
+        if !m_poll(k, st, out) {
+            break;
+        }
+        let cid = ret_id(ds(st), i, out);
         out.send(h, Concl::RRet(cid));
         out.worked(1);
         out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1675,7 +1704,11 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     }
     ls.sort_unstable();
     ls.dedup_by_key(|p| p.0);
-    for (i, u) in ls {
+    for (k, (i, u)) in ls.into_iter().enumerate() {
+        if k > 0 && k % M_POLL == 0 && !out.sent_go_on() {
+            x.store.interrupted = true;
+            return;
+        }
         let l = Lit::xl(i);
         let r = x.root.as_deref().expect("read above");
         let held = r.mr().holders.get(&l).is_some_and(|hs| {
@@ -1725,7 +1758,10 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
         return;
     }
     let cid = ret_id(x, id, out);
-    for h in hs {
+    for (k, h) in hs.into_iter().enumerate() {
+        if !m_poll(k, st, out) {
+            break;
+        }
         out.send(h, Concl::RRet(cid));
         out.worked(1);
         out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
