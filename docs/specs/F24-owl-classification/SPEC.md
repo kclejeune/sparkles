@@ -131,7 +131,12 @@ when the EL part has no keys, as the check for individuals in the EL part alread
 and such a run answers as a run without the option. Each reason the rewriting declines a
 key, its bound, data, the bottom property, a construct without a reduction and the reserved
 prefix, has a regression test. The rooted taxonomies and statistics of 198 fixture and
-generated ontologies, 62 of them with keys, are unchanged.
+generated ontologies, 62 of them with keys, are unchanged. A rooted run that completed
+before gives the same answers, except that some such runs now take axioms they used to
+leave out. In one case a retained key and an individual only in a key outside OWL 2 EL
+gave a rooted run with an empty root, which left out a minimum cardinality. The run is no
+longer rooted, takes the cardinality and derives the subsumption that the run without the
+option derives, which a regression test checks.
 
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item

@@ -9,8 +9,9 @@ over object properties that item 805's rewriting declined, exited with an intern
 in the disjunctive rules. The rewriting declines a key past its bound, beside data, the
 bottom property or a construct it cannot rewrite, and in an ontology with a name that has
 the prefix of its made-up names. Such a run is now not rooted and gives the answer of a run
-without the option, which leaves the axioms with individuals out and reports them. Roadmap
-item 1265.
+without the option, which leaves the axioms with individuals out and reports them. Rooted
+runs that completed before give the same answers, except that some now take axioms they
+used to leave out and derive the subsumptions those axioms give. Roadmap item 1265.
 
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
