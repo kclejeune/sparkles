@@ -1273,7 +1273,8 @@ fn window_against_recompute() {
         metric(&format!("window/{name}/query"), qm, "ms", "lower");
         metric(&format!("window/{name}/pass-median"), pm, "ms", "lower");
         metric(&format!("window/{name}/pass-p95"), p95, "ms", "lower");
-        metric(&format!("window/{name}/pass-max"), max, "ms", "lower");
+        // the largest pass is a refill, one per `max(k, 100)` deletions, so it is
+        // printed and not recorded as a metric a gate could compare
         metric(&format!("window/{name}/state"), state, "MiB", "lower");
         rt.delete(name).unwrap();
         rt.round(&s);
