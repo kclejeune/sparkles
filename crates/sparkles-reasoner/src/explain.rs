@@ -1259,6 +1259,7 @@ fn program_search(
             max_inferred: usize::MAX,
             budget: budget.clone(),
             closures: false,
+            magic: None,
             sampled_planning: false,
             cancel: opts.cancel.clone(),
             deadline: opts.deadline,

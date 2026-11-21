@@ -1,0 +1,30 @@
+RERUN locks held 2026-11-20T21:24:58Z load 0.01 0.00 0.07 1/662 4186306
+reasoning_latency-base: OK
+reasoning_latency-tip: OK
+100 metrics and 198 checks from 1 runs into /home/kclejeune/lanes/reasoner-456-next/reruns/20261120T212459Z/latency/1-base/record.json
+LATENCY-RUN 1 base 2026-11-20T21:33:03Z
+100 metrics and 198 checks from 1 runs into /home/kclejeune/lanes/reasoner-456-next/reruns/20261120T212459Z/latency/2-tip/record.json
+LATENCY-RUN 2 tip 2026-11-20T21:41:09Z
+100 metrics and 198 checks from 1 runs into /home/kclejeune/lanes/reasoner-456-next/reruns/20261120T212459Z/latency/3-off/record.json
+LATENCY-RUN 3 off 2026-11-20T21:49:24Z
+100 metrics and 198 checks from 1 runs into /home/kclejeune/lanes/reasoner-456-next/reruns/20261120T212459Z/latency/4-off/record.json
+LATENCY-RUN 4 off 2026-11-20T21:57:35Z
+100 metrics and 198 checks from 1 runs into /home/kclejeune/lanes/reasoner-456-next/reruns/20261120T212459Z/latency/5-tip/record.json
+LATENCY-RUN 5 tip 2026-11-20T22:05:49Z
+100 metrics and 198 checks from 1 runs into /home/kclejeune/lanes/reasoner-456-next/reruns/20261120T212459Z/latency/6-base/record.json
+LATENCY-RUN 6 base 2026-11-20T22:13:54Z
+compare 1-base 2-tip exit 1
+
+100 metrics compared, 4 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.
+compare 6-base 5-tip exit 1
+
+100 metrics compared, 11 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.
+compare 3-off 2-tip exit 1
+
+100 metrics compared, 8 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.
+compare 4-off 5-tip exit 1
+
+100 metrics compared, 9 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.
+run dir /home/kclejeune/lanes/reasoner-456-next/reruns/20261120T212459Z
+RERUN-DONE flagged 1-base-2-tip 6-base-5-tip 3-off-2-tip 4-off-5-tip
+DONE

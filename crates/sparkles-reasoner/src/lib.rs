@@ -538,6 +538,7 @@ fn derive_here(
             progress: opts.progress.clone(),
             budget: budget.clone(),
             closures: false,
+            magic: None,
             sampled_planning: opts.sampled_planning,
         };
         progress(opts, 0.1, "reasoning");
@@ -567,6 +568,7 @@ fn derive_here(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: opts.closure_operators && opts.analysis.is_none(),
+        magic: None,
         sampled_planning: opts.sampled_planning,
     };
     progress(opts, 0.1, "reasoning");
@@ -1558,6 +1560,7 @@ fn witness_limits(budget: &Arc<Budget>, opts: &ReasonOptions) -> engine::Limits 
         progress: None,
         budget: budget.clone(),
         closures: false,
+        magic: None,
         sampled_planning: false,
     }
 }
@@ -1968,6 +1971,7 @@ fn update_closure(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: false,
+        magic: None,
         sampled_planning: opts.sampled_planning,
     };
     let ch = &ch;
@@ -2373,6 +2377,7 @@ pub fn dred_overdeletion(
         progress: None,
         budget: Budget::unlimited(),
         closures: false,
+        magic: None,
         sampled_planning: false,
     };
     let mut c = d.into_closure()?;

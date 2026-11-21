@@ -153,6 +153,49 @@ before the grouped probes. Both builds derived 52,966,139 and 10,907,379 facts, 
 OWL2Bench(5) stayed at 4.6 GB and the tier ended at 2,746 MB. These are benchmark-worker
 measurements, and the benchmark host has not rerun them.
 
+### Query-time closure operators on OWL2Bench
+
+Derivation on demand closes the adorned copies of transitive rules with closure operators
+([F23](../../specs/F23-reasoner-core/SPEC.md#closure-operators)). On forge, the benchmark
+host, each query ran `sparkles query --reasoning demand --profile owl-rl --max-derived 0`
+on an unmaterialized OWL2Bench(1) store with the joins at `5f3f69c2` and with the operators
+at `365cffcf`. Each figure is the median of three rounds that alternate the order of the
+builds, and the peak RSS comes from GNU time. Both builds returned the same rows in every
+round.
+
+| Query | Joins | Joins, peak RSS | Operators | Operators, peak RSS | Rows |
+|---|---:|---:|---:|---:|---:|
+| q2 | 113.2 s | 2,352 MiB | 8.33 s | 1,222 MiB | 7,422 |
+| q7 | 117.4 s | 2,323 MiB | 8.39 s | 1,226 MiB | 1,685 |
+| q12 | 115.1 s | 2,354 MiB | 8.50 s | 1,203 MiB | 2,495 |
+| q19 | 115.7 s | 2,376 MiB | 8.53 s | 1,236 MiB | 859 |
+
+The operators make these queries 13.5 to 14 times faster and use about half the peak
+memory.
+
+The [run directory](runs/2026-11-20-item-521-forge/env.txt) holds the host, builds and
+commands, the [gate script](runs/2026-11-20-item-521-forge/gate.sh.txt), its
+[log](runs/2026-11-20-item-521-forge/gate.log.txt) and the [OWL2Bench
+timings](runs/2026-11-20-item-521-forge/owl2bench-summary.txt).
+
+A second forge run compared `5ef06e3f` with `5f3f69c2` on the [reasoning latency
+gate](#query-time-reasoning-latency). That commit also sorts each chunk of a demand session's
+exported facts in predicate, object and subject order and checks the rules for operators at a
+session's first run. The harness ran six times with 15 rounds of three timed runs, in the
+order base, tip, the tip with the operators off twice, tip and base. No pair failed a check
+or changed an answer fingerprint, and no metric of the tip was slower than base in every
+round. The closest was `owl-rl` demand `q6`,
+slower in 29 of 30 rounds by 2.5 to 3.6% at about 1.6 s, and the tip with the operators off
+was as slow, so that difference does not come from the operators. `owl-rl` demand `q5` was
+slower in 27 of 30 rounds, and [item 1244](../../ROADMAP.md) holds both costs until they are
+recovered. The 12 metrics that `bench-gate.py` flagged at 10% against base were slower in 13
+to 21 of 30 rounds, and six of them are materialized queries under 0.1 ms. Their rounds burst in every run, more often in
+the tip's runs than in base's or in those of the tip with the operators off. The [run
+directory](runs/2026-11-20-item-521-forge-rerun/env.txt) holds the records, the
+[comparisons](runs/2026-11-20-item-521-forge-rerun/latency-summary.txt) and the [per-round
+analysis](runs/2026-11-20-item-521-forge-rerun/analysis.txt). The OWL2Bench timings above
+were not repeated at `5ef06e3f`.
+
 ### Sampled rule-body planning
 
 Roadmap item 939 orders rule bodies from sampled bindings. On atlas, an Intel Core
