@@ -393,8 +393,18 @@ class Timeout(unittest.TestCase):
             self.assertIsNone(code)
             pid = int(pidfile.read_text())
             # The grandchild left the parent's process group and ignored SIGTERM, and is gone.
-            with self.assertRaises(ProcessLookupError):
-                os.kill(pid, 0)
+            # Its new parent reaps it, which a loaded host can take a moment to schedule, so a
+            # zombie counts as gone.
+            end = time.monotonic() + 10
+            while True:
+                try:
+                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+                except FileNotFoundError:
+                    break
+                if state == "Z":
+                    break
+                self.assertLess(time.monotonic(), end, f"process {pid} is still running")
+                time.sleep(0.05)
             size = beat.stat().st_size
             time.sleep(0.3)
             self.assertEqual(beat.stat().st_size, size)
