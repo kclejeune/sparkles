@@ -3957,7 +3957,14 @@ data property is the restriction `≤1 d` on `owl:Thing`. A data value has no su
 and the data property hierarchy, disjointness, ranges and functionality all apply to one
 element, so the data successors of an element exist only inside the checker. The top
 data property, which OWL 2 DL allows only as a superproperty, relates every element to
-every value and adds no constraint between elements. The complement of a data atom is a
+every value and adds no constraint between elements. A restriction over it is never an
+atom, since `∃U.R` with R not empty holds of every element and would need a valid clause
+with an empty body, so its axiom is left out and reported. A negative data assertion
+`NegativeDataPropertyAssertion(d a v)` in a component of the checker is the atom
+`∀d.¬{v}` on the constant a, a positive atom. With it, a constant whose values of d are
+all ruled out is a conflict and needs no cover, and the negative assertions add no body
+atoms. A component that stays with the EL lattice keeps the EL index's form `{a} ⊓
+∃d.{v} ⊑ ⊥`. The complement of a data atom is a
 data atom, `∀d.¬R` for `∃d.R` and `≤(n-1) d.R` for `≥n d.R`. The normalization keeps
 one invariant that the theory rule needs. Every data atom in the body of a clause is of
 the at-least kind, an existential, a value or a minimum, since a universal or a maximum
@@ -3988,11 +3995,16 @@ their ranges, and large minimums need no enumeration of witnesses. A search past
 bound answers that the bound was passed, which the callers treat as their work bounds.
 
 **The theory rule.** A context's clauses hold data atoms like any other atoms over x, and
-the context's units held in the EL index count as clauses with an empty body. When a
-processed clause's maximal literal is a data atom P, the rule takes P with the data
-atoms that are maximal in the context's other clauses and with the body atoms, the data
-atoms in the bodies of ontology clauses, in the told subsumers of the EL index such as
-the `∃d.rdfs:Literal` of a domain, and in the key clauses. The atoms it takes are those
+the context's units held in the EL index count as clauses with an empty body. The rule
+fires when a processed clause's maximal literal is a data atom P and when the context
+gains a data atom P as a unit, whichever rule derived it. It takes P with the data atoms
+that are maximal in the context's other clauses or are its units, and with the body
+atoms. The body atoms are the data atoms with a negative occurrence anywhere in the
+index. Such an occurrence is in the body of an ontology clause, on the left of a told
+subsumer such as the `∃d.rdfs:Literal` of a domain, an operand of a conjunction, the
+filler of a negative existential restriction, the qualifier of an at-most restriction, a
+member of a disjointness axiom or a key clause. The index registers them where it
+registers every negative occurrence, so that no position is missed. The atoms it takes are those
 of P's component, the data properties connected by the hierarchy and by disjointness. It
 asks the checker for the pairs of a set of maximal atoms containing P and a set of body
 atoms whose negations make them unsatisfiable, minimal in both sets at once, so that a
@@ -4002,9 +4014,16 @@ maximal atom, it derives the union of those clauses' other literals and the pair
 atoms under the union of their bodies. A pair without body atoms is a conflict, such
 as a minimum above the size of its range, one body atom is an entailment such as
 `≥2 d.xsd:boolean ⊑ ∃d.{true}`, and two or more are a cover, such as `∃d.xsd:boolean
-⊑ ∃d.{true} ⊔ ∃d.{false}`. A cover needs two body atoms that overlap
-the maximal atoms partially, so it is tested only when there are two. After an equality
-rewrites a term, the rule reads the atoms of the term that remains.
+⊑ ∃d.{true} ⊔ ∃d.{false}`. Every body atom of a minimal cover is consistent with the
+pair's set of maximal atoms and not entailed by it, so for a set of maximal atoms the
+rule asks for covers only when two or more body atoms of the component pass both tests.
+The tests are made against that set and not against every atom of the context. With
+`Γ1 → ∃d.xsd:boolean` and `Γ2 → ∀d.{true}`, the atom `∃d.{false}` is inconsistent with
+the context's atoms taken together, and the cover `Γ1 → ∃d.{true} ⊔ ∃d.{false}` is still
+needed, since the universal holds only under Γ2. No filter compares the ranges of the
+atoms, since a cover can hold an atom whose range contains the others, as `∃d.xsd:int[1,
+2] ⊓ ∃d.xsd:int[2, 3] ⊑ ≥2 d.xsd:integer ⊔ ∃d.{2}` does. In a rooted run, after an
+equality rewrites a term, the rule reads the atoms of the term that remains.
 
 **Completeness.** The rule is Hyper over the clauses `P_1(x) ∧ … ∧ P_k(x) → Q_1(x) ∨ … ∨
 Q_m(x)` that are valid in the datatype map, with the `P_i` among the ontology's finitely
@@ -4013,7 +4032,19 @@ the same models, since an element whose data atoms are true cannot be given valu
 its other body atoms false only when one of these clauses is violated, and a data atom
 that occurs in no body triggers no ontology clause. The calculus with them is complete
 by its own theorem, since they are ordinary ontology clauses over x, and the invariant
-above makes the clauses with an empty body unnecessary. The rule computes them lazily
+above, with the replacement of zero minimums and no atoms over the top data property,
+makes the clauses with an empty body unnecessary. The theorem needs the run with the rule
+to be the calculus on the larger ontology in its other rules too. The valid clauses are
+over x alone, so they add no atom over y, no role atom and no qualifier of an at-most
+restriction, which are what Pred and the at-most rule read from the ontology, and Succ
+sends a successor the marker of every atom over its term whatever the ontology's bodies
+hold. A data atom is an atom of the index like a named class, in the cores of
+successors, in markers, in the conjunctions of the Horn rules, under the equality rules
+and as a qualifier. A data atom over a successor or predecessor term therefore reaches
+the context whose x it is, and the rule fires there. The tests take `A ⊑ ∃r.B`, `A ⊑
+∀r.∃d.{1}` and `B ⊑ ∃d.{2}` with d functional, which entail `A ⊑ ⊥`, and two successors
+of a functional property, one with `∃d.xsd:int[1, 2]` and the other with
+`∀d.xsd:int[2, 3]`, whose merged successor has the value 2. The rule computes them lazily
 and fires on exactly the premises that Hyper would take with them, since a valid clause
 whose body atoms are not all maximal in the context cannot fire there. This makes the
 unrooted run complete in the sense of the existing tiers. The rooted run takes the same
@@ -4036,14 +4067,25 @@ today. Every other component is all data atoms. A lattice over the whole map
 would not be convex, since `∃d.xsd:boolean` entails a class that both `∃d.{true}` and
 `∃d.{false}` imply, and `∃d.xsd:integer` one that `∃d.xsd:integer[≤0]` and
 `∃d.xsd:positiveInteger` imply. The Horn tier applies the theory rule to the data atoms
-of its contexts. A conflict gives `owl:Nothing` and an entailment gives its body atom,
-which the Horn rules can take. A cover gives one class when each of its body atoms is the
-only body atom of the clauses it occurs in and they all have that class as their head,
-as for negative data assertions that all give `owl:Nothing`. Any other cover needs a
-case analysis, so the Horn tier reports its axioms as used in part and a run that Tier D
-takes decides them there. With these rules the Horn tier is complete when it reports
-nothing, since several successors and pigeonholes come out as entailments of one body
-atom. A data restriction in a negative position whose negation is not Horn, a universal
+of its contexts. A context of the Horn rules holds only units, so its data atoms in a
+component are one set S and the rule needs no minimal pairs. A conflict of S gives
+`owl:Nothing`, and each body atom of the component that S entails is given as a unit,
+which the Horn rules can take. A remaining body atom, one that the context does not
+hold, is free when its only negative occurrences are told subsumptions whose subsumers
+the context holds, since its truth then changes no conclusion. A class C is given when S
+with the negations of the remaining atoms whose only negative occurrences are told
+subsumptions by C or by units of the context is unsatisfiable, as for a Boolean property
+whose two values both give C, and those atoms become free. A cover remains when S with
+the negations of the remaining atoms that are not free is unsatisfiable. It needs a case
+analysis, so the Horn tier reports its axioms as used in part and a run that Tier D takes
+decides them there. With these rules the Horn tier is complete when it reports nothing.
+Kazakov's canonical model has an element for each context, whose atoms are the
+context's units. When no cover remains, each element can be given data values that
+satisfy S and falsify every remaining atom that is not free. A data atom in a negative
+position of an axiom is then true of the element only when the context holds it or the
+subsumers it gives are units already, so the model satisfies the data axioms and has
+the subsumers that the rules derived. Several successors and pigeonholes come out as
+entailments of one body atom. A data restriction in a negative position whose negation is not Horn, a universal
 restriction or a maximum on the left, stays with Tier D. On the 67 ORE 2015 DL files
 that the census found leaving axioms out for 768 or 972, all 27 files with data
 restrictions outside OWL 2 EL have them only in positive positions, so no negative
@@ -4068,11 +4110,13 @@ keys whose properties, and the subproperties of those, have no positive restrict
 other than a single value, so that a shared value is the same value on both sides, as
 the worlds take today. A hash of the constants by their key values finds the pairs.
 Every other key is reported as used in part, since a range such as `xsd:int[5, 6]` on
-one side could need the cover `∃d.{5} ⊔ ∃d.{6}` to decide the pair.
+one side could need the cover `∃d.{5} ⊔ ∃d.{6}` to decide the pair. The worlds of
+the Horn rules with individuals take the same condition, so a key over a data property
+outside it is reported as used in part there too.
 
 **The rooted run.** A data assertion `DataPropertyAssertion(d a v)` is the atom
-`∃d.{v}` on the constant a, and its negative form is `{a} ⊓ ∃d.{v} ⊑ ⊥`, as in the EL
-index. Hyper binds x to a constant, and the theory rule does the same, so each context
+`∃d.{v}` on the constant a, and its negative form is the atom `∀d.¬{v}` on a, as the
+atoms paragraph gives it. Hyper binds x to a constant, and the theory rule does the same, so each context
 decides the ground data atoms of each constant as it decides those over x.
 
 **Representation and incremental checking.** A run builds the data tables only when its
