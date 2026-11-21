@@ -367,3 +367,53 @@ test('a full summary of a newer commit whose head fails to read again offers a r
     await request.delete(`/$/branches/uni/${branch}?force=true`);
   }
 });
+
+test('a retried full summary whose head moves on again waits for Count the axioms', async ({
+  page,
+  request,
+}) => {
+  // ROADMAP item 735: the head shows C1, the full summary lands at C2 and the head's next read
+  // fails; Count the axioms reads the full summary at C2 again while the ontology moves to C3,
+  // and the head's read of C3 neither starts another full read nor loses the retry's outcome
+  const branch = 'full-retry';
+  await newBranch(request, branch);
+  try {
+    await page.goto(`/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch })}`);
+    await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
+    let fulls = 0;
+    let failHeads = false;
+    await page.route('**/$/ontology/uni?*', async (route) => {
+      const head = new URL(route.request().url()).searchParams.get('view') === 'head';
+      if (head) {
+        if (failHeads) return route.fulfill({ status: 500, body: 'unavailable' });
+        return route.continue();
+      }
+      fulls++;
+      if (fulls === 1) {
+        failHeads = true;
+        await update(request, branch, 'INSERT DATA { <urn:x> <urn:p> "1" }');
+        return route.continue();
+      }
+      // the retry: the summary of C2, then a write to C3 before the head reads again
+      const response = await route.fetch();
+      failHeads = false;
+      await update(request, branch, 'INSERT DATA { <urn:x> <urn:p> "2" }');
+      return route.fulfill({ response });
+    });
+    await page.getByRole('tab', { name: 'Header' }).click();
+    const contents = page.getByRole('region', { name: 'Contents' });
+    await expect(contents).toContainText('The ontology changed while its axioms were counted.');
+    await contents.getByRole('button', { name: 'Count the axioms' }).click();
+    await expect.poll(() => fulls).toBe(2);
+    await expect(contents).toContainText('The ontology changed while its axioms were counted.');
+    await expect(contents.getByRole('button', { name: 'Count the axioms' })).toBeVisible();
+    await expect(contents).not.toContainText('Counting the axioms');
+    await page.waitForTimeout(1000);
+    expect(fulls).toBe(2);
+  } finally {
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
