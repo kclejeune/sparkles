@@ -1,18 +1,19 @@
 """Isolate the Git that script tests and their fixtures run from the host's Git settings.
 
-A test module that runs git, or runs a script that does, imports this module before its
-tests start. The import scrubs the process environment that every subprocess inherits.
-It removes every GIT_* variable, so a GIT_DIR or GIT_WORK_TREE set by a hook or a shell
-cannot make a fixture's `git init` or commit land in another repository, and GIT_CONFIG_*
-cannot add settings. It sets GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_NOSYSTEM=1, so
-the user's and the system's configuration, with core.hooksPath, commit signing and
-init.templateDir, are not read, and it points GIT_TEMPLATE_DIR at an empty directory, so a
-new repository gets no hooks. A fixed author and committer identity replaces the one the
-global configuration gave. Repository-local configuration still applies, so tests that
-read the checkout itself see its own settings.
+Every test module imports this module first, since a test can run git through a script as
+well as directly, and a targeted run of one module must be isolated too. The import scrubs
+the process environment that every subprocess inherits. It removes every GIT_* variable, so
+a GIT_DIR or GIT_WORK_TREE set by a hook or a shell cannot make a fixture's `git init` or
+commit land in another repository, and GIT_CONFIG_* cannot add settings. It sets
+GIT_CONFIG_GLOBAL=/dev/null and GIT_CONFIG_NOSYSTEM=1, so the user's and the system's
+configuration, with core.hooksPath, commit signing and init.templateDir, are not read, and
+it points GIT_TEMPLATE_DIR at an empty directory, so a new repository gets no hooks. A
+fixed author and committer identity replaces the one the global configuration gave.
+Repository-local configuration still applies, so tests that read the checkout itself see
+its own settings.
 
-test_git_isolation.py checks that every test module that runs git imports this module, and
-that a fixture run under a hostile GIT_DIR and global configuration leaves both alone.
+test_git_isolation.py checks that every test module imports this module first, and that
+fixture tests run alone under a hostile GIT_DIR and global configuration leave both alone.
 """
 import atexit
 import os

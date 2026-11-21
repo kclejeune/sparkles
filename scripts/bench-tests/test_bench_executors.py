@@ -4,6 +4,7 @@ with a stub server in place of sparkles, and of `bench-gate.py compare --best-of
     python3 -m unittest discover -s scripts/bench-tests -p test_bench_executors.py
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 import os
 import shutil

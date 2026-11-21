@@ -3,6 +3,7 @@
     python3 -m unittest discover -s scripts/bench-tests -p test_unittest_parallel.py
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import subprocess
 import sys
 import tempfile

@@ -1,5 +1,6 @@
 """Exercise package selection without building packages or starting benchmark servers."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 import os
 from pathlib import Path

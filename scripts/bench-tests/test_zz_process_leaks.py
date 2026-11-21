@@ -8,6 +8,7 @@ with the creation stack of every Popen that was collected unwaited or is still u
 the end of the suite. The check needs no interpreter flags, so it runs under the plain
 `python3 -m unittest discover -s scripts/bench-tests` of mise and CI.
 """
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import gc
 import subprocess
 import traceback

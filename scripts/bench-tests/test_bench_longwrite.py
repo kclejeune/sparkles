@@ -4,6 +4,7 @@ scripts/bench-record.py, and the OWL2Bench query extraction (scripts/bench-owl2b
     python3 -m unittest discover -s scripts/bench-tests
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import http.server
 import importlib.util
 import json

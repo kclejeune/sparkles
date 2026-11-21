@@ -3,6 +3,7 @@ calls it, every `sparkles infer` of it and of compare.sh takes MAX_INFERRED as i
 --max-inferred, and its capped runner classifies a run's end and leaves no process behind.
 The runner tests need a systemd user manager and GNU time, and are skipped without them."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import process_checks
 import os
 import re

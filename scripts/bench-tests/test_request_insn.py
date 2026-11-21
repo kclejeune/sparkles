@@ -3,6 +3,7 @@
     python3 -m unittest discover -s scripts/bench-tests -p test_request_insn.py
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import process_checks
 import json

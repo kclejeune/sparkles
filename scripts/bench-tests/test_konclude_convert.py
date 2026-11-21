@@ -1,6 +1,7 @@
 """Check scripts/elk-compare/konclude.py's conversion of Konclude's class hierarchy into
 the reference form that scripts/el-oracle.py reads."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 from pathlib import Path
 import importlib.util
 import json

@@ -1,4 +1,5 @@
 """The warm worker's disk cleanup and the stop paths that run it; no provider operation runs."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import process_checks
 from pathlib import Path
 import contextlib
