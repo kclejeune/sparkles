@@ -735,7 +735,8 @@ fn a_window_over_keys_without_a_total_order_rebuilds() {
     let s = Store::in_memory(StoreOptions::default());
     let date = |i: u32, tz: bool| {
         let z = if tz { "Z" } else { "" };
-        format!(":d{i} :v \"2026-01-{:02}T12:00:00{z}\"^^<{DT}>", i + 1)
+        // minutes apart, so a date without a timezone is indeterminate against one with
+        format!(":d{i} :v \"2026-01-01T12:{i:02}:00{z}\"^^<{DT}>")
     };
     let data: Vec<String> = (0..20).map(|i| date(i, i % 2 == 0)).collect();
     upd(&s, &format!("INSERT DATA {{ {} }}", data.join(" . ")));
@@ -752,6 +753,7 @@ fn a_window_over_keys_without_a_total_order_rebuilds() {
         }
     };
     check(&c, &names);
+    assert!(window_op(&c).partial(), "the keys have no total order");
     let mut left = names;
     for i in 0..18u32 {
         upd(&s, &format!("DELETE DATA {{ {} }}", date(i, i % 2 == 0)));

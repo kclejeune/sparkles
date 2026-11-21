@@ -1623,7 +1623,13 @@ of the `recompute` node it was before.
   once. The window's state is its input's total weight and its rows with their copies,
   in order.
 - Under a provenance setting a window's rows carry unknown witnesses, as the `recompute`
-  node did, while its input keeps its annotations current.
+  node did, while its input keeps its annotations current. A refill under one carries
+  them through, which a test checks.
+- The inner nodes of a property path that the compiler expands into triple patterns had
+  names starting with `__incr`, which a query variable can also take, so such a variable
+  joined with the path's inner node. They now start with `#`, which no SPARQL variable
+  can spell, as the window's hidden keys and the fixed-point operator's names do (item
+  549).
 
 The window's differential tests in `incr/window_tests.rs` check eight windows through
 random histories against a model of the data, with ties, duplicates, an offset, an

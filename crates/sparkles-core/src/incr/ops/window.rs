@@ -522,6 +522,12 @@ impl Window {
         )
     }
 
+    /// Whether the window holds a key without a total order and so rebuilds its rows.
+    #[cfg(test)]
+    pub(crate) fn partial(&self) -> bool {
+        self.partial
+    }
+
     pub fn bytes(&self) -> u64 {
         // the vector's slots, whether used or not, then each row's ids and keys
         let slots = self.kept.capacity() as u64 * std::mem::size_of::<Entry>() as u64;
