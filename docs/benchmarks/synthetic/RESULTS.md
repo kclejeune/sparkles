@@ -1373,19 +1373,28 @@ and every invocation returned the same answers.
 | `export-500k` | eager | 2.41 | 2.40 | 4.68 | 2.32 | 2.38 | 2.38 |
 
 In the same-day run the three builds agree on these queries within the spread of their
-epochs, and every build runs at or below the times of the 6dbf2a08 matrix. The flags in
-this cell therefore do not come from the code of either range. Their cause is not known.
-The same-day run held the same locks and the same data as the matrices, with the disk 96%
-to 97% full, its throttle counters did not change, and `knows-reach` stayed within 3% of the
-6dbf2a08 matrix in both slow matrices. The other cells have no same-day run, and roadmap
-item 1267 holds their flags.
+epochs. Every build runs below the times of the 6dbf2a08 matrix on four of the five query
+and mode pairs. On streamed `optional-chain` the builds take 26.51 to 26.65 ms, 1.005 to
+1.010 times the 26.38 ms of that matrix. The flags of this cell therefore did not reproduce
+in this run. One run cannot rule out an effect of either range that appears only under the
+conditions of the matrices, and the cause of the flags is not known.
+
+The same-day run held the same locks and used the same data as the matrices, with the disk
+96% to 97% full, and its throttle counters did not change. In the two slow matrices
+`knows-reach` took 1.013 to 1.031 times as long as in the 6dbf2a08 matrix, far less than
+the flagged queries. The other three cells have no same-day run, and roadmap item 1267
+holds their flags. If the next forge matrix still flags these cells against 6dbf2a08, the
+next step is a same-day rerun of the 6dbf2a08 binary's matrix with host sampling and a
+same-day check of the three binaries in the flagged cells.
 
 Paired epoch by epoch with its neighbour in the run order, b47b582b is slower than 6dbf2a08
 in all four paired epochs of a mode on nine query and mode pairs above 0.3 ms, and faster in
 all four on five, so most of these single directions are within what four pairs give by
 chance. `class-predicate-list` and `class-predicates` are slower in both modes, by 2.5% to
-3.4%, and also in the 0779d666 arm and in both matrices at 1.006 to 1.022, so roadmap item
-1255 records them as costs of item 1136.
+3.4%. The 0779d666 arm reads 1.022 to 1.035 on them, and both matrices read 1.006 to
+1.022, so roadmap item 1255 records them as costs of item 1136. In this run b47b582b takes
+10.53 and 10.90 ms on `class-predicate-list` and 10.41 and 10.81 ms on `class-predicates`,
+eager and streamed, as medians of its four epochs in each mode.
 
 | query | mode | 6dbf2a08 ms | median ratio | lowest ratio |
 |---|---|--:|--:|--:|

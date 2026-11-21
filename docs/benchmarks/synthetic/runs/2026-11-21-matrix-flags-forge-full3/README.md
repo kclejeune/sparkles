@@ -27,8 +27,8 @@ eager, streaming, streaming, eager, with the matrix's settings in `run.env`, so 
 has four eager and four streaming server epochs. Each epoch times 31 queries with 3 warm-up
 and 10 timed requests. `samples/` holds each invocation's samples.
 
-`summary.txt` gives each build's epoch medians and the ratio of the medians of the eight
-epochs. `paired.py` pairs each invocation with its neighbour in the palindrome, invocation
+`summary.txt` gives each build's epoch medians in each mode, the median of its four epochs
+in that mode and the ratio of those medians to 6dbf2a08. `paired.py` pairs each invocation with its neighbour in the palindrome, invocation
 2 with 1, 5 with 6, 3 with 1 and 4 with 6, and prints the ratio of each paired epoch in
 `paired.txt`, with `ALL>1` where all four ratios of a mode are above 1 and `ALL<1` where
 all four are below 1. In `paired.txt`, `A` is eager and `B` is streaming.

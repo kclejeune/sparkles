@@ -2,16 +2,18 @@
 
 ## Unreleased
 
-### The matrix flags of batches 49 and 50 did not reproduce
+### The matrix flags of batches 49 and 50 did not reproduce in a same-day run
 
 The forge matrices of b47b582b and 0779d666 ran `order-by-full` and `optional-chain` 1.3 to
 1.8 times as long as the matrix of 6dbf2a08 at 10.5M triples with 12 threads. A same-day
 run of all three matrix binaries in that cell, through the unmodified matrix harness in six
 invocations, ran `order-by-full` in 103 to 109 ms and `optional-chain` in 25 to 27 ms in
-every build, at or below the times of the 6dbf2a08 matrix, so neither item 1136 nor batch
-50 causes those flags. Their cause is not known, and roadmap item 1267 now holds the flags
-of the other cells. The same run finds small costs of item 1136 of 2.5% to 3.4% on
-`class-predicate-list` and `class-predicates` in both modes, which item 1255 records.
+every build. These times are below those of the 6dbf2a08 matrix, apart from streamed
+`optional-chain` at up to 1.010 times its time, so the flags did not reproduce in this run.
+Their cause is not known, and roadmap item 1267 holds the flags of the other cells. The
+same run finds small costs of item 1136 of 2.5% to 3.4% on `class-predicate-list` and
+`class-predicates` in both modes, which item 1255 records.
+
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
