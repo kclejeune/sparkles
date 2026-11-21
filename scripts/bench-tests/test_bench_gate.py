@@ -860,6 +860,25 @@ class GateTests(unittest.TestCase):
             self.assertIn("INVALID: a query has a variant with one server process", out)
             self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
                                              "first"]).returncode, 1)
+            # a query under 0.3 ms takes no part in the spread, but with every request but one
+            # of each variant failed, one server process per variant still cannot decide it
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            for rnd in (1, 2):
+                for i, v in enumerate("ABBA"):
+                    epoch = 4 * (rnd - 1) + i + 1
+                    lines.append(f"{rnd}\t{epoch}\t{v}\tcontrol\t1\t1.0\t2")
+                    lines.append(f"{rnd}\t{epoch}\t{v}\ttiny\t1\t" + ("0.1\t0.2" if epoch in (1, 2) else "error\terror"))
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            out = subprocess.run([sys.executable, str(summary), d], capture_output=True, text=True).stdout
+            s = json.loads((Path(d) / "summary.json").read_text())
+            self.assertTrue(s["validity"]["valid"])
+            self.assertEqual(s["thin"], ["tiny"])
+            self.assertIn("fewer than two server processes of a variant for: tiny", out)
+            for kind, flagged in (("first", ""), ("rerun", "tiny")):
+                self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                                 kind, flagged]).returncode, 1, kind)
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                             "rerun", "control"]).returncode, 0)
 
 
 if __name__ == "__main__":

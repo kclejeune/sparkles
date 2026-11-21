@@ -150,11 +150,12 @@ class KitTests(unittest.TestCase):
         r, s = self.stage(tips=(("tip", 1.0),))
         env = (s / "run.env").read_text()
         (s / "run.env").write_text(env.replace("REPS=2\n", "REPS=0\n").replace("RERUN_ROUNDS=2\n", "RERUN_ROUNDS=1\n")
-                                   .replace("FLAG_RATIO=1.10", "FLAG_RATIO=0.9"))
+                                   .replace("FLAG_RATIO=1.10", "FLAG_RATIO=0.9") + "RERUN_REPS=0\n")
         r = kit("preflight", s)
         self.assertIn("REPS must be a whole number of at least 1, not 0", r.stderr)
         self.assertIn("RERUN_ROUNDS must be a whole number of at least 2, not 1", r.stderr)
         self.assertIn("FLAG_RATIO must be a ratio above 1", r.stderr)
+        self.assertIn("RERUN_REPS must be a whole number of at least 1, not 0", r.stderr)
 
     def test_preflight_needs_a_hash_of_every_binary(self):
         r, s = self.stage(tips=(("tip", 1.0),))

@@ -403,8 +403,9 @@ commands accept an explicit admitted `boat:bx_ID` worker. Build hosts, partition
 shares and gate hosts accept the same selector. The [remote executor commands](REMOTE-EXECUTORS.md)
 describe the tracked qualification/environment/finish commands, explicit private
 profile and admission inputs, warm reuse, artifact transport and cleanup. The batch query
-screen runs through `bench:remote` on a Boat worker, and the retired `bench:nsc` tasks are
-unsupported. Changing placement preserves the tests, benchmark comparability and acceptance criteria.
+screen runs on a quiet Intel host, as [benchmarking](BENCHMARKING.md) describes, and a
+`bench:remote` run on a Boat worker gives only an approximate check. The retired
+`bench:nsc` tasks are unsupported. Changing placement preserves the tests, benchmark comparability and acceptance criteria.
 
 ### Known flaky tests
 

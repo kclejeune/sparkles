@@ -321,6 +321,139 @@ class RequestClientTests(unittest.TestCase):
         self.assertEqual(len({port for port, _ in rows}), 4 * 2 * (2 + 3) + 4 + 2 * 2)
 
 
+class ScriptedServer:
+    """A raw HTTP server whose answers a test scripts byte by byte.
+
+    Each accepted connection serves requests in turn. For the n-th request over all
+    connections, `answer(n)` gives a list of (delay seconds, bytes) steps to send, and a
+    final None step closes the connection. The server counts the requests it read."""
+
+    def __init__(self, answer):
+        import threading
+        self.answer, self.requests = answer, 0
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen()
+        self.port = self.sock.getsockname()[1]
+        self.lock = threading.Lock()
+        threading.Thread(target=self.serve, daemon=True).start()
+
+    def serve(self):
+        import threading
+        while True:
+            try:
+                c, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self.connection, args=(c,), daemon=True).start()
+
+    def connection(self, c):
+        import time
+        f = c.makefile("rb")
+        try:
+            while True:
+                length = None
+                line = f.readline()
+                if not line:
+                    return
+                while line not in (b"\r\n", b""):
+                    if line.lower().startswith(b"content-length:"):
+                        length = int(line.split(b":")[1])
+                    line = f.readline()
+                f.read(length or 0)
+                with self.lock:
+                    self.requests += 1
+                    n = self.requests
+                for step in self.answer(n):
+                    if step is None:
+                        c.close()
+                        return
+                    delay, data = step
+                    time.sleep(delay)
+                    c.sendall(data)
+        except OSError:
+            return
+        finally:
+            c.close()
+
+    def close(self):
+        self.sock.close()
+
+
+def answer(body=b'{"execMs":1.5}', headers=b"", trickle=None, delay=0.0):
+    """The steps of one answer: its headers then its body, optionally trickled one byte at a
+    time with `trickle` seconds between bytes, into "head" or "body"."""
+    head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n" % len(body) + headers + b"\r\n"
+    steps = [(delay, b"")]
+    for part, name in ((head, "head"), (body, "body")):
+        if trickle and trickle[0] == name:
+            steps += [(trickle[1], part[i:i + 1]) for i in range(len(part))]
+        else:
+            steps.append((0, part))
+    return steps
+
+
+class RequestClientDeadlineTests(unittest.TestCase):
+    """The persistent client of nsc-bench-remote.sh, run directly against scripted servers."""
+
+    def client(self, server, max_time, reps=1):
+        d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, d, True)
+        text = (SCRIPTS / "nsc-bench-remote.sh").read_text()
+        start = text.index("cat > bench-client.py << 'PY'\n") + len("cat > bench-client.py << 'PY'\n")
+        (d / "bench-client.py").write_text(text[start:text.index("\nPY\n", start) + 1])
+        (d / "queries").mkdir()
+        (d / "queries" / "q.rq").write_text("SELECT * WHERE { ?s ?p ?o }\n")
+        import time
+        t0 = time.monotonic()
+        subprocess.run([sys.executable, "bench-client.py", "--port", str(server.port), "--round", "1", "--epoch", "1",
+                        "--variant", "A", "--warmup", "0", "--reps", str(reps), "--max-time", str(max_time),
+                        "--samples", "samples.tsv", "--warm-answers", "warm.tsv", "q"],
+                       cwd=d, check=True, timeout=60)
+        rows = [l.split("\t") for l in (d / "samples.tsv").read_text().splitlines()]
+        return [r[5] for r in rows], time.monotonic() - t0
+
+    def serve(self, fn):
+        s = ScriptedServer(fn)
+        self.addCleanup(s.close)
+        return s
+
+    def test_an_answer_that_closes_its_connection_is_kept(self):
+        s = self.serve(lambda n: answer(headers=b"Connection: close\r\n") + [None])
+        rows, _ = self.client(s, 5, reps=3)
+        self.assertEqual(rows, ["1.5"] * 3)
+        self.assertEqual(s.requests, 3)
+        # an answer without a length that ends when the server closes is kept too
+        s = self.serve(lambda n: [(0, b'HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{"execMs":2}'), None])
+        rows, _ = self.client(s, 5, reps=2)
+        self.assertEqual(rows, ["2"] * 2)
+
+    def test_trickled_headers_and_bodies_end_at_the_deadline(self):
+        for part in ("head", "body"):
+            # each byte arrives well inside any one read's timeout, and the whole answer
+            # would take several seconds
+            s = self.serve(lambda n: answer(body=b'{"execMs":1.5}' + b" " * 40, trickle=(part, 0.1)))
+            rows, took = self.client(s, 0.5, reps=2)
+            self.assertEqual(rows, ["error"] * 2, part)
+            self.assertLess(took, 3, part)
+            # a timed-out request is not sent again
+            self.assertEqual(s.requests, 2, part)
+
+    def test_no_max_time_waits_for_a_slow_answer(self):
+        s = self.serve(lambda n: answer(trickle=("body", 0.05), delay=0.3))
+        rows, took = self.client(s, 0)
+        self.assertEqual(rows, ["1.5"])
+        self.assertGreater(took, 0.3)
+
+    def test_a_timeout_on_a_reused_connection_is_sent_once(self):
+        # the first request answers at once, and the second, on the same connection, stalls
+        s = self.serve(lambda n: answer() if n == 1 else answer(delay=3))
+        rows, took = self.client(s, 0.5, reps=2)
+        self.assertEqual(rows, ["1.5", "error"])
+        self.assertEqual(s.requests, 2)
+        self.assertLess(took, 2.5)
+
+
 class TimedDigestTests(unittest.TestCase):
     def run_dir(self, d, warm):
         root = Path(d) / "run"

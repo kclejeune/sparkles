@@ -41,10 +41,10 @@ different providers.
 
 | Host | Use | Why |
 |---|---|---|
-| Boat worker, `mise run bench:remote --executor boat:bx_ID A B` | Quick approximate A/B checks of changes of about 10% or more | A Boat worker is a shared virtual machine. The same binary's speed moves too much between its server processes for a verdict. |
-| `atlas` or `forge`, Intel Core i5-13500 | The batch query screen, effects under about 5%, queries under 0.3 ms and changes sensitive to code generation | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
-| `forge` | Published reference numbers | The main comparison tables use this host and preserve each run's environment. |
-| `wally`, Intel Core i7-12800H with 32 GiB RAM | Separately qualified memory-heavy query recovery | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
+| Boat worker, `mise run bench:remote --executor boat:bx_ID A B` | Use this worker for quick approximate A/B checks of changes of about 10% or more. | A Boat worker is a shared virtual machine. The same binary's speed moves too much between its server processes for a verdict. |
+| `atlas` or `forge`, Intel Core i5-13500 | Use these hosts for the batch query screen, effects under about 5%, queries under 0.3 ms and changes sensitive to code generation. | The published numbers come from this microarchitecture, and a result that depends on how one CPU schedules a loop has to be measured on that CPU. |
+| `forge` | Use this host for published reference numbers. | The main comparison tables use this host and preserve each run's environment. |
+| `wally`, Intel Core i7-12800H with 32 GiB RAM | Use this host for separately qualified recovery of memory-heavy queries. | Run each engine alone, record power state and leave room for the OS. Keep these results separate from Forge and do not compute cross-host latency ratios. |
 
 The microarchitecture matters. A fix to the merge join's zipper made `optional-count`
 28.5% faster and `minus` 31.9% faster at 1.05M triples on atlas, and the same comparison
@@ -1200,8 +1200,8 @@ numbers still come from the benchmark host.
 The batch query screen runs on a quiet Intel host, `atlas` or `forge`, under the host's
 locks with nothing beside it, and it is the screen of record. Both arms and the reruns of
 its flagged queries stay on that host. A screen through `bench:remote` on a Boat worker is
-approximate and decides nothing. There one binary timed against itself read between 0.91
-and 1.06, against a same-binary spread of about 2% on an Intel host.
+approximate and decides nothing, because one binary timed against itself on a Boat worker
+moves far more between server processes than the screen's 3% same-binary bound allows.
 
 ### Timing runs on an Intel host
 
@@ -1226,13 +1226,12 @@ the host's locks and queues a systemd user unit that takes `~/lanes/.bench.lock`
 checks again under the locks, times a first pass, reruns the queries flagged in any pair
 with more rounds and writes `verdict.md`.
 
-The harness forks curl, grep and awk for every request, which costs about 19 ms of client
-time per request and most of a screen's time. `REQUEST_CLIENT=persistent` sends the same
-requests from one process over one kept-alive connection, so a server process's work
-takes a fraction of the time. Back-to-back requests find the server warmer, though, and
-queries under about 0.5 ms read several times faster in `execMs` than with curl, so the
-persistent client measures a different regime and no screen uses it until it is qualified
-on an Intel host. `REQUEST_GAP_MS` adds a pause before each of its requests, and
+The harness forks curl, grep and awk for every request, and that client work takes most
+of a screen's time. `REQUEST_CLIENT=persistent` sends the same requests from one process
+over one kept-alive connection, so a server process's work takes a fraction of the time.
+Back-to-back requests find the server warmer, though, and the shortest queries read faster
+in `execMs` than with curl. The persistent client therefore measures a different regime,
+and no screen uses it until an Intel host run shows that it keeps the screen's verdicts. `REQUEST_GAP_MS` adds a pause before each of its requests, and
 `timing-kit.py stage --clients` times every arm under several clients in one run for that
 qualification.
 

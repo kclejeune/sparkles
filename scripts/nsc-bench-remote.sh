@@ -265,7 +265,7 @@ request() { # <query> -> "execMs wallSeconds", or "error"
 # the curl loop below.
 if [ "$PERSISTENT" = 1 ]; then
   cat > bench-client.py << 'PY'
-import argparse, http.client, os, re, shlex, subprocess, sys, time, urllib.parse
+import argparse, http.client, os, re, shlex, socket, subprocess, sys, threading, time, urllib.parse
 
 p = argparse.ArgumentParser()
 p.add_argument("--port", type=int, required=True)
@@ -317,39 +317,60 @@ def request(body):
         # other failure, a timeout among them, gives an error row as curl's does.
         reused = conn.sock is not None
         t0 = time.perf_counter()
-        deadline = None if LIMIT is None else t0 + LIMIT
         got = False
-
-        def left():
-            if deadline is None:
-                return None
-            r = deadline - time.perf_counter()
-            if r <= 0:
-                raise TimeoutError("the request took longer than MAX_TIME")
-            return r
-
+        # A watchdog shuts the socket down at the deadline, so that a server that trickles
+        # its headers or its body cannot keep one request alive past MAX_TIME. The socket's
+        # own timeout only bounds each read. The lock makes the request either finish or
+        # time out, never both.
+        lock = threading.Lock()
+        state = {"done": False, "fired": False}
+        timer = None
         try:
-            conn.timeout = left()
-            if conn.sock is not None:
-                conn.sock.settimeout(left())
-            conn.request("POST", "/bench/sparql", body, HEADERS)
+            if conn.sock is None:
+                conn.connect()
             sock = conn.sock
+
+            def expire():
+                with lock:
+                    if state["done"]:
+                        return
+                    state["fired"] = True
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+            if LIMIT is not None:
+                left = LIMIT - (time.perf_counter() - t0)
+                if left <= 0:
+                    raise TimeoutError("the request took longer than MAX_TIME")
+                sock.settimeout(left)
+                timer = threading.Timer(left, expire)
+                timer.daemon = True
+                timer.start()
+            conn.request("POST", "/bench/sparql", body, HEADERS)
             r = conn.getresponse()
             got = True
-            parts = []
-            while True:
-                sock.settimeout(left())
-                chunk = r.read(1 << 16)
-                if not chunk:
-                    break
-                parts.append(chunk)
-            data = b"".join(parts)
+            # read() returns the whole body, by its length, its chunks or the server's close,
+            # and leaves a connection that the server closed for the next request to reopen
+            data = r.read()
+            with lock:
+                state["done"] = True
+                fired = state["fired"]
+            if fired:
+                raise TimeoutError("the request took longer than MAX_TIME")
             break
         except (OSError, http.client.HTTPException) as e:
+            with lock:
+                state["done"] = True
+                fired = state["fired"]
             conn.close()
             conn = connect()
-            if got or not reused or attempt == 2 or not isinstance(e, STALE):
+            if fired or got or not reused or attempt == 2 or not isinstance(e, STALE):
                 return None, None, None
+        finally:
+            if timer is not None:
+                timer.cancel()
     w = time.perf_counter() - t0
     if r.status >= 400:
         return None, w, None

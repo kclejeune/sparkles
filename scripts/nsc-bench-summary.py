@@ -28,8 +28,9 @@ under "validity", with "valid" false when either bound fails, and the summary sa
 first lines.
 
 --check exits 0 when a pass may decide and 1 when it may not. A first pass needs a valid
-run with timings of both variants for every query. A rerun needs timings of both variants for every flagged query, and a valid run unless
-all of them take under 0.3 ms.
+run with timings of both variants for every query, each from at least two server processes
+of each variant. A rerun needs the same of every flagged query, and a valid run unless all
+of them take under 0.3 ms.
 """
 
 import csv
@@ -103,6 +104,17 @@ def validity(samples, order):
             "valid": not unjudged and sp <= MAX_SPREAD and min(rel) >= 1 - MAX_DRIFT and max(rel) <= 1 + MAX_DRIFT}
 
 
+MIN_EPOCHS = 2
+
+
+def thin(m):
+    """Whether a query's timings come from fewer than two server processes of either variant.
+
+    One process per variant cannot tell the binary from that process's luck, whatever the
+    query's speed and whatever the controls say about the host."""
+    return min(m.get("epochs_a", 0), m.get("epochs_b", 0)) < MIN_EPOCHS
+
+
 def check(path, kind, flagged):
     """The exit status of a host screen's pass: 0 when it may decide, 1 when it may not.
 
@@ -114,11 +126,12 @@ def check(path, kind, flagged):
     if kind == "rerun":
         for q in flagged.split():
             m = s["queries"].get(q, {}).get("exec_ms")
-            if not m or not m.get("n_a") or not m.get("n_b") or (not v and m["a"] >= MIN_MS):
+            if not m or not m.get("n_a") or not m.get("n_b") or thin(m) or (not v and m["a"] >= MIN_MS):
                 return 1
         return 0 if not v or v["valid"] else 1
-    # every query needs timings of both variants
-    return 0 if v and v["valid"] and not s.get("missing") else 1
+    # every query needs timings of both variants from at least two server processes of each
+    thin_any = any(thin(q["exec_ms"]) for q in s["queries"].values() if "exec_ms" in q)
+    return 0 if v and v["valid"] and not s.get("missing") and not thin_any else 1
 
 
 def main():
@@ -173,7 +186,8 @@ def main():
             return max(meds) / min(meds) - 1 if min(meds) > 0 else float("nan")
 
         ma, mb = med(a), med(b)
-        return {"a": ma, "b": mb, "ratio": mb / ma, "rounds": per_round, "spread_a": spread(a), "spread_b": spread(b), "n_a": len(a), "n_b": len(b)}
+        return {"a": ma, "b": mb, "ratio": mb / ma, "rounds": per_round, "spread_a": spread(a), "spread_b": spread(b), "n_a": len(a), "n_b": len(b),
+                "epochs_a": len({x[1] for x in a}), "epochs_b": len({x[1] for x in b})}
 
     summary = {"queries": {}, "geomean": {}, "validity": validity(samples["exec_ms"], order),
                "errors": {f"{q} {v}": n for (q, v), n in sorted(errors.items())}}
@@ -184,6 +198,7 @@ def main():
                 summary["queries"].setdefault(q, {})[m] = s
         if m == "exec_ms":
             summary["missing"] = [q for q in order if m not in summary["queries"].get(q, {})]
+            summary["thin"] = [q for q in order if m in summary["queries"].get(q, {}) and thin(summary["queries"][q][m])]
         ratios = [summary["queries"][q][m]["ratio"] for q in order if m in summary["queries"].get(q, {})]
         if ratios:
             summary["geomean"][m] = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
@@ -225,6 +240,9 @@ def main():
         p()
     if summary["missing"]:
         p("No timings of both variants for: " + ", ".join(summary["missing"]) + ", so the run cannot decide.")
+        p()
+    if summary["thin"]:
+        p("Timings from fewer than two server processes of a variant for: " + ", ".join(summary["thin"]) + ", so the run cannot decide them.")
         p()
     if errors:
         p("Failed timed requests: " + ", ".join(f"{q} {v} {n}" for (q, v), n in sorted(errors.items())) + ".")
