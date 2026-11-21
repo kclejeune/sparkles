@@ -679,3 +679,20 @@ fn assertions_not_read_agree_with_a_pass_over_the_whole_case() {
     assert!(compared > 100, "{compared}");
     eprintln!("{compared} compared, {counted} counted the assertions, {wider} wider");
 }
+
+#[test]
+fn a_terminology_without_assertions_takes_no_extraction() {
+    let (all, _) = read("DisjointClasses(:A :B)\nSubClassOf(:C :A)");
+    let all: Vec<&AxiomKind> = all.iter().collect();
+    let a = Class::new("http://e/#A");
+    let mut stream = |_: &mut dyn FnMut(&AxiomKind) -> bool| true;
+    // a bound of no work at all: any extraction would pass it
+    let c = coverage(&all, &[], true, [&a], 0, &|| false, Some(&mut stream)).unwrap();
+    assert_eq!(
+        c,
+        Coverage {
+            consistency_known: true,
+            ..Coverage::default()
+        }
+    );
+}

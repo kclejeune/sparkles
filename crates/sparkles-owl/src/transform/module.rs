@@ -163,6 +163,26 @@ pub(crate) fn coverage<'c>(
             ..Coverage::default()
         });
     }
+    // nothing left out and no dropped axiom with logical content, such as a terminology
+    // without assertions, which then costs one look at the stream
+    if left_out.is_empty()
+        && let Some(d) = dropped.as_deref_mut()
+    {
+        let mut any = false;
+        let finished = d(&mut |k| {
+            any = Index::indexed(k);
+            !any
+        });
+        if !finished {
+            return Err(Stopped);
+        }
+        if !any {
+            return Ok(Coverage {
+                consistency_known: true,
+                ..Coverage::default()
+            });
+        }
+    }
     let mut ix = Index::new(axioms);
     let wanted: FxHashSet<&AxiomKind> = left_out.iter().copied().collect();
     let mut left = vec![false; ix.axioms.len()];
