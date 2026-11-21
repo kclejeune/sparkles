@@ -595,6 +595,94 @@ class Discovery(Base):
             s, p = self.same_verdict(d, *args, expect=1)
             self.assertIn("the whole suite runs in one process, since unittest.TestSuite was rebound", p.stdout)
 
+    def test_a_module_kind_that_counts_dictionary_reads_is_read_as_serial_discovery_does(self):
+        # Review r9 finding 1: the runner reads a module's dictionary without asking it.
+        d = self.suite(test_a=ONE, test_z="""
+            import sys, types, unittest
+
+            DICTS = 0
+
+            class Z(unittest.TestCase):
+                def test_ok(self):
+                    pass
+
+            def fail():
+                raise AssertionError("the hook must run")
+
+            def hook(loader, tests, pattern):
+                return unittest.TestSuite([unittest.FunctionTestCase(fail)])
+
+            class Module(types.ModuleType):
+                def __getattribute__(self, name):
+                    global DICTS
+                    if name == "__dict__":
+                        DICTS += 1
+                    if name == "load_tests":
+                        return hook if DICTS == 1 else None
+                    return super().__getattribute__(name)
+
+            sys.modules[__name__].__class__ = Module
+            """)
+        for args in ((), ("--split", "test_z")):
+            s, p = self.same_verdict(d, *args, expect=1)
+            self.assertIn("the whole suite runs in one process, since test_z is a module of kind test_z.Module", p.stdout)
+
+    def test_a_rebound_base_suite_class_runs_as_serial_discovery_does(self):
+        # Review r9 finding 2: a suite of a kind derived from BaseTestSuite is one occurrence.
+        d = self.suite(test_a="""
+            import unittest
+
+            class Checking(unittest.BaseTestSuite):
+                pass
+
+            unittest.TestSuite = Checking
+            unittest.TestLoader.suiteClass = Checking
+
+            class A(unittest.TestCase):
+                def test_a(self):
+                    pass
+            """, test_z=ONE)
+        for args in ((), ("--split", "test_a")):
+            s, p = self.same_verdict(d, *args, expect=0)
+            self.assertIn("the whole suite runs in one process, since unittest.TestSuite was rebound", p.stdout)
+
+    def test_a_root_that_holds_a_test_that_is_not_a_testcase_names_its_module(self):
+        # Review r9 finding 3: the entry is named after the test's module, not its id().
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            class Check:
+                def id(self):
+                    return "test_z.Check.test_ok"
+
+                def __call__(self, result):
+                    result.startTest(self)
+                    result.addSuccess(self)
+                    result.stopTest(self)
+
+            def load_tests(loader, tests, pattern):
+                loader.suiteClass = lambda items=(): unittest.TestSuite([Check()])
+                return tests
+            """)
+        for args in ((), ("--split", "test_z")):
+            s, p = self.same_verdict(d, *args, expect=0)
+            self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
+
+    def test_a_split_asked_of_a_suite_that_runs_whole_is_not_refused(self):
+        # A root of a kind of its own is not looked into, so it has no named entries.
+        d = self.suite(test_a=ONE, test_z="""
+            import unittest
+
+            class Root(unittest.TestSuite):
+                pass
+
+            def load_tests(loader, tests, pattern):
+                loader.suiteClass = Root
+                return tests
+            """)
+        s, p = self.same_verdict(d, "--split", "test_a", expect=0)
+        self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
+
     def test_a_repeated_occurrence_runs_each_time(self):
         d = self.suite(test_rep="""
             import unittest

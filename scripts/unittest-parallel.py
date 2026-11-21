@@ -22,7 +22,9 @@ suites and TestCase tests, including a default suite with attributes of its own 
 run() given to the instance, when a test module has changed unittest's suite classes or put
 other classes under their names, and when test classes of one module run in more than
 one entry, as when one test module imports another's class, since they can share that
-module's state. The runner does not ask what such a hook or suite does. State that tests
+module's state. The runner does not ask what such a hook or suite does, reads modules'
+attributes from their own dictionaries, and counts a suite of a kind of its own as one
+occurrence without listing what it holds. State that tests
 share in some other way, such as through a helper module's globals, is not detected, so a
 test that depends on a test in another unit having run first can pass or skip here and fail
 serially. The same holds for the tests of a split module, which each run in a unit of their
@@ -96,6 +98,31 @@ _SUITE_DICTS = {cls: dict(vars(cls)) for cls in _SUITE_CLASSES}
 _SUITE_NAMES = [(unittest, "unittest", "TestSuite", _SUITE), (unittest.suite, "unittest.suite", "TestSuite", _SUITE),
                 (unittest, "unittest", "BaseTestSuite", _BASE_SUITE),
                 (unittest.suite, "unittest.suite", "BaseTestSuite", _BASE_SUITE)]
+# A module's dictionary, read through the descriptor of the module type itself, so that a
+# module of a kind of its own cannot see or answer the read.
+_MODULE_DICT = types.ModuleType.__dict__["__dict__"]
+# A default suite's dictionary, read the same way, in case a test module has changed the class.
+_SUITE_DICT = _BASE_SUITE.__dict__["__dict__"]
+
+
+def _dict(module):
+    """MODULE's own dictionary, or an empty one for an object that is not a module. Neither
+    this nor the type checks below look up an attribute that a test's own code can answer."""
+    return _MODULE_DICT.__get__(module) if issubclass(type(module), types.ModuleType) else {}
+
+
+def _is_suite(node):
+    return issubclass(type(node), _BASE_SUITE)
+
+
+def _is_case(node):
+    return issubclass(type(node), _CASE)
+
+
+def _default(node):
+    """Whether NODE is of one of unittest's own suite classes, whose contents the runner can
+    list without running code of a test module's."""
+    return type(node) in _SUITE_CLASSES
 
 
 # ----- discovery, in the discovery child and in every unit ---------------------------------
@@ -113,7 +140,7 @@ class _TaggingLoader(unittest.TestLoader):
         # unittest looks for the hook here, for test modules and packages alike. The module's
         # dictionary is read directly, so the runner adds no lookup that code could answer, and
         # a module that can answer unittest's own lookup with code counts as having a hook.
-        own = vars(module)
+        own = _dict(module)
         name = own.get("__name__")
         if "load_tests" in own:
             self.hooks.append(f"{name} defines load_tests")
@@ -123,33 +150,33 @@ class _TaggingLoader(unittest.TestLoader):
             self.hooks.append(f"{name} is a module of kind {type(module).__module__}.{type(module).__qualname__}")
         suite = super().loadTestsFromModule(module, *args, **kwargs)
         # The suite is kept with its name, so that its id is not reused by another.
-        self.labels.setdefault(id(suite), (suite, module.__name__))
+        self.labels.setdefault(id(suite), (suite, name))
         return suite
 
 
 def _tree(node, deep=True):
-    if isinstance(node, _SUITE):
+    """NODE's description. A suite of a kind of its own is described by its kind alone, since
+    listing it would run its code."""
+    if _is_suite(node):
         cls = type(node)
-        tree = {"suite": f"{cls.__module__}.{cls.__qualname__}", "own": sorted(set(vars(node)) - _SUITE_KEYS)}
-        if deep:
-            tree["tests"] = [_tree(t) for t in node]
+        tree = {"suite": f"{cls.__module__}.{cls.__qualname__}"}
+        if _default(node):
+            tree["own"] = sorted(set(_SUITE_DICT.__get__(node)) - _SUITE_KEYS)
+            if deep:
+                tree["tests"] = [_tree(t) for t in node]
         return tree
     return _id(node)
 
 
 def _own(module, name):
-    """MODULE's attribute NAME from its dictionary, or None. The runner reads test modules'
-    attributes this way, so that no lookup it makes reaches a module's own __getattr__."""
-    try:
-        return vars(module).get(name)
-    except TypeError:
-        return None
+    """MODULE's attribute NAME from its own dictionary, or None."""
+    return _dict(module).get(name)
 
 
 def _id(test):
-    """TEST's id, or for a test that is not a TestCase, a name for its kind, which the runner
-    finds without asking the test anything."""
-    if isinstance(test, _CASE):
+    """TEST's id, or for a test that is not a TestCase or a suite of a kind of its own, a name
+    for its kind, which the runner finds without asking the test anything."""
+    if _is_case(test):
         return test.id()
     return f"<{type(test).__module__}.{type(test).__qualname__}>"
 
@@ -159,14 +186,14 @@ def _custom(node):
     TestCase does, or None. A suite of a kind of its own, a default suite with attributes of
     its own, such as a run() given to the instance, and a test that is not a TestCase can
     each do anything when they run, including depend on the result of what ran before."""
-    if isinstance(node, _SUITE):
+    if _is_suite(node):
         if type(node) is not _SUITE:
             return f"has a suite of kind {type(node).__module__}.{type(node).__qualname__}"
-        own = sorted(set(vars(node)) - _SUITE_KEYS)
+        own = sorted(set(_SUITE_DICT.__get__(node)) - _SUITE_KEYS)
         if own:
             return f"has a suite with attributes of its own: {', '.join(own)}"
         return None
-    if not isinstance(node, _CASE):
+    if not _is_case(node):
         return f"has a test of kind {type(node).__module__}.{type(node).__qualname__}"
     return None
 
@@ -186,7 +213,8 @@ def _changed_suite_classes():
 
 
 def _leaves(node):
-    if isinstance(node, _SUITE):
+    """The occurrences under NODE in order. A suite of a kind of its own counts as one."""
+    if _default(node):
         for t in node:
             yield from _leaves(t)
     else:
@@ -201,6 +229,8 @@ def _label(loader, entry, index):
         # and unittest.loader.ModuleSkipped.MODULE.
         if type(t).__module__ == "unittest.loader":
             return _id(t).rsplit(".", 1)[-1]
+        if not _is_case(t):
+            return type(t).__module__
         return _id(t).rsplit(".", 2)[0]
     return f"entry-{index}"
 
@@ -220,14 +250,14 @@ def _plain(label, entry):
     if module is None:
         return "it is not a module of its own"
     for hook in ("setUpModule", "tearDownModule", "parallel_absorb"):
-        if hook in vars(module):
+        if hook in _dict(module):
             return f"it defines {hook}"
     if unittest.case._module_cleanups:
         return "a module cleanup is registered"
     seen = set()
 
     def walk(node):
-        if isinstance(node, _SUITE):
+        if _is_suite(node):
             for t in node:
                 why = walk(t)
                 if why:
@@ -258,7 +288,9 @@ def discover(directory):
     before = set(sys.modules)
     loader = _TaggingLoader()
     suite = loader.discover(str(directory))
-    entries = list(suite)
+    # A root of a kind of its own is not listed, since listing it would run its code, and it
+    # sends the whole suite to one process.
+    entries = list(suite) if _default(suite) else []
     changed = _changed_suite_classes()
     serial = _serial(loader, suite, entries, changed)
     units = []
@@ -281,7 +313,8 @@ def discover(directory):
                      if callable(_own(sys.modules[m], "parallel_export")))
     # The hooks, the root and each suite's own attributes are part of the description, so a
     # unit whose discovery made them differently fails its comparison with the runner's.
-    return suite, entries, {"root": _tree(suite, deep=False), "changed": changed,
+    return suite, entries, {"root": _tree(suite, deep=False), "leaves": [_id(t) for t in _leaves(suite)],
+                            "changed": changed,
                             "hooks": loader.hooks, "units": units, "exports": exports,
                             "serial": serial}
 
@@ -303,7 +336,7 @@ def _serial(loader, suite, entries, changed):
         why = _custom(node)
         if why:
             return f"{where} {why}"
-        if isinstance(node, _SUITE):
+        if _is_suite(node):
             for t in node:
                 why = custom(t, where)
                 if why:
@@ -378,7 +411,7 @@ def worker_main(directory, plan_path, index, split, record_path, absorb_path):
         with open(absorb_path) as f:
             exports = json.load(f)
         label = plan["units"][index]["label"]
-        sys.modules[label].parallel_absorb(exports.get(label, []))
+        _own(sys.modules[label], "parallel_absorb")(exports.get(label, []))
     # A suite drops each test once it has run, so the occurrences are listed first.
     ran = [_id(t) for t in _leaves(entry)]
     warnings = None if sys.warnoptions else "default"
@@ -392,7 +425,7 @@ def worker_main(directory, plan_path, index, split, record_path, absorb_path):
         expectedFailures=len(result.expectedFailures),
         unexpectedSuccesses=len(result.unexpectedSuccesses),
         successful=result.wasSuccessful(),
-        exports={m: sys.modules[m].parallel_export() for m in plan["exports"]},
+        exports={m: _own(sys.modules[m], "parallel_export")() for m in plan["exports"]},
     )
     sys.stderr.flush()
     _write_json(record_path, record)
@@ -569,13 +602,14 @@ def plan_units(description, split):
     """The units to run: (name, entry index, leaf index or -1), longest first, with the
     absorbing modules' units last."""
     units = description["units"]
+    if description["serial"]:
+        # A split asks nothing of a suite that runs whole, which may have no named entries.
+        print(f"unittest-parallel: the whole suite runs in one process, since {description['serial']}")
+        return [("the whole suite", -1, -1)], []
     labels = [u["label"] for u in units]
     missing = [m for m in split if m not in labels]
     if missing:
         raise SystemExit(f"unittest-parallel: no module {', '.join(missing)} in the suite")
-    if description["serial"]:
-        print(f"unittest-parallel: the whole suite runs in one process, since {description['serial']}")
-        return [("the whole suite", -1, -1)], []
     first, last = [], []
     for i, u in enumerate(units):
         if u["inert"]:
@@ -726,7 +760,7 @@ def supervise(a, workdir, active):
             except ValueError:
                 record = {"complete": False}
         if job.index < 0:
-            leaves = [leaf for u in units for leaf in u["leaves"]]
+            leaves = description["leaves"]
         else:
             leaves = units[job.index]["leaves"]
         assigned = leaves if job.split < 0 else [leaves[job.split]]
