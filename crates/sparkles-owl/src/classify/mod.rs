@@ -429,6 +429,9 @@ pub struct Stats {
     pub index: Duration,
     pub saturation: Duration,
     pub taxonomy: Duration,
+    /// the time the locality modules of a run that left axioms out took to decide which
+    /// classes keep their complete answer, 0 for a run that left nothing out
+    pub coverage: Duration,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
     pub outside_el: OutsideEl,
@@ -576,6 +579,7 @@ impl Classification {
             return;
         }
         self.complete = false;
+        let start = std::time::Instant::now();
         let left: Vec<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
         // a partial answer that left the consistency unknown has every class open
         if self.consistency == Consistency::Unknown {
@@ -590,6 +594,7 @@ impl Classification {
         if !c.consistency_known {
             self.consistency = Consistency::Unknown;
         }
+        self.stats.coverage = start.elapsed();
         if c.incomplete.is_empty() {
             return;
         }
