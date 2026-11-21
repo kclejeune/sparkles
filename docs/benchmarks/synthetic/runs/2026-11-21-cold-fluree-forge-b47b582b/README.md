@@ -34,9 +34,9 @@ value fingerprints agree on every query, and the exact fingerprints differ only 
 - `m2.sh.txt` runs the three rounds again into `dcold-1` to `dcold-3` with a 1 s pause after
   the readiness check, which it adds to a copy of `bench-lib.sh` as the single line
   `sleep "${COLD_DELAY:-0}"`. It also records Sparkles' server timings for cold requests
-  in `native/native.json`.
+  in `native/native.json`, with each request's timing metadata in `native/native.log`.
 - `m3.sh.txt` adds the same pause to a copy of `bench-regressions.py` and records server
-  timings at pauses of 0 and 1 s in `m3`. `m4.sh.txt` compares pauses of 0, 0.2, 0.5, 1 and
+  timings at pauses of 0 and 1 s in `m3`, with the metadata in `m3/d0.log` and `m3/d1.log`. `m4.sh.txt` compares pauses of 0, 0.2, 0.5, 1 and
   3 s, and `serve --no-code-prefault` and `MIMALLOC_PURGE_DELAY=-1` at 1 s, in `m4`.
   `m5.sh.txt` records the `profile=io` timings of `count-all` at pauses of 0 and 1 s in `m5`.
 - `fluree-october-store` holds the cold samples of Fluree on the store loaded for the

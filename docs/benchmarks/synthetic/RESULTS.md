@@ -284,11 +284,9 @@ on CPU 11 and the server on CPUs 0–9, with the result cache off.
 Cold mode restarts the server and evicts its files from the OS page cache before each
 query, three times per query, and reports the median request time without process
 startup. Eviction does not guarantee that the device itself is cold. A Sparkles server is
-ready 0.09 s after a restart at both scales. In the full run of 28 queries, Sparkles was
-fastest on 21 cold queries at 1.05M and on 24 at 10.5M. Its five losses to Fluree at 1.05M
-did not hold when both engines were measured again in one run, which
-[Cold against Fluree at 1.05M](#cold-against-fluree-at-105m) describes. The other cold
-losses of the full run are these:
+ready 0.09 s after a restart at both scales. Against Fluree at 1.05M,
+[Cold against Fluree at 1.05M](#cold-against-fluree-at-105m) gives the current figures.
+Against the other engines, the run of all 28 queries found these cold losses:
 
 Jena also completes `knows-reach` with the larger stack after three process restarts
 and file-cache evictions at each scale. Its median request times are 1,417.885 ms and
@@ -329,10 +327,8 @@ followed by the fastest and the slowest.
 
 Fluree answers its readiness check 0.02 s after a restart, against 0.09 s for Sparkles.
 Most of its first requests take 14 to 55 ms, and a few `count-all` and `distinct-obj`
-requests take 1.5 to 2.6 ms. The store loaded for the earlier run shows the same split, so
-the new load does not cause it. The earlier Fluree medians of 2.2, 1.6, 12.1 and 8.5 ms on
-`count-all`, `distinct-obj`, `contains` and `employee-docs` were not reproduced, and the
-cause is not known.
+requests take 1.5 to 2.6 ms. An older Fluree store of the same data shows the same split,
+so it does not come from this load, and its cause is not known.
 
 The harness sends the timed request as soon as the server answers its readiness check. A
 second run of the same rounds waited 1 s between the readiness check and the request, in a
@@ -354,12 +350,12 @@ Every Sparkles query takes 8 to 11 ms longer than without the pause. In the serv
 `profile=io` timings, `count-all` reads no index block and one vocabulary page, for the
 `rdf:type` lookup of the planner's characteristic sets. That lookup takes 0.2 ms right
 after the readiness check and 7.5 to 8.4 ms after a 1 s pause, while parsing, execution
-and serialization do not change, and pauses of 0.2, 0.5 and 3 s cost the request as much. A single direct 4 KiB read on forge's
-NVMe drive takes 0.1 to 0.5 ms within 50 ms of the previous read and about 8 ms after 0.2
-to 1 s without reads, which matches the drive leaving a low-power state. The harness's
-cold rows on this page were taken with the drive awake from the restart. A server that has
-been idle for longer pays the wake once, on the first request that reads its files, and a
-request that reads nothing does not.
+and serialization do not change. Pauses of 0.2, 0.5 and 3 s cost the request as much.
+Single direct 4 KiB reads on forge's NVMe drive take 0.1 to 0.5 ms within 50 ms of the
+previous read, while after 0.2 to 1 s without reads some of them take about 8 ms. That is
+consistent with the drive leaving a low-power state, which was not measured directly. The
+harness's cold rows on this page were taken right after a restart, when the drive had just
+been read.
 
 Cold `contains` spends 3.9 to 6.4 ms of its 11 to 14 ms in the server on planning, where
 the selectivity sample of its filter decodes four PSO columns. The

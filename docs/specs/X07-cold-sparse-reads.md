@@ -1182,6 +1182,13 @@ where the execution took 0.03 ms and most of the time passed outside the server'
 That cost follows the wake-up of idle threads and cores rather than any work of the query,
 and it is a follow-up under roadmap item 572.
 
+A later run at 1.05M found a second part of that cost. After a pause of 0.2 s or more past
+readiness, cold `count-all` spends about 8 ms in its one vocabulary read instead of 0.2 ms,
+and single direct reads on forge's NVMe drive sometimes take about 8 ms after such a gap,
+which is consistent with the drive waking from a low-power state. The
+[synthetic results](../benchmarks/synthetic/RESULTS.md#cold-against-fluree-at-105m) hold
+that run.
+
 The final code was compared with main at `21da069d` on forge on 2026-11-02, with both
 binaries built the same way and both forge locks held for the whole run. The
 [run record](../benchmarks/synthetic/runs/2026-11-02-first-request-forge/validation.json)
