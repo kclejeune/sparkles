@@ -1605,10 +1605,12 @@ of the `recompute` node it was before.
   not by the input. The heap that collects the best rows, its sort keys' strings, the
   kept rows a refill still holds and that bookkeeping are charged to the pass's memory
   budget at every row, so a window over long keys fails with a memory error while it
-  builds and not after. A fresh build appends the heap's sorted rows without searching
+  builds and not after. The keys that a pass computes for its changes and for rows
+  loaded from a checkpoint are charged the same way. A fresh build appends the heap's sorted rows without searching
   among them, so ties cost no more than other rows. Computing the keys of loaded rows and
-  of a pass's changes, the heap's sort and the placement of its rows all obey the pass's
-  cancellation and deadline. A pass that fails while it places the rows leaves the window
+  of a pass's changes and the placement of the heap's rows obey the pass's cancellation
+  and deadline, which are also checked before and after the heap's sort but not within
+  it or within one key's decoding. A pass that fails while it places the rows leaves the window
   empty with the input's total, which the next changing pass refills. Named views build
   without a memory limit, for this operator as for every other, which item 1298 takes.
 - Rows that the order does not tell apart keep the order in which they entered the kept
