@@ -1282,6 +1282,8 @@ pub struct Axioms {
     pub functional: Vec<Role>,
     /// `range(d) = R`, for a data role of a checker component and the checker's range
     pub dt_ranges: Vec<(Role, Rid)>,
+    /// the pairs of disjoint data roles of checker components
+    pub dt_disjoint: Vec<(Role, Role)>,
     /// `HasKey(c (p…) (d…))`
     pub keys: Vec<Key>,
     /// the individuals of assertions, which classification checks for consistency
@@ -1301,7 +1303,11 @@ impl Axioms {
     pub fn append_mapped(&mut self, chunk: Axioms, nodes: &[Ex], roles: &[Role]) {
         let n = |e: Ex| nodes[e as usize];
         let r = |x: Role| roles[x as usize];
-        debug_assert!(chunk.data_ranges.is_empty() && chunk.dt_ranges.is_empty());
+        debug_assert!(
+            chunk.data_ranges.is_empty()
+                && chunk.dt_ranges.is_empty()
+                && chunk.dt_disjoint.is_empty()
+        );
         self.subs
             .extend(chunk.subs.into_iter().map(|(a, b)| (n(a), n(b))));
         for mut d in chunk.disjoint {
@@ -1354,6 +1360,7 @@ impl Axioms {
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
             + self.dt_ranges.capacity() * 8
+            + self.dt_disjoint.capacity() * 8
             + self.functional.capacity() * 4
             + self.keys.capacity() * 72
             + self.individuals.capacity() * 4
@@ -1379,6 +1386,7 @@ impl Axioms {
             + self.ranges.capacity() * 8
             + self.data_ranges.capacity() * 8
             + self.dt_ranges.capacity() * 8
+            + self.dt_disjoint.capacity() * 8
             + self.functional.capacity() * 4
             + self
                 .keys
@@ -2825,24 +2833,40 @@ fn dt_index(
                 .horn
                 .as_ref()
                 .is_some_and(|h| h.is(e, super::horn::HornIx::FILLER));
-        let told = (!other).then(|| {
-            ix.told_of(ix.head(e))
-                .iter()
-                .copied()
-                .filter(|&t| !matches!(it.nodes[t as usize], Node::DtFire(_)))
-                .collect()
-        });
+        // a told subsumer that has no marker for the atom's component, such as one the
+        // Horn index tells after the markers are made, would make the rule's answer
+        // depend on the order of the conclusions, so the atom has more than its told uses
+        let told: Option<Box<[Ex]>> = (!other)
+            .then(|| {
+                ix.told_of(ix.head(e))
+                    .iter()
+                    .copied()
+                    .filter(|&t| !matches!(it.nodes[t as usize], Node::DtFire(_)))
+                    .collect::<Box<[Ex]>>()
+            })
+            .filter(|ts| {
+                ts.iter()
+                    .all(|&t| t == TOP || refire.get(&t).is_some_and(|cs| cs.contains(&comp)))
+            });
         debug_assert!(
             key.at_least,
             "a body atom of the Horn tier is an at-least atom"
         );
         body[comp as usize].push(Body { e, told });
     }
+    let mut disjoint: Vec<(Role, Role)> = ax
+        .dt_disjoint
+        .iter()
+        .copied()
+        .filter(|(a, b)| roles.contains_key(a) && roles.contains_key(b))
+        .collect();
+    disjoint.sort_unstable();
+    disjoint.dedup();
     DtIx::new(
         it.dt.atoms.clone(),
         roles,
         body,
-        Vec::new(),
+        disjoint,
         it.dt.ranges.clone(),
         run.comps.clone(),
         refire,

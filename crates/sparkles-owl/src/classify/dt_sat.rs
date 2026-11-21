@@ -117,7 +117,10 @@ impl DtIx {
         }
     }
 
-    /// The bytes the tables hold, the cache and the ranges with them.
+    /// The bytes the tables hold, the cache and the ranges with them. The saturation
+    /// charges the growth of the cache and the ranges as it makes it, and the estimates
+    /// that read this, the base before the saturation and the retained state after it,
+    /// are built from the tables alone, so nothing is counted twice.
     pub fn bytes(&self) -> usize {
         let key = std::mem::size_of::<DtKey>();
         self.keys.capacity() * key
@@ -370,7 +373,12 @@ pub fn collect(ix: &Index, ctx: &Contexts, dynamic: Option<&Dynamic>, worst: &mu
     for (w, &s) in worst.iter_mut().zip(dt.sticky.lock().iter()) {
         *w = (*w).max(s);
     }
+    // an unsatisfiable context has every subsumer, so an evaluation it made before its
+    // conflict leaves nothing out
     let mut read = |st: &State| {
+        if st.bottom {
+            return;
+        }
         if let Some(x) = &st.extra {
             for s in &x.dt {
                 let w = &mut worst[s.comp as usize];

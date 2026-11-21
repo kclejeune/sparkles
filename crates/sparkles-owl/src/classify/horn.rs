@@ -812,6 +812,7 @@ struct Out {
     premises: Vec<Ex>,
     /// the data axioms of checker components, as the EL normalization keeps them
     dt_ranges: Vec<(Role, super::dtcheck::range::Rid)>,
+    dt_disjoint: Vec<(Role, Role)>,
     functional: Vec<Role>,
     individuals: Vec<Ex>,
 }
@@ -827,6 +828,7 @@ impl Out {
         h.clash.extend(self.clash);
         h.premises.extend(self.premises);
         ax.dt_ranges.extend(self.dt_ranges);
+        ax.dt_disjoint.extend(self.dt_disjoint);
         ax.functional.extend(self.functional);
         ax.individuals.extend(self.individuals);
     }
@@ -1383,6 +1385,28 @@ impl Norm<'_> {
                 let x = self.it.dt_range(r)?;
                 let r = self.it.role(RoleName::Data(d.clone()));
                 self.out.dt_ranges.push((r, x));
+                Ok(())
+            }
+            // the pairs of a disjointness of checker properties, which the pre-pass puts
+            // in one component; one with the top or bottom data property, which have no
+            // component, is left out
+            K::DisjointDataProperties(ps) if ps.iter().all(|d| self.it.dt_checker(d)) => {
+                let rs: Vec<Role> = ps
+                    .iter()
+                    .map(|d| self.it.role(RoleName::Data(d.clone())))
+                    .collect();
+                for (i, &a) in rs.iter().enumerate() {
+                    for &b in &rs[i + 1..] {
+                        self.out.dt_disjoint.push((a.min(b), a.max(b)));
+                    }
+                }
+                Ok(())
+            }
+            // a definition outside OWL 2 EL makes every property it is used on a checker
+            // property, whose atoms read it in place of its datatype, so the run takes it
+            // when the checker converts it
+            K::DatatypeDefinition(d, _) if self.it.dt_run.is_some() => {
+                self.it.dt_range(&DataRange::Datatype(d.clone()))?;
                 Ok(())
             }
             K::FunctionalDataProperty(d) if self.it.dt_checker(d) => {

@@ -317,24 +317,111 @@ fn a_cancellation_polled_once_stops_a_checker_run_wherever_it_comes() {
 }
 
 #[test]
-fn a_disjointness_of_checker_properties_is_reported() {
-    // `DisjointDataProperties` makes its properties one checker component. No tier takes
-    // the axiom, so the run must report it rather than drop it: `A` would be
-    // unsatisfiable with it. The second body adds a disjunctive axiom, which Tier D does
-    // not take beside data, so the Horn rules run and leave it out as well.
+fn a_disjointness_of_checker_properties_is_taken() {
+    // `DisjointDataProperties` makes its properties one checker component, and the rule
+    // reads its pairs: `A` has the value 1 by both. The second body adds a disjunctive
+    // axiom, which Tier D does not take beside data, so the Horn rules run.
     for extra in ["", "SubClassOf(:X ObjectUnionOf(:Y :Z))"] {
         let (sat, ax) = run(&format!(
             "DisjointDataProperties(:d :e)\n\
              SubClassOf(:A DataHasValue(:d \"1\"^^xsd:integer))\n\
-             SubClassOf(:A DataHasValue(:e \"1\"^^xsd:integer))\n{extra}"
+             SubClassOf(:A DataHasValue(:e \"1\"^^xsd:integer))\n\
+             SubClassOf(:B DataHasValue(:d \"1\"^^xsd:integer))\n\
+             SubClassOf(:B DataHasValue(:e \"2\"^^xsd:integer))\n{extra}"
         ));
         assert!(!sat.interner.dt.is_empty(), "{extra}");
+        assert!(sub(&sat, "A", "Nothing"), "{extra}");
+        assert!(!sub(&sat, "B", "Nothing"), "{extra}");
         assert!(
-            matches!(gap_of(&sat, &ax[0]), Some(Gap::Outside { .. })),
+            gap_of(&sat, &ax[0]).is_none(),
             "{extra}: {:?}",
             sat.excluded()
         );
     }
+}
+
+#[test]
+fn a_disjointness_reaches_the_subproperties() {
+    let (sat, _) = run("DisjointDataProperties(:d :e)\n\
+         SubDataPropertyOf(:d2 :d)\n\
+         SubDataPropertyOf(:e2 :e)\n\
+         SubClassOf(:A DataHasValue(:d2 \"1\"^^xsd:integer))\n\
+         SubClassOf(:A DataHasValue(:e2 \"1\"^^xsd:integer))");
+    assert!(sub(&sat, "A", "Nothing"));
+    assert!(sat.excluded().is_empty(), "{:?}", sat.excluded());
+}
+
+#[test]
+fn a_disjointness_with_assertions_decides_consistency() {
+    for (v, consistent) in [("1", false), ("2", true)] {
+        let (_, _, c) = run_consistent(
+            &format!(
+                "DisjointDataProperties(:d :e)\n\
+                 DataPropertyAssertion(:d :a \"1\"^^xsd:integer)\n\
+                 DataPropertyAssertion(:e :a \"{v}\"^^xsd:integer)"
+            ),
+            1,
+        );
+        assert_eq!(c, consistent, "{v}");
+    }
+}
+
+#[test]
+fn a_disjointness_that_no_tier_takes_is_reported() {
+    let body = "DisjointDataProperties(:d :e)\n\
+         SubClassOf(:A DataHasValue(:d \"1\"^^xsd:integer))\n\
+         SubClassOf(:A DataHasValue(:e \"1\"^^xsd:integer))";
+    let ax = axioms(body);
+    let all: Vec<&AxiomKind> = ax.iter().collect();
+    let mut sat = Saturation::new();
+    sat.saturate(
+        &all,
+        None,
+        &Limits {
+            el_only: true,
+            ..Limits::default()
+        },
+    )
+    .unwrap();
+    assert!(gap_of(&sat, &ax[0]).is_some(), "{:?}", sat.excluded());
+    // with the top data property the axiom has no component, and stays out
+    let (sat, ax) = run("DisjointDataProperties(:d owl:topDataProperty)\n\
+         SubClassOf(:A DataHasValue(:d \"1\"^^xsd:integer))\n\
+         SubClassOf(:B DataAllValuesFrom(:d xsd:int))");
+    assert!(gap_of(&sat, &ax[0]).is_some(), "{:?}", sat.excluded());
+    // beside literals of datatypes outside OWL 2 EL and a disjunctive axiom, which Tier
+    // D can take (row 1303), the axiom is used or reported, never dropped
+    let (sat, ax) = run("DisjointDataProperties(:d :e)\n\
+         SubClassOf(:A DataHasValue(:d \"1\"^^xsd:int))\n\
+         SubClassOf(:A DataHasValue(:e \"1\"^^xsd:int))\n\
+         SubClassOf(:X ObjectUnionOf(:Y :Z))");
+    assert!(
+        sub(&sat, "A", "Nothing") || gap_of(&sat, &ax[0]).is_some(),
+        "{:?}",
+        sat.excluded()
+    );
+}
+
+#[test]
+fn a_definition_the_checker_cannot_convert_is_reported() {
+    for def in [
+        "DatatypeDefinition(:t DatatypeRestriction(xsd:string xsd:pattern \"a*\"))",
+        "DatatypeDefinition(:t DataUnionOf(:t xsd:int))",
+    ] {
+        let (sat, ax) = run(&format!(
+            "{def}\nSubClassOf(:A DataSomeValuesFrom(:d :t))\n\
+             SubClassOf(:B DataAllValuesFrom(:d xsd:int))"
+        ));
+        assert!(
+            gap_of(&sat, &ax[0]).is_some(),
+            "{def}: {:?}",
+            sat.excluded()
+        );
+    }
+    // an unused definition beside the checker is taken: it says nothing of a class
+    let (sat, ax) = run("DatatypeDefinition(:t DataUnionOf(xsd:boolean xsd:int))\n\
+         SubClassOf(:B DataAllValuesFrom(:d xsd:int))");
+    assert!(gap_of(&sat, &ax[0]).is_none(), "{:?}", sat.excluded());
 }
 
 #[test]
@@ -374,4 +461,92 @@ fn an_added_definition_that_makes_a_checker_component_starts_again() {
     assert_eq!(out.taxonomy, want.taxonomy);
     assert_eq!(sat.excluded(), fresh.excluded());
     assert!(sub(&sat, "A", "B"));
+}
+
+#[test]
+fn a_cover_before_a_conflict_leaves_nothing_out() {
+    // A's context finds the cover of `∃d.boolean` before the chain to owl:Nothing ends,
+    // and an unsatisfiable class has every subsumer
+    let (sat, _) = run(&format!(
+        "SubClassOf(DataHasValue(:d {BOOL}) :C)\n\
+         SubClassOf(DataHasValue(:d {NOT_BOOL}) :D)\n\
+         SubClassOf(:A DataSomeValuesFrom(:d xsd:boolean))\n\
+         SubClassOf(:A :E)\nSubClassOf(:E :F)\nSubClassOf(:F :G)\nSubClassOf(:G owl:Nothing)"
+    ));
+    assert!(sub(&sat, "A", "C") && sub(&sat, "A", "D"));
+    assert!(sat.excluded().is_empty(), "{:?}", sat.excluded());
+}
+
+#[test]
+fn a_parallel_run_with_covers_reports_what_one_thread_reports() {
+    let mut body = format!(
+        "SubClassOf(DataHasValue(:d {BOOL}) :C)\n\
+         SubClassOf(DataHasValue(:d {NOT_BOOL}) :D)\n\
+         SubClassOf(DataHasValue(:d {BOOL}) :H)\n\
+         SubClassOf(DataHasValue(:d {NOT_BOOL}) :H)\n\
+         SubClassOf(:A DataSomeValuesFrom(:d xsd:boolean))\n"
+    );
+    for i in 0..4 * PARALLEL_AXIOMS {
+        body.push_str(&format!("SubClassOf(:X{i} :A)\nSubClassOf(:Y{i} :X{i})\n"));
+    }
+    let ax = axioms(&body);
+    let all: Vec<&AxiomKind> = ax.iter().collect();
+    let on = |threads: usize| {
+        let mut sat = Saturation::new();
+        let out = sat
+            .classify(
+                &all,
+                None,
+                &Limits {
+                    threads,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        (out.taxonomy, sat.excluded().to_vec())
+    };
+    let one = on(1);
+    let many = on(4);
+    assert_eq!(one, many);
+    // the cover over C and D is left in part; both values give H
+    assert!(!one.1.is_empty());
+}
+
+/// Ontologies whose only axioms outside OWL 2 EL are data restrictions that the checker
+/// takes as one atom each, however many values or disjuncts their ranges have.
+#[test]
+fn data_disjunctions_inside_atoms_stay_with_the_horn_tier() {
+    for (body, a, c) in [
+        (
+            "SubClassOf(:A DataSomeValuesFrom(:d DataUnionOf(xsd:boolean xsd:int)))\n\
+             SubClassOf(DataSomeValuesFrom(:d DataUnionOf(xsd:boolean xsd:int xsd:string)) :C)",
+            "A",
+            "C",
+        ),
+        (
+            "SubClassOf(:A DataMaxCardinality(2 :d xsd:boolean))\n\
+             SubClassOf(:A DataSomeValuesFrom(:d xsd:boolean))\n\
+             SubClassOf(DataSomeValuesFrom(:d xsd:boolean) :C)",
+            "A",
+            "C",
+        ),
+        (
+            "DatatypeDefinition(:bi DataUnionOf(xsd:boolean xsd:int))\n\
+             SubClassOf(:A DataSomeValuesFrom(:d xsd:int))\n\
+             SubClassOf(DataSomeValuesFrom(:d :bi) :C)",
+            "A",
+            "C",
+        ),
+        (
+            "SubClassOf(:A DataSomeValuesFrom(:d DataOneOf(\"1\"^^xsd:int \"2\"^^xsd:int)))\n\
+             SubClassOf(DataSomeValuesFrom(:d xsd:int) :C)",
+            "A",
+            "C",
+        ),
+    ] {
+        let (sat, _) = run(body);
+        assert!(!sat.interner.dt.is_empty(), "{body}");
+        assert!(sub(&sat, a, c), "{body}");
+        assert!(sat.excluded().is_empty(), "{body}: {:?}", sat.excluded());
+    }
 }
