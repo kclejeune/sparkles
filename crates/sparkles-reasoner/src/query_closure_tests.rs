@@ -551,7 +551,7 @@ impl Rng {
     }
 }
 
-/// What one case of [`random_sessions_derive_what_the_joins_derive`] held and did.
+/// What one case of [`random_sessions_part`] held and did.
 #[derive(Debug)]
 struct Tally {
     transitive: bool,
@@ -565,16 +565,19 @@ struct Tally {
 /// functional properties, property hierarchies and chains of two and three properties,
 /// sameAs between individuals and with literals, literal values whose ids differ for
 /// equal values, and classes, and random demands of every shape, derived one after the
-/// other. `SPARKLES_CLOSURE_CASES` sets the number of cases (6 by default).
-#[test]
-fn random_sessions_derive_what_the_joins_derive() {
+/// other. `SPARKLES_CLOSURE_CASES` sets the number of cases (6 by default), which the
+/// parts below share by seed, so that part `part` of `parts` derives the seeds whose
+/// remainder by `parts` is `part`. The six default cases took 340 s to 480 s as one test
+/// on a four-CPU GitHub runner and reached nextest's limit of 600 s beside other slow
+/// tests.
+fn random_sessions_part(part: u64, parts: u64) {
     let mut engaged = Stats::default();
     let mut tally = Vec::new();
     let cases: u64 = std::env::var("SPARKLES_CLOSURE_CASES")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
-    for seed in 0..cases {
+    for seed in (part..cases).step_by(parts as usize) {
         let mut r = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let (props, inds) = (2 + r.below(3), 5 + r.below(10));
         let mut t = String::new();
@@ -702,7 +705,22 @@ fn random_sessions_derive_what_the_joins_derive() {
         );
     }
     assert!(
-        engaged.forward.pairs + engaged.backward.pairs + engaged.full.pairs > 0,
+        tally.is_empty() || engaged.forward.pairs + engaged.backward.pairs + engaged.full.pairs > 0,
         "{engaged:?}"
     );
+}
+
+#[test]
+fn random_sessions_derive_what_the_joins_derive_part_1_of_3() {
+    random_sessions_part(0, 3);
+}
+
+#[test]
+fn random_sessions_derive_what_the_joins_derive_part_2_of_3() {
+    random_sessions_part(1, 3);
+}
+
+#[test]
+fn random_sessions_derive_what_the_joins_derive_part_3_of_3() {
+    random_sessions_part(2, 3);
 }

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### The reasoner's random closure sessions run as three tests
+
+`random_sessions_derive_what_the_joins_derive` in sparkles-reasoner derived its six random
+sessions in one test, which took 340 s to 480 s on GitHub's four-CPU runners and passed
+nextest's limit of 600 s on 0779d666, beside other slow tests in its shard. The code was
+not slower, since on `wally` the test took 140 s at both 0779d666 and b47b582b. The six
+cases now run as three tests of two seeds each, `..._part_1_of_3` to `..._part_3_of_3`,
+with the same seeds, checks and `SPARKLES_CLOSURE_CASES` setting, as roadmap item 1275.
+
 ### A kept EL classification over its memory budget starts again in full
 
 A kept OWL 2 EL run counts the contexts it keeps and its own new state against
