@@ -865,6 +865,41 @@ class Deadlines(Base):
                 self.assertEqual(p.returncode, 2, opt + value + p.stderr)
 
 
+class WithoutProc(Base):
+    """On a host without /proc or prctl, the suite runs serially through unittest discover."""
+
+    def run_without_proc(self, d):
+        # The runner, loaded with its host check answering as a host without /proc would.
+        wrapper = d.parent / f"{d.name}-wrapper.py"
+        self.addCleanup(lambda: wrapper.unlink(missing_ok=True))
+        wrapper.write_text(textwrap.dedent(f"""
+            import importlib.util, sys
+            spec = importlib.util.spec_from_file_location("unittest_parallel_no_proc", {str(RUNNER)!r})
+            rp = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(rp)
+            assert rp._unsupported() is None
+            rp._unsupported = lambda: "this host has no /proc"
+            sys.exit(rp.main(sys.argv[1:]))
+            """))
+        return subprocess.run([sys.executable, str(wrapper), "--jobs", "4", "--split", "test_a", str(d)],
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+
+    def test_a_passing_suite_passes_serially(self):
+        p = self.run_without_proc(self.suite(test_a=PASS, test_c=PASS))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("unittest-parallel: this host has no /proc, so the suite runs serially", p.stdout)
+        self.assertIn("Ran 4 tests", p.stderr)
+
+    def test_a_failing_suite_fails_serially(self):
+        p = self.run_without_proc(self.suite(test_a=PASS, test_b=FAIL))
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("Ran 3 tests", p.stderr)
+
+    def test_an_empty_suite_exits_5_serially(self):
+        p = self.run_without_proc(self.suite(test_none="VALUE = 1\n"))
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+
+
 class Identity(unittest.TestCase):
     """The process search keeps each process's identity, so a reused pid is never signalled."""
 

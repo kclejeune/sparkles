@@ -57,6 +57,9 @@ unit's tree before that, by being orphaned, is not found. An interrupted run exi
 the signal number. Discovery and each unit get SIGTERM from the kernel when the runner dies
 without stopping them, as under SIGKILL, and then stop their own descendants the same way
 and exit.
+On a host without /proc or prctl, which the runner needs, it prints a notice and runs the
+suite serially with `python3 -m unittest discover -s DIR` instead, ignoring the options
+other than DIR, and exits as that does.
 --keep DIR keeps the discovery, the plan, each unit's output and the result records in a
 new directory under DIR. --jobs 1 runs the units one at a time, in the same processes.
 """
@@ -557,6 +560,18 @@ def check(record, assigned, exports):
     return None  # a failed test is in unittest's own report
 
 
+def _unsupported():
+    """Why this host cannot supervise units, or None. The runner reads /proc and sets a parent
+    death signal with prctl."""
+    if not os.path.exists(f"/proc/{os.getpid()}/stat"):
+        return "this host has no /proc"
+    try:
+        ctypes.CDLL(None).prctl
+    except (AttributeError, OSError, TypeError):
+        return "this host has no prctl"
+    return None
+
+
 def parse_args(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
@@ -595,6 +610,12 @@ def main(argv=None):
         _die_with_parent(int(parent), float(grace))
         return worker_main(directory, plan, int(index), int(split), record, absorb)
     a = parse_args(argv)
+    why = _unsupported()
+    if why:
+        # Supervision needs /proc and prctl, which only Linux has.
+        print(f"unittest-parallel: {why}, so the suite runs serially with unittest discover", flush=True)
+        return subprocess.run([sys.executable, *(f"-W{w}" for w in sys.warnoptions), "-m", "unittest",
+                               "discover", "-s", str(a.directory)], stdin=subprocess.DEVNULL).returncode
     old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     if a.keep:
         a.keep.mkdir(parents=True, exist_ok=True)

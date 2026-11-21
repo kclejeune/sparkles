@@ -401,7 +401,8 @@ when it does, has a 2400 s deadline, which `--suite-timeout` changes. At a deadl
 SIGHUP, the runner starts no more processes, stops every active one with its group and the
 descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
 the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
-stop their own descendants. `--keep DIR` keeps the discovery, the plan, each process's
+stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
+host it says so and runs the suite serially with `unittest discover`. `--keep DIR` keeps the discovery, the plan, each process's
 output and the result records.
 
 Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
