@@ -2919,14 +2919,21 @@ impl Saturation {
                         .iter()
                         .zip(&refs)
                         .find(|(m, _)| dl_root::is_root(&ix, m.me))
-                        .map(|(m, c)| dl_root::marker_root_gbody(&ix, m.me, &c.st.lock(), &d.lits))
-                        .unwrap_or_default();
-                    for (m, c) in cs.iter().zip(&refs) {
+                        .map(|(m, c)| {
+                            dl_root::marker_root_gbody(&ix, m.me, &c.st.lock(), &d.lits, &mut dpoll)
+                        })
+                        .unwrap_or(Some(Vec::new()));
+                    // a refusal recorded its stop, which the run returns below
+                    for (m, c) in cs
+                        .iter()
+                        .zip(&refs)
+                        .take(if rg.is_some() { cs.len() } else { 0 })
+                    {
                         match dl_root::marker_def(
                             &ix,
                             m,
                             &c.st.lock(),
-                            &rg,
+                            rg.as_deref().unwrap_or_default(),
                             &d.lits,
                             cf,
                             &mut dpoll,
@@ -2960,6 +2967,9 @@ impl Saturation {
                     else {
                         return Err(stop.take().unwrap_or(Error::Cancelled));
                     };
+                    if let Some(e) = stop.take() {
+                        return Err(e);
+                    }
                     stats.dl_marker_deficits = def;
                     eprintln!(
                         "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}/{} dwork={}",

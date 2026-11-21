@@ -1713,8 +1713,7 @@ impl Scan {
 /// refused them, which marks the store `x` interrupted. The caller releases the bytes
 /// either way.
 fn m_admit<S: Sink>(x: &mut DlSt, bytes: usize, out: &mut S) -> bool {
-    // nothing to admit asks no check of the bounds, which the scans and sends poll
-    if bytes == 0 || out.reserve_data(bytes) {
+    if out.reserve_data(bytes) {
         return true;
     }
     x.store.interrupted = true;
@@ -1940,27 +1939,49 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     let Some(r) = x.root.as_deref().filter(|r| r.m.is_some()) else {
         return;
     };
-    // the held literals over the constants, admitted before they are listed
-    let n: usize = new
-        .iter()
-        .map(|u| r.mr().held_at.get(u).map_or(0, Vec::len))
-        .sum();
+    // the held literals over the constants, admitted before they are listed; the sizing,
+    // the listing and the sends are read as one scan, a read per constant and per pair
+    let mut scan = Scan(0);
+    let mut n = 0;
+    let mut cut = false;
+    for u in new {
+        if !scan.read(1, out) {
+            cut = true;
+            break;
+        }
+        n += r.mr().held_at.get(u).map_or(0, Vec::len);
+    }
+    if cut {
+        scan.end(out);
+        x.store.interrupted = true;
+        return;
+    }
     let bytes = n * std::mem::size_of::<(u32, u32)>();
     if !m_admit(x, bytes, out) {
+        scan.end(out);
         out.release_data(bytes);
         return;
     }
     let r = x.root.as_deref().expect("read above");
     let mut ls: Vec<(u32, u32)> = Vec::with_capacity(n);
-    for &u in new {
+    'list: for &u in new {
+        if !scan.read(1, out) {
+            cut = true;
+            break;
+        }
         for &i in r.mr().held_at.get(&u).into_iter().flatten() {
+            if !scan.read(1, out) {
+                cut = true;
+                break 'list;
+            }
             ls.push((i, u));
         }
     }
+    if cut {
+        ls.clear();
+    }
     ls.sort_unstable();
     ls.dedup_by_key(|p| p.0);
-    let mut scan = Scan(0);
-    let mut cut = false;
     for (k, (i, _)) in ls.into_iter().enumerate() {
         if (k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on()) || !scan.read(1, out) {
             cut = true;
@@ -2133,15 +2154,48 @@ fn ret_products(
 /// M-return-cf ([`MREPAIR_CF`]), only those whose body has no ground literal
 /// ([`ground_body`]).
 fn ret_lists(st: &State, body: &[Lit], cf: Option<Cf>) -> Vec<Vec<Side>> {
-    body.iter()
-        .map(|&l| {
-            partners_of(st, l, true)
-                .into_iter()
-                .filter(|s| !(s.1.is_empty() && s.0 == [l]))
-                .filter(|s| cf.is_none_or(|cf| !ground_body(cf, &s.0)))
-                .collect()
-        })
-        .collect()
+    ret_lists_with(st, body, cf, &mut |_| true).expect("a read that never stops")
+}
+
+/// [`ret_lists`], which tells `read` of each premise it reads, with the length of its
+/// body when M-return-cf tests it, and is `None` once read answers false.
+fn ret_lists_with(
+    st: &State,
+    body: &[Lit],
+    cf: Option<Cf>,
+    read: &mut dyn FnMut(usize) -> bool,
+) -> Option<Vec<Vec<Side>>> {
+    let mut lists = Vec::with_capacity(body.len());
+    for &l in body {
+        let mut v = Vec::new();
+        if let Some(d) = dl(st) {
+            for &i in d.store.by_xl.get(&l).into_iter().flatten() {
+                if !read(1) {
+                    return None;
+                }
+                // partners_of with selected premises
+                let s = &d.store.clauses[i as usize];
+                if s.dead {
+                    continue;
+                }
+                let p = side(&s.c, l);
+                if p.1.is_empty() && p.0 == [l] {
+                    continue;
+                }
+                if let Some(cf) = cf {
+                    if !read(p.0.len()) {
+                        return None;
+                    }
+                    if ground_body(cf, &p.0) {
+                        continue;
+                    }
+                }
+                v.push(p);
+            }
+        }
+        lists.push(v);
+    }
+    Some(lists)
 }
 
 /// What M-return-cf's test of a premise's body reads: the index and the run's interned
@@ -2345,24 +2399,29 @@ pub(super) fn marker_root_gbody(
     me: Ex,
     st: &State,
     lits: &super::dl_clause::Lits,
-) -> Vec<Clause> {
+    poll: &mut dyn FnMut(usize) -> bool,
+) -> Option<Vec<Clause>> {
     let inv = inv_of(ix, dix(ix));
     let Some(x) = dl(st).filter(|_| is_root(ix, me)) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
-    x.store
-        .clauses
-        .iter()
-        .filter(|s| {
-            !s.dead
-                && !s.c.body().is_empty()
-                && s.c
-                    .body()
-                    .iter()
-                    .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
-        })
-        .map(|s| s.c.clone())
-        .collect()
+    let mut rd = Reads::new(poll);
+    let mut rg = Vec::new();
+    for s in &x.store.clauses {
+        if !rd.read(1 + s.c.body().len()) {
+            return None;
+        }
+        if !s.dead
+            && !s.c.body().is_empty()
+            && s.c
+                .body()
+                .iter()
+                .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
+        {
+            rg.push(s.c.clone());
+        }
+    }
+    rd.end().then_some(rg)
 }
 
 /// The choices of one product of [`marker_def`] past which a pair counts as unchecked.
@@ -2395,12 +2454,16 @@ pub(super) fn marker_def(
 ) -> Result<Option<MarkerDef>, ()> {
     let Some(x) = dl(st) else { return Ok(None) };
     let is_root = is_root(ix, m.me);
+    let mut rd = Reads::new(poll);
     let mut marks = Vec::new();
-    if let Some(r) = x.root.as_deref() {
-        marks.extend(r.gmarks.iter().copied());
+    for &l in x.root.as_deref().into_iter().flat_map(|r| &r.gmarks) {
+        if !rd.read(1) {
+            return Err(());
+        }
+        marks.push(l);
     }
-    for (k, s) in x.store.clauses.iter().enumerate() {
-        if k > 0 && k.is_multiple_of(DIAG_POLL) && !poll(DIAG_POLL / WORK_READS) {
+    for s in &x.store.clauses {
+        if !rd.read(1) {
             return Err(());
         }
         if s.dead {
@@ -2420,27 +2483,25 @@ pub(super) fn marker_def(
     }
     marks.sort_unstable();
     marks.dedup();
-    if !poll(marks.len() / WORK_READS + 1) {
-        return Err(());
-    }
     let (mut owed, mut unchecked) = (0, 0);
     if !is_root && !st.bottom && !rg.is_empty() {
-        let held: FxHashSet<Lit> = m.held.iter().copied().collect();
-        if !poll(held.len() / WORK_READS + 1) {
-            return Err(());
+        let mut held: FxHashSet<Lit> = FxHashSet::default();
+        for &l in &m.held {
+            if !rd.read(1) {
+                return Err(());
+            }
+            held.insert(l);
         }
         for c in rg {
-            if !poll(1 + c.body().len() / WORK_READS) {
+            if !rd.read(1 + c.body().len()) {
                 return Err(());
             }
             if !c.body().iter().all(|l| held.contains(l)) {
                 continue;
             }
-            let lists = ret_lists(st, c.body(), cf.then_some((ix, lits)));
-            // the premises read for the lists
-            if !poll(1 + lists.iter().map(Vec::len).sum::<usize>() / WORK_READS) {
-                return Err(());
-            }
+            // the premises, each candidate read
+            let lists = ret_lists_with(st, c.body(), cf.then_some((ix, lits)), &mut |n| rd.read(n))
+                .ok_or(())?;
             let n = lists
                 .iter()
                 .try_fold(1usize, |n, l| n.checked_mul(l.len()))
@@ -2449,10 +2510,13 @@ pub(super) fn marker_def(
                 unchecked += 1;
                 continue;
             }
-            if n > 0 && !products_held(ix, st, &lists, c.head(), lits, poll).ok_or(())? {
+            if n > 0 && !products_held(ix, st, &lists, c.head(), lits, &mut rd).ok_or(())? {
                 owed += 1;
             }
         }
+    }
+    if !rd.end() {
+        return Err(());
     }
     Ok(Some(MarkerDef {
         bottom: st.bottom,
@@ -2498,12 +2562,10 @@ impl<'a> Reads<'a> {
         (self.poll)(w)
     }
 
-    /// Charges the reads since the last check.
-    fn end(self) {
-        let w = self.n % DIAG_POLL / WORK_READS;
-        if w > 0 {
-            (self.poll)(w);
-        }
+    /// Charges the reads since the last check and checks the bounds, false when the check
+    /// stopped the diagnostic.
+    fn end(self) -> bool {
+        (self.poll)(self.n % DIAG_POLL / WORK_READS)
     }
 }
 
@@ -2515,7 +2577,7 @@ fn products_held(
     lists: &[Vec<Side>],
     head: &[Lit],
     lits: &super::dl_clause::Lits,
-    poll: &mut dyn FnMut(usize) -> bool,
+    rd: &mut Reads,
 ) -> Option<bool> {
     use super::dl_clause::X;
     let Some(x) = dl(st) else { return Some(false) };
@@ -2523,10 +2585,9 @@ fn products_held(
     let is =
         |l: Lit, a: Ex| l.kind() == XL && matches!(lits.view(l, inv), XLit::Atom(b, _) if b == a);
     let mut at = vec![0usize; lists.len()];
-    let mut choices = 0usize;
     loop {
-        choices += 1;
-        if choices.is_multiple_of(DIAG_POLL) && !poll(DIAG_POLL) {
+        // a choice counts as a conclusion
+        if !rd.read(WORK_READS) {
             return None;
         }
         let mut body: Vec<Lit> = Vec::new();
@@ -2743,13 +2804,31 @@ pub(super) fn marker_deficits(
     let Some(root) = dx.root else {
         return Some(out);
     };
-    let by: FxHashMap<Ex, usize> = cs.iter().enumerate().map(|(i, c)| (c.me, i)).collect();
-    let Some(&ri) = by.get(&root) else {
-        return Some(out);
-    };
-    let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
-    let edges: FxHashMap<u32, &[Ex]> = cs[ri].edges.iter().map(|(u, v)| (*u, &v[..])).collect();
     let mut rd = Reads::new(poll);
+    let mut by: FxHashMap<Ex, usize> = FxHashMap::default();
+    for (i, c) in cs.iter().enumerate() {
+        if !rd.read(1) {
+            return None;
+        }
+        by.insert(c.me, i);
+    }
+    let Some(&ri) = by.get(&root) else {
+        return rd.end().then_some(out);
+    };
+    let mut units: FxHashSet<Lit> = FxHashSet::default();
+    for &l in &cs[ri].units {
+        if !rd.read(1) {
+            return None;
+        }
+        units.insert(l);
+    }
+    let mut edges: FxHashMap<u32, &[Ex]> = FxHashMap::default();
+    for (u, v) in &cs[ri].edges {
+        if !rd.read(1) {
+            return None;
+        }
+        edges.insert(*u, &v[..]);
+    }
     // the contexts that `from` reaches, each successor read a read
     let reach = |from: Ex, rd: &mut Reads| {
         let mut seen: FxHashSet<Ex> = FxHashSet::default();
@@ -2816,7 +2895,9 @@ pub(super) fn marker_deficits(
             }
         }
     }
-    rd.end();
+    if !rd.end() {
+        return None;
+    }
     for d in defs.iter().flatten() {
         out[1] += d.owed;
         out[2] += d.unchecked;
@@ -3386,7 +3467,14 @@ mod tests {
         super::super::dl_rules::derive(&ix, &mut st, (vec![], vec![gb]), &mut out);
         assert!(dl(&st).unwrap().promoted.contains(&[gb][..]));
         let lists = [vec![(vec![Lit::x(k)], vec![])]];
-        let held = products_held(&ix, &st, &lists, &[gb], &run.lits, &mut |_| true);
+        let held = products_held(
+            &ix,
+            &st,
+            &lists,
+            &[gb],
+            &run.lits,
+            &mut Reads::new(&mut |_| true),
+        );
         assert_eq!(held, Some(true));
         assert!(!marker_def_cf(MREPAIR_CF) && !marker_def_cf(0));
         assert!(marker_def_cf(MREPAIR_ON | MREPAIR_CF) && !marker_def_cf(MREPAIR_ON));
@@ -3742,6 +3830,204 @@ mod tests {
             calls <= cs.len()
         });
         assert_eq!((n, calls), (None, cs.len() + 1));
+    }
+
+    /// A context K holding a(u) and b(u), with `na` premises K → a(u) ∨ Z ∨ H_i and `nb`
+    /// premises Z → b(u) ∨ K ∨ H_j, whose products with the root clause a(u) ∧ b(u) → ⊥ are
+    /// all tautologies, and `dead` further premises on a(u) that died, for the diagnostic.
+    fn def_ctx(na: usize, nb: usize, dead: usize) -> (Index, DlRun, State, MarkerCtx, Clause) {
+        let mut sig = Sig::new();
+        let [a, b, k, z] = ["A", "B", "K", "Z"].map(|n| sig.class(n));
+        let u = sig.ind("u");
+        let hs: Vec<Ex> = (0..na + nb + dead)
+            .map(|i| sig.class(&format!("H{i}")))
+            .collect();
+        let (ix, _) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let (ga, gb) = (glit(&run, &ix, a, u), glit(&run, &ix, b, u));
+        let mut st = State::default();
+        for &h in &hs[..na] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![Lit::x(k)], vec![ga, Lit::x(z), Lit::x(h)]));
+        }
+        for &h in &hs[na..na + nb] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![Lit::x(z)], vec![gb, Lit::x(k), Lit::x(h)]));
+        }
+        for &h in &hs[na + nb..] {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![Lit::x(k)], vec![ga, Lit::x(h)]));
+        }
+        let inv = inv_of(&ix, dix(&ix));
+        let order = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        let mut max = Vec::new();
+        while ds(&mut st)
+            .store
+            .next(&ix, Some(&order), &mut max)
+            .is_some()
+        {}
+        let n = ds(&mut st).store.clauses.len();
+        for s in &mut ds(&mut st).store.clauses[n - dead..] {
+            s.dead = true;
+        }
+        let m = MarkerCtx {
+            me: k,
+            held: vec![ga, gb],
+            succ: vec![],
+            edges: vec![],
+            units: vec![],
+        };
+        (ix, run, st, m, Clause::new(vec![ga, gb], vec![]))
+    }
+
+    #[test]
+    fn the_diagnostic_charges_what_it_reads_where_it_reads_it() {
+        // 63 x 65 tautological products, short of a multiple of the poll, charge every
+        // choice; 8,192 dead premises charge their reads though no list keeps them; a
+        // holder of 100,000 literals is read under the run's checks
+        let (ix, run, st, m, rg) = def_ctx(63, 65, 0);
+        let mut work = 0;
+        let def = marker_def(&ix, &m, &st, &[rg], &run.lits, false, &mut |n| {
+            work += n;
+            true
+        });
+        assert_eq!(
+            def.map(|d| d.map(|d| (d.owed, d.unchecked))),
+            Ok(Some((0, 0)))
+        );
+        assert!(work >= 63 * 65, "{work} work for {} products", 63 * 65);
+        let (ix, run, st, m, rg) = def_ctx(1, 1, 8192);
+        let mut work = 0;
+        let def = marker_def(&ix, &m, &st, &[rg], &run.lits, false, &mut |n| {
+            work += n;
+            true
+        });
+        assert!(def.is_ok_and(|d| d.is_some()));
+        assert!(
+            work >= 8192 / WORK_READS,
+            "{work} work for 8,192 dead premises"
+        );
+        let (ix, run, st, mut m, rg) = def_ctx(1, 1, 0);
+        m.held.extend((0..100_000).map(Lit::xl));
+        let mut polls = 0;
+        let def = marker_def(&ix, &m, &st, &[rg], &run.lits, false, &mut |_| {
+            polls += 1;
+            true
+        });
+        assert!(def.is_ok_and(|d| d.is_some()));
+        assert!(
+            polls >= 100_000 / DIAG_POLL,
+            "{polls} checks for 100,000 held literals"
+        );
+    }
+
+    #[test]
+    fn a_refusal_at_any_check_of_the_diagnostic_ends_it() {
+        // for each check k of a complete count, a run whose check k refuses gets no count
+        let (ix, run, st, m, rg) = def_ctx(16, 16, 64);
+        let rg = [rg];
+        let mut total = 0;
+        assert!(
+            marker_def(&ix, &m, &st, &rg, &run.lits, false, &mut |_| {
+                total += 1;
+                true
+            })
+            .is_ok_and(|d| d.is_some())
+        );
+        for k in 1..=total {
+            let mut calls = 0;
+            let def = marker_def(&ix, &m, &st, &rg, &run.lits, false, &mut |_| {
+                calls += 1;
+                calls < k
+            });
+            assert!(def.is_err(), "marker_def, check {k} of {total}");
+        }
+        // the count over a holder of 64 literals and 64 destinations
+        let mut sig = Sig::new();
+        let k = sig.class("K");
+        let ss: Vec<Ex> = (0..64).map(|i| sig.class(&format!("S{i}"))).collect();
+        let u = sig.ind("u");
+        let (ix, root) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let RTerm::C(cu) = c(u, &ix) else { panic!() };
+        let dests: Vec<Ex> = (100_000..100_064).collect();
+        let ctx = |me: Ex| MarkerCtx {
+            me,
+            held: vec![],
+            succ: vec![],
+            edges: vec![],
+            units: vec![],
+        };
+        let mut cs = vec![MarkerCtx {
+            succ: dests.iter().copied().chain([k]).collect(),
+            edges: vec![(cu, dests.clone())],
+            ..ctx(root)
+        }];
+        cs.extend(dests.iter().map(|&d| ctx(d)));
+        cs.push(MarkerCtx {
+            held: ss.iter().map(|&s| glit(&run, &ix, s, u)).collect(),
+            ..ctx(k)
+        });
+        let defs: Vec<Option<MarkerDef>> = cs
+            .iter()
+            .map(|_| {
+                Some(MarkerDef {
+                    bottom: false,
+                    marks: vec![],
+                    owed: 0,
+                    unchecked: 0,
+                })
+            })
+            .collect();
+        let mut total = 0;
+        assert_eq!(
+            marker_deficits(&ix, &cs, &defs, &run.lits, &mut |_| {
+                total += 1;
+                true
+            }),
+            Some([64 * 64, 0, 0])
+        );
+        for k in 1..=total {
+            let mut calls = 0;
+            let n = marker_deficits(&ix, &cs, &defs, &run.lits, &mut |_| {
+                calls += 1;
+                calls < k
+            });
+            assert_eq!(n, None, "marker_deficits, check {k} of {total}");
+        }
+    }
+
+    #[test]
+    fn a_replay_over_many_constants_checks_the_bounds() {
+        // a registration replay for 200,000 constants that hold no literal reads each, so a
+        // stopped run's check ends it before any admission
+        for mode in MODES {
+            let (_ix, run, mut st, k, _) = many_held(mode);
+            let new: Vec<u32> = (1_000_000..1_200_000).collect();
+            let mut out = Stops::new(&run);
+            let work = run.work();
+            m_registered(ds(&mut st), k, &new, &mut out);
+            assert!(
+                out.polls.get() >= 200_000 / M_SCAN,
+                "mode {mode}: {}",
+                out.polls.get()
+            );
+            assert!(run.work() - work >= 200_000 / WORK_READS - 1, "mode {mode}");
+            let (_ix, run, mut st, k, _) = many_held(mode);
+            let mut out = Stops::new(&run);
+            out.refuse = true;
+            m_registered(ds(&mut st), k, &new, &mut out);
+            assert!(out.asked == 0 && out.held == 0, "mode {mode}");
+            assert!(ds(&mut st).store.interrupted, "mode {mode}");
+        }
     }
 
     /// A small signature: classes, individuals and roles by name.
