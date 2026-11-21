@@ -11,14 +11,14 @@
 //! checker refuses, such as one with a pattern, an unknown datatype or an ill-typed
 //! literal, makes nothing a checker component, since its axiom is left out either way.
 
-use super::range::Ranges;
+use super::range::{Defs, Fail, Ranges};
 use crate::classify::data::Kind;
 use crate::model::*;
 use crate::vocab;
 use rustc_hash::FxHashMap;
 
-/// The deepest nesting of datatype definitions the pre-pass follows.
-const MAX_DEPTH: usize = 64;
+/// The axioms the pre-pass reads between two polls of its stop.
+const POLL: usize = 4096;
 
 /// The components of a run's data properties.
 #[derive(Clone, Debug, Default)]
@@ -31,17 +31,27 @@ pub struct Comps {
 
 impl Comps {
     /// The components of the data properties of `axioms`, with the datatype definitions
-    /// that the data ranges naming a defined datatype stand for.
-    pub fn of(axioms: &[&AxiomKind], defs: &FxHashMap<Datatype, DataRange>) -> Comps {
+    /// that the data ranges naming a defined datatype stand for, or `None` once `stop`
+    /// returns true.
+    pub fn of(axioms: &[&AxiomKind], defs: &Defs, stop: &dyn Fn() -> bool) -> Option<Comps> {
         let mut w = Walk {
             ids: FxHashMap::default(),
             parent: Vec::new(),
             trig: Vec::new(),
-            defs,
+            defs: defs.unconverted(),
+            el_defs: FxHashMap::default(),
             scratch: Ranges::new(),
+            stop,
+            stopped: false,
         };
-        for &k in axioms {
+        for (i, &k) in axioms.iter().enumerate() {
+            if w.stopped || (i.is_multiple_of(POLL) && stop()) {
+                return None;
+            }
             w.axiom(k);
+        }
+        if w.stopped {
+            return None;
         }
         let n = w.parent.len();
         let mut root_comp: FxHashMap<usize, u32> = FxHashMap::default();
@@ -62,7 +72,7 @@ impl Comps {
             }
         }
         let comp = w.ids.into_iter().map(|(d, i)| (d, of_id[i])).collect();
-        Comps { comp, checker }
+        Some(Comps { comp, checker })
     }
 
     /// The component of a data property, when the axioms name it.
@@ -106,8 +116,12 @@ struct Walk<'a> {
     ids: FxHashMap<DataProperty, usize>,
     parent: Vec<usize>,
     trig: Vec<bool>,
-    defs: &'a FxHashMap<Datatype, DataRange>,
+    defs: Defs,
+    /// whether each defined datatype has the forms of OWL 2 EL, `None` while it is read
+    el_defs: FxHashMap<Datatype, Option<bool>>,
     scratch: Ranges,
+    stop: &'a dyn Fn() -> bool,
+    stopped: bool,
 }
 
 impl Walk<'_> {
@@ -256,27 +270,43 @@ impl Walk<'_> {
         if self.el_range(r, 0) {
             return false;
         }
-        match expand(r, self.defs, 0) {
-            Some(r) => self.scratch.of(&r).is_ok(),
-            None => false,
+        match self.scratch.of_defined(r, &mut self.defs, self.stop) {
+            Ok(_) => true,
+            Err(Fail::Unsupported(_)) => false,
+            Err(Fail::Stopped) => {
+                self.stopped = true;
+                false
+            }
         }
     }
 
     /// Whether a data range has the forms of OWL 2 EL: datatypes of the EL map,
-    /// intersections and enumerations of one literal of the map.
-    fn el_range(&self, r: &DataRange, depth: usize) -> bool {
-        if depth > MAX_DEPTH {
+    /// intersections and enumerations of one literal of the map. Each definition is read
+    /// once.
+    fn el_range(&mut self, r: &DataRange, depth: usize) -> bool {
+        if depth > Defs::MAX_DEPTH {
             return false;
         }
         match r {
             DataRange::Datatype(d) => {
                 let iri = d.0.as_str();
-                iri == vocab::RDFS_LITERAL
-                    || Kind::of(iri).is_some()
-                    || self
-                        .defs
-                        .get(d)
-                        .is_some_and(|x| self.el_range(x, depth + 1))
+                if iri == vocab::RDFS_LITERAL || Kind::of(iri).is_some() {
+                    return true;
+                }
+                let Some(x) = self.defs.map().get(d).cloned() else {
+                    return false;
+                };
+                match self.el_defs.get(d) {
+                    Some(Some(b)) => *b,
+                    // a definition that names itself
+                    Some(None) => false,
+                    None => {
+                        self.el_defs.insert(d.clone(), None);
+                        let b = self.el_range(&x, depth + 1);
+                        self.el_defs.insert(d.clone(), Some(b));
+                        b
+                    }
+                }
             }
             DataRange::IntersectionOf(rs) => rs.iter().all(|x| self.el_range(x, depth + 1)),
             DataRange::OneOf(ls) => ls.len() == 1 && ls.iter().all(el_literal),
@@ -288,38 +318,6 @@ impl Walk<'_> {
 /// Whether a literal's datatype is in the EL map, or it has a language tag.
 fn el_literal(l: &Literal) -> bool {
     l.0.language().is_some() || Kind::of(l.0.datatype().as_str()).is_some()
-}
-
-/// The data range with each defined datatype replaced by its definition, or `None` when
-/// the definitions nest past [`MAX_DEPTH`].
-pub fn expand(
-    r: &DataRange,
-    defs: &FxHashMap<Datatype, DataRange>,
-    depth: usize,
-) -> Option<DataRange> {
-    if depth > MAX_DEPTH {
-        return None;
-    }
-    Some(match r {
-        DataRange::Datatype(d) => match defs.get(d) {
-            Some(x) => expand(x, defs, depth + 1)?,
-            None => r.clone(),
-        },
-        DataRange::IntersectionOf(rs) => DataRange::IntersectionOf(
-            rs.iter()
-                .map(|x| expand(x, defs, depth + 1))
-                .collect::<Option<_>>()?,
-        ),
-        DataRange::UnionOf(rs) => DataRange::UnionOf(
-            rs.iter()
-                .map(|x| expand(x, defs, depth + 1))
-                .collect::<Option<_>>()?,
-        ),
-        DataRange::ComplementOf(x) => {
-            DataRange::ComplementOf(Box::new(expand(x, defs, depth + 1)?))
-        }
-        DataRange::OneOf(_) | DataRange::DatatypeRestriction(..) => r.clone(),
-    })
 }
 
 #[cfg(test)]
@@ -342,11 +340,11 @@ mod tests {
                 defs.insert(d.clone(), r.clone());
             }
         }
-        Comps::of(&ax, &defs)
+        Comps::of(&ax, &Defs::new(defs), &|| false).unwrap()
     }
 
     fn d(name: &str) -> DataProperty {
-        DataProperty::new(&format!("http://ex.org/{name}"))
+        DataProperty::new(format!("http://ex.org/{name}"))
     }
 
     #[test]
@@ -445,5 +443,43 @@ mod tests {
         );
         assert!(c.checker(&d("d")));
         assert!(!c.checker(&d("e")));
+    }
+
+    #[test]
+    fn shared_nested_definitions_are_read_once() {
+        // each definition names the one below it twice, so its expansion has 2^40 leaves
+        let mut ax = String::from(
+            "DatatypeDefinition(:t0 DatatypeRestriction(xsd:integer xsd:maxInclusive \"5\"^^xsd:integer))\n",
+        );
+        for i in 1..=40 {
+            ax.push_str(&format!(
+                "DatatypeDefinition(:t{i} DataIntersectionOf(:t{p} DataUnionOf(:t{p} xsd:string)))\n",
+                p = i - 1
+            ));
+        }
+        ax.push_str("SubClassOf(:A DataSomeValuesFrom(:d :t40))\nSubClassOf(:A DataSomeValuesFrom(:e xsd:integer))");
+        let c = comps(&ax);
+        assert!(c.checker(&d("d")));
+        assert!(!c.checker(&d("e")));
+    }
+
+    #[test]
+    fn a_definition_that_names_itself_triggers_nothing() {
+        let c = comps(
+            "DatatypeDefinition(:loop DataUnionOf(:loop xsd:string))\n\
+             SubClassOf(:A DataSomeValuesFrom(:d :loop))",
+        );
+        assert!(!c.checker(&d("d")));
+    }
+
+    #[test]
+    fn the_pre_pass_stops_on_its_flag() {
+        let doc = ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)\nPrefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\n\
+             Ontology(\nSubClassOf(:A DataSomeValuesFrom(:d xsd:int))\n)",
+        )
+        .unwrap();
+        let ax: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        assert!(Comps::of(&ax, &Defs::default(), &|| true).is_none());
     }
 }

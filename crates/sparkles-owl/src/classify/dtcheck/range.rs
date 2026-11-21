@@ -14,7 +14,7 @@ use super::bcp47;
 use super::sets::{CAP, Dense, Disc, End, Rat, Size, Step};
 use super::value::{self, DVal, NAN, Unsupported, double_key, float_key};
 use crate::datatypes;
-use crate::model::{DataRange, Literal};
+use crate::model::{DataRange, Datatype, Literal};
 use crate::vocab;
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
@@ -1242,15 +1242,74 @@ impl Ranges {
     /// The range of a data range of the ontology, stopping once `stop` returns true. The
     /// flag is read before each operand, since an enumeration of n literals costs n joins.
     pub fn of_stopping(&mut self, r: &DataRange, stop: &dyn Fn() -> bool) -> Result<Rid, Fail> {
+        self.of_in(r, None, 0, stop)
+    }
+
+    /// [`Ranges::of_stopping`], with each datatype that `defs` defines standing for its
+    /// definition. Each definition is converted once, so definitions shared by many
+    /// ranges or nested in each other cost their size and not the size of their
+    /// expansion. `defs` must be used with this table only, since it keeps its ids.
+    pub fn of_defined(
+        &mut self,
+        r: &DataRange,
+        defs: &mut Defs,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Rid, Fail> {
+        self.of_in(r, Some(defs), 0, stop)
+    }
+
+    fn of_in(
+        &mut self,
+        r: &DataRange,
+        mut defs: Option<&mut Defs>,
+        depth: usize,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Rid, Fail> {
         if stop() {
             return Err(Fail::Stopped);
         }
         Ok(match r {
-            DataRange::Datatype(d) => self.datatype(d.0.as_str())?,
+            DataRange::Datatype(d) => match defs {
+                Some(defs) if defs.map.contains_key(d) => {
+                    match defs.memo.get(d) {
+                        Some(Some(Ok(id))) => return Ok(*id),
+                        Some(Some(Err(u))) => return Err(Fail::Unsupported(u.clone())),
+                        // a definition that names itself, which OWL 2 does not allow
+                        Some(None) => {
+                            return Err(Fail::Unsupported(Unsupported::Datatype(
+                                d.0.as_str().to_string(),
+                            )));
+                        }
+                        None => {}
+                    }
+                    if depth >= Defs::MAX_DEPTH {
+                        return Err(Fail::Unsupported(Unsupported::Datatype(
+                            d.0.as_str().to_string(),
+                        )));
+                    }
+                    defs.memo.insert(d.clone(), None);
+                    let x = defs.map[d].clone();
+                    match self.of_in(&x, Some(&mut *defs), depth + 1, stop) {
+                        Ok(id) => {
+                            defs.memo.insert(d.clone(), Some(Ok(id)));
+                            id
+                        }
+                        Err(Fail::Unsupported(u)) => {
+                            defs.memo.insert(d.clone(), Some(Err(u.clone())));
+                            return Err(Fail::Unsupported(u));
+                        }
+                        Err(Fail::Stopped) => {
+                            defs.memo.remove(d);
+                            return Err(Fail::Stopped);
+                        }
+                    }
+                }
+                _ => self.datatype(d.0.as_str())?,
+            },
             DataRange::IntersectionOf(rs) => {
                 let mut acc = Ranges::FULL;
                 for x in rs {
-                    let x = self.of_stopping(x, stop)?;
+                    let x = self.of_in(x, defs.as_deref_mut(), depth, stop)?;
                     acc = self.meet(acc, x);
                 }
                 acc
@@ -1258,13 +1317,13 @@ impl Ranges {
             DataRange::UnionOf(rs) => {
                 let mut acc = Ranges::EMPTY;
                 for x in rs {
-                    let x = self.of_stopping(x, stop)?;
+                    let x = self.of_in(x, defs.as_deref_mut(), depth, stop)?;
                     acc = self.join(acc, x);
                 }
                 acc
             }
             DataRange::ComplementOf(x) => {
-                let x = self.of_stopping(x, stop)?;
+                let x = self.of_in(x, defs, depth, stop)?;
                 self.not(x)
             }
             DataRange::OneOf(ls) => {
@@ -1295,6 +1354,42 @@ impl Ranges {
                 self.intern(n)
             }
         })
+    }
+}
+
+/// The datatype definitions of a run, with the range of each defined datatype in one
+/// [`Ranges`] table once [`Ranges::of_defined`] has converted it.
+#[derive(Clone, Debug, Default)]
+pub struct Defs {
+    map: FxHashMap<Datatype, DataRange>,
+    /// `None` while the definition is being converted
+    memo: FxHashMap<Datatype, Option<Result<Rid, Unsupported>>>,
+}
+
+impl Defs {
+    /// The deepest nesting of definitions a conversion follows.
+    pub const MAX_DEPTH: usize = 64;
+
+    pub fn new(map: FxHashMap<Datatype, DataRange>) -> Defs {
+        Defs {
+            map,
+            memo: FxHashMap::default(),
+        }
+    }
+
+    pub fn map(&self) -> &FxHashMap<Datatype, DataRange> {
+        &self.map
+    }
+
+    /// The definitions without the ranges converted so far, for another table.
+    pub fn unconverted(&self) -> Defs {
+        Defs::new(self.map.clone())
+    }
+
+    /// The bytes the converted ranges take, the definitions aside.
+    pub fn bytes(&self) -> usize {
+        self.memo.capacity()
+            * (std::mem::size_of::<(Datatype, Option<Result<Rid, Unsupported>>)>() + 1)
     }
 }
 
