@@ -778,6 +778,28 @@ class ShadowTests(unittest.TestCase):
         self.assertEqual((s["queries"]["q"]["rounds"], s["undecidable"]),
                          (9, [f"q {m} every-round" for m in self.kit.STOP_METRICS]))
 
+    def test_a_direct_call_without_a_schedule_cannot_claim_an_every_round_cost(self):
+        # the helpers take no completeness by default, so a caller that does not say whether
+        # its rounds hold the whole schedule cannot get an every-round cost
+        slow = {k: {"A": [1.0], "B": [1.3]} for k in range(1, 9)}
+        pm = {m: slow for m in self.kit.STOP_METRICS}
+        for call in (lambda: self.kit.combined_stop(pm, 1.10, ("every-round",)),
+                     lambda: self.kit.combined_stop(pm, 1.10, ("every-round",), complete=True),
+                     lambda: self.kit.every_round(slow, 8),
+                     lambda: self.kit.decide(slow, "every-round", 1.10, 8),
+                     lambda: self.kit.undecidable(slow, "every-round", 8)):
+            with self.assertRaises(TypeError):
+                call()
+        _stop, out = self.kit.combined_stop(pm, 1.10, ("every-round",), scheduled=(), complete=False)
+        for dec in out.values():
+            self.assertEqual((dec["flagged"], dec["flagged_all_rounds"], dec["undecidable"]), (False, False, True))
+        self.assertEqual(self.kit.every_round(slow, 8, complete=False), "undecidable")
+        self.assertFalse(self.kit.decide(slow, "every-round", 1.10, 8, complete=False))
+        # a caller that knows its rounds are the whole schedule still gets the cost
+        self.assertEqual(self.kit.every_round(slow, 8, complete=True), "yes")
+        _stop, out = self.kit.combined_stop(pm, 1.10, ("every-round",), scheduled=range(1, 9), complete=True)
+        self.assertTrue(all(dec["flagged"] for dec in out.values()))
+
     def test_a_rerun_replayed_from_its_parent_takes_the_rerun_schedule(self):
         # a rerun pass without its own run.env ran RERUN_ROUNDS, not ROUNDS, so a missing round
         # past ROUNDS still counts; rounds past the schedule mean the schedule is not the

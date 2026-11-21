@@ -777,7 +777,7 @@ def exact_stop(rounds):
     return last, "all"
 
 
-def every_round(rounds, upto, complete=True):
+def every_round(rounds, upto, *, complete):
     """The every-round question on rounds 1..upto: "yes", "no" or "undecidable".
 
     A round at or below 1 answers no whatever the other rounds hold. Otherwise every round
@@ -802,11 +802,11 @@ def every_round(rounds, upto, complete=True):
     return "yes" if (statistics.median(b) - statistics.median(a)) * 1000 > EVERY_ROUND_ADDED_US else "no"
 
 
-def decide(rounds, rule, bound, upto, complete=True):
+def decide(rounds, rule, bound, upto, *, complete):
     """The rule's flag on rounds 1..upto, as a gate would take it from those samples alone.
     An every-round question that cannot be decided does not flag (see every_round)."""
     if rule != "bound":
-        return every_round(rounds, upto, complete) == "yes"
+        return every_round(rounds, upto, complete=complete) == "yes"
     kept = {k: v for k, v in rounds.items() if k <= upto}
     a = [x for v in kept.values() for x in v.get("A", [])]
     b = [x for v in kept.values() for x in v.get("B", [])]
@@ -815,11 +815,11 @@ def decide(rounds, rule, bound, upto, complete=True):
     return statistics.median(b) / statistics.median(a) >= bound
 
 
-def undecidable(rounds, rule, upto, complete=True):
+def undecidable(rounds, rule, upto, *, complete):
     """Whether the rule cannot answer on rounds 1..upto, which only the every-round question
     can be, when a round lacks a usable pair, or the schedule is not known to be complete,
     and no round answers no."""
-    return rule == "every-round" and every_round(rounds, upto, complete) == "undecidable"
+    return rule == "every-round" and every_round(rounds, upto, complete=complete) == "undecidable"
 
 
 def scheduled_rounds(rounds, scheduled):
@@ -828,7 +828,7 @@ def scheduled_rounds(rounds, scheduled):
     return {k: rounds.get(k, {"A": [], "B": []}) for k in sorted(set(rounds) | set(scheduled))}
 
 
-def combined_stop(per_metric, bound, rules=("bound",), scheduled=(), complete=True):
+def combined_stop(per_metric, bound, rules=("bound",), *, scheduled, complete):
     """Where one query stops when the stop must answer every rule on every metric.
 
     per_metric maps each metric to its rounds, as stop_rule takes them. Each rule and metric
@@ -836,8 +836,10 @@ def combined_stop(per_metric, bound, rules=("bound",), scheduled=(), complete=Tr
     stops at the latest of them, where each is decided again on the rounds the query keeps.
     The every-round question also judges each of the scheduled rounds that a metric has no
     entry for, as a round without a pair, while the bound's stop and pooled flag take the
-    rounds as given. complete=False says the schedule is unknown, so that the every-round
-    question cannot claim a cost (see every_round). The result is (stop round, {"METRIC RULE": {"stop_round", "how",
+    rounds as given. Both scheduled and complete are required, so that no caller is taken
+    to know its schedule without saying so. complete=False says the schedule is unknown or
+    is not the rounds that ran, so that the every-round question cannot claim a cost (see
+    every_round). The result is (stop round, {"METRIC RULE": {"stop_round", "how",
     "flagged", "flagged_all_rounds", "undecidable", "undecidable_all_rounds"}})."""
     bad = [r for r in rules if r not in STOP_RULES]
     if bad or not rules:
@@ -853,10 +855,10 @@ def combined_stop(per_metric, bound, rules=("bound",), scheduled=(), complete=Tr
     for key, x in out.items():
         r = key.split(" ")[1]
         rounds = of[key]
-        x["flagged"] = decide(rounds, r, bound, stop, complete)
-        x["flagged_all_rounds"] = decide(rounds, r, bound, max(rounds), complete)
-        x["undecidable"] = undecidable(rounds, r, stop, complete)
-        x["undecidable_all_rounds"] = undecidable(rounds, r, max(rounds), complete)
+        x["flagged"] = decide(rounds, r, bound, stop, complete=complete)
+        x["flagged_all_rounds"] = decide(rounds, r, bound, max(rounds), complete=complete)
+        x["undecidable"] = undecidable(rounds, r, stop, complete=complete)
+        x["undecidable_all_rounds"] = undecidable(rounds, r, max(rounds), complete=complete)
     return stop, out
 
 
@@ -979,7 +981,7 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), sche
                 for k, _e, ms in xs:
                     rounds[k][v].append(ms)
             per_metric[metric] = dict(rounds)
-        stop, metrics = combined_stop(per_metric, bound, rules, scheduled, complete=complete)
+        stop, metrics = combined_stop(per_metric, bound, rules, scheduled=scheduled, complete=complete)
         last = max(max(per_metric["exec_ms"]), stop, schedule or 0)
         # a metric that ran every round it had ran to the end of the schedule, even when the
         # schedule's last rounds left no rows, and no rows past them change its decisions
