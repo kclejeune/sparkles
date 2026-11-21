@@ -3811,8 +3811,8 @@ decides, for one context, the data restrictions, data ranges, data cardinalities
 functional data properties and data-property keys that apply there, over the whole OWL 2
 datatype map with its facets. The EL and Horn tiers call it for the meets and inclusions
 of their data lattice and for the covers that would need a case analysis, Tier D and the
-rooted run call it through a theory rule over the data successor terms of each context,
-and the worlds of the Horn rules with individuals call it for the values of keys and
+rooted run call it through a theory rule over the data atoms of each context, and the
+worlds of the Horn rules with individuals call it for the values of keys and
 functional properties. It is written from the OWL 2 Structural Specification §4, §5.7,
 §9.3.6, §9.4 and §11.2, the Direct Semantics §2.2 and §2.3, and XML Schema 1.1 Part 2,
 with the theory resolution of Stickel (*Automated deduction by theory resolution*, JAR
@@ -3884,148 +3884,145 @@ regular expression, which the first phases do not build. Until a later item buil
 range with a pattern is an opaque atom below its datatype, as an unknown datatype is
 today, and its axiom is reported as used in part.
 
-**Sizes.** Every range has a size, the number of its values saturating at 2^63. The
-integer stratum, the floating-point families, the Boolean family, the finite sets, the
-strings and binary values with bounded lengths and the date-times with bounded instants
-have finite sizes, and the other strata, unbounded lengths and the reals do not. A
-string cell of bounded length is finite, but its size is far past every cardinality an
-axiom can state except at length 0, which holds only the empty string. The size is what
-the cardinalities need.
+**Sizes.** Every range has a size, the number of its values saturating at 2^63. A
+bounded interval of the integer stratum, every range of the floating-point and Boolean
+families and every finite set of values have finite sizes. The seconds of a date-time
+are a decimal of unbounded precision, so an interval of instants is infinite unless it
+is one instant, which has one value for each of the 1,681 offsets from `-14:00` to
+`+14:00`. A string or binary cell of bounded length is finite, but its size is past
+every cardinality an axiom can state except at small lengths, such as length 0, which
+holds only the empty string. The other strata, unbounded lengths and the reals are
+infinite. The size is what the cardinalities need, and an overestimate of finiteness
+would make the pigeonhole cases report false inconsistencies, so each family's size
+function has its own tests at the boundaries.
 
 **Literals.** A literal of a datatype in the map has the canonical value of its lexical
 form, which `datatypes::lexical` checks. A literal whose lexical form is outside the
 lexical space of its datatype violates §5.7, so the ontology is not in OWL 2 DL and the
 Direct Semantics gives the literal no value. The checker reads such a literal as the
-empty range, so an assertion or `DataHasValue` with it is unsatisfiable. This choice is
-open for the advisor and the comparison with HermiT. An XML literal and a literal of a
-datatype outside the map stay opaque atoms that only equal themselves, and their axioms
-are reported as used in part.
+empty range, so a class with `DataHasValue` of it is unsatisfiable and an assertion with
+it makes the ontology inconsistent. Phase 2 compares this reading with HermiT's before
+it is kept, since it decides between an unsatisfiable class and an inconsistent
+ontology. An XML literal and a literal of a datatype outside the map stay opaque atoms
+that only equal themselves, and their axioms are reported as used in part.
 
-**The problem it decides.** One question goes to the checker. It gets a set of data terms
-with literals of three kinds, a range `R(t)` on a term, an equality `t ≈ u` and an
-inequality `t ≉ u`, and it answers whether some assignment of values to the terms makes
-every literal true. It joins equal terms, meets the ranges of each class and answers no
-when a meet is empty or an inequality joins a class to itself. It then drops every class
-whose range has more values than it has inequalities, since such a class always has a
-value left, and repeats until no class drops. The classes that remain have finite ranges
-no larger than the number of their inequalities, and a backtracking search over those
-values decides them. A search past a bound on its steps answers that the bound was
-passed, which the callers treat as their work bounds. When the answer is no, the checker
-also gives the minimal unsatisfiable subsets of the literals that contain a literal the
-caller names, found by deletion and enumerated up to a bound, which the theory rule
-needs.
+**Data restrictions are atoms.** Every data restriction of the ontology,
+`DataSomeValuesFrom`, `DataAllValuesFrom`, `DataHasValue` and the three data
+cardinalities, is an atom over x in every tier, and a functional data property is the
+restriction `≤1 d` on `owl:Thing`. A data value has no successors and nothing about it
+reaches another element, so the data successors of an element exist only inside the
+checker. A set of data atoms that hold of one element, and a set that do not, is a
+local problem, which the checker decides with the ranges of the properties and the data
+property hierarchy. The complement of a data atom is a data atom, `∀d.¬R` for `∃d.R` and
+`≤(n-1) d.R` for `≥n d.R`, so a negated atom is one more atom of the problem.
+
+**The local problem.** The checker gets the atoms and builds the element's data
+successors. A minimum `≥n d.R` gives n distinct witnesses and an existential one witness,
+each in the meet of its range, the ranges of its property and the universal restrictions
+on the property and its superproperties. A maximum `≤n d.R` bounds the number of distinct
+values in `R` among the witnesses of `d` and its subproperties. Only the cells of the
+ranges involved matter, the nonempty intersections of each range or its complement, so
+the search gives each witness a cell and an identity within it, with the cells' sizes
+bounding the identities, and two witnesses with the same cell and identity are one value.
+`DisjointDataProperties` forbids a shared value between the witnesses of its properties.
+A witness whose cell is infinite, or larger than the number of witnesses, always has a
+fresh identity and needs no search. The search is exact and bounded, and past its bound
+it answers that the bound was passed, which the callers treat as their work bounds. The
+census files need at most a few witnesses per element.
+
+**The theory rule.** A context's clauses hold data atoms like any other atoms over x.
+When a processed clause's maximal literal is a data atom P, the rule takes P with the
+data atoms that are maximal in the context's other processed clauses, and with the data
+atoms that occur in the bodies of ontology clauses. It asks the checker for the minimal
+sets of maximal atoms that contain P and, with the negation of a minimal set of body
+atoms, are unsatisfiable. For each such set and each choice of one clause for each atom,
+it derives the union of those clauses' other literals and the chosen body atoms under
+the union of their bodies. An empty set of body atoms is a conflict, one body atom is an
+entailment such as `≥3 d.xsd:boolean ⊑ ∃d.{true}`, and two or more are a cover, such as
+`∃d.xsd:boolean ⊑ ∃d.{true} ⊔ ∃d.{false}`. A cover needs two body atoms that overlap
+the maximal atoms partially, so it is tested only when there are two.
+
+**Completeness.** The rule is Hyper over the clauses `P_1(x) ∧ … ∧ P_k(x) → Q_1(x) ∨ … ∨
+Q_m(x)` that are valid in the datatype map over the ontology's finitely many data atoms.
+Added to the ontology they give it the same models, and the calculus with them is
+complete by its own theorem, since they are ordinary ontology clauses over x. The rule
+computes them lazily, and it fires on exactly the premises that Hyper would take with
+them, since a valid clause whose body atoms are not all maximal in the context cannot
+fire there. The rule is therefore complete in the sense of the existing tiers, and a
+search or a set of minimal subsets past its bound passes the work bound as the case
+analysis of an inference does. An earlier design kept the data successors as terms of
+the clauses, with data function symbols, equalities between data terms and a data
+at-most rule over every set of n + 1 neighbours. It needs new rules and an argument that
+theory literals entailed by later ones do not break the model construction, and it buys
+nothing that the atoms do not, since no data term is shared between contexts.
 
 **The EL and Horn tiers.** The EL lattice of `classify/data.rs` keeps its shape, and its
 `Known` part becomes a range id of the checker, so meets and inclusions cover every
-datatype of the map and a singleton range such as `xsd:int[≥5, ≤5]` is a value. Finite
-value spaces make the lattice no longer convex, which the EL profile avoided by leaving
-them out. A context whose data successor holds a range `M` meets the negative
-restrictions `∃d.N_i ⊑ B_i` of its role, and when two or more `N_i` overlap `M` without
-containing it, the checker tests whether they cover `M`. A cover whose `B_i` are the same
-class, as for negative data assertions and disjointness, which give `owl:Nothing`, gives
-that class. A cover with different classes needs a case analysis, so the Horn tier
-reports those axioms as used in part, and a run that Tier D takes decides them there. A
-range overlapped by at most one `N_i`, which is every range of the EL profile, needs no
-test. The Horn tier also takes `DataAllValuesFrom` and `DataMaxCardinality(1)` in a
-positive position, which meet the ranges of a context's data successors and join them as
-a functional property does. The worlds of the Horn rules with individuals compare key
-values and functional values by identity through the checker.
+datatype of the map and a singleton range such as `xsd:int[≥5, ≤5]` is a value. Each
+data restriction in a positive position that the Horn rules cannot read through the
+lattice, a universal restriction, a data cardinality or an enumeration of several
+values, is a data atom of the Horn contexts, and the Horn tier applies the theory rule
+to it. A conflict gives `owl:Nothing` and an entailment gives its body atom, which the
+Horn rules can take. A cover whose classes differ needs a case analysis, so the Horn
+tier reports its axioms as used in part and a run that Tier D takes decides them there,
+while a cover whose classes are the same, such as negative data assertions that all give
+`owl:Nothing`, gives that class. A data restriction in a negative position whose
+negation is not Horn, a universal restriction or a cardinality on the left, stays with
+Tier D. On the 67 ORE 2015 DL files that the census found leaving axioms out for 768 or
+972, all 27 files with data restrictions outside OWL 2 EL have them only in positive
+positions, so the Horn tier can take their data whole. The worlds of the Horn rules with
+individuals compare key values and functional values by identity through the checker.
 
-**Tier D.** Data successors never get contexts, since a data value has no successors and
-nothing about it reaches another context. Each `DataSomeValuesFrom` restriction of the
-index gets a data function symbol, and a context's clauses hold its data literals in the
-existing literal kinds, the role literal `d(x, f(x))`, the atom `R(f(x))` with a range id
-for the atom and the equalities and inequalities between data terms. A complement is a
-range, so every data literal is positive. The ontology's data axioms become clauses of
-these shapes.
-
-| Axiom | Clauses |
-|---|---|
-| `A ⊑ ∃d.R`, `DataHasValue` on the right, a data assertion | `A(x) → d(x, f(x))` and `A(x) → R(f(x))` |
-| `A ⊑ ∀d.R`, a range of `d` | `A(x) ∧ d(x, z) → R(z)` |
-| `∃d.R ⊑ A`, `DataHasValue` on the left, a domain | `d(x, z) → A(x) ∨ ¬R(z)` |
-| `∀d.R ⊑ A` | `→ A(x) ∨ d(x, f(x))` and `→ A(x) ∨ ¬R(f(x))` |
-| `A ⊑ ≥n d.R` | n function symbols `f_i` with `d(x, f_i(x))`, `R(f_i(x))` and `f_i(x) ≉ f_j(x)` |
-| `A ⊑ ≤n d.R`, a functional property with n = 1 | an at-most atom `M(x)` read by the data at-most rule |
-| `DisjointDataProperties(d e)` | `d(x, z) ∧ e(x, w) → z ≉ w` |
-
-A minimum or maximum on the left becomes its dual on the right, as for object
-restrictions. Three rules read these clauses, and Succ and Pred pass over data function
-symbols.
-
-* *Data universal.* A clause whose maximal literal is `s(x, f(x))` for a data term meets
-  every ontology clause `Ψ(x) ∧ d(x, z) → Φ` with `s` under `d`, by hyperresolution with
-  clauses whose maximal literals are the atoms of `Ψ`, and gives `Φ` with `z` read as
-  `f(x)`.
-* *Data at-most.* An at-most atom `M(x)` for `≤n d.R` and n + 1 clauses whose maximal
-  literals are role literals `s_i(x, f_i(x))` with `s_i` under `d` give the disjunction of
-  `f_i(x) ≈ f_j(x)` over the pairs and `¬R(f_i(x))` over the terms. Among any n + 1
-  neighbours two are the same value or one is outside `R`, which is the semantics of the
-  restriction, and no qualified role is needed. The bounds of the object at-most rule
-  apply, 12 terms and 16,384 subsets.
-* *Theory.* A clause whose maximal literal `L` is a data literal is checked with the
-  maximal data literals of the context's other clauses on terms that equalities and
-  inequalities connect to `L`'s. For each minimal unsatisfiable subset that contains
-  `L`, and each choice of one clause for each of its other literals, the rule derives the
-  union of the clauses' other literals under the union of their bodies.
-
-The theory rule is ordered theory resolution, and it keeps the calculus complete in the
-same sense as before. In the model construction of a context, a data literal is
-produced when its clause is false and the literal is consistent with the data literals
-produced so far. A minimal clause that is false in the model has a maximal literal
-inconsistent with the smaller produced ones, and the rule's conclusion from that clause
-and the producing clauses is smaller and false, which contradicts minimality. A
-produced set that the checker accepts has an assignment of values, and every clause is
-true there. The data terms take no part in the cross-context argument, since no clause
-of another context mentions them. Equalities between data terms are theory literals and
-are not rewritten by the equality rules, which is why the at-most rule takes every
-subset of n + 1 neighbours rather than relying on rewriting.
+**Tier D.** Tier D's eligibility drops its refusal of data roles and keeps its refusal of
+the top data property. Data atoms are atoms of the index like named classes, ordered
+above them by id, and the theory rule runs beside Hyper in every context that holds a
+data atom.
 
 **Keys.** A key constrains only named individuals (Direct Semantics Table 9), so it adds
 nothing to a run without individuals, and Tier D without individuals ignores keys. In a
-rooted run the root holds the facts about constants, and its data terms `f(u)` are the
-values of constant `u`. For two constants `u` and `v` in a key's class, the clause
-`→ u ≈ v ∨ f(u) ≉ g(v)` for each key property is added when the ranges of `f(u)` and
-`g(v)` are the same singleton or are both finite and overlap, since otherwise the
-values can always differ. A hash of singleton values finds the first case, and the
-second is bounded, past which the key is reported as used in part. The theory rule then
-merges the constants whose values must agree, including the pigeonhole case of more key
-individuals than values.
+rooted run, a key `HasKey(K (p…) (d…))` relates two constants u and v of K with one
+clause for the pair, `K(u) ∧ K(v) → u ≈ v ∨ D`, where D holds, for each key property,
+the literal that u and v share no value of it. For an object property that literal is
+the difference of their named fillers. For a data property the theory rule decides it
+from the data atoms of u and v, which must force a shared value, and the first phases
+take only the forced case that the worlds take today, one singleton value on each side
+that is the same. A hash of the constants by their singleton key values finds the pairs.
+A key whose values could be shared only by a pigeonhole over a finite range, or whose
+values are not singletons, is reported as used in part.
 
-**The rooted run.** A data assertion `DataPropertyAssertion(d a v)` is `{a} ⊑ ∃d.{v}`
-and its negative form is `{a} ⊓ ∃d.{v} ⊑ ⊥`, as in the EL index. The data function
-symbols of constants, `f(u)`, are ground data terms. Every context applies the theory
-rule to its ground data literals as it applies the other rules to its ground literals,
-and the root does so for the unconditional facts.
+**The rooted run.** A data assertion `DataPropertyAssertion(d a v)` is the atom
+`∃d.{v}` on the constant a, and its negative form is `{a} ⊓ ∃d.{v} ⊑ ⊥`, as in the EL
+index. Hyper binds x to a constant, and the theory rule does the same, so each context
+decides the ground data atoms of each constant as it decides those over x.
 
 **Representation and incremental checking.** A run builds the data tables only when its
-index has a data role. A context then keeps, for each data term, the processed clauses
-whose maximal literal is a data literal over it, and for each component of terms
-connected by equalities and inequalities, the meet of its unit ranges and whether the
-component is known to be satisfiable. A new maximal data literal first meets the cached
-meet of its term, which settles a component without equalities or inequalities without
-a search, and only a component with equalities, inequalities or finite ranges goes to
-the full check. The checks and the minimal subsets count toward the run's work bound and
-memory budget as the case analysis of an inference does.
+index has a data atom. A context then keeps its processed clauses with a maximal data
+atom by the data property of the atom, with the cached answers of the checker for the
+sets it has asked about, and the run keeps the cells of each property's ranges. A new
+maximal data atom is checked only with the atoms on its property, its subproperties and
+superproperties, and the answers for the same sets of atoms are shared by every context
+through a run-level cache. The checks and the minimal sets count toward the run's work
+bound and memory budget as the case analysis of an inference does.
 
-**Cost without data.** An ontology without data roles builds no data tables, interns no
-ranges and adds no rule, and the run-level flag is read once per rule application, not
-per literal. The tests compare instruction counts of the disjunctive fixtures with and
-without the change, and the timing A/B of the phases that touch the rules runs on a
-quiet Intel host.
+**Cost without data.** An ontology without data atoms builds no data tables, interns no
+ranges and adds no rule, and the rule is skipped by a run-level flag read once per
+processed clause, not per literal. Phase 3 compares instruction counts of the
+disjunctive fixtures with and without the change, and its timing A/B runs on a quiet
+Intel host.
 
-**Cost with data.** Item 768's experiment found that sending these files to Tier D costs
-far more than leaving their data axioms out, 442 ms against 6 ms on ore_ont_3231, before
-any data reasoning, because Tier D replaces the Horn rules on the whole file. Phase 3
-measures ore_ont_3231, ore_ont_7584, ore_ont_8273 and ore_ont_13306 first, and keeps the
-Horn tier's share of a file when the case analysis only needs data, so that Tier D's
-cost is paid only where the census shows axioms that need it.
+**Cost with data.** Item 768's experiment took the EL data restrictions as atoms in Tier
+D, which is this design without the checker, and found that sending these files to
+Tier D costs far more than leaving their data axioms out, 442 ms against 6 ms on
+ore_ont_3231. The cost came from Tier D replacing the Horn rules on the whole file, not
+from the data. Phase 2's Horn tier takes the files whose only case analysis would be in
+their data, and phase 3 measures ore_ont_3231, ore_ont_7584, ore_ont_8273 and
+ore_ont_13306 first, so that Tier D's cost is paid only where the census shows axioms
+that need it.
 
 **What stays out.** The `pattern` facet until its automaton is built, XML literals and
 datatypes outside the map stay opaque and are reported as used in part. The top data
 property stays with the EL index and declines Tier D, as the top object property does.
-A search or a set of minimal subsets past its bound, and a key past its bound, pass the
-work bound or report the axiom.
+Keys outside the forced singleton case are reported as used in part.
 
 **Phases and tests.** Phase 1 builds the checker as a module with unit tests from the
 W3C OWL 2 test cases that involve datatypes, among them `Datatype-Float-Discrete-001`,
@@ -4033,10 +4030,13 @@ W3C OWL 2 test cases that involve datatypes, among them `Datatype-Float-Discrete
 `Qualified-cardinality-boolean`, `inconsistent-integer-filler`,
 `Contradicting-dateTime-restrictions`, `New-Feature-DataQCR-001`, the
 `New-Feature-DisjointDataProperties` and `New-Feature-Keys` cases and
-`string-integer-clash`. Phase 2 is item 972, the literals and ranges of the whole map in
-the EL and Horn tiers and their worlds, checked against HermiT on the OML probes and the
-census files. Phase 3 is item 768, data properties in Tier D and the rooted run, with
-the census tool run on the 61 files before and after.
+`string-integer-clash`, with tests of the zeros, such as `minExclusive "-0"` excluding
+`+0`. A differential test compares the checker's answers on random small sets of atoms
+with a brute-force model finder over small finite stand-ins for the value spaces, and a
+second one does the same for the theory rule's clauses. Phase 2 is item 972 with the
+Horn tier's data atoms, checked against HermiT on the OML probes and the census files.
+Phase 3 is item 768, data atoms in Tier D and the rooted run, with the census tool run
+on the 61 files before and after.
 
 ### Nominals in the disjunctive rules
 
