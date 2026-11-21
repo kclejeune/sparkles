@@ -765,6 +765,210 @@
     "unmapped": 0,
     "warnings": []
   },
+  "ranged-header": {
+    "axiomCount": 3,
+    "axioms": {
+      "DataPropertyAssertion": 1,
+      "DataPropertyRange": 1,
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/p> is not declared and was read as DataProperty from its use",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 8,
+    "unmapped": 4,
+    "warnings": []
+  },
+  "ranged-header-strict": {
+    "axiomCount": 1,
+    "axioms": {
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 6,
+      "list": [
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/p> <http://www.w3.org/2000/01/rdf-schema#range> <http://www.w3.org/2001/XMLSchema#string> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedSource> <http://ex.org/o> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedProperty> <http://ex.org/p> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedTarget> \"title\" maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Annotation> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/o> <http://ex.org/p> \"title\" maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 8,
+    "unmapped": 6,
+    "warnings": []
+  },
+  "reified-annotation-property": {
+    "axiomCount": 1,
+    "axioms": {
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "missing-main",
+          "message": "the owl:Axiom node _:b0 annotates a triple the graph does not hold",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(<http://ex.org/p> \"x\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 12,
+    "unmapped": 5,
+    "warnings": []
+  },
+  "reified-annotation-property-strict": {
+    "axiomCount": 1,
+    "axioms": {
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 5,
+      "list": [
+        {
+          "code": "missing-main",
+          "message": "the owl:Axiom node _:b0 annotates a triple the graph does not hold",
+          "severity": "warning"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedSource> <http://ex.org/p> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedProperty> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedTarget> <http://www.w3.org/2002/07/owl#AnnotationProperty> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2000/01/rdf-schema#comment> \"declared here\" maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Axiom> maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(<http://ex.org/p> \"x\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 12,
+    "unmapped": 5,
+    "warnings": []
+  },
   "reified-header": {
     "axiomCount": 2,
     "axioms": {
@@ -967,6 +1171,70 @@
     "mode": "strict",
     "triples": 5,
     "unmapped": 0,
+    "warnings": []
+  },
+  "type-as-ontology-property": {
+    "axiomCount": 2,
+    "axioms": {
+      "AnnotationAssertion": 2
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 3,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "type-reified-as-annotation": {
+    "axiomCount": 1,
+    "axioms": {
+      "AnnotationAssertion": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "missing-main",
+          "message": "the owl:Axiom node _:b0 annotates a triple the graph does not hold",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 7,
+    "unmapped": 5,
     "warnings": []
   }
 }

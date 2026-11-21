@@ -134,6 +134,27 @@ const NESTED_DECLARATIONS: &str = ":o a owl:Ontology .
 const TYPE_AS_ANNOTATION: &str = ":o a owl:Ontology ; rdfs:label \"o\" .
     rdf:type a owl:AnnotationProperty . :A a owl:Class . :p a owl:ObjectProperty .";
 
+const RANGED_HEADER: &str = ":o a owl:Ontology ; :p \"title\" .
+    :p rdfs:range xsd:string .
+    [] a owl:Annotation ; owl:annotatedSource :o ; owl:annotatedProperty :p ;
+        owl:annotatedTarget \"title\" .
+    :A a owl:Class .";
+
+const REIFIED_ANNOTATION_PROPERTY: &str = ":o a owl:Ontology ; :p \"x\" .
+    [] a owl:Axiom ; owl:annotatedSource :p ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget owl:AnnotationProperty ; rdfs:comment \"declared here\" .
+    [] a owl:Annotation ; owl:annotatedSource :o ; owl:annotatedProperty :p ;
+        owl:annotatedTarget \"x\" .
+    :A a owl:Class .";
+
+const TYPE_AS_ONTOLOGY_PROPERTY: &str = ":o a owl:Ontology .
+    rdf:type a owl:OntologyProperty . :A a owl:Class .";
+
+const TYPE_REIFIED_AS_ANNOTATION: &str = ":o a owl:Ontology .
+    [] a owl:Axiom ; owl:annotatedSource rdf:type ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget owl:AnnotationProperty ; rdfs:comment \"odd\" .
+    :A a owl:Class .";
+
 pub(super) const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "basic",
@@ -245,10 +266,51 @@ pub(super) const FIXTURES: &[Fixture] = &[
         data: GRAPHS,
         args: g1_g1,
     },
+    Fixture {
+        name: "ranged-header",
+        data: RANGED_HEADER,
+        args: default_args,
+    },
+    Fixture {
+        name: "ranged-header-strict",
+        data: RANGED_HEADER,
+        args: strict,
+    },
+    Fixture {
+        name: "reified-annotation-property",
+        data: REIFIED_ANNOTATION_PROPERTY,
+        args: default_args,
+    },
+    Fixture {
+        name: "reified-annotation-property-strict",
+        data: REIFIED_ANNOTATION_PROPERTY,
+        args: strict,
+    },
+    Fixture {
+        name: "type-as-ontology-property",
+        data: TYPE_AS_ONTOLOGY_PROPERTY,
+        args: default_args,
+    },
+    Fixture {
+        name: "type-reified-as-annotation",
+        data: TYPE_REIFIED_AS_ANNOTATION,
+        args: default_args,
+    },
 ];
 
 /// The fixtures whose reading needs the whole mapping, so that the head opens the ontology.
-const OPENED: &[&str] = &["type-as-annotation", "type-as-annotation-strict"];
+const OPENED: &[&str] = &[
+    "type-as-annotation",
+    "type-as-annotation-strict",
+    "reified-header",
+    "reified-header-strict",
+    "reified-annotation-property",
+    "reified-annotation-property-strict",
+    "ranged-header",
+    "ranged-header-strict",
+    "type-as-ontology-property",
+    "type-reified-as-annotation",
+];
 
 fn g1_g1() -> J {
     json!({ "graph": ["http://ex.org/g1", "http://ex.org/g2", "http://ex.org/g1"] })

@@ -35,6 +35,21 @@ pub const MAX_FRAGMENT: usize = 100_000;
 /// The most reified `rdf:type` triples the counts map.
 pub const MAX_REIFIED: usize = 10_000;
 
+/// The types that make an IRI a property of OWL, directly or by the OWL 1 rules.
+const PROPERTY_TYPES: [&str; 11] = [
+    vocab::OWL_ANNOTATION_PROPERTY,
+    vocab::OWL_ONTOLOGY_PROPERTY,
+    vocab::OWL_OBJECT_PROPERTY,
+    vocab::OWL_DATATYPE_PROPERTY,
+    vocab::OWL_FUNCTIONAL_PROPERTY,
+    vocab::OWL_INVERSE_FUNCTIONAL_PROPERTY,
+    vocab::OWL_TRANSITIVE_PROPERTY,
+    vocab::OWL_SYMMETRIC_PROPERTY,
+    vocab::OWL_ASYMMETRIC_PROPERTY,
+    vocab::OWL_REFLEXIVE_PROPERTY,
+    vocab::OWL_IRREFLEXIVE_PROPERTY,
+];
+
 /// What the head of an ontology answers.
 #[derive(Clone, Debug)]
 pub struct Head {
@@ -110,7 +125,7 @@ impl Ontologies {
         let inferences = self.inferences_of(&graphs, &graph_ids, view.commit, record.as_ref());
         check(opts)?;
         let r = Reader::new(&view, &graph_ids, requested, req.mode, opts)?;
-        let read = match r.usual() {
+        let read = match r.usual()? {
             false => None,
             true => match r.header()? {
                 Some(h) => r.entities()?.map(|e| (h, e)),
@@ -229,15 +244,98 @@ impl<'a> Reader<'a> {
         Ok(r)
     }
 
-    /// Whether the reverse mapping reads the vocabulary as usual: no graph read declares
-    /// `rdf:type` or another structural predicate an annotation property, which makes the
-    /// reader take its triples as annotations (the head then opens the ontology).
-    fn usual(&self) -> bool {
-        !vocab::STRUCTURAL_PREDICATES
+    /// Whether the reverse mapping reads the vocabulary as usual: no graph read types
+    /// `rdf:type` or another structural predicate as a property of OWL, directly or by a
+    /// reified type triple, which makes the reader take its triples as annotations or
+    /// assertions (the head then opens the ontology).
+    fn usual(&self) -> Result<bool> {
+        let Some(t) = self.rdf_type else {
+            return Ok(true);
+        };
+        let kinds: FxHashSet<Id> = PROPERTY_TYPES.iter().filter_map(|p| self.id(p)).collect();
+        let (src, prop, tgt) = (
+            self.id(vocab::OWL_ANNOTATED_SOURCE),
+            self.id(vocab::OWL_ANNOTATED_PROPERTY),
+            self.id(vocab::OWL_ANNOTATED_TARGET),
+        );
+        for p in vocab::STRUCTURAL_PREDICATES
             .iter()
             .chain([&vocab::RDF_TYPE])
+        {
+            let Some(p) = self.id(p) else { continue };
+            let mut typed = false;
+            self.each(Perm::Spo, &[p.0, t.0], |q| {
+                typed |= kinds.contains(&q[2]);
+                Ok(!typed)
+            })?;
+            if typed {
+                return Ok(false);
+            }
+            let (Some(src), Some(prop), Some(tgt)) = (src, prop, tgt) else {
+                continue;
+            };
+            let mut reifiers = Vec::new();
+            self.each(Perm::Pos, &[src.0, p.0], |q| {
+                reifiers.push(q[0]);
+                Ok(reifiers.len() <= MAX_REIFIED)
+            })?;
+            for r in reifiers {
+                let mut typing = false;
+                let mut target = false;
+                self.each(Perm::Spo, &[r.0], |q| {
+                    typing |= q[1] == prop && q[2] == t;
+                    target |= q[1] == tgt && kinds.contains(&q[2]);
+                    Ok(true)
+                })?;
+                if typing && target {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether the full read could type a predicate of `f` from triples outside it: a
+    /// predicate outside the terminological ones, which only the main triples of
+    /// reifications bring in, that no graph read declares directly and that is not built
+    /// in. A lenient read infers its kind from its use, and either mode reads a
+    /// declaration that only an `owl:Axiom` node states.
+    fn undeclared(&self, f: &Fragment) -> Result<bool> {
+        let Some(t) = self.rdf_type else {
+            return Ok(false);
+        };
+        let kinds: FxHashSet<Id> = EntityKind::ALL
+            .iter()
+            .map(|k| k.rdf_type())
+            .chain(PROPERTY_TYPES)
             .filter_map(|p| self.id(p))
-            .any(|id| self.declared.contains(&id))
+            .collect();
+        let mut preds: Vec<Id> = f
+            .quads
+            .iter()
+            .map(|q| q[1])
+            .filter(|p| !self.terminological.contains(p) && Some(*p) != self.rdf_type)
+            .collect();
+        preds.sort_unstable();
+        preds.dedup();
+        for p in preds {
+            let builtin = match self.snap.term(p) {
+                Some(Term::NamedNode(n)) => read::builtin_kind(n.as_str()).is_some(),
+                _ => false,
+            };
+            if builtin {
+                continue;
+            }
+            let mut declared = false;
+            self.each(Perm::Spo, &[p.0, t.0], |q| {
+                declared |= kinds.contains(&q[2]);
+                Ok(!declared)
+            })?;
+            if !declared {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn id(&self, iri: &str) -> Option<Id> {
@@ -484,7 +582,7 @@ impl<'a> Reader<'a> {
                 return Ok(None);
             }
         }
-        if !self.add_types(&mut f)? {
+        if !self.add_types(&mut f)? || self.undeclared(&f)? {
             return Ok(None);
         }
         Ok(Some(self.map(&f).header))
@@ -559,7 +657,7 @@ impl<'a> Reader<'a> {
                     return Ok(None);
                 }
             }
-            if !self.add_types(&mut f)? {
+            if !self.add_types(&mut f)? || self.undeclared(&f)? {
                 return Ok(None);
             }
             let own: FxHashSet<String> = reified
