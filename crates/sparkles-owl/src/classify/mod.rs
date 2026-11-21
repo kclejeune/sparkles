@@ -462,7 +462,7 @@ pub struct Stats {
     /// the deadline or a cancellation stopped the modules' pass, so every class is
     /// incomplete and the consistency unknown
     pub coverage_stopped: bool,
-    /// the triples of the input that map to no axiom, such as a SWRL rule or a domain of
+    /// the triples of the input that map to no axiom, such as a domain of
     /// a property that is not declared, which the answer counts as left out
     /// ([`Classification::leave_out_unmapped`]): at least one when the run did not read
     /// the assertions, whose read stops at the first

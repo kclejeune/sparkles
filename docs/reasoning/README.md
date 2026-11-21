@@ -687,7 +687,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   inconsistent terminology stays `inconsistent`. A class that only such an assertion
   names is in no taxonomy, so it is not listed in `incomplete` and shows only through
   `complete` and the `assertion-not-read` entry. A triple that maps to no axiom, such as
-  a SWRL rule in RDF or the domain of a property that is not declared, is counted in the
+  the domain of a property that is not declared, is counted in the
   `unmapped` statistic and leaves the answer incomplete in the same way, with or without
   `assertions`. `strict` on the request, `--strict` on `sparkles ontology classify` and
   `--strict true` on ROBOT's `reason`, `reduce` and `materialize`, which is their default

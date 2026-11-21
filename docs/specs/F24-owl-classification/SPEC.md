@@ -4636,8 +4636,8 @@ review rounds each found a case it missed, all of the kind of a class that only 
 assertion names, so it was removed, and roadmap item 1293 records a sound replacement.
 `assertions` true gives the complete answer, and roadmap item 1279 makes it the default.
 
-A triple that maps to no axiom, such as a SWRL rule in RDF, an assertion that a strict
-read cannot map or the domain of a property that is not declared, may carry any logical
+A triple that maps to no axiom, such as an assertion that a strict read cannot map or
+the domain of a property that is not declared, may carry any logical
 content. Every classification counts such triples, of the terminology and of the
 assertions, in `Stats::unmapped`, and with any of them the answer is not complete, every
 class is incomplete and a consistency found is `unknown`. No `excluded` entry names them,

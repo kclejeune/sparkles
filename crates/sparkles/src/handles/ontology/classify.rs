@@ -151,7 +151,7 @@ pub fn strict_refusal(classification: &Classification, excluded: &[Excluded]) ->
     };
     if unmapped > 0 {
         message.push_str(&format!(
-            "; {unmapped} triples of the input map to no axiom, such as a SWRL rule or a \
+            "; {unmapped} triples of the input map to no axiom, such as the domain of a \
              property that is not declared, and may carry anything: declare the property \
              or remove the triples"
         ));
