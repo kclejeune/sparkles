@@ -87,6 +87,8 @@ mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
 mod saturate;
+#[cfg(test)]
+mod scratch_admission_tests;
 mod taxonomy;
 mod world;
 
@@ -2331,6 +2333,8 @@ impl Saturation {
             };
             budget.grow(0)?;
             stats.cleared = self.invalidate(&scratch, &ix, renumbered, &mut budget)?;
+            #[cfg(test)]
+            scratch_audit::premises(premises_bytes);
             normalized_peak = budget.peak;
             poll(limits)?;
         }
@@ -3413,10 +3417,30 @@ impl Saturation {
                 && gone.0.len() == self.ctx.len().div_ceil(64),
             "the invalidation's scratch passed what the budget admitted"
         );
+        #[cfg(test)]
+        let live =
+            (few.capacity() + stack.capacity() + queue.capacity()) * std::mem::size_of::<Ex>();
         drop((few, stack, queue, parts));
         if !any && !renumbered {
+            #[cfg(test)]
+            scratch_audit::record(budget, live, 0, 0);
             return Ok(0);
         }
+        // the kept contexts that number their sets again may need larger maps, which
+        // the budget admits before any context changes
+        let mut maps = 0;
+        if renumbered {
+            for (e, c) in self.ctx.iter().enumerate() {
+                let Some(c) = c.get() else { continue };
+                let st = c.st.lock();
+                if st.init && !gone.has(e as Ex) && !st.disj.is_empty() {
+                    maps += st.disjoint_growth(ix);
+                }
+            }
+            budget.grow(maps)?;
+        }
+        #[cfg(any(test, debug_assertions))]
+        let mut grown = 0;
         let mut cleared = 0;
         for (e, c) in self.ctx.iter_mut().enumerate() {
             let Some(c) = c.get_mut() else { continue };
@@ -3432,10 +3456,23 @@ impl Saturation {
                     st.drop_links_where(|s| gone.has(s));
                 }
                 if renumbered && !st.disj.is_empty() {
+                    #[cfg(any(test, debug_assertions))]
+                    let had = st.disj.capacity();
                     st.reindex_disjoint(ix);
+                    #[cfg(any(test, debug_assertions))]
+                    if st.disj.capacity() > had {
+                        grown += saturate::table_bytes(st.disj.capacity(), 8);
+                    }
                 }
             }
         }
+        #[cfg(any(test, debug_assertions))]
+        debug_assert!(
+            grown <= maps,
+            "the disjointness maps grew past what the budget admitted"
+        );
+        #[cfg(test)]
+        scratch_audit::record(budget, live, maps, grown);
         Ok(cleared)
     }
 
@@ -3459,6 +3496,55 @@ impl Saturation {
             .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
             .collect();
         Some((st.bottom, named))
+    }
+}
+
+/// What the last invalidation on a thread admitted and held, which the tests of its
+/// admission read.
+#[cfg(test)]
+mod scratch_audit {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(super) struct Audit {
+        /// the estimate held after the invalidation, and the run's peak
+        pub held: usize,
+        pub peak: usize,
+        /// the bytes admitted for the lists, and those the lists held
+        pub lists: usize,
+        pub live: usize,
+        /// the bytes admitted for the disjointness maps, and those the maps took
+        pub maps: usize,
+        pub grown: usize,
+        /// the bytes of the normalized premises of the changed axioms
+        pub premises: usize,
+    }
+
+    thread_local! {
+        static LAST: Cell<Option<Audit>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record(b: &super::Scratch<'_>, live: usize, maps: usize, grown: usize) {
+        LAST.set(Some(Audit {
+            held: b.held,
+            peak: b.peak,
+            lists: b.lists,
+            live,
+            maps,
+            grown,
+            premises: 0,
+        }));
+    }
+
+    pub(super) fn premises(bytes: usize) {
+        LAST.set(LAST.get().map(|a| Audit {
+            premises: bytes,
+            ..a
+        }));
+    }
+
+    pub(super) fn take() -> Option<Audit> {
+        LAST.take()
     }
 }
 

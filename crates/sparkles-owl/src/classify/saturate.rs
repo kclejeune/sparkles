@@ -561,13 +561,46 @@ impl State {
     }
 
     /// Recomputes the members of the disjointness sets among the subsumers, whose
-    /// numbers the index of each run gives anew.
+    /// numbers the index of each run gives anew. An unsatisfiable context reads no
+    /// membership again, so it keeps none: its subsumers hold `owl:Nothing` and the
+    /// subsumer that gave it, whose memberships the saturation never recorded. The map
+    /// grows only past [`State::disjoint_growth`], which the caller admits first.
     pub fn reindex_disjoint(&mut self, ix: &Index) {
         self.disj.clear();
+        if self.bottom {
+            return;
+        }
+        let n = self.disjoint_members(ix);
+        if n > self.disj.capacity() {
+            // drop the old table before the new one is allocated
+            self.disj = FxHashMap::default();
+            self.disj.reserve(n);
+        }
         for &d in &self.subs {
             for &s in ix.disjoint(d) {
                 self.disj.entry(s).or_insert(d);
             }
+        }
+    }
+
+    /// The memberships of the subsumers in the index's disjointness sets, a bound on the
+    /// entries of the map that [`State::reindex_disjoint`] builds.
+    fn disjoint_members(&self, ix: &Index) -> usize {
+        self.subs.iter().map(|&d| ix.disjoint(d).len()).sum()
+    }
+
+    /// The bytes of the table that [`State::reindex_disjoint`] allocates over `ix`, none
+    /// when the map it has holds the memberships. A table reserved for `n` entries has
+    /// at most `2n + 8` of capacity.
+    pub fn disjoint_growth(&self, ix: &Index) -> usize {
+        if self.bottom {
+            return 0;
+        }
+        let n = self.disjoint_members(ix);
+        if n <= self.disj.capacity() {
+            0
+        } else {
+            table_bytes(2 * n + 8, 8)
         }
     }
 

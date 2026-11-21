@@ -103,7 +103,9 @@ to clear 3 to 39 of its 659,580 contexts. Kept contexts now keep their propagati
 renumber their disjointness sets only when the run's sets differ from the last run's,
 and the two remaining reads of every context use bit sets. The invalidation admits its
 bit sets and the normalized premises of the changed axioms before it starts, and its lists
-of parts, of the walk and of the cleared contexts before each grows. Items 590 and 664 wait for
+of parts, of the walk and of the cleared contexts before each grows. It also admits the
+larger disjointness maps that kept contexts need when they number their sets again,
+before any context changes, and an unsatisfiable context keeps no map. Items 590 and 664 wait for
 item 1254, since on that file the index build and the checks before it are 0.47 of a run
 that starts again.
 
