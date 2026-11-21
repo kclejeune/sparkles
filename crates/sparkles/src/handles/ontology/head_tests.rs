@@ -109,6 +109,31 @@ const GRAPHS: &str = "GRAPH :g1 {
     GRAPH :g3 { :C a owl:Class . }
     :D a owl:Class .";
 
+const REIFIED_HEADER: &str = ":o a owl:Ontology ; :p \"title\" ; rdfs:label \"o\" .
+    [] a owl:Annotation ; owl:annotatedSource :o ; owl:annotatedProperty :p ;
+        owl:annotatedTarget \"title\" ; rdfs:comment \"why\" .
+    _:r1 a owl:Axiom ; owl:annotatedSource :o ; owl:annotatedProperty rdfs:label ;
+        owl:annotatedTarget \"o\" ; rdfs:comment \"first\" .
+    [] a owl:Annotation ; owl:annotatedSource _:r1 ; owl:annotatedProperty rdfs:comment ;
+        owl:annotatedTarget \"first\" ; rdfs:label \"nested\" .
+    :A a owl:Class .";
+
+const NESTED_DECLARATIONS: &str = ":o a owl:Ontology .
+    :A a owl:Class .
+    _:d1 a owl:Axiom ; owl:annotatedSource :A ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget owl:Class ; rdfs:comment \"same\" .
+    _:d2 a owl:Axiom ; owl:annotatedSource :A ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget owl:Class ; rdfs:comment \"same\" .
+    [] a owl:Annotation ; owl:annotatedSource _:d2 ; owl:annotatedProperty rdfs:comment ;
+        owl:annotatedTarget \"same\" ; rdfs:label \"inner\" .
+    :B a owl:Class .
+    [] a owl:Axiom ; owl:annotatedSource :B ; owl:annotatedProperty rdfs:subClassOf ;
+        owl:annotatedTarget :A ; rdfs:comment \"sub\" .
+    :B rdfs:subClassOf :A .";
+
+const TYPE_AS_ANNOTATION: &str = ":o a owl:Ontology ; rdfs:label \"o\" .
+    rdf:type a owl:AnnotationProperty . :A a owl:Class . :p a owl:ObjectProperty .";
+
 pub(super) const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "basic",
@@ -190,7 +215,44 @@ pub(super) const FIXTURES: &[Fixture] = &[
         data: GRAPHS,
         args: g1_g2,
     },
+    Fixture {
+        name: "reified-header",
+        data: REIFIED_HEADER,
+        args: default_args,
+    },
+    Fixture {
+        name: "reified-header-strict",
+        data: REIFIED_HEADER,
+        args: strict,
+    },
+    Fixture {
+        name: "nested-declarations",
+        data: NESTED_DECLARATIONS,
+        args: default_args,
+    },
+    Fixture {
+        name: "type-as-annotation",
+        data: TYPE_AS_ANNOTATION,
+        args: default_args,
+    },
+    Fixture {
+        name: "type-as-annotation-strict",
+        data: TYPE_AS_ANNOTATION,
+        args: strict,
+    },
+    Fixture {
+        name: "graphs-repeated",
+        data: GRAPHS,
+        args: g1_g1,
+    },
 ];
+
+/// The fixtures whose reading needs the whole mapping, so that the head opens the ontology.
+const OPENED: &[&str] = &["type-as-annotation", "type-as-annotation-strict"];
+
+fn g1_g1() -> J {
+    json!({ "graph": ["http://ex.org/g1", "http://ex.org/g2", "http://ex.org/g1"] })
+}
 
 pub(super) fn dataset(data: &str) -> Dataset {
     let ds = Dataset::memory();
@@ -272,7 +334,7 @@ fn the_head_reads_without_opening_the_ontology() {
         let ds = dataset(f.data);
         let req = super::wire::request_of((f.args)().as_object().unwrap()).unwrap();
         let h = ds.ontology().head(&req, &QueryOptions::default()).unwrap();
-        assert!(!h.opened, "fixture {}", f.name);
+        assert_eq!(h.opened, OPENED.contains(&f.name), "fixture {}", f.name);
     }
 }
 
@@ -355,4 +417,79 @@ fn the_head_reads_the_inferences_with_their_freshness() {
     ds.update(&format!("{PREFIXES} INSERT DATA {{ :C a owl:Class }}"))
         .unwrap();
     same(&ds, inferred, &QueryOptions::default());
+}
+
+#[test]
+fn the_head_refuses_a_cancelled_or_late_read() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    let ds = dataset(BASIC);
+    let req = super::OntologyRequest::default();
+    let cancelled = QueryOptions {
+        cancel: Some(Arc::new(AtomicBool::new(true))),
+        ..Default::default()
+    };
+    assert!(ds.ontology().head(&req, &cancelled).is_err());
+    let late = QueryOptions {
+        deadline: Some(std::time::Instant::now() - std::time::Duration::from_secs(1)),
+        ..Default::default()
+    };
+    assert!(ds.ontology().head(&req, &late).is_err());
+    let empty = Dataset::memory();
+    assert!(empty.ontology().head(&req, &cancelled).is_err());
+}
+
+#[test]
+fn the_head_reads_a_past_state() {
+    // a dataset on disk keeps its history
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open(dir.path()).unwrap();
+    ds.update(&format!("{PREFIXES} INSERT DATA {{ {BASIC} }}"))
+        .unwrap();
+    let c0 = ds.store().snapshot().commit;
+    ds.update(&format!(
+        "{PREFIXES} INSERT DATA {{ :E a owl:Class . :o rdfs:label \"later\" }}"
+    ))
+    .unwrap();
+    let at = json!({ "at": format!("commit:{c0}") });
+    same(&ds, at, &QueryOptions::default());
+    same(&ds, json!({}), &QueryOptions::default());
+}
+
+#[test]
+fn the_head_opens_the_ontology_past_its_reified_bound() {
+    let mut data = String::from(":o a owl:Ontology . ");
+    for n in 0..=super::head::MAX_REIFIED {
+        data.push_str(&format!(
+            "<http://ex.org/C{n}> a owl:Class . [] a owl:Axiom ; \
+             owl:annotatedSource <http://ex.org/C{n}> ; owl:annotatedProperty rdf:type ; \
+             owl:annotatedTarget owl:Class ; rdfs:comment \"c\" . "
+        ));
+    }
+    let ds = dataset(&data);
+    let req = super::OntologyRequest::default();
+    let h = ds.ontology().head(&req, &QueryOptions::default()).unwrap();
+    assert!(h.opened);
+    same(&ds, json!({}), &QueryOptions::default());
+}
+
+#[test]
+fn the_head_reads_through_a_masked_view() {
+    // grants that hide the requested graph's header, or one graph of a declaration
+    use crate::access::{GraphAccess, GraphRule, Graphs};
+    let ds = dataset(GRAPHS);
+    let g = Graphs::Only(GraphRule::new(
+        ["http://ex.org/g2", "http://ex.org/g3"],
+        &[],
+    ));
+    let o = QueryOptions {
+        graphs: Some(std::sync::Arc::new(GraphAccess::graphs(g.clone(), g))),
+        ..Default::default()
+    };
+    same(&ds, g1(), &o);
+    same(
+        &ds,
+        json!({ "graph": ["http://ex.org/g1", "http://ex.org/g3"] }),
+        &o,
+    );
 }

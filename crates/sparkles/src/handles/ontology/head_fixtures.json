@@ -298,6 +298,58 @@
     "unmapped": 0,
     "warnings": []
   },
+  "graphs-repeated": {
+    "axiomCount": 5,
+    "axioms": {
+      "Declaration": 5
+    },
+    "closure": [
+      {
+        "cycle": false,
+        "from": "http://ex.org/g1",
+        "graphs": [
+          "http://ex.org/g2"
+        ],
+        "iri": "http://ex.org/g2",
+        "via": "graph"
+      }
+    ],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 4,
+      "ObjectProperty": 1
+    },
+    "graphs": [
+      "http://ex.org/g1",
+      "http://ex.org/g2"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"one\")"
+      ],
+      "imports": [
+        "http://ex.org/g2"
+      ],
+      "iri": "http://ex.org/g1",
+      "versionIri": null
+    },
+    "imports": [
+      {
+        "graph": "http://ex.org/g2",
+        "iri": "http://ex.org/g2"
+      }
+    ],
+    "mode": "lenient",
+    "triples": 16,
+    "unmapped": 0,
+    "warnings": []
+  },
   "graphs-two": {
     "axiomCount": 5,
     "axioms": {
@@ -444,6 +496,38 @@
     "warnings": [
       "owl:imports <http://ex.org/missing> did not resolve to a graph"
     ]
+  },
+  "nested-declarations": {
+    "axiomCount": 4,
+    "axioms": {
+      "Declaration": 3,
+      "SubClassOf": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 3
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 24,
+    "unmapped": 0,
+    "warnings": []
   },
   "no-header": {
     "axiomCount": 2,
@@ -681,6 +765,109 @@
     "unmapped": 0,
     "warnings": []
   },
+  "reified-header": {
+    "axiomCount": 2,
+    "axioms": {
+      "AnnotationAssertion": 1,
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [
+        {
+          "code": "undeclared",
+          "message": "<http://ex.org/p> is not declared and was read as AnnotationProperty from its use",
+          "severity": "warning"
+        }
+      ],
+      "warnings": 1
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(Annotation(rdfs:comment \"why\") <http://ex.org/p> \"title\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 19,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "reified-header-strict": {
+    "axiomCount": 2,
+    "axioms": {
+      "AnnotationAssertion": 1,
+      "Declaration": 1
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 6,
+      "list": [
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedSource> <http://ex.org/o> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedProperty> <http://ex.org/p> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2002/07/owl#annotatedTarget> \"title\" maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/2000/01/rdf-schema#comment> \"why\" maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple _:b0 <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#Annotation> maps to no axiom",
+          "severity": "error"
+        },
+        {
+          "code": "unmapped",
+          "message": "the triple <http://ex.org/o> <http://ex.org/p> \"title\" maps to no axiom",
+          "severity": "error"
+        }
+      ],
+      "warnings": 0
+    },
+    "entities": {
+      "Class": 1
+    },
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
+    "triples": 19,
+    "unmapped": 6,
+    "warnings": []
+  },
   "two-nodes": {
     "axiomCount": 1,
     "axioms": {
@@ -716,6 +903,68 @@
     },
     "imports": [],
     "mode": "lenient",
+    "triples": 5,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "type-as-annotation": {
+    "axiomCount": 3,
+    "axioms": {
+      "AnnotationAssertion": 3
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"o\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "lenient",
+    "triples": 5,
+    "unmapped": 0,
+    "warnings": []
+  },
+  "type-as-annotation-strict": {
+    "axiomCount": 3,
+    "axioms": {
+      "AnnotationAssertion": 3
+    },
+    "closure": [],
+    "commit": 1,
+    "dataset": "",
+    "diagnostics": {
+      "errors": 0,
+      "list": [],
+      "warnings": 0
+    },
+    "entities": {},
+    "graphs": [
+      "default"
+    ],
+    "header": {
+      "annotations": [
+        "Annotation(rdfs:label \"o\")"
+      ],
+      "imports": [],
+      "iri": "http://ex.org/o",
+      "versionIri": null
+    },
+    "imports": [],
+    "mode": "strict",
     "triples": 5,
     "unmapped": 0,
     "warnings": []

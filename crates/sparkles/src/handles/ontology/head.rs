@@ -108,11 +108,16 @@ impl Ontologies {
             .map(|g| g.id(&view).filter(|id| readable(*id)))
             .collect();
         let inferences = self.inferences_of(&graphs, &graph_ids, view.commit, record.as_ref());
+        check(opts)?;
         let r = Reader::new(&view, &graph_ids, requested, req.mode, opts)?;
-        let read = match r.header()? {
-            Some(h) => r.entities()?.map(|e| (h, e)),
-            None => None,
+        let read = match r.usual() {
+            false => None,
+            true => match r.header()? {
+                Some(h) => r.entities()?.map(|e| (h, e)),
+                None => None,
+            },
         };
+        check(opts)?;
         let (header, entities, opened) = match read {
             Some((h, e)) => (h, e, false),
             None => {
@@ -140,6 +145,8 @@ impl Ontologies {
 struct Fragment {
     quads: Vec<[Id; 4]>,
     seen: FxHashSet<[Id; 4]>,
+    /// the subjects whose quads and reifications were read
+    visited: FxHashSet<Id>,
 }
 
 impl Fragment {
@@ -164,6 +171,8 @@ struct Reader<'a> {
     /// the types whose `rdf:type` triples `read_store` reads
     structural: FxHashSet<Id>,
     rdf_type: Option<Id>,
+    /// the annotation properties declared in the graphs read
+    declared: FxHashSet<Id>,
     n: Cell<usize>,
 }
 
@@ -190,6 +199,7 @@ impl<'a> Reader<'a> {
             terminological: FxHashSet::default(),
             structural: FxHashSet::default(),
             rdf_type: snap.lookup_iri(vocab::RDF_TYPE),
+            declared: FxHashSet::default(),
             n: Cell::new(0),
         };
         for p in vocab::STRUCTURAL_PREDICATES
@@ -213,9 +223,21 @@ impl<'a> Reader<'a> {
                 declared.push(q[0]);
                 Ok(true)
             })?;
-            r.terminological.extend(declared);
+            r.terminological.extend(declared.iter().copied());
+            r.declared.extend(declared);
         }
         Ok(r)
+    }
+
+    /// Whether the reverse mapping reads the vocabulary as usual: no graph read declares
+    /// `rdf:type` or another structural predicate an annotation property, which makes the
+    /// reader take its triples as annotations (the head then opens the ontology).
+    fn usual(&self) -> bool {
+        !vocab::STRUCTURAL_PREDICATES
+            .iter()
+            .chain([&vocab::RDF_TYPE])
+            .filter_map(|p| self.id(p))
+            .any(|id| self.declared.contains(&id))
     }
 
     fn id(&self, iri: &str) -> Option<Id> {
@@ -244,6 +266,7 @@ impl<'a> Reader<'a> {
         prefix: &[u64],
         mut f: impl FnMut([Id; 4]) -> Result<bool>,
     ) -> Result<()> {
+        check(self.opts)?;
         let (graphs, opts, n) = (&self.graphs, self.opts, &self.n);
         let mut one = |q: [Id; 4]| -> Result<bool> {
             n.set(n.get() + 1);
@@ -287,20 +310,85 @@ impl<'a> Reader<'a> {
         Ok((!over).then_some(out))
     }
 
-    /// Add the quads of `subject` and of the blank nodes they reach to `f`, or `false`
-    /// past [`MAX_FRAGMENT`].
-    fn add_closure(&self, f: &mut Fragment, subject: Id) -> Result<bool> {
-        let mut stack = vec![subject];
-        let mut seen: FxHashSet<Id> = FxHashSet::default();
-        seen.insert(subject);
-        while let Some(s) = stack.pop() {
-            let Some(qs) = self.kept_quads(Perm::Spo, &[s.0], MAX_FRAGMENT)? else {
+    /// Add to `f` the kept quads of `node`, of the blank nodes they reach and of the
+    /// `owl:Axiom` and `owl:Annotation` nodes that reify a triple of any of them, nested
+    /// ones included, with the main triples of those reifications that `read_store` reads
+    /// although their predicate is not terminological. `false` past [`MAX_FRAGMENT`].
+    fn add_node(&self, f: &mut Fragment, node: Id) -> Result<bool> {
+        let src = self.id(vocab::OWL_ANNOTATED_SOURCE);
+        let mut stack = vec![node];
+        let mut reifiers: Vec<Id> = Vec::new();
+        while let Some(x) = stack.pop() {
+            if !f.visited.insert(x) {
+                continue;
+            }
+            let Some(qs) = self.kept_quads(Perm::Spo, &[x.0], MAX_FRAGMENT)? else {
                 return Ok(false);
             };
             for q in qs {
-                if self.is_bnode(q[2]) && seen.insert(q[2]) {
+                if self.is_bnode(q[2]) {
                     stack.push(q[2]);
                 }
+                f.add(q);
+            }
+            if let Some(src) = src {
+                let Some(qs) = self.kept_quads(Perm::Pos, &[src.0, x.0], MAX_REIFIED)? else {
+                    return Ok(false);
+                };
+                for q in qs {
+                    reifiers.push(q[0]);
+                    stack.push(q[0]);
+                }
+            }
+            if f.quads.len() > MAX_FRAGMENT {
+                return Ok(false);
+            }
+        }
+        self.add_mains(f, &reifiers)
+    }
+
+    /// The main triples of the reifications `reifiers` whose predicate is not
+    /// terminological, in each graph read that holds them, as `read_store` adds them.
+    fn add_mains(&self, f: &mut Fragment, reifiers: &[Id]) -> Result<bool> {
+        let (Some(src), Some(prop), Some(tgt)) = (
+            self.id(vocab::OWL_ANNOTATED_SOURCE),
+            self.id(vocab::OWL_ANNOTATED_PROPERTY),
+            self.id(vocab::OWL_ANNOTATED_TARGET),
+        ) else {
+            return Ok(true);
+        };
+        let wanted: FxHashSet<Id> = reifiers.iter().copied().collect();
+        // the source, property and target of each reifier in each graph, as read_store
+        // groups them
+        let mut parts: BTreeMap<(Id, Id), [Option<Id>; 3]> = BTreeMap::new();
+        for q in &f.quads {
+            if !wanted.contains(&q[0]) {
+                continue;
+            }
+            let slot = if q[1] == src {
+                0
+            } else if q[1] == prop {
+                1
+            } else if q[1] == tgt {
+                2
+            } else {
+                continue;
+            };
+            parts.entry((q[0], q[3])).or_default()[slot] = Some(q[2]);
+        }
+        for part in parts.into_values() {
+            let [Some(s), Some(p), Some(o)] = part else {
+                continue;
+            };
+            if self.terminological.contains(&p) {
+                continue;
+            }
+            let mut found = Vec::new();
+            self.each(Perm::Spo, &[s.0, p.0, o.0], |q| {
+                found.push(q);
+                Ok(true)
+            })?;
+            for q in found {
                 f.add(q);
             }
             if f.quads.len() > MAX_FRAGMENT {
@@ -310,8 +398,11 @@ impl<'a> Reader<'a> {
         Ok(true)
     }
 
-    /// Add the reifications whose source is `x` to `f`, or `false` past the bounds.
-    fn add_reifications(&self, f: &mut Fragment, x: Id) -> Result<bool> {
+    /// Add to `f` the reifications whose source is `x`, with what [`add_node`] reads of
+    /// each, without the other quads of `x`. `false` past the bounds.
+    ///
+    /// [`add_node`]: Self::add_node
+    fn add_reifications_of(&self, f: &mut Fragment, x: Id) -> Result<bool> {
         let Some(src) = self.id(vocab::OWL_ANNOTATED_SOURCE) else {
             return Ok(true);
         };
@@ -319,7 +410,7 @@ impl<'a> Reader<'a> {
             return Ok(false);
         };
         for q in qs {
-            if !self.add_closure(f, q[0])? {
+            if !self.add_node(f, q[0])? {
                 return Ok(false);
             }
         }
@@ -389,7 +480,7 @@ impl<'a> Reader<'a> {
         nodes.dedup();
         let mut f = Fragment::default();
         for n in nodes {
-            if !self.add_closure(&mut f, n)? || !self.add_reifications(&mut f, n)? {
+            if !self.add_node(&mut f, n)? {
                 return Ok(None);
             }
         }
@@ -462,7 +553,9 @@ impl<'a> Reader<'a> {
                 for q in qs {
                     f.add(q);
                 }
-                if !self.add_reifications(&mut f, *s)? || f.quads.len() > MAX_FRAGMENT {
+                // the reifications of the subject's triples, nested ones included, which
+                // the visit reads from the subject's own quads as well
+                if !self.add_reifications_of(&mut f, *s)? {
                     return Ok(None);
                 }
             }
