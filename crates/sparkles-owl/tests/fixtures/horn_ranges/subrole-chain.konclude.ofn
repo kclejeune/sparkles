@@ -1,0 +1,5 @@
+Declaration(Class(<http://ex.org/A>))
+Declaration(Class(<http://ex.org/B>))
+Declaration(Class(<http://ex.org/D>))
+Declaration(Class(<http://ex.org/X>))
+SubClassOf(<http://ex.org/A> <http://ex.org/X>)

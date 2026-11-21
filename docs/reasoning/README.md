@@ -1143,11 +1143,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   realness. Roadmap item 1025 and the
   [classification report](../benchmarks/el-classification/RESULTS.md#guarded-horn-rules-with-individuals)
   track the remaining work.
-* GO's inverse properties take the Horn rules, which classify it 12% slower than the EL
-  rules on one thread and raise its peak resident set from 196 to 223 MiB. On two
-  Uberon-based ontologies of the ORE 2015 DL sample the Horn rules take about five times
-  the EL rules' time, since each context of a conjunction derives its successor's
-  subsumers again. Roadmap item 693.
+* GO's inverse properties take the Horn rules, which classify it 17% slower than the EL
+  rules on one thread on `atlas` and raise its peak resident set from 196 to 248 MiB. On
+  two Uberon-based ontologies of the ORE 2015 DL sample the Horn rules derive 1.6 and
+  3.8 times the EL rules' conclusions, since each context of a conjunction derives its
+  successor's subsumers again. Roadmap item 693.
 * The same two Uberon-based ontologies take the disjunctive rules first, whose attempt
   passes its bound on derived conclusions before the Horn rules answer. On four threads on
   `atlas` the bound ends the attempt so that `ore_ont_9663` classifies in 7.5 to 8.8 s and

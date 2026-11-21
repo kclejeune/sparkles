@@ -1898,6 +1898,65 @@ releases of it among the final files, `ore_ont_16847` and `ore_ont_9024`, halve 
 and `ore_ont_3258` derives 12 fewer conclusions with the same work. No other file changes
 its work, stored clauses, conclusions or outcome.
 
+### Range universals that the links cover
+
+Roadmap item 693 leaves out the universal restriction on `owl:Thing` of a range of a
+property that chains reach when the told ranges of the links that end the property's
+paths already give it, as
+[F24](../../specs/F24-owl-classification/SPEC.md#the-horn-rules) argues. On `atlas` five
+rounds in rotating order compared the base, commit 378127e2, with the build of the rule,
+commit 27471426, run as it is and with `SPARKLES_HORN_RANGES=keep`, which keeps every
+range universal. The last two are one binary, so their ratio isolates the rule. The Uberon
+files ran with `--dl-attempt-work 1`, so that the disjunctive attempt ends at once and the
+Horn rules answer, and three classifications per process. GO ran five per process, with
+the Horn rules as by default and with the EL rules alone. Each time is the median over the
+five processes of a side of the process's median classification. Each round divides the
+rule's time by the time with every universal kept, the ratio is the median of the five
+rounds' ratios, and the range is their range. The conclusions are those of one thread, where
+the five processes of a side report the same count. The memory is the median peak resident set. Every taxonomy has the same
+hash on the three sides in every round.
+
+| Ontology | Threads | Base ms | Kept ms | Rule ms | Rule / kept | Range of the rounds | Kept MiB | Rule MiB | Conclusions, kept | Conclusions, rule |
+|---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|
+| `ore_ont_14817` | 1 | 1,985 | 1,866 | 1,757 | 0.942 | 0.940 to 0.945 | 697 | 638 | 22,090,010 | 20,275,376 |
+| | 4 | 755 | 729 | 681 | 0.927 | 0.925 to 0.975 | 844 | 786 | | |
+| `ore_ont_9663` | 1 | 2,697 | 2,584 | 2,467 | 0.955 | 0.938 to 0.975 | 959 | 910 | 35,611,566 | 33,065,044 |
+| | 4 | 1,024 | 982 | 955 | 0.960 | 0.947 to 1.003 | 1,158 | 1,112 | | |
+| GO, Horn rules | 1 | 305 | 298 | 300 | 1.004 | 1.000 to 1.012 | 248 | 248 | 2,937,284 | 2,937,284 |
+| | 4 | 105 | 103 | 103 | 1.004 | 1.000 to 1.027 | 267 | 272 | | |
+| GO, EL rules | 1 | 269 | 254 | 255 | 1.002 | 0.988 to 1.008 | 196 | 196 | 2,635,665 | 2,635,665 |
+| | 4 | 92 | 88 | 88 | 1.001 | 0.993 to 1.008 | 224 | 236 | | |
+
+The rule leaves out all 6 range universals of `ore_ont_14817` and 13 of the 16 of
+`ore_ont_9663`, and the Horn rules derive 8.2% and 7.2% fewer conclusions on them. GO has no
+range universal, so its two sides do the same work on one binary, and their ratio is the
+spread of that binary, at or below 1 in at least one round of each pair. The base differs from the kept side by the commits between 378127e2 and fd47b7ae,
+which the EL rules' 6% on GO shows. On the laptop commit 27471426 takes 7.4% and 6.5%
+fewer instructions per classification than commit fd47b7ae on the two Uberon files and 0.01% more on GO, counted on
+one P-core as the difference between three classifications and one, halved.
+
+A sweep on the laptop ran the build with the rule and with every universal kept on the 207
+development and 187 final-set files of the ORE 2015 DL sample on one thread, with the
+attempt bounded at 1 and an 8 GiB cap. None of them is in the sealed held-out third. The
+taxonomies are equal on the 389 files that both sides classify, and the rule leaves out
+1,082 universals on 135 of them. These counts come from commit 1580ce54, which counts each pair of
+a property and a range once and leaves ranges of `owl:Thing` to their universals. It gives
+the same taxonomies as the build the timing used on all 390 files that it classifies, and
+the same conclusion counts on all but two. On `ore_ont_8273` and `ore_ont_9904` it keeps the
+universals of ranges of `owl:Thing` and derives 67,608 and 1,617 conclusions against
+57,780 and 1,241. `ore_ont_7646` classifies within the cap only with the
+rule, with the attempt bounded at 1 as in the whole sweep. The build before the change,
+commit fd47b7ae, gives the same taxonomy and the same conclusion count as the side with
+every universal kept on each of the 389 files. With an 18 GiB cap the side with every universal kept gives the same taxonomy, with
+398.7 million conclusions, 28.8 s and a peak resident set of 8.0 GiB against 219.2 million,
+24.5 s and 5.6 GiB, and the rule leaves out 25 universals. Four files fail on both sides,
+three refused by the reader and `ore_ont_7192` at the cap. Of 4,000 generated Horn ontologies with chains, transitive,
+symmetric and inverse properties, ranges, domains, assertions and nominals, the 3,537 that
+the reader accepts give the same taxonomy with the rule on one and four threads and with
+every universal kept, and the rule leaves a universal out on 886 of them. HermiT 1.4.5.519
+gives the same taxonomy on 853 of those 886 and refuses the other 33 as property
+hierarchies that are not regular.
+
 ## Records
 
 The [record of the guarded Horn rules](runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json) holds the Atlas process reports and taxonomy hashes, the HermiT comparison summary, the original count-only witness diagnostics and the separate four-round Atlas control of the default Uberon attempt. The [same-snapshot witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) holds the later correctness comparison of the named-class sets.
@@ -2160,6 +2219,12 @@ holds the instruction counts, the corpus sweep with its comparison, the counter 
 the development set and of the generated ontologies with a union, the profile of
 `ore_ont_14817`, the patches of the diagnostic builds and the scripts. Its times come from
 a loaded laptop and are not measurements.
+
+The [atlas record of the range universals](runs/2026-11-21-horn-ranges-atlas-27471426/record.json)
+holds every classification of the five rounds on `atlas` of the base, the rule and every
+universal kept, with their process reports, taxonomy hashes, binary and data hashes and the
+host state, the laptop's instruction counts, the corpus sweep, the generated cases with
+HermiT's answers and the scripts that ran.
 
 The [forge record of the disjunctive attempt and the universals](runs/2026-11-20-horn-cost-forge-378127e2/record.json)
 holds every classification of the five rounds on forge of the base, the tip with and

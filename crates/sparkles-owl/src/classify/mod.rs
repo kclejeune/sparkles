@@ -81,6 +81,8 @@ mod dl_root;
 mod dl_rules;
 mod dtcheck;
 mod horn;
+#[cfg(test)]
+mod horn_range_tests;
 mod horn_rules;
 mod index;
 mod numeric;
@@ -458,6 +460,10 @@ pub struct Stats {
     /// the Horn rules passed their memory budget, so the run classified by the OWL 2 EL
     /// rules alone, as [`Limits::el_only`] does, and left the axioms outside OWL 2 EL out
     pub horn_over_budget: bool,
+    /// the ranges of properties that chains reach whose universal restriction the Horn
+    /// rules leave out, since the ranges of the links that end every path of the
+    /// property already hold there (roadmap item 693)
+    pub horn_ranges_left_out: usize,
     /// the clauses with two or more disjuncts that Tier D took, 0 for a run without it
     pub clauses: usize,
     /// the contexts that held clauses of Tier D
@@ -2416,6 +2422,7 @@ impl Saturation {
         self.disjoint = std::mem::take(&mut ax.disjoint);
         stats.outside_el = outside_el;
         stats.tier = stats.outside_el.tier();
+        stats.horn_ranges_left_out = ax.horn.as_ref().map_or(0, |h| h.ranges_covered);
         poll(limits)?;
         let n = self.interner.len();
         // a run whose axioms the Horn normalization took starts its contexts again, with

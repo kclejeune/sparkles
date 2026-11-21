@@ -1,0 +1,64 @@
+# make-record.py LANE DEST: the benchmark record of lane horn-ranges-693's atlas A/B (item 693's
+# range universals) from the files copied back from atlas:~/lanes/horn-ranges-693
+import json, sys, os, glob, shutil
+lane, dest = sys.argv[1], sys.argv[2]
+src = os.path.join(lane, 'atlas')
+keep = ['classifyMs', 'classifyMedianMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
+        'dlAttemptOver', 'outside', 'outsideTaken', 'conclusions', 'contexts', 'conjunctions', 'hornRangesLeftOut',
+        'estimatedBytes', 'peakEstimatedBytes', 'peakRssKib', 'threads', 'consistency', 'unsatisfiable']
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+t = os.path.join(src, 'out', 'timing')
+runs = []
+for p in sorted(glob.glob(os.path.join(t, '*.json'))):
+    line = next((l for l in open(p) if l.startswith('{')), None)
+    d = json.loads(line) if line else {}
+    runs.append({'path': os.path.relpath(p, t), 'report': {k: d.get(k) for k in keep}, 'stderr': text(p[:-5] + '.err') or ''})
+sums = {l.split()[1]: l.split()[0] for l in text(os.path.join(src, 'SHA256SUMS')).splitlines()}
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'ORE 2015 DL development files ore_ont_14817 and ore_ont_9663, and GO 2026-07-26 with the Horn rules and with the EL rules alone',
+  'host': {'name': 'atlas', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15614},
+  'manifest': {
+    'sides': {'base': '378127e2, the build of the last forge record of item 693',
+              'tip': '27471426, the build the timing used, which leaves out the range universals that the ranges of the final links cover',
+              'keep': '27471426 with SPARKLES_HORN_RANGES=keep, which keeps every range universal, so that tip against keep isolates the rule on one binary'},
+    'build': 'mbx build --release -p sparkles-owl --example el_classify on stanley, the laptop, with mbx 1.29.1 and the pinned toolchain, copied to atlas',
+    'binaries_sha256': {k.split('/')[-1]: v for k, v in sums.items() if k.startswith('bin/')},
+    'data_sha256': {k.split('/')[-1]: v for k, v in sums.items() if k.startswith('files/')},
+    'scripts': ['run.sh.txt', 'timing.sh.txt', 'analyze.py.txt', 'make-record.py.txt', 'sweep.sh.txt', 'insn.sh.txt', 'gen.py.txt', 'cmp.sh.txt', 'hermit.sh.txt', 'closure.py.txt', 'sweep-base.sh.txt', 'sweep-tip.sh.txt']},
+  'settings': {'threads': 'one and four',
+               'pinning': 'taskset, cpu 2 on one thread and cpus 2, 4, 6 and 8 on four',
+               'scope': 'one process per run in a 12 GiB systemd scope without swap, with a 900 s timeout',
+               'lock': 'the rounds ran under ~/lanes/.bench.lock and ~/lanes/.heavy.lock as the systemd user unit horn-ranges-693, alone on the host',
+               'limits': 'ore_ont_14817 and ore_ont_9663 with --dl-attempt-work 1 and --repeat 3, so that the disjunctive attempt ends at once and the Horn rules answer; GO with --repeat 5 by default and with --el-only'},
+  'method': 'timing.sh ran five rounds of the three sides in an order that rotates with the round and thread count, one process per side, file and thread count. analyze.py takes the median over the five processes of each process median classification, the ratio of each side to the base and the range of the five rounds ratios. The ratios of tip to keep in the report are the medians of the five rounds own ratios. tip and keep are one binary.',
+  'timing': runs,
+  'timing_log': text(os.path.join(t, 'log.txt')),
+  'timing_summary': text(os.path.join(src, 'out', 'summary.md')),
+  'instructions_on_the_laptop': {'method': 'insn.sh: cpu_core instructions in user mode, pinned to a P-core, per classification as (count at --repeat 3 - count at --repeat 1) / 2, base fd47b7ae (the lane base) against the tip, on one thread with --dl-attempt-work 1',
+                                 'counts': text(os.path.join(lane, 'out', 'insn.txt'))},
+  'correctness_on_the_laptop': {
+    'corpus_sweep': 'sweep.sh ran the tip with the rule and with SPARKLES_HORN_RANGES=keep on the 207 development and 187 final-set files of the ORE 2015 DL sample, none of them in the sealed held-out third, on one thread with --dl-attempt-work 1 in 8 GiB scopes. Each line gives the file, the side, the exit status, the taxonomy hash, and the tier, conclusions, conjunction contexts, universals left out and classification time',
+    'corpus_log': text(os.path.join(lane, 'out', 'sweep', 'log.txt')),
+    'generated': 'gen.py 4000 cases with seed 693, cmp.sh with the rule on one and four threads and with keep on one, and hermit.sh with HermiT 1.4.5.519 on the cases that leave a universal out; each line gives the case, its status against HermiT and the subsumptions HermiT has that the tip lacks',
+    'generated_cmp': text(os.path.join(lane, 'gen', 'cmp.txt')),
+    'generated_hermit': text(os.path.join(lane, 'gen', 'hermit.txt')),
+    'ore_ont_7646': {'command': 'SPARKLES_HORN_RANGES=keep systemd-run --user --scope -p MemoryMax=18G -p MemorySwapMax=0 -p OOMPolicy=continue timeout 1200 bin/tip --threads 1 --dl-attempt-work 1 --taxonomy 7646.keep18.tax ore_ont_7646.owl, rerun of the kept side, which the sweep killed at its 8 GiB cap',
+                     'kept_18gib_report': text(os.path.join(lane, 'out', 'sweep', '7646.keep18.json')),
+                     'kept_18gib_taxonomy_hash': '20bdbd7e41f13755',
+                     'rule_report': text(os.path.join(lane, 'out', 'sweep', 'ore_ont_7646.covered.json'))},
+    'base_sweep': 'sweep-base.sh ran fd47b7ae, the build before the change, over the same files; base_sweep_log gives its lines in the form of corpus_log, whose taxonomy hashes and conclusion counts equal those of the side with every universal kept on the 389 files that both classify',
+    'base_sweep_log': text(os.path.join(lane, 'out', 'sweep-base', 'log.txt')),
+    'final_sweep': 'sweep-tip.sh ran the rule arm of 1580ce54, which counts each pair of a property and a range once and leaves ranges of owl:Thing to their universals; later commits only add polls of the stop; final_sweep_log gives its lines, with the taxonomy hashes of corpus_log on all 390 files it classifies and its conclusion counts on all but ore_ont_8273 and ore_ont_9904, where keeping the universals of ranges of owl:Thing gives 67,608 and 1,617 conclusions against 57,780 and 1,241; it leaves out 1,082 universals on 135 files and 25 on ore_ont_7646; final_generated gives each generated case with the final build as name, hash, earlier hash, final count and earlier counts, all taxonomies equal and 886 cases leaving a universal out',
+    'final_sweep_log': text(os.path.join(lane, 'out', 'sweep-tip', 'log.txt')),
+    'final_generated': text(os.path.join(lane, 'gen', 'tip4.txt')),
+    'generated_base': 'the conclusions of each valid generated case with every universal kept and on fd47b7ae; they differ on 27 cases, where the rules for the links of negative existentials made positive add conclusions, and those 27 taxonomies are equal',
+    'generated_base_counts': text(os.path.join(lane, 'gen', 'base-concl.txt'))},
+  'hosts': {f: text(os.path.join(src, 'out', f)) for f in ['before.txt', 'after.txt', 'sha-check.txt']} | {'queue.log': text(os.path.join(src, 'queue.log')), 'DONE': text(os.path.join(src, 'DONE'))},
+}
+os.makedirs(dest, exist_ok=True)
+for s, name in [('atlas/run.sh', 'run.sh'), ('atlas/timing.sh', 'timing.sh'), ('atlas/analyze.py', 'analyze.py'), ('make-record.py', 'make-record.py'), ('sweep.sh', 'sweep.sh'), ('insn.sh', 'insn.sh'), ('gen/gen.py', 'gen.py'), ('gen/cmp.sh', 'cmp.sh'), ('gen/hermit.sh', 'hermit.sh'), ('gen/closure.py', 'closure.py'), ('sweep-base.sh', 'sweep-base.sh'), ('sweep-tip.sh', 'sweep-tip.sh')]:
+    shutil.copyfile(os.path.join(lane, s), os.path.join(dest, name + '.txt'))
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']))

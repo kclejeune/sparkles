@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# hermit.sh: HermiT against the tip on the generated cases whose run left a range universal out
+G=$(dirname $(readlink -f $0)); H=/nix/store/r0l9qni556kvw6vliqmif0pdrjkrdsx6-hermit-1.4.5.519/bin/hermit-classify
+mkdir -p $G/h
+awk '{split($5,a,","); if(a[2]+0>0) print $1, a[3]}' $G/cmp.txt | xargs -P 4 -n 2 sh -c '
+f=$0; out=$1
+'$G'/../bin/tip --threads 1 --taxonomy '$G'/h/$f.ours '$G'/files/$f > /dev/null 2>&1
+timeout 120 '$H' --taxonomy '$G'/h/$f.hermit '$G'/files/$f > /dev/null 2>&1 || { echo "$f outside=$out HERMIT-FAIL"; exit 0; }
+echo "$f outside=$out $(python3 '$G'/closure.py '$G'/h/$f.ours '$G'/h/$f.hermit)"'

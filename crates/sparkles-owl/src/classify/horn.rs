@@ -50,6 +50,10 @@ pub struct HornAx {
     pub autos: FxHashMap<Role, Nfa>,
     /// the axioms outside OWL 2 EL the run takes
     pub taken: usize,
+    /// the ranges of roles that chains reach whose universal on `owl:Thing` the run
+    /// leaves out, since the ranges of the links that end their paths give it
+    /// ([`ends_in_range`])
+    pub ranges_covered: usize,
 }
 
 impl HornAx {
@@ -248,6 +252,82 @@ pub struct EpsFree {
 }
 
 impl Nfa {
+    /// The labels of the transitions into the final states of [`Nfa::eps_free`], sorted,
+    /// or `None` when its start is final, found without building the closure: a labelled
+    /// transition from a state that the start reaches to one whose ε-transitions reach the
+    /// end. The work is linear in the automaton up to the sort of the labels, and it polls
+    /// `stop` every [`POLL_WORK`] steps and once more after the sort. Its scratch is a few
+    /// words for each state and transition, of which it counts an upper bound before it
+    /// allocates and refuses past `limit` bytes, as the role box refuses its closure.
+    pub fn final_labels(
+        &self,
+        limit: Option<usize>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Role>>, Halt> {
+        // an upper bound: the two lists of each state and their entries, the two marks of
+        // each state, a stack that holds at most every transition's target once more than
+        // the transitions, and the labels, each vector at up to twice its length by growth
+        let (n, m) = (self.states as usize, self.trans.len());
+        let bytes = n * (2 * 24 + 2) + 2 * (2 * m * 4 + (m + 1) * 4 + m * 4);
+        if limit.is_some_and(|l| bytes > l) {
+            return Err(Halt::Memory(bytes));
+        }
+        let mut work = 0usize;
+        let mut tick = || {
+            work += 1;
+            if work.is_multiple_of(POLL_WORK) && stop() {
+                Err(Halt::Stopped)
+            } else {
+                Ok(())
+            }
+        };
+        let n = self.states as usize;
+        let mut back: Vec<Vec<u32>> = vec![Vec::new(); n];
+        let mut out: Vec<Vec<u32>> = vec![Vec::new(); n];
+        for &(p, l, q) in &self.trans {
+            tick()?;
+            out[p as usize].push(q);
+            if l.is_none() {
+                back[q as usize].push(p);
+            }
+        }
+        let mut ends = vec![false; n];
+        let mut stack = vec![self.end];
+        while let Some(x) = stack.pop() {
+            tick()?;
+            if !std::mem::replace(&mut ends[x as usize], true) {
+                stack.extend(back[x as usize].iter().copied());
+            }
+        }
+        if ends[self.start as usize] {
+            return Ok(None);
+        }
+        let mut reached = vec![false; n];
+        let mut stack = vec![self.start];
+        while let Some(x) = stack.pop() {
+            tick()?;
+            if !std::mem::replace(&mut reached[x as usize], true) {
+                stack.extend(out[x as usize].iter().copied());
+            }
+        }
+        let mut ls: Vec<Role> = Vec::new();
+        for &(p, l, q) in &self.trans {
+            tick()?;
+            if let Some(l) = l
+                && reached[p as usize]
+                && ends[q as usize]
+            {
+                ls.push(l);
+            }
+        }
+        ls.sort_unstable();
+        ls.dedup();
+        if stop() {
+            return Err(Halt::Stopped);
+        }
+        Ok(Some(ls))
+    }
+
     /// The automaton with its ε-transitions closed over: a state takes the transitions of
     /// the states its ε-transitions reach, and is final when one of them is the end.
     pub fn eps_free(&self) -> EpsFree {
@@ -314,6 +394,129 @@ impl Nfa {
             left,
         }
     }
+}
+
+/// Which universals on `owl:Thing` a run makes for the ranges of the roles that chains
+/// reach (roadmap item 693).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RangeUniversals {
+    /// every one but those whose paths the ranges of their last links cover, the default
+    Covered,
+    /// every one, which `SPARKLES_HORN_RANGES=keep` selects for the comparison of the forms
+    Keep,
+    /// none, which is incomplete and only the tests use, to show which answers need them
+    #[cfg(test)]
+    Drop,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RANGES_OVERRIDE: std::cell::Cell<Option<RangeUniversals>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the range universals of `mode`, for the tests that compare the forms.
+/// The normalization runs on the calling thread, so the override reaches it, and a guard
+/// restores the earlier mode even when `f` panics.
+#[cfg(test)]
+pub fn with_range_universals<T>(mode: RangeUniversals, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<RangeUniversals>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RANGES_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(RANGES_OVERRIDE.with(|c| c.replace(Some(mode))));
+    f()
+}
+
+/// The range universals of a run: the tests' override, then `SPARKLES_HORN_RANGES`.
+pub fn range_universals() -> RangeUniversals {
+    #[cfg(test)]
+    if let Some(m) = RANGES_OVERRIDE.with(|c| c.get()) {
+        return m;
+    }
+    static MODE: std::sync::OnceLock<RangeUniversals> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SPARKLES_HORN_RANGES").as_deref() {
+        Ok("keep") => RangeUniversals::Keep,
+        _ => RangeUniversals::Covered,
+    })
+}
+
+/// Whether the told ranges already give `c` at the end of every path that implies `r`,
+/// so that `⊤ ⊑ ∀r.c` adds nothing (roadmap item 693, F24's section on the Horn rules).
+/// `told` holds the roles that have `c` as a told range. The last letter of every word
+/// that the automaton of `r` accepts labels a transition into a final state, and the test
+/// asks of each such label `l` that `l` or a role above it, `r` included, be in `told`. The index gives the target of every link
+/// by a role under `l` the ranges of that role and its superroles, and the source of
+/// every link by a role under `l⁻` the same ranges through `∃l⁻.⊤ ⊑ c`
+/// ([`super::index`]'s `horn_index`), and a loop takes the ranges of its role and its
+/// inverse. The empty word, which a final start would accept, and the top property,
+/// which relates every pair, are left to the universal.
+fn ends_in_range(
+    rb: &mut RoleBox,
+    labels: &mut FxHashMap<Role, Option<Vec<Role>>>,
+    told: &[Role],
+    tops: &[Role],
+    r: Role,
+    limit: Option<usize>,
+    stop: &dyn Fn() -> bool,
+) -> Result<bool, Halt> {
+    if tops.contains(&r) {
+        return Ok(false);
+    }
+    // the labels into final states, once for each role whatever its ranges
+    let ls = match labels.entry(r) {
+        std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+        std::collections::hash_map::Entry::Vacant(e) => {
+            let ls = match rb.autos.get(&r) {
+                Some(a) => a.final_labels(limit, stop)?,
+                None => match rb.auto(r, &mut Vec::new()) {
+                    Some(a) => a.final_labels(limit, stop)?,
+                    None => None,
+                },
+            };
+            e.insert(ls.filter(|ls| !ls.is_empty()))
+        }
+    };
+    let Some(ls) = ls else {
+        return Ok(false);
+    };
+    // a test for each pair of a label and a top or told property, polling the stop
+    let mut work = 0usize;
+    let mut tick = || {
+        work += 1;
+        if work.is_multiple_of(POLL_WORK) && stop() {
+            Err(Halt::Stopped)
+        } else {
+            Ok(())
+        }
+    };
+    for &l in ls.iter() {
+        let mut top = false;
+        for &t in tops {
+            tick()?;
+            top |= t == l;
+        }
+        if top {
+            return Ok(false);
+        }
+        let mut found = false;
+        for &l2 in told {
+            tick()?;
+            if rb.sub(l, l2) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+    }
+    if work >= POLL_WORK && stop() {
+        return Err(Halt::Stopped);
+    }
+    Ok(true)
 }
 
 /// How far a run reduces the automata that unfold its universals (roadmap item 693):
@@ -1621,14 +1824,49 @@ pub fn normalize(
         })
         .collect();
     ax.ranges.extend(domains);
-    // a range of a role that a chain reaches holds along the chain's paths too
-    let ranges: Vec<(Role, Ex)> = ax
+    // a range of a role that a chain reaches holds along the chain's paths too, unless the
+    // ranges of the links that end every such path give it already (roadmap item 693)
+    let mut ranges: Vec<(Role, Ex)> = ax
         .ranges
         .iter()
         .copied()
         .filter(|&(r, _)| !rb.simple(r))
         .collect();
-    for (r, c) in ranges {
+    // a range told twice, such as a range of r and a domain of r⁻, is one universal
+    ranges.sort_unstable();
+    ranges.dedup();
+    let mode = range_universals();
+    let tops: Vec<Role> = [
+        RoleName::Object(ObjectProperty::top()),
+        RoleName::Inverse(ObjectProperty::top()),
+    ]
+    .iter()
+    .filter_map(|n| it.role_id(n))
+    .collect();
+    // the roles with each told range, so that a label's test reads only those of its filler
+    let mut by_filler: FxHashMap<Ex, Vec<Role>> = FxHashMap::default();
+    for &(l, c) in &ax.ranges {
+        by_filler.entry(c).or_default().push(l);
+    }
+    let mut labels: FxHashMap<Role, Option<Vec<Role>>> = FxHashMap::default();
+    for (i, (r, c)) in ranges.into_iter().enumerate() {
+        if i % 64 == 63 && stop() {
+            return Err(Halt::Stopped);
+        }
+        let skip = match mode {
+            RangeUniversals::Covered if c != TOP => {
+                let told = by_filler.get(&c).map_or(&[][..], |v| v.as_slice());
+                ends_in_range(&mut rb, &mut labels, told, &tops, r, limit, stop)?
+            }
+            RangeUniversals::Covered => false,
+            RangeUniversals::Keep => false,
+            #[cfg(test)]
+            RangeUniversals::Drop => true,
+        };
+        if skip {
+            h.ranges_covered += 1;
+            continue;
+        }
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
     }
@@ -1641,6 +1879,105 @@ pub fn normalize(
 #[cfg(test)]
 mod reduction_tests {
     use super::*;
+
+    /// The reading of the final labels stops when the run stops, also after its last scan,
+    /// and refuses scratch past the limit.
+    #[test]
+    fn final_labels_poll_and_count() {
+        let a = Nfa {
+            states: 2,
+            start: 0,
+            end: 1,
+            trans: (0..(4 * POLL_WORK as Role))
+                .map(|l| (0, Some(l), 1))
+                .collect(),
+        };
+        assert_eq!(a.final_labels(None, &|| true), Err(Halt::Stopped));
+        assert!(matches!(
+            a.final_labels(Some(1000), &|| false),
+            Err(Halt::Memory(_))
+        ));
+        // a stop that comes only after the twelve polls of the scans still ends the reading
+        let calls = std::cell::Cell::new(0usize);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 12
+        };
+        assert_eq!(a.final_labels(None, &late), Err(Halt::Stopped));
+        assert_eq!(
+            a.final_labels(None, &|| false).unwrap().map(|v| v.len()),
+            Some(4 * POLL_WORK)
+        );
+    }
+
+    /// The match of cached labels against the told properties stops when the run stops.
+    #[test]
+    fn ends_in_range_polls_over_cached_labels() {
+        let it = Interner::new();
+        let mut rb = RoleBox::new(&it, &[], &[], None, &|| false).unwrap();
+        let n = 400 as Role;
+        let mut labels = FxHashMap::default();
+        labels.insert(n * 2, Some((0..n).collect::<Vec<Role>>()));
+        // every label is told, found after the told properties that no label is
+        let told: Vec<Role> = (n..2 * n).chain(0..n).collect();
+        let go = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| false);
+        assert_eq!(go, Ok(true));
+        let halt = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| true);
+        assert_eq!(halt, Err(Halt::Stopped));
+        // one label found after many told properties, with a stop that comes only after
+        // the first poll
+        let one = POLL_WORK as Role + 3;
+        labels.insert(one + 1, Some(vec![one]));
+        let told: Vec<Role> = (0..=one).collect();
+        let calls = std::cell::Cell::new(0usize);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+        let halt = ends_in_range(&mut rb, &mut labels, &told, &[], one + 1, None, &late);
+        assert_eq!(halt, Err(Halt::Stopped));
+    }
+
+    /// The labels into final states read from the automaton equal those of its closure
+    /// over the ε-transitions, on the automata of random role boxes.
+    #[test]
+    fn final_labels_match_the_closure() {
+        let mut seed = 693u64;
+        let mut next = |m: u32| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) % m as u64) as u32
+        };
+        for _ in 0..2000 {
+            let states = 2 + next(7);
+            let mut a = Nfa {
+                states,
+                start: 0,
+                end: 1 + next(states - 1),
+                trans: Vec::new(),
+            };
+            for _ in 0..next(14) {
+                let l = if next(3) == 0 { None } else { Some(next(4)) };
+                a.trans.push((next(states), l, next(states)));
+            }
+            let e = a.eps_free();
+            let want = if e.finals[e.start as usize] {
+                None
+            } else {
+                let mut ls: Vec<Role> = e
+                    .trans
+                    .iter()
+                    .filter(|t| e.finals[t.2 as usize])
+                    .map(|t| t.1)
+                    .collect();
+                ls.sort_unstable();
+                ls.dedup();
+                Some(ls)
+            };
+            assert_eq!(a.final_labels(None, &|| false).unwrap(), want, "{a:?}");
+        }
+    }
 
     fn auto(states: u32, finals: &[u32], trans: &[(u32, Role, u32)]) -> EpsFree {
         let mut a = EpsFree {

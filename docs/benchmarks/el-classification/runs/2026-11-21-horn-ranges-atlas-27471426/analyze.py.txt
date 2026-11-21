@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""analyze.py OUT EXPECTED: summary of out/timing/log.txt of lane horn-ranges-693 A/B.
+
+For each file and thread count: the median classification time of each arm over the
+rounds, the ratio of each arm's median to the base's, the range of the rounds' ratios,
+and whether every run of every arm gave the same taxonomy hash and exited 0 with a report.
+Prints a Markdown table and exits 1 when a taxonomy differs, a run failed or has no report, the
+log has not TIMING-DONE, or it holds other than EXPECTED runs.
+"""
+
+import json
+import statistics
+import sys
+from collections import defaultdict
+
+out = sys.argv[1]
+expected = int(sys.argv[2])
+rows = []
+with open(f"{out}/timing/log.txt") as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith("{"):
+            rows.append(json.loads(line))
+with open(f"{out}/timing/log.txt") as f:
+    done = f.read().rstrip().endswith("TIMING-DONE")
+
+ms = defaultdict(list)  # (file, threads, arm) -> [ms]
+per_round = defaultdict(dict)  # (file, threads, round) -> {arm: ms}
+tax = defaultdict(set)  # (file, threads) -> hashes
+bad = []
+arms = []
+for r in rows:
+    if r["arm"] not in arms:
+        arms.append(r["arm"])
+    k = (r["file"], r["threads"])
+    if r.get("ms") is None or r.get("exit") != 0:
+        bad.append(r)
+        continue
+    ms[k + (r["arm"],)].append(r["ms"])
+    per_round[k + (r["round"],)][r["arm"]] = r["ms"]
+    tax[k].add(r["tax"])
+
+keys = sorted({(f, t) for (f, t, _) in ms}, key=lambda k: (k[1], k[0]))
+others = [a for a in arms if a != "base"]
+head = "| Ontology | Threads | " + " | ".join(f"{a} ms" for a in arms) + " | " + " | ".join(
+    f"{a} / base | {a} range" for a in others) + " | Taxonomies |"
+print(head)
+print("|" + "---|" * (2 + len(arms) + 2 * len(others) + 1))
+for f, t in keys:
+    med = {a: statistics.median(ms[(f, t, a)]) for a in arms if ms[(f, t, a)]}
+    cells = [f"`{f}`", str(t)] + [f"{med[a]:,.1f}" if a in med else "-" for a in arms]
+    rounds = sorted(r for (ff, tt, r) in per_round if ff == f and tt == t)
+    for a in others:
+        if a in med and "base" in med:
+            rs = [per_round[(f, t, r)][a] / per_round[(f, t, r)]["base"] for r in rounds
+                  if a in per_round[(f, t, r)] and "base" in per_round[(f, t, r)]]
+            cells += [f"{med[a] / med['base']:.3f}", f"{min(rs):.3f} to {max(rs):.3f}"]
+        else:
+            cells += ["-", "-"]
+    cells.append("same" if len(tax[(f, t)]) == 1 else "DIFFER " + ",".join(sorted(tax[(f, t)])))
+    print("| " + " | ".join(cells) + " |")
+print()
+print(f"runs {len(rows)} of {expected}, failed or without a report {len(bad)}, log complete {done}")
+for r in bad:
+    print("FAILED", json.dumps(r))
+sys.exit(1 if bad or len(rows) != expected or any(len(v) != 1 for v in tax.values()) or not done else 0)

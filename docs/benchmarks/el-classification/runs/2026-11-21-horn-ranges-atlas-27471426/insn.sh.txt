@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# insn.sh: instructions per classification on the P-cores, as (count at --repeat 3 - count at
+# --repeat 1) / 2, for base and tip on GO, ore_ont_14817 and ore_ont_9663 on one thread with
+# the disjunctive attempt bounded at 1
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/lanes/horn-ranges-693
+PERF=/nix/store/ciwqn0d1ybrvzw9sdlklfhg58njv3inc-perf-linux-7.3.3/bin/perf
+CPUS=$(cat /sys/devices/cpu_core/cpus)
+D=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/archived-worktrees/horn-cost-693/.artifacts/lanes/horn-cost-693/data
+GO=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/archived-worktrees/horn-cost-1025/.artifacts/lanes/horn-cost-1025/data/go.ofn
+for f in $GO $D/ore_ont_14817.owl $D/ore_ont_9663.owl; do
+  for arm in base tip; do
+    c=()
+    for rep in 1 3; do
+      n=$(taskset -c ${CPUS%%-*} $PERF stat -x, -e cpu_core/instructions/u $L/bin/$arm --threads 1 --dl-attempt-work 1 --repeat $rep $f 2>&1 >/dev/null | grep cpu_core | cut -d, -f1)
+      c+=($n)
+    done
+    echo "$(basename $f) $arm r1=${c[0]} r3=${c[1]} per_classify=$(( (c[1]-c[0])/2 ))"
+  done
+done
+echo INSN-DONE

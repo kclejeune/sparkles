@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# timing.sh: the Intel A/B of lane horn-ranges-693, run by run.sh under the bench and heavy locks.
+# Arms, interleaved in a rotating order in each round, on 1 and 4 threads:
+#   base  bin/base (378127e2)
+#   tip   bin/tip (the lane tip), which leaves the covered range universals out
+#   keep  bin/tip with SPARKLES_HORN_RANGES=keep, which keeps every range universal
+# Files: ore_ont_14817 and ore_ont_9663 with --dl-attempt-work 1, so that the Horn rules answer
+# at once, GO as it runs by default, and go-el, GO with --el-only. One JSON line per process in
+# out/timing/log.txt, which ends with TIMING-DONE. Each process runs in a 12 GiB scope without
+# swap, pinned to cpu 2 on one thread and cpus 2, 4, 6 and 8 on four.
+set -u
+ROUNDS=${ROUNDS:-5}
+O=out/timing; mkdir -p $O
+log=$O/log.txt
+ARMS=(base tip keep)
+FILES=(ore_ont_14817 ore_ont_9663 go go-el)
+for r in $(seq 1 $ROUNDS); do
+  for t in 1 4; do
+    for n in "${FILES[@]}"; do
+      case $n in
+        go) f=files/go.ofn; x=(--repeat 5);;
+        go-el) f=files/go.ofn; x=(--repeat 5 --el-only);;
+        *) f=files/$n.owl; x=(--repeat 3 --dl-attempt-work 1);;
+      esac
+      k=$(( (r + t) % ${#ARMS[@]} ))
+      for i in $(seq 0 $(( ${#ARMS[@]} - 1 ))); do
+        arm=${ARMS[$(( (k + i) % ${#ARMS[@]} ))]}
+        case $arm in base) b=bin/base; e=SPARKLES_HORN_RANGES=covered;; tip) b=bin/tip; e=SPARKLES_HORN_RANGES=covered;; keep) b=bin/tip; e=SPARKLES_HORN_RANGES=keep;; esac
+        case $t in 1) cpus=2;; *) cpus=2,4,6,8;; esac
+        tax=$O/$arm.$n.t$t.tax; js=$O/$arm.$n.t$t.r$r.json
+        env $e systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 taskset -c $cpus $b --threads $t --taxonomy $tax "${x[@]}" $f > $js 2> $O/$arm.$n.t$t.r$r.err
+        st=$?
+        sha=$(LC_ALL=C sort $tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $tax
+        rep=$(grep '^{' $js | head -1); [ -n "$rep" ] || rep=null
+        jq -nc --arg arm $arm --arg n $n --argjson r $r --argjson t $t --arg sha $sha --argjson st $st --argjson rep "$rep" \
+          '{round:$r,arm:$arm,file:$n,threads:$t,exit:$st,tax:$sha,ms:($rep|if .==null then null else .classifyMedianMs end),sat:($rep|if .==null then null else .saturationMs end),rss:($rep|if .==null then null else .peakRssKib end),conclusions:($rep|if .==null then null else .conclusions end),left:($rep|if .==null then null else .hornRangesLeftOut end)}' >> $log
+      done
+    done
+  done
+done
+echo TIMING-DONE >> $log

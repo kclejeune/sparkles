@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# cmp.sh: each generated case by the tip with the rule, with every range universal kept and
+# with the rule on four threads; prints name, the three taxonomy hashes, tier and universals left out
+G=$(dirname $0); B=$G/../bin/tip
+ls $G/files | xargs -P 4 -I{} sh -c '
+a=$(SPARKLES_HORN_RANGES=covered timeout 30 '$B' --threads 1 --taxonomy /dev/stdout '$G'/files/{} 2>/dev/null)
+b=$(SPARKLES_HORN_RANGES=keep timeout 30 '$B' --threads 1 --taxonomy /dev/stdout '$G'/files/{} 2>/dev/null)
+c=$(SPARKLES_HORN_RANGES=covered timeout 30 '$B' --threads 4 --taxonomy /dev/stdout '$G'/files/{} 2>/dev/null)
+h() { echo "$1" | grep -v "^{" | LC_ALL=C sort | sha256sum | cut -c1-12; }
+j=$(echo "$a" | grep "^{" | jq -c "[.tier,.hornRangesLeftOut,.outside,.conclusions]")
+jb=$(echo "$b" | grep "^{" | jq -c ".conclusions")
+echo "{} $(h "$a") $(h "$b") $(h "$c") $j $jb"'

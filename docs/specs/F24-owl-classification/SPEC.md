@@ -605,6 +605,22 @@ results on the 1,010 pairs that both classified. On
 one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
 0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1234 follows.
 
+Item 693 leaves out the universal restriction on `owl:Thing` of a range of a property that
+chains reach when the told ranges of the links that end the property's paths already give
+it, as [the Horn rules](#the-horn-rules) argue. The rule leaves out all 6 such universals
+of ore_ont_14817 and 13 of the 16 of ore_ont_9663, which then derive 8.2% and 7.2% fewer
+conclusions and take 7.4% and 6.5% fewer instructions per classification on the laptop.
+On `atlas`, without their disjunctive attempt and against the same binary with every
+universal kept, they classify in a median over five paired rounds of 0.942 and 0.955 times
+the time on one thread and 0.927 and 0.960 times on four, with peak resident sets of 638 against 697 MiB and 910 against
+959 MiB on one thread. GO has no such universal and takes the same time. The taxonomies
+are equal on the 389 development and final-set files of the ORE 2015 DL sample that both
+sides classify, and on 3,537 generated Horn ontologies, of which the 853 that leave a
+universal out and that HermiT accepts give HermiT's taxonomy. `ore_ont_7646` now
+classifies within 8 GiB on one thread with the attempt bounded at 1, with 219.2 million conclusions against 398.7
+million. The [benchmark report](../../benchmarks/el-classification/RESULTS.md#range-universals-that-the-links-cover)
+holds the rounds and the sweeps.
+
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
 timed the worlds on the 207 files of the ORE 2015 DL development set on four threads on
@@ -1372,6 +1388,64 @@ and the third one that of 2,658. GO, ChEBI lite, the ORE 2015 EL files and the D
 development set, 497 files that the laptop classifies within 8 GiB, give the same
 taxonomies with and without the reductions on one and eight threads, and 67 of them
 change their conclusion count.
+
+A range of a property that chains reach is the universal restriction `⊤ ⊑ ∀r.C`, which
+every context holds and unfolds into the states of the automaton of `r`. The run leaves
+it out when the told ranges already give `C` at the end of every path that implies `r`
+(item 693). Every word that the automaton accepts ends with the label of a transition
+into a final state. The universal is left out when the start state is not final and,
+for every such label `l`, `C` is a told range of `l` or of a property above `l`, with
+`r` itself among them. The told ranges include the domains, each a range of the inverse
+property, and the universal property is never such a label. On ore_ont_14817 the rule
+leaves out all 6 range universals and on ore_ont_9663 13 of 16. The property 207 of the
+second file keeps its universal, since its paths can end with links by properties 206,
+329, 355 and 356, which have no range `C`, and without that universal the taxonomy
+loses subsumptions.
+
+Leaving an entailed axiom out is sound. The argument for completeness changes the first
+of the three steps above and leaves the other two.
+
+1. **A told range holds on every link.** For each told range `C` of a property `p`, the
+   index gives `C` to the successor of each existential restriction on a property under
+   `p`, and to the source of each link by a property under `p⁻` through `∃p⁻.⊤ ⊑ C`. A
+   loop takes the ranges of its property and of the property's inverse, and the range of
+   a reflexive or universal property holds everywhere. R3 and the merges of R5 keep the
+   cores that carry the ranges, R6 gives a predecessor the core of the successor it is
+   identified with, and the rules of individuals copy links with their properties. This
+   is how the run treats the ranges of simple properties, which never have a universal.
+   The translation of the first step therefore keeps `⊤ ⊑ ∀p.C` on the links of the
+   chain-free model for every told range, whether `p` is simple or not.
+2. **The translation without the universal preserves named subsumption.** A model of the
+   ontology is a model of the translation without the states of the left-out universal.
+   Close a model of that translation under the chains. An edge that the closure adds by
+   `r` runs along a path whose properties spell a word that the automaton of `r`
+   accepts, by the construction of Horrocks, Kutz and Sattler. The last edge of the path
+   is an edge of the model by a property under the word's last label `l`. That label has
+   `C` as a told range of a property `l'` above it, and `⊤ ⊑ ∀l'.C` holds on the edges
+   of the model, so the end of the path is in `C`. The closure then satisfies
+   `⊤ ⊑ ∀r.C`, and every other axiom as the first step shows.
+3. **The rest is unchanged.** The calculus without composition is complete for this
+   translation, and chain selection derives what that calculus derives, as before.
+
+The argument holds for several universals left out at once, since each one's case reads
+only the told ranges on links and not another universal. Its first point needs every
+property that a link can have to count for the rule `∃p⁻.⊤ ⊑ C`. A context that derives
+a negative existential restriction made positive by its unfolding links to its
+successor, so the index gives those properties the same rule (item 693). Those rules
+add conclusions on 27 of 3,537 generated ontologies, on none of the 389 files of the ORE
+2015 sweep and on no file of the benchmark, and change no taxonomy. The
+automaton's reductions and pruning do not affect the test, which reads the labels into
+the final states of the closure over the ε-transitions before them. It finds them from
+the transitions between a state that the start reaches and one whose ε-transitions reach
+the end, without building the closure, in time linear in the automaton apart from the sort
+of the labels and with polls of the run's deadline and cancellation, and it refuses
+scratch whose upper bound passes the run's memory limit, as the property closure does. When the left-out universals were a run's only
+universal restrictions and no other Horn rule can fire, the run takes the EL rules, which
+compose every chain, as for any such run. A change to the axioms after a run with the
+Horn rules normalizes them again, so a removed range that covered a universal brings the
+universal back.
+Tier D makes its own range universals and keeps them all. `SPARKLES_HORN_RANGES=keep`
+keeps every range universal for a comparison.
 
 Item 693 also fixed a gap in completeness that phase 3 left. A chain
 `r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of
