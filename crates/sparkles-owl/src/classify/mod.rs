@@ -433,7 +433,10 @@ pub struct Stats {
     pub marking: Duration,
     pub taxonomy: Duration,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
-    /// rules of roadmap item 603 take; the others are left out and reported
+    /// rules of roadmap item 603 take; the others are left out and reported. The counts
+    /// go by each axiom's shape and by what the tiers take, not by what the run answers in
+    /// full. An axiom answered in part, such as one the datatype checker covers, is
+    /// reported as [`Gap::Partial`] among the run's excluded axioms.
     pub outside_el: OutsideEl,
     /// the rules the run's axioms need
     pub tier: Tier,

@@ -315,3 +315,63 @@ fn a_cancellation_polled_once_stops_a_checker_run_wherever_it_comes() {
         );
     }
 }
+
+#[test]
+fn a_disjointness_of_checker_properties_is_reported() {
+    // `DisjointDataProperties` makes its properties one checker component. No tier takes
+    // the axiom, so the run must report it rather than drop it: `A` would be
+    // unsatisfiable with it. The second body adds a disjunctive axiom, which Tier D does
+    // not take beside data, so the Horn rules run and leave it out as well.
+    for extra in ["", "SubClassOf(:X ObjectUnionOf(:Y :Z))"] {
+        let (sat, ax) = run(&format!(
+            "DisjointDataProperties(:d :e)\n\
+             SubClassOf(:A DataHasValue(:d \"1\"^^xsd:integer))\n\
+             SubClassOf(:A DataHasValue(:e \"1\"^^xsd:integer))\n{extra}"
+        ));
+        assert!(!sat.interner.dt.is_empty(), "{extra}");
+        assert!(
+            matches!(gap_of(&sat, &ax[0]), Some(Gap::Outside { .. })),
+            "{extra}: {:?}",
+            sat.excluded()
+        );
+    }
+}
+
+#[test]
+fn an_added_definition_that_makes_a_checker_component_starts_again() {
+    // `:small` is unknown at first, so its axiom is left out and the run has no checker
+    // component. The added definition gives it a facet, which makes `d` the checker's.
+    let first = axioms(
+        "SubClassOf(:A DataSomeValuesFrom(:d :small))\n\
+         SubClassOf(DataSomeValuesFrom(:d xsd:integer) :B)\n\
+         SubClassOf(:C :D)",
+    );
+    let def = axioms(
+        "DatatypeDefinition(:small DatatypeRestriction(xsd:integer xsd:maxInclusive \"5\"^^xsd:integer))",
+    );
+    assert!(def.iter().all(needs_full_run));
+    let before: Vec<&AxiomKind> = first.iter().collect();
+    let added: Vec<&AxiomKind> = def.iter().collect();
+    let all: Vec<&AxiomKind> = before.iter().chain(&added).copied().collect();
+    let mut sat = Saturation::new();
+    sat.classify(&before, None, &Limits::default()).unwrap();
+    assert!(sat.interner.dt.is_empty());
+    assert!(gap_of(&sat, &first[0]).is_some());
+    let out = sat
+        .classify(
+            &all,
+            Some(Changes {
+                added: &added,
+                removed: &[],
+            }),
+            &Limits::default(),
+        )
+        .unwrap();
+    assert!(!out.stats.incremental);
+    assert!(!sat.interner.dt.is_empty());
+    let mut fresh = Saturation::new();
+    let want = fresh.classify(&all, None, &Limits::default()).unwrap();
+    assert_eq!(out.taxonomy, want.taxonomy);
+    assert_eq!(sat.excluded(), fresh.excluded());
+    assert!(sub(&sat, "A", "B"));
+}
