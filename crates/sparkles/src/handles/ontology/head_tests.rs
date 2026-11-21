@@ -1,4 +1,5 @@
-//! The summary's answer on fixtures, pinned in `head_fixtures.json` (roadmap item 735).
+//! The summary's answer on fixtures, pinned in `head_fixtures.json`, and the head's
+//! agreement with it (roadmap item 735).
 //!
 //! `SPARKLES_BLESS_HEAD=1` prints the current answers as the fixture file's content
 //! between two marker lines instead of comparing them.
@@ -225,4 +226,133 @@ fn the_summary_answers_as_pinned() {
         assert_eq!(got[f.name], want[f.name], "fixture {}", f.name);
     }
     assert_eq!(got, want);
+}
+
+/// The head's answer for `f`.
+fn head(f: &Fixture) -> J {
+    let ds = dataset(f.data);
+    let mut args = (f.args)();
+    args["view"] = json!("head");
+    super::wire::call(&ds, "summary", &args, &QueryOptions::default()).unwrap()
+}
+
+/// The members of `full` that the head answers, with `view`.
+pub(super) fn head_of(full: &J) -> J {
+    let mut j = serde_json::Map::new();
+    for k in [
+        "dataset",
+        "commit",
+        "mode",
+        "graphs",
+        "imports",
+        "warnings",
+        "inferences",
+        "header",
+        "entities",
+        "closure",
+    ] {
+        if let Some(v) = full.get(k) {
+            j.insert(k.to_string(), v.clone());
+        }
+    }
+    j.insert("view".into(), json!("head"));
+    J::Object(j)
+}
+
+#[test]
+fn the_head_answers_what_the_summary_does() {
+    for f in FIXTURES {
+        assert_eq!(head(f), head_of(&full(f)), "fixture {}", f.name);
+    }
+}
+
+#[test]
+fn the_head_reads_without_opening_the_ontology() {
+    for f in FIXTURES {
+        let ds = dataset(f.data);
+        let req = super::wire::request_of((f.args)().as_object().unwrap()).unwrap();
+        let h = ds.ontology().head(&req, &QueryOptions::default()).unwrap();
+        assert!(!h.opened, "fixture {}", f.name);
+    }
+}
+
+#[test]
+fn the_head_refuses_a_bad_view_and_metrics() {
+    let ds = dataset(BASIC);
+    let o = QueryOptions::default();
+    assert!(super::wire::call(&ds, "summary", &json!({"view": "light"}), &o).is_err());
+    let both = json!({"view": "head", "metrics": true});
+    assert!(super::wire::call(&ds, "summary", &both, &o).is_err());
+    let full = super::wire::call(&ds, "summary", &json!({"view": "full"}), &o).unwrap();
+    assert!(full.get("axioms").is_some());
+}
+
+#[test]
+fn the_head_opens_the_ontology_past_its_bounds() {
+    // more ontology nodes than the header fragment reads
+    let mut data = String::new();
+    for n in 0..=super::head::MAX_NODES {
+        data.push_str(&format!("<http://ex.org/o{n}> a owl:Ontology . "));
+    }
+    data.push_str(":A a owl:Class .");
+    let ds = Dataset::memory();
+    ds.update(&format!("{PREFIXES} INSERT DATA {{ {data} }}"))
+        .unwrap();
+    let req = super::OntologyRequest::default();
+    let o = QueryOptions::default();
+    let h = ds.ontology().head(&req, &o).unwrap();
+    assert!(h.opened);
+    let s = ds.ontology().open(&req, &o).unwrap().summary();
+    assert_eq!(h.header, s.header);
+    assert_eq!(h.entities, s.entities);
+}
+
+fn same(ds: &Dataset, args: J, o: &QueryOptions) {
+    let mut full = super::wire::call(ds, "summary", &args, o).unwrap();
+    full.as_object_mut().unwrap().remove("cached");
+    let mut h = args.clone();
+    h["view"] = json!("head");
+    let head = super::wire::call(ds, "summary", &h, o).unwrap();
+    assert_eq!(head, head_of(&full), "{args}");
+}
+
+#[test]
+fn the_head_reads_through_the_callers_grants() {
+    use crate::access::{GraphAccess, GraphRule, Graphs};
+    let ds = dataset(GRAPHS);
+    let g = Graphs::Only(GraphRule::new(["http://ex.org/g1"], &[]));
+    let o = QueryOptions {
+        graphs: Some(std::sync::Arc::new(GraphAccess::graphs(g.clone(), g))),
+        ..Default::default()
+    };
+    same(&ds, g1(), &o);
+    same(&ds, g1_g2(), &o);
+    let mut h = g1_g2();
+    h["view"] = json!("head");
+    let head = super::wire::call(&ds, "summary", &h, &o).unwrap();
+    assert_eq!(head["entities"], json!({ "Class": 2 }));
+}
+
+#[test]
+fn the_head_reads_the_inferences_with_their_freshness() {
+    let ds = dataset(
+        ":o a owl:Ontology ; rdfs:label \"o\" . :A a owl:Class . :B a owl:Class .
+        :A rdfs:subClassOf :B . :p a owl:TransitiveProperty .",
+    );
+    let inferred = json!({ "inferences": true });
+    same(&ds, inferred.clone(), &QueryOptions::default());
+    ds.reasoning()
+        .run(&crate::reasoning::ReasonRequest {
+            profile: sparkles_reasoner::Profile::OwlRl,
+            ..Default::default()
+        })
+        .unwrap();
+    same(&ds, inferred.clone(), &QueryOptions::default());
+    let args = json!({ "inferences": true, "view": "head" });
+    let h = super::wire::call(&ds, "summary", &args, &QueryOptions::default()).unwrap();
+    assert_eq!(h["inferences"]["included"], json!(true), "{h}");
+    same(&ds, json!({}), &QueryOptions::default());
+    ds.update(&format!("{PREFIXES} INSERT DATA {{ :C a owl:Class }}"))
+        .unwrap();
+    same(&ds, inferred, &QueryOptions::default());
 }
