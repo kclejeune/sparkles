@@ -10,9 +10,11 @@ the five that the October run counted as losses to Fluree, with `count-all` at 2
 19.2 ms and `distinct-obj` at 1.8 against 19.3 ms. With a 1 s pause between readiness and
 the request, Fluree leads `count-all` at 2.8 against 10.1 ms. After the pause Sparkles' one
 vocabulary read takes about 8 ms, which is consistent with forge's NVMe drive waking from a
-low-power state, and item 572 now records it beside the 10.5M case. The October Fluree
-medians of 2.2, 1.6, 12.1 and 8.5 ms on `count-all`, `distinct-obj`, `contains` and
-`employee-docs` were not reproduced, and the cause is not known.
+low-power state, and item 572 now records it beside the 10.5M case. Fluree's first
+request is fast on the restarts where its readiness check answers 0.05 s or more after the
+start, as nearly every restart of the October run did, which is consistent with its October
+`count-all` and `distinct-obj` medians of 2.2 and 1.6 ms. Its October `contains` and
+`employee-docs` medians of 12.1 and 8.5 ms were not reproduced.
 
 ### A kept EL classification over its memory budget starts again in full
 

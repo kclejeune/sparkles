@@ -325,10 +325,12 @@ followed by the fastest and the slowest.
 | `values-star` | **5.2** (3.4 to 6.0) | 36.5 (27.0 to 44.4) |
 | `path-plus` | **2.5** (1.5 to 3.2) | 29.1 (22.9 to 36.7) |
 
-Fluree answers its readiness check 0.02 s after a restart, against 0.09 s for Sparkles.
-Most of its first requests take 14 to 55 ms, and a few `count-all` and `distinct-obj`
-requests take 1.5 to 2.6 ms. An older Fluree store of the same data shows the same split,
-so it does not come from this load, and its cause is not known.
+Fluree answers its readiness check 0.02 s after most restarts, against 0.09 s for
+Sparkles, and its first request then takes 14 to 55 ms. On 28 of the 168 restarts its check
+answered only on the harness's second poll, 0.05 s or more after the start, and the first
+request was faster, with medians of 1.8 ms on `count-all`, 2.1 ms on `distinct-obj` and
+15.1 ms on `employee-docs`. A Fluree store of the same data loaded earlier behaves the same
+way.
 
 The harness sends the timed request as soon as the server answers its readiness check. A
 second run of the same rounds waited 1 s between the readiness check and the request, in a

@@ -23,8 +23,8 @@ with its SHA-256 in the same file. The harness is `scripts/bench.sh` and
 ## Correctness
 
 `answers/answers.json` holds both engines' answer fingerprints for the eight queries. The
-value fingerprints agree on every query, and the exact fingerprints differ only on
-`star-lookup`, whose rows come back in another order.
+value fingerprints agree on every query. The exact fingerprints, which also compare
+lexical forms, differ only on `star-lookup`.
 
 ## Files
 
