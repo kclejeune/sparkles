@@ -113,7 +113,7 @@ impl Reduction {
         let mut out = dl::OutsideEl::default();
         let mut seen: BTreeSet<&AxiomKind> = BTreeSet::new();
         for k in axioms {
-            if super::logical(k) && !crate::profiles::el_axiom(k).is_empty() && seen.insert(k) {
+            if super::logical(k) && crate::profiles::el_first(k).is_some() && seen.insert(k) {
                 out.add(dl::shape(k));
             }
         }

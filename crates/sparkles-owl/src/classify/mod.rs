@@ -2039,7 +2039,7 @@ impl Saturation {
                 let mut out = Vec::new();
                 for (i, k) in chunk.iter().enumerate() {
                     if logical(k)
-                        && let Some(b) = profiles::el_axiom(k).into_iter().next()
+                        && let Some(b) = profiles::el_first(k)
                     {
                         out.push((at + i, (b.rule.to_string(), b.message)));
                     }
@@ -2073,9 +2073,9 @@ impl Saturation {
         let stale = self.stale_tier
             || changes.is_some_and(|c| {
                 c.removed.iter().any(|k| !tier_neutral(k))
-                    || c.added.iter().any(|k| {
-                        !tier_neutral(k) && profiles::el_axiom(k).into_iter().next().is_some()
-                    })
+                    || c.added
+                        .iter()
+                        .any(|k| !tier_neutral(k) && profiles::el_first(k).is_some())
             });
         let full = self.entangled
             || match (&kept, changes) {
@@ -3122,7 +3122,7 @@ impl Saturation {
             return true;
         }
         let outside: Vec<&AxiomKind> = changed()
-            .filter(|a| logical(a) && profiles::el_axiom(a).into_iter().next().is_some())
+            .filter(|a| logical(a) && profiles::el_first(a).is_some())
             .collect();
         let in_play = k.outside || !outside.is_empty();
         if in_play && changed().any(|a| logical(a) && !tier_neutral(a)) {
@@ -4230,7 +4230,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(i, k)| {
-                let b = profiles::el_axiom(k).into_iter().next()?;
+                let b = profiles::el_first(k)?;
                 Some((i, (b.rule.to_string(), b.message)))
             })
             .collect();
