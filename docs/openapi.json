@@ -42100,6 +42100,10 @@
                       "null"
                     ]
                   },
+                  "strict": {
+                    "description": "Refuse with `422` and code `classification-incomplete` when the classifier would leave an axiom out or use one only in part, or the run stopped, so that an answer is always complete for the whole ontology, as HermiT refuses what it does not support. The message names the axioms and the rules they break.",
+                    "type": "boolean"
+                  },
                   "target": {
                     "description": "A named graph outside the graphs read that takes the direct taxonomy.",
                     "type": "string"
@@ -42130,6 +42134,11 @@
                           "type": "integer"
                         },
                         "complete": {
+                          "description": "Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way.",
+                          "type": "boolean"
+                        },
+                        "completeForTaken": {
+                          "description": "Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer.",
                           "type": "boolean"
                         },
                         "consistent": {
@@ -42139,6 +42148,7 @@
                       "required": [
                         "consistent",
                         "complete",
+                        "completeForTaken",
                         "classes"
                       ],
                       "type": "object"
@@ -42174,6 +42184,9 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
           },
           "507": {
             "$ref": "#/components/responses/InsufficientStorage"
