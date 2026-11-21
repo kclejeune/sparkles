@@ -1231,6 +1231,21 @@ staged query needs these answers, whether or not its requests left a timing. In 
 several tips or clients, every arm must give the same answers, so one arm that answers
 differently stops every pair of the run.
 
+Early stopping runs only in shadow mode. With `EARLY_STOP=shadow`, which `stage` writes by
+default, `run` replays a stopping rule on the finished first pass and writes `shadow.md` and
+`pass1/shadow-X-Y.json` beside the verdict, and `timing-kit.py shadow PASS_DIR` does the same
+for any finished pass of the harness, such as a batch screen's. The rule ends a query that is
+not a control once a 99.5% t interval of its per-round log ratios, after at least three
+rounds, lies wholly below the flag bound with the pooled ratio below it too, or lies at or
+above the bound. The controls run every round and decide validity. When their same-binary
+spread is between 2.2% and the 3% bound, the stopped queries would run their remaining rounds
+and the rule of all rounds would decide. The record gives each query's stop round and flag
+beside those of all rounds, both validities, the share of requests that would have run and a
+hash of the samples, and a run agrees when every flag and the validity match. Shadow mode never
+changes the verdict, the flagged queries, the rerun or the exit status. It tests the decision
+rule only, since live stopping would also change which queries run between the remaining ones
+and would run a fallback's remaining rounds in new server processes.
+
 The harness forks curl, grep and awk for every request. `REQUEST_CLIENT=persistent` sends
 the same requests from one process over one kept-alive connection, without those processes.
 Back-to-back requests can find the server's caches and clocks warmer than requests with a

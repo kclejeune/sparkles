@@ -3,6 +3,7 @@
     python3 -m unittest discover -s scripts/bench-tests -p test_timing_kit.py
 """
 
+import importlib.util
 import json
 import os
 import shutil
@@ -160,6 +161,14 @@ class KitTests(unittest.TestCase):
         self.assertIn("FLAG_RATIO must be a ratio above 1", r.stderr)
         self.assertIn("RERUN_REPS must be a whole number of at least 1, not 0", r.stderr)
 
+    def test_preflight_refuses_early_stopping_that_acts(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        self.assertIn("EARLY_STOP=shadow\n", (s / "run.env").read_text())
+        (s / "run.env").write_text((s / "run.env").read_text().replace("EARLY_STOP=shadow", "EARLY_STOP=on"))
+        r = kit("preflight", s)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("EARLY_STOP must be off or shadow, not on", r.stderr)
+
     def test_preflight_needs_a_hash_of_every_binary(self):
         r, s = self.stage(tips=(("tip", 1.0),))
         lines = (s / "binaries.sha256").read_text().splitlines()
@@ -291,6 +300,12 @@ class KitTests(unittest.TestCase):
         verdict = (s / "verdict.md").read_text()
         self.assertIn("fast (B) against base (A): first pass valid", verdict)
         self.assertIn("flagged none, none slower after the rerun", verdict)
+        # shadow mode records the rule's decisions without acting, and with two rounds the
+        # rule cannot stop before the last
+        self.assertIn("slow (C) against base (A): agrees with all rounds", (s / "shadow.md").read_text())
+        sh = json.loads((s / "pass1" / "shadow-A-C.json").read_text())
+        self.assertTrue(sh["agree"])
+        self.assertEqual(sh["request_share"], 1.0)
         self.assertIn("slow (C) against base (A): first pass valid", verdict)
         self.assertIn("slower after the rerun: class-predicates 1.300", verdict)
         # the run removes its copies of the binaries and data
@@ -326,6 +341,105 @@ class KitTests(unittest.TestCase):
             self.assertEqual(set(p1["answers"].values()), {status}, pair)
             self.assertEqual(set(p1["answers_all_arms"].values()), {"differ"}, pair)
         self.assertEqual(set(json.loads((s / "rerun" / "summary-A-D.json").read_text())["answers"].values()), {"differ"})
+
+
+def load_kit():
+    spec = importlib.util.spec_from_file_location("timing_kit", KIT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def write_samples(d, ratio, rounds=8, noise=None, controls=CONTROLS, query="q", spread=0.0):
+    """A pass of A,B,B,A rounds of 2 requests, where B takes ratio times A's 1 ms on query,
+    with noise[k] scaling B in round k, and B is as fast as A on the controls. With spread,
+    the second server process of each variant in a round is that much slower on every query."""
+    res = Path(d) / "results"
+    res.mkdir(parents=True)
+    lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+    epoch = 0
+    for k in range(1, rounds + 1):
+        for i, v in enumerate("ABBA"):
+            epoch += 1
+            slow = 1 + spread * (i >= 2)
+            for q in [query, *controls]:
+                ms = (ratio * (noise[k - 1] if noise else 1) if v == "B" and q == query else 1.0) * slow
+                for rep in (1, 2):
+                    lines.append(f"{k}\t{epoch}\t{v}\t{q}\t{rep}\t{ms}\t{ms + 1}")
+    (res / "samples.tsv").write_text("\n".join(lines) + "\n")
+    return res.parent
+
+
+class ShadowTests(unittest.TestCase):
+    def setUp(self):
+        self.kit = load_kit()
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+
+    def test_stop_rule_stops_inside_outside_or_not_at_all(self):
+        rule = self.kit.stop_rule
+        flat = {k: {"A": [1.0, 1.0], "B": [1.0 + 0.001 * k, 1.0]} for k in range(1, 9)}
+        self.assertEqual(rule(flat, 1.10), (3, False, "inside"))
+        slow = {k: {"A": [1.0], "B": [1.3 + 0.001 * k]} for k in range(1, 9)}
+        self.assertEqual(rule(slow, 1.10), (3, True, "outside"))
+        # rounds that swing across the bound never stop, and all rounds decide
+        swing = {k: {"A": [1.0], "B": [1.25 if k % 2 else 0.98]} for k in range(1, 9)}
+        self.assertEqual(rule(swing, 1.10), (8, True, "all"))
+        # an interval inside the bound with a pooled ratio at the bound does not stop
+        # inside, as in the replayed rule
+        self.assertEqual(rule({1: {"A": [1.0], "B": [1.0]}, 2: {"A": [1.0], "B": [1.0]}}, 1.10), (2, False, "all"))
+        gap = {**flat, 2: {"A": [1.0], "B": []}}
+        self.assertEqual(rule(gap, 1.10), (8, False, "unjudged"))
+        # more rounds than the t table holds use its last quantile
+        long = {k: {"A": [1.0], "B": [1.25 if k % 2 else 0.98]} for k in range(1, 41)}
+        self.assertEqual(rule(long, 1.10)[2], "all")
+
+    def test_shadow_records_the_rule_beside_all_rounds(self):
+        d = write_samples(self.d / "same", 1.0)
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+        self.assertTrue(s["agree"])
+        self.assertEqual(s["queries"]["q"]["how"], "inside")
+        self.assertEqual(s["queries"]["q"]["stop_round"], 3)
+        for c in CONTROLS:
+            self.assertEqual((s["queries"][c]["how"], s["queries"][c]["stop_round"]), ("control", 8))
+        # q stops after 3 of 8 rounds, and the 3 controls run all 8
+        self.assertAlmostEqual(s["request_share"], (3 + 3 * 8) / (4 * 8))
+        self.assertEqual(len(s["samples_sha256"]), 64)
+        self.assertEqual(s["rule"]["kmin"], 3)
+        d = write_samples(self.d / "slow", 1.3)
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+        self.assertEqual((s["queries"]["q"]["how"], s["queries"]["q"]["flagged"]), ("outside", True))
+        self.assertTrue(s["agree"])
+        # a ratio that the first rounds put inside and the later rounds put well outside
+        # stops inside and disagrees with all rounds
+        d = write_samples(self.d / "late", 1.0, noise=[1.0, 1.0, 1.0, 1.4, 1.4, 1.4, 1.4, 1.4])
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+        self.assertFalse(s["agree"])
+        self.assertEqual(s["flags_differ"], ["q"])
+
+    def test_shadow_falls_back_in_the_band_and_judges_validity_by_the_controls(self):
+        d = write_samples(self.d / "band", 1.0, spread=0.025)
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+        self.assertTrue(s["validity"]["fallback"])
+        self.assertEqual(s["request_share"], 1.0)
+        self.assertTrue(s["agree"])
+        d = write_samples(self.d / "noisy", 1.0, spread=0.05)
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+        self.assertEqual((s["validity"]["all_rounds"], s["validity"]["shadow"], s["agree"]), (False, False, True))
+        # without enough controls the shadow cannot be valid
+        d = write_samples(self.d / "bare", 1.0, controls=["class-predicates"])
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
+        self.assertEqual((s["validity"]["all_rounds"], s["validity"]["shadow"], s["agree"]), (True, False, False))
+
+    def test_shadow_command_reads_a_screen_pass(self):
+        d = write_samples(self.d / "out" / "pass1", 1.0)
+        (self.d / "out" / "run.env").write_text("ROUNDS=8\nFLAG_RATIO=1.20\n")
+        r = kit("shadow", d)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("B against A: agrees with all rounds", r.stdout)
+        s = json.loads((d / "shadow-A-B.json").read_text())
+        self.assertEqual(s["rule"]["bound"], 1.20)
+        self.assertEqual(s["controls"], CONTROLS)
 
 
 if __name__ == "__main__":

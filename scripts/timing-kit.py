@@ -6,6 +6,7 @@
     scripts/timing-kit.py launch --host HOST --unit NAME [--dry-run] STAGE...
     scripts/timing-kit.py run STAGE...          (the unit's driver, on the timing host)
     scripts/timing-kit.py summarize STAGE
+    scripts/timing-kit.py shadow [--pair X,Y] [--controls Q,...] [--flag-ratio R] PASS_DIR
 
 `stage` assembles one run directory for scripts/nsc-bench-remote.sh. The base binary is
 variant A and each tip is B, C and so on, so that several tips that share a base, data,
@@ -41,18 +42,38 @@ differently, fail its answer check or lack an answer to it, or when any arm of t
 answers a query differently from the others, and verdict.md names the queries whose
 answers stopped it. DONE gets the exit status, which is 3 when a pass that
 decides is invalid.
+
+`shadow` replays the early-stopping rule on a finished pass, whose every round ran, and
+records what the rule would have decided beside the verdict of all rounds. Each query that
+is not a control stops once a t interval at 99.5% of its per-round log ratios, after at
+least three rounds, lies below the flag bound with the pooled ratio so far below it too, or
+lies at or above the bound. The controls run every round and carry the validity check, and
+when their same-binary spread is 2.2% or more but within the 3% bound, the stopped queries
+would run their remaining rounds and the rule of all rounds would decide. PASS_DIR/shadow-X-Y.json
+gets each query's stop round, its decision and that of all rounds, the validity of both, the
+share of requests the rule would have sent and a hash of samples.tsv. A run agrees when every
+query's flag and the validity are the same. With EARLY_STOP=shadow in run.env, which `stage`
+writes by default, `run` does this for each pair of the first pass and writes shadow.md.
+Shadow mode never changes verdict.md, flagged.txt, the rerun or the exit status, and it
+cannot show what live stopping would change, since stopped queries would no longer sit
+between the others and the remaining rounds of a fallback would run in new server processes.
 """
 
 import argparse
+import csv
+import importlib.util
 import json
+import math
 import os
 import re
 import shlex
 import shutil
 import signal
 import socket
+import statistics
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -63,6 +84,14 @@ CONTROLS = ("expr-bind-group range-topk not-exists class-predicates exists-join 
             "two-hop-count group-avg knows-reach").split()
 MIN_CONTROLS = 3
 KIT_FILES = ("nsc-bench-remote.sh", "nsc-bench-summary.py", "timing-kit.py")
+# the early-stopping rule that the replay of 75 Intel runs chose, which shadow mode records
+EARLY_KMIN = 3
+EARLY_CONF = 0.995
+FALLBACK_SPREAD = 0.022
+# two-sided 99.5% t quantiles for 1 to 30 degrees of freedom; more degrees use the last,
+# which is above the true quantile and so stops later
+T995 = [127.3, 14.09, 7.453, 5.598, 4.773, 4.317, 4.029, 3.833, 3.690, 3.581, 3.497, 3.428, 3.372, 3.326, 3.286,
+        3.252, 3.222, 3.197, 3.174, 3.153, 3.135, 3.119, 3.104, 3.091, 3.078, 3.067, 3.057, 3.047, 3.038, 3.030]
 
 
 def die(msg):
@@ -230,6 +259,7 @@ def cmd_stage(a):
         "SERVE_ARGS": a.serve_args, "EXECUTION": a.execution,
         "PAIRS": " ".join(pairs), "XPAIRS": " ".join(xpairs), "CONTROLS": " ".join(controls),
         "FLAG_RATIO": a.flag_ratio, "RERUN_ROUNDS": a.rerun_rounds, "RERUN_REPS": a.rerun_reps,
+        "EARLY_STOP": a.early_stop,
     }
     (out / "run.env").write_text("".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()))
     kit = {"arms": [{"variant": v, "label": l + (f" [{name}{'' if name == 'curl' else ' gap ' + gap + ' ms'}]" if len(configs) > 1 else ""),
@@ -285,6 +315,8 @@ def static_checks(stage):
         v = env.get(k, default)
         if not re.fullmatch(r"[0-9]+", v) or int(v) < least:
             p.append(f"{k} must be a whole number of at least {least}, not {v}")
+    if env.get("EARLY_STOP", "off") not in ("off", "shadow"):
+        p.append(f"EARLY_STOP must be off or shadow, not {env.get('EARLY_STOP')}, since stopping that acts is not qualified")
     if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", env.get("FLAG_RATIO", "1.10")) or float(env.get("FLAG_RATIO", "1.10")) <= 1:
         p.append(f"FLAG_RATIO must be a ratio above 1, not {env.get('FLAG_RATIO')}")
     queries = {f.stem for f in (stage / "queries").glob("*.rq")} if (stage / "queries").is_dir() else set()
@@ -585,6 +617,8 @@ def cmd_run(a):
             continue
         if write_verdict(stage, flagged):
             rc = max(rc, 3)
+        if env.get("EARLY_STOP", "off") == "shadow":
+            write_shadow(stage)
         log(stage, "finished")
     return rc
 
@@ -644,6 +678,161 @@ def write_verdict(stage, flagged):
     return invalid
 
 
+def stop_rule(rounds, bound, kmin=EARLY_KMIN):
+    """Where the early-stopping rule ends one query and what it decides.
+
+    rounds maps each round to the variant's times, {"A": [...], "B": [...]}. The result is
+    (stop round, flagged, how), with how "inside" or "outside" for an early stop, "all" when
+    the query ran every round, and "unjudged" when a round lacks a variant."""
+    last = max(rounds)
+
+    def pooled(upto):
+        a = [x for k, v in rounds.items() if k <= upto for x in v.get("A", [])]
+        b = [x for k, v in rounds.items() if k <= upto for x in v.get("B", [])]
+        return statistics.median(b) / statistics.median(a) if a and b else float("nan")
+
+    logs = []
+    for k in sorted(rounds):
+        v = rounds[k]
+        if not v.get("A") or not v.get("B") or min(v["A"] + v["B"]) <= 0:
+            return last, pooled(last) >= bound, "unjudged"
+        logs.append(math.log(statistics.median(v["B"]) / statistics.median(v["A"])))
+        n = len(logs)
+        if n < kmin or k == last:
+            continue
+        m, h = statistics.mean(logs), T995[min(n - 2, len(T995) - 1)] * statistics.stdev(logs) / math.sqrt(n)
+        if m + h < math.log(bound) and pooled(k) < bound:
+            return k, False, "inside"
+        if m - h >= math.log(bound):
+            return k, True, "outside"
+    return last, pooled(last) >= bound, "all"
+
+
+def load_summary_module():
+    spec = importlib.util.spec_from_file_location("nsc_bench_summary", HERE / "nsc-bench-summary.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
+    """The early-stopping rule's decisions on the finished pass d beside those of all rounds."""
+    d = Path(d)
+    path = d / "results" / "samples.tsv"
+    with path.open() as f:
+        rows = list(csv.DictReader(f, delimiter="\t"))
+    x, y = pair
+    name = {x: "A", y: "B"}
+    samples = defaultdict(lambda: defaultdict(list))  # query -> variant -> (round, epoch, ms)
+    walls = defaultdict(float)  # (query, round) -> wall ms of both variants
+    sent = defaultdict(int)  # (query, round) -> requests of both variants
+    order = []
+    for r in rows:
+        if r["variant"] not in name:
+            continue
+        q, k = r["query"], int(r["round"])
+        if q not in order:
+            order.append(q)
+        sent[(q, k)] += 1
+        if r["exec_ms"] == "error":
+            continue
+        walls[(q, k)] += float(r["wall_ms"])
+        samples[q][name[r["variant"]]].append((k, int(r["epoch"]), float(r["exec_ms"])))
+    if not order:
+        raise ValueError(f"no samples of {x} and {y} in {path}")
+    controls = [q for q in (controls if controls is not None else CONTROLS) if q in order]
+    summary = load_summary_module()
+    full = summary.validity(samples, order)
+    ctl = summary.validity(samples, controls) if len(controls) >= MIN_CONTROLS else None
+    queries = {}
+    for q in order:
+        rounds = defaultdict(lambda: {"A": [], "B": []})
+        for k in {k for (qq, k) in sent if qq == q}:
+            rounds[k]  # a round whose every request failed still counts, as unjudged
+        for v, xs in samples[q].items():
+            for k, _e, ms in xs:
+                rounds[k][v].append(ms)
+        a = [ms for _k, _e, ms in samples[q].get("A", [])]
+        b = [ms for _k, _e, ms in samples[q].get("B", [])]
+        all_flag = bool(a and b) and statistics.median(b) / statistics.median(a) >= bound
+        if q in controls:
+            stop, flag, how = max(rounds), all_flag, "control"
+        else:
+            stop, flag, how = stop_rule(dict(rounds), bound)
+        queries[q] = {"stop_round": stop, "rounds": max(rounds), "how": how, "flagged": flag, "flagged_all_rounds": all_flag}
+    # the controls decide validity, and a spread within the fallback band sends every stopped
+    # query back to its remaining rounds, where the rule of all rounds decides
+    fallback = bool(ctl and ctl["valid"] and ctl["spread"] >= FALLBACK_SPREAD)
+    if fallback:
+        for m in queries.values():
+            m.update(stop_round=m["rounds"], flagged=m["flagged_all_rounds"])
+    valid_all = bool(full and full["valid"])
+    valid_shadow = valid_all if fallback else bool(ctl and ctl["valid"])
+    total = sum(sent.values()) or 1
+    kept = sum(n for (q, k), n in sent.items() if k <= queries[q]["stop_round"])
+    wall_all = sum(walls.values()) or 1
+    wall_kept = sum(w for (q, k), w in walls.items() if k <= queries[q]["stop_round"])
+    differ = sorted(q for q, m in queries.items() if m["flagged"] != m["flagged_all_rounds"])
+    return {
+        "pair": {"A": x, "B": y}, "samples_sha256": sha256(path),
+        "rule": {"kmin": EARLY_KMIN, "conf": EARLY_CONF, "bound": bound, "fallback_spread": FALLBACK_SPREAD,
+                 "max_spread": summary.MAX_SPREAD},
+        "controls": controls,
+        "validity": {"all_rounds": valid_all, "shadow": valid_shadow, "controls": ctl, "fallback": fallback,
+                     "all_rounds_spread": full and full["spread"]},
+        "queries": queries, "flags_differ": differ,
+        "request_share": kept / total, "wall_share": wall_kept / wall_all,
+        "agree": not differ and valid_all == valid_shadow,
+    }
+
+
+def shadow_line(label, s):
+    v = s["validity"]
+    stopped = sum(1 for m in s["queries"].values() if m["stop_round"] < m["rounds"])
+    return (f"- {label}: {'agrees' if s['agree'] else 'DISAGREES'} with all rounds. "
+            f"Validity {'valid' if v['shadow'] else 'INVALID'} against {'valid' if v['all_rounds'] else 'INVALID'}"
+            + (", with the controls' spread in the fallback band" if v["fallback"] else "") + ". "
+            f"{stopped} of {len(s['queries'])} queries would stop early, "
+            + (f"flags differ for {', '.join(s['flags_differ'])}, " if s["flags_differ"] else "")
+            + f"{s['request_share']:.0%} of requests and {s['wall_share']:.0%} of client wall time would run.")
+
+
+def write_shadow(stage):
+    """shadow-X-Y.json in the first pass and shadow.md for each pair; a failure is logged and
+    changes nothing else."""
+    stage = Path(stage)
+    try:
+        env = read_env(stage / "run.env")
+        kit = json.loads((stage / "kit.json").read_text()) if (stage / "kit.json").exists() else {"arms": []}
+        label = {arm["variant"]: arm["label"] for arm in kit["arms"]}
+        lines = ["# Early stopping in shadow mode", "",
+                 "The rule did not act. Every round ran, and verdict.md comes from all of them.", ""]
+        for x, y in pairs_of(stage):
+            s = shadow(stage / "pass1", (x, y), env.get("CONTROLS", " ".join(CONTROLS)).split(),
+                       float(env.get("FLAG_RATIO", "1.10")))
+            (stage / "pass1" / f"shadow-{x}-{y}.json").write_text(json.dumps(s, indent=1) + "\n")
+            lines.append(shadow_line(f"{label.get(y, y)} ({y}) against {label.get(x, x)} ({x})", s))
+        (stage / "shadow.md").write_text("\n".join(lines) + "\n")
+    except Exception as e:  # noqa: BLE001 - shadow mode must not change the run's result
+        log(stage, f"shadow mode failed, which changes nothing else: {e!r}")
+
+
+def cmd_shadow(a):
+    d = Path(a.pass_dir)
+    env = {}
+    for f in (d / "run.env", d.parent / "run.env"):
+        if f.is_file():
+            env = read_env(f)
+            break
+    controls = a.controls.split(",") if a.controls else env.get("CONTROLS", " ".join(CONTROLS)).split()
+    bound = float(a.flag_ratio or env.get("FLAG_RATIO", "1.10"))
+    x, _, y = (a.pair or "A,B").partition(",")
+    s = shadow(d, (x, y), controls, bound)
+    (d / f"shadow-{x}-{y}.json").write_text(json.dumps(s, indent=1) + "\n")
+    print(shadow_line(f"{y} against {x}", s))
+    return 0
+
+
 def cmd_summarize(a):
     stage = Path(a.stage)
     for name in ("pass1", "rerun"):
@@ -685,6 +874,8 @@ def main():
     s.add_argument("--rerun-rounds", default="16")
     s.add_argument("--rerun-reps", default="40")
     s.add_argument("--note", default="")
+    s.add_argument("--early-stop", default="shadow", choices=("off", "shadow"),
+                   help="record what the early-stopping rule would decide, without acting on it (default shadow)")
     f = sub.add_parser("preflight")
     f.add_argument("--host-side", action="store_true")
     f.add_argument("stages", nargs="+")
@@ -699,9 +890,14 @@ def main():
     r.add_argument("stages", nargs="+")
     m = sub.add_parser("summarize")
     m.add_argument("stage")
+    h = sub.add_parser("shadow")
+    h.add_argument("--pair")
+    h.add_argument("--controls")
+    h.add_argument("--flag-ratio")
+    h.add_argument("pass_dir")
     a = p.parse_args()
     return {"stage": cmd_stage, "preflight": cmd_preflight, "launch": cmd_launch, "run": cmd_run,
-            "summarize": cmd_summarize}[a.cmd](a)
+            "summarize": cmd_summarize, "shadow": cmd_shadow}[a.cmd](a)
 
 
 if __name__ == "__main__":
