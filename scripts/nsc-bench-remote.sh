@@ -13,7 +13,9 @@
 # (execMs of application/x-sparkles+json, unrounded) and curl's wall time. results/answers.tsv
 # gets a checksum of each variant's sorted TSV answer to each query, results/queries.txt the
 # names of the queries the run times, and results/load.tsv the
-# load times. With ORDER_DIGEST set to a command, such as `python3 scripts/bench-gate.py
+# load times. With EXPECTED_ANSWER_CHANGE set to a comma-separated list of queries and
+# EXPECTED_ANSWER_CHANGE_REASON to why their answers change, results/expected-answer-change.txt
+# gets both, and the summary reports a change of those queries' answers instead of refusing it. With ORDER_DIGEST set to a command, such as `python3 scripts/bench-gate.py
 # order-digest`, it is run with the query file and the TSV answer, and its output, a digest
 # of the ORDER BY keys in the returned order or "-", is a fifth column of answers.tsv. With
 # WARM_DIGEST set to a command, such as `python3 scripts/bench-gate.py native-digest`, it is
@@ -444,6 +446,10 @@ printf 'round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n' > "$R/samples.tsv
 # the queries this run times, so that a summary requires each of them even when none of
 # its requests leaves a sample
 printf '%s\n' "${QUERIES[@]}" > "$R/queries.txt"
+# the queries whose answers the run expects to change, and why, as run.env set them
+if [ -n "${EXPECTED_ANSWER_CHANGE:-}" ]; then
+  printf 'queries\t%s\nreason\t%s\n' "${EXPECTED_ANSWER_CHANGE//,/ }" "${EXPECTED_ANSWER_CHANGE_REASON:-}" > "$R/expected-answer-change.txt"
+fi
 read -r steal0 total0 < <(stat_cpu)
 epoch=0
 checked=" "

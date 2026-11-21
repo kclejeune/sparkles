@@ -161,6 +161,32 @@ class KitTests(unittest.TestCase):
         self.assertIn("FLAG_RATIO must be a ratio above 1", r.stderr)
         self.assertIn("RERUN_REPS must be a whole number of at least 1, not 0", r.stderr)
 
+    def test_preflight_refuses_an_expected_answer_change_without_a_reason_or_a_staged_query(self):
+        r, s = self.stage("--expected-answer-change", "tiny,star-join", "--expected-answer-change-reason",
+                          "the fix of the join returns the rows it lost", tips=(("tip", 1.0),))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        env = (s / "run.env").read_text()
+        self.assertIn("EXPECTED_ANSWER_CHANGE=tiny,star-join\n", env)
+        self.assertIn("EXPECTED_ANSWER_CHANGE_REASON='the fix of the join returns the rows it lost'\n", env)
+        for change, reason, want in (("tiny,nosuch", "a fix", "nosuch is not a staged query"),
+                                     ("tiny", "", "gives no reason"),
+                                     ("", "a fix", "names no queries"),
+                                     ("tiny star-join", "a fix", "comma-separated list of query names")):
+            text = "".join(line + "\n" for line in env.splitlines() if not line.startswith("EXPECTED_ANSWER_CHANGE"))
+            text += f"EXPECTED_ANSWER_CHANGE='{change}'\nEXPECTED_ANSWER_CHANGE_REASON='{reason}'\n"
+            (s / "run.env").write_text(text)
+            r = kit("preflight", s)
+            self.assertEqual(r.returncode, 1, change)
+            self.assertIn(want, r.stderr, change)
+        # a reason that run.env cannot hold as one plain quoted string is refused at stage time
+        r, _ = self.stage("--expected-answer-change", "tiny", "--expected-answer-change-reason", "it's fixed",
+                          tips=(("tip", 1.0),), name="quote")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("reason", r.stderr)
+        r, _ = self.stage("--expected-answer-change", "tiny", tips=(("tip", 1.0),), name="bare")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("reason", r.stderr)
+
     def test_preflight_refuses_early_stopping_that_acts(self):
         r, s = self.stage(tips=(("tip", 1.0),))
         self.assertIn("EARLY_STOP=shadow\n", (s / "run.env").read_text())
@@ -316,6 +342,33 @@ class KitTests(unittest.TestCase):
             if not epochs or epochs[-1][0] != p[1]:
                 epochs.append((p[1], p[2]))
         self.assertEqual("".join(v for _, v in epochs), "ABCCBA" * 2)
+
+    @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
+                         and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")
+    def test_an_expected_answer_change_decides_for_the_listed_queries_only(self):
+        why = "the fix returns the rows the old join lost"
+        every = ",".join(sorted(CONTROLS + ["tiny"]))
+        r, s = self.stage("--expected-answer-change", every, "--expected-answer-change-reason", why,
+                          tips=(("fixed", 1.0, "2"),))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = kit("run", s, env=self.env, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        verdict = (s / "verdict.md").read_text()
+        self.assertIn("fixed (B) against base (A): first pass valid", verdict)
+        self.assertIn(f"answers changed as run.env expects for {', '.join(sorted(CONTROLS + ['tiny']))} ({why})", verdict)
+        p1 = json.loads((s / "pass1" / "summary-A-B.json").read_text())
+        self.assertEqual(set(p1["answers"].values()), {"changed"})
+        self.assertEqual(p1["expected_answer_change"]["reason"], why)
+        # with only tiny listed, the controls' other answers still stop the pass
+        r, s = self.stage("--expected-answer-change", "tiny", "--expected-answer-change-reason", why,
+                          tips=(("fixed", 1.0, "2"),), name="one")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = kit("run", s, env=self.env, timeout=600)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        verdict = (s / "verdict.md").read_text()
+        self.assertIn("fixed (B) against base (A): first pass INVALID", verdict)
+        self.assertIn("answers differ for " + ", ".join(sorted(CONTROLS)), verdict)
+        self.assertIn(f"answers changed as run.env expects for tiny ({why})", verdict)
 
     @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
                          and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")

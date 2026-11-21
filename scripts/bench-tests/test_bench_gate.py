@@ -1005,6 +1005,85 @@ class GateTests(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("Regenerate it with nsc-bench-summary.py", r.stderr)
 
+    def test_cell_summary_reports_an_expected_answer_change_of_listed_queries_only(self):
+        summary = SCRIPTS / "nsc-bench-summary.py"
+
+        def check(d, name, kind, flagged=""):
+            return subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / name), kind, flagged],
+                                  capture_output=True, text=True)
+
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            # a quiet run of A, B and C, where C runs A's binary under another client
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            epoch = 0
+            for rnd in (1, 2):
+                for v in "ABCCBA":
+                    epoch += 1
+                    for q in ("p", "q"):
+                        lines.append(f"{rnd}\t{epoch}\t{v}\t{q}\t1\t1.0\t2")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            res.joinpath("queries.txt").write_text("p\nq\n")
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\nBINARY_OF_C=A\n")
+            listed = "queries\tq\nreason\tthe fix of q's join returns the rows it lost\n"
+            same_p = "A\tp\t1\tx\nB\tp\t1\tx\nC\tp\t1\tx\n"
+            cases = {
+                # B's answer to the listed query changes, and C, on A's binary, answers as A
+                "changed": (listed, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n", "changed", "changed", 0),
+                # with no list, the same answers stop the run
+                "unlisted": (None, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n", "differ", "differ", 1),
+                # a list without a reason excuses nothing
+                "no reason": ("queries\tq\nreason\t\n", same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n", "differ", "differ", 1),
+                # a listed query whose check failed is not a change
+                "failed": (listed, same_p + "A\tq\t1\ty\nB\tq\terror\terror\nC\tq\t1\ty\n", "failed", "failed", 1),
+                # a binary that gives two answers to the listed query disagrees with itself
+                "unstable": (listed, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nB\tq\t3\tw\nC\tq\t1\ty\n", "differ", "differ", 1),
+                # C runs A's binary, so its other answer is not the expected change
+                "client": (listed, same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t2\tz\n", "changed", "differ", 1),
+                # a listed query whose answers stay the same is reported and decides
+                "unchanged": (listed, same_p + "A\tq\t1\ty\nB\tq\t1\ty\nC\tq\t1\ty\n", "same", "same", 0),
+            }
+            for name, (expected, rows, pair_status, arms_status, rc) in cases.items():
+                f = res / "expected-answer-change.txt"
+                f.unlink(missing_ok=True)
+                if expected is not None:
+                    f.write_text(expected)
+                res.joinpath("answers.tsv").write_text(rows)
+                out = subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, text=True)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                s = json.loads((Path(d) / "summary-A-B.json").read_text())
+                self.assertEqual(s["answers"], {"p": "same", "q": pair_status}, name)
+                self.assertEqual(s["answers_all_arms"], {"p": "same", "q": arms_status}, name)
+                self.assertEqual(check(d, "summary-A-B.json", "first").returncode, rc, name)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "q").returncode, rc, name)
+                self.assertEqual(check(d, "summary-A-B.json", "rerun", "p").returncode, 0, name)
+                if name == "changed":
+                    self.assertEqual(s["expected_answer_change"], {"queries": ["q"], "reason": "the fix of q's join returns the rows it lost",
+                                                                   "changed": ["q"], "unchanged": []})
+                    self.assertIn("Answers changed for q (A 1/y, B 2/z) as run.env expects: the fix of q's join returns the rows it lost.", out.stdout)
+                if name == "no reason":
+                    self.assertIn("gives no reason", out.stdout)
+                    self.assertNotIn("expected_answer_change", s)
+                if name == "unchanged":
+                    self.assertEqual(s["expected_answer_change"]["unchanged"], ["q"])
+                    self.assertIn("run.env expects the answers of q to change, but A and B answered them the same", out.stdout)
+                # the pair of A with C, which runs A's binary, never excuses a difference
+                subprocess.run([sys.executable, str(summary), "--pair", "A,C", d], capture_output=True, check=True)
+                ac = json.loads((Path(d) / "summary-A-C.json").read_text())
+                self.assertEqual(ac["answers"]["q"], "differ" if name == "client" else "same", name)
+            # an unlisted query that also changes still stops the run, and a listed query
+            # that the pass did not time is not reported
+            res.joinpath("expected-answer-change.txt").write_text("queries\tq r\nreason\tthe fix\n")
+            res.joinpath("answers.tsv").write_text("A\tp\t1\tx\nB\tp\t1\tw\nC\tp\t1\tx\nA\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n")
+            subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+            s = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual((s["answers"]["p"], s["answers"]["q"]), ("differ", "changed"))
+            self.assertEqual(s["expected_answer_change"]["queries"], ["q"])
+            r = check(d, "summary-A-B.json", "first")
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("differ for p, so", r.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

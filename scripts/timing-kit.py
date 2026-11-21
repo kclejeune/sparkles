@@ -40,7 +40,10 @@ nsc-bench-summary.py --pair, and verdict.md lists them. A pass is invalid when i
 was not quiet, when a query lacks timings, or when the two arms of a pair answer a query
 differently, fail its answer check or lack an answer to it, or when any arm of the run
 answers a query differently from the others, and verdict.md names the queries whose
-answers stopped it. DONE gets the exit status, which is 3 when a pass that
+answers stopped it. EXPECTED_ANSWER_CHANGE in run.env, a comma-separated list of queries
+that stage --expected-answer-change writes with the reason that EXPECTED_ANSWER_CHANGE_REASON
+holds, lets the binaries answer those queries differently, and verdict.md names the change
+and its reason in place of the refusal. DONE gets the exit status, which is 3 when a pass that
 decides is invalid.
 
 `shadow` replays the early-stopping rule on a finished pass, whose every round ran, and
@@ -192,6 +195,10 @@ def cmd_stage(a):
         die("name at least one --tip")
     if len(arms) > len(LETTERS):
         die("too many tips")
+    if a.expected_answer_change and not a.expected_answer_change_reason.strip():
+        die("--expected-answer-change needs --expected-answer-change-reason, which says why the answers change")
+    if re.search(r"['\n\t\\]", a.expected_answer_change_reason):
+        die("the expected-answer-change reason must be one line without quotes, tabs or backslashes")
     labels, bins = [], []
     for spec in arms:
         label, _, path = spec.partition("=")
@@ -261,6 +268,9 @@ def cmd_stage(a):
         "FLAG_RATIO": a.flag_ratio, "RERUN_ROUNDS": a.rerun_rounds, "RERUN_REPS": a.rerun_reps,
         "EARLY_STOP": a.early_stop,
     }
+    if a.expected_answer_change:
+        env["EXPECTED_ANSWER_CHANGE"] = a.expected_answer_change
+        env["EXPECTED_ANSWER_CHANGE_REASON"] = a.expected_answer_change_reason
     (out / "run.env").write_text("".join(f"{k}={shlex.quote(str(v))}\n" for k, v in env.items()))
     kit = {"arms": [{"variant": v, "label": l + (f" [{name}{'' if name == 'curl' else ' gap ' + gap + ' ms'}]" if len(configs) > 1 else ""),
                      "source": str(b.resolve()), "sha256": sha256(out / f"bin-{own[j]}")}
@@ -322,6 +332,17 @@ def static_checks(stage):
     queries = {f.stem for f in (stage / "queries").glob("*.rq")} if (stage / "queries").is_dir() else set()
     if not queries:
         p.append("the stage has no queries")
+    if "EXPECTED_ANSWER_CHANGE" in env or "EXPECTED_ANSWER_CHANGE_REASON" in env:
+        change = env.get("EXPECTED_ANSWER_CHANGE", "")
+        if not change:
+            p.append("EXPECTED_ANSWER_CHANGE names no queries")
+        elif not re.fullmatch(r"[A-Za-z0-9_.-]+(,[A-Za-z0-9_.-]+)*", change):
+            p.append(f"EXPECTED_ANSWER_CHANGE must be a comma-separated list of query names, not {change}")
+        else:
+            p += [f"{q} is not a staged query, so EXPECTED_ANSWER_CHANGE cannot name it"
+                  for q in change.split(",") if q not in queries]
+        if change and not env.get("EXPECTED_ANSWER_CHANGE_REASON", "").strip():
+            p.append("EXPECTED_ANSWER_CHANGE gives no reason in EXPECTED_ANSWER_CHANGE_REASON")
     controls = env.get("CONTROLS", " ".join(CONTROLS)).split()
     present = [q for q in controls if q in queries]
     if len(present) < MIN_CONTROLS:
@@ -632,7 +653,21 @@ def answer_problems(answers, queries):
     for q in queries:
         bad.setdefault(answers.get(q, "missing"), []).append(q)
     words = {"differ": "differ for", "failed": "failed for", "missing": "are missing for"}
-    return "; ".join(f"{words.get(st, st)} {', '.join(qs)}" for st, qs in sorted(bad.items()) if st != "same")
+    return "; ".join(f"{words.get(st, st)} {', '.join(qs)}" for st, qs in sorted(bad.items()) if st not in ("same", "changed"))
+
+
+def expected_changes(summary):
+    """The verdict's words for the queries whose answers changed as run.env expects, and for
+    those run.env expects to change that did not."""
+    e = summary.get("expected_answer_change")
+    if not e:
+        return ""
+    words = []
+    if e["changed"]:
+        words.append(f"answers changed as run.env expects for {', '.join(e['changed'])} ({e['reason']})")
+    if e["unchanged"]:
+        words.append(f"run.env expects a change of {', '.join(e['unchanged'])} that did not happen")
+    return ", ".join(words)
 
 
 def write_verdict(stage, flagged):
@@ -669,7 +704,8 @@ def write_verdict(stage, flagged):
         lines.append(f"- {label.get(y, y)} ({y}) against {label.get(x, x)} ({x}): first pass "
                      f"{'valid' if not first else 'INVALID'} (spread {v.get('spread', float('nan')) * 100:.1f}%"
                      + (f", answers {first_answers}" if first_answers else "") + "), "
-                     f"flagged {', '.join(own) or 'none'}, "
+                     + (expected_changes(p1) + ", " if expected_changes(p1) else "")
+                     + f"flagged {', '.join(own) or 'none'}, "
                      + (f"rerun {'valid' if not rerun_ok else 'INVALID'}"
                         + (f" (answers {rerun_answers})" if rerun_answers else "") + ", " if own else "")
                      + (f"slower after the rerun: {', '.join(f'{q} {r:.3f}' for q, r in slower)}" if slower else "none slower after the rerun"))
@@ -874,6 +910,9 @@ def main():
     s.add_argument("--rerun-rounds", default="16")
     s.add_argument("--rerun-reps", default="40")
     s.add_argument("--note", default="")
+    s.add_argument("--expected-answer-change", default="",
+                   help="comma-separated queries whose answers the tips are expected to change")
+    s.add_argument("--expected-answer-change-reason", default="", help="why those answers change")
     s.add_argument("--early-stop", default="shadow", choices=("off", "shadow"),
                    help="record what the early-stopping rule would decide, without acting on it (default shadow)")
     f = sub.add_parser("preflight")

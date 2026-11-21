@@ -1236,6 +1236,16 @@ staged query needs these answers, whether or not its requests left a timing. In 
 several tips or clients, every arm must give the same answers, so one arm that answers
 differently stops every pair of the run.
 
+A batch that is meant to change some answers, such as the fix of a wrong result, names
+those queries with `stage --expected-answer-change q1,q2` and says why with
+`--expected-answer-change-reason`, which run.env holds as `EXPECTED_ANSWER_CHANGE` and
+`EXPECTED_ANSWER_CHANGE_REASON`. For those queries alone, answers that differ between the
+binaries no longer stop the pass, and `verdict.md` names the changed queries and the
+reason. Each arm must still give one answer, arms that run the same binary must still
+agree, and a failed or missing answer check still stops the pass. A listed query whose
+answers stay the same is reported without stopping the pass. `preflight` refuses a list
+without a reason and a name that is not a staged query.
+
 Early stopping runs only in shadow mode. With `EARLY_STOP=shadow`, which `stage` writes by
 default, `run` replays a stopping rule on the finished first pass and writes `shadow.md` and
 `pass1/shadow-X-Y.json` beside the verdict, and `timing-kit.py shadow PASS_DIR` does the same

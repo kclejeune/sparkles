@@ -35,9 +35,16 @@ query staged in OUT/queries, is required, whether or not its requests left a sam
 the run, so that one pair of a multi-variant run cannot decide while another arm answers
 differently.
 
+OUT/results/expected-answer-change.txt, which the harness writes from EXPECTED_ANSWER_CHANGE
+and EXPECTED_ANSWER_CHANGE_REASON, names queries whose answers the run expects to change and
+why. A listed query whose binaries each give one answer, with the variants of one binary
+(BINARY_OF_<v> in run.env) agreeing, gets the status "changed" in place of "differ", and
+summary.json lists the changed and unchanged ones under "expected_answer_change". A list
+without a reason excuses nothing, and a failed or missing check is never a change.
+
 --check exits 0 when a pass may decide and 1 when it may not. A first pass needs a valid
 run with timings of both variants for every query, each from at least two server processes
-of each variant, and the same answers of both variants to every query. A rerun needs the
+of each variant, and the same answers of both variants to every query, or a change that run.env expects. A rerun needs the
 same of every flagged query, and a valid run unless all of them take under 0.3 ms.
 """
 
@@ -129,9 +136,14 @@ def answer_record_ok(r):
     return len(r) in (2, 3) and r[0].isdigit() and all(x and x != "error" for x in r)
 
 
-def answer_status(queries, answers, variants=("A", "B")):
+def answer_status(queries, answers, variants=("A", "B"), expected=(), binary_of=None):
     """The answer check of each query across variants, from rows of variant, query, rows,
-    digest and an optional order digest: same, differ, failed or missing."""
+    digest and an optional order digest: same, differ, failed or missing.
+
+    A query in expected whose answers differ only between binaries is "changed": each
+    variant gave one answer, and the variants that run one binary, which binary_of maps
+    each variant to, gave the same one. A failed or missing check is never a change."""
+    binary_of = binary_of or {}
     by_q = defaultdict(lambda: defaultdict(set))
     for row in answers:
         if len(row) >= 2:
@@ -143,9 +155,16 @@ def answer_status(queries, answers, variants=("A", "B")):
             status[q] = "missing"
         elif not all(answer_record_ok(r) for rs in recs for r in rs):
             status[q] = "failed"
+        elif len(set().union(*recs)) == 1:
+            status[q] = "same"
         else:
-            # a variant with two different answers to one query differs from itself
-            status[q] = "same" if len(set().union(*recs)) == 1 else "differ"
+            # a variant with two different answers to one query differs from itself, and
+            # so do two variants of one binary, whatever change the run expects
+            by_bin = defaultdict(set)
+            for v, rs in zip(variants, recs):
+                by_bin[binary_of.get(v, v)] |= rs
+            own = all(len(rs) == 1 for rs in recs) and all(len(rs) == 1 for rs in by_bin.values())
+            status[q] = "changed" if q in expected and own and len(by_bin) > 1 else "differ"
     return status
 
 
@@ -154,7 +173,7 @@ def answer_problems(answers, queries):
     bad = defaultdict(list)
     for q in queries:
         st = answers.get(q, "missing")
-        if st != "same":
+        if st not in ("same", "changed"):
             bad[st].append(q)
     words = {"differ": "differ for", "failed": "failed for", "missing": "are missing for"}
     return "; ".join(f"{words[st]} {', '.join(qs)}" for st, qs in sorted(bad.items()))
@@ -304,19 +323,43 @@ def main():
         p(f"Validity: {verdict}. Same-binary spread {v['spread'] * 100:.1f}% over {v['queries']} queries of at least {MIN_MS} ms (at most {MAX_SPREAD * 100:.0f}%), server-process speed {v['speed_min']:.3f} to {v['speed_max']:.3f} of the median (within {MAX_DRIFT * 100:.0f}%).")
         p()
 
+    # the queries whose answers run.env expects to change, with its reason, as the harness
+    # wrote them after sourcing run.env; a list without a reason excuses nothing
+    listed, reason = [], ""
+    for line in read_tsv(res / "expected-answer-change.txt"):
+        if line and line[0] == "queries":
+            listed = " ".join(line[1:]).split()
+        elif line and line[0] == "reason":
+            reason = " ".join(line[1:]).strip()
+    if listed and not reason:
+        p(f"run.env lists {', '.join(listed)} as expected answer changes but gives no reason, so none is excused.")
+        p()
+        listed = []
+    listed = [q for q in required if q in listed]
+    # the variant whose binary each variant runs, the last assignment counting as in Bash
+    binary_of = {}
+    for line in run_env.splitlines():
+        k, eq, val = line.partition("=")
+        if eq and k.startswith("BINARY_OF_"):
+            binary_of[k[len("BINARY_OF_"):]] = val.strip("'\"")
     answers = read_tsv(res / "answers.tsv")
-    summary["answers_all_arms"] = answer_status(required, answers, arms)
+    summary["answers_all_arms"] = answer_status(required, answers, arms, listed, binary_of)
     if pair:
         answers = [[pair[r[0]]] + r[1:] for r in answers if r and r[0] in pair]
+        binary_of = {pair[v]: binary_of.get(v, v) for v in pair}
     by_q = defaultdict(lambda: defaultdict(list))
     for row in answers:
         # variant, query, rows, digest and, with ORDER_DIGEST, an order digest
         if len(row) >= 2:
             by_q[row[1]][row[0]].append(tuple(row[2:]))
-    summary["answers"] = answer_status(required, answers)
+    summary["answers"] = answer_status(required, answers, ("A", "B"), listed, binary_of)
+    changed = [q for q in listed if summary["answers"][q] == "changed"]
+    if listed:
+        summary["expected_answer_change"] = {"queries": listed, "reason": reason, "changed": changed,
+                                             "unchanged": [q for q in listed if summary["answers"][q] == "same"]}
     diff = [q for q in required if summary["answers"][q] in ("differ", "failed")]
     lost = [q for q in required if summary["answers"][q] == "missing"]
-    arm_bad = [q for q in required if summary["answers_all_arms"][q] != "same"]
+    arm_bad = [q for q in required if summary["answers_all_arms"][q] not in ("same", "changed")]
     show = lambda rs: " ".join("/".join(r) for r in rs) if rs else "none"
     if diff:
         p("Answers differ or failed for: " + ", ".join(f"{q} (A {show(by_q[q].get('A'))}, B {show(by_q[q].get('B'))})" for q in diff)
@@ -325,8 +368,19 @@ def main():
     if lost:
         p("No answer check of both variants for: " + ", ".join(lost) + ", so the run cannot decide.")
         p()
-    if not diff and not lost:
+    if changed:
+        p("Answers changed for " + ", ".join(f"{q} (A {show(by_q[q].get('A'))}, B {show(by_q[q].get('B'))})" for q in changed)
+          + f" as run.env expects: {reason}.")
+        p()
+    if listed and summary["expected_answer_change"]["unchanged"]:
+        p(f"run.env expects the answers of {', '.join(summary['expected_answer_change']['unchanged'])} to change, "
+          "but A and B answered them the same.")
+        p()
+    if not diff and not lost and not changed:
         p(f"A and B returned the same sorted TSV answers to all {len(required)} queries.")
+        p()
+    elif not diff and not lost:
+        p(f"A and B returned the same sorted TSV answers to the other {len(required) - len(changed)} queries.")
         p()
     if len(arms) > 2:
         if arm_bad:
