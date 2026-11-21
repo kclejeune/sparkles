@@ -537,7 +537,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   sends it to the contexts registered for its individual, and the root returns the clauses
   it derives under the fact to the contexts that hold it. With the repair and without the
   check, the generated ontologies and fixtures built around the loss give HermiT's answers
-  in every run that finishes, and the larger generated corpora derive 2 to 12% more
+  in every run that finishes, and the larger generated corpora derive 2 to 13% more
   conclusions, so that a few of their runs pass the work bound. With the selection of
   ground body literals turned off for measurement, the repair makes the generated ontology
   g1-051_p0012 grow past every bound tried, and the work and memory bounds stop it.

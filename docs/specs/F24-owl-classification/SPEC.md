@@ -229,9 +229,9 @@ differs from HermiT apart from g2-150. With the repair off, every corpus gives t
 answers and the same counts of derived conclusions as before. With the diagnostic
 `SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in `Stats::dl_marker_deficits` the markers
 and returned products that its quiescent contexts still owe, and every finished run on the
-corpora owes none with the repair. The repair derives 1.02 to 1.12 times the conclusions
-on the larger generated corpora, up to 1.39 times on corpora of small files, up to 1.28
-times with counting and 1.4 to 1.6 times on the two built around the loss, which now
+corpora owes none with the repair. The repair derives 1.02 to 1.13 times the conclusions
+on the larger generated corpora, up to 1.41 times on corpora of small files, up to 1.28
+times with counting and 1.4 to 1.65 times on the two built around the loss, which now
 derive the missing entailments, so a few runs near the bound pass it and give their
 default answer.
 
