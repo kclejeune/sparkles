@@ -412,11 +412,16 @@ descendants it can find, with SIGKILL after a grace period that `--grace` sets, 
 the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
 stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
 host it says so and hands the run to a serial `unittest discover`, which then exits as it
-would on its own. It hands the run over in the same way when the discovery directory or the
-working directory has an entry named as one of the few modules that its processes load
+would on its own. It hands the run over in the same way when the discovery directory, or any
+directory under it, has an entry named as one of the few modules that its processes load
 before discovery and serial discovery does not, such as `json.py`, since a test importing
-`json` would get that file serially and the runner's module in its processes. `--keep DIR` keeps the discovery, the plan, each process's
-output and the result records. Discovery and every process get the interpreter's `-W`
+`json` would get that file serially and the runner's module in its processes. Serial
+discovery puts the working directory first on the path before it loads `argparse` and
+`unittest`, so an entry there named as any module loaded after interpreter startup, such as
+`locale.py`, also hands the run over. A test that puts a directory outside the discovery
+directory on the path is not checked, and the nightly comparison of the two runs catches a
+module that it shadows. `--keep DIR` keeps the discovery, the plan, each process's output
+and the result records. Discovery and every process get the interpreter's `-W`
 options, so `python3 -Werror scripts/unittest-parallel.py` fails on a warning as serial
 `python3 -Werror -m unittest discover` does.
 

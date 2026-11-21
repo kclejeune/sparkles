@@ -1211,13 +1211,13 @@ class Shadowing(Base):
         write(d, "json.py", json_body)
         return d
 
-    def check(self, d, expect, *, cwd=None, target=None):
-        for args in ((), ("--split", "test_json")):
+    def check(self, d, expect, *, cwd=None, target=None, name="json.py", split="test_json"):
+        for args in ((), ("--split", split)):
             s = self.serial(target or d, cwd=cwd)
             self.assertEqual(s.returncode, expect, "serial discovery:\n" + s.stdout + s.stderr)
             p = self.run_runner(*args, str(target or d), cwd=cwd)
             self.assertEqual(p.returncode, expect, f"runner {args}:\n" + p.stdout + p.stderr)
-            self.assertIn("json.py has the name of a module that the runner loads before discovery, "
+            self.assertIn(f"{name} has the name of a module that the runner loads before discovery, "
                           "so the suite runs serially with unittest discover", p.stdout)
         return s, p
 
@@ -1250,6 +1250,44 @@ class Shadowing(Base):
         write(d, "tests/test_json.py", SHADOW_TEST)
         write(d, "json.py", "def dumps(value):\n    return '{}'\n\ndef loads(text):\n    return {}\n")
         self.check(d, 1, cwd=d, target=d / "tests")
+
+    def test_a_module_both_runs_load_counts_in_the_working_directory(self):
+        # Serial discovery imports the working directory's locale.py while it builds its
+        # argparse parsers, and the runner imports the standard library's (r13.1).
+        d = self.suite()
+        write(d, "tests/test_locale.py", """
+            import locale, unittest
+
+            class T(unittest.TestCase):
+                def test_locale(self):
+                    self.assertTrue(hasattr(locale, "getlocale"))
+            """)
+        write(d, "locale.py", "def normalize(name):\n    return name\n")
+        self.check(d, 1, cwd=d, target=d / "tests", name="locale.py", split="test_locale")
+
+    def test_a_module_in_a_helper_directory_under_the_discovery_directory_counts(self):
+        # A test that puts a directory under the discovery directory on the path imports its
+        # json.py serially and the runner's json in a unit (r13.2).
+        d = self.suite(test_json="""
+            import os, sys, unittest
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__), "vendor"))
+            from json import dumps, loads
+
+            class T(unittest.TestCase):
+                def test_json(self):
+                    self.assertEqual(loads(dumps({"a": 1})), {"a": 1})
+            """)
+        write(d, "vendor/json.py", "def dumps(value):\n    return '{}'\n\ndef loads(text):\n    return {}\n")
+        self.check(d, 1, name="vendor/json.py")
+
+    def test_a_cache_directory_is_not_a_module_name(self):
+        # Compiled files in __pycache__ are named after their sources, and a run never puts
+        # that directory on the path.
+        d = self.suite(test_json=SHADOW_TEST)
+        write(d, "__pycache__/json.cpython-314.pyc", "")
+        p = self.run_runner(str(d))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("runs serially", p.stdout)
 
     def test_a_unit_loads_no_module_that_serial_discovery_does_not_unless_it_is_checked(self):
         # Each run's test writes the top-level modules loaded while it runs. A name loaded

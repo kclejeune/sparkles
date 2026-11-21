@@ -73,17 +73,25 @@ and exit.
 On a host without /proc or prctl, which the runner needs, it prints a notice and runs the
 suite serially by replacing itself with `python3 -m unittest discover -s DIR`, ignoring the
 options other than DIR, so the run exits as that does, or ends by the signal that ends it.
-It does the same when DIR or the working directory, which serial discovery puts first on
-the path, has an entry named as a module that discovery and the units load before they
-discover and serial discovery does not, such as json.py, since a test module importing that
-name would get the file serially and the runner's module here. The runner loads few such
-modules, json and ctypes with what they import, and imports the rest of what its own
-process uses only there.
+It does the same when DIR, or any directory under it, has an entry named as a module that
+discovery and the units load before they discover and serial discovery does not, such as
+json.py, since a test module importing that name, from DIR or from a helper directory under
+it that a test puts on the path, would get the file serially and the runner's module here.
+The runner loads few such modules, json and ctypes with what they import, and imports the
+rest of what its own process uses only there. Serial discovery also puts the working
+directory first on the path before it loads argparse and unittest, so an entry there named
+as any module loaded after interpreter startup, such as locale.py, sends the run to serial
+discovery too. A test that puts a directory outside DIR on the path is not checked, and the
+nightly comparison covers it.
 --keep DIR keeps the discovery, the plan, each unit's output and the result records in a
 new directory under DIR. --jobs 1 runs the units one at a time, in the same processes.
 """
 
 import sys
+
+# The top-level modules the interpreter has loaded at startup, before either run puts its
+# first directory on the path.
+_STARTUP = frozenset(m.partition(".")[0] for m in sys.modules)
 
 # `python3 -m unittest` has loaded runpy and unittest, with what they import, before it
 # discovers, and has built its command line's argparse parsers, whose translated help and
@@ -652,17 +660,25 @@ def _unsupported():
 
 
 def _shadowed(directory):
-    """Why the suite runs serially because a name in the discovery directory or the working
-    directory, which both runs put first on the path, is that of a module the runner has
-    loaded before it discovers and serial discovery has not, or None. Any entry counts, a
-    package, a module file, a compiled module or a directory with no __init__.py alike."""
-    for where in dict.fromkeys((os.path.abspath(directory), os.getcwd())):
-        try:
-            names = sorted(os.listdir(where))
-        except OSError:
-            continue
-        for name in names:
-            if name.partition(".")[0] in _OWN_MODULES:
+    """Why the suite runs serially because a local name is that of a module the runner's
+    processes load, or None. Serial discovery puts the working directory first on the path
+    before it loads argparse and unittest, and the runner does not, so an entry there named
+    as any module loaded after interpreter startup counts. Both runs load the modules before
+    the discovery directory reaches the path, so an entry anywhere under it counts when it is
+    named as a module that the runner's processes load and serial discovery does not, which
+    covers a helper directory that a test puts on the path. Any entry counts, a package, a
+    module file, a compiled module or a directory with no __init__.py alike."""
+    loaded = {m.partition(".")[0] for m in sys.modules} - _STARTUP
+    try:
+        names = [(os.getcwd(), sorted(os.listdir()), loaded)]
+    except OSError:
+        names = []
+    for where, dirs, files in os.walk(os.path.abspath(directory)):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        names.append((where, sorted(dirs + files), _OWN_MODULES))
+    for where, entries, modules in names:
+        for name in entries:
+            if name.partition(".")[0] in modules:
                 return (f"{os.path.join(where, name)} has the name of a module that the runner loads "
                         f"before discovery")
     return None
