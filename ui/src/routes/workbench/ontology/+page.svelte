@@ -314,18 +314,26 @@
     const my = ++fullSeq;
     fullLoadingKey = key;
     fullError = null;
-    let behind = false;
     try {
       const r = await ontologySummary(t, s);
       if (my !== fullSeq) return;
       full = { key: JSON.stringify([scope, r.summary.commit]), summary: r.summary };
-      // a newer commit: the head is read again, and the read stays pending until it lands
-      behind = r.summary.commit !== head.commit;
-      if (behind) void loadAll();
+      if (r.summary.commit !== head.commit) {
+        // a newer commit: the head is read again, and the read stays pending until it lands
+        await loadAll();
+        if (my !== fullSeq) return;
+        // a head that failed or moved on is not paired with this summary, and the failure
+        // waits for Count the axioms instead of reading again by itself
+        if (headKey && full?.key !== headKey)
+          fullError = {
+            key: headKey,
+            error: new Error('The ontology changed while its axioms were counted.'),
+          };
+      }
     } catch (e) {
       if (my === fullSeq) fullError = { key, error: e as Error };
     } finally {
-      if (my === fullSeq && !behind) fullLoadingKey = null;
+      if (my === fullSeq) fullLoadingKey = null;
     }
   }
   /** Forget the full summary, which belongs to a scope the page left. */

@@ -327,3 +327,43 @@ test('a protected branch shows no actions and refuses a fetch', async ({ page, r
     await request.delete(`/$/branches/uni/${branch}?force=true`);
   }
 });
+
+test('a full summary of a newer commit whose head fails to read again offers a retry', async ({
+  page,
+  request,
+}) => {
+  // ROADMAP item 735: the Header tab's full summary lands at a newer commit than the head on
+  // screen, the head's next read fails, and the counts wait for Count the axioms instead of
+  // spinning or reading again by themselves
+  const branch = 'full-behind';
+  await newBranch(request, branch);
+  try {
+    await page.goto(`/ui/workbench/ontology?${new URLSearchParams({ ds: 'uni', branch })}`);
+    await expect(page.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
+      timeout: 30_000,
+    });
+    let bumped = false;
+    let fulls = 0;
+    await page.route('**/$/ontology/uni?*', async (route) => {
+      const head = new URL(route.request().url()).searchParams.get('view') === 'head';
+      if (!head) {
+        fulls++;
+        if (!bumped) {
+          bumped = true;
+          await update(request, branch, 'INSERT DATA { <urn:x> <urn:p> "1" }');
+        }
+      }
+      if (head && bumped) return route.fulfill({ status: 500, body: 'unavailable' });
+      return route.continue();
+    });
+    await page.getByRole('tab', { name: 'Header' }).click();
+    const contents = page.getByRole('region', { name: 'Contents' });
+    await expect(contents).toContainText('The ontology changed while its axioms were counted.');
+    await expect(contents.getByRole('button', { name: 'Count the axioms' })).toBeVisible();
+    await expect(contents).not.toContainText('Counting the axioms');
+    expect(fulls).toBe(1);
+  } finally {
+    await page.unrouteAll({ behavior: 'ignoreErrors' });
+    await request.delete(`/$/branches/uni/${branch}?force=true`);
+  }
+});
