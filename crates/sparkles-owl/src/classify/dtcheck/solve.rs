@@ -426,10 +426,10 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     let exact = sizes.iter().all(|s| s.is_exact());
     let with_caps = |cap: &dyn Fn(usize) -> Option<u128>| {
         let mut all = cons.clone();
-        for ci in 0..cells.len() {
+        for (ci, vars) in by_cell.iter().enumerate() {
             if let Some(n) = cap(ci) {
                 all.push(Lin {
-                    vars: by_cell[ci].clone(),
+                    vars: vars.clone(),
                     at_least: false,
                     n,
                 });
@@ -454,5 +454,70 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
         (_, Run::Sat) => Answer::Sat,
         (Run::Bound, _) | (_, Run::Bound) => Answer::Unknown(Why::Bound),
         _ => Answer::Unknown(Why::Uncounted),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Lin, Run, solve};
+    use proptest::prelude::*;
+
+    fn brute(nvars: usize, cons: &[Lin], most: u128) -> bool {
+        let mut x = vec![0u128; nvars];
+        loop {
+            let ok = cons.iter().all(|c| {
+                let s: u128 = c.vars.iter().map(|&v| x[v]).sum();
+                if c.at_least { s >= c.n } else { s <= c.n }
+            });
+            if ok {
+                return true;
+            }
+            let mut i = 0;
+            loop {
+                if i == nvars {
+                    return false;
+                }
+                if x[i] < most {
+                    x[i] += 1;
+                    break;
+                }
+                x[i] = 0;
+                i += 1;
+            }
+        }
+    }
+
+    fn arb_lin(nvars: usize) -> impl Strategy<Value = Lin> {
+        (
+            proptest::collection::btree_set(0..nvars, 0..=nvars),
+            any::<bool>(),
+            0u128..=6,
+        )
+            .prop_map(|(vars, at_least, n)| Lin {
+                vars: vars.into_iter().collect(),
+                at_least,
+                n,
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        /// The search with its pruning against enumeration. A solution, if any, has one
+        /// whose counts are each at most the largest minimum, since lowering a count that
+        /// no tight minimum needs keeps every constraint.
+        #[test]
+        fn solve_matches_enumeration(
+            (nvars, cons) in (1usize..=4).prop_flat_map(|n| (Just(n), proptest::collection::vec(arb_lin(n), 0..=5)))
+        ) {
+            let most = cons.iter().filter(|c| c.at_least).map(|c| c.n).max().unwrap_or(0);
+            let want = brute(nvars, &cons, most);
+            let got = match solve(nvars, cons.clone(), 1_000_000) {
+                Run::Sat => true,
+                Run::Unsat => false,
+                Run::Bound => panic!("bound on a small system"),
+            };
+            prop_assert_eq!(got, want);
+        }
     }
 }

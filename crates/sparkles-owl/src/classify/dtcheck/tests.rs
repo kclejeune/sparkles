@@ -1198,3 +1198,280 @@ fn edge_api() {
         Answer::Unknown(super::solve::Why::Bound)
     );
 }
+
+// ------------------------------------------------ the wide differential test ----
+
+/// A value of the wide test: integers, halves as decimals, thirds as rationals, floats by
+/// index into [`FLOATS`], strings, tagged strings, and date-times with an offset by their
+/// hour and offset in hours.
+#[derive(Clone, Debug, PartialEq)]
+enum X {
+    I(i64),
+    D(i64),
+    Q(i64),
+    F(usize),
+    S(&'static str),
+    L(&'static str, &'static str),
+    T(i64, i64),
+}
+
+const FLOATS: [f32; 5] = [-1.0, -0.0, 0.0, 1.5, f32::NAN];
+const FLOAT_LEX: [&str; 5] = ["-1.0", "-0.0", "0.0", "1.5", "NaN"];
+const STRS: [&str; 7] = ["", " ", "a", "ab", "a b", "\t", ":"];
+const LANGS: [(&str, &str); 3] = [("a", "en"), ("a", "en-us"), ("", "fr")];
+
+impl X {
+    /// The value times 6, for the real numbers.
+    fn six(&self) -> Option<i64> {
+        match self {
+            X::I(i) => Some(6 * i),
+            X::D(h) => Some(3 * h),
+            X::Q(t) => Some(2 * t),
+            _ => None,
+        }
+    }
+    fn lit(&self) -> Literal {
+        match self {
+            X::I(i) => lit(&i.to_string(), "integer"),
+            X::D(h) => lit(&half(*h), "decimal"),
+            X::Q(t) => Literal::typed(format!("{t}/3"), vocab::OWL_RATIONAL),
+            X::F(k) => lit(FLOAT_LEX[*k], "float"),
+            X::S(s) => Literal::simple(s.to_string()),
+            X::L(s, t) => Literal::lang(*s, t).unwrap(),
+            X::T(h, o) => lit(&stamp(*h, *o), "dateTimeStamp"),
+        }
+    }
+}
+
+fn half(h: i64) -> String {
+    format!(
+        "{}{}.{}",
+        if h < 0 { "-" } else { "" },
+        h.abs() / 2,
+        if h % 2 == 0 { 0 } else { 5 }
+    )
+}
+fn stamp(h: i64, o: i64) -> String {
+    let off = if o == 0 {
+        "Z".to_string()
+    } else {
+        format!("{}{:02}:00", if o < 0 { '-' } else { '+' }, o.abs())
+    };
+    format!("2000-01-01T{h:02}:00:00{off}")
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Side {
+    Lo(bool),
+    Hi(bool),
+}
+
+#[derive(Clone, Debug)]
+enum W {
+    /// decimal with a bound at a half
+    Dec(Side, i64),
+    /// owl:rational with a bound at a half
+    Rat(Side, i64),
+    Real,
+    /// float with a bound at a float other than NaN
+    Float(Side, usize),
+    FloatAll,
+    /// a string datatype by level of the chain, 0 for string to 4 for Name
+    Level(usize),
+    /// string with length, minLength or maxLength
+    Len(u8, u64),
+    /// rdf:PlainLiteral with length, minLength or maxLength
+    PlainLen(u8, u64),
+    Range(&'static str),
+    /// dateTimeStamp with a bound at an hour with Z
+    Time(Side, i64),
+    One(Vec<X>),
+    Not(Box<W>),
+    And(Box<W>, Box<W>),
+    Or(Box<W>, Box<W>),
+}
+
+const LEVELS: [&str; 5] = ["string", "normalizedString", "token", "NMTOKEN", "Name"];
+const LEN_FACETS: [&str; 3] = ["length", "minLength", "maxLength"];
+
+fn bound_facet(s: Side) -> &'static str {
+    match s {
+        Side::Lo(true) => "minInclusive",
+        Side::Lo(false) => "minExclusive",
+        Side::Hi(true) => "maxInclusive",
+        Side::Hi(false) => "maxExclusive",
+    }
+}
+
+fn w_range(w: &W) -> DataRange {
+    let bound = |dt: &str, s: Side, v: Literal| {
+        DataRange::DatatypeRestriction(
+            Datatype::new(dt),
+            [FacetRestriction {
+                facet: iri(xsd(bound_facet(s))),
+                value: v,
+            }]
+            .into_iter()
+            .collect(),
+        )
+    };
+    match w {
+        W::Dec(s, h) => bound(&xsd("decimal"), *s, lit(&half(*h), "decimal")),
+        W::Rat(s, h) => bound(vocab::OWL_RATIONAL, *s, lit(&half(*h), "decimal")),
+        W::Real => dt_iri(vocab::OWL_REAL),
+        W::Float(s, k) => bound(&xsd("float"), *s, lit(FLOAT_LEX[*k], "float")),
+        W::FloatAll => dt("float"),
+        W::Level(k) => dt(LEVELS[*k]),
+        W::Len(f, n) => restr("string", &[(LEN_FACETS[*f as usize], nn(*n))]),
+        W::PlainLen(f, n) => plain_restr(&[(&xsd(LEN_FACETS[*f as usize]), nn(*n))]),
+        W::Range(r) => plain_restr(&[lang_range(r)]),
+        W::Time(s, h) => bound(
+            &xsd("dateTimeStamp"),
+            *s,
+            lit(&stamp(*h, 0), "dateTimeStamp"),
+        ),
+        W::One(xs) => one(&xs.iter().map(X::lit).collect::<Vec<_>>()),
+        W::Not(a) => not(w_range(a)),
+        W::And(a, b) => and(vec![w_range(a), w_range(b)]),
+        W::Or(a, b) => or(vec![w_range(a), w_range(b)]),
+    }
+}
+
+fn cmp_side<T: PartialOrd>(s: Side, x: T, b: T) -> bool {
+    match s {
+        Side::Lo(true) => x >= b,
+        Side::Lo(false) => x > b,
+        Side::Hi(true) => x <= b,
+        Side::Hi(false) => x < b,
+    }
+}
+
+fn level_of(s: &str) -> usize {
+    // the deepest level of the chain that holds `s`, of string to Name
+    let tok = !s.contains('\t') && !s.starts_with(' ') && !s.ends_with(' ') && !s.contains("  ");
+    let nmtoken = !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == ':');
+    let name = nmtoken && !s.starts_with(|c: char| c.is_ascii_digit());
+    if s.contains('\t') {
+        0
+    } else if !tok {
+        1
+    } else if !nmtoken {
+        2
+    } else if !name {
+        3
+    } else {
+        4
+    }
+}
+
+fn w_holds(w: &W, x: &X) -> bool {
+    let len_ok = |f: u8, n: u64, l: u64| match f {
+        0 => l == n,
+        1 => l >= n,
+        _ => l <= n,
+    };
+    match (w, x) {
+        (W::Dec(s, h), x) if !matches!(x, X::Q(_)) => {
+            x.six().is_some_and(|v| cmp_side(*s, v, 3 * h))
+        }
+        (W::Rat(s, h), x) | (W::Dec(s, h), x @ X::Q(_)) => {
+            matches!(w, W::Rat(..)) && x.six().is_some_and(|v| cmp_side(*s, v, 3 * h))
+        }
+        (W::Real, x) => x.six().is_some(),
+        (W::Float(s, k), X::F(i)) => cmp_side(*s, FLOATS[*i], FLOATS[*k]),
+        (W::FloatAll, X::F(_)) => true,
+        (W::Level(k), X::S(s)) => level_of(s) >= *k,
+        (W::Len(f, n), X::S(s)) => len_ok(*f, *n, s.chars().count() as u64),
+        (W::PlainLen(f, n), X::S(s) | X::L(s, _)) => len_ok(*f, *n, s.chars().count() as u64),
+        (W::Range(r), X::L(_, t)) => *r == "*" || t == r || t.starts_with(&format!("{r}-")),
+        (W::Time(s, h), X::T(xh, o)) => cmp_side(*s, 60 * xh - o * 60, 60 * h),
+        (W::One(xs), x) => xs.iter().any(|y| match (y, x) {
+            (X::F(a), X::F(b)) => FLOAT_LEX[*a] == FLOAT_LEX[*b],
+            _ => y == x,
+        }),
+        (W::Not(a), x) => !w_holds(a, x),
+        (W::And(a, b), x) => w_holds(a, x) && w_holds(b, x),
+        (W::Or(a, b), x) => w_holds(a, x) || w_holds(b, x),
+        _ => false,
+    }
+}
+
+fn all_x() -> Vec<X> {
+    let mut v: Vec<X> = Vec::new();
+    v.extend((-2..=3).map(X::I));
+    v.extend([-3, -1, 1, 5].map(X::D));
+    v.extend([-1, 1, 2].map(X::Q));
+    v.extend((0..FLOATS.len()).map(X::F));
+    v.extend(STRS.map(X::S));
+    v.extend(LANGS.map(|(s, t)| X::L(s, t)));
+    for h in 0..3 {
+        for o in [0, 1] {
+            v.push(X::T(h, o));
+        }
+    }
+    v
+}
+
+fn arb_x() -> impl Strategy<Value = X> {
+    let xs = all_x();
+    (0..xs.len()).prop_map(move |i| xs[i].clone())
+}
+
+fn arb_w() -> impl Strategy<Value = W> {
+    let side = prop_oneof![
+        any::<bool>().prop_map(Side::Lo),
+        any::<bool>().prop_map(Side::Hi)
+    ];
+    let leaf = prop_oneof![
+        (side.clone(), -4i64..=6).prop_map(|(s, h)| W::Dec(s, h)),
+        (side.clone(), -4i64..=6).prop_map(|(s, h)| W::Rat(s, h)),
+        Just(W::Real),
+        (side.clone(), 0usize..4).prop_map(|(s, k)| W::Float(s, k)),
+        Just(W::FloatAll),
+        (0usize..5).prop_map(W::Level),
+        (0u8..3, 0u64..=3).prop_map(|(f, n)| W::Len(f, n)),
+        (0u8..3, 0u64..=2).prop_map(|(f, n)| W::PlainLen(f, n)),
+        prop_oneof![Just("*"), Just("en"), Just("en-us"), Just("fr")].prop_map(W::Range),
+        (side, 0i64..=3).prop_map(|(s, h)| W::Time(s, h)),
+        proptest::collection::vec(arb_x(), 1..4).prop_map(W::One),
+    ];
+    leaf.prop_recursive(3, 12, 2, |inner| {
+        prop_oneof![
+            inner.clone().prop_map(|x| W::Not(Box::new(x))),
+            (inner.clone(), inner.clone()).prop_map(|(a, b)| W::And(Box::new(a), Box::new(b))),
+            (inner.clone(), inner).prop_map(|(a, b)| W::Or(Box::new(a), Box::new(b))),
+        ]
+    })
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(400))]
+
+    /// Membership and sizes across the families against their semantics, and the laws of
+    /// the algebra on ids for these families, whose finite classes the forms hold one way.
+    #[test]
+    fn wide_algebra_matches_semantics(a in arb_w(), b in arb_w()) {
+        let mut t = T::new();
+        let x = t.of(&w_range(&a));
+        let xs = all_x();
+        for v in &xs {
+            prop_assert_eq!(t.r.contains(x, &val(&v.lit())), w_holds(&a, v), "{:?}", v);
+        }
+        let universe = W::One(xs.clone());
+        let y = t.of(&w_range(&W::And(Box::new(a.clone()), Box::new(universe))));
+        let count = xs.iter().filter(|v| w_holds(&a, v)).count() as u128;
+        prop_assert_eq!(t.r.size(y), Size::exact(count));
+        let nx = t.r.not(x);
+        prop_assert_eq!(t.r.join(x, nx), Ranges::FULL);
+        prop_assert_eq!(t.r.meet(x, nx), Ranges::EMPTY);
+        let z = t.of(&w_range(&b));
+        let nz = t.r.not(z);
+        let m = t.r.meet(x, z);
+        let lhs = t.r.not(m);
+        let rhs = t.r.join(nx, nz);
+        prop_assert_eq!(lhs, rhs);
+        // `not` computed afresh, not through the table's reverse entry
+        let again = t.r.nf(nx).not();
+        prop_assert_eq!(t.r.intern(again), x);
+    }
+}
