@@ -1453,22 +1453,28 @@ impl Found {
     pub(super) fn ground_products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, true);
     }
-    /// The bytes that the conclusions and products waiting here hold, as [`fold`] counts a
-    /// side, for a rule that admits a batch before it drains it.
+    /// The bytes that the conclusions and products waiting here hold, their vectors'
+    /// capacities included, for a rule that admits a batch before it drains it.
     pub(super) fn held_bytes(&self) -> usize {
-        let side = |s: &Side| (s.0.capacity() + s.1.capacity()) * std::mem::size_of::<Lit>() + 48;
-        let one: usize = self.one.iter().map(|(s, _)| side(s)).sum();
-        let prods: usize = self
-            .prods
-            .iter()
-            .map(|(lists, base, ..)| {
-                side(base)
-                    + lists
-                        .iter()
-                        .map(|l| 24 + l.iter().map(side).sum::<usize>())
-                        .sum::<usize>()
-            })
-            .sum();
+        use std::mem::size_of;
+        let lits = |s: &Side| (s.0.capacity() + s.1.capacity()) * size_of::<Lit>();
+        let one = self.one.capacity() * size_of::<(Side, &str)>()
+            + self.one.iter().map(|(s, _)| lits(s)).sum::<usize>();
+        let prods = self.prods.capacity() * size_of::<(Vec<Vec<Side>>, Side, bool, &str)>()
+            + self
+                .prods
+                .iter()
+                .map(|(lists, base, ..)| {
+                    lits(base)
+                        + lists.capacity() * size_of::<Vec<Side>>()
+                        + lists
+                            .iter()
+                            .map(|l| {
+                                l.capacity() * size_of::<Side>() + l.iter().map(lits).sum::<usize>()
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
         one + prods
     }
     fn products_of(&mut self, mut lists: Vec<Vec<Side>>, base: Side, ground: bool) {
