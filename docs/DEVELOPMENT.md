@@ -383,7 +383,9 @@ than default suites and `TestCase` tests, including a suite given its own `run`,
 module changes unittest's suite classes or rebinds their names, or when test classes of one
 module run under more than one module, as when one test module imports another's class. Such
 a suite or test can depend on what ran before it, and the runner does not try to tell
-whether it does. Tests that share state in another way, such as a helper module's globals,
+whether it does. A default suite that replaces its own `run` or `countTestCases` and also
+hides its tests, for instance by setting `_tests` to `None`, is outside what the runner
+supports, and the runner fails the run with exit 1 instead of passing it. Tests that share state in another way, such as a helper module's globals,
 are not detected. The runner therefore reaches the serial verdict only when no test depends
 on state that a test in another process left behind, and passing alone does not show this,
 since such a test can skip instead of fail. The same holds for the tests of a split module.
@@ -410,7 +412,9 @@ the run. When the runner itself is killed, its processes get SIGTERM from the ke
 stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
 host it says so and hands the run to a serial `unittest discover`, which then exits as it
 would on its own. `--keep DIR` keeps the discovery, the plan, each process's
-output and the result records.
+output and the result records. Discovery and every process get the interpreter's `-W`
+options, so `python3 -Werror scripts/unittest-parallel.py` fails on a warning as serial
+`python3 -Werror -m unittest discover` does.
 
 Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
 `test_git_isolation.py` fails when one does not. The import removes the host's `GIT_*`
@@ -1262,6 +1266,8 @@ with the parallel runner, one after the other, and fails when their exit statuse
 counts of tests run and skipped differ. The parallel runner reaches the serial verdict only
 under assumptions about the tests that it does not check, which
 [Script tests](#script-tests) lists, and this comparison catches a test that breaks one.
+The comparison adds about 13 minutes to a full gate, and it runs only on full and nightly
+gates, not on a batch gate that selects its checks.
 
 Each run writes a log to `.artifacts/gates/nightly/` in the main checkout, and the gate's
 results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. The server artifact link

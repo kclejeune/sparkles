@@ -22,7 +22,10 @@ suite with attributes of its own such as a run() given to the instance, when a t
 has changed unittest's suite classes or put other classes under their names, and when test
 classes of one module run in more than one entry, as when one test module imports another's
 class, since they can share that module's state. The runner does not ask what such a hook
-or suite does, and counts a suite of a kind of its own as one occurrence.
+or suite does, and counts a suite of a kind of its own as one occurrence. A default suite
+that replaces its own run() or countTestCases() and also hides its tests, for instance by
+setting _tests to None, is outside this contract. The runner fails the run with exit 1 while
+describing such a suite, before the whole-suite run could start, and never passes it.
 
 The runner reaches serial discovery's verdict under three assumptions, which it does not
 check. No test depends on state, such as a helper module's globals, that a test in another
@@ -45,7 +48,8 @@ counts and verdict, and a completion mark. A unit fails when its exit status is 
 record is missing, incomplete or for other occurrences, or unittest's result was not
 successful. A test's own output never counts. The run exits 1 when any unit failed or
 discovery failed, 5 when no test ran and none was skipped, as unittest does, and 0
-otherwise. Tests run with warnings set to 'default' unless the interpreter was given -W.
+otherwise. Discovery and every unit get the interpreter's -W options, and tests run with
+warnings set to 'default' unless the interpreter was given -W.
 
 A test module can share evidence across units. When a module defines parallel_export(),
 each unit calls it after its tests and teardown and puts the result in its record, and a
@@ -538,9 +542,14 @@ class Job:
         return time.monotonic() - self.t0
 
 
+def _warn_args():
+    """The interpreter's -W options, which discovery and every unit get, as serial discovery would."""
+    return [f"-W{w}" for w in sys.warnoptions]
+
+
 def run_discovery(a, workdir, active):
     path = os.path.join(workdir, "discovery.json")
-    job = Job("discovery", [sys.executable, RUNNER, "--_discover", str(os.getpid()), str(a.grace),
+    job = Job("discovery", [sys.executable, *_warn_args(), RUNNER, "--_discover", str(os.getpid()), str(a.grace),
                             path, str(a.directory)],
               a.discover_timeout, workdir)
     active.append(job)
@@ -666,7 +675,7 @@ def main(argv=None):
         # is the run's.
         print(f"unittest-parallel: {why}, so the suite runs serially with unittest discover", flush=True)
         sys.stderr.flush()
-        os.execv(sys.executable, [sys.executable, *(f"-W{w}" for w in sys.warnoptions), "-m", "unittest",
+        os.execv(sys.executable, [sys.executable, *_warn_args(), "-m", "unittest",
                                   "discover", "-s", str(a.directory)])
     old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     if a.keep:
@@ -713,7 +722,7 @@ def supervise(a, workdir, active):
         name, index, split = work
         record = os.path.join(workdir, f"record-{count}.json")
         count += 1
-        job = Job(name, [sys.executable, RUNNER, "--_unit", str(os.getpid()), str(a.grace),
+        job = Job(name, [sys.executable, *_warn_args(), RUNNER, "--_unit", str(os.getpid()), str(a.grace),
                          plan_path, str(index), str(split),
                          record, absorb, str(a.directory)], unit_deadline(a, index), workdir)
         job.record, job.index, job.split = record, index, split

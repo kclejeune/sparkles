@@ -146,6 +146,34 @@ class Runner(Base):
         p = self.run_runner(str(d), cwd=work)
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
 
+    def test_the_interpreters_warning_options_reach_discovery_and_the_units(self):
+        warn_in_test = """
+            import unittest, warnings
+
+            class W(unittest.TestCase):
+                def test_warns(self):
+                    warnings.warn("in a test", UserWarning)
+            """
+        warn_at_import = """
+            import unittest, warnings
+            warnings.warn("at import", UserWarning)
+
+            class I(unittest.TestCase):
+                def test_ok(self):
+                    pass
+            """
+        for name, body in (("test_w", warn_in_test), ("test_i", warn_at_import)):
+            with self.subTest(name):
+                d = self.suite(test_a=PASS, **{name: body})
+                self.assertEqual(self.run_runner(str(d)).returncode, 0)
+                s = subprocess.run([sys.executable, "-Werror", "-m", "unittest", "discover", "-s", str(d)],
+                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+                self.assertEqual(s.returncode, 1, s.stdout + s.stderr)
+                p = subprocess.run([sys.executable, "-Werror", str(RUNNER), str(d)], stdin=subprocess.DEVNULL,
+                                   capture_output=True, text=True, timeout=120)
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertIn(f"failed: {name}", p.stdout)
+
 
 class Discovery(Base):
     """The runner runs what serial discovery runs and reaches its verdict."""
