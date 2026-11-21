@@ -1981,9 +1981,9 @@ Every process exited normally and each file gave one taxonomy across the builds.
 laptop the base and the tip classified GO, ChEBI lite, the 298 ORE 2015 EL files and the
 207 DL development files on one and four threads, and the 1,010 pairs that both builds
 classified gave the same taxonomy, tier, flags, consistency and axioms left out, with the
-same rules and messages in the same order. The axioms left out number 5.75 million over
-the 242 pairs that have any. Both builds refuse one file at the reader and stop one at its
-memory budget. The
+same rules and messages in the same order. Axioms are left out or used in part in 242 of
+those pairs. On both builds the reader refuses one DL file for an invalid IRI, and the 10
+GiB cap of its scope ends the process of another. The
 index stage of `ore_ont_13482` on one thread takes 0.625 of the base's time, and the
 whole classification 0.871, below 1 in every round. Against ELK's 2,766 ms in
 [Against ELK](#against-elk), which was not run again, the tip's 898 ms is 3.08 times
@@ -1998,13 +1998,14 @@ of `ore_ont_13482` stays below 1 in every forge round on both thread counts.
 
 GO's saturation takes 262 ms on the tip against 251 ms on the base and 244 ms with the
 check alone, in every round, although no saturation code changed and the tip counts
-fewer instructions than the check. The saturation's worker function has the same size in
-the two builds and starts 48 bytes later in the tip. On `atlas`, a build of the tip that
+fewer instructions than the check. The saturation's worker function has the same size,
+11,475 bytes, in the check and the tip and starts 48 bytes later in the tip, while the
+base's is 10,848 bytes, since the inlining in the crate moved with the check's change. On `atlas`, a build of the tip that
 copies the IRI at each role it finds, as the base did, ran GO at 1.058 of the check's
 time and the tip at 1.057 in seven rounds, so the move comes from where the code lies
 and not from the heap. Roadmap item 1280 holds GO's 1.0% on one thread, with item 722.
 
-Two ideas of the same report were not built. The negative occurrences of the whole index
+Two further ideas for the index stage were not built. The negative occurrences of the whole index
 took 4 ms on `ore_ont_13482` on the laptop, so a reused stack can save less than that,
 and the sort and deduplication of the told subsumptions took 10 ms, of which per-key
 sorts could save only part.

@@ -1143,6 +1143,12 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   Roadmap item 1224 follows them, and the
   [EL classification results](../benchmarks/el-classification/RESULTS.md#left-linear-chains-of-transitive-roles)
   give the rounds.
+* GO classifies 1.0% slower on one thread on the benchmark host since the index stage
+  stopped allocating in its profile check. Its index stage is faster, and its saturation,
+  whose code did not change, moved with the code's layout. Roadmap item 1280 follows it,
+  and the
+  [EL classification results](../benchmarks/el-classification/RESULTS.md#allocations-of-the-index-stage)
+  give the rounds.
 * A small ontology's first classification in a process on several threads starts its
   helper threads after 0.5 ms of work, and later ones after as long as the last start of
   the helpers took. Warm runs of some small files on eight threads take up to 0.2 ms

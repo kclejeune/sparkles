@@ -1508,9 +1508,10 @@ table of role ids. On forge `ore_ont_13482` classifies on one thread in 898 ms a
 999 ms, with an index stage of 216 against 345 ms, and in 0.918 of the time on four
 threads. ChEBI lite classifies in 0.964 and 0.956 of the time. GO's index stage is
 faster, but its saturation moved with the code's layout, and its classification takes
-1.0% longer on one thread, which item 1280 holds. GO, ChEBI lite, the 298 ORE 2015 EL
-files and the 207 DL development files give the base's taxonomies and the base's axioms
-left out, with their rules and messages, on one and four threads. The
+1.0% longer on one thread, which item 1280 holds. On GO, ChEBI lite, the 298 ORE 2015 EL
+files and the 207 DL development files on one and four threads, the 1,010 pairs that both
+builds classify give the base's taxonomies and the base's axioms left out, with their
+rules and messages, and both builds fail on the same two DL files. The
 [EL classification results](../../benchmarks/el-classification/RESULTS.md#allocations-of-the-index-stage)
 give the rounds.
 
