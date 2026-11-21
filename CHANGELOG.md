@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### The classifier takes anonymous individuals
+
+The OWL classifier left out every axiom that held an anonymous individual, and dropped
+anonymous members of `SameIndividual` and `DifferentIndividuals` without a report. On the
+ORE 2015 DL development set that left out 2.8 million axioms in 55 files, most of them
+`oboInOwl` reifications. Each anonymous individual is now a fresh individual of the run,
+as OWL 2's semantics reads it and standard reasoners classify it, so consistency accounts
+for its assertions and no answer names it. A key does not bind it. Class assertions of a
+named class whose anonymous individual occurs nowhere else share one individual for each
+class. Thirty of the 55 files now leave nothing out, and the taxonomies of the 29 with a
+HermiT reference equal HermiT's. An ontology whose only individuals are anonymous now
+counts as having individuals, so a run that is not rooted leaves its disjunctive axioms
+out instead of its assertions. This is roadmap item 1281.
+
+### An inclusion in a top property keeps no ontology from the disjunctive rules
+
+`SubObjectPropertyOf(r owl:topObjectProperty)`, in any of its subproperty forms, and
+`SubDataPropertyOf(d owl:topDataProperty)` hold of every ontology. The classifier interned
+the top property for them, which closed the disjunctive rules and the rooted run, and
+in six files of the ORE 2015 DL development set it was one of the things that did. It now
+takes them as axioms that add nothing, as roadmap item 1282.
+
 ### A kept EL classification over its memory budget starts again in full
 
 A kept OWL 2 EL run counts the contexts it keeps and its own new state against

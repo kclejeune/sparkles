@@ -433,7 +433,19 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   hierarchy with the top and bottom properties, property chains, transitive and
   reflexive properties, domains, ranges, disjointness, `ObjectHasSelf`, the datatypes,
   literals and data ranges of the profile, functional data properties, datatype
-  definitions, keys and negative property assertions. A class whose instances reach an
+  definitions, keys and negative property assertions. An anonymous individual is a
+  fresh individual of the run, as OWL 2 reasoners read one, so the consistency of the
+  ontology accounts for its assertions, equalities and inequalities. A key does not bind
+  it and no answer names it. Class assertions of a named class whose anonymous
+  individual occurs in no other axiom share one individual for each class, so
+  ontologies that reify axioms or cross-references as anonymous individuals, such as
+  those with `oboInOwl` annotations, hold one individual for each class of such
+  assertions. An anonymous
+  individual is an individual for the choice of rules below, so the disjunctive rules
+  without the rooted run do not take an ontology that has one. An inclusion of a property
+  in the top object or data property, `SubObjectPropertyOf(r owl:topObjectProperty)`,
+  holds of every ontology and adds nothing, so it keeps no ontology from the rules that
+  the top properties close. A class whose instances reach an
   individual through a context that holds only where the class has an instance is
   classified again in a world of its own. An ontology where only an individual's own
   context derives the individual, and that has no keys or universal roles, skips that

@@ -458,7 +458,8 @@ million conclusions. The Horn rules then take 2.0 to 2.2 times the EL rules' tim
 thread, against 4.2 to 5.6 times before, and item 1025 follows that remainder. The Horn
 normalization also passes over an assertion about an anonymous individual before it
 opens a scope for it, which takes 136 to 251 ms off the index stage of the four files
-whose 243,972 to 457,662 such axioms the reader leaves out. GO, ChEBI lite, the 298 ORE
+whose 243,972 to 457,662 such axioms the reader leaves out. Item 1281 replaced that
+refusal, and those files now classify by the EL rules. GO, ChEBI lite, the 298 ORE
 2015 EL files and the files of the development set keep their taxonomies byte for byte
 on one and eight threads, as the
 [benchmark report](../../benchmarks/el-classification/RESULTS.md#conjunctions-with-an-individual)
@@ -1927,7 +1928,9 @@ discusses.
 **Out of scope.** Enumerations of several individuals in a positive position need case
 analysis and stay with the rooted run. At-least restrictions above one beside
 individuals are item 867, and chains through the top property stay in item 663. A cheaper
-witness criterion is not built. Anonymous individuals stay with the reader's rules. Data cardinalities
+witness criterion is not built. Item 1281 later took anonymous individuals, as
+[Anonymous individuals and top-property inclusions](#anonymous-individuals-and-top-property-inclusions)
+describes. Data cardinalities
 and keys over data properties beside the disjunctive rules stay with item 768, counting
 with item 728 and incremental runs after a change with item 753.
 
@@ -4358,6 +4361,91 @@ is the duplication of ground reasoning across contexts that item 1061 follows. I
 clauses that hold x, about 380,000 of 866,000 conclusions in four seconds. With a bound of
 200 million it finishes after 4.7 million conclusions in 4.4 s on four threads of a build
 without link-time optimization. Item 1075 follows these equalities.
+
+### Anonymous individuals and top-property inclusions
+
+Items 1281 and 1282 close the two cheapest gaps of item 1272's census of what
+classification leaves out. On the ORE 2015 DL development set, 55 files left out
+2,827,410 axioms with anonymous individuals, most of them `oboInOwl` reifications such as
+`ClassAssertion(oboInOwl:DbXref _:x)`, and for 31 files nothing else. In six files an inclusion
+`SubObjectPropertyOf(r owl:topObjectProperty)` was one of the things that kept the
+disjunctive rules closed.
+
+**Anonymous individuals.** OWL 2's Direct Semantics satisfies an ontology when some
+mapping of its anonymous individuals to elements satisfies every axiom, so each anonymous
+individual stands for an element that the whole ontology quantifies existentially. A
+fresh constant in its place keeps the ontology's consistency and every entailment that
+does not name it, which is how standard reasoners classify such ontologies. The
+classifier now interns each anonymous individual as a nominal named `_:label`, which no
+IRI can be since the scheme of an IRI starts with a letter. The EL, Horn and disjunctive
+normalizations take it in class and property assertions, negative assertions,
+`SameIndividual`, `DifferentIndividuals`, `ObjectOneOf` and `ObjectHasValue`, where they
+left out the whole axiom before and dropped anonymous members of equalities without a
+report. A label names one individual wherever it occurs among a run's axioms, as the
+axiom model makes equal axioms one. A key binds named individuals alone, as
+`HasKey`'s semantics requires, so the EL rules' key matching skips anonymous nominals as
+members and as values, and item 805's rewriting of keys already enumerated named
+individuals only. A description never lists an anonymous individual among the
+instances of a class, and a change to an axiom with one runs in full. The detection of
+individuals that makes a disjunctive run rooted, and that selects the Horn rules with
+individuals, counts anonymous ones too.
+
+An anonymous individual is an individual for the choice of tier. The disjunctive rules
+without the rooted run take no individuals, so an ontology whose only individuals are
+anonymous, and which has axioms that need case analysis, now leaves those axioms out
+instead of its assertions. No file of the census is such an ontology, and the rooted run
+takes it, which item 823 follows.
+
+A class assertion of a named class whose anonymous individual occurs in no other
+logical axiom, and only once in it, says that the class has an instance and no more. Two
+of them over one class are interchangeable, so the one whose individual has the least
+label stands for the others, which the run does not read. A class assertion of a named
+class is an OWL 2 EL axiom that every run takes in full, so the run reports nothing for
+the assertions it does not read. Before the run, a scan counts the labels of these
+assertions in every logical axiom. Its scratch of 96 bytes for each assertion and one for
+each axiom is admitted against `Limits::max_memory` and the pool before it is
+allocated, a refusal leaves every assertion its own individual, and the scan polls the
+deadline and cancellation. Every merged assertion in the census is of a named class.
+On `ore_ont_5857`, with 723,805 such assertions, the merge keeps the rooted run within
+its bound, which a constant for each assertion passed.
+
+**Top-property inclusions.** `SubObjectPropertyOf(X owl:topObjectProperty)`, for a
+property, an inverse or a chain `X`, and `SubDataPropertyOf(d owl:topDataProperty)` hold
+of every ontology, and the role table already puts every role below a top property that
+another axiom names. The classifier takes them as OWL 2 EL axioms whose normalization
+adds nothing and interns no top property, so they no longer close
+`Saturation::disj_allowed` or the rooted run's gate. A chain among them meets no range
+restriction of OWL 2 EL, and item 805's rewriting neither starts for them alone nor
+lets a data property among them keep it from an ontology. The run reports them neither
+as left out nor as taken.
+
+**Gate.** The census tool of item 1272, built on the base 0779d666 and on the lane tip,
+reran the 59 files that hold anonymous individuals or top-property inclusions on two
+threads, in the default and the rooted run. Their left-out axioms fall from 5,659,868 to
+5,048 across both runs. Thirty files leave nothing out in the default run and 31 in the
+rooted run, where all 59 left something out before, and no file leaves out an axiom
+without an anonymous individual that the base took. The anonymous-only files move from
+the Horn rules to the EL rules or stay with the Horn rules, and every file keeps its
+consistency. The six files with top-property inclusions leave out what they left out
+before, since their data properties, datatypes and, in the default run, individuals keep
+the disjunctive rules closed too, which items 768, 972 and 823 follow. Item 1272's
+ablation without those axioms showed that the inclusions then no longer close the gate
+and the files reach the rooted run's bound, which item 1061 follows. The peak
+resident memory of a census process, which reads the file and runs both, falls from 752
+to 196 MiB on `ore_ont_10073` and `ore_ont_5481`, from 1,674 to 501 MiB on
+`ore_ont_5857` and by a sixth to two thirds on the other files above 400 MiB. It rises
+by 6 to 7% on `ore_ont_4510` and `ore_ont_9654`, whose anonymous individuals occur in
+other axioms and become individuals of the run, and by 4 to 5 MiB on six files of about
+22 MiB. HermiT
+1.4.5.519 references exist for 29 of the 31 files that anonymous individuals alone kept
+from a full answer, and the tip's taxonomy equals HermiT's on all 29 in both runs on four
+threads, with the same consistency. The hand cases of `tests/anonymous_individuals.rs`
+cover each position of an anonymous individual in each tier, keys with anonymous members
+and values, the hiding in descriptions, edits, the shared individual and its budget, and
+the reports and counts of a run that starts again. `dl_tier_d` and `dl_nominals` cover
+the inclusions in each form, a chain beside a range of the top property and item 805's
+rewriting beside a data inclusion. The census, the judgements and the logs are in the
+lane's records.
 
 ### ROBOT-compatible commands
 
