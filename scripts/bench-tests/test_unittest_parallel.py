@@ -409,6 +409,25 @@ class Discovery(Base):
         s, p = self.same_verdict(d, expect=1)
         self.assertIn("since test classes of test_a run in 2 top-level entries", p.stdout)
 
+    def test_a_root_that_changes_between_discoveries_fails_the_unit(self):
+        # Review r6 finding 1: the root's own behaviour is part of what each unit compares,
+        # also when another reason already sends the whole suite to one process.
+        d = self.suite(test_a=ONE, test_b="from test_a import One\n")
+        marker = d / "discovered"
+        write(d, "test_z.py", self.ROOT_RUN.replace(
+            "            loader.suiteClass = suite_class",
+            f"            from pathlib import Path\n"
+            f"            if not Path({str(marker)!r}).exists():\n"
+            f"                Path({str(marker)!r}).touch()\n"
+            f"                loader.suiteClass = suite_class"))
+        for args in ((), ("--split", "test_a")):
+            marker.unlink(missing_ok=True)
+            self.assertEqual(self.serial(d).returncode, 1)
+            marker.unlink(missing_ok=True)
+            p = self.run_runner(*args, str(d))
+            self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+            self.assertIn("the suite discovered here differs from the runner's discovery", p.stdout)
+
     def test_a_suite_class_changed_at_import_runs_as_serial_discovery_does(self):
         d = self.suite(test_a=ONE, test_z="""
             import unittest

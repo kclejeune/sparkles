@@ -103,10 +103,13 @@ class _TaggingLoader(unittest.TestLoader):
         return suite
 
 
-def _tree(node):
+def _tree(node, deep=True):
     if isinstance(node, unittest.TestSuite):
         cls = type(node)
-        return {"suite": f"{cls.__module__}.{cls.__qualname__}", "tests": [_tree(t) for t in node]}
+        tree = {"suite": f"{cls.__module__}.{cls.__qualname__}", "own": sorted(set(vars(node)) - _SUITE_KEYS)}
+        if deep:
+            tree["tests"] = [_tree(t) for t in node]
+        return tree
     return _id(node)
 
 
@@ -240,7 +243,10 @@ def discover(directory):
                      if callable(getattr(sys.modules[m], "parallel_export", None)))
     root = _custom(suite)
     serial = _shared(entries, units) or (f"the suite that discovery returns {root}" if root else None)
-    return suite, entries, {"units": units, "exports": exports, "serial": serial}
+    # The root and each suite's own attributes are part of the description, so a unit whose
+    # discovery made them differently fails its comparison with the runner's.
+    return suite, entries, {"root": _tree(suite, deep=False), "changed": _changed_suite_classes(),
+                            "units": units, "exports": exports, "serial": serial}
 
 
 def _inert(node):
