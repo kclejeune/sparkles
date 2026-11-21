@@ -389,7 +389,12 @@ pub(crate) fn record_unadmitted_events(
 /// is the caller's declaration, checked only against the frame's total imported child
 /// credit, so a wrong declaration that unrelated imported credit covers passes. One
 /// [`Origin`] names one acquisition, so a reservation grown or merged across stages of
-/// different origins cannot be settled correctly.
+/// different origins cannot be settled correctly. Credit that a stage acquires for
+/// storage made before it, such as the spare capacity of an earlier list, is credit
+/// without an allocation of the stage, so an unadmitted temporary up to that size reads
+/// as no excess there. The observation also does not follow one allocation against the
+/// credit that holds it, so it does not show that storage is freed before its credit
+/// returns. The filter-list lifetime tests watch the allocation for that.
 pub(crate) struct Stage(Option<u64>);
 
 fn used_at(counter: usize) -> u64 {

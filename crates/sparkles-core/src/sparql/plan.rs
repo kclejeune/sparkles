@@ -2195,8 +2195,9 @@ impl<'a> Planner<'a> {
             .is_err()
         })?;
         #[cfg(test)]
-        if credit.is_some() {
+        if let Some(credit) = &credit {
             note_list(2, deferred.len());
+            watch_list(2, &deferred, credit);
         }
         Ok((deferred, list_credit(credit)))
     }
@@ -2265,7 +2266,10 @@ impl<'a> Planner<'a> {
             fill(filters);
             debug_assert_eq!(filters.len(), need);
             #[cfg(test)]
-            note_list(site, need);
+            {
+                note_list(site, need);
+                watch_list(site, filters, &credit);
+            }
             credit
         };
         Ok(list_credit(Some(credit)))
@@ -4456,8 +4460,9 @@ impl<'a> Planner<'a> {
                         .is_err()
                 })?;
                 #[cfg(test)]
-                if credit.is_some() {
+                if let Some(credit) = &credit {
                     note_list(3, late.len());
+                    watch_list(3, &late, credit);
                 }
                 (settled, late, list_credit(credit))
             };
@@ -4861,6 +4866,10 @@ impl<'a> Planner<'a> {
                             && any
                     }
                 })?;
+                #[cfg(test)]
+                if let Some(credit) = &now_list {
+                    watch_list(5, &now, credit);
+                }
                 _now_list = list_credit(now_list);
                 now
             };
@@ -4970,6 +4979,8 @@ impl<'a> Planner<'a> {
                 .map_err(|_| partition.preparation().exhausted())?;
             now.extend(filters.extract_if(.., |f| bound(f)));
             debug_assert_eq!(now.len(), placed);
+            #[cfg(test)]
+            watch_list(PARTITION_WATCH, &now, &partition);
             (Some(partition), now)
         } else {
             let (now, later) = std::mem::take(filters).into_iter().partition(applies);
@@ -5093,7 +5104,8 @@ impl<'a> Planner<'a> {
         let _stage = crate::test_alloc::Stage::within(6);
         let mut scratch = self.filter_scratch(&n, exprs.iter(), false)?;
         // A list that filters were moved out of in place keeps its capacity, which the
-        // FILTER keeps with it.
+        // FILTER keeps with it. That storage was made before this stage, so its credit
+        // here has no allocation of the stage beside it.
         let spare = exprs.capacity() - exprs.len();
         if let Some(scratch) = scratch.as_mut()
             && spare > 0
@@ -6462,9 +6474,11 @@ pub(super) const FILTER_PHASE: &str = "reserving filter";
 /// The phase that admits a list of filters that planning moves filters into or grows.
 pub(super) const FILTER_LIST_PHASE: &str = "reserving filter list";
 
-/// The credit for a list of filters, held while the caller plans with the list. Unit
-/// tests settle its drop with the observer, as credit handed up by the stage that
-/// acquired it.
+/// The credit for a list of filters, held while the caller plans with the list. Its
+/// binding is declared before the list's binding, or before the parameter that owns the
+/// list is bound again, so that on every path the list is freed, or moved into storage
+/// admitted on its own, before the credit returns. Unit tests settle its drop with the
+/// observer, as credit handed up by the stage that acquired it.
 #[cfg(test)]
 type ListCredit = crate::test_alloc::Settled;
 #[cfg(not(test))]
@@ -6480,6 +6494,33 @@ thread_local! {
     /// late ones join.
     pub(super) static LIST_REACH: std::cell::Cell<[usize; 9]> =
         const { std::cell::Cell::new([0; 9]) };
+}
+
+#[cfg(test)]
+type ListWatch = Box<dyn Fn(usize, &[Expr], &Reservation)>;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's look at each filter list on the checked route right after it is made or
+    /// grown: the producer as in [`LIST_REACH`], or [`PARTITION_WATCH`] for the filters
+    /// that [`Planner::place_where`] places, then the list and the credit that holds it.
+    /// The test may watch the list's storage, fill the budget or cancel there, and then
+    /// see whether the list is freed before its credit returns.
+    pub(super) static LIST_WATCH: std::cell::RefCell<Option<ListWatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The [`LIST_WATCH`] site of the filters that [`Planner::place_where`] places.
+#[cfg(test)]
+pub(super) const PARTITION_WATCH: usize = 9;
+
+#[cfg(test)]
+fn watch_list(site: usize, list: &[Expr], credit: &Reservation) {
+    LIST_WATCH.with(|watch| {
+        if let Some(watch) = watch.borrow().as_ref() {
+            watch(site, list, credit);
+        }
+    });
 }
 
 #[cfg(test)]

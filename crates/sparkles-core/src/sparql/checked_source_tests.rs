@@ -4003,6 +4003,35 @@ fn checked_graph_r12_observer_surplus_witness_is_the_omission() {
 }
 
 #[test]
+fn checked_graph_r12_observer_preexisting_spare_credit_hides_temporary() {
+    use crate::test_alloc::Stage;
+    // A limit of the observer. Credit that a stage acquires for storage made before it,
+    // as a FILTER admits the spare capacity of an earlier list, has no allocation of the
+    // stage beside it, so it hides an unadmitted temporary up to its size. Without that
+    // credit the same temporary is excess.
+    let prep = Preparation::new(Control::none(), 1 << 20).unwrap();
+    for spare in [true, false] {
+        let earlier = observer_bytes(1000);
+        let (max, _) = crate::test_alloc::record_unadmitted_events(&prep, || {
+            let held;
+            {
+                let _stage = Stage::enter(6);
+                held = spare.then(|| prep.reserve(1000).unwrap());
+                let omitted = observer_bytes(500);
+                std::hint::black_box(&omitted);
+            }
+            drop(held);
+        });
+        std::hint::black_box(&earlier);
+        if spare {
+            assert!(max[6].excess <= 0, "{}", max[6].excess);
+        } else {
+            assert_eq!(max[6].excess, 500);
+        }
+    }
+}
+
+#[test]
 fn checked_graph_r12_observer_foreign_frees() {
     use crate::test_alloc::{Origin, Settled, Stage};
     // Storage allocated before the stage and freed in it is no cushion.
@@ -4459,4 +4488,267 @@ fn checked_graph_r12_filter_input_lists_match_ordinary() {
             "{name}"
         );
     }
+}
+
+/// What [`checked_list_lifetime`] does at the watched list.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ListAction {
+    /// Fill the budget, so that the next admission is refused.
+    Fill,
+    /// Cancel the query, so that the next planning stage stops it.
+    Cancel,
+    /// Only watch.
+    Watch,
+}
+
+/// The lifetime of the first nonempty filter list that `site` of [`plan::LIST_WATCH`]
+/// makes in a checked GRAPH query.
+struct ListLifetime {
+    outcome: Result<QueryResult>,
+    /// Whether the site made such a list.
+    watched: bool,
+    /// Frees of the list's storage.
+    frees: usize,
+    /// Releases of the credit's size, on the credit's preparation, before and after the
+    /// list was freed, less the partitions of that size that placing its filters made
+    /// and returned before.
+    early: usize,
+    late: usize,
+    /// The preparation's live credit just after the action, and when the list was freed.
+    used_at_action: u64,
+    used_at_free: u64,
+}
+
+fn checked_list_lifetime(
+    store: &Store,
+    text: &str,
+    site: usize,
+    action: ListAction,
+) -> ListLifetime {
+    #[derive(Default)]
+    struct State {
+        watch: Option<AllocationWatch>,
+        counter: usize,
+        bytes: u64,
+        filler: Option<crate::access::Reservation>,
+        used_at_action: u64,
+        early: usize,
+        late: usize,
+        partitions: usize,
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            plan::LIST_WATCH.with(|watch| *watch.borrow_mut() = None);
+        }
+    }
+    let _observe = Observe;
+    let _clear = Clear;
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let prep = Preparation::new(Control::with_cancel(cancelled.clone()), 64 << 20).unwrap();
+    let view = GraphAccess::all()
+        .masked_controlled(&store.snapshot(), &prep)
+        .unwrap();
+    let state = std::rc::Rc::new(std::cell::RefCell::new(State::default()));
+    plan::LIST_WATCH.with(|watch| {
+        let state = state.clone();
+        *watch.borrow_mut() = Some(Box::new(move |at, list, credit| {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return;
+            };
+            if at == plan::PARTITION_WATCH
+                && at != site
+                && state.watch.is_some()
+                && credit.bytes() == state.bytes
+                && DEALLOCATION.with(std::cell::Cell::get).3 == 0
+            {
+                // A placement of the watched list's filters admits a partition of the
+                // same size, which it returns once the FILTER holds them.
+                state.partitions += 1;
+            }
+            if at != site || list.is_empty() || state.watch.is_some() {
+                return;
+            }
+            let preparation = credit.preparation();
+            state.counter = preparation.test_used_counter() as *const _ as usize;
+            state.bytes = credit.bytes();
+            state.watch = Some(AllocationWatch::new(list.as_ptr() as usize, preparation));
+            match action {
+                ListAction::Fill => {
+                    state.filler = Some(preparation.reserve(preparation.room()).unwrap())
+                }
+                ListAction::Cancel => cancelled.store(true, Ordering::Relaxed),
+                ListAction::Watch => {}
+            }
+            state.used_at_action = preparation.test_used_counter().load(Ordering::Relaxed);
+        }));
+    });
+    RELEASE_OBSERVER.with(|observer| {
+        let state = state.clone();
+        *observer.borrow_mut() = Some(Box::new(move |preparation, bytes| {
+            let Ok(mut state) = state.try_borrow_mut() else {
+                return;
+            };
+            if state.watch.is_none()
+                || bytes != state.bytes
+                || preparation.test_used_counter() as *const _ as usize != state.counter
+            {
+                return;
+            }
+            let (_, _, _, frees) = DEALLOCATION.with(std::cell::Cell::get);
+            if frees == 0 {
+                state.early += 1;
+            } else {
+                state.late += 1;
+            }
+        }));
+    });
+    let outcome = query_prepared_source(view.read_source(), text, &opts());
+    RELEASE_OBSERVER.with(|observer| *observer.borrow_mut() = None);
+    plan::LIST_WATCH.with(|watch| *watch.borrow_mut() = None);
+    let mut state = state.borrow_mut();
+    let (used_at_free, frees) = state
+        .watch
+        .as_ref()
+        .map_or((0, 0), AllocationWatch::observed);
+    let lifetime = ListLifetime {
+        outcome,
+        watched: state.watch.is_some(),
+        frees,
+        early: state.early.saturating_sub(state.partitions),
+        late: state.late,
+        used_at_action: state.used_at_action,
+        used_at_free,
+    };
+    state.filler = None;
+    state.watch = None;
+    lifetime
+}
+
+/// Check that the list `site` of `body` makes is freed before its credit returns, when
+/// `action` at the list ends the query, or when the query answers. With `same_frame`,
+/// nothing else releases credit between the action and the free.
+fn check_list_lifetime(
+    failures: &mut Vec<String>,
+    name: &str,
+    body: &str,
+    site: usize,
+    action: ListAction,
+    same_frame: bool,
+) {
+    let store = checked_chain_fixture(12);
+    let text = format!("SELECT ?g ?x WHERE {{ GRAPH ?g {{ {body} }} }}");
+    let seen = checked_list_lifetime(&store, &text, site, action);
+    println!(
+        "{name} site {site} {action:?}: watched {} frees {} early {} late {} used {} at the action, {} at the free, {}",
+        seen.watched,
+        seen.frees,
+        seen.early,
+        seen.late,
+        seen.used_at_action,
+        seen.used_at_free,
+        match &seen.outcome {
+            Ok(_) => "answers".to_string(),
+            Err(error) => error.to_string(),
+        }
+    );
+    let ended = match action {
+        ListAction::Fill => matches!(
+            seen.outcome,
+            Err(Error::BudgetExceeded(crate::error::Budget {
+                kind: crate::error::BudgetKind::Memory,
+                ..
+            }))
+        ),
+        ListAction::Cancel => matches!(seen.outcome, Err(Error::Cancelled)),
+        ListAction::Watch => seen.outcome.is_ok(),
+    };
+    let mut wrong = Vec::new();
+    if !seen.watched {
+        wrong.push("the site made no list".to_string());
+    }
+    if !ended {
+        wrong.push("unexpected outcome".to_string());
+    }
+    if seen.frees != 1 {
+        wrong.push(format!("{} frees of the list", seen.frees));
+    }
+    if seen.early != 0 || seen.late == 0 {
+        wrong.push(format!(
+            "{} releases of the list's credit before its free and {} after",
+            seen.early, seen.late
+        ));
+    }
+    if same_frame && seen.used_at_free != seen.used_at_action {
+        wrong.push(format!(
+            "{} bytes of credit at the free, {} at the action",
+            seen.used_at_free, seen.used_at_action
+        ));
+    }
+    if !wrong.is_empty() {
+        failures.push(format!(
+            "{name} site {site} {action:?}: {}",
+            wrong.join(", ")
+        ));
+    }
+}
+
+#[test]
+fn checked_graph_r12_filter_list_credit_outlives_storage() {
+    // Each list that planning moves filters into or grows is freed before the credit
+    // that holds it returns, when the next admission is refused or the query cancelled
+    // while the list is still the caller's, and when the query answers.
+    let mut bodies: std::collections::HashMap<_, _> =
+        checked_filter_list_bodies().into_iter().collect();
+    // "joined" with one more filter that stays in the remaining list until the parts
+    // join, so that the grown list's credit has a size no other list's credit has.
+    bodies.insert(
+        "joined apart",
+        format!(
+            "?x <urn:v> ?v . {{ ?x <urn:c:1> ?y }} UNION {{ ?x <urn:c:2> ?v }} ?q <urn:v> ?u . FILTER(?u > 0 && ?x != ?q && {}) BIND(?x AS ?first)",
+            (0..30)
+                .map(|k| format!("?v - ?u > {}", -k))
+                .collect::<Vec<_>>()
+                .join(" && ")
+        ),
+    );
+    let mut failures = Vec::new();
+    for (name, site, action, same_frame) in [
+        // the keyed join's condition, before its boxes are admitted
+        ("keyed many", 5, ListAction::Fill, true),
+        ("keyed many", 5, ListAction::Cancel, true),
+        // the deferred filters, before the leaves' storage is admitted
+        ("deferred", 2, ListAction::Fill, false),
+        // the late filters, while the parts are joined
+        ("late", 3, ListAction::Fill, false),
+        ("late", 3, ListAction::Cancel, false),
+        // the remaining filters grown for the settled ones, while the components join,
+        // and emptied by placement when the query answers
+        ("joined", 4, ListAction::Fill, false),
+        ("joined apart", 4, ListAction::Fill, false),
+        ("joined apart", 4, ListAction::Watch, false),
+    ] {
+        check_list_lifetime(&mut failures, name, &bodies[name], site, action, same_frame);
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn checked_graph_r12_placed_filter_credit_outlives_refusal_storage() {
+    // The filters placed on a plan move into a list admitted to its size, which is freed
+    // before that credit returns when the FILTER's own admission is refused or cancelled.
+    let bodies: std::collections::HashMap<_, _> =
+        checked_filter_list_bodies().into_iter().collect();
+    let mut failures = Vec::new();
+    for action in [ListAction::Fill, ListAction::Cancel] {
+        check_list_lifetime(
+            &mut failures,
+            "conjuncts",
+            &bodies["conjuncts"],
+            plan::PARTITION_WATCH,
+            action,
+            true,
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
