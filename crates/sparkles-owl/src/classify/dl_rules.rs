@@ -544,7 +544,8 @@ pub struct DlRun {
     /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
     /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`], with
     /// [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and
-    /// [`MREPAIR_NO_RETURN`] and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests
+    /// [`MREPAIR_NO_RETURN`] and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests, and
+    /// [`MREPAIR_CF`] for M-return's restriction to premises without ground body literals
     pub mrepair: u8,
     /// the repair's counts, for measurements: the notices of held triggers the root took,
     /// the markers it sent and the clauses it returned
@@ -568,6 +569,12 @@ pub const MREPAIR_NO_RETURN: u8 = 32;
 /// [`DlRun::mrepair`], for the deficits' tests only: a context that the root registers or
 /// reaches late takes no marker sent before, so that a missing marker shows in the first.
 pub const MREPAIR_NO_REPLAY: u8 = 64;
+/// [`DlRun::mrepair`]: M-return-cf. M-return resolves a returned clause only with premises
+/// of the holder whose body has no ground literal, a literal over constants and function
+/// terms of constants alone, at the return and at the late premise. A product with a ground
+/// body then never arises, which would go back to the root and out again through each
+/// alternative condition of its body atoms.
+pub const MREPAIR_CF: u8 = 128;
 
 impl DlRun {
     pub fn new(eager: bool, worked: std::sync::Arc<std::sync::atomic::AtomicBool>) -> DlRun {

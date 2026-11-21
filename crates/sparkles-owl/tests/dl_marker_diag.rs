@@ -62,9 +62,11 @@ const FIXTURES: [(&str, &str); 3] = [
     ),
 ];
 
-/// The modes: the repair on (1), on without returns (1 + 32), on without the replay of
-/// markers to contexts registered or reached late (1 + 64), and off.
+/// The modes: the repair on (1), on with M-return-cf (1 + 128), on without returns (1 + 32),
+/// on without the replay of markers to contexts registered or reached late (1 + 64), and
+/// off.
 const ON: u8 = 1;
+const CF: u8 = 1 | 128;
 const NO_RETURN: u8 = 1 | 32;
 const NO_REPLAY: u8 = 1 | 64;
 const OFF: u8 = 0;
@@ -79,7 +81,13 @@ const CFGS: [Cfg; 4] = [
     (4, Expansion::Eager, false),
 ];
 
-fn deficits(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> [usize; 3] {
+fn deficits(body: &str, mode: u8, cfg: Cfg) -> [usize; 3] {
+    classified(body, mode, cfg).0
+}
+
+/// The deficits of a run of `body` with the mode `mode`, and whether its complete answer
+/// holds the fixture's entailment: K is unsatisfiable for a denial and K ⊑ Ans otherwise.
+fn classified(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> ([usize; 3], bool) {
     marker_test_mode(mode, true);
     let mut k = Classifier::of(&axioms(body));
     let out = k
@@ -95,7 +103,18 @@ fn deficits(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> [usize
         .unwrap();
     marker_test_mode(0, false);
     assert_eq!(out.stats.tier, Tier::Disjunctive);
-    out.stats.dl_marker_deficits
+    let c = |n: &str| match n {
+        "Nothing" => Class::nothing(),
+        n => Class::new(format!("{EX}{n}")),
+    };
+    let goal = if body.contains("owl:Nothing") {
+        "Nothing"
+    } else {
+        "Ans"
+    };
+    let found =
+        out.complete && !out.stats.dl_over_budget && out.taxonomy.is_subclass(&c("K"), &c(goal));
+    (out.stats.dl_marker_deficits, found)
 }
 
 /// The deficits of a saturation of `body` with the mode `mode`, and whether it found a model.
@@ -118,7 +137,8 @@ fn saturated(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> ([usi
 }
 
 /// With the repair each fixture is owed nothing; a run without returns is owed a return
-/// product, and a run without the replay or without the repair is owed markers. A
+/// product, and a run without the replay or without the repair is owed markers. With
+/// M-return-cf each fixture is owed nothing and the run finds its entailment. A
 /// saturation of the regression is owed markers without the repair and nothing with it.
 #[test]
 fn the_deficits_find_a_missing_marker_and_a_missing_return_product() {
@@ -127,6 +147,7 @@ fn the_deficits_find_a_missing_marker_and_a_missing_return_product() {
             let at = format!("{name}, {cfg:?}");
             for _ in 0..4 {
                 assert_eq!(deficits(body, ON, cfg), [0, 0, 0], "{at}: on");
+                assert_eq!(classified(body, CF, cfg), ([0, 0, 0], true), "{at}: cf");
             }
             let d = deficits(body, NO_RETURN, cfg);
             assert!(d[0] == 0 && d[1] > 0, "{at}: without returns {d:?}");

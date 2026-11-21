@@ -49,9 +49,9 @@
 
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
-    DlIx, DlSt, Found, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN, MREPAIR_ON,
-    MREPAIR_UNITS, MREPAIR_WIDE, Side, alls, dix, dl, drain, drain_with, ds, merge, pred_id,
-    restricted, side, unit, with,
+    DlIx, DlSt, Found, MREPAIR_CF, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN,
+    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, Side, alls, dix, dl, drain, drain_with, ds, merge,
+    pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -947,7 +947,7 @@ pub(super) fn on_max<S: Sink>(
             && !is_marker(c)
             && let Some(root) = dx.root
         {
-            m_note(root, me, st, l, prem, found, out);
+            m_note(ix, root, me, st, l, prem, found, out);
         }
     }
     join_head(ix, st, c, l, prem, found, &out.dl().lits, sel);
@@ -1467,7 +1467,8 @@ fn root_pred_of(
 /// Row 1231's marker repair for a run, as [`DlRun::mrepair`](super::dl_rules::DlRun)
 /// holds it: `on` is [`Limits::rooted_marker_repair`](super::Limits), and
 /// `SPARKLES_ROOTED_MARKER_REPAIR` overrides it for measurements with `0`, `1` or a sum of
-/// the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`].
+/// the bits [`MREPAIR_ON`], [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`], [`MREPAIR_WIDE`] and
+/// [`MREPAIR_CF`].
 pub(super) fn marker_repair(on: bool) -> u8 {
     static ENV: std::sync::OnceLock<Option<u8>> = std::sync::OnceLock::new();
     let env = *ENV.get_or_init(|| {
@@ -1503,7 +1504,9 @@ pub fn marker_test_mode(mode: u8, diag: bool) {
 /// tells the root once that it holds l, and the root sends l's marker to the contexts
 /// registered for l's constants. The premise also meets the clauses the root returned
 /// with l in their bodies (M-return's late premise).
+#[allow(clippy::too_many_arguments)]
 fn m_note<S: Sink>(
+    ix: &Index,
     root: Ex,
     me: Ex,
     st: &mut State,
@@ -1519,10 +1522,14 @@ fn m_note<S: Sink>(
         out.dl().grow(b);
         out.send(root, Concl::RMark(me, l.xid()));
     }
+    let cf = cf_of(ix, out);
+    if cf.is_some_and(|cf| ground_body(cf, &prem.0)) {
+        return;
+    }
     let cids = r.mr().rets.get(&l).cloned().unwrap_or_default();
     for cid in cids {
         let c = out.dl().table.get(cid).clone();
-        ret_products(st, &c, Some((l, prem)), found);
+        ret_products(st, &c, Some((l, prem)), cf_of(ix, out), found);
     }
 }
 
@@ -1818,18 +1825,25 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
     }
     out.dl().grow(grown);
     let mut found = Found::default();
-    ret_products(st, &c, None, &mut found);
+    ret_products(st, &c, None, cf_of(ix, out), &mut found);
     drain(ix, st, found, out);
     true
 }
 
 /// M-return's resolution of the returned clause `c` in a context: for each body literal,
 /// the context's processed clauses other than markers where it is maximal, selected ones
-/// included, or the premise `fixed` for its literal.
-fn ret_products(st: &State, c: &Clause, fixed: Option<(Lit, &Side)>, found: &mut Found) {
+/// included, or the premise `fixed` for its literal. With `cf`, M-return-cf, the premises
+/// whose body has a ground literal are left out ([`ret_lists`]).
+fn ret_products(
+    st: &State,
+    c: &Clause,
+    fixed: Option<(Lit, &Side)>,
+    cf: Option<Cf>,
+    found: &mut Found,
+) {
     found.rule = "mret";
     let body = c.body();
-    let free = ret_lists(st, body);
+    let free = ret_lists(st, body, cf);
     let base: Side = (Vec::new(), c.head().to_vec());
     match fixed {
         None => found.products(free, base),
@@ -1846,16 +1860,37 @@ fn ret_products(st: &State, c: &Clause, fixed: Option<(Lit, &Side)>, found: &mut
 }
 
 /// The premises of M-return's resolution on each literal of `body`: the context's processed
-/// clauses other than markers where it is maximal, selected ones included.
-fn ret_lists(st: &State, body: &[Lit]) -> Vec<Vec<Side>> {
+/// clauses other than markers where it is maximal, selected ones included. With `cf`,
+/// M-return-cf ([`MREPAIR_CF`]), only those whose body has no ground literal
+/// ([`ground_body`]).
+fn ret_lists(st: &State, body: &[Lit], cf: Option<Cf>) -> Vec<Vec<Side>> {
     body.iter()
         .map(|&l| {
             partners_of(st, l, true)
                 .into_iter()
                 .filter(|s| !(s.1.is_empty() && s.0 == [l]))
+                .filter(|s| cf.is_none_or(|cf| !ground_body(cf, &s.0)))
                 .collect()
         })
         .collect()
+}
+
+/// What M-return-cf's test of a premise's body reads: the index and the run's interned
+/// literals.
+type Cf<'a> = (&'a Index, &'a super::dl_clause::Lits);
+
+/// M-return-cf's test, `Some` when the run's repair has [`MREPAIR_CF`].
+fn cf_of<'a, S: Sink>(ix: &'a Index, out: &'a S) -> Option<Cf<'a>> {
+    (out.dl().mrepair & MREPAIR_CF != 0).then(|| (ix, &out.dl().lits))
+}
+
+/// Whether a premise's body holds a ground literal, for M-return-cf: an interned literal
+/// whose terms are constants or function terms of constants, so that it mentions neither x
+/// nor y.
+fn ground_body((ix, lits): Cf, body: &[Lit]) -> bool {
+    let inv = inv_of(ix, dix(ix));
+    body.iter()
+        .any(|&l| l.kind() == XL && super::dl_rules::no_xy(lits.view(l, inv)))
 }
 
 /// Row 1231's diagnostic, which `SPARKLES_ROOTED_MARKER_DIAG=1` turns on: after a rooted
@@ -2073,13 +2108,16 @@ const DEF_CHOICES: usize = 1 << 16;
 /// the tests that `derive` applies first in a rooted run (owl:Thing and owl:Nothing over
 /// constants, a head literal in the body, an equality beside its inequality), nor subsumed
 /// by a live clause of the context. derive's other simplifications are not replayed, so a
-/// product they drop can count.
+/// product they drop can count. With `cf`, the run's M-return-cf ([`MREPAIR_CF`]), the
+/// products take only the premises that M-return-cf takes, so the deficit checks the
+/// delivery of the rule the run applies, not what M-return-cf leaves out.
 pub(super) fn marker_def(
     ix: &Index,
     m: &MarkerCtx,
     st: &State,
     rg: &[Clause],
     lits: &super::dl_clause::Lits,
+    cf: bool,
 ) -> Option<MarkerDef> {
     let x = dl(st)?;
     let is_root = is_root(ix, m.me);
@@ -2109,7 +2147,7 @@ pub(super) fn marker_def(
             if !c.body().iter().all(|l| m.held.contains(l)) {
                 continue;
             }
-            let lists = ret_lists(st, c.body());
+            let lists = ret_lists(st, c.body(), cf.then_some((ix, lits)));
             let n = lists
                 .iter()
                 .try_fold(1usize, |n, l| n.checked_mul(l.len()))

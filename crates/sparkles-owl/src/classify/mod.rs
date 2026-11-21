@@ -2912,7 +2912,14 @@ impl Saturation {
                         .map(|(m, c)| dl_root::marker_root_gbody(&ix, m.me, &c.st.lock(), &d.lits))
                         .unwrap_or_default();
                     for (m, c) in cs.iter().zip(&refs) {
-                        defs.push(dl_root::marker_def(&ix, m, &c.st.lock(), &rg, &d.lits));
+                        defs.push(dl_root::marker_def(
+                            &ix,
+                            m,
+                            &c.st.lock(),
+                            &rg,
+                            &d.lits,
+                            d.mrepair & dl_rules::MREPAIR_CF != 0,
+                        ));
                     }
                 }
                 if !ok {
