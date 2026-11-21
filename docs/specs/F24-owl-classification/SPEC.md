@@ -3836,9 +3836,9 @@ of `xsd:float` or `xsd:double` are equal and not identical, so a functional prop
 with both values is inconsistent, while `minInclusive 0` admits both. NaN is identical to
 itself and is excluded by every bound facet, since it is incomparable with every value.
 Two date-times that denote the same instant with different offsets are equal and not
-identical (§4.7). The canonical value of a literal, which the EL lattice already
-computes for its datatypes, therefore stays an identity key, and the checker adds the
-order that the facets use beside it.
+identical (§4.7). The checker therefore computes an exact value of each literal as its
+identity key, with rationals of any size and date-times with years of any length and
+seconds of any precision, and keeps the order that the facets use beside it.
 
 **Families and value spaces.** The checker reads the map as disjoint families. Within a
 family the datatypes nest or are intervals, and between families the value spaces are
@@ -3850,9 +3850,9 @@ disjointness of `rdf:XMLLiteral` rests on its definition in RDF and is verified 
 
 | Family | Datatypes | Representation |
 |---|---|---|
-| Real | `owl:real`, `owl:rational`, `xsd:decimal`, `xsd:integer` and its eleven subtypes | Four strata, the integers, the decimals that are not integers, the rationals that are not decimals and the reals that are not rationals. Each stratum holds a finite union of intervals with exact rational ends, each end open or closed. |
+| Real | `owl:real`, `owl:rational`, `xsd:decimal`, `xsd:integer` and its twelve subtypes | Four strata, the integers, the decimals that are not integers, the rationals that are not decimals and the reals that are not rationals. Each stratum holds a finite union of intervals with exact rational ends, each end open or closed. |
 | Double, Float | `xsd:double`, `xsd:float` | A finite union of intervals over the values in their total order, with `-0` below `+0` and NaN as a separate point. |
-| Plain | `rdf:PlainLiteral`, `xsd:string`, `normalizedString`, `token`, `NMTOKEN`, `Name`, `NCName`, `language` | Untagged strings by cells of the string chain with a set of lengths, and tagged strings by a set of language ranges with a set of lengths, each with finite sets of included and excluded values. |
+| Plain | `rdf:PlainLiteral`, `xsd:string`, `normalizedString`, `token`, `NMTOKEN`, `Name`, `NCName`, `language` | Untagged strings by a set of lengths for each cell of the string chain. Tagged strings by a set of lengths for each tag, given by the longest basic language range of a finite map that matches the tag or by a default, so that a range minus a narrower range is represented. `rdf:langString` is the tagged strings alone. |
 | URI | `xsd:anyURI` | Strings with a set of lengths and finite included and excluded values. |
 | Hex, Base64 | `xsd:hexBinary`, `xsd:base64Binary` | Octet sequences with a set of lengths and finite included and excluded values. |
 | Boolean | `xsd:boolean` | A subset of the two values. |
@@ -3864,19 +3864,28 @@ The integer subtypes are intervals of the integer stratum with the bounds of XML
 datatypes form one chain, `xsd:string ⊃ normalizedString ⊃ token ⊃ NMTOKEN ⊃ Name ⊃
 NCName ⊃ language`, since every language tag starts with a letter and holds only
 letters, digits and hyphens. A cell of the chain is the strings at one level and not at
-the next. A range in normal form is a union over the families of these pieces, which is
-closed under intersection, union and complement, and `rdfs:Literal` is the union of all
-families. A complement is taken within the data domain, as Table 3 of the Direct
-Semantics defines `DataComplementOf`, so `DataComplementOf(xsd:int)` holds every string.
+the next. A range in normal form is a union over the families of these pieces, with finite sets of
+values included beyond them and excluded from them, which is closed under intersection,
+union and complement. `rdfs:Literal` is the whole data domain, which the Direct
+Semantics §2.2 requires only to contain the value spaces of the map. The normal form
+therefore has one more region, the values outside every datatype of the map, which no
+literal denotes and which is infinite for the checker, since an interpretation can
+always add values there. A complement is taken within the data domain, as Table 3 of the
+Direct Semantics defines `DataComplementOf`, so `DataComplementOf(xsd:int)` holds every
+string, and the complement of the union of every datatype of the map is not empty.
 A datatype definition is replaced by its range, which §11.2 keeps acyclic. Normal forms
 are interned, so equal ranges have one id, and the meet, inclusion and emptiness of two
 ids are computed once and cached.
 
 **Facets.** The bound facets of the real, floating-point and time families cut their
-intervals. A bound of the time family on a value without an offset follows XML Schema's
-partial order, under which a local time is below an instant only when it is below it
-with the offset `+14:00` and above it only when it is above it with `-14:00`, so a bound
-with an offset narrows the local times by fourteen hours on that side. The length facets
+intervals. A bound of the time family on a value without an offset follows the partial order of
+§4.7, under which a local time and an instant are never equal, a local time is below an
+instant only when it is below it with the offset `-14:00`, the latest instant it can
+denote, and above it only when it is above it with `+14:00`, the earliest. A bound with
+an offset therefore narrows the local times by fourteen hours on that side and becomes
+strict there, and a bound without an offset does the same to the instants. Under the
+§4.7 example, `minInclusive "1956-01-01T04:00:00-05:00"` holds `1956-01-01T10:00:00Z`
+and not `1956-01-01T10:00:00`. The length facets
 of the string, URI and binary families cut their sets of lengths, counted in characters
 for strings and in octets for binary data, and `rdf:langRange` keeps the tags that a
 basic language range matches. The `pattern` facet needs an automaton for an XML Schema
@@ -3886,10 +3895,12 @@ today, and its axiom is reported as used in part.
 
 **Sizes.** Every range has a size, the number of its values saturating at 2^63. A
 bounded interval of the integer stratum, every range of the floating-point and Boolean
-families and every finite set of values have finite sizes. The seconds of a date-time
-are a decimal of unbounded precision, so an interval of instants is infinite unless it
-is one instant, which has one value for each of the 1,681 offsets from `-14:00` to
-`+14:00`. The cells of the string chain are small at short lengths. The empty string is
+families and every finite set of values have finite sizes. An interval of a dense stratum of the reals is empty when it holds no value of
+the stratum, one value when it is a point of the stratum, such as `xsd:decimal[≥0.5,
+≤0.5]`, and infinite otherwise, so `owl:real[≥1/3, ≤1/3]` without `owl:rational` is
+empty. The seconds of a date-time are a decimal of unbounded precision, so an interval
+of instants is infinite unless it is one instant, which has one value for each of the
+1,681 offsets from `-14:00` to `+14:00`. The cells of the string chain are small at short lengths. The empty string is
 the only string of length 0, `normalizedString` without `token` holds only the space at
 length 1, `string` without `normalizedString` holds three strings of length 1, and
 `language` holds 52 of length 1 and caps each subtag at 8 characters. The checker counts
@@ -3899,8 +3910,10 @@ counted. The other strata, unbounded lengths and the reals are infinite. An
 underestimate of a size would be unsound and an overestimate incomplete, so each
 family's size function has its own tests at the boundaries.
 
-**Literals.** A literal of a datatype in the map has the canonical value of its lexical
-form, which `datatypes::lexical` checks. A literal whose lexical form is outside the
+**Literals.** A literal of a datatype in the map has the value of its lexical form,
+which `datatypes::lexical` checks. Date-times are checked by the checker's own parser,
+since `datatypes::lexical` refuses fractions of a second past eighteen digits, which
+XML Schema 1.1 allows, and item 1301 corrects it for the other readers. A literal whose lexical form is outside the
 lexical space of its datatype violates §5.7, so the ontology is not in OWL 2 DL and the
 Direct Semantics gives the literal no value. Reading it as the empty range would draw
 entailments from an input the semantics does not define, since its complement would hold
@@ -3911,7 +3924,9 @@ datatype outside the map, and their axioms are reported as used in part.
 **Data restrictions are atoms.** Every data restriction of the ontology,
 `DataSomeValuesFrom`, `DataAllValuesFrom`, `DataHasValue`, `DataMinCardinality` and
 `DataMaxCardinality`, is an atom over x in every tier, and `DataExactCardinality` is the
-conjunction of its minimum and maximum, since its complement is no atom. A functional
+conjunction of its minimum and maximum, since its complement is no atom. A minimum of
+zero holds of every element and is replaced by `owl:Thing` before the atoms are formed,
+and its complement by `owl:Nothing`, as the object cardinalities already are. A functional
 data property is the restriction `≤1 d` on `owl:Thing`. A data value has no successors,
 and the data property hierarchy, disjointness, ranges and functionality all apply to one
 element, so the data successors of an element exist only inside the checker. The top
@@ -3954,9 +3969,10 @@ atoms whose negations make them unsatisfiable, minimal in both sets at once, so 
 pair with a smaller head set and a larger body set is kept beside one with a smaller
 body set and a larger head set. For each pair and each choice of one clause for each
 maximal atom, it derives the union of those clauses' other literals and the pair's body
-atoms under the union of their bodies. An empty head set is a conflict, one body atom is
-an entailment such as `≥3 d.xsd:boolean ⊑ ∃d.{true}`, and two or more are a cover, such
-as `∃d.xsd:boolean ⊑ ∃d.{true} ⊔ ∃d.{false}`. A cover needs two body atoms that overlap
+atoms under the union of their bodies. A pair without body atoms is a conflict, such
+as a minimum above the size of its range, one body atom is an entailment such as
+`≥2 d.xsd:boolean ⊑ ∃d.{true}`, and two or more are a cover, such as `∃d.xsd:boolean
+⊑ ∃d.{true} ⊔ ∃d.{false}`. A cover needs two body atoms that overlap
 the maximal atoms partially, so it is tested only when there are two. After an equality
 rewrites a term, the rule reads the atoms of the term that remains.
 
@@ -3981,8 +3997,8 @@ nothing that the atoms do not, since no data term is shared between contexts.
 
 **The EL and Horn tiers.** The data properties fall into components connected by the
 hierarchy and by disjointness. A component whose ranges are all in the OWL 2 EL map and
-that has no universal restriction, cardinality, enumeration of several values or facet
-stays with the EL lattice of `classify/data.rs`, which is convex
+that has no universal restriction, cardinality, enumeration of several values, facet or
+`DisjointDataProperties` axiom stays with the EL lattice of `classify/data.rs`, which is convex
 there, since every value space of the profile is infinite and no union of its ranges
 covers another, and the lattice already meets the ranges under a functional data
 property. An ontology whose data is within OWL 2 EL therefore runs the code it runs
@@ -4039,8 +4055,8 @@ checks and the minimal pairs count toward the run's work bound and memory budget
 case analysis of an inference does.
 
 **Cost without data.** An ontology without data atoms builds no data tables, interns no
-ranges and adds no rule, and the rule is skipped by a run-level flag read once per
-processed clause, not per literal. Phase 3 compares instruction counts of the
+ranges and adds no rule. The run chooses its clause loop once, before saturation, so a
+run without data atoms executes no added test per processed clause. Phase 3 compares instruction counts of the
 disjunctive fixtures with and without the change, and its timing A/B runs on a quiet
 Intel host.
 
