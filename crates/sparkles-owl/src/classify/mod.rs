@@ -903,14 +903,17 @@ const LABEL_BYTES: usize = 96;
 /// annotations, have hundreds of thousands of such assertions, and the run then holds
 /// one individual for each class instead of one for each assertion.
 ///
-/// The scratch holds an entry for each such assertion's label and class and a flag for
-/// each axiom. It is admitted against `max_memory` and the pool before it is allocated,
-/// and a refusal leaves every assertion with its individual. The pool's grant for it
-/// stays with the run, which counts its own memory apart.
+/// The scratch holds an entry for each such assertion's label and class and the list of
+/// the axioms the run reads. It is admitted against `max_memory`, beside the `held`
+/// bytes of the caller's axioms, and against the pool before it is allocated, and a
+/// refusal leaves every assertion with its individual. The second value is what the pool
+/// granted, which the run draws on first and counts in its peak. Every pass over the
+/// axioms polls the deadline and cancellation.
 fn interchangeable<'a>(
     axioms: &[&'a AxiomKind],
+    held: usize,
     limits: &Limits,
-) -> Result<Option<Vec<&'a AxiomKind>>, Error> {
+) -> Result<(Option<Vec<&'a AxiomKind>>, usize), Error> {
     fn candidate(k: &AxiomKind) -> Option<(&Class, &str)> {
         match k {
             AxiomKind::ClassAssertion(ClassExpression::Class(c), Individual::Anonymous(a)) => {
@@ -927,18 +930,30 @@ fn interchangeable<'a>(
         n += candidate(k).is_some() as usize;
     }
     if n < 2 {
-        return Ok(None);
+        return Ok((None, 0));
     }
-    let scratch = n.saturating_mul(LABEL_BYTES).saturating_add(axioms.len());
-    if limits.max_memory.is_some_and(|m| scratch > m)
-        || limits.charge.as_ref().is_some_and(|f| !f(scratch))
+    let scratch = n.saturating_mul(LABEL_BYTES).saturating_add(
+        axioms
+            .len()
+            .saturating_mul(std::mem::size_of::<&AxiomKind>()),
+    );
+    if limits
+        .max_memory
+        .is_some_and(|m| held.saturating_add(scratch) > m)
     {
-        return Ok(None);
+        return Ok((None, 0));
     }
+    if limits.charge.as_ref().is_some_and(|f| !f(scratch)) {
+        return Ok((None, 0));
+    }
+    let granted = if limits.charge.is_some() { scratch } else { 0 };
     // how often the label of each candidate occurs in the logical axioms
     let mut count: FxHashMap<&str, u32> = FxHashMap::default();
     count.reserve(n);
-    for k in axioms {
+    for (i, k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
         if let Some((_, l)) = candidate(k) {
             count.insert(l, 0);
         }
@@ -961,19 +976,36 @@ fn interchangeable<'a>(
     // the label that stands for each class: the least among its lone assertions
     let lone = |k: &'a AxiomKind| candidate(k).filter(|(_, l)| count.get(l) == Some(&1));
     let mut first: FxHashMap<&Class, &str> = FxHashMap::default();
-    for &k in axioms {
+    for (i, &k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
         if let Some((c, l)) = lone(k) {
             first.entry(c).and_modify(|f| *f = (*f).min(l)).or_insert(l);
         }
     }
-    poll(limits)?;
     let redundant = |k: &'a AxiomKind| lone(k).is_some_and(|(c, l)| first.get(c) != Some(&l));
-    if !axioms.iter().any(|&k| redundant(k)) {
-        return Ok(None);
+    let mut dropped = 0usize;
+    for (i, &k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        dropped += redundant(k) as usize;
     }
-    Ok(Some(
-        axioms.iter().copied().filter(|&k| !redundant(k)).collect(),
-    ))
+    if dropped == 0 {
+        return Ok((None, granted));
+    }
+    // the list the run reads, whose capacity the scratch admitted
+    let mut kept = Vec::with_capacity(axioms.len() - dropped);
+    for (i, &k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        if !redundant(k) {
+            kept.push(k);
+        }
+    }
+    Ok((Some(kept), granted))
 }
 
 /// Whether the axiom has logical content for classification.
@@ -1334,20 +1366,46 @@ impl Saturation {
         // the class assertions that another one stands for add nothing (roadmap item
         // 1281), and the run reads the other axioms, whose list it holds beside the
         // caller's
-        let Some(kept) = interchangeable(axioms, limits)? else {
-            return self.run_with_all(axioms, changes, held_bytes, limits, with_taxonomy);
+        let (kept, granted) = match interchangeable(axioms, held_bytes, limits) {
+            Ok(k) => k,
+            Err(e) => {
+                // the caller has applied its changes, which a later run must still read
+                self.dirty = true;
+                return Err(e);
+            }
         };
-        let kept_bytes = kept.capacity() * std::mem::size_of::<&AxiomKind>();
-        // a run that reads them all counts the caller's axioms as added
-        self.source_len = Some(axioms.len());
-        let r = self.run_with_all(
-            &kept,
-            changes,
-            held_bytes + kept_bytes,
-            limits,
-            with_taxonomy,
-        );
-        self.source_len = None;
+        // the run's charges draw first on what the pool admitted for the scan
+        let credited;
+        let limits = match &limits.charge {
+            Some(f) if granted > 0 => {
+                credited = Limits {
+                    charge: Some(drawing_on(granted, f.clone())),
+                    ..limits.clone()
+                };
+                &credited
+            }
+            _ => limits,
+        };
+        let mut r = match kept {
+            None => self.run_with_all(axioms, changes, held_bytes, limits, with_taxonomy),
+            Some(kept) => {
+                let kept_bytes = kept.capacity() * std::mem::size_of::<&AxiomKind>();
+                // a run that reads them all counts the caller's axioms as added
+                self.source_len = Some(axioms.len());
+                let r = self.run_with_all(
+                    &kept,
+                    changes,
+                    held_bytes + kept_bytes,
+                    limits,
+                    with_taxonomy,
+                );
+                self.source_len = None;
+                r
+            }
+        };
+        if let Ok((_, _, stats)) = &mut r {
+            stats.peak_memory = stats.peak_memory.max(granted);
+        }
         r
     }
 
@@ -5324,16 +5382,20 @@ mod tests {
             )
         }));
         let axioms: Vec<&AxiomKind> = kinds.iter().collect();
-        let kept = interchangeable(&axioms, &Limits::default())
-            .unwrap()
-            .unwrap();
-        assert_eq!(kept.len(), axioms.len() - 3);
-        // a budget below the scratch leaves every assertion its individual
+        let (kept, granted) = interchangeable(&axioms, 0, &Limits::default()).unwrap();
+        let kept = kept.unwrap();
+        assert_eq!((kept.len(), granted), (axioms.len() - 3, 0));
+        // the scratch admits the list the run reads, which it allocates once
+        let scratch = 4 * LABEL_BYTES + axioms.len() * std::mem::size_of::<&AxiomKind>();
+        assert_eq!(kept.capacity(), kept.len());
+        // a budget below the scratch beside the caller's axioms leaves every assertion
+        // its individual
         let small = Limits {
-            max_memory: Some(4 * LABEL_BYTES),
+            max_memory: Some(scratch),
             ..Limits::default()
         };
-        assert!(interchangeable(&axioms, &small).unwrap().is_none());
+        assert!(interchangeable(&axioms, 0, &small).unwrap().0.is_some());
+        assert!(interchangeable(&axioms, 1, &small).unwrap().0.is_none());
         // so does a pool that refuses it, which is told the scratch alone
         let told = std::sync::Arc::new(AtomicUsize::new(0));
         let t = told.clone();
@@ -5344,14 +5406,14 @@ mod tests {
             })),
             ..Limits::default()
         };
-        assert!(interchangeable(&axioms, &refusing).unwrap().is_none());
-        assert_eq!(told.load(Ordering::Relaxed), 4 * LABEL_BYTES + axioms.len());
+        assert_eq!(interchangeable(&axioms, 0, &refusing).unwrap(), (None, 0));
+        assert_eq!(told.load(Ordering::Relaxed), scratch);
         let cancelled = Limits {
             cancelled: Some(std::sync::Arc::new(|| true)),
             ..Limits::default()
         };
         assert!(matches!(
-            interchangeable(&axioms, &cancelled),
+            interchangeable(&axioms, 0, &cancelled),
             Err(Error::Cancelled)
         ));
     }

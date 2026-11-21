@@ -4402,10 +4402,13 @@ of them over one class are interchangeable, so the one whose individual has the 
 label stands for the others, which the run does not read. A class assertion of a named
 class is an OWL 2 EL axiom that every run takes in full, so the run reports nothing for
 the assertions it does not read. Before the run, a scan counts the labels of these
-assertions in every logical axiom. Its scratch of 96 bytes for each assertion and one for
-each axiom is admitted against `Limits::max_memory` and the pool before it is
-allocated, a refusal leaves every assertion its own individual, and the scan polls the
-deadline and cancellation. Every merged assertion in the census is of a named class.
+assertions in every logical axiom. Its scratch of 96 bytes for each assertion and a
+pointer for each axiom, which holds the list the run reads, is admitted against
+`Limits::max_memory` beside the caller's axioms and against the pool before it is
+allocated. A refusal leaves every assertion its own individual. The run draws first on
+what the pool granted for the scan and counts it in its peak, every pass of the scan
+polls the deadline and cancellation, and a stopped scan leaves the next run to start
+again in full, as a stopped run does. Every merged assertion in the census is of a named class.
 On `ore_ont_5857`, with 723,805 such assertions, the merge keeps the rooted run within
 its bound, which a constant for each assertion passed.
 

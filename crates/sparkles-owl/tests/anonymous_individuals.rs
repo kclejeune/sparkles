@@ -366,3 +366,75 @@ fn a_run_that_starts_again_counts_every_axiom_as_added() {
     let mut k = Classifier::of(&ax);
     assert_eq!(k.classify(&rooted()).unwrap().stats.added, 54);
 }
+
+/// Classifies `base`, applies `edit`, stops the next run at its first poll, and returns
+/// the run after it, which must answer for the edit (review round 2 of item 1281: the
+/// scan for shared individuals polls before the run is marked as needing a full run).
+fn after_a_cancelled_run(base: &str, edit: impl FnOnce(&mut Classifier)) -> Classification {
+    let base = axioms(base);
+    let mut k = Classifier::of(&base);
+    k.classify(&Limits::default()).unwrap();
+    edit(&mut k);
+    let stopped = k.classify(&Limits {
+        cancelled: Some(std::sync::Arc::new(|| true)),
+        ..Limits::default()
+    });
+    assert!(matches!(
+        stopped,
+        Err(sparkles_owl::classify::Error::Cancelled)
+    ));
+    k.classify(&Limits::default()).unwrap()
+}
+
+#[test]
+fn a_cancelled_run_keeps_an_added_axiom() {
+    for extra in ["", "ClassAssertion(:D _:x) ClassAssertion(:D _:y)"] {
+        let add = axioms("SubClassOf(:B :C)");
+        let out = after_a_cancelled_run(
+            &format!("SubClassOf(:A :B) Declaration(Class(:C)) {extra}"),
+            |k| k.add(&add),
+        );
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("C")), "{extra}");
+    }
+}
+
+#[test]
+fn a_cancelled_run_drops_a_removed_axiom() {
+    for extra in ["", "ClassAssertion(:D _:x) ClassAssertion(:D _:y)"] {
+        let gone = axioms("SubClassOf(:B :C)");
+        let out = after_a_cancelled_run(
+            &format!("SubClassOf(:A :B) SubClassOf(:B :C) Declaration(Class(:C)) {extra}"),
+            |k| k.remove(&gone),
+        );
+        assert!(!out.taxonomy.is_subclass(&c("A"), &c("C")), "{extra}");
+    }
+}
+
+#[test]
+fn the_pool_grants_no_more_than_the_peak_with_shared_individuals() {
+    // review round 2 of item 1281: what the pool admitted for the scan for shared
+    // individuals is what the run draws on first, and the peak counts it
+    let body: String = (0..10_000)
+        .map(|i| format!("ClassAssertion(:C _:x{i})\n"))
+        .collect();
+    let ax = axioms(&body);
+    let kinds: Vec<&AxiomKind> = ax.iter().map(|a| &a.kind).collect();
+    let granted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let g = granted.clone();
+    let limits = Limits {
+        threads: 1,
+        charge: Some(std::sync::Arc::new(move |b: usize| {
+            g.fetch_add(b, std::sync::atomic::Ordering::Relaxed);
+            true
+        })),
+        ..Limits::default()
+    };
+    let mut sat = sparkles_owl::classify::Saturation::new();
+    let out = sat.classify(&kinds, None, &limits).unwrap();
+    let granted = granted.load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        granted <= out.stats.peak_memory,
+        "granted {granted}, peak {}",
+        out.stats.peak_memory
+    );
+}
