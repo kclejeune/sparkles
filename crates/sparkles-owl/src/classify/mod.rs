@@ -2866,6 +2866,8 @@ impl Saturation {
                 let n = self.ctx.len() + dynamic.as_ref().map_or(0, |dy| dy.len());
                 let mut ok = admit((n * std::mem::size_of::<dl_root::MarkerCtx>()) as isize);
                 let mut cs = Vec::with_capacity(if ok { n } else { 0 });
+                let diag = dl_root::marker_diag();
+                let mut defs = Vec::new();
                 for (e, c) in self
                     .ctx
                     .iter()
@@ -2876,8 +2878,16 @@ impl Saturation {
                     if !ok {
                         break;
                     }
-                    match dl_root::marker_ctx(&ix, e, &c.st.lock(), &d.lits, &mut admit) {
-                        Ok(Some(m)) => cs.push(m),
+                    let st = c.st.lock();
+                    match dl_root::marker_ctx(&ix, e, &st, &d.lits, &mut admit) {
+                        Ok(Some(m)) => {
+                            cs.push(m);
+                            // the deficits' copy, outside the run's memory budget, as the
+                            // diagnostic's sets are
+                            if diag {
+                                defs.push(dl_root::marker_def(&ix, e, &st, &d.lits));
+                            }
+                        }
                         Ok(None) => {}
                         Err(()) => {
                             ok = false;
@@ -2893,7 +2903,6 @@ impl Saturation {
                         used: refused.unwrap_or(held),
                     });
                 }
-                let diag = dl_root::marker_diag();
                 let (trips, pr) =
                     dl_root::marker_trips(&ix, &cs, &d.lits, decline.filter(|_| !diag));
                 if diag {
@@ -2905,7 +2914,7 @@ impl Saturation {
                         .mcount
                         .each_ref()
                         .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
-                    let def = dl_root::marker_deficits(&ix, &cs, &d.lits);
+                    let def = dl_root::marker_deficits(&ix, &cs, &defs, &d.lits);
                     eprintln!(
                         "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}",
                         stats.dl_work,

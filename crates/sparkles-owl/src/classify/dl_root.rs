@@ -1843,11 +1843,10 @@ pub(super) struct MarkerCtx {
     pub(super) edges: Vec<(u32, Vec<Ex>)>,
     /// in the root, the heads of its live facts with one literal
     pub(super) units: Vec<Lit>,
-    /// what the diagnostic's deficits read, only with the diagnostic
-    pub(super) def: Option<Box<MarkerDef>>,
 }
 
-/// What [`marker_deficits`] reads of one context.
+/// What [`marker_deficits`] reads of one context, which [`marker_def`] copies only with the
+/// diagnostic, beside the context's [`MarkerCtx`], so that a copy without it is no larger.
 #[derive(Default)]
 pub(super) struct MarkerDef {
     /// whether the context is unsatisfiable, which discharges what it is owed
@@ -1952,52 +1951,61 @@ pub(super) fn marker_ctx(
         }
     }
     admit(-scratch);
-    let mut def = None;
-    // the deficits' copies, outside the run's memory budget, as the diagnostic's sets are
-    if marker_diag() {
-        let (mut marks, mut took, mut gbody) = (Vec::new(), Vec::new(), Vec::new());
-        if let Some(r) = x.root.as_deref() {
-            marks.extend(r.gmarks.iter().copied());
-            took.extend(r.seen.iter().copied());
-        }
-        for s in &x.store.clauses {
-            if s.dead {
-                continue;
-            }
-            let (b, h) = (s.c.body(), s.c.head());
-            let one: Vec<Lit> = b.iter().chain(h).copied().collect();
-            if one.len() <= 2
-                && b.len() <= 1
-                && h.len() <= 1
-                && one.windows(2).all(|w| w[0] == w[1])
-                && let Some(&l) = one.first()
-                && l.kind() == XL
-            {
-                marks.push(l);
-            }
-            if is_root
-                && !b.is_empty()
-                && b.iter()
-                    .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
-            {
-                gbody.push((b.to_vec(), s.sent));
-            }
-        }
-        def = Some(Box::new(MarkerDef {
-            bottom: st.bottom,
-            marks,
-            took,
-            gbody,
-        }));
-    }
     Ok(Some(MarkerCtx {
         me,
         succ: successors(ix, st),
         held,
         edges,
         units,
-        def,
     }))
+}
+
+/// The deficits' copy of the context `me` with the state `st`, for the diagnostic and outside
+/// the run's memory budget, as the diagnostic's sets are.
+pub(super) fn marker_def(
+    ix: &Index,
+    me: Ex,
+    st: &State,
+    lits: &super::dl_clause::Lits,
+) -> Option<MarkerDef> {
+    let x = dl(st)?;
+    let dx = dix(ix);
+    let inv = inv_of(ix, dx);
+    let is_root = dx.root == Some(me);
+    let (mut marks, mut took, mut gbody) = (Vec::new(), Vec::new(), Vec::new());
+    if let Some(r) = x.root.as_deref() {
+        marks.extend(r.gmarks.iter().copied());
+        took.extend(r.seen.iter().copied());
+    }
+    for s in &x.store.clauses {
+        if s.dead {
+            continue;
+        }
+        let (b, h) = (s.c.body(), s.c.head());
+        let one: Vec<Lit> = b.iter().chain(h).copied().collect();
+        if one.len() <= 2
+            && b.len() <= 1
+            && h.len() <= 1
+            && one.windows(2).all(|w| w[0] == w[1])
+            && let Some(&l) = one.first()
+            && l.kind() == XL
+        {
+            marks.push(l);
+        }
+        if is_root
+            && !b.is_empty()
+            && b.iter()
+                .all(|&l| l.kind() == XL && ground_trigger(lits.view(l, inv)))
+        {
+            gbody.push((b.to_vec(), s.sent));
+        }
+    }
+    Some(MarkerDef {
+        bottom: st.bottom,
+        marks,
+        took,
+        gbody,
+    })
 }
 
 /// Counts, for each tier, the conditional ground triggers, their constants and the pairs
@@ -2155,10 +2163,12 @@ pub(super) fn marker_trips(
 /// whose context holds neither the trigger's marker nor a clause that subsumes it, and the
 /// pairs of a live root clause whose body is ground triggers and a context that holds every
 /// body literal and did not take it. A run without the repair has no clause to take, so its
-/// second count is every such pair.
+/// second count is every such pair. `defs` holds [`marker_def`]'s copy of each context of
+/// `cs`, in its order.
 pub(super) fn marker_deficits(
     ix: &Index,
     cs: &[MarkerCtx],
+    defs: &[Option<MarkerDef>],
     lits: &super::dl_clause::Lits,
 ) -> [usize; 2] {
     let dx = dix(ix);
@@ -2203,7 +2213,7 @@ pub(super) fn marker_deficits(
             to.dedup();
             for d in to {
                 let Some(&i) = by.get(&d) else { continue };
-                let Some(dd) = cs[i].def.as_deref() else {
+                let Some(dd) = defs.get(i).and_then(Option::as_ref) else {
                     continue;
                 };
                 if !dd.bottom && !dd.marks.contains(&l) {
@@ -2212,12 +2222,12 @@ pub(super) fn marker_deficits(
             }
         }
     }
-    let Some(rd) = cs[ri].def.as_deref() else {
+    let Some(rd) = defs.get(ri).and_then(Option::as_ref) else {
         return out;
     };
     for (b, id) in &rd.gbody {
-        for c in cs {
-            let Some(cd) = c.def.as_deref() else { continue };
+        for (c, cd) in cs.iter().zip(defs) {
+            let Some(cd) = cd.as_ref() else { continue };
             if c.me != root
                 && !cd.bottom
                 && b.iter().all(|l| c.held.contains(l))
