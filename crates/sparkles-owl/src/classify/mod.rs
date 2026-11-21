@@ -2162,11 +2162,14 @@ impl Saturation {
                 .iter()
                 .map(|d| d.capacity() * 4)
                 .sum::<usize>();
+        // the normalized premises of the changed axioms, which stay until the
+        // invalidation
+        let premises_bytes = premises.as_ref().map_or(0, |p| p.bytes());
         let (mut ax, mut ix, mut normalized_peak, outside_el) = self.build(
             axioms,
             &outside,
             threads,
-            held_bytes + old_bytes + sets_bytes,
+            held_bytes + old_bytes + sets_bytes + premises_bytes,
             kept_bytes,
             limits,
         )?;
@@ -2315,26 +2318,20 @@ impl Saturation {
             // the context table may have grown for the expressions the edit added
             let slot = std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
             let kept_bytes = kept_bytes + self.ctx.capacity().saturating_sub(kept_capacity) * slot;
-            let held = self.index_bytes(&ix)
-                + held_bytes
-                + ax.bytes()
-                + kept_bytes
-                + scratch.rough_bytes()
-                + bits;
-            let more = held.saturating_sub(normalized_peak);
-            if limits.max_memory.is_some_and(|m| held > m)
-                || limits
-                    .charge
-                    .as_deref()
-                    .is_some_and(|f| more > 0 && !f(more))
-            {
-                return Err(Error::Memory {
-                    limit: limits.max_memory.unwrap_or(held),
-                    used: held,
-                });
-            }
-            normalized_peak = normalized_peak.max(held);
-            stats.cleared = self.invalidate(&scratch, &ix, renumbered);
+            let mut budget = Scratch {
+                limits,
+                held: self.index_bytes(&ix)
+                    + held_bytes
+                    + ax.bytes()
+                    + kept_bytes
+                    + premises_bytes
+                    + bits,
+                peak: normalized_peak,
+                lists: 0,
+            };
+            budget.grow(0)?;
+            stats.cleared = self.invalidate(&scratch, &ix, renumbered, &mut budget)?;
+            normalized_peak = budget.peak;
             poll(limits)?;
         }
         if let Some(old) = old_ix.filter(|_| reuse) {
@@ -3339,7 +3336,7 @@ impl Saturation {
     /// propagations are the negative existential restrictions `∃s.d` of the index for
     /// each subsumer `d`. The index finds them among the left sides of the subsumptions,
     /// the members of the disjointness sets and the classes of keys, and a change to a
-    /// key or a role axiom starts again ([`needs_full_run`]). So a restriction that an
+    /// key, a role axiom or a self restriction starts again ([`needs_full_run`]). So a restriction that an
     /// edit adds or removes has its filler `d` among the parts of the changed left sides
     /// or sets walked below, and every context that holds `d` is cleared. The
     /// disjointness sets of the index are numbered by their place among the run's sets,
@@ -3351,40 +3348,50 @@ impl Saturation {
     /// The search for the contexts that hold a changed part still reads every context,
     /// as does the pass that drops their links from cleared ones, since no table maps
     /// an expression to the contexts that hold it.
-    fn invalidate(&mut self, changed: &Axioms, ix: &Index, renumbered: bool) -> usize {
+    fn invalidate(
+        &mut self,
+        changed: &Axioms,
+        ix: &Index,
+        renumbered: bool,
+        budget: &mut Scratch<'_>,
+    ) -> Result<usize, Error> {
         let nodes = &self.interner.nodes;
+        // the two bit sets are in the budget's start, and the lists ask it as they grow
         let mut parts = Marks::new(nodes.len());
+        let mut gone = Marks::new(self.ctx.len());
         let mut few: Vec<Ex> = Vec::new();
         let mut stack: Vec<Ex> = Vec::new();
-        stack.extend(changed.subs.iter().map(|&(a, _)| a));
-        stack.extend(changed.disjoint.iter().flatten().copied());
+        for &(a, _) in &changed.subs {
+            budget.push(&mut stack, a)?;
+        }
+        for &e in changed.disjoint.iter().flatten() {
+            budget.push(&mut stack, e)?;
+        }
         while let Some(e) = stack.pop() {
             if !parts.insert(e) {
                 continue;
             }
-            few.push(e);
+            budget.push(&mut few, e)?;
             match nodes[e as usize] {
                 Node::Conj(a, b) => {
-                    stack.push(a);
-                    stack.push(b);
+                    budget.push(&mut stack, a)?;
+                    budget.push(&mut stack, b)?;
                 }
-                Node::Exist(_, f) => stack.push(f),
+                Node::Exist(_, f) => budget.push(&mut stack, f)?,
                 _ => {}
             }
         }
-        let mut affected: FxHashSet<Ex> = FxHashSet::default();
+        // the contexts that hold a part, then every context with a link into one
+        let mut queue: Vec<Ex> = Vec::new();
         for (e, c) in self.ctx.iter().enumerate() {
             let Some(c) = c.get() else { continue };
             let st = c.st.lock();
-            if !st.init {
-                continue;
-            }
-            if st.subs.meets(&few, |s| parts.has(s)) {
-                affected.insert(e as Ex);
+            if st.init && st.subs.meets(&few, |s| parts.has(s)) {
+                gone.insert(e as Ex);
+                budget.push(&mut queue, e as Ex)?;
             }
         }
-        // every context with a link into an affected context is affected
-        let mut queue: Vec<Ex> = affected.iter().copied().collect();
+        let mut any = !queue.is_empty();
         while let Some(e) = queue.pop() {
             let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get()) else {
                 continue;
@@ -3392,18 +3399,23 @@ impl Saturation {
             let st = c.st.lock();
             for (_, srcs) in &st.back {
                 for &s in &srcs.list {
-                    if affected.insert(s) {
-                        queue.push(s);
+                    if gone.insert(s) {
+                        any = true;
+                        budget.push(&mut queue, s)?;
                     }
                 }
             }
         }
-        if affected.is_empty() && !renumbered {
-            return 0;
-        }
-        let mut gone = Marks::new(self.ctx.len());
-        for &e in &affected {
-            gone.insert(e);
+        debug_assert!(
+            (few.capacity() + stack.capacity() + queue.capacity()) * std::mem::size_of::<Ex>()
+                <= budget.lists
+                && parts.0.len() == nodes.len().div_ceil(64)
+                && gone.0.len() == self.ctx.len().div_ceil(64),
+            "the invalidation's scratch passed what the budget admitted"
+        );
+        drop((few, stack, queue, parts));
+        if !any && !renumbered {
+            return Ok(0);
         }
         let mut cleared = 0;
         for (e, c) in self.ctx.iter_mut().enumerate() {
@@ -3416,7 +3428,7 @@ impl Saturation {
                 *st = saturate::State::default();
                 *c.started.get_mut() = false;
             } else if st.init {
-                if !affected.is_empty() {
+                if any {
                     st.drop_links_where(|s| gone.has(s));
                 }
                 if renumbered && !st.disj.is_empty() {
@@ -3424,7 +3436,7 @@ impl Saturation {
                 }
             }
         }
-        cleared
+        Ok(cleared)
     }
 
     /// The subsumers of a saturated context that are named classes, with their
@@ -3447,6 +3459,51 @@ impl Saturation {
             .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
             .collect();
         Some((st.bottom, named))
+    }
+}
+
+/// The memory that the invalidation of a run kept by the EL rules holds beside the kept
+/// contexts, the index and the normalized axioms, which it admits against the run's
+/// limit and pool before each list of ids grows.
+struct Scratch<'l> {
+    limits: &'l Limits,
+    /// the estimated bytes held, which grow and are never given back before the run's
+    /// memory is reconciled
+    held: usize,
+    /// the run's peak estimate, past which a growth is charged to the pool
+    peak: usize,
+    /// the bytes admitted for the lists
+    lists: usize,
+}
+
+impl Scratch<'_> {
+    /// Admits `bytes` more, or stops the run with [`Error::Memory`].
+    fn grow(&mut self, bytes: usize) -> Result<(), Error> {
+        self.held += bytes;
+        let more = self.held.saturating_sub(self.peak);
+        if self.limits.max_memory.is_some_and(|m| self.held > m)
+            || more > 0 && self.limits.charge.as_deref().is_some_and(|f| !f(more))
+        {
+            return Err(Error::Memory {
+                limit: self.limits.max_memory.unwrap_or(self.held),
+                used: self.held,
+            });
+        }
+        self.peak = self.peak.max(self.held);
+        Ok(())
+    }
+
+    /// Pushes `e` onto `v`, admitting the list's growth before it allocates.
+    fn push(&mut self, v: &mut Vec<Ex>, e: Ex) -> Result<(), Error> {
+        if v.len() == v.capacity() {
+            let more = v.capacity().max(4);
+            let bytes = more * std::mem::size_of::<Ex>();
+            self.grow(bytes)?;
+            self.lists += bytes;
+            v.reserve_exact(more);
+        }
+        v.push(e);
+        Ok(())
     }
 }
 

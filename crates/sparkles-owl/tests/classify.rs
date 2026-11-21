@@ -387,6 +387,79 @@ fn edit_agrees(
     out
 }
 
+/// The invalidation's lists of parts, of the walk and of the cleared contexts grow with
+/// the edit and count against the budget before they grow: removing `owl:Thing ⊑ C2000 ⊓
+/// … ⊓ C2031` beside 1,024 classes clears every context, and a limit or a pool one byte
+/// below the run's reported peak refuses the run, after which a run with the ordinary
+/// limits gives the fresh taxonomy (roadmap item 1256). In a debug build the
+/// invalidation also checks that its lists hold no more than it admitted.
+#[test]
+fn the_invalidation_admits_its_scratch_before_it_grows() {
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut held: Vec<AxiomKind> = (0..1024)
+        .map(|n| Axiom::declaration(Entity::Class(c(&format!("C{n}")))).kind)
+        .collect();
+    let gone = sub(
+        Class::thing(),
+        and((2000..2032).map(|n| ce(&format!("C{n}")))),
+    )
+    .kind;
+    held.push(gone.clone());
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let rest: Vec<&AxiomKind> = held[..held.len() - 1].iter().collect();
+    let removed = [&gone];
+    let change = || Changes {
+        added: &[],
+        removed: &removed,
+    };
+    let mut sat = Saturation::new();
+    sat.saturate(&all, None, &limits).unwrap();
+    let out = sat.saturate(&rest, Some(change()), &limits).unwrap();
+    assert!(
+        out.stats.incremental && out.stats.cleared > 1024,
+        "{:?}",
+        out.stats
+    );
+    let peak = out.stats.peak_memory;
+    let fresh = Saturation::new().classify(&rest, None, &limits).unwrap();
+    for pool in [false, true] {
+        for cap in [peak - 1, peak] {
+            let mut sat = Saturation::new();
+            sat.saturate(&all, None, &limits).unwrap();
+            let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let t = total.clone();
+            let bounded = Limits {
+                max_memory: (!pool).then_some(cap),
+                charge: pool.then(|| {
+                    Arc::new(move |n: usize| {
+                        let was = t.load(Ordering::SeqCst);
+                        was + n <= cap && {
+                            t.fetch_add(n, Ordering::SeqCst);
+                            true
+                        }
+                    }) as Arc<dyn Fn(usize) -> bool + Send + Sync>
+                }),
+                ..limits.clone()
+            };
+            let result = sat.saturate(&rest, Some(change()), &bounded);
+            if cap < peak {
+                assert!(
+                    matches!(result, Err(Error::Memory { .. })),
+                    "pool {pool}: {result:?}"
+                );
+                let retry = sat.classify(&rest, Some(change()), &limits).unwrap();
+                assert_eq!(retry.taxonomy, fresh.taxonomy);
+                assert_eq!(retry.consistent, fresh.consistent);
+            } else {
+                assert!(result.is_ok(), "pool {pool} at the peak: {result:?}");
+            }
+        }
+    }
+}
+
 /// The disjointness sets are numbered by their place among the run's sets, so removing
 /// one moves the numbers of those after it. A kept context that holds a member of a moved
 /// set must know it by its new number: here `a` keeps `B1` from set 1, which becomes set
