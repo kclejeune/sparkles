@@ -315,6 +315,80 @@ impl Walk<'_> {
     }
 }
 
+impl Comps {
+    /// The checker components whose properties the axiom names.
+    pub fn touched(&self, k: &AxiomKind) -> Vec<u32> {
+        let mut out = Vec::new();
+        props_of(k, &mut |d| {
+            if let Some(c) = self.component(d)
+                && self.checker[c as usize]
+                && !out.contains(&c)
+            {
+                out.push(c);
+            }
+        });
+        out
+    }
+}
+
+/// Calls `f` on each data property that the axiom names.
+fn props_of(k: &AxiomKind, f: &mut dyn FnMut(&DataProperty)) {
+    use AxiomKind as K;
+    match k {
+        K::SubClassOf(a, b) => {
+            class_props(a, f);
+            class_props(b, f);
+        }
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+            cs.iter().for_each(|c| class_props(c, f))
+        }
+        K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) | K::ClassAssertion(c, _) => {
+            class_props(c, f)
+        }
+        K::SubDataPropertyOf(a, b) => {
+            f(a);
+            f(b);
+        }
+        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
+            ps.iter().for_each(&mut *f)
+        }
+        K::DataPropertyDomain(d, c) => {
+            f(d);
+            class_props(c, f);
+        }
+        K::DataPropertyRange(d, _)
+        | K::FunctionalDataProperty(d)
+        | K::DataPropertyAssertion(d, _, _)
+        | K::NegativeDataPropertyAssertion(d, _, _) => f(d),
+        K::HasKey(c, _, ds) => {
+            class_props(c, f);
+            ds.iter().for_each(&mut *f);
+        }
+        _ => {}
+    }
+}
+
+fn class_props(c: &ClassExpression, f: &mut dyn FnMut(&DataProperty)) {
+    use ClassExpression as C;
+    match c {
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => {
+            cs.iter().for_each(|c| class_props(c, f))
+        }
+        C::ObjectComplementOf(c) | C::ObjectSomeValuesFrom(_, c) | C::ObjectAllValuesFrom(_, c) => {
+            class_props(c, f)
+        }
+        C::ObjectMinCardinality(_, _, Some(c))
+        | C::ObjectMaxCardinality(_, _, Some(c))
+        | C::ObjectExactCardinality(_, _, Some(c)) => class_props(c, f),
+        C::DataSomeValuesFrom(ps, _) | C::DataAllValuesFrom(ps, _) => ps.iter().for_each(&mut *f),
+        C::DataHasValue(d, _)
+        | C::DataMinCardinality(_, d, _)
+        | C::DataMaxCardinality(_, d, _)
+        | C::DataExactCardinality(_, d, _) => f(d),
+        _ => {}
+    }
+}
+
 /// Whether a literal's datatype is in the EL map, or it has a language tag.
 fn el_literal(l: &Literal) -> bool {
     l.0.language().is_some() || Kind::of(l.0.datatype().as_str()).is_some()

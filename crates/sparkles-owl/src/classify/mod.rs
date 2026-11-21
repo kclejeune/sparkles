@@ -79,6 +79,7 @@ mod dl_norm;
 mod dl_reduce;
 mod dl_root;
 mod dl_rules;
+mod dt_sat;
 #[cfg(test)]
 mod dt_wiring_tests;
 mod dtcheck;
@@ -848,6 +849,7 @@ impl TierMark {
                         | Node::SelfLoop(_)
                         | Node::DataSome(..)
                         | Node::DtAtom(_)
+                        | Node::DtFire(_)
                         | Node::AtMost1(..)
                 )
             })
@@ -1623,6 +1625,8 @@ impl Saturation {
         budget.baseline(self.interner.bytes())?;
         self.interner.ranges.begin(budget.clone());
         let result = self.build_inner(axioms, outside, threads, held_bytes, limits);
+        // the run's components and definitions end with its normalization, on every exit
+        self.interner.dt_run = None;
         self.numeric_halt |= self.interner.ranges.check().is_err();
         self.interner.ranges.end();
         result.map(|(ax, ix, peak, outside)| (ax, ix, peak.max(budget.peak()), outside))
@@ -1688,6 +1692,7 @@ impl Saturation {
                     deadline: limits.deadline,
                     cancelled: limits.cancelled.clone(),
                 },
+                stopped: None,
             }));
         }
         let dt_mark = self.interner.nodes.len();
@@ -1909,6 +1914,13 @@ impl Saturation {
             );
         }
         self.interner.ranges.check()?;
+        // a datatype conversion that the run's deadline or cancellation stopped stops the
+        // run, as the numeric construction's halt does, and is not an axiom used in part
+        match self.interner.dt_run.as_ref().and_then(|r| r.stopped) {
+            Some(dtcheck::atoms::Halted::Timeout) => return Err(Error::Timeout),
+            Some(dtcheck::atoms::Halted::Cancelled) => return Err(Error::Cancelled),
+            None => {}
+        }
         // A fresh run decides its tier before these normalizations, so what they intern
         // that the decision reads would keep a later run over this interner from Tier D.
         // A run whose rules take it starts again anyway, as `entangled` says.
@@ -2157,7 +2169,25 @@ impl Saturation {
                         !tier_neutral(k) && profiles::el_axiom(k).into_iter().next().is_some()
                     })
             });
+        // A run with checker components starts again, since what the premises below
+        // intern for a checker property would be the lattice's, and so does a change
+        // that makes a component the checker's.
+        let checker = self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
+            || changes.is_some_and(|c| {
+                let mut defs: FxHashMap<Datatype, DataRange> = FxHashMap::default();
+                for &k in axioms {
+                    if let AxiomKind::DatatypeDefinition(d, r) = k {
+                        defs.insert(d.clone(), r.clone());
+                    }
+                }
+                let changed: Vec<&AxiomKind> = c.added.iter().chain(c.removed).copied().collect();
+                dtcheck::comp::Comps::of(&changed, &dtcheck::range::Defs::new(defs), &|| {
+                    poll(limits).is_err()
+                })
+                .is_none_or(|cs| cs.any())
+            });
         let full = self.entangled
+            || checker
             || match (&kept, changes) {
                 (Some(k), Some(c)) => {
                     self.must_restart(k, c)
@@ -3066,6 +3096,31 @@ impl Saturation {
             totals.peak = totals.peak.max(totals.memory);
             if horn {
                 stats.conjunctions = d.len();
+            }
+        }
+        // the checker's covers and the answers it could not give, from each kept
+        // context's last evaluation of a component and the worst of the others
+        if let Some(dt) = ix.dt.as_deref() {
+            let mut worst = Vec::new();
+            dt_sat::collect(&ix, &self.ctx, dynamic.as_ref(), &mut worst);
+            if worst.iter().any(|&w| w != dt_sat::FINE) {
+                for &k in axioms {
+                    let w = dt
+                        .comps
+                        .touched(k)
+                        .into_iter()
+                        .map(|c| worst[c as usize])
+                        .max()
+                        .unwrap_or(dt_sat::FINE);
+                    if w != dt_sat::FINE {
+                        self.excluded.push(Excluded {
+                            axiom: k.clone(),
+                            gap: Gap::Partial(dt_sat::reason(w)),
+                        });
+                    }
+                }
+                self.excluded.sort();
+                self.excluded.dedup();
             }
         }
         self.dynamic = dynamic;

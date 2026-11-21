@@ -11,7 +11,7 @@ use super::solve::{Answer, Atom, Bounds, Problem, Why, check_stopping};
 
 /// What a body atom's negative occurrences make of it, which the caller reads from the
 /// index and the context's units.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Group {
     /// every negative occurrence is a told subsumption whose subsumer the context holds,
     /// so the atom's truth changes no conclusion

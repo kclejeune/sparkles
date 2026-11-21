@@ -1107,6 +1107,7 @@ pub type Rid = u32;
 
 /// The interned ranges of one run, with the meets, joins and complements already
 /// computed.
+#[derive(Clone)]
 pub struct Ranges {
     nfs: Vec<Nf>,
     ids: FxHashMap<Nf, Rid>,

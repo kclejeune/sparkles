@@ -810,6 +810,10 @@ struct Out {
     reflexive: Vec<Role>,
     clash: Vec<(Role, Role)>,
     premises: Vec<Ex>,
+    /// the data axioms of checker components, as the EL normalization keeps them
+    dt_ranges: Vec<(Role, super::dtcheck::range::Rid)>,
+    functional: Vec<Role>,
+    individuals: Vec<Ex>,
 }
 
 impl Out {
@@ -822,6 +826,9 @@ impl Out {
         ax.reflexive.extend(self.reflexive);
         h.clash.extend(self.clash);
         h.premises.extend(self.premises);
+        ax.dt_ranges.extend(self.dt_ranges);
+        ax.functional.extend(self.functional);
+        ax.individuals.extend(self.individuals);
     }
 }
 
@@ -928,10 +935,7 @@ impl Norm<'_> {
             }
             _ => return Err("a universal or maximum data restriction in a negative position"),
         };
-        // the atom is interned, so that its axiom keeps its ids across runs, and the
-        // axiom stays out until the saturation reads the checker's atoms
-        let _ = e;
-        Err(super::index::DT_UNWIRED)
+        Ok(e)
     }
 
     /// `x` with `x ⊑ c`.
@@ -1372,6 +1376,35 @@ impl Norm<'_> {
         let one = |a: &Individual| C::ObjectOneOf(std::iter::once(a.clone()).collect());
         match ax {
             K::SubClassOf(c, d) => self.sub(vec![c.clone()], vec![d.clone()]),
+            // the data axioms of a checker component that are outside OWL 2 EL, for a
+            // range or a literal of a DL datatype, as the EL normalization takes the
+            // others (F24, "The EL and Horn tiers")
+            K::DataPropertyRange(d, r) if self.it.dt_checker(d) => {
+                let x = self.it.dt_range(r)?;
+                let r = self.it.role(RoleName::Data(d.clone()));
+                self.out.dt_ranges.push((r, x));
+                Ok(())
+            }
+            K::FunctionalDataProperty(d) if self.it.dt_checker(d) => {
+                let r = self.it.role(RoleName::Data(d.clone()));
+                self.out.functional.push(r);
+                Ok(())
+            }
+            K::DataPropertyAssertion(d, Individual::Named(a), v)
+            | K::NegativeDataPropertyAssertion(d, Individual::Named(a), v)
+                if self.it.dt_checker(d) =>
+            {
+                let positive = matches!(ax, K::DataPropertyAssertion(..));
+                let x = self.it.dt_literal(v)?;
+                // ¬d(a, v) is `{a} ⊑ ∀d.¬{v}`, which is `{a} ⊑ ≤ 0 d.{v}`
+                let e = self
+                    .it
+                    .dt_node(d, positive, if positive { 1 } else { 0 }, x);
+                let a = self.it.nominal(a);
+                self.out.individuals.push(a);
+                self.out.subs.push((a, e));
+                Ok(())
+            }
             // the assertions with a Horn class expression or an inverse property, as the
             // class axioms they are: `{a} ⊑ C`, `{a} ⊑ ∃p.{b}` and `{a} ⊓ ∃p.{b} ⊑ ⊥`
             K::ClassAssertion(c, a) => self.sub(vec![one(a)], vec![c.clone()]),

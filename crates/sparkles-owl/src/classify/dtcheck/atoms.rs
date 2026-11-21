@@ -60,10 +60,24 @@ pub struct Stop {
     pub cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
+/// Which of a run's stops came.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Halted {
+    Timeout,
+    Cancelled,
+}
+
 impl Stop {
-    pub fn stopped(&self) -> bool {
-        self.deadline.is_some_and(|d| Instant::now() >= d)
-            || self.cancelled.as_ref().is_some_and(|f| f())
+    /// The stop that has come, reading each source once, since a caller's cancellation
+    /// may answer true only once.
+    pub fn check(&self) -> Option<Halted> {
+        if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(Halted::Timeout)
+        } else if self.cancelled.as_ref().is_some_and(|f| f()) {
+            Some(Halted::Cancelled)
+        } else {
+            None
+        }
     }
 }
 
@@ -73,6 +87,8 @@ pub struct DtRun {
     pub comps: Comps,
     pub defs: Defs,
     pub stop: Stop,
+    /// the stop that a conversion saw, which stops the run once its normalization ends
+    pub stopped: Option<Halted>,
 }
 
 /// Why a data restriction has no atom.
@@ -86,11 +102,25 @@ impl DtRun {
 
     /// The range of a data range in `ranges`, with the run's definitions.
     pub fn range(&mut self, ranges: &mut Ranges, r: &DataRange) -> Result<Rid, &'static str> {
-        let DtRun { defs, stop, .. } = self;
-        match ranges.of_defined(r, defs, &|| stop.stopped()) {
+        let DtRun {
+            defs,
+            stop,
+            stopped,
+            ..
+        } = self;
+        let seen = std::cell::Cell::new(None);
+        let poll = || {
+            let h = stop.check();
+            seen.set(h);
+            h.is_some()
+        };
+        match ranges.of_defined(r, defs, &poll) {
             Ok(id) => Ok(id),
             Err(Fail::Unsupported(_)) => Err(REFUSED),
-            Err(Fail::Stopped) => Err(STOPPED),
+            Err(Fail::Stopped) => {
+                *stopped = Some(seen.get().unwrap_or(Halted::Cancelled));
+                Err(STOPPED)
+            }
         }
     }
 

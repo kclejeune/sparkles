@@ -351,6 +351,8 @@ pub struct Extra {
     pub horn: super::horn_rules::HornSt,
     /// what Tier D keeps, once the context has a clause that is not a unit
     pub dl: Option<Box<super::dl_rules::DlSt>>,
+    /// the data atoms of the checker's components and their last evaluations
+    pub dt: Vec<super::dt_sat::DtSt>,
 }
 
 /// Data successors of a context that functional data roles make one value: the
@@ -376,6 +378,7 @@ impl Extra {
             + self.groups.capacity() * std::mem::size_of::<Group>()
             + self.horn.bytes()
             + self.dl.as_ref().map_or(0, |d| d.bytes())
+            + self.dt.iter().map(|s| s.bytes()).sum::<usize>()
     }
 }
 
@@ -1266,6 +1269,11 @@ pub trait Sink {
     }
     fn release_data(&mut self, _bytes: usize) {}
     fn data_overflow(&mut self) {}
+    /// whether the states the rules run on are the run's own contexts, which the run
+    /// reads after the saturation, and not copies such as a world's
+    fn keeps_states(&self) -> bool {
+        false
+    }
 
     /// sends a conclusion to a context, which may be the one the rules run in
     fn send(&mut self, to: Ex, c: Concl);
@@ -1328,6 +1336,10 @@ pub trait Sink {
 }
 
 impl Sink for Out<'_, '_> {
+    fn keeps_states(&self) -> bool {
+        true
+    }
+
     fn reserve_data(&mut self, bytes: usize) -> bool {
         if bytes > isize::MAX as usize
             || self
@@ -1684,6 +1696,13 @@ impl Dynamic {
     /// The bytes of the tables and the conjunctions.
     pub fn bytes(&self) -> usize {
         self.bytes.load(Ordering::Relaxed)
+    }
+
+    /// Calls `f` on each initialized context, without creating any.
+    pub fn each(&self, mut f: impl FnMut(&Ctx)) {
+        for c in (0..self.len() as Ex).filter_map(|i| self.slot(self.base + i).ctx.get()) {
+            f(c);
+        }
     }
 
     /// Tables/cores and the states of initialized contexts, without creating any.
@@ -2845,6 +2864,9 @@ fn apply_rules<S: Sink, R: Rules>(
                 Node::DataSome(r, _) if R::FULL && !roles.functional(r).is_empty() => {
                     functional(ix, st, r, h.succ, out)
                 }
+                // not gated on the rules: the checker's atoms reach every tier but Tier D
+                Node::DtAtom(id) => super::dt_sat::fire(ix, st, d, id, out),
+                Node::DtFire(t) => super::dt_sat::refire(ix, st, t, out),
                 _ => {}
             }
             let wait = if R::DISJ && matches!(h.node, Node::Fresh(_)) {
