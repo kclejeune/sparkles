@@ -3874,8 +3874,16 @@ always add values there. A complement is taken within the data domain, as Table 
 Direct Semantics defines `DataComplementOf`, so `DataComplementOf(xsd:int)` holds every
 string, and the complement of the union of every datatype of the map is not empty.
 A datatype definition is replaced by its range, which §11.2 keeps acyclic. Normal forms
-are interned, so equal ranges have one id, and the meet, inclusion and emptiness of two
-ids are computed once and cached.
+are interned, and the meet, inclusion and emptiness of two ids are computed once and
+cached. The values that a family's base holds as points are never held among the
+included or excluded values. These are the numbers, the floating-point and Boolean
+values, the date-times without an offset and the members of the classes of at most
+three values, which are the empty string, the space, `:`, the tab, line feed and carriage
+return, and the empty values of `xsd:anyURI`, `xsd:hexBinary` and `xsd:base64Binary`.
+The tests check that equal ranges of these families have one id. A larger finite class,
+such as `xsd:hexBinary` of length 1, can be held whole in the base by one form and value
+by value by another, so equal ranges can have two ids. Ids are therefore cache keys, and
+whether a range lies within another is decided through sizes, never by comparing ids.
 
 **Facets.** The bound facets of the real, floating-point and time families cut their
 intervals. A bound of the time family on a value without an offset follows the partial order of
@@ -3888,14 +3896,18 @@ strict there, and a bound without an offset does the same to the instants. Under
 and not `1956-01-01T10:00:00`. The length facets
 of the string, URI and binary families cut their sets of lengths, counted in characters
 for strings and in octets for binary data, and `rdf:langRange` keeps the tags that a
-basic language range matches. The `pattern` facet needs an automaton for an XML Schema
+basic language range matches. The tags are the well-formed language tags of BCP 47, which
+RDF requires, so the range `a` matches no tag and keeps nothing, while `en-a` matches
+`en-a-bb`. The `pattern` facet needs an automaton for an XML Schema
 regular expression, which the first phases do not build. Until a later item builds it, a
 range with a pattern, like an unknown datatype, is not passed to the checker, and its
 axiom is left out and reported as used in part.
 
 **Sizes.** Every range has a size, the number of its values saturating at 2^63, given as
 a lower and an upper bound. The model's cardinalities are 32-bit numbers, so their sums
-stay far below the saturation, and the checker declines a problem whose counts reach it. A
+stay far below the saturation, and the checker declines a problem whose counts reach it.
+A size also says whether the range is infinite, which only an unbounded source sets, so a
+finite count that saturates stays a lower bound that removing values lowers. A
 bounded interval of the integer stratum, every range of the floating-point and Boolean
 families and every finite set of values have finite sizes. An interval of a dense stratum of the reals is empty when it holds no value of
 the stratum, one value when it is a point of the stratum, such as `xsd:decimal[≥0.5,
@@ -3910,14 +3922,23 @@ length 1, `string` without `normalizedString` holds three strings of length 1, a
 `language` holds 52 of length 1 and caps each subtag at 8 characters. The checker counts
 the cells of bounded length exactly up to a small length and reports an axiom as used in
 part when it would compare a cardinality with a string or binary cell it has not
-counted. The other strata, unbounded lengths and the reals are infinite. An
+counted. The tagged strings are counted by tag. Each irregular grandfathered tag, such
+as `i-klingon`, is a whole tag that nothing extends, so `rdf:PlainLiteral[rdf:langRange
+"i-klingon", length 0]` has one value. A range that matches any other tag matches
+infinitely many. The other strata, unbounded lengths and the reals are infinite. An
 underestimate of a size would be unsound and an overestimate incomplete, so each
 family's size function has its own tests at the boundaries.
 
 **Literals.** A literal of a datatype in the map has the value of its lexical form,
 which `datatypes::lexical` checks. Date-times are checked by the checker's own parser,
 since `datatypes::lexical` refuses fractions of a second past eighteen digits, which
-XML Schema 1.1 allows, and item 1289 corrects it for the other readers. A literal whose lexical form is outside the
+XML Schema 1.1 allows, and item 1289 corrects it for the other readers. The bound facets
+of the time family are checked by the same parser. A language-tagged literal has a value
+when its string is of XML characters and its tag is well-formed under BCP 47, in either
+of its forms, and item 1290 brings the other readers to the same rule. A number or
+date-time whose lexical form is longer than 4,096 characters is not passed to the
+checker, which bounds the cost of its exact arithmetic, and its axioms are left out and
+reported as used in part. A literal whose lexical form is outside the
 lexical space of its datatype violates §5.7, so the ontology is not in OWL 2 DL and the
 Direct Semantics gives the literal no value. Reading it as the empty range would draw
 entailments from an input the semantics does not define, since its complement would hold
@@ -3955,8 +3976,12 @@ sum to at least n, an existential is a minimum of one, and a maximum is the same
 bounded above. A universal `∀d.R` and a range of `d` set to zero every type with `d`
 whose cell is outside `R`, and `DisjointDataProperties` sets to zero every type whose
 property set holds two of its properties. The types of one cell sum to at most the
-cell's size. The answer is whether this small integer program has a solution, which
+cell's size. Each cell records, for every range involved, whether it lies within the
+range or its complement, which its construction decides, so no test of inclusion rests on
+comparing ids. The answer is whether this small integer program has a solution, which
 the checker finds exactly by a bounded search over the types that some bound mentions.
+The search bounds each count by what the other counts leave to each minimum and maximum,
+and prunes a minimum whose counts all lie under a maximum with a smaller bound.
 The counts make no assumption about which witnesses are the same value, so two
 existentials under a functional property are satisfiable with one value in the meet of
 their ranges, and large minimums need no enumeration of witnesses. A search past its
