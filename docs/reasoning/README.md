@@ -476,7 +476,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   disjunctive rules that its deadline, cancellation or memory budget stops returns the
   subsumptions it proved, with `Classification::complete` false, the classes it may have
   left incomplete in `incomplete`, and a consistency of consistent, inconsistent or
-  unknown, which leaves every class incomplete when unknown. The same rules can count, but
+  unknown, which leaves every class incomplete when unknown. Every language, HTTP and the
+  CLI return such a partial answer. The same rules can count, but
   counting is off by default. `Limits::counting` turns it on. A counting run without
   individuals orders its number restrictions by entailment unless `Limits::number_order`,
   which is on by default, is set to false. The run tells itself that `≥m r.F` entails
@@ -514,7 +515,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   restriction into a singleton, or into a class below one, gives a role atom to the
   individual in place of an anonymous successor, except in a run that counts. It is off by default,
   since the completeness of the departed calculus is not proved, and every answer it gives
-  is entailed. A rooted answer that reports itself complete can still miss entailments,
+  is entailed. On the 50 nominal fixtures of its gate it gives HermiT's taxonomies on 48,
+  and the other two fall back to the default answer at its work bound. A rooted answer
+  that reports itself complete can still miss entailments,
   as roadmap item 1231 records, so it cannot be relied on as complete while
   roadmap item 823 is open. A rooted run selects ground body literals, and Hyper over `x`
   and Pred from a successor over a successor term of a constant take selected clauses as
@@ -529,8 +532,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   roadmap item 1229 stays open for the proof. A rooted run can
   also miss an entailment while it reports itself complete when a fact that holds only
   under the queried class concerns an individual reached from another individual, which
-  is roadmap item 1231. A rooted run without counting has a bound of 524,288 derived
-  proof. A rooted run with counting can still miss entailed subsumptions on a generated
+  is roadmap item 1231. A rooted run with counting can still miss entailed subsumptions on a generated
   ontology, with or without these repairs, which is roadmap item 1229. A fact that holds
   only under the queried class and concerns an individual reached from another
   individual can make a rooted run miss an entailment. After its saturation a rooted run
@@ -608,7 +610,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   2015 EL ontologies on one and eight threads. GO's `InverseObjectProperties(part_of
   has_part)` takes the Horn rules, which add the 14 subsumptions that Konclude and HermiT
   entail and ELK misses and make GO 12% slower to classify on one thread than with the EL
-  rules alone. Roadmap item 693. The classifier's direct hierarchy of GO is the one GO's
+  rules alone. Roadmap item 693. Its taxonomies equal ELK's and Konclude's on ChEBI lite
+  and the ORE 2015 EL sample and Konclude's on GO, where the ELK mode gives ELK's.
+  `ore_ont_8737`, a transitive closure of 2.5 million existential restrictions, classifies
+  in 1.39 s on four threads on the benchmark host, since the links of its transitive role
+  compose left-linearly. The classifier's direct hierarchy of GO is the one GO's
   release publishes with those 7 direct edges added, and its taxonomy of ChEBI entails
   every subsumption ChEBI asserts and gives no direct subsumption that ChEBI does not
   assert ([results](../benchmarks/el-classification/RESULTS.md)).
@@ -800,7 +806,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   their class answers can miss entailed subsumptions. Every answer names the engine,
   why it was chosen, whether it is complete and the axioms outside the profile. The
   instances come from a classification with the assertions, which the dataset does not
-  keep, so an instance query classifies the ontology again.
+  keep, so an instance query classifies the ontology again. MCP and the CLI run no DL
+  queries and read no Manchester syntax. Roadmap item 661.
 * The web UI's **Ontology** page, `/ui/workbench/ontology`, edits an ontology graph over these
   routes ([U12](../specs/U12-ontology-workbench/SPEC.md#outcome)). It has trees of
   classes, object, data and annotation properties and individuals, an entity frame with
