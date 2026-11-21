@@ -1532,6 +1532,22 @@ both builds refuse one file at the reader and stop one at its memory budget. The
 [EL classification results](../../benchmarks/el-classification/RESULTS.md#left-linear-chains-of-transitive-roles)
 give the rounds.
 
+Item 1269 removes allocations from the index stage. The profile check of each axiom ran
+the profile checker, whose datatype pass copies each class and property IRI into a
+signature. It now walks the axiom without allocating and falls back to the full check
+only for an axiom that may break a rule, so the axioms left out keep their rules,
+messages and order. Normalization looks up an object property's role by its IRI in a
+table of role ids. On forge `ore_ont_13482` classifies on one thread in 898 ms against
+999 ms, with an index stage of 216 against 345 ms, and in 0.918 of the time on four
+threads. ChEBI lite classifies in 0.964 and 0.956 of the time. GO's index stage is
+faster, but its saturation moved with the code's layout, and its classification takes
+1.0% longer on one thread, which item 1280 holds. On GO, ChEBI lite, the 298 ORE 2015 EL
+files and the 207 DL development files on one and four threads, the 1,010 pairs that both
+builds classify give the base's taxonomies and the base's axioms left out, with their
+rules and messages, and both builds fail on the same two DL files. The
+[EL classification results](../../benchmarks/el-classification/RESULTS.md#allocations-of-the-index-stage)
+give the rounds.
+
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the
 ontology inconsistent, which its rules cannot cause, since the properties in their heads
