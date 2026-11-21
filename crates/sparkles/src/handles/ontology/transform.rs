@@ -31,6 +31,9 @@ pub struct WorkingOntology {
     pub doc: Document,
     /// the prefixes of the input, which the writers use
     pub prefixes: BTreeMap<String, String>,
+    /// the triples of the input that map to no axiom, which every classification of the
+    /// ontology counts as left out
+    pub unmapped: usize,
 }
 
 impl WorkingOntology {
@@ -63,16 +66,18 @@ impl WorkingOntology {
                 name: path.display().to_string(),
                 doc: Document::new(doc.header, doc.axioms),
                 prefixes: doc.prefixes.into_iter().collect(),
+                unmapped: 0,
             });
         }
         if let Some(file) = OntologyFile::read(path, req, threads)? {
             let prefixes = file.prefixes();
             let name = file.name.clone();
-            let doc = file.into_document(opts)?;
+            let (doc, unmapped) = file.into_counted_document(opts)?;
             return Ok(WorkingOntology {
                 name,
                 doc,
                 prefixes,
+                unmapped,
             });
         }
         let ds = Dataset::memory();
@@ -90,9 +95,11 @@ impl WorkingOntology {
         opts: &QueryOptions,
     ) -> Result<WorkingOntology> {
         let mut axioms: Vec<Axiom> = o.ontology.axioms.keys().cloned().collect();
+        let mut unmapped = o.ontology.unmapped.len();
         o.assertions(opts, |ax, _, _| {
-            if let Some(ax) = ax {
-                axioms.push(ax);
+            match ax {
+                Some(ax) => axioms.push(ax),
+                None => unmapped += 1,
             }
             Ok(true)
         })?;
@@ -100,6 +107,7 @@ impl WorkingOntology {
             name,
             doc: Document::new(o.ontology.header.clone(), axioms),
             prefixes,
+            unmapped,
         })
     }
 
@@ -120,7 +128,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::reason(&mut self.doc, o, &mut classifier(c, opts))
+        transform::reason(&mut self.doc, o, &mut classifier(c, opts, self.unmapped))
     }
 
     /// `reduce`.
@@ -130,7 +138,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::reduce(&mut self.doc, o, &mut classifier(c, opts))
+        transform::reduce(&mut self.doc, o, &mut classifier(c, opts, self.unmapped))
     }
 
     /// `materialize`. The ontology is unchanged when it fails.
@@ -140,7 +148,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::materialize(&mut self.doc, o, &mut classifier(c, opts))
+        transform::materialize(&mut self.doc, o, &mut classifier(c, opts, self.unmapped))
     }
 
     /// `relax`, which classifies nothing.
@@ -165,10 +173,12 @@ impl WorkingOntology {
 /// The classification of a transformation: the classifier with the request's threads
 /// and the options' deadline and budgets. A transformation asserts what the taxonomy
 /// says, so it never takes a partial answer, and a stopped run fails. A strict request
-/// fails when the classification leaves an axiom out.
+/// fails when the classification leaves an axiom out, or the `unmapped` triples of the
+/// input that map to no axiom.
 fn classifier<'a>(
     c: &'a ClassifyRequest,
     opts: &'a QueryOptions,
+    unmapped: usize,
 ) -> impl FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>)> + 'a {
     // a transformation reads the taxonomy and what was left out, not which classes keep
     // their answer
@@ -178,7 +188,7 @@ fn classifier<'a>(
         ..c.clone()
     };
     move |kinds: &[&AxiomKind]| {
-        let (classification, excluded) = classify_once(kinds, &c, opts, None)?;
+        let (classification, excluded) = classify_once(kinds, &c, opts, None, &|| unmapped)?;
         if c.strict && !classification.complete {
             return Err(super::classify::strict_refusal(&classification, &excluded));
         }
@@ -403,5 +413,32 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
             &sparkles_owl::Class::new("http://ex.org/A"),
             &sparkles_owl::Class::new("http://ex.org/C"),
         ));
+    }
+    /// A triple that maps to no axiom, here the domain of a property that is not
+    /// declared, is left out of every classification of the ontology: a strict reason
+    /// refuses, and one that is not strict answers incomplete.
+    #[test]
+    fn a_triple_that_maps_to_no_axiom_is_left_out() {
+        let d = tempfile::tempdir().unwrap();
+        let input = d.path().join("o.ttl");
+        std::fs::write(
+            &input,
+            "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             :A a owl:Class . :B a owl:Class . :C a owl:Class .
+             :p rdfs:domain :A . :A owl:disjointWith :B . :C rdfs:subClassOf :B .
+             :x :p :y . :x a :B .",
+        )
+        .unwrap();
+        let mut w = read(&input);
+        assert!(w.unmapped > 0, "the domain triple maps to an axiom");
+        let strict = ClassifyRequest {
+            strict: true,
+            ..Default::default()
+        };
+        let err = w
+            .reason(&ReasonOptions::default(), &strict, &QueryOptions::default())
+            .unwrap_err();
+        assert!(format!("{err:?}").contains("map to no axiom"), "{err:?}");
     }
 }

@@ -276,10 +276,21 @@ impl OntologyFile {
     /// map to axioms, as a document a command transforms. A triple that maps to no axiom
     /// is left out, as the reverse mapping leaves it out of the ontology.
     pub fn into_document(self, opts: &QueryOptions) -> Result<sparkles_owl::transform::Document> {
+        Ok(self.into_counted_document(opts)?.0)
+    }
+
+    /// [`into_document`](Self::into_document), with the number of triples that map to no
+    /// axiom, which a classification of the document counts as left out.
+    pub(crate) fn into_counted_document(
+        self,
+        opts: &QueryOptions,
+    ) -> Result<(sparkles_owl::transform::Document, usize)> {
         let mut axioms: Vec<Axiom> = Vec::new();
+        let mut unmapped = self.ontology.unmapped.len();
         self.assertions(opts, |ax, _| {
-            if let Some(ax) = ax {
-                axioms.push(ax.into_owned());
+            match ax {
+                Some(ax) => axioms.push(ax.into_owned()),
+                None => unmapped += 1,
             }
             Ok(true)
         })?;
@@ -288,7 +299,10 @@ impl OntologyFile {
             Err(o) => (o.header.clone(), o.axioms.keys().cloned().collect()),
         };
         axioms.extend(terminology);
-        Ok(sparkles_owl::transform::Document::new(header, axioms))
+        Ok((
+            sparkles_owl::transform::Document::new(header, axioms),
+            unmapped,
+        ))
     }
 
     /// The members of the read that answers carry, as a read of the loaded file gives them.
@@ -371,23 +385,37 @@ impl OntologyFile {
         let opts = self.ds.ontology().anchored(opts)?;
         let mut owned: Vec<Axiom> = Vec::new();
         let mut axioms = logical_axioms(&self.ontology);
+        // the assertion triples that map to no axiom
+        let mut unread = 0;
         if c.assertions {
             self.assertions(&opts, |ax, _| {
-                if let Some(ax) = ax {
-                    owned.push(ax.into_owned());
+                match ax {
+                    Some(ax) => owned.push(ax.into_owned()),
+                    None => unread += 1,
                 }
                 Ok(true)
             })?;
             axioms.extend(owned.iter().map(|a| &a.kind).filter(|k| logical(k)));
         }
-        // a classification of the terminology alone counts the assertions it did not
-        // read as left out when they could change its answer
+        // A classification of the terminology alone counts the assertions it did not read
+        // as left out when one has logical content, and every run counts the triples that
+        // map to no axiom.
+        let seen = std::cell::Cell::new(false);
         let mut dropped = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
-            self.assertions(&opts, |ax, _| Ok(ax.is_none_or(|ax| f(&ax.kind))))
-                .is_ok()
+            self.assertions(&opts, |ax, _| {
+                Ok(match ax {
+                    Some(ax) => f(&ax.kind),
+                    None => {
+                        seen.set(true);
+                        false
+                    }
+                })
+            })
+            .is_ok()
         };
         let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
-        let (classification, excluded) = classify_once(&axioms, c, &opts, dropped)?;
+        let unmapped = || self.ontology.unmapped.len() + unread + usize::from(seen.get());
+        let (classification, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
         if c.strict && !classification.complete {
             return Err(super::classify::refuse_strict(
                 &classification,

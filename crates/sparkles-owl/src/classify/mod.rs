@@ -462,6 +462,11 @@ pub struct Stats {
     /// the deadline or a cancellation stopped the modules' pass, so every class is
     /// incomplete and the consistency unknown
     pub coverage_stopped: bool,
+    /// the triples of the input that map to no axiom, such as a SWRL rule or a domain of
+    /// a property that is not declared, which the answer counts as left out
+    /// ([`Classification::leave_out_unmapped`]): at least one when the run did not read
+    /// the assertions, whose read stops at the first
+    pub unmapped: usize,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
     pub outside_el: OutsideEl,
@@ -638,11 +643,7 @@ impl Classification {
             };
             if let Some(w) = witness {
                 self.stats.coverage = start.elapsed();
-                self.complete = false;
-                self.all_incomplete();
-                if self.consistency == Consistency::Consistent {
-                    self.consistency = Consistency::Unknown;
-                }
+                self.not_all_read();
                 return Some(not_read(w));
             }
             if excluded.is_empty() {
@@ -706,6 +707,28 @@ impl Classification {
             self.incomplete = all;
         }
         None
+    }
+
+    /// Counts `n` triples of the input that map to no axiom as left out: with any, the
+    /// answer is not complete, every class is incomplete and a consistency the run found
+    /// is unknown, since such a triple may carry any logical content. The caller reports
+    /// them, as no axiom of [`Excluded`] can name them.
+    pub fn leave_out_unmapped(&mut self, n: usize) {
+        if n > 0 {
+            self.stats.unmapped += n;
+            self.not_all_read();
+        }
+    }
+
+    /// The answer when the run did not read part of the ontology that may carry any
+    /// logical content: not complete, every class incomplete, and an inconsistency kept,
+    /// as it holds for the whole ontology too, but a consistency unknown.
+    fn not_all_read(&mut self) {
+        self.complete = false;
+        self.all_incomplete();
+        if self.consistency == Consistency::Consistent {
+            self.consistency = Consistency::Unknown;
+        }
     }
 
     /// The answer of a modules' pass that its deadline, its cancellation or its stream of

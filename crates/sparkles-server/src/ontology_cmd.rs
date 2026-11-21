@@ -786,8 +786,9 @@ pub(crate) fn finish_classify(
     } else if j["complete"].as_bool() == Some(false) {
         // as ELK warns of the axioms outside its fragment
         eprintln!(
-            "incomplete answer: {} axioms left out or used in part, {} classes may miss entailments, consistency {}; --strict refuses instead",
+            "incomplete answer: {} axioms left out or used in part, {} triples that map to no axiom, {} classes may miss entailments, consistency {}; --strict refuses instead",
             j["excludedCount"].as_u64().unwrap_or(0),
+            j["stats"]["unmapped"].as_u64().unwrap_or(0),
             j["incompleteCount"].as_u64().unwrap_or(0),
             j["consistency"].as_str().unwrap_or("unknown"),
         );
@@ -1087,6 +1088,10 @@ fn print_classify(j: &J) {
                 });
             println!("  {why}\n    {}", e["ofn"].as_str().unwrap_or(""));
         }
+    }
+    let unmapped = j["stats"]["unmapped"].as_u64().unwrap_or(0);
+    if j["complete"].as_bool() != Some(true) && unmapped > 0 {
+        println!("incomplete: {unmapped} triples of the input map to no axiom");
     }
     if j["complete"].as_bool() != Some(true)
         && j["partial"].as_bool() != Some(true)

@@ -190,6 +190,13 @@ fn check(
 ) -> Vec<String> {
     let mut failures = Vec::new();
     n.runs += 1;
+    // every case maps in full, so nothing is left out for a triple
+    if got.stats.unmapped > 0 {
+        failures.push(format!(
+            "{run}: {} triples map to no axiom",
+            got.stats.unmapped
+        ));
+    }
     let witness = excluded
         .iter()
         .any(|e| matches!(&e.gap, Gap::Outside { rule, .. } if rule == NOT_READ));

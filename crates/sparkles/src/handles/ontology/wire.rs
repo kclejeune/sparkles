@@ -1659,6 +1659,7 @@ pub fn classification_body(
         "coverageMs": s.coverage.as_secs_f64() * 1000.0,
         "coverageOver": s.coverage_over,
         "coverageStopped": s.coverage_stopped,
+        "unmapped": s.unmapped,
     });
     if q.nodes {
         let total = t.nodes().len();

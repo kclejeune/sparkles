@@ -2059,6 +2059,78 @@ mod classification {
         assert!(a.classification.complete, "{:?}", a.excluded);
     }
 
+    /// A triple that maps to no axiom, here the domain of a property that is not
+    /// declared, leaves every classification incomplete, of the terminology alone and
+    /// with the assertions, and a commit that adds one makes the kept answer incomplete.
+    #[test]
+    fn a_triple_that_maps_to_no_axiom_leaves_the_answer_incomplete() {
+        use sparkles_owl::classify::Consistency;
+        let body = ":A a owl:Class . :B a owl:Class . :C a owl:Class .
+            :A owl:disjointWith :B . :C rdfs:subClassOf :B .";
+        let ds = dataset(body);
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let first = h
+            .classify(&req, &ClassifyRequest::default(), &opts())
+            .unwrap();
+        assert!(first.classification.complete && first.classification.stats.unmapped == 0);
+        ds.update(&format!("{PREFIXES} INSERT DATA {{ :p rdfs:domain :A . }}"))
+            .unwrap();
+        for assertions in [false, true] {
+            let c = h
+                .classify(
+                    &req,
+                    &ClassifyRequest {
+                        assertions,
+                        ..Default::default()
+                    },
+                    &opts(),
+                )
+                .unwrap();
+            let k = &c.classification;
+            assert!(!c.reused, "assertions {assertions}");
+            assert!(
+                k.stats.unmapped > 0,
+                "assertions {assertions}: {:?}",
+                c.excluded
+            );
+            assert!(
+                !k.complete && k.complete_for_taken,
+                "assertions {assertions}"
+            );
+            assert_eq!(
+                k.consistency,
+                Consistency::Unknown,
+                "assertions {assertions}"
+            );
+            assert!(
+                k.incomplete.contains(&self::c("C")),
+                "assertions {assertions}"
+            );
+            let strict = ClassifyRequest {
+                assertions,
+                strict: true,
+                ..Default::default()
+            };
+            let Err(err) = h.classify(&req, &strict, &opts()) else {
+                panic!("assertions {assertions}: a strict run answered");
+            };
+            assert!(err.to_string().contains("map to no axiom"), "{err}");
+        }
+        // with the assertions that make it inconsistent through the domain
+        ds.update(&format!(
+            "{PREFIXES} INSERT DATA {{ :x :p :y . :x a :B . }}"
+        ))
+        .unwrap();
+        let all = ClassifyRequest {
+            assertions: true,
+            ..Default::default()
+        };
+        let c = h.classify(&req, &all, &opts()).unwrap();
+        assert!(!c.classification.complete);
+        assert_ne!(c.classification.consistency, Consistency::Consistent);
+    }
+
     #[test]
     fn the_json_operation_answers_counts_nodes_and_a_class() {
         // a maximum of two needs counting, which the classifier leaves out

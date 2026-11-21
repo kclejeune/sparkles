@@ -60,6 +60,7 @@ use sparkles_owl::{
     AnnotationProperty, AnnotationValue, Axiom, AxiomKind, ClassExpression, Entity, vocab,
 };
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
+use std::cell::Cell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -137,14 +138,24 @@ pub(super) fn refuse_strict(
 /// ontology: the axioms left out, which the error's source holds as
 /// [`sparkles_owl::classify::Error::Incomplete`], or the run that stopped.
 pub fn strict_refusal(classification: &Classification, excluded: &[Excluded]) -> Error {
-    let message = if excluded.is_empty() {
+    let unmapped = classification.stats.unmapped;
+    let mut message = if !excluded.is_empty() {
+        sparkles_owl::classify::refusal(excluded)
+    } else if unmapped > 0 {
+        String::from("the classification would not be complete")
+    } else {
         format!(
             "the classification would not be complete: the run stopped before it decided {} classes",
             classification.incomplete.len()
         )
-    } else {
-        sparkles_owl::classify::refusal(excluded)
     };
+    if unmapped > 0 {
+        message.push_str(&format!(
+            "; {unmapped} triples of the input map to no axiom, such as a SWRL rule or a \
+             property that is not declared, and may carry anything: declare the property \
+             or remove the triples"
+        ));
+    }
     incomplete(message, excluded)
 }
 
@@ -367,19 +378,24 @@ impl Ontologies {
             self.classify_kept(&o, req, c, &opts)?
         } else {
             let mut assertions: Vec<Axiom> = Vec::new();
+            // the assertion triples that map to no axiom
+            let mut unread = 0;
             if c.assertions {
                 o.assertions(&opts, |ax, _, _| {
-                    if let Some(ax) = ax {
-                        assertions.push(ax);
+                    match ax {
+                        Some(ax) => assertions.push(ax),
+                        None => unread += 1,
                     }
                     Ok(true)
                 })?;
             }
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
-            let mut dropped = dropped_assertions(&o, &opts);
+            let seen = Cell::new(false);
+            let mut dropped = dropped_assertions(&o, &opts, &seen);
             let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
-            let (out, excluded) = classify_once(&axioms, c, &opts, dropped)?;
+            let unmapped = || o.ontology.unmapped.len() + unread + usize::from(seen.get());
+            let (out, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
             (
                 KeptClassification::capture(
                     self,
@@ -474,9 +490,20 @@ impl Ontologies {
             // Admission precedes mutation, so a refused admission preserves a proven
             // old entry/publication. Later errors conservatively discard both.
             let par = admit(c.threads, opts)?;
-            let mut dropped = dropped_assertions(o, opts);
+            let seen = Cell::new(false);
+            let mut dropped = dropped_assertions(o, opts, &seen);
+            let unmapped = || o.ontology.unmapped.len() + usize::from(seen.get());
             let (out, witness) = e.run_over(o, Vec::new(), |s, axioms, changes| {
-                run(s, axioms, changes, par, opts, c, Some(&mut dropped))
+                run(
+                    s,
+                    axioms,
+                    changes,
+                    par,
+                    opts,
+                    c,
+                    Some(&mut dropped),
+                    &unmapped,
+                )
             })?;
             #[cfg(test)]
             let out = if FORCE_PARTIAL.with(|f| f.replace(false)) {
@@ -784,30 +811,43 @@ pub(super) fn admit(threads: usize, opts: &QueryOptions) -> Result<Par> {
 ///
 /// `dropped` streams the axioms of the ontology that `axioms` leaves out, such as the
 /// assertions of a classification of the terminology alone, which count as left out
-/// when they could change the answer ([`Classification::cover`]).
+/// when one has logical content ([`Classification::cover`]). `unmapped` answers, after
+/// that read, how many triples of the input map to no axiom, which count as left out
+/// too ([`Classification::leave_out_unmapped`]).
 pub(crate) fn classify_once(
     axioms: &[&AxiomKind],
     c: &ClassifyRequest,
     opts: &QueryOptions,
     dropped: Option<&mut Dropped<'_>>,
+    unmapped: &dyn Fn() -> usize,
 ) -> Result<(Classification, Vec<Excluded>)> {
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
-    let (out, witness) = run(&mut s, axioms, None, par, opts, c, dropped)?;
+    let (out, witness) = run(&mut s, axioms, None, par, opts, c, dropped, unmapped)?;
     let mut excluded = s.excluded().to_vec();
     excluded.extend(witness);
     Ok((out, excluded))
 }
 
 /// The assertions of an open ontology, as the axioms a classification of its terminology
-/// alone drops ([`classify_once`]).
+/// alone drops ([`classify_once`]). A triple that maps to no axiom stops the read and
+/// sets `unmapped`.
 pub(super) fn dropped_assertions<'o>(
     o: &'o Opened,
     opts: &'o QueryOptions,
+    unmapped: &'o Cell<bool>,
 ) -> impl FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'o {
     move |f| {
-        o.assertions(opts, |ax, _, _| Ok(ax.is_none_or(|ax| f(&ax.kind))))
-            .is_ok()
+        o.assertions(opts, |ax, _, _| {
+            Ok(match ax {
+                Some(ax) => f(&ax.kind),
+                None => {
+                    unmapped.set(true);
+                    false
+                }
+            })
+        })
+        .is_ok()
     }
 }
 
@@ -817,6 +857,8 @@ pub(super) fn dropped_assertions<'o>(
 ///
 /// The modules' pass ([`Classification::cover`]) runs after the saturation under the same
 /// bounds, with the `dropped` axioms, and answers the one of them it reports as left out.
+/// The triples that `unmapped` then counts are left out too.
+#[allow(clippy::too_many_arguments)]
 fn run(
     k: &mut Saturation,
     axioms: &[&AxiomKind],
@@ -825,6 +867,7 @@ fn run(
     opts: &QueryOptions,
     c: &ClassifyRequest,
     dropped: Option<&mut Dropped<'_>>,
+    unmapped: &dyn Fn() -> usize,
 ) -> Result<(Classification, Option<Excluded>)> {
     bounded(par, opts, |limits| {
         let limits = Limits {
@@ -837,6 +880,7 @@ fn run(
         };
         let mut out = k.classify(axioms, changes, &limits)?;
         let witness = out.cover(axioms, k.excluded(), dropped, &limits);
+        out.leave_out_unmapped(unmapped());
         Ok((out, witness))
     })
 }
