@@ -113,13 +113,15 @@ the run finds unsatisfiable, or in a world whose class has no instance, is not r
 data unions or enumerations, which the Horn tier now decides. A cover over the values of
 a property that gives different classes, a key over a checker property and a universal
 or maximum data restriction on the left are reported as used in part, and item 768 takes
-them in Tier D and the rooted run. HermiT 1.4.5 gives the checker's answer on 34 of the
-35 claims of the 22 test ontologies checked against it. The other is a
+them in Tier D and the rooted run. On 21 of the wiring tests' ontologies HermiT 1.4.5
+gives 32 of the 33 answers that the tests pin, and it derives the subsumption whose cover
+a world reports as used in part. The other answer is a
 `NegativeDataPropertyAssertion` of `"3"^^xsd:integer` beside the assertion of
 `"3"^^xsd:int`, which HermiT finds consistent, while it finds the same negation written as
 a class assertion of a complement inconsistent, as the shared numeric value space of
 OWL 2 requires. Item 1303 records that one axiom needing case analysis sends an ontology
-to Tier D, which leaves out every data axiom.
+whose data properties occur only outside OWL 2 EL to Tier D, which leaves out every data
+axiom.
 
 Item 1256 changes the invalidation of a run kept by the EL rules. It recomputed what
 every kept context takes from the index and read every subsumer of every context with

@@ -1240,9 +1240,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   metrology library do. The disjunctive rules take no data properties, so a case
   analysis over data values, a key over a data property that the datatype checker takes and
   a universal or maximum data restriction on the left are used in part. Roadmap item 768.
-  One axiom that needs case analysis sends an ontology to the disjunctive rules, which then
-  leave out every data axiom that the Horn rules would decide through the datatype
-  checker. Roadmap item 1303.
+  When an ontology's data properties occur only in axioms outside OWL 2 EL, one axiom that
+  needs case analysis sends it to the disjunctive rules, which then leave out every data
+  axiom that the Horn rules would decide through the datatype checker. Roadmap item 1303.
 * A lenient read maps no axiom for an `owl:AllDisjointClasses` with an undeclared member
   and reports no warning. Roadmap item 973. The `all-disjoint-classes` check of
   `sparkles infer --check` passes its intermediate-row limit on a 55-member list with a
