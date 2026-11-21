@@ -12,10 +12,13 @@ runs in its own process, which discovers the whole suite again, checks that its 
 the recorded one, and runs one top-level entry exactly as discovered. So every module is
 imported in every unit, as in serial discovery, and load_tests hooks, import errors and
 import-time skips, custom suites and class and module fixtures behave as they do serially.
-An entry made only of default suites with no test does nothing and gets no process. When a
-test class runs in more than one entry, as when one test module imports another's class,
-its occurrences can share state, so the whole suite runs in one process instead, and the
-runner says why.
+An entry made only of default suites with no test does nothing and gets no process. The
+whole suite runs in one process instead, and the runner says why, when test classes of one
+module run in more than one entry, as when one test module imports another's class, since
+they can share that module's state, or when any entry has a suite of a kind of its own,
+since its run() can depend on everything run before it. State that test modules share in
+some other way, such as through a helper module's globals, is not detected, so a test that
+depends on another module's tests having run first can pass here and fail serially.
 
 A module named with --split runs one process per test instead, for modules whose few tests
 take most of the suite's time. The split is taken only when the module's entry is plain,
@@ -186,7 +189,7 @@ def discover(directory):
         u["inert"] = _inert(entry)
     exports = sorted(m for m in set(sys.modules) - before
                      if callable(getattr(sys.modules[m], "parallel_export", None)))
-    return entries, {"units": units, "exports": exports, "serial": _shared(entries)}
+    return entries, {"units": units, "exports": exports, "serial": _shared(entries, units)}
 
 
 def _inert(node):
@@ -194,20 +197,35 @@ def _inert(node):
     return type(node) is unittest.TestSuite and all(_inert(t) for t in node)
 
 
-def _shared(entries):
-    """Why the entries cannot run in separate processes, or None. A test class that runs in
-    more than one entry, as when one test module imports another's class, can share state
-    and fixtures between its occurrences, which only one process keeps."""
+def _shared(entries, units):
+    """Why the entries cannot run in separate processes, or None. Test classes of one module
+    that run in more than one entry, as when one test module imports another's class, can
+    share that module's state and fixtures, which only one process keeps. A suite of a kind
+    of its own can depend on the result of everything run before it."""
     where = {}
     for i, entry in enumerate(entries):
         for t in _leaves(entry):
-            cls = type(t)
-            if cls.__module__ == "unittest.loader":
-                continue
-            where.setdefault(f"{cls.__module__}.{cls.__qualname__}", set()).add(i)
-    for name, found in where.items():
+            module = type(t).__module__
+            if module != "unittest.loader":
+                where.setdefault(module, set()).add(i)
+
+    def custom(node):
+        if isinstance(node, unittest.TestSuite):
+            if type(node) is not unittest.TestSuite:
+                return type(node)
+            for t in node:
+                kind = custom(t)
+                if kind:
+                    return kind
+        return None
+
+    for module, found in where.items():
         if len(found) > 1:
-            return f"{name} runs in {len(found)} top-level entries"
+            return f"test classes of {module} run in {len(found)} top-level entries"
+    for u, entry in zip(units, entries):
+        kind = custom(entry)
+        if kind:
+            return f"{u['label']} has a suite of kind {kind.__module__}.{kind.__qualname__}"
     return None
 
 
@@ -599,10 +617,14 @@ def supervise(a, workdir, active):
                 absorbed.setdefault(m, []).append((job.name, value))
 
     not_started = []
+    halted = []
 
     def drain(queue, absorb_for):
+        if halted:
+            not_started.extend(w[0] for w in queue)
+            return
         while queue or active:
-            while queue and len(active) < a.jobs:
+            while queue and len(active) < a.jobs and not halted:
                 _check_stop()
                 start(queue.pop(0), absorb_for())
             time.sleep(0.05)
@@ -614,6 +636,7 @@ def supervise(a, workdir, active):
                 for job in active:
                     job.timed_out = job in late
                     job.halted = job not in late
+                halted.append(True)
                 not_started.extend(w[0] for w in queue)
                 queue.clear()
                 stop_all({job.proc.pid: job.start for job in active}, a.grace)
@@ -626,7 +649,7 @@ def supervise(a, workdir, active):
 
     drain(list(first), lambda: "")
     absorb_path = ""
-    if not_started:
+    if halted:
         not_started.extend(w[0] for w in last)
         last = []
     if last:

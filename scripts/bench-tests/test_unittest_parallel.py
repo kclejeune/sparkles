@@ -246,7 +246,7 @@ class Discovery(Base):
         d = self.suite(test_a=FAIL, test_b="from test_a import B\n")
         s, p = self.same_verdict(d, expect=1)
         self.assertIn("failures=2", s.stderr)
-        self.assertIn("the whole suite runs in one process, since test_a.B runs in 2", p.stdout)
+        self.assertIn("the whole suite runs in one process, since test classes of test_a run in 2", p.stdout)
         self.assertIn("failed: the whole suite", p.stdout)
 
     def test_an_imported_class_keeps_its_state_across_occurrences(self):
@@ -263,6 +263,48 @@ class Discovery(Base):
             """, test_b="from test_a import A\n", test_c=ONE)
         self.same_verdict(d, expect=1)
         self.same_verdict(d, "--jobs", "1", expect=1)
+
+    def test_classes_of_one_module_share_its_state_across_modules(self):
+        d = self.suite(shared="""
+            import unittest
+
+            COUNT = []
+
+            class A(unittest.TestCase):
+                def test_a(self):
+                    COUNT.append(1)
+                    self.assertEqual(len(COUNT), 1)
+
+            class B(unittest.TestCase):
+                def test_b(self):
+                    COUNT.append(1)
+                    self.assertEqual(len(COUNT), 1)
+            """, test_one="from shared import A\n", test_two="from shared import B\n")
+        self.same_verdict(d, expect=1)
+
+    def test_a_custom_suite_sees_the_tests_run_before_it(self):
+        d = self.suite(test_a=ONE, test_gen="""
+            import unittest
+
+            class Checking(unittest.TestSuite):
+                def run(self, result, debug=False):
+                    if result.testsRun > 0:
+                        result.addError(self, (RuntimeError, RuntimeError("ran after others"), None))
+                    return result
+
+                def id(self):
+                    return "test_gen.Checking"
+
+                def __str__(self):
+                    return "test_gen.Checking"
+
+                def shortDescription(self):
+                    return None
+
+            def load_tests(loader, tests, pattern):
+                return Checking()
+            """)
+        self.same_verdict(d, expect=1)
 
     def test_an_empty_custom_suite_still_runs(self):
         d = self.suite(test_a=ONE, test_gen="""
@@ -348,7 +390,7 @@ class Discovery(Base):
                 return Ready(loader.loadTestsFromTestCase(T))
             """)
         s, p = self.same_verdict(d, "--split", "test_custom", expect=0)
-        self.assertIn("--split test_custom runs whole", p.stdout)
+        self.assertIn("the whole suite runs in one process, since test_custom has a suite of kind", p.stdout)
 
     def test_a_split_module_with_a_class_fixture_runs_whole(self):
         d = self.suite(test_fix="""
@@ -682,6 +724,26 @@ class Deadlines(Base):
         p = self.run_runner("--jobs", "1", "--unit-timeout", "4", "--grace", "1", str(d), timeout=60)
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("not started after a deadline: test_mark", p.stdout)
+        self.assertFalse(marker.exists())
+        self.assert_owned_gone(3)
+
+    def test_a_deadline_also_holds_back_the_absorbing_units(self):
+        marker = self.pids.parent / f"{self.pids.name}-marker"
+        self.addCleanup(lambda: marker.unlink(missing_ok=True))
+        d = self.suite(test_hang=HANG.format(pids=str(self.pids)), test_zz_last=f"""
+            import unittest
+            from pathlib import Path
+
+            def parallel_absorb(exports):
+                pass
+
+            class L(unittest.TestCase):
+                def test_mark(self):
+                    Path({str(marker)!r}).write_text("")
+            """)
+        p = self.run_runner("--unit-timeout", "4", "--grace", "1", str(d), timeout=60)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("not started after a deadline: test_zz_last", p.stdout)
         self.assertFalse(marker.exists())
         self.assert_owned_gone(3)
 
