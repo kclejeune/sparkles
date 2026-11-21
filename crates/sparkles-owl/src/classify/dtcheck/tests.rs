@@ -659,6 +659,10 @@ fn counting() {
     let mut p = P::new(1);
     p.min(0, 4_294_967_297, &dt("int"));
     assert_eq!(p.check(), Unsat);
+    // counts past the saturation of sizes are not decided
+    let mut p = P::new(1);
+    p.min(0, 10_000_000_000_000_000_000, &dt("double"));
+    assert_eq!(p.check(), Unknown(super::solve::Why::Uncounted));
     // a subproperty's values count for its superproperty
     let mut p = P::new(2);
     p.p.props[0].supers.push(1);

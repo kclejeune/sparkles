@@ -238,6 +238,18 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
     if np > b.props {
         return Answer::Unknown(Why::Bound);
     }
+    // Sizes saturate at 2^63, which is exact only while the counts asked for stay below
+    // it. The model's cardinalities are 32-bit, so only a caller's own numbers reach it.
+    let demand: u128 = p
+        .atoms
+        .iter()
+        .map(|a| match *a {
+            Atom::AtLeast(_, n, _) | Atom::AtMost(_, n, _) => u128::from(n) + 1,
+        })
+        .sum();
+    if demand >= CAP {
+        return Answer::Unknown(Why::Uncounted);
+    }
     // upward closure of the hierarchy
     let mut up: Vec<u64> = (0..np).map(|i| 1u64 << i).collect();
     loop {

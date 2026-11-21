@@ -3890,17 +3890,21 @@ of the string, URI and binary families cut their sets of lengths, counted in cha
 for strings and in octets for binary data, and `rdf:langRange` keeps the tags that a
 basic language range matches. The `pattern` facet needs an automaton for an XML Schema
 regular expression, which the first phases do not build. Until a later item builds it, a
-range with a pattern is an opaque atom below its datatype, as an unknown datatype is
-today, and its axiom is reported as used in part.
+range with a pattern, like an unknown datatype, is not passed to the checker, and its
+axiom is left out and reported as used in part.
 
-**Sizes.** Every range has a size, the number of its values saturating at 2^63. A
+**Sizes.** Every range has a size, the number of its values saturating at 2^63, given as
+a lower and an upper bound. The model's cardinalities are 32-bit numbers, so their sums
+stay far below the saturation, and the checker declines a problem whose counts reach it. A
 bounded interval of the integer stratum, every range of the floating-point and Boolean
 families and every finite set of values have finite sizes. An interval of a dense stratum of the reals is empty when it holds no value of
 the stratum, one value when it is a point of the stratum, such as `xsd:decimal[≥0.5,
 ≤0.5]`, and infinite otherwise, so `owl:real[≥1/3, ≤1/3]` without `owl:rational` is
 empty. The seconds of a date-time are a decimal of unbounded precision, so an interval
 of instants is infinite unless it is one instant, which has one value for each of the
-1,681 offsets from `-14:00` to `+14:00`. The cells of the string chain are small at short lengths. The empty string is
+1,681 offsets from `-14:00` to `+14:00`. A length of `xsd:anyURI` holds at least the strings of ASCII letters of that
+length, which are relative IRIs, and at most every string of it, since XML Schema 1.1
+makes every string a value and OWL 2 §4.6 calls the value space the set of IRIs. The cells of the string chain are small at short lengths. The empty string is
 the only string of length 0, `normalizedString` without `token` holds only the space at
 length 1, `string` without `normalizedString` holds three strings of length 1, and
 `language` holds 52 of length 1 and caps each subtag at 8 characters. The checker counts
@@ -3917,9 +3921,10 @@ XML Schema 1.1 allows, and item 1301 corrects it for the other readers. A litera
 lexical space of its datatype violates §5.7, so the ontology is not in OWL 2 DL and the
 Direct Semantics gives the literal no value. Reading it as the empty range would draw
 entailments from an input the semantics does not define, since its complement would hold
-every value and a negative assertion with it would say nothing. Such a literal therefore
-stays an opaque atom that only equals itself, as do an XML literal and a literal of a
-datatype outside the map, and their axioms are reported as used in part.
+every value and a negative assertion with it would say nothing. Such a literal is
+therefore never passed to the checker, nor is an XML literal or a literal of a
+datatype outside the map, since the checker cannot tell which of them denote the same
+value. Their axioms are left out and reported as used in part.
 
 **Data restrictions are atoms.** Every data restriction of the ontology,
 `DataSomeValuesFrom`, `DataAllValuesFrom`, `DataHasValue`, `DataMinCardinality` and
@@ -4075,7 +4080,7 @@ the two tiers' subsumptions as the answer, since both are sound. The proof that 
 reaching no such context is complete is that phase's obligation before it is kept.
 
 **What stays out.** The `pattern` facet until its automaton is built, ill-typed literals,
-XML literals and datatypes outside the map stay opaque and are reported as used in part,
+XML literals and datatypes outside the map stay out of the checker and are reported as used in part,
 and so do cardinalities compared with string cells the checker has not counted. The top data
 property stays with the EL index and declines Tier D, as the top object property does.
 Keys outside the forced singleton case are reported as used in part.
