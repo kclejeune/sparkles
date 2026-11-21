@@ -178,7 +178,7 @@ fn classifier<'a>(
         ..c.clone()
     };
     move |kinds: &[&AxiomKind]| {
-        let (classification, excluded) = classify_once(kinds, &c, opts)?;
+        let (classification, excluded) = classify_once(kinds, &c, opts, None)?;
         if c.strict && !classification.complete {
             return Err(super::classify::strict_refusal(&classification, &excluded));
         }

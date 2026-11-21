@@ -40,7 +40,16 @@ fn cov(body: &str, classes: &[&str]) -> Coverage {
         .iter()
         .map(|c| Class::new(format!("http://e/#{c}")))
         .collect();
-    coverage(&all, &out, true, classes.iter(), usize::MAX, &|| false).unwrap()
+    coverage(
+        &all,
+        &out,
+        true,
+        classes.iter(),
+        usize::MAX,
+        &|| false,
+        None,
+    )
+    .unwrap()
 }
 
 fn names(c: &Coverage) -> Vec<String> {
@@ -136,7 +145,7 @@ fn an_inconsistent_run_is_complete() {
     let all: Vec<&AxiomKind> = all.iter().collect();
     let out: Vec<&AxiomKind> = out.iter().collect();
     let a = Class::new("http://e/#A");
-    let c = coverage(&all, &out, false, [&a], usize::MAX, &|| false).unwrap();
+    let c = coverage(&all, &out, false, [&a], usize::MAX, &|| false, None).unwrap();
     assert!(c.consistency_known && c.incomplete.is_empty());
 }
 
@@ -147,7 +156,7 @@ fn a_left_out_axiom_that_is_not_given_leaves_everything_unknown() {
     let all: Vec<&AxiomKind> = all.iter().collect();
     let out: Vec<&AxiomKind> = out.iter().collect();
     let a = Class::new("http://e/#A");
-    let c = coverage(&all, &out, true, [&a], usize::MAX, &|| false).unwrap();
+    let c = coverage(&all, &out, true, [&a], usize::MAX, &|| false, None).unwrap();
     assert!(!c.consistency_known);
     assert_eq!(c.incomplete, [a]);
 }
@@ -235,7 +244,13 @@ fn top_locality_keeps_what_every_pair_and_everything_break() {
     assert!(!local(
         "SubClassOf(:A ObjectSomeValuesFrom(owl:bottomObjectProperty :B))"
     ));
-    assert!(!local("DataPropertyAssertion(:d :a \"x\")"));
+    // the universal data property gives every element every value, which an ill-typed
+    // literal does not have
+    assert!(local("DataPropertyAssertion(:d :a \"x\")"));
+    assert!(local("DataPropertyAssertion(:d :a \"x\"@en)"));
+    assert!(!local(
+        "DataPropertyAssertion(:d :a \"x\"^^<http://www.w3.org/2001/XMLSchema#integer>)"
+    ));
     assert!(!local("NegativeObjectPropertyAssertion(:r :a :b)"));
     assert!(!local("DifferentIndividuals(:a :b)"));
 }
@@ -250,7 +265,7 @@ fn past_its_bound_the_pass_leaves_the_undecided_classes_incomplete() {
         .map(|c| Class::new(format!("http://e/#{c}")))
         .collect();
     for budget in 0..64 {
-        let c = coverage(&all, &out, true, classes.iter(), budget, &|| false).unwrap();
+        let c = coverage(&all, &out, true, classes.iter(), budget, &|| false, None).unwrap();
         // whatever the bound, the classes called complete are a subset of the exact ones
         let exact = ["Ans", "D1", "D2"];
         for k in &classes {
@@ -265,7 +280,7 @@ fn past_its_bound_the_pass_leaves_the_undecided_classes_incomplete() {
             assert!(c.incomplete.len() >= 2, "{budget}: {c:?}");
         }
     }
-    let c = coverage(&all, &out, true, classes.iter(), 0, &|| false).unwrap();
+    let c = coverage(&all, &out, true, classes.iter(), 0, &|| false, None).unwrap();
     assert!(c.over_budget && !c.consistency_known && c.incomplete.len() == 5);
     // a caller's stop ends the pass with an error
     let many: Vec<AxiomKind> = (0..10_000)
@@ -279,7 +294,15 @@ fn past_its_bound_the_pass_leaves_the_undecided_classes_incomplete() {
     let mut with: Vec<&AxiomKind> = many.iter().collect();
     with.extend(all.iter().copied());
     assert_eq!(
-        coverage(&with, &out, true, classes.iter(), usize::MAX, &|| true),
+        coverage(
+            &with,
+            &out,
+            true,
+            classes.iter(),
+            usize::MAX,
+            &|| true,
+            None
+        ),
         Err(Stopped)
     );
 }
@@ -360,4 +383,299 @@ fn the_fast_extraction_is_the_plain_fixpoint() {
         }
     }
     assert!(compared > 5000, "{compared}");
+}
+
+/// The coverage of a body whose lines marked `#drop` the run was not given at all, and
+/// the reference: one pass over the whole body with those lines left out.
+fn cov_drop(body: &str, classes: &[&str]) -> (Coverage, Coverage) {
+    let mut taken = String::new();
+    let mut whole = String::new();
+    let mut drop = String::new();
+    for line in body.lines() {
+        match line.trim().strip_suffix("#drop") {
+            Some(l) => {
+                whole.push_str(&format!("{l} #out\n"));
+                drop.push_str(&format!("{l}\n"));
+            }
+            None => {
+                taken.push_str(&format!("{line}\n"));
+                whole.push_str(&format!("{line}\n"));
+            }
+        }
+    }
+    let (t_all, t_out) = read(&taken);
+    let (w_all, w_out) = read(&whole);
+    let (d, _) = read(&drop);
+    let classes: Vec<Class> = classes
+        .iter()
+        .map(|c| Class::new(format!("http://e/#{c}")))
+        .collect();
+    let refs = |v: &[AxiomKind]| -> Vec<AxiomKind> { v.to_vec() };
+    let (t_all, t_out, w_all, w_out) = (refs(&t_all), refs(&t_out), refs(&w_all), refs(&w_out));
+    let mut stream = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+        for k in &d {
+            if !f(k) {
+                break;
+            }
+        }
+        true
+    };
+    let mine = coverage(
+        &t_all.iter().collect::<Vec<_>>(),
+        &t_out.iter().collect::<Vec<_>>(),
+        true,
+        classes.iter(),
+        usize::MAX,
+        &|| false,
+        Some(&mut stream),
+    )
+    .unwrap();
+    let reference = coverage(
+        &w_all.iter().collect::<Vec<_>>(),
+        &w_out.iter().collect::<Vec<_>>(),
+        true,
+        classes.iter(),
+        usize::MAX,
+        &|| false,
+        None,
+    )
+    .unwrap();
+    assert_eq!(mine.consistency_known, reference.consistency_known);
+    assert!(
+        reference
+            .incomplete
+            .iter()
+            .all(|c| mine.incomplete.contains(c)),
+        "{:?} misses some of {:?}",
+        mine.incomplete,
+        reference.incomplete
+    );
+    (mine, reference)
+}
+
+#[test]
+fn positive_assertions_not_read_change_no_answer() {
+    let (c, r) = cov_drop(
+        "
+        SubClassOf(:A :B)
+        SubClassOf(:B ObjectSomeValuesFrom(:r :C))
+        ClassAssertion(:A :x) #drop
+        ObjectPropertyAssertion(:r :x :y) #drop
+        DataPropertyAssertion(:d :x \"7\"^^<http://www.w3.org/2001/XMLSchema#integer>) #drop
+        ",
+        &["A", "B", "C"],
+    );
+    assert!(c.consistency_known && c.dropped.is_none(), "{c:?}");
+    assert!(c.incomplete.is_empty() && r.incomplete.is_empty());
+}
+
+#[test]
+fn assertions_not_read_that_meet_a_disjointness_count_as_left_out() {
+    let (c, _) = cov_drop(
+        "
+        DisjointClasses(:Cell :Organelle)
+        ClassAssertion(:Cell :x) #drop
+        ClassAssertion(:Organelle :x) #drop
+        ",
+        &["Cell", "Organelle"],
+    );
+    assert!(!c.consistency_known, "{c:?}");
+    assert!(c.dropped.is_some());
+    assert_eq!(names(&c), ["Cell", "Organelle"]);
+}
+
+#[test]
+fn an_ill_typed_value_not_read_counts_as_left_out() {
+    let (c, _) = cov_drop(
+        "
+        SubClassOf(:A :B)
+        DataPropertyAssertion(:d :x \"seven\"^^<http://www.w3.org/2001/XMLSchema#integer>) #drop
+        ",
+        &["A", "B"],
+    );
+    assert!(!c.consistency_known && c.dropped.is_some(), "{c:?}");
+}
+
+#[test]
+fn assertions_not_read_with_a_nominal_in_the_terminology_count_as_left_out() {
+    let (c, _) = cov_drop(
+        "
+        SubClassOf(:A ObjectHasValue(:r :o))
+        SubClassOf(:B :C)
+        ClassAssertion(:B :o) #drop
+        ",
+        &["A", "B", "C"],
+    );
+    assert!(c.consistency_known && c.dropped.is_some(), "{c:?}");
+    assert_eq!(names(&c), ["A", "B", "C"]);
+}
+
+#[test]
+fn the_universal_property_in_an_assertion_not_read_counts_it_as_left_out() {
+    let (c, _) = cov_drop(
+        "
+        SubClassOf(:A :B)
+        ObjectPropertyAssertion(owl:topObjectProperty :x :y) #drop
+        ",
+        &["A", "B"],
+    );
+    assert!(c.dropped.is_some(), "{c:?}");
+    assert_eq!(names(&c), ["A", "B"]);
+}
+
+#[test]
+fn annotations_not_read_are_no_content() {
+    let (c, _) = cov_drop(
+        "
+        DisjointClasses(:A :B)
+        AnnotationAssertion(rdfs:label :x \"x\") #drop
+        ",
+        &["A", "B"],
+    );
+    assert_eq!(
+        c,
+        Coverage {
+            consistency_known: true,
+            ..Coverage::default()
+        }
+    );
+}
+
+#[test]
+fn assertions_not_read_beside_a_left_out_axiom_keep_its_layers() {
+    // the irl1 case read as its terminology: K's module holds the left-out union, and
+    // the assertion of K is positive
+    let body = IRL1.replace("ClassAssertion(:K :a)", "ClassAssertion(:K :a) #drop");
+    let (c, r) = cov_drop(&body, &["K", "S", "Ans", "D1", "D2"]);
+    assert!(c.consistency_known && c.dropped.is_none(), "{c:?}");
+    assert_eq!(c.incomplete, r.incomplete);
+}
+
+#[test]
+fn a_stream_that_stops_stops_the_pass() {
+    let (all, out) = read("SubClassOf(:A :B) #out\nSubClassOf(:B :C)");
+    let all: Vec<&AxiomKind> = all.iter().collect();
+    let out: Vec<&AxiomKind> = out.iter().collect();
+    let a = Class::new("http://e/#A");
+    let x = crate::ofn_read::parse(
+        "Prefix(:=<http://e/#>)\nOntology(<http://e/o>\nClassAssertion(:A :x)\n)",
+    )
+    .unwrap()
+    .axioms;
+    let mut stream = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+        f(&x[0].kind);
+        false
+    };
+    let r = coverage(
+        &all,
+        &out,
+        true,
+        [&a],
+        usize::MAX,
+        &|| false,
+        Some(&mut stream),
+    );
+    assert_eq!(r, Err(Stopped));
+}
+
+/// Over the 640 cases of roadmap item 603, a pass that streams each case's assertions as
+/// axioms the run was not given agrees with one pass over the whole case that leaves the
+/// assertions out, with and without a left-out axiom of the terminology.
+#[test]
+fn assertions_not_read_agree_with_a_pass_over_the_whole_case() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl603");
+    let mut cases: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".ofn") && n.matches('.').count() == 1)
+        })
+        .collect();
+    cases.sort();
+    let (mut compared, mut counted, mut wider) = (0usize, 0usize, 0usize);
+    for case in &cases {
+        let doc = crate::ofn_read::parse(&std::fs::read_to_string(case).unwrap()).unwrap();
+        let is_drop = |k: &AxiomKind| assertion_or_key(k) && !matches!(k, AxiomKind::HasKey(..));
+        let d: Vec<&AxiomKind> = doc
+            .axioms
+            .iter()
+            .map(|a| &a.kind)
+            .filter(|k| is_drop(k))
+            .collect();
+        if d.is_empty() {
+            continue;
+        }
+        let t: Vec<&AxiomKind> = doc
+            .axioms
+            .iter()
+            .map(|a| &a.kind)
+            .filter(|k| !is_drop(k))
+            .collect();
+        let classes: Vec<Class> = doc
+            .axioms
+            .iter()
+            .filter_map(|a| match &a.kind {
+                AxiomKind::Declaration(Entity::Class(c)) => Some(c.clone()),
+                _ => None,
+            })
+            .collect();
+        let first_logical = t.iter().copied().find(|k| Index::indexed(k));
+        for l in [None, first_logical] {
+            let left: Vec<&AxiomKind> = l.into_iter().collect();
+            let mut stream = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+                for k in &d {
+                    if !f(k) {
+                        break;
+                    }
+                }
+                true
+            };
+            let mine = coverage(
+                &t,
+                &left,
+                true,
+                classes.iter(),
+                usize::MAX,
+                &|| false,
+                Some(&mut stream),
+            )
+            .unwrap();
+            let mut whole_left = left.clone();
+            whole_left.extend(d.iter().copied());
+            let mut whole = t.clone();
+            whole.extend(d.iter().copied());
+            let reference = coverage(
+                &whole,
+                &whole_left,
+                true,
+                classes.iter(),
+                usize::MAX,
+                &|| false,
+                None,
+            )
+            .unwrap();
+            let at = format!("{}, left out {:?}", case.display(), l);
+            assert_eq!(mine.consistency_known, reference.consistency_known, "{at}");
+            assert!(
+                reference
+                    .incomplete
+                    .iter()
+                    .all(|c| mine.incomplete.contains(c)),
+                "{at}"
+            );
+            if mine.dropped.is_none() {
+                assert_eq!(mine.incomplete, reference.incomplete, "{at}");
+            } else {
+                counted += 1;
+            }
+            if mine.incomplete != reference.incomplete {
+                wider += 1;
+            }
+            compared += 1;
+        }
+    }
+    assert!(compared > 100, "{compared}");
+    eprintln!("{compared} compared, {counted} counted the assertions, {wider} wider");
 }

@@ -415,6 +415,20 @@ def test_classify(ds: sparkles.Dataset) -> None:
     ]
 
 
+def test_classify_strict_refuses_what_it_leaves_out(ds: sparkles.Dataset) -> None:
+    # a maximum of two needs counting, which the classifier leaves out
+    ds.update(
+        f"{PREFIXES} INSERT DATA {{ :X rdfs:subClassOf [ a owl:Restriction ; "
+        "owl:onProperty :teaches ; owl:maxCardinality 2 ] . }"
+    )
+    r = ds.ontology.classify()
+    assert not r["complete"] and r["completeForTaken"] and not r["partial"]
+    assert r["excludedCount"] >= 1
+    with pytest.raises(sparkles.UnsupportedError) as e:
+        ds.ontology.classify(strict=True)
+    assert "maxCardinality" in str(e.value) or "ObjectMaxCardinality" in str(e.value)
+
+
 def cases(n: int, inconsistent: bool) -> str:
     """Item 603's cases, as the Rust tests write them: a classification that the
     disjunctive rules take, long enough that a deadline stops it part way."""

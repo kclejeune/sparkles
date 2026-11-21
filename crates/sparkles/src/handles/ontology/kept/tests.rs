@@ -1392,3 +1392,34 @@ fn raw_and_structured_kept_selectors_reject_duplicates_overflow_and_inferences()
     empty_slot(&ds);
     assert!(ds.state().ontology_cache.lock().is_empty());
 }
+
+/// A kept classification whose modules' pass the deadline stopped answers with every
+/// class incomplete but publishes nothing, and keeps its saturation, so the next request
+/// takes the pass again without saturating from the start.
+#[test]
+fn a_stopped_coverage_pass_keeps_the_saturation_and_publishes_nothing() {
+    let ds = ds(":A a owl:Class ; rdfs:subClassOf :B . :B a owl:Class .");
+    super::super::classify::FORCE_COVERAGE_STOP.with(|f| f.set(true));
+    let first = ds
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    assert!(first.classification.stats.coverage_stopped);
+    assert!(!first.classification.complete && first.classification.complete_for_taken);
+    assert!(!first.retained && !first.reused);
+    let second = ds
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    assert!(!second.reused, "a stopped pass is never published");
+    assert!(
+        second.classification.stats.incremental,
+        "the saturation was kept"
+    );
+    assert!(second.classification.complete && second.retained);
+    let third = ds
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    assert!(third.reused);
+}

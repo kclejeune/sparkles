@@ -238,6 +238,9 @@ pub struct Limits {
     /// decided are incomplete ([`Stats::coverage_over`]); by default
     /// [`COVERAGE_WORK_PER_AXIOM`] for each axiom of the input
     pub coverage_work: Option<usize>,
+    /// leave the modules' pass to the caller, which calls [`Classification::cover`]
+    /// after the run with the axioms it did not give the run as well
+    pub cover_later: bool,
     /// the expansion strategy of Tier D's Succ rule
     pub expansion: Expansion,
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
@@ -357,6 +360,7 @@ impl Default for Limits {
             strict: false,
             coverage: true,
             coverage_work: None,
+            cover_later: false,
             expansion: Expansion::default(),
             dl_work: None,
             dl_attempt_work: None,
@@ -455,6 +459,9 @@ pub struct Stats {
     /// the modules' pass passed its bound on work ([`Limits::coverage_work`]), so the
     /// classes it had not decided are incomplete
     pub coverage_over: bool,
+    /// the deadline or a cancellation stopped the modules' pass, so every class is
+    /// incomplete and the consistency unknown
+    pub coverage_stopped: bool,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
     pub outside_el: OutsideEl,
@@ -592,37 +599,53 @@ impl Classification {
         }
     }
 
-    /// Takes account of the axioms the run over `axioms` left out or used only in part:
-    /// the answer is not complete for the whole ontology, and the classes whose module
-    /// holds one of them, or every class when the consistency is no longer known, join
-    /// [`incomplete`](Classification::incomplete). Costs nothing when nothing is left
-    /// out.
-    fn cover(
+    /// Takes account of the axioms the run over `axioms` left out or used only in part
+    /// (`excluded`) and of those of the ontology it was not given at all (`dropped`, such
+    /// as the assertions of a classification of the terminology alone): the answer is not
+    /// complete for the whole ontology when one is left out, and the classes whose module
+    /// holds one, or every class when the consistency is no longer known, join
+    /// [`incomplete`](Classification::incomplete). The dropped axioms count as left out
+    /// only when they could change an answer, and then the answer names one of them,
+    /// for the caller to report beside `excluded`. A run takes this pass itself unless
+    /// [`Limits::cover_later`] leaves it to its caller. Costs nothing when nothing is left
+    /// out or dropped.
+    ///
+    /// A pass that its deadline or cancellation stops leaves every class incomplete and
+    /// the consistency unknown, with [`Stats::coverage_stopped`] set, rather than throw
+    /// away the saturation: such an answer depends on timing.
+    pub fn cover(
         &mut self,
         axioms: &[&AxiomKind],
         excluded: &[Excluded],
+        dropped: Option<&mut crate::transform::Dropped<'_>>,
         limits: &Limits,
-    ) -> Result<(), Error> {
-        if excluded.is_empty() {
-            return Ok(());
+    ) -> Option<Excluded> {
+        if excluded.is_empty() && dropped.is_none() {
+            return None;
         }
-        self.complete = false;
+        if !excluded.is_empty() {
+            self.complete = false;
+        }
         let start = Instant::now();
         let left: Vec<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
         // an inconsistency is sound, and every class's answer is then complete
         if self.consistency == Consistency::Inconsistent {
-            return Ok(());
+            return None;
         }
         // A partial answer that left the consistency unknown has every class open, and
         // one that stopped is past its deadline, so neither takes the modules' pass,
         // and neither does a run that asks for none: every class is then incomplete.
         if self.consistency == Consistency::Unknown || !self.complete_for_taken || !limits.coverage
         {
-            self.all_incomplete();
-            if self.consistency == Consistency::Consistent {
-                self.consistency = Consistency::Unknown;
+            let witness = dropped.and_then(|d| first_logical(d));
+            if !excluded.is_empty() || witness.is_some() {
+                self.complete = false;
+                self.all_incomplete();
+                if self.consistency == Consistency::Consistent {
+                    self.consistency = Consistency::Unknown;
+                }
             }
-            return Ok(());
+            return witness.map(not_read);
         }
         let budget = limits.coverage_work.unwrap_or_else(|| {
             COVERAGE_WORK_PER_AXIOM
@@ -630,30 +653,39 @@ impl Classification {
                 .max(COVERAGE_WORK_MIN)
         });
         let stop = || poll(limits).is_err();
-        let Ok(c) = crate::transform::coverage(
+        let c = crate::transform::coverage(
             axioms,
             &left,
             self.consistency == Consistency::Consistent,
             by_depth(&self.taxonomy),
             budget,
             &stop,
-        ) else {
-            return poll(limits).and(Err(Error::Cancelled));
+            dropped,
+        );
+        self.stats.coverage = start.elapsed();
+        let Ok(c) = c else {
+            self.stats.coverage_stopped = true;
+            self.complete = false;
+            self.all_incomplete();
+            self.consistency = Consistency::Unknown;
+            return None;
         };
         if !c.consistency_known {
             self.consistency = Consistency::Unknown;
         }
-        self.stats.coverage = start.elapsed();
         self.stats.coverage_over = c.over_budget;
-        if c.incomplete.is_empty() {
-            return Ok(());
+        let witness = c.dropped.map(not_read);
+        if witness.is_some() {
+            self.complete = false;
         }
-        let mut all = std::mem::take(&mut self.incomplete);
-        all.extend(c.incomplete);
-        all.sort();
-        all.dedup();
-        self.incomplete = all;
-        Ok(())
+        if !c.incomplete.is_empty() {
+            let mut all = std::mem::take(&mut self.incomplete);
+            all.extend(c.incomplete);
+            all.sort();
+            all.dedup();
+            self.incomplete = all;
+        }
+        witness
     }
 
     /// Every class but owl:Thing and owl:Nothing incomplete, in IRI order.
@@ -672,6 +704,38 @@ impl Classification {
         all.sort();
         all.dedup();
         self.incomplete = all;
+    }
+}
+
+/// The first dropped axiom with logical content.
+fn first_logical(d: &mut crate::transform::Dropped<'_>) -> Option<AxiomKind> {
+    let mut first = None;
+    d(&mut |k| {
+        if logical(k) && !matches!(k, AxiomKind::Declaration(_)) {
+            first = Some(k.clone());
+            false
+        } else {
+            true
+        }
+    });
+    first
+}
+
+/// The rule of an axiom that a classification of the terminology alone did not read
+/// and that could change its answer ([`Classification::cover`]).
+pub const NOT_READ: &str = "assertion-not-read";
+
+/// A dropped axiom that counts as left out, as the run reports it.
+fn not_read(axiom: AxiomKind) -> Excluded {
+    Excluded {
+        axiom,
+        gap: Gap::Outside {
+            rule: NOT_READ.to_string(),
+            message: "the classification read the terminology alone, and the assertions it \
+                did not read could make the ontology inconsistent or change a class's \
+                answer through a nominal: classify with the assertions"
+                .to_string(),
+        },
     }
 }
 
@@ -1270,7 +1334,9 @@ impl Classifier {
                 .filter(|(_, h)| h.count > 0)
                 .map(|(k, _)| k)
                 .collect();
-            out.cover(&held, excluded, limits)?;
+            if !limits.cover_later {
+                out.cover(&held, excluded, None, limits);
+            }
         }
         Ok(out)
     }
@@ -1401,7 +1467,9 @@ impl Saturation {
             if limits.strict {
                 return Err(Error::Incomplete(self.excluded.clone()));
             }
-            out.cover(axioms, &self.excluded, limits)?;
+            if !limits.cover_later {
+                out.cover(axioms, &self.excluded, None, limits);
+            }
         }
         Ok(out)
     }
@@ -4524,6 +4592,54 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    /// A modules' pass that its cancellation stops answers with every class incomplete
+    /// and the consistency unknown, instead of failing a finished saturation.
+    #[test]
+    fn a_stopped_coverage_pass_answers_with_every_class_incomplete() {
+        let mut text = String::from("Prefix(:=<http://e/#>)\nOntology(<http://e/o>\n");
+        for i in 0..6000 {
+            text.push_str(&format!("SubClassOf(:A{i} :B{i})\n"));
+        }
+        text.push_str("SubClassOf(:X ObjectUnionOf(:Y :Z))\n)");
+        let doc = crate::ofn_read::parse(&text).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::new();
+        let limits = Limits {
+            el_only: true,
+            cover_later: true,
+            ..Limits::default()
+        };
+        let mut out = s.classify(&kinds, None, &limits).unwrap();
+        assert!(!s.excluded().is_empty());
+        assert!(
+            out.complete && out.incomplete.is_empty(),
+            "the pass is the caller's"
+        );
+        let stop = Limits {
+            cancelled: Some(Arc::new(|| true)),
+            ..limits.clone()
+        };
+        let witness = out.cover(&kinds, s.excluded(), None, &stop);
+        assert!(witness.is_none());
+        assert!(out.stats.coverage_stopped && !out.complete && out.complete_for_taken);
+        assert_eq!(out.consistency, Consistency::Unknown);
+        assert_eq!(out.incomplete.len(), 12003);
+        // the same pass, not stopped, decides the classes
+        let mut again = s.classify(&kinds, None, &limits).unwrap();
+        again.cover(&kinds, s.excluded(), None, &limits);
+        assert!(!again.stats.coverage_stopped && again.consistency == Consistency::Consistent);
+        assert!(
+            !again
+                .incomplete
+                .iter()
+                .any(|c| c.as_str() == "http://e/#A0"),
+            "{} incomplete, over {}, {:?}",
+            again.incomplete.len(),
+            again.stats.coverage_over,
+            again.incomplete.iter().take(5).collect::<Vec<_>>()
+        );
+    }
 
     /// Item 1231's scan counts against the run's budget. A scan that would pass the
     /// caller's memory budget, or that the pool refuses, ends the rooted run as past its

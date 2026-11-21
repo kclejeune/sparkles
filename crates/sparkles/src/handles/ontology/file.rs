@@ -53,6 +53,7 @@ use sparkles_owl::classify::{Classification, Excluded, logical};
 use sparkles_owl::ofn::Renderer;
 use sparkles_owl::profiles::{CheckOptions, Checker, Report};
 use sparkles_owl::read::{self, Mode, ReadOptions};
+use sparkles_owl::transform::Dropped;
 use sparkles_owl::{Axiom, AxiomKind, ClassExpression, Entity, ObjectPropertyExpression, vocab};
 use sparkles_reasoner::inputs::{GraphRef, Import, ImportMode, MAX_IMPORTS};
 use std::collections::{BTreeMap, BTreeSet};
@@ -379,7 +380,14 @@ impl OntologyFile {
             })?;
             axioms.extend(owned.iter().map(|a| &a.kind).filter(|k| logical(k)));
         }
-        let (classification, excluded) = classify_once(&axioms, c, &opts)?;
+        // a classification of the terminology alone counts the assertions it did not
+        // read as left out when they could change its answer
+        let mut dropped = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+            self.assertions(&opts, |ax, _| Ok(ax.is_none_or(|ax| f(&ax.kind))))
+                .is_ok()
+        };
+        let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
+        let (classification, excluded) = classify_once(&axioms, c, &opts, dropped)?;
         if c.strict && !classification.complete {
             return Err(super::classify::strict_refusal(&classification, &excluded));
         }

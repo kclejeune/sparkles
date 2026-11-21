@@ -1656,6 +1656,9 @@ pub fn classification_body(
         "indexMs": s.index.as_secs_f64() * 1000.0,
         "saturationMs": s.saturation.as_secs_f64() * 1000.0,
         "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
+        "coverageMs": s.coverage.as_secs_f64() * 1000.0,
+        "coverageOver": s.coverage_over,
+        "coverageStopped": s.coverage_stopped,
     });
     if q.nodes {
         let total = t.nodes().len();

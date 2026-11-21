@@ -55,6 +55,7 @@ use sparkles_owl::classify::{
     Changes, Classification, Excluded, Expansion, Limits, Saturation, logical,
 };
 use sparkles_owl::read::Mode;
+use sparkles_owl::transform::Dropped;
 use sparkles_owl::{
     AnnotationProperty, AnnotationValue, Axiom, AxiomKind, ClassExpression, Entity, vocab,
 };
@@ -344,7 +345,9 @@ impl Ontologies {
             }
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
-            let (out, excluded) = classify_once(&axioms, c, &opts)?;
+            let mut dropped = dropped_assertions(&o, &opts);
+            let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
+            let (out, excluded) = classify_once(&axioms, c, &opts, dropped)?;
             (
                 KeptClassification::capture(
                     self,
@@ -438,8 +441,9 @@ impl Ontologies {
             // Admission precedes mutation, so a refused admission preserves a proven
             // old entry/publication. Later errors conservatively discard both.
             let par = admit(c.threads, opts)?;
-            let out = e.run_over(o, Vec::new(), |s, axioms, changes| {
-                run(s, axioms, changes, par, opts, c)
+            let mut dropped = dropped_assertions(o, opts);
+            let (out, witness) = e.run_over(o, Vec::new(), |s, axioms, changes| {
+                run(s, axioms, changes, par, opts, c, Some(&mut dropped))
             })?;
             #[cfg(test)]
             let out = if FORCE_PARTIAL.with(|f| f.replace(false)) {
@@ -452,18 +456,34 @@ impl Ontologies {
             } else {
                 out
             };
+            #[cfg(test)]
+            let out = if FORCE_COVERAGE_STOP.with(|f| f.replace(false)) {
+                let mut stopped = out;
+                stopped.complete = false;
+                stopped.stats.coverage_stopped = true;
+                stopped.consistency = sparkles_owl::classify::Consistency::Unknown;
+                stopped.incomplete = stopped.taxonomy.classes().cloned().collect();
+                stopped
+            } else {
+                out
+            };
+            let mut excluded = e.saturation.excluded().to_vec();
+            excluded.extend(witness);
             let p = KeptClassification::capture(
                 self,
                 req,
                 c,
                 o,
                 Arc::new(out),
-                Arc::new(e.saturation.excluded().to_vec()),
+                Arc::new(excluded),
                 opts,
             )?;
             let keep = p.classification.complete_for_taken
                 && classification_retained_bytes(e, &p) <= retention_cap();
-            e.result = keep.then(|| p.clone());
+            // A modules' pass that the deadline stopped answers by timing, so the next
+            // request takes the pass again over the kept saturation.
+            let publish = keep && !p.classification.stats.coverage_stopped;
+            e.result = publish.then(|| p.clone());
             Ok(((p, false), keep))
         })
     }
@@ -704,6 +724,9 @@ thread_local! {
     pub(super) static FORCE_PARTIAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(super) static FLIGHT_WAIT_NOTIFY: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
     pub(super) static REFUSE_ADMISSION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Makes the next kept classification on this thread answer as one whose modules'
+    /// pass the deadline stopped.
+    pub(super) static FORCE_COVERAGE_STOP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The threads of a classification, from the algorithm pool. A caller takes them before
@@ -721,20 +744,42 @@ pub(super) fn admit(threads: usize, opts: &QueryOptions) -> Result<Par> {
 /// A classification of `axioms` by a saturation of its own, on the threads `c` asks the
 /// algorithm pool for and under the deadline, cancellation and memory budget of `opts`,
 /// with the axioms it left out or used in part.
+///
+/// `dropped` streams the axioms of the ontology that `axioms` leaves out, such as the
+/// assertions of a classification of the terminology alone, which count as left out
+/// when they could change the answer ([`Classification::cover`]).
 pub(crate) fn classify_once(
     axioms: &[&AxiomKind],
     c: &ClassifyRequest,
     opts: &QueryOptions,
+    dropped: Option<&mut Dropped<'_>>,
 ) -> Result<(Classification, Vec<Excluded>)> {
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
-    let out = run(&mut s, axioms, None, par, opts, c)?;
-    Ok((out, s.excluded().to_vec()))
+    let (out, witness) = run(&mut s, axioms, None, par, opts, c, dropped)?;
+    let mut excluded = s.excluded().to_vec();
+    excluded.extend(witness);
+    Ok((out, excluded))
+}
+
+/// The assertions of an open ontology, as the axioms a classification of its terminology
+/// alone drops ([`classify_once`]).
+pub(super) fn dropped_assertions<'o>(
+    o: &'o Opened,
+    opts: &'o QueryOptions,
+) -> impl FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'o {
+    move |f| {
+        o.assertions(opts, |ax, _, _| Ok(ax.is_none_or(|ax| f(&ax.kind))))
+            .is_ok()
+    }
 }
 
 /// Runs a classification on the threads of `par` under the options' deadline,
 /// cancellation and memory budget, with the rules, the partial answer and the expansion
 /// strategy that `c` asks for.
+///
+/// The modules' pass ([`Classification::cover`]) runs after the saturation under the same
+/// bounds, with the `dropped` axioms, and answers the one of them it reports as left out.
 fn run(
     k: &mut Saturation,
     axioms: &[&AxiomKind],
@@ -742,16 +787,20 @@ fn run(
     par: Par,
     opts: &QueryOptions,
     c: &ClassifyRequest,
-) -> Result<Classification> {
+    dropped: Option<&mut Dropped<'_>>,
+) -> Result<(Classification, Option<Excluded>)> {
     bounded(par, opts, |limits| {
         let limits = Limits {
             el_only: c.el_only,
             partial: c.partial,
             expansion: c.expansion,
             coverage: !c.skip_coverage,
+            cover_later: true,
             ..limits.clone()
         };
-        k.classify(axioms, changes, &limits)
+        let mut out = k.classify(axioms, changes, &limits)?;
+        let witness = out.cover(axioms, k.excluded(), dropped, &limits);
+        Ok((out, witness))
     })
 }
 

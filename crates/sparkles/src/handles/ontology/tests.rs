@@ -1987,6 +1987,51 @@ mod classification {
         let all = h.classify(&req, &abox, &opts()).unwrap();
         assert!(!all.classification.consistent);
         assert!(!all.reused);
+        // the terminology alone does not answer for the whole ontology, whose assertions
+        // can make it inconsistent, so they count as left out
+        use sparkles_owl::classify::{Consistency, Gap, NOT_READ};
+        assert!(!tbox.classification.complete);
+        assert!(tbox.classification.complete_for_taken);
+        assert_eq!(tbox.classification.consistency, Consistency::Unknown);
+        assert!(tbox.classification.incomplete.len() >= 4);
+        assert!(matches!(
+            &tbox.excluded[..],
+            [e] if matches!(&e.gap, Gap::Outside { rule, .. } if rule == NOT_READ)
+        ));
+        let strict = ClassifyRequest {
+            strict: true,
+            ..Default::default()
+        };
+        let err = h.classify(&req, &strict, &opts()).err().unwrap();
+        assert!(
+            err.to_string().contains("classify with the assertions"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn assertions_that_cannot_change_an_answer_leave_the_terminology_complete() {
+        let ds = dataset(&format!(
+            "{ONTO} :Cell rdfs:subClassOf :Thing2 . :x a :Cell ; :partOf :y . :y :size 3 ."
+        ));
+        let h = ds.ontology();
+        let c = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &opts(),
+            )
+            .unwrap();
+        assert!(c.classification.complete, "{:?}", c.excluded);
+        assert!(c.excluded.is_empty() && c.classification.incomplete.is_empty());
+        let strict = ClassifyRequest {
+            strict: true,
+            ..Default::default()
+        };
+        assert!(
+            h.classify(&OntologyRequest::default(), &strict, &opts())
+                .is_ok()
+        );
     }
 
     #[test]
