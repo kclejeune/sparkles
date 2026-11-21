@@ -2005,6 +2005,99 @@ fn the_decline_withdraws_the_rooted_answer_on_every_path() {
     }
 }
 
+/// Row 1231's marker repair finds `K ⊑ Ans` on every path a rooted run takes: a
+/// classification and its repetition on the same classifier, a run that counts, a run of
+/// axioms that item 805 rewrites, a run after an edit, and runs on one classifier whose
+/// repair setting differs from that of the run before. No rooted run keeps its contexts
+/// for the next, so a run never meets contexts whose holders sent no notice; the test pins
+/// that. A saturation and a classification of `denial2` with an element of `K` that the
+/// ABox asserts find no model, as they do without the repair, since the facts of a context
+/// that the root reaches hold without a condition.
+#[test]
+fn the_marker_repair_delivers_on_every_path() {
+    let keyed = format!("{AV2}\n     HasKey(:K (:q) ())");
+    let counted = format!("{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))");
+    let edit = axioms("SubClassOf(:F ObjectSomeValuesFrom(:t :G))");
+    let limits = |threads, expansion, counting, repair| Limits {
+        threads,
+        expansion,
+        counting,
+        rooted: true,
+        rooted_decline: false,
+        rooted_marker_repair: repair,
+        ..Limits::default()
+    };
+    for (name, body, counting) in [
+        ("plain", AV2.to_string(), false),
+        ("counting", counted, true),
+        ("keys", keyed, false),
+    ] {
+        let ax = axioms(&body);
+        for (threads, expansion) in CONFIGS {
+            let on = limits(threads, expansion, counting, true);
+            let off = limits(threads, expansion, counting, false);
+            let at = format!("{name}, {threads} threads {expansion:?}");
+            let found = |k: &Classifier, out: &Classification, what: &str| {
+                assert!(rooted_claim(k, out), "{at}, {what}: no claim");
+                out.taxonomy.is_subclass(&c("K"), &c("Ans"))
+            };
+            let mut k = Classifier::of(&ax);
+            for round in 0..2 {
+                let out = k.classify(&on).unwrap();
+                assert!(
+                    found(&k, &out, &format!("round {round}")),
+                    "{at}, round {round}"
+                );
+            }
+            // an edit that leaves the answer as it is
+            k.add(&edit);
+            let out = k.classify(&on).unwrap();
+            assert!(found(&k, &out, "after an edit"), "{at}, after an edit");
+            assert!(
+                !out.stats.incremental,
+                "{at}: a rooted run kept its contexts"
+            );
+            k.remove(&edit);
+            // the repair setting changes between the runs of one classifier, both ways
+            let mut k = Classifier::of(&ax);
+            let out = k.classify(&off).unwrap();
+            assert!(!found(&k, &out, "off first"), "{at}: the control changed");
+            let out = k.classify(&on).unwrap();
+            assert!(found(&k, &out, "on after off"), "{at}, on after off");
+            let out = k.classify(&off).unwrap();
+            assert!(!found(&k, &out, "off after on"), "{at}, off after on");
+            k.add(&edit);
+            let out = k.classify(&on).unwrap();
+            assert!(
+                found(&k, &out, "on after off and an edit"),
+                "{at}, on after an edit"
+            );
+            assert!(
+                !out.stats.incremental,
+                "{at}: a rooted run kept its contexts"
+            );
+        }
+    }
+    // the denial of the condition of an element of K leaves the ontology without a model
+    let denied = axioms(&format!(
+        "{}\n     ClassAssertion(ObjectSomeValuesFrom(:p0 :K) :a)",
+        REPAIRS.iter().find(|(n, _)| *n == "denial2").unwrap().1
+    ));
+    for (threads, expansion) in CONFIGS {
+        let at = format!("{threads} threads {expansion:?}");
+        let mut k = Classifier::of(&denied);
+        let sat = k
+            .saturate(&limits(threads, expansion, false, true))
+            .unwrap();
+        assert!(!sat.consistent, "{at}: the saturation finds a model");
+        let mut k = Classifier::of(&denied);
+        let out = k
+            .classify(&limits(threads, expansion, false, true))
+            .unwrap();
+        assert!(!out.consistent, "{at}: the classification finds a model");
+    }
+}
+
 /// A rooted run with counting that passes its bound starts again without counting, and
 /// that run is rooted too: when it withdraws its answer, the run starts again without the
 /// rooted rules and reports both fallbacks. The bound lies between the work of the run
@@ -2037,4 +2130,71 @@ fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
         .unwrap();
     assert!(out.stats.dl_counting_over && !out.stats.dl_rooted_declined);
     assert!(out.stats.tier == Tier::Disjunctive && !out.stats.dl_rooted_over);
+}
+
+/// The repair in the run without counting after a rooted run with counting passes its bound:
+/// that run answers rooted and finds `K ⊑ Ans`. The bound lies between the work of the two
+/// runs with the repair, 303 without counting and 453 to 464 with it.
+#[test]
+fn the_marker_repair_delivers_in_the_run_without_counting_after_the_bound() {
+    let ax = axioms(&format!(
+        "{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))"
+    ));
+    for (threads, expansion) in CONFIGS {
+        let at = format!("{threads} threads {expansion:?}");
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                rooted_decline: false,
+                rooted_marker_repair: true,
+                dl_work: Some(380),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            out.stats.dl_counting_over,
+            "{at}: the run with counting finished"
+        );
+        // the bound passed with counting marks the run over budget, which the claim
+        // predicate excludes, and the run without counting leaves the maximum out, so the
+        // rooted answer is checked here as the control above does
+        assert!(
+            out.complete && out.stats.tier == Tier::Disjunctive,
+            "{at}: no answer of Tier D"
+        );
+        assert!(
+            !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined,
+            "{at}: the run started again without the rooted rules"
+        );
+        assert!(
+            out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{at}: K ⊑ Ans missed"
+        );
+        // the control: without the repair, the same path under the bound of 180, between
+        // 145 and 216, misses K ⊑ Ans
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                rooted_decline: false,
+                dl_work: Some(180),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            out.stats.dl_counting_over && !out.stats.dl_rooted_over,
+            "{at}: control"
+        );
+        assert!(
+            !out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{at}: the control finds K ⊑ Ans"
+        );
+    }
 }
