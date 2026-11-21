@@ -50,6 +50,10 @@ pub struct HornAx {
     pub autos: FxHashMap<Role, Nfa>,
     /// the axioms outside OWL 2 EL the run takes
     pub taken: usize,
+    /// the ranges of roles that chains reach whose universal on `owl:Thing` the run
+    /// leaves out, since the ranges of the links that end their paths give it
+    /// ([`ends_in_range`])
+    pub ranges_covered: usize,
 }
 
 impl HornAx {
@@ -314,6 +318,83 @@ impl Nfa {
             left,
         }
     }
+}
+
+/// Which universals on `owl:Thing` a run makes for the ranges of the roles that chains
+/// reach (roadmap item 693).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RangeUniversals {
+    /// every one but those whose paths the ranges of their last links cover, the default
+    Covered,
+    /// every one, which `SPARKLES_HORN_RANGES=keep` selects for the comparison of the forms
+    Keep,
+    /// none, which is incomplete and only the tests use, to show which answers need them
+    #[cfg(test)]
+    Drop,
+}
+
+#[cfg(test)]
+thread_local! {
+    static RANGES_OVERRIDE: std::cell::Cell<Option<RangeUniversals>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with the range universals of `mode`, for the tests that compare the forms.
+/// The normalization runs on the calling thread, so the override reaches it.
+#[cfg(test)]
+pub fn with_range_universals<T>(mode: RangeUniversals, f: impl FnOnce() -> T) -> T {
+    let before = RANGES_OVERRIDE.with(|c| c.replace(Some(mode)));
+    let out = f();
+    RANGES_OVERRIDE.with(|c| c.set(before));
+    out
+}
+
+/// The range universals of a run: the tests' override, then `SPARKLES_HORN_RANGES`.
+pub fn range_universals() -> RangeUniversals {
+    #[cfg(test)]
+    if let Some(m) = RANGES_OVERRIDE.with(|c| c.get()) {
+        return m;
+    }
+    static MODE: std::sync::OnceLock<RangeUniversals> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("SPARKLES_HORN_RANGES").as_deref() {
+        Ok("keep") => RangeUniversals::Keep,
+        _ => RangeUniversals::Covered,
+    })
+}
+
+/// Whether the told ranges already give `c` at the end of every path that implies `r`,
+/// so that `⊤ ⊑ ∀r.c` adds nothing (roadmap item 693, F24's section on the Horn rules).
+/// The last letter of every word that the automaton of `r` accepts labels a transition
+/// into a final state, and the test asks of each such label `l` that `c` be a told range
+/// of `l` or of a role above it, `r` included. The index gives the target of every link
+/// by a role under `l` the ranges of that role and its superroles, and the source of
+/// every link by a role under `l⁻` the same ranges through `∃l⁻.⊤ ⊑ c`
+/// ([`super::index`]'s `horn_index`), and a loop takes the ranges of its role and its
+/// inverse. The empty word, which a final start would accept, and the top property,
+/// which relates every pair, are left to the universal.
+fn ends_in_range(rb: &mut RoleBox, ranges: &[(Role, Ex)], tops: &[Role], r: Role, c: Ex) -> bool {
+    if tops.contains(&r) {
+        return false;
+    }
+    let Some(nfa) = rb.auto(r, &mut Vec::new()) else {
+        return false;
+    };
+    let a = nfa.eps_free();
+    if a.finals[a.start as usize] {
+        return false;
+    }
+    let mut labels: Vec<Role> = a
+        .trans
+        .iter()
+        .filter(|t| a.finals[t.2 as usize])
+        .map(|t| t.1)
+        .collect();
+    labels.sort_unstable();
+    labels.dedup();
+    !labels.is_empty()
+        && labels
+            .iter()
+            .all(|&l| !tops.contains(&l) && ranges.iter().any(|&(l2, c2)| c2 == c && rb.sub(l, l2)))
 }
 
 /// How far a run reduces the automata that unfold its universals (roadmap item 693):
@@ -1621,14 +1702,33 @@ pub fn normalize(
         })
         .collect();
     ax.ranges.extend(domains);
-    // a range of a role that a chain reaches holds along the chain's paths too
+    // a range of a role that a chain reaches holds along the chain's paths too, unless the
+    // ranges of the links that end every such path give it already (roadmap item 693)
     let ranges: Vec<(Role, Ex)> = ax
         .ranges
         .iter()
         .copied()
         .filter(|&(r, _)| !rb.simple(r))
         .collect();
+    let mode = range_universals();
+    let tops: Vec<Role> = [
+        RoleName::Object(ObjectProperty::top()),
+        RoleName::Inverse(ObjectProperty::top()),
+    ]
+    .iter()
+    .filter_map(|n| it.role_id(n))
+    .collect();
     for (r, c) in ranges {
+        let skip = match mode {
+            RangeUniversals::Covered => ends_in_range(&mut rb, &ax.ranges, &tops, r, c),
+            RangeUniversals::Keep => false,
+            #[cfg(test)]
+            RangeUniversals::Drop => true,
+        };
+        if skip {
+            h.ranges_covered += 1;
+            continue;
+        }
         let e = it.node(Node::Forall(r, c));
         ax.subs.push((TOP, e));
     }

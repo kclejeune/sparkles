@@ -1344,6 +1344,57 @@ development set, 497 files that the laptop classifies within 8 GiB, give the sam
 taxonomies with and without the reductions on one and eight threads, and 67 of them
 change their conclusion count.
 
+A range of a property that chains reach is the universal restriction `⊤ ⊑ ∀r.C`, which
+every context holds and unfolds into the states of the automaton of `r`. The run leaves
+it out when the told ranges already give `C` at the end of every path that implies `r`
+(item 693). Every word that the automaton accepts ends with the label of a transition
+into a final state. The universal is left out when the start state is not final and,
+for every such label `l`, `C` is a told range of `l` or of a property above `l`, with
+`r` itself among them. The told ranges include the domains, each a range of the inverse
+property, and the universal property is never such a label. On ore_ont_14817 the rule
+leaves out all 6 range universals and on ore_ont_9663 13 of 16. The property 207 of the
+second file keeps its universal, since its paths can end with links by properties 206,
+329, 355 and 356, which have no range `C`, and without that universal the taxonomy
+loses subsumptions.
+
+Leaving an entailed axiom out is sound. The argument for completeness changes the first
+of the three steps above and leaves the other two.
+
+1. **A told range holds on every link.** For each told range `C` of a property `p`, the
+   index gives `C` to the successor of each existential restriction on a property under
+   `p`, and to the source of each link by a property under `p⁻` through `∃p⁻.⊤ ⊑ C`. A
+   loop takes the ranges of its property and of the property's inverse, and the range of
+   a reflexive or universal property holds everywhere. R3 and the merges of R5 keep the
+   cores that carry the ranges, R6 gives a predecessor the core of the successor it is
+   identified with, and the rules of individuals copy links with their properties. This
+   is how the run treats the ranges of simple properties, which never have a universal.
+   The translation of the first step therefore keeps `⊤ ⊑ ∀p.C` on the links of the
+   chain-free model for every told range, whether `p` is simple or not.
+2. **The translation without the universal preserves named subsumption.** A model of the
+   ontology is a model of the translation without the states of the left-out universal.
+   Close a model of that translation under the chains. An edge that the closure adds by
+   `r` runs along a path whose properties spell a word that the automaton of `r`
+   accepts, by the construction of Horrocks, Kutz and Sattler. The last edge of the path
+   is an edge of the model by a property under the word's last label `l`. That label has
+   `C` as a told range of a property `l'` above it, and `⊤ ⊑ ∀l'.C` holds on the edges
+   of the model, so the end of the path is in `C`. The closure then satisfies
+   `⊤ ⊑ ∀r.C`, and every other axiom as the first step shows.
+3. **The rest is unchanged.** The calculus without composition is complete for this
+   translation, and chain selection derives what that calculus derives, as before.
+
+The argument holds for several universals left out at once, since each one's case reads
+only the told ranges on links and not another universal. Its first point needs every
+property that a link can have to count for the rule `∃p⁻.⊤ ⊑ C`. A context that derives
+a negative existential restriction made positive by its unfolding links to its
+successor, so the index gives those properties the same rule (item 693). The
+automaton's reductions and pruning do not affect the test, which reads the closure
+over the ε-transitions before them. When the left-out universals were a run's only
+universal restrictions and no other Horn rule can fire, the run takes the EL rules, which
+compose every chain, as for any such run. A change to a property axiom or a range starts
+the run again, so a removed range that covered a universal brings the universal back.
+Tier D makes its own range universals and keeps them all. `SPARKLES_HORN_RANGES=keep`
+keeps every range universal for a comparison.
+
 Item 693 also fixed a gap in completeness that phase 3 left. A chain
 `r_1 ∘ … ∘ r_n ⊑ s` entails its mirror image `r_n⁻ ∘ … ∘ r_1⁻ ⊑ s⁻`, and the rules of
 phase 3 composed the told chain only. With `r0 ∘ r2⁻ ⊑ r0` and `r2` the inverse of `r0`,

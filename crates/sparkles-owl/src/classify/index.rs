@@ -2772,6 +2772,53 @@ fn horn_index(
     for &(_, _, e) in &unfold {
         b.positive(e, it, ix);
     }
+    // The negative existentials that the universals above give a context are positive now,
+    // so their roles have links too, and a range of s holds of the sources of those that
+    // run against s as of the others. The range universals that the Horn normalization
+    // leaves out rely on it (roadmap item 693).
+    let later: Vec<Role> = {
+        let roles = &ix.roles;
+        let mut v: Vec<Role> = b
+            .succ
+            .iter()
+            .filter_map(|&(e, _)| match it.nodes[e as usize] {
+                Node::Exist(r, _) => Some(r),
+                _ => None,
+            })
+            .filter(|r| links.binary_search(r).is_err())
+            .collect();
+        let back: Vec<Role> = v
+            .iter()
+            .filter(|&&l| {
+                counts(l)
+                    || roles
+                        .sup
+                        .get(l as usize)
+                        .is_some_and(|s| s.iter().any(|&s| counts(s)))
+            })
+            .filter_map(|&l| roles.inv(l))
+            .collect();
+        v.extend(back);
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    if !later.is_empty() {
+        let over_later = roles_over(&ix.roles, &later);
+        let mut news: Vec<(Ex, Ex)> = Vec::new();
+        for &(s, c) in &ax.ranges {
+            if let Some(i) = ix.roles.inv(s)
+                && !linked(i)
+                && over_later.get(i as usize).copied().unwrap_or(false)
+            {
+                news.push((it.node(Node::Exist(i, TOP)), c));
+            }
+        }
+        for &(e, c) in &news {
+            b.negative(e, it);
+            told.push((e, c));
+        }
+    }
     // the universals on roles that chains reach, unfolded by the automata, each state a
     // fresh class; the universals the automata make are not unfolded again, in this
     // run or in a later one over the same interner
