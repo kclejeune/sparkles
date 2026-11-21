@@ -365,6 +365,200 @@ fn incremental_runs_reuse_contexts() {
     );
 }
 
+/// Edits `k`, holding `held`, and checks that the run kept contexts and answers as a
+/// fresh classifier does.
+fn edit_agrees(
+    k: &mut Classifier,
+    held: &mut Vec<Axiom>,
+    add: &[Axiom],
+    remove: &[Axiom],
+) -> sparkles_owl::classify::Classification {
+    held.retain(|a| !remove.contains(a));
+    held.extend(add.iter().cloned());
+    k.remove(remove);
+    k.add(add);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    let full = Classifier::of(held.iter())
+        .classify(&Limits::default())
+        .unwrap();
+    assert_eq!(out.consistent, full.consistent);
+    assert_eq!(out.taxonomy, full.taxonomy);
+    out
+}
+
+/// The invalidation's lists of parts, of the walk and of the cleared contexts grow with
+/// the edit and count against the budget before they grow: removing `owl:Thing ⊑ C2000 ⊓
+/// … ⊓ C2031` beside 1,024 classes clears every context, and a limit or a pool one byte
+/// below the run's reported peak refuses the kept run (roadmap item 1256). The kept run
+/// then starts again in full under the same limits (roadmap item 1263), so the call either
+/// fails with a memory error, after which a run with the ordinary limits gives the fresh
+/// taxonomy, or returns a run that is not incremental and equals the fresh one. In a debug
+/// build the invalidation also checks that its lists hold no more than it admitted.
+#[test]
+fn the_invalidation_admits_its_scratch_before_it_grows() {
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut held: Vec<AxiomKind> = (0..1024)
+        .map(|n| Axiom::declaration(Entity::Class(c(&format!("C{n}")))).kind)
+        .collect();
+    let gone = sub(
+        Class::thing(),
+        and((2000..2032).map(|n| ce(&format!("C{n}")))),
+    )
+    .kind;
+    held.push(gone.clone());
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let rest: Vec<&AxiomKind> = held[..held.len() - 1].iter().collect();
+    let removed = [&gone];
+    let change = || Changes {
+        added: &[],
+        removed: &removed,
+    };
+    let mut sat = Saturation::new();
+    sat.saturate(&all, None, &limits).unwrap();
+    let out = sat.saturate(&rest, Some(change()), &limits).unwrap();
+    assert!(
+        out.stats.incremental && out.stats.cleared > 1024,
+        "{:?}",
+        out.stats
+    );
+    let peak = out.stats.peak_memory;
+    let fresh = Saturation::new().classify(&rest, None, &limits).unwrap();
+    for pool in [false, true] {
+        for cap in [peak - 1, peak] {
+            let mut sat = Saturation::new();
+            sat.saturate(&all, None, &limits).unwrap();
+            let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let t = total.clone();
+            let bounded = Limits {
+                max_memory: (!pool).then_some(cap),
+                charge: pool.then(|| {
+                    Arc::new(move |n: usize| {
+                        let was = t.load(Ordering::SeqCst);
+                        was + n <= cap && {
+                            t.fetch_add(n, Ordering::SeqCst);
+                            true
+                        }
+                    }) as Arc<dyn Fn(usize) -> bool + Send + Sync>
+                }),
+                ..limits.clone()
+            };
+            let result = sat.saturate(&rest, Some(change()), &bounded);
+            if cap < peak {
+                match result {
+                    Err(Error::Memory { .. }) => {
+                        let retry = sat.classify(&rest, Some(change()), &limits).unwrap();
+                        assert_eq!(retry.taxonomy, fresh.taxonomy);
+                        assert_eq!(retry.consistent, fresh.consistent);
+                    }
+                    Ok(out) => {
+                        assert!(!out.stats.incremental, "pool {pool}: {:?}", out.stats);
+                        assert_eq!(out.consistent, fresh.consistent);
+                        // The run built no taxonomy, so read the saturated state's
+                        // taxonomy through a kept run with nothing changed.
+                        let none = Changes {
+                            added: &[],
+                            removed: &[],
+                        };
+                        let kept = sat.classify(&rest, Some(none), &limits).unwrap();
+                        assert_eq!(kept.taxonomy, fresh.taxonomy);
+                        assert_eq!(kept.consistent, fresh.consistent);
+                    }
+                    Err(e) => panic!("pool {pool}: {e:?}"),
+                }
+            } else {
+                assert!(result.is_ok(), "pool {pool} at the peak: {result:?}");
+            }
+        }
+    }
+}
+
+/// The disjointness sets are numbered by their place among the run's sets, so removing
+/// one moves the numbers of those after it. A kept context that holds a member of a moved
+/// set must know it by its new number: here `a` keeps `B1` from set 1, which becomes set
+/// 0, and then takes `C1` from `b`, whose set takes number 1. By the old number the two
+/// would clash and make the ontology inconsistent (roadmap item 1256).
+#[test]
+fn a_kept_context_follows_the_new_numbers_of_the_disjointness_sets() {
+    let limits = Limits::default();
+    let disjoint = |a: &str, b: &str| Axiom::disjoint_classes([ce(a), ce(b)]).kind;
+    let gone = disjoint("A1", "A2");
+    let mut held: Vec<AxiomKind> = vec![
+        gone.clone(),
+        disjoint("B1", "B2"),
+        disjoint("C1", "C2"),
+        is_a("B1", "a").kind,
+        is_a("E", "b").kind,
+        sub(c("E"), c("C1")).kind,
+        sub(and([ce("E"), ce("H")]), one("a")).kind,
+    ];
+    // the run numbers the sets in the order of the axioms it is given
+    let mut sat = Saturation::new();
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    assert!(sat.classify(&all, None, &limits).unwrap().consistent);
+    let fresh = |held: &[AxiomKind]| {
+        let all: Vec<&AxiomKind> = held.iter().collect();
+        Saturation::new().classify(&all, None, &limits).unwrap()
+    };
+    held.remove(0);
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let changes = Changes {
+        added: &[],
+        removed: &[&gone],
+    };
+    let out = sat.classify(&all, Some(changes), &limits).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    assert!(out.consistent);
+    let added = sub(c("E"), c("H")).kind;
+    held.push(added.clone());
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let changes = Changes {
+        added: &[&added],
+        removed: &[],
+    };
+    let out = sat.classify(&all, Some(changes), &limits).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    let full = fresh(&held);
+    assert!(full.consistent);
+    assert_eq!(out.consistent, full.consistent);
+    assert_eq!(out.taxonomy, full.taxonomy);
+    assert!(out.taxonomy.is_subclass(&c("E"), &c("B1")));
+}
+
+/// A kept context keeps the negative existential restrictions whose filler it holds,
+/// which reach a context that an edit links to it: `B` holds `B2`, so a new link from
+/// `C` to `B` gives `C` the restriction `∃r.B2` and with it `G`.
+#[test]
+fn a_kept_filler_gives_its_restrictions_to_a_new_predecessor() {
+    let mut held = vec![
+        sub(some("r", c("B2")), c("G")),
+        sub(c("B"), c("B2")),
+        sub(c("C"), c("D")),
+    ];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let out = edit_agrees(&mut k, &mut held, &[sub(c("C"), some("r", c("B")))], &[]);
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("G")));
+    assert_eq!(out.stats.cleared, 1, "{:?}", out.stats);
+}
+
+/// An edit that adds or removes a negative existential restriction clears the
+/// predecessors of the contexts that hold its filler.
+#[test]
+fn a_new_restriction_on_the_left_reaches_the_predecessors_of_its_filler() {
+    let mut held = vec![sub(c("A"), some("r", c("B"))), sub(c("X"), c("Y"))];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let left = sub(some("r", c("B")), c("G"));
+    let out = edit_agrees(&mut k, &mut held, std::slice::from_ref(&left), &[]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    let out = edit_agrees(&mut k, &mut held, &[], &[left]);
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("G")));
+}
+
 fn nested(depth: usize, filler: &str) -> ClassExpression {
     let mut e = ce(filler);
     for _ in 0..depth {
@@ -1178,6 +1372,117 @@ fn removing_an_axiom_not_held_does_not_cancel_a_later_addition() {
     k.add([&a]);
     let out = k.classify(&Limits::default()).unwrap();
     assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+}
+
+/// Classifies `held`, applies each edit of `edits` as removals then additions, and
+/// checks every incremental run against a run of a new classifier (roadmap item 1258).
+fn edits_agree(mut held: Vec<Axiom>, edits: &[(Vec<Axiom>, Vec<Axiom>)]) {
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&held);
+    k.classify(&limits).unwrap();
+    for (adds, removes) in edits {
+        held.retain(|a| !removes.contains(a));
+        k.remove(removes);
+        k.add(adds);
+        held.extend(adds.iter().cloned());
+        let inc = k.classify(&limits).unwrap();
+        let full = Classifier::of(&held).classify(&limits).unwrap();
+        assert_eq!(
+            inc.taxonomy, full.taxonomy,
+            "after adding {adds:?} and removing {removes:?}"
+        );
+        assert_eq!(inc.consistent, full.consistent);
+    }
+}
+
+fn self_of(r: &str) -> ClassExpression {
+    ClassExpression::ObjectHasSelf(ope(r))
+}
+
+fn subrole(a: &str, b: &str) -> Axiom {
+    ax(AxiomKind::SubObjectPropertyOf(
+        SubObjectPropertyExpression::Expression(ope(a)),
+        ope(b),
+    ))
+}
+
+#[test]
+fn an_added_self_restriction_on_a_superrole_reaches_kept_loops() {
+    let held = vec![
+        subrole("r", "s"),
+        sub(Class::thing(), self_of("r")),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("s"), c("C"));
+    edits_agree(
+        held,
+        &[
+            (vec![edit.clone()], vec![]),
+            (vec![], vec![edit.clone()]),
+            (vec![edit], vec![]),
+        ],
+    );
+}
+
+#[test]
+fn a_change_with_a_self_restriction_runs_everything_again() {
+    let held = vec![sub(c("A"), self_of("r")), sub(self_of("s"), c("C"))];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let edit = sub(self_of("s"), c("D"));
+    k.add([&edit]);
+    assert!(!k.classify(&Limits::default()).unwrap().stats.incremental);
+    k.remove([&edit]);
+    assert!(!k.classify(&Limits::default()).unwrap().stats.incremental);
+    let plain = sub(c("A"), c("B"));
+    k.add([&plain]);
+    assert!(k.classify(&Limits::default()).unwrap().stats.incremental);
+    // a role edge that a self restriction reaches changes the role table
+    let edge = subrole("r", "s");
+    k.add([&edge]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+}
+
+#[test]
+fn an_added_self_filler_reaches_a_kept_existential_filler() {
+    let held = vec![
+        subrole("r", "s"),
+        sub(c("D"), self_of("r")),
+        sub(c("A"), some("t", c("D"))),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(some("t", self_of("s")), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
+#[test]
+fn an_added_self_restriction_reaches_the_loops_of_a_reflexive_role() {
+    let held = vec![
+        ax(AxiomKind::ReflexiveObjectProperty(ope("r"))),
+        Axiom::declaration(Entity::Class(c("A"))),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("r"), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
+#[test]
+fn an_added_self_restriction_reaches_the_loops_of_a_chain() {
+    let held = vec![
+        ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Chain(vec![ope("r"), ope("r")]),
+            ope("t"),
+        )),
+        sub(c("A"), self_of("r")),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("t"), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
 }
 
 // ---------------------------------------------------------------------------------

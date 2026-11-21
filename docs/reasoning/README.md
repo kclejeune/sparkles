@@ -580,7 +580,14 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   count, so near the bound a kept run can answer in full where a full run falls back.
   Roadmap item 1010. A kept classification holds
   the last index beside the new one while it compares them, and starts again once it
-  keeps more than twice the expressions of its last full run. A run stops at its deadline, its
+  keeps more than twice the expressions of its last full run. A classification kept by
+  the EL rules holds its contexts while it normalizes the axioms and builds the new
+  index, which a run that starts again frees first, so it trades a higher peak for the
+  saturation it saves. On `ore_ont_13482` on `stanley` the classifier's estimate of its
+  peak, which the memory budget reads, is 1.58 GB in a kept run against 1.04 GB in a run
+  that starts again. The process's resident peak rose 0.15 GB above its resident bytes
+  in a kept run and 0.03 GB in a run that starts again, to 2.44 and 2.33 GB. Roadmap item
+  1254 covers an index that an edit patches in place of a second build. A run stops at its deadline, its
   memory budget or a cancellation, which it checks while it indexes, builds the property
   closure, saturates and builds the taxonomy. Integer, decimal and rational literals
   use exact arbitrary-precision values, so equal reduced fractions and equivalent
@@ -1103,8 +1110,8 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   outside the supported OWL 2 datatype map and chains through the top object property
   remain partial. XML namespace conformance preserves lexical spellings and does not
   provide canonical value equality. Roadmap item 663.
-* An EL classification after a change to an axiom with an individual, a data property
-  or a key saturates everything again, and so does any change after a run that merged
+* An EL classification after a change to an axiom with an individual, a data property,
+  a key or a self restriction saturates everything again, and so does any change after a run that merged
   a context with an individual.
   Roadmap item 664.
 * In an ontology with individuals, the Horn rules leave out an at-least restriction

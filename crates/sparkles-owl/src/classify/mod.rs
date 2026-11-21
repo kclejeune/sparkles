@@ -87,6 +87,8 @@ mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
 mod saturate;
+#[cfg(test)]
+mod scratch_admission_tests;
 mod taxonomy;
 mod world;
 
@@ -419,6 +421,12 @@ pub struct Stats {
     pub threads: usize,
     pub index: Duration,
     pub saturation: Duration,
+    /// the part of [`saturation`](Stats::saturation) from the end of the first
+    /// saturation and of Tier D's tests to the end of the stage: the marking of real
+    /// contexts with its rounds, the facts of universal roles, the merges of keys, the
+    /// witnesses and the worlds, and the counts of the contexts and the diagnostics of a
+    /// rooted run that close the stage
+    pub marking: Duration,
     pub taxonomy: Duration,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
@@ -606,6 +614,9 @@ pub struct Saturation {
     consistent: bool,
     /// the contexts of conjunctions that the last run's Horn rules created
     dynamic: Option<saturate::Dynamic>,
+    /// the disjointness sets of the last run's index, whose place among them numbers
+    /// each set in the contexts that the run leaves
+    disjoint: Vec<Vec<Ex>>,
     /// whether the current run's axioms went to the Horn normalization, from its start
     /// until the normalization took none
     horn_tried: bool,
@@ -727,20 +738,26 @@ pub struct Changes<'a> {
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
 /// role table, which a run builds once, one with data, whose told subsumers the index
-/// derives from every data axiom at once, a key, or one with an individual, whose
-/// merges the invalidation does not follow.
+/// derives from every data axiom at once, a key, one with an individual, whose
+/// merges the invalidation does not follow, or one with a self restriction (roadmap
+/// item 1258). A negative self restriction gives its subsumer to every context with a
+/// loop by a subrole, and a loop comes from a self restriction of another role, a
+/// reflexive role or a chain as well as from the restriction itself, so a kept context
+/// can have the loop without holding the changed expression that the invalidation
+/// looks for.
 fn needs_full_run(ax: &AxiomKind) -> bool {
     if role_axiom(ax) || matches!(ax, AxiomKind::HasKey(..)) {
         return true;
     }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.0.iter().any(|e| {
-        matches!(
-            e,
-            Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
-        )
-    })
+    sig.2
+        || sig.0.iter().any(|e| {
+            matches!(
+                e,
+                Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
+            )
+        })
 }
 
 /// Whether an edit of the axiom leaves alone what decides a run's tier and what its
@@ -1130,6 +1147,7 @@ impl Saturation {
             stale_tier: false,
             consistent: true,
             dynamic: None,
+            disjoint: Vec::new(),
             horn_tried: false,
             dl_tried: false,
             skip_dl: false,
@@ -1571,6 +1589,7 @@ impl Saturation {
         self.interner = Interner::new();
         self.stale_tier = false;
         self.ctx = Vec::new();
+        self.disjoint = Vec::new();
         self.dynamic = None;
         self.dl_run = None;
     }
@@ -1578,18 +1597,20 @@ impl Saturation {
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
     /// axioms the profile check leaves out.
     /// The answer's last part is the estimated peak of a parallel normalization, with
-    /// `held_bytes`, which the pool has been charged for, or 0.
+    /// `held_bytes`, which the pool has been charged for, or 0. `kept_bytes` are those of
+    /// the contexts the run keeps, [`Saturation::context_bytes`].
     fn build(
         &mut self,
         axioms: &[&AxiomKind],
         outside: &[(usize, (String, String))],
         threads: usize,
         held_bytes: usize,
+        kept_bytes: usize,
         limits: &Limits,
     ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
         let budget = numeric::Budget::new(
             limits,
-            held_bytes + self.context_bytes(),
+            held_bytes + kept_bytes,
             self.interner.ranges.ledger.clone(),
         );
         budget.baseline(self.interner.bytes())?;
@@ -2100,6 +2121,7 @@ impl Saturation {
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
+            self.disjoint = Vec::new();
             self.dynamic = None;
             self.dl_run = None;
         }
@@ -2132,9 +2154,34 @@ impl Saturation {
         // The old index is no longer read. Drop its handles before constructing the
         // replacement, while cached contexts retain their shared numeric ledger.
         self.index = None;
-        let (ax, mut ix, mut normalized_peak, outside_el) =
-            self.build(axioms, &outside, threads, held_bytes + old_bytes, limits)?;
+        // the kept contexts, which stay as they are until the invalidation, and the last
+        // run's disjointness sets, which stay until the comparison below
+        let kept_bytes = self.context_bytes();
+        let kept_capacity = self.ctx.capacity();
+        let sets_bytes = self.disjoint.capacity() * 24
+            + self
+                .disjoint
+                .iter()
+                .map(|d| d.capacity() * 4)
+                .sum::<usize>();
+        // the normalized premises of the changed axioms, which stay until the
+        // invalidation
+        let premises_bytes = premises.as_ref().map_or(0, |p| p.bytes());
+        let (mut ax, mut ix, mut normalized_peak, outside_el) = self.build(
+            axioms,
+            &outside,
+            threads,
+            held_bytes + old_bytes + sets_bytes + premises_bytes,
+            kept_bytes,
+            limits,
+        )?;
         drop(outside);
+        // the disjointness sets by their numbers in this index, beside those of the
+        // last run's, by which the contexts it leaves number the sets they meet; the run
+        // reads them only in the build, so they move from the axioms, which the budget
+        // counted, and the last run's are freed
+        let renumbered = self.disjoint != ax.disjoint;
+        self.disjoint = std::mem::take(&mut ax.disjoint);
         stats.outside_el = outside_el;
         stats.tier = stats.outside_el.tier();
         poll(limits)?;
@@ -2267,7 +2314,28 @@ impl Saturation {
         });
         if let Some(scratch) = premises {
             stats.incremental = true;
-            stats.cleared = self.invalidate(&scratch, &ix);
+            // the invalidation's bit sets, one bit for each expression and each context,
+            // beside the kept contexts, the index and the normalized axioms
+            let bits = 8 * (self.interner.len().div_ceil(64) + self.ctx.len().div_ceil(64));
+            // the context table may have grown for the expressions the edit added
+            let slot = std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
+            let kept_bytes = kept_bytes + self.ctx.capacity().saturating_sub(kept_capacity) * slot;
+            let mut budget = Scratch {
+                limits,
+                held: self.index_bytes(&ix)
+                    + held_bytes
+                    + ax.bytes()
+                    + kept_bytes
+                    + premises_bytes
+                    + bits,
+                peak: normalized_peak,
+                lists: 0,
+            };
+            budget.grow(0)?;
+            stats.cleared = self.invalidate(&scratch, &ix, renumbered, &mut budget)?;
+            #[cfg(test)]
+            scratch_audit::premises(premises_bytes);
+            normalized_peak = budget.peak;
             poll(limits)?;
         }
         if let Some(old) = old_ix.filter(|_| reuse) {
@@ -2624,6 +2692,7 @@ impl Saturation {
         // keys and for universal roles. Then owl:Thing and the individuals become real,
         // and so does what they reach, between rounds of the saturation, with the facts
         // of universal roles and the merges of keys, until none is new.
+        let marking_start = Instant::now();
         let mut universal: Vec<Ex> = Vec::new();
         // a run with the Horn rules and individuals always marks them, since R7 reads
         // the real predecessors of the global state (roadmap item 692)
@@ -2941,6 +3010,7 @@ impl Saturation {
             }
         }
         self.dynamic = dynamic;
+        stats.marking = marking_start.elapsed();
         stats.saturation = t.elapsed();
         stats.conclusions = totals.conclusions;
         totals.memory += world_bytes;
@@ -3069,6 +3139,12 @@ impl Saturation {
                 .map_or(0, |l| l.bytes())
             + ix.bytes()
             + self.interner.scope_bytes()
+            + self.disjoint.capacity() * 24
+            + self
+                .disjoint
+                .iter()
+                .map(|d| d.capacity() * 4)
+                .sum::<usize>()
     }
 
     fn retained_bytes(&self, held_bytes: usize, root_bytes: usize, world_bytes: usize) -> usize {
@@ -3254,55 +3330,72 @@ impl Saturation {
     }
 
     /// Clears the contexts that the changed axioms can affect: those that derived the
-    /// left side of a changed subsumption or part of it, those with a link that a
-    /// changed existential restriction can use, and every context with a link to one of
-    /// them. The other contexts drop their links from cleared contexts and recompute
-    /// what they take from the index. The answer is the number cleared.
-    fn invalidate(&mut self, changed: &Axioms, ix: &Index) -> usize {
+    /// left side of a changed subsumption or part of it, and every context with a link
+    /// to one of them. The parts take in the filler of each existential restriction, so
+    /// a context with a link that a changed restriction can use links to a cleared
+    /// context. The other contexts drop their links from cleared contexts. The answer
+    /// is the number cleared.
+    ///
+    /// What a kept context takes from the index stays as it is (roadmap item 1256). Its
+    /// propagations are the negative existential restrictions `∃s.d` of the index for
+    /// each subsumer `d`. The index finds them among the left sides of the subsumptions,
+    /// the members of the disjointness sets and the classes of keys, and a change to a
+    /// key, a role axiom or a self restriction starts again ([`needs_full_run`]). So a restriction that an
+    /// edit adds or removes has its filler `d` among the parts of the changed left sides
+    /// or sets walked below, and every context that holds `d` is cleared. The
+    /// disjointness sets of the index are numbered by their place among the run's sets,
+    /// so `renumbered` says that they are not those of the last run, by which a kept
+    /// context numbers what it holds. Then a kept context that holds a member of one
+    /// numbers them again. One that holds none still holds none: a member of a new set
+    /// is a part of a changed set, which clears the contexts that hold it.
+    ///
+    /// The search for the contexts that hold a changed part still reads every context,
+    /// as does the pass that drops their links from cleared ones, since no table maps
+    /// an expression to the contexts that hold it.
+    fn invalidate(
+        &mut self,
+        changed: &Axioms,
+        ix: &Index,
+        renumbered: bool,
+        budget: &mut Scratch<'_>,
+    ) -> Result<usize, Error> {
         let nodes = &self.interner.nodes;
-        let mut subs: FxHashSet<Ex> = FxHashSet::default();
-        let mut links: Vec<(index::Role, Ex)> = Vec::new();
+        // the two bit sets are in the budget's start, and the lists ask it as they grow
+        let mut parts = Marks::new(nodes.len());
+        let mut gone = Marks::new(self.ctx.len());
+        let mut few: Vec<Ex> = Vec::new();
         let mut stack: Vec<Ex> = Vec::new();
-        stack.extend(changed.subs.iter().map(|&(a, _)| a));
-        stack.extend(changed.disjoint.iter().flatten().copied());
+        for &(a, _) in &changed.subs {
+            budget.push(&mut stack, a)?;
+        }
+        for &e in changed.disjoint.iter().flatten() {
+            budget.push(&mut stack, e)?;
+        }
         while let Some(e) = stack.pop() {
-            if !subs.insert(e) {
+            if !parts.insert(e) {
                 continue;
             }
+            budget.push(&mut few, e)?;
             match nodes[e as usize] {
                 Node::Conj(a, b) => {
-                    stack.push(a);
-                    stack.push(b);
+                    budget.push(&mut stack, a)?;
+                    budget.push(&mut stack, b)?;
                 }
-                Node::Exist(r, f) => {
-                    links.push((r, f));
-                    stack.push(f);
-                }
+                Node::Exist(_, f) => budget.push(&mut stack, f)?,
                 _ => {}
             }
         }
-        let mut affected: FxHashSet<Ex> = FxHashSet::default();
+        // the contexts that hold a part, then every context with a link into one
+        let mut queue: Vec<Ex> = Vec::new();
         for (e, c) in self.ctx.iter().enumerate() {
             let Some(c) = c.get() else { continue };
             let st = c.st.lock();
-            if !st.init {
-                continue;
-            }
-            if st.subs.iter().any(|s| subs.contains(s)) {
-                affected.insert(e as Ex);
-            }
-            for &(s, f) in &links {
-                if st.subs.contains(&f) {
-                    for (r, srcs) in &st.back {
-                        if ix.roles.sub(*r, s) {
-                            affected.extend(srcs.list.iter().copied());
-                        }
-                    }
-                }
+            if st.init && st.subs.meets(&few, |s| parts.has(s)) {
+                gone.insert(e as Ex);
+                budget.push(&mut queue, e as Ex)?;
             }
         }
-        // every context with a link into an affected context is affected
-        let mut queue: Vec<Ex> = affected.iter().copied().collect();
+        let mut any = !queue.is_empty();
         while let Some(e) = queue.pop() {
             let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get()) else {
                 continue;
@@ -3310,28 +3403,77 @@ impl Saturation {
             let st = c.st.lock();
             for (_, srcs) in &st.back {
                 for &s in &srcs.list {
-                    if affected.insert(s) {
-                        queue.push(s);
+                    if gone.insert(s) {
+                        any = true;
+                        budget.push(&mut queue, s)?;
                     }
                 }
             }
         }
+        debug_assert!(
+            (few.capacity() + stack.capacity() + queue.capacity()) * std::mem::size_of::<Ex>()
+                <= budget.lists
+                && parts.0.len() == nodes.len().div_ceil(64)
+                && gone.0.len() == self.ctx.len().div_ceil(64),
+            "the invalidation's scratch passed what the budget admitted"
+        );
+        #[cfg(test)]
+        let live =
+            (few.capacity() + stack.capacity() + queue.capacity()) * std::mem::size_of::<Ex>();
+        drop((few, stack, queue, parts));
+        if !any && !renumbered {
+            #[cfg(test)]
+            scratch_audit::record(budget, live, 0, 0);
+            return Ok(0);
+        }
+        // the kept contexts that number their sets again may need larger maps, which
+        // the budget admits before any context changes
+        let mut maps = 0;
+        if renumbered {
+            for (e, c) in self.ctx.iter().enumerate() {
+                let Some(c) = c.get() else { continue };
+                let st = c.st.lock();
+                if st.init && !gone.has(e as Ex) && !st.disj.is_empty() {
+                    maps += st.disjoint_growth(ix);
+                }
+            }
+            budget.grow(maps)?;
+        }
+        #[cfg(any(test, debug_assertions))]
+        let mut grown = 0;
         let mut cleared = 0;
         for (e, c) in self.ctx.iter_mut().enumerate() {
             let Some(c) = c.get_mut() else { continue };
             let st = c.st.get_mut();
-            if affected.contains(&(e as Ex)) {
+            if gone.has(e as Ex) {
                 if st.init {
                     cleared += 1;
                 }
                 *st = saturate::State::default();
                 *c.started.get_mut() = false;
             } else if st.init {
-                st.drop_links_from(&affected);
-                st.reindex(ix);
+                if any {
+                    st.drop_links_where(|s| gone.has(s));
+                }
+                if renumbered && !st.disj.is_empty() {
+                    #[cfg(any(test, debug_assertions))]
+                    let had = st.disj.capacity();
+                    st.reindex_disjoint(ix);
+                    #[cfg(any(test, debug_assertions))]
+                    if st.disj.capacity() > had {
+                        grown += saturate::table_bytes(st.disj.capacity(), 8);
+                    }
+                }
             }
         }
-        cleared
+        #[cfg(any(test, debug_assertions))]
+        debug_assert!(
+            grown <= maps,
+            "the disjointness maps grew past what the budget admitted"
+        );
+        #[cfg(test)]
+        scratch_audit::record(budget, live, maps, grown);
+        Ok(cleared)
     }
 
     /// The subsumers of a saturated context that are named classes, with their
@@ -3354,6 +3496,128 @@ impl Saturation {
             .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
             .collect();
         Some((st.bottom, named))
+    }
+}
+
+/// What the last invalidation on a thread admitted and held, which the tests of its
+/// admission read.
+#[cfg(test)]
+mod scratch_audit {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(super) struct Audit {
+        /// the estimate held after the invalidation, and the run's peak
+        pub held: usize,
+        pub peak: usize,
+        /// the bytes admitted for the lists, and those the lists held
+        pub lists: usize,
+        pub live: usize,
+        /// the bytes admitted for the disjointness maps, and those the maps took
+        pub maps: usize,
+        pub grown: usize,
+        /// the bytes of the normalized premises of the changed axioms
+        pub premises: usize,
+    }
+
+    thread_local! {
+        static LAST: Cell<Option<Audit>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record(b: &super::Scratch<'_>, live: usize, maps: usize, grown: usize) {
+        LAST.set(Some(Audit {
+            held: b.held,
+            peak: b.peak,
+            lists: b.lists,
+            live,
+            maps,
+            grown,
+            premises: 0,
+        }));
+    }
+
+    pub(super) fn premises(bytes: usize) {
+        LAST.set(LAST.get().map(|a| Audit {
+            premises: bytes,
+            ..a
+        }));
+    }
+
+    pub(super) fn take() -> Option<Audit> {
+        LAST.take()
+    }
+}
+
+/// The memory that the invalidation of a run kept by the EL rules holds beside the kept
+/// contexts, the index and the normalized axioms, which it admits against the run's
+/// limit and pool before each list of ids grows.
+struct Scratch<'l> {
+    limits: &'l Limits,
+    /// the estimated bytes held, which grow and are never given back before the run's
+    /// memory is reconciled
+    held: usize,
+    /// the run's peak estimate, past which a growth is charged to the pool
+    peak: usize,
+    /// the bytes admitted for the lists
+    lists: usize,
+}
+
+impl Scratch<'_> {
+    /// Admits `bytes` more, or stops the run with [`Error::Memory`].
+    fn grow(&mut self, bytes: usize) -> Result<(), Error> {
+        self.held += bytes;
+        let more = self.held.saturating_sub(self.peak);
+        if self.limits.max_memory.is_some_and(|m| self.held > m)
+            || more > 0 && self.limits.charge.as_deref().is_some_and(|f| !f(more))
+        {
+            return Err(Error::Memory {
+                limit: self.limits.max_memory.unwrap_or(self.held),
+                used: self.held,
+            });
+        }
+        self.peak = self.peak.max(self.held);
+        Ok(())
+    }
+
+    /// Pushes `e` onto `v`, admitting the list's growth before it allocates.
+    fn push(&mut self, v: &mut Vec<Ex>, e: Ex) -> Result<(), Error> {
+        if v.len() == v.capacity() {
+            let more = v.capacity().max(4);
+            let bytes = more * std::mem::size_of::<Ex>();
+            self.grow(bytes)?;
+            self.lists += bytes;
+            v.reserve_exact(more);
+        }
+        v.push(e);
+        Ok(())
+    }
+}
+
+/// A set of expressions or contexts by id, one bit each, which the invalidation reads
+/// once for each member of every context it passes.
+struct Marks(Vec<u64>);
+
+impl Marks {
+    fn new(n: usize) -> Marks {
+        Marks(vec![0; n.div_ceil(64)])
+    }
+
+    /// Adds `e`, and answers whether it was new.
+    fn insert(&mut self, e: Ex) -> bool {
+        let (w, b) = (e as usize / 64, 1u64 << (e % 64));
+        if w >= self.0.len() {
+            self.0.resize(w + 1, 0);
+        }
+        let new = self.0[w] & b == 0;
+        self.0[w] |= b;
+        new
+    }
+
+    #[inline]
+    fn has(&self, e: Ex) -> bool {
+        self.0
+            .get(e as usize / 64)
+            .is_some_and(|w| w & (1u64 << (e % 64)) != 0)
     }
 }
 
@@ -4236,7 +4500,7 @@ mod tests {
             .collect();
         let mut s = Saturation::default();
         let (_, ix, _, _) = s
-            .build(&axioms, &outside, 1, 0, &Limits::default())
+            .build(&axioms, &outside, 1, 0, 0, &Limits::default())
             .unwrap();
         assert!(ix.horn.is_some());
         ix
