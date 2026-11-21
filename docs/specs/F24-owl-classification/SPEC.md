@@ -558,11 +558,26 @@ without the reductions, which suggests that the attempt does the same work there
 `ore_ont_8737` takes 1.03 to 1.04 times the base's time on the build with and without
 the reductions, within the range of the base's own rounds. Item 1090 follows both, and
 the [benchmark report](../../benchmarks/el-classification/RESULTS.md#reduced-automata)
-holds every file. The reductions were also tried in the unfolding of the disjunctive
-rules and not kept, as [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#reasoning)
-records. Item 693 keeps the remaining cost of the Horn rules on the two files, which
+holds every file. Item 712 applies the first two reductions in the unfolding of the
+disjunctive rules as well. Item 693 keeps the remaining cost of the Horn rules on the two files, which
 still derive 22.1 and 35.6 million conclusions against 16.5 and 10.8 million for the EL
 rules alone.
+
+Item 712 reduces the automata by which the disjunctive rules unfold their universal and
+negative existential restrictions, with the first two reductions of the Horn rules, as
+[reduced automata of the disjunctive rules](#reduced-automata-of-the-disjunctive-rules)
+describes. On BioTop, ore_ont_12141 of the ORE 2015 DL sample, the 22 unfoldings of its 11
+automata make 62 fresh classes and 77 transition axioms where they made 111 and 357, and
+the attempt's `Stats::dl_work` on one thread falls from 136,117 to 66,200, with 42,242
+stored clauses against 75,182. On `atlas`, twelve rounds in alternating order of one
+binary with `SPARKLES_DL_AUTOMATA` at 0 and at 2 took BioTop's classification from 56.2 to
+31.0 ms on one thread, a median paired ratio of 0.552 with every round between 0.550 and
+0.556, and from 23.7 to 14.3 ms on four threads, 0.599 with rounds from 0.550 to 0.657.
+The run's estimated bytes fall from 21.2 to 12.8 MB. Two other releases of BioTop among
+the final files of the ORE sample, ore_ont_16847 and ore_ont_9024, halve their work in the
+same way. Every taxonomy is equal at both levels on the 205 development files and the 183
+final files that both classify and on the 874 fixtures of items 603, 897 and 712. Item 712 stays open for
+its aim of three times Konclude's speed, which a comparison on one host decides.
 
 The rule for a new universal no longer searches the context's universals for the same
 role and filler. A context derives each universal once, since a role and a filler have
@@ -1326,12 +1341,10 @@ alone derive 16.5 and 10.8 million. The contexts of conjunctions hold 5.47 milli
 subsumers on ore_ont_14817 where they held 8.50 million. On the benchmark host the Horn
 rules alone then take 2.0 against 2.5 s and 2.7 against 3.7 s on one thread, with peak
 resident sets of 713 against 808 MiB and 951 against 1,215 MiB, as the Outcome records.
-The taxonomies are equal at every level on one and eight threads. Tier D's own unfolding in its bounded
-attempt is not reduced. The first two reductions were tried there and not kept. On the
-96 disjunctive files of the development set the taxonomies were equal, the same three
-attempts ended over their bound, and the times of the two Uberon files differed by no
-more than the spread of their runs, 52 to 125 s, as the
-[experiments log](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
+The taxonomies are equal at every level on one and eight threads. The disjunctive rules apply the first two
+reductions in their own unfolding and not the third, as
+[reduced automata of the disjunctive rules](#reduced-automata-of-the-disjunctive-rules)
+describes.
 
 A differential check generated small Horn ontologies with chains, transitive properties,
 inverses, ranges and property hierarchies over six properties, of which the class axioms
@@ -1957,7 +1970,9 @@ covers ALCHI, which adds unions, complements and universal restrictions in every
 to the EL classifier's language, with inverse properties and property hierarchies.
 Transitive properties and chains are taken through the automata of Horrocks, Kutz and
 Sattler, which unfold the universal restrictions, negative existential restrictions and
-ranges on the properties they reach. A run that does not count reads an at-least
+ranges on the properties they reach, after the reductions that
+[reduced automata of the disjunctive rules](#reduced-automata-of-the-disjunctive-rules)
+describes. A run that does not count reads an at-least
 restriction in a positive position and an at-most restriction in a negative one as the
 existential restriction they imply, which keeps ALCHI's models. The rules run when an
 axiom needs case analysis and the ontology has no individuals, data properties, self
@@ -3818,6 +3833,74 @@ build, and a run that falls back takes less, since it makes its attempt once. On
 thread the fallback of ore_ont_6485 takes 55 ms longer, and that of ore_ont_14817 takes
 10 s against 132 s without steps. The times above are from one host under load, and
 none is from the benchmark host.
+
+#### Reduced automata of the disjunctive rules
+
+The disjunctive rules unfold a universal restriction `∀r.C` on a property that chains or
+transitivity reach by the automaton of `r` without its ε-transitions, and a negative
+existential restriction `∃r.F ⊑ G` as `F ⊑ ∀r⁻.G`. Each state `s` becomes a fresh class
+`X_s`, the holder of the restriction gets `X_start`, each transition by `l` from `p` to `q`
+gives `X_p ⊑ ∀l.X_q`, and each final state gives `X_s ⊑ C`. The restriction itself stays,
+which is sound on the direct links. Item 712 reduces each automaton before the unfolding
+with the first two reductions of [the Horn rules](#the-horn-rules), and
+`Limits::dl_automata` or `SPARKLES_DL_AUTOMATA` set to 0 or 1 turns off both or the second
+for a comparison. The default is 2, which applies both.
+
+`X_s` stands for the universal restriction over every word that `s` accepts, in which a
+link meets a letter `l` when its property is under `l`. The rules read universals in that
+way. A universal on `l` reaches each successor whose property is under `l`, through the
+existential restrictions and the stored clauses whose maximal literal is a role under `l`,
+each predecessor whose link is under the inverse of `l`, through the propagations over the
+backward links, and in a rooted run each constant that a link under `l` reaches. Every one
+of these tests reads the index's property hierarchy, which closes the same property
+inclusions as the automata, closed under inverses, and in which every property that an
+automaton names has its inverse. The tables that let a role reach a successor or a
+predecessor at all hold every superproperty of a role they hold. A test that holds under
+`l` therefore holds under every superproperty of `l`.
+
+1. **States that accept the same words become one.** The coarsest partition of the states
+   whose blocks are final alike and have transitions by the same properties into the same
+   blocks puts states with the same language together. Each block accepts what each of its
+   states accepted, so every class of the quotient stands for the universal that the class
+   of any of its states stood for, and the quotient's axioms have the consequences of the
+   axioms they replace. A merge that ignored which states are final would make the start
+   final and put the holder under the filler.
+2. **A transition that another covers by a superproperty goes.** When a state has
+   transitions by `l` and by `l'` into the same state and `l` is under `l'`, the transition
+   by `l` goes, and of two transitions by equivalent properties the one with the lower id
+   stays. The state accepts fewer words, but each word it no longer accepts differs from
+   one it accepts only in letters that are subproperties of the accepted word's letters,
+   so the universal it stands for is the same. `X_p ⊑ ∀l.X_q` follows from
+   `X_p ⊑ ∀l'.X_q` and `l ⊑ l'`, and the rules derive each of its instances from the kept
+   axiom, since they apply the kept universal over every link under `l'` in both
+   directions. Dropping the transition by `l'` instead would lose the paths whose link is
+   only under `l'`.
+3. **Transitions by properties that no link can have stay.** The Horn rules' third
+   reduction rests on the list of properties that their links and loops can have, argued
+   for their rules R3 and R4. The disjunctive rules make links from the heads of clauses
+   and from hypothetical successors as well, and the list is not argued for them, so their
+   automata keep these transitions.
+
+The two reductions alternate until neither applies, within the Horn rules' bound of steps.
+They read only the property axioms, so the positions of an unfolding's fresh classes, which
+a kept run reuses, depend on the property axioms and the level alone, and the level is one
+of the options that a kept run must share with the last one.
+
+`tests/dl_automata.rs` checks the reductions. Seven hand-written cases combine transitive
+properties under transitive properties, inverses, negative existential restrictions, a
+chain, equivalent properties and a nominal with unions. Each is taken whole by the
+disjunctive rules at every level on one and four threads with the answer of the reference
+reasoners, HermiT 1.4.5 and Konclude 0.7.0, whose union is the reference because each
+misses subsumptions that the other finds. The reduced automata derive fewer conclusions on
+each case. A merge that ignores which states are final and a covered transition dropped
+by the superproperty each fail all seven, the backward cases through a holder that only a
+union gives, so that the EL rules cannot answer them. 200 generated cases with transitive
+properties, chains and inclusions between properties and between their inverses are taken
+whole at levels 0 and 2 on one thread with the reference answer, and the reduction changes
+the conclusions of 107 of them. The wrong merge fails 172 of them and the wrong drop none,
+so the hand-written cases alone guard the second reduction. Levels 0 and 2 give one answer on every fixture of items
+603, 897 and 712 on which neither run falls back, and none of the fixtures of items 603
+and 897 has an automaton that the reduction changes.
 
 ### Nominals in the disjunctive rules
 

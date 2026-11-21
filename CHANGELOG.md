@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### The disjunctive rules reduce their automata
+
+Roadmap item 712 reduces the automata by which the disjunctive rules unfold universal and
+negative existential restrictions on properties that chains or transitivity reach. Before
+the unfolding, the states that accept the same words become one, and a transition goes
+when another from the same state into the same state has a superproperty of its property,
+as the Horn rules already did. The rules apply a universal to every link under its
+property in both directions, so a state stands for the same restriction after either step.
+`Limits::dl_automata` and `SPARKLES_DL_AUTOMATA` select level 0 or 1 for a comparison. On
+`atlas` BioTop, `ore_ont_12141`, classifies in 31.0 against 56.2 ms on one thread, a
+median paired ratio of 0.552, and in 14.3 against 23.7 ms on four, 0.599, with half the
+work and fewer than half the estimated bytes. The taxonomies are equal at both levels on
+the development and final files of the ORE 2015 DL sample and on 207 new fixtures checked
+against HermiT and Konclude. An earlier experiment had attributed BioTop's halved work to
+schedule noise, and the experiments page now records the correction.
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M

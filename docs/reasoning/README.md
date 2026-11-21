@@ -455,7 +455,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   without individuals, data properties, self restrictions, reflexive properties or top
   properties, axioms that need case analysis, such as unions, complements and universal
   restrictions on the left, take the disjunctive rules of the consequence-based calculus
-  for ALCHI, with transitive properties and chains through the same automata. Each
+  for ALCHI, with transitive properties and chains through the same automata. These
+  rules first merge the states of an automaton that accept the same words and drop a
+  transition that another into the same state covers by a superproperty, which halves the
+  work on BioTop. `Limits::dl_automata` set to 0 or 1 keeps the automata whole or only
+  merges, for a comparison, and a run that finishes gives the same answer at every level. Each
   context keeps clauses under one total order of literals, and a named subsumer that only
   a case analysis gives is found by a test context for the class with the candidate's
   complement. `Limits::expansion` chooses the cautious or the eager successor strategy,
@@ -1189,9 +1193,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   requested, the attempt and the run without it together, takes 213 ms on one thread with
   the order and 188 ms with `Limits::number_order` set to false, 1.14 times as long,
   against 7 ms without counting and 40 ms for Konclude. Roadmap items 896 and 729.
-* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 23 ms on four threads,
-  the time Konclude takes, which is short of the classifier's aim of three times
-  Konclude's speed. Roadmap item 712.
+* BioTop, ore_ont_12141 of the ORE 2015 DL sample, classifies in 31 ms on one thread and
+  14 ms on four on `atlas`. Konclude took about 23 ms on another host, and the classifier
+  aims at three times Konclude's speed on one host. Roadmap item 712.
 * ore_ont_3215 of the ORE 2015 DL sample passes the disjunctive rules' bound on derived
   conclusions and gets the Horn rules' answer without its 18,323 unions. Roadmap item 713.
 * `partial` applies only to runs of the disjunctive rules, and runs of the EL and Horn

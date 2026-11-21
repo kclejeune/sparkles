@@ -334,7 +334,8 @@ pub struct Limits {
     /// words by the same transitions, and 2 also dropping a transition that another from
     /// the same state into the same state covers by a superproperty. `None` takes
     /// `SPARKLES_DL_AUTOMATA` when it is set and 2 otherwise, and a level above 2 is 2.
-    /// Every level gives the same taxonomy, and 2 derives the fewest conclusions.
+    /// A run that finishes gives the same taxonomy at every level, and 2 derives the fewest
+    /// conclusions, so an attempt can pass its bound at a lower level where it finishes at 2.
     pub dl_automata: Option<u8>,
 }
 

@@ -175,7 +175,8 @@ fn limits(level: u8, threads: usize, rooted: bool) -> Limits {
 /// Each hand-written case is taken whole by Tier D at every level, on one thread and on
 /// four, with the reference answer, and the reduced automata derive less than the unreduced
 /// ones. A merge that ignored which states are final, or a covered transition dropped by
-/// the superproperty instead of the subproperty, changes the answer of every case.
+/// the superproperty instead of the subproperty, changes the answer of every case. The run
+/// with the default limits answers as level 2 does.
 #[test]
 fn the_hand_cases_give_the_reference_answer_at_every_level() {
     let cases = cases("dl712", &["hand-"]);
@@ -204,6 +205,18 @@ fn the_hand_cases_give_the_reference_answer_at_every_level() {
         }
         if work[2] >= work[0] {
             failures.push(format!("{}: work by level {work:?}", case.stem));
+        }
+        let default = run(
+            case,
+            &Limits {
+                threads: 1,
+                counting: true,
+                rooted,
+                ..Limits::default()
+            },
+        );
+        if default.got != *want || default.stats.conclusions != work[2] {
+            failures.push(format!("{}: the default is not level 2", case.stem));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
