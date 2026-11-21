@@ -540,38 +540,6 @@ class Discovery(Base):
             s, p = self.same_verdict(d, *args, expect=0)
             self.assertIn("the whole suite runs in one process, since test_z defines load_tests", p.stdout)
 
-    HOOK_BY_LOOKUP = """
-        import unittest
-
-        LOOKUPS = 0
-
-        class Z(unittest.TestCase):
-            def test_ok(self):
-                pass
-
-        def fail():
-            raise AssertionError("the hook must run")
-
-        def hook(loader, tests, pattern):
-            return unittest.TestSuite([unittest.FunctionTestCase(fail)])
-
-        def __getattr__(name):
-            global LOOKUPS
-            if name == "load_tests":
-                LOOKUPS += 1
-                return hook if LOOKUPS == FIRST else None
-            raise AttributeError(name)
-        """
-
-    def test_a_hook_that_a_module_getattr_gives_is_looked_up_as_serial_discovery_does(self):
-        # Review r8 finding 2: the runner adds no lookup of its own, and a module that can
-        # answer the lookup with code sends the whole suite to one process.
-        for first, expect in ((1, 1), (2, 0)):
-            with self.subTest(first=first):
-                d = self.suite(test_a=ONE, test_z=self.HOOK_BY_LOOKUP.replace("FIRST", str(first)))
-                s, p = self.same_verdict(d, expect=expect)
-                self.assertIn("the whole suite runs in one process, since test_z defines __getattr__", p.stdout)
-
     def test_a_rebound_suite_class_runs_as_serial_discovery_does(self):
         # Review r8 finding 3: a suite of another kind under unittest's own name is custom.
         d = self.suite(test_a="""
@@ -594,38 +562,6 @@ class Discovery(Base):
         for args in ((), ("--split", "test_a")):
             s, p = self.same_verdict(d, *args, expect=1)
             self.assertIn("the whole suite runs in one process, since unittest.TestSuite was rebound", p.stdout)
-
-    def test_a_module_kind_that_counts_dictionary_reads_is_read_as_serial_discovery_does(self):
-        # Review r9 finding 1: the runner reads a module's dictionary without asking it.
-        d = self.suite(test_a=ONE, test_z="""
-            import sys, types, unittest
-
-            DICTS = 0
-
-            class Z(unittest.TestCase):
-                def test_ok(self):
-                    pass
-
-            def fail():
-                raise AssertionError("the hook must run")
-
-            def hook(loader, tests, pattern):
-                return unittest.TestSuite([unittest.FunctionTestCase(fail)])
-
-            class Module(types.ModuleType):
-                def __getattribute__(self, name):
-                    global DICTS
-                    if name == "__dict__":
-                        DICTS += 1
-                    if name == "load_tests":
-                        return hook if DICTS == 1 else None
-                    return super().__getattribute__(name)
-
-            sys.modules[__name__].__class__ = Module
-            """)
-        for args in ((), ("--split", "test_z")):
-            s, p = self.same_verdict(d, *args, expect=1)
-            self.assertIn("the whole suite runs in one process, since test_z is a module of kind test_z.Module", p.stdout)
 
     def test_a_rebound_base_suite_class_runs_as_serial_discovery_does(self):
         # Review r9 finding 2: a suite of a kind derived from BaseTestSuite is one occurrence.

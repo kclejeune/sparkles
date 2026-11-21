@@ -16,20 +16,20 @@ test does nothing and gets no process.
 
 The whole suite runs in one process instead, as discovery returned it, and the runner says
 why, when anything in it could make a part of the suite depend on what ran before it. That
-is the case when a module or package that discovery loads defines a load_tests hook, a
-module __getattr__ that could give one or a module class of its own, when the suite holds
-anything other than default suites and TestCase tests, including a default suite with
-attributes of its own such as a run() given to the instance, when a test module has changed
-unittest's suite classes or put other classes under their names, and when test classes of
-one module run in more than one entry, as when one test module imports another's class,
-since they can share that module's state. The runner does not ask what such a hook or suite
-does, reads modules' attributes from their own dictionaries, and counts a suite of a kind of
-its own as one occurrence without listing what it holds. State that tests share in some
-other way, such as through a helper module's globals, is not detected, so a test that
-depends on a test in another unit having run first can pass or skip here and fail serially.
-The same holds for the tests of a split module, which each run in a unit of their own. The
-runner also assumes that a test's run(), when a TestCase defines its own, reads only its own
-test's result.
+is the case when a module or package that discovery loads has a load_tests hook, when the
+suite holds anything other than default suites and TestCase tests, including a default
+suite with attributes of its own such as a run() given to the instance, when a test module
+has changed unittest's suite classes or put other classes under their names, and when test
+classes of one module run in more than one entry, as when one test module imports another's
+class, since they can share that module's state. The runner does not ask what such a hook
+or suite does, and counts a suite of a kind of its own as one occurrence.
+
+The runner reaches serial discovery's verdict under three assumptions, which it does not
+check. No test depends on state, such as a helper module's globals, that a test in another
+unit left behind, since such a test can pass or skip here and fail serially, and the same
+holds for the tests of a split module. A test's own run() reads only its own test's result.
+Test code does not react to being inspected or imported more than once, since each unit
+imports every module and asks each test for its id() and attributes again.
 
 A module named with --split runs one process per test instead, for modules whose few tests
 take most of the suite's time. The split is taken only when the module's entry is plain,
@@ -81,7 +81,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import types
 import unittest
 from pathlib import Path
 
@@ -97,25 +96,6 @@ _SUITE_DICTS = {cls: dict(vars(cls)) for cls in _SUITE_CLASSES}
 _SUITE_NAMES = [(unittest, "unittest", "TestSuite", _SUITE), (unittest.suite, "unittest.suite", "TestSuite", _SUITE),
                 (unittest, "unittest", "BaseTestSuite", _BASE_SUITE),
                 (unittest.suite, "unittest.suite", "BaseTestSuite", _BASE_SUITE)]
-# A module's dictionary, read through the descriptor of the module type itself, so that a
-# module of a kind of its own cannot see or answer the read.
-_MODULE_DICT = types.ModuleType.__dict__["__dict__"]
-# A default suite's dictionary, read the same way, in case a test module has changed the class.
-_SUITE_DICT = _BASE_SUITE.__dict__["__dict__"]
-
-
-def _dict(module):
-    """MODULE's own dictionary, or an empty one for an object that is not a module. Neither
-    this nor the type checks below look up an attribute that a test's own code can answer."""
-    return _MODULE_DICT.__get__(module) if issubclass(type(module), types.ModuleType) else {}
-
-
-def _is_suite(node):
-    return issubclass(type(node), _BASE_SUITE)
-
-
-def _is_case(node):
-    return issubclass(type(node), _CASE)
 
 
 def _default(node):
@@ -128,7 +108,7 @@ def _default(node):
 
 class _TaggingLoader(unittest.TestLoader):
     """A loader that remembers which module produced each suite, to name the units, and
-    which modules can give unittest a load_tests hook."""
+    which modules give unittest a load_tests hook."""
 
     def __init__(self):
         super().__init__()
@@ -136,46 +116,34 @@ class _TaggingLoader(unittest.TestLoader):
         self.hooks = []
 
     def loadTestsFromModule(self, module, *args, **kwargs):
-        # unittest looks for the hook here, for test modules and packages alike. The module's
-        # dictionary is read directly, so the runner adds no lookup that code could answer, and
-        # a module that can answer unittest's own lookup with code counts as having a hook.
-        own = _dict(module)
-        name = own.get("__name__")
-        if "load_tests" in own:
-            self.hooks.append(f"{name} defines load_tests")
-        elif "__getattr__" in own:
-            self.hooks.append(f"{name} defines __getattr__")
-        elif type(module) is not types.ModuleType:
-            self.hooks.append(f"{name} is a module of kind {type(module).__module__}.{type(module).__qualname__}")
+        # unittest looks for the hook here, for test modules and packages alike, with the
+        # same lookup.
+        if getattr(module, "load_tests", None) is not None:
+            self.hooks.append(f"{module.__name__} defines load_tests")
         suite = super().loadTestsFromModule(module, *args, **kwargs)
         # The suite is kept with its name, so that its id is not reused by another.
-        self.labels.setdefault(id(suite), (suite, name))
+        self.labels.setdefault(id(suite), (suite, module.__name__))
         return suite
 
 
 def _tree(node, deep=True):
     """NODE's description. A suite of a kind of its own is described by its kind alone, since
     listing it would run its code."""
-    if _is_suite(node):
+    if isinstance(node, _BASE_SUITE):
         cls = type(node)
         tree = {"suite": f"{cls.__module__}.{cls.__qualname__}"}
         if _default(node):
-            tree["own"] = sorted(set(_SUITE_DICT.__get__(node)) - _SUITE_KEYS)
+            tree["own"] = sorted(set(vars(node)) - _SUITE_KEYS)
             if deep:
                 tree["tests"] = [_tree(t) for t in node]
         return tree
     return _id(node)
 
 
-def _own(module, name):
-    """MODULE's attribute NAME from its own dictionary, or None."""
-    return _dict(module).get(name)
-
-
 def _id(test):
-    """TEST's id, or for a test that is not a TestCase or a suite of a kind of its own, a name
-    for its kind, which the runner finds without asking the test anything."""
-    if _is_case(test) and not _is_suite(test):
+    """TEST's id, or for a suite of a kind of its own or a test with no id(), a name for its
+    kind. A suite is named by its kind even when it is also a TestCase."""
+    if not isinstance(test, _BASE_SUITE) and callable(getattr(test, "id", None)):
         return test.id()
     return f"<{type(test).__module__}.{type(test).__qualname__}>"
 
@@ -185,14 +153,14 @@ def _custom(node):
     TestCase does, or None. A suite of a kind of its own, a default suite with attributes of
     its own, such as a run() given to the instance, and a test that is not a TestCase can
     each do anything when they run, including depend on the result of what ran before."""
-    if _is_suite(node):
+    if isinstance(node, _BASE_SUITE):
         if type(node) is not _SUITE:
             return f"has a suite of kind {type(node).__module__}.{type(node).__qualname__}"
-        own = sorted(set(_SUITE_DICT.__get__(node)) - _SUITE_KEYS)
+        own = sorted(set(vars(node)) - _SUITE_KEYS)
         if own:
             return f"has a suite with attributes of its own: {', '.join(own)}"
         return None
-    if not _is_case(node):
+    if not isinstance(node, _CASE):
         return f"has a test of kind {type(node).__module__}.{type(node).__qualname__}"
     return None
 
@@ -228,7 +196,7 @@ def _label(loader, entry, index):
         # and unittest.loader.ModuleSkipped.MODULE.
         if type(t).__module__ == "unittest.loader":
             return _id(t).rsplit(".", 1)[-1]
-        if _is_suite(t) or not _is_case(t):
+        if isinstance(t, _BASE_SUITE) or not isinstance(t, _CASE):
             return type(t).__module__
         return _id(t).rsplit(".", 2)[0]
     return f"entry-{index}"
@@ -249,14 +217,14 @@ def _plain(label, entry):
     if module is None:
         return "it is not a module of its own"
     for hook in ("setUpModule", "tearDownModule", "parallel_absorb"):
-        if hook in _dict(module):
+        if hasattr(module, hook):
             return f"it defines {hook}"
     if unittest.case._module_cleanups:
         return "a module cleanup is registered"
     seen = set()
 
     def walk(node):
-        if _is_suite(node):
+        if isinstance(node, _BASE_SUITE):
             for t in node:
                 why = walk(t)
                 if why:
@@ -296,7 +264,7 @@ def discover(directory):
     for i, entry in enumerate(entries):
         label = _label(loader, entry, i)
         module = sys.modules.get(label)
-        f = _own(module, "__file__")
+        f = getattr(module, "__file__", None)
         units.append({
             "label": label,
             "tree": _tree(entry),
@@ -304,12 +272,12 @@ def discover(directory):
             # A split check needs default suites and TestCase tests, which the fallback does not.
             "split": "the whole suite runs in one process" if serial else _plain(label, entry),
             "size": os.path.getsize(f) if f and os.path.exists(f) else 0,
-            "absorb": callable(_own(module, "parallel_absorb")),
+            "absorb": callable(getattr(module, "parallel_absorb", None)),
             # With no custom node anywhere, a part with no test does nothing when it runs.
             "inert": not any(True for _ in _leaves(entry)),
         })
     exports = sorted(m for m in set(sys.modules) - before
-                     if callable(_own(sys.modules[m], "parallel_export")))
+                     if callable(getattr(sys.modules[m], "parallel_export", None)))
     # The hooks, the root and each suite's own attributes are part of the description, so a
     # unit whose discovery made them differently fails its comparison with the runner's.
     return suite, entries, {"root": _tree(suite, deep=False), "leaves": [_id(t) for t in _leaves(suite)],
@@ -335,7 +303,7 @@ def _serial(loader, suite, entries, changed):
         why = _custom(node)
         if why:
             return f"{where} {why}"
-        if _is_suite(node):
+        if isinstance(node, _BASE_SUITE):
             for t in node:
                 why = custom(t, where)
                 if why:
@@ -410,7 +378,7 @@ def worker_main(directory, plan_path, index, split, record_path, absorb_path):
         with open(absorb_path) as f:
             exports = json.load(f)
         label = plan["units"][index]["label"]
-        _own(sys.modules[label], "parallel_absorb")(exports.get(label, []))
+        sys.modules[label].parallel_absorb(exports.get(label, []))
     # A suite drops each test once it has run, so the occurrences are listed first.
     ran = [_id(t) for t in _leaves(entry)]
     warnings = None if sys.warnoptions else "default"
@@ -424,7 +392,7 @@ def worker_main(directory, plan_path, index, split, record_path, absorb_path):
         expectedFailures=len(result.expectedFailures),
         unexpectedSuccesses=len(result.unexpectedSuccesses),
         successful=result.wasSuccessful(),
-        exports={m: _own(sys.modules[m], "parallel_export")() for m in plan["exports"]},
+        exports={m: sys.modules[m].parallel_export() for m in plan["exports"]},
     )
     sys.stderr.flush()
     _write_json(record_path, record)

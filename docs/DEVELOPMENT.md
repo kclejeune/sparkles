@@ -378,17 +378,18 @@ package that discovery loads. Each process discovers the whole suite again, chec
 found the same tests in the same order, and runs its own part exactly as discovered. Import
 errors, import-time skips and class and module fixtures therefore behave as they do
 serially. The whole suite runs in one process, as discovery returned it, and the runner says
-why, when any module or package defines a `load_tests` hook, a module `__getattr__` that
-could give one or a module class of its own, when the suite holds anything other than
-default suites and `TestCase` tests, including a suite given its own `run`, when a test
+why, when any module or package has a `load_tests` hook, when the suite holds anything other
+than default suites and `TestCase` tests, including a suite given its own `run`, when a test
 module changes unittest's suite classes or rebinds their names, or when test classes of one
 module run under more than one module, as when one test module imports another's class. Such
 a suite or test can depend on what ran before it, and the runner does not try to tell
 whether it does. Tests that share state in another way, such as a helper module's globals,
-are not detected, and the runner assumes that a test's own `run` method reads only its own
-test's result. The runner therefore reaches the serial verdict only when no test depends on
-state that a test in another process left behind, and passing alone does not show this,
+are not detected. The runner therefore reaches the serial verdict only when no test depends
+on state that a test in another process left behind, and passing alone does not show this,
 since such a test can skip instead of fail. The same holds for the tests of a split module.
+The runner also assumes that a test's own `run` method reads only its own test's result, and
+that test code does not react to being inspected or imported more than once, since each
+process imports every module and asks each test for its id and attributes again.
 The three long tests of `test_x08_latency` run one per process. A module named with
 `--split` is split this way only when it has no fixtures, imported classes or repeated
 tests, and otherwise runs whole with a note that says why.
