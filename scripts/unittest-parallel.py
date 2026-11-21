@@ -17,8 +17,9 @@ whole suite runs in one process instead, and the runner says why, when test clas
 module run in more than one entry, as when one test module imports another's class, since
 they can share that module's state, or when any entry has a suite of a kind of its own, a
 default suite with attributes of its own such as a run() given to the instance, or a test
-that is not a TestCase, or when a test module has changed unittest's suite classes, since
-such a run() can depend on everything run before it. State that tests share in some other
+that is not a TestCase, when the suite that discovery returns is one of these, or when a
+test module has changed unittest's suite classes, since such a run() can depend on
+everything run before it. That suite then runs as discovery returned it. State that tests share in some other
 way, such as through a helper module's globals, is not detected, so a test that depends on
 a test in another unit having run first can pass or skip here and fail serially. The same
 holds for the tests of a split module, which each run in a unit of their own.
@@ -58,8 +59,8 @@ the signal number. Discovery and each unit get SIGTERM from the kernel when the 
 without stopping them, as under SIGKILL, and then stop their own descendants the same way
 and exit.
 On a host without /proc or prctl, which the runner needs, it prints a notice and runs the
-suite serially with `python3 -m unittest discover -s DIR` instead, ignoring the options
-other than DIR, and exits as that does.
+suite serially by replacing itself with `python3 -m unittest discover -s DIR`, ignoring the
+options other than DIR, so the run exits as that does, or ends by the signal that ends it.
 --keep DIR keeps the discovery, the plan, each unit's output and the result records in a
 new directory under DIR. --jobs 1 runs the units one at a time, in the same processes.
 """
@@ -212,7 +213,7 @@ def _plain(label, entry):
 
 def discover(directory):
     """Discover DIRECTORY as `python3 -m unittest discover -s DIRECTORY` does, and return the
-    loader, the top-level entries and their description."""
+    suite that discovery returns, its top-level entries and their description."""
     # `python3 -m unittest` puts the working directory first on the path, where a script puts
     # its own directory.
     sys.path[0] = os.getcwd()
@@ -237,7 +238,9 @@ def discover(directory):
         u["inert"] = _inert(entry)
     exports = sorted(m for m in set(sys.modules) - before
                      if callable(getattr(sys.modules[m], "parallel_export", None)))
-    return entries, {"units": units, "exports": exports, "serial": _shared(entries, units)}
+    root = _custom(suite)
+    serial = _shared(entries, units) or (f"the suite that discovery returns {root}" if root else None)
+    return suite, entries, {"units": units, "exports": exports, "serial": serial}
 
 
 def _inert(node):
@@ -293,7 +296,7 @@ def _write_json(path, value):
 
 def discover_main(directory, out):
     # The caller has set up _die_with_parent before any test module is imported.
-    _, description = discover(directory)
+    _, _, description = discover(directory)
     _write_json(out, description)
     return 0
 
@@ -319,13 +322,14 @@ def _die_with_parent(parent, grace):
 def worker_main(directory, plan_path, index, split, record_path, absorb_path):
     with open(plan_path) as f:
         plan = json.load(f)
-    entries, description = discover(directory)
+    suite, entries, description = discover(directory)
     record = {"complete": True, "index": index, "split": split}
     if description != plan:
         record.update(error="the suite discovered here differs from the runner's discovery", ran=[])
         _write_json(record_path, record)
         return 1
-    entry = unittest.TestSuite(entries) if index < 0 else entries[index]
+    # The whole suite runs as discovery returned it, which may have behaviour of its own.
+    entry = suite if index < 0 else entries[index]
     if split >= 0:
         entry = unittest.TestSuite([list(_leaves(entry))[split]])
     if absorb_path:
@@ -613,9 +617,12 @@ def main(argv=None):
     why = _unsupported()
     if why:
         # Supervision needs /proc and prctl, which only Linux has.
+        # unittest takes this process's place, so its exit status, or the signal that ends it,
+        # is the run's.
         print(f"unittest-parallel: {why}, so the suite runs serially with unittest discover", flush=True)
-        return subprocess.run([sys.executable, *(f"-W{w}" for w in sys.warnoptions), "-m", "unittest",
-                               "discover", "-s", str(a.directory)], stdin=subprocess.DEVNULL).returncode
+        sys.stderr.flush()
+        os.execv(sys.executable, [sys.executable, *(f"-W{w}" for w in sys.warnoptions), "-m", "unittest",
+                                  "discover", "-s", str(a.directory)])
     old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     if a.keep:
         a.keep.mkdir(parents=True, exist_ok=True)

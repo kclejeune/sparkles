@@ -372,6 +372,43 @@ class Discovery(Base):
         s, p = self.same_verdict(d, expect=0)
         self.assertIn("the whole suite runs in one process", p.stdout)
 
+    ROOT_RUN = """
+        import unittest
+
+        class T(unittest.TestCase):
+            def test_ok(self):
+                pass
+
+        def load_tests(loader, tests, pattern):
+            # The suite that discovery returns, made after this hook, gets a run of its own.
+            def suite_class(items=()):
+                suite = unittest.TestSuite(items)
+                plain = suite.run
+                def run(result, debug=False):
+                    result = plain(result, debug)
+                    case = unittest.FunctionTestCase(lambda: None, description="root check")
+                    result.addFailure(case, (AssertionError, AssertionError("the root's run must run"), None))
+                    return result
+                suite.run = run
+                return suite
+            loader.suiteClass = suite_class
+            return tests
+        """
+
+    def test_a_discovered_root_with_a_run_of_its_own_still_runs(self):
+        # Review r5 finding 1: the suite discovery returns is run as it is, not rebuilt.
+        # The hook's module is discovered last, so only the root gets the run of its own.
+        d = self.suite(test_a=ONE, test_z=self.ROOT_RUN)
+        for args in ((), ("--split", "test_a")):
+            s, p = self.same_verdict(d, *args, expect=1)
+            self.assertIn("the whole suite runs in one process, since the suite that discovery returns has a suite with attributes of its own: run", p.stdout)
+
+    def test_a_discovered_root_with_a_run_of_its_own_runs_in_the_fallback_too(self):
+        # test_b imports test_a's class, which sends the whole suite to one process first.
+        d = self.suite(test_a=ONE, test_b="from test_a import One\n", test_z=self.ROOT_RUN)
+        s, p = self.same_verdict(d, expect=1)
+        self.assertIn("since test classes of test_a run in 2 top-level entries", p.stdout)
+
     def test_a_suite_class_changed_at_import_runs_as_serial_discovery_does(self):
         d = self.suite(test_a=ONE, test_z="""
             import unittest
@@ -894,6 +931,18 @@ class WithoutProc(Base):
         p = self.run_without_proc(self.suite(test_a=PASS, test_b=FAIL))
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("Ran 3 tests", p.stderr)
+
+    def test_a_test_that_ends_by_a_signal_ends_the_run_by_it(self):
+        d = self.suite(test_term="""
+            import os, signal, unittest
+
+            class T(unittest.TestCase):
+                def test_term(self):
+                    os.kill(os.getpid(), signal.SIGTERM)
+            """)
+        self.assertEqual(self.serial(d).returncode, -signal.SIGTERM)
+        p = self.run_without_proc(d)
+        self.assertEqual(p.returncode, -signal.SIGTERM, p.stdout + p.stderr)
 
     def test_an_empty_suite_exits_5_serially(self):
         p = self.run_without_proc(self.suite(test_none="VALUE = 1\n"))

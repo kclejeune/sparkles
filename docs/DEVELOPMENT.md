@@ -380,9 +380,9 @@ order, and runs its own part exactly as discovered. Import errors, import-time s
 `load_tests` hooks and class and module fixtures therefore behave as they do serially.
 The whole suite runs in one process, and the runner says why, when test classes of one
 module run under more than one module, as when one test module imports another's class,
-when a `load_tests` hook returns a suite of its own kind or a suite given its own `run`, or
-when a test module changes unittest's suite classes, since such tests can depend on what ran
-before them. Tests that share state in another way, such as a helper module's globals, are
+when a `load_tests` hook makes a suite of its own kind or a suite given its own `run`, which
+can also be the suite that discovery returns, or when a test module changes unittest's suite
+classes, since such tests can depend on what ran before them. Tests that share state in another way, such as a helper module's globals, are
 not detected. The runner therefore reaches the serial verdict only when no test depends on
 state that a test in another process left behind, and passing alone does not show this,
 since such a test can skip instead of fail. The same holds for the tests of a split module.
@@ -402,7 +402,8 @@ SIGHUP, the runner starts no more processes, stops every active one with its gro
 descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
 the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
 stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
-host it says so and runs the suite serially with `unittest discover`. `--keep DIR` keeps the discovery, the plan, each process's
+host it says so and hands the run to a serial `unittest discover`, which then exits as it
+would on its own. `--keep DIR` keeps the discovery, the plan, each process's
 output and the result records.
 
 Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
