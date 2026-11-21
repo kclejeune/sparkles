@@ -65,6 +65,7 @@ fn error(e: &Error) -> Value {
         Error::Memory { limit, used } => json!({"kind": "memory", "limit": limit, "used": used}),
         Error::Timeout => json!({"kind": "timeout"}),
         Error::Cancelled => json!({"kind": "cancelled"}),
+        Error::Incomplete(e) => json!({"kind": "incomplete", "excluded": e.len()}),
     }
 }
 

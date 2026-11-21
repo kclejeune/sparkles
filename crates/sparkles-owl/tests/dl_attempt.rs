@@ -203,7 +203,7 @@ fn an_attempt_on_one_thread_past_its_width_takes_the_answer_of_the_horn_rules() 
             })
             .unwrap();
         let a = answer(&out, &k);
-        (out.complete, out.stats.dl_attempt_over, a)
+        (out.complete_for_taken, out.stats.dl_attempt_over, a)
     };
     let past = partial(Some(1), Some(0));
     assert!(past.1);

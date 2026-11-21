@@ -347,10 +347,25 @@ fn answer(
             *partial.entry(why).or_default() += 1;
         }
     }
+    // the SWRL rules the reader passed over are outside what the coverage can test, so
+    // they leave the consistency unknown and every class incomplete
+    let incomplete: Vec<&str> = if rules > 0 {
+        out.taxonomy
+            .classes()
+            .map(|c| c.as_str())
+            .filter(|c| {
+                *c != sparkles_owl::vocab::OWL_THING && *c != sparkles_owl::vocab::OWL_NOTHING
+            })
+            .collect()
+    } else {
+        out.incomplete.iter().map(|c| c.as_str()).collect()
+    };
     serde_json::json!({
-        "complete": out.complete,
-        "incomplete": out.incomplete.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        "complete": out.complete && rules == 0,
+        "completeForTaken": out.complete_for_taken,
+        "incomplete": incomplete,
         "consistency": match out.consistency {
+            _ if rules > 0 => "unknown",
             sparkles_owl::classify::Consistency::Consistent => "consistent",
             sparkles_owl::classify::Consistency::Inconsistent => "inconsistent",
             sparkles_owl::classify::Consistency::Unknown => "unknown",
@@ -440,6 +455,7 @@ mod tests {
             "classifyMs",
             "clauses",
             "complete",
+            "completeForTaken",
             "conclusions",
             "conjunctions",
             "consistency",

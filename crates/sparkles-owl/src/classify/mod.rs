@@ -219,9 +219,13 @@ pub struct Limits {
     pub charge: Option<std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>>,
     /// a run with Tier D (roadmap item 603) that its deadline, cancellation or memory
     /// budget stops answers with what it proved, in a [`Classification`] whose
-    /// [`complete`](Classification::complete) is false, instead of failing. Runs of the
-    /// other tiers fail as before.
+    /// [`complete_for_taken`](Classification::complete_for_taken) is false, instead of
+    /// failing. Runs of the other tiers fail as before.
     pub partial: bool,
+    /// refuse a run that leaves an axiom out or uses one only in part with
+    /// [`Error::Incomplete`], after the run, as a complete reasoner such as HermiT
+    /// refuses what it does not support. The classifier keeps the run's state.
+    pub strict: bool,
     /// the expansion strategy of Tier D's Succ rule
     pub expansion: Expansion,
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
@@ -338,6 +342,7 @@ impl Default for Limits {
             cancelled: None,
             charge: None,
             partial: false,
+            strict: false,
             expansion: Expansion::default(),
             dl_work: None,
             dl_attempt_work: None,
@@ -375,6 +380,9 @@ pub enum Error {
         limit: usize,
         used: usize,
     },
+    /// a strict run ([`Limits::strict`]) left out or used only in part these axioms, so
+    /// its answer would not be complete for the whole ontology
+    Incomplete(Vec<Excluded>),
 }
 
 impl std::fmt::Display for Error {
@@ -386,6 +394,7 @@ impl std::fmt::Display for Error {
                 f,
                 "classification needs more than its memory budget of {limit} bytes (at least {used})"
             ),
+            Error::Incomplete(excluded) => f.write_str(&refusal(excluded)),
         }
     }
 }
@@ -490,14 +499,29 @@ pub struct Classification {
     pub consistent: bool,
     pub taxonomy: Taxonomy,
     pub stats: Stats,
-    /// false for the partial answer of a run that stopped ([`Limits::partial`]): its
-    /// subsumptions are entailed, and those of the classes not in
-    /// [`incomplete`](Classification::incomplete) are all that hold
+    /// whether every subsumption between named classes and every unsatisfiable class
+    /// that the whole ontology entails is in the taxonomy: false when the run left an
+    /// axiom out or used one only in part ([`Saturation::excluded`]) and for the partial
+    /// answer of a run that stopped ([`Limits::partial`]). Every subsumption the taxonomy
+    /// holds is entailed either way, and the classes not in
+    /// [`incomplete`](Classification::incomplete) have their complete answer.
     pub complete: bool,
-    /// the classes whose subsumers a partial answer may miss, in IRI order
+    /// whether the answer is complete for the axioms the run took: false only for the
+    /// partial answer of a run that stopped. This is what
+    /// [`complete`](Classification::complete) meant before it covered the axioms left
+    /// out, and it is the meaning of a profile reasoner such as ELK, which ignores the
+    /// axioms outside its fragment.
+    pub complete_for_taken: bool,
+    /// the classes whose superclasses, equivalent classes or satisfiability the answer
+    /// may miss, in IRI order: those a partial answer leaves open and those whose
+    /// bottom-locality module holds an axiom left out (see
+    /// [`transform::Coverage`](crate::transform::Coverage)). It can be empty while
+    /// [`complete`](Classification::complete) is false, when no class's answer depends on
+    /// what was left out.
     pub incomplete: Vec<Class>,
     /// whether the ontology has a model, as far as the run knows: a partial answer can
-    /// leave it unknown, and then no class is complete
+    /// leave it unknown, and so can an axiom left out that could make the ontology
+    /// inconsistent, and then no class is complete
     pub consistency: Consistency,
 }
 
@@ -536,10 +560,64 @@ impl Classification {
             taxonomy: taxonomy.expect("a taxonomy was asked for"),
             stats,
             complete,
+            complete_for_taken: complete,
             incomplete,
             consistency,
         }
     }
+
+    /// Takes account of the axioms the run over `axioms` left out or used only in part:
+    /// the answer is not complete for the whole ontology, and the classes whose module
+    /// holds one of them, or every class when the consistency is no longer known, join
+    /// [`incomplete`](Classification::incomplete). Costs nothing when nothing is left
+    /// out.
+    fn cover(&mut self, axioms: &[&AxiomKind], excluded: &[Excluded]) {
+        if excluded.is_empty() {
+            return;
+        }
+        self.complete = false;
+        let left: Vec<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
+        // a partial answer that left the consistency unknown has every class open
+        if self.consistency == Consistency::Unknown {
+            return;
+        }
+        let c = crate::transform::coverage(
+            axioms,
+            &left,
+            self.consistency == Consistency::Consistent,
+            self.taxonomy.classes(),
+        );
+        if !c.consistency_known {
+            self.consistency = Consistency::Unknown;
+        }
+        if c.incomplete.is_empty() {
+            return;
+        }
+        let mut all = std::mem::take(&mut self.incomplete);
+        all.extend(c.incomplete);
+        all.sort();
+        all.dedup();
+        self.incomplete = all;
+    }
+}
+
+/// The message of a strict run's refusal ([`Error::Incomplete`]): how many axioms were
+/// left out or used only in part, and the first of them with the rule each breaks.
+pub fn refusal(excluded: &[Excluded]) -> String {
+    const SHOWN: usize = 10;
+    let mut m = format!(
+        "the classification would not be complete: it leaves out or uses only in part {} axiom{}",
+        excluded.len(),
+        if excluded.len() == 1 { "" } else { "s" }
+    );
+    for (i, e) in excluded.iter().take(SHOWN).enumerate() {
+        m.push_str(if i == 0 { ": " } else { "; " });
+        m.push_str(&e.describe());
+    }
+    if excluded.len() > SHOWN {
+        m.push_str(&format!("; and {} more", excluded.len() - SHOWN));
+    }
+    m
 }
 
 /// An axiom the classifier leaves out or uses only in part, and why.
@@ -547,6 +625,18 @@ impl Classification {
 pub struct Excluded {
     pub axiom: AxiomKind,
     pub gap: Gap,
+}
+
+impl Excluded {
+    /// The axiom in functional-style syntax, with the rule it breaks or what the
+    /// classifier misses of it.
+    pub fn describe(&self) -> String {
+        let ax = crate::ofn::Renderer::default().axiom(&Axiom::new(self.axiom.clone()));
+        match &self.gap {
+            Gap::Outside { rule, message } => format!("{ax} ({rule}: {message})"),
+            Gap::Partial(why) => format!("{ax} (used only in part: {why})"),
+        }
+    }
 }
 
 /// One axiom the classifier holds: how many times it is added now and was at the start
@@ -1048,9 +1138,23 @@ impl Classifier {
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
         let r = self.run_held(limits, true);
         let partial = self.sat.partial.take();
-        r.map(|(consistent, taxonomy, stats)| {
+        let mut out = r.map(|(consistent, taxonomy, stats)| {
             Classification::new(consistent, taxonomy, stats, partial)
-        })
+        })?;
+        let excluded = self.sat.excluded();
+        if !excluded.is_empty() {
+            if limits.strict {
+                return Err(Error::Incomplete(excluded.to_vec()));
+            }
+            let held: Vec<&AxiomKind> = self
+                .axioms
+                .iter()
+                .filter(|(_, h)| h.count > 0)
+                .map(|(k, _)| k)
+                .collect();
+            out.cover(&held, excluded);
+        }
+        Ok(out)
     }
 
     /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
@@ -1171,9 +1275,16 @@ impl Saturation {
     ) -> Result<Classification, Error> {
         let r = self.run_with(axioms, changes, 0, limits, true);
         let partial = self.partial.take();
-        r.map(|(consistent, taxonomy, stats)| {
+        let mut out = r.map(|(consistent, taxonomy, stats)| {
             Classification::new(consistent, taxonomy, stats, partial)
-        })
+        })?;
+        if !self.excluded.is_empty() {
+            if limits.strict {
+                return Err(Error::Incomplete(self.excluded.clone()));
+            }
+            out.cover(axioms, &self.excluded);
+        }
+        Ok(out)
     }
 
     /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
@@ -3688,7 +3799,7 @@ mod tests {
                     Err(e) => panic!("{threads} threads, poll {n}: {e:?}"),
                     Ok(out) => {
                         assert!(
-                            !out.complete,
+                            !out.complete_for_taken,
                             "{threads} threads, poll {n}: the saturation was not cancelled"
                         );
                         assert_eq!(out.consistency, Consistency::Unknown);
@@ -3800,7 +3911,7 @@ mod tests {
                 match stopped {
                     Err(Error::Cancelled) => {}
                     Err(e) => panic!("{threads} threads, poll {at}: {e:?}"),
-                    Ok(out) if out.complete => assert_eq!(outcome(&out), first),
+                    Ok(out) if out.complete_for_taken => assert_eq!(outcome(&out), first),
                     Ok(out) => {
                         for (i, &(p, unsat, h)) in outcome(&out).0.iter().enumerate() {
                             assert!(p <= first.0[i].0 && unsat <= first.0[i].1 && !h);
@@ -3847,7 +3958,7 @@ mod tests {
                     ..limits
                 })
                 .unwrap();
-            assert!(out.complete && !out.stats.dl_over_budget);
+            assert!(out.complete_for_taken && !out.stats.dl_over_budget);
             let answer: Vec<bool> = (0..n)
                 .map(|i| {
                     out.taxonomy
