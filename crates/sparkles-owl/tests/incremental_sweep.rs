@@ -254,6 +254,18 @@ impl Gen {
 struct Count {
     runs: usize,
     kept: usize,
+    /// the runs whose axioms changed, and those of them that kept contexts
+    changed: usize,
+    kept_changed: usize,
+}
+
+impl Count {
+    fn add(&mut self, kept: bool, changed: bool) {
+        self.runs += 1;
+        self.kept += kept as usize;
+        self.changed += changed as usize;
+        self.kept_changed += (kept && changed) as usize;
+    }
 }
 
 const STEPS: usize = 6;
@@ -315,13 +327,14 @@ fn sweep_one(
         };
         assert_eq!(inc.taxonomy, fresh.taxonomy, "classifier: {}", what());
         assert_eq!(inc.consistent, fresh.consistent, "classifier: {}", what());
-        let n = counts.entry((family, "classifier")).or_default();
-        n.runs += 1;
-        n.kept += inc.stats.incremental as usize;
-
         let now = kinds(&now_axioms);
         let add: Vec<&AxiomKind> = now.difference(&before).collect();
         let rem: Vec<&AxiomKind> = before.difference(&now).collect();
+        let changed = !add.is_empty() || !rem.is_empty();
+        counts
+            .entry((family, "classifier"))
+            .or_default()
+            .add(inc.stats.incremental, changed);
         let held: Vec<&AxiomKind> = now.iter().collect();
         let out = sat
             .classify(
@@ -335,9 +348,10 @@ fn sweep_one(
             .unwrap();
         assert_eq!(out.taxonomy, fresh.taxonomy, "saturation: {}", what());
         assert_eq!(out.consistent, fresh.consistent, "saturation: {}", what());
-        let n = counts.entry((family, "saturation")).or_default();
-        n.runs += 1;
-        n.kept += out.stats.incremental as usize;
+        counts
+            .entry((family, "saturation"))
+            .or_default()
+            .add(out.stats.incremental, changed);
         before = now;
     }
 }
@@ -357,22 +371,21 @@ fn incremental_runs_agree_with_fresh_ones_across_constructors() {
         }
     }
     for ((family, path), n) in &counts {
-        eprintln!("sweep {family:?} {path}: {} runs, {} kept", n.runs, n.kept);
+        eprintln!(
+            "sweep {family:?} {path}: {} runs, {} kept, {} changed, {} kept of those",
+            n.runs, n.kept, n.changed, n.kept_changed
+        );
     }
-    // the sweep tests the kept path only when edits reach it
-    for family in [
-        Family::Selfs,
-        Family::TopBottom,
-        Family::Ranges,
-        Family::Unsatisfiable,
-        Family::Loops,
-    ] {
-        let n = &counts[&(family, "classifier")];
+    // the sweep tests the kept path only when changed axioms reach it, through both
+    // entry points; a merge with an individual ties the contexts of the next run
+    // together, so the nominal family keeps fewer
+    for ((family, path), n) in &counts {
+        let share = if *family == Family::Nominals { 10 } else { 4 };
         assert!(
-            n.kept * 4 >= n.runs,
-            "{family:?} kept {} of {} runs",
-            n.kept,
-            n.runs
+            n.kept_changed * share >= n.changed,
+            "{family:?} {path} kept {} of {} changed runs",
+            n.kept_changed,
+            n.changed
         );
     }
 }

@@ -735,15 +735,19 @@ other contexts drop their links from cleared contexts and recompute what they ta
 the index, which is rebuilt from the axioms on every run. A change to the property
 hierarchy, chains, reflexivity or ranges saturates everything again, and so does a
 change to an axiom with an individual, a data property, a datatype, a key or a self
-restriction. A context can have a loop by a role without holding the self restriction
-whose subsumer the loop gives, since a loop also comes from a self restriction on a
-subrole, a reflexive role or a chain, so the invalidation could not find the contexts
-that a changed self restriction reaches. So does any
-change after a run that marked the real contexts, which merges, worlds, keys and the
-facts of universal roles tie together in ways the invalidation does not follow, and a
+restriction. So does any change after a run that marked the real contexts, which
+merges, worlds, keys and the facts of universal roles tie together in ways the
+invalidation does not follow, and a
 run after a run that stopped before its saturation ended. A run that stops later keeps
 its saturated contexts. Property tests check that an incremental run after random
 additions and removals gives the taxonomy of a full run.
+
+A self restriction starts the run again because a context can have a loop by a role
+without holding the self restriction whose subsumer the loop gives. A loop also comes
+from a self restriction on a subrole, a reflexive role or a chain, so the invalidation
+cannot find the contexts that a changed self restriction reaches by the expressions they
+hold. Until item 1258, an added `ObjectHasSelf(s) ⊑ C` beside `r ⊑ s` and
+`owl:Thing ⊑ ObjectHasSelf(r)` cleared no context and left out `owl:Thing ⊑ C`.
 
 This reuse applies to eligible EL edits. Normalization with Horn or disjunctive axioms
 currently clears the contexts and marks the run entangled, so a later edited source
