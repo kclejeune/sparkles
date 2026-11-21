@@ -37,15 +37,20 @@ every other unit has ended, and its unit calls parallel_absorb with the list of
 its one test runs once, last, on the evidence of every unit.
 
 Discovery and each unit have deadlines, 300 s and 900 s by default. Each runs in its own
-session with its output in a file. When a deadline passes, or the runner gets SIGINT or
-SIGTERM, it stops admitting units, sends SIGTERM to the unit's process group and to every
-descendant it finds under /proc, follows with SIGKILL after the grace period, 5 s by
-default, and reports the unit. A process that left the unit's tree before that, by being
-orphaned, is not found. An interrupted run exits 128 plus the signal number.
---jobs 1 runs the units one at a time, in the same processes.
+session with its output in a file. When a deadline passes, or the runner gets SIGINT,
+SIGTERM or SIGHUP, it stops admitting units, sends SIGTERM to the process group and session
+of each unit it stops and to every descendant it finds under /proc, follows with SIGKILL
+after one grace period, 5 s by default, and reports the units. A process is signalled only
+while its start time still matches, so a reused pid is left alone. A process that left the
+unit's tree before that, by being orphaned, is not found. An interrupted run exits 128 plus
+the signal number. A unit gets SIGTERM from the kernel when the runner dies without stopping
+it, as under SIGKILL, and then stops its own descendants the same way and exits.
+--keep DIR keeps the discovery, the plan, each unit's output and the result records in a
+new directory under DIR. --jobs 1 runs the units one at a time, in the same processes.
 """
 
 import argparse
+import ctypes
 import json
 import os
 import signal
@@ -70,7 +75,8 @@ class _TaggingLoader(unittest.TestLoader):
 
     def loadTestsFromModule(self, module, *args, **kwargs):
         suite = super().loadTestsFromModule(module, *args, **kwargs)
-        self.labels.setdefault(id(suite), module.__name__)
+        # The suite is kept with its name, so that its id is not reused by another.
+        self.labels.setdefault(id(suite), (suite, module.__name__))
         return suite
 
 
@@ -90,9 +96,8 @@ def _leaves(node):
 
 
 def _label(loader, entry, index):
-    name = loader.labels.get(id(entry))
-    if name:
-        return name
+    if id(entry) in loader.labels:
+        return loader.labels[id(entry)][1]
     for t in _leaves(entry):
         # Import failures and import-time skips stand in as unittest.loader._FailedTest.MODULE
         # and unittest.loader.ModuleSkipped.MODULE.
@@ -103,7 +108,12 @@ def _label(loader, entry, index):
 
 
 def _overridden(cls, name):
-    return getattr(cls, name).__func__ is not getattr(unittest.TestCase, name).__func__
+    for k in cls.__mro__:
+        if k is unittest.TestCase:
+            return False
+        if name in vars(k):
+            return True
+    return False
 
 
 def _plain(label, entry):
@@ -184,6 +194,22 @@ def discover_main(directory, out):
     return 0
 
 
+def _die_with_parent(parent, grace):
+    """End this unit, and what it started, when the runner ends without stopping it, as when
+    it is killed with SIGKILL. The kernel sends SIGTERM when the runner dies, and the handler
+    stops this unit's descendants as the runner would have."""
+    def on_term(signum, frame):
+        found = _owned([os.getpid()])
+        found.pop(os.getpid(), None)
+        stop_all(list(found), grace)
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, on_term)
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
+    if os.getppid() != parent:
+        on_term(signal.SIGTERM, None)
+
+
 def worker_main(directory, plan_path, index, split, record_path, absorb_path):
     with open(plan_path) as f:
         plan = json.load(f)
@@ -229,12 +255,22 @@ class Interrupted(Exception):
         self.signum = signum
 
 
+# The signals received. The handler only records them, and the supervising loops, which poll
+# every 50 ms, raise Interrupted where every started process is already tracked.
+_STOP = []
+
+
 def _on_signal(signum, frame):
-    raise Interrupted(signum)
+    _STOP.append(signum)
+
+
+def _check_stop():
+    if _STOP:
+        raise Interrupted(_STOP[0])
 
 
 def _process_table():
-    """Each live process's (parent, group, session), read from /proc."""
+    """Each live process's (parent, group, session, start time), read from /proc."""
     table = {}
     for d in os.listdir("/proc"):
         if not d.isdigit():
@@ -245,31 +281,53 @@ def _process_table():
         except OSError:
             continue
         if fields[0] != "Z":
-            table[int(d)] = (int(fields[1]), int(fields[2]), int(fields[3]))
+            table[int(d)] = (int(fields[1]), int(fields[2]), int(fields[3]), int(fields[19]))
     return table
 
 
-def _owned(root):
-    """ROOT, its descendants, and the members of its group and session and of theirs."""
-    table = _process_table()
-    owned = {root} if root in table else set()
+def _owned(roots, table=None):
+    """The live processes among ROOTS, their descendants, and the members of their groups and
+    sessions and of their descendants', as {pid: start time}. A root that has died still
+    counts, so its group and its children are found."""
+    table = _process_table() if table is None else table
+    owned = set(roots)
     changed = True
     while changed:
         changed = False
-        for pid, (ppid, pgid, sid) in table.items():
+        for pid, (ppid, pgid, sid, _) in table.items():
             if pid not in owned and (ppid in owned or pgid in owned or sid in owned):
                 owned.add(pid)
                 changed = True
     owned.discard(os.getpid())
-    return owned
+    return {pid: table[pid][3] for pid in owned if pid in table}
 
 
-def _signal_all(pids, sig):
-    for pid in pids:
+def _signal_all(found, sig):
+    """Send SIG to each process of FOUND that is still the one found, by its start time."""
+    table = _process_table()
+    for pid, start in found.items():
+        if table.get(pid, (0, 0, 0, None))[3] != start:
+            continue
         try:
             os.kill(pid, sig)
         except (ProcessLookupError, PermissionError):
             pass
+
+
+def stop_all(roots, grace):
+    """Stop ROOTS and everything they own: SIGTERM to all, then SIGKILL to what is left after
+    one shared GRACE period."""
+    seen = _owned(roots)
+    _signal_all(seen, signal.SIGTERM)
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        table = _process_table()
+        seen.update(_owned(roots, table))
+        if not any(table.get(pid, (0, 0, 0, None))[3] == start for pid, start in seen.items()):
+            return
+        time.sleep(0.05)
+    seen.update(_owned(roots))
+    _signal_all(seen, signal.SIGKILL)
 
 
 class Job:
@@ -289,18 +347,10 @@ class Job:
                                      stderr=subprocess.STDOUT, start_new_session=True)
 
     def stop(self, grace):
-        """Stop the process and everything it owns: SIGTERM, then SIGKILL after GRACE."""
-        root = self.proc.pid
-        seen = _owned(root)
-        _signal_all(seen, signal.SIGTERM)
-        end = time.monotonic() + grace
-        while time.monotonic() < end:
-            seen |= _owned(root)
-            if not (_process_table().keys() & seen):
-                break
-            time.sleep(0.05)
-        seen |= _owned(root)
-        _signal_all(seen, signal.SIGKILL)
+        stop_all([self.proc.pid], grace)
+        self.reap(grace)
+
+    def reap(self, grace):
         try:
             self.proc.wait(timeout=grace + 5)
         except subprocess.TimeoutExpired:
@@ -316,21 +366,23 @@ class Job:
         return time.monotonic() - self.t0
 
 
-def run_discovery(a, workdir):
+def run_discovery(a, workdir, active):
     path = os.path.join(workdir, "discovery.json")
     job = Job("discovery", [sys.executable, RUNNER, "--_discover", path, str(a.directory)],
               a.discover_timeout, workdir)
+    active.append(job)
     try:
         while job.proc.poll() is None:
+            _check_stop()
             if time.monotonic() >= job.end:
                 job.stop(a.grace)
                 print(f"unittest-parallel: discovery: deadline of {a.discover_timeout:g} s passed")
                 sys.stdout.write(job.output())
                 return None
             time.sleep(0.05)
-    except Interrupted:
-        job.stop(a.grace)
-        raise
+    finally:
+        if job.proc.returncode is not None:
+            active.remove(job)
     text = job.output()
     if job.proc.returncode != 0 or not os.path.exists(path):
         print(f"unittest-parallel: discovery failed with exit {job.proc.returncode}")
@@ -386,7 +438,8 @@ def main(argv=None):
     if argv[:1] == ["--_discover"]:
         return discover_main(argv[2], argv[1])
     if argv[:1] == ["--_unit"]:
-        plan, index, split, record, absorb, directory = argv[1:]
+        parent, grace, plan, index, split, record, absorb, directory = argv[1:]
+        _die_with_parent(int(parent), float(grace))
         return worker_main(directory, plan, int(index), int(split), record, absorb)
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
@@ -394,6 +447,7 @@ def main(argv=None):
     ap.add_argument("--unit-timeout", type=float, default=900.0)
     ap.add_argument("--discover-timeout", type=float, default=300.0)
     ap.add_argument("--grace", type=float, default=5.0)
+    ap.add_argument("--keep", type=Path, help="keep the discovery, plan, outputs and result records in a new directory under this one")
     ap.add_argument("directory", type=Path)
     a = ap.parse_args(argv)
     if a.jobs < 1:
@@ -401,28 +455,34 @@ def main(argv=None):
     for opt in ("unit_timeout", "discover_timeout", "grace"):
         if not getattr(a, opt) > 0:
             ap.error(f"--{opt.replace('_', '-')} must be more than 0")
-    old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM)}
-    workdir = tempfile.mkdtemp(prefix="unittest-parallel-")
+    old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    if a.keep:
+        a.keep.mkdir(parents=True, exist_ok=True)
+        workdir = tempfile.mkdtemp(prefix="run-", dir=a.keep)
+    else:
+        workdir = tempfile.mkdtemp(prefix="unittest-parallel-")
     active = []
     try:
         return supervise(a, workdir, active)
     except Interrupted as e:
-        for s in old:
-            signal.signal(s, signal.SIG_IGN)
         names = " ".join(job.name for job in active)
+        stop_all([job.proc.pid for job in active], a.grace)
         for job in active:
-            job.stop(a.grace)
+            job.reap(a.grace)
         print(f"unittest-parallel: interrupted by signal {e.signum}, stopped: {names or 'nothing'}", flush=True)
         return 128 + e.signum
     finally:
         for s, h in old.items():
             signal.signal(s, h)
-        subprocess.run(["rm", "-rf", workdir], check=False)
+        if a.keep:
+            print(f"unittest-parallel: discovery, plan, outputs and result records are in {workdir}")
+        else:
+            subprocess.run(["rm", "-rf", workdir], check=False)
 
 
 def supervise(a, workdir, active):
     t0 = time.monotonic()
-    description = run_discovery(a, workdir)
+    description = run_discovery(a, workdir, active)
     if description is None:
         return 1
     first, last = plan_units(description, a.split)
@@ -440,7 +500,8 @@ def supervise(a, workdir, active):
         name, index, split = work
         record = os.path.join(workdir, f"record-{count}.json")
         count += 1
-        job = Job(name, [sys.executable, RUNNER, "--_unit", plan_path, str(index), str(split),
+        job = Job(name, [sys.executable, RUNNER, "--_unit", str(os.getpid()), str(a.grace),
+                         plan_path, str(index), str(split),
                          record, absorb, str(a.directory)], a.unit_timeout, workdir)
         job.record, job.index, job.split = record, index, split
         active.append(job)
@@ -478,8 +539,10 @@ def supervise(a, workdir, active):
     def drain(queue, absorb_for):
         while queue or active:
             while queue and len(active) < a.jobs:
+                _check_stop()
                 start(queue.pop(0), absorb_for())
             time.sleep(0.05)
+            _check_stop()
             for job in list(active):
                 if job.proc.poll() is None and time.monotonic() >= job.end:
                     job.timed_out = True

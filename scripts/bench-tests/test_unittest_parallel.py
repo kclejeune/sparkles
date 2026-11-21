@@ -601,6 +601,30 @@ class Deadlines(Base):
     def test_a_terminate_stops_every_active_unit(self):
         self.interrupt(signal.SIGTERM)
 
+    def test_units_end_when_the_runner_is_killed(self):
+        d = self.hang_suite("test_hang")
+        p = subprocess.Popen([sys.executable, str(RUNNER), "--grace", "1", str(d)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            end = time.monotonic() + 60
+            while len(self.recorded()) < 3 and time.monotonic() < end:
+                time.sleep(0.1)
+            self.assertEqual(len(self.recorded()), 3, sorted(p.name for p in self.pids.iterdir()))
+        finally:
+            p.kill()
+            p.wait(timeout=30)
+        self.assert_owned_gone(3)
+
+    def test_kept_records_hold_the_plan_and_each_units_result(self):
+        d = self.suite(test_a=ONE, test_b=PASS)
+        keep = Path(tempfile.mkdtemp(prefix="unittest-parallel-keep-"))
+        self.addCleanup(shutil.rmtree, keep, True)
+        p = self.run_runner("--keep", str(keep), str(d))
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        [run] = keep.iterdir()
+        self.assertTrue((run / "plan.json").exists())
+        self.assertEqual(len(list(run.glob("record-*.json"))), 2)
+
     def test_deadlines_must_be_positive(self):
         d = self.suite(test_a=ONE)
         for opt in ("--unit-timeout", "--discover-timeout", "--grace"):
