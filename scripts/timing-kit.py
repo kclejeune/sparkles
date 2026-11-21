@@ -374,7 +374,8 @@ def static_checks(stage):
                 continue
             listed[m.group(2)] = m.group(1)
     for v in variants:
-        if env.get(f"BINARY_OF_{v}", v) != v:
+        # an empty mapping is the variant's own binary, as the harness reads it
+        if (env.get(f"BINARY_OF_{v}") or v) != v:
             continue
         name = next((n for n in (f"bin-{v}", f"bin-{v}.zst") if (stage / n).is_file()), None)
         if name is None:

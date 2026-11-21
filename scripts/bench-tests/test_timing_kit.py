@@ -221,6 +221,49 @@ class KitTests(unittest.TestCase):
         r = kit("preflight", s)
         self.assertIn("a line that is not HASH  bin-V: junk", r.stderr)
 
+    def test_an_empty_own_binary_mapping_keeps_its_hash_check(self):
+        # the harness reads BINARY_OF_A='' as A's own binary, so preflight must verify bin-A
+        r, s = self.stage(tips=(("tip", 1.0),))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        with open(s / "bin-A", "a") as f:
+            f.write("# changed after staging\n")
+        env = (s / "run.env").read_text()
+        for mapping in ("", "BINARY_OF_A=''\n", "BINARY_OF_A=\n", 'BINARY_OF_A=""\n', "BINARY_OF_A=A\n"):
+            (s / "run.env").write_text(env + mapping)
+            r = kit("preflight", s)
+            self.assertEqual(r.returncode, 1, mapping)
+            self.assertIn("bin-A does not match binaries.sha256", r.stderr, mapping)
+
+    @unittest.skipUnless(all(shutil.which(t) for t in NEEDS), "needs taskset, chrt, zstd and curl")
+    def test_a_harness_rerun_without_the_list_drops_the_old_exemption(self):
+        # a run listing q writes results/expected-answer-change.txt, and a later run in the same
+        # directory whose run.env lists nothing, or an empty list, must not inherit it
+        d = self.d / "rerun"
+        (d / "queries").mkdir(parents=True)
+        (d / "queries" / "q.rq").write_text("SELECT (COUNT(*) AS ?c) WHERE { ?s ?p ?o }\n")
+        shutil.copy(SCRIPTS / "nsc-bench-remote.sh", d)
+        for v, answer in (("A", "1"), ("B", "2")):
+            shutil.copy(stub(self.d, v, 1.0, answer), d / f"bin-{v}")
+        shutil.copy(self.d / "data.nt.zst", d)
+        base = ("SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\n"
+                f"ROUNDS=1\nREPS=1\nWARMUP=0\nPORT={free_port()}\n")
+        listed = "EXPECTED_ANSWER_CHANGE=q\nEXPECTED_ANSWER_CHANGE_REASON='the fix'\n"
+        clean = {k: v for k, v in os.environ.items() if not k.startswith("EXPECTED_ANSWER_CHANGE")}
+        for extra, want_status, want_rc in ((listed, "changed", 0), ("", "differ", 1), (listed, "changed", 0),
+                                            ("EXPECTED_ANSWER_CHANGE=\nEXPECTED_ANSWER_CHANGE_REASON=\n", "differ", 1)):
+            (d / "run.env").write_text(base + extra)
+            r = subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True,
+                               env=clean, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual((d / "results" / "done").read_text().strip(), "ok")
+            self.assertEqual((d / "results" / "expected-answer-change.txt").exists(), bool(extra == listed), extra)
+            subprocess.run([sys.executable, str(SCRIPTS / "nsc-bench-summary.py"), str(d)],
+                           capture_output=True, check=True)
+            self.assertEqual(json.loads((d / "summary.json").read_text())["answers"]["q"], want_status, extra)
+            check = subprocess.run([sys.executable, str(SCRIPTS / "nsc-bench-summary.py"), "--check",
+                                    str(d / "summary.json"), "first"], capture_output=True, text=True)
+            self.assertEqual(check.returncode, want_rc, extra + check.stdout + check.stderr)
+
     def test_launch_refuses_names_a_shell_would_read(self):
         r, s = self.stage(tips=(("tip", 1.0),))
         for args, want in ((["--unit", "x;rm -rf ~"], "unit name"), (["--unit", "ok", "--timeout", "1h; reboot"], "timeout"),

@@ -458,7 +458,9 @@ printf 'round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms\n' > "$R/samples.tsv
 # the queries this run times, so that a summary requires each of them even when none of
 # its requests leaves a sample
 printf '%s\n' "${QUERIES[@]}" > "$R/queries.txt"
-# the queries whose answers the run expects to change, and why, as run.env set them
+# the queries whose answers the run expects to change, and why, as run.env set them. A
+# rerun in this directory without the list must not keep an earlier run's file.
+rm -f "$R/expected-answer-change.txt"
 if [ -n "${EXPECTED_ANSWER_CHANGE:-}" ]; then
   printf 'queries\t%s\nreason\t%s\n' "${EXPECTED_ANSWER_CHANGE//,/ }" "${EXPECTED_ANSWER_CHANGE_REASON:-}" > "$R/expected-answer-change.txt"
 fi
