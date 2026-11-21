@@ -593,6 +593,9 @@ pub struct Saturation {
     interner: Interner,
     index: Option<Index>,
     ctx: Contexts,
+    /// the number of the caller's axioms while a run reads fewer, after
+    /// [`interchangeable`] dropped the class assertions that another stands for
+    source_len: Option<usize>,
     /// what the last run left out or used only in part, sorted
     excluded: Vec<Excluded>,
     /// set when a run stopped part way, so that the next run starts again
@@ -883,84 +886,94 @@ fn el_break(ax: &AxiomKind) -> Option<profiles::Broken> {
     profiles::el_axiom_with_anonymous(ax).into_iter().next()
 }
 
-/// The bytes that [`interchangeable`] may count with, for each anonymous individual.
-const LABEL_BYTES: usize = 48;
+/// The bytes of scratch that [`interchangeable`] counts for each class assertion it
+/// reads: the entry of its label and, at most, that of its class.
+const LABEL_BYTES: usize = 96;
 
 /// The axioms without the class assertions that another one stands for, or `None` when
-/// there are none (roadmap item 1281). A class assertion `C(_:x)` whose anonymous
-/// individual occurs in no other logical axiom, and only once in it, says that `C` has an
-/// instance and no more. Two of them with the same class are interchangeable, since an
-/// element that stands for one stands for the other, so the one whose individual has the
-/// least label stands for every other, which adds nothing. The answer depends on the
-/// axioms alone, whatever their order. Ontologies that reify axioms or cross-references
-/// as anonymous individuals, such as the `oboInOwl` ones, have hundreds of thousands of
-/// such assertions, and the run then holds one individual for each class instead of
-/// one for each assertion. The count of the labels is left alone when it would pass
-/// `memory`, the run's memory budget, and every assertion then keeps its individual.
+/// there are none (roadmap item 1281). A class assertion `C(_:x)` of a named class whose
+/// anonymous individual occurs in no other logical axiom, and only once in it, says that
+/// `C` has an instance and no more. Two of them with the same class are interchangeable,
+/// since an element that stands for one stands for the other, so the one whose
+/// individual has the least label stands for every other, which adds nothing. The answer
+/// depends on the axioms alone, whatever their order. A class assertion of a named class
+/// is an axiom of OWL 2 EL that every run takes in full, so the one that stands for the
+/// others is never left out and the report needs none of them. Ontologies that reify
+/// axioms or cross-references as anonymous individuals, such as those with `oboInOwl`
+/// annotations, have hundreds of thousands of such assertions, and the run then holds
+/// one individual for each class instead of one for each assertion.
+///
+/// The scratch holds an entry for each such assertion's label and class and a flag for
+/// each axiom. It is admitted against `max_memory` and the pool before it is allocated,
+/// and a refusal leaves every assertion with its individual. The pool's grant for it
+/// stays with the run, which counts its own memory apart.
 fn interchangeable<'a>(
     axioms: &[&'a AxiomKind],
-    memory: Option<usize>,
-) -> Option<Vec<&'a AxiomKind>> {
-    let candidates: Vec<usize> = (0..axioms.len())
-        .filter(|&i| {
-            matches!(
-                axioms[i],
-                AxiomKind::ClassAssertion(_, Individual::Anonymous(_))
-            )
-        })
-        .collect();
-    if candidates.len() < 2 {
-        return None;
+    limits: &Limits,
+) -> Result<Option<Vec<&'a AxiomKind>>, Error> {
+    fn candidate(k: &AxiomKind) -> Option<(&Class, &str)> {
+        match k {
+            AxiomKind::ClassAssertion(ClassExpression::Class(c), Individual::Anonymous(a)) => {
+                Some((c, a.label()))
+            }
+            _ => None,
+        }
     }
-    if memory.is_some_and(|m| candidates.len().saturating_mul(LABEL_BYTES) > m) {
-        return None;
+    let mut n = 0usize;
+    for (i, k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        n += candidate(k).is_some() as usize;
     }
-    // how often each anonymous individual occurs in the logical axioms
+    if n < 2 {
+        return Ok(None);
+    }
+    let scratch = n.saturating_mul(LABEL_BYTES).saturating_add(axioms.len());
+    if limits.max_memory.is_some_and(|m| scratch > m)
+        || limits.charge.as_ref().is_some_and(|f| !f(scratch))
+    {
+        return Ok(None);
+    }
+    // how often the label of each candidate occurs in the logical axioms
     let mut count: FxHashMap<&str, u32> = FxHashMap::default();
+    count.reserve(n);
     for k in axioms {
+        if let Some((_, l)) = candidate(k) {
+            count.insert(l, 0);
+        }
+    }
+    for (i, k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
         if !logical(k) {
             continue;
         }
-        for i in profiles::individuals(k) {
-            if let Individual::Anonymous(a) = i {
-                let n = count.entry(a.label()).or_insert(0);
-                *n = n.saturating_add(1);
+        for ind in profiles::individuals(k) {
+            if let Individual::Anonymous(a) = ind
+                && let Some(c) = count.get_mut(a.label())
+            {
+                *c = c.saturating_add(1);
             }
         }
     }
-    // the assertion that stands for each class: the one whose individual has the least
-    // label
-    let mut first: FxHashMap<&ClassExpression, &str> = FxHashMap::default();
-    let mut lone = Vec::with_capacity(candidates.len());
-    for &i in &candidates {
-        if let AxiomKind::ClassAssertion(c, Individual::Anonymous(a)) = axioms[i]
-            && count.get(a.label()) == Some(&1)
-        {
-            lone.push(i);
-            first
-                .entry(c)
-                .and_modify(|l| *l = (*l).min(a.label()))
-                .or_insert(a.label());
+    // the label that stands for each class: the least among its lone assertions
+    let lone = |k: &'a AxiomKind| candidate(k).filter(|(_, l)| count.get(l) == Some(&1));
+    let mut first: FxHashMap<&Class, &str> = FxHashMap::default();
+    for &k in axioms {
+        if let Some((c, l)) = lone(k) {
+            first.entry(c).and_modify(|f| *f = (*f).min(l)).or_insert(l);
         }
     }
-    let mut redundant = vec![false; axioms.len()];
-    let mut any = false;
-    for i in lone {
-        if let AxiomKind::ClassAssertion(c, Individual::Anonymous(a)) = axioms[i]
-            && first.get(c) != Some(&a.label())
-        {
-            redundant[i] = true;
-            any = true;
-        }
+    poll(limits)?;
+    let redundant = |k: &'a AxiomKind| lone(k).is_some_and(|(c, l)| first.get(c) != Some(&l));
+    if !axioms.iter().any(|&k| redundant(k)) {
+        return Ok(None);
     }
-    any.then(|| {
-        axioms
-            .iter()
-            .zip(&redundant)
-            .filter(|(_, r)| !**r)
-            .map(|(k, _)| *k)
-            .collect()
-    })
+    Ok(Some(
+        axioms.iter().copied().filter(|&k| !redundant(k)).collect(),
+    ))
 }
 
 /// Whether the axiom has logical content for classification.
@@ -1240,6 +1253,7 @@ impl Saturation {
             interner: Interner::new(),
             index: None,
             ctx: Vec::new(),
+            source_len: None,
             excluded: Vec::new(),
             dirty: true,
             worlds: FxHashMap::default(),
@@ -1320,10 +1334,12 @@ impl Saturation {
         // the class assertions that another one stands for add nothing (roadmap item
         // 1281), and the run reads the other axioms, whose list it holds beside the
         // caller's
-        let Some(kept) = interchangeable(axioms, limits.max_memory) else {
+        let Some(kept) = interchangeable(axioms, limits)? else {
             return self.run_with_all(axioms, changes, held_bytes, limits, with_taxonomy);
         };
         let kept_bytes = kept.capacity() * std::mem::size_of::<&AxiomKind>();
+        // a run that reads them all counts the caller's axioms as added
+        self.source_len = Some(axioms.len());
         let r = self.run_with_all(
             &kept,
             changes,
@@ -1331,12 +1347,8 @@ impl Saturation {
             limits,
             with_taxonomy,
         );
-        r.map(|(consistent, taxonomy, mut stats)| {
-            if changes.is_none() {
-                stats.added = axioms.len();
-            }
-            (consistent, taxonomy, stats)
-        })
+        self.source_len = None;
+        r
     }
 
     /// [`run_with`](Saturation::run_with) over every axiom it is given.
@@ -2115,7 +2127,7 @@ impl Saturation {
             match r {
                 Ok(Some(mut r)) if self.dl_tried => {
                     red.restore(axioms, &mut self.excluded);
-                    r.2.added = axioms.len();
+                    r.2.added = self.source_len.unwrap_or(axioms.len());
                     let tier = r.2.tier;
                     let mut chains: Vec<Excluded> = std::mem::take(&mut self.chain_ranged)
                         .into_iter()
@@ -2176,7 +2188,7 @@ impl Saturation {
                 stats.added = c.added.len();
                 stats.removed = c.removed.len();
             }
-            None => stats.added = axioms.len(),
+            None => stats.added = self.source_len.unwrap_or(axioms.len()),
         }
         let again = self.dirty || self.index.is_none();
         // until the saturation ends, a stop leaves the state for a run that starts again
@@ -3804,10 +3816,13 @@ fn normalize_axioms<'k>(
             index::intern_signature(k, it);
             continue;
         }
+        // a chain into the top property holds of every ontology, and its normalization
+        // adds nothing, so it meets no range restriction (roadmap item 1282)
         if matches!(
             k,
             AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
-        ) {
+        ) && !index::top_inclusion(k)
+        {
             out.chains.push(k);
             continue;
         }
@@ -5288,6 +5303,57 @@ mod tests {
         );
         assert!(matches!(horn(None, &|| true), Err(index::Halt::Stopped)));
         assert_eq!(horn(None, &|| false).ok(), Some(vec![true]));
+    }
+
+    #[test]
+    fn the_shared_individuals_poll_and_respect_the_budget() {
+        // roadmap item 1281: the scratch of `interchangeable` is admitted before it is
+        // allocated and grows only with the class assertions it may share, and the scan
+        // polls the deadline and cancellation
+        let class = ClassExpression::Class(Class::new("http://ex.org/C"));
+        let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
+        let anon = |i: usize| Individual::Anonymous(AnonymousIndividual::new(format!("x{i}")));
+        let mut kinds: Vec<AxiomKind> = (0..4)
+            .map(|i| AxiomKind::ClassAssertion(class.clone(), anon(i)))
+            .collect();
+        kinds.extend((10..20_000).map(|i| {
+            AxiomKind::ObjectPropertyAssertion(
+                r.clone(),
+                anon(i),
+                Individual::named("http://ex.org/a"),
+            )
+        }));
+        let axioms: Vec<&AxiomKind> = kinds.iter().collect();
+        let kept = interchangeable(&axioms, &Limits::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(kept.len(), axioms.len() - 3);
+        // a budget below the scratch leaves every assertion its individual
+        let small = Limits {
+            max_memory: Some(4 * LABEL_BYTES),
+            ..Limits::default()
+        };
+        assert!(interchangeable(&axioms, &small).unwrap().is_none());
+        // so does a pool that refuses it, which is told the scratch alone
+        let told = std::sync::Arc::new(AtomicUsize::new(0));
+        let t = told.clone();
+        let refusing = Limits {
+            charge: Some(std::sync::Arc::new(move |b: usize| {
+                t.fetch_add(b, Ordering::Relaxed);
+                false
+            })),
+            ..Limits::default()
+        };
+        assert!(interchangeable(&axioms, &refusing).unwrap().is_none());
+        assert_eq!(told.load(Ordering::Relaxed), 4 * LABEL_BYTES + axioms.len());
+        let cancelled = Limits {
+            cancelled: Some(std::sync::Arc::new(|| true)),
+            ..Limits::default()
+        };
+        assert!(matches!(
+            interchangeable(&axioms, &cancelled),
+            Err(Error::Cancelled)
+        ));
     }
 
     #[test]

@@ -1402,6 +1402,15 @@ pub fn is_anonymous(i: &NamedIndividual) -> bool {
     i.as_str().starts_with(ANONYMOUS)
 }
 
+/// Whether the axiom holds an individual outside its annotations, named or anonymous
+/// (roadmap item 1281).
+pub fn holds_individual(ax: &AxiomKind) -> bool {
+    crate::model::Signature::names_individual(ax)
+        || crate::profiles::individuals(ax)
+            .iter()
+            .any(|i| matches!(i, Individual::Anonymous(_)))
+}
+
 /// Interns the classes of an axiom's signature.
 pub fn intern_signature(ax: &AxiomKind, it: &mut Interner) {
     let mut sig = crate::model::Signature::default();

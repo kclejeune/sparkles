@@ -250,3 +250,119 @@ fn interchangeable_anonymous_individuals_share_one() {
     let out = whole(&format!("SubClassOf(:C owl:Nothing) {many}"));
     assert!(!out.consistent);
 }
+
+fn rooted() -> Limits {
+    Limits {
+        rooted: true,
+        ..Limits::default()
+    }
+}
+
+#[test]
+fn an_anonymous_individual_outside_the_el_part_makes_the_run_rooted() {
+    // the union holds of _:x, and both of its members are empty
+    let ax = axioms(
+        "ClassAssertion(ObjectUnionOf(:A :B) _:x)
+         SubClassOf(:A owl:Nothing) SubClassOf(:B owl:Nothing)",
+    );
+    for threads in [1, 8] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                ..rooted()
+            })
+            .unwrap();
+        assert!(!out.consistent);
+        assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    }
+    // anonymous individuals in enumerations and values outside OWL 2 EL
+    let ax = axioms(
+        "SubClassOf(:A ObjectUnionOf(:B :C)) SubClassOf(:B :D) SubClassOf(:C :D)
+         SubClassOf(:E ObjectOneOf(_:x _:y)) SubClassOf(:X ObjectHasValue(ObjectInverseOf(:r) _:x))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted()).unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+    // a run that counts: three r-successors among two individuals cannot be
+    let ax = axioms(
+        "SubClassOf(:A ObjectMinCardinality(3 :r ObjectOneOf(_:x _:y)))
+         SubClassOf(:X ObjectUnionOf(:Y :Z))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            counting: true,
+            ..rooted()
+        })
+        .unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+}
+
+#[test]
+fn an_assertion_left_out_reports_the_assertions_it_stands_for() {
+    // the classifier shares an individual only among assertions of named classes, which
+    // every run takes, so each assertion of a union that the EL rules leave out is
+    // reported
+    let ax =
+        axioms("ClassAssertion(ObjectUnionOf(:A :B) _:x) ClassAssertion(ObjectUnionOf(:A :B) _:y)");
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            el_only: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(out.consistent);
+    assert_eq!(k.excluded().len(), 2, "{:#?}", k.excluded());
+    assert_eq!(out.stats.outside_el.disjunctive, 2);
+    for (body, el_only) in [
+        (
+            "ClassAssertion(ObjectAllValuesFrom(:r :B) _:x) ClassAssertion(ObjectAllValuesFrom(:r :B) _:y)",
+            true,
+        ),
+        (
+            "ClassAssertion(DataHasValue(:d \"1\"^^:custom) _:x) ClassAssertion(DataHasValue(:d \"1\"^^:custom) _:y)",
+            false,
+        ),
+    ] {
+        let ax = axioms(body);
+        let mut k = Classifier::of(&ax);
+        k.classify(&Limits {
+            el_only,
+            ..Limits::default()
+        })
+        .unwrap();
+        assert_eq!(k.excluded().len(), 2, "{body}: {:#?}", k.excluded());
+    }
+}
+
+#[test]
+fn a_run_that_starts_again_counts_every_axiom_as_added() {
+    let ax = axioms(
+        "ClassAssertion(:E _:x) ClassAssertion(:E _:y)
+         SubClassOf(:A ObjectUnionOf(:B :C)) SubClassOf(:B :D) SubClassOf(:C :D)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            dl_work: Some(1),
+            ..rooted()
+        })
+        .unwrap();
+    assert_eq!(out.stats.added, 5);
+    let mut k = Classifier::of(&ax);
+    assert_eq!(k.classify(&Limits::default()).unwrap().stats.added, 5);
+    // item 805's rewriting of a key, which the run reads beside the shared individuals
+    let many: String = (0..50)
+        .map(|i| format!("ClassAssertion(:E _:x{i})\n"))
+        .collect();
+    let ax = axioms(&format!(
+        "HasKey(:K (:p) ()) SubClassOf(:A ObjectUnionOf(:B :C)) SubClassOf(:B :D)
+         SubClassOf(:C :D) {many}"
+    ));
+    let mut k = Classifier::of(&ax);
+    assert_eq!(k.classify(&rooted()).unwrap().stats.added, 54);
+}

@@ -1466,16 +1466,8 @@ pub fn normalize(
     let mut h = HornAx::default();
     // whether the run has individuals: those the EL axioms interned, and those the axioms
     // here name, anonymous ones among them (roadmap item 1281)
-    let individuals = !it.individuals.is_empty()
-        || axioms.iter().any(|k| {
-            crate::profiles::individuals(k)
-                .iter()
-                .any(|i| matches!(i, Individual::Anonymous(_)))
-                || Axiom::from((*k).clone())
-                    .signature()
-                    .iter()
-                    .any(|e| matches!(e, Entity::NamedIndividual(_)))
-        });
+    let individuals =
+        !it.individuals.is_empty() || axioms.iter().any(|k| super::index::holds_individual(k));
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles

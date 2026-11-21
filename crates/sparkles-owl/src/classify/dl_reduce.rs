@@ -377,6 +377,11 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
     }
     let mut inds = BTreeSet::new();
     for k in axioms {
+        // an inclusion in a top property is dropped below, and its subproperty, such as
+        // a data property, keeps nothing from the rewriting
+        if super::index::top_inclusion(k) {
+            continue;
+        }
         if blocked(k, &mut inds) {
             return None;
         }

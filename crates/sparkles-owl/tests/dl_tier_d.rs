@@ -2530,3 +2530,25 @@ fn an_inclusion_in_a_top_property_keeps_no_run_from_tier_d() {
         &[("A", "B"), ("Y", "X")],
     );
 }
+
+#[test]
+fn a_chain_into_the_top_property_meets_no_range_restriction() {
+    // roadmap item 1282: the chain holds of every ontology, so the range of the top
+    // property, which its last property lacks, does not leave it out
+    let ax = axioms(
+        "SubObjectPropertyOf(ObjectPropertyChain(:r :s) owl:topObjectProperty)
+         ObjectPropertyRange(owl:topObjectProperty :C) SubClassOf(:A :B)",
+    );
+    for el_only in [false, true] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                el_only,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+        assert_eq!(out.stats.outside_el.horn, 0);
+        assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
+    }
+}
