@@ -438,3 +438,25 @@ fn the_pool_grants_no_more_than_the_peak_with_shared_individuals() {
         out.stats.peak_memory
     );
 }
+
+#[test]
+fn the_peak_counts_the_scan_for_shared_individuals_without_a_pool() {
+    // review round 3 of item 1281: the scan's scratch is part of the run's peak whether
+    // or not a pool is told of it
+    let body: String = (0..10_000)
+        .map(|i| format!("ClassAssertion(:C _:x{i})\n"))
+        .collect();
+    let ax = axioms(&body);
+    let kinds: Vec<&AxiomKind> = ax.iter().map(|a| &a.kind).collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = sparkles_owl::classify::Saturation::new();
+    let out = sat.classify(&kinds, None, &limits).unwrap();
+    assert!(
+        out.stats.peak_memory >= 10_000 * 96,
+        "peak {}",
+        out.stats.peak_memory
+    );
+}

@@ -906,8 +906,9 @@ const LABEL_BYTES: usize = 96;
 /// The scratch holds an entry for each such assertion's label and class and the list of
 /// the axioms the run reads. It is admitted against `max_memory`, beside the `held`
 /// bytes of the caller's axioms, and against the pool before it is allocated, and a
-/// refusal leaves every assertion with its individual. The second value is what the pool
-/// granted, which the run draws on first and counts in its peak. Every pass over the
+/// refusal leaves every assertion with its individual. The second value is the scratch
+/// the scan admitted, which the run draws on first when a pool granted it and counts in
+/// its peak in any case. Every pass over the
 /// axioms polls the deadline and cancellation.
 fn interchangeable<'a>(
     axioms: &[&'a AxiomKind],
@@ -946,7 +947,6 @@ fn interchangeable<'a>(
     if limits.charge.as_ref().is_some_and(|f| !f(scratch)) {
         return Ok((None, 0));
     }
-    let granted = if limits.charge.is_some() { scratch } else { 0 };
     // how often the label of each candidate occurs in the logical axioms
     let mut count: FxHashMap<&str, u32> = FxHashMap::default();
     count.reserve(n);
@@ -993,7 +993,7 @@ fn interchangeable<'a>(
         dropped += redundant(k) as usize;
     }
     if dropped == 0 {
-        return Ok((None, granted));
+        return Ok((None, scratch));
     }
     // the list the run reads, whose capacity the scratch admitted
     let mut kept = Vec::with_capacity(axioms.len() - dropped);
@@ -1005,7 +1005,7 @@ fn interchangeable<'a>(
             kept.push(k);
         }
     }
-    Ok((Some(kept), granted))
+    Ok((Some(kept), scratch))
 }
 
 /// Whether the axiom has logical content for classification.
@@ -1366,7 +1366,7 @@ impl Saturation {
         // the class assertions that another one stands for add nothing (roadmap item
         // 1281), and the run reads the other axioms, whose list it holds beside the
         // caller's
-        let (kept, granted) = match interchangeable(axioms, held_bytes, limits) {
+        let (kept, scratch) = match interchangeable(axioms, held_bytes, limits) {
             Ok(k) => k,
             Err(e) => {
                 // the caller has applied its changes, which a later run must still read
@@ -1377,9 +1377,9 @@ impl Saturation {
         // the run's charges draw first on what the pool admitted for the scan
         let credited;
         let limits = match &limits.charge {
-            Some(f) if granted > 0 => {
+            Some(f) if scratch > 0 => {
                 credited = Limits {
-                    charge: Some(drawing_on(granted, f.clone())),
+                    charge: Some(drawing_on(scratch, f.clone())),
                     ..limits.clone()
                 };
                 &credited
@@ -1404,7 +1404,7 @@ impl Saturation {
             }
         };
         if let Ok((_, _, stats)) = &mut r {
-            stats.peak_memory = stats.peak_memory.max(granted);
+            stats.peak_memory = stats.peak_memory.max(held_bytes + scratch);
         }
         r
     }
@@ -5382,11 +5382,11 @@ mod tests {
             )
         }));
         let axioms: Vec<&AxiomKind> = kinds.iter().collect();
-        let (kept, granted) = interchangeable(&axioms, 0, &Limits::default()).unwrap();
+        let (kept, admitted) = interchangeable(&axioms, 0, &Limits::default()).unwrap();
         let kept = kept.unwrap();
-        assert_eq!((kept.len(), granted), (axioms.len() - 3, 0));
         // the scratch admits the list the run reads, which it allocates once
         let scratch = 4 * LABEL_BYTES + axioms.len() * std::mem::size_of::<&AxiomKind>();
+        assert_eq!((kept.len(), admitted), (axioms.len() - 3, scratch));
         assert_eq!(kept.capacity(), kept.len());
         // a budget below the scratch beside the caller's axioms leaves every assertion
         // its individual
