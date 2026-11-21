@@ -2016,3 +2016,77 @@ fn an_inclusion_in_the_top_data_property_keeps_the_rewriting() {
     );
     assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
 }
+
+/// The axioms of [`KEYED`] with an anonymous individual in place of `:a`, which makes a
+/// run rooted as a named one does (roadmap items 1265 and 1281).
+const KEYED_ANONYMOUS: &str =
+    "SubClassOf(:A ObjectUnionOf(:B ObjectSomeValuesFrom(:r ObjectOneOf(_:a))))
+     SubClassOf(:C ObjectUnionOf(:A :B))
+     SubClassOf(:B ObjectSomeValuesFrom(:r :A))";
+
+#[test]
+fn a_key_left_after_the_rewriting_keeps_a_run_with_an_anonymous_individual_from_being_rooted() {
+    // the only individual is anonymous and outside OWL 2 EL, so without item 1265's check
+    // the normalization would make the run rooted beside the key the rewriting declined
+    let left = keys_left(
+        &format!("{KEYED_ANONYMOUS}\nHasKey(:B (:r) ())\nSubClassOf(<{INTERNAL}x> :A)"),
+        true,
+    );
+    assert!(left_with_individual(&left), "{left:?}");
+    let left = keys_left(
+        &format!(
+            "SubClassOf(:A ObjectUnionOf(:B :C))
+             ClassAssertion(ObjectUnionOf(:B ObjectComplementOf(:A)) _:x)
+             HasKey(:B (:r) ())
+             SubClassOf(:B ObjectSomeValuesFrom(:r :A))
+             SubClassOf(<{INTERNAL}x> :A)"
+        ),
+        true,
+    );
+    assert!(
+        left.iter().any(|l| l.contains("ClassAssertion")),
+        "{left:?}"
+    );
+}
+
+#[test]
+fn a_key_left_after_the_rewriting_beside_an_anonymous_individual_in_owl_2_el() {
+    // the anonymous individual is in the EL part, which keeps the disjunctive rules from
+    // the run, and the key keeps it from being rooted, so both runs answer alike
+    keys_left(
+        &format!(
+            "{KEYED}\nHasKey(:B (:r) ())\nClassAssertion(:B _:x)\nSubClassOf(<{INTERNAL}x> :A)"
+        ),
+        false,
+    );
+}
+
+#[test]
+fn a_rewritten_key_does_not_bind_an_anonymous_individual_in_a_rooted_run() {
+    // item 805's rewriting enumerates the named individuals alone, so in a rooted run of
+    // Tier D the key makes :a equal to a named :x and not to an anonymous _:x
+    let run = |x: &str| {
+        let ax = axioms(&format!(
+            "HasKey(:K (:p) ()) ClassAssertion(:K {x}) ObjectPropertyAssertion(:p {x} :v)
+             ClassAssertion(:K :a) ObjectPropertyAssertion(:p :a :v)
+             ClassAssertion(:A {x}) ClassAssertion(:B :a) DisjointClasses(:A :B)"
+        ));
+        let mut outs = Vec::new();
+        for threads in [1, 4] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    ..rooted_limits()
+                })
+                .unwrap();
+            assert_eq!(out.stats.tier, Tier::Disjunctive, "{x}");
+            assert!(k.excluded().is_empty(), "{x}: {:#?}", k.excluded());
+            outs.push(out.consistent);
+        }
+        assert_eq!(outs[0], outs[1], "{x}");
+        outs[0]
+    };
+    assert!(run("_:x"));
+    assert!(!run(":x"));
+}

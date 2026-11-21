@@ -565,8 +565,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   individuals for a key with one property, and a cardinality, functionality or
   disjointness of the universal property leave the ontology to the default paths, as do
   keys over data properties, the top data property and functional data properties.
-  When such a key remains and the only individuals are in axioms outside OWL 2 EL, the
-  run is not rooted and answers as a run without the option, which leaves those axioms
+  When such a key remains and the only individuals, named or anonymous, are in axioms
+  outside OWL 2 EL, the run is not rooted and answers as a run without the option, which leaves those axioms
   out and reports them. Roadmap items 823, 1061 and 1075. Without the option, any other axiom
   outside OWL 2 EL that needs case analysis, such as a union, is left out and reported
   with its rule, while the Horn axioms run with the individuals. An axiom with a literal

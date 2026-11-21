@@ -2017,11 +2017,12 @@ impl Saturation {
         // Tier D takes them instead when one is disjunctive and the EL part has nothing
         // that its rules leave out
         let mut dl_taken = false;
-        // A run whose individuals are only in the axioms outside OWL 2 EL takes Tier D
-        // through `disj_allowed`, and the normalization makes it rooted. Keys that item
-        // 805's rewriting declined would then mark the contexts real in rules that do
-        // not take those marks, so such a run normalizes as a run without the option does
-        // and leaves the axioms with individuals out (roadmap item 1265).
+        // A run whose individuals, named or anonymous, are only in the axioms outside
+        // OWL 2 EL takes Tier D through `disj_allowed`, and the normalization makes it
+        // rooted. Keys that item 805's rewriting declined would then mark the contexts
+        // real in rules that do not take those marks, so such a run normalizes as a run
+        // without the option does and leaves the axioms with individuals out (roadmap
+        // items 1265 and 1281).
         let rooted = limits.rooted && !self.no_rooted && self.rooted_allowed(&ax);
         if !candidates.is_empty()
             && !limits.el_only
@@ -2131,7 +2132,8 @@ impl Saturation {
     /// properties or functional data roles. A key over object properties and the
     /// universal object property reach this check only when item 805's rewriting in
     /// [`Saturation::run`] declined them. The check holds for the individuals of the EL
-    /// part and for those that only the axioms outside it name (roadmap item 1265).
+    /// part and for those that only the axioms outside it hold, anonymous ones among them
+    /// (roadmap items 1265 and 1281).
     fn rooted_allowed(&self, ax: &Axioms) -> bool {
         let it = &self.interner;
         ax.functional.is_empty()
