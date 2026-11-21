@@ -1453,6 +1453,24 @@ impl Found {
     pub(super) fn ground_products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, true);
     }
+    /// The bytes that the conclusions and products waiting here hold, as [`fold`] counts a
+    /// side, for a rule that admits a batch before it drains it.
+    pub(super) fn held_bytes(&self) -> usize {
+        let side = |s: &Side| (s.0.capacity() + s.1.capacity()) * std::mem::size_of::<Lit>() + 48;
+        let one: usize = self.one.iter().map(|(s, _)| side(s)).sum();
+        let prods: usize = self
+            .prods
+            .iter()
+            .map(|(lists, base, ..)| {
+                side(base)
+                    + lists
+                        .iter()
+                        .map(|l| 24 + l.iter().map(side).sum::<usize>())
+                        .sum::<usize>()
+            })
+            .sum();
+        one + prods
+    }
     fn products_of(&mut self, mut lists: Vec<Vec<Side>>, base: Side, ground: bool) {
         if lists.iter().any(|l| l.is_empty()) {
             return;
@@ -1525,7 +1543,7 @@ const PRODUCT_POLL: usize = 256;
 
 /// The most bytes of a product's record of its conclusions that may go uncharged when the
 /// product ends between two checks of the bounds; a larger tail is charged at the end.
-const RECORD_SLACK: usize = 64 * 1024;
+pub(super) const RECORD_SLACK: usize = 64 * 1024;
 
 /// The most sides of one step of a product that [`fold`] keeps only where no other side
 /// of the step has a subset of their literals, which costs a comparison of each side with

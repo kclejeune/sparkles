@@ -50,8 +50,8 @@
 use super::dl_clause::{Clause, Lit, Made, RTerm, Rooted, XL, XLit, terms_of};
 use super::dl_rules::{
     DlIx, DlSt, Found, MREPAIR_CF, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN,
-    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, Side, alls, dix, dl, drain, drain_with, ds, merge,
-    pred_id, restricted, side, unit, with,
+    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, RECORD_SLACK, Side, alls, dix, dl, drain, drain_with,
+    ds, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Sink, State, table_bytes};
@@ -946,8 +946,9 @@ pub(super) fn on_max<S: Sink>(
         if out.dl().mrepair & MREPAIR_ON != 0
             && !is_marker(c)
             && let Some(root) = dx.root
+            && !m_note(ix, root, me, st, l, prem, out)
         {
-            m_note(ix, root, me, st, l, prem, found, out);
+            return;
         }
     }
     join_head(ix, st, c, l, prem, found, &out.dl().lits, sel);
@@ -1503,8 +1504,8 @@ pub fn marker_test_mode(mode: u8, diag: bool) {
 /// literal `l` is a ground trigger of a processed clause other than a marker: the context
 /// tells the root once that it holds l, and the root sends l's marker to the contexts
 /// registered for l's constants. The premise also meets the clauses the root returned
-/// with l in their bodies (M-return's late premise).
-#[allow(clippy::too_many_arguments)]
+/// with l in their bodies (M-return's late premise, [`m_late`]). It is false when a stop of
+/// the run cut the replay off, which marks the store interrupted.
 fn m_note<S: Sink>(
     ix: &Index,
     root: Ex,
@@ -1512,9 +1513,8 @@ fn m_note<S: Sink>(
     st: &mut State,
     l: Lit,
     prem: &Side,
-    found: &mut Found,
     out: &mut S,
-) {
+) -> bool {
     let r = rst(st, out);
     mrep_new(r, out);
     if let Some(b) = RootSt::ins(&mut r.mw().mheld, l, 8) {
@@ -1524,13 +1524,66 @@ fn m_note<S: Sink>(
     }
     let cf = cf_of(ix, out);
     if cf.is_some_and(|cf| ground_body(cf, &prem.0)) {
-        return;
+        return true;
     }
-    let cids = r.mr().rets.get(&l).cloned().unwrap_or_default();
-    for cid in cids {
+    m_late(ix, st, l, prem, out)
+}
+
+/// M-return's late premise `prem`, whose maximal literal is `l`: the clauses the root
+/// returned with l in their bodies are resolved with it in batches, each drained before the
+/// next is made, so that the many returns of a literal are never prepared whole. A batch
+/// closes after [`M_POLL`] returns or once its products hold [`RECORD_SLACK`] bytes, and its
+/// bytes are admitted to the run's memory before it drains and released after, so what one
+/// batch holds uncharged is at most the slack and one return's lists. The admission checks
+/// the run's bounds, and a batch with nothing to admit polls them instead. A refusal, or a
+/// drain that stopped, ends the replay with the store interrupted, as [`drain`] leaves it,
+/// and the function is false. The conclusions are charged as `drain` charges them.
+fn m_late<S: Sink>(ix: &Index, st: &mut State, l: Lit, prem: &Side, out: &mut S) -> bool {
+    let mut batch = Found::default();
+    let mut since = 0;
+    for k in 0.. {
+        if st.bottom {
+            return true;
+        }
+        let Some(cid) = rst(st, out)
+            .mr()
+            .rets
+            .get(&l)
+            .and_then(|v| v.get(k).copied())
+        else {
+            break;
+        };
         let c = out.dl().table.get(cid).clone();
-        ret_products(st, &c, Some((l, prem)), cf_of(ix, out), found);
+        ret_products(st, &c, Some((l, prem)), cf_of(ix, out), &mut batch);
+        since += 1;
+        if since >= M_POLL || batch.held_bytes() >= RECORD_SLACK {
+            since = 0;
+            if !m_flush(ix, st, &mut batch, out) {
+                return false;
+            }
+        }
     }
+    since == 0 || m_flush(ix, st, &mut batch, out)
+}
+
+/// Admits and drains one batch of [`m_late`], false when the run stopped.
+fn m_flush<S: Sink>(ix: &Index, st: &mut State, batch: &mut Found, out: &mut S) -> bool {
+    let b = std::mem::take(batch);
+    let held = b.held_bytes();
+    let go = if held > 0 {
+        out.reserve_data(held)
+    } else {
+        out.go_on()
+    };
+    if !go {
+        out.release_data(held);
+        ds(st).store.interrupted = true;
+        return false;
+    }
+    let was = ds(st).store.interrupted;
+    drain(ix, st, b, out);
+    out.release_data(held);
+    was || !ds(st).store.interrupted
 }
 
 /// The repair's pair set: the root reaches the context `me` by successors, from a
@@ -2455,6 +2508,153 @@ mod tests {
     use super::*;
     use crate::model::{Class, NamedIndividual, ObjectProperty};
     use std::sync::OnceLock;
+
+    /// A sink for M-return's late replay: its answer to every check of the run's bounds, the
+    /// checks it was asked, and the bytes it holds reserved and their most.
+    struct Bounded<'a> {
+        run: &'a DlRun,
+        go: bool,
+        polls: std::cell::Cell<usize>,
+        held: usize,
+        peak: usize,
+    }
+
+    impl Sink for Bounded<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn go_on(&self) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            self.go
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            self.polls.set(self.polls.get() + 1);
+            self.held += bytes;
+            self.peak = self.peak.max(self.held);
+            self.go
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.held -= bytes;
+        }
+    }
+
+    /// What a late replay did, [`late_replay`]'s answer.
+    #[derive(Debug)]
+    struct Late {
+        /// the checks of the bounds before the caller drained the rule's other conclusions
+        polls: usize,
+        /// whether the store was interrupted then
+        interrupted: bool,
+        /// the conclusions derived in all
+        work: usize,
+        /// the most bytes reserved at once, and the bytes still reserved at the end
+        peak: usize,
+        held: usize,
+    }
+
+    /// A context other than the root holds `rets` returned clauses A(u) ∧ M(u) → H_n(u) and
+    /// `partners` processed premises B_j(x) → M(u), with ground-free bodies so that
+    /// M-return-cf keeps them, and takes the late premise K(x) → A(u) with the repair in
+    /// `mode`, under a sink whose checks of the bounds all answer `go`.
+    fn late_replay(mode: u8, rets: usize, partners: usize, go: bool) -> Late {
+        let mut sig = Sig::new();
+        let [a, m, k] = ["A", "M", "K"].map(|n| sig.class(n));
+        let u = sig.ind("u");
+        let bs: Vec<Ex> = (0..partners).map(|j| sig.class(&format!("B{j}"))).collect();
+        let hs: Vec<Ex> = (0..rets).map(|n| sig.class(&format!("H{n}"))).collect();
+        let (ix, _) = probe_ix(sig);
+        let mut run = DlRun::new(false, Default::default());
+        run.mrepair = mode;
+        let inv = inv_of(&ix, dix(&ix));
+        let lit = |a: Ex| match run.lits.lit(XLit::Atom(a, c(u, &ix)), inv) {
+            Made::Lit(l) => l,
+            _ => panic!("a literal"),
+        };
+        let (la, lm) = (lit(a), lit(m));
+        let ids: Vec<u32> = hs
+            .iter()
+            .map(|&h| run.table.push(Clause::new(vec![la, lm], vec![lit(h)])))
+            .collect();
+        let mut st = State {
+            init: true,
+            ..State::default()
+        };
+        for &b in &bs {
+            ds(&mut st)
+                .store
+                .add(Clause::new(vec![Lit::x(b)], vec![lm]));
+        }
+        let order = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total: true,
+        };
+        let mut max = Vec::new();
+        while ds(&mut st)
+            .store
+            .next(&ix, Some(&order), &mut max)
+            .is_some()
+        {}
+        let mut out = Bounded {
+            run: &run,
+            go,
+            polls: std::cell::Cell::new(0),
+            held: 0,
+            peak: 0,
+        };
+        let r = rst(&mut st, &out);
+        mrep_new(r, &out);
+        r.mw().mheld.insert(la);
+        r.mw().rets.insert(la, ids);
+        let work = run.work();
+        let premise = Clause::new(vec![Lit::x(k)], vec![la]);
+        let prem = side(&premise, la);
+        let mut found = Found::default();
+        on_max(
+            &ix, k, &mut st, &premise, la, &prem, &mut found, &mut out, true,
+        );
+        let (polls, interrupted) = (out.polls.get(), ds(&mut st).store.interrupted);
+        drain(&ix, &mut st, found, &mut out);
+        Late {
+            polls,
+            interrupted,
+            work: run.work() - work,
+            peak: out.peak,
+            held: out.held,
+        }
+    }
+
+    #[test]
+    fn m_return_s_late_replay_is_bounded_and_complete() {
+        // the replay of many saved returns checks the run's bounds and admits what it
+        // prepares batch by batch, so a refusal stops it before the returns are all
+        // expanded, whatever their number, and with every check passed it derives each
+        // return's resolvent with each partner, a last part batch included
+        for mode in [MREPAIR_ON, MREPAIR_ON | MREPAIR_CF] {
+            let (rets, partners) = (4 * M_POLL + 5, 3);
+            let all = late_replay(mode, rets, partners, true);
+            assert_eq!(all.work, rets * partners, "mode {mode}: {all:?}");
+            assert!(
+                !all.interrupted && all.peak > 0 && all.held == 0,
+                "mode {mode}: {all:?}"
+            );
+            let more = late_replay(mode, 4 * rets, partners, true);
+            assert_eq!(more.work, 4 * rets * partners, "mode {mode}: {more:?}");
+            assert_eq!(more.peak, all.peak, "mode {mode}: one batch at a time");
+            for rets in [rets, 4 * rets] {
+                let cut = late_replay(mode, rets, partners, false);
+                assert!(cut.polls >= 1 && cut.interrupted, "mode {mode}: {cut:?}");
+                assert!(cut.work < M_POLL * partners, "mode {mode}: {cut:?}");
+                assert!(
+                    cut.peak <= all.peak && cut.held == 0,
+                    "mode {mode}: {cut:?}"
+                );
+            }
+        }
+    }
 
     /// A small signature: classes, individuals and roles by name.
     struct Sig {
