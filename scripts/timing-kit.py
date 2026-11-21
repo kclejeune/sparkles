@@ -777,13 +777,15 @@ def exact_stop(rounds):
     return last, "all"
 
 
-def every_round(rounds, upto):
+def every_round(rounds, upto, complete=True):
     """The every-round question on rounds 1..upto: "yes", "no" or "undecidable".
 
     A round at or below 1 answers no whatever the other rounds hold. Otherwise every round
     must have a usable pair, timings of both variants above zero, before a cost can be
-    claimed, and a round without one leaves the question undecidable. A cost is every round
-    above 1 with the pooled median adding more than EVERY_ROUND_ADDED_US."""
+    claimed, and a round without one leaves the question undecidable. Without complete,
+    which says that rounds holds every scheduled round, a round may be missing altogether,
+    so the question is undecidable unless a round answers no. A cost is every round above 1
+    with the pooled median adding more than EVERY_ROUND_ADDED_US."""
     kept = {k: v for k, v in rounds.items() if k <= upto}
     per, unpaired = [], False
     for v in kept.values():
@@ -793,18 +795,18 @@ def every_round(rounds, upto):
             per.append(statistics.median(v["B"]) / statistics.median(v["A"]))
     if any(r <= 1 for r in per):
         return "no"
-    if unpaired or not per:
+    if unpaired or not per or not complete:
         return "undecidable"
     a = [x for v in kept.values() for x in v["A"]]
     b = [x for v in kept.values() for x in v["B"]]
     return "yes" if (statistics.median(b) - statistics.median(a)) * 1000 > EVERY_ROUND_ADDED_US else "no"
 
 
-def decide(rounds, rule, bound, upto):
+def decide(rounds, rule, bound, upto, complete=True):
     """The rule's flag on rounds 1..upto, as a gate would take it from those samples alone.
     An every-round question that cannot be decided does not flag (see every_round)."""
     if rule != "bound":
-        return every_round(rounds, upto) == "yes"
+        return every_round(rounds, upto, complete) == "yes"
     kept = {k: v for k, v in rounds.items() if k <= upto}
     a = [x for v in kept.values() for x in v.get("A", [])]
     b = [x for v in kept.values() for x in v.get("B", [])]
@@ -813,10 +815,11 @@ def decide(rounds, rule, bound, upto):
     return statistics.median(b) / statistics.median(a) >= bound
 
 
-def undecidable(rounds, rule, upto):
+def undecidable(rounds, rule, upto, complete=True):
     """Whether the rule cannot answer on rounds 1..upto, which only the every-round question
-    can be, when a round lacks a usable pair and no round answers no."""
-    return rule == "every-round" and every_round(rounds, upto) == "undecidable"
+    can be, when a round lacks a usable pair, or the schedule is not known to be complete,
+    and no round answers no."""
+    return rule == "every-round" and every_round(rounds, upto, complete) == "undecidable"
 
 
 def scheduled_rounds(rounds, scheduled):
@@ -825,7 +828,7 @@ def scheduled_rounds(rounds, scheduled):
     return {k: rounds.get(k, {"A": [], "B": []}) for k in sorted(set(rounds) | set(scheduled))}
 
 
-def combined_stop(per_metric, bound, rules=("bound",), scheduled=()):
+def combined_stop(per_metric, bound, rules=("bound",), scheduled=(), complete=True):
     """Where one query stops when the stop must answer every rule on every metric.
 
     per_metric maps each metric to its rounds, as stop_rule takes them. Each rule and metric
@@ -833,7 +836,8 @@ def combined_stop(per_metric, bound, rules=("bound",), scheduled=()):
     stops at the latest of them, where each is decided again on the rounds the query keeps.
     The every-round question also judges each of the scheduled rounds that a metric has no
     entry for, as a round without a pair, while the bound's stop and pooled flag take the
-    rounds as given. The result is (stop round, {"METRIC RULE": {"stop_round", "how",
+    rounds as given. complete=False says the schedule is unknown, so that the every-round
+    question cannot claim a cost (see every_round). The result is (stop round, {"METRIC RULE": {"stop_round", "how",
     "flagged", "flagged_all_rounds", "undecidable", "undecidable_all_rounds"}})."""
     bad = [r for r in rules if r not in STOP_RULES]
     if bad or not rules:
@@ -849,10 +853,10 @@ def combined_stop(per_metric, bound, rules=("bound",), scheduled=()):
     for key, x in out.items():
         r = key.split(" ")[1]
         rounds = of[key]
-        x["flagged"] = decide(rounds, r, bound, stop)
-        x["flagged_all_rounds"] = decide(rounds, r, bound, max(rounds))
-        x["undecidable"] = undecidable(rounds, r, stop)
-        x["undecidable_all_rounds"] = undecidable(rounds, r, max(rounds))
+        x["flagged"] = decide(rounds, r, bound, stop, complete)
+        x["flagged_all_rounds"] = decide(rounds, r, bound, max(rounds), complete)
+        x["undecidable"] = undecidable(rounds, r, stop, complete)
+        x["undecidable_all_rounds"] = undecidable(rounds, r, max(rounds), complete)
     return stop, out
 
 
@@ -898,7 +902,18 @@ def pass_check(d, pair):
     return ok, problems
 
 
-def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",)):
+def pass_schedule(d):
+    """The number of rounds the pass d scheduled, from ROUNDS in its run.env, which run_pass
+    writes, or in its parent's when the pass has none, as a replay of a stage finds it. None
+    when neither file exists or the first that exists gives no plain positive ROUNDS."""
+    for f in (Path(d) / "run.env", Path(d).parent / "run.env"):
+        if f.is_file():
+            v = read_env(f, []).get("ROUNDS", "")
+            return int(v) if v.isdigit() and int(v) > 0 else None
+    return None
+
+
+def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",), schedule=None):
     """The early-stopping rule's decisions on the finished pass d beside those of all rounds.
 
     A query stops only once every rule in rules has stopped on both execution and wall time,
@@ -907,8 +922,14 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",)):
     check with the host's spread and drift judged by the controls, so that answers, missing
     timings and queries with one server process stop both alike. A query stopped after its
     first rounds keeps two server processes of each variant a round, so stopping cannot
-    thin it below the check's minimum."""
+    thin it below the check's minimum.
+
+    The every-round question judges each of rounds 1..schedule, ROUNDS of the pass's run.env
+    when schedule is None (pass_schedule), so a round that left no rows counts as a round
+    without a pair. When the schedule is unknown, that question cannot claim a cost."""
     d = Path(d)
+    if schedule is None:
+        schedule = pass_schedule(d)
     path = d / "results" / "samples.tsv"
     with path.open() as f:
         rows = list(csv.DictReader(f, delimiter="\t"))
@@ -937,7 +958,8 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",)):
     if not order:
         raise ValueError(f"no samples of {x} and {y} in {path}")
     controls = [q for q in (controls if controls is not None else CONTROLS) if q in order]
-    scheduled = sorted({k for (_q, k) in sent})  # every round the pair ran
+    # every scheduled round, and any round the pair ran past it
+    scheduled = sorted({k for (_q, k) in sent} | set(range(1, (schedule or 0) + 1)))
     summary = load_summary_module()
     full = summary.validity(samples, order)
     full_ok, problems = pass_check(d, pair)
@@ -953,8 +975,8 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",)):
                 for k, _e, ms in xs:
                     rounds[k][v].append(ms)
             per_metric[metric] = dict(rounds)
-        stop, metrics = combined_stop(per_metric, bound, rules, scheduled)
-        last = max(max(per_metric["exec_ms"]), stop)
+        stop, metrics = combined_stop(per_metric, bound, rules, scheduled, complete=schedule is not None)
+        last = max(max(per_metric["exec_ms"]), stop, schedule or 0)
         if q in controls:  # a control runs every round, and all rounds decide
             stop = last
             for dec in metrics.values():
@@ -991,7 +1013,7 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",)):
         "rule": {"kmin": EARLY_KMIN, "conf": EARLY_CONF, "bound": bound, "fallback_spread": FALLBACK_SPREAD,
                  "max_spread": summary.MAX_SPREAD, "metrics": list(STOP_METRICS), "rules": list(rules),
                  "every_round_added_us": EVERY_ROUND_ADDED_US},
-        "controls": controls,
+        "controls": controls, "schedule": schedule,
         "validity": {"all_rounds": valid_all, "shadow": valid_shadow, "controls": ctl, "fallback": fallback,
                      "all_rounds_spread": full and full["spread"], "pass_problems": problems},
         "queries": queries, "flags_differ": differ, "decisions_differ": decisions, "undecidable": unknown,
@@ -1009,8 +1031,9 @@ def shadow_line(label, s):
             + (f", since the pass cannot decide: {'; '.join(v['pass_problems'])}" if v.get("pass_problems") else "") + ". "
             f"{stopped} of {len(s['queries'])} queries would stop early, "
             + (f"flags differ for {', '.join(s['decisions_differ'])}, " if s["decisions_differ"] else "")
-            + (f"the every-round question cannot decide {', '.join(s['undecidable'])}, since a round has no "
-               "usable pair, and flags no cost there, " if s.get("undecidable") else "")
+            + (f"the every-round question cannot decide {', '.join(s['undecidable'])}, since "
+               + ("a round has no usable pair" if s.get("schedule") else "the pass does not say how many rounds it scheduled")
+               + ", and flags no cost there, " if s.get("undecidable") else "")
             + f"{s['request_share']:.0%} of requests and {s['wall_share']:.0%} of client wall time would run.")
 
 

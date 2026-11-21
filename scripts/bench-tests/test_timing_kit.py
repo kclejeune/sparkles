@@ -480,15 +480,17 @@ def load_kit():
 
 
 def write_samples(d, ratio, rounds=8, noise=None, controls=CONTROLS, query="q", spread=0.0, answers=None,
-                  wall_noise=None):
+                  wall_noise=None, schedule=True):
     """A pass of A,B,B,A rounds of 2 requests, where B takes ratio times A's 1 ms on query,
     with noise[k] scaling B in round k, and B is as fast as A on the controls. With spread,
     the second server process of each variant in a round is that much slower on every query.
     Wall time is execution time plus 1 ms, and wall_noise[k] scales B's wall time on query in
     round k on top of that. Both variants give the same answer to every query, unless answers
-    gives answers.tsv."""
+    gives answers.tsv. With schedule, the pass's run.env gives its rounds, as run_pass writes it."""
     res = Path(d) / "results"
     res.mkdir(parents=True)
+    if schedule:
+        (Path(d) / "run.env").write_text(f"ROUNDS={rounds}\nREPS=2\n")
     (res / "queries.txt").write_text("".join(f"{q}\n" for q in [query, *controls]))
     (res / "answers.tsv").write_text(answers if answers is not None else
                                      "".join(f"{v}\t{q}\t1\tx\n" for v in "AB" for q in [query, *controls]))
@@ -709,6 +711,85 @@ class ShadowTests(unittest.TestCase):
             self.assertEqual((dec["how"], dec["flagged"], dec["undecidable"], dec["undecidable_all_rounds"]),
                              ("control", False, True, True), m)
 
+    def drop_round(self, d, k):
+        """Leave every row of round k out of the pass, as if the round had left no samples."""
+        t = d / "results" / "samples.tsv"
+        lines = t.read_text().splitlines()
+        t.write_text("\n".join([lines[0]] + [line for line in lines[1:] if int(line.split("\t")[0]) != k]) + "\n")
+        return d
+
+    def assert_undecidable(self, s, what, how=None):
+        q = s["queries"]["q"]
+        self.assertEqual(q["rounds"], 8, what)
+        for m in self.kit.STOP_METRICS:
+            dec = q["metrics"][f"{m} every-round"]
+            got = (dec["flagged"], dec["flagged_all_rounds"], dec["undecidable"], dec["undecidable_all_rounds"])
+            self.assertEqual(got, (False, False, True, True), (what, m))
+            if how:
+                self.assertEqual(dec["how"], how, (what, m))
+            if "bound" in s["rule"]["rules"]:
+                dec = q["metrics"][f"{m} bound"]
+                self.assertEqual((dec["flagged"], dec["flagged_all_rounds"], dec["undecidable"]), (True, True, False),
+                                 (what, m))
+        self.assertEqual(s["undecidable"], [f"q {m} every-round" for m in self.kit.STOP_METRICS], what)
+
+    def test_an_every_round_rule_judges_every_scheduled_round_even_one_with_no_rows(self):
+        # B is 30% slower in every round that has samples, but a scheduled round left no rows
+        # for any query of the pair, inside the pass or at its end. The pass's run.env gives 8
+        # rounds, so the every-round question cannot be decided on the 7 that remain, in the
+        # ordinary shadow, in the fallback band and for a control, and the bound's pooled flag
+        # still flags.
+        for k in (5, 8):
+            for rules in (("every-round",), ("bound", "every-round")):
+                d = self.drop_round(write_samples(self.d / f"gap{k}-{len(rules)}", 1.3), k)
+                s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
+                self.assertEqual(s["queries"]["q"]["stop_round"], 8, (k, rules))
+                self.assert_undecidable(s, (k, rules), "unjudged")
+                d = self.drop_round(write_samples(self.d / f"band{k}-{len(rules)}", 1.3, spread=0.025), k)
+                s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
+                self.assertTrue(s["validity"]["fallback"], (k, rules))
+                self.assert_undecidable(s, ("fallback", k, rules))
+                d = self.drop_round(write_samples(self.d / f"ctl{k}-{len(rules)}", 1.3), k)
+                s = self.kit.shadow(d, ("A", "B"), ["q", *CONTROLS], 1.10, rules=rules)
+                self.assert_undecidable(s, ("control", k, rules), "control")
+                self.assertEqual(s["queries"]["q"]["stop_round"], 8, ("control", k, rules))
+
+    def test_an_every_round_rule_without_the_pass_schedule_cannot_claim_a_cost(self):
+        # neither the pass nor its parent says how many rounds were scheduled, so a round
+        # missing altogether cannot be ruled out and no cost is claimed, even on complete rounds
+        for rules in (("every-round",), ("bound", "every-round")):
+            d = write_samples(self.d / f"bare-{len(rules)}" / "pass1", 1.3, schedule=False)
+            s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=rules)
+            self.assert_undecidable(s, rules)
+        # the schedule-free pass still answers no from a round at or below 1
+        noise = [1.0, 1.0, 1.0, 1.0, 0.97, 1.0, 1.0, 1.0]
+        d = write_samples(self.d / "bare-no" / "pass1", 1.02, noise=noise, wall_noise=noise, schedule=False)
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=("every-round",))
+        for m in self.kit.STOP_METRICS:
+            dec = s["queries"]["q"]["metrics"][f"{m} every-round"]
+            self.assertEqual((dec["flagged"], dec["undecidable"], dec["undecidable_all_rounds"]), (False, False, False), m)
+        # and the parent's run.env gives the schedule when the pass has none
+        (self.d / "bare-1" / "run.env").write_text("ROUNDS=8\n")
+        s = self.kit.shadow(self.d / "bare-1" / "pass1", ("A", "B"), CONTROLS, 1.10, rules=("every-round",))
+        self.assertEqual((s["queries"]["q"]["metrics"]["exec_ms every-round"]["flagged"], s["undecidable"]), (True, []))
+        # a parent schedule longer than the samples counts its missing final rounds
+        (self.d / "bare-1" / "run.env").write_text("ROUNDS=9\n")
+        s = self.kit.shadow(self.d / "bare-1" / "pass1", ("A", "B"), CONTROLS, 1.10, rules=("every-round",))
+        self.assertEqual((s["queries"]["q"]["rounds"], s["undecidable"]),
+                         (9, [f"q {m} every-round" for m in self.kit.STOP_METRICS]))
+
+    def test_shadow_command_takes_the_schedule_from_the_pass_or_its_parent(self):
+        for where in ("pass", "parent"):
+            for rules in ("every-round", "bound,every-round"):
+                out = self.d / f"cli-{where}-{rules}"
+                d = self.drop_round(write_samples(out / "pass1", 1.3, schedule=where == "pass"), 8)
+                if where == "parent":
+                    (out / "run.env").write_text("ROUNDS=8\n")
+                r = kit("shadow", "--rules", rules, d)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn("cannot decide q exec_ms every-round, q wall_ms every-round", r.stdout, (where, rules))
+                self.assert_undecidable(json.loads((d / "shadow-A-B.json").read_text()), (where, rules))
+
     def test_shadow_falls_back_in_the_band_and_judges_validity_by_the_controls(self):
         d = write_samples(self.d / "band", 1.0, spread=0.025)
         s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
@@ -757,7 +838,7 @@ class ShadowTests(unittest.TestCase):
             self.assertFalse(list(d.glob("summary*")), name)
 
     def test_shadow_command_reads_a_screen_pass(self):
-        d = write_samples(self.d / "out" / "pass1", 1.0)
+        d = write_samples(self.d / "out" / "pass1", 1.0, schedule=False)
         (self.d / "out" / "run.env").write_text("ROUNDS=8\nFLAG_RATIO=1.20\n")
         r = kit("shadow", d)
         self.assertEqual(r.returncode, 0, r.stderr)
