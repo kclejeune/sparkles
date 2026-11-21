@@ -45,8 +45,9 @@ every other unit has ended, and its unit calls parallel_absorb with the list of
 (unit, export) pairs before its tests start. The suite's process-leak check uses this, so
 its one test runs once, last, on the evidence of every unit.
 
-Discovery and each unit have deadlines, 300 s and 900 s by default, and every duration
-must be finite. Each runs in its own session with its output in a file. When a deadline
+Discovery and each unit have deadlines, 300 s and 900 s by default, and the one unit that
+runs the whole suite, when it does, has the longer of --unit-timeout and --suite-timeout,
+2400 s by default. Every duration must be finite. Each runs in its own session with its output in a file. When a deadline
 passes, or the runner gets SIGINT, SIGTERM or SIGHUP, it starts no more units, sends SIGTERM
 to the process group and session of every active unit and to every descendant it finds
 under /proc, follows with SIGKILL after one grace period, 5 s by default, and reports the
@@ -556,6 +557,32 @@ def check(record, assigned, exports):
     return None  # a failed test is in unittest's own report
 
 
+def parse_args(argv):
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
+    ap.add_argument("--split", action="append", default=[])
+    ap.add_argument("--unit-timeout", type=float, default=900.0)
+    ap.add_argument("--suite-timeout", type=float, default=2400.0,
+                    help="the deadline of the one process that runs the whole suite, when it does")
+    ap.add_argument("--discover-timeout", type=float, default=300.0)
+    ap.add_argument("--grace", type=float, default=5.0)
+    ap.add_argument("--keep", type=Path, help="keep the discovery, plan, outputs and result records in a new directory under this one")
+    ap.add_argument("directory", type=Path)
+    a = ap.parse_args(argv)
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    for opt in ("unit_timeout", "suite_timeout", "discover_timeout", "grace"):
+        if not (math.isfinite(getattr(a, opt)) and getattr(a, opt) > 0):
+            ap.error(f"--{opt.replace('_', '-')} must be a finite number of seconds more than 0")
+    return a
+
+
+def unit_deadline(a, index):
+    """The deadline of the unit that runs entry INDEX, or the whole suite when INDEX is -1.
+    The whole suite takes as long as every unit together, so it gets the longer of the two."""
+    return max(a.unit_timeout, a.suite_timeout) if index < 0 else a.unit_timeout
+
+
 def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
@@ -567,20 +594,7 @@ def main(argv=None):
         parent, grace, plan, index, split, record, absorb, directory = argv[1:]
         _die_with_parent(int(parent), float(grace))
         return worker_main(directory, plan, int(index), int(split), record, absorb)
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
-    ap.add_argument("--split", action="append", default=[])
-    ap.add_argument("--unit-timeout", type=float, default=900.0)
-    ap.add_argument("--discover-timeout", type=float, default=300.0)
-    ap.add_argument("--grace", type=float, default=5.0)
-    ap.add_argument("--keep", type=Path, help="keep the discovery, plan, outputs and result records in a new directory under this one")
-    ap.add_argument("directory", type=Path)
-    a = ap.parse_args(argv)
-    if a.jobs < 1:
-        ap.error("--jobs must be at least 1")
-    for opt in ("unit_timeout", "discover_timeout", "grace"):
-        if not (math.isfinite(getattr(a, opt)) and getattr(a, opt) > 0):
-            ap.error(f"--{opt.replace('_', '-')} must be a finite number of seconds more than 0")
+    a = parse_args(argv)
     old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     if a.keep:
         a.keep.mkdir(parents=True, exist_ok=True)
@@ -628,7 +642,7 @@ def supervise(a, workdir, active):
         count += 1
         job = Job(name, [sys.executable, RUNNER, "--_unit", str(os.getpid()), str(a.grace),
                          plan_path, str(index), str(split),
-                         record, absorb, str(a.directory)], a.unit_timeout, workdir)
+                         record, absorb, str(a.directory)], unit_deadline(a, index), workdir)
         job.record, job.index, job.split = record, index, split
         active.append(job)
 
@@ -647,7 +661,7 @@ def supervise(a, workdir, active):
             leaves = units[job.index]["leaves"]
         assigned = leaves if job.split < 0 else [leaves[job.split]]
         if job.timed_out:
-            why = f"deadline of {a.unit_timeout:g} s passed"
+            why = f"deadline of {job.deadline:g} s passed"
         elif job.halted:
             why = "stopped when another unit passed its deadline"
         else:

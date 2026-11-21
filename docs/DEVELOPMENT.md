@@ -396,7 +396,8 @@ a complete record fails, and a run in which no test ran and none was skipped exi
 unittest does. The process-leak check in `test_zz_process_leaks.py` runs once, after every
 other process, on the unwaited subprocesses that each process reports after its tests and
 teardown. Discovery has a 300 s deadline and each process a 900 s deadline, which
-`--discover-timeout` and `--unit-timeout` change. At a deadline, or on SIGINT, SIGTERM or
+`--discover-timeout` and `--unit-timeout` change. The one process that runs the whole suite,
+when it does, has a 2400 s deadline, which `--suite-timeout` changes. At a deadline, or on SIGINT, SIGTERM or
 SIGHUP, the runner starts no more processes, stops every active one with its group and the
 descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
 the run. When the runner itself is killed, its processes get SIGTERM from the kernel and

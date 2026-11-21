@@ -705,6 +705,36 @@ class Deadlines(Base):
         self.assertIn("failed: test_hang", p.stdout)
         self.assert_owned_gone(3)
 
+    def test_the_whole_suite_fallback_has_a_deadline_of_its_own(self):
+        d = self.hang_suite("test_hang")
+        # A module whose suite has a run of its own sends the whole suite to one process.
+        write(d, "test_custom.py", """
+            import unittest
+
+            def load_tests(loader, tests, pattern):
+                suite = unittest.TestSuite()
+                suite.run = lambda result, debug=False: result
+                return suite
+            """)
+        t0 = time.monotonic()
+        p = self.run_runner("--unit-timeout", "2", "--suite-timeout", "6", "--grace", "1", str(d), timeout=60)
+        self.assertGreater(time.monotonic() - t0, 5)
+        self.assertLess(time.monotonic() - t0, 40)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("the whole suite runs in one process", p.stdout)
+        self.assertIn("the whole suite: deadline of 6 s passed", p.stdout)
+        self.assert_owned_gone(3)
+
+    def test_the_whole_suite_fallback_deadline_is_at_least_2400_s_by_default(self):
+        spec = importlib.util.spec_from_file_location("unittest_parallel_defaults", RUNNER)
+        rp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(rp)
+        a = rp.parse_args([str(HERE)])
+        self.assertGreaterEqual(rp.unit_deadline(a, -1), 2400)
+        self.assertEqual(rp.unit_deadline(a, 0), 900)
+        a = rp.parse_args(["--unit-timeout", "3000", str(HERE)])
+        self.assertGreaterEqual(rp.unit_deadline(a, -1), 3000)
+
     def test_a_hung_discovery_is_stopped_at_its_deadline(self):
         d = self.suite(test_a=ONE, test_slow=f"""
             import os, threading
@@ -829,7 +859,7 @@ class Deadlines(Base):
 
     def test_deadlines_must_be_positive_and_finite(self):
         d = self.suite(test_a=ONE)
-        for opt in ("--unit-timeout", "--discover-timeout", "--grace"):
+        for opt in ("--unit-timeout", "--suite-timeout", "--discover-timeout", "--grace"):
             for value in ("0", "inf", "nan"):
                 p = self.run_runner(opt, value, str(d))
                 self.assertEqual(p.returncode, 2, opt + value + p.stderr)
