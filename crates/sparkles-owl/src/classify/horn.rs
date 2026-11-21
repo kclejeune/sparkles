@@ -255,10 +255,21 @@ impl Nfa {
     /// The labels of the transitions into the final states of [`Nfa::eps_free`], sorted,
     /// or `None` when its start is final, found without building the closure: a labelled
     /// transition from a state that the start reaches to one whose ε-transitions reach the
-    /// end. The work is linear in the automaton up to the sort of the labels, its scratch
-    /// is a few words for each state and transition the automaton holds already, and it
-    /// polls `stop` every [`POLL_WORK`] steps.
-    pub fn final_labels(&self, stop: &dyn Fn() -> bool) -> Result<Option<Vec<Role>>, Halt> {
+    /// end. The work is linear in the automaton up to the sort of the labels, and it polls
+    /// `stop` every [`POLL_WORK`] steps and once more after the sort. Its scratch is a few
+    /// words for each state and transition, which it counts before it allocates and
+    /// refuses past `limit` bytes, as the role box refuses its closure.
+    pub fn final_labels(
+        &self,
+        limit: Option<usize>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Option<Vec<Role>>, Halt> {
+        // the lists of each state, the marks and the stack, the transitions in the lists
+        // and the labels
+        let bytes = self.states as usize * (2 * 24 + 2 + 2 * 4) + self.trans.len() * (2 * 4 + 4);
+        if limit.is_some_and(|l| bytes > l) {
+            return Err(Halt::Memory(bytes));
+        }
         let mut work = 0usize;
         let mut tick = || {
             work += 1;
@@ -297,13 +308,21 @@ impl Nfa {
                 stack.extend(out[x as usize].iter().copied());
             }
         }
-        let mut ls: Vec<Role> = self
-            .trans
-            .iter()
-            .filter_map(|&(p, l, q)| l.filter(|_| reached[p as usize] && ends[q as usize]))
-            .collect();
+        let mut ls: Vec<Role> = Vec::new();
+        for &(p, l, q) in &self.trans {
+            tick()?;
+            if let Some(l) = l
+                && reached[p as usize]
+                && ends[q as usize]
+            {
+                ls.push(l);
+            }
+        }
         ls.sort_unstable();
         ls.dedup();
+        if stop() {
+            return Err(Halt::Stopped);
+        }
         Ok(Some(ls))
     }
 
@@ -438,6 +457,7 @@ fn ends_in_range(
     told: &[Role],
     tops: &[Role],
     r: Role,
+    limit: Option<usize>,
     stop: &dyn Fn() -> bool,
 ) -> Result<bool, Halt> {
     if tops.contains(&r) {
@@ -448,9 +468,9 @@ fn ends_in_range(
         std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
         std::collections::hash_map::Entry::Vacant(e) => {
             let ls = match rb.autos.get(&r) {
-                Some(a) => a.final_labels(stop)?,
+                Some(a) => a.final_labels(limit, stop)?,
                 None => match rb.auto(r, &mut Vec::new()) {
-                    Some(a) => a.final_labels(stop)?,
+                    Some(a) => a.final_labels(limit, stop)?,
                     None => None,
                 },
             };
@@ -1802,7 +1822,7 @@ pub fn normalize(
         let skip = match mode {
             RangeUniversals::Covered if c != TOP => {
                 let told = by_filler.get(&c).map_or(&[][..], |v| v.as_slice());
-                ends_in_range(&mut rb, &mut labels, told, &tops, r, stop)?
+                ends_in_range(&mut rb, &mut labels, told, &tops, r, limit, stop)?
             }
             RangeUniversals::Covered => false,
             RangeUniversals::Keep => false,
@@ -1825,6 +1845,36 @@ pub fn normalize(
 #[cfg(test)]
 mod reduction_tests {
     use super::*;
+
+    /// The reading of the final labels stops when the run stops, also after its last scan,
+    /// and refuses scratch past the limit.
+    #[test]
+    fn final_labels_poll_and_count() {
+        let a = Nfa {
+            states: 2,
+            start: 0,
+            end: 1,
+            trans: (0..(4 * POLL_WORK as Role))
+                .map(|l| (0, Some(l), 1))
+                .collect(),
+        };
+        assert_eq!(a.final_labels(None, &|| true), Err(Halt::Stopped));
+        assert!(matches!(
+            a.final_labels(Some(1000), &|| false),
+            Err(Halt::Memory(_))
+        ));
+        // a stop that comes only after the twelve polls of the scans still ends the reading
+        let calls = std::cell::Cell::new(0usize);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 12
+        };
+        assert_eq!(a.final_labels(None, &late), Err(Halt::Stopped));
+        assert_eq!(
+            a.final_labels(None, &|| false).unwrap().map(|v| v.len()),
+            Some(4 * POLL_WORK)
+        );
+    }
 
     /// The labels into final states read from the automaton equal those of its closure
     /// over the ε-transitions, on the automata of random role boxes.
@@ -1863,7 +1913,7 @@ mod reduction_tests {
                 ls.dedup();
                 Some(ls)
             };
-            assert_eq!(a.final_labels(&|| false).unwrap(), want, "{a:?}");
+            assert_eq!(a.final_labels(None, &|| false).unwrap(), want, "{a:?}");
         }
     }
 
