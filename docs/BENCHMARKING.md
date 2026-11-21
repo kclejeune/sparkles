@@ -1249,16 +1249,25 @@ without a reason and a name that is not a staged query.
 Early stopping runs only in shadow mode. With `EARLY_STOP=shadow`, which `stage` writes by
 default, `run` replays a stopping rule on the finished first pass and writes `shadow.md` and
 `pass1/shadow-X-Y.json` beside the verdict, and `timing-kit.py shadow PASS_DIR` does the same
-for any finished pass of the harness, such as a batch screen's. The rule ends a query that is
-not a control once a 99.5% t interval of its per-round log ratios, after at least three
-rounds, lies wholly below the flag bound with the pooled ratio below it too, or lies at or
-above the bound. The controls run every round and judge the host's spread and drift, while
-the checks of answers, missing timings and server processes per query apply to the shadow
-as they do to all rounds. When their same-binary
-spread is between 2.2% and the 3% bound, the stopped queries would run their remaining rounds
-and the rule of all rounds would decide. The record gives each query's stop round and flag
-beside those of all rounds, both validities, the share of requests that would have run and a
-hash of the samples, and a run agrees when every flag and the validity match. Shadow mode never
+for any finished pass of the harness, such as a batch screen's. A query that is not a control
+stops only once the rule has stopped on both its execution time and its wall time, since
+the gates score both, and each metric's flag is then taken on the rounds that the query
+keeps. For the flag at the bound, a metric stops once a 99.5% t interval of its per-round
+log ratios, after at least three rounds, lies wholly below the bound with the pooled ratio
+below it too, or lies at or above the bound. An interval cannot answer a rule that asks
+whether every round is above 1, so `EARLY_STOP_RULES=every-round`, which `stage
+--early-stop-rules` writes, gives that question the exact stop instead. A metric then stops
+at its first round at or below 1, where the answer is no whatever the later rounds hold, and
+otherwise runs every round, and a cost is flagged when every round is above 1 and the median
+adds more than 0.5 µs. `EARLY_STOP_RULES=bound,every-round` answers both questions, and the
+query stops at the later of the two stops. The default is `bound`. The controls run every
+round and judge the host's spread and drift, while the checks of answers, missing timings
+and server processes per query apply to the shadow as they do to all rounds. When their
+same-binary spread is between 2.2% and the 3% bound, the stopped queries would run their
+remaining rounds and the rule of all rounds would decide. The record gives each query's stop
+round and, for each metric and question, its stop and flag beside the flag of all rounds. It
+also gives both validities, the share of requests that would have run and a hash of the
+samples, and a run agrees when every flag and the validity match. Shadow mode never
 changes the verdict, the flagged queries, the rerun or the exit status. It tests the decision
 rule only, since live stopping would also change which queries run between the remaining ones
 and would run a fallback's remaining rounds in new server processes.

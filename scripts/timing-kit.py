@@ -6,7 +6,7 @@
     scripts/timing-kit.py launch --host HOST --unit NAME [--dry-run] STAGE...
     scripts/timing-kit.py run STAGE...          (the unit's driver, on the timing host)
     scripts/timing-kit.py summarize STAGE
-    scripts/timing-kit.py shadow [--pair X,Y] [--controls Q,...] [--flag-ratio R] PASS_DIR
+    scripts/timing-kit.py shadow [--pair X,Y] [--controls Q,...] [--flag-ratio R] [--rules R,...] PASS_DIR
 
 `stage` assembles one run directory for scripts/nsc-bench-remote.sh. The base binary is
 variant A and each tip is B, C and so on, so that several tips that share a base, data,
@@ -47,16 +47,21 @@ and its reason in place of the refusal. DONE gets the exit status, which is 3 wh
 decides is invalid.
 
 `shadow` replays the early-stopping rule on a finished pass, whose every round ran, and
-records what the rule would have decided beside the verdict of all rounds. Each query that
-is not a control stops once a t interval at 99.5% of its per-round log ratios, after at
-least three rounds, lies below the flag bound with the pooled ratio so far below it too, or
-lies at or above the bound. The controls run every round and carry the host's validity check,
+records what the rule would have decided beside the verdict of all rounds. A query that is
+not a control stops only once every question the stop must answer has stopped on both its
+execution time and its wall time, since the gates score both, and each decision is then
+taken on the rounds the query keeps. For the flag at the bound, a metric stops once a t
+interval at 99.5% of its per-round log ratios, after at least three rounds, lies below the
+bound with the pooled ratio so far below it too, or lies at or above the bound. With
+EARLY_STOP_RULES=every-round, or bound,every-round, the stop also answers whether every round
+is above 1 with more than 0.5 us added, which an interval cannot answer, so that metric stops
+exactly, at its first round at or below 1, or runs every round. The controls run every round and carry the host's validity check,
 the pass's checks of answers, timings and server processes apply to both alike, and
 when their same-binary spread is 2.2% or more but within the 3% bound, the stopped queries
 would run their remaining rounds and the rule of all rounds would decide. PASS_DIR/shadow-X-Y.json
-gets each query's stop round, its decision and that of all rounds, the validity of both, the
-share of requests the rule would have sent and a hash of samples.tsv. A run agrees when every
-query's flag and the validity are the same. With EARLY_STOP=shadow in run.env, which `stage`
+gets each query's stop round, each metric's and question's stop and decision beside that of
+all rounds, the validity of both, the share of requests the rule would have sent and a hash
+of samples.tsv. A run agrees when every decision and the validity are the same. With EARLY_STOP=shadow in run.env, which `stage`
 writes by default, `run` does this for each pair of the first pass and writes shadow.md.
 Shadow mode never changes verdict.md, flagged.txt, the rerun or the exit status, and it
 cannot show what live stopping would change, since stopped queries would no longer sit
@@ -92,6 +97,12 @@ KIT_FILES = ("nsc-bench-remote.sh", "nsc-bench-summary.py", "timing-kit.py")
 EARLY_KMIN = 3
 EARLY_CONF = 0.995
 FALLBACK_SPREAD = 0.022
+# the metrics a stop must cover, since the gates score both, and the questions it can answer:
+# "bound" is the flag at FLAG_RATIO, and "every-round" is a cost in every round, above 1 in
+# each and adding more than EVERY_ROUND_ADDED_US, which only the exact stop answers
+STOP_METRICS = ("exec_ms", "wall_ms")
+STOP_RULES = ("bound", "every-round")
+EVERY_ROUND_ADDED_US = 0.5
 # two-sided 99.5% t quantiles for 1 to 30 degrees of freedom; more degrees use the last,
 # which is above the true quantile and so stops later
 T995 = [127.3, 14.09, 7.453, 5.598, 4.773, 4.317, 4.029, 3.833, 3.690, 3.581, 3.497, 3.428, 3.372, 3.326, 3.286,
@@ -267,7 +278,7 @@ def cmd_stage(a):
         "SERVE_ARGS": a.serve_args, "EXECUTION": a.execution,
         "PAIRS": " ".join(pairs), "XPAIRS": " ".join(xpairs), "CONTROLS": " ".join(controls),
         "FLAG_RATIO": a.flag_ratio, "RERUN_ROUNDS": a.rerun_rounds, "RERUN_REPS": a.rerun_reps,
-        "EARLY_STOP": a.early_stop,
+        "EARLY_STOP": a.early_stop, "EARLY_STOP_RULES": a.early_stop_rules,
     }
     if a.expected_answer_change:
         env["EXPECTED_ANSWER_CHANGE"] = a.expected_answer_change
@@ -330,6 +341,9 @@ def static_checks(stage):
             p.append(f"{k} must be a whole number of at least {least}, not {v}")
     if env.get("EARLY_STOP", "off") not in ("off", "shadow"):
         p.append(f"EARLY_STOP must be off or shadow, not {env.get('EARLY_STOP')}, since stopping that acts is not qualified")
+    rules = env.get("EARLY_STOP_RULES", "bound").split(",")
+    if not all(r in STOP_RULES for r in rules):
+        p.append(f"EARLY_STOP_RULES must be a comma-separated list of {', '.join(STOP_RULES)}, not {env.get('EARLY_STOP_RULES')}")
     if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", env.get("FLAG_RATIO", "1.10")) or float(env.get("FLAG_RATIO", "1.10")) <= 1:
         p.append(f"FLAG_RATIO must be a ratio above 1, not {env.get('FLAG_RATIO')}")
     queries = {f.stem for f in (stage / "queries").glob("*.rq")} if (stage / "queries").is_dir() else set()
@@ -749,6 +763,58 @@ def stop_rule(rounds, bound, kmin=EARLY_KMIN):
     return last, pooled(last) >= bound, "all"
 
 
+def exact_stop(rounds):
+    """Where the every-round question ends one query: at the first round whose ratio is at or
+    below 1, which answers no whatever the other rounds hold, or after all rounds. The result
+    is (stop round, how), with how "exact" for an early stop, "all" or "unjudged"."""
+    last = max(rounds)
+    for k in sorted(rounds):
+        v = rounds[k]
+        if not v.get("A") or not v.get("B") or min(v["A"] + v["B"]) <= 0:
+            return last, "unjudged"
+        if k < last and statistics.median(v["B"]) / statistics.median(v["A"]) <= 1:
+            return k, "exact"
+    return last, "all"
+
+
+def decide(rounds, rule, bound, upto):
+    """The rule's flag on rounds 1..upto, as a gate would take it from those samples alone."""
+    kept = {k: v for k, v in rounds.items() if k <= upto}
+    a = [x for v in kept.values() for x in v.get("A", [])]
+    b = [x for v in kept.values() for x in v.get("B", [])]
+    if not a or not b or min(a + b) <= 0:
+        return False
+    if rule == "bound":
+        return statistics.median(b) / statistics.median(a) >= bound
+    per = [statistics.median(v["B"]) / statistics.median(v["A"]) for v in kept.values() if v.get("A") and v.get("B")]
+    return min(per) > 1 and (statistics.median(b) - statistics.median(a)) * 1000 > EVERY_ROUND_ADDED_US
+
+
+def combined_stop(per_metric, bound, rules=("bound",)):
+    """Where one query stops when the stop must answer every rule on every metric.
+
+    per_metric maps each metric to its rounds, as stop_rule takes them. Each rule and metric
+    stops on its own, "bound" by stop_rule and "every-round" by exact_stop, and the query
+    stops at the latest of them, where each is decided again on the rounds the query keeps.
+    The result is (stop round, {"METRIC RULE": {"stop_round", "how", "flagged",
+    "flagged_all_rounds"}})."""
+    bad = [r for r in rules if r not in STOP_RULES]
+    if bad or not rules:
+        raise ValueError(f"unknown early-stopping rules {bad or 'none'}, which must be some of {', '.join(STOP_RULES)}")
+    out = {}
+    for m, rounds in per_metric.items():
+        for r in rules:
+            k, how = exact_stop(rounds) if r == "every-round" else stop_rule(rounds, bound)[::2]
+            out[f"{m} {r}"] = {"stop_round": k, "how": how}
+    stop = max(x["stop_round"] for x in out.values())
+    for key, x in out.items():
+        m, r = key.split(" ")
+        rounds = per_metric[m]
+        x["flagged"] = decide(rounds, r, bound, stop)
+        x["flagged_all_rounds"] = decide(rounds, r, bound, max(rounds))
+    return stop, out
+
+
 def load_summary_module():
     spec = importlib.util.spec_from_file_location("nsc_bench_summary", HERE / "nsc-bench-summary.py")
     mod = importlib.util.module_from_spec(spec)
@@ -791,10 +857,12 @@ def pass_check(d, pair):
     return ok, problems
 
 
-def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
+def shadow(d, pair=("A", "B"), controls=None, bound=1.10, rules=("bound",)):
     """The early-stopping rule's decisions on the finished pass d beside those of all rounds.
 
-    The validity of all rounds is the full-pass check. The shadow's validity is the same
+    A query stops only once every rule in rules has stopped on both execution and wall time,
+    and each of those decisions is taken on the rounds it keeps (combined_stop). The validity
+    of all rounds is the full-pass check. The shadow's validity is the same
     check with the host's spread and drift judged by the controls, so that answers, missing
     timings and queries with one server process stop both alike. A query stopped after its
     first rounds keeps two server processes of each variant a round, so stopping cannot
@@ -805,7 +873,11 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
         rows = list(csv.DictReader(f, delimiter="\t"))
     x, y = pair
     name = {x: "A", y: "B"}
+    rules = tuple(rules)
+    if not rules or any(r not in STOP_RULES for r in rules):
+        raise ValueError(f"unknown early-stopping rules {list(rules)}, which must be some of {', '.join(STOP_RULES)}")
     samples = defaultdict(lambda: defaultdict(list))  # query -> variant -> (round, epoch, ms)
+    wall_samples = defaultdict(lambda: defaultdict(list))  # the same with wall ms
     walls = defaultdict(float)  # (query, round) -> wall ms of both variants
     sent = defaultdict(int)  # (query, round) -> requests of both variants
     order = []
@@ -820,6 +892,7 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
             continue
         walls[(q, k)] += float(r["wall_ms"])
         samples[q][name[r["variant"]]].append((k, int(r["epoch"]), float(r["exec_ms"])))
+        wall_samples[q][name[r["variant"]]].append((k, int(r["epoch"]), float(r["wall_ms"])))
     if not order:
         raise ValueError(f"no samples of {x} and {y} in {path}")
     controls = [q for q in (controls if controls is not None else CONTROLS) if q in order]
@@ -829,41 +902,55 @@ def shadow(d, pair=("A", "B"), controls=None, bound=1.10):
     ctl = summary.validity(samples, controls) if len(controls) >= MIN_CONTROLS else None
     queries = {}
     for q in order:
-        rounds = defaultdict(lambda: {"A": [], "B": []})
-        for k in {k for (qq, k) in sent if qq == q}:
-            rounds[k]  # a round whose every request failed still counts, as unjudged
-        for v, xs in samples[q].items():
-            for k, _e, ms in xs:
-                rounds[k][v].append(ms)
-        a = [ms for _k, _e, ms in samples[q].get("A", [])]
-        b = [ms for _k, _e, ms in samples[q].get("B", [])]
-        all_flag = bool(a and b) and statistics.median(b) / statistics.median(a) >= bound
+        per_metric = {}
+        for metric, src in zip(STOP_METRICS, (samples, wall_samples)):
+            rounds = defaultdict(lambda: {"A": [], "B": []})
+            for k in {k for (qq, k) in sent if qq == q}:
+                rounds[k]  # a round whose every request failed still counts, as unjudged
+            for v, xs in src[q].items():
+                for k, _e, ms in xs:
+                    rounds[k][v].append(ms)
+            per_metric[metric] = dict(rounds)
+        last = max(per_metric["exec_ms"])
         if q in controls:
-            stop, flag, how = max(rounds), all_flag, "control"
+            stop = last
+            metrics = {f"{m} {r}": {"stop_round": last, "how": "control", "flagged": decide(per_metric[m], r, bound, last),
+                                    "flagged_all_rounds": decide(per_metric[m], r, bound, last)}
+                       for m in STOP_METRICS for r in rules}
         else:
-            stop, flag, how = stop_rule(dict(rounds), bound)
-        queries[q] = {"stop_round": stop, "rounds": max(rounds), "how": how, "flagged": flag, "flagged_all_rounds": all_flag}
+            stop, metrics = combined_stop(per_metric, bound, rules)
+        latest = [m["how"] for m in metrics.values() if m["stop_round"] == stop]
+        how = "control" if q in controls else next((h for h in latest if h not in ("all", "unjudged")),
+                                                   "unjudged" if "unjudged" in latest else "all")
+        first = metrics.get("exec_ms bound") or next(iter(metrics.values()))
+        queries[q] = {"stop_round": stop, "rounds": last, "how": how, "flagged": first["flagged"],
+                      "flagged_all_rounds": first["flagged_all_rounds"], "metrics": metrics}
     # the controls decide validity, and a spread within the fallback band sends every stopped
     # query back to its remaining rounds, where the rule of all rounds decides
     fallback = bool(ctl and ctl["valid"] and ctl["spread"] >= FALLBACK_SPREAD)
     if fallback:
         for m in queries.values():
             m.update(stop_round=m["rounds"], flagged=m["flagged_all_rounds"])
+            for x in m["metrics"].values():
+                x.update(flagged=x["flagged_all_rounds"])
     valid_all = full_ok
     valid_shadow = valid_all if fallback else bool(ctl and ctl["valid"]) and not problems
     total = sum(sent.values()) or 1
     kept = sum(n for (q, k), n in sent.items() if k <= queries[q]["stop_round"])
     wall_all = sum(walls.values()) or 1
     wall_kept = sum(w for (q, k), w in walls.items() if k <= queries[q]["stop_round"])
-    differ = sorted(q for q, m in queries.items() if m["flagged"] != m["flagged_all_rounds"])
+    decisions = sorted(f"{q} {key}" for q, m in queries.items() for key, x in m["metrics"].items()
+                       if x["flagged"] != x["flagged_all_rounds"])
+    differ = sorted({d.split(" ")[0] for d in decisions})
     return {
         "pair": {"A": x, "B": y}, "samples_sha256": sha256(path),
         "rule": {"kmin": EARLY_KMIN, "conf": EARLY_CONF, "bound": bound, "fallback_spread": FALLBACK_SPREAD,
-                 "max_spread": summary.MAX_SPREAD},
+                 "max_spread": summary.MAX_SPREAD, "metrics": list(STOP_METRICS), "rules": list(rules),
+                 "every_round_added_us": EVERY_ROUND_ADDED_US},
         "controls": controls,
         "validity": {"all_rounds": valid_all, "shadow": valid_shadow, "controls": ctl, "fallback": fallback,
                      "all_rounds_spread": full and full["spread"], "pass_problems": problems},
-        "queries": queries, "flags_differ": differ,
+        "queries": queries, "flags_differ": differ, "decisions_differ": decisions,
         "request_share": kept / total, "wall_share": wall_kept / wall_all,
         "agree": not differ and valid_all == valid_shadow,
     }
@@ -877,7 +964,7 @@ def shadow_line(label, s):
             + (", with the controls' spread in the fallback band" if v["fallback"] else "")
             + (f", since the pass cannot decide: {'; '.join(v['pass_problems'])}" if v.get("pass_problems") else "") + ". "
             f"{stopped} of {len(s['queries'])} queries would stop early, "
-            + (f"flags differ for {', '.join(s['flags_differ'])}, " if s["flags_differ"] else "")
+            + (f"flags differ for {', '.join(s['decisions_differ'])}, " if s["decisions_differ"] else "")
             + f"{s['request_share']:.0%} of requests and {s['wall_share']:.0%} of client wall time would run.")
 
 
@@ -893,7 +980,7 @@ def write_shadow(stage):
                  "The rule did not act. Every round ran, and verdict.md comes from all of them.", ""]
         for x, y in pairs_of(stage):
             s = shadow(stage / "pass1", (x, y), env.get("CONTROLS", " ".join(CONTROLS)).split(),
-                       float(env.get("FLAG_RATIO", "1.10")))
+                       float(env.get("FLAG_RATIO", "1.10")), env.get("EARLY_STOP_RULES", "bound").split(","))
             (stage / "pass1" / f"shadow-{x}-{y}.json").write_text(json.dumps(s, indent=1) + "\n")
             lines.append(shadow_line(f"{label.get(y, y)} ({y}) against {label.get(x, x)} ({x})", s))
         (stage / "shadow.md").write_text("\n".join(lines) + "\n")
@@ -910,8 +997,9 @@ def cmd_shadow(a):
             break
     controls = a.controls.split(",") if a.controls else env.get("CONTROLS", " ".join(CONTROLS)).split()
     bound = float(a.flag_ratio or env.get("FLAG_RATIO", "1.10"))
+    rules = (a.rules or env.get("EARLY_STOP_RULES", "bound")).split(",")
     x, _, y = (a.pair or "A,B").partition(",")
-    s = shadow(d, (x, y), controls, bound)
+    s = shadow(d, (x, y), controls, bound, rules)
     (d / f"shadow-{x}-{y}.json").write_text(json.dumps(s, indent=1) + "\n")
     print(shadow_line(f"{y} against {x}", s))
     return 0
@@ -966,6 +1054,9 @@ def main():
     s.add_argument("--expected-answer-change-reason", default="", help="why those answers change")
     s.add_argument("--early-stop", default="shadow", choices=("off", "shadow"),
                    help="record what the early-stopping rule would decide, without acting on it (default shadow)")
+    s.add_argument("--early-stop-rules", default="bound",
+                   help="comma-separated questions the stop must answer: bound, the flag at --flag-ratio, and "
+                        "every-round, a cost in every round, which takes the exact stop (default bound)")
     f = sub.add_parser("preflight")
     f.add_argument("--host-side", action="store_true")
     f.add_argument("stages", nargs="+")
@@ -984,6 +1075,8 @@ def main():
     h.add_argument("--pair")
     h.add_argument("--controls")
     h.add_argument("--flag-ratio")
+    h.add_argument("--rules", help="comma-separated questions the stop must answer, of bound and every-round "
+                   "(default EARLY_STOP_RULES from run.env, else bound)")
     h.add_argument("pass_dir")
     a = p.parse_args()
     return {"stage": cmd_stage, "preflight": cmd_preflight, "launch": cmd_launch, "run": cmd_run,

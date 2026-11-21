@@ -208,6 +208,15 @@ class KitTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("EARLY_STOP must be off or shadow, not on", r.stderr)
 
+    def test_preflight_refuses_an_unknown_early_stopping_question(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        env = (s / "run.env").read_text()
+        self.assertIn("EARLY_STOP_RULES=bound\n", env)
+        (s / "run.env").write_text(env.replace("EARLY_STOP_RULES=bound", "EARLY_STOP_RULES=bound,median"))
+        r = kit("preflight", s)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("EARLY_STOP_RULES must be a comma-separated list of bound, every-round, not bound,median", r.stderr)
+
     def test_preflight_needs_a_hash_of_every_binary(self):
         r, s = self.stage(tips=(("tip", 1.0),))
         lines = (s / "binaries.sha256").read_text().splitlines()
@@ -470,11 +479,14 @@ def load_kit():
     return mod
 
 
-def write_samples(d, ratio, rounds=8, noise=None, controls=CONTROLS, query="q", spread=0.0, answers=None):
+def write_samples(d, ratio, rounds=8, noise=None, controls=CONTROLS, query="q", spread=0.0, answers=None,
+                  wall_noise=None):
     """A pass of A,B,B,A rounds of 2 requests, where B takes ratio times A's 1 ms on query,
     with noise[k] scaling B in round k, and B is as fast as A on the controls. With spread,
     the second server process of each variant in a round is that much slower on every query.
-    Both variants give the same answer to every query, unless answers gives answers.tsv."""
+    Wall time is execution time plus 1 ms, and wall_noise[k] scales B's wall time on query in
+    round k on top of that. Both variants give the same answer to every query, unless answers
+    gives answers.tsv."""
     res = Path(d) / "results"
     res.mkdir(parents=True)
     (res / "queries.txt").write_text("".join(f"{q}\n" for q in [query, *controls]))
@@ -488,8 +500,9 @@ def write_samples(d, ratio, rounds=8, noise=None, controls=CONTROLS, query="q", 
             slow = 1 + spread * (i >= 2)
             for q in [query, *controls]:
                 ms = (ratio * (noise[k - 1] if noise else 1) if v == "B" and q == query else 1.0) * slow
+                wall = (ms + 1) * (wall_noise[k - 1] if wall_noise and v == "B" and q == query else 1)
                 for rep in (1, 2):
-                    lines.append(f"{k}\t{epoch}\t{v}\t{q}\t{rep}\t{ms}\t{ms + 1}")
+                    lines.append(f"{k}\t{epoch}\t{v}\t{q}\t{rep}\t{ms}\t{wall}")
     (res / "samples.tsv").write_text("\n".join(lines) + "\n")
     return res.parent
 
@@ -540,6 +553,62 @@ class ShadowTests(unittest.TestCase):
         s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10)
         self.assertFalse(s["agree"])
         self.assertEqual(s["flags_differ"], ["q"])
+
+    def test_shadow_stops_a_query_only_once_every_scored_metric_has_stopped(self):
+        # execution time stays flat, and B's wall time is 40% slower from round 4, so the
+        # first three rounds put both metrics inside the bound, while all rounds flag wall
+        # time. The shadow must report that the stop loses the wall flag.
+        late = [1.0, 1.0, 1.0, 1.4, 1.4, 1.4, 1.4, 1.4]
+        s = self.kit.shadow(write_samples(self.d / "wall-late", 1.0, wall_noise=late), ("A", "B"), CONTROLS, 1.10)
+        q = s["queries"]["q"]
+        self.assertEqual(q["metrics"]["exec_ms bound"]["flagged_all_rounds"], False)
+        self.assertEqual((q["metrics"]["wall_ms bound"]["flagged"], q["metrics"]["wall_ms bound"]["flagged_all_rounds"]),
+                         (False, True))
+        self.assertFalse(s["agree"])
+        self.assertEqual(s["flags_differ"], ["q"])
+        self.assertEqual(s["decisions_differ"], ["q wall_ms bound"])
+        # wall time that swings around 1 keeps its interval wide, so the query runs on past
+        # the round at which execution time alone would stop it, and both decisions hold
+        swing = [1.0, 1.08, 0.94, 1.07, 0.95, 1.0, 1.06, 0.96]
+        s = self.kit.shadow(write_samples(self.d / "wall-swing", 1.0, wall_noise=swing), ("A", "B"), CONTROLS, 1.10)
+        q = s["queries"]["q"]
+        self.assertEqual(q["metrics"]["exec_ms bound"]["stop_round"], 3)
+        self.assertGreater(q["metrics"]["wall_ms bound"]["stop_round"], 3)
+        self.assertEqual(q["stop_round"], q["metrics"]["wall_ms bound"]["stop_round"])
+        self.assertTrue(s["agree"])
+        # each metric's flag is taken on the rounds the query keeps, not at that metric's own stop
+        for m in q["metrics"].values():
+            self.assertEqual(m["flagged"], m["flagged_all_rounds"])
+        self.assertEqual(s["rule"]["metrics"], ["exec_ms", "wall_ms"])
+
+    def test_an_every_round_rule_uses_the_exact_stop(self):
+        # every round of B is 2% slower but round 5, which is 1% faster. The interval would
+        # stop at round 3 with every round so far above 1, which answers the every-round
+        # question wrongly. The exact stop ends the query at round 5, where the answer is no.
+        rounds = [1.0, 1.0, 1.0, 1.0, 0.97, 1.0, 1.0, 1.0]
+        d = write_samples(self.d / "dip", 1.02, noise=rounds)
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=("every-round",))
+        q = s["queries"]["q"]
+        self.assertEqual(q["stop_round"], 5)
+        self.assertEqual(q["metrics"]["exec_ms every-round"]["how"], "exact")
+        self.assertEqual(q["metrics"]["exec_ms every-round"]["flagged"], False)
+        self.assertTrue(s["agree"])
+        self.assertEqual(s["rule"]["rules"], ["every-round"])
+        # with the bound rule as well, the later of the two stops holds
+        s = self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=("bound", "every-round"))
+        self.assertEqual(s["queries"]["q"]["stop_round"], 5)
+        self.assertEqual(s["queries"]["q"]["metrics"]["exec_ms bound"]["stop_round"], 3)
+        self.assertTrue(s["agree"])
+        # a cost in every round runs every round and is flagged, since it adds 20 us
+        s = self.kit.shadow(write_samples(self.d / "cost", 1.02), ("A", "B"), CONTROLS, 1.10, rules=("every-round",))
+        q = s["queries"]["q"]
+        self.assertEqual((q["stop_round"], q["metrics"]["exec_ms every-round"]["flagged"]), (8, True))
+        self.assertTrue(s["agree"])
+        # and a cost in every round that adds no more than 0.5 us is noise
+        s = self.kit.shadow(write_samples(self.d / "tiny", 1.0004), ("A", "B"), CONTROLS, 1.10, rules=("every-round",))
+        self.assertEqual(s["queries"]["q"]["metrics"]["exec_ms every-round"]["flagged"], False)
+        with self.assertRaises(ValueError):
+            self.kit.shadow(d, ("A", "B"), CONTROLS, 1.10, rules=("median",))
 
     def test_shadow_falls_back_in_the_band_and_judges_validity_by_the_controls(self):
         d = write_samples(self.d / "band", 1.0, spread=0.025)
@@ -593,6 +662,13 @@ class ShadowTests(unittest.TestCase):
         s = json.loads((d / "shadow-A-B.json").read_text())
         self.assertEqual(s["rule"]["bound"], 1.20)
         self.assertEqual(s["controls"], CONTROLS)
+        self.assertEqual(s["rule"]["rules"], ["bound"])
+        # the questions come from run.env, and --rules overrides them
+        (self.d / "out" / "run.env").write_text("ROUNDS=8\nFLAG_RATIO=1.20\nEARLY_STOP_RULES=bound,every-round\n")
+        self.assertEqual(kit("shadow", d).returncode, 0)
+        self.assertEqual(json.loads((d / "shadow-A-B.json").read_text())["rule"]["rules"], ["bound", "every-round"])
+        self.assertEqual(kit("shadow", "--rules", "every-round", d).returncode, 0)
+        self.assertEqual(json.loads((d / "shadow-A-B.json").read_text())["rule"]["rules"], ["every-round"])
 
 
 if __name__ == "__main__":
