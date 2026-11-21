@@ -264,15 +264,24 @@ conclusions to the run's totals. The contract therefore bounds neither the time 
 two checks by a fixed number of reads nor the allocated bytes by the memory budget, which
 is an estimate.
 
-Some steps of the repair and of the rooted rules read between two checks without
-counting what they read. The index of a clause that the root offers to its holders is
-built for the whole body before the first check, so that step is bounded by one clause's
-body. With `SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test of each of the
-diagnostic's products scans the context's stored clauses without a count, and the
-diagnostic's other reads are counted and checked after every 4,096. The marker pass that
-the diagnostic and the decline check run after a rooted run saturates checks no bound.
-The decline check runs it on every rooted run with the check on, with the repair on or
-off, and item 1260 follows its stop latency. Item 1280 gives the repair and the store's
+Some steps of the repair and of the rooted rules read between two checks without counting
+what they read. The premise lists of a returned clause are prepared for one return, and
+for up to 64 returns when a late premise replays them, before the next check. On the
+three files where the returns derive most, part022 p01, g1-051_p0121 and g1-051_p0012
+under the containment arm with the repair at 1 and at 129, a list read at most 456
+premises and kept at most 378, one pruning of a list made at most 38,226 comparisons, one
+return's preparation took at most 3 ms on a loaded machine, and the preparation of a
+batch of returns allocated at most 143 KB, under 6% of the holder's store. The index of a
+clause that the root offers to its holders is built for the whole body before the first
+check, so that step is bounded by one clause's body. With
+`SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test of each of the diagnostic's products
+scans the context's stored clauses without a count, and the diagnostic's other reads are
+counted and checked after every 4,096. The marker pass that the diagnostic and the
+decline check run after a rooted run saturates checks no bound. The decline check runs it
+on every rooted run with the check on, with the repair on or off. When the last step of a
+wide product passes 4,096 unions, the product derives the 4,097 unions that it holds
+before its next check, also with the repair off. Item 1260 follows the stop latency of
+the marker pass and of the wide product, and item 1280 gives the repair and the store's
 premise lists one meter that counts these reads.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
