@@ -1187,8 +1187,9 @@ readiness, cold `count-all` spends about 8 ms in its one vocabulary read instead
 and single direct reads on forge's NVMe drive sometimes take about 8 ms after such a gap,
 which is consistent with the drive waking from a low-power state. The
 [synthetic results](../benchmarks/synthetic/RESULTS.md#cold-against-fluree-at-105m) hold
-that run. In it Sparkles led Fluree on every cold query sent right after readiness, so the
-stretch target of §9 holds in that mode, and Fluree led `count-all` after a 1 s pause.
+that run. In it Sparkles led Fluree on all eight cold queries sent right after readiness,
+including `count-all` and `contains` of the §9 stretch target, and Fluree led `count-all`
+after a 1 s pause. `star-join` and `lang-filter` were not measured.
 
 The final code was compared with main at `21da069d` on forge on 2026-11-02, with both
 binaries built the same way and both forge locks held for the whole run. The
