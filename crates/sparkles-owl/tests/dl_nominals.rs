@@ -1809,3 +1809,163 @@ fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
     assert!(out.stats.dl_counting_over && !out.stats.dl_rooted_declined);
     assert!(out.stats.tier == Tier::Disjunctive && !out.stats.dl_rooted_over);
 }
+
+/// The axioms of the rooted-key cases below. Their only individual is in an axiom outside
+/// OWL 2 EL, so the EL part has none and Tier D takes the run with the option as it does
+/// without it, and the key is left for item 805's rewriting.
+const KEYED: &str = "SubClassOf(:A ObjectUnionOf(:B ObjectSomeValuesFrom(:r ObjectOneOf(:a))))
+     SubClassOf(:C ObjectUnionOf(:A :B))
+     SubClassOf(:B ObjectSomeValuesFrom(:r :A))";
+
+/// Classifies with and without the rooted run on one and four threads under both
+/// strategies, checks that each pair agrees on the taxonomy, the consistency, the
+/// completeness and the axioms left out, and returns those left out. With `tier_d`, it also
+/// checks that Tier D took clauses. A key that item 805's rewriting declines keeps the run
+/// from being rooted, so it answers as the run without the option does (roadmap item 1265).
+fn keys_left(body: &str, tier_d: bool) -> Vec<String> {
+    let ax = axioms(body);
+    let mut left = Vec::new();
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let limits = Limits {
+            threads,
+            expansion,
+            ..Limits::default()
+        };
+        let mut p = Classifier::of(&ax);
+        let plain = p.classify(&limits).unwrap();
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                rooted: true,
+                ..limits
+            })
+            .unwrap();
+        if tier_d {
+            assert_eq!(out.stats.tier, Tier::Disjunctive);
+            assert!(out.stats.clauses > 0, "Tier D took no clause");
+        }
+        assert_eq!(out.taxonomy, plain.taxonomy);
+        assert_eq!(out.consistency, plain.consistency);
+        assert_eq!(out.complete, plain.complete);
+        assert_eq!(out.incomplete, plain.incomplete);
+        assert_eq!(k.excluded(), p.excluded());
+        left = k
+            .excluded()
+            .iter()
+            .map(|e| format!("{:?}", e.axiom))
+            .collect();
+    }
+    left
+}
+
+/// Whether one of the axioms left out names an individual in an enumeration.
+fn left_with_individual(left: &[String]) -> bool {
+    left.iter().any(|l| l.contains("ObjectOneOf"))
+}
+
+#[test]
+fn a_key_kept_by_a_name_with_the_prefix_of_the_reductions_keeps_the_run_from_being_rooted() {
+    let left = keys_left(
+        &format!("{KEYED}\nHasKey(:B (:r) ())\nSubClassOf(<{INTERNAL}x> :A)"),
+        true,
+    );
+    assert!(left_with_individual(&left), "{left:?}");
+}
+
+#[test]
+fn a_key_beside_an_assertion_outside_owl_2_el_keeps_the_run_from_being_rooted() {
+    let left = keys_left(
+        &format!(
+            "ClassAssertion(ObjectUnionOf(:B ObjectComplementOf(:A)) :a)
+             SubClassOf(:A ObjectUnionOf(:B :C))
+             SubClassOf(:C ObjectUnionOf(:A :B))
+             HasKey(:B (:r) ())
+             SubClassOf(:B ObjectSomeValuesFrom(:r :A))
+             SubClassOf(<{INTERNAL}x> :A)"
+        ),
+        true,
+    );
+    assert!(
+        left.iter().any(|l| l.contains("ClassAssertion")),
+        "{left:?}"
+    );
+}
+
+#[test]
+fn a_key_past_the_budget_of_its_reduction_keeps_the_run_from_being_rooted() {
+    // seventy-one individuals put the key's reduction past its bound, and none of them is
+    // in the EL part
+    let mut body = format!("{KEYED}\nHasKey(:B (:r) ())\n");
+    for i in 0..70 {
+        body.push_str(&format!(
+            "ClassAssertion(ObjectAllValuesFrom(:s :N) :i{i})\n"
+        ));
+    }
+    let left = keys_left(&body, true);
+    assert!(left_with_individual(&left), "{left:?}");
+}
+
+#[test]
+fn a_key_beside_a_construct_without_a_reduction_keeps_the_run_from_being_rooted() {
+    let left = keys_left(
+        &format!(
+            "{KEYED}\nHasKey(:B (:r) ())\nSubClassOf(:C ObjectMaxCardinality(3 owl:topObjectProperty))"
+        ),
+        true,
+    );
+    assert!(left_with_individual(&left), "{left:?}");
+}
+
+#[test]
+fn a_key_beside_data_outside_owl_2_el_keeps_the_run_from_being_rooted() {
+    let left = keys_left(
+        &format!(
+            "{KEYED}\nHasKey(:B (:r) ())
+             SubClassOf(:C ObjectUnionOf(:A DataSomeValuesFrom(:d <http://www.w3.org/2001/XMLSchema#integer>)))"
+        ),
+        true,
+    );
+    assert!(left_with_individual(&left), "{left:?}");
+}
+
+#[test]
+fn a_key_beside_the_bottom_property_outside_owl_2_el_keeps_the_run_from_being_rooted() {
+    let left = keys_left(
+        &format!(
+            "{KEYED}\nHasKey(:B (:r) ())
+             SubClassOf(:C ObjectUnionOf(:A ObjectSomeValuesFrom(owl:bottomObjectProperty :B)))"
+        ),
+        true,
+    );
+    assert!(left_with_individual(&left), "{left:?}");
+}
+
+#[test]
+fn a_key_with_a_data_property_answers_as_the_run_without_the_option() {
+    // the key's data property keeps Tier D from the run whether or not it is rooted
+    keys_left(&format!("{KEYED}\nHasKey(:B (:r) (:d))"), false);
+}
+
+#[test]
+fn a_key_outside_owl_2_el_leaves_the_run_rooted() {
+    // the key is left out, so the EL part has none and the rooted run takes the
+    // enumeration, which the run without the option leaves out
+    let ax = axioms(&format!(
+        "{KEYED}\nHasKey(ObjectUnionOf(:B :C) (:r) ())\nSubClassOf(<{INTERNAL}x> :A)"
+    ));
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    let left: Vec<String> = k
+        .excluded()
+        .iter()
+        .map(|e| format!("{:?}", e.axiom))
+        .collect();
+    assert!(!left_with_individual(&left), "{left:?}");
+    assert!(left.iter().any(|l| l.contains("HasKey")), "{left:?}");
+}
