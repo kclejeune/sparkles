@@ -1263,15 +1263,17 @@ fn window_against_recompute() {
         let qm = pct(&mut query, 0.5);
         let pm = pct(&mut passes, 0.5);
         let p95 = pct(&mut passes, 0.95);
+        let max = passes.iter().copied().fold(0.0, f64::max);
         let state = info.state_bytes as f64 / (1 << 20) as f64;
         println!(
-            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {:.0} | {state:.1} |",
+            "| {name} | {build:.1} | {qm:.1} | {pm:.3} | {p95:.3} | {max:.3} | {:.0} | {state:.1} |",
             qm / pm,
         );
         metric(&format!("window/{name}/build"), build, "ms", "lower");
         metric(&format!("window/{name}/query"), qm, "ms", "lower");
         metric(&format!("window/{name}/pass-median"), pm, "ms", "lower");
         metric(&format!("window/{name}/pass-p95"), p95, "ms", "lower");
+        metric(&format!("window/{name}/pass-max"), max, "ms", "lower");
         metric(&format!("window/{name}/state"), state, "MiB", "lower");
         rt.delete(name).unwrap();
         rt.round(&s);

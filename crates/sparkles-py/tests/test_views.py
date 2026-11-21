@@ -34,6 +34,23 @@ def test_live_queries_send_diffs() -> None:
         assert str(terms[0]) == "<urn:b>" and count == 1
 
 
+def test_ordered_live_queries_send_positions() -> None:
+    ds = sparkles.Dataset.memory()
+    ds.update("INSERT DATA { <urn:a> <urn:v> 1 . <urn:b> <urn:v> 2 . <urn:c> <urn:v> 3 }")
+    q = "SELECT ?p WHERE { ?p <urn:v> ?v } ORDER BY ?v LIMIT 2"
+    with ds.live(q) as live:
+        first = next(live)
+        assert [str(t[0][0]) for t in first["rows"]] == ["<urn:a>", "<urn:b>"]
+        assert first["positions"] == [0, 1]
+        ds.update("INSERT DATA { <urn:d> <urn:v> 0 }")
+        diff = live.next(timeout=10)
+        assert diff is not None and diff["event"] == "diff"
+        assert [str(t[0][0]) for t in diff["removed"]] == ["<urn:b>"]
+        assert diff["removedPositions"] == [1]
+        assert [str(t[0][0]) for t in diff["added"]] == ["<urn:d>"]
+        assert diff["addedPositions"] == [0]
+
+
 def test_close_wakes_a_waiting_iterator() -> None:
     import threading
 
