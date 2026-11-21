@@ -22,10 +22,11 @@ use sparkles::store::Snapshot;
 pub(super) const SPARKLES_COMMIT_MESSAGE: &str = "sparkles-commit-message";
 
 /// The serializations a tag can name, `owl`, the tag of the ontology summary
-/// (`GET /$/ontology/{ds}`), which an edit of its axioms can name, and `owl-tree` and
-/// `owl-term`, the tags of the ontology browser's hierarchy and term reads.
-const FORMATS: [&str; 9] = [
-    "ttl", "nt", "nq", "trig", "rdf", "jsonld", "owl", "owl-tree", "owl-term",
+/// (`GET /$/ontology/{ds}`), and `owl-head`, the tag of its head (`view=head`), which an
+/// edit of its axioms can name, and `owl-tree` and `owl-term`, the tags of the ontology
+/// browser's hierarchy and term reads.
+const FORMATS: [&str; 10] = [
+    "ttl", "nt", "nq", "trig", "rdf", "jsonld", "owl", "owl-head", "owl-tree", "owl-term",
 ];
 
 /// The entity tag of a Graph Store representation read at commit `seq`.
