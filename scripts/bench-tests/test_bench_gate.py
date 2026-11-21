@@ -1083,6 +1083,26 @@ class GateTests(unittest.TestCase):
             r = check(d, "summary-A-B.json", "first")
             self.assertEqual(r.returncode, 1)
             self.assertIn("differ for p, so", r.stderr)
+            # an empty BINARY_OF runs the variant's own binary, as in the harness, so C still
+            # runs A's binary and its other answer is no expected change, first or on a rerun
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\nBINARY_OF_A=''\nBINARY_OF_C=A\n")
+            res.joinpath("expected-answer-change.txt").write_text(listed)
+            res.joinpath("answers.tsv").write_text(same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t2\tz\n")
+            for pair in ("A,B", "A,C"):
+                subprocess.run([sys.executable, str(summary), "--pair", pair, d], capture_output=True, check=True)
+            ab = json.loads((Path(d) / "summary-A-B.json").read_text())
+            self.assertEqual(ab["answers_all_arms"]["q"], "differ")
+            self.assertEqual(json.loads((Path(d) / "summary-A-C.json").read_text())["answers"]["q"], "differ")
+            for name in ("summary-A-B.json", "summary-A-C.json"):
+                self.assertEqual(check(d, name, "first").returncode, 1, name)
+                self.assertEqual(check(d, name, "rerun", "q").returncode, 1, name)
+            # the reason reaches the summary as the harness wrote it, quotes and all
+            (Path(d) / "run.env").write_text("VARIANTS='A B C'\nBINARY_OF_C=A\n")
+            why = '"JOIN" now returns the missing rows'
+            res.joinpath("expected-answer-change.txt").write_text(f"queries\tq\nreason\t{why}\n")
+            res.joinpath("answers.tsv").write_text(same_p + "A\tq\t1\ty\nB\tq\t2\tz\nC\tq\t1\ty\n")
+            subprocess.run([sys.executable, str(summary), "--pair", "A,B", d], capture_output=True, check=True)
+            self.assertEqual(json.loads((Path(d) / "summary-A-B.json").read_text())["expected_answer_change"]["reason"], why)
 
 
 if __name__ == "__main__":

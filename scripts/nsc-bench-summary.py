@@ -326,11 +326,14 @@ def main():
     # the queries whose answers run.env expects to change, with its reason, as the harness
     # wrote them after sourcing run.env; a list without a reason excuses nothing
     listed, reason = [], ""
-    for line in read_tsv(res / "expected-answer-change.txt"):
-        if line and line[0] == "queries":
-            listed = " ".join(line[1:]).split()
-        elif line and line[0] == "reason":
-            reason = " ".join(line[1:]).strip()
+    # the file holds literal text after one tab, so it is split without CSV quoting
+    meta = res / "expected-answer-change.txt"
+    for line in meta.read_text().splitlines() if meta.exists() else []:
+        key, _, value = line.partition("\t")
+        if key == "queries":
+            listed = value.split()
+        elif key == "reason":
+            reason = value.strip()
     if listed and not reason:
         p(f"run.env lists {', '.join(listed)} as expected answer changes but gives no reason, so none is excused.")
         p()
@@ -341,7 +344,8 @@ def main():
     for line in run_env.splitlines():
         k, eq, val = line.partition("=")
         if eq and k.startswith("BINARY_OF_"):
-            binary_of[k[len("BINARY_OF_"):]] = val.strip("'\"")
+            # an empty value runs the variant's own binary, as the harness's ${!b:-$v} does
+            binary_of[k[len("BINARY_OF_"):]] = val.strip("'\"") or k[len("BINARY_OF_"):]
     answers = read_tsv(res / "answers.tsv")
     summary["answers_all_arms"] = answer_status(required, answers, arms, listed, binary_of)
     if pair:
