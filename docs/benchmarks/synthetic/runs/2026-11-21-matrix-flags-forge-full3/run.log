@@ -1,0 +1,115 @@
+FULL3 locks held 2026-11-21T15:00:27Z load 1.64 1.22 0.78 1/680 1553295
+binary 6dbf2a08 sha256 ef9a69befb46f3d9467304567c7f13c5141736ca2298ca6cc2d737b9e94d8c24
+binary b47b582b sha256 b9428eb5c2716c3badb05021bf08574ae7dfabd16d7eab9eb97be5bb8e6aaf56
+binary 0779d666 sha256 428c958107e42852691adac56280b35def5ebc1121d24cf9982b2f8698eb355e
+--- host start 2026-11-21T15:00:32Z
+/dev/mapper/vg-root  460G  423G   14G  97% /
+MemFree: 5883200 kB MemAvailable: 14194928 kB Cached: 6561572 kB SwapFree: 7965268 kB Dirty: 1206464 kB Writeback: 172 kB
+psi cpu: some avg10=0.25 avg60=0.13 avg300=0.08 total=109644548764 full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+psi io: some avg10=0.51 avg60=0.11 avg300=0.05 total=5070992986 full avg10=0.18 avg60=0.04 avg300=0.03 total=4685789114
+psi memory: some avg10=0.07 avg60=0.41 avg300=0.96 total=1020568404 full avg10=0.07 avg60=0.41 avg300=0.96 total=1010644902
+governor powersave no_turbo 0 max_perf_pct 100 min_perf_pct 18 hwp_boost 0
+cur_freq 0-11 kHz: 799452 1051717 801873 800000 800000 800000 800000 800000 800000 800000 800000 1043747
+throttle core/pkg counts: 30172 12644
+rapl: constraint_0_power_limit_uw=154000000 constraint_1_power_limit_uw=154000000 
+temps: SEN3=46050 INT3400 Thermal=20000 SEN4=21050 acpitz=50000 SEN5=35050 TCPU=43000 TCPU_PCI=42000 x86_pkg_temp=42000 iwlwifi_1=29000 
+nvme: ps_max_latency_us 100000 aspm [default] performance powersave powersupersave  pm auto sched [none] mq-deadline kyber 
+nvme stat: 53990022 6842904 4271486710 58633302 86233857 60503497 10985799149 273101877 0 22934238 339488578 7924128 0 25289465288 2126833 5535531 5626564
+load 1.59 1.21 0.78 1/694 1553410
+invocation 1 6dbf2a08 start 2026-11-21T15:00:32Z load 1.59 1.21 0.78 3/696 1553416
+invocation 1 6dbf2a08 end 2026-11-21T15:36:03Z exit 0 done 'ok'
+--- host after-1-6dbf2a08 2026-11-21T15:36:03Z
+/dev/mapper/vg-root  460G  422G   15G  97% /
+MemFree: 7405856 kB MemAvailable: 14260204 kB Cached: 5246076 kB SwapFree: 7968792 kB Dirty: 1128 kB Writeback: 0 kB
+psi cpu: some avg10=3.65 avg60=1.00 avg300=0.51 total=109659547550 full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+psi io: some avg10=0.00 avg60=0.00 avg300=0.00 total=5071734313 full avg10=0.00 avg60=0.00 avg300=0.00 total=4686456688
+psi memory: some avg10=0.00 avg60=0.00 avg300=0.00 total=1020784981 full avg10=0.00 avg60=0.00 avg300=0.00 total=1010860934
+governor powersave no_turbo 0 max_perf_pct 100 min_perf_pct 18 hwp_boost 0
+cur_freq 0-11 kHz: 800307 923822 800418 800000 801092 800000 800000 800000 1797760 800000 800000 800000
+throttle core/pkg counts: 30172 12644
+rapl: constraint_0_power_limit_uw=154000000 constraint_1_power_limit_uw=154000000 
+temps: SEN3=45050 INT3400 Thermal=20000 SEN4=22050 acpitz=41000 SEN5=34050 TCPU=38000 TCPU_PCI=38000 x86_pkg_temp=38000 iwlwifi_1=30000 
+nvme: ps_max_latency_us 100000 aspm [default] performance powersave powersupersave  pm auto sched [none] mq-deadline kyber 
+nvme stat: 53995583 6843362 4271729078 58639683 86306333 60565558 11014298533 273532638 0 22952389 339926669 7926093 0 25310626144 2127401 5536000 5626947
+load 1.00 1.05 1.05 1/686 1576913
+invocation 2 b47b582b start 2026-11-21T15:36:03Z load 1.00 1.05 1.05 1/686 1576915
+invocation 2 b47b582b end 2026-11-21T16:11:30Z exit 0 done 'ok'
+--- host after-2-b47b582b 2026-11-21T16:11:30Z
+/dev/mapper/vg-root  460G  415G   22G  96% /
+MemFree: 7820600 kB MemAvailable: 14257340 kB Cached: 4826916 kB SwapFree: 7973256 kB Dirty: 636 kB Writeback: 0 kB
+psi cpu: some avg10=3.43 avg60=1.04 avg300=0.53 total=109675190301 full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+psi io: some avg10=0.00 avg60=0.00 avg300=0.00 total=5072237075 full avg10=0.00 avg60=0.00 avg300=0.00 total=4686926386
+psi memory: some avg10=0.00 avg60=0.00 avg300=0.00 total=1020845484 full avg10=0.00 avg60=0.00 avg300=0.00 total=1010920626
+governor powersave no_turbo 0 max_perf_pct 100 min_perf_pct 18 hwp_boost 0
+cur_freq 0-11 kHz: 863097 800000 800607 800000 800000 800000 800000 800000 800000 800000 797372 800000
+throttle core/pkg counts: 30172 12644
+rapl: constraint_0_power_limit_uw=154000000 constraint_1_power_limit_uw=154000000 
+temps: SEN3=44050 INT3400 Thermal=20000 SEN4=22050 acpitz=41000 SEN5=35050 TCPU=38000 TCPU_PCI=38000 x86_pkg_temp=39000 iwlwifi_1=32000 
+nvme: ps_max_latency_us 100000 aspm [default] performance powersave powersupersave  pm auto sched [none] mq-deadline kyber 
+nvme stat: 53998291 6843790 4271774838 58645633 86372506 60623452 11040758165 273798484 0 22967412 340199471 7928286 0 25357333760 2128024 5536473 5627330
+load 1.33 1.23 1.18 1/671 1600409
+invocation 3 0779d666 start 2026-11-21T16:11:31Z load 1.33 1.23 1.18 1/671 1600411
+invocation 3 0779d666 end 2026-11-21T16:46:57Z exit 0 done 'ok'
+--- host after-3-0779d666 2026-11-21T16:46:57Z
+/dev/mapper/vg-root  460G  415G   22G  96% /
+MemFree: 7738368 kB MemAvailable: 14216728 kB Cached: 4865968 kB SwapFree: 7976880 kB Dirty: 420 kB Writeback: 0 kB
+psi cpu: some avg10=4.19 avg60=1.20 avg300=0.55 total=109690794892 full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+psi io: some avg10=0.00 avg60=0.00 avg300=0.00 total=5072862810 full avg10=0.00 avg60=0.00 avg300=0.00 total=4687517148
+psi memory: some avg10=0.00 avg60=0.00 avg300=0.00 total=1020935524 full avg10=0.00 avg60=0.00 avg300=0.00 total=1011010563
+governor powersave no_turbo 0 max_perf_pct 100 min_perf_pct 18 hwp_boost 0
+cur_freq 0-11 kHz: 898466 800000 1703446 800000 800663 800000 800000 800000 800000 800000 1446927 800000
+throttle core/pkg counts: 30172 12644
+rapl: constraint_0_power_limit_uw=154000000 constraint_1_power_limit_uw=154000000 
+temps: SEN3=45050 INT3400 Thermal=20000 SEN4=23050 acpitz=42000 SEN5=36050 TCPU=39000 TCPU_PCI=40000 x86_pkg_temp=39000 iwlwifi_1=32000 
+nvme: ps_max_latency_us 100000 aspm [default] performance powersave powersupersave  pm auto sched [none] mq-deadline kyber 
+nvme stat: 54001071 6843943 4271878902 58651045 86435362 60679083 11066972061 274011660 0 22982390 340418945 7929606 0 25390541184 2128454 5536946 5627784
+load 1.34 1.10 1.05 1/692 1623939
+invocation 4 0779d666 start 2026-11-21T16:46:57Z load 1.34 1.10 1.05 1/692 1623941
+invocation 4 0779d666 end 2026-11-21T17:22:16Z exit 0 done 'ok'
+--- host after-4-0779d666 2026-11-21T17:22:16Z
+/dev/mapper/vg-root  460G  415G   22G  96% /
+MemFree: 7915644 kB MemAvailable: 14259464 kB Cached: 4737396 kB SwapFree: 7980328 kB Dirty: 372 kB Writeback: 0 kB
+psi cpu: some avg10=3.94 avg60=1.10 avg300=0.54 total=109706041186 full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+psi io: some avg10=0.00 avg60=0.00 avg300=0.00 total=5073427935 full avg10=0.00 avg60=0.00 avg300=0.00 total=4688046397
+psi memory: some avg10=0.00 avg60=0.00 avg300=0.00 total=1021098044 full avg10=0.00 avg60=0.00 avg300=0.00 total=1011173022
+governor powersave no_turbo 0 max_perf_pct 100 min_perf_pct 18 hwp_boost 0
+cur_freq 0-11 kHz: 841520 800000 798566 800000 800231 800000 801254 800000 1470303 800000 800000 800000
+throttle core/pkg counts: 30172 12644
+rapl: constraint_0_power_limit_uw=154000000 constraint_1_power_limit_uw=154000000 
+temps: SEN3=45050 INT3400 Thermal=20000 SEN4=23050 acpitz=42000 SEN5=36050 TCPU=39000 TCPU_PCI=39000 x86_pkg_temp=40000 iwlwifi_1=32000 
+nvme: ps_max_latency_us 100000 aspm [default] performance powersave powersupersave  pm auto sched [none] mq-deadline kyber 
+nvme stat: 54002736 6844126 4271894470 58656062 86498143 60734641 11093388117 274312673 0 22996509 340725658 7930409 0 25424136504 2128733 5537406 5628189
+load 1.02 1.05 1.08 1/687 1647364
+invocation 5 b47b582b start 2026-11-21T17:22:16Z load 1.02 1.05 1.08 1/687 1647366
+invocation 5 b47b582b end 2026-11-21T17:57:35Z exit 0 done 'ok'
+--- host after-5-b47b582b 2026-11-21T17:57:35Z
+/dev/mapper/vg-root  460G  415G   22G  96% /
+MemFree: 7802332 kB MemAvailable: 14264472 kB Cached: 4878384 kB SwapFree: 7981808 kB Dirty: 376 kB Writeback: 0 kB
+psi cpu: some avg10=2.61 avg60=0.89 avg300=0.47 total=109721320971 full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+psi io: some avg10=0.00 avg60=0.00 avg300=0.00 total=5074065249 full avg10=0.00 avg60=0.00 avg300=0.00 total=4688642189
+psi memory: some avg10=0.00 avg60=0.00 avg300=0.00 total=1021292705 full avg10=0.00 avg60=0.00 avg300=0.00 total=1011367547
+governor powersave no_turbo 0 max_perf_pct 100 min_perf_pct 18 hwp_boost 0
+cur_freq 0-11 kHz: 834798 800000 800000 800000 800000 800000 800000 800000 799450 800000 710988 800000
+throttle core/pkg counts: 30172 12644
+rapl: constraint_0_power_limit_uw=154000000 constraint_1_power_limit_uw=154000000 
+temps: SEN3=47050 INT3400 Thermal=20000 SEN4=24050 acpitz=43000 SEN5=37050 TCPU=40000 TCPU_PCI=41000 x86_pkg_temp=41000 iwlwifi_1=33000 
+nvme: ps_max_latency_us 100000 aspm [default] performance powersave powersupersave  pm auto sched [none] mq-deadline kyber 
+nvme stat: 54010803 6844492 4272656038 58660012 86560038 60789443 11119319949 274529137 0 23009473 340946798 7931140 0 25457343080 2129014 5537872 5628633
+load 0.95 1.04 1.08 1/690 1671293
+invocation 6 6dbf2a08 start 2026-11-21T17:57:35Z load 0.95 1.04 1.08 1/690 1671295
+invocation 6 6dbf2a08 end 2026-11-21T18:32:53Z exit 0 done 'ok'
+--- host after-6-6dbf2a08 2026-11-21T18:32:53Z
+/dev/mapper/vg-root  460G  415G   22G  96% /
+MemFree: 8100096 kB MemAvailable: 14254032 kB Cached: 4599852 kB SwapFree: 7982260 kB Dirty: 232 kB Writeback: 0 kB
+psi cpu: some avg10=3.52 avg60=1.12 avg300=0.55 total=109736741642 full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+psi io: some avg10=0.00 avg60=0.00 avg300=0.00 total=5074604980 full avg10=0.00 avg60=0.00 avg300=0.00 total=4689145934
+psi memory: some avg10=0.00 avg60=0.00 avg300=0.00 total=1021578296 full avg10=0.00 avg60=0.00 avg300=0.00 total=1011652827
+governor powersave no_turbo 0 max_perf_pct 100 min_perf_pct 18 hwp_boost 0
+cur_freq 0-11 kHz: 800000 800000 800000 800000 800000 800000 801192 800000 3649170 800000 800000 800000
+throttle core/pkg counts: 30172 12644
+rapl: constraint_0_power_limit_uw=154000000 constraint_1_power_limit_uw=154000000 
+temps: SEN3=45050 INT3400 Thermal=20000 SEN4=23050 acpitz=42000 SEN5=37050 TCPU=39000 TCPU_PCI=40000 x86_pkg_temp=39000 iwlwifi_1=32000 
+nvme: ps_max_latency_us 100000 aspm [default] performance powersave powersupersave  pm auto sched [none] mq-deadline kyber 
+nvme stat: 54011971 6844601 4272681662 58661173 86622188 60844780 11145495461 274786320 0 23020189 341205809 7931826 0 25492813152 2129273 5538342 5629042
+load 0.94 1.01 1.02 1/670 1694832
+FULL3-DONE ok
