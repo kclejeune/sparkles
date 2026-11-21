@@ -1713,7 +1713,8 @@ impl Scan {
 /// refused them, which marks the store `x` interrupted. The caller releases the bytes
 /// either way.
 fn m_admit<S: Sink>(x: &mut DlSt, bytes: usize, out: &mut S) -> bool {
-    if out.reserve_data(bytes) {
+    // nothing to admit asks no check of the bounds, which the scans and sends poll
+    if bytes == 0 || out.reserve_data(bytes) {
         return true;
     }
     x.store.interrupted = true;
@@ -1833,22 +1834,37 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
             out.release_data(bytes);
             return true;
         }
+        // the registrations are read as a scan, charged and polled, and the destinations
+        // are built in the capacity admitted for them
         let r = x.root.as_deref_mut().expect("made above");
-        let mut to: Vec<Ex> = us
-            .iter()
-            .flat_map(|u| r.edges.get(u).into_iter().flatten().copied())
-            .filter(|&d| d != root && (d != h || mode & MREPAIR_HOLDER != 0))
-            .filter(|d| mode & MREPAIR_WIDE != 0 || r.mr().reach_set.contains(d))
-            .collect();
-        to.sort_unstable();
-        to.dedup();
+        let mut scan = Scan(0);
+        let mut to: Vec<Ex> = Vec::with_capacity(n);
         let mut cut = false;
-        for (k, d) in to.into_iter().enumerate() {
-            if k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on() {
-                cut = true;
-                break;
+        'scan: for u in &us {
+            for &d in r.edges.get(u).into_iter().flatten() {
+                if !scan.read(1, out) {
+                    cut = true;
+                    break 'scan;
+                }
+                if d != root
+                    && (d != h || mode & MREPAIR_HOLDER != 0)
+                    && (mode & MREPAIR_WIDE != 0 || r.mr().reach_set.contains(&d))
+                {
+                    to.push(d);
+                }
             }
-            m_fwd(r, d, l, out);
+        }
+        scan.end(out);
+        if !cut {
+            to.sort_unstable();
+            to.dedup();
+            for (k, d) in to.into_iter().enumerate() {
+                if k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on() {
+                    cut = true;
+                    break;
+                }
+                m_fwd(r, d, l, out);
+            }
         }
         out.release_data(bytes);
         if cut {
@@ -1873,19 +1889,22 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
     }
     let r = x.root.as_deref().expect("made above");
     let mut scan = Scan(0);
-    let mut ids: Vec<u32> = Vec::new();
+    let mut ids: Vec<u32> = Vec::with_capacity(g);
     let mut cut = false;
-    for &i in r.mr().gbody.get(&l).into_iter().flatten() {
-        if !scan.read(1, out) {
-            cut = true;
-            break;
+    'scan: for &i in r.mr().gbody.get(&l).into_iter().flatten() {
+        let mut all = true;
+        for &m in x.store.clauses[i as usize].c.body() {
+            // each body literal checked is a read
+            if !scan.read(1, out) {
+                cut = true;
+                break 'scan;
+            }
+            if m != l && !r.mr().hold_set.contains(&(h, m)) {
+                all = false;
+                break;
+            }
         }
-        if x.store.clauses[i as usize]
-            .c
-            .body()
-            .iter()
-            .all(|&m| m == l || r.mr().hold_set.contains(&(h, m)))
-        {
+        if all {
             ids.push(i);
         }
     }
@@ -2007,24 +2026,30 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
     // and the scan of the others' charged and polled
     let len = |l: &Lit| r.mr().holders.get(l).map_or(0, Vec::len);
     let first = *c.body().iter().min_by_key(|l| len(l)).expect("a body");
-    let bytes = len(&first) * std::mem::size_of::<Ex>();
+    let cap = len(&first);
+    let bytes = cap * std::mem::size_of::<Ex>();
     if !m_admit(x, bytes, out) {
         out.release_data(bytes);
         return;
     }
     let r = x.root.as_deref().expect("made above");
     let mut scan = Scan(0);
-    let mut hs: Vec<Ex> = Vec::new();
+    let mut hs: Vec<Ex> = Vec::with_capacity(cap);
     let mut cut = false;
-    for &h in r.mr().holders.get(&first).into_iter().flatten() {
-        if !scan.read(1, out) {
-            cut = true;
-            break;
+    'scan: for &h in r.mr().holders.get(&first).into_iter().flatten() {
+        let mut all = true;
+        for &m in c.body() {
+            // each body literal checked is a read
+            if !scan.read(1, out) {
+                cut = true;
+                break 'scan;
+            }
+            if m != first && !r.mr().hold_set.contains(&(h, m)) {
+                all = false;
+                break;
+            }
         }
-        if c.body()
-            .iter()
-            .all(|&m| m == first || r.mr().hold_set.contains(&(h, m)))
-        {
+        if all {
             hs.push(h);
         }
     }
@@ -2200,7 +2225,7 @@ pub(super) struct MarkerDef {
     /// whether the context is unsatisfiable, which discharges what it is owed
     bottom: bool,
     /// in another context, the ground literals whose markers it holds or has a live clause
-    /// that subsumes
+    /// that subsumes, in order
     marks: Vec<Lit>,
     /// in another context, the live root clauses with ground bodies that it holds every body
     /// literal of and lacks a product of, and those whose products are too many to check
@@ -2393,16 +2418,29 @@ pub(super) fn marker_def(
             marks.push(l);
         }
     }
+    marks.sort_unstable();
+    marks.dedup();
+    if !poll(marks.len() / WORK_READS + 1) {
+        return Err(());
+    }
     let (mut owed, mut unchecked) = (0, 0);
-    if !is_root && !st.bottom {
+    if !is_root && !st.bottom && !rg.is_empty() {
+        let held: FxHashSet<Lit> = m.held.iter().copied().collect();
+        if !poll(held.len() / WORK_READS + 1) {
+            return Err(());
+        }
         for c in rg {
-            if !poll(1) {
+            if !poll(1 + c.body().len() / WORK_READS) {
                 return Err(());
             }
-            if !c.body().iter().all(|l| m.held.contains(l)) {
+            if !c.body().iter().all(|l| held.contains(l)) {
                 continue;
             }
             let lists = ret_lists(st, c.body(), cf.then_some((ix, lits)));
+            // the premises read for the lists
+            if !poll(1 + lists.iter().map(Vec::len).sum::<usize>() / WORK_READS) {
+                return Err(());
+            }
             let n = lists
                 .iter()
                 .try_fold(1usize, |n, l| n.checked_mul(l.len()))
@@ -2433,6 +2471,41 @@ pub(super) fn marker_def_cf(mode: u8) -> bool {
 
 /// The reads or choices of the diagnostic between two of its polls.
 const DIAG_POLL: usize = 4096;
+
+/// The diagnostic's count of what it reads: it charges `poll` a conclusion for each
+/// [`WORK_READS`] reads, after every [`DIAG_POLL`] of them, and stops once poll answers
+/// false.
+struct Reads<'a> {
+    n: usize,
+    poll: &'a mut dyn FnMut(usize) -> bool,
+}
+
+impl<'a> Reads<'a> {
+    fn new(poll: &'a mut dyn FnMut(usize) -> bool) -> Self {
+        Reads { n: 0, poll }
+    }
+
+    /// Counts `k` reads, false when a check of the bounds stopped the diagnostic.
+    fn read(&mut self, k: usize) -> bool {
+        let before = self.n / DIAG_POLL;
+        self.n += k;
+        let polls = self.n / DIAG_POLL - before;
+        polls == 0 || (self.poll)(polls * (DIAG_POLL / WORK_READS))
+    }
+
+    /// Charges `w` conclusions and checks the bounds at once.
+    fn check(&mut self, w: usize) -> bool {
+        (self.poll)(w)
+    }
+
+    /// Charges the reads since the last check.
+    fn end(self) {
+        let w = self.n % DIAG_POLL / WORK_READS;
+        if w > 0 {
+            (self.poll)(w);
+        }
+    }
+}
 
 /// Whether the context holds every product of `lists` with the head `head`: each is a
 /// tautology or a live clause of the context subsumes it.
@@ -2654,8 +2727,9 @@ pub(super) fn marker_trips(
 /// pairs of a live root clause whose body is ground triggers and a context that holds every
 /// body literal and lacks one of the clause's M-return products ([`marker_def`]), and the
 /// pairs whose products are too many to check. `defs` holds marker_def's copy of each
-/// context of `cs`, in its order. The count charges `poll` with the contexts and literals
-/// it reads, for each context, and is `None` once poll answers false.
+/// context of `cs`, in its order. The count charges `poll` with the contexts, successors,
+/// literals, registrations and destinations it reads, checks it for each context and
+/// after every [`DIAG_POLL`] reads, and is `None` once poll answers false.
 pub(super) fn marker_deficits(
     ix: &Index,
     cs: &[MarkerCtx],
@@ -2675,52 +2749,74 @@ pub(super) fn marker_deficits(
     };
     let units: FxHashSet<Lit> = cs[ri].units.iter().copied().collect();
     let edges: FxHashMap<u32, &[Ex]> = cs[ri].edges.iter().map(|(u, v)| (*u, &v[..])).collect();
-    let reach = |from: Ex| {
+    let mut rd = Reads::new(poll);
+    // the contexts that `from` reaches, each successor read a read
+    let reach = |from: Ex, rd: &mut Reads| {
         let mut seen: FxHashSet<Ex> = FxHashSet::default();
         let mut todo = vec![from];
         seen.insert(from);
         while let Some(e) = todo.pop() {
-            for &w in by.get(&e).map_or(&[][..], |&i| &cs[i].succ[..]) {
+            let succ = by.get(&e).map_or(&[][..], |&i| &cs[i].succ[..]);
+            if !rd.read(1 + succ.len()) {
+                return None;
+            }
+            for &w in succ {
                 if seen.insert(w) {
                     todo.push(w);
                 }
             }
         }
-        seen
+        Some(seen)
     };
-    let from_root = reach(root);
+    let from_root = reach(root, &mut rd)?;
     for c in cs {
-        if !poll(1 + c.held.len() + cs.len() / WORK_READS) {
+        if !rd.check(1) {
             return None;
         }
         if c.me == root || c.held.is_empty() {
             continue;
         }
-        let down = reach(c.me);
+        let down = reach(c.me, &mut rd)?;
+        let mut us = Vec::new();
+        let mut to: Vec<Ex> = Vec::new();
         for &l in &c.held {
+            if !rd.read(1) {
+                return None;
+            }
             if units.contains(&l) {
                 continue;
             }
-            let mut us = Vec::new();
+            us.clear();
             consts(lits.view(l, inv), &mut us);
-            let mut to: Vec<Ex> = us
+            to.clear();
+            for &d in us
                 .iter()
-                .flat_map(|u| edges.get(u).copied().unwrap_or(&[]).iter().copied())
-                .filter(|d| *d != root && from_root.contains(d) && !down.contains(d))
-                .collect();
+                .flat_map(|u| edges.get(u).copied().unwrap_or(&[]).iter())
+            {
+                if !rd.read(1) {
+                    return None;
+                }
+                if d != root && from_root.contains(&d) && !down.contains(&d) {
+                    to.push(d);
+                }
+            }
             to.sort_unstable();
             to.dedup();
-            for d in to {
+            for &d in &to {
+                if !rd.read(1) {
+                    return None;
+                }
                 let Some(&i) = by.get(&d) else { continue };
                 let Some(dd) = defs.get(i).and_then(Option::as_ref) else {
                     continue;
                 };
-                if !dd.bottom && !dd.marks.contains(&l) {
+                if !dd.bottom && dd.marks.binary_search(&l).is_err() {
                     out[0] += 1;
                 }
             }
         }
     }
+    rd.end();
     for d in defs.iter().flatten() {
         out[1] += d.owed;
         out[2] += d.unchecked;
@@ -2924,13 +3020,15 @@ mod tests {
     const MODES: [u8; 2] = [MREPAIR_ON, MREPAIR_ON | MREPAIR_CF];
 
     /// A sink for the repair's bounds: it records what the rules send, counts the checks
-    /// of the run's bounds, answers each with `refuse` unset, and stays stopped after a
-    /// refusal or once `stop` is set, as a run does. It tracks the bytes reserved.
+    /// of the run's bounds, answers each with `refuse` unset or among the first `after`,
+    /// and stays stopped after a refusal or once `stop` is set, as a run does. It tracks
+    /// the bytes reserved.
     struct Stops<'a> {
         run: &'a DlRun,
         polls: std::cell::Cell<usize>,
         stop: std::cell::Cell<bool>,
         refuse: bool,
+        after: usize,
         sent: Vec<(Ex, Concl)>,
         asked: usize,
         held: usize,
@@ -2944,6 +3042,7 @@ mod tests {
                 polls: Default::default(),
                 stop: Default::default(),
                 refuse: false,
+                after: 0,
                 sent: Vec::new(),
                 asked: 0,
                 held: 0,
@@ -2962,7 +3061,7 @@ mod tests {
         }
         fn go_on(&self) -> bool {
             self.polls.set(self.polls.get() + 1);
-            if self.refuse {
+            if self.refuse && self.polls.get() > self.after {
                 self.stop.set(true);
             }
             !self.stop.get()
@@ -3350,6 +3449,299 @@ mod tests {
         );
         let cut = marker_def(&ix, &m, &st, &rg, &run.lits, false, &mut |_| false);
         assert!(cut.is_err());
+    }
+
+    /// Reports the failures that a test over [`MODES`] collected, so that one run shows
+    /// every mode's.
+    fn report(fails: &[String]) {
+        assert!(fails.is_empty(), "{}", fails.join("\n"));
+    }
+
+    #[test]
+    fn the_repair_s_scratch_stays_within_its_admission() {
+        // the destinations of a notice, the returns of a notice and the holders of an
+        // offered clause, 40,000 of each and all passing, are built in the bytes admitted
+        // for them: what the handler allocates at its most is the admission and the state
+        // it charged
+        const N: u32 = 40_000;
+        let mut fails = Vec::new();
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let [a, b, k, hd] = ["A", "B", "K", "H"].map(|n| sig.class(n));
+            let u = sig.ind("u");
+            let (ix, _) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let (ga, gb) = (glit(&run, &ix, a, u), glit(&run, &ix, b, u));
+            let gh = glit(&run, &ix, hd, u);
+            let RTerm::C(cu) = c(u, &ix) else { panic!() };
+            let many: Vec<Ex> = (100_000..100_000 + N).collect();
+            let within = |fails: &mut Vec<String>, what: &str, peak, out: &Stops, grown| {
+                if peak > out.peak + grown + 4096 {
+                    fails.push(format!(
+                        "mode {mode} {what}: allocated {peak}, admitted {} and charged {grown}",
+                        out.peak
+                    ));
+                }
+            };
+            // the destinations of the notice of ga, each sent the marker already
+            let mut st = State::default();
+            let mut out = Stops::new(&run);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            r.edges.insert(cu, many.clone());
+            for &d in &many {
+                r.mw().reach_set.insert(d);
+                r.gsent.insert((d, ga));
+            }
+            let before = run.bytes();
+            let (_, alloc) = super::super::numeric::tests::measure(|| {
+                rmark(&ix, &mut st, k, ga.xid(), &mut out)
+            });
+            within(
+                &mut fails,
+                "destinations",
+                alloc.peak,
+                &out,
+                run.bytes() - before,
+            );
+            // the returns of the notice of ga: N root clauses ga → H whose ids it sent
+            let mut st = State::default();
+            let mut out = Stops::new(&run);
+            out.sent.reserve(N as usize + 16);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            r.mw().gbody.insert(ga, (0..N).collect());
+            let mut one = Clause::new(vec![ga], vec![gh]);
+            ds(&mut st).store.add(one.clone());
+            ds(&mut st).store.clauses[0].sent = Some(0);
+            let sample = ds(&mut st).store.clauses[0].clone();
+            for _ in 1..N {
+                ds(&mut st).store.clauses.push(sample.clone());
+            }
+            let before = run.bytes();
+            let (_, alloc) = super::super::numeric::tests::measure(|| {
+                rmark(&ix, &mut st, k, ga.xid(), &mut out)
+            });
+            within(
+                &mut fails,
+                "returns",
+                alloc.peak,
+                &out,
+                run.bytes() - before,
+            );
+            if out.sent.len() != N as usize {
+                fails.push(format!("mode {mode} returns: {} sent", out.sent.len()));
+            }
+            // the holders of ga and gb, N contexts that hold both, for the offer of ga ∧ gb
+            let mut st = State::default();
+            let mut out = Stops::new(&run);
+            out.sent.reserve(N as usize + 16);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            r.mw().holders.insert(ga, many.clone());
+            r.mw().holders.insert(gb, many.clone());
+            for &h in &many {
+                r.mw().hold_set.insert((h, ga));
+                r.mw().hold_set.insert((h, gb));
+            }
+            one = Clause::new(vec![ga, gb], vec![gh]);
+            ds(&mut st).store.add(one.clone());
+            ds(&mut st).store.clauses[0].sent = Some(0);
+            let before = run.bytes();
+            let (_, alloc) =
+                super::super::numeric::tests::measure(|| m_offer(&ix, &mut st, 0, &one, &mut out));
+            within(
+                &mut fails,
+                "holders",
+                alloc.peak,
+                &out,
+                run.bytes() - before,
+            );
+            if out.sent.len() != N as usize {
+                fails.push(format!("mode {mode} holders: {} sent", out.sent.len()));
+            }
+        }
+        report(&fails);
+    }
+
+    #[test]
+    fn the_destination_scan_is_charged_and_polled() {
+        // a notice over a constant that 200,000 contexts the root does not reach registered
+        // for sends nothing, charges its reads, checks the run's bounds as it goes, and
+        // stops at a refusal after its admission
+        const N: u32 = 200_000;
+        let mut fails = Vec::new();
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let [a, k] = ["A", "K"].map(|n| sig.class(n));
+            let u = sig.ind("u");
+            let (ix, _) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let ga = glit(&run, &ix, a, u);
+            let RTerm::C(cu) = c(u, &ix) else { panic!() };
+            for after in [usize::MAX, 1] {
+                let mut st = State::default();
+                let mut out = Stops::new(&run);
+                let r = rst(&mut st, &out);
+                mrep_new(r, &out);
+                r.edges.insert(cu, (100_000..100_000 + N).collect());
+                out.refuse = true;
+                out.after = after;
+                let work = run.work();
+                rmark(&ix, &mut st, k, ga.xid(), &mut out);
+                let (work, polls) = (run.work() - work, out.polls.get());
+                let cut = ds(&mut st).store.interrupted;
+                if !out.sent.is_empty() || out.held != 0 {
+                    fails.push(format!("mode {mode} after {after}: sent or held"));
+                }
+                if after == 1 {
+                    if !cut || polls != 2 {
+                        fails.push(format!(
+                            "mode {mode}: a refusal after the admission, interrupted {cut}, {polls} checks"
+                        ));
+                    }
+                } else if cut || work < N as usize / WORK_READS - 1 || polls < N as usize / M_SCAN {
+                    fails.push(format!(
+                        "mode {mode}: {work} work and {polls} checks for {N} reads"
+                    ));
+                }
+            }
+        }
+        report(&fails);
+    }
+
+    #[test]
+    fn the_body_checks_are_charged_per_literal() {
+        // 256 root clauses with the same 2,048 ground body literals, of which the holder
+        // holds all but the last in the body's order, and an offer of the clause to 256
+        // such holders: each check of a body literal counts as a read
+        const B: usize = 2048;
+        const H: u32 = 256;
+        let reads = H as usize * (B - 1);
+        let mut fails = Vec::new();
+        for mode in MODES {
+            let mut sig = Sig::new();
+            let [k, hd] = ["K", "H"].map(|n| sig.class(n));
+            let ss: Vec<Ex> = (0..B).map(|i| sig.class(&format!("S{i}"))).collect();
+            let u = sig.ind("u");
+            let (ix, _) = probe_ix(sig);
+            let mut run = DlRun::new(false, Default::default());
+            run.mrepair = mode;
+            let body: Vec<Lit> = ss.iter().map(|&s| glit(&run, &ix, s, u)).collect();
+            let one = Clause::new(body, vec![glit(&run, &ix, hd, u)]);
+            let (&l, &last) = (one.body().first().unwrap(), one.body().last().unwrap());
+            // the notice of the body's first literal
+            let mut st = State::default();
+            let mut out = Stops::new(&run);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            r.mw().gbody.insert(l, (0..H).collect());
+            for &m in &one.body()[1..B - 1] {
+                r.mw().hold_set.insert((k, m));
+            }
+            for _ in 0..H {
+                ds(&mut st).store.add(one.clone());
+            }
+            let sample = ds(&mut st).store.clauses[0].clone();
+            ds(&mut st).store.clauses.resize(H as usize, sample);
+            let work = run.work();
+            rmark(&ix, &mut st, k, l.xid(), &mut out);
+            let (work, polls) = (run.work() - work, out.polls.get());
+            if !out.sent.is_empty() || work < reads / WORK_READS - 1 || polls < reads / M_SCAN {
+                fails.push(format!(
+                    "mode {mode} notice: {work} work, {polls} checks, {} sent",
+                    out.sent.len()
+                ));
+            }
+            // the offer to 256 holders of every body literal but the last
+            let mut st = State::default();
+            let mut out = Stops::new(&run);
+            let r = rst(&mut st, &out);
+            mrep_new(r, &out);
+            let hs: Vec<Ex> = (100_000..100_000 + H).collect();
+            for &m in one.body() {
+                r.mw().holders.insert(m, hs.clone());
+                if m != last {
+                    for &h in &hs {
+                        r.mw().hold_set.insert((h, m));
+                    }
+                }
+            }
+            ds(&mut st).store.add(one.clone());
+            let work = run.work();
+            m_offer(&ix, &mut st, 0, &one, &mut out);
+            let (work, polls) = (run.work() - work, out.polls.get());
+            if !out.sent.is_empty() || work < reads / WORK_READS - 1 || polls < reads / M_SCAN {
+                fails.push(format!(
+                    "mode {mode} offer: {work} work, {polls} checks, {} sent",
+                    out.sent.len()
+                ));
+            }
+        }
+        report(&fails);
+    }
+
+    #[test]
+    fn the_deficit_count_polls_within_a_context() {
+        // one holder of 4,096 ground literals over a constant that 256 contexts the root
+        // reaches registered for, none of which holds a marker: the count charges the
+        // 1,048,576 pairs it checks and polls among them, and a refusal of the first poll
+        // inside the holder ends it
+        const L: usize = 4096;
+        const D: u32 = 256;
+        let mut sig = Sig::new();
+        let k = sig.class("K");
+        let ss: Vec<Ex> = (0..L).map(|i| sig.class(&format!("S{i}"))).collect();
+        let u = sig.ind("u");
+        let (ix, root) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let RTerm::C(cu) = c(u, &ix) else { panic!() };
+        let dests: Vec<Ex> = (100_000..100_000 + D).collect();
+        let ctx = |me: Ex| MarkerCtx {
+            me,
+            held: vec![],
+            succ: vec![],
+            edges: vec![],
+            units: vec![],
+        };
+        let mut cs = vec![MarkerCtx {
+            succ: dests.iter().copied().chain([k]).collect(),
+            edges: vec![(cu, dests.clone())],
+            ..ctx(root)
+        }];
+        cs.extend(dests.iter().map(|&d| ctx(d)));
+        cs.push(MarkerCtx {
+            held: ss.iter().map(|&s| glit(&run, &ix, s, u)).collect(),
+            ..ctx(k)
+        });
+        let def = || MarkerDef {
+            bottom: false,
+            marks: vec![],
+            owed: 0,
+            unchecked: 0,
+        };
+        let defs: Vec<Option<MarkerDef>> = cs.iter().map(|_| Some(def())).collect();
+        let (mut polls, mut work) = (0, 0);
+        let n = marker_deficits(&ix, &cs, &defs, &run.lits, &mut |w| {
+            polls += 1;
+            work += w;
+            true
+        });
+        let pairs = L * D as usize;
+        assert_eq!(n, Some([pairs, 0, 0]));
+        assert!(
+            work >= pairs / WORK_READS && polls >= pairs / DIAG_POLL,
+            "{work} work, {polls} checks"
+        );
+        // a check per context passes, and the first one inside the holder refuses
+        let mut calls = 0;
+        let n = marker_deficits(&ix, &cs, &defs, &run.lits, &mut |_| {
+            calls += 1;
+            calls <= cs.len()
+        });
+        assert_eq!((n, calls), (None, cs.len() + 1));
     }
 
     /// A small signature: classes, individuals and roles by name.

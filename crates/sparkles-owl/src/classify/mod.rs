@@ -2904,11 +2904,13 @@ impl Saturation {
                 // sets are: the root's live clauses with ground bodies first, which each
                 // holder's copy reads
                 let mut defs = Vec::new();
-                // the deficits' work counts as the run's, and the run's deadline and
+                // the deficits' work is counted apart from the run's, whose count a later
+                // run that keeps these contexts carries, and the run's deadline and
                 // cancellation stop it
                 let stop = std::cell::Cell::new(None);
+                let dwork = std::cell::Cell::new(0usize);
                 let mut dpoll = |n: usize| {
-                    d.count(n);
+                    dwork.set(dwork.get().saturating_add(n));
                     poll(limits).map_err(|e| stop.set(Some(e))).is_ok()
                 };
                 let cf = dl_root::marker_def_cf(d.mrepair);
@@ -2960,7 +2962,7 @@ impl Saturation {
                     };
                     stats.dl_marker_deficits = def;
                     eprintln!(
-                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}/{}",
+                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}/{} dwork={}",
                         stats.dl_work,
                         pr[0],
                         pr[1],
@@ -2971,7 +2973,8 @@ impl Saturation {
                         m[2],
                         def[0],
                         def[1],
-                        def[2]
+                        def[2],
+                        dwork.get()
                     );
                 }
                 if let Some(t) = decline
