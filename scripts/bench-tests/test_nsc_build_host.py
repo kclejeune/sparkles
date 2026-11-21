@@ -198,10 +198,12 @@ class BuildHost(unittest.TestCase):
             while not self.reaper_stop.wait(0.01):
                 for path in (self.hosts/'units').glob('*.scope'):
                     if path.name in self.reaper_skip:continue
+                    # The fake scope writes its file after creating it, so the reaper can read
+                    # it empty, and that pass must skip it rather than end the thread.
                     try:
                         group=int(path.read_text().split()[0])
                         while os.waitpid(-group,os.WNOHANG)[0]>0:pass
-                    except (ChildProcessError,FileNotFoundError,ProcessLookupError,ValueError):pass
+                    except (ChildProcessError,FileNotFoundError,IndexError,ProcessLookupError,ValueError):pass
         self.fixture_reaper=threading.Thread(target=reap_owned_mock_scopes,daemon=True)
         self.fixture_reaper.start()
 
