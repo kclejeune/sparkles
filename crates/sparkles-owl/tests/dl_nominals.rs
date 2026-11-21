@@ -2132,6 +2132,67 @@ fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
     assert!(out.stats.tier == Tier::Disjunctive && !out.stats.dl_rooted_over);
 }
 
+/// M-send skips the marker of a trigger that is a live unit of the root, since the contexts
+/// registered for its constants take the unit as a fact. A unit `→ l` of the root dies only
+/// when a clause that subsumes it arrives, and only the empty clause does: the store takes
+/// no second copy of the unit, and an equality adds clauses beside the unit rather than
+/// rewriting it. So a unit live at the skip dies only when the root becomes unsatisfiable,
+/// which sends the empty clause to every registered context. The cases: `pos` with an
+/// equality of the constant that the root derives later, along a chain or through a
+/// successor and back, with the linked element on either name, and `pos` whose root derives
+/// a contradiction with the unit after the skip.
+#[test]
+fn a_root_unit_live_at_the_skip_stays_live_or_ends_the_root() {
+    let pos = REPAIRS.iter().find(|(n, _)| *n == "pos").unwrap().1;
+    let chain = "ClassAssertion(:H0 :w)
+     SubClassOf(:H0 :H1)
+     SubClassOf(:H1 :H2)
+     SubClassOf(:H2 ObjectOneOf(:w2))";
+    let back = "ClassAssertion(ObjectSomeValuesFrom(:p9 :H0) :w)
+     SubClassOf(:H0 ObjectSomeValuesFrom(:p8 :H1))
+     SubClassOf(:H1 ObjectHasValue(:p7 :w2))
+     SubClassOf(ObjectSomeValuesFrom(:p7 ObjectOneOf(:w2)) :H4)
+     SubClassOf(ObjectSomeValuesFrom(:p8 :H4) :H5)
+     SubClassOf(ObjectSomeValuesFrom(:p9 :H5) ObjectOneOf(:w2))";
+    let to_w2 = "SubClassOf(:E ObjectHasValue(:r2 :w2))";
+    let cases = [
+        format!("{pos}\n     {chain}"),
+        format!("{pos}\n     {chain}\n     {to_w2}"),
+        format!("{pos}\n     {back}"),
+        format!("{pos}\n     {back}\n     {to_w2}"),
+    ];
+    let ended = format!(
+        "{pos}\n     ClassAssertion(:H0 :w)
+     SubClassOf(:H0 :H1)
+     SubClassOf(:H1 :H2)
+     DisjointClasses(:H2 :G)"
+    );
+    for (threads, expansion) in CONFIGS {
+        let limits = Limits {
+            threads,
+            expansion,
+            rooted: true,
+            rooted_decline: false,
+            rooted_marker_repair: true,
+            ..Limits::default()
+        };
+        let at = format!("{threads} threads {expansion:?}");
+        for (i, body) in cases.iter().enumerate() {
+            let mut k = Classifier::of(&axioms(body));
+            let out = k.classify(&limits).unwrap();
+            assert!(rooted_claim(&k, &out), "{at}, case {i}: no claim");
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "{at}, case {i}: K ⊑ Ans missed"
+            );
+        }
+        let mut k = Classifier::of(&axioms(&ended));
+        let out = k.classify(&limits).unwrap();
+        assert!(rooted_claim(&k, &out), "{at}, ended: no claim");
+        assert!(!out.consistent, "{at}: the contradiction is missed");
+    }
+}
+
 /// The repair in the run without counting after a rooted run with counting passes its bound:
 /// that run answers rooted and finds `K ⊑ Ans`. The bound lies between the work of the two
 /// runs with the repair, 303 without counting and 453 to 464 with it.
