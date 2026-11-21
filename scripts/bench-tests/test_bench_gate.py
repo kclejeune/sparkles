@@ -832,6 +832,35 @@ class GateTests(unittest.TestCase):
             r = subprocess.run([sys.executable, str(summary), "--pair", "A,A", d], capture_output=True, text=True)
             self.assertIn("two different variants", r.stderr)
 
+    def test_cell_summary_refuses_incomplete_comparisons(self):
+        summary = SCRIPTS / "nsc-bench-summary.py"
+        with tempfile.TemporaryDirectory() as d:
+            res = Path(d) / "results"
+            res.mkdir()
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            for epoch, v in enumerate("ABBA", 1):
+                lines.append(f"1\t{epoch}\t{v}\tq\t1\t1.0\t2")
+                # every B request of r failed
+                lines.append(f"1\t{epoch}\t{v}\tr\t1\t" + ("error\terror" if v == "B" else "1.0\t2"))
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            out = subprocess.run([sys.executable, str(summary), d], capture_output=True, text=True).stdout
+            self.assertIn("No timings of both variants for: r", out)
+            s = json.loads((Path(d) / "summary.json").read_text())
+            self.assertEqual(s["missing"], ["r"])
+            self.assertEqual(s["errors"], {"r B": 2})
+            self.assertTrue(s["validity"]["valid"])
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                             "first"]).returncode, 1)
+            # one server process of B gives no spread to judge
+            lines = ["round\tepoch\tvariant\tquery\trep\texec_ms\twall_ms"]
+            for epoch, v in enumerate("ABA", 1):
+                lines.append(f"1\t{epoch}\t{v}\tq\t1\t1.0\t2")
+            res.joinpath("samples.tsv").write_text("\n".join(lines) + "\n")
+            out = subprocess.run([sys.executable, str(summary), d], capture_output=True, text=True).stdout
+            self.assertIn("INVALID: a query has a variant with one server process", out)
+            self.assertEqual(subprocess.run([sys.executable, str(summary), "--check", str(Path(d) / "summary.json"),
+                                             "first"]).returncode, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

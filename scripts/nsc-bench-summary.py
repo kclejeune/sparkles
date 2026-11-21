@@ -22,12 +22,13 @@ which a quiet host keeps near 1 to 2%. The same-binary spread is the median, ove
 whose A median takes at least 0.3 ms, of the larger of their A and B spreads, and it must be
 at most 3%. The machine speed of each server process is the geometric mean, over all queries,
 of the process's median over the median of the query's requests to the same binary in the
-whole run, and every process must be within 5% of the median process. summary.json gets them
+whole run, and every process must be within 5% of the median process. A variant of a
+query with only one server process gives no spread, and the run is then not valid. summary.json gets them
 under "validity", with "valid" false when either bound fails, and the summary says so in its
 first lines.
 
 --check exits 0 when a pass may decide and 1 when it may not. A first pass needs a valid
-run. A rerun needs timings of both variants for every flagged query, and a valid run unless
+run with timings of both variants for every query. A rerun needs timings of both variants for every flagged query, and a valid run unless
 all of them take under 0.3 ms.
 """
 
@@ -76,10 +77,15 @@ def validity(samples, order):
         for _round, epoch, x in xs:
             by[epoch].append(x)
         m = [statistics.median(v) for v in by.values()]
-        return max(m) / min(m) - 1 if m and min(m) > 0 else float("nan")
+        # one server process gives no spread to judge
+        return max(m) / min(m) - 1 if len(m) >= 2 and min(m) > 0 else float("nan")
 
     big = [q for q in order if samples[q].get("A") and statistics.median(x[2] for x in samples[q]["A"]) >= MIN_MS]
-    spreads = [max(spread(samples[q]["A"]), spread(samples[q].get("B", []))) for q in big if samples[q].get("B")]
+    def both(q):
+        a, b = spread(samples[q]["A"]), spread(samples[q]["B"])
+        return float("nan") if math.isnan(a) or math.isnan(b) else max(a, b)
+
+    spreads = [both(q) for q in big if samples[q].get("B")]
     epochs = sorted({e for _q, e in meds})
     speed = []
     for e in epochs:
@@ -90,10 +96,11 @@ def validity(samples, order):
         return None
     mid = statistics.median(speed)
     rel = [x / mid for x in speed]
-    sp = statistics.median(spreads)
-    return {"spread": sp, "queries": len(spreads), "speed_min": min(rel), "speed_max": max(rel),
+    unjudged = sum(1 for x in spreads if math.isnan(x))
+    sp = statistics.median(spreads) if not unjudged else float("nan")
+    return {"spread": sp, "queries": len(spreads), "unjudged": unjudged, "speed_min": min(rel), "speed_max": max(rel),
             "max_spread": MAX_SPREAD, "max_drift": MAX_DRIFT,
-            "valid": sp <= MAX_SPREAD and min(rel) >= 1 - MAX_DRIFT and max(rel) <= 1 + MAX_DRIFT}
+            "valid": not unjudged and sp <= MAX_SPREAD and min(rel) >= 1 - MAX_DRIFT and max(rel) <= 1 + MAX_DRIFT}
 
 
 def check(path, kind, flagged):
@@ -110,7 +117,8 @@ def check(path, kind, flagged):
             if not m or not m.get("n_a") or not m.get("n_b") or (not v and m["a"] >= MIN_MS):
                 return 1
         return 0 if not v or v["valid"] else 1
-    return 0 if v and v["valid"] else 1
+    # every query needs timings of both variants
+    return 0 if v and v["valid"] and not s.get("missing") else 1
 
 
 def main():
@@ -167,12 +175,15 @@ def main():
         ma, mb = med(a), med(b)
         return {"a": ma, "b": mb, "ratio": mb / ma, "rounds": per_round, "spread_a": spread(a), "spread_b": spread(b), "n_a": len(a), "n_b": len(b)}
 
-    summary = {"queries": {}, "geomean": {}, "validity": validity(samples["exec_ms"], order)}
+    summary = {"queries": {}, "geomean": {}, "validity": validity(samples["exec_ms"], order),
+               "errors": {f"{q} {v}": n for (q, v), n in sorted(errors.items())}}
     for m in samples:
         for q in order:
             s = stats(samples[m][q])
             if s:
                 summary["queries"].setdefault(q, {})[m] = s
+        if m == "exec_ms":
+            summary["missing"] = [q for q in order if m not in summary["queries"].get(q, {})]
         ratios = [summary["queries"][q][m]["ratio"] for q in order if m in summary["queries"].get(q, {})]
         if ratios:
             summary["geomean"][m] = math.exp(sum(math.log(r) for r in ratios) / len(ratios))
@@ -192,7 +203,8 @@ def main():
     p()
     v = summary["validity"]
     if v:
-        verdict = "valid" if v["valid"] else "INVALID: the host was not quiet enough for a timing comparison"
+        verdict = ("valid" if v["valid"] else "INVALID: a query has a variant with one server process"
+                   if v.get("unjudged") else "INVALID: the host was not quiet enough for a timing comparison")
         p(f"Validity: {verdict}. Same-binary spread {v['spread'] * 100:.1f}% over {v['queries']} queries of at least {MIN_MS} ms (at most {MAX_SPREAD * 100:.0f}%), server-process speed {v['speed_min']:.3f} to {v['speed_max']:.3f} of the median (within {MAX_DRIFT * 100:.0f}%).")
         p()
 
@@ -210,6 +222,9 @@ def main():
             p("Answers differ or failed for: " + ", ".join(f"{q} (A {by_q[q].get('A')}, B {by_q[q].get('B')})" for q in diff) + ".")
         else:
             p(f"A and B returned the same sorted TSV answers to all {len(by_q)} queries.")
+        p()
+    if summary["missing"]:
+        p("No timings of both variants for: " + ", ".join(summary["missing"]) + ", so the run cannot decide.")
         p()
     if errors:
         p("Failed timed requests: " + ", ".join(f"{q} {v} {n}" for (q, v), n in sorted(errors.items())) + ".")

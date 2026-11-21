@@ -284,7 +284,7 @@ p.add_argument("queries", nargs="+")
 a = p.parse_args()
 EXEC = re.compile(rb'"execMs":([0-9.eE+-]*)')
 HEADERS = {"Accept": "application/x-sparkles+json", "Content-Type": "application/x-www-form-urlencoded"}
-conn = http.client.HTTPConnection("localhost", a.port, timeout=a.max_time)
+conn = None
 
 
 def form(text):
@@ -296,28 +296,59 @@ def form(text):
     return body.encode()
 
 
+# MAX_TIME bounds each whole request, as curl's --max-time does, and 0 means no bound
+LIMIT = a.max_time if a.max_time > 0 else None
+# the failures of a kept-alive connection that the server closed while it was idle
+STALE = (http.client.RemoteDisconnected, ConnectionResetError, ConnectionAbortedError, BrokenPipeError)
+
+
+def connect():
+    return http.client.HTTPConnection("localhost", a.port, timeout=LIMIT)
+
+
 def request(body):
     """(execMs text or None, wall seconds, answer bytes or None)"""
     global conn
     if a.gap_ms > 0:
         time.sleep(a.gap_ms / 1000)
     for attempt in (1, 2):
-        # A kept-alive connection that the server closed while it was idle fails before any
-        # answer arrives, so the request is sent once more on a new connection, and timed
-        # from there. A new connection that fails gives an error row.
+        # A request on a reused connection that fails as a stale connection does, before any
+        # answer arrives, is sent once more on a new connection and timed from there. Every
+        # other failure, a timeout among them, gives an error row as curl's does.
         reused = conn.sock is not None
         t0 = time.perf_counter()
+        deadline = None if LIMIT is None else t0 + LIMIT
         got = False
+
+        def left():
+            if deadline is None:
+                return None
+            r = deadline - time.perf_counter()
+            if r <= 0:
+                raise TimeoutError("the request took longer than MAX_TIME")
+            return r
+
         try:
+            conn.timeout = left()
+            if conn.sock is not None:
+                conn.sock.settimeout(left())
             conn.request("POST", "/bench/sparql", body, HEADERS)
+            sock = conn.sock
             r = conn.getresponse()
             got = True
-            data = r.read()
+            parts = []
+            while True:
+                sock.settimeout(left())
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                parts.append(chunk)
+            data = b"".join(parts)
             break
-        except (OSError, http.client.HTTPException):
+        except (OSError, http.client.HTTPException) as e:
             conn.close()
-            conn = http.client.HTTPConnection("localhost", a.port, timeout=a.max_time)
-            if got or not reused or attempt == 2:
+            conn = connect()
+            if got or not reused or attempt == 2 or not isinstance(e, STALE):
                 return None, None, None
     w = time.perf_counter() - t0
     if r.status >= 400:
@@ -326,6 +357,7 @@ def request(body):
     return (m.group(1).decode() if m and m.group(1) else None), w, data
 
 
+conn = connect()
 with open(a.samples, "a") as samples, open(a.warm_answers, "a") as warm:
     for q in a.queries:
         path = f"queries/{q}.rq"
@@ -350,8 +382,12 @@ with open(a.samples, "a") as samples, open(a.warm_answers, "a") as warm:
                     os.remove(name)
         samples.flush()
         if a.digest:
-            r = subprocess.run(shlex.split(a.digest) + [path] + files, stdout=subprocess.PIPE, text=True)
-            digests = r.stdout.splitlines()
+            # as in the curl loop, a digest command that fails or cannot start gives "no digest"
+            try:
+                digests = subprocess.run(shlex.split(a.digest) + [path] + files, stdout=subprocess.PIPE,
+                                         text=True).stdout.splitlines()
+            except OSError:
+                digests = []
             for rep in range(1, a.reps + 1):
                 d = (digests[rep - 1] if rep <= len(digests) else "") or "no digest"
                 warm.write(f"{a.epoch}\t{a.variant}\t{q}\t{rep}\t{d}\n")

@@ -279,6 +279,40 @@ class RequestClientTests(unittest.TestCase):
         # each request reached the server once
         self.assertEqual(len((d / "requests.tsv").read_text().splitlines()), 2 * 4 * 2 * (2 + 3) + 2 * 2)
 
+    def test_timeouts_and_a_missing_digest_command_match_curl(self):
+        extra = "MAX_TIME=1\nWARM_DIGEST=/nonexistent/digest\n"
+        runs = {}
+        for client in ("curl", "persistent"):
+            d = self.run_client(client, extra)
+            # the answer checks use curl in both runs, so only the timed loop differs
+            runs[client] = d
+        for d in runs.values():
+            rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()[1:]]
+            self.assertTrue(all(r[5] == "2.5" for r in rows))
+            self.assertEqual({l.split("\t")[4] for l in (d / "results" / "warm-answers.tsv").read_text().splitlines()},
+                             {"no digest"})
+
+    def test_a_request_past_max_time_is_an_error_and_is_not_retried(self):
+        runs = {}
+        for client in ("curl", "persistent"):
+            d = Path(tempfile.mkdtemp())
+            self.addCleanup(shutil.rmtree, d, True)
+            shutil.copy(SCRIPTS / "nsc-bench-remote.sh", d)
+            (d / "queries").mkdir()
+            (d / "queries" / "slow.rq").write_text("SELECT * WHERE { ?s ?p ?o } #sleep\n")
+            (d / "run.env").write_text("SERVER_CPU=0\nCLIENT_CPU=0\nSPIN=0\nDYNAMIC_A=0\nDYNAMIC_B=0\nROUNDS=1\n"
+                                       f"REPS=2\nWARMUP=0\nMAX_TIME=1\nREQUEST_CLIENT={client}\nPORT={free_port()}\n")
+            for v in "AB":
+                (d / f"bin-{v}").write_text(STUB.read_text().replace('IDENTITY = "stub"', f'IDENTITY = "{v}"'))
+            subprocess.run(["zstd", "-q", "-o", str(d / "data.nt.zst")], input=b"", check=True)
+            r = subprocess.run(["bash", str(d / "nsc-bench-remote.sh")], capture_output=True, text=True, timeout=120)
+            self.assertEqual((d / "results" / "done").read_text().strip(), "ok", r.stdout + r.stderr)
+            runs[client] = d
+        for client, d in runs.items():
+            rows = [l.split("\t") for l in (d / "results" / "samples.tsv").read_text().splitlines()[1:]]
+            self.assertEqual([r[5:] for r in rows], [["error", "error"]] * 8, client)
+        self.assertEqual((runs["curl"] / "requests.tsv").read_text(), (runs["persistent"] / "requests.tsv").read_text())
+
     def test_one_variant_per_client(self):
         d = self.run_client("persistent", "REQUEST_CLIENT_A=curl\nREQUEST_GAP_MS_B=1.5\n")
         self.assertIn("request client: A=curl B=persistent(gap 1.5 ms) Python", (d / "results" / "env.txt").read_text())

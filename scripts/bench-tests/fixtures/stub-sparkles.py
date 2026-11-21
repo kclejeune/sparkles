@@ -15,6 +15,7 @@ import http.server
 import json
 import os
 import sys
+import time
 import urllib.parse
 
 IDENTITY = "stub"
@@ -63,6 +64,9 @@ def main():
             # blank values are kept, so that an empty execution field differs from none
             form = urllib.parse.parse_qs(body, keep_blank_values=True)
             accept = self.headers.get("Accept", "")
+            if "#sleep" in form.get("query", [""])[0]:
+                # a query with this comment takes two seconds, for tests of request timeouts
+                time.sleep(2)
             mode = form.get("execution", ["-"])[0]
             with open(log, "a") as f:
                 f.write(f"{IDENTITY}\t{owner}\t{store}\t{mode}\t{accept}\n")

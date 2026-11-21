@@ -65,19 +65,27 @@ def die(msg):
     sys.exit(f"timing-kit: {msg}")
 
 
-def read_env(path):
-    """KEY=VALUE lines of a run.env, with one level of quotes removed."""
+# The harness sources run.env with bash. The kit reads only plain assignments whose value
+# is a bare word or one quoted string without expansions, so that what it checks is what
+# bash sets, and it refuses any other line.
+ASSIGN = re.compile(r"""([A-Z_][A-Z0-9_]*)=(?:([^\s'"$`\\;&|<>()~]*)|'([^']*)'|"([^"$`\\]*)")""")
+
+
+def read_env(path, problems=None):
+    """The assignments of a run.env. A line the kit cannot read exactly goes to problems,
+    or ends the program when no list is given."""
     env = {}
-    for line in Path(path).read_text().splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
+    for n, line in enumerate(Path(path).read_text().splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        k, _, v = line.partition("=")
-        try:
-            parts = shlex.split(v)
-        except ValueError:
-            parts = [v]
-        env[k.strip()] = " ".join(parts)
+        m = ASSIGN.fullmatch(line)
+        if not m:
+            msg = f"{path}:{n} is not a plain KEY=VALUE assignment: {line}"
+            if problems is None:
+                die(msg)
+            problems.append(msg)
+            continue
+        env[m.group(1)] = next(g for g in m.groups()[1:] if g is not None)
     return env
 
 
@@ -251,7 +259,7 @@ def static_checks(stage):
     p = []
     if not (stage / "run.env").is_file():
         return [f"{stage} has no run.env"]
-    env = read_env(stage / "run.env")
+    env = read_env(stage / "run.env", p)
     for k in ("SERVER_CPU", "CLIENT_CPU"):
         if not re.fullmatch(r"[0-9]+", env.get(k, "")):
             p.append(f"{k} must name one CPU explicitly, not {env.get(k, 'nothing')}")
@@ -268,8 +276,13 @@ def static_checks(stage):
                          "and the same-binary spread needs two server processes of each variant a round")
         if o != o[::-1]:
             p.append(f"the order '{' '.join(o)}' is not a palindrome, so a steady drift favours one variant")
-    if not re.fullmatch(r"[0-9]+", env.get("ROUNDS", "4")) or int(env.get("ROUNDS", "4")) < 2:
-        p.append("ROUNDS must be at least 2")
+    for k, default, least in (("ROUNDS", "4", 2), ("REPS", "20", 1), ("WARMUP", "3", 0),
+                              ("RERUN_ROUNDS", "16", 2), ("RERUN_REPS", "40", 1)):
+        v = env.get(k, default)
+        if not re.fullmatch(r"[0-9]+", v) or int(v) < least:
+            p.append(f"{k} must be a whole number of at least {least}, not {v}")
+    if not re.fullmatch(r"[0-9]+(\.[0-9]+)?", env.get("FLAG_RATIO", "1.10")) or float(env.get("FLAG_RATIO", "1.10")) <= 1:
+        p.append(f"FLAG_RATIO must be a ratio above 1, not {env.get('FLAG_RATIO')}")
     queries = {f.stem for f in (stage / "queries").glob("*.rq")} if (stage / "queries").is_dir() else set()
     if not queries:
         p.append("the stage has no queries")
@@ -290,20 +303,26 @@ def static_checks(stage):
             p.append(f"the pair {pair} does not name two variants")
         elif clients[x] != clients[y]:
             p.append(f"the pair {pair} mixes request clients {clients[x]} and {clients[y]}")
+    listed = {}
     if not (stage / "binaries.sha256").is_file():
         p.append("binaries.sha256 is missing")
     else:
         for line in (stage / "binaries.sha256").read_text().splitlines():
-            want, _, name = line.partition("  ")
-            f = stage / name.strip()
-            if not f.is_file():
-                p.append(f"{name} is missing")
-            elif sha256(f) != want:
-                p.append(f"{name} does not match binaries.sha256")
+            m = re.fullmatch(r"([0-9a-f]{64})  (bin-[A-Z](?:\.zst)?)", line)
+            if not m:
+                p.append(f"binaries.sha256 has a line that is not HASH  bin-V: {line}")
+                continue
+            listed[m.group(2)] = m.group(1)
     for v in variants:
-        own = env.get(f"BINARY_OF_{v}", v) == v
-        if own and not (stage / f"bin-{v}").is_file() and not (stage / f"bin-{v}.zst").is_file():
+        if env.get(f"BINARY_OF_{v}", v) != v:
+            continue
+        name = next((n for n in (f"bin-{v}", f"bin-{v}.zst") if (stage / n).is_file()), None)
+        if name is None:
             p.append(f"bin-{v} is missing")
+        elif name not in listed:
+            p.append(f"binaries.sha256 has no hash of {name}")
+        elif sha256(stage / name) != listed[name]:
+            p.append(f"{name} does not match binaries.sha256")
     if not (stage / "data.nt.zst").is_file():
         p.append("data.nt.zst is missing")
     for f in ("nsc-bench-remote.sh", "nsc-bench-summary.py"):
@@ -380,37 +399,50 @@ def cmd_preflight(a):
 
 # --------------------------------------------------------------------------- launch
 
+SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*")
+
+
 def cmd_launch(a):
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", a.unit):
+    if not SAFE.fullmatch(a.unit):
         die(f"the unit name {a.unit} is not a plain name")
+    if not re.fullmatch(r"[0-9]+[smhd]?", a.timeout):
+        die(f"the timeout is a number with s, m, h or d, not {a.timeout}")
+    if not SAFE.fullmatch(a.host):
+        die(f"the host {a.host} is not a plain name")
     stages = [Path(s).resolve() for s in a.stages]
     names = [s.name for s in stages]
     if len(set(names)) != len(names):
         die("two stages share a directory name")
+    for n in names:
+        if not SAFE.fullmatch(n) or n == "timing-kit.py":
+            die(f"the stage directory name {n} is not a plain name")
     for s in stages:
         problems = static_checks(s)
         if problems:
             for x in problems:
                 print(f"{s}: refused: {x}", file=sys.stderr)
             return 1
+    home = f"/home/{os.environ.get('USER', 'kclejeune')}"
+    remote = a.remote_dir or f"{home}/lanes/{a.unit}"
+    if not re.fullmatch(r"/[A-Za-z0-9_./-]+", remote) or "/../" in remote + "/":
+        die(f"the remote directory {remote} is not a plain absolute path")
+    q = shlex.quote
     ssh = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", a.host]
-    remote = f"/home/{os.environ.get('USER', 'kclejeune')}/lanes/{a.unit}" if not a.remote_dir else a.remote_dir
-    steps = [ssh + [f"test ! -e {remote} && ! systemctl --user cat {a.unit}.service >/dev/null 2>&1"]]
-    for s in stages:
-        # one transfer per stage, niced and on the host's last CPUs, under the host's locks
-        steps.append(["sh", "-c", f"tar -C {shlex.quote(str(s.parent))} -cf - {shlex.quote(s.name)} | zstd -q -T0 -3 | "
-                      + shlex.join(ssh) + " " + shlex.quote(
-                          f"mkdir -p {remote} && flock -w 28800 ~/lanes/.bench.lock flock -w 28800 ~/lanes/.heavy.lock "
-                          f"nice -n 19 sh -c 'zstd -q -dc | tar -x -C {remote}'")])
-    steps.append(ssh + [f"cd {remote} && env -u MBX_REMOTE_URL python3 {names[0]}/timing-kit.py preflight --host-side "
-                        + " ".join(names)])
-    inner = (f"rc=0; flock -w 28800 /home/{os.environ.get('USER', 'kclejeune')}/lanes/.bench.lock "
-             f"flock -w 28800 /home/{os.environ.get('USER', 'kclejeune')}/lanes/.heavy.lock "
-             f"timeout -k 60 {a.timeout} python3 {names[0]}/timing-kit.py run {' '.join(names)} || rc=$?; "
-             f"printf \"exit %s %s\\n\" \"$rc\" \"$(date -u +%FT%TZ)\" > {remote}/DONE; exit \"$rc\"")
-    steps.append(ssh + [f"systemd-run --user --unit={a.unit} -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue "
-                        f"--setenv=PATH=\"$PATH\" --setenv=MBX_REMOTE_URL= -p WorkingDirectory={remote} "
-                        f"/bin/bash -c {shlex.quote(inner)}"])
+    locks = f"flock -w 28800 {q(home + '/lanes/.bench.lock')} flock -w 28800 {q(home + '/lanes/.heavy.lock')}"
+    steps = [ssh + [f"test ! -e {q(remote)} && ! systemctl --user cat {q(a.unit + '.service')} >/dev/null 2>&1"]]
+    # the kit's own driver goes beside the stages, so that a stage need not carry it
+    sources = [(str(HERE), "timing-kit.py")] + [(str(s.parent), s.name) for s in stages]
+    for parent, name in sources:
+        # one transfer each, niced, under the host's locks, so that it never disturbs a timing
+        receive = f"mkdir -p {q(remote)} && {locks} nice -n 19 sh -c {q('zstd -q -dc | tar -x -C ' + q(remote))}"
+        steps.append(["sh", "-c", f"tar -C {q(parent)} -cf - {q(name)} | zstd -q -T0 -3 | {shlex.join(ssh)} {q(receive)}"])
+    steps.append(ssh + [f"cd {q(remote)} && env -u MBX_REMOTE_URL python3 timing-kit.py preflight --host-side "
+                        + " ".join(map(q, names))])
+    inner = (f"rc=0; {locks} timeout -k 60 {a.timeout} python3 timing-kit.py run {' '.join(map(q, names))} || rc=$?; "
+             f"printf 'exit %s %s\\n' \"$rc\" \"$(date -u +%FT%TZ)\" > {q(remote + '/DONE')}; exit \"$rc\"")
+    steps.append(ssh + [f"systemd-run --user --unit={q(a.unit)} -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue "
+                        f"--setenv=PATH=\"$PATH\" --setenv=MBX_REMOTE_URL= -p WorkingDirectory={q(remote)} "
+                        f"/bin/bash -c {q(inner)}"])
     for step in steps:
         print("+ " + shlex.join(step))
         if not a.dry_run:
@@ -429,13 +461,29 @@ def cmd_launch(a):
 CHILD = None
 
 
-def on_term(signum, _frame):
-    if CHILD and CHILD.poll() is None:
-        CHILD.terminate()
+def stop_child():
+    """End the harness and everything it started, the servers, the busy loops and the
+    clients, which share the harness's process group."""
+    if CHILD is None:
+        return
+    for sig, wait in ((signal.SIGTERM, 60), (signal.SIGKILL, 30)):
         try:
-            CHILD.wait(60)
+            os.killpg(CHILD.pid, sig)
+        except ProcessLookupError:
+            break
+        try:
+            CHILD.wait(wait)
         except subprocess.TimeoutExpired:
-            CHILD.kill()
+            continue
+        # the harness is gone, and its group may still hold children it left
+        try:
+            os.killpg(CHILD.pid, 0)
+        except ProcessLookupError:
+            break
+
+
+def on_term(signum, _frame):
+    stop_child()
     sys.exit(128 + signum)
 
 
@@ -469,8 +517,10 @@ def run_pass(stage, name, rounds, reps, queries=None):
             shutil.copy(f, d / "queries" / f.name)
     log(stage, f"{name}: {rounds} rounds, {reps} reps, {len(list((d / 'queries').glob('*.rq')))} queries")
     with open(d / "nohup.log", "w") as out:
-        CHILD = subprocess.Popen(["bash", str(d / "nsc-bench-remote.sh")], stdout=out, stderr=subprocess.STDOUT)
+        CHILD = subprocess.Popen(["bash", str(d / "nsc-bench-remote.sh")], stdout=out, stderr=subprocess.STDOUT,
+                                 start_new_session=True)
         CHILD.wait()
+        stop_child()
         CHILD = None
     done = (d / "results" / "done").read_text().strip() if (d / "results" / "done").exists() else "no done marker"
     for f in list(d.glob("bin-*")) + [d / "data.nt", d / "data.nt.zst"] + list(d.glob("*/sparkles")):

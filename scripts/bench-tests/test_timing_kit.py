@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -137,6 +138,50 @@ class KitTests(unittest.TestCase):
         self.assertIn("only 2 control queries", r.stderr)
         self.assertIn("mixes request clients", r.stderr)
 
+    def test_preflight_reads_only_plain_assignments(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        (s / "run.env").write_text((s / "run.env").read_text() + "export SERVER_CPU=1\nREPS=$((0))\n")
+        r = kit("preflight", s)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("is not a plain KEY=VALUE assignment: export SERVER_CPU=1", r.stderr)
+        self.assertIn("is not a plain KEY=VALUE assignment: REPS=$((0))", r.stderr)
+
+    def test_preflight_refuses_counts_that_cannot_decide(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        env = (s / "run.env").read_text()
+        (s / "run.env").write_text(env.replace("REPS=2\n", "REPS=0\n").replace("RERUN_ROUNDS=2\n", "RERUN_ROUNDS=1\n")
+                                   .replace("FLAG_RATIO=1.10", "FLAG_RATIO=0.9"))
+        r = kit("preflight", s)
+        self.assertIn("REPS must be a whole number of at least 1, not 0", r.stderr)
+        self.assertIn("RERUN_ROUNDS must be a whole number of at least 2, not 1", r.stderr)
+        self.assertIn("FLAG_RATIO must be a ratio above 1", r.stderr)
+
+    def test_preflight_needs_a_hash_of_every_binary(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        lines = (s / "binaries.sha256").read_text().splitlines()
+        (s / "binaries.sha256").write_text(lines[0] + "\n")
+        r = kit("preflight", s)
+        self.assertIn("binaries.sha256 has no hash of bin-B", r.stderr)
+        (s / "binaries.sha256").write_text("")
+        r = kit("preflight", s)
+        self.assertIn("binaries.sha256 has no hash of bin-A", r.stderr)
+        (s / "binaries.sha256").write_text("junk\n")
+        r = kit("preflight", s)
+        self.assertIn("a line that is not HASH  bin-V: junk", r.stderr)
+
+    def test_launch_refuses_names_a_shell_would_read(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        for args, want in ((["--unit", "x;rm -rf ~"], "unit name"), (["--unit", "ok", "--timeout", "1h; reboot"], "timeout"),
+                           (["--unit", "ok", "--remote-dir", "/tmp/a b"], "remote directory"),
+                           (["--unit", "ok", "--remote-dir", "/tmp/../etc"], "remote directory")):
+            r = kit("launch", "--host", "nohost.invalid", "--dry-run", *args, s)
+            self.assertEqual(r.returncode, 1, args)
+            self.assertIn(want, r.stderr)
+        odd = self.d / "odd name"
+        shutil.copytree(s, odd)
+        r = kit("launch", "--host", "nohost.invalid", "--unit", "ok", "--dry-run", odd)
+        self.assertIn("not a plain name", r.stderr)
+
     def test_preflight_accepts_a_screen_stage(self):
         # a batch screen's stage: the harness's own A/B run.env, without the kit's settings
         s = self.d / "screen"
@@ -154,6 +199,11 @@ class KitTests(unittest.TestCase):
                                    "CONTROLS=\"%s\"\n" % (free_port(), " ".join(CONTROLS)))
         r = kit("preflight", "--host-side", s, env=self.env)
         self.assertEqual(r.returncode, 0, r.stderr)
+        # the kit sends its own driver beside a stage that does not carry it
+        r = kit("launch", "--host", "nohost.invalid", "--unit", "kit-test", "--dry-run", s)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"tar -C {SCRIPTS} -cf - timing-kit.py", r.stdout)
+        self.assertIn("python3 timing-kit.py run screen", r.stdout)
 
     def test_host_checks(self):
         r, s = self.stage(tips=(("tip", 1.0),))
@@ -187,6 +237,36 @@ class KitTests(unittest.TestCase):
         r = kit("launch", "--host", "nohost.invalid", "--unit", "kit-test", "--dry-run", s)
         self.assertEqual(r.returncode, 1)
         self.assertNotIn("systemd-run", r.stdout)
+
+    @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and {0, 1} <= os.sched_getaffinity(0),
+                         "needs taskset, chrt, zstd, curl and CPUs 0 and 1")
+    def test_a_stopped_run_leaves_no_process_behind(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        (s / "run.env").write_text((s / "run.env").read_text().replace("ROUNDS=2", "ROUNDS=50")
+                                   .replace("=curl\n", "=persistent\n"))
+        p = subprocess.Popen([sys.executable, str(KIT), "run", str(s)], env={**os.environ, **self.env},
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        samples = s / "pass1" / "results" / "samples.tsv"
+        deadline = time.time() + 60
+        while time.time() < deadline and (not samples.exists() or len(samples.read_text().splitlines()) < 5):
+            time.sleep(0.2)
+        self.assertTrue(samples.exists())
+        p.terminate()
+        self.assertEqual(p.wait(120), 128 + 15)
+
+        def left():
+            out = []
+            for proc in Path("/proc").iterdir():
+                try:
+                    cmd = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                    cwd = os.readlink(proc / "cwd")
+                except OSError:
+                    continue
+                if str(s) in cmd or cwd.startswith(str(s)):
+                    out.append(cmd)
+            return out
+
+        self.assertEqual(left(), [])
 
     @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
                          and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")
