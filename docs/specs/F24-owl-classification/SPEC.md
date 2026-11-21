@@ -4441,7 +4441,7 @@ by 6 to 7% on `ore_ont_4510` and `ore_ont_9654`, whose anonymous individuals occ
 other axioms and become individuals of the run, and by 4 to 5 MiB on six files of about
 22 MiB. On `atlas`
 with four threads, in three alternating rounds of three classifications a side of
-781da4c8 against 0779d666, 34 of the 118 file and run cells are faster in every
+781da4c8, before the review fixes, against 0779d666, 34 of the 118 file and run cells are faster in every
 classification and 6 slower. The tip classifies `ore_ont_10073` and `ore_ont_5481` in 88
 to 90 ms against 756 to 774 ms, `ore_ont_5857` in 242 against 1,392 ms by default and in
 1,930 against 3,387 ms rooted, and the other files above 100 ms in 0.16 to 0.80 times the
@@ -4455,8 +4455,13 @@ cover each position of an anonymous individual in each tier, keys with anonymous
 and values, the hiding in descriptions, edits, the shared individual and its budget, and
 the reports and counts of a run that starts again. `dl_tier_d` and `dl_nominals` cover
 the inclusions in each form, a chain beside a range of the top property and item 805's
-rewriting beside a data inclusion. The
-[record](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
+rewriting beside a data inclusion. The census and the HermiT comparison above are those
+of 781da4c8, and a rerun with the build of 3c7d0eb0, after the review fixes, gives the
+same left-out axioms, tiers and consistency in all 118 cells and HermiT's taxonomy in all
+58 runs, as its
+[record](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-laptop-3c7d0eb0/record.json)
+shows. The
+[record of 781da4c8](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
 holds the timings, the census and the judgements, which the
 [benchmark report](../../benchmarks/el-classification/RESULTS.md#anonymous-individuals-and-top-property-inclusions)
 discusses.

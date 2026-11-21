@@ -1955,7 +1955,7 @@ Roadmap items 1281 and 1282 take the axioms with anonymous individuals and the
 inclusions in a top property that the classifier left out, as
 [F24](../../specs/F24-owl-classification/SPEC.md#anonymous-individuals-and-top-property-inclusions)
 describes. On `atlas` three rounds of alternating order compared the base, commit
-0779d666, with commit 781da4c8 on the 59 files of the ORE 2015 DL development set that
+0779d666, with commit 781da4c8, before the review fixes, on the 59 files of the ORE 2015 DL development set that
 hold either, one process per side, file and run with three classifications each on four
 threads. Each time is the median of a side's nine classifications. Of the 118 cells, 34
 are faster in every classification and 6 slower, and the rest overlap. The table gives
@@ -1992,14 +1992,17 @@ each class and the EL rules take them. `ore_ont_4510`, `ore_ont_12901`, `ore_ont
 and `ore_ont_9654` take 1.18 to 1.23 times as long while they take the 479 to 3,981 axioms
 that the base left out, which roadmap item 1300 follows. On the 29 files with a HermiT
 reference whose anonymous individuals were all they left out, the tip's taxonomy equals
-HermiT's in both runs.
+HermiT's in both runs. A rerun of the census and the HermiT comparison with commit
+3c7d0eb0, after the review fixes, gives the same result in every cell.
 
 ## Records
 
 The [record of items 1281 and 1282](runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
 holds every classification of the rounds on `atlas` with its report, the binary hashes,
 the host's state before and after, the census of both builds on the laptop with its
-left-out counts and peak memory, the HermiT judgements and the scripts that ran.
+left-out counts and peak memory, the HermiT judgements and the scripts that ran. The
+[record of the rerun at 3c7d0eb0](runs/2026-11-21-anonymous-individuals-laptop-3c7d0eb0/record.json)
+holds its census, its HermiT judgements and their comparison with 781da4c8.
 
 The [record of item 956's left-linear chains](runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json)
 holds every process of the rounds on forge with its report, the rules fixed before the

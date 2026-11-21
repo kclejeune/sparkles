@@ -1,0 +1,1166 @@
+{
+ "ore_ont_10073.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_10409.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_10594.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_10985.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_11110.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_11311.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_12414.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_12448.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_12901.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_13545.owl": {
+  "default": {
+   "outside": 62,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 3,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 24,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMaxCardinality is not allowed | EquivalentClasses": 13,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 14
+   }
+  },
+  "rooted": {
+   "outside": 62,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 3,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 24,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMaxCardinality is not allowed | EquivalentClasses": 13,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 14
+   }
+  }
+ },
+ "ore_ont_1370.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_13755.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_14375.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_14551.owl": {
+  "default": {
+   "outside": 146,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 5,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 3,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 6,
+    "OWL 2 Profiles \u00a72.2.3 | DataMinCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 27,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectComplementOf is not allowed | EquivalentClasses": 4,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMaxCardinality is not allowed | EquivalentClasses": 13,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMinCardinality is not allowed | SubClassOf": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 35,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 32
+   }
+  },
+  "rooted": {
+   "outside": 146,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 5,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 3,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 6,
+    "OWL 2 Profiles \u00a72.2.3 | DataMinCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 27,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectComplementOf is not allowed | EquivalentClasses": 4,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMaxCardinality is not allowed | EquivalentClasses": 13,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMinCardinality is not allowed | SubClassOf": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 35,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 32
+   }
+  }
+ },
+ "ore_ont_14767.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_15231.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_15516.owl": {
+  "default": {
+   "outside": 17,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectComplementOf is not allowed | EquivalentClasses": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | ClassAssertion": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 4,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.4 | DataOneOf with more than one literal is not allowed | ClassAssertion": 1
+   }
+  },
+  "rooted": {
+   "outside": 17,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectComplementOf is not allowed | EquivalentClasses": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | ClassAssertion": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 4,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.4 | DataOneOf with more than one literal is not allowed | ClassAssertion": 1
+   }
+  }
+ },
+ "ore_ont_15544.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_15733.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_15993.owl": {
+  "default": {
+   "outside": 48,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | DataPropertyDomain": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 4,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | ObjectPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 10
+   }
+  },
+  "rooted": {
+   "outside": 48,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | DataPropertyDomain": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 4,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | ObjectPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 10
+   }
+  }
+ },
+ "ore_ont_16642.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_1790.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_1823.owl": {
+  "default": {
+   "outside": 42,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 41,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 1
+   }
+  },
+  "rooted": {
+   "outside": 42,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 41,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 1
+   }
+  }
+ },
+ "ore_ont_2456.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_2624.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_2700.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_2775.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_2817.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_3050.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_3114.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_3357.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_3529.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_3795.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_4210.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_4510.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_4527.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_4662.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_4755.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_5448.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_5481.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_5502.owl": {
+  "default": {
+   "outside": 56,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 3,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | DataPropertyDomain": 14,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 14,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 15,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 8,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 1
+   }
+  },
+  "rooted": {
+   "outside": 56,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 3,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | DataPropertyDomain": 14,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 14,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 15,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 8,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 1
+   }
+  }
+ },
+ "ore_ont_580.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_5857.owl": {
+  "default": {
+   "outside": 38,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 38
+   }
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_6266.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_6478.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_6765.owl": {
+  "default": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 83,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 68,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 10,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | DataExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_6817.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_7195.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_7251.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_7417.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "horn",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_7663.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_7858.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_7914.owl": {
+  "default": {
+   "outside": 41,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 27,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 14
+   }
+  },
+  "rooted": {
+   "outside": 41,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectExactCardinality is not allowed | SubClassOf": 27,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 14
+   }
+  }
+ },
+ "ore_ont_8203.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_9151.owl": {
+  "default": {
+   "outside": 1075,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 282,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 33,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 31,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMinCardinality is not allowed | SubClassOf": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | DataPropertyDomain": 16,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 311,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 258,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 124
+   }
+  },
+  "rooted": {
+   "outside": 1075,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyAssertion": 282,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 33,
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | SubClassOf": 31,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMinCardinality is not allowed | SubClassOf": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | DataPropertyDomain": 16,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 311,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 258,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | SubClassOf": 124
+   }
+  }
+ },
+ "ore_ont_9654.owl": {
+  "default": {
+   "outside": 12,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 3,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 6,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 3
+   }
+  },
+  "rooted": {
+   "outside": 12,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 3,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyDomain": 6,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 3
+   }
+  }
+ },
+ "ore_ont_9761.owl": {
+  "default": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  },
+  "rooted": {
+   "outside": 0,
+   "tier": "el",
+   "consistency": "Consistent",
+   "excluded": {}
+  }
+ },
+ "ore_ont_980.owl": {
+  "default": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  },
+  "rooted": {
+   "outside": 11,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 9,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 2
+   }
+  }
+ },
+ "ore_ont_9890.owl": {
+  "default": {
+   "outside": 88,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 16,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 31,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectComplementOf is not allowed | EquivalentClasses": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMaxCardinality is not allowed | EquivalentClasses": 13,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 17,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 1
+   }
+  },
+  "rooted": {
+   "outside": 88,
+   "tier": "disjunctive",
+   "consistency": "Consistent",
+   "excluded": {
+    "OWL 2 Profiles \u00a72.2.1 | the datatype <IRI> is not allowed | DataPropertyRange": 1,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | EquivalentClasses": 16,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectAllValuesFrom is not allowed | SubClassOf": 31,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectComplementOf is not allowed | EquivalentClasses": 2,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectMaxCardinality is not allowed | EquivalentClasses": 13,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectOneOf with more than one individual is not allowed | EquivalentClasses": 7,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | EquivalentClasses": 17,
+    "OWL 2 Profiles \u00a72.2.3 | ObjectUnionOf is not allowed | ObjectPropertyRange": 1
+   }
+  }
+ }
+}

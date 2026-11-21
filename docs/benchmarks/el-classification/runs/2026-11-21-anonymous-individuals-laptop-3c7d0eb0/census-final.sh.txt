@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# final-tip rerun: build el_classify and census at the lane tip, then the census of the 59 files and the HermiT taxonomies
+set -u
+R=/home/kclejeune/repositories/github.com/kclejeune/sparkles
+L=$R/.artifacts/lanes/outside-ab
+W=$R/worktrees/outside-ab
+H=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/hermit
+mkdir -p $L/census-final $L/hermit-final
+while IFS=$'\t' read -r s f; do
+  b=$(basename "$f")
+  o=$L/census-final/$b.json
+  /usr/bin/time -f '%M' -o "$o.rss" timeout -k 10 900 $L/bin/census-final --threads 2 --deadline 300 --no-modules "$f" > "$o" 2> "$o.err" || echo "{\"failed\":1}" > "$o"
+done < $L/anon-inputs-final.tsv
+echo FINAL-DONE
