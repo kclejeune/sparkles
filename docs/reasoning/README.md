@@ -368,9 +368,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   follows `owl:imports` to graphs of the dataset that the caller can read. A strict read
   keeps every triple the mapping does not cover as unmapped and refuses shared list
   cells. A lenient read, the default, also types undeclared entities from their use and
-  records each guess as a diagnostic. It also reads a typing as `rdf:Property` alone,
-  as RDFS vocabularies type their properties, as no axiom and warns of it. Triples that
-  map to no axiom are counted and listed, never dropped silently.
+  records each guess as a diagnostic. Triples that map to no axiom are counted and
+  listed, never dropped silently.
 * The profile checks test the OWL 2 DL structural restrictions and the grammars of
   OWL 2 EL, QL and RL. Each violation names its rule and section in the recommendations
   and the axiom it concerns. A report on a profile also lists the DL violations, since
@@ -692,6 +691,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `unmapped` statistic and leaves the answer incomplete in the same way, with or without
   `assertions`. The answer lists the first 100 such triples in `unmappedTriples`, with
   `unmappedTruncated` when there are more, as the OWL API reports its unparsed triples.
+  A typing as `rdf:Property` alone, as RDFS vocabularies type their properties, carries
+  no logical content and is not counted.
   The kept classification's outcome reports the count as `unmappedCount`, and the
   Workbench notes it. `strict` on the request, `--strict` on `sparkles ontology classify` and
   `--strict true` on ROBOT's `reason`, `reduce` and `materialize`, which is their default

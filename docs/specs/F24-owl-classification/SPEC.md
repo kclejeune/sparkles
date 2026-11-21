@@ -4652,9 +4652,9 @@ has logical content or maps to no axiom, so it counts and lists at most one unma
 assertion triple. A file in functional-style syntax
 whose entities are all declared reads without the store and has no unmapped triples. One
 with an undeclared entity takes the store's reading, in which a domain or range of an
-undeclared property is such a triple. A lenient read takes a typing as `rdf:Property`
-alone, as RDFS vocabularies type their properties, as no axiom with a warning, since it
-carries no logical content. The GO and ChEBI lite releases in RDF/XML, and stores of
+undeclared property is such a triple. A typing as `rdf:Property` alone, as RDFS
+vocabularies type their properties, carries no logical content, so a classification does
+not count it, while the read and the profile checks still report it as unmapped. The GO and ChEBI lite releases in RDF/XML, and stores of
 OWL2Bench and of LUBM with their assertions, count no unmapped triple. The triples of a SWRL rule are not unmapped, since
 the RDF reader maps a rule and its atoms to assertions about anonymous individuals, so a
 classification with `assertions` reads them as assertions and can answer complete while

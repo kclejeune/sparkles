@@ -864,14 +864,26 @@ pub(super) fn dropped_assertions<'o>(
 
 /// The triples that map to no axiom of a classification of `o`: the terminology's, then
 /// the assertion triples a run read (`unread`), then the one at which a stream of the
-/// assertions that the run did not read stopped (`seen`).
+/// assertions that the run did not read stopped (`seen`). A typing as `rdf:Property`
+/// that the read left unmapped, which no OWL type accompanies, as RDFS vocabularies type
+/// their properties, carries no logical content, so the classification does not count
+/// it; the read still reports it, as the profile checks do.
 pub(super) fn unmapped_of(
     o: &sparkles_owl::read::Ontology,
     unread: &Unmapped,
     seen: &RefCell<Option<Triple>>,
 ) -> Unmapped {
+    let rdfs_property = |t: &&Triple| {
+        t.predicate.as_str() == vocab::RDF_TYPE
+            && matches!(&t.object, Term::NamedNode(n) if n.as_str() == vocab::RDF_PROPERTY)
+    };
     Unmapped::default()
-        .extend(o.unmapped.iter().map(|i| &o.triples[*i]))
+        .extend(
+            o.unmapped
+                .iter()
+                .map(|i| &o.triples[*i])
+                .filter(|t| !rdfs_property(t)),
+        )
         .merge(unread)
         .extend(seen.borrow().as_ref())
 }

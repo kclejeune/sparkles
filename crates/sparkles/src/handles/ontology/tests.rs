@@ -2157,16 +2157,27 @@ mod classification {
     }
 
     /// RDFS-style typings, `rdfs:Class` and `rdf:Property` without an OWL type, carry no
-    /// logical content, so a lenient read counts no unmapped triple for them.
+    /// logical content, so a classification counts no unmapped triple for them.
     #[test]
     fn rdfs_style_typings_count_no_unmapped_triple() {
-        let ds =
-            dataset(":A a owl:Class . :q a rdf:Property . :t a rdfs:Class . :x a :A . :x :q :y .");
-        let o = ds
-            .ontology()
-            .open(&OntologyRequest::default(), &opts())
+        let ds = dataset(
+            ":A a owl:Class . :q a rdf:Property . :t a rdfs:Class . :B a owl:Class .
+            :B rdfs:subClassOf :A .",
+        );
+        let h = ds.ontology();
+        let o = h.open(&OntologyRequest::default(), &opts()).unwrap();
+        // the read reports the lone rdf:Property typing, as the DL profile check needs
+        assert_eq!(o.ontology.unmapped.len(), 1, "{:?}", o.ontology.unmapped);
+        let c = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest::default(),
+                &opts(),
+            )
             .unwrap();
-        assert!(o.ontology.unmapped.is_empty(), "{:?}", o.ontology.unmapped);
+        let k = &c.classification;
+        assert_eq!(k.stats.unmapped, 0, "{:?}", k.unmapped);
+        assert!(k.complete, "{:?}", c.excluded);
     }
 
     /// A triple that maps to no axiom, here the domain of a property that is not

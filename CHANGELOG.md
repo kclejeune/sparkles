@@ -26,7 +26,7 @@ ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the e
 `--reasoner hermit` or `jfact`, and `--strict false` turns that off. The answers' stats gain `coverageMs`,
 `coverageOver`, `coverageStopped` and `unmapped`, the answer lists the first 100 such
 triples in `unmappedTriples` with `unmappedTruncated`, the kept classification's outcome gains
-`unmappedCount`, a lenient read takes a typing as `rdf:Property` alone as no axiom, and the content fingerprint of a retained
+`unmappedCount`, a classification does not count a typing as `rdf:Property` alone, which has no logical content, and the content fingerprint of a retained
 classification is version 2, as roadmap item 1271.
 
 ### A kept EL classification over its memory budget starts again in full
