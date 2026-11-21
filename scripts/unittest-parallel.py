@@ -11,8 +11,11 @@ test occurrence in order. The runner's own process imports no test module. Each 
 runs in its own process, which discovers the whole suite again, checks that its tree matches
 the recorded one, and runs one top-level entry exactly as discovered. So every module is
 imported in every unit, as in serial discovery, and load_tests hooks, import errors and
-import-time skips, test classes imported into other modules, custom suites and class and
-module fixtures behave as they do serially.
+import-time skips, custom suites and class and module fixtures behave as they do serially.
+An entry made only of default suites with no test does nothing and gets no process. When a
+test class runs in more than one entry, as when one test module imports another's class,
+its occurrences can share state, so the whole suite runs in one process instead, and the
+runner says why.
 
 A module named with --split runs one process per test instead, for modules whose few tests
 take most of the suite's time. The split is taken only when the module's entry is plain,
@@ -36,15 +39,17 @@ every other unit has ended, and its unit calls parallel_absorb with the list of
 (unit, export) pairs before its tests start. The suite's process-leak check uses this, so
 its one test runs once, last, on the evidence of every unit.
 
-Discovery and each unit have deadlines, 300 s and 900 s by default. Each runs in its own
-session with its output in a file. When a deadline passes, or the runner gets SIGINT,
-SIGTERM or SIGHUP, it stops admitting units, sends SIGTERM to the process group and session
-of each unit it stops and to every descendant it finds under /proc, follows with SIGKILL
-after one grace period, 5 s by default, and reports the units. A process is signalled only
+Discovery and each unit have deadlines, 300 s and 900 s by default, and every duration
+must be finite. Each runs in its own session with its output in a file. When a deadline
+passes, or the runner gets SIGINT, SIGTERM or SIGHUP, it starts no more units, sends SIGTERM
+to the process group and session of every active unit and to every descendant it finds
+under /proc, follows with SIGKILL after one grace period, 5 s by default, and reports the
+units, including those that never started. A process is signalled only
 while its start time still matches, so a reused pid is left alone. A process that left the
 unit's tree before that, by being orphaned, is not found. An interrupted run exits 128 plus
-the signal number. A unit gets SIGTERM from the kernel when the runner dies without stopping
-it, as under SIGKILL, and then stops its own descendants the same way and exits.
+the signal number. Discovery and each unit get SIGTERM from the kernel when the runner dies
+without stopping them, as under SIGKILL, and then stop their own descendants the same way
+and exit.
 --keep DIR keeps the discovery, the plan, each unit's output and the result records in a
 new directory under DIR. --jobs 1 runs the units one at a time, in the same processes.
 """
@@ -52,6 +57,7 @@ new directory under DIR. --jobs 1 runs the units one at a time, in the same proc
 import argparse
 import ctypes
 import json
+import math
 import os
 import signal
 import subprocess
@@ -176,9 +182,33 @@ def discover(directory):
             "size": os.path.getsize(f) if f and os.path.exists(f) else 0,
             "absorb": callable(getattr(module, "parallel_absorb", None)),
         })
+    for u, entry in zip(units, entries):
+        u["inert"] = _inert(entry)
     exports = sorted(m for m in set(sys.modules) - before
                      if callable(getattr(sys.modules[m], "parallel_export", None)))
-    return entries, {"units": units, "exports": exports}
+    return entries, {"units": units, "exports": exports, "serial": _shared(entries)}
+
+
+def _inert(node):
+    """Whether NODE is default suites only, with no test, so running it does nothing."""
+    return type(node) is unittest.TestSuite and all(_inert(t) for t in node)
+
+
+def _shared(entries):
+    """Why the entries cannot run in separate processes, or None. A test class that runs in
+    more than one entry, as when one test module imports another's class, can share state
+    and fixtures between its occurrences, which only one process keeps."""
+    where = {}
+    for i, entry in enumerate(entries):
+        for t in _leaves(entry):
+            cls = type(t)
+            if cls.__module__ == "unittest.loader":
+                continue
+            where.setdefault(f"{cls.__module__}.{cls.__qualname__}", set()).add(i)
+    for name, found in where.items():
+        if len(found) > 1:
+            return f"{name} runs in {len(found)} top-level entries"
+    return None
 
 
 def _write_json(path, value):
@@ -189,6 +219,7 @@ def _write_json(path, value):
 
 
 def discover_main(directory, out):
+    # The caller has set up _die_with_parent before any test module is imported.
     _, description = discover(directory)
     _write_json(out, description)
     return 0
@@ -198,10 +229,12 @@ def _die_with_parent(parent, grace):
     """End this unit, and what it started, when the runner ends without stopping it, as when
     it is killed with SIGKILL. The kernel sends SIGTERM when the runner dies, and the handler
     stops this unit's descendants as the runner would have."""
+    me = {os.getpid(): _start_of(os.getpid())}
+
     def on_term(signum, frame):
-        found = _owned([os.getpid()])
+        found = _owned(me)
         found.pop(os.getpid(), None)
-        stop_all(list(found), grace)
+        stop_all(found, grace)
         os._exit(128 + signum)
 
     signal.signal(signal.SIGTERM, on_term)
@@ -219,7 +252,7 @@ def worker_main(directory, plan_path, index, split, record_path, absorb_path):
         record.update(error="the suite discovered here differs from the runner's discovery", ran=[])
         _write_json(record_path, record)
         return 1
-    entry = entries[index]
+    entry = unittest.TestSuite(entries) if index < 0 else entries[index]
     if split >= 0:
         entry = unittest.TestSuite([list(_leaves(entry))[split]])
     if absorb_path:
@@ -285,28 +318,38 @@ def _process_table():
     return table
 
 
+def _start_of(pid):
+    """PID's start time, which with the pid names one process, or None when it has ended."""
+    return _process_table().get(pid, (0, 0, 0, None))[3]
+
+
 def _owned(roots, table=None):
-    """The live processes among ROOTS, their descendants, and the members of their groups and
-    sessions and of their descendants', as {pid: start time}. A root that has died still
-    counts, so its group and its children are found."""
+    """The processes that ROOTS, a {pid: start time} map, own, as {pid: start time}: each root
+    still running as the process recorded, or ended, with its descendants and the members
+    of its group and session and of its descendants'. A root whose pid now names another
+    process is left out, so a reused pid is not taken for the one recorded."""
     table = _process_table() if table is None else table
-    owned = set(roots)
+    owned = {}
+    for pid, start in roots.items():
+        now = table.get(pid)
+        if now is None or now[3] == start:
+            owned[pid] = start
     changed = True
     while changed:
         changed = False
-        for pid, (ppid, pgid, sid, _) in table.items():
+        for pid, (ppid, pgid, sid, start) in table.items():
             if pid not in owned and (ppid in owned or pgid in owned or sid in owned):
-                owned.add(pid)
+                owned[pid] = start
                 changed = True
-    owned.discard(os.getpid())
-    return {pid: table[pid][3] for pid in owned if pid in table}
+    owned.pop(os.getpid(), None)
+    return owned
 
 
 def _signal_all(found, sig):
     """Send SIG to each process of FOUND that is still the one found, by its start time."""
     table = _process_table()
     for pid, start in found.items():
-        if table.get(pid, (0, 0, 0, None))[3] != start:
+        if start is None or table.get(pid, (0, 0, 0, None))[3] != start:
             continue
         try:
             os.kill(pid, sig)
@@ -315,18 +358,24 @@ def _signal_all(found, sig):
 
 
 def stop_all(roots, grace):
-    """Stop ROOTS and everything they own: SIGTERM to all, then SIGKILL to what is left after
-    one shared GRACE period."""
+    """Stop ROOTS, a {pid: start time} map, and everything they own: SIGTERM to all, then
+    SIGKILL to what is left after one shared GRACE period. A process keeps the identity it
+    was first found with."""
     seen = _owned(roots)
+
+    def look(table=None):
+        for pid, start in _owned(roots, table).items():
+            seen.setdefault(pid, start)
+
     _signal_all(seen, signal.SIGTERM)
     end = time.monotonic() + grace
     while time.monotonic() < end:
         table = _process_table()
-        seen.update(_owned(roots, table))
+        look(table)
         if not any(table.get(pid, (0, 0, 0, None))[3] == start for pid, start in seen.items()):
             return
         time.sleep(0.05)
-    seen.update(_owned(roots))
+    look()
     _signal_all(seen, signal.SIGKILL)
 
 
@@ -345,9 +394,11 @@ class Job:
         self.timed_out = False
         self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=self.out,
                                      stderr=subprocess.STDOUT, start_new_session=True)
+        self.start = _start_of(self.proc.pid)
+        self.halted = False
 
     def stop(self, grace):
-        stop_all([self.proc.pid], grace)
+        stop_all({self.proc.pid: self.start}, grace)
         self.reap(grace)
 
     def reap(self, grace):
@@ -368,7 +419,8 @@ class Job:
 
 def run_discovery(a, workdir, active):
     path = os.path.join(workdir, "discovery.json")
-    job = Job("discovery", [sys.executable, RUNNER, "--_discover", path, str(a.directory)],
+    job = Job("discovery", [sys.executable, RUNNER, "--_discover", str(os.getpid()), str(a.grace),
+                            path, str(a.directory)],
               a.discover_timeout, workdir)
     active.append(job)
     try:
@@ -402,9 +454,12 @@ def plan_units(description, split):
     missing = [m for m in split if m not in labels]
     if missing:
         raise SystemExit(f"unittest-parallel: no module {', '.join(missing)} in the suite")
+    if description["serial"]:
+        print(f"unittest-parallel: the whole suite runs in one process, since {description['serial']}")
+        return [("the whole suite", -1, -1)], []
     first, last = [], []
     for i, u in enumerate(units):
-        if not u["leaves"]:
+        if u["inert"]:
             continue
         if u["label"] in split and u["split"] is None:
             first += [(leaf, i, j, 1 << 40) for j, leaf in enumerate(u["leaves"])]
@@ -436,7 +491,9 @@ def main(argv=None):
     if argv is None:
         argv = sys.argv[1:]
     if argv[:1] == ["--_discover"]:
-        return discover_main(argv[2], argv[1])
+        parent, grace, out, directory = argv[1:]
+        _die_with_parent(int(parent), float(grace))
+        return discover_main(directory, out)
     if argv[:1] == ["--_unit"]:
         parent, grace, plan, index, split, record, absorb, directory = argv[1:]
         _die_with_parent(int(parent), float(grace))
@@ -453,8 +510,8 @@ def main(argv=None):
     if a.jobs < 1:
         ap.error("--jobs must be at least 1")
     for opt in ("unit_timeout", "discover_timeout", "grace"):
-        if not getattr(a, opt) > 0:
-            ap.error(f"--{opt.replace('_', '-')} must be more than 0")
+        if not (math.isfinite(getattr(a, opt)) and getattr(a, opt) > 0):
+            ap.error(f"--{opt.replace('_', '-')} must be a finite number of seconds more than 0")
     old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     if a.keep:
         a.keep.mkdir(parents=True, exist_ok=True)
@@ -466,7 +523,7 @@ def main(argv=None):
         return supervise(a, workdir, active)
     except Interrupted as e:
         names = " ".join(job.name for job in active)
-        stop_all([job.proc.pid for job in active], a.grace)
+        stop_all({job.proc.pid: job.start for job in active}, a.grace)
         for job in active:
             job.reap(a.grace)
         print(f"unittest-parallel: interrupted by signal {e.signum}, stopped: {names or 'nothing'}", flush=True)
@@ -515,10 +572,15 @@ def supervise(a, workdir, active):
                     record = json.load(f)
             except ValueError:
                 record = {"complete": False}
-        leaves = units[job.index]["leaves"]
+        if job.index < 0:
+            leaves = [leaf for u in units for leaf in u["leaves"]]
+        else:
+            leaves = units[job.index]["leaves"]
         assigned = leaves if job.split < 0 else [leaves[job.split]]
         if job.timed_out:
             why = f"deadline of {a.unit_timeout:g} s passed"
+        elif job.halted:
+            why = "stopped when another unit passed its deadline"
         else:
             why = check(record, assigned, exports)
         n = record.get("testsRun", 0) if record else 0
@@ -536,6 +598,8 @@ def supervise(a, workdir, active):
             for m, value in record.get("exports", {}).items():
                 absorbed.setdefault(m, []).append((job.name, value))
 
+    not_started = []
+
     def drain(queue, absorb_for):
         while queue or active:
             while queue and len(active) < a.jobs:
@@ -543,16 +607,28 @@ def supervise(a, workdir, active):
                 start(queue.pop(0), absorb_for())
             time.sleep(0.05)
             _check_stop()
+            late = [job for job in active if job.proc.poll() is None and time.monotonic() >= job.end]
+            if late:
+                # A unit past its deadline stops the run: no more units start, and the active
+                # ones stop together, so hung units cannot take one deadline after another.
+                for job in active:
+                    job.timed_out = job in late
+                    job.halted = job not in late
+                not_started.extend(w[0] for w in queue)
+                queue.clear()
+                stop_all({job.proc.pid: job.start for job in active}, a.grace)
+                for job in active:
+                    job.reap(a.grace)
             for job in list(active):
-                if job.proc.poll() is None and time.monotonic() >= job.end:
-                    job.timed_out = True
-                    job.stop(a.grace)
-                if job.proc.poll() is not None:
+                if job.proc.poll() is not None or job.timed_out or job.halted:
                     active.remove(job)
                     finish(job)
 
     drain(list(first), lambda: "")
     absorb_path = ""
+    if not_started:
+        not_started.extend(w[0] for w in last)
+        last = []
     if last:
         absorb_path = os.path.join(workdir, "absorb.json")
         _write_json(absorb_path, absorbed)
@@ -560,6 +636,8 @@ def supervise(a, workdir, active):
     work = len(first) + len(last)
     print(f"unittest-parallel: {totals['testsRun']} tests in {work} processes, {a.jobs} at a time, "
           f"{time.monotonic() - t0:.1f} s")
+    if not_started:
+        print(f"unittest-parallel: not started after a deadline: {' '.join(not_started)}")
     if failed:
         print(f"unittest-parallel: failed: {' '.join(failed)}")
         return 1

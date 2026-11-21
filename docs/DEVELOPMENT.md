@@ -376,8 +376,10 @@ tests serially and reaches the same verdict. The runner discovers the suite once
 child process and then starts one process per module or package that discovery loads. Each
 process discovers the whole suite again, checks that it found the same tests in the same
 order, and runs its own part exactly as discovered. Import errors, import-time skips,
-`load_tests` hooks, test classes imported into another module and class and module
-fixtures therefore behave as they do serially. The three long tests of `test_x08_latency`
+`load_tests` hooks, custom suites and class and module fixtures therefore behave as they
+do serially. When a test class runs under more than one module, as when one test module
+imports another's class, its runs can share state, so the whole suite runs in one process
+and the runner says why. The three long tests of `test_x08_latency`
 run one per process. A module named with `--split` is split this way only when it has no
 fixtures, custom suites, imported classes or repeated tests, and otherwise runs whole with
 a note that says why.
@@ -388,9 +390,12 @@ a complete record fails, and a run in which no test ran and none was skipped exi
 unittest does. The process-leak check in `test_zz_process_leaks.py` runs once, after every
 other process, on the unwaited subprocesses that each process reports after its tests and
 teardown. Discovery has a 300 s deadline and each process a 900 s deadline, which
-`--discover-timeout` and `--unit-timeout` change. At a deadline, or on SIGINT or SIGTERM,
-the runner stops the process's group and every descendant it can find, with SIGKILL after
-a grace period that `--grace` sets, and fails the run.
+`--discover-timeout` and `--unit-timeout` change. At a deadline, or on SIGINT, SIGTERM or
+SIGHUP, the runner starts no more processes, stops every active one with its group and the
+descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
+the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
+stop their own descendants. `--keep DIR` keeps the discovery, the plan, each process's
+output and the result records.
 
 Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
 `test_git_isolation.py` fails when one does not. The import removes the host's `GIT_*`

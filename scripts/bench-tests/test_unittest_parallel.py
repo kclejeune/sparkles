@@ -10,6 +10,7 @@ the processes the tests started are gone afterwards, and that an unrelated proce
 """
 
 import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest import mock
 
 import process_checks
 
@@ -244,7 +246,47 @@ class Discovery(Base):
         d = self.suite(test_a=FAIL, test_b="from test_a import B\n")
         s, p = self.same_verdict(d, expect=1)
         self.assertIn("failures=2", s.stderr)
-        self.assertIn("failed: test_a test_b", p.stdout)
+        self.assertIn("the whole suite runs in one process, since test_a.B runs in 2", p.stdout)
+        self.assertIn("failed: the whole suite", p.stdout)
+
+    def test_an_imported_class_keeps_its_state_across_occurrences(self):
+        # The second occurrence sees the first one's count in serial discovery and fails.
+        d = self.suite(test_a="""
+            import unittest
+
+            COUNT = []
+
+            class A(unittest.TestCase):
+                def test_once(self):
+                    COUNT.append(1)
+                    self.assertEqual(len(COUNT), 1)
+            """, test_b="from test_a import A\n", test_c=ONE)
+        self.same_verdict(d, expect=1)
+        self.same_verdict(d, "--jobs", "1", expect=1)
+
+    def test_an_empty_custom_suite_still_runs(self):
+        d = self.suite(test_a=ONE, test_gen="""
+            import unittest
+
+            class Checking(unittest.TestSuite):
+                def run(self, result, debug=False):
+                    result.testsRun += 1
+                    result.addFailure(self, (AssertionError, AssertionError("checked"), None))
+                    return result
+
+                def id(self):
+                    return "test_gen.Checking"
+
+                def __str__(self):
+                    return "test_gen.Checking"
+
+                def shortDescription(self):
+                    return None
+
+            def load_tests(loader, tests, pattern):
+                return Checking()
+            """)
+        self.same_verdict(d, expect=1)
 
     def test_a_repeated_occurrence_runs_each_time(self):
         d = self.suite(test_rep="""
@@ -625,11 +667,84 @@ class Deadlines(Base):
         self.assertTrue((run / "plan.json").exists())
         self.assertEqual(len(list(run.glob("record-*.json"))), 2)
 
-    def test_deadlines_must_be_positive(self):
+    def test_a_deadline_stops_the_run_and_admits_no_more_units(self):
+        marker = self.pids.parent / f"{self.pids.name}-marker"
+        self.addCleanup(lambda: marker.unlink(missing_ok=True))
+        # The hung module is the larger file, so it starts first.
+        d = self.suite(test_hang=HANG.format(pids=str(self.pids)), test_mark=f"""
+            import unittest
+            from pathlib import Path
+
+            class M(unittest.TestCase):
+                def test_mark(self):
+                    Path({str(marker)!r}).write_text("")
+            """)
+        p = self.run_runner("--jobs", "1", "--unit-timeout", "4", "--grace", "1", str(d), timeout=60)
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn("not started after a deadline: test_mark", p.stdout)
+        self.assertFalse(marker.exists())
+        self.assert_owned_gone(3)
+
+    def test_discovery_ends_when_the_runner_is_killed(self):
+        d = self.suite(test_a=ONE, test_slow=f"""
+            import os, threading
+            from pathlib import Path
+            (Path({str(self.pids)!r}) / f"discover.{{os.getpid()}}").write_text("")
+            threading.Event().wait()
+            """)
+        p = subprocess.Popen([sys.executable, str(RUNNER), "--grace", "1", str(d)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            end = time.monotonic() + 60
+            while not self.recorded() and time.monotonic() < end:
+                time.sleep(0.1)
+            self.assertEqual(len(self.recorded()), 1)
+        finally:
+            p.kill()
+            p.wait(timeout=30)
+        self.assert_owned_gone(1)
+
+    def test_deadlines_must_be_positive_and_finite(self):
         d = self.suite(test_a=ONE)
         for opt in ("--unit-timeout", "--discover-timeout", "--grace"):
-            p = self.run_runner(opt, "0", str(d))
-            self.assertEqual(p.returncode, 2, opt + p.stderr)
+            for value in ("0", "inf", "nan"):
+                p = self.run_runner(opt, value, str(d))
+                self.assertEqual(p.returncode, 2, opt + value + p.stderr)
+
+
+class Identity(unittest.TestCase):
+    """The process search keeps each process's identity, so a reused pid is never signalled."""
+
+    def setUp(self):
+        spec = importlib.util.spec_from_file_location("unittest_parallel_under_test", RUNNER)
+        self.rp = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.rp)
+
+    def test_a_reused_root_pid_is_not_signalled(self):
+        # Root 4000001 started at 10 and its child 4000002 at 11. During the grace period both
+        # pids come to name new processes, started at 50 and 51, which must be left alone.
+        tables = [{4000001: (1, 4000001, 4000001, 10), 4000002: (4000001, 4000001, 4000001, 11)}] * 2
+        later = {4000001: (1, 4000001, 4000001, 50), 4000002: (4000001, 4000001, 4000001, 51)}
+        sent = []
+        current = []
+
+        def table():
+            current[:] = [tables.pop(0) if tables else later]
+            return current[0]
+
+        def kill(pid, sig):
+            # The start time of the process the pid named when the runner last looked.
+            sent.append((pid, sig, current[0][pid][3]))
+
+        with mock.patch.object(self.rp, "_process_table", table), mock.patch.object(self.rp.os, "kill", kill):
+            self.rp.stop_all({4000001: 10}, 0.2)
+        self.assertTrue(sent)
+        self.assertEqual([(pid, sig) for pid, sig, start in sent if start >= 50], [])
+        self.assertEqual({pid for pid, sig, _ in sent if sig == signal.SIGTERM}, {4000001, 4000002})
+
+    def test_a_root_whose_pid_names_another_process_owns_nothing(self):
+        table = {4000001: (1, 4000001, 4000001, 50), 4000002: (4000001, 4000001, 4000001, 51)}
+        self.assertEqual(self.rp._owned({4000001: 10}, table), {})
 
 
 if __name__ == "__main__":
