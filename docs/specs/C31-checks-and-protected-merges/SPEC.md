@@ -83,6 +83,26 @@ SHACL-SPARQL literals. Gate results attach to the merge response, the task detai
 run record in the merge commit, and [item 1139](../../ROADMAP.md) adds a first-class merge
 request.
 
+The Rust gate runner evaluates standalone queries and supported SHACL and ShEx checks
+against the candidate. These checks refuse `SERVICE` even inside an expression. SHACL
+queries read the selected candidate data and refuse explicit `GRAPH`, `FROM` and
+`FROM NAMED` clauses. The SHACL profile also refuses unsupported and malformed targets,
+conflicting node-expression forms and malformed SPARQL constraint deactivation flags.
+ShEx refuses semantic actions and fixed blank-node data selectors. Its SPARQL selectors
+read the full validation data as their default graph and have no named graphs. The
+[reasoning and validation guide](../../reasoning/README.md#gate-suite-validation)
+describes the supported profiles.
+
+The controlled Rust runner shares one deadline and produced-row allowance across each
+check's setup and queries, and bounds retained validation results including SHACL
+details. The deadline covers SHACL list and property path compilation, SPARQL path
+substitution, pinned shapes reads, and physical scans for targets and their
+conformance probes. Each embedded SHACL query's memory ceiling includes preparing
+its default graph IDs and retaining the graph filter shared by its plan. ShEx also shares its
+query memory ceiling across preparation, FOCUS scan
+workspace and retained selector output. Diagnostics with materialized inference reading
+turned off exclude the inferred graph even when the store's SPARQL default is a union.
+
 A suite can name a `chk:UnsatisfiableClassesCheck`, which parses and counts in the suite's
 revision, but no build runs it. Its result is an error with the code `check-unavailable`,
 so a required one fails the suite. The OWL reader cannot yet read a terminology with the

@@ -12,6 +12,9 @@ use super::ctx::Ctx;
 use super::exec::PlanPattern;
 use super::expr::{Compiler, ExistsSpec, Expr};
 use super::table::{Table, VarId};
+use crate::access::{
+    Preparation, PreparationBuffer, PreparationMap, PreparationText, Reservation, sort_by_prepared,
+};
 use crate::error::{Error, Result};
 use crate::id::{Id, Tag};
 use crate::index::{G, O, P, Perm, S};
@@ -23,6 +26,8 @@ use spargebra::algebra::{
     PropertyPathExpression,
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
+use std::cell::OnceCell;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// The graph that triple patterns are matched against.
@@ -35,7 +40,7 @@ pub enum ActiveGraph {
     Var(VarId),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub enum GraphFilter {
     /// no restriction (graph is an output column or the prefix)
     All,
@@ -44,6 +49,96 @@ pub enum GraphFilter {
     Named,
     One(u64),
     Set(Vec<u64>),
+    PreparedSet(Arc<PreparedGraphSet>),
+}
+
+/// Canonical graph IDs retained by checked plan filters and their clones.
+pub struct PreparedGraphSet {
+    ids: Vec<u64>,
+    _held: Reservation,
+}
+
+impl PreparedGraphSet {
+    fn new(preparation: &Preparation, set: &[Id]) -> Result<Arc<Self>> {
+        let bytes = (set.len() as u64)
+            .checked_mul(size_of::<u64>() as u64)
+            .and_then(|bytes| {
+                bytes.checked_add((size_of::<Self>() + 2 * size_of::<usize>()) as u64)
+            })
+            .ok_or_else(|| preparation.exhausted())?;
+        let held = preparation.reserve(bytes)?;
+        let mut ids = Vec::new();
+        ids.try_reserve_exact(set.len())
+            .map_err(|_| preparation.exhausted())?;
+        if ids.capacity() != set.len() {
+            return Err(preparation.exhausted());
+        }
+        let mut ordered = true;
+        for &id in set {
+            preparation.check()?;
+            if let Some(&last) = ids.last() {
+                ordered &= last <= id.0;
+                if last == id.0 {
+                    continue;
+                }
+            }
+            ids.push(id.0);
+        }
+        if !ordered {
+            sort_by_prepared(&mut ids, preparation, |a, b| Ok(a.cmp(b)))?;
+            let mut unique = 1;
+            for at in 1..ids.len() {
+                preparation.check()?;
+                if ids[at] != ids[unique - 1] {
+                    ids[unique] = ids[at];
+                    unique += 1;
+                }
+            }
+            ids.truncate(unique);
+        }
+        preparation.check()?;
+        Ok(Arc::new(Self { ids, _held: held }))
+    }
+}
+
+impl std::fmt::Debug for PreparedGraphSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.ids, f)
+    }
+}
+
+impl PartialEq for GraphFilter {
+    fn eq(&self, other: &Self) -> bool {
+        use GraphFilter::*;
+        match (self, other) {
+            (All, All) | (Default, Default) | (Named, Named) => true,
+            (One(a), One(b)) => a == b,
+            (Set(a), Set(b)) => a == b,
+            (PreparedSet(a), PreparedSet(b)) => Arc::ptr_eq(a, b) || a.ids == b.ids,
+            (Set(a), PreparedSet(b)) | (PreparedSet(b), Set(a)) => *a == b.ids,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for GraphFilter {}
+
+impl Hash for GraphFilter {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            Self::All => 0u8.hash(state),
+            Self::Default => 1u8.hash(state),
+            Self::Named => 2u8.hash(state),
+            Self::One(id) => {
+                3u8.hash(state);
+                id.hash(state);
+            }
+            Self::Set(_) | Self::PreparedSet(_) => {
+                4u8.hash(state);
+                self.set_ids().hash(state);
+            }
+        }
+    }
 }
 
 impl GraphFilter {
@@ -55,13 +150,26 @@ impl GraphFilter {
             GraphFilter::Named => g != Id::DEFAULT_GRAPH.0,
             GraphFilter::One(x) => g == *x,
             GraphFilter::Set(s) => s.binary_search(&g).is_ok(),
+            GraphFilter::PreparedSet(s) => s.ids.binary_search(&g).is_ok(),
         }
     }
+
+    pub(crate) fn set_ids(&self) -> Option<&[u64]> {
+        match self {
+            Self::Set(ids) => Some(ids),
+            Self::PreparedSet(set) => Some(&set.ids),
+            _ => None,
+        }
+    }
+
     /// Whether rows of several graphs can pass (so equal triples may repeat).
     pub fn multi(&self) -> bool {
         matches!(
             self,
-            GraphFilter::All | GraphFilter::Named | GraphFilter::Set(_)
+            GraphFilter::All
+                | GraphFilter::Named
+                | GraphFilter::Set(_)
+                | GraphFilter::PreparedSet(_)
         )
     }
 }
@@ -347,6 +455,20 @@ pub struct PathSpec {
     pub src: Option<Arc<PlanPattern>>,
 }
 
+/// The admitted backing table for checked GRAPH name enumeration.
+pub struct PreparedGraphNames {
+    pub(super) table: Table,
+    _held: Reservation,
+}
+
+/// A checked per-graph group. Planner alternatives share the immutable branches.
+pub struct PreparedGraphBranches {
+    pub(super) inputs: Vec<Node>,
+    pub(super) contains_algorithm: bool,
+    max_depth: usize,
+    _held: Reservation,
+}
+
 // `Values` / `Scan` are much larger than the other variants; nodes are few, so this is fine.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
@@ -357,6 +479,8 @@ pub enum Kind {
     /// ORDER BY + LIMIT over a scan, read in value order (see [`OrderedTopK`])
     OrderedTopK(Box<OrderedTopK>),
     Values(Table),
+    GraphNames(Arc<PreparedGraphNames>),
+    GraphBranches(Arc<PreparedGraphBranches>),
     Empty,
     Join {
         algo: JoinAlgo,
@@ -570,7 +694,12 @@ impl Node {
         let mut todo = vec![(self, 1)];
         while let Some((n, d)) = todo.pop() {
             deepest = deepest.max(d);
-            todo.extend(n.children.iter().map(|c| (c, d + 1)));
+            if let Kind::GraphBranches(branches) = &n.kind {
+                let depth = if branches.inputs.len() == 1 { d - 1 } else { d };
+                deepest = deepest.max(depth + branches.max_depth);
+            } else {
+                todo.extend(n.children.iter().map(|c| (c, d + 1)));
+            }
         }
         deepest
     }
@@ -611,12 +740,35 @@ impl Node {
             .clamp(1.0, self.est.max(1.0))
     }
 
+    pub(super) fn graph_diagnostic_children(&self) -> &[Node] {
+        match &self.kind {
+            Kind::GraphBranches(branches) => &branches.inputs,
+            Kind::OrderedTopK(top) => std::slice::from_ref(top.fallback.as_ref()),
+            _ => &self.children,
+        }
+    }
+
+    pub(super) fn graph_singleton(&self) -> Option<&Node> {
+        if let Kind::GraphBranches(branches) = &self.kind
+            && let [branch] = branches.inputs.as_slice()
+        {
+            Some(branch)
+        } else {
+            None
+        }
+    }
+
     pub fn operator(&self) -> &'static str {
+        if let Some(branch) = self.graph_singleton() {
+            return branch.operator();
+        }
         match &self.kind {
             Kind::Scan(_) => "IndexScan",
             Kind::RangeScan(..) => "IndexRangeScan",
             Kind::OrderedTopK(_) => "IndexTopK",
             Kind::Values(_) => "Values",
+            Kind::GraphNames(_) => "GraphNames",
+            Kind::GraphBranches(_) => "GraphBranches",
             Kind::Empty => "Empty",
             Kind::Join {
                 algo: JoinAlgo::Merge,
@@ -709,13 +861,107 @@ enum Item {
     Node(Node),
 }
 
-#[derive(Clone)]
+#[cfg(test)]
+pub(super) fn graph_item_slots_bytes(slots: usize) -> usize {
+    slots * size_of::<Item>()
+}
+
+/// A vector whose backing stays admitted until its slots are actually dropped.
+enum PlanningVec<T> {
+    Ordinary(Vec<T>),
+    Checked(PreparationBuffer<T>),
+}
+
+impl<T> PlanningVec<T> {
+    fn push(&mut self, value: T) -> Result<()> {
+        match self {
+            Self::Ordinary(values) => {
+                values.push(value);
+                Ok(())
+            }
+            Self::Checked(values) => {
+                values.push_staged(value, Some("growing checked graph planning buffer"))
+            }
+        }
+    }
+
+    fn into_parts(self) -> (Vec<T>, Option<Reservation>) {
+        match self {
+            Self::Ordinary(values) => (values, None),
+            Self::Checked(values) => {
+                let (values, held) = values.into_parts();
+                (values, Some(held))
+            }
+        }
+    }
+
+    fn remove(&mut self, index: usize) -> T {
+        match self {
+            Self::Ordinary(values) => values.remove(index),
+            Self::Checked(values) => values.remove(index),
+        }
+    }
+}
+
+impl<T> std::ops::Deref for PlanningVec<T> {
+    type Target = [T];
+
+    fn deref(&self) -> &[T] {
+        match self {
+            Self::Ordinary(values) => values,
+            Self::Checked(values) => values,
+        }
+    }
+}
+
+impl<T> std::ops::DerefMut for PlanningVec<T> {
+    fn deref_mut(&mut self) -> &mut [T] {
+        match self {
+            Self::Ordinary(values) => values,
+            Self::Checked(values) => values,
+        }
+    }
+}
+
+struct PlanningItems<T> {
+    values: std::vec::IntoIter<T>,
+    _held: Option<Reservation>,
+}
+
+impl<T> Iterator for PlanningItems<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.values.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.values.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for PlanningItems<T> {}
+
+impl<T> IntoIterator for PlanningVec<T> {
+    type Item = T;
+    type IntoIter = PlanningItems<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let (values, held) = self.into_parts();
+        PlanningItems {
+            values: values.into_iter(),
+            _held: held,
+        }
+    }
+}
+
 struct PathItem {
     s: PT,
     path: PropertyPathExpression,
     o: PT,
     graph: ActiveGraph,
     src: Option<Arc<PlanPattern>>,
+    _held: Option<Reservation>,
 }
 
 pub(super) const FILTER_SELECTIVITY: f64 = 0.3;
@@ -725,6 +971,11 @@ const POINT_ROWS: f64 = 4.0;
 
 pub struct Planner<'a> {
     pub ctx: &'a Ctx,
+    default_filter: OnceCell<Arc<PreparedGraphSet>>,
+    named_filter: OnceCell<Arc<PreparedGraphSet>>,
+    checked_exists: std::cell::RefCell<Option<super::checked_syntax::Sources>>,
+    branch_payload: std::cell::RefCell<Option<Reservation>>,
+    branch_shared_payload: std::cell::RefCell<Option<Reservation>>,
     pub subst: FxHashMap<VarId, Id>,
     /// The variables of `subst` that a sub-select hides unless it projects them: a
     /// `LATERAL`'s substitutions, where a variable a sub-select does not project is a
@@ -796,6 +1047,11 @@ impl<'a> Planner<'a> {
     pub fn new(ctx: &'a Ctx) -> Planner<'a> {
         Planner {
             ctx,
+            default_filter: OnceCell::new(),
+            named_filter: OnceCell::new(),
+            checked_exists: Default::default(),
+            branch_payload: Default::default(),
+            branch_shared_payload: Default::default(),
             subst: FxHashMap::default(),
             scoped: FxHashSet::default(),
             property_inputs: FxHashSet::default(),
@@ -838,9 +1094,8 @@ impl<'a> Planner<'a> {
 
     pub fn compile(&self, e: &Expression, graph: &ActiveGraph) -> Expr {
         let ctx = self.ctx;
-        let g = graph.clone();
         let subst = &self.subst;
-        let exists = move |p: &GraphPattern| -> Arc<ExistsSpec> {
+        let exists = |p: &GraphPattern| -> Arc<ExistsSpec> {
             let mut names = Vec::new();
             collect_pattern_vars(p, &mut names);
             let mut vars: Vec<VarId> = names.iter().map(|n| ctx.var(n)).collect();
@@ -850,14 +1105,313 @@ impl<'a> Planner<'a> {
                 .iter()
                 .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
                 .collect();
-            Arc::new(ExistsSpec::new(p.clone(), g.clone(), vars, bound))
+            Arc::new(ExistsSpec::new(p.clone(), graph.clone(), vars, bound))
         };
         Compiler {
             ctx,
-            subst: &self.subst,
+            subst,
             exists: &exists,
         }
         .compile(e)
+    }
+
+    fn compile_in_branch(&self, e: &Expression, graph: &ActiveGraph) -> Result<Expr> {
+        if self.checked_exists.borrow().is_none() {
+            return Ok(self.compile(e, graph));
+        }
+        let ctx = self.ctx;
+        let subst = &self.subst;
+        let preparation = ctx
+            .source_preparation
+            .as_ref()
+            .expect("checked graph planning");
+        let exists = |p: &GraphPattern| -> Result<Arc<ExistsSpec>> {
+            let pattern = self
+                .checked_exists
+                .borrow_mut()
+                .as_mut()
+                .expect("graph syntax registry")
+                .get(p, preparation)?;
+            let mut ids = PreparationBuffer::new(preparation)?;
+            let mut status = Ok(());
+            visit_pattern_vars(p, &mut |name| {
+                if status.is_ok() {
+                    status = ctx
+                        .var_prepared(name, preparation)
+                        .and_then(|id| ids.push(id));
+                }
+            });
+            status?;
+            sort_by_prepared(&mut ids, preparation, |a, b| Ok(a.cmp(b)))?;
+            ids.dedup();
+            let bound_len = ids.iter().filter(|id| subst.contains_key(id)).count();
+            let held = ExistsSpec::reserve_checked(preparation, ids.len(), bound_len)?;
+            let mut vars = Vec::with_capacity(ids.len());
+            let mut bound = Vec::with_capacity(bound_len);
+            for &id in &*ids {
+                preparation.check()?;
+                vars.push(id);
+                if let Some(value) = subst.get(&id) {
+                    bound.push((id, *value));
+                }
+            }
+            Ok(Arc::new(ExistsSpec::new_checked(
+                pattern,
+                graph.clone(),
+                vars,
+                bound,
+                held,
+            )))
+        };
+        super::expr::compile_expression(
+            ctx,
+            subst,
+            &exists,
+            &|expr| self.admit_expression(expr),
+            &|name| ctx.var_prepared(name, preparation),
+            e,
+        )
+    }
+
+    pub(super) fn planning_scratch(
+        &self,
+        measure: impl FnOnce(&mut super::checked_layout::Layout<'_>) -> Result<()>,
+    ) -> Result<Option<Reservation>> {
+        let active = self.branch_payload.borrow();
+        let Some(held) = active.as_ref() else {
+            return Ok(None);
+        };
+        let preparation = held.preparation();
+        let mut layout = super::checked_layout::Layout::new(preparation);
+        measure(&mut layout)?;
+        preparation.reserve(layout.bytes()).map(Some)
+    }
+
+    /// Keep `held`, the credit for storage that the plan being made keeps, for as long
+    /// as the checked branch's other plan storage.
+    pub(super) fn retain_planning(&self, held: Reservation) {
+        match self.branch_payload.borrow_mut().as_mut() {
+            Some(credit) => credit.merge(held),
+            None => drop(held),
+        }
+    }
+
+    /// Plan `gp` on the default graph as a checked graph branch is planned, with fresh
+    /// credit from `preparation`, for the tests that compare the two routes.
+    #[cfg(test)]
+    pub(super) fn plan_admitted_for_test(
+        &mut self,
+        gp: &GraphPattern,
+        preparation: &Preparation,
+    ) -> Result<Node> {
+        let previous = self.branch_payload.replace(Some(preparation.reserve(0)?));
+        let previous_shared = self
+            .branch_shared_payload
+            .replace(Some(preparation.reserve(0)?));
+        let node = self.plan(gp, &ActiveGraph::Default, Vec::new());
+        self.branch_payload.replace(previous);
+        self.branch_shared_payload.replace(previous_shared);
+        node
+    }
+
+    /// Report a checked planning phase, which rechecks the request's controls. The
+    /// ordinary route reports nothing.
+    pub(super) fn planning_stage(&self, phase: &str) -> Result<()> {
+        let preparation = match self.branch_payload.borrow().as_ref() {
+            Some(held) => held.preparation().clone(),
+            None => return Ok(()),
+        };
+        preparation.stage(phase)
+    }
+
+    fn planning_vec<T>(&self) -> Result<PlanningVec<T>> {
+        if let Some(held) = self.branch_payload.borrow().as_ref() {
+            Ok(PlanningVec::Checked(PreparationBuffer::new(
+                held.preparation(),
+            )?))
+        } else {
+            Ok(PlanningVec::Ordinary(Vec::new()))
+        }
+    }
+
+    fn admit_payload(
+        &self,
+        measure: impl FnOnce(&mut super::checked_layout::Layout<'_>) -> Result<()>,
+    ) -> Result<()> {
+        if let Some(credit) = self.branch_payload.borrow_mut().as_mut() {
+            let mut layout = super::checked_layout::Layout::new(credit.preparation());
+            measure(&mut layout)?;
+            let bytes = layout.bytes();
+            credit.grow_by(bytes)?;
+        }
+        Ok(())
+    }
+
+    fn admit_expression(&self, expr: &Expression) -> Result<()> {
+        use Expression as E;
+        if let E::Literal(literal) = expr
+            && let Some(credit) = self.branch_shared_payload.borrow_mut().as_mut()
+        {
+            // The Value built for a literal holds its lexeme and optional type
+            // or language in Arcs. Join alternatives share these payloads.
+            let mut layout = super::checked_layout::Layout::new(credit.preparation());
+            layout.add(literal.value().len())?;
+            layout.add(literal.datatype().as_str().len())?;
+            layout.add(4 * size_of::<usize>())?;
+            if let Some(lang) = literal.language() {
+                layout.add(lang.len())?;
+            }
+            let bytes = layout.bytes();
+            credit.grow_by(bytes)?;
+        }
+        self.admit_payload(|layout| {
+            let boxed = match expr {
+                E::Or(..)
+                | E::And(..)
+                | E::Equal(..)
+                | E::SameTerm(..)
+                | E::Greater(..)
+                | E::GreaterOrEqual(..)
+                | E::Less(..)
+                | E::LessOrEqual(..)
+                | E::Add(..)
+                | E::Subtract(..)
+                | E::Multiply(..)
+                | E::Divide(..) => 2,
+                E::UnaryPlus(_) | E::UnaryMinus(_) | E::Not(_) | E::In(..) => 1,
+                E::If(..) => 3,
+                E::NamedNode(_)
+                | E::Literal(_)
+                | E::Variable(_)
+                | E::Exists(_)
+                | E::Bound(_)
+                | E::Coalesce(_)
+                | E::FunctionCall(..) => 0,
+            };
+            layout.slots::<Expr>(boxed)?;
+            let args = match expr {
+                E::In(_, args) | E::Coalesce(args) | E::FunctionCall(_, args) => args.len(),
+                _ => 0,
+            };
+            if args > 0 {
+                // Fallible collection grows geometrically. At growth the old
+                // allocation can coexist with its replacement.
+                let slots = args
+                    .checked_next_power_of_two()
+                    .and_then(|size| size.max(4).checked_mul(2))
+                    .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+                layout.slots::<Expr>(slots)?;
+            }
+            match expr {
+                E::NamedNode(node) => layout.add(node.as_str().len()),
+                E::Literal(literal) => {
+                    layout.add(literal.value().len())?;
+                    layout.add(literal.datatype().as_str().len())?;
+                    if let Some(lang) = literal.language() {
+                        layout.add(lang.len())?;
+                    }
+                    Ok(())
+                }
+                E::FunctionCall(spargebra::algebra::Function::Custom(iri), _) => {
+                    layout.add(iri.as_str().len())
+                }
+                _ => Ok(()),
+            }
+        })
+    }
+
+    fn branch_description(
+        &self,
+        write: impl FnOnce(&mut dyn std::fmt::Write) -> std::fmt::Result,
+    ) -> Result<String> {
+        if let Some(credit) = self.branch_payload.borrow_mut().as_mut() {
+            let mut text = PreparationText::new(credit.preparation())?;
+            let written = write(&mut text);
+            self.ctx.check()?;
+            let (desc, held) = text.finish()?;
+            if written.is_err() {
+                drop(desc);
+                return Err(Error::invalid("could not write a graph branch description"));
+            }
+            credit.merge(held);
+            return Ok(desc);
+        }
+        let mut text = String::new();
+        write(&mut text).expect("writing to String");
+        Ok(text)
+    }
+
+    fn branch_var(&self, name: &str) -> Result<VarId> {
+        if self.branch_payload.borrow().is_some() {
+            let preparation = self.ctx.source_preparation.as_ref().expect("checked GRAPH");
+            self.ctx.var_prepared(name, preparation)
+        } else {
+            Ok(self.ctx.var(name))
+        }
+    }
+
+    fn union_for_branch(&self, children: PlanningVec<Node>) -> Result<Node> {
+        let (children, storage) = children.into_parts();
+        let Some(storage) = storage else {
+            return Ok(union(children));
+        };
+        if children.len() < 2 {
+            let result = union(children);
+            drop(storage);
+            return Ok(result);
+        }
+        let checked = checked_union_shape(&children, storage.preparation());
+        let (mut out, shape) = match checked {
+            Ok(value) => value,
+            Err(error) => {
+                drop(children);
+                return Err(error);
+            }
+        };
+        let mut active = self.branch_payload.borrow_mut();
+        let held = active.as_mut().expect("checked graph union");
+        held.merge(storage);
+        held.merge(shape);
+        out.children = children;
+        Ok(out)
+    }
+
+    fn project_for_branch(&self, child: Node, vars: Vec<VarId>) -> Result<Node> {
+        if self.branch_payload.borrow().is_none() {
+            return Ok(project(child, vars, self.ctx));
+        }
+        self.admit_payload(|layout| {
+            layout.metadata(&child)?;
+            layout.slots::<Node>(1)?;
+            layout.slots::<VarId>(vars.len())?;
+            layout.slots::<VarId>(child.sorted.len())
+        })?;
+        let desc = self.branch_description(|text| {
+            let names = self.ctx.var_names.read();
+            for (index, var) in vars.iter().enumerate() {
+                if index != 0 {
+                    text.write_char(' ')?;
+                }
+                write!(text, "?{}", names[*var as usize])?;
+            }
+            Ok(())
+        })?;
+        Ok(project_described(child, vars, desc))
+    }
+
+    fn admit_binding_shape(&self, child: &Node, new_vars: usize) -> Result<()> {
+        self.admit_payload(|layout| {
+            layout.metadata(child)?;
+            layout.slots::<Node>(1)?;
+            let max = child
+                .vars
+                .len()
+                .checked_add(new_vars)
+                .and_then(|len| len.max(4).checked_mul(2))
+                .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+            layout.slots::<VarId>(max)?;
+            layout.map::<VarId, f64>(max)
+        })
     }
 
     fn var(&self, name: &str) -> PT {
@@ -914,10 +1468,11 @@ impl<'a> Planner<'a> {
             // Jena's `SERVICE <loop:…>`: evaluated per solution of the patterns before it
             GP::Join { left, right } if super::enhancer::is_loop(right) => {
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::enhancer::plan_loop(self, l, right, g, None)?;
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::LeftJoin {
                 left,
@@ -925,10 +1480,11 @@ impl<'a> Planner<'a> {
                 expression,
             } if super::enhancer::is_loop(right) => {
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::enhancer::plan_loop(self, l, right, g, Some(expression.clone()))?;
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::Bgp { .. } | GP::Path { .. } | GP::Join { .. } | GP::Graph { .. } => {
                 // a constant table joined with a UNION goes into each branch, where it
@@ -947,6 +1503,13 @@ impl<'a> Planner<'a> {
                 // the named graphs a table moving into `GRAPH ?g` is copied into, one
                 // plan of the inner pattern for each
                 let graphs = || {
+                    if self.ctx.selector_default_only {
+                        return 0;
+                    }
+                    if self.ctx.source_preparation.is_some() {
+                        // Suppress this speculative rewrite without enumerating named graphs.
+                        return usize::MAX;
+                    }
                     self.ctx.snap.graph_ids().map_or(usize::MAX, |ids| {
                         ids.iter()
                             .filter(|gid| {
@@ -968,7 +1531,7 @@ impl<'a> Planner<'a> {
                     // Preserve outer filters' ordinary evaluation boundary, including
                     // extension aliases and dynamic calls that might be volatile.
                     && filters.is_empty();
-                let mut items = Vec::new();
+                let mut items = self.planning_vec()?;
                 self.collect(gp, g, &mut items)?;
                 let original = self.plan_group(items, filters)?;
                 if consider_union
@@ -998,7 +1561,7 @@ impl<'a> Planner<'a> {
                 Ok(original)
             }
             GP::Lateral { left, right } if super::lateral::join_equivalent(self, left, right) => {
-                let mut items = Vec::new();
+                let mut items = self.planning_vec()?;
                 self.collect(gp, g, &mut items)?;
                 self.plan_group(items, filters)
             }
@@ -1006,22 +1569,39 @@ impl<'a> Planner<'a> {
                 // filters on variables every left row binds keep their value in the
                 // merged rows, as the right side cannot bind them differently
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::lateral::plan(self, l, right, g)?;
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::Filter { expr, inner } if self.ctx.calls_extensions => {
                 // Keep application calls at their algebra operator, including AND
                 // short-circuiting. No sampling, conjunct reordering or pushdown.
                 let child = self.plan(inner, g, Vec::new())?;
-                let expression = self.compile(expr, g);
-                let node = self.apply_filters(child, vec![expression]);
-                Ok(self.apply_filters(node, filters))
+                let expression = self.compile_in_branch(expr, g)?;
+                // On the checked route the list of one is admitted before it is made.
+                let (single, _single) = if self.branch_payload.borrow().is_none() {
+                    (vec![expression], list_credit(None))
+                } else {
+                    let mut single = Vec::new();
+                    let credit = self.grow_filters(&mut single, 1, 6, |s| s.push(expression))?;
+                    (single, credit)
+                };
+                let node = self.apply_filters(child, single)?;
+                self.apply_filters(node, filters)
             }
             GP::Filter { expr, inner } => {
                 let mut fs = filters;
-                fs.extend(self.compile(expr, g).conjuncts());
+                let compiled = self.compile_in_branch(expr, g)?;
+                if self.branch_payload.borrow().is_none() {
+                    fs.extend(compiled.conjuncts());
+                    return self.plan(inner, g, fs);
+                }
+                // The conjuncts join the list in place, which grows to its size first.
+                let more = compiled.conjunct_count();
+                let _grown =
+                    self.grow_filters(&mut fs, more, 0, |fs| compiled.conjuncts_into(fs))?;
                 self.plan(inner, g, fs)
             }
             GP::LeftJoin {
@@ -1034,10 +1614,11 @@ impl<'a> Planner<'a> {
                 // ARQ evaluates the OPTIONAL per left row, so that the property functions
                 // of the right side read the left side's values
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let n = super::lateral::plan_optional(self, l, right, expression.as_ref(), g)?;
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::LeftJoin {
                 left,
@@ -1045,24 +1626,29 @@ impl<'a> Planner<'a> {
                 expression,
             } => {
                 let certain = certain_vars(left, self.ctx);
-                let (push, top) = self.split_filters(filters, |v| certain.contains(v));
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |v| certain.contains(v))?;
                 let l = self.plan(left, g, push)?;
                 let r = self.plan(right, g, Vec::new())?;
-                let expr = expression.as_ref().map(|e| self.compile(e, g));
+                let expr = expression
+                    .as_ref()
+                    .map(|e| self.compile_in_branch(e, g))
+                    .transpose()?;
                 let n = left_join(l, r, expr, self.ctx);
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::Union { .. } => {
-                let mut branches = Vec::new();
-                flatten_union(gp, &mut branches);
-                let mut children = Vec::new();
-                for b in branches {
-                    let c = self.plan(b, g, filters.clone())?;
-                    if !c.is_empty() {
-                        children.push(c);
+                let mut branches = self.planning_vec()?;
+                flatten_union(gp, &mut branches)?;
+                let mut children = self.planning_vec()?;
+                for branch in branches {
+                    self.admit_payload(|layout| layout.expressions(&filters))?;
+                    let child = self.plan(branch, g, filters.clone())?;
+                    if !child.is_empty() {
+                        children.push(child)?;
                     }
                 }
-                Ok(union(children))
+                self.union_for_branch(children)
             }
             GP::SemiJoin { left, right } | GP::AntiJoin { left, right } => {
                 // the left side's solutions are kept unchanged, so a filter over the
@@ -1114,34 +1700,53 @@ impl<'a> Planner<'a> {
                 variable,
                 expression,
             } => {
-                let v = self.ctx.var(variable.as_str());
-                let (push, top) = self.split_filters(filters, |x| *x != v);
+                let v = self.branch_var(variable.as_str())?;
+                let (push, top, _push_list) = self.split_filters(filters, |x| *x != v)?;
                 let child = self.plan(inner, g, push)?;
-                let e = self.compile(expression, g);
-                let desc = format!("?{} := {}", variable.as_str(), e.display(self.ctx));
+                let e = self.compile_in_branch(expression, g)?;
+                self.admit_binding_shape(&child, 1)?;
+                let desc = self.branch_description(|text| {
+                    write!(text, "?{} := ", variable.as_str())?;
+                    e.write_description(self.ctx, text)
+                })?;
                 let mut n = Node::unary(Kind::Extend(v, e), child, desc);
                 n.vars.push(v);
                 n.dist.insert(v, n.est);
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::Assign {
                 inner,
                 variable,
                 expression,
             } => {
-                let v = self.ctx.var(variable.as_str());
-                let (push, top) = self.split_filters(filters, |x| *x != v);
+                let v = self.branch_var(variable.as_str())?;
+                let (push, top, _push_list) = self.split_filters(filters, |x| *x != v)?;
                 let child = self.plan(inner, g, push)?;
-                let e = self.compile(expression, g);
-                let desc = format!("?{} := {}", variable.as_str(), e.display(self.ctx));
+                let e = self.compile_in_branch(expression, g)?;
+                self.admit_binding_shape(&child, 1)?;
+                let desc = self.branch_description(|text| {
+                    write!(text, "?{} := ", variable.as_str())?;
+                    e.write_description(self.ctx, text)
+                })?;
                 if let Some(&c) = self.subst.get(&v) {
                     // the outer solution binds ?v (a LATERAL or EXISTS substitution): a
                     // different value drops the solution, and an error keeps it
-                    let keep = Expr::Coalesce(vec![
-                        Expr::Eq(Box::new(e), Box::new(Expr::Const(c))),
-                        Expr::Const(Id::from_bool(true)),
-                    ]);
-                    return Ok(self.apply_filters(filter(child, vec![keep], self.ctx), top));
+                    let n = {
+                        #[cfg(test)]
+                        let _stage = crate::test_alloc::Stage::within(6);
+                        // the test's list of two and its two boxes, and the FILTER's list
+                        let built = self.planning_scratch(|layout| layout.slots::<Expr>(5))?;
+                        let keep = Expr::Coalesce(vec![
+                            Expr::Eq(Box::new(e), Box::new(Expr::Const(c))),
+                            Expr::Const(Id::from_bool(true)),
+                        ]);
+                        let filters = vec![keep];
+                        if let Some(built) = built {
+                            self.retain_planning(built);
+                        }
+                        self.filter_admitted(child, filters)?
+                    };
+                    return self.apply_filters(n, top);
                 }
                 let n = if child.vars.contains(&v) {
                     // LET of a variable the pattern may bind: compared where it is bound
@@ -1155,7 +1760,7 @@ impl<'a> Planner<'a> {
                     n.dist.insert(v, n.est);
                     n
                 };
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::Unfold {
                 inner,
@@ -1163,20 +1768,24 @@ impl<'a> Planner<'a> {
                 variable,
                 second,
             } => {
-                let v = self.ctx.var(variable.as_str());
-                let w = second.as_ref().map(|s| self.ctx.var(s.as_str()));
-                let (push, top) = self.split_filters(filters, |x| *x != v && Some(*x) != w);
+                let v = self.branch_var(variable.as_str())?;
+                let w = second
+                    .as_ref()
+                    .map(|s| self.branch_var(s.as_str()))
+                    .transpose()?;
+                let (push, top, _push_list) =
+                    self.split_filters(filters, |x| *x != v && Some(*x) != w)?;
                 let child = self.plan(inner, g, push)?;
-                let e = self.compile(expression, g);
-                let desc = match second {
-                    Some(s) => format!(
-                        "{} AS ?{}, ?{}",
-                        e.display(self.ctx),
-                        variable.as_str(),
-                        s.as_str()
-                    ),
-                    None => format!("{} AS ?{}", e.display(self.ctx), variable.as_str()),
-                };
+                let e = self.compile_in_branch(expression, g)?;
+                self.admit_binding_shape(&child, 1 + usize::from(second.is_some()))?;
+                let desc = self.branch_description(|text| {
+                    e.write_description(self.ctx, text)?;
+                    write!(text, " AS ?{}", variable.as_str())?;
+                    if let Some(second) = second {
+                        write!(text, ", ?{}", second.as_str())?;
+                    }
+                    Ok(())
+                })?;
                 let mut n = Node::unary(
                     Kind::Unfold {
                         expr: e,
@@ -1193,12 +1802,16 @@ impl<'a> Planner<'a> {
                     n.vars.push(x);
                     n.dist.insert(x, n.est);
                 }
-                Ok(self.apply_filters(n, top))
+                self.apply_filters(n, top)
             }
             GP::Values {
                 variables,
                 bindings,
             } => {
+                if self.branch_payload.borrow().is_some() {
+                    let values = self.checked_values(variables, bindings)?;
+                    return self.apply_filters(values, filters);
+                }
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
                 let mut t = Table::new(vars.clone());
                 // a term repeated in the table is looked up once
@@ -1242,79 +1855,90 @@ impl<'a> Planner<'a> {
                 let est = t.len() as f64;
                 let mut n = Node::leaf(Kind::Values(t), vars, est, format!("{} rows", est));
                 n.certain = certain;
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::OrderBy { inner, expression } => {
                 let child = self.plan(inner, g, Vec::new())?;
-                // a variable that the initial bindings substitute is compiled to its
-                // constant, not to the column the BIND computes
-                let bound: Vec<_> = if self.ctx.opt.bound_order_keys {
-                    bound_expressions(inner)
-                        .into_iter()
-                        .filter(|(v, _)| !self.subst.contains_key(&self.ctx.var(v.as_str())))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                let keys = expression
-                    .iter()
-                    .map(|o| {
-                        let (e, asc) = match o {
-                            OrderExpression::Asc(e) => (e, true),
-                            OrderExpression::Desc(e) => (e, false),
-                        };
-                        let e = match bound.iter().find(|(_, x)| *x == e) {
-                            Some((v, _)) => self.compile(&Expression::Variable((*v).clone()), g),
-                            None => self.compile(e, g),
-                        };
-                        (e, asc)
-                    })
-                    .collect::<Vec<_>>();
-                let desc = keys
-                    .iter()
-                    .map(|(e, asc)| {
-                        format!(
-                            "{}({})",
-                            if *asc { "ASC" } else { "DESC" },
-                            e.display(self.ctx)
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" ");
+                let mut bound = self.planning_vec()?;
+                if self.ctx.opt.bound_order_keys {
+                    for (var, rhs) in bound_expressions(self, inner)? {
+                        if !self.subst.contains_key(&self.branch_var(var.as_str())?) {
+                            bound.push((var, rhs))?;
+                        }
+                    }
+                }
+                self.admit_payload(|layout| {
+                    layout.slots::<(Expr, bool)>(expression.len())?;
+                    layout.metadata(&child)?;
+                    layout.slots::<Node>(1)
+                })?;
+                let mut keys = Vec::with_capacity(expression.len());
+                for order in expression {
+                    let (expr, asc) = match order {
+                        OrderExpression::Asc(e) => (e, true),
+                        OrderExpression::Desc(e) => (e, false),
+                    };
+                    let e = match bound.iter().find(|(_, rhs)| *rhs == expr) {
+                        Some((var, _)) => {
+                            let var = self.branch_var(var.as_str())?;
+                            self.subst
+                                .get(&var)
+                                .map_or(Expr::Var(var), |id| Expr::Const(*id))
+                        }
+                        None => self.compile_in_branch(expr, g)?,
+                    };
+                    keys.push((e, asc));
+                }
+                let desc = self.branch_description(|text| {
+                    for (index, (key, asc)) in keys.iter().enumerate() {
+                        if index != 0 {
+                            text.write_char(' ')?;
+                        }
+                        text.write_str(if *asc { "ASC(" } else { "DESC(" })?;
+                        key.write_description(self.ctx, text)?;
+                        text.write_char(')')?;
+                    }
+                    Ok(())
+                })?;
                 let mut n = Node::unary(Kind::OrderBy { keys, limit: None }, child, desc);
                 n.sorted.clear();
                 n.cost += n.est * n.est.max(2.0).log2() * 0.5;
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Project { inner, variables } => {
                 // sub-select: fresh scope for blank node labels
                 self.bnode_scope += 1;
-                let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
-                // a LATERAL's substitution does not reach a variable the sub-select hides
-                let hidden: Vec<(VarId, Id)> = self
-                    .scoped
-                    .iter()
-                    .filter(|v| !vars.contains(v))
-                    .filter_map(|v| self.subst.get(v).map(|id| (*v, *id)))
-                    .collect();
-                for (v, _) in &hidden {
-                    self.subst.remove(v);
+                self.admit_payload(|layout| layout.slots::<VarId>(variables.len()))?;
+                let mut vars = Vec::with_capacity(variables.len());
+                for variable in variables {
+                    vars.push(self.branch_var(variable.as_str())?);
                 }
-                let hidden_inputs: Vec<_> = self
+                // A LATERAL's substitution does not reach variables hidden by the sub-select.
+                let mut hidden = self.planning_vec()?;
+                for v in self.scoped.iter().filter(|v| !vars.contains(v)) {
+                    if let Some(id) = self.subst.get(v) {
+                        hidden.push((*v, *id))?;
+                    }
+                }
+                let mut hidden_inputs = self.planning_vec()?;
+                for v in self
                     .property_inputs
                     .iter()
                     .filter(|v| self.scoped.contains(v) && !vars.contains(v))
-                    .copied()
-                    .collect();
-                for v in &hidden_inputs {
-                    self.property_inputs.remove(v);
+                {
+                    hidden_inputs.push(*v)?;
+                }
+                for (var, _) in hidden.iter() {
+                    self.subst.remove(var);
+                }
+                for var in hidden_inputs.iter() {
+                    self.property_inputs.remove(var);
                 }
                 let child = self.plan(inner, g, Vec::new());
                 self.property_inputs.extend(hidden_inputs);
                 self.subst.extend(hidden);
-                let child = child?;
-                let n = project(child, vars, self.ctx);
-                Ok(self.apply_filters(n, filters))
+                let n = self.project_for_branch(child?, vars)?;
+                self.apply_filters(n, filters)
             }
             GP::Distinct { inner } => {
                 // SELECT DISTINCT ?p over ?s ?p ?o: the predicates the patterns list
@@ -1327,7 +1951,7 @@ impl<'a> Planner<'a> {
                 {
                     self.bnode_scope += 1;
                     if let Some(n) = self.pattern_count(pinner, variables, &[], g)? {
-                        return Ok(self.apply_filters(n, filters));
+                        return self.apply_filters(n, filters);
                     }
                 }
                 let child = self.plan(inner, g, Vec::new())?;
@@ -1336,11 +1960,11 @@ impl<'a> Planner<'a> {
                 if self.ctx.spill.is_some() {
                     n = super::demand::distinct_below_order(self.ctx, n);
                 }
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Reduced { inner } => {
                 let child = self.plan(inner, g, Vec::new())?;
-                Ok(self.apply_filters(child, filters))
+                self.apply_filters(child, filters)
             }
             GP::Slice {
                 inner,
@@ -1350,7 +1974,7 @@ impl<'a> Planner<'a> {
                 let mut child = self.plan(inner, g, Vec::new())?;
                 super::demand::plan_slice(self.ctx, &mut child, *start, *length);
                 let n = slice(child, *start, *length, self.ctx);
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Group {
                 inner,
@@ -1358,7 +1982,7 @@ impl<'a> Planner<'a> {
                 aggregates,
             } => {
                 if let Some(n) = self.pattern_count(inner, variables, aggregates, g)? {
-                    return Ok(self.apply_filters(n, filters));
+                    return self.apply_filters(n, filters);
                 }
                 let child = self.plan(inner, g, Vec::new())?;
                 let keys: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
@@ -1379,7 +2003,7 @@ impl<'a> Planner<'a> {
                                 distinct,
                             } => Agg {
                                 func: name.clone(),
-                                expr: Some(self.compile(expr, g)),
+                                expr: Some(self.compile_in_branch(expr, g)?),
                                 distinct: *distinct,
                                 fold: None,
                                 registered: match name {
@@ -1401,42 +2025,49 @@ impl<'a> Planner<'a> {
                                 func: AggregateFunction::Custom(
                                     spargebra::term::NamedNode::new_unchecked(FOLD),
                                 ),
-                                expr: Some(self.compile(expr, g)),
+                                expr: Some(self.compile_in_branch(expr, g)?),
                                 distinct: *distinct,
                                 fold: Some(Box::new(Fold {
-                                    value: value.as_ref().map(|e| self.compile(e, g)),
+                                    value: value
+                                        .as_ref()
+                                        .map(|e| self.compile_in_branch(e, g))
+                                        .transpose()?,
                                     order: order
                                         .iter()
                                         .map(|o| match o {
-                                            OrderExpression::Asc(e) => (self.compile(e, g), true),
-                                            OrderExpression::Desc(e) => (self.compile(e, g), false),
+                                            OrderExpression::Asc(e) => {
+                                                Ok((self.compile_in_branch(e, g)?, true))
+                                            }
+                                            OrderExpression::Desc(e) => {
+                                                Ok((self.compile_in_branch(e, g)?, false))
+                                            }
                                         })
-                                        .collect(),
+                                        .collect::<Result<_>>()?,
                                 })),
                                 registered: None,
                             },
                         };
-                        (self.ctx.var(v.as_str()), agg)
+                        Ok((self.ctx.var(v.as_str()), agg))
                     })
-                    .collect();
+                    .collect::<Result<_>>()?;
                 let n = group(child, keys, aggs, self.ctx);
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Service { inner, name, .. } if super::viewsvc::is_read(name) => {
                 let n = super::viewsvc::view_leaf(self, inner)?;
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Service { inner, name, .. } if super::history_svc::is_changes(name) => {
                 let n = super::history_svc::history_leaf(self, inner)?;
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Service { name, inner, .. } if super::algosvc::is_algo(name) => {
                 let n = super::algosvc::algo_leaf(self, name, inner, g)?;
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Service { name, inner, .. } if super::pathsearch::is_search(name) => {
                 let n = super::pathsearch::path_search_leaf(self, inner, g)?;
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
             GP::Service {
                 name,
@@ -1504,30 +2135,196 @@ impl<'a> Planner<'a> {
                 );
                 n.certain.clear();
                 n.cost = 100_000.0;
-                Ok(self.apply_filters(n, filters))
+                self.apply_filters(n, filters)
             }
         }
     }
 
+    /// The filters without EXISTS whose variables all pass `ok`, which move below an
+    /// operator, and the rest, which stay above it. On the checked route the first list
+    /// is admitted before it is made, to its size, the rest stay in `filters`' own list,
+    /// and the credit returned holds the first list while the caller plans with it.
     fn split_filters(
         &self,
         filters: Vec<Expr>,
         ok: impl Fn(&VarId) -> bool,
-    ) -> (Vec<Expr>, Vec<Expr>) {
-        filters
-            .into_iter()
-            .partition(|f| !f.has_exists() && f.var_set().iter().all(&ok))
+    ) -> Result<(Vec<Expr>, Vec<Expr>, ListCredit)> {
+        if self.branch_payload.borrow().is_none() || filters.is_empty() {
+            let (push, top) = filters
+                .into_iter()
+                .partition(|f| !f.has_exists() && f.var_set().iter().all(&ok));
+            return Ok((push, top, list_credit(None)));
+        }
+        let mut top = filters;
+        // The same test without allocating: every occurrence of a variable passes `ok`.
+        let (push, credit) = self.extract_filters(&mut top, |f| {
+            !f.has_exists()
+                && f.visit_vars(&mut |v| if ok(&v) { Ok(()) } else { Err(()) })
+                    .is_ok()
+        })?;
+        #[cfg(test)]
+        if credit.is_some() {
+            note_list(1, push.len());
+        }
+        Ok((push, top, list_credit(credit)))
     }
 
-    fn apply_filters(&self, n: Node, filters: Vec<Expr>) -> Node {
-        if filters.is_empty() || n.is_empty() {
-            return n;
+    /// [`defer_open_filters`] on the checked route: the deferred filters move into a list
+    /// made to their number and admitted before it is made, and the rest stay in
+    /// `filters`' own list. The credit returned holds the deferred list.
+    fn defer_open_filters_checked(
+        &self,
+        filters: &mut Vec<Expr>,
+        triples: &[Triple],
+        paths: &[PathItem],
+        nodes: &[Node],
+        unpacks: &[UnpackItem],
+    ) -> Result<(Vec<Expr>, ListCredit)> {
+        if filters.is_empty() || !may_defer(nodes) {
+            return Ok((Vec::new(), list_credit(None)));
         }
-        filter(n, filters, self.ctx)
+        // The same test without allocating: a variable of the filter is open.
+        let (deferred, credit) = self.extract_filters(filters, |f| {
+            f.visit_vars(&mut |v| {
+                if open_filter_var(v, triples, paths, nodes, unpacks) {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        })?;
+        #[cfg(test)]
+        if let Some(credit) = &credit {
+            note_list(2, deferred.len());
+            watch_list(2, &deferred, credit);
+        }
+        Ok((deferred, list_credit(credit)))
+    }
+
+    /// On the checked route, the credit for a list of `slots` filters, taken before the
+    /// list is made or grown. `None` on the ordinary route.
+    fn filter_list_scratch(&self, slots: usize) -> Result<Option<Reservation>> {
+        if self.branch_payload.borrow().is_none() {
+            return Ok(None);
+        }
+        self.planning_stage(FILTER_LIST_PHASE)?;
+        self.planning_scratch(|layout| layout.slots::<Expr>(slots))
+    }
+
+    /// Move the filters that `take` selects out of `filters` into a list made to their
+    /// number and admitted before it is made, keeping the order of both. The rest stay
+    /// in `filters`' own list. The credit returned holds the new list.
+    fn extract_filters(
+        &self,
+        filters: &mut Vec<Expr>,
+        take: impl Fn(&Expr) -> bool,
+    ) -> Result<(Vec<Expr>, Option<Reservation>)> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(10);
+        let count = filters.iter().filter(|f| take(f)).count();
+        let credit = self.filter_list_scratch(count)?;
+        let mut out = Vec::new();
+        if let Some(credit) = &credit {
+            out.try_reserve_exact(count)
+                .map_err(|_| credit.preparation().exhausted())?;
+        }
+        out.extend(filters.extract_if(.., |f| take(f)));
+        debug_assert_eq!(out.len(), count);
+        Ok((out, credit))
+    }
+
+    /// Add `more` filters to `filters` with `fill`. On the checked route, when the list
+    /// must grow, the whole grown list is admitted before it is made, since the old list
+    /// and its replacement can be live at once, and `fill` runs under the same admission.
+    /// The credit returned holds the grown list.
+    fn grow_filters(
+        &self,
+        filters: &mut Vec<Expr>,
+        more: usize,
+        #[allow(unused_variables)] site: usize,
+        fill: impl FnOnce(&mut Vec<Expr>),
+    ) -> Result<ListCredit> {
+        let need = filters
+            .len()
+            .checked_add(more)
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        if self.branch_payload.borrow().is_none() || filters.capacity() >= need {
+            fill(filters);
+            debug_assert_eq!(filters.len(), need);
+            return Ok(list_credit(None));
+        }
+        let credit = {
+            #[cfg(test)]
+            let _stage = crate::test_alloc::Stage::enter(10);
+            let credit = self
+                .filter_list_scratch(need)?
+                .expect("checked filter list");
+            filters
+                .try_reserve_exact(more)
+                .map_err(|_| credit.preparation().exhausted())?;
+            fill(filters);
+            debug_assert_eq!(filters.len(), need);
+            #[cfg(test)]
+            {
+                note_list(site, need);
+                watch_list(site, filters, &credit);
+            }
+            credit
+        };
+        Ok(list_credit(Some(credit)))
+    }
+
+    fn apply_filters(&self, n: Node, filters: Vec<Expr>) -> Result<Node> {
+        if filters.is_empty() || n.is_empty() {
+            return Ok(n);
+        }
+        self.filter_admitted(n, filters)
+    }
+
+    /// The checked collector can borrow the triples when all extractors would
+    /// leave them unchanged. Keep each extractor's exact recognition test.
+    fn plain_checked_bgp(&self, patterns: &[TriplePattern]) -> Result<bool> {
+        let Some(preparation) = &self.ctx.source_preparation else {
+            return Ok(false);
+        };
+        if self.branch_payload.borrow().is_none() {
+            return Ok(false);
+        }
+        let rewrite = super::georewrite::rewrite_enabled(self.ctx);
+        for pattern in patterns {
+            preparation.check()?;
+            let one = std::slice::from_ref(pattern);
+            if super::arqpf::has_calls(one) || super::propertyext::has_calls(self.ctx, one) {
+                return Ok(false);
+            }
+            let NamedNodePattern::NamedNode(predicate) = &pattern.predicate else {
+                continue;
+            };
+            let iri = predicate.as_str();
+            if matches!(
+                iri,
+                super::arqpf::RDFS_MEMBER
+                    | super::textpf::TEXT_QUERY
+                    | crate::vector::VECTOR_SEARCH
+                    | super::hybrid::HYBRID_SEARCH
+                    | super::georewrite::SPATIAL_EQUALS
+            ) || crate::geo::SpatialPfKind::from_iri(iri).is_some()
+                || rewrite && crate::geo::Relation::from_property(iri).is_some()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Flatten a join group into items + filters.
-    fn collect(&mut self, gp: &GraphPattern, g: &ActiveGraph, items: &mut Vec<Item>) -> Result<()> {
+    fn collect(
+        &mut self,
+        gp: &GraphPattern,
+        g: &ActiveGraph,
+        items: &mut PlanningVec<Item>,
+    ) -> Result<()> {
         use GraphPattern as GP;
         match gp {
             GP::Bgp { patterns }
@@ -1542,10 +2339,20 @@ impl<'a> Planner<'a> {
                 self.collect(&GP::Bgp { patterns: rest }, g, items)?;
                 for t in &calls {
                     let n = self.has_predicate(t, g)?;
-                    items.push(Item::Node(n));
+                    items.push(Item::Node(n))?;
                 }
             }
             GP::Bgp { patterns } => {
+                if self.plain_checked_bgp(patterns)? {
+                    for tp in patterns {
+                        self.ctx.check()?;
+                        items.push(Item::Triple(self.triple(tp, g)))?;
+                    }
+                    for unpack in self.unpacks.borrow_mut().drain(..) {
+                        items.push(Item::Unpack(unpack))?;
+                    }
+                    return Ok(());
+                }
                 if super::propertyext::has_calls(self.ctx, patterns) {
                     // a context configured on a pattern without the call never runs it
                     if !self.ctx.calls_extensions {
@@ -1553,10 +2360,11 @@ impl<'a> Planner<'a> {
                     }
                     let (calls, rest) = super::propertyext::take_calls(self.ctx, patterns)?;
                     self.collect(&GP::Bgp { patterns: rest }, g, items)?;
-                    let input = self.plan_group(std::mem::take(items), Vec::new())?;
+                    let input = self
+                        .plan_group(std::mem::replace(items, self.planning_vec()?), Vec::new())?;
                     items.push(Item::Node(super::propertyext::attach(
                         self, input, calls, g,
-                    )?));
+                    )?))?;
                     return Ok(());
                 }
                 // ARQ's property function library: the variables bound before a call
@@ -1576,7 +2384,7 @@ impl<'a> Planner<'a> {
                     for c in pcalls {
                         let n = super::arqpf::leaf(self, c, g, &bound)?;
                         bound.extend(n.vars.iter().copied());
-                        items.push(Item::Node(n));
+                        items.push(Item::Node(n))?;
                     }
                     rest = others;
                     &rest
@@ -1602,26 +2410,28 @@ impl<'a> Planner<'a> {
                     super::georewrite::take_rewrite_triples(patterns, self.ctx)?;
                 let (scalls, patterns) = super::geopf::take_spatial_calls(&patterns)?;
                 for tp in &patterns {
-                    items.push(Item::Triple(self.triple(tp, g)));
+                    items.push(Item::Triple(self.triple(tp, g)))?;
                 }
                 for c in calls {
-                    items.push(Item::Node(self.text_leaf(c, g)?));
+                    items.push(Item::Node(self.text_leaf(c, g)?))?;
                 }
                 for (subjects, args) in vcalls {
-                    items.push(Item::Node(self.vector_leaf(subjects, args, g)?));
+                    items.push(Item::Node(self.vector_leaf(subjects, args, g)?))?;
                 }
                 for (subjects, args) in hcalls {
                     items.push(Item::Node(super::hybrid::hybrid_leaf(
                         self, subjects, args, g,
-                    )?));
+                    )?))?;
                 }
                 for c in scalls {
-                    items.push(Item::Node(super::geopf::spatial_leaf(self, c, g)?));
+                    items.push(Item::Node(super::geopf::spatial_leaf(self, c, g)?))?;
                 }
                 for c in rcalls {
-                    items.push(Item::Node(super::georewrite::rewrite_leaf(self, c, g)?));
+                    items.push(Item::Node(super::georewrite::rewrite_leaf(self, c, g)?))?;
                 }
-                items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
+                for unpack in self.unpacks.borrow_mut().drain(..) {
+                    items.push(Item::Unpack(unpack))?;
+                }
             }
             GP::Path {
                 subject,
@@ -1638,7 +2448,9 @@ impl<'a> Planner<'a> {
                     )
                 });
                 self.collect_path(s, path, o, g, items, &src)?;
-                items.extend(self.unpacks.borrow_mut().drain(..).map(Item::Unpack));
+                for unpack in self.unpacks.borrow_mut().drain(..) {
+                    items.push(Item::Unpack(unpack))?;
+                }
             }
             GP::Join { left, right } if !super::enhancer::is_loop(right) => {
                 self.collect(left, g, items)?;
@@ -1647,6 +2459,19 @@ impl<'a> Planner<'a> {
             GP::Lateral { left, right } if super::lateral::join_equivalent(self, left, right) => {
                 self.collect(left, g, items)?;
                 self.collect(right, g, items)?;
+            }
+            GP::Graph { .. } if self.ctx.selector_default_only => {
+                // The selector has no named graphs, including the ARQ aliases.
+                // Preserve the algebra's variable scope without planning the inner group.
+                let mut vars = Vec::new();
+                gp.on_in_scope_variable(|variable| {
+                    if let PT::V(var) = self.var(variable.as_str()) {
+                        vars.push(var);
+                    }
+                });
+                vars.sort_unstable();
+                vars.dedup();
+                items.push(Item::Node(Node::empty(vars)))?;
             }
             GP::Graph { name, inner } if !self.simple_graph_group(name, inner) => {
                 // Per-graph evaluation (Jena OpGraph semantics): evaluate the inner pattern
@@ -1660,12 +2485,26 @@ impl<'a> Planner<'a> {
                     // a substituted graph variable (EXISTS, LATERAL, initial bindings)
                     // names one graph
                     let named = ActiveGraph::Named(gid);
-                    let node = match self.graph_filter(&named) {
+                    let checked_names = self
+                        .ctx
+                        .source_preparation
+                        .is_some()
+                        .then(|| self.graph_names(&named))
+                        .transpose()?;
+                    let node = match self.graph_filter(&named)? {
                         Some(_) => self.plan(inner, &named, Vec::new())?,
                         None => Node::empty(Vec::new()),
                     };
-                    items.push(Item::Node(node));
-                    items.push(Item::Node(self.graph_names(&named)?));
+                    items.push(Item::Node(node))?;
+                    let names = match checked_names {
+                        Some(names) => names,
+                        None => self.graph_names(&named)?,
+                    };
+                    items.push(Item::Node(names))?;
+                    return Ok(());
+                }
+                if self.ctx.source_preparation.is_some() {
+                    items.push(Item::Node(self.prepare_graph_branches(inner, v)?))?;
                     return Ok(());
                 }
                 let accept = |gid: &Id| {
@@ -1697,7 +2536,7 @@ impl<'a> Planner<'a> {
                 if n.vars.is_empty() && n.children.is_empty() {
                     n = Node::empty(vec![v]);
                 }
-                items.push(Item::Node(n));
+                items.push(Item::Node(n))?;
             }
             GP::Graph { name, inner } => {
                 let g2 = match name {
@@ -1714,16 +2553,24 @@ impl<'a> Planner<'a> {
                         PT::V(v) => ActiveGraph::Var(v),
                     },
                 };
+                let checked_names = (self.ctx.source_preparation.is_some()
+                    && matches!(g2, ActiveGraph::Named(_)))
+                .then(|| self.graph_names(&g2))
+                .transpose()?;
                 if let GP::Filter { .. } = &**inner {
-                    items.push(Item::Node(self.plan(inner, &g2, Vec::new())?));
+                    items.push(Item::Node(self.plan(inner, &g2, Vec::new())?))?;
                 } else {
                     self.collect(inner, &g2, items)?;
                 }
                 // GRAPH ?g / GRAPH <g> iterate over (existing) named graphs even when the
                 // inner pattern does not touch the data
-                items.push(Item::Node(self.graph_names(&g2)?));
+                let names = match checked_names {
+                    Some(names) => names,
+                    None => self.graph_names(&g2)?,
+                };
+                items.push(Item::Node(names))?;
             }
-            other => items.push(Item::Node(self.plan(other, g, Vec::new())?)),
+            other => items.push(Item::Node(self.plan(other, g, Vec::new())?))?,
         }
         Ok(())
     }
@@ -1734,16 +2581,23 @@ impl<'a> Planner<'a> {
         path: &PropertyPathExpression,
         o: PT,
         g: &ActiveGraph,
-        items: &mut Vec<Item>,
+        items: &mut PlanningVec<Item>,
         src: &Option<Arc<PlanPattern>>,
     ) -> Result<()> {
         use PropertyPathExpression as PP;
         match path {
             // ARQ's `multi(path)`: the path with its closures counting walks
-            PP::Multi(p) => return self.collect_path(s, &counted(p), o, g, items, src),
+            PP::Multi(path) => {
+                // Counted closures have the same per-node layout, and removing
+                // a nested Multi can only remove a box.
+                let _normalized = self.planning_scratch(|layout| layout.path(path))?;
+                let normalized = counted(path);
+                self.ctx.check()?;
+                return self.collect_path(s, &normalized, o, g, items, src);
+            }
             // ARQ's `distinct(path)`: the pairs the path connects, each once
             PP::Distinct(p) => {
-                let mut sub = Vec::new();
+                let mut sub = self.planning_vec()?;
                 self.collect_path(s, p, o, g, &mut sub, src)?;
                 let node = self.plan_group(sub, Vec::new())?;
                 let mut vars = Vec::new();
@@ -1757,7 +2611,7 @@ impl<'a> Planner<'a> {
                 let n = project(node, vars, self.ctx);
                 let mut d = Node::unary(Kind::Distinct, n, "distinct(path)".into());
                 d.est = d.children[0].est;
-                items.push(Item::Node(d));
+                items.push(Item::Node(d))?;
                 return Ok(());
             }
             PP::Shortest(_) => {
@@ -1773,7 +2627,7 @@ impl<'a> Planner<'a> {
                 ],
                 graph: g.clone(),
                 src: src.clone(),
-            })),
+            }))?,
             PP::Reverse(p) => self.collect_path(o, p, s, g, items, src)?,
             PP::Sequence(a, b) => {
                 let mid = PT::V(self.ctx.fresh_var());
@@ -1795,8 +2649,18 @@ impl<'a> Planner<'a> {
                     from = to;
                 }
                 if *max != Some(*min) {
+                    let held = self.planning_scratch(|layout| {
+                        layout.slots::<PropertyPathExpression>(1)?;
+                        layout.path(path)
+                    })?;
+                    let inner = match &held {
+                        Some(held) => {
+                            Box::new(super::checked_syntax::copy_path(path, held.preparation())?)
+                        }
+                        None => path.clone(),
+                    };
                     let rest = PP::Range {
-                        path: path.clone(),
+                        path: inner,
                         min: 0,
                         max: max.map(|m| m - min),
                     };
@@ -1806,16 +2670,25 @@ impl<'a> Planner<'a> {
                         o,
                         graph: g.clone(),
                         src: src.clone(),
-                    }));
+                        _held: held,
+                    }))?;
                 }
             }
-            _ => items.push(Item::Path(PathItem {
-                s,
-                path: path.clone(),
-                o,
-                graph: g.clone(),
-                src: src.clone(),
-            })),
+            _ => {
+                let held = self.planning_scratch(|layout| layout.path(path))?;
+                let path = match &held {
+                    Some(held) => super::checked_syntax::copy_path(path, held.preparation())?,
+                    None => path.clone(),
+                };
+                items.push(Item::Path(PathItem {
+                    s,
+                    path,
+                    o,
+                    graph: g.clone(),
+                    src: src.clone(),
+                    _held: held,
+                }))?;
+            }
         }
         Ok(())
     }
@@ -1946,7 +2819,7 @@ impl<'a> Planner<'a> {
                 vars.push(v);
             }
         }
-        let Some((graph, graph_var)) = self.graph_filter(g) else {
+        let Some((graph, graph_var)) = self.graph_filter(g)? else {
             return empty(vars);
         };
         if let Some(gv) = graph_var
@@ -2138,7 +3011,7 @@ impl<'a> Planner<'a> {
             slot(&c.prop),
             slot(&output(&c.rank)),
         );
-        let Some((graph, graph_var)) = self.graph_filter(g) else {
+        let Some((graph, graph_var)) = self.graph_filter(g)? else {
             let mut vars: Vec<VarId> = [score, literal, graph_out, prop, rank]
                 .into_iter()
                 .flatten()
@@ -2251,6 +3124,9 @@ impl<'a> Planner<'a> {
                 name: NamedNodePattern::NamedNode(n),
                 inner,
             } if n.as_str() == super::ctx::UNION_GRAPH_IRI => {
+                if self.ctx.selector_default_only {
+                    return Ok(None);
+                }
                 union = ActiveGraph::Union;
                 (&**inner, &union)
             }
@@ -2269,7 +3145,7 @@ impl<'a> Planner<'a> {
         {
             return Ok(None);
         }
-        let Some((gf, None)) = self.graph_filter(g) else {
+        let Some((gf, None)) = self.graph_filter(g)? else {
             return Ok(None);
         };
         let Some(uses) = usable(self.ctx, &gf) else {
@@ -2410,7 +3286,7 @@ impl<'a> Planner<'a> {
         if vars.len() == [s, p].iter().filter(|x| matches!(x, PT::V(_))).count()
             && matches!(p, PT::V(_))
             && !matches!(g, ActiveGraph::Var(_))
-            && let Some((gf, None)) = self.graph_filter(g)
+            && let Some((gf, None)) = self.graph_filter(g)?
             && let Some(uses) = usable(self.ctx, &gf)
         {
             let stats = &self.ctx.snap.generation.stats;
@@ -2453,11 +3329,12 @@ impl<'a> Planner<'a> {
             return Ok(n);
         }
         let o = PT::V(self.ctx.fresh_var());
-        let sub = vec![Item::Triple(Triple {
+        let mut sub = self.planning_vec()?;
+        sub.push(Item::Triple(Triple {
             t: [s, p, o],
             graph: g.clone(),
             src,
-        })];
+        }))?;
         let node = self.plan_group(sub, Vec::new())?;
         if let ActiveGraph::Var(gv) = g
             && node.vars.contains(gv)
@@ -2625,22 +3502,299 @@ impl<'a> Planner<'a> {
                 _ => false,
             }
         }
-        let mut names = Vec::new();
-        collect_pattern_vars(inner, &mut names);
-        plain(inner, self.ctx) && !names.iter().any(|n| n == v.as_str())
+        if !plain(inner, self.ctx) {
+            return false;
+        }
+        let mut mentions_graph_var = false;
+        visit_pattern_vars(inner, &mut |name| mentions_graph_var |= name == v.as_str());
+        !mentions_graph_var
+    }
+
+    fn named_accepts(&self, id: Id) -> Result<bool> {
+        let Some(named) = &self.ctx.dataset.named else {
+            return Ok(true);
+        };
+        if self.ctx.source_preparation.is_some() && named.len() > 1 {
+            let filter = self.set_filter(named, &self.named_filter)?;
+            Ok(filter.accepts(id.0))
+        } else {
+            Ok(named.contains(&id))
+        }
+    }
+
+    fn prepare_graph_names(
+        &self,
+        var: VarId,
+        preparation: &Preparation,
+    ) -> Result<Arc<PreparedGraphNames>> {
+        let fixed = size_of::<PreparedGraphNames>()
+            + 2 * size_of::<usize>()
+            + size_of::<Vec<Id>>()
+            + size_of::<VarId>();
+        let mut held = preparation.reserve(fixed as u64)?;
+        let selected = self
+            .ctx
+            .dataset
+            .named
+            .as_ref()
+            .map(|named| self.set_filter(named, &self.named_filter))
+            .transpose()?;
+        let mut ids = PreparationBuffer::new(preparation)?;
+        self.ctx.snap.scan_graph_ids_prepared(preparation, |id| {
+            if id != Id::DEFAULT_GRAPH
+                && selected.as_ref().is_none_or(|filter| filter.accepts(id.0))
+            {
+                ids.push(id)?;
+            }
+            Ok(())
+        })?;
+        let (ids, credit) = ids.into_parts();
+        held.merge(credit);
+        let len = ids.len();
+        let table = Table {
+            vars: vec![var],
+            cols: vec![ids],
+            len,
+            sorted: Vec::new(),
+        };
+        Ok(Arc::new(PreparedGraphNames { table, _held: held }))
+    }
+
+    fn prepare_graph_branches(&mut self, inner: &GraphPattern, var: VarId) -> Result<Node> {
+        let ctx = self.ctx;
+        let preparation = ctx
+            .source_preparation
+            .as_ref()
+            .expect("checked graph planning");
+        let names = self.prepare_graph_names(var, preparation)?;
+        if self.checked_exists.get_mut().is_some() || names.table.len == 0 {
+            return self.build_graph_branches(inner, var, &names, preparation);
+        }
+        let sources = super::checked_syntax::Sources::new(inner, preparation)?;
+        *self.checked_exists.get_mut() = Some(sources);
+        let result = self.build_graph_branches(inner, var, &names, preparation);
+        *self.checked_exists.get_mut() = None;
+        result
+    }
+
+    fn checked_values(
+        &self,
+        variables: &[oxrdf::Variable],
+        bindings: &[Vec<Option<GroundTerm>>],
+    ) -> Result<Node> {
+        let preparation = self.ctx.source_preparation.as_ref().expect("checked GRAPH");
+        let mut layout = super::checked_layout::Layout::new(preparation);
+        let width = variables.len();
+        let rows = bindings.len();
+        let cells = width
+            .checked_mul(rows)
+            .ok_or_else(|| preparation.exhausted())?;
+        layout.slots::<Id>(cells)?;
+        layout.slots::<Vec<Id>>(width)?;
+        // Table, node output schema and certainty each own one vector.
+        let schema_slots = width
+            .checked_mul(3)
+            .ok_or_else(|| preparation.exhausted())?;
+        layout.slots::<VarId>(schema_slots)?;
+        layout.map::<VarId, f64>(width)?;
+        // Any row count as displayed by f64 fits in this decimal description.
+        layout.add(64)?;
+        self.branch_payload
+            .borrow_mut()
+            .as_mut()
+            .expect("branch construction")
+            .grow_by(layout.bytes())?;
+
+        let mut vars = Vec::with_capacity(width);
+        for variable in variables {
+            vars.push(self.ctx.var_prepared(variable.as_str(), preparation)?);
+        }
+        let mut table = Table::new(vars.clone());
+        for column in &mut table.cols {
+            column
+                .try_reserve_exact(rows)
+                .map_err(|_| preparation.exhausted())?;
+        }
+
+        let mut seen = PreparationMap::new(preparation)?;
+        for row in bindings {
+            preparation.check()?;
+            if row.len() != width {
+                return Err(Error::invalid("VALUES row does not match its variables"));
+            }
+            for (term, column) in row.iter().zip(&mut table.cols) {
+                preparation.check()?;
+                let id = if let Some(term) = term {
+                    if let Some(&id) = seen.get(term) {
+                        id
+                    } else {
+                        let mut layout = super::checked_layout::Layout::new(preparation);
+                        layout.ground(term)?;
+                        let _term = preparation.reserve(layout.bytes())?;
+                        let id = match term {
+                            GroundTerm::Literal(literal) => self.ctx.intern_query_literal(literal),
+                            _ => self.ctx.intern_term(&ground_term(term)),
+                        };
+                        self.ctx.check()?;
+                        seen.insert(term, id)?;
+                        id
+                    }
+                } else {
+                    Id::UNDEF
+                };
+                column.push(id);
+            }
+            table.len += 1;
+        }
+        drop(seen);
+        for (index, var) in vars.iter().enumerate() {
+            let Some(&bound) = self.subst.get(var) else {
+                continue;
+            };
+            let mut keep = PreparationBuffer::new(preparation)?;
+            for id in &table.cols[index] {
+                keep.push(id.is_undef() || *id == bound)?;
+            }
+            table.filter_rows(&keep);
+            table.cols[index].fill(bound);
+        }
+        let est = table.len() as f64;
+        let mut node = Node::leaf(Kind::Values(table), vars, est, format!("{est} rows"));
+        let Kind::Values(table) = &node.kind else {
+            unreachable!();
+        };
+        let mut certain = 0;
+        for (index, column) in table.cols.iter().enumerate() {
+            preparation.check()?;
+            let mut bound = true;
+            for part in column.chunks(1024) {
+                preparation.check()?;
+                if part.iter().any(|id| id.is_undef()) {
+                    bound = false;
+                    break;
+                }
+            }
+            if bound {
+                node.certain[certain] = node.vars[index];
+                certain += 1;
+            }
+        }
+        node.certain.truncate(certain);
+        Ok(node)
+    }
+
+    fn build_graph_branches(
+        &mut self,
+        inner: &GraphPattern,
+        var: VarId,
+        names: &PreparedGraphNames,
+        preparation: &Preparation,
+    ) -> Result<Node> {
+        let fixed = size_of::<PreparedGraphBranches>() + 2 * size_of::<usize>();
+        let mut held = preparation.reserve(fixed as u64)?;
+        let mut inputs = PreparationBuffer::new(preparation)?;
+        let mut contains_algorithm = false;
+        let mut max_depth = 0;
+        // Each checked payload and candidate belongs to the graph already being
+        // planned. It shares the allowance with the preceding live branches.
+        for &id in &names.table.cols[0] {
+            preparation.check()?;
+            let payload = preparation.reserve(0)?;
+            let shared_payload = preparation.reserve(0)?;
+            let previous = self.branch_payload.replace(Some(payload));
+            let previous_shared = self.branch_shared_payload.replace(Some(shared_payload));
+            let node = self.plan(inner, &ActiveGraph::Named(id), Vec::new());
+            let mut payload = self
+                .branch_payload
+                .replace(previous)
+                .expect("branch construction");
+            let shared_payload = self
+                .branch_shared_payload
+                .replace(previous_shared)
+                .expect("branch shared payload");
+            let node = node?;
+            if node.is_empty() {
+                continue;
+            }
+
+            let mut layout = super::checked_layout::Layout::new(preparation);
+            layout.slots::<VarId>(3)?;
+            layout.slots::<Vec<Id>>(1)?;
+            layout.slots::<Id>(4)?;
+            layout.map::<VarId, f64>(1)?;
+            layout.add("graph".len())?;
+            payload.grow_by(layout.bytes())?;
+            let mut binding = Table::new(vec![var]);
+            binding.push_row(&[id]);
+            let bind = Node::leaf(Kind::Values(binding), vec![var], 1.0, "graph".into());
+            let branch = checked_graph_binding_join(node, bind, var, self.ctx, &mut payload)?;
+            let mut retained = super::checked_layout::Layout::retained(preparation);
+            retained.node(&branch)?;
+            let retained_bytes = retained.bytes();
+            // Producers outside this admission (see the lane notes) still leave the
+            // branch short here, so tests read the shortfall rather than assert it.
+            #[cfg(test)]
+            BRANCH_SHORTFALL.with(|most| {
+                most.set(
+                    most.get()
+                        .max(retained_bytes.saturating_sub(payload.bytes())),
+                );
+            });
+            payload.grow_to(retained_bytes)?;
+            // Planning and join selection have dropped their temporary storage.
+            // Shared backing has its own credit, independent of node copies.
+            payload.release_to(retained_bytes);
+            held.merge(payload);
+            held.merge(shared_payload);
+            contains_algorithm |= super::exec::contains_algorithm(&branch);
+            max_depth = max_depth.max(branch.depth());
+            inputs.push(branch)?;
+        }
+        if inputs.is_empty() {
+            return Ok(Node::empty(vec![var]));
+        }
+        let (inputs, credit) = inputs.into_parts();
+        held.merge(credit);
+        let mut out = if let [branch] = inputs.as_slice() {
+            let mut layout = super::checked_layout::Layout::new(preparation);
+            layout.metadata(branch)?;
+            held.grow_by(layout.bytes())?;
+            Node {
+                kind: Kind::Empty,
+                children: Vec::new(),
+                vars: branch.vars.clone(),
+                certain: branch.certain.clone(),
+                sorted: branch.sorted.clone(),
+                est: branch.est,
+                cost: branch.cost,
+                dist: branch.dist.clone(),
+                desc: branch.desc.clone(),
+            }
+        } else {
+            let (shape, credit) = checked_union_shape(&inputs, preparation)?;
+            held.merge(credit);
+            shape
+        };
+        out.kind = Kind::GraphBranches(Arc::new(PreparedGraphBranches {
+            inputs,
+            contains_algorithm,
+            max_depth,
+            _held: held,
+        }));
+        Ok(out)
     }
 
     /// One row per named graph of the active dataset (bound to the graph variable), or
     /// the unit table if a constant graph exists.
     fn graph_names(&self, g: &ActiveGraph) -> Result<Node> {
-        let accept = |gid: Id| match &self.ctx.dataset.named {
-            Some(set) => set.contains(&gid),
-            None => true,
-        };
-        let exists = |gid: Id| -> Result<bool> {
-            Ok(accept(gid)
-                && gid.tag() != Tag::Local
-                && self.ctx.snap.count(Perm::Gspo, &[gid.0])? > 0)
+        let exists = |id: Id| -> Result<bool> {
+            if id.tag() == Tag::Local || !self.named_accepts(id)? {
+                return Ok(false);
+            }
+            if let Some(preparation) = &self.ctx.source_preparation {
+                return self.ctx.snap.graph_exists_prepared(id, preparation);
+            }
+            Ok(self.ctx.snap.count(Perm::Gspo, &[id.0])? > 0)
         };
         Ok(match g {
             ActiveGraph::Var(v) => match self.subst.get(v) {
@@ -2652,9 +3806,19 @@ impl<'a> Planner<'a> {
                     }
                 }
                 None => {
+                    if let Some(preparation) = &self.ctx.source_preparation {
+                        let names = self.prepare_graph_names(*v, preparation)?;
+                        let est = names.table.len() as f64;
+                        return Ok(Node::leaf(
+                            Kind::GraphNames(names),
+                            vec![*v],
+                            est,
+                            format!("{est} named graphs"),
+                        ));
+                    }
                     let mut t = Table::new(vec![*v]);
                     for gid in self.ctx.snap.graph_ids()? {
-                        if accept(gid) {
+                        if self.named_accepts(gid)? {
                             t.push_row(&[gid]);
                         }
                     }
@@ -2683,160 +3847,208 @@ impl<'a> Planner<'a> {
 
     // --------------------------------------------------------- graph filters ------
 
-    pub(super) fn graph_filter(&self, g: &ActiveGraph) -> Option<(GraphFilter, Option<VarId>)> {
+    fn set_filter(
+        &self,
+        set: &[Id],
+        cache: &OnceCell<Arc<PreparedGraphSet>>,
+    ) -> Result<GraphFilter> {
+        if let Some(preparation) = &self.ctx.source_preparation {
+            if let Some(filter) = cache.get() {
+                return Ok(GraphFilter::PreparedSet(filter.clone()));
+            }
+            let filter = PreparedGraphSet::new(preparation, set)?;
+            let _ = cache.set(filter.clone());
+            return Ok(GraphFilter::PreparedSet(filter));
+        }
+        let mut ids: Vec<u64> = set.iter().map(|id| id.0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(GraphFilter::Set(ids))
+    }
+
+    pub(super) fn graph_filter(
+        &self,
+        g: &ActiveGraph,
+    ) -> Result<Option<(GraphFilter, Option<VarId>)>> {
         let ds = &self.ctx.dataset;
-        let set_of = |set: &[Id]| {
-            let mut s: Vec<u64> = set.iter().map(|i| i.0).collect();
-            s.sort_unstable();
-            s.dedup();
-            s
-        };
-        Some(match g {
-            // an empty default graph (a dataset of named graphs only) matches nothing
+        Ok(Some(match g {
+            // An empty default graph (a dataset of named graphs only) matches nothing.
             ActiveGraph::Default => match &ds.default {
-                Some(set) if set.is_empty() => return None,
+                Some(set) if set.is_empty() => return Ok(None),
                 Some(set) if set.len() == 1 => (GraphFilter::One(set[0].0), None),
-                Some(set) => (GraphFilter::Set(set_of(set)), None),
+                Some(set) => (self.set_filter(set, &self.default_filter)?, None),
                 None if ds.union_default || self.ctx.snap.union_default_graph => {
                     (GraphFilter::Named, None)
                 }
                 None => (GraphFilter::Default, None),
             },
-            // the union graph of a graph view is the union of the named graphs it sees
+            // The union graph of a graph view is the union of the named graphs it sees.
             ActiveGraph::Union => match (&self.ctx.graphs, &ds.named) {
-                (Some(_), Some(set)) if set.is_empty() => return None,
-                (Some(_), Some(set)) => (GraphFilter::Set(set_of(set)), None),
+                (Some(_), Some(set)) if set.is_empty() => return Ok(None),
+                (Some(_), Some(set)) => (self.set_filter(set, &self.named_filter)?, None),
                 _ => (GraphFilter::Named, None),
             },
             ActiveGraph::Named(id) => {
                 if id.tag() == Tag::Local {
-                    return None;
+                    return Ok(None);
                 }
-                if let Some(named) = &ds.named
-                    && !named.contains(id)
-                {
-                    return None;
+                if !self.named_accepts(*id)? {
+                    return Ok(None);
                 }
                 (GraphFilter::One(id.0), None)
             }
             ActiveGraph::Var(v) => match self.subst.get(v) {
                 Some(id) => return self.graph_filter(&ActiveGraph::Named(*id)),
                 None => match &ds.named {
-                    Some(set) if set.is_empty() => return None,
-                    Some(set) => (GraphFilter::Set(set_of(set)), Some(*v)),
+                    Some(set) if set.is_empty() => return Ok(None),
+                    Some(set) => (self.set_filter(set, &self.named_filter)?, Some(*v)),
                     None => (GraphFilter::Named, Some(*v)),
                 },
             },
-        })
+        }))
     }
 
     // ----------------------------------------------------------------- scans ------
 
     /// All useful scan plans for a triple pattern (one per sort order).
-    fn scan_options(&self, t: &Triple) -> Result<Vec<Node>> {
-        let vars_of = |t: &Triple| {
-            let mut v: Vec<VarId> =
+    fn scan_options(&self, t: &Triple) -> Result<PlanningVec<Node>> {
+        let empty_options = |t: &Triple| -> Result<PlanningVec<Node>> {
+            self.admit_payload(|layout| {
+                layout.slots::<VarId>(8)?;
+                layout.map::<VarId, f64>(4)?;
+                layout.add("empty".len())
+            })?;
+            let mut v = Vec::with_capacity(4);
+            v.extend(
                 t.t.iter()
-                    .filter_map(|x| if let PT::V(v) = x { Some(*v) } else { None })
-                    .collect();
+                    .filter_map(|x| if let PT::V(v) = x { Some(*v) } else { None }),
+            );
             if let ActiveGraph::Var(g) = t.graph {
                 v.push(g);
             }
             v.sort_unstable();
             v.dedup();
-            v
+            let mut options = self.planning_vec()?;
+            options.push(Node::empty(v))?;
+            Ok(options)
         };
-        let Some((gf, gvar)) = self.graph_filter(&t.graph) else {
-            return Ok(vec![Node::empty(vars_of(t))]);
+        let Some((gf, gvar)) = self.graph_filter(&t.graph)? else {
+            return empty_options(t);
         };
         // unknown constants → empty
         if t.t
             .iter()
             .any(|x| matches!(x, PT::C(id) if self.ctx.unknown_const(*id)))
         {
-            return Ok(vec![Node::empty(vars_of(t))]);
+            return empty_options(t);
         }
         // positions S=0,P=1,O=2,G=3 → PT
         let mut pos: [Option<PT>; 4] = [Some(t.t[0]), Some(t.t[1]), Some(t.t[2]), None];
         if let Some(gv) = gvar {
             pos[3] = Some(PT::V(gv));
         }
-        let bound: Vec<usize> = (0..3)
-            .filter(|&i| matches!(pos[i], Some(PT::C(_))))
-            .collect();
-        let mut out = Vec::new();
-        let mut perms: Vec<Perm> = [
+        let mut bound = [0; 3];
+        let mut bound_len = 0;
+        for (i, item) in pos.iter().enumerate().take(3) {
+            if matches!(item, Some(PT::C(_))) {
+                bound[bound_len] = i;
+                bound_len += 1;
+            }
+        }
+        let bound = &bound[..bound_len];
+        let mut out = self.planning_vec()?;
+        let use_gspo = matches!(gf, GraphFilter::One(_))
+            && (bound.is_empty() || bound == [S] || bound == [S, P] || bound == [S, P, O]);
+        let perms = [
             Perm::Spo,
             Perm::Sop,
             Perm::Pso,
             Perm::Pos,
             Perm::Osp,
             Perm::Ops,
+            Perm::Gspo,
         ]
         .into_iter()
-        .filter(|p| {
-            let o = p.order();
-            let mut first: Vec<usize> = o[..bound.len()].to_vec();
-            first.sort_unstable();
-            first == bound
-        })
-        .collect();
-        // GSPO for a single constant graph with a compatible prefix
-        let use_gspo = matches!(gf, GraphFilter::One(_))
-            && (bound.is_empty() || bound == [S] || bound == [S, P] || bound == [S, P, O]);
-        if use_gspo {
-            perms.push(Perm::Gspo);
-        }
-        // de-duplicate perms that produce the same sort order for this pattern
-        let mut seen_orders: FxHashSet<Vec<VarId>> = FxHashSet::default();
+        .filter(|perm| {
+            if *perm == Perm::Gspo {
+                return use_gspo;
+            }
+            let mut order = perm.order();
+            order[..bound.len()].sort_unstable();
+            &order[..bound.len()] == bound
+        });
+        // An order is distinguished by its first variable, or by the absence of one.
+        let mut seen_orders = [None; 7];
+        let mut orders = 0;
         let stats = &self.ctx.snap.generation.stats;
         let snap = &self.ctx.snap;
         for perm in perms {
             let order = perm.order();
-            let (prefix, first_free): (Vec<u64>, usize) = if perm == Perm::Gspo {
+            let mut prefix = [0; 4];
+            let mut first_free = 0;
+            if perm == Perm::Gspo {
                 let GraphFilter::One(gid) = gf else {
                     unreachable!()
                 };
-                let mut p = vec![gid];
-                for &c in &order[1..] {
-                    match pos[c] {
-                        Some(PT::C(id)) => p.push(id.0),
-                        _ => break,
+                prefix[0] = gid;
+                first_free = 1;
+            }
+            for &component in &order[first_free..] {
+                match pos[component] {
+                    Some(PT::C(id)) => {
+                        prefix[first_free] = id.0;
+                        first_free += 1;
                     }
+                    _ => break,
                 }
-                let n = p.len();
-                (p, n)
-            } else {
-                (
-                    bound
-                        .iter()
-                        .map(|_| 0)
-                        .enumerate()
-                        .map(|(i, _)| match pos[order[i]] {
-                            Some(PT::C(id)) => id.0,
-                            _ => unreachable!(),
-                        })
-                        .collect(),
-                    bound.len(),
-                )
-            };
-            let mut cols: Vec<(usize, VarId)> = Vec::new();
-            let mut eqs = Vec::new();
+            }
+            // Other permutations bind only their leading SPO constants.
+            if perm != Perm::Gspo {
+                first_free = bound.len();
+            }
+            let prefix = &prefix[..first_free];
+            let mut cols = [(0usize, 0); 4];
+            let mut eqs = [(0usize, 0usize); 4];
+            let mut variables = 0;
+            let mut equalities = 0;
             for (kc, &c) in order.iter().enumerate().skip(first_free) {
                 if let Some(PT::V(v)) = pos[c] {
-                    match cols.iter().find(|(_, x)| *x == v) {
-                        Some((k0, _)) => eqs.push((*k0, kc)),
-                        None => cols.push((kc, v)),
+                    match cols[..variables].iter().find(|(_, x)| *x == v) {
+                        Some((k0, _)) => {
+                            eqs[equalities] = (*k0, kc);
+                            equalities += 1;
+                        }
+                        None => {
+                            cols[variables] = (kc, v);
+                            variables += 1;
+                        }
                     }
                 }
             }
-            let sort_vars: Vec<VarId> = cols.iter().map(|(_, v)| *v).collect();
-            if !seen_orders.insert(sort_vars.iter().take(1).copied().collect()) {
+            let first = cols[..variables].first().map(|(_, v)| *v);
+            if seen_orders[..orders].contains(&first) {
                 continue;
             }
+            seen_orders[orders] = first;
+            orders += 1;
+            let cols = &cols[..variables];
+            let eqs = &eqs[..equalities];
+            self.admit_payload(|layout| {
+                layout.slice(prefix)?;
+                layout.slice(cols)?;
+                layout.slice(eqs)?;
+                layout.slots::<VarId>(variables * 3)?;
+                // Only this map is newly built, with at most four keys.
+                layout.map::<VarId, f64>(variables)?;
+                layout.map::<VarId, f64>(variables)?;
+                if let GraphFilter::Set(ids) = &gf {
+                    layout.slice(ids)?;
+                }
+                Ok(())
+            })?;
             let graph_col = perm.col_of(G);
             let graph = if perm == Perm::Gspo
-                || gvar.is_some() && !matches!(gf, GraphFilter::Set(_) | GraphFilter::Named)
+                || gvar.is_some() && gf.set_ids().is_none() && !matches!(gf, GraphFilter::Named)
             {
                 GraphFilter::All
             } else {
@@ -2845,11 +4057,11 @@ impl<'a> Planner<'a> {
             let dedup = gvar.is_none() && gf.multi() && perm != Perm::Gspo;
             let mut est = if prefix.is_empty() {
                 snap.len() as f64
-            } else if let Some(n) = snap.predicate_count(perm, &prefix) {
+            } else if let Some(n) = snap.predicate_count(perm, prefix) {
                 // the same exact count, without decoding the predicate's end blocks
                 n as f64
             } else {
-                snap.count(perm, &prefix)? as f64
+                snap.count(perm, prefix)? as f64
             };
             if matches!(gf, GraphFilter::Default) && !stats.graphs.is_empty() && perm != Perm::Gspo
             {
@@ -2877,7 +4089,7 @@ impl<'a> Planner<'a> {
             // a pattern with one free subject, predicate or object column has a value of it
             // per triple
             let free_spo = cols.iter().filter(|(kc, _)| order[*kc] != G).count();
-            for &(kc, v) in &cols {
+            for &(kc, v) in cols {
                 let comp = order[kc];
                 let d = match (comp, pstat.as_ref()) {
                     (S | P | O, _) if free_spo == 1 => est,
@@ -2899,51 +4111,144 @@ impl<'a> Planner<'a> {
                 };
                 dist.insert(v, d.clamp(1.0, est.max(1.0)));
             }
-            let desc = format!(
-                "{} {}",
-                perm.name().to_uppercase(),
-                t.t.iter()
-                    .map(|x| self.pt_str(x))
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            ) + &match &t.graph {
-                ActiveGraph::Default => String::new(),
-                g => format!(
-                    " GRAPH {}",
-                    match g {
-                        ActiveGraph::Named(id) => self.pt_str(&PT::C(*id)),
-                        ActiveGraph::Var(v) => self.pt_str(&PT::V(*v)),
-                        _ => String::new(),
-                    }
-                ),
-            };
-            let vars: Vec<VarId> = cols.iter().map(|(_, v)| *v).collect();
-            let mut n = Node::leaf(
-                Kind::Scan(ScanSpec {
+            let desc = self.scan_description(perm, t)?;
+            let sorted: Vec<VarId> = cols.iter().map(|(_, v)| *v).collect();
+            let n = Node {
+                kind: Kind::Scan(ScanSpec {
                     perm,
-                    prefix,
-                    cols,
-                    eqs,
+                    prefix: prefix.to_vec(),
+                    cols: cols.to_vec(),
+                    eqs: eqs.to_vec(),
                     graph,
                     graph_col,
                     dedup,
                     src: t.src.clone(),
                 }),
-                vars,
+                vars: sorted.clone(),
+                certain: sorted.clone(),
+                sorted,
+                children: Vec::new(),
                 est,
+                cost: est,
+                dist,
                 desc,
-            );
-            n.sorted = sort_vars;
-            n.dist = dist;
+            };
             if est == 0.0 {
-                return Ok(vec![Node::empty(vars_of(t))]);
+                return empty_options(t);
             }
-            out.push(n);
+            out.push(n)?;
         }
         if out.is_empty() {
-            return Ok(vec![Node::empty(vars_of(t))]);
+            return empty_options(t);
         }
         Ok(out)
+    }
+
+    fn scan_description(&self, perm: Perm, triple: &Triple) -> Result<String> {
+        use std::fmt::Write;
+
+        let mut active = self.branch_payload.borrow_mut();
+        let Some(held) = active.as_mut() else {
+            return Ok(format!(
+                "{} {}",
+                perm.name().to_uppercase(),
+                triple
+                    .t
+                    .iter()
+                    .map(|term| self.pt_str(term))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ) + &match &triple.graph {
+                ActiveGraph::Default => String::new(),
+                graph => format!(
+                    " GRAPH {}",
+                    match graph {
+                        ActiveGraph::Named(id) => self.pt_str(&PT::C(*id)),
+                        ActiveGraph::Var(var) => self.pt_str(&PT::V(*var)),
+                        _ => String::new(),
+                    }
+                ),
+            });
+        };
+
+        let preparation = held.preparation().clone();
+        let mut text = PreparationText::new(&preparation)?;
+        for ch in perm.name().chars().flat_map(char::to_uppercase) {
+            let _ = text.write_char(ch);
+        }
+        for term in &triple.t {
+            text.push_str(" ")?;
+            self.write_checked_plan_term(&mut text, &preparation, *term)?;
+        }
+        match triple.graph {
+            ActiveGraph::Default => {}
+            ActiveGraph::Named(id) => {
+                text.push_str(" GRAPH ")?;
+                self.write_checked_plan_term(&mut text, &preparation, PT::C(id))?;
+            }
+            ActiveGraph::Var(var) => {
+                text.push_str(" GRAPH ")?;
+                self.write_checked_plan_term(&mut text, &preparation, PT::V(var))?;
+            }
+            ActiveGraph::Union => text.push_str(" GRAPH ")?,
+        }
+        let (desc, desc_credit) = text.finish()?;
+        held.merge(desc_credit);
+        Ok(desc)
+    }
+
+    fn write_checked_plan_term(
+        &self,
+        text: &mut PreparationText,
+        preparation: &Preparation,
+        term: PT,
+    ) -> Result<()> {
+        use std::fmt::Write;
+
+        if let PT::V(var) = term {
+            let names = self.ctx.var_names.read();
+            let name = &names[var as usize];
+            text.push_str("?")?;
+            return text.push_str(if name.starts_with(' ') { "_" } else { name });
+        }
+        let PT::C(id) = term else { unreachable!() };
+        let decoded = self.ctx.charge(0)?;
+        let Some(term) = self.ctx.output_term(id, &decoded)? else {
+            let _ = write!(text, "{id:?}");
+            return Ok(());
+        };
+        if let Term::NamedNode(iri) = &term {
+            if let Some((prefix, suffix)) = short_iri(iri.as_str()) {
+                text.push_str(prefix)?;
+                return text.push_str(suffix);
+            }
+            text.push_str("<")?;
+            text.push_str(iri.as_str())?;
+            return text.push_str(">");
+        }
+        if let Term::Literal(literal) = &term
+            && literal.datatype() == xsd::INTEGER
+        {
+            return text.push_str(literal.value());
+        }
+
+        // Preserve the existing truncation after N-Triples rendering.
+        let mut rendered = PreparationText::new(preparation)?;
+        let _ = write!(rendered, "{term}");
+        let (rendered, credit) = rendered.finish()?;
+        let result = if rendered.len() > 60 {
+            let end = rendered
+                .char_indices()
+                .nth(57)
+                .map_or(rendered.len(), |(index, _)| index);
+            text.push_str(&rendered[..end])
+                .and_then(|()| text.push_str("…"))
+        } else {
+            text.push_str(&rendered)
+        };
+        drop(rendered);
+        drop(credit);
+        result
     }
 
     pub(super) fn pt_str(&self, x: &PT) -> String {
@@ -2965,23 +4270,32 @@ impl<'a> Planner<'a> {
 
     // ------------------------------------------------------------- join groups ------
 
-    fn plan_group(&mut self, items: Vec<Item>, mut filters: Vec<Expr>) -> Result<Node> {
-        let mut triples = Vec::new();
-        let mut paths: Vec<PathItem> = Vec::new();
-        let mut nodes = Vec::new();
-        let mut unpacks: Vec<UnpackItem> = Vec::new();
+    fn plan_group(&mut self, items: PlanningVec<Item>, filters: Vec<Expr>) -> Result<Node> {
+        // The credit for each filter list on the checked route is declared before the
+        // list it covers, and the parameter is moved below them, so that every list is
+        // freed before its credit is released on each path, refusals included.
+        let _deferred_list;
+        let _late_list;
+        let mut joined_list = list_credit(None);
+        let _settled_list;
+        let _late_joined;
+        let mut filters = filters;
+        let mut triples = self.planning_vec()?;
+        let mut paths = self.planning_vec()?;
+        let mut nodes = self.planning_vec()?;
+        let mut unpacks = self.planning_vec()?;
         for it in items {
             match it {
-                Item::Unpack(u) => unpacks.push(u),
-                Item::Triple(t) => triples.push(t),
-                Item::Path(p) => paths.push(p),
-                Item::Node(n) => nodes.push(n),
+                Item::Unpack(u) => unpacks.push(u)?,
+                Item::Triple(t) => triples.push(t)?,
+                Item::Path(p) => paths.push(p)?,
+                Item::Node(n) => nodes.push(n)?,
             }
         }
 
         // Filter-equality substitution (Jena TransformFilterEquality): FILTER(?x = <iri>)
         // with ?x only used in triple patterns → substitute the constant.
-        let mut binds: Vec<(VarId, Id)> = Vec::new();
+        let mut binds = self.planning_vec::<(VarId, Id)>()?;
         let mut i = 0;
         while i < filters.len() {
             if let Some((v, c)) = equality_constant(&filters[i], self.ctx)
@@ -2996,7 +4310,7 @@ impl<'a> Planner<'a> {
                     .any(|t| matches!(t.graph, ActiveGraph::Var(g) if g == v))
             {
                 filters.remove(i);
-                for t in &mut triples {
+                for t in triples.iter_mut() {
                     for x in &mut t.t {
                         if *x == PT::V(v) {
                             *x = PT::C(c);
@@ -3004,9 +4318,9 @@ impl<'a> Planner<'a> {
                     }
                 }
                 for f in &mut filters {
-                    substitute(f, v, c);
+                    substitute(f, v, c)?;
                 }
-                binds.push((v, c));
+                binds.push((v, c))?;
                 continue;
             }
             i += 1;
@@ -3026,7 +4340,7 @@ impl<'a> Planner<'a> {
                     continue;
                 };
                 triples.remove(i);
-                for t in &mut triples {
+                for t in triples.iter_mut() {
                     for x in &mut t.t {
                         if *x == PT::V(v) {
                             *x = PT::C(c);
@@ -3034,9 +4348,9 @@ impl<'a> Planner<'a> {
                     }
                 }
                 for f in &mut filters {
-                    substitute(f, v, c);
+                    substitute(f, v, c)?;
                 }
-                binds.push((v, c));
+                binds.push((v, c))?;
             }
         }
 
@@ -3045,11 +4359,34 @@ impl<'a> Planner<'a> {
         // variable that an element may leave unbound (a UNION branch, an OPTIONAL, a
         // failed BIND, an UNDEF of VALUES) does not, when another element can still bind
         // it. Such a FILTER waits until every element that binds them has joined.
-        let deferred = defer_open_filters(&mut filters, &triples, &paths, &nodes, &unpacks);
+        let deferred;
+        (deferred, _deferred_list) = if self.branch_payload.borrow().is_none() {
+            let deferred = defer_open_filters(&mut filters, &triples, &paths, &nodes, &unpacks);
+            (deferred, list_credit(None))
+        } else {
+            self.defer_open_filters_checked(&mut filters, &triples, &paths, &nodes, &unpacks)?
+        };
 
-        let mut leaves: Vec<Vec<Node>> = Vec::new();
-        for t in &triples {
-            leaves.push(self.scan_options(t)?);
+        let leaf_slots = triples
+            .len()
+            .checked_add(nodes.len())
+            .ok_or_else(|| self.ctx.memory_exceeded(u64::MAX))?;
+        let leaf_storage = self.planning_scratch(|layout| layout.slots::<Vec<Node>>(leaf_slots))?;
+        let mut scan_storage = self.planning_scratch(|layout| layout.slots::<Node>(nodes.len()))?;
+        let mut leaves = if leaf_storage.is_some() {
+            Vec::with_capacity(leaf_slots)
+        } else {
+            Vec::new()
+        };
+        for t in triples.iter() {
+            let (options, credit) = self.scan_options(t)?.into_parts();
+            if let Some(credit) = credit {
+                scan_storage
+                    .as_mut()
+                    .expect("checked scan storage")
+                    .merge(credit);
+            }
+            leaves.push(options);
         }
         if self.ctx.opt.sampled_filters && !filters.is_empty() {
             super::sample::prepare(self.ctx, &leaves, &filters);
@@ -3063,7 +4400,7 @@ impl<'a> Planner<'a> {
                 PT::C(c) => Term::C(c.0),
             };
             let mut stars: Vec<(VarId, u64)> = Vec::new();
-            for t in &triples {
+            for t in triples.iter() {
                 super::charsets::items_of(
                     term(t.t[0]),
                     term(t.t[1]),
@@ -3076,8 +4413,9 @@ impl<'a> Planner<'a> {
             super::charsets::register(self.ctx, &stars);
         }
         // searches that read the rest of the group are attached to it at the end
-        let (dependent, nodes): (Vec<Node>, Vec<Node>) =
-            nodes.into_iter().partition(|n| match &n.kind {
+        let mut dependent = self.planning_vec()?;
+        for node in nodes {
+            let needs_input = match &node.kind {
                 Kind::VectorSearch(s) => s.needs_input(),
                 Kind::TextSearch(s) => s.needs_input(),
                 Kind::HybridSearch(s) => s.needs_input(),
@@ -3087,9 +4425,12 @@ impl<'a> Planner<'a> {
                 Kind::HistoryChanges(s) => s.needs_input(),
                 Kind::AlgoCall(s) => s.needs_input(),
                 _ => false,
-            });
-        for n in nodes {
-            leaves.push(vec![n]);
+            };
+            if needs_input {
+                dependent.push(node)?;
+            } else {
+                leaves.push(vec![node]);
+            }
         }
         // A deferred FILTER whose variables only the join's leaves bind is settled once
         // the components that hold them are planned, since a component holds every leaf
@@ -3103,23 +4444,52 @@ impl<'a> Planner<'a> {
                     .any(|u| u.t == v || u.parts.contains(&PT::V(v)))
                 || dependent.iter().any(|n| n.vars.contains(&v))
         };
-        let (mut settled, late): (Vec<Expr>, Vec<Expr>) = deferred
-            .into_iter()
-            .partition(|f| !f.var_set().into_iter().any(binds_late));
+        let mut settled;
+        let late;
+        (settled, late, _late_list) =
+            if self.branch_payload.borrow().is_none() || deferred.is_empty() {
+                let (settled, late): (Vec<Expr>, Vec<Expr>) = deferred
+                    .into_iter()
+                    .partition(|f| !f.var_set().into_iter().any(binds_late));
+                (settled, late, list_credit(None))
+            } else {
+                // The late filters move out of the deferred list, the settled ones stay.
+                let mut settled = deferred;
+                let (late, credit) = self.extract_filters(&mut settled, |f| {
+                    f.visit_vars(&mut |v| if binds_late(v) { Err(()) } else { Ok(()) })
+                        .is_err()
+                })?;
+                #[cfg(test)]
+                if let Some(credit) = &credit {
+                    note_list(3, late.len());
+                    watch_list(3, &late, credit);
+                }
+                (settled, late, list_credit(credit))
+            };
         if self.ctx.opt.probed_keys && leaves.len() > 1 {
             super::keyprobe::prepare(self.ctx, &leaves);
         }
         let mut result = if leaves.is_empty() {
+            drop(leaves);
             Node::unit()
         } else if leaves.iter().any(|l| l[0].is_empty()) {
             let mut vars: Vec<VarId> = leaves.iter().flat_map(|l| l[0].vars.clone()).collect();
             vars.sort_unstable();
             vars.dedup();
+            drop(leaves);
             Node::empty(vars)
         } else {
-            self.join_order(leaves, &mut filters, &mut settled)?
+            self.join_order(leaves, &mut filters, &mut settled, &mut joined_list)?
         };
-        filters.append(&mut settled);
+        drop(scan_storage);
+        drop(leaf_storage);
+        _settled_list = if self.branch_payload.borrow().is_none() {
+            filters.append(&mut settled);
+            list_credit(None)
+        } else {
+            let more = settled.len();
+            self.grow_filters(&mut filters, more, 7, |f| f.append(&mut settled))?
+        };
 
         // attach property paths, preferring those whose endpoint is already bound
         while !paths.is_empty() {
@@ -3133,27 +4503,13 @@ impl<'a> Planner<'a> {
                 .unwrap_or(0);
             let p = paths.remove(idx);
             result = self.attach_path(result, p)?;
-            let (now, later): (Vec<Expr>, Vec<Expr>) =
-                std::mem::take(&mut filters).into_iter().partition(|f| {
-                    !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
-                });
-            filters = later;
-            if !now.is_empty() {
-                result = filter(result, now, self.ctx);
-            }
+            result = self.place_retained(result, &mut filters, true)?;
         }
         // decompose triple terms once their variable is bound (outer before nested)
         while let Some(i) = unpacks.iter().position(|u| result.vars.contains(&u.t)) {
             let u = unpacks.remove(i);
             result = self.unpack(result, u);
-            let (now, later): (Vec<Expr>, Vec<Expr>) =
-                std::mem::take(&mut filters).into_iter().partition(|f| {
-                    !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
-                });
-            filters = later;
-            if !now.is_empty() {
-                result = filter(result, now, self.ctx);
-            }
+            result = self.place_retained(result, &mut filters, true)?;
         }
         for d in dependent {
             result = match &d.kind {
@@ -3166,18 +4522,17 @@ impl<'a> Planner<'a> {
                 Kind::HybridSearch(_) => super::hybrid::attach(self, result, d)?,
                 _ => self.attach_vector(result, d)?,
             };
-            let (now, later): (Vec<Expr>, Vec<Expr>) =
-                std::mem::take(&mut filters).into_iter().partition(|f| {
-                    !f.has_exists() && f.var_set().iter().all(|v| result.vars.contains(v))
-                });
-            filters = later;
-            if !now.is_empty() {
-                result = filter(result, now, self.ctx);
-            }
+            result = self.place_retained(result, &mut filters, true)?;
         }
-        filters.extend(late);
+        _late_joined = if self.branch_payload.borrow().is_none() {
+            filters.extend(late);
+            list_credit(None)
+        } else {
+            let more = late.len();
+            self.grow_filters(&mut filters, more, 8, |f| f.extend(late))?
+        };
         if !filters.is_empty() {
-            result = filter(result, filters, self.ctx);
+            result = self.filter_admitted(result, filters)?;
         }
         for (v, c) in binds {
             let mut n = Node::unary(
@@ -3259,14 +4614,30 @@ impl<'a> Planner<'a> {
     /// DP / greedy join ordering over connected components (QLever QueryPlanner).
     /// `settled` are FILTERs that may run only on whole components: each is placed on
     /// the component that binds all its variables, and the rest join the `filters` of
-    /// the joins between components.
+    /// the joins between components. On the checked route, when `filters` grow for the
+    /// rest of `settled`, the credit for the grown list goes into `append_credit`, the
+    /// caller's slot, which the caller declares before its list.
     fn join_order(
         &self,
         leaves: Vec<Vec<Node>>,
         filters: &mut Vec<Expr>,
         settled: &mut Vec<Expr>,
+        append_credit: &mut ListCredit,
     ) -> Result<Node> {
         let n = leaves.len();
+        let preparation = self
+            .branch_payload
+            .borrow()
+            .as_ref()
+            .map(|held| held.preparation().clone());
+        // Component parents, the membership map, the ordered groups and the
+        // moved leaf slots all coexist until the component join plans are known.
+        let _components = self.planning_scratch(|layout| {
+            layout.slots::<usize>(n)?;
+            layout.map::<usize, PlanningVec<usize>>(n)?;
+            layout.slots::<PlanningVec<usize>>(n)?;
+            layout.slots::<Option<Vec<Node>>>(n)
+        })?;
         // connected components by shared variables
         let mut comp: Vec<usize> = (0..n).collect();
         fn find(c: &mut [usize], x: usize) -> usize {
@@ -3297,9 +4668,19 @@ impl<'a> Planner<'a> {
             // each leaf joins the component of the first leaf with each of its variables,
             // since testing every pair costs the square of the leaves
             let mut first: FxHashMap<VarId, usize> = FxHashMap::default();
+            let mut checked_first = preparation.as_ref().map(PreparationMap::new).transpose()?;
             for (i, l) in leaves.iter().enumerate() {
                 for &v in &l[0].vars {
-                    let j = *first.entry(v).or_insert(i);
+                    let j = if let Some(first) = &mut checked_first {
+                        if let Some(&previous) = first.get(&v) {
+                            previous
+                        } else {
+                            first.insert(v, i)?;
+                            i
+                        }
+                    } else {
+                        *first.entry(v).or_insert(i)
+                    };
                     if j != i {
                         let (a, b) = (find(&mut comp, j), find(&mut comp, i));
                         comp[a] = b;
@@ -3307,42 +4688,84 @@ impl<'a> Planner<'a> {
                 }
             }
         }
-        let mut groups: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+        let mut groups: FxHashMap<usize, PlanningVec<usize>> = FxHashMap::default();
+        if let Some(preparation) = &preparation {
+            groups.try_reserve(n).map_err(|_| preparation.exhausted())?;
+        }
         for i in 0..n {
             let r = find(&mut comp, i);
-            groups.entry(r).or_default().push(i);
+            match groups.entry(r) {
+                std::collections::hash_map::Entry::Occupied(mut group) => {
+                    group.get_mut().push(i)?
+                }
+                std::collections::hash_map::Entry::Vacant(group) => {
+                    let mut members = self.planning_vec()?;
+                    members.push(i)?;
+                    group.insert(members);
+                }
+            }
         }
         let mut leaves: Vec<Option<Vec<Node>>> = leaves.into_iter().map(Some).collect();
-        let mut parts: Vec<Node> = Vec::new();
-        let mut group_list: Vec<Vec<usize>> = groups.into_values().collect();
-        group_list.sort();
+        let mut group_list: Vec<_> = groups.into_values().collect();
+        // Component member lists are disjoint, nonempty and ascending, so ordering them by
+        // their first member equals the lexicographic order and they never tie.
+        group_list.sort_unstable_by_key(|members| members[0]);
+        let _components_out = self.planning_scratch(|layout| {
+            layout.slots::<Node>(group_list.len())?;
+            // Keep the stable cost sort of components, including equal estimates.
+            layout.slots::<Node>(group_list.len())
+        })?;
+        let mut parts = if preparation.is_some() {
+            Vec::with_capacity(group_list.len())
+        } else {
+            Vec::new()
+        };
         for members in group_list {
+            self.ctx.check()?;
+            let _items =
+                self.planning_scratch(|layout| layout.slots::<Vec<Node>>(members.len()))?;
             let items: Vec<Vec<Node>> =
                 members.iter().map(|&i| leaves[i].take().unwrap()).collect();
             let plan = if items.len() == 1 {
                 // filters can change which access path is cheapest (range pushdown)
                 let opts = items.into_iter().next().unwrap();
-                let (best, rest) = opts
-                    .into_iter()
-                    .map(|o| {
+                if preparation.is_some() {
+                    self.choose_checked_scan(opts, filters)?
+                } else {
+                    // the first of the cheapest, as `min_by` takes it
+                    let mut best: Option<(Node, Vec<Expr>)> = None;
+                    for o in opts {
                         let mut f = filters.clone();
-                        (self.place_filters(o, &mut f), f)
-                    })
-                    .min_by(|a, b| a.0.cost.total_cmp(&b.0.cost))
-                    .unwrap();
-                *filters = rest;
-                best
+                        let n = self.place_filters(o, &mut f)?;
+                        if best
+                            .as_ref()
+                            .is_none_or(|(b, _)| n.cost.total_cmp(&b.cost).is_lt())
+                        {
+                            best = Some((n, f));
+                        }
+                    }
+                    let (best, rest) = best.unwrap();
+                    *filters = rest;
+                    best
+                }
             } else {
                 #[cfg(test)]
                 if REFERENCE_JOIN_ORDER.with(|r| r.get()) {
-                    parts.push(self.place_filters(self.reference_order(items, filters)?, settled));
+                    parts.push(self.place_filters(self.reference_order(items, filters)?, settled)?);
                     continue;
                 }
                 super::joinorder::order(self, items, filters)?
             };
-            parts.push(self.place_filters(plan, settled));
+            parts.push(self.place_filters(plan, settled)?);
         }
-        filters.append(settled);
+        // On the checked route the credit for the grown list goes into the caller's slot,
+        // which is declared before the caller's list, before anything else can fail.
+        if preparation.is_none() {
+            filters.append(settled);
+        } else {
+            let more = settled.len();
+            *append_credit = self.grow_filters(filters, more, 4, |f| f.append(settled))?;
+        }
         // components connected by a spatial conjunct are joined on it
         super::geojoin::spatial_joins(&mut parts, filters, self.ctx);
         // cross products between components, smallest first
@@ -3350,16 +4773,49 @@ impl<'a> Planner<'a> {
         let mut it = parts.into_iter();
         let mut acc = it.next().unwrap();
         for p in it {
-            acc = self.join_components(acc, p, filters);
+            acc = self.join_components(acc, p, filters)?;
         }
         Ok(super::indexjoin::fuse_stars(acc, self.ctx))
+    }
+
+    fn choose_checked_scan(&self, options: Vec<Node>, filters: &mut Vec<Expr>) -> Result<Node> {
+        struct Choice {
+            node: Node,
+            rest: Vec<Expr>,
+            copy: Reservation,
+        }
+
+        let mut best: Option<Choice> = None;
+        for option in options {
+            self.ctx.check()?;
+            let mut copy = self
+                .planning_scratch(|layout| layout.expressions(filters))?
+                .expect("checked scan choice");
+            let mut rest = filters.clone();
+            let (node, kept) = self.place_filters_held(option, &mut rest)?;
+            if let Some(kept) = kept {
+                copy.merge(kept);
+            }
+            let candidate = Choice { node, rest, copy };
+            if best
+                .as_ref()
+                .is_none_or(|best| candidate.node.cost.total_cmp(&best.node.cost).is_lt())
+            {
+                best = Some(candidate);
+            }
+        }
+        let Choice { node, rest, copy } = best.expect("one scan option");
+        let mut active = self.branch_payload.borrow_mut();
+        active.as_mut().expect("checked graph branch").merge(copy);
+        *filters = rest;
+        Ok(node)
     }
 
     /// The join of `a` and `b`, which share no variable, keyed on a conjunct `?x = ?y` of
     /// a remaining FILTER with one variable on each side (see [`Kind::KeyedJoin`]). Every
     /// FILTER that both sides together bind is tested on the candidates and removed from
     /// `filters`. Without a suitable equality it retains the ordinary product.
-    fn join_components(&self, a: Node, b: Node, filters: &mut Vec<Expr>) -> Node {
+    fn join_components(&self, a: Node, b: Node, filters: &mut Vec<Expr>) -> Result<Node> {
         // An application callback in the condition may count or depend on its calls,
         // which the candidates change, so it keeps the product.
         if !self.ctx.opt.keyed_join
@@ -3368,7 +4824,7 @@ impl<'a> Planner<'a> {
             || b.is_empty()
             || a.vars.iter().any(|v| b.vars.contains(v))
         {
-            return self.place_filters(join(a, b, self.ctx), filters);
+            return self.place_filters(super::joinorder::join_admitted(a, b, self)?, filters);
         }
         let bound = |f: &Expr| {
             !f.has_exists() && {
@@ -3381,38 +4837,290 @@ impl<'a> Planner<'a> {
             .filter(|f| bound(f))
             .find_map(|f| equality_key(f, &a, &b))
         else {
-            return self.place_filters(join(a, b, self.ctx), filters);
+            return self.place_filters(super::joinorder::join_admitted(a, b, self)?, filters);
         };
-        let (now, later): (Vec<Expr>, Vec<Expr>) =
-            std::mem::take(filters).into_iter().partition(|f| bound(f));
-        *filters = later;
-        let expr = now
-            .into_iter()
-            .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
-            .expect("the linking FILTER");
+        let expr = if self.branch_payload.borrow().is_none() {
+            let (now, later): (Vec<Expr>, Vec<Expr>) =
+                std::mem::take(filters).into_iter().partition(|f| bound(f));
+            *filters = later;
+            now.into_iter()
+                .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
+                .expect("the linking FILTER")
+        } else {
+            // The same test without allocating: every occurrence of a variable is bound
+            // by one of the sides, and there is one.
+            // The credit is declared before the list, which is freed first on a refusal.
+            let _now_list;
+            let now = {
+                let (now, now_list) = self.extract_filters(filters, |f| {
+                    !f.has_exists() && {
+                        let mut any = false;
+                        f.visit_vars(&mut |v| {
+                            any = true;
+                            if a.vars.contains(&v) || b.vars.contains(&v) {
+                                Ok(())
+                            } else {
+                                Err(())
+                            }
+                        })
+                        .is_ok()
+                            && any
+                    }
+                })?;
+                #[cfg(test)]
+                if let Some(credit) = &now_list {
+                    watch_list(5, &now, credit);
+                }
+                _now_list = list_credit(now_list);
+                now
+            };
+            #[cfg(test)]
+            note_list(5, now.len());
+            // The conjunction the join keeps boxes both sides of each conjunct it adds,
+            // admitted before it is made, with the plan's other storage.
+            let (expr, boxes) = {
+                #[cfg(test)]
+                let _stage = crate::test_alloc::Stage::enter(10);
+                let boxes = now.len().saturating_sub(1).saturating_mul(2);
+                let boxes = self
+                    .filter_list_scratch(boxes)?
+                    .expect("checked join condition");
+                let expr = now
+                    .into_iter()
+                    .reduce(|l, r| Expr::And(Box::new(l), Box::new(r)))
+                    .expect("the linking FILTER");
+                (expr, boxes)
+            };
+            self.retain_planning(boxes);
+            expr
+        };
         // The larger input is streamed and the smaller one indexed.
-        if a.est >= b.est {
+        Ok(if a.est >= b.est {
             keyed_inner_join(a, b, expr, (x, y), self.ctx)
         } else {
             keyed_inner_join(b, a, expr, (y, x), self.ctx)
-        }
+        })
     }
 
-    /// Apply (and remove) filters whose variables are all bound by `n`.
-    pub(super) fn place_filters(&self, n: Node, filters: &mut Vec<Expr>) -> Node {
-        let (now, later): (Vec<Expr>, Vec<Expr>) =
-            std::mem::take(filters).into_iter().partition(|f| {
-                !f.has_exists() && {
-                    let vs = f.var_set();
-                    !vs.is_empty() && vs.iter().all(|v| n.vars.contains(v))
-                }
-            });
-        *filters = later;
-        if now.is_empty() {
-            n
-        } else {
-            filter(n, now, self.ctx)
+    /// Apply (and remove) filters whose variables are all bound by `n`. On the checked
+    /// route what the plan keeps of the FILTER stays with the branch's plan storage.
+    pub(super) fn place_filters(&self, n: Node, filters: &mut Vec<Expr>) -> Result<Node> {
+        self.place_retained(n, filters, false)
+    }
+
+    /// [`Planner::place_filters`], with the credit for what the plan keeps of the FILTER
+    /// returned to the caller instead.
+    pub(super) fn place_filters_held(
+        &self,
+        n: Node,
+        filters: &mut Vec<Expr>,
+    ) -> Result<(Node, Option<Reservation>)> {
+        self.place_where(n, filters, false)
+    }
+
+    fn place_retained(&self, n: Node, filters: &mut Vec<Expr>, constant: bool) -> Result<Node> {
+        let (n, kept) = self.place_where(n, filters, constant)?;
+        if let Some(kept) = kept {
+            self.retain_planning(kept);
         }
+        Ok(n)
+    }
+
+    /// Apply (and remove) the filters without EXISTS whose variables are all bound by
+    /// `n`, and those without variables when `constant`. On the checked route the
+    /// partition of the filters is admitted before it is made, the filters not placed
+    /// stay in `filters`' own list, and the credit returned holds what the plan keeps of
+    /// the FILTER.
+    fn place_where(
+        &self,
+        n: Node,
+        filters: &mut Vec<Expr>,
+        constant: bool,
+    ) -> Result<(Node, Option<Reservation>)> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::within(6);
+        let applies = |f: &Expr| {
+            !f.has_exists() && {
+                let vs = f.var_set();
+                (constant || !vs.is_empty()) && vs.iter().all(|v| n.vars.contains(v))
+            }
+        };
+        // The same test without allocating: every occurrence of a variable is bound by
+        // `n`, and there is one unless `constant`.
+        let bound = |f: &Expr| {
+            !f.has_exists() && {
+                let mut any = false;
+                f.visit_vars(&mut |v| {
+                    any = true;
+                    if n.vars.contains(&v) { Ok(()) } else { Err(()) }
+                })
+                .is_ok()
+                    && (constant || any)
+            }
+        };
+        // The reservation is declared before the list it covers, which is freed first on
+        // a refusal.
+        let mut partition;
+        let (held, now) = if self.branch_payload.borrow().is_some() && !filters.is_empty() {
+            self.planning_stage(FILTER_PHASE)?;
+            let placed = filters.iter().filter(|f| bound(f)).count();
+            #[cfg(test)]
+            BOUND_TERMS.with(|terms| {
+                let mut t = terms.get();
+                t[2] = t[2].max(filters.len() as u64);
+                terms.set(t);
+            });
+            // The filters placed here move into a list of their own, made to its size,
+            // and the rest stay in the caller's list, which allocates nothing here.
+            let partition = self
+                .planning_scratch(|layout| layout.slots::<Expr>(placed))?
+                .expect("checked filter partition");
+            let mut now = Vec::new();
+            now.try_reserve_exact(placed)
+                .map_err(|_| partition.preparation().exhausted())?;
+            now.extend(filters.extract_if(.., |f| bound(f)));
+            debug_assert_eq!(now.len(), placed);
+            #[cfg(test)]
+            watch_list(PARTITION_WATCH, &now, &partition);
+            (Some(partition), now)
+        } else {
+            let (now, later) = std::mem::take(filters).into_iter().partition(applies);
+            *filters = later;
+            (None, now)
+        };
+        partition = match held {
+            Some(held) => held,
+            None => {
+                return Ok((
+                    if now.is_empty() {
+                        n
+                    } else {
+                        filter(n, now, self.ctx)
+                    },
+                    None,
+                ));
+            }
+        };
+        let (n, kept) = if now.is_empty() {
+            (n, None)
+        } else {
+            let scratch = self.filter_scratch(&n, now.iter(), false)?;
+            let owned = self.filters_owned(&now)?;
+            self.filter_held(scratch, n, now, owned)?
+        };
+        // the FILTER keeps its list of conjuncts, which `kept` holds
+        partition.release_to(0);
+        #[cfg(test)]
+        crate::test_alloc::observe_release();
+        if let Some(kept) = kept {
+            partition.merge(kept);
+        }
+        Ok((n, Some(partition)))
+    }
+
+    /// The credit for [`filter`] of `n` under the filters `exprs` lists, taken before the
+    /// caller copies them when `copies`, or `None` on the ordinary route.
+    pub(super) fn filter_scratch<'e>(
+        &self,
+        n: &Node,
+        exprs: impl Iterator<Item = &'e Expr> + Clone,
+        copies: bool,
+    ) -> Result<Option<Reservation>> {
+        if self.branch_payload.borrow().is_none() {
+            return Ok(None);
+        }
+        self.planning_stage(FILTER_PHASE)?;
+        self.planning_scratch(|layout| filter_bound(layout, n, exprs, copies, self.ctx))
+    }
+
+    /// The storage that `exprs` own beyond their list, which a caller's credit holds
+    /// when it moves them into a FILTER. Zero on the ordinary route.
+    fn filters_owned(&self, exprs: &[Expr]) -> Result<u64> {
+        let active = self.branch_payload.borrow();
+        let Some(held) = active.as_ref() else {
+            return Ok(0);
+        };
+        let mut layout = super::checked_layout::Layout::retained(held.preparation());
+        for e in exprs {
+            layout.expression(e)?;
+        }
+        Ok(layout.bytes())
+    }
+
+    /// [`filter`] of `n` under `exprs`, admitted by `scratch` from
+    /// [`Planner::filter_scratch`]. `owned` is the storage of `exprs` that the caller's
+    /// credit holds already. On the checked route the credit returned holds what the plan
+    /// keeps beyond `n` and that storage.
+    pub(super) fn filter_held(
+        &self,
+        scratch: Option<Reservation>,
+        n: Node,
+        exprs: Vec<Expr>,
+        owned: u64,
+    ) -> Result<(Node, Option<Reservation>)> {
+        let Some(mut held) = scratch else {
+            return Ok((filter(n, exprs, self.ctx), None));
+        };
+        let before = {
+            let mut layout = super::checked_layout::Layout::retained(held.preparation());
+            layout.shallow(&n)?;
+            layout.bytes()
+        };
+        let f = filter(n, exprs, self.ctx);
+        // The FILTER, and the scan under it that range pushdown made in place of `n`,
+        // or `n` itself, whose storage `before` measured.
+        let (after, spatial) = {
+            let mut layout = super::checked_layout::Layout::retained(held.preparation());
+            layout.shallow(&f)?;
+            let base = match &f.kind {
+                Kind::Filter(_) => {
+                    layout.shallow(&f.children[0])?;
+                    &f.children[0]
+                }
+                _ => &f,
+            };
+            (layout.bytes(), matches!(base.kind, Kind::SpatialScan(_)))
+        };
+        let kept = after.saturating_sub(before).saturating_sub(owned);
+        // the spatial index's pushdown is admitted on its own (not yet)
+        debug_assert!(
+            spatial || kept <= held.bytes(),
+            "the filter keeps {kept} bytes of the {} admitted",
+            held.bytes()
+        );
+        if kept <= held.bytes() {
+            held.release_to(kept);
+        } else {
+            held.grow_by(kept - held.bytes())?;
+        }
+        #[cfg(test)]
+        crate::test_alloc::observe_release();
+        Ok((f, Some(held)))
+    }
+
+    /// [`filter`] of `n` under `exprs`, which the plan's credit holds already, with what
+    /// the plan keeps of it admitted on the checked route.
+    fn filter_admitted(&self, n: Node, exprs: Vec<Expr>) -> Result<Node> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::within(6);
+        let mut scratch = self.filter_scratch(&n, exprs.iter(), false)?;
+        // A list that filters were moved out of in place keeps its capacity, which the
+        // FILTER keeps with it. That storage was made before this stage, so its credit
+        // here has no allocation of the stage beside it.
+        let spare = exprs.capacity() - exprs.len();
+        if let Some(scratch) = scratch.as_mut()
+            && spare > 0
+        {
+            let mut layout = super::checked_layout::Layout::new(scratch.preparation());
+            layout.slots::<Expr>(spare)?;
+            scratch.grow_by(layout.bytes())?;
+        }
+        let owned = self.filters_owned(&exprs)?;
+        let (n, kept) = self.filter_held(scratch, n, exprs, owned)?;
+        if let Some(kept) = kept {
+            self.retain_planning(kept);
+        }
+        Ok(n)
     }
 
     // --------------------------------------------------------------- paths ------
@@ -3462,15 +5170,15 @@ impl<'a> Planner<'a> {
                 (u8::from(*min > 0), false, &**path)
             }
             PP::Alternative(..) => {
-                let mut alts = Vec::new();
-                flatten_alt(&p.path, &mut alts);
-                let mut branches = Vec::new();
+                let mut alts = self.planning_vec()?;
+                flatten_alt_into(&p.path, &mut |alt| alts.push(alt))?;
+                let mut branches = self.planning_vec()?;
                 for a in alts {
-                    let mut items = Vec::new();
+                    let mut items = self.planning_vec()?;
                     self.collect_path(p.s, a, p.o, &p.graph, &mut items, &p.src)?;
-                    branches.push(self.plan_group(items, Vec::new())?);
+                    branches.push(self.plan_group(items, Vec::new())?)?;
                 }
-                return Ok(join(left, union(branches), self.ctx));
+                return Ok(join(left, self.union_for_branch(branches)?, self.ctx));
             }
             PP::NegatedPropertySet(set) => {
                 // ?s ?p ?o FILTER(?p NOT IN set) (forward only; spargebra splits inverses)
@@ -3482,13 +5190,26 @@ impl<'a> Planner<'a> {
                 };
                 let mut opts = self.scan_options(&t)?;
                 opts.sort_by(|a, b| a.cost.total_cmp(&b.cost));
-                let scan = opts.swap_remove(0);
-                let list: Vec<Expr> = set
-                    .iter()
-                    .map(|n| Expr::Const(self.ctx.intern_term(&Term::NamedNode(n.clone()))))
-                    .collect();
-                let f = Expr::Not(Box::new(Expr::In(Box::new(Expr::Var(pv)), list)));
-                let mut n = filter(scan, vec![f], self.ctx);
+                let scan = opts.remove(0);
+                let mut n = {
+                    #[cfg(test)]
+                    let _stage = crate::test_alloc::Stage::within(6);
+                    // the list of the set's terms, the test's two boxes and the FILTER's
+                    // list, which the plan keeps
+                    let built = self.planning_scratch(|layout| {
+                        layout.slots::<Expr>(set.len().saturating_add(3))
+                    })?;
+                    let list: Vec<Expr> = set
+                        .iter()
+                        .map(|n| Expr::Const(self.ctx.intern_term(&Term::NamedNode(n.clone()))))
+                        .collect();
+                    let filters =
+                        vec![Expr::Not(Box::new(Expr::In(Box::new(Expr::Var(pv)), list)))];
+                    if let Some(built) = built {
+                        self.retain_planning(built);
+                    }
+                    self.filter_admitted(scan, filters)?
+                };
                 n = project(
                     n.clone(),
                     n.vars.iter().copied().filter(|v| *v != pv).collect(),
@@ -3497,13 +5218,13 @@ impl<'a> Planner<'a> {
                 return Ok(join(left, n, self.ctx));
             }
             _ => {
-                let mut items = Vec::new();
+                let mut items = self.planning_vec()?;
                 self.collect_path(p.s, &p.path, p.o, &p.graph, &mut items, &p.src)?;
                 let n = self.plan_group(items, Vec::new())?;
                 return Ok(join(left, n, self.ctx));
             }
         };
-        let Some((gf, gvar)) = self.graph_filter(&p.graph) else {
+        let Some((gf, gvar)) = self.graph_filter(&p.graph)? else {
             return Ok(Node::empty(left.vars.clone()));
         };
         let to_end = |x: PT| match x {
@@ -3546,7 +5267,7 @@ impl<'a> Planner<'a> {
             Some((id, rev)) if id.tag() != Tag::Local || self.ctx.local_facts => Some((id.0, rev)),
             _ => {
                 let (a, b) = (self.ctx.fresh_var(), self.ctx.fresh_var());
-                let mut items = Vec::new();
+                let mut items = self.planning_vec()?;
                 self.collect_path(PT::V(a), inner, PT::V(b), &p.graph, &mut items, &None)?;
                 let edges = self.plan_group(items, Vec::new())?;
                 let mut keep = vec![a, b];
@@ -4066,8 +5787,110 @@ impl<'a> VarSet<'a> {
     }
 }
 
+/// The most that [`union_vars`] of `a` and `b` variables allocates at once: the copy of
+/// the first list, which grows to hold both while old and new storage coexist, and the
+/// set of seen variables of a long union with its growth.
+pub(super) fn union_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: usize,
+    b: usize,
+) -> Result<()> {
+    let width = a.saturating_add(b);
+    layout.slots::<VarId>(width.max(4).saturating_mul(3))?;
+    if b > 32 && width > 64 {
+        layout.map::<VarId, ()>(width)?;
+        layout.map::<VarId, ()>(width)?;
+    }
+    Ok(())
+}
+
+/// The most that [`merge_dist`] of plans with `a` and `b` variables allocates at once:
+/// the membership sets of long inputs and the table, with its growth.
+pub(super) fn dist_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: usize,
+    b: usize,
+) -> Result<()> {
+    let width = a.saturating_add(b);
+    for side in [a, b] {
+        if side > 32 && width > 32 {
+            layout.map::<VarId, ()>(side)?;
+        }
+    }
+    layout.map::<VarId, f64>(width)?;
+    layout.map::<VarId, f64>(width)
+}
+
+/// The most that [`mk_join`] of `a` and `b` allocates at once, counting what the join
+/// keeps: the variable unions, the order, the distinct values, a short description and
+/// the children. The keys are the caller's.
+pub(super) fn join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+) -> Result<()> {
+    union_bound(layout, a.vars.len(), b.vars.len())?;
+    union_bound(layout, a.certain.len(), b.certain.len())?;
+    layout.slots::<VarId>(a.sorted.len().max(b.sorted.len()).max(1))?;
+    dist_bound(layout, a.vars.len(), b.vars.len())?;
+    layout.add(64)?;
+    layout.slots::<Node>(2)
+}
+
+/// The most that [`merge_join`] of `a` and `b` on `v`, which share `keys` variables,
+/// allocates at once: the join, a sort over each input not sorted on `v`, the keys with
+/// `v` first, and the description naming `v`.
+pub(super) fn merge_join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+    v: VarId,
+    keys: usize,
+    ctx: &Ctx,
+) -> Result<()> {
+    join_bound(layout, a, b)?;
+    for input in [a, b] {
+        if input.sorted.first() != Some(&v) {
+            layout.metadata(input)?;
+            layout.slots::<Node>(1)?;
+            layout.slots::<VarId>(2)?;
+        }
+    }
+    // the keys grow by pushes from one, and old and new storage can coexist
+    layout.slots::<VarId>(keys.saturating_add(1).max(4).saturating_mul(3))?;
+    let name = ctx.var_names.read()[v as usize].len();
+    layout.add(name.saturating_add(16).saturating_mul(4))
+}
+
+/// The most that [`hash_join`] of `a` and `b` on `keys` allocates at once: the join and
+/// its description, which spells each key, collects the spellings and joins them.
+pub(super) fn hash_join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+    keys: impl Iterator<Item = VarId>,
+    ctx: &Ctx,
+) -> Result<()> {
+    join_bound(layout, a, b)?;
+    let names = ctx.var_names.read();
+    let (mut count, mut text) = (0usize, 0usize);
+    for v in keys {
+        count += 1;
+        text = text.saturating_add(names[v as usize].len().saturating_add(2));
+    }
+    drop(names);
+    layout.slots::<String>(count)?;
+    layout.add(text.saturating_mul(6))?;
+    layout.add(64)
+}
+
 pub(super) fn mk_join(a: Node, b: Node, algo: JoinAlgo, keys: Vec<VarId>, ctx: &Ctx) -> Node {
-    let (est, star) = join_est_with(&a, &b, &keys, ctx);
+    let (est, star) = {
+        // estimates can grow the query's memo of characteristic sets (a stage of its own)
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(8);
+        join_est_with(&a, &b, &keys, ctx)
+    };
     let vars = union_vars(&a.vars, &b.vars);
     let certain = union_vars(&a.certain, &b.certain);
     let sorted = match algo {
@@ -4184,6 +6007,13 @@ pub(super) fn hash_join(a: Node, b: Node, keys: Vec<VarId>, ctx: &Ctx) -> Node {
     h
 }
 
+/// Whether [`join`] of `a` and `b` returns one of them unchanged, since the other is
+/// the one empty solution.
+pub(super) fn join_keeps_input(a: &Node, b: &Node) -> bool {
+    let unit = |n: &Node| n.vars.is_empty() && matches!(&n.kind, Kind::Values(t) if t.len() == 1);
+    !a.is_empty() && !b.is_empty() && (unit(a) || unit(b))
+}
+
 /// Best single join of two plans (used outside the DP).
 pub fn join(a: Node, b: Node, ctx: &Ctx) -> Node {
     if a.is_empty() || b.is_empty() {
@@ -4206,6 +6036,167 @@ pub fn join(a: Node, b: Node, ctx: &Ctx) -> Node {
         .into_iter()
         .min_by(|x, y| x.cost.total_cmp(&y.cost))
         .unwrap()
+}
+
+/// Independent payloads of one candidate and its output join metadata.
+struct GraphJoinCandidate {
+    node: Node,
+    held: Reservation,
+}
+
+fn graph_join_metadata(
+    layout: &mut super::checked_layout::Layout<'_>,
+    branch: &Node,
+    binding: &Node,
+    var: VarId,
+    ctx: &Ctx,
+) -> Result<()> {
+    let width = branch
+        .vars
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    // Variables and certainty clone the branch's vector before appending the one
+    // variable the binding can add. The old and replacement vectors can coexist.
+    let schemas = width
+        .max(4)
+        .checked_mul(6)
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    layout.slots::<VarId>(schemas)?;
+    layout.slots::<VarId>(branch.sorted.len().max(binding.sorted.len()).max(1))?;
+    layout.slots::<Node>(2)?;
+    layout.slots::<VarId>(1)?;
+    // Join distributions grow a raw table and may use a temporary variable
+    // membership set for the larger side.
+    layout.map::<VarId, f64>(width)?;
+    layout.map::<VarId, f64>(width)?;
+    layout.map::<VarId, ()>(branch.vars.len())?;
+    let name_len = ctx.var_names.read()[var as usize].len();
+    // A one-key description can hold only the key and fixed framing. Hash join
+    // retains the name, its prefixed spelling and the joined text while formatting.
+    let text = name_len
+        .checked_add(32)
+        .and_then(|len| len.checked_mul(8))
+        .ok_or_else(|| ctx.memory_exceeded(u64::MAX))?;
+    layout.add(text)?;
+    layout.slots::<String>(1)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most bytes a graph's branch kept beyond the credit admitted while it was
+    /// built, on this thread since the last reset.
+    pub(super) static BRANCH_SHORTFALL: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The event before the index candidate of a graph's binding is admitted.
+pub(super) const GRAPH_INDEX_PHASE: &str = "reserving graph binding index join";
+
+#[cfg(test)]
+thread_local! {
+    /// The index candidates of graph bindings built on this thread since the last reset.
+    pub(super) static GRAPH_INDEX_OFFERS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn checked_graph_binding_join(
+    branch: Node,
+    binding: Node,
+    var: VarId,
+    ctx: &Ctx,
+    original: &mut Reservation,
+) -> Result<Node> {
+    let preparation = original.preparation().clone();
+    let mut layout = super::checked_layout::Layout::new(&preparation);
+    graph_join_metadata(&mut layout, &branch, &binding, var, ctx)?;
+
+    // The empty and identity cases and the Cartesian path keep their owning
+    // inputs without making alternate copies.
+    if !branch.vars.contains(&var) {
+        original.grow_by(layout.bytes())?;
+        return Ok(join(branch, binding, ctx));
+    }
+
+    let mut copies = super::checked_layout::Layout::new(&preparation);
+    copies.node(&branch)?;
+    copies.node(&binding)?;
+    let alternative = |merge: bool| -> Result<GraphJoinCandidate> {
+        preparation.stage("copying graph join candidate")?;
+        let mut held = preparation.reserve(layout.bytes())?;
+        held.grow_by(copies.bytes())?;
+        if merge {
+            for input in [&branch, &binding] {
+                if input.sorted.first() != Some(&var) {
+                    let mut sort = super::checked_layout::Layout::new(&preparation);
+                    sort.metadata(input)?;
+                    sort.slots::<Node>(1)?;
+                    sort.slots::<VarId>(2)?;
+                    held.grow_by(sort.bytes())?;
+                }
+            }
+        }
+        let a = branch.clone();
+        let b = binding.clone();
+        let node = if merge {
+            merge_join(a, b, var, &[var], ctx)
+        } else {
+            hash_join(a, b, vec![var], ctx)
+        };
+        Ok(GraphJoinCandidate { node, held })
+    };
+    let merge = (branch.certain.contains(&var)
+        && merge_offered(
+            branch.est,
+            branch.sorted.first() == Some(&var),
+            binding.est,
+            binding.sorted.first() == Some(&var),
+        ))
+    .then(|| alternative(true))
+    .transpose()?;
+    let hash = alternative(false)?;
+    let index = if ctx.opt.batched_join {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(7);
+        // The candidate copies the binding, and offering it copies the branch's filters
+        // and builds the operator, whether or not it is then offered.
+        preparation.stage(GRAPH_INDEX_PHASE)?;
+        let mut bound = super::checked_layout::Layout::new(&preparation);
+        bound.node(&binding)?;
+        super::indexjoin::index_join_bound(&mut bound, &binding, &branch, ctx)?;
+        let mut held = preparation.reserve(bound.bytes())?;
+        match super::indexjoin::graph_binding_candidate(&binding, &branch, ctx) {
+            Some(node) => {
+                #[cfg(test)]
+                GRAPH_INDEX_OFFERS.with(|offers| offers.set(offers.get() + 1));
+                // The offer's temporary storage is gone, so the candidate keeps only
+                // what its plan keeps.
+                let mut retained = super::checked_layout::Layout::retained(&preparation);
+                retained.node(&node)?;
+                let kept = retained.bytes();
+                debug_assert!(
+                    kept <= held.bytes(),
+                    "the index candidate keeps {kept} bytes of the {} admitted",
+                    held.bytes()
+                );
+                held.grow_to(kept)?;
+                held.release_to(kept);
+                Some(GraphJoinCandidate { node, held })
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let winner = [merge, Some(hash), index]
+        .into_iter()
+        .flatten()
+        .min_by(|a, b| a.node.cost.total_cmp(&b.node.cost))
+        .expect("a hash candidate is always available");
+    drop(branch);
+    drop(binding);
+    original.release_to(0);
+    original.merge(winner.held);
+    Ok(winner.node)
 }
 
 fn left_join(l: Node, r: Node, expr: Option<Expr>, ctx: &Ctx) -> Node {
@@ -4368,38 +6359,325 @@ fn union(children: Vec<Node>) -> Node {
         1 => return children.into_iter().next().unwrap(),
         _ => {}
     }
+    let mut node = union_shape(&children, || Ok(())).expect("uncontrolled union shape");
+    node.children = children;
+    node
+}
+
+fn union_shape(children: &[Node], check: impl Fn() -> Result<()>) -> Result<Node> {
     let mut vars: Vec<VarId> = Vec::new();
-    for c in &children {
-        for v in &c.vars {
-            if !vars.contains(v) {
-                vars.push(*v);
+    let mut shared = children[0].certain.clone();
+    let mut est = 0.0;
+    let mut cost = 0.0;
+    for child in children {
+        check()?;
+        for &var in &child.vars {
+            if !vars.contains(&var) {
+                vars.push(var);
             }
         }
+        shared.retain(|var| child.certain.contains(var));
+        est += child.est;
+        cost += child.cost;
     }
-    let certain: Vec<VarId> = vars
+    let certain = vars
         .iter()
-        .filter(|v| children.iter().all(|c| c.certain.contains(v)))
         .copied()
+        .filter(|v| shared.contains(v))
         .collect();
-    let est: f64 = children.iter().map(|c| c.est).sum();
-    let cost: f64 = children.iter().map(|c| c.cost).sum::<f64>() + est;
     let dist = vars.iter().map(|&v| (v, est.max(1.0))).collect();
-    Node {
+    Ok(Node {
         kind: Kind::Union,
         vars,
         certain,
         sorted: Vec::new(),
         est,
-        cost,
+        cost: cost + est,
         dist,
         desc: format!("{} branches", children.len()),
-        children,
+        children: Vec::new(),
+    })
+}
+
+fn checked_union_shape(
+    children: &[Node],
+    preparation: &Preparation,
+) -> Result<(Node, Reservation)> {
+    use std::fmt::Write;
+
+    let mut vars = PreparationBuffer::new(preparation)?;
+    let mut seen = PreparationMap::<VarId, ()>::new(preparation)?;
+    let mut occurrences = PreparationMap::new(preparation)?;
+    let mut est = 0.0;
+    let mut cost = 0.0;
+    for (index, child) in children.iter().enumerate() {
+        preparation.check()?;
+        for &var in &child.vars {
+            if seen.insert(var, ())?.is_none() {
+                vars.push(var)?;
+            }
+        }
+        for &var in &child.certain {
+            let (count, last) = occurrences.get(&var).copied().unwrap_or((0, usize::MAX));
+            if last != index {
+                occurrences.insert(var, (count + 1, index))?;
+            }
+        }
+        est += child.est;
+        cost += child.cost;
     }
+    drop(seen);
+
+    let mut certain = PreparationBuffer::new(preparation)?;
+    let mut dist = PreparationMap::new(preparation)?;
+    for &var in &*vars {
+        if occurrences
+            .get(&var)
+            .is_some_and(|(count, _)| *count == children.len())
+        {
+            certain.push(var)?;
+        }
+        dist.insert(var, est.max(1.0))?;
+    }
+    drop(occurrences);
+
+    let length = (children.len().ilog10() + 1) as usize + " branches".len();
+    let mut held = preparation.reserve(length as u64)?;
+    let mut desc = String::new();
+    desc.try_reserve_exact(length)
+        .map_err(|_| preparation.exhausted())?;
+    write!(desc, "{} branches", children.len()).expect("writing to a String");
+    let (vars, vars_credit) = vars.into_parts();
+    let (certain, certain_credit) = certain.into_parts();
+    let (dist, dist_credit) = dist.into_parts();
+    held.merge(vars_credit);
+    held.merge(certain_credit);
+    held.merge(dist_credit);
+    Ok((
+        Node {
+            kind: Kind::Union,
+            vars,
+            certain,
+            sorted: Vec::new(),
+            est,
+            cost: cost + est,
+            dist,
+            desc,
+            children: Vec::new(),
+        },
+        held,
+    ))
+}
+
+/// The phase that admits a FILTER placed on a plan (see [`Planner::filter_scratch`]).
+pub(super) const FILTER_PHASE: &str = "reserving filter";
+
+/// The phase that admits a list of filters that planning moves filters into or grows.
+pub(super) const FILTER_LIST_PHASE: &str = "reserving filter list";
+
+/// The credit for a list of filters, held while the caller plans with the list. Its
+/// binding is declared before the list's binding, or before the parameter that owns the
+/// list is bound again, so that on every path the list is freed, or moved into storage
+/// admitted on its own, before the credit returns. Unit tests settle its drop with the
+/// observer, as credit handed up by the stage that acquired it.
+#[cfg(test)]
+type ListCredit = crate::test_alloc::Settled;
+#[cfg(not(test))]
+type ListCredit = Option<Reservation>;
+
+#[cfg(test)]
+thread_local! {
+    /// The longest admitted filter list per producer: the FILTER's conjuncts, the
+    /// filters moved below an operator, the deferred and the late filters, the
+    /// remaining filters that the settled ones join after the components, the filters
+    /// of a keyed join, the list of one FILTER that calls application extensions, and
+    /// the remaining filters that the settled ones join without components and that the
+    /// late ones join.
+    pub(super) static LIST_REACH: std::cell::Cell<[usize; 9]> =
+        const { std::cell::Cell::new([0; 9]) };
+}
+
+#[cfg(test)]
+type ListWatch = Box<dyn Fn(usize, &[Expr], &Reservation)>;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's look at each filter list on the checked route right after it is made or
+    /// grown: the producer as in [`LIST_REACH`], or [`PARTITION_WATCH`] for the filters
+    /// that [`Planner::place_where`] places, then the list and the credit that holds it.
+    /// The test may watch the list's storage, fill the budget or cancel there, and then
+    /// see whether the list is freed before its credit returns.
+    pub(super) static LIST_WATCH: std::cell::RefCell<Option<ListWatch>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The [`LIST_WATCH`] site of the filters that [`Planner::place_where`] places.
+#[cfg(test)]
+pub(super) const PARTITION_WATCH: usize = 9;
+
+#[cfg(test)]
+fn watch_list(site: usize, list: &[Expr], credit: &Reservation) {
+    LIST_WATCH.with(|watch| {
+        if let Some(watch) = watch.borrow().as_ref() {
+            watch(site, list, credit);
+        }
+    });
+}
+
+#[cfg(test)]
+fn note_list(site: usize, len: usize) {
+    LIST_REACH.with(|reach| {
+        let mut all = reach.get();
+        all[site] = all[site].max(len);
+        reach.set(all);
+    });
+}
+
+#[cfg(test)]
+fn list_credit(held: Option<Reservation>) -> ListCredit {
+    crate::test_alloc::Settled::new(crate::test_alloc::Origin::handed_up(), held)
+}
+#[cfg(not(test))]
+fn list_credit(held: Option<Reservation>) -> ListCredit {
+    held
+}
+
+/// The most that [`filter`] of `n` under `exprs` allocates at once, counting what the
+/// FILTER keeps but not what it keeps of `n`, and the copies of `exprs` when `copies`.
+/// Moving range conjuncts into a scan of `n` splits the filters into their conjuncts,
+/// sorts them and renders the moved ones, and copies the scan. A FILTER renders every
+/// conjunct for its description and its sampled selectivity, and a FILTER over a
+/// scan's sorted column may compile the conjuncts on it to find the key ranges it
+/// reads. The spatial index's pushdown is not counted here.
+pub(super) fn filter_bound<'e>(
+    layout: &mut super::checked_layout::Layout<'_>,
+    n: &Node,
+    exprs: impl Iterator<Item = &'e Expr> + Clone,
+    copies: bool,
+    ctx: &Ctx,
+) -> Result<()> {
+    struct Count(usize);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 = self.0.saturating_add(s.len());
+            Ok(())
+        }
+    }
+    let (mut count, mut conjuncts, mut text, mut most) = (0usize, 0usize, Count(0), 0usize);
+    for e in exprs.clone() {
+        count += 1;
+        conjuncts = conjuncts.saturating_add(e.conjunct_count());
+        text.0 = text.0.saturating_add(8);
+        let _ = e.write_description(ctx, &mut text);
+        let mut occurrences = 0usize;
+        let _ = e.visit_vars(&mut |_| {
+            occurrences += 1;
+            Ok::<(), ()>(())
+        });
+        most = most.max(occurrences);
+    }
+    let copy = |layout: &mut super::checked_layout::Layout<'_>| -> Result<()> {
+        layout.slots::<Expr>(count.max(4).saturating_mul(2))?;
+        for e in exprs.clone() {
+            layout.expression(e)?;
+        }
+        Ok(())
+    };
+    if copies {
+        copy(layout)?;
+    }
+    let slots = conjuncts.max(4);
+    // every rendered conjunct, separator and note, as a list, joined and formatted
+    let texts = text
+        .0
+        .saturating_add(conjuncts.saturating_mul(4))
+        .saturating_add(n.desc.len())
+        .saturating_add(64)
+        .saturating_mul(6);
+    if let Kind::Scan(spec) = &n.kind {
+        // range pushdown splits the filters into their conjuncts and partitions them
+        layout.slots::<Expr>(slots.saturating_mul(8))?;
+        #[cfg(test)]
+        let sizes = std::cell::Cell::new((0u64, 0u64, 0usize));
+        // Then either range conjuncts move into a range scan, which the key ranges of
+        // the start do not read, or none do and the scan may read key ranges.
+        layout.larger(
+            |layout| {
+                #[cfg(test)]
+                let start = layout.bytes();
+                // the atoms, the id ranges, the rendered conjuncts and the scan's copy
+                layout.slots::<(RangeOp, super::value::Value)>(slots.saturating_mul(2))?;
+                layout.slots::<IdRange>(64)?;
+                layout.slots::<String>(conjuncts)?;
+                layout.add(texts)?;
+                layout.scan(spec)?;
+                #[cfg(test)]
+                sizes.set((layout.bytes() - start, sizes.get().1, sizes.get().2));
+                Ok(())
+            },
+            |layout| {
+                #[cfg(test)]
+                let start = layout.bytes();
+                // copies of the conjuncts on the sorted column, their key tests with the
+                // prefixes they give, and the id ranges of those prefixes
+                layout.slots::<Expr>(slots.saturating_mul(2))?;
+                for e in exprs.clone() {
+                    layout.expression(e)?;
+                }
+                if let Some(&(_, v)) = spec.cols.first() {
+                    let mut tests = 0usize;
+                    for e in exprs.clone() {
+                        tests = tests
+                            .saturating_add(super::keyfilter::KeyFilter::plan_prefixes_bytes(e, v));
+                    }
+                    layout.add(tests)?;
+                    #[cfg(test)]
+                    sizes.set((sizes.get().0, sizes.get().1, tests));
+                }
+                layout.slots::<(u64, u64)>(4)?;
+                #[cfg(test)]
+                sizes.set((sizes.get().0, layout.bytes() - start, sizes.get().2));
+                Ok(())
+            },
+        )?;
+        #[cfg(test)]
+        {
+            // the terms of the branch that sets the bound
+            let (range, keys, tests) = sizes.get();
+            BOUND_TERMS.with(|terms| {
+                let mut t = terms.get();
+                if range >= keys {
+                    t[0] = t[0].max(range);
+                } else {
+                    t[1] = t[1].max(tests as u64);
+                }
+                terms.set(t);
+            });
+        }
+    }
+    // the variables of one filter at a time, listed with every occurrence, and the
+    // reason a filter is not evaluated once per value, when it costs the FILTER's sort
+    // or tests the scan's key column
+    layout.slots::<VarId>(most.max(4).saturating_mul(2))?;
+    layout.add(128)?;
+    // the rendered conjuncts, their sampled selectivities, the description, and the
+    // FILTER's copy of its input's metadata
+    layout.slots::<String>(conjuncts)?;
+    layout.slots::<Option<super::sample::Sampled>>(conjuncts)?;
+    layout.add(texts)?;
+    layout.metadata(n)?;
+    layout.slots::<Node>(1)
 }
 
 pub fn filter(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> Node {
+    #[cfg(test)]
+    let _stage = crate::test_alloc::Stage::within(6);
     let (n, exprs) = push_range(n, exprs, ctx);
-    let (n, exprs) = super::geopf::push_spatial(n, exprs, ctx);
+    let (n, exprs) = {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(9);
+        super::geopf::push_spatial(n, exprs, ctx)
+    };
     if exprs.is_empty() {
         return n;
     }
@@ -4459,6 +6737,8 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
         .cloned()
         .collect();
     let prefixes = super::keyfilter::KeyFilter::plan_prefixes(&on_key, v)?;
+    #[cfg(test)]
+    REACHED.with(|r| r.set((r.get().0, r.get().1.max(on_key.len()))));
     let vocab = &ctx.snap.generation.vocab;
     let mut ids = vec![(0, Id::vocab(0).0 - 1)];
     for p in prefixes {
@@ -4475,6 +6755,10 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
     };
     let mut rows = 0.0;
     for &(lo, hi) in &ids {
+        // the store's reads, which the planner's credit does not cover (as for join
+        // estimates)
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(8);
         rows += ctx
             .snap
             .count_between(spec.perm, bound(lo, 0), bound(hi, u64::MAX))
@@ -4490,12 +6774,13 @@ fn prefix_rows(n: &Node, exprs: &[Expr], ctx: &Ctx) -> Option<(f64, usize)> {
 /// error, which orders as the error does. An expression that reads a variable bound by
 /// its own or a later BIND of the chain would read another value at the ORDER BY, so it
 /// is left out.
-fn bound_expressions(
-    gp: &GraphPattern,
-) -> Vec<(&spargebra::term::Variable, &spargebra::algebra::Expression)> {
-    let mut out = Vec::new();
+fn bound_expressions<'a>(
+    planner: &Planner<'_>,
+    gp: &'a GraphPattern,
+) -> Result<PlanningVec<(&'a oxrdf::Variable, &'a Expression)>> {
+    let mut out = planner.planning_vec()?;
     // the variables bound between an Extend's input and the ORDER BY
-    let mut later: Vec<&spargebra::term::Variable> = Vec::new();
+    let mut later = planner.planning_vec()?;
     let mut gp = gp;
     while let GraphPattern::Extend {
         inner,
@@ -4503,25 +6788,25 @@ fn bound_expressions(
         expression,
     } = gp
     {
-        later.push(variable);
-        let mut read = Vec::new();
-        expression_vars(expression, &mut read);
+        later.push(variable)?;
+        let mut read = planner.planning_vec()?;
+        expression_vars(expression, &mut read)?;
         if row_determined(expression) && !read.iter().any(|v| later.contains(v)) {
-            out.push((variable, expression));
+            out.push((variable, expression))?;
         }
         gp = inner;
     }
-    out
+    Ok(out)
 }
 
 /// The variables an expression reads (outside EXISTS, which [`row_determined`] rejects).
 fn expression_vars<'e>(
     e: &'e spargebra::algebra::Expression,
-    out: &mut Vec<&'e spargebra::term::Variable>,
-) {
+    out: &mut PlanningVec<&'e spargebra::term::Variable>,
+) -> Result<()> {
     use spargebra::algebra::Expression as E;
     match e {
-        E::Variable(v) | E::Bound(v) => out.push(v),
+        E::Variable(v) | E::Bound(v) => out.push(v)?,
         E::NamedNode(_) | E::Literal(_) | E::Exists(_) => {}
         E::Or(a, b)
         | E::And(a, b)
@@ -4535,22 +6820,28 @@ fn expression_vars<'e>(
         | E::Subtract(a, b)
         | E::Multiply(a, b)
         | E::Divide(a, b) => {
-            expression_vars(a, out);
-            expression_vars(b, out);
+            expression_vars(a, out)?;
+            expression_vars(b, out)?;
         }
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expression_vars(a, out),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expression_vars(a, out)?,
         E::In(a, l) => {
-            expression_vars(a, out);
-            l.iter().for_each(|x| expression_vars(x, out));
+            expression_vars(a, out)?;
+            for item in l {
+                expression_vars(item, out)?;
+            }
         }
         E::If(a, b, c) => {
-            expression_vars(a, out);
-            expression_vars(b, out);
-            expression_vars(c, out);
+            expression_vars(a, out)?;
+            expression_vars(b, out)?;
+            expression_vars(c, out)?;
         }
-        E::Coalesce(l) => l.iter().for_each(|x| expression_vars(x, out)),
-        E::FunctionCall(_, l) => l.iter().for_each(|x| expression_vars(x, out)),
+        E::Coalesce(l) | E::FunctionCall(_, l) => {
+            for item in l {
+                expression_vars(item, out)?;
+            }
+        }
     }
+    Ok(())
 }
 
 /// Whether an expression's value is the same each time it is evaluated on a row: no
@@ -4758,6 +7049,20 @@ pub(super) fn numeric_segment(
     })
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The most conjuncts moved into one range scan, and the most key tests that set
+    /// the rows of one scan, on this thread since the last reset.
+    pub(super) static REACHED: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+    /// The terms of [`filter_bound`] and of the checked partition of filters that set a
+    /// bound, on this thread since the last reset: the most bytes of the range scan's
+    /// branch when it is the larger, the most bytes of key tests in the key ranges'
+    /// branch when that is the larger, and the most filters partitioned at once.
+    pub(super) static BOUND_TERMS: std::cell::Cell<[u64; 3]> =
+        const { std::cell::Cell::new([0; 3]) };
+}
+
 /// Move numeric range conjuncts on a scan's sorted column into an [`Kind::RangeScan`].
 fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
     let Kind::Scan(spec) = &n.kind else {
@@ -4801,10 +7106,14 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
             k[spec.prefix.len()] = v;
             k
         };
-        let Ok(rows) = ctx
-            .snap
-            .count_between(spec.perm, bound(r.lo, 0), bound(r.hi, u64::MAX))
-        else {
+        let counted = {
+            // the store's reads, which the planner's credit does not cover
+            #[cfg(test)]
+            let _stage = crate::test_alloc::Stage::enter(8);
+            ctx.snap
+                .count_between(spec.perm, bound(r.lo, 0), bound(r.hi, u64::MAX))
+        };
+        let Ok(rows) = counted else {
             return (n, rest.into_iter().chain(pushed).collect());
         };
         let rows = rows as f64;
@@ -4817,6 +7126,8 @@ fn push_range(n: Node, exprs: Vec<Expr>, ctx: &Ctx) -> (Node, Vec<Expr>) {
     let read = (exact_rows + tested_rows).min(n.est);
     let est = (exact_rows + tested_rows * FILTER_SELECTIVITY.powi(pushed.len() as i32)).min(n.est);
     let seeks = 4.0 * ranges.len() as f64;
+    #[cfg(test)]
+    REACHED.with(|r| r.set((r.get().0.max(pushed.len()), r.get().1)));
     let spec = spec.clone();
     let mut r = Node {
         kind: Kind::RangeScan(
@@ -5150,6 +7461,10 @@ pub fn project(n: Node, vars: Vec<VarId>, ctx: &Ctx) -> Node {
         .map(|v| format!("?{}", ctx.var_name(*v)))
         .collect::<Vec<_>>()
         .join(" ");
+    project_described(n, vars, desc)
+}
+
+fn project_described(n: Node, vars: Vec<VarId>, desc: String) -> Node {
     let mut p = Node::unary(Kind::Project(vars.clone()), n, desc);
     p.cost = p.children[0].cost;
     p.certain.retain(|v| vars.contains(v));
@@ -5767,32 +8082,10 @@ fn defer_open_filters(
     nodes: &[Node],
     unpacks: &[UnpackItem],
 ) -> Vec<Expr> {
-    if filters.is_empty() || !nodes.iter().any(|n| n.certain.len() < n.vars.len()) {
+    if filters.is_empty() || !may_defer(nodes) {
         return Vec::new();
     }
-    let in_graph = |g: &ActiveGraph, v: VarId| matches!(g, ActiveGraph::Var(x) if *x == v);
-    let open = |v: VarId| {
-        if !nodes
-            .iter()
-            .any(|n| n.vars.contains(&v) && !n.certain.contains(&v))
-        {
-            return false;
-        }
-        let elements = triples
-            .iter()
-            .filter(|t| t.t.contains(&PT::V(v)) || in_graph(&t.graph, v))
-            .count()
-            + paths
-                .iter()
-                .filter(|p| p.s == PT::V(v) || p.o == PT::V(v) || in_graph(&p.graph, v))
-                .count()
-            + nodes.iter().filter(|n| n.vars.contains(&v)).count()
-            + unpacks
-                .iter()
-                .filter(|u| u.t == v || u.parts.contains(&PT::V(v)))
-                .count();
-        elements > 1
-    };
+    let open = |v: VarId| open_filter_var(v, triples, paths, nodes, unpacks);
     let (deferred, kept): (Vec<Expr>, Vec<Expr>) = std::mem::take(filters)
         .into_iter()
         .partition(|f| f.var_set().into_iter().any(open));
@@ -5800,12 +8093,63 @@ fn defer_open_filters(
     deferred
 }
 
-fn flatten_union<'g>(gp: &'g GraphPattern, out: &mut Vec<&'g GraphPattern>) {
+/// Whether an element of the group may leave a variable unbound, so that a FILTER of the
+/// group may wait (see [`defer_open_filters`]).
+fn may_defer(nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| n.certain.len() < n.vars.len())
+}
+
+/// Whether a FILTER on `v` waits until every element of the group that binds `v` has
+/// joined (see [`defer_open_filters`]).
+fn open_filter_var(
+    v: VarId,
+    triples: &[Triple],
+    paths: &[PathItem],
+    nodes: &[Node],
+    unpacks: &[UnpackItem],
+) -> bool {
+    let in_graph = |g: &ActiveGraph, v: VarId| matches!(g, ActiveGraph::Var(x) if *x == v);
+    if !nodes
+        .iter()
+        .any(|n| n.vars.contains(&v) && !n.certain.contains(&v))
+    {
+        return false;
+    }
+    let elements = triples
+        .iter()
+        .filter(|t| t.t.contains(&PT::V(v)) || in_graph(&t.graph, v))
+        .count()
+        + paths
+            .iter()
+            .filter(|p| p.s == PT::V(v) || p.o == PT::V(v) || in_graph(&p.graph, v))
+            .count()
+        + nodes.iter().filter(|n| n.vars.contains(&v)).count()
+        + unpacks
+            .iter()
+            .filter(|u| u.t == v || u.parts.contains(&PT::V(v)))
+            .count();
+    elements > 1
+}
+
+fn flatten_union<'g>(gp: &'g GraphPattern, out: &mut PlanningVec<&'g GraphPattern>) -> Result<()> {
     if let GraphPattern::Union { left, right } = gp {
-        flatten_union(left, out);
-        flatten_union(right, out);
+        flatten_union(left, out)?;
+        flatten_union(right, out)?;
     } else {
-        out.push(gp);
+        out.push(gp)?;
+    }
+    Ok(())
+}
+
+fn flatten_alt_into<'g>(
+    path: &'g PropertyPathExpression,
+    push: &mut impl FnMut(&'g PropertyPathExpression) -> Result<()>,
+) -> Result<()> {
+    if let PropertyPathExpression::Alternative(left, right) = path {
+        flatten_alt_into(left, push)?;
+        flatten_alt_into(right, push)
+    } else {
+        push(path)
     }
 }
 
@@ -5881,7 +8225,7 @@ fn equality_constant(e: &Expr, ctx: &Ctx) -> Option<(VarId, Id)> {
     }
 }
 
-fn substitute(e: &mut Expr, v: VarId, c: Id) {
+fn substitute(e: &mut Expr, v: VarId, c: Id) -> Result<()> {
     match e {
         Expr::Var(x) if *x == v => *e = Expr::Const(c),
         Expr::Bound(x) if *x == v => *e = Expr::Const(Id::from_bool(true)),
@@ -5891,24 +8235,33 @@ fn substitute(e: &mut Expr, v: VarId, c: Id) {
         | Expr::SameTerm(a, b)
         | Expr::Cmp(a, b, _)
         | Expr::Arith(a, b, _) => {
-            substitute(a, v, c);
-            substitute(b, v, c);
+            substitute(a, v, c)?;
+            substitute(b, v, c)?;
         }
-        Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => substitute(a, v, c),
+        Expr::Not(a) | Expr::Neg(a) | Expr::Pos(a) => substitute(a, v, c)?,
         Expr::In(a, l) => {
-            substitute(a, v, c);
-            l.iter_mut().for_each(|x| substitute(x, v, c));
+            substitute(a, v, c)?;
+            for e in l {
+                substitute(e, v, c)?;
+            }
         }
         Expr::If(a, b, d) => {
-            substitute(a, v, c);
-            substitute(b, v, c);
-            substitute(d, v, c);
+            substitute(a, v, c)?;
+            substitute(b, v, c)?;
+            substitute(d, v, c)?;
         }
-        Expr::Coalesce(l) | Expr::Call(_, l) => l.iter_mut().for_each(|x| substitute(x, v, c)),
+        Expr::Coalesce(l) | Expr::Call(_, l) => {
+            for e in l {
+                substitute(e, v, c)?;
+            }
+        }
         // the EXISTS pattern is substituted when it is evaluated: it keeps the constant
-        Expr::Exists(spec) if spec.vars.contains(&v) => *spec = Arc::new(spec.with_bound(v, c)),
+        Expr::Exists(spec) if spec.vars.contains(&v) => {
+            *spec = Arc::new(spec.with_bound_checked(v, c)?)
+        }
         _ => {}
     }
+    Ok(())
 }
 
 /// Variables certainly bound by a pattern (used for filter placement).
@@ -6059,13 +8412,17 @@ fn item_vars(items: &[Item]) -> FxHashSet<VarId> {
 
 /// All variable names mentioned in a pattern (for EXISTS / SERVICE).
 pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
-    gp.on_in_scope_variable(|v| out.push(v.as_str().to_string()));
+    visit_pattern_vars(gp, &mut |name| out.push(name.to_string()));
+}
+
+fn visit_pattern_vars(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
+    gp.on_in_scope_variable(|v| out(v.as_str()));
     // variables used only in filters also matter for substitution
-    fn walk(gp: &GraphPattern, out: &mut Vec<String>) {
+    fn walk(gp: &GraphPattern, out: &mut impl FnMut(&str)) {
         use GraphPattern as GP;
         match gp {
             GP::Filter { expr, inner } => {
-                expr_vars(expr, out);
+                visit_expr_vars(expr, out);
                 walk(inner, out);
             }
             GP::LeftJoin {
@@ -6074,7 +8431,7 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
                 expression,
             } => {
                 if let Some(e) = expression {
-                    expr_vars(e, out);
+                    visit_expr_vars(e, out);
                 }
                 walk(left, out);
                 walk(right, out);
@@ -6097,7 +8454,7 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
             | GP::Unfold {
                 inner, expression, ..
             } => {
-                expr_vars(expression, out);
+                visit_expr_vars(expression, out);
                 walk(inner, out);
             }
             GP::Graph { inner, .. }
@@ -6112,9 +8469,13 @@ pub fn collect_pattern_vars(gp: &GraphPattern, out: &mut Vec<String>) {
 }
 
 pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
+    visit_expr_vars(e, &mut |name| out.push(name.to_string()));
+}
+
+fn visit_expr_vars(e: &Expression, out: &mut impl FnMut(&str)) {
     use Expression as E;
     match e {
-        E::Variable(v) | E::Bound(v) => out.push(v.as_str().to_string()),
+        E::Variable(v) | E::Bound(v) => out(v.as_str()),
         E::Or(a, b)
         | E::And(a, b)
         | E::Equal(a, b)
@@ -6127,21 +8488,21 @@ pub(super) fn expr_vars(e: &Expression, out: &mut Vec<String>) {
         | E::Subtract(a, b)
         | E::Multiply(a, b)
         | E::Divide(a, b) => {
-            expr_vars(a, out);
-            expr_vars(b, out);
+            visit_expr_vars(a, out);
+            visit_expr_vars(b, out);
         }
-        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => expr_vars(a, out),
+        E::UnaryPlus(a) | E::UnaryMinus(a) | E::Not(a) => visit_expr_vars(a, out),
         E::In(a, l) => {
-            expr_vars(a, out);
-            l.iter().for_each(|x| expr_vars(x, out));
+            visit_expr_vars(a, out);
+            l.iter().for_each(|x| visit_expr_vars(x, out));
         }
         E::If(a, b, c) => {
-            expr_vars(a, out);
-            expr_vars(b, out);
-            expr_vars(c, out);
+            visit_expr_vars(a, out);
+            visit_expr_vars(b, out);
+            visit_expr_vars(c, out);
         }
-        E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| expr_vars(x, out)),
-        E::Exists(p) => collect_pattern_vars(p, out),
+        E::Coalesce(l) | E::FunctionCall(_, l) => l.iter().for_each(|x| visit_expr_vars(x, out)),
+        E::Exists(p) => visit_pattern_vars(p, out),
         _ => {}
     }
 }
@@ -6179,22 +8540,29 @@ pub fn ground_term(t: &GroundTerm) -> Term {
     }
 }
 
+fn short_iri(iri: &str) -> Option<(&'static str, &str)> {
+    for (prefix, namespace) in [
+        ("rdf:", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
+        ("rdfs:", "http://www.w3.org/2000/01/rdf-schema#"),
+        ("owl:", "http://www.w3.org/2002/07/owl#"),
+        ("xsd:", "http://www.w3.org/2001/XMLSchema#"),
+    ] {
+        if let Some(suffix) = iri.strip_prefix(namespace) {
+            return Some((prefix, suffix));
+        }
+    }
+    None
+}
+
 /// Compact term rendering for plan descriptions.
 pub fn short(t: &Term) -> String {
     match t {
         Term::NamedNode(n) => {
-            let s = n.as_str();
-            for (p, ns) in [
-                ("rdf:", "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
-                ("rdfs:", "http://www.w3.org/2000/01/rdf-schema#"),
-                ("owl:", "http://www.w3.org/2002/07/owl#"),
-                ("xsd:", "http://www.w3.org/2001/XMLSchema#"),
-            ] {
-                if let Some(l) = s.strip_prefix(ns) {
-                    return format!("{p}{l}");
-                }
+            let iri = n.as_str();
+            match short_iri(iri) {
+                Some((prefix, suffix)) => format!("{prefix}{suffix}"),
+                None => format!("<{iri}>"),
             }
-            format!("<{s}>")
         }
         Term::Literal(l) if l.datatype() == xsd::INTEGER => l.value().to_string(),
         t => {
@@ -6229,7 +8597,7 @@ pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -
         },
         g => g.clone(),
     };
-    let node = p.plan(&spec.pattern, &graph, Vec::new())?;
+    let node = p.plan(spec.pattern(), &graph, Vec::new())?;
     // A substituted pattern of one triple or a table of values reads its first row
     // directly, as the per-row evaluation of EXISTS stays eager until item 829. A larger
     // pattern pulls its first solution through cursor operators, as a LIMIT does, or
@@ -6386,7 +8754,11 @@ impl Planner<'_> {
         for (i, opts) in items.into_iter().enumerate() {
             let mut v = Vec::new();
             for o in opts {
-                let (o, fm) = super::joinorder::place_masked(self, o, 0, filters, &filter_vars);
+                let (o, fm, kept) =
+                    super::joinorder::place_masked(self, o, 0, filters, &filter_vars)?;
+                if let Some(kept) = kept {
+                    self.retain_planning(kept);
+                }
                 v.push((o, fm));
             }
             table.insert(1 << i, v);
@@ -6411,13 +8783,16 @@ impl Planner<'_> {
                                     continue;
                                 }
                                 for c in join_candidates(a, b, self.ctx) {
-                                    let (c, fm) = super::joinorder::place_masked(
+                                    let (c, fm, kept) = super::joinorder::place_masked(
                                         self,
                                         c,
                                         fa | fb,
                                         filters,
                                         &filter_vars,
-                                    );
+                                    )?;
+                                    if let Some(kept) = kept {
+                                        self.retain_planning(kept);
+                                    }
                                     cands.push((c, fm));
                                 }
                             }
@@ -6473,7 +8848,7 @@ impl Planner<'_> {
                 o.swap_remove(0)
             })
             .map(|p| self.place_filters(p, filters))
-            .collect();
+            .collect::<Result<_>>()?;
         while plans.len() > 1 {
             self.ctx.check()?;
             let mut best: Option<(usize, usize, Node)> = None;
@@ -6494,12 +8869,12 @@ impl Planner<'_> {
             let Some((i, j, c)) = best else { break };
             plans.remove(j);
             plans.remove(i);
-            plans.push(self.place_filters(c, filters));
+            plans.push(self.place_filters(c, filters)?);
         }
         let mut it = plans.into_iter();
         let mut acc = it.next().unwrap();
         for p in it {
-            acc = self.place_filters(join(acc, p, self.ctx), filters);
+            acc = self.place_filters(join(acc, p, self.ctx), filters)?;
         }
         Ok(acc)
     }

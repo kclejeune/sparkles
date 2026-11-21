@@ -48,6 +48,18 @@
 //! ordinary named graph: `chk:shapesGraph` refuses the ARQ aliases and the reserved graphs,
 //! and shapes with no active shape that has a target are refused rather than validating
 //! nothing. A shape that `sh:deactivated true` turns off is not active.
+//! Embedded SHACL-SPARQL reads the selected candidate data as its default graph.
+//! The gate refuses `GRAPH`, `FROM` and `FROM NAMED` in these queries. It also refuses
+//! `sh:target` declarations, malformed targets and conflicting node expression forms.
+//! A constraint's `sh:deactivated` flag must be a single valid Boolean literal.
+//! A blank node in `sh:targetNode` remains a constant unless its predicates identify a node expression.
+//!
+//! Standalone query checks, ShEx SPARQL selectors and SHACL-SPARQL queries refuse
+//! `SERVICE`, including operations inside expressions. Gate ShEx schemas cannot
+//! contain semantic actions, and shape-map data selectors cannot contain fixed
+//! blank nodes. Blank-node shape labels and selectors that match nothing are supported.
+//! ShEx SPARQL selectors read the validation data as their default graph and have
+//! no named graphs.
 //!
 //! An unsatisfiable-classes check parses, has a revision and can be named in a suite, but
 //! no build runs it. Its result is an error with the code `check-unavailable`, so a
@@ -67,7 +79,7 @@ mod run;
 #[cfg(test)]
 mod tests;
 
-pub use run::{CheckResult, Inputs, Note, Status, SuiteReport, run};
+pub use run::{CheckResult, GateControls, Inputs, Note, Status, SuiteReport, run, run_controlled};
 
 use oxrdf::{NamedNode, Term, Triple};
 use std::collections::{BTreeMap, BTreeSet};

@@ -866,6 +866,49 @@ Editing forms also edit declared nested blank-node children, SHACL 1.2 lists and
 commit. See the [nested form model](../visualization/README.md#nested-form-read-models)
 for its allowances and the editors.
 
+### Gate suite validation
+
+The Rust gate runner in `sparkles::gate` takes the state before a change and its
+candidate state. A SHACL check compiles its pinned shapes graph from the earlier state
+or reads inline shapes. Its embedded SPARQL queries use only the selected candidate data
+as their default graph. They refuse `GRAPH`, `FROM` and `FROM NAMED`. The gate refuses
+unsupported `sh:target` declarations and malformed targets even when a shape also has
+a valid target. A blank node in `sh:targetNode` is a constant unless its predicates
+identify a list or function expression. The gate refuses conflicting expression forms
+on the same node. A SPARQL constraint's `sh:deactivated` flag must be a single valid
+Boolean literal.
+
+Standalone queries, SHACL-SPARQL and ShEx SPARQL selectors refuse `SERVICE` before
+evaluation, including in expressions and subqueries. Gate ShEx schemas refuse semantic
+actions, and fixed blank-node data selectors are refused because their identifiers
+belong to a store. ShEx SPARQL selectors use the full validation data as their
+default graph, including any selected blank-node-named graphs, and have no named graphs.
+A blank-node shape label is supported, and a supported selector that matches no node
+can pass. See [C31](../specs/C31-checks-and-protected-merges/SPEC.md#outcome) for the gate suite work.
+
+The controlled Rust runner uses the earliest of its parent deadline and each check's
+timeouts. The deadline is cooperative and includes loading, parsing and compiling
+inputs, evaluation and report collection. SHACL checks it while compiling RDF lists
+and property paths, substituting SPARQL paths, and scanning pinned shapes and
+candidate data. Target conformance probes check the deadline while reading the
+candidate, including when they find no matches. A completed violation still blocks if its checker returns
+late. A timed-out or incomplete check returns an error.
+
+The produced-row budget is shared by all queries of a check. Intermediate row and
+query memory limits apply to each query. An embedded SHACL query's memory limit includes
+the workspace and graph IDs used to prepare its default dataset and the shared
+graph filter its plans retain. The public controlled SHACL API also supports queries
+with named graphs. Its query memory limit covers discovering their names and the
+estimated storage for the resulting per-graph plans. ShEx also enforces the
+same memory limit across shared preparation, FOCUS scan workspace and retained selector
+output. Retaining the
+first selector's output can reduce the memory available to a later selector. The runner
+can separately limit the number and estimated bytes of retained validation results.
+These bounds include SHACL detail results, ShEx expanded associations and explanations,
+and diagnostic evidence and messages. An asserted-only diagnostic excludes materialized
+inferences even when the store uses a union default graph. Enabling inferences preserves
+the normal selection of asserted data.
+
 ### Schema discovery and drafted shapes
 
 * `GET /$/schema/{ds}`, `sparkles schema` and `sparkles::schema` list classes and

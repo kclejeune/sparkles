@@ -13,6 +13,7 @@ use super::plan::{
 use super::sortkey::{Entry, Screen, SortKey, TopK};
 use super::table::{InputCredit, Materialized, Table, VarId};
 use super::value::{NumOp, Value, arith, order_cmp};
+use crate::access::Reservation;
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::index::{Block, ColMask, Key, Perm, pad};
@@ -24,6 +25,8 @@ use spargebra::algebra::AggregateFunction;
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
+
+pub(super) mod graph_diagnostics;
 
 pub(super) const PAR_THRESHOLD: usize = 16_384;
 
@@ -210,6 +213,33 @@ pub struct PlanInfo {
     /// The parts of the query the node reads (see [`PlanRefs`]). Only nodes that read
     /// triple patterns, filter or join have any, so it is boxed like `fidelity`.
     pub refs: Option<Box<PlanRefs>>,
+    #[doc(hidden)]
+    pub prepared_diagnostics: Option<std::sync::Arc<PreparedDiagnostics>>,
+}
+
+/// Owns the storage admitted while constructing an internal diagnostic tree.
+#[doc(hidden)]
+pub struct PreparedDiagnostics(
+    pub(super) Reservation,
+    Option<std::sync::Arc<PreparedDiagnostics>>,
+);
+
+impl PreparedDiagnostics {
+    pub(super) fn attach(info: &mut PlanInfo, held: Reservation) {
+        info.prepared_diagnostics = Some(std::sync::Arc::new(Self(
+            held,
+            info.prepared_diagnostics.take(),
+        )));
+    }
+}
+
+impl std::fmt::Debug for PreparedDiagnostics {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("PreparedDiagnostics")
+            .field(&self.0.bytes())
+            .field(&self.1)
+            .finish()
+    }
 }
 
 /// What a plan node reads of the query's text, so that a client can draw the plan on
@@ -787,6 +817,12 @@ fn names(ctx: &Ctx, vars: &[VarId]) -> Vec<String> {
 
 /// Plan description without execution (EXPLAIN).
 pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
+    if matches!(n.kind, Kind::GraphBranches(_))
+        && let Some(preparation) = &ctx.source_preparation
+    {
+        return graph_diagnostics::tree(ctx, n, preparation)
+            .unwrap_or_else(|_| describe_node(ctx, n.graph_singleton().unwrap_or(n)));
+    }
     PlanInfo {
         children: described_children(ctx, n),
         ..describe_node(ctx, n)
@@ -796,6 +832,11 @@ pub fn describe(ctx: &Ctx, n: &Node) -> PlanInfo {
 /// [`describe`] that stops at the query's timeout or cancellation: describing a plan at
 /// the plan limit names thousands of columns for each of thousands of nodes.
 pub(super) fn try_describe(ctx: &Ctx, n: &Node) -> Result<PlanInfo> {
+    if matches!(n.kind, Kind::GraphBranches(_))
+        && let Some(preparation) = &ctx.source_preparation
+    {
+        return graph_diagnostics::tree(ctx, n, preparation);
+    }
     ctx.check()?;
     // the node before its children, so that each check follows the work of a node
     let mut info = describe_node(ctx, n);
@@ -865,14 +906,34 @@ pub(crate) fn execute_materialized<'ctx>(
 ) -> Result<(Materialized<'ctx>, PlanInfo)> {
     execute_owned_inner(ctx, n, contains_algorithm(n))
 }
-fn contains_algorithm(n: &Node) -> bool {
-    matches!(n.kind, Kind::AlgoCall(_)) || n.children.iter().any(contains_algorithm)
+pub(super) fn contains_algorithm(n: &Node) -> bool {
+    matches!(n.kind, Kind::AlgoCall(_))
+        || match &n.kind {
+            Kind::GraphBranches(branches) => branches.contains_algorithm,
+            _ => n.children.iter().any(contains_algorithm),
+        }
 }
 fn execute_owned_inner<'ctx>(
     ctx: &'ctx Ctx,
     n: &Node,
     algorithm: bool,
 ) -> Result<(Materialized<'ctx>, PlanInfo)> {
+    execute_owned_with_diagnostics(ctx, n, algorithm, false)
+}
+
+fn execute_owned_with_diagnostics<'ctx>(
+    ctx: &'ctx Ctx,
+    n: &Node,
+    algorithm: bool,
+    checked_diagnostics: bool,
+) -> Result<(Materialized<'ctx>, PlanInfo)> {
+    if let Some(branch) = n.graph_singleton() {
+        return execute_owned_with_diagnostics(ctx, branch, algorithm, true).inspect_err(|_| {
+            if let Some(info) = ctx.take_failed(branch) {
+                ctx.set_failed(n, info);
+            }
+        });
+    }
     ctx.check()
         .inspect_err(|_| fail(ctx, n, Instant::now(), Vec::new()))?;
     let results = &ctx.snap.results;
@@ -884,6 +945,8 @@ fn execute_owned_inner<'ctx>(
             Kind::Scan(_)
                 | Kind::RangeScan(..)
                 | Kind::Values(_)
+                | Kind::GraphNames(_)
+                | Kind::GraphBranches(_)
                 | Kind::Empty
                 | Kind::CountScan { .. }
                 | Kind::CountDistinctScan { .. }
@@ -905,7 +968,12 @@ fn execute_owned_inner<'ctx>(
         };
         if let Some(t) = hit {
             ctx.produced(t.table.len())?;
-            let mut info = describe(ctx, n);
+            let mut info = if checked_diagnostics {
+                let preparation = ctx.source_preparation.as_ref().expect("checked GRAPH");
+                graph_diagnostics::tree(ctx, n, preparation)?
+            } else {
+                describe(ctx, n)
+            };
             info.actual_rows = t.table.len() as i64;
             info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
             info.cached = true;
@@ -917,7 +985,7 @@ fn execute_owned_inner<'ctx>(
             return Ok((t, info));
         }
     }
-    let (t, info) = execute_uncached(ctx, n, algorithm)?;
+    let (t, info) = execute_node(ctx, n, None, algorithm, None, checked_diagnostics)?;
     if let Some(k) = key {
         // only worth caching when recomputation is not trivially cheap
         if info.time_ms >= results.min_ms {
@@ -925,14 +993,6 @@ fn execute_owned_inner<'ctx>(
         }
     }
     Ok((t, info))
-}
-
-fn execute_uncached<'ctx>(
-    ctx: &'ctx Ctx,
-    n: &Node,
-    algorithm: bool,
-) -> Result<(Materialized<'ctx>, PlanInfo)> {
-    execute_node(ctx, n, None, algorithm, None)
 }
 
 /// The inputs of an operator, from a caller that produces each child's table itself.
@@ -959,7 +1019,7 @@ pub(super) fn execute_with_inputs<'ctx>(
     inputs: Inputs<'_, 'ctx>,
 ) -> Result<(Materialized<'ctx>, PlanInfo)> {
     debug_assert!(reads_inputs(n));
-    execute_node(ctx, n, Some(inputs), contains_algorithm(n), None)
+    execute_node(ctx, n, Some(inputs), contains_algorithm(n), None, false)
 }
 
 fn execute_node<'ctx>(
@@ -968,15 +1028,45 @@ fn execute_node<'ctx>(
     inputs: Option<Inputs<'_, 'ctx>>,
     algorithm: bool,
     equality: Option<(VarId, VarId)>,
+    checked_diagnostics: bool,
 ) -> Result<(Materialized<'ctx>, PlanInfo)> {
     let start = Instant::now();
+    let checked_diagnostics = checked_diagnostics || matches!(n.kind, Kind::GraphBranches(_));
     let mut failing = Failing {
         ctx,
         n,
         start,
         infos: Vec::new(),
+        prepared: None,
         armed: true,
     };
+    if checked_diagnostics {
+        let preparation = ctx
+            .source_preparation
+            .as_ref()
+            .expect("checked GRAPH diagnostics");
+        let mut held = graph_diagnostics::owner(preparation)?;
+        let children = n.graph_diagnostic_children();
+        let bytes = children
+            .len()
+            .checked_mul(size_of::<PlanInfo>())
+            .ok_or_else(|| preparation.exhausted())?;
+        held.grow_by(bytes as u64)?;
+        held.grow_by(size_of::<PlanFidelity>() as u64)?;
+        let header = graph_diagnostics::leaf(ctx, n, &mut held, None)?;
+        failing.prepared = Some(DiagnosticState { header, held });
+        failing
+            .infos
+            .try_reserve_exact(children.len())
+            .map_err(|_| preparation.exhausted())?;
+        if matches!(n.kind, Kind::GraphBranches(_)) {
+            for branch in children {
+                failing
+                    .infos
+                    .push(graph_diagnostics::pending(ctx, branch, preparation)?);
+            }
+        }
+    }
     // The result goes straight to the caller, and the guard keeps the plan only when
     // `run_node` returns an error, so the success path pays nothing for it.
     run_node(
@@ -985,6 +1075,7 @@ fn execute_node<'ctx>(
         inputs,
         start,
         &mut failing.infos,
+        &mut failing.prepared,
         &mut failing.armed,
         algorithm,
         equality,
@@ -998,12 +1089,48 @@ struct Failing<'a> {
     n: &'a Node,
     start: Instant,
     infos: Vec<PlanInfo>,
+    prepared: Option<DiagnosticState>,
     armed: bool,
+}
+
+struct DiagnosticState {
+    header: PlanInfo,
+    held: Reservation,
+}
+
+impl DiagnosticState {
+    fn finish(mut self, infos: Vec<PlanInfo>) -> PlanInfo {
+        self.header.children = infos;
+        PreparedDiagnostics::attach(&mut self.header, self.held);
+        self.header
+    }
 }
 
 impl Drop for Failing<'_> {
     fn drop(&mut self) {
         if self.armed && !std::thread::panicking() {
+            if let Some(mut diagnostic) = self.prepared.take() {
+                diagnostic.header.fidelity_mut().incomplete = true;
+                diagnostic.header.time_ms = self.start.elapsed().as_secs_f64() * 1000.0;
+                if matches!(self.n.kind, Kind::GraphBranches(_)) {
+                    for (branch, info) in self
+                        .n
+                        .graph_diagnostic_children()
+                        .iter()
+                        .zip(&mut self.infos)
+                    {
+                        if let Some(failure) = self.ctx.take_failed(branch) {
+                            *info = failure;
+                        }
+                    }
+                }
+                let mut info = diagnostic.finish(std::mem::take(&mut self.infos));
+                if self.ctx.graphs.is_some() {
+                    info.redact();
+                }
+                self.ctx.set_failed(self.n, info);
+                return;
+            }
             fail(
                 self.ctx,
                 self.n,
@@ -1060,6 +1187,7 @@ fn run_node<'ctx>(
     mut inputs: Option<Inputs<'_, 'ctx>>,
     start: Instant,
     infos: &mut Vec<PlanInfo>,
+    diagnostics: &mut Option<DiagnosticState>,
     failing: &mut bool,
     algorithm: bool,
     equality: Option<(VarId, VarId)>,
@@ -1069,19 +1197,26 @@ fn run_node<'ctx>(
     let owned_input = std::cell::Cell::new(false);
     let last_input = std::cell::Cell::new(InputCredit::Plain);
     let filtered_cross = inputs.is_none().then(|| string_cross_hint(n)).flatten();
+    let checked_diagnostics = diagnostics.is_some();
     let mut child = |i: usize, infos: &mut Vec<PlanInfo>| -> Result<Table> {
         let (mut t, info) = match inputs.as_mut() {
             Some(inputs) => inputs(i)?,
             // A filtered subset is not the unfiltered child's result. In particular,
             // never look it up or store it under the ordinary Cross cache key. The
             // logical parent Filter and both complete inputs still cache normally.
-            None if i == 0 && filtered_cross.is_some() => {
-                execute_node(ctx, &n.children[i], None, algorithm, filtered_cross)?
-            }
-            None => execute_owned_inner(
+            None if i == 0 && filtered_cross.is_some() => execute_node(
+                ctx,
+                &n.children[i],
+                None,
+                algorithm,
+                filtered_cross,
+                checked_diagnostics,
+            )?,
+            None => execute_owned_with_diagnostics(
                 ctx,
                 &n.children[i],
                 algorithm && contains_algorithm(&n.children[i]),
+                checked_diagnostics,
             )?,
         };
         infos.push(info);
@@ -1106,6 +1241,49 @@ fn run_node<'ctx>(
         Kind::Empty => Table::empty(n.vars.clone()),
         Kind::Values(t) => {
             let (table, credit) = Materialized::clone_fast(ctx, t)?.into_fast_parts()?;
+            output_fast = Some(credit);
+            table
+        }
+        Kind::GraphNames(names) => {
+            let (table, credit) = Materialized::clone_fast(ctx, &names.table)?.into_fast_parts()?;
+            output_fast = Some(credit);
+            table
+        }
+        Kind::GraphBranches(branches) => {
+            let mut out = Materialized::empty_fast(ctx, &n.vars, &[])?;
+            for (index, branch) in branches.inputs.iter().enumerate() {
+                ctx.check()?;
+                let (rows, info) = execute_owned_with_diagnostics(
+                    ctx,
+                    branch,
+                    algorithm && contains_algorithm(branch),
+                    true,
+                )?;
+                infos[index] = info;
+                let rows = rows.as_table();
+                let count = out
+                    .table
+                    .len
+                    .checked_add(rows.len)
+                    .ok_or_else(|| Error::invalid("graph group row count overflow"))?;
+                ctx.check_output_rows(count)?;
+                out.reserve_rows(ctx, count)?;
+                for (&var, target) in n.vars.iter().zip(&mut out.table.cols) {
+                    if let Some(column) = rows.col_of(var) {
+                        for part in rows.cols[column].chunks(1024) {
+                            ctx.check()?;
+                            target.extend_from_slice(part);
+                        }
+                    } else {
+                        while target.len() < count {
+                            ctx.check()?;
+                            target.resize((target.len() + 1024).min(count), Id::UNDEF);
+                        }
+                    }
+                }
+                out.table.len = count;
+            }
+            let (table, credit) = out.into_fast_parts()?;
             output_fast = Some(credit);
             table
         }
@@ -1733,25 +1911,35 @@ fn run_node<'ctx>(
         ctx.check_output(output.table.len(), output.table.width())?;
     }
     ctx.produced(output.table.len())?;
-    let info = PlanInfo {
-        fidelity: node_fidelity(ctx, n),
-        refs: node_refs(ctx, n),
-        operator: n.operator().to_string(),
-        description: match note {
-            Some(x) => format!("{} {x}", n.desc),
-            None => n.desc.clone(),
-        },
-        columns: names(ctx, &n.vars),
-        sorted_on: names(ctx, &n.sorted),
-        estimated_rows: n.est.round(),
-        estimated_cost: n.cost.round(),
-        actual_rows: output.table.len() as i64,
-        time_ms: start.elapsed().as_secs_f64() * 1000.0,
-        cached: false,
-        children: std::mem::take(infos),
-        counters,
-        warnings: Vec::new(),
+    if let (Some(diag), Some(note)) = (diagnostics.as_mut(), note.as_deref()) {
+        diag.header.description = graph_diagnostics::text(&mut diag.held, |out| {
+            out.write_str(&n.desc)?;
+            out.write_char(' ')?;
+            out.write_str(note)
+        })?;
+    }
+    let mut info = if let Some(diag) = diagnostics.take() {
+        diag.finish(std::mem::take(infos))
+    } else {
+        PlanInfo {
+            fidelity: node_fidelity(ctx, n),
+            refs: node_refs(ctx, n),
+            operator: n.operator().to_string(),
+            description: match note {
+                Some(x) => format!("{} {x}", n.desc),
+                None => n.desc.clone(),
+            },
+            columns: names(ctx, &n.vars),
+            sorted_on: names(ctx, &n.sorted),
+            estimated_rows: n.est.round(),
+            estimated_cost: n.cost.round(),
+            children: std::mem::take(infos),
+            ..Default::default()
+        }
     };
+    info.actual_rows = output.table.len() as i64;
+    info.time_ms = start.elapsed().as_secs_f64() * 1000.0;
+    info.counters = counters;
     *failing = false;
     Ok((output, info))
 }
@@ -2824,6 +3012,18 @@ pub(super) fn leaf_rows<'ctx>(
             let (t, truncated) = scan_limited(ctx, spec, &n.vars, &n.sorted, Some(want))
                 .inspect_err(|_| fail(ctx, n, start, Vec::new()))?;
             finish(t, Vec::new(), !truncated)
+        }
+        Kind::GraphNames(names) => {
+            let count = want.min(names.table.len());
+            let mut out = Materialized::empty_fast(ctx, &n.vars, &[])?;
+            ctx.check_output_rows(count)?;
+            out.reserve_rows(ctx, count)?;
+            for ids in names.table.cols[0][..count].chunks(1024) {
+                ctx.check()?;
+                out.table.cols[0].extend_from_slice(ids);
+            }
+            out.table.len = count;
+            finish(out, Vec::new(), count == names.table.len())
         }
         Kind::Values(_) | Kind::Empty => {
             let (t, info) = execute_materialized(ctx, n)?;

@@ -1084,12 +1084,11 @@ of them under 0.3 ms. The table lists all 24 flags above 0.3 ms.
 Eager `minus` read 1.30 to 1.42 of cc94ac7f in the batch-30 record and 1.16 to 1.28 here.
 With one thread, every server process of a cell agrees on `lang-filter`, `regex-iri` and
 streamed `optional-chain`, and their ratios to cc94ac7f are within 0.04 of those in the
-[batch-30 record](#forge-record-at-batch-30-against-cc94ac7f). Row 1072 records
-`lang-filter` at about 2.5% slower after item 678, and no row records a cost on
-`regex-iri`, streamed `optional-chain` or streamed `optional-count`, so the drift of these
-four queries from cc94ac7f is larger than the recorded costs that
-[row 1074](../../ROADMAP.md) counts. An interleaved forge A/B of cc94ac7f and the current
-main decides how much of that drift is a cost of the code before the range is bisected. In
+[batch-30 record](#forge-record-at-batch-30-against-cc94ac7f). At batch 33, item 1072
+recorded `lang-filter` at about 2.5% slower after item 678. Costs on `regex-iri` and
+streamed `optional-chain` and `optional-count` had no rows. The drift of the four queries
+from cc94ac7f exceeded the costs that [row 1074](../../ROADMAP.md) counted and prompted
+the [pinned interleaved run](#pinned-checks-and-drift-at-batch-37). In
 wall time, streamed `export-500k` is 7% to 9% slower than cc94ac7f in all four cells, and
 `lang-filter` and `regex-iri` 9% slower at 10.5M triples with one thread.
 
@@ -1148,8 +1147,9 @@ queries since the fixed baseline with one thread at 1.05M triples.
 
 Each ratio is the whole drift since cc94ac7f. The
 [separate timing of item 678](../../specs/X14-unified-executor/SPEC.md#charged-query-state-and-chunked-live-reservations)
-compares `lang-filter` against that item's own base. The two comparisons leave the share of
-the 1.029 endpoint ratio attributable to item 678 unresolved. The separate matrix runs of 8baa5686 and bccc5f7b read
+compares `lang-filter` against that item's own base. Roadmap item 1089 tracks that cost.
+The share of the 1.029 endpoint ratio attributable to item 678 remains unresolved. The
+separate matrix runs of 8baa5686 and bccc5f7b read
 `lang-filter` and `regex-iri` at 1.08 to 1.12 of the cc94ac7f run in the same cells, against
 1.03 here. Their instruction counts are nearly flat from 8baa5686 to 71c277b0, so the gap
 between the two methods is not explained. The 10.5M and 12-thread cells of these four

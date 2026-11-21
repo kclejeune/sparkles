@@ -5,6 +5,7 @@ use super::pool::PoolGrant;
 use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger, same};
 use super::table::VarId;
 use super::value::Value;
+use crate::access::{Preparation, PreparationText, Reservation};
 use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::store::{Snapshot, bnode_for, parse_bnode_label};
@@ -15,6 +16,12 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
+
+#[derive(Default)]
+struct PreparedVariables {
+    text: Option<Reservation>,
+    vector: Option<Reservation>,
+}
 
 /// Jena's IRI for the default graph (`Quad.defaultGraphIRI`).
 pub const DEFAULT_GRAPH_IRI: &str = "urn:x-arq:DefaultGraph";
@@ -928,6 +935,8 @@ pub struct Ctx {
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
+    /// A validation selector has only its selected default data, even for ARQ graph aliases.
+    pub(super) selector_default_only: bool,
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
@@ -937,6 +946,7 @@ pub struct Ctx {
     now: std::sync::OnceLock<oxsdatatypes::DateTime>,
     pub base_iri: Option<oxiri::Iri<String>>,
     pub var_names: RwLock<Vec<String>>,
+    prepared_var_names: parking_lot::Mutex<PreparedVariables>,
     /// Maximum number of rows any intermediate result may have (memory guard).
     pub max_rows: usize,
     /// Budget for the estimated bytes of intermediate results alive at once
@@ -1483,10 +1493,12 @@ impl Ctx {
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),
+            selector_default_only: false,
             graphs: None,
             now: std::sync::OnceLock::new(),
             base_iri: None,
             var_names: RwLock::new(Vec::new()),
+            prepared_var_names: Default::default(),
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
             grant: None,
@@ -1743,6 +1755,12 @@ impl Ctx {
             return None;
         }
         m.get(text).copied()
+    }
+
+    /// Whether some selectivity was measured on a sample while planning this query, so
+    /// that [`Ctx::sampled`] can find one.
+    pub(super) fn has_sampled(&self) -> bool {
+        !self.sampled.lock().is_empty()
     }
 
     /// Keep the selectivity measured for the conjunct shown as `text` (the first one
@@ -2351,6 +2369,61 @@ impl Ctx {
         }
         w.push(name.to_string());
         (w.len() - 1) as VarId
+    }
+
+    /// Intern a checked planner variable with its query-owned vector and text.
+    pub(super) fn var_prepared(&self, name: &str, preparation: &Preparation) -> Result<VarId> {
+        let find = |names: &[String]| -> Result<Option<VarId>> {
+            for (start, part) in names.chunks(256).enumerate() {
+                preparation.check()?;
+                if let Some(offset) = part.iter().position(|current| current == name) {
+                    return Ok(Some((start * 256 + offset) as VarId));
+                }
+            }
+            Ok(None)
+        };
+        if let Some(id) = find(&self.var_names.read())? {
+            return Ok(id);
+        }
+        let mut names = self.var_names.write();
+        if let Some(id) = find(&names)? {
+            return Ok(id);
+        }
+
+        let id = VarId::try_from(names.len()).map_err(|_| preparation.exhausted())?;
+        let mut text = PreparationText::new(preparation)?;
+        text.push_str(name)?;
+        let mut paid = self.prepared_var_names.lock();
+        if names.len() == names.capacity() {
+            let capacity = names
+                .capacity()
+                .checked_mul(2)
+                .map(|capacity| capacity.max(4))
+                .ok_or_else(|| preparation.exhausted())?;
+            let bytes = capacity
+                .checked_mul(size_of::<String>())
+                .ok_or_else(|| preparation.exhausted())?;
+            let vector_credit = preparation.reserve(bytes as u64)?;
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(capacity)
+                .map_err(|_| preparation.exhausted())?;
+            // Reallocation is committed as a unit so cancellation cannot remove
+            // names already in use by another part of the query.
+            replacement.append(&mut names);
+            let old = std::mem::replace(&mut *names, replacement);
+            drop(old);
+            paid.vector = Some(vector_credit);
+        }
+        let (name, text_credit) = text.finish()?;
+        names.push(name);
+        if let Some(held) = &mut paid.text {
+            held.merge(text_credit);
+        } else {
+            paid.text = Some(text_credit);
+        }
+        preparation.check()?;
+        Ok(id)
     }
 
     /// A fresh variable that can never clash with user variables.

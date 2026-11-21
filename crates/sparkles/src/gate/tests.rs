@@ -900,6 +900,951 @@ fn shapes_that_are_all_deactivated_are_refused() {
     assert_eq!(r.status, Status::Passed, "{r:?}");
 }
 
+fn profile_refusal(result: &CheckResult, reason: &str) {
+    assert_eq!(result.status, Status::Error, "{result:?}");
+    assert_eq!(result.code, Some("input-invalid"), "{result:?}");
+    assert!(result.blocks(), "{result:?}");
+    assert!(
+        result.messages[0].contains(reason),
+        "expected {reason:?}: {result:?}"
+    );
+}
+
+const NESTED_SERVICE: &str = "SELECT ?focus WHERE {
+    VALUES ?focus { <urn:x> }
+    BIND(EXISTS { SERVICE <urn:offline:unused> { ?a ?b ?c } } AS ?hit)
+    FILTER(?hit)
+}";
+
+#[test]
+fn gate_query_profile_refuses_service_before_evaluation() {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { GRAPH <urn:data> { <urn:x> <urn:p> <urn:y> } }")
+        .unwrap();
+    let snapshot = ds.store().snapshot();
+    let run_query = |query: &str| {
+        let literal = oxrdf::Literal::new_simple_literal(query);
+        let suite = suite(&format!(
+            "<urn:s> a chk:Suite ; chk:check <urn:c> .
+             <urn:c> a chk:QueryCheck ; chk:query {literal} ."
+        ))
+        .unwrap();
+        run_on(&suite, &snapshot, &snapshot).results.remove(0)
+    };
+    let queries = [
+        NESTED_SERVICE,
+        "ASK { SERVICE SILENT <urn:offline:unused> { ?s ?p ?o } }",
+        "SELECT ?s {
+            VALUES (?s ?endpoint) { (<urn:x> <urn:offline:unused>) }
+            OPTIONAL { ?s ?p ?o FILTER(EXISTS { SERVICE ?endpoint { ?a ?b ?c } }) }
+        }",
+        "SELECT ?count WHERE {
+            { SELECT (COUNT(IF(EXISTS { SERVICE <urn:offline:unused> { ?a ?b ?c } },
+                                1, 0)) AS ?count) WHERE {} }
+        }",
+        "SELECT ?s { ?s ?p ?o }
+         ORDER BY DESC(IF(EXISTS { SERVICE <urn:offline:unused> { ?a ?b ?c } }, 1, 0))",
+    ];
+    for query in queries {
+        sparkles_core::sparql::parse_query(query, None, &[]).expect(query);
+        profile_refusal(&run_query(query), "SERVICE");
+    }
+    assert_eq!(
+        run_query("ASK { FILTER(CONTAINS('SERVICE', 'SERVICE')) }").status,
+        Status::Failed
+    );
+    assert_eq!(
+        run_query("ASK FROM <urn:data> { <urn:x> <urn:p> <urn:y> }").status,
+        Status::Failed
+    );
+}
+
+#[cfg(feature = "shacl")]
+fn inline_shacl(shapes: &str, selection: &str) -> Suite {
+    let text = oxrdf::Literal::new_simple_literal(format!("@prefix sh: <{SH_NS}> .\n{shapes}"));
+    suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShaclCheck ; chk:shapes {text} {selection} ."
+    ))
+    .unwrap()
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_refuses_access_to_the_candidate_copy_of_pinned_shapes() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        &format!(
+            "PREFIX sh: <{SH_NS}>
+             INSERT DATA {{ GRAPH <urn:shapes> {{
+                 <urn:S> sh:targetNode <urn:x> ;
+                     sh:sparql [ sh:select
+                        'SELECT $this WHERE {{ GRAPH $shapesGraph {{ <urn:ref> <urn:flag> true }} }}'
+                     ] .
+                 <urn:ref> <urn:flag> true .
+             }} }}"
+        ),
+        "DELETE DATA { GRAPH <urn:shapes> { <urn:ref> <urn:flag> true } }",
+    );
+    let suite = shacl_suite("").unwrap();
+    profile_refusal(
+        &run_on(&suite, &before, &after).results[0],
+        "GRAPH is not allowed in the gate's SHACL profile",
+    );
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_checks_all_embedded_query_forms() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        "",
+        "INSERT DATA {
+            GRAPH <urn:data> { <urn:x> <urn:flag> true }
+            GRAPH <urn:other> { <urn:x> <urn:otherFlag> true }
+        }",
+    );
+    let run_shapes = |shapes: &str| {
+        let suite = inline_shacl(shapes, "; chk:dataGraph <urn:data>");
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    for graph in [
+        "<urn:other>",
+        "?g",
+        "<urn:x-arq:DefaultGraph>",
+        "<urn:x-arq:UnionGraph>",
+    ] {
+        let shapes = format!(
+            "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select
+              'SELECT $this WHERE {{ GRAPH {graph} {{ <urn:x> <urn:flag> true }} }}' ] ."
+        );
+        profile_refusal(
+            &run_shapes(&shapes),
+            "GRAPH is not allowed in the gate's SHACL profile",
+        );
+    }
+    let shapes = [
+        "<urn:S> sh:targetNode <urn:x>,
+             [ sh:select '''SELECT ?result WHERE {
+                 BIND(EXISTS { GRAPH <urn:other> { ?s ?p ?o } } AS ?result)
+             }''' ] .",
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+           sh:validator [ a sh:SPARQLAskValidator ;
+                           sh:ask 'ASK { GRAPH <urn:other> { ?s ?p ?o } }' ] .
+         <urn:S> sh:targetNode <urn:x> .",
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+           sh:propertyValidator [ a sh:SPARQLSelectValidator ;
+                   sh:select 'SELECT $this WHERE { GRAPH ?g { $this $PATH ?o } }' ] .
+         <urn:S> sh:targetNode <urn:x> ;
+             sh:property [ sh:path <urn:flag> ; <urn:param> true ] .",
+        "<urn:f> a sh:SPARQLFunction ;
+            sh:select 'SELECT ?o WHERE { GRAPH <urn:other> { ?s ?p ?o } }' .
+         <urn:S> sh:targetNode <urn:x> .",
+    ];
+    for shapes in shapes {
+        profile_refusal(
+            &run_shapes(shapes),
+            "GRAPH is not allowed in the gate's SHACL profile",
+        );
+    }
+    for from in ["FROM <urn:other>", "FROM NAMED <urn:other>"] {
+        for shapes in [
+            format!(
+                "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select
+                   'SELECT $this {from} WHERE {{ $this <urn:flag> true }}' ] ."
+            ),
+            format!(
+                "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+                    sh:nodeValidator [ sh:select 'SELECT $this {from} WHERE {{}}' ] .
+                 <urn:S> sh:targetNode <urn:x> ; <urn:param> true ."
+            ),
+            format!(
+                "<urn:S> sh:targetNode
+                    [ sh:select 'SELECT ?result {from} WHERE {{ ?result <urn:flag> true }}' ] ;
+                    sh:class <urn:Required> ."
+            ),
+        ] {
+            profile_refusal(
+                &run_shapes(&shapes),
+                "FROM and FROM NAMED are not allowed in the gate's SHACL profile",
+            );
+        }
+    }
+    let supported = [
+        "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select
+           'SELECT $this WHERE { $this <urn:flag> true }' ] .",
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+           sh:propertyValidator [ a sh:SPARQLSelectValidator ;
+                sh:select 'SELECT $this WHERE { $this $PATH $param }' ] .
+         <urn:S> sh:targetNode <urn:x> ;
+             sh:property [ sh:path <urn:flag> ; <urn:param> true ] .",
+        "<urn:S> sh:targetNode
+            [ sh:select 'SELECT ?result WHERE { ?result <urn:flag> true }' ] ;
+            sh:class <urn:Required> .",
+    ];
+    for shapes in supported {
+        let result = run_shapes(shapes);
+        assert_eq!(result.status, Status::Failed, "{shapes}: {result:?}");
+    }
+    for constraint in [
+        "sh:select 'SELECT $this WHERE { $this <urn:otherFlag> true }'",
+        "sh:deactivated true ; sh:select 'SELECT $this WHERE { GRAPH ?g { ?s ?p ?o } }'",
+    ] {
+        let result = run_shapes(&format!(
+            "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ {constraint} ] ."
+        ));
+        assert_eq!(result.status, Status::Passed, "{result:?}");
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_refuses_conflicting_node_expression_forms() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:ok> a <urn:Allowed> }");
+    let run_target = |target: &str, class: &str| {
+        let suite = inline_shacl(
+            &format!(
+                "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+                 @prefix sparql: <http://www.w3.org/ns/sparql#> .
+                 <urn:S> sh:targetNode {target} ; sh:class <urn:{class}> ."
+            ),
+            "",
+        );
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    let list = "[ rdf:first <urn:ok> ; rdf:rest rdf:nil ; <urn:annotation> 'a list' ]";
+    assert_eq!(run_target(list, "Allowed").status, Status::Passed);
+    assert_eq!(run_target(list, "Required").status, Status::Failed);
+    for mixed in [
+        "[ rdf:first <urn:ok> ; rdf:rest rdf:nil ; sh:select
+           'SELECT ?result WHERE { GRAPH ?g { ?result ?p ?o } }' ]",
+        "[ sh:select 'SELECT ?result WHERE { BIND(<urn:ok> AS ?result) }' ;
+            sparql:STR ( <urn:ok> ) ]",
+    ] {
+        profile_refusal(
+            &run_target(mixed, "Allowed"),
+            "conflicting node expression forms",
+        );
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_requires_a_typed_constraint_deactivation_flag() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> <urn:flag> true }");
+    let run_constraint = |flag: &str| {
+        let suite = inline_shacl(
+            &format!(
+                "<urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:deactivated {flag} ;
+                    sh:select 'SELECT $this WHERE {{ GRAPH ?g {{ ?s ?p ?o }} }}' ] ."
+            ),
+            "",
+        );
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    assert_eq!(run_constraint("true").status, Status::Passed);
+    profile_refusal(
+        &run_constraint("false"),
+        "GRAPH is not allowed in the gate's SHACL profile",
+    );
+    for invalid in [
+        "'true'",
+        "'yes'^^<http://www.w3.org/2001/XMLSchema#boolean>",
+        "true, false",
+    ] {
+        profile_refusal(
+            &run_constraint(invalid),
+            "sh:deactivated must be a single xsd:boolean literal",
+        );
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_preserves_path_variables_in_node_validators() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        "",
+        "INSERT DATA { <urn:x> <urn:flag> true ; <urn:edge> <urn:mid> .
+                       <urn:mid> <urn:leaf> true }",
+    );
+    for validator in ["nodeValidator", "validator"] {
+        let suite = inline_shacl(
+            &format!(
+                "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+                    sh:{validator} [ a sh:SPARQLSelectValidator ;
+                        sh:select 'SELECT $this $PATH WHERE {{ $this <urn:flag> $PATH }}' ] .
+                 <urn:S> sh:targetNode <urn:x> ; <urn:param> true ."
+            ),
+            "",
+        );
+        let result = run_on(&suite, &before, &after).results.remove(0);
+        assert_eq!(result.status, Status::Failed, "{validator}: {result:?}");
+        assert_eq!(result.findings, 1, "{validator}: {result:?}");
+    }
+    let suite = inline_shacl(
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+             sh:validator [ a sh:SPARQLSelectValidator ;
+                 sh:select 'SELECT $this WHERE { $this $PATH / <urn:leaf> $param }' ] .
+         <urn:S> sh:targetNode <urn:x> ;
+             sh:property [ sh:path <urn:edge> ; <urn:param> true ] .",
+        "",
+    );
+    let result = run_on(&suite, &before, &after).results.remove(0);
+    assert_eq!(result.status, Status::Failed, "{result:?}");
+    assert_eq!(result.findings, 1, "{result:?}");
+    let suite = inline_shacl(
+        "<urn:C> a sh:ConstraintComponent ; sh:parameter [ sh:path <urn:param> ] ;
+             sh:validator [ a sh:SPARQLAskValidator ; sh:ask 'ASK FROM $PATH {}' ] .
+         <urn:S> sh:targetNode <urn:x> .",
+        "",
+    );
+    profile_refusal(
+        &run_on(&suite, &before, &after).results[0],
+        "FROM and FROM NAMED are not allowed in the gate's SHACL profile",
+    );
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_refuses_skipped_targets() {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> a <urn:Observed> }");
+    let run_shapes = |shapes: &str| {
+        let suite = inline_shacl(shapes, "");
+        run_on(&suite, &before, &after).results.remove(0)
+    };
+    for (target, reason) in [
+        (
+            "sh:target [ a sh:SPARQLTarget ; sh:select 'SELECT $this { $this a <urn:Observed> }' ]",
+            "sh:target",
+        ),
+        (
+            "sh:targetNode [ sh:select <urn:not-a-string> ]",
+            "sh:targetNode",
+        ),
+        ("sh:targetClass 'not-an-iri'", "sh:targetClass"),
+        ("sh:targetSubjectsOf []", "sh:targetSubjectsOf"),
+        ("sh:targetObjectsOf 'not-an-iri'", "sh:targetObjectsOf"),
+        ("sh:targetWhere 'not-a-shape'", "sh:targetWhere"),
+    ] {
+        let mixed = format!("<urn:S> sh:targetNode <urn:valid> ; {target} .");
+        profile_refusal(&run_shapes(&mixed), reason);
+    }
+    for node in ["[]", "[ <urn:description> 'a regular blank node' ]"] {
+        let result = run_shapes(&format!(
+            "<urn:S> sh:targetNode {node} ; sh:nodeKind sh:IRI ."
+        ));
+        assert_eq!(result.status, Status::Failed, "{node}: {result:?}");
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_profile_preserves_a_described_pinned_blank_target() {
+    let ds = Dataset::memory();
+    let (before, after) = states(
+        &ds,
+        &format!(
+            "PREFIX sh: <{SH_NS}>
+             INSERT DATA {{ GRAPH <urn:shapes> {{
+                 <urn:S> sh:targetNode [ <urn:description> 'ordinary node' ] ;
+                     sh:nodeKind sh:IRI .
+             }} }}"
+        ),
+        "INSERT DATA { <urn:x> a <urn:Observed> }",
+    );
+    let r = run_on(&shacl_suite("").unwrap(), &before, &after);
+    assert_eq!(r.results[0].status, Status::Failed, "{:?}", r.results[0]);
+    assert_eq!(r.results[0].findings, 1);
+}
+
+#[cfg(feature = "shex")]
+fn shex_profile_suite(schema: &str, map: &str) -> Suite {
+    let schema = oxrdf::Literal::new_simple_literal(schema);
+    let map = oxrdf::Literal::new_simple_literal(map);
+    suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShexCheck ; chk:schema {schema} ; chk:shapeMap {map} ."
+    ))
+    .unwrap()
+}
+
+#[cfg(feature = "shex")]
+fn run_shex_profile(schema: &str, map: &str) -> CheckResult {
+    let ds = Dataset::memory();
+    let (before, after) = states(&ds, "", "INSERT DATA { <urn:x> <urn:link> <urn:y> }");
+    let suite = shex_profile_suite(schema, map);
+    run_on(&suite, &before, &after).results.remove(0)
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_sparql_selects_from_blank_node_named_graphs() {
+    let ds = Dataset::from_store(crate::store::Store::in_memory(crate::store::StoreOptions {
+        union_default_graph: true,
+        ..Default::default()
+    }));
+    let before = ds.store().snapshot();
+    ds.load_str("_:g { <urn:x> <urn:link> <urn:y> }", RdfFormat::TriG)
+        .unwrap();
+    let after = ds.store().snapshot();
+    let schema = "<urn:S> { <urn:required> . }";
+    for map in [
+        "{FOCUS <urn:link> _}@<urn:S>",
+        "SPARQL 'SELECT ?focus WHERE { ?focus <urn:link> ?o }'@<urn:S>",
+    ] {
+        let suite = shex_profile_suite(schema, map);
+        let result = run_on(&suite, &before, &after).results.remove(0);
+        assert_eq!(result.status, Status::Failed, "{map}: {result:?}");
+        assert_eq!(result.findings, 1, "{map}: {result:?}");
+        assert!(result.messages[0].contains("<urn:x>"), "{map}: {result:?}");
+    }
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_refuses_nonportable_blank_data_selectors() {
+    let label = sparkles_core::store::bnode_for(crate::id::Id::bnode(1));
+    let selectors = [
+        "_:x@<urn:S>".to_string(),
+        format!("_:{label}@<urn:S>", label = label.as_str()),
+        "{FOCUS <urn:link> _:x}@<urn:S>".to_string(),
+        "{_:x <urn:link> FOCUS}@<urn:S>".to_string(),
+    ];
+    for selector in selectors {
+        profile_refusal(&run_shex_profile("<urn:S> {}", &selector), "blank node");
+    }
+    let blank_shape = run_shex_profile("_:shape { <urn:required> . }", "<urn:x>@_:shape");
+    assert_eq!(blank_shape.status, Status::Failed, "{blank_shape:?}");
+    assert_eq!(blank_shape.findings, 1, "{blank_shape:?}");
+    assert_eq!(
+        run_shex_profile("<urn:S> { <urn:req> . }", "{FOCUS <urn:absent> _}@<urn:S>").status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_refuses_compiled_semantic_actions() {
+    for schema in [
+        "<urn:S> { <urn:link> @<urn:T> } <urn:T> {} %<urn:unknown>% ",
+        "%<urn:unknown>% <urn:S> {}",
+        "<urn:S> { ( <urn:link> . ; <urn:unused> .? ) %<urn:unknown>% }",
+    ] {
+        profile_refusal(
+            &run_shex_profile(schema, "<urn:x>@<urn:S>"),
+            "semantic action",
+        );
+    }
+    assert_eq!(
+        run_shex_profile(
+            "<urn:S> { <urn:link> @<urn:T> } <urn:T> {}",
+            "<urn:x>@<urn:S>",
+        )
+        .status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_profile_refuses_service_in_selector_expressions() {
+    let schema = "<urn:S> { <urn:required> . }";
+    let selector = format!("SPARQL '''{NESTED_SERVICE}'''@<urn:S>");
+    profile_refusal(&run_shex_profile(schema, &selector), "SERVICE");
+    assert_eq!(
+        run_shex_profile(
+            schema,
+            "SPARQL 'SELECT ?focus WHERE { ?focus <urn:absent> ?o }'@<urn:S>",
+        )
+        .status,
+        Status::Passed
+    );
+}
+
+fn run_with_controls(suite: &Suite, snap: &Arc<Snapshot>, controls: &GateControls) -> CheckResult {
+    run_controlled(
+        suite,
+        &Inputs {
+            before: snap,
+            after: snap,
+            stored: None,
+            timeout: None,
+        },
+        controls,
+    )
+    .results
+    .remove(0)
+}
+
+fn gate_budget_refusal(result: &CheckResult) {
+    assert_eq!(result.status, Status::Error, "{result:?}");
+    assert_eq!(result.code, Some("budget-exceeded"), "{result:?}");
+    assert!(result.blocks());
+}
+
+#[test]
+fn gate_query_obeys_the_work_cap_and_earliest_deadline() {
+    let ds = Dataset::memory();
+    let snap = ds.store().snapshot();
+    let check = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:QueryCheck ; chk:query 'SELECT ?x { VALUES ?x { 1 2 } }' .",
+    )
+    .unwrap();
+    gate_budget_refusal(&run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            budgets: crate::Budgets {
+                max_rows_produced: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ));
+    let expired = run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            deadline: Some(std::time::Instant::now()),
+            budgets: crate::Budgets {
+                timeout: Some(std::time::Duration::from_secs(10)),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert_eq!(expired.code, Some("check-timeout"), "{expired:?}");
+    let overflow = run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            budgets: crate::Budgets {
+                timeout: Some(std::time::Duration::MAX),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert_eq!(overflow.code, Some("input-invalid"), "{overflow:?}");
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_covers_setup_and_embedded_query_resources() {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:x> <urn:p> 1, 2 }").unwrap();
+    let snap = ds.store().snapshot();
+    let inactive = inline_shacl("<urn:S> sh:targetNode <urn:x> ; sh:deactivated true .", "");
+    let timeout = run_with_controls(
+        &inactive,
+        &snap,
+        &GateControls {
+            budgets: crate::Budgets {
+                timeout: Some(std::time::Duration::ZERO),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    assert_eq!(timeout.code, Some("check-timeout"), "{timeout:?}");
+    let expired = sparkles_shacl::Shapes::from_store_for_gate(
+        &snap,
+        "urn:missing",
+        Some(std::time::Instant::now()),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        expired.downcast_ref::<crate::Error>(),
+        Some(crate::Error::Timeout)
+    ));
+
+    let nested = inline_shacl(
+        "<urn:S> sh:targetNode <urn:x> ; sh:sparql [
+            sh:select 'SELECT $this ?value { $this <urn:p> ?value }'
+         ] .",
+        "",
+    );
+    for budgets in [
+        crate::Budgets {
+            max_rows_produced: Some(1),
+            ..Default::default()
+        },
+        crate::Budgets {
+            max_rows: Some(1),
+            ..Default::default()
+        },
+        crate::Budgets {
+            max_memory_bytes: Some(0),
+            ..Default::default()
+        },
+    ] {
+        gate_budget_refusal(&run_with_controls(
+            &nested,
+            &snap,
+            &GateControls {
+                budgets,
+                ..Default::default()
+            },
+        ));
+    }
+    assert_eq!(
+        run_with_controls(&nested, &snap, &GateControls::default()).findings,
+        2,
+    );
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_admits_embedded_union_dataset_graphs() {
+    fn candidate(graphs: usize, union_default_graph: bool) -> Arc<Snapshot> {
+        use oxrdf::{NamedNode, Quad};
+        let store = crate::store::Store::in_memory(crate::store::StoreOptions {
+            union_default_graph,
+            ..Default::default()
+        });
+        let mut txn = store.write();
+        let s = NamedNode::new_unchecked("urn:x");
+        let p = NamedNode::new_unchecked("urn:p");
+        let o = NamedNode::new_unchecked("urn:o");
+        let mut labels = Default::default();
+        for i in 0..graphs {
+            let g = NamedNode::new_unchecked(format!("urn:g:{i}"));
+            let ids = txn
+                .encode_quad(&Quad::new(s.clone(), p.clone(), o.clone(), g), &mut labels)
+                .unwrap();
+            assert!(txn.insert(ids).unwrap());
+        }
+        txn.commit().unwrap();
+        let snap = store.snapshot();
+        assert_eq!(snap.delta.inserts(), graphs);
+        snap
+    }
+
+    let controls = GateControls {
+        budgets: crate::Budgets {
+            max_memory_bytes: Some(64 * 1024),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    for (selection, native_union) in [("; chk:dataGraph chk:UnionGraph", false), ("", true)] {
+        let small = candidate(1, native_union);
+        let large = candidate(16_384, native_union);
+        for query in [
+            "SELECT $this WHERE {}",
+            "SELECT $this WHERE { $this <urn:p> ?a . $this <urn:p> ?b . $this <urn:p> ?c }",
+        ] {
+            let suite = inline_shacl(
+                &format!(
+                    "<urn:S> sh:targetNode <urn:x> ;
+                     sh:sparql [ sh:select '{query}' ] ."
+                ),
+                selection,
+            );
+            let small_run = run_with_controls(&suite, &small, &controls);
+            assert_eq!(small_run.status, Status::Failed, "{small_run:?}");
+            assert_eq!(small_run.findings, 1, "{small_run:?}");
+            let baseline = run_with_controls(&suite, &large, &GateControls::default());
+            assert_eq!(baseline.status, Status::Failed, "{baseline:?}");
+            assert_eq!(baseline.findings, 1, "{baseline:?}");
+            gate_budget_refusal(&run_with_controls(&suite, &large, &controls));
+        }
+    }
+}
+
+#[cfg(feature = "shacl")]
+#[test]
+fn gate_shacl_bounds_nested_and_top_level_reports() {
+    let ds = Dataset::memory();
+    ds.update("INSERT DATA { <urn:x> <urn:list> (1 2) }")
+        .unwrap();
+    let snap = ds.store().snapshot();
+    let capped = GateControls {
+        max_results: Some(1),
+        ..Default::default()
+    };
+    for shapes in [
+        "<urn:S> sh:targetNode <urn:x> ; sh:class <urn:A> ; sh:nodeKind sh:Literal .",
+        "<urn:S> sh:targetNode <urn:x> ;
+            sh:property [ sh:path <urn:list> ; sh:memberShape [ sh:nodeKind sh:IRI ] ] .",
+    ] {
+        let check = inline_shacl(shapes, "");
+        gate_budget_refusal(&run_with_controls(&check, &snap, &capped));
+        assert_eq!(
+            run_with_controls(&check, &snap, &GateControls::default()).status,
+            Status::Failed
+        );
+    }
+    let with_message = inline_shacl(
+        &format!(
+            "<urn:S> sh:targetNode <urn:x> ; sh:class <urn:Missing> ; sh:message '{}'.",
+            "m".repeat(8192)
+        ),
+        "",
+    );
+    gate_budget_refusal(&run_with_controls(
+        &with_message,
+        &snap,
+        &GateControls {
+            max_report_bytes: Some(4096),
+            ..Default::default()
+        },
+    ));
+    let empty = inline_shacl(
+        "<urn:S> sh:targetClass <urn:Missing> ; sh:closed true .",
+        "",
+    );
+    assert_eq!(
+        run_with_controls(
+            &empty,
+            &snap,
+            &GateControls {
+                max_results: Some(0),
+                max_report_bytes: Some(0),
+                ..Default::default()
+            },
+        )
+        .status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_bounds_selector_work_and_retained_results() {
+    let ds = Dataset::memory();
+    let snap = ds.store().snapshot();
+    let check = suite(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:ShexCheck ; chk:schema '<urn:S> {}' ;
+             chk:shapeMap \"SPARQL 'SELECT ?focus { VALUES ?focus { <urn:x> <urn:y> } }'@<urn:S>\" .",
+    )
+    .unwrap();
+    for controls in [
+        GateControls {
+            budgets: crate::Budgets {
+                max_rows_produced: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        GateControls {
+            max_results: Some(1),
+            ..Default::default()
+        },
+        GateControls {
+            max_report_bytes: Some(0),
+            ..Default::default()
+        },
+    ] {
+        gate_budget_refusal(&run_with_controls(&check, &snap, &controls));
+    }
+    assert_eq!(
+        run_with_controls(&check, &snap, &GateControls::default()).status,
+        Status::Passed
+    );
+}
+
+#[cfg(feature = "shex")]
+#[test]
+fn gate_shex_selectors_spend_one_check_work_allowance() {
+    let snap = Dataset::memory().store().snapshot();
+    let query = "SELECT ?focus { VALUES ?focus { <urn:x> } }";
+    let one = crate::sparql::query(snap.clone(), query, &Default::default()).unwrap();
+    assert!(one.rows_produced > 0);
+    let controls = GateControls {
+        budgets: crate::Budgets {
+            max_rows_produced: Some(one.rows_produced),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let check = |count: usize| {
+        let selector = |label| format!("SPARQL '{query}'@<urn:{label}>");
+        let selectors = ["A", "B"]
+            .into_iter()
+            .take(count)
+            .map(selector)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let map = oxrdf::Literal::new_simple_literal(selectors);
+        suite(&format!(
+            "<urn:s> a chk:Suite ; chk:check <urn:c> .
+             <urn:c> a chk:ShexCheck ; chk:schema '<urn:A> {{}} <urn:B> {{}}' ; chk:shapeMap {map} ."
+        ))
+        .unwrap()
+    };
+    assert_eq!(
+        run_with_controls(&check(1), &snap, &controls).status,
+        Status::Passed
+    );
+    gate_budget_refusal(&run_with_controls(&check(2), &snap, &controls));
+}
+
+#[cfg(feature = "reasoning")]
+fn gate_diagnostics_suite(inferences: bool) -> Suite {
+    suite(&format!(
+        "<urn:s> a chk:Suite ; chk:check <urn:c> .
+         <urn:c> a chk:DiagnosticsCheck ; chk:diagnostic 'disjoint-classes' ;
+             chk:inferences {inferences} ."
+    ))
+    .unwrap()
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn gate_diagnostics_obeys_the_native_default_and_inference_flag() {
+    let store = |union_default_graph| {
+        Dataset::from_store(crate::store::Store::in_memory(crate::store::StoreOptions {
+            union_default_graph,
+            ..Default::default()
+        }))
+    };
+    let inferred = sparkles_core::INFERRED_GRAPH;
+    let asserted = "<urn:A> <http://www.w3.org/2002/07/owl#disjointWith> <urn:B> .
+                    <urn:x> a <urn:A> .";
+    let union = store(true);
+    union
+        .update(&format!(
+            "INSERT DATA {{
+                GRAPH <urn:asserted> {{ {asserted} }}
+                GRAPH <{inferred}> {{ <urn:x> a <urn:B> }}
+            }}"
+        ))
+        .unwrap();
+    let plain = store(false);
+    plain
+        .update(&format!(
+            "INSERT DATA {{ {asserted} GRAPH <{inferred}> {{ <urn:x> a <urn:B> }} }}"
+        ))
+        .unwrap();
+    for ds in [&union, &plain] {
+        let snap = ds.store().snapshot();
+        for (flag, status) in [(false, Status::Passed), (true, Status::Failed)] {
+            let check = gate_diagnostics_suite(flag);
+            let r = run_on(&check, &snap, &snap);
+            assert_eq!(r.results[0].status, status, "{:?}", r.results[0]);
+        }
+    }
+    use sparkles_reasoner::diagnostics::{Basis, DiagnoseOptions, diagnose_for_gate};
+    let evidence = diagnose_for_gate(
+        union.store().snapshot(),
+        &DiagnoseOptions {
+            checks: vec!["disjoint-classes".into()],
+            inferences: true,
+            ..Default::default()
+        },
+        &Default::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(evidence.findings[0].basis, Basis::UsesInferences);
+    union
+        .update("INSERT DATA { GRAPH <urn:asserted> { <urn:x> a <urn:B> } }")
+        .unwrap();
+    let snap = union.store().snapshot();
+    for flag in [false, true] {
+        let result = run_on(&gate_diagnostics_suite(flag), &snap, &snap)
+            .results
+            .remove(0);
+        assert_eq!(result.status, Status::Failed, "{result:?}");
+    }
+
+    let evidence = diagnose_for_gate(
+        snap,
+        &DiagnoseOptions {
+            checks: vec!["disjoint-classes".into()],
+            inferences: true,
+            ..Default::default()
+        },
+        &Default::default(),
+        None,
+        None,
+    )
+    .unwrap();
+    assert_eq!(evidence.findings[0].basis, Basis::Asserted);
+
+    let blank = store(true);
+    blank
+        .store()
+        .load(&[sparkles_core::io::Source::from_bytes(
+            format!("_:graph {{ {asserted} <urn:x> a <urn:B> . }}").into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let snap = blank.store().snapshot();
+    let result = run_on(&gate_diagnostics_suite(false), &snap, &snap)
+        .results
+        .remove(0);
+    assert_eq!(result.status, Status::Failed, "{result:?}");
+
+    let union_only_default = store(true);
+    union_only_default
+        .update(&format!(
+            "INSERT DATA {{ {asserted} <urn:x> a <urn:B> .
+                             GRAPH <urn:unrelated> {{ <urn:y> a <urn:C> }} }}"
+        ))
+        .unwrap();
+    let snap = union_only_default.store().snapshot();
+    for flag in [false, true] {
+        assert!(run_on(&gate_diagnostics_suite(flag), &snap, &snap).passed());
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn gate_diagnostics_bounds_queries_and_the_report() {
+    let ds = Dataset::memory();
+    ds.update(
+        "INSERT DATA {
+             <urn:A> <http://www.w3.org/2002/07/owl#disjointWith> <urn:B> .
+             <urn:x> a <urn:A>, <urn:B> . <urn:y> a <urn:A>, <urn:B> .
+         }",
+    )
+    .unwrap();
+    let snap = ds.store().snapshot();
+    let check = gate_diagnostics_suite(false);
+    for controls in [
+        GateControls {
+            budgets: crate::Budgets {
+                max_memory_bytes: Some(0),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        GateControls {
+            max_results: Some(0),
+            ..Default::default()
+        },
+        GateControls {
+            max_report_bytes: Some(0),
+            ..Default::default()
+        },
+    ] {
+        gate_budget_refusal(&run_with_controls(&check, &snap, &controls));
+    }
+    let truncated = run_with_controls(
+        &check,
+        &snap,
+        &GateControls {
+            max_results: Some(1),
+            ..Default::default()
+        },
+    );
+    assert_eq!(truncated.status, Status::Failed, "{truncated:?}");
+    assert_eq!(truncated.findings, 1);
+}
+
 #[test]
 fn a_note_is_reported_with_its_severity_and_never_blocks() {
     let note = Note {

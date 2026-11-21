@@ -91,7 +91,7 @@ impl CursorStatus {
 /// the root, as the nodes of an eager plan do (see [`PlanInfo`]). A plan deeper than
 /// [`MAX_ID_DEPTH`](super::exec::MAX_ID_DEPTH) levels is written without ids, in plan
 /// format 2.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CursorPlan {
     pub operator: PlanInfo,
     pub materializes: bool,
@@ -969,6 +969,7 @@ fn open_pattern_cursor_input(
                 None,
                 source,
                 bound_policy.as_ref(),
+                None,
             )?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let levels = levels.max(prepared.plan_depth);
@@ -999,7 +1000,7 @@ fn from_prepared(
     let variables = Variables::new(&ctx, &prepared.pattern, &prepared.node.vars, query)?;
     let spec = graph::Spec::from_parsed(parsed, options)?;
     let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
-    let plan = root.describe(&ctx);
+    let plan = root.describe_with_graph_branches(&ctx)?;
     ctx.check()?;
     let shared = kind == QueryKind::Select && prepared.bound.is_empty();
     Ok((
@@ -1059,12 +1060,9 @@ fn finish_ask_with_plan(
             }
             let plan = depth::with_stack(cursor.depth, || {
                 incomplete(&mut cursor.plan);
-                cursor.plan_info()
+                cursor.take_plan_info().ok()
             });
-            return Err(Box::new(super::Failed {
-                error,
-                plan: Some(plan),
-            }));
+            return Err(Box::new(super::Failed { error, plan }));
         }
     };
     finish_ask_result(cursor, boolean).map_err(Into::into)
@@ -1073,7 +1071,7 @@ fn finish_ask_with_plan(
 fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> Result<QueryResult> {
     cursor.close();
     let stats = cursor.stats();
-    let plan = depth::with_stack(cursor.depth, || cursor.plan_info());
+    let plan = depth::with_stack(cursor.depth, || cursor.take_plan_info())?;
     super::ResultParts {
         kind: QueryKind::Ask,
         variables: None,
@@ -1540,7 +1538,7 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
                 && keyed_exists(ctx, node, spec)
                     .or_else(|| {
                         super::plan::Planner::new(ctx)
-                            .plan(&spec.pattern, &spec.graph, Vec::new())
+                            .plan(spec.pattern(), &spec.graph, Vec::new())
                             .ok()
                     })
                     .is_some_and(|planned| at(ctx, &planned, depth + 1))
@@ -2156,7 +2154,7 @@ impl QueryCursor {
             match attempt {
                 Ok(SharedAttempt::Unsupported) => self.shared = false,
                 Ok(SharedAttempt::Ready(batch)) => {
-                    let root = self.root.as_ref().expect("open cursor");
+                    let root = self.root.as_mut().expect("open cursor");
                     root.update_plan(&mut self.plan);
                     let complete = root.done || batch.is_none();
                     self.plan.operator.warnings = self.ctx.warnings();
@@ -2176,7 +2174,7 @@ impl QueryCursor {
                 }
                 Err(error) => {
                     // the counts so far, as the pull path keeps them
-                    if let Some(root) = &self.root {
+                    if let Some(root) = &mut self.root {
                         root.update_plan(&mut self.plan);
                     }
                     self.plan.operator.warnings = self.ctx.warnings();
@@ -2226,7 +2224,7 @@ impl QueryCursor {
             Ok(batch)
         });
         self.timing.exec_ms += started.elapsed().as_secs_f64() * 1000.0;
-        if let Some(root) = &self.root {
+        if let Some(root) = &mut self.root {
             root.update_plan(&mut self.plan);
         }
         self.plan.operator.warnings = self.ctx.warnings();
@@ -2304,7 +2302,7 @@ impl QueryCursor {
             output.reconcile()?;
         }
         let stats = self.stats();
-        let plan = self.plan_info();
+        let plan = self.take_plan_info()?;
         let output = super::table::Materialized::with_owned(output.table, output.charge)?
             .into_retained(&self.ctx)?;
         super::ResultParts {
@@ -2326,14 +2324,88 @@ impl QueryCursor {
         .freeze()
     }
 
-    fn plan_info(&self) -> PlanInfo {
-        fn build(p: &CursorPlan) -> PlanInfo {
-            let mut info = p.operator.clone();
-            info.children = p.children.iter().map(build).collect();
-            info
-        }
-        build(&self.plan)
+    fn take_plan_info(&mut self) -> Result<PlanInfo> {
+        let plan = std::mem::take(&mut self.plan);
+        depth::with_stack(self.depth, || {
+            consuming_plan_info(&self.ctx, plan, false, false)
+        })
     }
+}
+
+/// Convert a cursor diagnostic tree to the eager shape, keeping its original
+/// allocations and separately admitting the new vector of child plan records.
+fn consuming_plan_info(
+    ctx: &Ctx,
+    plan: CursorPlan,
+    stopped: bool,
+    failed: bool,
+) -> Result<PlanInfo> {
+    let CursorPlan {
+        operator: mut info,
+        children,
+        complete,
+        ..
+    } = plan;
+    let mut held = if info.prepared_diagnostics.is_some() {
+        let preparation = ctx
+            .source_preparation
+            .as_ref()
+            .expect("checked GRAPH diagnostics");
+        let mut held = exec::graph_diagnostics::owner(preparation)?;
+        let bytes = children
+            .len()
+            .checked_mul(size_of::<PlanInfo>())
+            .ok_or_else(|| preparation.exhausted())?;
+        held.grow_by(bytes as u64)?;
+        Some(held)
+    } else {
+        None
+    };
+    let mut plans = Vec::new();
+    plans
+        .try_reserve_exact(children.len())
+        .map_err(|_| ctx.memory_exceeded(u64::MAX))?;
+    for child in children {
+        plans.push(consuming_plan_info(ctx, child, stopped, failed)?);
+    }
+    if !complete && info.fidelity().skipped.is_none() {
+        if failed {
+            if let Some(held) = &mut held {
+                held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+            }
+            info.fidelity_mut().incomplete = true;
+        } else if stopped
+            && (info.actual_rows < 0 || (info.actual_rows == 0 && info.time_ms == 0.0))
+        {
+            const SKIPPED: &str = "the limit was met before it ran";
+            if let Some(held) = &mut held {
+                let reason = exec::graph_diagnostics::text(held, |out| out.write_str(SKIPPED))?;
+                held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+                info.fidelity_mut().skipped = Some(reason);
+                info.actual_rows = -1;
+            } else {
+                info.children = std::mem::take(&mut plans);
+                return Ok(info.skip(SKIPPED));
+            }
+        } else if stopped && info.actual_rows >= 0 {
+            if let Some(held) = &mut held {
+                let text = exec::graph_diagnostics::text(held, |out| {
+                    out.write_str(&info.description)?;
+                    out.write_str(" [stopped early]")
+                })?;
+                held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+                info.description = text;
+            } else {
+                info.description = format!("{} [stopped early]", info.description);
+            }
+            info.fidelity_mut().stopped_early = true;
+        }
+    }
+    if let Some(held) = held {
+        exec::PreparedDiagnostics::attach(&mut info, held);
+    }
+    info.children = plans;
+    Ok(info)
 }
 
 impl Drop for QueryCursor {
@@ -2440,41 +2512,24 @@ fn pull_planned<'ctx>(
             ended,
         ));
     }
-    let mut plan = root.describe(ctx);
-    root.update_plan(&mut plan);
-    // the plan of what ran, moved out of the cursor's plan rather than copied
-    fn info(plan: CursorPlan, stopped: bool, failed: bool) -> PlanInfo {
-        let CursorPlan {
-            operator: mut out,
-            children,
-            complete,
-            ..
-        } = plan;
-        out.children = children
-            .into_iter()
-            .map(|c| info(c, stopped, failed))
-            .collect();
-        if !complete && out.fidelity().skipped.is_none() {
-            if failed {
-                out.fidelity_mut().incomplete = true;
-            } else if stopped && out.actual_rows == 0 && out.time_ms == 0.0 {
-                // nothing pulled it before the consumer had its rows
-                return out.skip("the limit was met before it ran");
-            } else if stopped && out.actual_rows >= 0 {
-                out.description = format!("{} [stopped early]", out.description);
-                out.fidelity_mut().stopped_early = true;
-            }
+    let mut plan = match root.describe_with_graph_branches(ctx) {
+        Ok(plan) => plan,
+        Err(diagnostic) => {
+            ran?;
+            return Err(diagnostic);
         }
-        out
-    }
+    };
+    root.update_plan(&mut plan);
     if let Err(error) = ran {
-        // the rows the operators gave were not delivered, even when they all ran
-        let mut failed = info(plan, false, true);
-        failed.fidelity_mut().incomplete = true;
-        ctx.set_failed(node, failed);
+        // The rows produced were not delivered. If diagnostics also refuse,
+        // the original execution error still determines the result.
+        if let Ok(mut plan) = consuming_plan_info(ctx, plan, false, true) {
+            plan.fidelity_mut().incomplete = true;
+            ctx.set_failed(node, plan);
+        }
         return Err(error);
     }
-    let mut info = info(plan, !ended, false);
+    let mut info = consuming_plan_info(ctx, plan, !ended, false)?;
     // a filter's EXISTS notes and counters, as the eager filter reports them
     fn annotate(ctx: &Ctx, node: &Node, info: &mut PlanInfo) {
         if let Kind::Filter(exprs) = &node.kind
@@ -2523,7 +2578,7 @@ fn pull_planned<'ctx>(
     Ok((rows, info, ended))
 }
 
-fn plan_bytes(node: &Node) -> u64 {
+pub(super) fn plan_bytes(node: &Node) -> u64 {
     let values = match &node.kind {
         Kind::Values(t) => capacity_bytes(t),
         _ => 0,
@@ -2567,6 +2622,11 @@ enum State {
         table: Table,
         at: usize,
     },
+    GraphNames {
+        names: Arc<super::plan::PreparedGraphNames>,
+        at: usize,
+    },
+    GraphBranches(Box<GraphBranches>),
     Empty,
     Unary(Node),
     Slice {
@@ -2630,6 +2690,14 @@ struct Operator {
     last: Option<Vec<Id>>,
     /// A FILTER that may read ahead of its consumer's demand (see [`Ahead`]).
     ahead: Option<Box<Ahead>>,
+    // The delegated operator's state drops before its clone admission and source plan.
+    singleton_graph: Option<Box<SingletonGraph>>,
+}
+
+struct SingletonGraph {
+    _inner: Option<Box<SingletonGraph>>,
+    _plans: Arc<super::plan::PreparedGraphBranches>,
+    _charge: OwnedCharge,
 }
 
 /// The read-ahead of a FILTER without effects: while its batches come back empty, it
@@ -2641,6 +2709,120 @@ struct Ahead {
     demand: usize,
     pending: Option<Buffer>,
     at: usize,
+}
+
+fn reserve_graph_branch_copy(ctx: &Arc<Ctx>, plan: &Node, header: usize) -> Result<OwnedCharge> {
+    let preparation = ctx
+        .source_preparation
+        .as_ref()
+        .expect("checked GRAPH cursor");
+    let mut layout = super::checked_layout::Layout::new(preparation);
+    layout.add(header)?;
+    layout.node(plan)?;
+    OwnedCharge::new(ctx, layout.bytes())
+}
+
+struct GraphBranches {
+    current: Option<GraphBranchOperator>,
+    completed: crate::access::PreparationBuffer<(usize, CursorPlan)>,
+    at: usize,
+    fallback: FallbackPolicy,
+    plans: Arc<super::plan::PreparedGraphBranches>,
+}
+
+struct GraphBranchOperator {
+    operator: Operator,
+    plan: Option<CursorPlan>,
+    _copy: OwnedCharge,
+}
+
+impl GraphBranches {
+    fn next(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        options: &CursorOptions,
+        vars: &[VarId],
+        cap: usize,
+    ) -> Result<Option<Buffer>> {
+        while let Some(plan) = self.plans.inputs.get(self.at) {
+            ctx.check()?;
+            if self.current.is_none() {
+                let copy = reserve_graph_branch_copy(ctx, plan, 0)?;
+                let operator = Operator::build(ctx, plan.clone(), self.fallback)?;
+                let diagnostic = planned_graph_cursor(ctx, plan)?;
+                self.current = Some(GraphBranchOperator {
+                    operator,
+                    plan: Some(diagnostic),
+                    _copy: copy,
+                });
+            }
+            let current = self.current.as_mut().expect("current graph branch");
+            let batch = current.operator.next(ctx, options, cap)?;
+            if current.operator.done || batch.is_none() {
+                let mut diagnostic = match current.plan.take() {
+                    Some(plan) => plan,
+                    None => planned_graph_cursor(ctx, plan)?,
+                };
+                current.operator.update_plan(&mut diagnostic);
+                self.completed.push((self.at, diagnostic))?;
+                self.current = None;
+                self.at += 1;
+            }
+            if let Some(mut batch) = batch {
+                batch.project(vars)?;
+                return Ok(Some(batch));
+            }
+        }
+        Ok(None)
+    }
+
+    fn update_plan(&mut self, plan: &mut CursorPlan) {
+        while let Some((index, completed)) = self.completed.pop() {
+            if let Some(slot) = plan.children.get_mut(index) {
+                *slot = completed;
+            }
+        }
+        if let (Some(current), Some(slot)) = (&mut self.current, plan.children.get_mut(self.at)) {
+            if let Some(built) = current.plan.take() {
+                *slot = built;
+            }
+            current.operator.update_plan(slot);
+        }
+    }
+}
+
+fn planned_graph_cursor(ctx: &Ctx, mut node: &Node) -> Result<CursorPlan> {
+    let preparation = ctx
+        .source_preparation
+        .as_ref()
+        .expect("checked GRAPH cursor");
+    while let Some(branch) = node.graph_singleton() {
+        preparation.check()?;
+        node = branch;
+    }
+    let mut held = exec::graph_diagnostics::owner(preparation)?;
+    // Termination can add a fidelity marker without another allocation decision.
+    held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+    let mut operator = exec::graph_diagnostics::leaf(ctx, node, &mut held, None)?;
+    if ctx.graphs.is_some() {
+        operator.redact();
+    }
+    let mut children = crate::access::PreparationBuffer::new(preparation)?;
+    for child in node.graph_diagnostic_children() {
+        children.push(planned_graph_cursor(ctx, child)?)?;
+    }
+    let (children, credit) = children.into_parts();
+    held.merge(credit);
+    exec::PreparedDiagnostics::attach(&mut operator, held);
+    Ok(CursorPlan {
+        operator,
+        materializes: false,
+        full_input_before_output: false,
+        growing_state: false,
+        complete: false,
+        reason: None,
+        children,
+    })
 }
 
 /// The most cursor batches a FILTER that reads ahead asks its input for at once.
@@ -2662,6 +2844,8 @@ fn supported(kind: &Kind) -> bool {
         kind,
         Kind::Scan(_)
             | Kind::Values(_)
+            | Kind::GraphNames(_)
+            | Kind::GraphBranches(_)
             | Kind::Empty
             | Kind::Project(_)
             | Kind::Distinct
@@ -2718,7 +2902,7 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
         expr.exists_specs(&mut specs);
     }
     for spec in specs {
-        let planned = super::plan::Planner::new(ctx).plan(&spec.pattern, &spec.graph, Vec::new());
+        let planned = super::plan::Planner::new(ctx).plan(spec.pattern(), &spec.graph, Vec::new());
         if let Err(error) = &planned
             && super::extensions::is_unconfigured(error)
         {
@@ -2914,6 +3098,19 @@ impl Operator {
         needed: bool,
     ) -> Result<Self> {
         ctx.check()?;
+        if let Kind::GraphBranches(plans) = &node.kind
+            && let [branch] = plans.inputs.as_slice()
+        {
+            let charge = reserve_graph_branch_copy(ctx, branch, size_of::<SingletonGraph>())?;
+            let mut operator = Self::build_for(ctx, branch.clone(), fallback, needed)?;
+            let inner = operator.singleton_graph.take();
+            operator.singleton_graph = Some(Box::new(SingletonGraph {
+                _inner: inner,
+                _plans: plans.clone(),
+                _charge: charge,
+            }));
+            return Ok(operator);
+        }
         // A count over a join runs the join and counts its rows.
         let count_join = matches!(node.kind, Kind::CountJoin { .. });
         // A count whose eager kernel runs holds no join below it (see `whole`).
@@ -2970,6 +3167,17 @@ impl Operator {
                 "cursor requires materialization at {}; use AllowMaterialization or eager execution",
                 node.operator()
             )));
+        }
+        if fallback == FallbackPolicy::RejectMaterialization
+            && let Kind::GraphBranches(plans) = &node.kind
+        {
+            // The runtime opens branches on demand. Strict cursors still reject a
+            // known eager branch before emitting any output.
+            for plan in &plans.inputs {
+                ctx.check()?;
+                let _charge = reserve_graph_branch_copy(ctx, plan, 0)?;
+                Operator::build(ctx, plan.clone(), fallback)?;
+            }
         }
         let mut info = exec::describe_node(ctx, &node);
         if count_join && matches!(node.kind, Kind::Group { .. }) {
@@ -3283,6 +3491,23 @@ impl Operator {
                     };
                     State::Values { table, at: 0 }
                 }
+                Kind::GraphNames(names) => State::GraphNames {
+                    names: names.clone(),
+                    at: 0,
+                },
+                Kind::GraphBranches(plans) => {
+                    let preparation = ctx
+                        .source_preparation
+                        .as_ref()
+                        .expect("checked GRAPH cursor");
+                    State::GraphBranches(Box::new(GraphBranches {
+                        current: None,
+                        completed: crate::access::PreparationBuffer::new(preparation)?,
+                        at: 0,
+                        fallback,
+                        plans: plans.clone(),
+                    }))
+                }
                 Kind::Empty => State::Empty,
                 Kind::CountScan { .. }
                 | Kind::CountDistinctScan { .. }
@@ -3339,6 +3564,7 @@ impl Operator {
             #[cfg(debug_assertions)]
             last: None,
             ahead,
+            singleton_graph: None,
         })
     }
 
@@ -3390,6 +3616,7 @@ impl Operator {
             #[cfg(debug_assertions)]
             last: None,
             ahead: None,
+            singleton_graph: None,
         })
     }
 
@@ -3408,6 +3635,11 @@ impl Operator {
         self.released = true;
         match &mut self.state {
             State::Scan(scan) => scan.base = None,
+            State::GraphBranches(branches) => {
+                if let Some(current) = &mut branches.current {
+                    current.operator.release_finished();
+                }
+            }
             State::Binary(binary) => binary.release_working_sets(),
             State::Ripple(ripple) => ripple.release_working_sets(),
             _ => {}
@@ -3508,19 +3740,7 @@ impl Operator {
         CursorPlan {
             operator: self.info.clone(),
             materializes: self.materializes,
-            full_input_before_output: self.materializes
-                || matches!(
-                    self.state,
-                    State::Fallback { .. }
-                        | State::Binary(_)
-                        | State::Group(_)
-                        | State::Scalar(_)
-                        | State::Counts { .. }
-                        | State::Blocking { .. }
-                        | State::Whole(_)
-                        | State::TopK(_)
-                        | State::IndexTopK(_)
-                ),
+            full_input_before_output: self.full_input_before_output(),
             growing_state: self.growing,
             complete: false,
             reason: self.reason.clone(),
@@ -3540,7 +3760,56 @@ impl Operator {
         }
     }
 
-    fn update_plan(&self, plan: &mut CursorPlan) {
+    fn describe_with_graph_branches(&self, ctx: &Ctx) -> Result<CursorPlan> {
+        let mut plan = self.describe(ctx);
+        self.add_graph_descriptions(ctx, &mut plan)?;
+        Ok(plan)
+    }
+
+    fn add_graph_descriptions(&self, ctx: &Ctx, plan: &mut CursorPlan) -> Result<()> {
+        if let State::GraphBranches(branches) = &self.state {
+            let preparation = ctx
+                .source_preparation
+                .as_ref()
+                .expect("checked GRAPH cursor");
+            let mut held = exec::graph_diagnostics::owner(preparation)?;
+            let mut children = crate::access::PreparationBuffer::new(preparation)?;
+            for branch in &branches.plans.inputs {
+                children.push(planned_graph_cursor(ctx, branch)?)?;
+            }
+            let (children, credit) = children.into_parts();
+            held.merge(credit);
+            plan.children = children;
+            exec::PreparedDiagnostics::attach(&mut plan.operator, held);
+        }
+        for (operator, child) in self.children.iter().zip(&mut plan.children) {
+            operator.add_graph_descriptions(ctx, child)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this operator reads its whole input before its first output, as its plan
+    /// reports both when it is described and after each pull.
+    fn full_input_before_output(&self) -> bool {
+        self.materializes
+            || matches!(
+                self.state,
+                State::Fallback { .. }
+                    | State::Binary(_)
+                    | State::Group(_)
+                    | State::Scalar(_)
+                    | State::Counts { .. }
+                    | State::Blocking { .. }
+                    | State::Whole(_)
+                    | State::TopK(_)
+                    | State::IndexTopK(_)
+            )
+    }
+
+    fn update_plan(&mut self, plan: &mut CursorPlan) {
+        plan.materializes = self.materializes;
+        plan.full_input_before_output = self.full_input_before_output();
+        plan.growing_state = self.growing;
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
@@ -3600,7 +3869,10 @@ impl Operator {
         {
             plan.children.push(generic.clone());
         }
-        for (child, plan) in self.children.iter().zip(&mut plan.children) {
+        if let State::GraphBranches(branches) = &mut self.state {
+            branches.update_plan(plan);
+        }
+        for (child, plan) in self.children.iter_mut().zip(&mut plan.children) {
             child.update_plan(plan);
         }
     }
@@ -3991,6 +4263,19 @@ impl Operator {
                     }
                     self.done = *at == table.len;
                     b
+                }
+                State::GraphNames { names, at } => {
+                    let b = copy_rows(ctx, &names.table, *at, cap)?;
+                    if let Some(b) = &b {
+                        *at += b.table.len;
+                    }
+                    self.done = *at == names.table.len;
+                    b
+                }
+                State::GraphBranches(branches) => {
+                    let batch = branches.next(ctx, options, &self.vars, cap)?;
+                    self.done = branches.at == branches.plans.inputs.len();
+                    batch
                 }
                 State::Scan(scan) => {
                     let b = scan.next(ctx, &self.vars, cap)?;

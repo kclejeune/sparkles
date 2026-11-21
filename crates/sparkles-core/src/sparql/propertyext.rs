@@ -373,6 +373,12 @@ pub struct Spec {
 }
 
 impl Spec {
+    pub(super) fn copy_layout(&self, layout: &mut super::checked_layout::Layout<'_>) -> Result<()> {
+        layout.slots::<Self>(1)?;
+        layout.vector(&self.subject)?;
+        layout.vector(&self.object)
+    }
+
     /// Whether the registration declares that a prefix of the input gives a prefix of
     /// the output.
     pub(super) fn prefix_output(&self) -> bool {
@@ -526,7 +532,7 @@ pub(super) fn attach(
             graph: Arc::new(GraphFilter::All),
         })
         .collect();
-    let graph = p.graph_filter(graph).map(|(filter, _)| Arc::new(filter));
+    let graph = p.graph_filter(graph)?.map(|(filter, _)| Arc::new(filter));
     while !pending.is_empty() {
         let bound = |v: &VarId| input.vars.contains(v) || p.property_inputs.contains(v);
         let ready = pending.iter().position(|s| {

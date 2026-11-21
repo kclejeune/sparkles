@@ -962,7 +962,7 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
     if ctx
         .extensions
         .as_ref()
-        .is_some_and(|r| !r.is_empty() && r.references(&spec.pattern))
+        .is_some_and(|r| !r.is_empty() && r.references(spec.pattern()))
     {
         return Err("it calls a registered extension".into());
     }
@@ -978,7 +978,8 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
     }
     let charge = {
         let mut size = Size(0);
-        std::fmt::write(&mut size, format_args!("{}", spec.pattern)).map_err(|e| e.to_string())?;
+        std::fmt::write(&mut size, format_args!("{}", spec.pattern()))
+            .map_err(|e| e.to_string())?;
         ctx.retained_charge(
             size.0
                 .saturating_mul(32)
@@ -990,7 +991,7 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
         return Err("its active graph is a variable".into());
     }
     let mut risky = FxHashSet::default();
-    let cert = certain(ctx, &spec.pattern, &mut risky)?;
+    let cert = certain(ctx, spec.pattern(), &mut risky)?;
     let keys: Vec<VarId> = spec
         .vars
         .iter()
@@ -1010,7 +1011,7 @@ fn admit(ctx: &Ctx, spec: &ExistsSpec) -> std::result::Result<Plan, String> {
         return Err("it has more than 64 variables".into());
     }
     let node = Planner::new(ctx)
-        .plan(&spec.pattern, &spec.graph, Vec::new())
+        .plan(spec.pattern(), &spec.graph, Vec::new())
         .map_err(|e| format!("planning it failed ({e})"))?;
     if let Some(v) = keys.iter().find(|v| !node.vars.contains(v)) {
         return Err(format!("its plan does not bind ?{}", ctx.var_name(*v)));
