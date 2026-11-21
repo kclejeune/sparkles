@@ -112,7 +112,10 @@ pub struct Coverage {
 /// A stream of the axioms of an ontology that a run was not given at all, for
 /// [`Classification::cover`](crate::classify::Classification::cover): it calls its
 /// argument on each until that answers false, and answers false itself only when it
-/// could not finish, such as at its caller's deadline.
+/// could not finish, such as at its caller's deadline. The pass can read it more than
+/// once, and each call starts again from the first axiom, as a scan of a store's or a
+/// file's assertions does. The stream polls its own deadline, since the pass asks its
+/// stop only between the axioms it counts.
 pub type Dropped<'d> = dyn FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'd;
 
 /// Why [`coverage`] stopped before an answer: its caller's stop said so.

@@ -117,9 +117,6 @@ pub struct ClassifyRequest {
 /// component is `classifier`.
 pub const STRICT_CODE: &str = "classification-incomplete";
 
-/// The refusal of a strict classification whose answer is not complete for the whole
-/// ontology: the axioms left out, which the error's source holds as
-/// [`sparkles_owl::classify::Error::Incomplete`], or the run that stopped.
 /// A strict request's answer to a run that is not complete for the whole ontology: the
 /// caller's own deadline or cancellation when it stopped the modules' pass, which is no
 /// refusal of the ontology, and otherwise [`strict_refusal`].
@@ -136,6 +133,9 @@ pub(super) fn refuse_strict(
     strict_refusal(classification, excluded)
 }
 
+/// The refusal of a strict classification whose answer is not complete for the whole
+/// ontology: the axioms left out, which the error's source holds as
+/// [`sparkles_owl::classify::Error::Incomplete`], or the run that stopped.
 pub fn strict_refusal(classification: &Classification, excluded: &[Excluded]) -> Error {
     let message = if excluded.is_empty() {
         format!(

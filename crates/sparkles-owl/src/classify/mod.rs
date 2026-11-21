@@ -628,9 +628,27 @@ impl Classification {
         }
         let start = Instant::now();
         let left: Vec<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
-        // an inconsistency is sound, and every class's answer is then complete
+        // an inconsistency is sound, and every class's answer is then complete, unless
+        // a dropped axiom names a class the taxonomy lacks, which is unsatisfiable too
         if self.consistency == Consistency::Inconsistent {
-            return None;
+            let d = dropped?;
+            let mut unnamed = None;
+            let finished = d(&mut |k| {
+                if names_unknown_class(&self.taxonomy, k) {
+                    unnamed = Some(k.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if !finished && unnamed.is_none() {
+                self.stats.coverage_stopped = true;
+            }
+            if unnamed.is_some() || !finished {
+                self.complete = false;
+                self.all_incomplete();
+            }
+            return unnamed.map(not_read);
         }
         // A partial answer that left the consistency unknown has every class open, and
         // one that stopped is past its deadline, so neither takes the modules' pass,
@@ -692,7 +710,18 @@ impl Classification {
         self.stats.coverage_over = c.over_budget;
         // a dropped axiom that names a class the taxonomy lacks leaves that class out,
         // and every unsatisfiable class below it
-        let witness = c.dropped.or(unnamed.into_inner()).map(not_read);
+        let unnamed = unnamed.into_inner();
+        let mut c = c;
+        if unnamed.is_some() {
+            // every unsatisfiable class is below the class the taxonomy lacks
+            c.incomplete.extend(
+                self.taxonomy
+                    .unsatisfiable()
+                    .filter(|k| k.as_str() != crate::vocab::OWL_NOTHING)
+                    .cloned(),
+            );
+        }
+        let witness = c.dropped.or(unnamed).map(not_read);
         if witness.is_some() || !c.consistency_known || !c.incomplete.is_empty() {
             self.complete = false;
         }
@@ -1389,7 +1418,7 @@ impl Classifier {
                 out.cover(&held, excluded, None, limits);
             }
         }
-        if limits.strict && !limits.cover_later && !out.complete {
+        if limits.strict && !out.complete {
             return Err(Error::Incomplete(excluded.to_vec()));
         }
         Ok(out)
@@ -1525,7 +1554,7 @@ impl Saturation {
                 out.cover(axioms, &self.excluded, None, limits);
             }
         }
-        if limits.strict && !limits.cover_later && !out.complete {
+        if limits.strict && !out.complete {
             return Err(Error::Incomplete(self.excluded.clone()));
         }
         Ok(out)
@@ -4322,31 +4351,34 @@ mod tests {
              )",
         )
         .unwrap();
-        let mut refused = false;
-        for n in 0..64 {
-            let mut k = Classifier::of(&doc.axioms);
-            let polls = Arc::new(AtomicUsize::new(0));
-            let p = polls.clone();
-            let out = k.classify(&Limits {
-                threads: 1,
-                rooted: true,
-                partial: true,
-                strict: true,
-                cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= n)),
-                ..Limits::default()
-            });
-            match out {
-                Err(Error::Cancelled) => continue,
-                Err(Error::Incomplete(e)) => {
-                    assert!(e.is_empty() && refusal(&e).contains("stopped"));
-                    refused = true;
-                    break;
+        for cover_later in [false, true] {
+            let mut refused = false;
+            for n in 0..64 {
+                let mut k = Classifier::of(&doc.axioms);
+                let polls = Arc::new(AtomicUsize::new(0));
+                let p = polls.clone();
+                let out = k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    partial: true,
+                    strict: true,
+                    cover_later,
+                    cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= n)),
+                    ..Limits::default()
+                });
+                match out {
+                    Err(Error::Cancelled) => continue,
+                    Err(Error::Incomplete(e)) => {
+                        assert!(e.is_empty() && refusal(&e).contains("stopped"));
+                        refused = true;
+                        break;
+                    }
+                    Err(e) => panic!("poll {n}: {e:?}"),
+                    Ok(out) => assert!(out.complete, "poll {n}: a strict run answered in part"),
                 }
-                Err(e) => panic!("poll {n}: {e:?}"),
-                Ok(out) => assert!(out.complete, "poll {n}: a strict run answered in part"),
             }
+            assert!(refused);
         }
-        assert!(refused);
     }
 
     fn ofn(body: &str) -> Vec<Axiom> {
@@ -4380,6 +4412,45 @@ mod tests {
         };
         let w = out.cover(&kinds, s.excluded(), Some(&mut stream), &limits);
         assert!(w.is_some() && !out.complete, "{:?}", out.incomplete);
+        assert!(
+            out.incomplete.iter().any(|c| c.as_str() == "http://e/#A"),
+            "{:?}",
+            out.incomplete
+        );
+    }
+
+    /// An inconsistent terminology makes every class unsatisfiable, and a dropped
+    /// assertion of a class the taxonomy lacks leaves that class out of the node.
+    #[test]
+    fn an_inconsistent_run_with_a_dropped_class_it_lacks_is_not_complete() {
+        let t = ofn("SubClassOf(owl:Thing :A)
+                     SubClassOf(owl:Thing :B)
+                     DisjointClasses(:A :B)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let limits = Limits {
+            cover_later: true,
+            ..Limits::default()
+        };
+        for (body, lacks) in [
+            ("ClassAssertion(:C :a)", true),
+            ("ClassAssertion(:A :a)", false),
+        ] {
+            let d = ofn(body);
+            let mut s = Saturation::new();
+            let mut out = s.classify(&kinds, None, &limits).unwrap();
+            assert_eq!(out.consistency, Consistency::Inconsistent);
+            let mut stream = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+                for a in &d {
+                    if !f(&a.kind) {
+                        break;
+                    }
+                }
+                true
+            };
+            let w = out.cover(&kinds, s.excluded(), Some(&mut stream), &limits);
+            assert_eq!(w.is_some(), lacks, "{body}");
+            assert_eq!(out.complete, !lacks, "{body}");
+        }
     }
 
     /// When a class is incomplete, the node of the unsatisfiable classes may miss one, so
