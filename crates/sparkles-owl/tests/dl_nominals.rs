@@ -1969,3 +1969,36 @@ fn a_key_outside_owl_2_el_leaves_the_run_rooted() {
     assert!(!left_with_individual(&left), "{left:?}");
     assert!(left.iter().any(|l| l.contains("HasKey")), "{left:?}");
 }
+
+#[test]
+fn a_run_whose_only_individual_is_in_a_key_outside_owl_2_el_answers_as_without_the_option() {
+    // the retained key keeps the run from being rooted, so it takes the minimum it used to
+    // leave out with an empty root and derives X ⊑ Y, as the run without the option does
+    let body = format!(
+        "HasKey(:B (:r) ())
+         HasKey(ObjectUnionOf(:B ObjectOneOf(:a)) (:s) ())
+         SubClassOf(<{INTERNAL}x> :A)
+         SubClassOf(:X ObjectMinCardinality(2 :s :N))
+         SubClassOf(ObjectSomeValuesFrom(:s :N) :Y)"
+    );
+    let left = keys_left(&body, true);
+    assert!(left_with_individual(&left), "{left:?}");
+    assert!(
+        !left.iter().any(|l| l.contains("MinCardinality")),
+        "{left:?}"
+    );
+    for threads in [1, 4] {
+        let ax = axioms(&body);
+        let out = Classifier::of(&ax)
+            .classify(&Limits {
+                threads,
+                ..rooted_limits()
+            })
+            .unwrap();
+        assert!(
+            out.taxonomy.is_subclass(&c("X"), &c("Y")),
+            "{threads} threads"
+        );
+        assert!(!out.taxonomy.is_unsatisfiable(&c("X")));
+    }
+}
