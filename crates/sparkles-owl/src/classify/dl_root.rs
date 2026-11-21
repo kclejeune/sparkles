@@ -2656,6 +2656,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn m_return_s_late_replay_closes_a_batch_on_its_bytes() {
+        // with many partners a batch closes on RECORD_SLACK after a few returns, well before
+        // M_POLL of them, so what the replay and its drain hold at once stays near the slack,
+        // far below the returns' products together, whatever the number of returns
+        for mode in [MREPAIR_ON, MREPAIR_ON | MREPAIR_CF] {
+            let partners = 100;
+            let one = late_replay(mode, 1, partners, true).peak;
+            assert!(
+                one > 0 && one < RECORD_SLACK / 4,
+                "mode {mode}: one return {one}"
+            );
+            let rets = M_POLL - 1;
+            let all = late_replay(mode, rets, partners, true);
+            assert_eq!(all.work, rets * partners, "mode {mode}: {all:?}");
+            assert!(
+                all.peak <= 2 * RECORD_SLACK,
+                "mode {mode}: {all:?}, one {one}"
+            );
+            assert!(2 * all.peak < rets * one, "mode {mode}: {all:?}, one {one}");
+            let more = late_replay(mode, 4 * rets, partners, true);
+            assert_eq!(more.work, 4 * rets * partners, "mode {mode}: {more:?}");
+            assert!(
+                more.peak <= 2 * RECORD_SLACK,
+                "mode {mode}: {more:?}, {all:?}"
+            );
+            let cut = late_replay(mode, 4 * rets, partners, false);
+            assert!(
+                cut.polls >= 1 && cut.interrupted && cut.held == 0,
+                "mode {mode}: {cut:?}"
+            );
+            assert!(cut.peak <= 2 * RECORD_SLACK, "mode {mode}: {cut:?}");
+        }
+    }
+
     /// A small signature: classes, individuals and roles by name.
     struct Sig {
         it: Interner,
