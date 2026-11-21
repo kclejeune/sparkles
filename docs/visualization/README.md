@@ -539,8 +539,12 @@ not read, or in functional-style syntax. The page's tabs are **Tree**, **DL Quer
 data or annotation properties or individuals, and a segmented control on the entity panel
 switches between its frame and its usage.
 
-The editor reads what its views show. Opening it reads the ontology's summary and the first
-level of the tree on screen, and the other trees read their levels when their tab opens.
+The editor reads what its views show. Opening it reads the head of the ontology's summary,
+which gives the header, the counts of declared entities, the graphs and the imports from the
+index without mapping the ontology into axioms, and the first level of the tree on screen. The
+other trees read their levels when their tab opens. The axiom counts and the diagnostics of the
+read need the mapping of the whole ontology, so the Header tab reads the full summary when it
+opens, and the header panel beside the tree reads it when **Count the axioms** is pressed.
 Names come from the labels of the hierarchy answers and from one query for the labels of the
 IRIs a panel names for the first time, so no read lists every label of the ontology. The
 entity lists behind the add fields' pickers and the new-entity checks are read once an entity,

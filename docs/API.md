@@ -1859,6 +1859,24 @@ the commit it read.
 }
 ```
 
+`view=head` answers the head of the summary, which has the members above that need no
+mapping of the whole graph. These are `dataset`, `commit`, `mode`, `graphs`, `imports`,
+`warnings`, `inferences`, `header`, `entities` and `closure`, with `"view": "head"`, and
+`axioms`, `axiomCount`, `triples`, `unmapped`, `diagnostics` and `cached` are left out.
+The server reads the header from the quads of the ontology nodes and the blank nodes and
+reifications they reach, and the entity counts from the `rdf:type` triples of each
+declaring type, so its time grows with the header and the declarations and not with the
+axioms, which the full summary maps first. Its values equal the full summary's. A read past
+the head's bounds, such as more than 1,000 ontology nodes or 10,000 reified type
+triples, opens the ontology and answers from the mapping. The server also opens the
+ontology when a graph types `rdf:type` or another structural predicate as an OWL property,
+when the main triple of a reified header annotation uses a predicate that is not built in
+and not declared an annotation property directly, and when an IRI the header uses has an
+annotated declaration, since the mapping then reads triples outside the head's reads.
+The head has its own entity tag, which an edit's `If-Match` can name as it names the
+summary's. `view=full` is the default, and `view=head` refuses `metrics`. The Rust JSON `summary` operation and the
+Python `summary()` take the same `view`.
+
 `metrics=true` adds an on-demand `metrics` object without changing the ordinary
 summary. The Rust JSON `summary` operation accepts the same boolean. Counts, signature entities, expressivity and the four OWL 2 profile reports
 read one authorized revision and the same graphs and resolved dataset-local imports.
