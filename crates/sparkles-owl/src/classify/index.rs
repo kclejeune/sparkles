@@ -2787,6 +2787,8 @@ fn horn_index(
             })
             .filter(|r| links.binary_search(r).is_err())
             .collect();
+        v.sort_unstable();
+        v.dedup();
         let back: Vec<Role> = v
             .iter()
             .filter(|&&l| {

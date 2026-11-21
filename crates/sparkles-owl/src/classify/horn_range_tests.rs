@@ -27,7 +27,7 @@ fn iris(line: &str) -> Vec<String> {
         .collect()
 }
 
-/// The classes a HermiT taxonomy names and the subsumptions between them it entails,
+/// The classes a reference taxonomy names and the subsumptions between them it entails,
 /// closed under transitivity.
 fn hermit(text: &str) -> (BTreeSet<String>, BTreeSet<(String, String)>) {
     let mut classes = BTreeSet::new();
@@ -92,7 +92,15 @@ fn fixture(name: &str) -> (Vec<Axiom>, BTreeSet<String>, BTreeSet<(String, Strin
     let d = dir("horn_ranges");
     let doc =
         ofn_read::parse(&std::fs::read_to_string(d.join(format!("{name}.ofn"))).unwrap()).unwrap();
-    let text = std::fs::read_to_string(d.join(format!("{name}.hermit.ofn"))).unwrap();
+    // HermiT 1.4.5.519 misses the range of a superproperty of a chain's result, so the
+    // reference of such a fixture is Konclude 0.7.0's, which entails it
+    let konclude = d.join(format!("{name}.konclude.ofn"));
+    let reference = if konclude.exists() {
+        konclude
+    } else {
+        d.join(format!("{name}.hermit.ofn"))
+    };
+    let text = std::fs::read_to_string(reference).unwrap();
     let (classes, want) = hermit(&text);
     (doc.axioms, classes, want)
 }
@@ -121,6 +129,15 @@ const CASES: &[(&str, usize, bool)] = &[
     ("chain-individuals", 0, true),
     // a chain of inverse links, walked forwards and backwards, whose last link has no range
     ("inverse-path", 0, true),
+    // the last link is a chain's result whose own chain ends in a link without the range
+    ("nested-last", 0, true),
+    // a left-linear chain whose right operand has no range
+    ("left-linear", 0, true),
+    // a chain into a subproperty of the ranged property
+    ("subrole-chain", 0, true),
+    // a generated case in which unfolded negative existentials give links by roles that
+    // no positive existential has, which take the ranges of their inverses late
+    ("late-links", 1, false),
 ];
 
 #[test]

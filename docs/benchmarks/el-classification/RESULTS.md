@@ -1876,7 +1876,8 @@ Horn rules answer, and three classifications per process. GO ran five per proces
 the Horn rules as by default and with the EL rules alone. Each time is the median over the
 five processes of a side of the process's median classification. Each round divides the
 rule's time by the time with every universal kept, the ratio is the median of the five
-rounds' ratios, and the range is their range. The memory is the median peak resident set. Every taxonomy has the same
+rounds' ratios, and the range is their range. The conclusions are those of one thread, where
+the five processes of a side report the same count. The memory is the median peak resident set. Every taxonomy has the same
 hash on the three sides in every round.
 
 | Ontology | Threads | Base ms | Kept ms | Rule ms | Rule / kept | Range of the rounds | Kept MiB | Rule MiB | Conclusions, kept | Conclusions, rule |
@@ -1894,8 +1895,8 @@ The rule leaves out all 6 range universals of `ore_ont_14817` and 13 of the 16 o
 `ore_ont_9663`, and the Horn rules derive 8.2% and 7.2% fewer conclusions on them. GO has no
 range universal, so its two sides do the same work on one binary, and their ratio is the
 spread of that binary, at or below 1 in at least one round of each pair. The base differs from the kept side by the commits between 378127e2 and fd47b7ae,
-which the EL rules' 5% on GO shows. On the laptop the rule takes 7.4% and 6.5% fewer
-instructions per classification on the two Uberon files and 0.01% more on GO, counted on
+which the EL rules' 6% on GO shows. On the laptop commit 27471426 takes 7.4% and 6.5%
+fewer instructions per classification than commit fd47b7ae on the two Uberon files and 0.01% more on GO, counted on
 one P-core as the difference between three classifications and one, halved.
 
 A sweep on the laptop ran the build with the rule and with every universal kept on the 207

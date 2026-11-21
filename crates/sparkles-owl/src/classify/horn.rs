@@ -340,13 +340,18 @@ thread_local! {
 }
 
 /// Runs `f` with the range universals of `mode`, for the tests that compare the forms.
-/// The normalization runs on the calling thread, so the override reaches it.
+/// The normalization runs on the calling thread, so the override reaches it, and a guard
+/// restores the earlier mode even when `f` panics.
 #[cfg(test)]
 pub fn with_range_universals<T>(mode: RangeUniversals, f: impl FnOnce() -> T) -> T {
-    let before = RANGES_OVERRIDE.with(|c| c.replace(Some(mode)));
-    let out = f();
-    RANGES_OVERRIDE.with(|c| c.set(before));
-    out
+    struct Restore(Option<RangeUniversals>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RANGES_OVERRIDE.with(|c| c.set(self.0));
+        }
+    }
+    let _restore = Restore(RANGES_OVERRIDE.with(|c| c.replace(Some(mode))));
+    f()
 }
 
 /// The range universals of a run: the tests' override, then `SPARKLES_HORN_RANGES`.
@@ -364,9 +369,9 @@ pub fn range_universals() -> RangeUniversals {
 
 /// Whether the told ranges already give `c` at the end of every path that implies `r`,
 /// so that `⊤ ⊑ ∀r.c` adds nothing (roadmap item 693, F24's section on the Horn rules).
-/// The last letter of every word that the automaton of `r` accepts labels a transition
-/// into a final state, and the test asks of each such label `l` that `c` be a told range
-/// of `l` or of a role above it, `r` included. The index gives the target of every link
+/// `told` holds the roles that have `c` as a told range. The last letter of every word
+/// that the automaton of `r` accepts labels a transition into a final state, and the test
+/// asks of each such label `l` that `l` or a role above it, `r` included, be in `told`. The index gives the target of every link
 /// by a role under `l` the ranges of that role and its superroles, and the source of
 /// every link by a role under `l⁻` the same ranges through `∃l⁻.⊤ ⊑ c`
 /// ([`super::index`]'s `horn_index`), and a loop takes the ranges of its role and its
@@ -375,10 +380,9 @@ pub fn range_universals() -> RangeUniversals {
 fn ends_in_range(
     rb: &mut RoleBox,
     labels: &mut FxHashMap<Role, Option<Vec<Role>>>,
-    ranges: &[(Role, Ex)],
+    told: &[Role],
     tops: &[Role],
     r: Role,
-    c: Ex,
 ) -> bool {
     if tops.contains(&r) {
         return false;
@@ -403,7 +407,7 @@ fn ends_in_range(
         return false;
     };
     ls.iter()
-        .all(|&l| !tops.contains(&l) && ranges.iter().any(|&(l2, c2)| c2 == c && rb.sub(l, l2)))
+        .all(|&l| !tops.contains(&l) && told.iter().any(|&l2| rb.sub(l, l2)))
 }
 
 /// How far a run reduces the automata that unfold its universals (roadmap item 693):
@@ -1713,12 +1717,15 @@ pub fn normalize(
     ax.ranges.extend(domains);
     // a range of a role that a chain reaches holds along the chain's paths too, unless the
     // ranges of the links that end every such path give it already (roadmap item 693)
-    let ranges: Vec<(Role, Ex)> = ax
+    let mut ranges: Vec<(Role, Ex)> = ax
         .ranges
         .iter()
         .copied()
         .filter(|&(r, _)| !rb.simple(r))
         .collect();
+    // a range told twice, such as a range of r and a domain of r⁻, is one universal
+    ranges.sort_unstable();
+    ranges.dedup();
     let mode = range_universals();
     let tops: Vec<Role> = [
         RoleName::Object(ObjectProperty::top()),
@@ -1727,11 +1734,22 @@ pub fn normalize(
     .iter()
     .filter_map(|n| it.role_id(n))
     .collect();
+    // the roles with each told range, so that a label's test reads only those of its filler
+    let mut by_filler: FxHashMap<Ex, Vec<Role>> = FxHashMap::default();
+    for &(l, c) in &ax.ranges {
+        by_filler.entry(c).or_default().push(l);
+    }
     let mut labels: FxHashMap<Role, Option<Vec<Role>>> = FxHashMap::default();
-    for (r, c) in ranges {
+    for (i, (r, c)) in ranges.into_iter().enumerate() {
+        if i % 64 == 63 && stop() {
+            return Err(Halt::Stopped);
+        }
         let skip = match mode {
             RangeUniversals::Covered => {
-                ends_in_range(&mut rb, &mut labels, &ax.ranges, &tops, r, c)
+                c != TOP && {
+                    let told = by_filler.get(&c).map_or(&[][..], |v| v.as_slice());
+                    ends_in_range(&mut rb, &mut labels, told, &tops, r)
+                }
             }
             RangeUniversals::Keep => false,
             #[cfg(test)]

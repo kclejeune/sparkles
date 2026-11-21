@@ -580,8 +580,8 @@ it, as [the Horn rules](#the-horn-rules) argue. The rule leaves out all 6 such u
 of ore_ont_14817 and 13 of the 16 of ore_ont_9663, which then derive 8.2% and 7.2% fewer
 conclusions and take 7.4% and 6.5% fewer instructions per classification on the laptop.
 On `atlas`, without their disjunctive attempt and against the same binary with every
-universal kept, they classify in 0.942 and 0.955 times the time on one thread and 0.927 and
-0.960 times on four, with peak resident sets of 638 against 697 MiB and 910 against
+universal kept, they classify in a median over five paired rounds of 0.942 and 0.955 times
+the time on one thread and 0.927 and 0.960 times on four, with peak resident sets of 638 against 697 MiB and 910 against
 959 MiB on one thread. GO has no such universal and takes the same time. The taxonomies
 are equal on the 389 development and final-set files of the ORE 2015 DL sample that both
 sides classify, and on 3,537 generated Horn ontologies, of which the 853 that leave a
