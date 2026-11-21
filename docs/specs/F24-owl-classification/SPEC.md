@@ -3815,8 +3815,7 @@ rooted run call it through a theory rule over the data atoms of each context, an
 worlds of the Horn rules with individuals call it for the values of keys and
 functional properties. It is written from the OWL 2 Structural Specification §4, §5.7,
 §9.3.6, §9.4 and §11.2, the Direct Semantics §2.2 and §2.3, and XML Schema 1.1 Part 2,
-with the theory resolution of Stickel (*Automated deduction by theory resolution*, JAR
-1985) for the clause calculus. No other reasoner's source is read.
+and the Hyper rule of the clause calculus. No other reasoner's source is read.
 
 **Why it is needed.** On the ORE 2015 DL development files that the census of item 1272
 found leaving axioms out for data, the datatypes in use are `xsd:int`, `xsd:string`,
@@ -3846,7 +3845,8 @@ family the datatypes nest or are intervals, and between families the value space
 disjoint. §4.2 states that `xsd:double`, `xsd:float` and `owl:real` are pairwise
 disjoint, §4.5 and §4.6 state it of the two binary datatypes and of `xsd:anyURI` and
 `xsd:string`, and the families of `xsd:boolean`, `xsd:dateTime` and `rdf:XMLLiteral` are
-disjoint from the others as primitive datatypes of XML Schema. The families are these.
+disjoint from the others, the first two as primitive datatypes of XML Schema. The
+disjointness of `rdf:XMLLiteral` rests on its definition in RDF and is verified in phase 1. The families are these.
 
 | Family | Datatypes | Representation |
 |---|---|---|
@@ -3981,10 +3981,12 @@ nothing that the atoms do not, since no data term is shared between contexts.
 
 **The EL and Horn tiers.** The data properties fall into components connected by the
 hierarchy and by disjointness. A component whose ranges are all in the OWL 2 EL map and
-that has no universal restriction, cardinality, functional property, enumeration of
-several values or facet stays with the EL lattice of `classify/data.rs`, which is convex
+that has no universal restriction, cardinality, enumeration of several values or facet
+stays with the EL lattice of `classify/data.rs`, which is convex
 there, since every value space of the profile is infinite and no union of its ranges
-covers another. Every other component is all data atoms. A lattice over the whole map
+covers another, and the lattice already meets the ranges under a functional data
+property. An ontology whose data is within OWL 2 EL therefore runs the code it runs
+today. Every other component is all data atoms. A lattice over the whole map
 would not be convex, since `∃d.xsd:boolean` entails a class that both `∃d.{true}` and
 `∃d.{false}` imply, and `∃d.xsd:integer` one that `∃d.xsd:integer[≤0]` and
 `∃d.xsd:positiveInteger` imply. The Horn tier applies the theory rule to the data atoms
@@ -3998,8 +4000,11 @@ nothing, since several successors and pigeonholes come out as entailments of one
 atom. A data restriction in a negative position whose negation is not Horn, a universal
 restriction or a maximum on the left, stays with Tier D. On the 67 ORE 2015 DL files
 that the census found leaving axioms out for 768 or 972, all 27 files with data
-restrictions outside OWL 2 EL have them only in positive positions, so the Horn tier can
-take their data whole. The worlds of the Horn rules with individuals compare key values
+restrictions outside OWL 2 EL have them only in positive positions, so no negative
+universal or cardinality keeps them from the Horn tier. Covers can still arise from
+values on the left, such as a Boolean property whose two values define different
+classes, and phase 2 counts the files where a property with a finite range has two or
+more such values with different classes. The worlds of the Horn rules with individuals compare key values
 and functional values by identity through the checker.
 
 **Tier D.** Tier D's eligibility drops its refusal of data roles and keeps its refusal of
