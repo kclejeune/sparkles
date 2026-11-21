@@ -573,7 +573,12 @@ pub const MREPAIR_NO_REPLAY: u8 = 64;
 /// of the holder whose body has no ground literal, a literal over constants and function
 /// terms of constants alone, at the return and at the late premise. A product with a ground
 /// body then never arises, which would go back to the root and out again through each
-/// alternative condition of its body atoms.
+/// alternative condition of its body atoms. A measurement bit, off by default: with the
+/// selection of ground body literals off it loses no answer against [`MREPAIR_ON`] alone,
+/// finishes ten more runs within the bound and takes part022's cost from 24% to 10.5%,
+/// but g1-051_p0012 still passes the bound (roadmap item 1250) and g1-051_p0121 derives
+/// 1.42 million conclusions against 1.17 million. Which of the two the default takes is
+/// for item 1231 to decide on evidence.
 pub const MREPAIR_CF: u8 = 128;
 
 impl DlRun {
