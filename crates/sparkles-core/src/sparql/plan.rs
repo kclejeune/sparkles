@@ -4614,8 +4614,9 @@ impl<'a> Planner<'a> {
     /// DP / greedy join ordering over connected components (QLever QueryPlanner).
     /// `settled` are FILTERs that may run only on whole components: each is placed on
     /// the component that binds all its variables, and the rest join the `filters` of
-    /// the joins between components. On the checked route the credit returned holds
-    /// `filters` when they grow for the rest of `settled`.
+    /// the joins between components. On the checked route, when `filters` grow for the
+    /// rest of `settled`, the credit for the grown list goes into `append_credit`, the
+    /// caller's slot, which the caller declares before its list.
     fn join_order(
         &self,
         leaves: Vec<Vec<Node>>,
