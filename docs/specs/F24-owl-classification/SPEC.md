@@ -263,7 +263,9 @@ The run checks the work bound, the memory budget, the deadline and a cancellatio
 cooperative checkpoints, which come after every 256 choices of a product, after every 64
 sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
 totals. The contract therefore bounds neither the time between two checks by a fixed
-number of reads nor the allocated bytes by the memory budget, which is an estimate.
+number of reads nor the allocated bytes by the memory budget, which is an estimate. A counting allocator
+measures the heap 6 to 31% above the charged estimate on the three files named below, with the
+repair on or off, and item 1291 follows that difference.
 
 Some steps of the repair and of the rooted rules read between two checks without counting
 what they read. The steps named here are the ones that were measured or reproduced, and
