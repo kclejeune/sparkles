@@ -578,7 +578,8 @@ impl<'a> Reader<'a> {
             .collect();
         let mut types: FxHashSet<Id> = FxHashSet::default();
         let mut sources: FxHashSet<Id> = FxHashSet::default();
-        let mut targets: Vec<Id> = Vec::new();
+        // whether every target is a structural type, without keeping the targets
+        let mut structural_targets = true;
         let mut typing = false;
         let mut ok = true;
         self.each(Perm::Spo, &[r.0], |q| {
@@ -600,12 +601,13 @@ impl<'a> Reader<'a> {
                     || (root.is_some() && Some(q[2]) == self.rdf_type)
                     || (root == Some(Root::Ontology) && header_roles.contains(&q[2]))
             } else if Some(q[1]) == tgt {
-                targets.push(q[2]);
+                structural_targets &= self.structural.contains(&q[2]);
                 true
             } else {
                 !self.kept(&q) || self.annotation_predicate(q[1])
             };
-            Ok(ok)
+            // a second source or type already fails, so the sets stay small
+            Ok(ok && sources.len() <= 1 && types.len() <= 1)
         })?;
         if !ok || sources.len() != 1 || types.len() != 1 {
             return Ok(false);
@@ -613,7 +615,7 @@ impl<'a> Reader<'a> {
         // a reified type triple whose type is not structural is a main triple that
         // `read_store` reads outside the fragment, and the choice of the header reads every
         // triple of an ontology node
-        if typing && !targets.iter().all(|t| self.structural.contains(t)) {
+        if typing && !structural_targets {
             return Ok(false);
         }
         let ty = types.into_iter().next();

@@ -393,7 +393,12 @@ fn generate(seed: u64) -> Case {
             parts.push("a owl:Annotation, owl:Axiom".into());
         }
         parts.push(format!("owl:annotatedSource {s}"));
-        parts.push(format!("owl:annotatedProperty {p}"));
+        if r.p(0.97) {
+            parts.push(format!("owl:annotatedProperty {p}"));
+        }
+        if r.p(0.03) {
+            parts.push("owl:annotatedProperty rdfs:comment".into());
+        }
         if r.p(0.97) {
             parts.push(format!("owl:annotatedTarget {o}"));
         }
