@@ -1006,7 +1006,7 @@ touched it, so the query time is what each commit cost then. `oldest` and
 `oldest-page-5` order the ages with the person as a tie-breaker, the second at offset 40,
 and `largest-teams` orders the team sizes of a grouped count.
 
-The run below used a release build of commit `9934f16b` on wally, an Intel Core i7-12800H
+The run below used a release build of commit `1396fa6c` on wally, an Intel Core i7-12800H
 with 20 threads, under the host's heavy lock, with 200,000 people. Every view's
 maintained rows matched its query evaluated again at the end. The
 [run record](runs/2026-11-21-ordered-windows-wally/README.md) holds the raw output. The

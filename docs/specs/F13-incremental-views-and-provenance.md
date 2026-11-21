@@ -1612,9 +1612,10 @@ of the `recompute` node it was before.
   placement of the heap's rows obey the pass's cancellation and deadline, which are also
   checked before and after the heap's sort and at the end of each phase, before its
   result is installed, but not within the sort or within one key's decoding. A pass that
-  fails while it places the rows leaves the window empty with the input's total, which
-  the next changing pass refills. Named views build without a memory limit, for this
-  operator as for every other, which item 1298 takes.
+  fails while it places the rows leaves the window empty with the input's total, a
+  consistent state, and the runtime then fails the view, which a rebuild starts again
+  from the input. A named view that starts its own circuit builds without a memory
+  limit, for this operator as for every other, which item 1298 takes.
 - Rows that the order does not tell apart keep the order in which they entered the kept
   rows. The vector is saved in order and the keys depend on the terms, so a checkpoint
   and a generation switch keep it. Keys whose order is not total, such as dates with and

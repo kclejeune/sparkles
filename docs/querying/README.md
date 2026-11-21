@@ -599,12 +599,13 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   whose whole query is evaluated again, under inference or protections that depend on
   the data, streams its window without positions, an ordered stream does not merge its
   diffs under `coalesceMs`, and its resume starts with a `reset`. Roadmap item 1296.
-* A named view builds and refills its operators without a memory limit, and its
-  `memoryBytes` budget is checked against its state only after a pass, so a large build
-  allocates its whole state before the view is suspended. A live query that starts its
-  own circuit gives that circuit its budget, which ordered windows and `recompute` nodes charge as
-  they build, and
-  one that shares a view's circuit does not. Roadmap item 1298.
+* A named view that starts its own circuit builds and refills its operators without a
+  memory limit, and its `memoryBytes` budget is checked against its state only after a
+  pass, so a large build allocates its whole state before the view is suspended. A live
+  query that starts its own circuit gives that circuit its budget, which ordered windows
+  and `recompute` nodes charge as they build. A view or live query that joins an existing
+  circuit keeps that circuit's limit, so the limit depends on which of them created the
+  shared circuit. Roadmap item 1298.
 * A view maintains a property path with `+` or `*` only when its step is made of IRIs,
   inverses, sequences and alternatives, and recomputes paths with `?`, negated property
   sets, nested closures or a closure inside a sequence. Roadmap item 544. A path

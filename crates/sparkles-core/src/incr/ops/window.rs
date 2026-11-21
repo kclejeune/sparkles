@@ -175,7 +175,8 @@ impl Window {
         for e in &self.kept {
             p.tick()?;
             let k = self.key_of(p, &e.row);
-            used = used.saturating_add(key_bytes(&k));
+            // `bytes` counts each row's key slots already, so only the strings are new
+            used = used.saturating_add(k.iter().map(SortKey::payload_bytes).sum::<u64>());
             charge(p, used)?;
             keys.push(k);
         }
@@ -341,7 +342,8 @@ impl Window {
     /// not by the input. The heap, its keys' strings, the kept rows a refill still holds
     /// and the reconciliation are charged to the pass's memory budget at every row. A
     /// pass that fails while the rows are placed leaves the window empty with the input's
-    /// total, which the next changing pass refills.
+    /// total, a consistent state, and the runtime then fails the view, which a rebuild
+    /// starts again from `init`.
     fn fill(&mut self, p: &mut Pass, rows: Changes, keep: bool) -> Result<()> {
         p.control.check()?;
         let cap = usize::try_from(self.cap()).unwrap_or(usize::MAX);

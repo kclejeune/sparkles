@@ -5,7 +5,7 @@ This record holds the measurement of the ordered windows of
 a manual record. The files are the raw output of the run and are not edited.
 
 `window-against-recompute.log` is the whole output of one job of `scripts/remote-ci.sh
---cmd` on wally, an Intel Core i7-12800H with 20 threads, which ran under the host's heavy
+--cmd` on wally, a 12th Gen Intel Core i7-12800H with 20 CPUs as `lscpu` reports, which ran under the host's heavy
 lock with no other build or test beside it. The job checked out commit `9934f16b`, whose
 tree is that of `1396fa6c`, and ran
 `mbx test --release -p sparkles-core --test incr_bench -- --ignored --nocapture --test-threads 1 window_against_recompute`
