@@ -29,6 +29,12 @@ class Counts(unittest.TestCase):
         text = "Ran 1 test in 0.0s\n\nFAILED (failures=1, errors=2, skipped=4)\n"
         self.assertEqual(compare.serial_counts(text), (1, 4))
 
+    def test_a_coloured_summary_counts(self):
+        # Validation s8 finding 1: Python 3.14 colours the summary when PYTHON_COLORS=1, even
+        # in a file. These are its bytes for a pass with one skip.
+        text = "Ran 2 tests in 0.000s\n\n\x1b[32mOK\x1b[0m (\x1b[33mskipped=1\x1b[0m)\n"
+        self.assertEqual(compare.serial_counts(text), (2, 1))
+
     def test_no_tests_and_no_summary(self):
         self.assertEqual(compare.serial_counts("Ran 0 tests in 0.000s\n\nNO TESTS RAN\n"), (0, 0))
         self.assertIsNone(compare.serial_counts("Traceback (most recent call last):\n"))
@@ -78,9 +84,9 @@ class EndToEnd(unittest.TestCase):
             (d / f"{name}.py").write_text(textwrap.dedent(body))
         return d
 
-    def run_compare(self, *args):
+    def run_compare(self, *args, env=None):
         return subprocess.run([sys.executable, str(SCRIPT), *args], stdin=subprocess.DEVNULL,
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=120, env=env)
 
     def test_arms_that_agree_pass(self):
         d = self.suite(test_a="""
@@ -100,6 +106,41 @@ class EndToEnd(unittest.TestCase):
         p = self.run_compare(str(d))
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("both arms exited 0 with 3 tests run and 1 skipped", p.stdout)
+
+    def test_arms_that_agree_pass_when_python_is_told_to_colour(self):
+        # Validation s8 finding 1.
+        d = self.suite(test_a="""
+            import unittest
+            class A(unittest.TestCase):
+                def test_ok(self):
+                    pass
+                @unittest.skip("not here")
+                def test_skip(self):
+                    pass
+            """)
+        for colour in ({"PYTHON_COLORS": "1"}, {"FORCE_COLOR": "1"}):
+            p = self.run_compare(str(d), env={**os.environ, **colour})
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("both arms exited 0 with 2 tests run and 1 skipped", p.stdout)
+
+    def test_a_skip_from_a_local_module_named_as_a_runner_module_is_counted(self):
+        # Validation s8 finding 2: the runner has loaded json before discovery, so a local
+        # json.py that skips at import sends the suite to serial discovery, which skips it.
+        d = self.suite(json="""
+            import unittest
+            raise unittest.SkipTest("no JSON backend")
+            """, test_json="""
+            from json import dumps, loads
+            import unittest
+            class JsonTest(unittest.TestCase):
+                def test_roundtrip(self):
+                    self.assertEqual(loads(dumps({"a": 1})), {"a": 1})
+            """)
+        for args in ((), ("--split", "test_json")):
+            p = self.run_compare(*args, str(d))
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            self.assertIn("so the suite runs serially with unittest discover", p.stdout)
+            self.assertIn("both arms exited 0 with 1 tests run and 1 skipped", p.stdout)
 
     def test_a_failing_suite_fails_in_both_arms(self):
         d = self.suite(test_a="""

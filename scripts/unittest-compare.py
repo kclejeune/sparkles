@@ -10,8 +10,9 @@ number of tests it ran and skipped. The serial arm's counts come from unittest's
 summary on its standard error, which a test's own printed output cannot mask, and the
 parallel arm's from the result records of all its units, which the runner keeps for this
 with --keep. A runner that ran no unit, because the suite has no test, counts none, and a
-runner that replaced itself with serial discovery, on a host it cannot supervise from, is
-counted from that discovery's summary. The run exits 1 and names each difference when the arms
+runner that replaced itself with serial discovery, on a host it cannot supervise from or for
+a file named as one of its modules, is counted from that discovery's summary. Both arms run
+with Python's colour turned off, and a coloured summary is read without its escapes. The run exits 1 and names each difference when the arms
 disagree, and otherwise exits as both arms did. SIGINT, SIGTERM or SIGHUP sends SIGTERM to
 the running arm's process group and ends the run with 128 plus the signal number once the
 arm has ended.
@@ -33,6 +34,10 @@ import tempfile
 
 RUNNER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "unittest-parallel.py")
 
+# unittest colours its summary when Python is told to, even in a file, so the arms run with
+# colour off and the summary is read with any colour escape removed.
+_COLOUR = re.compile(r"\x1b\[[0-9;]*m")
+_NO_COLOUR = {"PYTHON_COLORS": "0", "NO_COLOR": "1"}
 _RAN = re.compile(r"^Ran (\d+) tests? in ", re.M)
 _STATUS = re.compile(r"^(OK|FAILED|NO TESTS RAN)(?: \((.*)\))?$", re.M)
 
@@ -41,6 +46,7 @@ def serial_counts(text):
     """The tests run and skipped that unittest's closing summary in TEXT, an arm's standard
     error, reports, or None when TEXT has no summary. The last summary is unittest's own,
     after anything a test wrote there."""
+    text = _COLOUR.sub("", text)
     ran = _RAN.findall(text)
     status = _STATUS.findall(text)
     if not ran or not status:
@@ -120,7 +126,8 @@ def run_arm(name, argv):
     _stopped(name)
     print(f"unittest-compare: {name}: {' '.join(argv)}", flush=True)
     with tempfile.TemporaryFile("w+") as out, tempfile.TemporaryFile("w+") as err:
-        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True)
+        proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, start_new_session=True,
+                                env={**os.environ, **_NO_COLOUR})
         _CURRENT.append(proc)
         # A signal that came before the arm was registered has not reached it.
         if _STOP:

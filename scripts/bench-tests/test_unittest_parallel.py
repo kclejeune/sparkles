@@ -1191,6 +1191,94 @@ class WithoutProc(Base):
         self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
 
 
+SHADOW_TEST = """
+from json import dumps, loads
+import unittest
+
+class JsonTest(unittest.TestCase):
+    def test_roundtrip(self):
+        self.assertEqual(loads(dumps({"a": 1})), {"a": 1})
+"""
+
+
+class Shadowing(Base):
+    """A file in the discovery or working directory with the name of a module that the
+    runner loads before discovery, as the validation of the s8 round found with json.py,
+    sends the suite to serial discovery, which imports that file as the test module does."""
+
+    def shadowed(self, json_body):
+        d = self.suite(test_json=SHADOW_TEST)
+        write(d, "json.py", json_body)
+        return d
+
+    def check(self, d, expect, *, cwd=None, target=None):
+        for args in ((), ("--split", "test_json")):
+            s = self.serial(target or d, cwd=cwd)
+            self.assertEqual(s.returncode, expect, "serial discovery:\n" + s.stdout + s.stderr)
+            p = self.run_runner(*args, str(target or d), cwd=cwd)
+            self.assertEqual(p.returncode, expect, f"runner {args}:\n" + p.stdout + p.stderr)
+            self.assertIn("json.py has the name of a module that the runner loads before discovery, "
+                          "so the suite runs serially with unittest discover", p.stdout)
+        return s, p
+
+    def test_a_failing_local_module_fails(self):
+        d = self.shadowed("""
+            def dumps(value):
+                return "{}"
+
+            def loads(text):
+                return {}
+            """)
+        _, p = self.check(d, 1)
+        self.assertIn("AssertionError", p.stderr)
+
+    def test_a_local_module_that_does_not_compile_fails(self):
+        self.check(self.shadowed("def dumps(:\n"), 1)
+
+    def test_a_skip_at_the_local_modules_import_is_counted(self):
+        s, p = self.check(self.shadowed("""
+            import unittest
+            raise unittest.SkipTest("no JSON backend")
+            """), 0)
+        self.assertIn("OK (skipped=1)", s.stderr)
+        self.assertIn("OK (skipped=1)", p.stderr)
+
+    def test_a_module_in_the_working_directory_counts_too(self):
+        # `python3 -m unittest` puts the working directory on the path after the discovery
+        # directory, so its json.py is what the test imports.
+        d = self.suite()
+        write(d, "tests/test_json.py", SHADOW_TEST)
+        write(d, "json.py", "def dumps(value):\n    return '{}'\n\ndef loads(text):\n    return {}\n")
+        self.check(d, 1, cwd=d, target=d / "tests")
+
+    def test_a_unit_loads_no_module_that_serial_discovery_does_not_unless_it_is_checked(self):
+        # Each run's test writes the top-level modules loaded while it runs. A name loaded
+        # in a unit and not serially must be one that the runner checks for, and serial
+        # discovery must load none that a unit does not.
+        d = self.suite(test_modules="""
+            import os, sys, unittest
+
+            class T(unittest.TestCase):
+                def test_modules(self):
+                    with open(os.environ["MODULES_OUT"], "w") as f:
+                        f.write("\\n".join(sorted({m.partition(".")[0] for m in sys.modules})))
+            """)
+        loaded = {}
+        for arm, argv in (("serial", ["-m", "unittest", "discover", "-s", str(d)]), ("unit", [str(RUNNER), str(d)])):
+            out = d / f"{arm}.txt"
+            p = subprocess.run([sys.executable, *argv], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                               timeout=120, env={**os.environ, "MODULES_OUT": str(out)})
+            self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+            loaded[arm] = set(out.read_text().split())
+        # The runner's list, as a fresh interpreter that loads it computes it.
+        own = subprocess.run([sys.executable, "-c", "import runpy, sys; "
+                              f"print(*runpy.run_path({str(RUNNER)!r}, run_name='probe')['_OWN_MODULES'])"],
+                             stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=60)
+        self.assertEqual(own.returncode, 0, own.stderr)
+        self.assertEqual(loaded["serial"] - loaded["unit"], set())
+        self.assertEqual(loaded["unit"] - loaded["serial"] - set(own.stdout.split()), set())
+
+
 class Identity(unittest.TestCase):
     """The process search keeps each process's identity, so a reused pid is never signalled."""
 

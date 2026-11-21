@@ -73,22 +73,41 @@ and exit.
 On a host without /proc or prctl, which the runner needs, it prints a notice and runs the
 suite serially by replacing itself with `python3 -m unittest discover -s DIR`, ignoring the
 options other than DIR, so the run exits as that does, or ends by the signal that ends it.
+It does the same when DIR or the working directory, which serial discovery puts first on
+the path, has an entry named as a module that discovery and the units load before they
+discover and serial discovery does not, such as json.py, since a test module importing that
+name would get the file serially and the runner's module here. The runner loads few such
+modules, json and ctypes with what they import, and imports the rest of what its own
+process uses only there.
 --keep DIR keeps the discovery, the plan, each unit's output and the result records in a
 new directory under DIR. --jobs 1 runs the units one at a time, in the same processes.
 """
 
+import sys
+
+# `python3 -m unittest` has loaded runpy and unittest, with what they import, before it
+# discovers, and has built its command line's argparse parsers, whose translated help and
+# formatter import gettext's locale and shutil. The runner does the same, so test code that
+# imports one of these gets the same module in both runs.
 import argparse
+import runpy  # noqa: F401
+import unittest
+
+argparse.ArgumentParser().add_argument("--discover")
+_SERIAL_MODULES = {m.partition(".")[0] for m in sys.modules}
+
 import ctypes
 import json
-import math
 import os
 import signal
-import subprocess
-import sys
-import tempfile
 import time
-import unittest
-from pathlib import Path
+
+# The top-level modules that discovery and every unit have loaded before they discover and
+# serial discovery has not. A test module that imports one of these names gets a file of
+# that name in the discovery directory serially and the runner's module here, so such a file
+# sends the suite to serial discovery. The modules that only the runner's own process uses
+# are imported where it uses them, so that they are not on this list.
+_OWN_MODULES = frozenset({m.partition(".")[0] for m in sys.modules} - _SERIAL_MODULES)
 
 RUNNER = os.path.abspath(__file__)
 
@@ -517,6 +536,7 @@ class Job:
         self.end = self.t0 + deadline
         self.deadline = deadline
         self.timed_out = False
+        import subprocess  # the runner's own process only, see _OWN_MODULES
         self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=self.out,
                                      stderr=subprocess.STDOUT, start_new_session=True)
         self.start = _start_of(self.proc.pid)
@@ -527,6 +547,7 @@ class Job:
         self.reap(grace)
 
     def reap(self, grace):
+        import subprocess
         try:
             self.proc.wait(timeout=grace + 5)
         except subprocess.TimeoutExpired:
@@ -630,7 +651,26 @@ def _unsupported():
     return None
 
 
+def _shadowed(directory):
+    """Why the suite runs serially because a name in the discovery directory or the working
+    directory, which both runs put first on the path, is that of a module the runner has
+    loaded before it discovers and serial discovery has not, or None. Any entry counts, a
+    package, a module file, a compiled module or a directory with no __init__.py alike."""
+    for where in dict.fromkeys((os.path.abspath(directory), os.getcwd())):
+        try:
+            names = sorted(os.listdir(where))
+        except OSError:
+            continue
+        for name in names:
+            if name.partition(".")[0] in _OWN_MODULES:
+                return (f"{os.path.join(where, name)} has the name of a module that the runner loads "
+                        f"before discovery")
+    return None
+
+
 def parse_args(argv):
+    import math
+    from pathlib import Path
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
     ap.add_argument("--split", action="append", default=[])
@@ -668,15 +708,18 @@ def main(argv=None):
         _die_with_parent(int(parent), float(grace))
         return worker_main(directory, plan, int(index), int(split), record, absorb)
     a = parse_args(argv)
-    why = _unsupported()
+    why = _unsupported() or _shadowed(a.directory)
     if why:
-        # Supervision needs /proc and prctl, which only Linux has.
+        # Supervision needs /proc and prctl, which only Linux has, and a test module must
+        # import the same modules as it does serially.
         # unittest takes this process's place, so its exit status, or the signal that ends it,
         # is the run's.
         print(f"unittest-parallel: {why}, so the suite runs serially with unittest discover", flush=True)
         sys.stderr.flush()
         os.execv(sys.executable, [sys.executable, *_warn_args(), "-m", "unittest",
                                   "discover", "-s", str(a.directory)])
+    import subprocess
+    import tempfile
     old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
     if a.keep:
         a.keep.mkdir(parents=True, exist_ok=True)
