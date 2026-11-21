@@ -607,7 +607,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   up to 13% on some ontologies in exchange for the speed. On the benchmark host GO
   classifies in 91 ms and ChEBI lite in 0.39 seconds on eight threads, and the
   classifier is 3.1 to 20 times as fast as ELK on GO, ChEBI lite and the largest ORE
-  2015 EL ontologies on one and eight threads. GO's `InverseObjectProperties(part_of
+  2015 EL ontologies on one and eight threads, and faster than Konclude. GO's `InverseObjectProperties(part_of
   has_part)` takes the Horn rules, which add the 14 subsumptions that Konclude and HermiT
   entail and ELK misses and make GO 12% slower to classify on one thread than with the EL
   rules alone. Roadmap item 693. Its taxonomies equal ELK's and Konclude's on ChEBI lite
