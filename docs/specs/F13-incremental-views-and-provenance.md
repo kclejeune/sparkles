@@ -1655,7 +1655,13 @@ the window in order. Further tests cover changes above, inside and below a windo
 that moves, duplicates that a window cuts, the number of refills over 250 deletions, the
 compiler's fallbacks and a window in a subquery against the engine.
 
-BENCH_SUMMARY
+On wally with 200,000 people, a maintained pass of the three windows of
+`window_against_recompute` costs 13 to 17 µs at the median, against 0.8 to 2.1 ms for
+the query evaluated again, which is what each commit cost before. A refill evaluates the
+window's input again and costs about 55 ms on the ages, and 400 commits with 200
+deletions at the front pay it twice. The
+[writes benchmark](../benchmarks/writes/RESULTS.md#ordered-windows-in-views) gives the
+table and its run record.
 
 ### Maintained assessments and conservative dependencies
 

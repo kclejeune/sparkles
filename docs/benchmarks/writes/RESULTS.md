@@ -1006,19 +1006,21 @@ touched it, so the query time is what each commit cost then. `oldest` and
 `oldest-page-5` order the ages with the person as a tie-breaker, the second at offset 40,
 and `largest-teams` orders the team sizes of a grouped count.
 
-The run below used a release build of commit TIP on wally, an Intel Core i7-12800H
+The run below used a release build of commit `9934f16b` on wally, an Intel Core i7-12800H
 with 20 threads, under the host's heavy lock, with 200,000 people. Every view's
-maintained rows matched its query evaluated again at the end. The raw output is the
-lane's `window_against_recompute-wally-TIP.log`. The numbers are a development-host
-measurement for the design, not a published result.
+maintained rows matched its query evaluated again at the end. The
+[run record](runs/2026-11-21-ordered-windows-wally/README.md) holds the raw output. The
+numbers are a development-host measurement for the design, not a published result.
 
 | View | Build ms | Query ms | Pass median ms | Pass p95 ms | Pass max ms | Query / pass | State MiB |
 |---|--:|--:|--:|--:|--:|--:|--:|
-ROWS
+| `oldest` | 68.7 | 2.0 | 0.015 | 0.038 | 54.980 | 132 | 0.0 |
+| `oldest-page-5` | 53.3 | 2.1 | 0.017 | 0.022 | 55.073 | 121 | 0.0 |
+| `largest-teams` | 31.4 | 0.8 | 0.013 | 0.034 | 0.075 | 64 | 0.2 |
 
-A pass costs 14 to 18 µs at the median against 0.8 to 2.2 ms for the query. The largest
+A pass costs 13 to 17 µs at the median against 0.8 to 2.1 ms for the query. The largest
 pass of `oldest` and `oldest-page-5` is a refill, which evaluates the window's input
-again, here a scan of the 200,000 ages, at about 50 ms. The 200 deletions at the front run
+again, here a scan of the 200,000 ages, at about 55 ms. The 200 deletions at the front run
 the reserve of 100 rows out twice, so two of the 400 commits pay it. The engine answers
 the query itself from a bounded top-k in about 2 ms, and a refill that read the engine's
 answer instead would cost that, which roadmap item 1294 takes up for inputs whose
