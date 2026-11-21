@@ -1180,6 +1180,117 @@ fn removing_an_axiom_not_held_does_not_cancel_a_later_addition() {
     assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
 }
 
+/// Classifies `held`, applies each edit of `edits` as removals then additions, and
+/// checks every incremental run against a run of a new classifier (roadmap item 1258).
+fn edits_agree(mut held: Vec<Axiom>, edits: &[(Vec<Axiom>, Vec<Axiom>)]) {
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&held);
+    k.classify(&limits).unwrap();
+    for (adds, removes) in edits {
+        held.retain(|a| !removes.contains(a));
+        k.remove(removes);
+        k.add(adds);
+        held.extend(adds.iter().cloned());
+        let inc = k.classify(&limits).unwrap();
+        let full = Classifier::of(&held).classify(&limits).unwrap();
+        assert_eq!(
+            inc.taxonomy, full.taxonomy,
+            "after adding {adds:?} and removing {removes:?}"
+        );
+        assert_eq!(inc.consistent, full.consistent);
+    }
+}
+
+fn self_of(r: &str) -> ClassExpression {
+    ClassExpression::ObjectHasSelf(ope(r))
+}
+
+fn subrole(a: &str, b: &str) -> Axiom {
+    ax(AxiomKind::SubObjectPropertyOf(
+        SubObjectPropertyExpression::Expression(ope(a)),
+        ope(b),
+    ))
+}
+
+#[test]
+fn an_added_self_restriction_on_a_superrole_reaches_kept_loops() {
+    let held = vec![
+        subrole("r", "s"),
+        sub(Class::thing(), self_of("r")),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("s"), c("C"));
+    edits_agree(
+        held,
+        &[
+            (vec![edit.clone()], vec![]),
+            (vec![], vec![edit.clone()]),
+            (vec![edit], vec![]),
+        ],
+    );
+}
+
+#[test]
+fn a_change_with_a_self_restriction_runs_everything_again() {
+    let held = vec![sub(c("A"), self_of("r")), sub(self_of("s"), c("C"))];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let edit = sub(self_of("s"), c("D"));
+    k.add([&edit]);
+    assert!(!k.classify(&Limits::default()).unwrap().stats.incremental);
+    k.remove([&edit]);
+    assert!(!k.classify(&Limits::default()).unwrap().stats.incremental);
+    let plain = sub(c("A"), c("B"));
+    k.add([&plain]);
+    assert!(k.classify(&Limits::default()).unwrap().stats.incremental);
+    // a role edge that a self restriction reaches changes the role table
+    let edge = subrole("r", "s");
+    k.add([&edge]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+}
+
+#[test]
+fn an_added_self_filler_reaches_a_kept_existential_filler() {
+    let held = vec![
+        subrole("r", "s"),
+        sub(c("D"), self_of("r")),
+        sub(c("A"), some("t", c("D"))),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(some("t", self_of("s")), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
+#[test]
+fn an_added_self_restriction_reaches_the_loops_of_a_reflexive_role() {
+    let held = vec![
+        ax(AxiomKind::ReflexiveObjectProperty(ope("r"))),
+        Axiom::declaration(Entity::Class(c("A"))),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("r"), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
+#[test]
+fn an_added_self_restriction_reaches_the_loops_of_a_chain() {
+    let held = vec![
+        ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Chain(vec![ope("r"), ope("r")]),
+            ope("t"),
+        )),
+        sub(c("A"), self_of("r")),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("t"), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
 // ---------------------------------------------------------------------------------
 // A naive completion procedure for EL++ without concrete domains (Baader, Brandt and
 // Lutz, "Pushing the EL Envelope", IJCAI 2005, with the range rule of their 2008

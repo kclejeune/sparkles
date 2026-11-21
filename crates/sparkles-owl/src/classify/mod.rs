@@ -728,20 +728,26 @@ pub struct Changes<'a> {
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
 /// role table, which a run builds once, one with data, whose told subsumers the index
-/// derives from every data axiom at once, a key, or one with an individual, whose
-/// merges the invalidation does not follow.
+/// derives from every data axiom at once, a key, one with an individual, whose
+/// merges the invalidation does not follow, or one with a self restriction (roadmap
+/// item 1258). A negative self restriction gives its subsumer to every context with a
+/// loop by a subrole, and a loop comes from a self restriction of another role, a
+/// reflexive role or a chain as well as from the restriction itself, so a kept context
+/// can have the loop without holding the changed expression that the invalidation
+/// looks for.
 fn needs_full_run(ax: &AxiomKind) -> bool {
     if role_axiom(ax) || matches!(ax, AxiomKind::HasKey(..)) {
         return true;
     }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.0.iter().any(|e| {
-        matches!(
-            e,
-            Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
-        )
-    })
+    sig.1.has_self()
+        || sig.0.iter().any(|e| {
+            matches!(
+                e,
+                Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
+            )
+        })
 }
 
 /// Whether an edit of the axiom leaves alone what decides a run's tier and what its
