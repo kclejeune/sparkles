@@ -484,17 +484,37 @@ fn ends_in_range(
     };
     // a test for each pair of a label and a top or told property, polling the stop
     let mut work = 0usize;
-    for &l in ls.iter() {
-        work += tops.len() + told.len();
-        if work >= POLL_WORK {
-            work = 0;
-            if stop() {
-                return Err(Halt::Stopped);
-            }
+    let mut tick = || {
+        work += 1;
+        if work.is_multiple_of(POLL_WORK) && stop() {
+            Err(Halt::Stopped)
+        } else {
+            Ok(())
         }
-        if tops.contains(&l) || !told.iter().any(|&l2| rb.sub(l, l2)) {
+    };
+    for &l in ls.iter() {
+        let mut top = false;
+        for &t in tops {
+            tick()?;
+            top |= t == l;
+        }
+        if top {
             return Ok(false);
         }
+        let mut found = false;
+        for &l2 in told {
+            tick()?;
+            if rb.sub(l, l2) {
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+    }
+    if work >= POLL_WORK && stop() {
+        return Err(Halt::Stopped);
     }
     Ok(true)
 }
@@ -1903,6 +1923,18 @@ mod reduction_tests {
         let go = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| false);
         assert_eq!(go, Ok(true));
         let halt = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| true);
+        assert_eq!(halt, Err(Halt::Stopped));
+        // one label found after many told properties, with a stop that comes only after
+        // the first poll
+        let one = POLL_WORK as Role + 3;
+        labels.insert(one + 1, Some(vec![one]));
+        let told: Vec<Role> = (0..=one).collect();
+        let calls = std::cell::Cell::new(0usize);
+        let late = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 1
+        };
+        let halt = ends_in_range(&mut rb, &mut labels, &told, &[], one + 1, None, &late);
         assert_eq!(halt, Err(Halt::Stopped));
     }
 
