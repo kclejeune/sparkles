@@ -297,19 +297,11 @@ impl<'a> Reader<'a> {
 
     /// Whether the full read could type a predicate of `f` from triples outside it: a
     /// predicate outside the terminological ones, which only the main triples of
-    /// reifications bring in, that no graph read declares directly and that is not built
-    /// in. A lenient read infers its kind from its use, and either mode reads a
-    /// declaration that only an `owl:Axiom` node states.
+    /// reifications bring in, that is not built in. Such a predicate is not declared an
+    /// annotation property directly, and its kind can rest on its use elsewhere, on a
+    /// declaration that only an `owl:Axiom` node states or on several declarations, so
+    /// the head opens the ontology for it whatever the graphs say of it.
     fn undeclared(&self, f: &Fragment) -> Result<bool> {
-        let Some(t) = self.rdf_type else {
-            return Ok(false);
-        };
-        let kinds: FxHashSet<Id> = EntityKind::ALL
-            .iter()
-            .map(|k| k.rdf_type())
-            .chain(PROPERTY_TYPES)
-            .filter_map(|p| self.id(p))
-            .collect();
         let mut preds: Vec<Id> = f
             .quads
             .iter()
@@ -323,15 +315,7 @@ impl<'a> Reader<'a> {
                 Some(Term::NamedNode(n)) => read::builtin_kind(n.as_str()).is_some(),
                 _ => false,
             };
-            if builtin {
-                continue;
-            }
-            let mut declared = false;
-            self.each(Perm::Spo, &[p.0, t.0], |q| {
-                declared |= kinds.contains(&q[2]);
-                Ok(!declared)
-            })?;
-            if !declared {
+            if !builtin {
                 return Ok(true);
             }
         }
@@ -516,11 +500,15 @@ impl<'a> Reader<'a> {
     }
 
     /// Add the kept `rdf:type` quads of every IRI the fragment uses, as context, or
-    /// `false` past the bounds.
+    /// `false` past the bounds. It is also `false` when a used IRI is the source of a
+    /// reified `rdf:type` triple outside the fragment, since the full read takes that
+    /// reification for a declaration of its own.
     fn add_types(&self, f: &mut Fragment) -> Result<bool> {
         let Some(t) = self.rdf_type else {
             return Ok(true);
         };
+        let src = self.id(vocab::OWL_ANNOTATED_SOURCE);
+        let prop = self.id(vocab::OWL_ANNOTATED_PROPERTY);
         let mut used: Vec<Id> = f
             .quads
             .iter()
@@ -530,6 +518,28 @@ impl<'a> Reader<'a> {
         used.sort_unstable();
         used.dedup();
         for id in used {
+            if let (Some(src), Some(prop)) = (src, prop) {
+                let mut reifiers = Vec::new();
+                self.each(Perm::Pos, &[src.0, id.0], |q| {
+                    if !f.visited.contains(&q[0]) {
+                        reifiers.push(q[0]);
+                    }
+                    Ok(reifiers.len() <= MAX_REIFIED)
+                })?;
+                if reifiers.len() > MAX_REIFIED {
+                    return Ok(false);
+                }
+                for r in reifiers {
+                    let mut typing = false;
+                    self.each(Perm::Spo, &[r.0, prop.0, t.0], |_| {
+                        typing = true;
+                        Ok(false)
+                    })?;
+                    if typing {
+                        return Ok(false);
+                    }
+                }
+            }
             let Some(qs) = self.kept_quads(Perm::Spo, &[id.0, t.0], MAX_FRAGMENT)? else {
                 return Ok(false);
             };

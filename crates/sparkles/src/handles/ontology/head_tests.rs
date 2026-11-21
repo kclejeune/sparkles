@@ -155,6 +155,26 @@ const TYPE_REIFIED_AS_ANNOTATION: &str = ":o a owl:Ontology .
         owl:annotatedTarget owl:AnnotationProperty ; rdfs:comment \"odd\" .
     :A a owl:Class .";
 
+const FUNCTIONAL_RANGED_HEADER: &str = ":o a owl:Ontology ; :p \"title\" .
+    :p a owl:FunctionalProperty ; rdfs:range xsd:string .
+    [] a owl:Annotation ; owl:annotatedSource :o ; owl:annotatedProperty :p ;
+        owl:annotatedTarget \"title\" .
+    :A a owl:Class .";
+
+const TYPED_REIFIED_ANNOTATION_PROPERTY: &str = ":o a owl:Ontology ; :p \"x\" .
+    :p a owl:DatatypeProperty .
+    [] a owl:Axiom ; owl:annotatedSource :p ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget owl:AnnotationProperty ; rdfs:comment \"declared here\" .
+    [] a owl:Annotation ; owl:annotatedSource :o ; owl:annotatedProperty :p ;
+        owl:annotatedTarget \"x\" .
+    :A a owl:Class .";
+
+const DECLARED_AND_REIFIED: &str = ":o a owl:Ontology ; :p \"x\" .
+    :p a owl:AnnotationProperty .
+    [] a owl:Axiom ; owl:annotatedSource :p ; owl:annotatedProperty rdf:type ;
+        owl:annotatedTarget owl:DatatypeProperty ; rdfs:comment \"also data\" .
+    :A a owl:Class .";
+
 pub(super) const FIXTURES: &[Fixture] = &[
     Fixture {
         name: "basic",
@@ -296,6 +316,36 @@ pub(super) const FIXTURES: &[Fixture] = &[
         data: TYPE_REIFIED_AS_ANNOTATION,
         args: default_args,
     },
+    Fixture {
+        name: "functional-ranged-header",
+        data: FUNCTIONAL_RANGED_HEADER,
+        args: default_args,
+    },
+    Fixture {
+        name: "functional-ranged-header-strict",
+        data: FUNCTIONAL_RANGED_HEADER,
+        args: strict,
+    },
+    Fixture {
+        name: "typed-reified-annotation-property",
+        data: TYPED_REIFIED_ANNOTATION_PROPERTY,
+        args: default_args,
+    },
+    Fixture {
+        name: "typed-reified-annotation-property-strict",
+        data: TYPED_REIFIED_ANNOTATION_PROPERTY,
+        args: strict,
+    },
+    Fixture {
+        name: "declared-and-reified",
+        data: DECLARED_AND_REIFIED,
+        args: default_args,
+    },
+    Fixture {
+        name: "declared-and-reified-strict",
+        data: DECLARED_AND_REIFIED,
+        args: strict,
+    },
 ];
 
 /// The fixtures whose reading needs the whole mapping, so that the head opens the ontology.
@@ -310,6 +360,12 @@ const OPENED: &[&str] = &[
     "ranged-header-strict",
     "type-as-ontology-property",
     "type-reified-as-annotation",
+    "functional-ranged-header",
+    "functional-ranged-header-strict",
+    "typed-reified-annotation-property",
+    "typed-reified-annotation-property-strict",
+    "declared-and-reified",
+    "declared-and-reified-strict",
 ];
 
 fn g1_g1() -> J {
