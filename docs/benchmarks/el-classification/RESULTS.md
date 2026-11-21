@@ -1949,7 +1949,73 @@ ChEBI lite gave the base's taxonomies on one and four threads with commit 3f20f7
 commit 05838a64, whose engine code is the build's, where both sides refuse one file at
 the reader and stop one at its memory budget.
 
+### Allocations of the index stage
+
+The index stage checked every axiom against OWL 2 EL with the profile checker, whose
+datatype pass builds a signature that copies each class and property IRI of the axiom.
+On `ore_ont_13482` on one thread that check took 81 to 88 ms of an index stage of about
+320 ms on the laptop. Roadmap item 1269 answers it with a walk that allocates nothing for
+an axiom that certainly breaks no rule and falls back to the full check for the rest, so
+the rules and messages of the axioms left out are those of the full check. The check
+then takes 16.5 ms. The item also looks up the role of an object property in a table of
+role ids by its IRI, which a lookup of the whole role name hashed and compared before.
+
+Forge ran nine rounds of three builds on one and four threads, one process per build,
+file and thread count, in an order that rotates with the round, under the bench and
+heavy locks with nothing else on the host. The base is commit b47b582b, the check is
+commit 15a9f9b2 and the tip, commit 89deb60f, adds the role lookup. Each cell is the
+median over the rounds of each process's median classification time in ms, the index
+time is that of each process's last classification, and the range is that of the nine
+rounds' ratios of the tip to the base.
+
+| Ontology | Threads | Base | Check | Tip | Tip / base | Range | Index, base | Index, tip |
+|---|---:|---:|---:|---:|---:|---|---:|---:|
+| `ore_ont_13482` | 1 | 999.4 | 961.4 | 898.2 | 0.871 | 0.826 to 0.992 | 345.3 | 215.7 |
+| | 4 | 462.6 | 441.6 | 418.1 | 0.918 | 0.869 to 0.989 | 241.9 | 192.3 |
+| ChEBI lite | 1 | 762.0 | 735.6 | 734.0 | 0.964 | 0.946 to 0.969 | 129.9 | 94.2 |
+| | 4 | 295.3 | 282.9 | 281.0 | 0.956 | 0.933 to 0.963 | 84.2 | 72.9 |
+| GO | 1 | 313.6 | 298.5 | 317.1 | 1.010 | 1.004 to 1.016 | 31.7 | 24.3 |
+| | 4 | 107.2 | 103.1 | 106.0 | 0.988 | 0.982 to 1.003 | 24.5 | 22.2 |
+
+Every process exited normally and each file gave one taxonomy across the builds. On the
+laptop the base and the tip classified GO, ChEBI lite, the 298 ORE 2015 EL files and the
+207 DL development files on one and four threads, and the 1,010 pairs that both builds
+classified gave the same taxonomy, tier, flags, consistency and axioms left out, with the
+same rules and messages in the same order. The axioms left out number 5.75 million over
+the 242 pairs that have any. Both builds refuse one file at the reader and stop one at its
+memory budget. The
+index stage of `ore_ont_13482` on one thread takes 0.625 of the base's time, and the
+whole classification 0.871, below 1 in every round. Against ELK's 2,766 ms in
+[Against ELK](#against-elk), which was not run again, the tip's 898 ms is 3.08 times
+faster. The base itself takes 999 ms in these rounds, against 897 ms in that table. The
+peak resident set of `ore_ont_13482` falls from 1,304 to 1,289 MiB, and the classifier's
+own estimate does not change.
+
+On the laptop, one pinned thread counts 8.554 billion user instructions per
+classification of `ore_ont_13482` for the base, 7.446 billion for the check and 7.259
+billion for the tip, and 5.332, 5.144 and 5.141 billion on GO. The tip/check index ratio
+of `ore_ont_13482` stays below 1 in every forge round on both thread counts.
+
+GO's saturation takes 262 ms on the tip against 251 ms on the base and 244 ms with the
+check alone, in every round, although no saturation code changed and the tip counts
+fewer instructions than the check. The saturation's worker function has the same size in
+the two builds and starts 48 bytes later in the tip. On `atlas`, a build of the tip that
+copies the IRI at each role it finds, as the base did, ran GO at 1.058 of the check's
+time and the tip at 1.057 in seven rounds, so the move comes from where the code lies
+and not from the heap. Roadmap item 1280 holds GO's 1.0% on one thread, with item 722.
+
+Two ideas of the same report were not built. The negative occurrences of the whole index
+took 4 ms on `ore_ont_13482` on the laptop, so a reused stack can save less than that,
+and the sort and deduplication of the told subsumptions took 10 ms, of which per-key
+sorts could save only part.
+
 ## Records
+
+The [record of item 1269's index allocations](runs/2026-11-21-el-index-alloc-forge-89deb60f/record.json)
+holds every process of the nine rounds on forge with its report, the analysis, the hash
+checks of the binaries and inputs, the host's state before and after, the separate
+`atlas` rounds with the layout probe, the laptop's instruction counts and stage probe,
+the taxonomy and exclusion sweep and the scripts that ran.
 
 The [record of item 956's left-linear chains](runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json)
 holds every process of the rounds on forge with its report, the rules fixed before the

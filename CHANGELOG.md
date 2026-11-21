@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### The EL index stage checks the profile without allocating
+
+Roadmap item 1269 removes allocations from the index stage of OWL 2 EL classification.
+The profile check of each axiom walks it without allocating and falls back to the full
+check, which copied each class and property IRI into a signature, only for an axiom that
+may break a rule, so the axioms left out keep their rules and messages. Normalization
+looks up an object property's role by its IRI in a table of role ids. On forge
+`ore_ont_13482` classifies on one thread in 898 ms against 999 ms, 0.871 of the base's
+time, with its index stage at 0.625, and ChEBI lite takes 0.964 on one and 0.956 on four
+threads. GO's index stage is faster too, but its saturation moved with the code's layout
+and the whole classification takes 1.0% longer on one thread, which item 1280 holds.
+
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
 Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
