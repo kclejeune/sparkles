@@ -2100,7 +2100,8 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
 /// choice of one of its processed clauses, other than a marker, with each body literal
 /// maximal, resolved with the returned clause on those literals, keeping the premises'
 /// bodies and residual heads. The clause is kept under its body literals for the premises
-/// that come later.
+/// that come later. The drain's products first reserve [`Found::fold_slack`], the bytes of
+/// fold's tables that its own charge leaves out, which a wide return makes large.
 pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool {
     if st.bottom || m_stopped(st, out) {
         return false;
@@ -2119,7 +2120,17 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
     out.dl().grow(grown);
     let mut found = Found::default();
     ret_products(st, &c, None, cf_of(ix, out), &mut found);
+    // fold's tables on M-return's wide products grow past its charge, so their bound is
+    // reserved before the drain and released after it, all of it transient. A refusal
+    // stops the run as a refused charge inside fold does.
+    let slack = found.fold_slack().min(isize::MAX as usize);
+    if slack > 0 && !out.reserve_data(slack) {
+        out.release_data(slack);
+        ds(st).store.interrupted = true;
+        return true;
+    }
     drain(ix, st, found, out);
+    out.release_data(slack);
     true
 }
 
@@ -3231,6 +3242,78 @@ mod tests {
             assert!(!m_poll(0, &mut other, &mut out), "mode {mode}");
             assert!(out.sent.is_empty(), "mode {mode}: {:?}", out.sent);
             assert_eq!((run.work(), run.bytes()), (work, bytes), "mode {mode}");
+        }
+    }
+
+    /// A context that holds four premises with `A(u)` in their heads and four with `B(u)`,
+    /// each with a body `K(x)` of its own, and the run's returned clause `A(u) ∧ B(u) → H(u)`,
+    /// whose M-return is a product of two lists of four.
+    fn wide_return(mode: u8) -> (Index, DlRun, State, u32) {
+        let mut sig = Sig::new();
+        let [a, b, h] = ["A", "B", "H"].map(|n| sig.class(n));
+        let ks: Vec<Ex> = (0..8).map(|i| sig.class(&format!("K{i}"))).collect();
+        let u = sig.ind("u");
+        let (ix, _) = probe_ix(sig);
+        let mut run = DlRun::new(false, Default::default());
+        run.mrepair = mode;
+        let (ga, gb, gh) = (
+            glit(&run, &ix, a, u),
+            glit(&run, &ix, b, u),
+            glit(&run, &ix, h, u),
+        );
+        let mut st = State::default();
+        for (i, &k) in ks.iter().enumerate() {
+            let l = if i < 4 { ga } else { gb };
+            let id = ds(&mut st).store.clauses.len() as u32;
+            assert!(
+                ds(&mut st)
+                    .store
+                    .add(Clause::new(vec![Lit::x(k)], vec![l]))
+                    .is_some()
+            );
+            ds(&mut st).store.by_xl.entry(l).or_default().push(id);
+        }
+        let cid = run.table.push(Clause::new(vec![ga, gb], vec![gh]));
+        (ix, run, st, cid)
+    }
+
+    #[test]
+    fn m_return_reserves_its_fold_tables() {
+        for mode in MODES {
+            // granted: the reservation covers the product's tables and is released after
+            let (ix, run, mut st, cid) = wide_return(mode);
+            let stored = dl(&st).unwrap().store.clauses.len();
+            let mut out = Stops::new(&run);
+            assert!(rret(&ix, &mut st, cid, &mut out), "mode {mode}");
+            let derived = dl(&st).unwrap().store.clauses.len() - stored;
+            assert!(derived > 0, "mode {mode}: the return derives");
+            assert!(!dl(&st).unwrap().store.interrupted, "mode {mode}");
+            assert_eq!(out.held, 0, "mode {mode}: everything reserved is released");
+            // 16 unions in a table of 32 buckets, which grew from 16, beyond 48 bytes each
+            assert!(out.peak >= 32 * 49 - 16 * 48, "mode {mode}: {}", out.peak);
+        }
+    }
+
+    #[test]
+    fn a_refused_m_return_reservation_stops_the_return() {
+        // refused at its first check: nothing is derived and the store is interrupted
+        for mode in MODES {
+            let (ix, run, mut st, cid) = wide_return(mode);
+            let stored = dl(&st).unwrap().store.clauses.len();
+            let mut out = Stops::new(&run);
+            out.refuse = true;
+            assert!(rret(&ix, &mut st, cid, &mut out), "mode {mode}");
+            assert_eq!(
+                dl(&st).unwrap().store.clauses.len(),
+                stored,
+                "mode {mode}: nothing derived after the refusal"
+            );
+            assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
+            assert!(out.stop.get() && out.asked > 0, "mode {mode}");
+            assert_eq!(
+                out.held, 0,
+                "mode {mode}: the refused reservation is released"
+            );
         }
     }
 

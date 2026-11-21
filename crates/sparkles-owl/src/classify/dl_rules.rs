@@ -1449,6 +1449,36 @@ impl Found {
     pub(super) fn products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, false);
     }
+    /// A bound on the bytes that [`fold`] holds without a charge while it derives the
+    /// products that are not ground, for a caller that reserves them before it drains:
+    /// the largest over the products, since fold drops a product's tables before the next.
+    /// fold charges each union it keeps, but not the slots of its `seen` table beyond the
+    /// union itself, nor its step list's spare capacity, each with the buffer it grew from.
+    /// The bound takes each step to make one union per choice, the product of the lengths
+    /// of the lists so far, which can far exceed the unions a step keeps.
+    pub(super) fn fold_slack(&self) -> usize {
+        self.prods
+            .iter()
+            .filter(|p| !p.2)
+            .map(|p| {
+                let last = p.0.len().saturating_sub(1);
+                let mut choices = 1usize;
+                let mut most = 0usize;
+                for (i, l) in p.0.iter().enumerate() {
+                    choices = choices.saturating_mul(l.len());
+                    // a last step past FOLD_PRUNE unions derives them as it makes them
+                    let listed = if i < last {
+                        choices
+                    } else {
+                        choices.min(FOLD_PRUNE + 1)
+                    };
+                    most = most.max(step_slack(choices, listed));
+                }
+                most
+            })
+            .max()
+            .unwrap_or(0)
+    }
     /// [`Found::products`] for a ground inference, whose choices the restriction filters.
     pub(super) fn ground_products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, true);
@@ -1555,6 +1585,41 @@ pub(super) const RECORD_SLACK: usize = 64 * 1024;
 /// of the step has a subset of their literals, which costs a comparison of each side with
 /// the sides kept before it.
 const FOLD_PRUNE: usize = 4096;
+
+/// The bytes of one step of [`fold`] that its charge leaves out, for `unions` unions of
+/// which `listed` stay in the step's list: the `seen` table's slots and control bytes
+/// beyond the size of a union, which fold charges for each, together with the table of
+/// half the buckets it grew from, and the list's capacity beyond its length, together with
+/// the buffer of half that capacity it grew from. The buckets follow the hash table's
+/// growth, a power of two at least 8/7 of the entries.
+fn step_slack(unions: usize, listed: usize) -> usize {
+    const SIDE: usize = std::mem::size_of::<Side>();
+    let table = |n: usize| -> usize {
+        let buckets = match n {
+            0 => 0,
+            1..4 => 4,
+            4..8 => 8,
+            _ => (n.saturating_mul(8) / 7)
+                .checked_next_power_of_two()
+                .unwrap_or(usize::MAX),
+        };
+        buckets.saturating_mul(SIDE + 1).saturating_add(16)
+    };
+    let grown = table(unions).saturating_add(if unions >= 4 {
+        table(unions / 2 + 1)
+    } else {
+        0
+    });
+    let cap = if listed == 0 {
+        0
+    } else {
+        listed.checked_next_power_of_two().unwrap_or(usize::MAX)
+    };
+    let list = cap.saturating_add(cap / 2).saturating_mul(SIDE);
+    grown
+        .saturating_sub(unions.saturating_mul(SIDE))
+        .saturating_add(list.saturating_sub(listed.saturating_mul(SIDE)))
+}
 
 /// Derives the conclusions of a product that is not ground (item 969): the union of one
 /// premise from every list with `base`, list after list. Each step keeps the unions it
