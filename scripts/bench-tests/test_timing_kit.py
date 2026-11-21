@@ -187,6 +187,19 @@ class KitTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("reason", r.stderr)
 
+    def test_stage_chooses_the_busy_loop_and_preflight_refuses_others(self):
+        r, s = self.stage(tips=(("tip", 1.0),))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("SPIN_LOOP=user\n", (s / "run.env").read_text())
+        r, s = self.stage("--spin-loop", "syscall", tips=(("tip", 1.0),), name="syscall")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        env = (s / "run.env").read_text()
+        self.assertIn("SPIN_LOOP=syscall\n", env)
+        (s / "run.env").write_text(env.replace("SPIN_LOOP=syscall", "SPIN_LOOP=fast"))
+        r = kit("preflight", s)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("SPIN_LOOP must be user or syscall, not fast", r.stderr)
+
     def test_preflight_refuses_early_stopping_that_acts(self):
         r, s = self.stage(tips=(("tip", 1.0),))
         self.assertIn("EARLY_STOP=shadow\n", (s / "run.env").read_text())
@@ -369,6 +382,17 @@ class KitTests(unittest.TestCase):
         self.assertIn("fixed (B) against base (A): first pass INVALID", verdict)
         self.assertIn("answers differ for " + ", ".join(sorted(CONTROLS)), verdict)
         self.assertIn(f"answers changed as run.env expects for tiny ({why})", verdict)
+
+    @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
+                         and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")
+    def test_the_busy_loop_that_enters_the_kernel_is_recorded_and_runs(self):
+        r, s = self.stage("--spin-loop", "syscall", tips=(("tip", 1.0),))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = kit("run", s, env=self.env, timeout=600)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("busy loops: syscall (while :; do : > /dev/null; done)",
+                      (s / "pass1" / "results" / "env.txt").read_text())
+        self.assertIn("Busy loops: syscall.", (s / "verdict.md").read_text())
 
     @unittest.skipUnless(all(shutil.which(t) for t in NEEDS) and len(os.sched_getaffinity(0)) >= 2
                          and {0, 1} <= os.sched_getaffinity(0), "needs taskset, chrt, zstd, curl and CPUs 0 and 1")

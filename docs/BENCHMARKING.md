@@ -1271,6 +1271,17 @@ screen uses it until an Intel host run shows that it keeps the screen's verdicts
 `timing-kit.py stage --clients` times every arm under several clients in one run for that
 qualification.
 
+The busy loops that keep the timing CPUs awake are shell loops that never enter the kernel.
+Under a kernel with lazy preemption, such as one that logs `Dynamic Preempt: lazy`, a server
+or client that another CPU wakes waits for the next scheduler tick on a CPU that runs such a
+loop. Each request's client wall time then gains up to one millisecond per wake-up, and the
+wall times of a 1000 Hz kernel fall on whole milliseconds. `SPIN_LOOP=syscall`, which
+`timing-kit.py stage --spin-loop syscall` writes, runs a loop of redirections to `/dev/null`
+in their place, whose system calls let the woken task run within microseconds. The default
+stays `SPIN_LOOP=user` until an Intel host run shows that the other loop keeps the screen's
+verdicts, and runs under different loops are never compared. `env.txt` and `verdict.md`
+name the loop.
+
 <a id="namespace-query-screens"></a>
 
 ### Query screens

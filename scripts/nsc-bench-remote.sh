@@ -37,7 +37,13 @@
 # server and client CPUs during the timed part. It keeps their vCPUs from halting between
 # requests, which in a VM costs a hypervisor exit and a cold wake-up, and it yields to the
 # server and client as soon as they run. In a noise test with one binary, it halved the
-# spread within a server process and between server processes.
+# spread within a server process and between server processes. SPIN_LOOP picks the loop.
+# With user, the default, it is `while :; do :; done`, which never enters the kernel. A kernel
+# with lazy preemption, such as one that logs "Dynamic Preempt: lazy", then lets a server or
+# client woken from another CPU wait for that CPU's next tick, so every request's wall time
+# gains up to a millisecond per wake. With syscall it is `while :; do : > /dev/null; done`,
+# whose system calls let the woken task run within microseconds. Runs under different loops
+# are never compared. env.txt records the loop.
 #
 # REQUEST_CLIENT picks the client of the warm-up and timed requests. With curl (the
 # default), each request forks curl, grep and awk, which costs about 19 ms of client time
@@ -57,7 +63,7 @@ cd "$(dirname "$0")"
 # shellcheck source=/dev/null
 source ./run.env
 : "${ROUNDS:=4}" "${REPS:=20}" "${WARMUP:=3}" "${SERVER_CPU:=2}" "${CLIENT_CPU:=4}"
-: "${RAYON_THREADS:=1}" "${PORT:=3999}" "${SERVE_ARGS:=}" "${EXECUTION:=}" "${MAX_TIME:=300}" "${SPIN:=1}"
+: "${RAYON_THREADS:=1}" "${PORT:=3999}" "${SERVE_ARGS:=}" "${EXECUTION:=}" "${MAX_TIME:=300}" "${SPIN:=1}" "${SPIN_LOOP:=user}"
 # SERVE_ARGS_A and SERVE_ARGS_B add flags for one variant. SHARE_STORE=1 serves B from A's
 # store, which compares settings of one binary without the differences between two stores.
 # scripts/nsc-bench.sh does not write these three, and scripts/x08-gates/latency.sh does.
@@ -132,6 +138,11 @@ for v in "${VARIANT_LIST[@]}"; do
   esac
 done
 [ "$PERSISTENT" = 0 ] || command -v python3 > /dev/null || fail "REQUEST_CLIENT=persistent needs python3"
+case $SPIN_LOOP in
+  user) SPIN_BODY='while :; do :; done' ;;
+  syscall) SPIN_BODY='while :; do : > /dev/null; done' ;;
+  *) fail "SPIN_LOOP is user or syscall, not $SPIN_LOOP" ;;
+esac
 
 # The binaries are built on another Linux and name the build host's glibc loader, so a
 # dynamically linked one (DYNAMIC_A, DYNAMIC_B) runs under this image's loader.
@@ -150,6 +161,7 @@ done
   echo "memory: $(free -m | awk '/Mem:/ {print $2}') MiB"
   echo "smt siblings: $(sort -u /sys/devices/system/cpu/cpu*/topology/thread_siblings_list | tr '\n' ' ')"
   echo "loader: $( (/lib64/ld-linux-x86-64.so.2 --version 2> /dev/null || echo none) | head -1)"
+  if [ "$SPIN" = 1 ]; then echo "busy loops: $SPIN_LOOP ($SPIN_BODY)"; else echo "busy loops: none"; fi
   echo "request client: $(for v in "${VARIANT_LIST[@]}"; do [ "${CLIENT_OF[$v]}" = curl ] && printf '%s=curl ' "$v" || printf '%s=persistent(gap %s ms) ' "$v" "${GAP_OF[$v]}"; done)$([ "$PERSISTENT" = 0 ] || python3 --version 2>&1)"
 } > "$R/env.txt"
 # the steal and total jiffies of the whole machine: summed before and after the timed part
@@ -436,7 +448,7 @@ fi
 SPINNERS=()
 if [ "$SPIN" = 1 ]; then
   for c in "$SERVER_CPU" "$CLIENT_CPU"; do
-    taskset -c "$c" chrt -i 0 sh -c 'while :; do :; done' > /dev/null 2>&1 &
+    taskset -c "$c" chrt -i 0 sh -c "$SPIN_BODY" > /dev/null 2>&1 &
     SPINNERS+=($!)
   done
 fi

@@ -263,7 +263,7 @@ def cmd_stage(a):
         **mapping,
         "VARIANTS": " ".join(variants), "ORDERS": ";".join(orders),
         "ROUNDS": a.rounds, "REPS": a.reps, "WARMUP": a.warmup, "RAYON_THREADS": a.rayon_threads,
-        "SERVER_CPU": a.server_cpu, "CLIENT_CPU": a.client_cpu, "PORT": a.port, "SPIN": 1,
+        "SERVER_CPU": a.server_cpu, "CLIENT_CPU": a.client_cpu, "PORT": a.port, "SPIN": 1, "SPIN_LOOP": a.spin_loop,
         "SERVE_ARGS": a.serve_args, "EXECUTION": a.execution,
         "PAIRS": " ".join(pairs), "XPAIRS": " ".join(xpairs), "CONTROLS": " ".join(controls),
         "FLAG_RATIO": a.flag_ratio, "RERUN_ROUNDS": a.rerun_rounds, "RERUN_REPS": a.rerun_reps,
@@ -312,6 +312,8 @@ def static_checks(stage):
         p.append("the server and the client share a CPU")
     if env.get("SPIN", "1") != "1":
         p.append("SPIN must be 1, so that the timing CPUs do not sleep between requests")
+    if env.get("SPIN_LOOP", "user") not in ("user", "syscall"):
+        p.append(f"SPIN_LOOP must be user or syscall, not {env.get('SPIN_LOOP')}")
     variants = env.get("VARIANTS", "A B").split()
     orders = [o.split() for o in env.get("ORDERS", "A B B A").split(";")]
     for o in orders:
@@ -678,7 +680,8 @@ def write_verdict(stage, flagged):
     label = {arm["variant"]: arm["label"] for arm in kit["arms"]}
     summary = stage / "nsc-bench-summary.py"
     invalid = False
-    lines = ["# Timing verdicts", ""]
+    lines = ["# Timing verdicts", "", f"Busy loops: {read_env(stage / 'run.env').get('SPIN_LOOP', 'user')}. "
+             "Runs under different busy loops are never compared.", ""]
     for x, y in pairs_of(stage):
         first = subprocess.run([sys.executable, str(summary), "--check", str(stage / "pass1" / f"summary-{x}-{y}.json"), "first"]).returncode
         mine = [q for q in flagged if q in pair_json(stage / "pass1", x, y)["queries"]]
@@ -954,6 +957,9 @@ def main():
     s.add_argument("--rerun-rounds", default="16")
     s.add_argument("--rerun-reps", default="40")
     s.add_argument("--note", default="")
+    s.add_argument("--spin-loop", default="user", choices=("user", "syscall"),
+                   help="the busy loop on the timing CPUs: user never enters the kernel, and syscall does, "
+                        "so that a wake-up under lazy preemption does not wait for the next tick (default user)")
     s.add_argument("--expected-answer-change", default="",
                    help="comma-separated queries whose answers the tips are expected to change")
     s.add_argument("--expected-answer-change-reason", default="", help="why those answers change")
