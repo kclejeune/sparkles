@@ -419,6 +419,10 @@ pub struct Stats {
     pub threads: usize,
     pub index: Duration,
     pub saturation: Duration,
+    /// the part of [`saturation`](Stats::saturation) after the first saturation: the
+    /// marking of real contexts with its rounds, the facts of universal roles, the merges
+    /// of keys, the witnesses and the worlds
+    pub marking: Duration,
     pub taxonomy: Duration,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
@@ -2624,6 +2628,7 @@ impl Saturation {
         // keys and for universal roles. Then owl:Thing and the individuals become real,
         // and so does what they reach, between rounds of the saturation, with the facts
         // of universal roles and the merges of keys, until none is new.
+        let marking_start = Instant::now();
         let mut universal: Vec<Ex> = Vec::new();
         // a run with the Horn rules and individuals always marks them, since R7 reads
         // the real predecessors of the global state (roadmap item 692)
@@ -2941,6 +2946,7 @@ impl Saturation {
             }
         }
         self.dynamic = dynamic;
+        stats.marking = marking_start.elapsed();
         stats.saturation = t.elapsed();
         stats.conclusions = totals.conclusions;
         totals.memory += world_bytes;
