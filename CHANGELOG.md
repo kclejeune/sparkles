@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Rooted runs with keys left after their rewriting no longer panic
+
+A rooted classification whose only individuals were in axioms outside OWL 2 EL, with a key
+over object properties that item 805's rewriting declined, exited with an internal error
+in the disjunctive rules. The rewriting declines a key past its bound, beside data, the
+bottom property or a construct it cannot rewrite, and in an ontology with a name that has
+the prefix of its made-up names. Such a run is now not rooted and gives the answer of a run
+without the option, which leaves the axioms with individuals out and reports them. Roadmap
+item 1265.
+
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
 Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
