@@ -106,7 +106,12 @@ per request, except one at 1.07%, and within 0.17% for larger queries, most with
 The small queries' counts spread by up to 4.1% over processes. A query is therefore
 flagged when its interval does not lie within 1 ± 1% below 2 million instructions per
 request, or within 1 ± 0.25% at or above it, and a lone flag of a small query near the
-threshold is rerun with more rounds. Under automatic execution a query can run on a different executor in different
+threshold is rerun with more rounds. On `wally`, two A-against-A runs of the screen's
+queries on the same store, one of four rounds and one of eight rounds of 50 requests under
+eager and streaming execution, each of a different binary, gave intervals within 1.6% of 1
+for queries under 2 million instructions per request and within 0.32% for larger queries.
+A count on `wally` therefore flags a query outside 1 ± 2% below 2 million instructions per
+request, or outside 1 ± 0.4% at or above it. Under automatic execution a query can run on a different executor in different
 processes, so its counts split into two groups. `str-filter-two` ran 225 or 272 million
 instructions per request in different processes of one binary, and other automatic
 queries spread by 20% to 90%. A flag on such a query is rerun under explicit modes before
