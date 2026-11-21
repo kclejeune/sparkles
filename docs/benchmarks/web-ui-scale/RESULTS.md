@@ -134,14 +134,15 @@ A run on `wally` measured the head of bd3bcea4 against the full summary of 0779d
 commit before it. The host is a 12th Gen Intel Core i7-12800H with 20 threads and 31 GiB of
 memory. Each cell is the median of three fresh servers, and the head's warm time is its
 second call. The server's resident memory is read after the first call, and a server holds about
-160 MB after it starts. These times are not comparable with the table above, which comes
+164 MB after it starts. The records give the resident memory in KiB, and the table
+gives it in decimal megabytes and gigabytes. These times are not comparable with the table above, which comes
 from another host.
 
 | Dataset | Full summary, cold | Full summary, warm | Head, cold | Head, warm | Memory after the full summary | Memory after the head |
 |---|---|---|---|---|---|---|
-| ChEBI lite | 2.77 s | 0.033 s | 9.6 ms | 6.8 ms | 2.53 GB | 175 MB |
-| Taxonomy of 300,000 classes | 1.35 s | 0.016 s | 8.7 ms | 4.2 ms | 1.33 GB | 171 MB |
-| Taxonomy of 1 million classes | 5.63 s | 5.45 s | 25.1 ms | 11.1 ms | 4.11 GB | 198 MB |
+| ChEBI lite | 2.77 s | 0.033 s | 9.6 ms | 6.8 ms | 2.59 GB | 179 MB |
+| Taxonomy of 300,000 classes | 1.35 s | 0.016 s | 8.7 ms | 4.2 ms | 1.36 GB | 175 MB |
+| Taxonomy of 1 million classes | 5.63 s | 5.45 s | 25.1 ms | 11.1 ms | 4.21 GB | 203 MB |
 
 The head never opened the ontology on these datasets, and its members equal those of the full
 summary. The full summary of bd3bcea4 equals that of 0779d666 and took 2.84, 1.35 and 5.52 s

@@ -1156,8 +1156,8 @@ of cases and the first seed.
 
 **Measurements.** On `wally` the head's first call takes 9.6 ms on ChEBI lite, 8.7 ms on a
 taxonomy of 300,000 classes and 25.1 ms on one of 1 million, against 2.77, 1.35 and 5.63 s
-for the full summary, and the server holds 175 to 198 MB after it instead of 1.33 to
-4.11 GB. The [web UI at scale results](../../benchmarks/web-ui-scale/RESULTS.md#the-head-of-the-summary)
+for the full summary, and the server holds 175 to 203 MB after it instead of 1.36 to
+4.21 GB. The [web UI at scale results](../../benchmarks/web-ui-scale/RESULTS.md#the-head-of-the-summary)
 give the table.
 
 **Remaining work.** Item 1297 narrows the fallbacks, such as nested `owl:Axiom` nodes, IRI
