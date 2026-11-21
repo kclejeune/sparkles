@@ -942,9 +942,14 @@ impl Axiom {
     }
 }
 
-/// The signature of a structure, collected by walking it, and its [`Shape`].
+/// The signature of a structure, collected by walking it, its [`Shape`], and whether
+/// the walk met an `ObjectHasSelf`, which the classifier's incremental runs read.
 #[derive(Default)]
-pub(crate) struct Signature(pub(crate) BTreeSet<Entity>, pub(crate) Shape);
+pub(crate) struct Signature(
+    pub(crate) BTreeSet<Entity>,
+    pub(crate) Shape,
+    pub(crate) bool,
+);
 
 /// What a walk of a structure found besides its signature.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -959,16 +964,9 @@ pub struct Shape {
     pub annotation_depth: usize,
     /// the nesting at the point of the walk
     at: usize,
-    /// an `ObjectHasSelf` anywhere
-    selfs: bool,
 }
 
 impl Shape {
-    /// Whether the walk met an `ObjectHasSelf`.
-    pub(crate) fn has_self(&self) -> bool {
-        self.selfs
-    }
-
     fn enter(&mut self) {
         self.at += 1;
         self.depth = self.depth.max(self.at);
@@ -1029,7 +1027,7 @@ impl Signature {
                 self.ind(i);
             }
             C::ObjectHasSelf(p) => {
-                self.1.selfs = true;
+                self.2 = true;
                 self.ope(p);
             }
             C::ObjectMinCardinality(_, p, c)

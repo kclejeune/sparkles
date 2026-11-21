@@ -750,7 +750,7 @@ fn needs_full_run(ax: &AxiomKind) -> bool {
     }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.1.has_self()
+    sig.2
         || sig.0.iter().any(|e| {
             matches!(
                 e,

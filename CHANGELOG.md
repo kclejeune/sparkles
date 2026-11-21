@@ -25,8 +25,9 @@ holding the restriction that the invalidation looks for. With `r ⊑ s` and
 `owl:Thing ⊑ ObjectHasSelf(r)` fixed, adding `ObjectHasSelf(s) ⊑ C` cleared no context and
 left out `owl:Thing ⊑ C`, and a reflexive `r` with an added `ObjectHasSelf(r) ⊑ C` did the
 same. A change to an axiom with a self restriction now saturates everything again, as a
-change to an axiom with an individual does. Runs with the Horn or disjunctive rules
-already started again, since they compare the self restrictions of the two indexes. A new
+change to an axiom with an individual does. Kept runs with the Horn or disjunctive rules
+already started again after such a change, through the check of the tier when axioms
+outside OWL 2 EL are in play and the comparison of the two indexes' tables. A new
 differential sweep, `tests/incremental_sweep.rs`, compares kept runs with fresh ones on
 edits of class axioms beside fixed self restrictions, reflexive roles, chains, ranges,
 individuals and the top and bottom properties.
