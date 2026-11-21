@@ -4634,7 +4634,9 @@ contradict, change nothing and leave the run complete. An ontology with disjoint
 `consistency` `unknown` and every class incomplete, since its assertions could make it
 inconsistent, and `assertions` true then gives the complete answer.
 
-The pass costs nothing when nothing is left out. Its extractions share one bound on the
+The pass costs nothing when nothing is left out and nothing is dropped. A classification of
+the terminology alone over a store or file with assertions extracts the two modules of the
+empty signature and scans the assertions, as roadmap item 1279 records. Its extractions share one bound on the
 axioms they examine, 1024 for each axiom of the input and at least about a million, past
 which the classes not yet decided are incomplete, so an answer depends on the input
 alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A

@@ -686,7 +686,7 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   contradict. `strict` on the request, `--strict` on `sparkles ontology classify` and
   `--strict true` on ROBOT's `reason`, `reduce` and `materialize` refuse such a run with
   the error `classification-incomplete`, HTTP 422, naming the axioms. The pass that decides
-  `incomplete` costs nothing when nothing is left out, has a bound on its work that
+  `incomplete` costs nothing when nothing is left out and no assertion goes unread, has a bound on its work that
   `coverageOver` reports, and answers with every class incomplete and `coverageStopped` set
   when the deadline stops it. The
   [F24 outcome](../specs/F24-owl-classification/SPEC.md#completeness-for-the-whole-ontology)
