@@ -1,0 +1,12 @@
+One 4 KiB O_DIRECT pread at a random offset of data.nt on forge's NVMe device
+(SK hynix HFS512GEJ9X102N, nvme_core.default_ps_max_latency_us=100000), after a sleep
+of the given gap, six times per gap, under ~/lanes/.bench.lock and .heavy.lock. Times in ms.
+
+gap 0 [0.18, 0.08, 0.08, 0.14, 0.13, 0.13]
+gap 0.005 [0.12, 0.12, 0.21, 0.2, 0.2, 0.21]
+gap 0.02 [0.26, 0.5, 0.47, 0.44, 0.32, 0.37]
+gap 0.05 [0.52, 0.44, 0.52, 0.51, 0.51, 0.48]
+gap 0.1 [1.9, 1.96, 1.67, 1.78, 1.77, 1.01]
+gap 0.2 [8.66, 0.93, 0.45, 0.32, 0.33, 0.45]
+gap 0.5 [7.8, 7.97, 7.74, 7.81, 7.33, 8.3]
+gap 1 [8.5, 8.27, 0.91, 1.02, 0.4, 8.25]

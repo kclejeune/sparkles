@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Cold small scans at 1.05M measured again against Fluree
+
+Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
+triples, as roadmap item 1270. Sparkles leads all eight cold queries that the October run
+counted as losses, including `count-all` at 2.1 against 19.2 ms and `distinct-obj` at 1.8
+against 19.3 ms. With a 1 s pause between readiness and the request, Fluree leads
+`count-all` at 2.8 against 10.1 ms. The pause lets forge's NVMe drive enter a low-power
+state, and Sparkles' one vocabulary read then waits about 8 ms for it, which corrects the
+cause that item 572 gave for the slow first query after an idle start. The earlier Fluree
+medians were not reproduced, and the synthetic results and BENCHMARKS.md carry the new
+tables.
+
 ### A kept EL classification over its memory budget starts again in full
 
 A kept OWL 2 EL run counts the contexts it keeps and its own new state against

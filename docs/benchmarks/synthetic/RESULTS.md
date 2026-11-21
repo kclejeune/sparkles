@@ -284,8 +284,11 @@ on CPU 11 and the server on CPUs 0–9, with the result cache off.
 Cold mode restarts the server and evicts its files from the OS page cache before each
 query, three times per query, and reports the median request time without process
 startup. Eviction does not guarantee that the device itself is cold. A Sparkles server is
-ready 0.09 s after a restart at both scales. Sparkles is fastest on 21 of 28 cold queries
-at 1.05M and on 24 of 28 at 10.5M. The cold losses are these:
+ready 0.09 s after a restart at both scales. In the full run of 28 queries, Sparkles was
+fastest on 21 cold queries at 1.05M and on 24 at 10.5M. Its five losses to Fluree at 1.05M
+did not hold when both engines were measured again in one run, which
+[Cold against Fluree at 1.05M](#cold-against-fluree-at-105m) describes. The other cold
+losses of the full run are these:
 
 Jena also completes `knows-reach` with the larger stack after three process restarts
 and file-cache evictions at each scale. Its median request times are 1,417.885 ms and
@@ -296,17 +299,72 @@ result.
 
 | Query, cold | Faster engine | 1.05M | 10.5M |
 |---|---|---|---|
-| `count-all` | Fluree at 1.05M | 1.55× (3.4 against 2.2 ms) | — |
-| `two-hop-count` | Fluree at 1.05M | 1.05× (18.6 against 17.7 ms) | — |
-| `contains` | Fluree at 1.05M | 1.17× (14.2 against 12.1 ms) | — |
 | `path-plus` | Oxigraph | 2.95× (6.5 against 2.2 ms) | 2.94× (4.7 against 1.6 ms) |
-| `distinct-obj` | Fluree at 1.05M | 3.0× (4.8 against 1.6 ms) | — |
 | `star-lookup` | Oxigraph at 10.5M | — | 1.31× (20.1 against 15.4 ms) |
 | `values-star` | Oxigraph | 1.51× (8.0 against 5.3 ms) | 1.50× (8.1 against 5.4 ms) |
-| `employee-docs` | Fluree at 1.05M, Oxigraph at 10.5M | 1.38× (11.7 against 8.5 ms) | 1.07× (14.7 against 13.7 ms) |
+| `employee-docs` | Oxigraph at 10.5M | — | 1.07× (14.7 against 13.7 ms) |
 
 *Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines on
 2026-10-19. Medians of three restarts are noisy at these sizes.*
+
+#### Cold against Fluree at 1.05M
+
+Sparkles at commit b47b582b and Fluree 4.2.2 from the repository's pinned package were
+measured in one run on forge, each loaded fresh from the same data. The cold mode of
+`bench.sh` ran 7 restarts per engine and query in each of three rounds, with the engines in
+the orders Sparkles then Fluree, Fluree then Sparkles, and Sparkles then Fluree. Both
+engines give the same answers to all eight queries. Each cell is the median of 21 samples,
+followed by the fastest and the slowest.
+
+| Cold, ms | Sparkles | Fluree |
+|---|---:|---:|
+| `count-all` | **2.1** (1.5 to 2.5) | 19.2 (1.5 to 27.4) |
+| `two-hop-count` | **13.0** (11.5 to 15.5) | 36.4 (21.8 to 49.5) |
+| `contains` | **11.9** (10.6 to 13.2) | 29.0 (25.2 to 33.7) |
+| `distinct-obj` | **1.8** (1.1 to 2.6) | 19.3 (2.0 to 27.2) |
+| `employee-docs` | **7.4** (5.7 to 8.3) | 29.5 (14.2 to 36.5) |
+| `star-lookup` | **10.1** (6.6 to 11.0) | 44.8 (35.7 to 54.4) |
+| `values-star` | **5.2** (3.4 to 6.0) | 36.5 (27.0 to 44.4) |
+| `path-plus` | **2.5** (1.5 to 3.2) | 29.1 (22.9 to 36.7) |
+
+Fluree answers its readiness check 0.02 s after a restart, against 0.09 s for Sparkles.
+Most of its first requests take 14 to 55 ms, and a few `count-all` and `distinct-obj`
+requests take 1.5 to 2.6 ms. The store loaded for the earlier run shows the same split, so
+the new load does not cause it. The earlier Fluree medians of 2.2, 1.6, 12.1 and 8.5 ms on
+`count-all`, `distinct-obj`, `contains` and `employee-docs` were not reproduced, and the
+cause is not known.
+
+The harness sends the timed request as soon as the server answers its readiness check. A
+second run of the same rounds waited 1 s between the readiness check and the request, in a
+copy of the harness with that one change.
+
+| Cold after a 1 s pause, ms | Sparkles | Fluree |
+|---|---:|---:|
+| `count-all` | 10.1 (9.2 to 11.4) | **2.8** (1.1 to 3.3) |
+| `two-hop-count` | **22.9** (14.7 to 25.1) | 43.7 (34.1 to 52.8) |
+| `contains` | **22.3** (20.2 to 25.0) | 34.3 (26.6 to 37.6) |
+| `distinct-obj` | **9.9** (8.7 to 10.9) | 10.8 (2.3 to 12.6) |
+| `employee-docs` | **17.7** (16.4 to 19.4) | 29.3 (16.6 to 36.1) |
+| `star-lookup` | **20.7** (19.0 to 23.5) | 54.2 (45.0 to 73.7) |
+| `values-star` | **14.7** (7.5 to 16.5) | 45.9 (36.7 to 58.9) |
+| `path-plus` | **11.0** (9.2 to 12.1) | 36.4 (32.4 to 41.5) |
+
+After the pause Fluree leads `count-all` 3.6 times, and `distinct-obj` is within 10%.
+Every Sparkles query takes 8 to 11 ms longer than without the pause. In the server's own
+`profile=io` timings, `count-all` reads no index block and one vocabulary page, for the
+`rdf:type` lookup of the planner's characteristic sets. That lookup takes 0.2 ms right
+after the readiness check and 7.5 to 8.4 ms after a 1 s pause, while parsing, execution
+and serialization do not change, and pauses of 0.2, 0.5 and 3 s cost the request as much. A single direct 4 KiB read on forge's
+NVMe drive takes 0.1 to 0.5 ms within 50 ms of the previous read and about 8 ms after 0.2
+to 1 s without reads, which matches the drive leaving a low-power state. The harness's
+cold rows on this page were taken with the drive awake from the restart. A server that has
+been idle for longer pays the wake once, on the first request that reads its files, and a
+request that reads nothing does not.
+
+Cold `contains` spends 3.9 to 6.4 ms of its 11 to 14 ms in the server on planning, where
+the selectivity sample of its filter decodes four PSO columns. The
+[run record](runs/2026-11-21-cold-fluree-forge-b47b582b/README.md) holds every sample, the
+harness patch, the server timings and the drive probe.
 
 Sparse point lookups and several small scans lose because warm execution hides their
 first-use reads and block decoding. Sparkles memory-maps its index and vocabulary, and
