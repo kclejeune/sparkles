@@ -58,6 +58,7 @@ export type ClassificationOutcome = {
   consistency: 'consistent' | 'inconsistent' | 'unknown';
   excludedCount: number;
   incompleteCount: number;
+  unmappedCount: number;
 };
 export type ClassificationPage = {
   part: ClassificationPart;

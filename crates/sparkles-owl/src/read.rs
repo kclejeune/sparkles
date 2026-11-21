@@ -1262,17 +1262,31 @@ impl<'a> Parser<'a> {
                 .iter()
                 .any(|t| self.has_type(&s, t).is_some()),
                 v::OWL_CLASS => self.has_type(&s, v::OWL_RESTRICTION).is_some(),
-                v::RDF_PROPERTY => [
-                    v::OWL_OBJECT_PROPERTY,
-                    v::OWL_FUNCTIONAL_PROPERTY,
-                    v::OWL_INVERSE_FUNCTIONAL_PROPERTY,
-                    v::OWL_TRANSITIVE_PROPERTY,
-                    v::OWL_DATATYPE_PROPERTY,
-                    v::OWL_ANNOTATION_PROPERTY,
-                    v::OWL_ONTOLOGY_PROPERTY,
-                ]
-                .iter()
-                .any(|t| self.has_type(&s, t).is_some()),
+                v::RDF_PROPERTY => {
+                    let owl = [
+                        v::OWL_OBJECT_PROPERTY,
+                        v::OWL_FUNCTIONAL_PROPERTY,
+                        v::OWL_INVERSE_FUNCTIONAL_PROPERTY,
+                        v::OWL_TRANSITIVE_PROPERTY,
+                        v::OWL_DATATYPE_PROPERTY,
+                        v::OWL_ANNOTATION_PROPERTY,
+                        v::OWL_ONTOLOGY_PROPERTY,
+                    ]
+                    .iter()
+                    .any(|t| self.has_type(&s, t).is_some());
+                    // An RDFS-style typing names a property of no OWL kind and says
+                    // nothing else, so a lenient read takes it as no axiom rather than
+                    // as an unmapped triple; the property's uses map, or stay unmapped,
+                    // on their own.
+                    if !owl && !self.strict {
+                        let msg = format!(
+                            "{} is typed rdf:Property alone and was read as no axiom",
+                            tr.subject
+                        );
+                        self.warn("undeclared", msg, vec![i]);
+                    }
+                    owl || !self.strict
+                }
                 v::RDF_LIST => {
                     !self.sp(&s, v::RDF_FIRST).is_empty() && !self.sp(&s, v::RDF_REST).is_empty()
                 }

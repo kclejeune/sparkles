@@ -344,7 +344,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 ..c.clone()
             };
             match w.reason(&o, &c, &q) {
-                Ok(r) => log(&r, w.unmapped),
+                Ok(r) => log(&r, &w.unmapped),
                 Err(e) => return Err(failed(e, a.dump_unsatisfiable.as_deref(), &w)),
             }
         }
@@ -360,7 +360,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 include_subproperties: is_true(&a.include_subproperties),
             };
             match w.reduce(&o, &c, &q) {
-                Ok(r) => log(&r, w.unmapped),
+                Ok(r) => log(&r, &w.unmapped),
                 Err(e) => return Err(failed(e, None, &w)),
             }
         }
@@ -370,7 +370,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
                 exclude_named_classes: boolean(&a.exclude_named_classes, "exclude-named-classes")?,
                 enforce_obo_format: boolean(&a.enforce_obo_format, "enforce-obo-format")?,
             };
-            log(&w.relax(&o), 0);
+            log(&w.relax(&o), &Default::default());
         }
         Step::Materialize(a) => {
             // ELK by default, as ROBOT's materialize, so the EL rules alone
@@ -381,7 +381,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             };
             let o = materialize_options(&a)?;
             match w.materialize(&o, &c, &q) {
-                Ok(r) => log(&r, w.unmapped),
+                Ok(r) => log(&r, &w.unmapped),
                 Err(e) => return Err(failed(e, None, &w)),
             }
         }
@@ -587,9 +587,12 @@ fn materialize_options(a: &MaterializeArgs) -> Result<MaterializeOptions> {
     })
 }
 
+/// The most unmapped triples a warning names.
+const UNMAPPED_LOGGED: usize = 5;
+
 /// The warnings of a run, on standard error, with the `unmapped` triples of the input,
 /// which a classification counts as left out.
-fn log(r: &Report, unmapped: usize) {
+fn log(r: &Report, unmapped: &sparkles::owl::classify::Unmapped) {
     for w in &r.warnings {
         eprintln!("WARN {w}");
     }
@@ -599,10 +602,20 @@ fn log(r: &Report, unmapped: usize) {
             r.excluded.len()
         );
     }
-    if unmapped > 0 {
+    if unmapped.count > 0 {
         eprintln!(
-            "WARN {unmapped} triples of the input map to no axiom, so the inferred axioms may be incomplete; --strict true refuses instead"
+            "WARN {} triples of the input map to no axiom, so the inferred axioms may be incomplete; --strict true refuses instead",
+            unmapped.count
         );
+        for t in unmapped.triples.iter().take(UNMAPPED_LOGGED) {
+            eprintln!("WARN   unmapped: {t} .");
+        }
+        if unmapped.count > UNMAPPED_LOGGED {
+            eprintln!(
+                "WARN   and {} more",
+                unmapped.count - UNMAPPED_LOGGED.min(unmapped.triples.len())
+            );
+        }
     }
 }
 

@@ -207,9 +207,14 @@
         This is a partial classification. It can miss clauses for {outcome.incompleteCount} incomplete
         classes.
       </p>{/if}
-    {#if !outcome.complete && !outcome.partial}<p class="note">
+    {#if !outcome.complete && !outcome.partial && outcome.excludedCount > 0}<p class="note">
         The {outcome.tier.toUpperCase()} classification omitted or partly used {outcome.excludedCount}
         axioms and can miss clauses.
+      </p>{/if}
+    {#if !outcome.complete && !outcome.partial && outcome.unmappedCount > 0}<p class="note">
+        {outcome.unmappedCount}
+        {outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom, so the classification
+        can miss clauses.
       </p>{/if}
     {#if model.isolated}<p class="note">
         This explicit result belongs to this view and is not retained for shared reads.

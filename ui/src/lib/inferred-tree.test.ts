@@ -229,6 +229,7 @@ describe('source-pinned inferred regions', () => {
           consistency: 'consistent',
           excludedCount: 0,
           incompleteCount: 0,
+          unmappedCount: 0,
         },
         entity: about
           ? {
@@ -404,6 +405,7 @@ describe('source-pinned inferred regions', () => {
           consistency: 'consistent',
           excludedCount: 0,
           incompleteCount: 0,
+          unmappedCount: 0,
         },
         entity: about
           ? {

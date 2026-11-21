@@ -11,7 +11,7 @@ use super::{OntologyRequest, Opened};
 use crate::Dataset;
 use crate::error::{Error, Result};
 use crate::sparql::QueryOptions;
-use sparkles_owl::classify::{Classification, Excluded};
+use sparkles_owl::classify::{Classification, Excluded, Unmapped};
 use sparkles_owl::ofn::Renderer;
 use sparkles_owl::transform::{
     self, Document, MaterializeOptions, ReasonOptions, ReduceOptions, RelaxOptions, Report,
@@ -33,7 +33,7 @@ pub struct WorkingOntology {
     pub prefixes: BTreeMap<String, String>,
     /// the triples of the input that map to no axiom, which every classification of the
     /// ontology counts as left out
-    pub unmapped: usize,
+    pub unmapped: Unmapped,
 }
 
 impl WorkingOntology {
@@ -66,7 +66,7 @@ impl WorkingOntology {
                 name: path.display().to_string(),
                 doc: Document::new(doc.header, doc.axioms),
                 prefixes: doc.prefixes.into_iter().collect(),
-                unmapped: 0,
+                unmapped: Unmapped::default(),
             });
         }
         if let Some(file) = OntologyFile::read(path, req, threads)? {
@@ -95,14 +95,16 @@ impl WorkingOntology {
         opts: &QueryOptions,
     ) -> Result<WorkingOntology> {
         let mut axioms: Vec<Axiom> = o.ontology.axioms.keys().cloned().collect();
-        let mut unmapped = o.ontology.unmapped.len();
-        o.assertions(opts, |ax, _, _| {
+        let mut unread = Unmapped::default();
+        o.assertions(opts, |ax, t, _| {
             match ax {
                 Some(ax) => axioms.push(ax),
-                None => unmapped += 1,
+                None => unread.push(t),
             }
             Ok(true)
         })?;
+        let unmapped =
+            super::classify::unmapped_of(&o.ontology, &unread, &std::cell::RefCell::new(None));
         Ok(WorkingOntology {
             name,
             doc: Document::new(o.ontology.header.clone(), axioms),
@@ -128,7 +130,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::reason(&mut self.doc, o, &mut classifier(c, opts, self.unmapped))
+        transform::reason(&mut self.doc, o, &mut classifier(c, opts, &self.unmapped))
     }
 
     /// `reduce`.
@@ -138,7 +140,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::reduce(&mut self.doc, o, &mut classifier(c, opts, self.unmapped))
+        transform::reduce(&mut self.doc, o, &mut classifier(c, opts, &self.unmapped))
     }
 
     /// `materialize`. The ontology is unchanged when it fails.
@@ -148,7 +150,7 @@ impl WorkingOntology {
         c: &ClassifyRequest,
         opts: &QueryOptions,
     ) -> std::result::Result<Report, TransformError> {
-        transform::materialize(&mut self.doc, o, &mut classifier(c, opts, self.unmapped))
+        transform::materialize(&mut self.doc, o, &mut classifier(c, opts, &self.unmapped))
     }
 
     /// `relax`, which classifies nothing.
@@ -178,7 +180,7 @@ impl WorkingOntology {
 fn classifier<'a>(
     c: &'a ClassifyRequest,
     opts: &'a QueryOptions,
-    unmapped: usize,
+    unmapped: &'a Unmapped,
 ) -> impl FnMut(&[&AxiomKind]) -> Result<(Classification, Vec<Excluded>)> + 'a {
     // a transformation reads the taxonomy and what was left out, not which classes keep
     // their answer
@@ -188,7 +190,8 @@ fn classifier<'a>(
         ..c.clone()
     };
     move |kinds: &[&AxiomKind]| {
-        let (classification, excluded) = classify_once(kinds, &c, opts, None, &|| unmapped)?;
+        let (classification, excluded) =
+            classify_once(kinds, &c, opts, None, &|| unmapped.clone())?;
         if c.strict && !classification.complete {
             return Err(super::classify::strict_refusal(&classification, &excluded));
         }
@@ -431,7 +434,16 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
         )
         .unwrap();
         let mut w = read(&input);
-        assert!(w.unmapped > 0, "the domain triple maps to an axiom");
+        assert!(w.unmapped.count > 0, "the domain triple maps to an axiom");
+        assert!(
+            w.unmapped
+                .triples
+                .iter()
+                .any(|t| t.to_string()
+                    == "<http://ex.org/p> <http://www.w3.org/2000/01/rdf-schema#domain> <http://ex.org/A>"),
+            "{:?}",
+            w.unmapped
+        );
         let strict = ClassifyRequest {
             strict: true,
             ..Default::default()

@@ -4641,11 +4641,21 @@ the domain of a property that is not declared, may carry any logical
 content. Every classification counts such triples, of the terminology and of the
 assertions, in `Stats::unmapped`, and with any of them the answer is not complete, every
 class is incomplete and a consistency found is `unknown`. No `excluded` entry names them,
-since an entry names an axiom, so the wire answers report the count as `stats.unmapped`,
-the CLI notes it and a strict run's refusal names it. A file in functional-style syntax
+since an entry names an axiom, so the wire answers report the count as `stats.unmapped`
+and list the first 100 triples in `unmappedTriples`, in the order the input gave them, as
+N-Triples terms, with `unmappedTruncated` when there are more. The CLI lists the first
+ten, ROBOT's warning the first five and a strict run's refusal the first three. The OWL
+API calls such triples unparsed and reports them through its RDF parser's metadata.
+Sparkles calls them unmapped, since a read of the store maps stored triples and parses
+nothing. A run of the terminology alone reads the assertions only up to the first that
+has logical content or maps to no axiom, so it counts and lists at most one unmapped
+assertion triple. A file in functional-style syntax
 whose entities are all declared reads without the store and has no unmapped triples. One
 with an undeclared entity takes the store's reading, in which a domain or range of an
-undeclared property is such a triple. The triples of a SWRL rule are not unmapped, since
+undeclared property is such a triple. A lenient read takes a typing as `rdf:Property`
+alone, as RDFS vocabularies type their properties, as no axiom with a warning, since it
+carries no logical content. The GO and ChEBI lite releases in RDF/XML, and stores of
+OWL2Bench and of LUBM with their assertions, count no unmapped triple. The triples of a SWRL rule are not unmapped, since
 the RDF reader maps a rule and its atoms to assertions about anonymous individuals, so a
 classification with `assertions` reads them as assertions and can answer complete while
 it ignores the rule. Roadmap item 1302 records this.

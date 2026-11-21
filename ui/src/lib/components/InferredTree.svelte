@@ -140,6 +140,9 @@
           Complete for its supported source.
         {:else if model.reply.outcome && model.reply.outcome.excludedCount > 0}
           Classification completed with {model.reply.outcome.excludedCount} omitted or partly used axioms.
+        {:else if model.reply.outcome && model.reply.outcome.unmappedCount > 0}
+          Classification is incomplete. {model.reply.outcome.unmappedCount}
+          {model.reply.outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom.
         {:else}
           Classification is incomplete.
         {/if}

@@ -411,6 +411,46 @@ fn reason_from_rdf_xml_and_a_database() {
     );
 }
 
+/// ROBOT's warning names the first triples that map to no axiom, and a strict run with
+/// HermiT refuses them.
+#[test]
+fn reason_names_the_triples_that_map_to_no_axiom() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    std::fs::write(
+        dir.join("u.ttl"),
+        "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         :A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A . :p rdfs:domain :A .",
+    )
+    .unwrap();
+    let o = sparkles(dir, &["ontology", "reason", "-i", "u.ttl", "-o", "r.ofn"]);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let e = err(&o);
+    assert!(e.contains("1 triples of the input map to no axiom"), "{e}");
+    assert!(
+        e.contains(
+            "unmapped: <http://ex.org/p> <http://www.w3.org/2000/01/rdf-schema#domain> <http://ex.org/A> ."
+        ),
+        "{e}"
+    );
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "--reasoner",
+            "hermit",
+            "-i",
+            "u.ttl",
+            "-o",
+            "s.ofn",
+        ],
+    );
+    assert_ne!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("<http://ex.org/p>"), "{}", err(&o));
+}
+
 #[test]
 fn functional_style_files_keep_n_ary_and_annotated_axioms() {
     let d = setup();

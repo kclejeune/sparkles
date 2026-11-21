@@ -4849,6 +4849,10 @@
               "disjunctive"
             ],
             "type": "string"
+          },
+          "unmappedCount": {
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -4857,7 +4861,8 @@
           "complete",
           "consistency",
           "excludedCount",
-          "incompleteCount"
+          "incompleteCount",
+          "unmappedCount"
         ],
         "type": "object"
       },
@@ -42142,6 +42147,33 @@
                           "type": "boolean"
                         },
                         "consistent": {
+                          "type": "boolean"
+                        },
+                        "unmappedTriples": {
+                          "description": "The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.",
+                          "items": {
+                            "properties": {
+                              "object": {
+                                "type": "string"
+                              },
+                              "predicate": {
+                                "type": "string"
+                              },
+                              "subject": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "subject",
+                              "predicate",
+                              "object"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "unmappedTruncated": {
+                          "description": "Whether `stats.unmapped` counts more triples than `unmappedTriples` lists.",
                           "type": "boolean"
                         }
                       },

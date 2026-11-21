@@ -47,12 +47,12 @@ use crate::error::{Error, Result};
 use crate::sparql::QueryOptions;
 use crate::store::Snapshot;
 use crate::{Budget, BudgetKind};
-use oxrdf::{Literal, NamedNode, Term};
+use oxrdf::{Literal, NamedNode, Term, Triple};
 use rustc_hash::FxHashSet;
 use sparkles_core::algo::Control;
 use sparkles_core::algo::pool::Par;
 use sparkles_owl::classify::{
-    Changes, Classification, Excluded, Expansion, Limits, Saturation, logical,
+    Changes, Classification, Excluded, Expansion, Limits, Saturation, Unmapped, logical,
 };
 use sparkles_owl::read::Mode;
 use sparkles_owl::transform::Dropped;
@@ -60,7 +60,7 @@ use sparkles_owl::{
     AnnotationProperty, AnnotationValue, Axiom, AxiomKind, ClassExpression, Entity, vocab,
 };
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
-use std::cell::Cell;
+use std::cell::RefCell;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -155,6 +155,16 @@ pub fn strict_refusal(classification: &Classification, excluded: &[Excluded]) ->
              property that is not declared, and may carry anything: declare the property \
              or remove the triples"
         ));
+        let first: Vec<String> = classification
+            .unmapped
+            .triples
+            .iter()
+            .take(3)
+            .map(|t| format!("{t} ."))
+            .collect();
+        if !first.is_empty() {
+            message.push_str(&format!(", such as {}", first.join(" ")));
+        }
     }
     incomplete(message, excluded)
 }
@@ -379,22 +389,22 @@ impl Ontologies {
         } else {
             let mut assertions: Vec<Axiom> = Vec::new();
             // the assertion triples that map to no axiom
-            let mut unread = 0;
+            let mut unread = Unmapped::default();
             if c.assertions {
-                o.assertions(&opts, |ax, _, _| {
+                o.assertions(&opts, |ax, t, _| {
                     match ax {
                         Some(ax) => assertions.push(ax),
-                        None => unread += 1,
+                        None => unread.push(t),
                     }
                     Ok(true)
                 })?;
             }
             let mut axioms = logical_axioms(&o.ontology);
             axioms.extend(assertions.iter().map(|a| &a.kind).filter(|k| logical(k)));
-            let seen = Cell::new(false);
+            let seen = RefCell::new(None);
             let mut dropped = dropped_assertions(&o, &opts, &seen);
             let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
-            let unmapped = || o.ontology.unmapped.len() + unread + usize::from(seen.get());
+            let unmapped = || unmapped_of(&o.ontology, &unread, &seen);
             let (out, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
             (
                 KeptClassification::capture(
@@ -490,9 +500,10 @@ impl Ontologies {
             // Admission precedes mutation, so a refused admission preserves a proven
             // old entry/publication. Later errors conservatively discard both.
             let par = admit(c.threads, opts)?;
-            let seen = Cell::new(false);
+            let seen = RefCell::new(None);
             let mut dropped = dropped_assertions(o, opts, &seen);
-            let unmapped = || o.ontology.unmapped.len() + usize::from(seen.get());
+            let none = Unmapped::default();
+            let unmapped = || unmapped_of(&o.ontology, &none, &seen);
             let (out, witness) = e.run_over(o, Vec::new(), |s, axioms, changes| {
                 run(
                     s,
@@ -819,7 +830,7 @@ pub(crate) fn classify_once(
     c: &ClassifyRequest,
     opts: &QueryOptions,
     dropped: Option<&mut Dropped<'_>>,
-    unmapped: &dyn Fn() -> usize,
+    unmapped: &dyn Fn() -> Unmapped,
 ) -> Result<(Classification, Vec<Excluded>)> {
     let mut s = Saturation::new();
     let par = admit(c.threads, opts)?;
@@ -835,20 +846,34 @@ pub(crate) fn classify_once(
 pub(super) fn dropped_assertions<'o>(
     o: &'o Opened,
     opts: &'o QueryOptions,
-    unmapped: &'o Cell<bool>,
+    unmapped: &'o RefCell<Option<Triple>>,
 ) -> impl FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + 'o {
     move |f| {
-        o.assertions(opts, |ax, _, _| {
+        o.assertions(opts, |ax, t, _| {
             Ok(match ax {
                 Some(ax) => f(&ax.kind),
                 None => {
-                    unmapped.set(true);
+                    *unmapped.borrow_mut() = Some(t.clone());
                     false
                 }
             })
         })
         .is_ok()
     }
+}
+
+/// The triples that map to no axiom of a classification of `o`: the terminology's, then
+/// the assertion triples a run read (`unread`), then the one at which a stream of the
+/// assertions that the run did not read stopped (`seen`).
+pub(super) fn unmapped_of(
+    o: &sparkles_owl::read::Ontology,
+    unread: &Unmapped,
+    seen: &RefCell<Option<Triple>>,
+) -> Unmapped {
+    Unmapped::default()
+        .extend(o.unmapped.iter().map(|i| &o.triples[*i]))
+        .merge(unread)
+        .extend(seen.borrow().as_ref())
 }
 
 /// Runs a classification on the threads of `par` under the options' deadline,
@@ -867,7 +892,7 @@ fn run(
     opts: &QueryOptions,
     c: &ClassifyRequest,
     dropped: Option<&mut Dropped<'_>>,
-    unmapped: &dyn Fn() -> usize,
+    unmapped: &dyn Fn() -> Unmapped,
 ) -> Result<(Classification, Option<Excluded>)> {
     bounded(par, opts, |limits| {
         let limits = Limits {

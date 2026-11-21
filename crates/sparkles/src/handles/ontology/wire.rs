@@ -1621,6 +1621,22 @@ pub fn classification_body(
     j["nodeCount"] = json!(t.nodes().len());
     j["unsatisfiableCount"] = json!(unsat.len());
     j["unsatisfiable"] = json!(unsat.iter().take(q.limit).collect::<Vec<_>>());
+    // the triples that map to no axiom, which no `excluded` entry names: the first of
+    // them, as N-Triples terms, and whether `stats.unmapped` counts more
+    j["unmappedTriples"] = J::Array(
+        cl.unmapped
+            .triples
+            .iter()
+            .map(|t| {
+                json!({
+                    "subject": t.subject.to_string(),
+                    "predicate": t.predicate.to_string(),
+                    "object": t.object.to_string(),
+                })
+            })
+            .collect(),
+    );
+    j["unmappedTruncated"] = json!(cl.unmapped.truncated);
     j["excludedCount"] = json!(c.excluded.len());
     j["excluded"] = J::Array(
         c.excluded

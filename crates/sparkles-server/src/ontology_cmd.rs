@@ -1092,6 +1092,22 @@ fn print_classify(j: &J) {
     let unmapped = j["stats"]["unmapped"].as_u64().unwrap_or(0);
     if j["complete"].as_bool() != Some(true) && unmapped > 0 {
         println!("incomplete: {unmapped} triples of the input map to no axiom");
+        let listed = j["unmappedTriples"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for t in listed.iter().take(10) {
+            let term = |k: &str| t[k].as_str().unwrap_or("").to_string();
+            println!(
+                "  {} {} {} .",
+                term("subject"),
+                term("predicate"),
+                term("object")
+            );
+        }
+        if unmapped as usize > listed.len().min(10) {
+            println!("  and {} more", unmapped as usize - listed.len().min(10));
+        }
     }
     if j["complete"].as_bool() != Some(true)
         && j["partial"].as_bool() != Some(true)

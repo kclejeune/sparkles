@@ -2059,6 +2059,116 @@ mod classification {
         assert!(a.classification.complete, "{:?}", a.excluded);
     }
 
+    /// The patterns of ordinary published ontologies and their individuals map to axioms or
+    /// to annotations, so they count no unmapped triple and leave the run complete: an
+    /// ontology header with annotations, a version IRI and an import, annotations of
+    /// classes, properties and individuals, deprecation, `owl:AllDifferent` and
+    /// `owl:AllDisjointClasses` lists, negative property assertions and property chains.
+    #[test]
+    fn common_ontology_patterns_map_every_triple() {
+        let body = ":o a owl:Ontology ; owl:versionIRI :o1 ; owl:versionInfo \"1\" ;
+                rdfs:comment \"An ontology\" ; rdfs:seeAlso :doc ; owl:imports <http://ex.org/missing> .
+            :doc a owl:NamedIndividual .
+            :note a owl:AnnotationProperty . :note rdfs:subPropertyOf rdfs:comment .
+            :A a owl:Class ; rdfs:label \"A\"@en ; :note \"n\" ; rdfs:isDefinedBy :o .
+            :B a owl:Class ; rdfs:subClassOf :A ; owl:deprecated true .
+            :C a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :A ] .
+            :D a owl:Class . :E a owl:Class .
+            [] a owl:AllDisjointClasses ; owl:members ( :C :D :E ) .
+            :r a owl:ObjectProperty ; rdfs:domain :A ; rdfs:range :A ; rdfs:label \"r\" .
+            :s a owl:ObjectProperty ; owl:propertyChainAxiom ( :r :r ) .
+            :d a owl:DatatypeProperty ; rdfs:range xsd:string .
+            :x a owl:NamedIndividual , :A ; rdfs:label \"x\" ; rdfs:seeAlso :doc ; :r :y ; :d \"v\" .
+            :y a owl:NamedIndividual , :C .
+            :z a owl:NamedIndividual .
+            [] a owl:AllDifferent ; owl:distinctMembers ( :x :y :z ) .
+            [] a owl:NegativePropertyAssertion ; owl:sourceIndividual :x ;
+                owl:assertionProperty :r ; owl:targetIndividual :z .
+            :x owl:sameAs :x2 .";
+        let ds = dataset(body);
+        let h = ds.ontology();
+        let o = h.open(&OntologyRequest::default(), &opts()).unwrap();
+        assert!(o.ontology.unmapped.is_empty(), "{:?}", o.ontology.unmapped);
+        let c = h
+            .classify(
+                &OntologyRequest::default(),
+                &ClassifyRequest {
+                    assertions: true,
+                    ..Default::default()
+                },
+                &opts(),
+            )
+            .unwrap();
+        let k = &c.classification;
+        assert_eq!(k.stats.unmapped, 0);
+        assert!(k.complete, "{:?}", c.excluded);
+    }
+
+    /// More unmapped triples than the answer lists: it keeps the first
+    /// [`UNMAPPED_LISTED`](sparkles_owl::classify::UNMAPPED_LISTED) in a stable order,
+    /// counts them all and says that the list is truncated, on the wire too.
+    #[test]
+    fn a_long_list_of_unmapped_triples_is_truncated() {
+        use sparkles_owl::classify::UNMAPPED_LISTED;
+        let n = UNMAPPED_LISTED + 20;
+        let body: String = (0..n)
+            .map(|i| format!(":p{i} rdfs:domain :A . "))
+            .chain([":A a owl:Class .".to_string()])
+            .collect();
+        let ds = dataset(&body);
+        let run = || {
+            ds.ontology()
+                .classify(
+                    &OntologyRequest::default(),
+                    &ClassifyRequest::default(),
+                    &opts(),
+                )
+                .unwrap()
+        };
+        let c = run();
+        let k = &c.classification;
+        assert_eq!(k.stats.unmapped, n);
+        assert_eq!(k.unmapped.count, n);
+        assert_eq!(k.unmapped.triples.len(), UNMAPPED_LISTED);
+        assert!(k.unmapped.truncated);
+        assert!(!k.complete);
+        assert_eq!(
+            run().classification.unmapped,
+            k.unmapped,
+            "the order is stable"
+        );
+        let j = wire::call(&ds, "classify", &json!({}), &opts()).unwrap();
+        assert_eq!(j["unmappedTruncated"], true, "{}", j["unmappedTriples"]);
+        assert_eq!(
+            j["unmappedTriples"].as_array().unwrap().len(),
+            UNMAPPED_LISTED
+        );
+        assert_eq!(j["stats"]["unmapped"], n);
+        let first = &j["unmappedTriples"][0];
+        assert!(
+            first["predicate"] == "<http://www.w3.org/2000/01/rdf-schema#domain>"
+                && first["object"] == format!("<{}>", ex("A"))
+                && first["subject"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("<http://ex.org/p"),
+            "{first}"
+        );
+    }
+
+    /// RDFS-style typings, `rdfs:Class` and `rdf:Property` without an OWL type, carry no
+    /// logical content, so a lenient read counts no unmapped triple for them.
+    #[test]
+    fn rdfs_style_typings_count_no_unmapped_triple() {
+        let ds =
+            dataset(":A a owl:Class . :q a rdf:Property . :t a rdfs:Class . :x a :A . :x :q :y .");
+        let o = ds
+            .ontology()
+            .open(&OntologyRequest::default(), &opts())
+            .unwrap();
+        assert!(o.ontology.unmapped.is_empty(), "{:?}", o.ontology.unmapped);
+    }
+
     /// A triple that maps to no axiom, here the domain of a property that is not
     /// declared, leaves every classification incomplete, of the terminology alone and
     /// with the assertions, and a commit that adds one makes the kept answer incomplete.
@@ -2094,6 +2204,18 @@ mod classification {
                 "assertions {assertions}: {:?}",
                 c.excluded
             );
+            // the answer lists the triple, as the wire does
+            let domain = format!(
+                "<{}> <http://www.w3.org/2000/01/rdf-schema#domain> <{}>",
+                ex("p"),
+                ex("A")
+            );
+            assert!(
+                k.unmapped.triples.iter().any(|t| t.to_string() == domain),
+                "assertions {assertions}: {:?}",
+                k.unmapped
+            );
+            assert!(!k.unmapped.truncated);
             assert!(
                 !k.complete && k.complete_for_taken,
                 "assertions {assertions}"

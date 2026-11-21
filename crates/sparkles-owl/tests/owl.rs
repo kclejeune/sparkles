@@ -997,6 +997,25 @@ fn dl_requires_typed_properties() {
     assert_profiles(&o, &[], &[(Profile::Dl, "§5.8.1")]);
 }
 
+/// A property typed `rdf:Property` alone, as RDFS vocabularies type theirs, is no
+/// unmapped triple in a lenient read, which warns of it, and stays unmapped in a strict
+/// read; with an OWL type beside it, Table 5 drops the typing in both.
+#[test]
+fn reads_an_rdfs_style_property_typing_as_no_axiom() {
+    let body = decl(":s a rdf:Property . :p a rdf:Property .");
+    let l = lenient(&body);
+    assert!(l.unmapped.is_empty(), "{:?}", l.unmapped);
+    assert!(
+        l.diagnostics
+            .iter()
+            .any(|d| d.message.contains("typed rdf:Property alone")),
+        "{:?}",
+        l.diagnostics
+    );
+    let s = strict(&body);
+    assert_eq!(s.unmapped.len(), 1, "{:?}", s.diagnostics);
+}
+
 #[test]
 fn dl_forbids_reserved_vocabulary() {
     let o = lenient(&decl("rdf:Property rdfs:subClassOf :A ."));

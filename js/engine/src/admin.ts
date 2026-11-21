@@ -618,6 +618,7 @@ export interface ClassificationOutcome {
   consistency: 'consistent' | 'inconsistent' | 'unknown';
   excludedCount: number;
   incompleteCount: number;
+  unmappedCount: number;
 }
 export type ClassificationSourceRow =
   | { kind: 'requestedGraph'; ordinal: number; graph: string }
@@ -728,6 +729,14 @@ export interface OntologyClassification extends OntologyState {
   unsatisfiable: string[];
   excludedCount: number;
   excluded: OntologyExcluded[];
+  /**
+   * the first 100 triples of the input that map to no axiom, as N-Triples terms, which
+   * leave the answer incomplete; `stats.unmapped` counts them all (the OWL API calls
+   * such triples unparsed)
+   */
+  unmappedTriples: { subject: string; predicate: string; object: string }[];
+  /** whether `stats.unmapped` counts more triples than `unmappedTriples` lists */
+  unmappedTruncated: boolean;
   stats: Configuration;
   nodes?: OntologyTaxonomyNode[];
   next?: number;

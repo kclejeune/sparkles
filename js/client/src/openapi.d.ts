@@ -6316,6 +6316,7 @@ export interface components {
             partial: boolean;
             /** @enum {string} */
             tier: "el" | "horn" | "disjunctive";
+            unmappedCount: number;
         };
         ClassificationParent: {
             equivalenceCount: number;
@@ -19977,6 +19978,14 @@ export interface operations {
                         /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
                         completeForTaken: boolean;
                         consistent: boolean;
+                        /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
+                        unmappedTriples?: {
+                            object: string;
+                            predicate: string;
+                            subject: string;
+                        }[];
+                        /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
+                        unmappedTruncated?: boolean;
                     } | components["schemas"]["OntologyFrameClassification"];
                     "text/owl-functional": string;
                 };

@@ -191,10 +191,10 @@ fn check(
     let mut failures = Vec::new();
     n.runs += 1;
     // every case maps in full, so nothing is left out for a triple
-    if got.stats.unmapped > 0 {
+    if got.stats.unmapped > 0 || !got.unmapped.triples.is_empty() || got.unmapped.truncated {
         failures.push(format!(
-            "{run}: {} triples map to no axiom",
-            got.stats.unmapped
+            "{run}: {} triples map to no axiom: {:?}",
+            got.stats.unmapped, got.unmapped
         ));
     }
     let witness = excluded

@@ -49,7 +49,7 @@ use crate::sparql::QueryOptions;
 use oxrdf::{NamedOrBlankNode, Term, Triple};
 use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
-use sparkles_owl::classify::{Classification, Excluded, logical};
+use sparkles_owl::classify::{Classification, Excluded, Unmapped, logical};
 use sparkles_owl::ofn::Renderer;
 use sparkles_owl::profiles::{CheckOptions, Checker, Report};
 use sparkles_owl::read::{self, Mode, ReadOptions};
@@ -284,16 +284,19 @@ impl OntologyFile {
     pub(crate) fn into_counted_document(
         self,
         opts: &QueryOptions,
-    ) -> Result<(sparkles_owl::transform::Document, usize)> {
+    ) -> Result<(sparkles_owl::transform::Document, Unmapped)> {
         let mut axioms: Vec<Axiom> = Vec::new();
-        let mut unmapped = self.ontology.unmapped.len();
-        self.assertions(opts, |ax, _| {
-            match ax {
-                Some(ax) => axioms.push(ax.into_owned()),
-                None => unmapped += 1,
+        let mut unread = Unmapped::default();
+        self.assertions(opts, |ax, t| {
+            match (ax, t) {
+                (Some(ax), _) => axioms.push(ax.into_owned()),
+                (None, Some(t)) => unread.push(t),
+                (None, None) => unread.count += 1,
             }
             Ok(true)
         })?;
+        let unmapped =
+            super::classify::unmapped_of(&self.ontology, &unread, &std::cell::RefCell::new(None));
         let (header, terminology): (_, Vec<Axiom>) = match Arc::try_unwrap(self.ontology) {
             Ok(o) => (o.header, o.axioms.into_keys().collect()),
             Err(o) => (o.header.clone(), o.axioms.keys().cloned().collect()),
@@ -386,12 +389,13 @@ impl OntologyFile {
         let mut owned: Vec<Axiom> = Vec::new();
         let mut axioms = logical_axioms(&self.ontology);
         // the assertion triples that map to no axiom
-        let mut unread = 0;
+        let mut unread = Unmapped::default();
         if c.assertions {
-            self.assertions(&opts, |ax, _| {
-                match ax {
-                    Some(ax) => owned.push(ax.into_owned()),
-                    None => unread += 1,
+            self.assertions(&opts, |ax, t| {
+                match (ax, t) {
+                    (Some(ax), _) => owned.push(ax.into_owned()),
+                    (None, Some(t)) => unread.push(t),
+                    (None, None) => unread.count += 1,
                 }
                 Ok(true)
             })?;
@@ -400,13 +404,13 @@ impl OntologyFile {
         // A classification of the terminology alone counts the assertions it did not read
         // as left out when one has logical content, and every run counts the triples that
         // map to no axiom.
-        let seen = std::cell::Cell::new(false);
+        let seen = std::cell::RefCell::new(None);
         let mut dropped = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
-            self.assertions(&opts, |ax, _| {
+            self.assertions(&opts, |ax, t| {
                 Ok(match ax {
                     Some(ax) => f(&ax.kind),
                     None => {
-                        seen.set(true);
+                        *seen.borrow_mut() = t.cloned();
                         false
                     }
                 })
@@ -414,7 +418,7 @@ impl OntologyFile {
             .is_ok()
         };
         let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
-        let unmapped = || self.ontology.unmapped.len() + unread + usize::from(seen.get());
+        let unmapped = || super::classify::unmapped_of(&self.ontology, &unread, &seen);
         let (classification, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
         if c.strict && !classification.complete {
             return Err(super::classify::refuse_strict(

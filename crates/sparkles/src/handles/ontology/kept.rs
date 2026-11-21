@@ -598,6 +598,7 @@ impl KeptClassification {
             consistency: consistency(c),
             excluded_count: self.excluded.len(),
             incomplete_count: c.incomplete.len(),
+            unmapped_count: c.stats.unmapped,
         }
     }
 }
@@ -610,6 +611,9 @@ pub struct Outcome {
     pub consistency: &'static str,
     pub excluded_count: usize,
     pub incomplete_count: usize,
+    /// The triples of the input that map to no axiom, each of which leaves the answer
+    /// incomplete although no `excluded` entry names it
+    pub unmapped_count: usize,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

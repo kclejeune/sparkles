@@ -561,6 +561,54 @@ pub struct Classification {
     /// leave it unknown, and so can an axiom left out that could make the ontology
     /// inconsistent, and then no class is complete
     pub consistency: Consistency,
+    /// the first [`UNMAPPED_LISTED`] of the triples that
+    /// [`Stats::unmapped`] counts, in the order the input gave them, and whether there are
+    /// more ([`Classification::leave_out_unmapped`])
+    pub unmapped: Unmapped,
+}
+
+/// The most triples that map to no axiom that a classification lists; it counts the rest.
+pub const UNMAPPED_LISTED: usize = 100;
+
+/// Triples of the input that map to no axiom, counted, with the first
+/// [`UNMAPPED_LISTED`] kept in the order they were added. The OWL API calls such triples
+/// unparsed and reports them through its RDF parser's metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unmapped {
+    pub count: usize,
+    pub triples: Vec<oxrdf::Triple>,
+    /// whether `count` is more than `triples` lists
+    pub truncated: bool,
+}
+
+impl Unmapped {
+    /// Counts `t`, and keeps it while fewer than [`UNMAPPED_LISTED`] are listed.
+    pub fn push(&mut self, t: &oxrdf::Triple) {
+        self.count += 1;
+        if self.triples.len() < UNMAPPED_LISTED {
+            self.triples.push(t.clone());
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    /// Adds `other`'s count and keeps its triples after these, up to the cap.
+    pub fn merge(mut self, other: &Unmapped) -> Unmapped {
+        let room = UNMAPPED_LISTED - self.triples.len();
+        self.count += other.count;
+        self.truncated |= other.truncated || other.triples.len() > room;
+        self.triples
+            .extend(other.triples.iter().take(room).cloned());
+        self
+    }
+
+    /// Counts and keeps each of `ts`, in order.
+    pub fn extend<'a>(mut self, ts: impl IntoIterator<Item = &'a oxrdf::Triple>) -> Unmapped {
+        for t in ts {
+            self.push(t);
+        }
+        self
+    }
 }
 
 /// Whether the ontology has a model, as far as a run knows.
@@ -601,6 +649,7 @@ impl Classification {
             complete_for_taken: complete,
             incomplete,
             consistency,
+            unmapped: Unmapped::default(),
         }
     }
 
@@ -709,13 +758,15 @@ impl Classification {
         None
     }
 
-    /// Counts `n` triples of the input that map to no axiom as left out: with any, the
-    /// answer is not complete, every class is incomplete and a consistency the run found
-    /// is unknown, since such a triple may carry any logical content. The caller reports
-    /// them, as no axiom of [`Excluded`] can name them.
-    pub fn leave_out_unmapped(&mut self, n: usize) {
-        if n > 0 {
-            self.stats.unmapped += n;
+    /// Counts the triples of the input that map to no axiom (`u`) as left out: with any,
+    /// the answer is not complete, every class is incomplete and a consistency the run
+    /// found is unknown, since such a triple may carry any logical content. The count goes
+    /// to [`Stats::unmapped`] and the list to [`Classification::unmapped`], as no axiom of
+    /// [`Excluded`] can name them.
+    pub fn leave_out_unmapped(&mut self, u: Unmapped) {
+        if u.count > 0 {
+            self.stats.unmapped += u.count;
+            self.unmapped = u;
             self.not_all_read();
         }
     }

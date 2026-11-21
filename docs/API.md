@@ -2383,11 +2383,20 @@ between is `409`. A write takes the parameters of the other writes, such as
 { "dataset": "go", "commit": 3, "mode": "lenient", "graphs": ["default"], "imports": [],
   "warnings": [], "consistent": true, "complete": true, "reused": false,
   "classes": 51986, "nodeCount": 51988, "unsatisfiableCount": 0, "unsatisfiable": [],
-  "excludedCount": 0, "excluded": [],
+  "excludedCount": 0, "excluded": [], "unmappedTriples": [], "unmappedTruncated": false,
   "stats": { "incremental": false, "added": 117650, "removed": 0, "cleared": 0,
     "contexts": 51987, "conclusions": 2801981, "estimatedBytes": 54673800, "threads": 4,
-    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8 } }
+    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8, "unmapped": 0 } }
 ```
+
+A triple of the input that maps to no axiom, such as the domain of a property that is not
+declared, may carry any logical content, so it leaves the answer incomplete although no
+`excluded` entry names it. `stats.unmapped` counts such triples, and `unmappedTriples`
+lists the first 100 in the order the input gave them, each with its `subject`,
+`predicate` and `object` as N-Triples terms, with `unmappedTruncated` true when there are
+more. The OWL API calls these unparsed triples and reports them through its RDF parser's
+metadata. Sparkles calls them unmapped, since a read of the store maps stored triples and
+parses nothing.
 
 `POST /$/ontology/{ds}/parse` reads `text` in the OWL 2 Manchester Syntax as the value
 that `as` names, which is `classExpression` by default or `dataRange`, `individual`,

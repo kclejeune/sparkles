@@ -656,6 +656,25 @@ fn raw_ontology_selectors_do_not_treat_a_null_body_as_an_empty_object() {
     }
 }
 
+/// A run whose only gap is a triple that maps to no axiom, here the domain of a property
+/// that is not declared, names the count in its outcome, since no `excluded` entry
+/// names such a triple.
+#[test]
+fn the_outcome_counts_the_triples_that_map_to_no_axiom() {
+    let ds = ds(":A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A . :p rdfs:domain :A .");
+    let frame = super::super::wire::call(
+        &ds,
+        "classify",
+        &json!({"projection":"frame","about":"http://ex.org/B","limit":10}),
+        &opts(),
+    )
+    .unwrap();
+    let outcome = &frame["frame"]["outcome"];
+    assert_eq!(outcome["complete"], false, "{outcome}");
+    assert_eq!(outcome["excludedCount"], 0, "{outcome}");
+    assert!(outcome["unmappedCount"].as_u64().unwrap() > 0, "{outcome}");
+}
+
 #[test]
 fn bounded_exclusions_have_typed_gaps_and_preserve_legacy_shape() {
     let ds = ds(
