@@ -2,7 +2,7 @@
 //! that starts again, for roadmap item 753.
 //!
 //! ```text
-//! incremental_classify [--threads N] [--edits N] [--seed N] [--counting] [--check] INPUT
+//! incremental_classify [--threads N] [--edits N] [--seed N] [--counting] [--check] [--abox] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax. The classifier runs once over the file, the cold
@@ -15,7 +15,15 @@
 //! many kept runs kept contexts, the contexts they cleared, the median time of the
 //! index with the normalization, of the saturation and of the taxonomy in the kept and
 //! in the full runs, and the classifier's estimate of the bytes it keeps and of its
-//! peak.
+//! peak, with the steps of the kept runs that started again and of the cold run. The
+//! steps also give `Stats::marking`, the part of the saturation from the end of the
+//! first saturation and of Tier D's tests to the end of the stage: the marking of real
+//! contexts with the facts, the key merges, the witnesses and the worlds, and the counts
+//! and diagnostics that close the stage. With `--abox`
+//! the edited axiom is chosen among the assertions about individuals instead. On Linux
+//! the line also gives the resident bytes of the process before the first edit's run
+//! and their peak during it, which no full run beside it has touched, and the peak
+//! after the cold run, which takes in the parse.
 
 use sparkles_owl::classify::{Classifier, Limits};
 use sparkles_owl::model::AxiomKind;
@@ -27,6 +35,25 @@ static GLOBAL: sparkles_alloc::Mimalloc = sparkles_alloc::Mimalloc;
 
 fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
+}
+
+/// The resident bytes of the process and their peak since the last [`reset_peak`], from
+/// `/proc/self/status`, or zeros where it cannot be read.
+fn resident() -> (u64, u64) {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let field = |name: &str| {
+        status
+            .lines()
+            .find_map(|l| l.strip_prefix(name))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
+            .map_or(0, |kb| kb * 1024)
+    };
+    (field("VmRSS:"), field("VmHWM:"))
+}
+
+/// Sets the peak of the resident bytes to what the process holds now.
+fn reset_peak() {
+    let _ = std::fs::write("/proc/self/clear_refs", "5");
 }
 
 /// The median, the least and the greatest of the times, in milliseconds.
@@ -44,6 +71,7 @@ fn main() {
     let mut seed = 0x9E37_79B9_7F4A_7C15u64;
     let mut counting = false;
     let mut check = false;
+    let mut abox = false;
     let mut input = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -54,11 +82,12 @@ fn main() {
             "--seed" => seed = number().expect("--seed N") | 1,
             "--counting" => counting = true,
             "--check" => check = true,
+            "--abox" => abox = true,
             _ => input = Some(a),
         }
     }
     let input = input.expect(
-        "usage: incremental_classify [--threads N] [--edits N] [--seed N] [--counting] [--check] INPUT",
+        "usage: incremental_classify [--threads N] [--edits N] [--seed N] [--counting] [--check] [--abox] INPUT",
     );
     let text = std::fs::read_to_string(&input).expect("the input file");
     let doc = ofn_read::parse(&text).expect("functional-style syntax");
@@ -78,16 +107,28 @@ fn main() {
     let t = Instant::now();
     let cold = kept.classify(&limits).expect("the cold run");
     let cold_ms = ms(t.elapsed());
+    let cold_hwm = resident().1;
+    let mut first_rss: Option<(u64, u64)> = None;
     let candidates: Vec<usize> = held
         .iter()
         .enumerate()
         .filter(|(_, a)| {
-            matches!(
-                a.kind,
-                AxiomKind::SubClassOf(..)
-                    | AxiomKind::EquivalentClasses(_)
-                    | AxiomKind::DisjointClasses(_)
-            )
+            if abox {
+                matches!(
+                    a.kind,
+                    AxiomKind::ClassAssertion(..)
+                        | AxiomKind::ObjectPropertyAssertion(..)
+                        | AxiomKind::DataPropertyAssertion(..)
+                        | AxiomKind::SameIndividual(_)
+                )
+            } else {
+                matches!(
+                    a.kind,
+                    AxiomKind::SubClassOf(..)
+                        | AxiomKind::EquivalentClasses(_)
+                        | AxiomKind::DisjointClasses(_)
+                )
+            }
         })
         .map(|(i, _)| i)
         .collect();
@@ -95,15 +136,18 @@ fn main() {
     let (mut incremental, mut cleared, mut runs) = (0usize, Vec::new(), 0usize);
     let (mut memory, mut peak) = (cold.stats.memory, cold.stats.peak_memory);
     // the steps of the kept runs and of the full runs: the index with the
-    // normalization, the saturation and the taxonomy
-    let (mut kept_steps, mut full_steps) = (
-        [Vec::new(), Vec::new(), Vec::new()],
-        [Vec::new(), Vec::new(), Vec::new()],
+    // normalization, the saturation, the taxonomy and the part of the saturation after
+    // its first pass
+    let (mut kept_steps, mut full_steps, mut restart_steps) = (
+        [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+        [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
     );
-    let steps = |into: &mut [Vec<f64>; 3], s: &sparkles_owl::classify::Stats| {
+    let steps = |into: &mut [Vec<f64>; 4], s: &sparkles_owl::classify::Stats| {
         into[0].push(ms(s.index));
         into[1].push(ms(s.saturation));
         into[2].push(ms(s.taxonomy));
+        into[3].push(ms(s.marking));
     };
     let contexts = cold.stats.contexts;
     for _ in 0..edits {
@@ -114,14 +158,19 @@ fn main() {
         let axiom = held[at].clone();
         // the removal
         kept.remove([&axiom]);
+        reset_peak();
+        let before = resident().0;
         let t = Instant::now();
         let out = kept.classify(&limits).expect("the run after a removal");
         removals.push(ms(t.elapsed()));
+        first_rss.get_or_insert((before, resident().1));
         runs += 1;
         incremental += usize::from(out.stats.incremental);
         if out.stats.incremental {
             cleared.push(out.stats.cleared as f64);
             steps(&mut kept_steps, &out.stats);
+        } else {
+            steps(&mut restart_steps, &out.stats);
         }
         memory = memory.max(out.stats.memory);
         peak = peak.max(out.stats.peak_memory);
@@ -154,6 +203,8 @@ fn main() {
         if out.stats.incremental {
             cleared.push(out.stats.cleared as f64);
             steps(&mut kept_steps, &out.stats);
+        } else {
+            steps(&mut restart_steps, &out.stats);
         }
         memory = memory.max(out.stats.memory);
         peak = peak.max(out.stats.peak_memory);
@@ -169,17 +220,23 @@ fn main() {
     let (am, alo, ahi) = spread(returns);
     let (fm, flo, fhi) = spread(full);
     let (cm, clo, chi) = spread(cleared);
-    let [ki, ks, kt] = kept_steps.map(|v| spread(v).0);
-    let [fi, fs, ft] = full_steps.map(|v| spread(v).0);
+    let [ki, ks, kt, km] = kept_steps.map(|v| spread(v).0);
+    let [fi, fs, ft, fmk] = full_steps.map(|v| spread(v).0);
+    let [xi, xs, xt, xm] = restart_steps.map(|v| spread(v).0);
+    let c = &cold.stats;
+    let (ci, cs, ct, cmk) = (ms(c.index), ms(c.saturation), ms(c.taxonomy), ms(c.marking));
     println!(
         "{{\"file\":\"{}\",\"threads\":{threads},\"counting\":{counting},\"tier\":\"{:?}\",\
          \"axioms\":{},\"classes\":{},\"contexts\":{contexts},\"cold_ms\":{cold_ms:.2},\
          \"runs\":{runs},\"incremental\":{incremental},\
          \"removal_ms\":[{rm:.3},{rlo:.3},{rhi:.3}],\"return_ms\":[{am:.3},{alo:.3},{ahi:.3}],\
          \"full_ms\":[{fm:.2},{flo:.2},{fhi:.2}],\"cleared\":[{cm},{clo},{chi}],\
-         \"kept_steps_ms\":[{ki:.3},{ks:.3},{kt:.3}],\"full_steps_ms\":[{fi:.3},{fs:.3},{ft:.3}],\
+         \"kept_steps_ms\":[{ki:.3},{ks:.3},{kt:.3},{km:.3}],\
+         \"full_steps_ms\":[{fi:.3},{fs:.3},{ft:.3},{fmk:.3}],\"abox\":{abox},\
+         \"restart_steps_ms\":[{xi:.3},{xs:.3},{xt:.3},{xm:.3}],\
+         \"cold_steps_ms\":[{ci:.3},{cs:.3},{ct:.3},{cmk:.3}],\
          \"cold_memory\":{},\"cold_peak\":{},\"kept_memory\":{memory},\"kept_peak\":{peak},\
-         \"checked\":{check}}}",
+         \"cold_rss_peak\":{cold_hwm},\"first_edit_rss\":[{},{}],\"checked\":{check}}}",
         std::path::Path::new(&input)
             .file_name()
             .and_then(|n| n.to_str())
@@ -189,5 +246,7 @@ fn main() {
         cold.taxonomy.classes().count(),
         cold.stats.memory,
         cold.stats.peak_memory,
+        first_rss.map_or(0, |r| r.0),
+        first_rss.map_or(0, |r| r.1),
     );
 }

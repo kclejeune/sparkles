@@ -2095,9 +2095,6 @@ impl Index {
     pub fn disjoint_of(&self, h: &Head) -> &[u32] {
         h.disj.of(&self.disjoint)
     }
-    pub fn exist(&self, e: Ex) -> &[(Role, Ex)] {
-        self.exist_of(self.head(e))
-    }
     pub fn disjoint(&self, e: Ex) -> &[u32] {
         self.disjoint_of(self.head(e))
     }
@@ -2412,6 +2409,19 @@ impl Index {
                     b.positive(e, it, &mut ix);
                 }
             }
+        }
+        // A loop by a role is a link from a context to itself, so the context takes the
+        // role's range (saturate.rs, `Concl::Loop`). Loops come from self restrictions,
+        // from chains that compose loops, from individuals linked to themselves and from
+        // the Horn rules, by roles that need not occur in any positive existential, so
+        // every range occurs positively (roadmap item 1262). A range that no context
+        // takes still costs its index entries, such as the intersections of the fillers
+        // of its existentials with their roles' ranges, their heads and successor
+        // entries and the told subsumers of its data restrictions, but no context is
+        // saturated for it.
+        let ranges: Vec<Ex> = ix.roles.range.iter().flatten().copied().collect();
+        for c in ranges {
+            b.positive(c, it, &mut ix);
         }
         // a reflexive role links every individual to itself, and a universal role every
         // individual to every one, so their ranges hold everywhere
