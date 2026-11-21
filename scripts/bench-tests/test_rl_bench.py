@@ -3,12 +3,12 @@ calls it, every `sparkles infer` of it and of compare.sh takes MAX_INFERRED as i
 --max-inferred, and its capped runner classifies a run's end and leaves no process behind.
 The runner tests need a systemd user manager and GNU time, and are skipped without them."""
 
+import process_checks
 import os
 import re
 import shutil
 import subprocess
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -135,10 +135,8 @@ class Capped(unittest.TestCase):
             )
             st, _ = self.capped("sh", "-c", engine, timer=True, run_timeout=1)
             self.assertEqual(st, "timeout")
-            time.sleep(0.5)
             for pid in pids.read_text().split():
-                with self.assertRaises(ProcessLookupError, msg=f"process {pid} survived"):
-                    os.kill(int(pid), 0)
+                self.assertTrue(process_checks.ended(int(pid)), f"process {pid} survived")
 
 
 @unittest.skipUnless(GTIME and SCOPED, "needs GNU time and a systemd user manager")

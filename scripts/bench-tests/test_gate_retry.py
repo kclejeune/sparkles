@@ -1,5 +1,6 @@
 """Exercise the batch gate's rerun of failed tests (scripts/gate/remote/test_retry.py)."""
 import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
+import process_checks
 import importlib.util
 import json
 import os
@@ -396,16 +397,7 @@ class Timeout(unittest.TestCase):
             # The grandchild left the parent's process group and ignored SIGTERM, and is gone.
             # Its new parent reaps it, which a loaded host can take a moment to schedule, so a
             # zombie counts as gone.
-            end = time.monotonic() + 10
-            while True:
-                try:
-                    state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
-                except FileNotFoundError:
-                    break
-                if state == "Z":
-                    break
-                self.assertLess(time.monotonic(), end, f"process {pid} is still running")
-                time.sleep(0.05)
+            self.assertTrue(process_checks.ended(pid), f"process {pid} is still running")
             size = beat.stat().st_size
             time.sleep(0.3)
             self.assertEqual(beat.stat().st_size, size)
@@ -456,8 +448,7 @@ class Timeout(unittest.TestCase):
                     code = e.code
         finally:
             signal.signal(signal.SIGTERM, old_handler)
-        with self.assertRaises(ProcessLookupError):
-            os.kill(int(pidfile.read_text()), 0)
+        self.assertTrue(process_checks.ended(int(pidfile.read_text())), "the discovery's helper is still running")
         self.assertFalse((out / "ci.forgiven").exists())
         return code
 
@@ -479,8 +470,7 @@ class Timeout(unittest.TestCase):
             """)
             with mock.patch.object(tr, "GRACE", 1):
                 self.assertEqual(tr.run([sys.executable, "-c", parent], Path(d) / "log", 30), 0)
-            with self.assertRaises(ProcessLookupError):
-                os.kill(int(pidfile.read_text()), 0)
+            self.assertTrue(process_checks.ended(int(pidfile.read_text())), "the command's child is still running")
 
 
 if __name__ == "__main__":

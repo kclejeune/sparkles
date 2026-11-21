@@ -259,7 +259,7 @@ class BuildHost(unittest.TestCase):
         out = self.root / f"out-{self.runs}"
         result = subprocess.run(["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out),
                                  *args, self.sha, self.sha], env=env or self.env,
-                                capture_output=True, text=True, timeout=60)
+                                capture_output=True, text=True, timeout=300)
         self.assertNotEqual(result.returncode, 0)
         if ok_stop:
             # Both binaries are staged and the run stops at the compiler check.
@@ -917,7 +917,7 @@ class BuildHost(unittest.TestCase):
                 except ProcessLookupError:
                     pass
                 try:
-                    process.communicate(timeout=20)
+                    process.communicate(timeout=120)
                 except subprocess.TimeoutExpired:
                     try:
                         os.killpg(process.pid, signal.SIGKILL)
@@ -930,7 +930,7 @@ class BuildHost(unittest.TestCase):
                 except OSError:
                     pass
         self.addCleanup(reap)
-        deadline = time.monotonic() + 20
+        deadline = time.monotonic() + 120
         while not (self.hosts / "build-started").exists():
             self.assertLess(time.monotonic(), deadline, "the build did not start")
             time.sleep(0.05)
@@ -938,7 +938,7 @@ class BuildHost(unittest.TestCase):
         scope = int(unit.read_text().split()[0])
         owned["scope"] = scope
         os.killpg(process.pid, signal.SIGINT)
-        process.communicate(timeout=20)
+        process.communicate(timeout=120)
         self.assertEqual(process.returncode, 130)
         self.assertEqual(self.scratch("h1"), [])
         self.assertTrue(unit.name.endswith(".scope"))

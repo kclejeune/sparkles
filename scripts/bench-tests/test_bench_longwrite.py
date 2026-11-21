@@ -109,8 +109,8 @@ class LongrunTests(unittest.TestCase):
                 "--writers", "2", "--batch", "5", "--live-max", "40", "--sample", "0.5", "--disk-every", "0.5",
                 "--out", out, *extra]
 
-    def run_load(self, url, out, *extra):
-        p = subprocess.run(self.cmd(url, out, 2, *extra), capture_output=True, text=True, timeout=120)
+    def run_load(self, url, out, *extra, seconds=2):
+        p = subprocess.run(self.cmd(url, out, seconds, *extra), capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)
 
@@ -122,7 +122,9 @@ class LongrunTests(unittest.TestCase):
     def test_the_writers_state_matches_the_server(self):
         srv, url = self.serve()
         out = os.path.join(self.tmp.name, "run.json")
-        totals = self.run_load(url, out)
+        # One reader process forked for a 2 s window made no read once in a parallel run at a
+        # load average of about 15, so this run, which asserts a read, gets 5 s.
+        totals = self.run_load(url, out, seconds=5)
         self.assertGreater(totals["writes"], 0)
         self.assertGreater(totals["reads"], 0)
         code, r = self.check(url, out)
