@@ -123,9 +123,30 @@ server's resident memory after the first call.
 | Taxonomy of 300,000 classes | 3.09 s | 0.02 s | 1.3 GB |
 | Taxonomy of 1 million classes | 13.9 s | 10.6 to 11.7 s | 4.1 GB |
 
-The result is not kept at the size of 1 million classes, so every call pays the mapping. Items
-735 and 736 of the [roadmap](../../ROADMAP.md) answer the head's counts without
-the mapping and speed up the mapping itself.
+The result is not kept at the size of 1 million classes, so every call pays the mapping.
+Item 736 of the [roadmap](../../ROADMAP.md) speeds up the mapping itself.
+
+### The head of the summary
+
+`GET /$/ontology/{ds}?view=head` answers the header, the entity counts, the graphs and the
+imports from index reads without the mapping, and the ontology editor reads it when it opens.
+A run on `wally` measured the head of bd3bcea4 against the full summary of 0779d666, the
+commit before it. The host is a 12th Gen Intel Core i7-12800H with 20 threads and 31 GiB of
+memory. Each cell is the median of three fresh servers, and the head's warm time is its
+second call. The server's resident memory is read after the first call, and a server holds about
+160 MB after it starts. These times are not comparable with the table above, which comes
+from another host.
+
+| Dataset | Full summary, cold | Full summary, warm | Head, cold | Head, warm | Memory after the full summary | Memory after the head |
+|---|---|---|---|---|---|---|
+| ChEBI lite | 2.77 s | 0.033 s | 9.6 ms | 6.8 ms | 2.53 GB | 175 MB |
+| Taxonomy of 300,000 classes | 1.35 s | 0.016 s | 8.7 ms | 4.2 ms | 1.33 GB | 171 MB |
+| Taxonomy of 1 million classes | 5.63 s | 5.45 s | 25.1 ms | 11.1 ms | 4.11 GB | 198 MB |
+
+The head never opened the ontology on these datasets, and its members equal those of the full
+summary. The full summary of bd3bcea4 equals that of 0779d666 and took 2.84, 1.35 and 5.52 s
+on its first call. The records are in
+[runs/2026-11-21-wally-0779d666-bd3bcea4](runs/2026-11-21-wally-0779d666-bd3bcea4/README.txt).
 
 ## Tradeoffs
 

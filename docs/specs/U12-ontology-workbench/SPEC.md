@@ -1111,6 +1111,59 @@ term pages in item 461. The kept named-class and strict materialization-backed s
 do not complete these parent items, compute on a read miss or use RL witnesses as
 classification explanations.
 
+### Ontology summary head
+
+Item 735 adds `view=head` to `GET /$/ontology/{ds}`, with the same `view` on the Rust JSON
+`summary` operation and the Python `summary()`. The head answers the dataset, commit, mode,
+graphs, imports, warnings, inferences, header, entity counts and closure of the summary, and
+leaves out the axioms, the triple counts, the unmapped triples and the diagnostics, which need
+the mapping of the whole ontology. The ontology editor reads the head when it opens. Its
+Header tab reads the full summary, and the header panel beside the tree reads it when
+**Count the axioms** is pressed.
+
+**Reads.** The header comes from the quads of the ontology nodes and of the `owl:Axiom` and
+`owl:Annotation` nodes that annotate their triples, and the counts from the `rdf:type`
+triples of each declaring type, with the OWL 1 property rules of the full read. A counted
+subject with a reified type triple is mapped from its own type triples and reifiers. The
+head reads through the caller's masked view, at the requested branch or past state, and has
+its own entity tag, which an edit's `If-Match` can name.
+
+**Closure.** The head answers from these reads only when an allow-list shows that no other
+triple can change the answer, and otherwise opens the ontology and answers every member
+from its mapping. An ontology node may hold its type, `owl:imports`, `owl:versionIRI` and
+annotation triples. A reifier is a blank node with exactly one type, `owl:Annotation`, or
+`owl:Axiom` when it annotates a root triple, with its source, property, target and
+annotations, and only the reifiers of its own annotations may name it. A reified property is
+an annotation property, `owl:imports` or `owl:versionIRI` on an ontology node, or
+`rdf:type` with an OWL or RDF Schema type. The ontology also opens when a graph types
+`rdf:type` or another structural predicate as an OWL property, when an IRI the header uses
+has an annotated declaration, and past the head's bounds of 1,000 ontology nodes, 100,000
+fragment quads and 10,000 reified type triples. The argument walks each step of the full
+read that can use a triple of the fragment, which are the choice of header candidates, the
+order of first triples, the annotation nodes keyed by source, property and target, the
+blank axiom types and the expression parses that consume blank nodes.
+
+**Tests.** `head_tests.rs` checks the head against the full summary on 41 fixtures pinned in
+`head_fixtures.json`, most of them in both modes, among them header candidates, punning, OWL 1 properties,
+reified declarations and annotation properties and blank axiom types on header nodes, and
+covers grants, masked views, past states, cancellation and the bounds.
+`head_gen_tests.rs` builds 6,000 seeded random ontologies by default, with ontology nodes,
+both reifier types, nested reifiers, blank axiom types on those nodes, declared and custom
+annotation properties, terminology elsewhere, several graphs and both modes. It checks that
+the head equals the full summary on each and that at least a fifth of them answer without
+opening the ontology. `SPARKLES_HEAD_GEN_CASES` and `SPARKLES_HEAD_GEN_SEED` set the number
+of cases and the first seed.
+
+**Measurements.** On `wally` the head's first call takes 9.6 ms on ChEBI lite, 8.7 ms on a
+taxonomy of 300,000 classes and 25.1 ms on one of 1 million, against 2.77, 1.35 and 5.63 s
+for the full summary, and the server holds 175 to 198 MB after it instead of 1.33 to
+4.11 GB. The [web UI at scale results](../../benchmarks/web-ui-scale/RESULTS.md#the-head-of-the-summary)
+give the table.
+
+**Remaining work.** Item 1297 narrows the fallbacks, such as nested `owl:Axiom` nodes, IRI
+reifiers, reifiers of custom predicates and the bound on reified type triples, which counts
+class assertions. Item 736 speeds up the mapping that the full summary and a fallback pay.
+
 ### Rendering preferences
 
 Item 625 adds a shared viewer setting for labels, prefixed names or complete IRIs in the
