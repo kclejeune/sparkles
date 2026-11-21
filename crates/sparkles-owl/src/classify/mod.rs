@@ -593,6 +593,9 @@ pub struct Saturation {
     interner: Interner,
     index: Option<Index>,
     ctx: Contexts,
+    /// the number of the caller's axioms while a run reads fewer, after
+    /// [`interchangeable`] dropped the class assertions that another stands for
+    source_len: Option<usize>,
     /// what the last run left out or used only in part, sorted
     excluded: Vec<Excluded>,
     /// set when a run stopped part way, so that the next run starts again
@@ -749,6 +752,14 @@ fn needs_full_run(ax: &AxiomKind) -> bool {
     if role_axiom(ax) || matches!(ax, AxiomKind::HasKey(..)) {
         return true;
     }
+    // an anonymous individual is an individual of the run, though no signature holds it
+    // (roadmap item 1281)
+    if profiles::individuals(ax)
+        .iter()
+        .any(|i| matches!(i, Individual::Anonymous(_)))
+    {
+        return true;
+    }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
     sig.2
@@ -861,6 +872,140 @@ fn role_axiom(ax: &AxiomKind) -> bool {
             | AxiomKind::DataPropertyRange(..)
             | AxiomKind::FunctionalDataProperty(_)
     )
+}
+
+/// The first rule of OWL 2 EL that the classifier holds the axiom to and that it breaks,
+/// without the global restriction on the ranges of property chains. The classifier takes
+/// an inclusion in a top property as an axiom of OWL 2 EL whatever its subproperty
+/// expression, since it holds of every ontology ([`index::top_inclusion`]), and takes an
+/// anonymous individual as a fresh individual that no answer names (roadmap item 1281).
+fn el_break(ax: &AxiomKind) -> Option<profiles::Broken> {
+    if index::top_inclusion(ax) {
+        return None;
+    }
+    profiles::el_first(ax)
+}
+
+/// The bytes of scratch that [`interchangeable`] counts for each class assertion it
+/// reads: the entry of its label and, at most, that of its class.
+const LABEL_BYTES: usize = 96;
+
+/// The axioms without the class assertions that another one stands for, or `None` when
+/// there are none (roadmap item 1281). A class assertion `C(_:x)` of a named class whose
+/// anonymous individual occurs in no other logical axiom, and only once in it, says that
+/// `C` has an instance and no more. Two of them with the same class are interchangeable,
+/// since an element that stands for one stands for the other, so the one whose
+/// individual has the least label stands for every other, which adds nothing. The answer
+/// depends on the axioms alone, whatever their order. A class assertion of a named class
+/// is an axiom of OWL 2 EL that every run takes in full, so the one that stands for the
+/// others is never left out and the report needs none of them. Ontologies that reify
+/// axioms or cross-references as anonymous individuals, such as those with `oboInOwl`
+/// annotations, have hundreds of thousands of such assertions, and the run then holds
+/// one individual for each class instead of one for each assertion.
+///
+/// The scratch holds an entry for each such assertion's label and class and the list of
+/// the axioms the run reads. It is admitted against `max_memory`, beside the `held`
+/// bytes of the caller's axioms, and against the pool before it is allocated, and a
+/// refusal leaves every assertion with its individual. The second value is the scratch
+/// the scan admitted, which the run draws on first when a pool granted it and counts in
+/// its peak in any case. Every pass over the
+/// axioms polls the deadline and cancellation.
+fn interchangeable<'a>(
+    axioms: &[&'a AxiomKind],
+    held: usize,
+    limits: &Limits,
+) -> Result<(Option<Vec<&'a AxiomKind>>, usize), Error> {
+    fn candidate(k: &AxiomKind) -> Option<(&Class, &str)> {
+        match k {
+            AxiomKind::ClassAssertion(ClassExpression::Class(c), Individual::Anonymous(a)) => {
+                Some((c, a.label()))
+            }
+            _ => None,
+        }
+    }
+    let mut n = 0usize;
+    for (i, k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        n += candidate(k).is_some() as usize;
+    }
+    if n < 2 {
+        return Ok((None, 0));
+    }
+    let scratch = n.saturating_mul(LABEL_BYTES).saturating_add(
+        axioms
+            .len()
+            .saturating_mul(std::mem::size_of::<&AxiomKind>()),
+    );
+    if limits
+        .max_memory
+        .is_some_and(|m| held.saturating_add(scratch) > m)
+    {
+        return Ok((None, 0));
+    }
+    if limits.charge.as_ref().is_some_and(|f| !f(scratch)) {
+        return Ok((None, 0));
+    }
+    // how often the label of each candidate occurs in the logical axioms
+    let mut count: FxHashMap<&str, u32> = FxHashMap::default();
+    count.reserve(n);
+    for (i, k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        if let Some((_, l)) = candidate(k) {
+            count.insert(l, 0);
+        }
+    }
+    for (i, k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        if !logical(k) {
+            continue;
+        }
+        for ind in profiles::individuals(k) {
+            if let Individual::Anonymous(a) = ind
+                && let Some(c) = count.get_mut(a.label())
+            {
+                *c = c.saturating_add(1);
+            }
+        }
+    }
+    // the label that stands for each class: the least among its lone assertions
+    let lone = |k: &'a AxiomKind| candidate(k).filter(|(_, l)| count.get(l) == Some(&1));
+    let mut first: FxHashMap<&Class, &str> = FxHashMap::default();
+    for (i, &k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        if let Some((c, l)) = lone(k) {
+            first.entry(c).and_modify(|f| *f = (*f).min(l)).or_insert(l);
+        }
+    }
+    let redundant = |k: &'a AxiomKind| lone(k).is_some_and(|(c, l)| first.get(c) != Some(&l));
+    let mut dropped = 0usize;
+    for (i, &k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        dropped += redundant(k) as usize;
+    }
+    if dropped == 0 {
+        return Ok((None, scratch));
+    }
+    // the list the run reads, whose capacity the scratch admitted
+    let mut kept = Vec::with_capacity(axioms.len() - dropped);
+    for (i, &k) in axioms.iter().enumerate() {
+        if i % POLL_AXIOMS == 0 {
+            poll(limits)?;
+        }
+        if !redundant(k) {
+            kept.push(k);
+        }
+    }
+    Ok((Some(kept), scratch))
 }
 
 /// Whether the axiom has logical content for classification.
@@ -1140,6 +1285,7 @@ impl Saturation {
             interner: Interner::new(),
             index: None,
             ctx: Vec::new(),
+            source_len: None,
             excluded: Vec::new(),
             dirty: true,
             worlds: FxHashMap::default(),
@@ -1210,6 +1356,61 @@ impl Saturation {
     /// [`classify`](Saturation::classify), with the bytes of the caller's copy of the
     /// axioms, which the run counts as its own.
     fn run_with(
+        &mut self,
+        axioms: &[&AxiomKind],
+        changes: Option<Changes<'_>>,
+        held_bytes: usize,
+        limits: &Limits,
+        with_taxonomy: bool,
+    ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
+        // the class assertions that another one stands for add nothing (roadmap item
+        // 1281), and the run reads the other axioms, whose list it holds beside the
+        // caller's
+        let (kept, scratch) = match interchangeable(axioms, held_bytes, limits) {
+            Ok(k) => k,
+            Err(e) => {
+                // the caller has applied its changes, which a later run must still read
+                self.dirty = true;
+                return Err(e);
+            }
+        };
+        // the run's charges draw first on what the pool admitted for the scan
+        let credited;
+        let limits = match &limits.charge {
+            Some(f) if scratch > 0 => {
+                credited = Limits {
+                    charge: Some(drawing_on(scratch, f.clone())),
+                    ..limits.clone()
+                };
+                &credited
+            }
+            _ => limits,
+        };
+        let mut r = match kept {
+            None => self.run_with_all(axioms, changes, held_bytes, limits, with_taxonomy),
+            Some(kept) => {
+                let kept_bytes = kept.capacity() * std::mem::size_of::<&AxiomKind>();
+                // a run that reads them all counts the caller's axioms as added
+                self.source_len = Some(axioms.len());
+                let r = self.run_with_all(
+                    &kept,
+                    changes,
+                    held_bytes + kept_bytes,
+                    limits,
+                    with_taxonomy,
+                );
+                self.source_len = None;
+                r
+            }
+        };
+        if let Ok((_, _, stats)) = &mut r {
+            stats.peak_memory = stats.peak_memory.max(held_bytes + scratch);
+        }
+        r
+    }
+
+    /// [`run_with`](Saturation::run_with) over every axiom it is given.
+    fn run_with_all(
         &mut self,
         axioms: &[&AxiomKind],
         changes: Option<Changes<'_>>,
@@ -1990,7 +2191,7 @@ impl Saturation {
             match r {
                 Ok(Some(mut r)) if self.dl_tried => {
                     red.restore(axioms, &mut self.excluded);
-                    r.2.added = axioms.len();
+                    r.2.added = self.source_len.unwrap_or(axioms.len());
                     let tier = r.2.tier;
                     let mut chains: Vec<Excluded> = std::mem::take(&mut self.chain_ranged)
                         .into_iter()
@@ -2051,7 +2252,7 @@ impl Saturation {
                 stats.added = c.added.len();
                 stats.removed = c.removed.len();
             }
-            None => stats.added = axioms.len(),
+            None => stats.added = self.source_len.unwrap_or(axioms.len()),
         }
         let again = self.dirty || self.index.is_none();
         // until the saturation ends, a stop leaves the state for a run that starts again
@@ -2066,7 +2267,7 @@ impl Saturation {
                 let mut out = Vec::new();
                 for (i, k) in chunk.iter().enumerate() {
                     if logical(k)
-                        && let Some(b) = profiles::el_first(k)
+                        && let Some(b) = el_break(k)
                     {
                         out.push((at + i, (b.rule.to_string(), b.message)));
                     }
@@ -2102,7 +2303,7 @@ impl Saturation {
                 c.removed.iter().any(|k| !tier_neutral(k))
                     || c.added
                         .iter()
-                        .any(|k| !tier_neutral(k) && profiles::el_first(k).is_some())
+                        .any(|k| !tier_neutral(k) && el_break(k).is_some())
             });
         let full = self.entangled
             || match (&kept, changes) {
@@ -3204,7 +3405,7 @@ impl Saturation {
             return true;
         }
         let outside: Vec<&AxiomKind> = changed()
-            .filter(|a| logical(a) && profiles::el_first(a).is_some())
+            .filter(|a| logical(a) && el_break(a).is_some())
             .collect();
         let in_play = k.outside || !outside.is_empty();
         if in_play && changed().any(|a| logical(a) && !tier_neutral(a)) {
@@ -3679,10 +3880,13 @@ fn normalize_axioms<'k>(
             index::intern_signature(k, it);
             continue;
         }
+        // a chain into the top property holds of every ontology, and its normalization
+        // adds nothing, so it meets no range restriction (roadmap item 1282)
         if matches!(
             k,
             AxiomKind::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _)
-        ) {
+        ) && !index::top_inclusion(k)
+        {
             out.chains.push(k);
             continue;
         }
@@ -4500,7 +4704,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(i, k)| {
-                let b = profiles::el_first(k)?;
+                let b = el_break(k)?;
                 Some((i, (b.rule.to_string(), b.message)))
             })
             .collect();
@@ -5166,10 +5370,65 @@ mod tests {
     }
 
     #[test]
-    fn the_horn_normalization_opens_no_scope_for_an_assertion_about_an_anonymous_individual() {
-        // roadmap item 869: the normalization refuses the assertions without reading
-        // them, so they take no scope and no copy, and the Horn axiom beside them is
-        // taken as before
+    fn the_shared_individuals_poll_and_respect_the_budget() {
+        // roadmap item 1281: the scratch of `interchangeable` is admitted before it is
+        // allocated and grows only with the class assertions it may share, and the scan
+        // polls the deadline and cancellation
+        let class = ClassExpression::Class(Class::new("http://ex.org/C"));
+        let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
+        let anon = |i: usize| Individual::Anonymous(AnonymousIndividual::new(format!("x{i}")));
+        let mut kinds: Vec<AxiomKind> = (0..4)
+            .map(|i| AxiomKind::ClassAssertion(class.clone(), anon(i)))
+            .collect();
+        kinds.extend((10..20_000).map(|i| {
+            AxiomKind::ObjectPropertyAssertion(
+                r.clone(),
+                anon(i),
+                Individual::named("http://ex.org/a"),
+            )
+        }));
+        let axioms: Vec<&AxiomKind> = kinds.iter().collect();
+        let (kept, admitted) = interchangeable(&axioms, 0, &Limits::default()).unwrap();
+        let kept = kept.unwrap();
+        // the scratch admits the list the run reads, which it allocates once
+        let scratch = 4 * LABEL_BYTES + axioms.len() * std::mem::size_of::<&AxiomKind>();
+        assert_eq!((kept.len(), admitted), (axioms.len() - 3, scratch));
+        assert_eq!(kept.capacity(), kept.len());
+        // a budget below the scratch beside the caller's axioms leaves every assertion
+        // its individual
+        let small = Limits {
+            max_memory: Some(scratch),
+            ..Limits::default()
+        };
+        assert!(interchangeable(&axioms, 0, &small).unwrap().0.is_some());
+        assert!(interchangeable(&axioms, 1, &small).unwrap().0.is_none());
+        // so does a pool that refuses it, which is told the scratch alone
+        let told = std::sync::Arc::new(AtomicUsize::new(0));
+        let t = told.clone();
+        let refusing = Limits {
+            charge: Some(std::sync::Arc::new(move |b: usize| {
+                t.fetch_add(b, Ordering::Relaxed);
+                false
+            })),
+            ..Limits::default()
+        };
+        assert_eq!(interchangeable(&axioms, 0, &refusing).unwrap(), (None, 0));
+        assert_eq!(told.load(Ordering::Relaxed), scratch);
+        let cancelled = Limits {
+            cancelled: Some(std::sync::Arc::new(|| true)),
+            ..Limits::default()
+        };
+        assert!(matches!(
+            interchangeable(&axioms, 0, &cancelled),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn the_horn_normalization_takes_assertions_about_an_anonymous_individual() {
+        // roadmap item 1281: an anonymous individual is a fresh individual of the run, so
+        // the assertions about it are Horn axioms like those about a named one, which
+        // replaced item 869's refusal of them
         let c = |n: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{n}")));
         let r = ObjectPropertyExpression::Property(ObjectProperty::new("http://ex.org/r"));
         let x = || Individual::Anonymous(AnonymousIndividual::new("x"));
@@ -5191,19 +5450,16 @@ mod tests {
             ),
             AxiomKind::NegativeObjectPropertyAssertion(r, x(), x()),
         ];
-        let run = |axioms: &[&AxiomKind]| {
-            let mut it = Interner::new();
-            let mut ax = index::Axioms::default();
-            let taken = horn::normalize(axioms, &mut it, &mut ax, None, &|| false).unwrap();
-            (taken, it.scope_bytes())
-        };
-        let (alone, bytes) = run(&[&all]);
-        assert_eq!(alone, vec![true]);
         let mut with: Vec<&AxiomKind> = assertions.iter().collect();
         with.push(&all);
-        let (taken, with_bytes) = run(&with);
-        assert_eq!(taken, vec![false, false, false, false, true]);
-        assert_eq!(with_bytes, bytes, "the assertions hold no scope");
+        let mut it = Interner::new();
+        let mut ax = index::Axioms::default();
+        let taken = horn::normalize(&with, &mut it, &mut ax, None, &|| false).unwrap();
+        assert_eq!(taken, vec![true; 5]);
+        assert!(
+            it.individuals.iter().any(index::is_anonymous),
+            "the anonymous individual is an individual of the run"
+        );
     }
 }
 

@@ -1,0 +1,7 @@
+host=atlas start=2026-11-21T13:14:53-05:00
+ 13:14:53  up  2:06,  0 users,  load average: 6.21, 27.11, 26.61
+               total        used        free      shared  buff/cache   available
+Mem:              15           1           1           0          12          14
+Swap:              7           0           7
+fa27acf7955c369687734150a36c5fb57f08cbe47f70b9876201a50e3a5e7879  /home/kclejeune/lanes/outside-ab/bin/base
+995b8a64430273cbb2479266e335f156e976f7f0d87b2d687904739fa2898fc8  /home/kclejeune/lanes/outside-ab/bin/tip

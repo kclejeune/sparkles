@@ -1445,24 +1445,6 @@ impl Norm<'_> {
     }
 }
 
-/// Whether the axiom is an assertion about an anonymous individual. The rules have no
-/// context for an anonymous individual, so the normalization refuses every such axiom,
-/// and the caller leaves it out and reports it. Finding it here spares the axiom's scope
-/// and the attempt (roadmap item 869).
-fn anonymous(ax: &AxiomKind) -> bool {
-    use AxiomKind as K;
-    let anon = |a: &Individual| matches!(a, Individual::Anonymous(_));
-    match ax {
-        K::ClassAssertion(_, a)
-        | K::DataPropertyAssertion(_, a, _)
-        | K::NegativeDataPropertyAssertion(_, a, _) => anon(a),
-        K::ObjectPropertyAssertion(_, a, b) | K::NegativeObjectPropertyAssertion(_, a, b) => {
-            anon(a) || anon(b)
-        }
-        _ => false,
-    }
-}
-
 /// Whether the expression is the top object property or its inverse.
 fn is_top(p: &ObjectPropertyExpression) -> bool {
     p.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY
@@ -1483,14 +1465,9 @@ pub fn normalize(
     let mut taken = vec![false; axioms.len()];
     let mut h = HornAx::default();
     // whether the run has individuals: those the EL axioms interned, and those the axioms
-    // here name
-    let individuals = !it.individuals.is_empty()
-        || axioms.iter().any(|k| {
-            Axiom::from((*k).clone())
-                .signature()
-                .iter()
-                .any(|e| matches!(e, Entity::NamedIndividual(_)))
-        });
+    // here name, anonymous ones among them (roadmap item 1281)
+    let individuals =
+        !it.individuals.is_empty() || axioms.iter().any(|k| super::index::holds_individual(k));
     // every object property has its inverse
     let named: Vec<ObjectProperty> = it
         .roles
@@ -1582,7 +1559,7 @@ pub fn normalize(
     // once one is taken
     let mut class_out: Vec<Out> = Vec::new();
     for (i, k) in axioms.iter().enumerate() {
-        if taken[i] || Norm::is_role_axiom(k) || anonymous(k) {
+        if taken[i] || Norm::is_role_axiom(k) {
             continue;
         }
         // the fresh classes of an axiom are those of its last run (roadmap item 753)

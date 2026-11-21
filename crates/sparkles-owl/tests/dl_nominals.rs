@@ -2002,3 +2002,17 @@ fn a_run_whose_only_individual_is_in_a_key_outside_owl_2_el_answers_as_without_t
         assert!(!out.taxonomy.is_unsatisfiable(&c("X")));
     }
 }
+
+#[test]
+fn an_inclusion_in_the_top_data_property_keeps_the_rewriting() {
+    // roadmap item 1282: the inclusion holds of every ontology, so its data property keeps
+    // nothing from item 805's rewriting of the universal property
+    let out = rooted(
+        "SubClassOf(:A ObjectUnionOf(:B :C)) SubClassOf(:B :D) SubClassOf(:C :D)
+         SubClassOf(:X ObjectSomeValuesFrom(owl:topObjectProperty :A))
+         SubDataPropertyOf(:d owl:topDataProperty)",
+        false,
+        &[("A", "D")],
+    );
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("D")));
+}

@@ -113,7 +113,7 @@ impl Reduction {
         let mut out = dl::OutsideEl::default();
         let mut seen: BTreeSet<&AxiomKind> = BTreeSet::new();
         for k in axioms {
-            if super::logical(k) && crate::profiles::el_first(k).is_some() && seen.insert(k) {
+            if super::logical(k) && super::el_break(k).is_some() && seen.insert(k) {
                 out.add(dl::shape(k));
             }
         }
@@ -366,8 +366,10 @@ fn blocked(k: &AxiomKind, inds: &mut BTreeSet<NamedIndividual>) -> bool {
 /// something keeps Tier D from it anyway, or when an axiom has no reduction or the keys'
 /// reductions pass the bound. `memory` is the run's memory budget.
 pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
+    // an inclusion in the top property alone needs no rewriting, since the run takes it
+    // as an axiom that adds nothing (roadmap item 1282)
     let wants = |k: &AxiomKind| {
-        ax_has_top(k)
+        ax_has_top(k) && !super::index::top_inclusion(k)
             || matches!(k, AxiomKind::HasKey(_, ops, dps) if !ops.is_empty() && dps.is_empty())
     };
     if !axioms.iter().any(|k| wants(k)) {
@@ -375,6 +377,11 @@ pub fn plan(axioms: &[&AxiomKind], memory: Option<usize>) -> Option<Reduction> {
     }
     let mut inds = BTreeSet::new();
     for k in axioms {
+        // an inclusion in a top property is dropped below, and its subproperty, such as
+        // a data property, keeps nothing from the rewriting
+        if super::index::top_inclusion(k) {
+            continue;
+        }
         if blocked(k, &mut inds) {
             return None;
         }

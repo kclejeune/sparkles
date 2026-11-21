@@ -225,10 +225,7 @@ fn key_add(count: &mut usize, more: usize) -> Result<(), Halt> {
 fn key_member(ix: &Index, view: &dyn View, individual: Ex, class: Ex) -> bool {
     let mut member = false;
     view.with(individual, &mut |st, real| {
-        member = real
-            && !st.bottom
-            && matches!(ix.head(individual).node, Node::Nominal(_))
-            && st.subs.contains(&class);
+        member = real && !st.bottom && ix.named_nominal(individual) && st.subs.contains(&class);
     });
     member
 }
@@ -247,11 +244,13 @@ fn key_member_count(
     }
     Ok(count)
 }
-fn key_aliases<'s>(ix: &Index, e: Ex, st: &'s State) -> impl Iterator<Item = Ex> + use<'s> {
-    matches!(ix.head(e).node, Node::Nominal(_))
+/// The named individuals that the context `e` stands for. A key binds named individuals
+/// alone, so an anonymous one is not among them (roadmap item 1281).
+fn key_aliases<'s>(ix: &'s Index, e: Ex, st: &'s State) -> impl Iterator<Item = Ex> + use<'s> {
+    ix.named_nominal(e)
         .then_some(e)
         .into_iter()
-        .chain(st.noms().iter().copied())
+        .chain(st.noms().iter().copied().filter(|&n| ix.named_nominal(n)))
 }
 
 /// No callback enters another View: Global holds a context mutex during with().

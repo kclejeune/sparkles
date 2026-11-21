@@ -686,6 +686,23 @@ impl Interner {
         self.node(Node::Nominal(id))
     }
 
+    /// The nominal of a named or an anonymous individual. An anonymous individual is a
+    /// fresh individual of the run (roadmap item 1281): in OWL 2 an ontology holds when
+    /// some element stands for each of its anonymous individuals, so the classifier names
+    /// each one, and the entailments that do not name it are those of the ontology. Its
+    /// label is the one of the read, which names one individual wherever it occurs among
+    /// the run's axioms, as it makes equal axioms one. Its name in the interner is
+    /// `_:label`, which no IRI starts with, since the scheme of an IRI starts with a
+    /// letter ([`is_anonymous`]).
+    pub fn individual(&mut self, i: &Individual) -> Ex {
+        match i {
+            Individual::Named(n) => self.nominal(n),
+            Individual::Anonymous(a) => {
+                self.nominal(&NamedIndividual::new(format!("{ANONYMOUS}{}", a.label())))
+            }
+        }
+    }
+
     /// The id of a data range.
     pub fn val(&mut self, v: DataVal) -> u32 {
         match self.val_ids.get(&v) {
@@ -790,6 +807,19 @@ impl Interner {
     /// The expressions of the individuals.
     pub fn nominals(&self) -> impl Iterator<Item = Ex> + '_ {
         (0..self.individuals.len() as u32).filter_map(|i| self.get(&Node::Nominal(i)))
+    }
+
+    /// The expressions of the anonymous individuals ([`Interner::individual`]), sorted.
+    pub fn anonymous_nominals(&self) -> Vec<Ex> {
+        let mut v: Vec<Ex> = self
+            .individuals
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| is_anonymous(n))
+            .filter_map(|(i, _)| self.get(&Node::Nominal(i as u32)))
+            .collect();
+        v.sort_unstable();
+        v
     }
 
     pub fn role(&mut self, r: RoleName) -> Role {
@@ -1385,6 +1415,40 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
     partial
 }
 
+/// Whether the axiom is an inclusion in the top object property or the top data
+/// property, `r ⊑ U`, whatever its subproperty expression: it holds of every ontology,
+/// and the role table puts every role below a top property that another axiom names
+/// (roadmap item 1282). The classifier takes it as an axiom of OWL 2 EL that adds
+/// nothing, and does not intern the top property for it, so that it keeps no run from
+/// the tiers that the top property closes.
+pub fn top_inclusion(ax: &AxiomKind) -> bool {
+    match ax {
+        AxiomKind::SubObjectPropertyOf(_, sup) => {
+            sup.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY
+        }
+        AxiomKind::SubDataPropertyOf(_, sup) => sup.as_str() == vocab::OWL_TOP_DATA_PROPERTY,
+        _ => false,
+    }
+}
+
+/// The start of the interner's name for an anonymous individual ([`Interner::individual`]).
+pub const ANONYMOUS: &str = "_:";
+
+/// Whether the interner's individual stands for an anonymous individual, which no answer
+/// names.
+pub fn is_anonymous(i: &NamedIndividual) -> bool {
+    i.as_str().starts_with(ANONYMOUS)
+}
+
+/// Whether the axiom holds an individual outside its annotations, named or anonymous
+/// (roadmap item 1281).
+pub fn holds_individual(ax: &AxiomKind) -> bool {
+    crate::model::Signature::names_individual(ax)
+        || crate::profiles::individuals(ax)
+            .iter()
+            .any(|i| matches!(i, Individual::Anonymous(_)))
+}
+
 /// Interns the classes of an axiom's signature.
 pub fn intern_signature(ax: &AxiomKind, it: &mut Interner) {
     let mut sig = crate::model::Signature::default();
@@ -1405,6 +1469,9 @@ fn normalize_axiom(
     out: &mut Axioms,
 ) -> Result<(Option<&'static str>, bool), &'static str> {
     use AxiomKind as K;
+    if top_inclusion(ax) {
+        return Ok((None, true));
+    }
     let mut partial: Option<&'static str> = None;
     let mut whole = true;
     fn ce(
@@ -1605,16 +1672,16 @@ fn normalize_axiom(
                 data,
             });
         }
-        K::ClassAssertion(c, Individual::Named(i)) => {
+        K::ClassAssertion(c, i) => {
             let c = ce(c, it, &mut partial)?;
-            let n = it.nominal(i);
+            let n = it.individual(i);
             out.individuals.push(n);
             out.subs.push((n, c));
         }
-        K::ObjectPropertyAssertion(p, Individual::Named(a), Individual::Named(b)) => {
+        K::ObjectPropertyAssertion(p, a, b) => {
             if let Some(r) = object_role(p, it) {
-                let a = it.nominal(a);
-                let b = it.nominal(b);
+                let a = it.individual(a);
+                let b = it.individual(b);
                 let e = it.node(Node::Exist(r, b));
                 out.individuals.push(a);
                 out.individuals.push(b);
@@ -1622,21 +1689,21 @@ fn normalize_axiom(
             }
         }
         // ¬p(a, b) is {a} ⊓ ∃p.{b} ⊑ ⊥
-        K::NegativeObjectPropertyAssertion(p, Individual::Named(a), Individual::Named(b)) => {
+        K::NegativeObjectPropertyAssertion(p, a, b) => {
             let Some(r) = object_role(p, it) else {
                 return Err("inverse properties");
             };
-            let a = it.nominal(a);
-            let b = it.nominal(b);
+            let a = it.individual(a);
+            let b = it.individual(b);
             let e = it.node(Node::Exist(r, b));
             let both = it.conj(a, e);
             out.individuals.push(a);
             out.individuals.push(b);
             out.subs.push((both, BOTTOM));
         }
-        K::DataPropertyAssertion(d, Individual::Named(a), v) => {
+        K::DataPropertyAssertion(d, a, v) => {
             let r = it.role(RoleName::Data(d.clone()));
-            let a = it.nominal(a);
+            let a = it.individual(a);
             let (v, opaque) = it.ranges.literal(v);
             it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             if opaque {
@@ -1648,9 +1715,9 @@ fn normalize_axiom(
             out.individuals.push(a);
             out.subs.push((a, e));
         }
-        K::NegativeDataPropertyAssertion(d, Individual::Named(a), v) => {
+        K::NegativeDataPropertyAssertion(d, a, v) => {
             let r = it.role(RoleName::Data(d.clone()));
-            let a = it.nominal(a);
+            let a = it.individual(a);
             let (v, opaque) = it.ranges.literal(v);
             it.ranges.check().map_err(|_| NUMERIC_HALTED)?;
             if opaque {
@@ -1664,13 +1731,7 @@ fn normalize_axiom(
             out.subs.push((both, BOTTOM));
         }
         K::SameIndividual(is) => {
-            let es: Vec<Ex> = is
-                .iter()
-                .filter_map(|i| match i {
-                    Individual::Named(n) => Some(it.nominal(n)),
-                    Individual::Anonymous(_) => None,
-                })
-                .collect();
+            let es: Vec<Ex> = is.iter().map(|i| it.individual(i)).collect();
             out.individuals.extend(es.iter().copied());
             for w in 0..es.len() {
                 let next = es[(w + 1) % es.len()];
@@ -1680,13 +1741,7 @@ fn normalize_axiom(
             }
         }
         K::DifferentIndividuals(is) => {
-            let mut es: Vec<Ex> = is
-                .iter()
-                .filter_map(|i| match i {
-                    Individual::Named(n) => Some(it.nominal(n)),
-                    Individual::Anonymous(_) => None,
-                })
-                .collect();
+            let mut es: Vec<Ex> = is.iter().map(|i| it.individual(i)).collect();
             out.individuals.extend(es.iter().copied());
             es.sort_unstable();
             es.dedup();
@@ -1699,8 +1754,7 @@ fn normalize_axiom(
         | K::SubAnnotationPropertyOf(..)
         | K::AnnotationPropertyDomain(..)
         | K::AnnotationPropertyRange(..) => {}
-        // the profile check leaves the remaining types out of OWL 2 EL, anonymous
-        // individuals among them
+        // the profile check leaves the remaining types out of OWL 2 EL
         _ => whole = false,
     }
     Ok((partial, whole))
@@ -1782,10 +1836,7 @@ pub fn class_expression(
             }
         }
         C::ObjectHasValue(p, i) => {
-            let f = match i {
-                Individual::Named(i) => it.nominal(i),
-                Individual::Anonymous(_) => return Err("anonymous individuals"),
-            };
+            let f = it.individual(i);
             match p {
                 ObjectPropertyExpression::Property(p) => {
                     let r = it.object_role(p);
@@ -1795,8 +1846,8 @@ pub fn class_expression(
             }
         }
         C::ObjectOneOf(is) if is.len() == 1 => match is.iter().next() {
-            Some(Individual::Named(i)) => (it.nominal(i), None),
-            _ => return Err("anonymous individuals"),
+            Some(i) => (it.individual(i), None),
+            None => return Err("an empty enumeration"),
         },
         C::ObjectHasSelf(ObjectPropertyExpression::Property(p)) => {
             let r = it.object_role(p);
@@ -1881,6 +1932,9 @@ pub struct Index {
     pub keys: Vec<Key>,
     /// the expressions of the individuals
     pub nominals: Vec<Ex>,
+    /// the expressions of the anonymous individuals among them, sorted, which a key does
+    /// not bind (roadmap item 1281)
+    pub anonymous: Vec<Ex>,
     /// whether a link to an individual can close a loop that a negative `ObjectHasSelf`
     /// reads
     pub nominal_selfs: bool,
@@ -1896,6 +1950,12 @@ impl Index {
     /// Whether `r` is above a top role, so that it relates every pair of elements.
     pub fn is_universal(&self, r: Role) -> bool {
         self.tops.iter().flatten().any(|&t| self.roles.sub(t, r))
+    }
+
+    /// Whether `e` is the expression of a named individual, which a key binds: a nominal
+    /// that is not an anonymous individual's.
+    pub fn named_nominal(&self, e: Ex) -> bool {
+        matches!(self.head(e).node, Node::Nominal(_)) && self.anonymous.binary_search(&e).is_err()
     }
 }
 
@@ -1917,6 +1977,7 @@ impl Index {
             universal: a_universal,
             keys: a_keys,
             nominals: a_nominals,
+            anonymous: a_anonymous,
             nominal_selfs: a_nominal_selfs,
             tops: a_tops,
             horn: a_horn,
@@ -1936,6 +1997,7 @@ impl Index {
             universal: b_universal,
             keys: b_keys,
             nominals: b_nominals,
+            anonymous: b_anonymous,
             nominal_selfs: b_nominal_selfs,
             tops: b_tops,
             horn: b_horn,
@@ -2061,6 +2123,7 @@ impl Index {
         assert_eq!(a_universal, b_universal, "fixture universal facts");
         assert_eq!(a_keys, b_keys, "fixture original keys including duplicates");
         assert_eq!(a_nominals, b_nominals, "fixture nominals");
+        assert_eq!(a_anonymous, b_anonymous, "fixture anonymous individuals");
         assert_eq!(a_nominal_selfs, b_nominal_selfs, "fixture nominal selfs");
         assert_eq!(a_tops, b_tops, "fixture top roles");
         assert!(
@@ -2365,6 +2428,7 @@ impl Index {
                 .sum::<usize>()
             + self.universal.capacity() * 8
             + self.nominals.capacity() * 4
+            + self.anonymous.capacity() * 4
             + self.roles.bytes()
             + self.horn.as_ref().map_or(0, |h| h.bytes())
             + self.dl.as_ref().map_or(0, |d| d.bytes())
@@ -2598,6 +2662,7 @@ impl Index {
         ix.selfs = b.selfs;
         ix.keys = ax.keys.clone();
         ix.nominals = it.nominals().collect();
+        ix.anonymous = it.anonymous_nominals();
         ix.vals = it.copy_values()?;
         ix.numeric_ledger = it.ranges.ledger.clone();
         if let Some(d) = &ax.dl {

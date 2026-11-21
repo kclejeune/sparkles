@@ -481,10 +481,7 @@ impl Norm<'_> {
     fn singletons(&mut self, is: &std::collections::BTreeSet<Individual>) -> Result<Vec<Ex>, Why> {
         let mut es = Vec::with_capacity(is.len());
         for i in is {
-            match i {
-                Individual::Named(n) => es.push(self.it.nominal(n)),
-                Individual::Anonymous(_) => return Err("anonymous individuals"),
-            }
+            es.push(self.it.individual(i));
         }
         es.sort_unstable();
         es.dedup();
@@ -1169,12 +1166,9 @@ fn normalize_within(
 ) -> Result<Option<(Vec<bool>, DlAx)>, Halt> {
     let mut taken = vec![false; axioms.len()];
     // individuals make the run rooted: those the EL part interned before the
-    // normalization, and those the axioms outside it name
+    // normalization, and those the axioms outside it hold, anonymous ones among them
     let rooted = allowed.rooted
-        && (!it.individuals.is_empty()
-            || axioms
-                .iter()
-                .any(|k| crate::model::Signature::names_individual(k)));
+        && (!it.individuals.is_empty() || axioms.iter().any(|k| super::index::holds_individual(k)));
     let counting = allowed.counting && axioms.iter().any(|k| axiom_counts(k, rooted));
     let order = allowed.order && counting && !rooted;
     // every object property has its inverse

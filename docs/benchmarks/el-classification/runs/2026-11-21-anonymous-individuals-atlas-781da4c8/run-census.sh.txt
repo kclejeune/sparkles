@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# census (no modules) of each affected input with the base and tip builds, then the tip's taxonomies for the HermiT check
+L=$(cd "$(dirname "$0")" && pwd)
+H=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/hermit
+mkdir -p $L/census-base $L/census-tip $L/hermit-tip
+while IFS=$'\t' read -r s f; do
+  b=$(basename "$f")
+  for arm in base tip; do
+    o=$L/census-$arm/$b.json; [ -s "$o" ] && continue
+    /usr/bin/time -f '%M' -o "$o.rss" timeout -k 10 900 $L/bin/census-$arm --threads 2 --deadline 300 --no-modules "$f" > "$o" 2> "$o.err" || echo "{\"failed\":1}" > "$o"
+  done
+  n=${b%.owl}
+  if [ -s $H/$n.txt ]; then
+    for mode in default rooted; do
+      flag=; [ $mode = rooted ] && flag=--rooted
+      o=$L/hermit-tip/$n-$mode
+      [ -s $o.json ] && continue
+      timeout -k 10 900 $L/bin/el_classify-tip --threads 4 $flag --taxonomy $o.txt "$f" > $o.json 2> $o.err; echo $? > $o.status
+    done
+  fi
+done < $L/anon-inputs.tsv
+echo CENSUS-DONE

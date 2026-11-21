@@ -118,19 +118,21 @@ pub(crate) fn broken(rule: &'static str, message: impl Into<String>) -> Broken {
 }
 
 /// The rules of OWL 2 EL that one axiom breaks, without the global restriction on the
-/// ranges of property chains.
-pub(crate) fn el_axiom(ax: &AxiomKind) -> Vec<Broken> {
-    el::axiom_kind(ax)
+/// ranges of property chains and without the rule against anonymous individuals, which
+/// the classifier takes as fresh individuals that no answer names (roadmap item 1281).
+pub(crate) fn el_axiom_with_anonymous(ax: &AxiomKind) -> Vec<Broken> {
+    el::axiom_kind_with(ax, true)
 }
 
-/// The first rule of [`el_axiom`] that one axiom breaks, which allocates only for an
-/// axiom that the allocation-free check cannot pass, so that a classification checks
-/// its axioms without copying their names.
+/// The first rule of [`el_axiom_with_anonymous`] that one axiom breaks, which allocates
+/// only for an axiom that the allocation-free check cannot pass, so that a classification
+/// checks its axioms without copying their names. That check passes no anonymous
+/// individual, so an axiom that holds one takes the full check.
 pub(crate) fn el_first(ax: &AxiomKind) -> Option<Broken> {
     if el::certainly_el(ax) {
         None
     } else {
-        el_axiom(ax).into_iter().next()
+        el_axiom_with_anonymous(ax).into_iter().next()
     }
 }
 
@@ -565,14 +567,16 @@ mod el_first_tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(4096))]
-        /// The allocation-free check passes only axioms that break no rule, and the first
-        /// rule broken is the full check's first, with its message.
+        /// The allocation-free check passes only axioms that break no rule, even with
+        /// the rule against anonymous individuals, and the first rule broken is the first
+        /// of the full check without that rule, with its message.
         #[test]
         fn el_first_matches_el_axiom(k in axiom()) {
-            let all = el_axiom(&k);
+            let strict = el::axiom_kind(&k);
             if el::certainly_el(&k) {
-                prop_assert!(all.is_empty(), "{k:?} passed but breaks {:?}", all[0].message);
+                prop_assert!(strict.is_empty(), "{k:?} passed but breaks {:?}", strict[0].message);
             }
+            let all = el_axiom_with_anonymous(&k);
             let first = el_first(&k);
             prop_assert_eq!(
                 first.map(|b| (b.rule, b.message)),

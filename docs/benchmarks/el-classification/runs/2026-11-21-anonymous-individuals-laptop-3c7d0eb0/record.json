@@ -1,0 +1,33 @@
+{
+ "suite": "el-classification",
+ "kind": "correctness",
+ "scale": "the 59 files of the ORE 2015 DL development set that hold anonymous individuals or inclusions in a top property (inputs.tsv)",
+ "host": {
+  "name": "stanley",
+  "role": "laptop"
+ },
+ "manifest": {
+  "commit": "3c7d0eb0",
+  "compared_with": "the census and taxonomies of 781da4c8 in runs/2026-11-21-anonymous-individuals-atlas-781da4c8",
+  "binaries": {
+   "census": "c5e269b71092e639b4a60e726ec8dbbfa89caf71d7962defcc0c8acb6ccae325",
+   "el_classify": "995b8a64430273cbb2479266e335f156e976f7f0d87b2d687904739fa2898fc8"
+  },
+  "build": "mbx build --release -p sparkles-owl --example el_classify --example census at 3c7d0eb0, with the census example of the earlier record"
+ },
+ "method": "census-final.sh.txt runs the census of each input on two threads in the default and the rooted run, and hermit-final.sh.txt classifies the 29 files with a HermiT 1.4.5.519 reference on four threads in both runs and judges each taxonomy with scripts/elk-compare/ours-compare.py. census-tip-final.txt compares the census with that of 781da4c8.",
+ "results": {
+  "cells": 118,
+  "cells_that_differ_from_781da4c8": 0,
+  "left_out": 5048,
+  "files_with_nothing_left_out": {
+   "default": 30,
+   "rooted": 31
+  },
+  "hermit": {
+   "judged": 58,
+   "equal": 58
+  }
+ },
+ "notes": "The review fixes after 781da4c8 change rooted detection, the Horn rules with individuals, chain deferral and the budget of the scan. No cell of these files changes."
+}

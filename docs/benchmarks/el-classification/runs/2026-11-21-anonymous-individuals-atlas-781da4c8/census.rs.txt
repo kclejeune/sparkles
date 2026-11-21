@@ -1,0 +1,615 @@
+//! Census of the axioms a classification run leaves out (lane outside-census, row 1272).
+//!
+//! census [--threads N] [--deadline SECS] [--module-work N] [--no-modules] INPUT
+//!
+//! Reads INPUT as el_classify does, classifies it with the default limits and again with
+//! `rooted`, and prints one JSON line with, for each run, the answer fields of el_classify,
+//! the excluded axioms grouped by rule, message (IRIs and numbers masked) and axiom kind,
+//! and the partial gaps. Unless `--no-modules` is given, it then computes the syntactic
+//! bottom-locality module of each named class (the rules of
+//! crates/sparkles-owl/src/transform/module.rs, copied here because `local` is private)
+//! and counts, for each run and group, the classes whose module holds an excluded axiom of
+//! that group: the classes whose subsumers the left-out axioms can change. The module work
+//! is bounded by `--module-work` axiom checks; past it the classes done are a uniform
+//! sample of the classes, and the report says how many were done.
+
+use oxrdf::Triple;
+use oxrdfio::{RdfFormat, RdfParser};
+use sparkles_owl::classify::{Gap, Limits, Saturation, logical};
+use sparkles_owl::model::*;
+use sparkles_owl::{Axiom, ofn_read, read, vocab};
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+type Set = rustc_hash::FxHashSet<String>;
+type Map<K, V> = rustc_hash::FxHashMap<K, V>;
+
+fn mask(s: &str) -> String {
+    // replace <...> IRIs and numbers so that messages group
+    let mut out = String::new();
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '<' {
+            for d in chars.by_ref() {
+                if d == '>' {
+                    break;
+                }
+            }
+            out.push_str("<IRI>");
+        } else if c.is_ascii_digit() {
+            while chars.peek().is_some_and(|d| d.is_ascii_digit()) {
+                chars.next();
+            }
+            out.push('N');
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn kind_name(k: &AxiomKind) -> String {
+    let d = format!("{k:?}");
+    d.split(['(', ' ', '{']).next().unwrap_or("").to_string()
+}
+
+struct Run {
+    json: serde_json::Value,
+    /// group key of each excluded axiom kind
+    groups: Vec<(String, AxiomKind)>,
+}
+
+fn run(kinds: &[&AxiomKind], limits: &Limits, rules: usize) -> Run {
+    let t = Instant::now();
+    let mut s = Saturation::new();
+    let r = s.classify(kinds, None, limits);
+    let ms = t.elapsed().as_secs_f64() * 1000.0;
+    let out = match r {
+        Ok(o) => o,
+        Err(e) => {
+            return Run {
+                json: serde_json::json!({"error": format!("{e:?}"), "ms": ms}),
+                groups: Vec::new(),
+            };
+        }
+    };
+    let st = &out.stats;
+    let mut groups = Vec::new();
+    let mut by: BTreeMap<String, usize> = BTreeMap::new();
+    let mut partial: BTreeMap<String, usize> = BTreeMap::new();
+    let mut outside = 0;
+    for e in s.excluded() {
+        match &e.gap {
+            Gap::Outside { rule, message } => {
+                outside += 1;
+                let key = format!("{rule} | {} | {}", mask(message), kind_name(&e.axiom));
+                *by.entry(key.clone()).or_default() += 1;
+                groups.push((key, e.axiom.clone()));
+            }
+            Gap::Partial(why) => {
+                *partial
+                    .entry(format!("{why} | {}", kind_name(&e.axiom)))
+                    .or_default() += 1;
+            }
+        }
+    }
+    let json = serde_json::json!({
+        "ms": ms,
+        "complete": out.complete,
+        "incomplete": out.incomplete.len(),
+        "consistency": format!("{:?}", out.consistency),
+        "outside": outside + rules,
+        "tier": st.tier.as_str(),
+        "outsideHorn": st.outside_el.horn,
+        "outsideDisjunctive": st.outside_el.disjunctive,
+        "outsideGlobal": st.outside_el.global,
+        "outsideTaken": st.outside_el.taken,
+        "hornOverBudget": st.horn_over_budget,
+        "dlOverBudget": st.dl_over_budget,
+        "dlCountingOver": st.dl_counting_over,
+        "dlRootedOver": st.dl_rooted_over,
+        "dlRootedDeclined": st.dl_rooted_declined,
+        "dlAttemptOver": st.dl_attempt_over,
+        "excluded": by,
+        "partial": partial,
+    });
+    Run { json, groups }
+}
+
+struct Sig<'s> {
+    base: &'s Set,
+    extra: &'s Set,
+}
+
+impl Sig<'_> {
+    fn has(&self, iri: &str) -> bool {
+        self.base.contains(iri) || self.extra.contains(iri)
+    }
+    fn outside_ope(&self, p: &ObjectPropertyExpression) -> bool {
+        let n = p.named().as_str();
+        n != vocab::OWL_TOP_OBJECT_PROPERTY && !self.has(n)
+    }
+    fn outside_dp(&self, p: &DataProperty) -> bool {
+        p.as_str() != vocab::OWL_TOP_DATA_PROPERTY && !self.has(p.as_str())
+    }
+    fn bottom(&self, c: &ClassExpression) -> bool {
+        use ClassExpression as C;
+        match c {
+            C::Class(c) => {
+                c.as_str() == vocab::OWL_NOTHING
+                    || c.as_str() != vocab::OWL_THING && !self.has(c.as_str())
+            }
+            C::ObjectComplementOf(c) => self.top(c),
+            C::ObjectIntersectionOf(cs) => cs.iter().any(|c| self.bottom(c)),
+            C::ObjectUnionOf(cs) => cs.iter().all(|c| self.bottom(c)),
+            C::ObjectSomeValuesFrom(p, c) => self.outside_ope(p) || self.bottom(c),
+            C::ObjectHasValue(p, _) | C::ObjectHasSelf(p) => self.outside_ope(p),
+            C::ObjectMinCardinality(n, p, c) | C::ObjectExactCardinality(n, p, c) => {
+                *n > 0 && (self.outside_ope(p) || c.as_deref().is_some_and(|c| self.bottom(c)))
+            }
+            C::DataSomeValuesFrom(ps, _) => ps.iter().any(|p| self.outside_dp(p)),
+            C::DataHasValue(p, _) => self.outside_dp(p),
+            C::DataMinCardinality(n, p, _) | C::DataExactCardinality(n, p, _) => {
+                *n > 0 && self.outside_dp(p)
+            }
+            C::ObjectOneOf(is) => is.is_empty(),
+            C::ObjectAllValuesFrom(..)
+            | C::ObjectMaxCardinality(..)
+            | C::DataAllValuesFrom(..)
+            | C::DataMaxCardinality(..) => false,
+        }
+    }
+    fn top(&self, c: &ClassExpression) -> bool {
+        use ClassExpression as C;
+        match c {
+            C::Class(c) => c.as_str() == vocab::OWL_THING,
+            C::ObjectComplementOf(c) => self.bottom(c),
+            C::ObjectIntersectionOf(cs) => cs.iter().all(|c| self.top(c)),
+            C::ObjectUnionOf(cs) => cs.iter().any(|c| self.top(c)),
+            C::ObjectAllValuesFrom(p, c) => self.outside_ope(p) || self.top(c),
+            C::ObjectMaxCardinality(_, p, c) => {
+                self.outside_ope(p) || c.as_deref().is_some_and(|c| self.bottom(c))
+            }
+            C::ObjectMinCardinality(0, ..) | C::DataMinCardinality(0, ..) => true,
+            C::DataAllValuesFrom(ps, _) => ps.iter().any(|p| self.outside_dp(p)),
+            C::DataMaxCardinality(_, p, _) => self.outside_dp(p),
+            _ => false,
+        }
+    }
+}
+
+fn local(k: &AxiomKind, s: &Sig) -> bool {
+    use AxiomKind as K;
+    let sub_ope = |p: &SubObjectPropertyExpression| match p {
+        SubObjectPropertyExpression::Expression(p) => s.outside_ope(p),
+        SubObjectPropertyExpression::Chain(ps) => ps.iter().any(|p| s.outside_ope(p)),
+    };
+    match k {
+        K::SubClassOf(a, b) => s.bottom(a) || s.top(b),
+        K::EquivalentClasses(cs) => cs.iter().all(|c| s.bottom(c)) || cs.iter().all(|c| s.top(c)),
+        K::DisjointClasses(cs) => cs.iter().filter(|c| !s.bottom(c)).count() <= 1,
+        K::DisjointUnion(c, cs) => !s.has(c.as_str()) && cs.iter().all(|c| s.bottom(c)),
+        K::SubObjectPropertyOf(p, _) => sub_ope(p),
+        K::EquivalentObjectProperties(ps) => ps.iter().all(|p| s.outside_ope(p)),
+        K::DisjointObjectProperties(ps) => ps.iter().filter(|p| !s.outside_ope(p)).count() <= 1,
+        K::InverseObjectProperties(p, q) => s.outside_ope(p) && s.outside_ope(q),
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => {
+            s.outside_ope(p) || s.top(c)
+        }
+        K::FunctionalObjectProperty(p)
+        | K::InverseFunctionalObjectProperty(p)
+        | K::IrreflexiveObjectProperty(p)
+        | K::SymmetricObjectProperty(p)
+        | K::AsymmetricObjectProperty(p)
+        | K::TransitiveObjectProperty(p) => s.outside_ope(p),
+        K::SubDataPropertyOf(p, _) => s.outside_dp(p),
+        K::EquivalentDataProperties(ps) => ps.iter().all(|p| s.outside_dp(p)),
+        K::DisjointDataProperties(ps) => ps.iter().filter(|p| !s.outside_dp(p)).count() <= 1,
+        K::DataPropertyDomain(p, c) => s.outside_dp(p) || s.top(c),
+        K::DataPropertyRange(p, _) | K::FunctionalDataProperty(p) => s.outside_dp(p),
+        K::ClassAssertion(c, _) => s.top(c),
+        K::NegativeObjectPropertyAssertion(p, _, _) => s.outside_ope(p),
+        K::NegativeDataPropertyAssertion(p, _, _) => s.outside_dp(p),
+        K::HasKey(..) | K::Declaration(_) => true,
+        K::AnnotationAssertion(..)
+        | K::SubAnnotationPropertyOf(..)
+        | K::AnnotationPropertyDomain(..)
+        | K::AnnotationPropertyRange(..) => true,
+        _ => false,
+    }
+}
+
+/// For each run, the classes whose bottom module holds an excluded axiom of each group.
+fn abox(k: &AxiomKind) -> bool {
+    use AxiomKind as K;
+    matches!(
+        k,
+        K::ClassAssertion(..)
+            | K::ObjectPropertyAssertion(..)
+            | K::DataPropertyAssertion(..)
+            | K::NegativeObjectPropertyAssertion(..)
+            | K::NegativeDataPropertyAssertion(..)
+            | K::SameIndividual(..)
+            | K::DifferentIndividuals(..)
+    )
+}
+
+fn modules(axioms: &[Axiom], runs: &[&Run], work_cap: u64, tbox: bool) -> serde_json::Value {
+    let t = Instant::now();
+    // the logical axioms, deduplicated by kind
+    let mut idx: Map<&AxiomKind, usize> = Map::default();
+    let mut ax: Vec<&AxiomKind> = Vec::new();
+    for a in axioms {
+        if logical(&a.kind)
+            && !matches!(a.kind, AxiomKind::Declaration(_))
+            && !(tbox && abox(&a.kind))
+            && !idx.contains_key(&a.kind)
+        {
+            idx.insert(&a.kind, ax.len());
+            ax.push(&a.kind);
+        }
+    }
+    let mut sigs: Vec<Vec<String>> = Vec::with_capacity(ax.len());
+    let mut by_entity: Map<String, Vec<u32>> = Map::default();
+    let mut classes: Vec<String> = Vec::new();
+    let mut seen_class = Set::default();
+    for (i, k) in ax.iter().enumerate() {
+        let a: Axiom = (*k).clone().into();
+        let mut v = Vec::new();
+        for e in a.signature() {
+            let iri = e.iri().as_str().to_string();
+            if let Entity::Class(_) = e
+                && iri != vocab::OWL_THING
+                && iri != vocab::OWL_NOTHING
+                && seen_class.insert(iri.clone())
+            {
+                classes.push(iri.clone());
+            }
+            by_entity.entry(iri.clone()).or_default().push(i as u32);
+            v.push(iri);
+        }
+        sigs.push(v);
+    }
+    // the group of each excluded axiom, per run
+    let mut tag: Vec<Map<u32, u32>> = Vec::new();
+    let mut names: Vec<Vec<String>> = Vec::new();
+    let mut unmatched = Vec::new();
+    for r in runs {
+        let mut m = Map::default();
+        let mut n: Vec<String> = Vec::new();
+        let mut gid: Map<&str, u32> = Map::default();
+        let mut un = 0;
+        for (g, k) in &r.groups {
+            let id = *gid.entry(g.as_str()).or_insert_with(|| {
+                n.push(g.clone());
+                (n.len() - 1) as u32
+            });
+            match idx.get(k) {
+                Some(&i) => {
+                    m.insert(i as u32, id);
+                }
+                None => un += 1,
+            }
+        }
+        tag.push(m);
+        names.push(n);
+        unmatched.push(un);
+    }
+    // the module of the empty signature, which every class's module holds
+    let empty = Set::default();
+    let mut base = Set::default();
+    let mut in_base = vec![false; ax.len()];
+    let mut queue: Vec<String> = Vec::new();
+    let mut work: u64 = 0;
+    for (i, k) in ax.iter().enumerate() {
+        work += 1;
+        if !local(
+            k,
+            &Sig {
+                base: &base,
+                extra: &empty,
+            },
+        ) {
+            in_base[i] = true;
+            for e in &sigs[i] {
+                if base.insert(e.clone()) {
+                    queue.push(e.clone());
+                }
+            }
+        }
+    }
+    while let Some(iri) = queue.pop() {
+        let Some(list) = by_entity.get(&iri) else {
+            continue;
+        };
+        for &i in list {
+            let i = i as usize;
+            work += 1;
+            if in_base[i]
+                || local(
+                    ax[i],
+                    &Sig {
+                        base: &base,
+                        extra: &empty,
+                    },
+                )
+            {
+                continue;
+            }
+            in_base[i] = true;
+            for e in &sigs[i] {
+                if base.insert(e.clone()) {
+                    queue.push(e.clone());
+                }
+            }
+        }
+    }
+    let base_size = in_base.iter().filter(|b| **b).count();
+    // the groups the base module holds, per run
+    let base_groups: Vec<Vec<u32>> = tag
+        .iter()
+        .map(|m| {
+            let mut v: Vec<u32> = (0..ax.len())
+                .filter(|i| in_base[*i])
+                .filter_map(|i| m.get(&(i as u32)).copied())
+                .collect();
+            v.sort();
+            v.dedup();
+            v
+        })
+        .collect();
+    // classes in a fixed pseudo-random order, so that a budget cut leaves a uniform sample
+    let mut order: Vec<usize> = (0..classes.len()).collect();
+    let mut x: u64 = 0x9e3779b97f4a7c15;
+    for i in (1..order.len()).rev() {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        order.swap(i, (x % (i as u64 + 1)) as usize);
+    }
+    let any_excluded = tag.iter().any(|m| !m.is_empty());
+    let mut counts: Vec<Vec<u64>> = names.iter().map(|n| vec![0; n.len()]).collect();
+    let mut any: Vec<u64> = vec![0; runs.len()];
+    let mut done = 0usize;
+    let mut stamp = vec![0u32; ax.len()];
+    let mut module_sizes: u64 = 0;
+    if any_excluded {
+        for (nth, &ci) in order.iter().enumerate() {
+            if work > work_cap {
+                break;
+            }
+            let g = nth as u32 + 1;
+            let c = &classes[ci];
+            let mut extra = Set::default();
+            let mut hit: Vec<Vec<u32>> = base_groups.clone();
+            if !base.contains(c) {
+                extra.insert(c.clone());
+                let mut q = vec![c.clone()];
+                while let Some(iri) = q.pop() {
+                    let Some(list) = by_entity.get(&iri) else {
+                        continue;
+                    };
+                    for &i in list {
+                        let iu = i as usize;
+                        work += 1;
+                        if in_base[iu] || stamp[iu] == g {
+                            continue;
+                        }
+                        if local(
+                            ax[iu],
+                            &Sig {
+                                base: &base,
+                                extra: &extra,
+                            },
+                        ) {
+                            continue;
+                        }
+                        stamp[iu] = g;
+                        module_sizes += 1;
+                        for (r, m) in tag.iter().enumerate() {
+                            if let Some(&gid) = m.get(&i) {
+                                hit[r].push(gid);
+                            }
+                        }
+                        for e in &sigs[iu] {
+                            if !base.contains(e) && extra.insert(e.clone()) {
+                                q.push(e.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            for (r, h) in hit.iter_mut().enumerate() {
+                h.sort();
+                h.dedup();
+                if !h.is_empty() {
+                    any[r] += 1;
+                }
+                for &gid in h.iter() {
+                    counts[r][gid as usize] += 1;
+                }
+            }
+            done += 1;
+        }
+    }
+    let per_run: Vec<serde_json::Value> = (0..runs.len())
+        .map(|r| {
+            let groups: BTreeMap<&str, u64> = names[r]
+                .iter()
+                .zip(&counts[r])
+                .map(|(n, c)| (n.as_str(), *c))
+                .collect();
+            serde_json::json!({
+                "classesAffected": any[r],
+                "byGroup": groups,
+                "unmatched": unmatched[r],
+                "baseGroups": base_groups[r].len(),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "classes": classes.len(),
+        "classesDone": if any_excluded { done } else { classes.len() },
+        "baseModule": base_size,
+        "logical": ax.len(),
+        "work": work,
+        "meanModule": if done > 0 { module_sizes as f64 / done as f64 + base_size as f64 } else { base_size as f64 },
+        "ms": t.elapsed().as_secs_f64() * 1000.0,
+        "runs": per_run,
+    })
+}
+
+fn main() {
+    let mut args = std::env::args().skip(1);
+    let mut threads = 4usize;
+    let mut deadline = 300u64;
+    let mut work_cap: u64 = 400_000_000;
+    let mut do_modules = true;
+    let mut features_only = false;
+    let mut counting_only = false;
+    let mut ablate = String::new();
+    let mut input = None;
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--threads" => threads = args.next().and_then(|v| v.parse().ok()).unwrap(),
+            "--deadline" => deadline = args.next().and_then(|v| v.parse().ok()).unwrap(),
+            "--module-work" => work_cap = args.next().and_then(|v| v.parse().ok()).unwrap(),
+            "--no-modules" => do_modules = false,
+            "--features" => features_only = true,
+            "--counting" => counting_only = true,
+            "--drop" => ablate = args.next().unwrap(),
+            _ => input = Some(a),
+        }
+    }
+    let input = input.expect("INPUT");
+    let t = Instant::now();
+    let mut rules = 0usize;
+    let bytes = std::fs::read(&input).expect("read input");
+    let head = String::from_utf8_lossy(&bytes[..bytes.len().min(4096)]).to_string();
+    let functional = input.ends_with(".ofn")
+        || head.trim_start().starts_with("Prefix(")
+        || head.trim_start().starts_with("Ontology(");
+    let axioms: Vec<Axiom> = if functional {
+        let text = String::from_utf8(bytes).expect("UTF-8");
+        let doc = ofn_read::parse_with(&text, ofn_read::Options { skip_rules: true })
+            .unwrap_or_else(|e| panic!("{input}: {e}"));
+        rules = doc.rules;
+        doc.axioms
+    } else {
+        let format = if input.ends_with(".ttl") {
+            RdfFormat::Turtle
+        } else if input.ends_with(".nt") {
+            RdfFormat::NTriples
+        } else {
+            RdfFormat::RdfXml
+        };
+        let mut triples = Vec::new();
+        for q in RdfParser::from_format(format).lenient().for_slice(&bytes) {
+            let q = q.unwrap_or_else(|e| panic!("{input}: {e}"));
+            triples.push(Triple::new(q.subject, q.predicate, q.object));
+        }
+        drop(bytes);
+        read::read_graph(triples, read::ReadOptions::default())
+            .axioms
+            .into_keys()
+            .collect()
+    };
+    let read_ms = t.elapsed().as_secs_f64() * 1000.0;
+    // ablation: drop the axioms with data properties, datatypes or literals ("data"), with
+    // anonymous individuals ("anon"), or both ("data,anon")
+    let before = axioms.len();
+    let axioms: Vec<Axiom> = if ablate.is_empty() {
+        axioms
+    } else {
+        axioms
+            .into_iter()
+            .filter(|a| {
+                if matches!(a.kind, AxiomKind::Declaration(_)) {
+                    return true;
+                }
+                let dbg = format!("{:?}", a.kind);
+                let data = dbg.contains("DataProperty(")
+                    || dbg.contains("Literal")
+                    || dbg.contains("Datatype(");
+                let anon = dbg.contains("Anonymous(");
+                // `r ⊑ U`, a tautology
+                let top_sub = matches!(&a.kind, AxiomKind::SubObjectPropertyOf(_, sup)
+                    if sup.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY);
+                !(ablate.contains("data") && data
+                    || ablate.contains("anon") && anon
+                    || ablate.contains("topsub") && top_sub)
+            })
+            .collect()
+    };
+    let dropped = before - axioms.len();
+    let kinds: Vec<&AxiomKind> = axioms
+        .iter()
+        .map(|a| &a.kind)
+        .filter(|k| logical(k))
+        .collect();
+    let mut kinds_count: BTreeMap<String, usize> = BTreeMap::new();
+    let (mut data, mut nominal, mut top) = (0usize, 0usize, 0usize);
+    let (mut selfs, mut bottom) = (0usize, 0usize);
+    for k in &kinds {
+        *kinds_count.entry(kind_name(k)).or_default() += 1;
+        let dbg = format!("{k:?}");
+        if dbg.contains("DataProperty(") && !matches!(k, AxiomKind::Declaration(_)) {
+            data += 1;
+        }
+        if dbg.contains("ObjectOneOf(") || dbg.contains("ObjectHasValue(") {
+            nominal += 1;
+        }
+        if dbg.contains("topObjectProperty") || dbg.contains("topDataProperty") {
+            top += 1;
+        }
+        if dbg.contains("ObjectHasSelf(") {
+            selfs += 1;
+        }
+        if dbg.contains("bottomObjectProperty") || dbg.contains("bottomDataProperty") {
+            bottom += 1;
+        }
+    }
+    let features = serde_json::json!({"kinds": kinds_count, "dataAxioms": data, "nominalAxioms": nominal, "topAxioms": top, "selfAxioms": selfs, "bottomPropAxioms": bottom});
+    if features_only {
+        println!(
+            "{}",
+            serde_json::json!({"input": input, "features": features})
+        );
+        return;
+    }
+    let mk = |rooted: bool| Limits {
+        threads,
+        rooted,
+        counting: counting_only,
+        deadline: Some(Instant::now() + Duration::from_secs(deadline)),
+        ..Limits::default()
+    };
+    let d = run(&kinds, &mk(false), rules);
+    let r = run(&kinds, &mk(true), rules);
+    let (m, mt) = if do_modules {
+        (
+            modules(&axioms, &[&d, &r], work_cap, false),
+            modules(&axioms, &[&d, &r], work_cap, true),
+        )
+    } else {
+        (serde_json::Value::Null, serde_json::Value::Null)
+    };
+    println!(
+        "{}",
+        serde_json::json!({
+            "input": input,
+            "counting": counting_only,
+            "drop": ablate,
+            "dropped": dropped,
+            "axioms": axioms.len(),
+            "logical": kinds.len(),
+            "rules": rules,
+            "readMs": read_ms,
+            "default": d.json,
+            "rooted": r.json,
+            "modules": m,
+            "modulesTbox": mt,
+            "features": features,
+        })
+    );
+}
