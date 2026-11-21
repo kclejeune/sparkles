@@ -12,6 +12,24 @@ import {
   configure,
 } from '../dist/index.js';
 
+// The engine exposes no count of running queries, so this probes with `noWait` queries until one
+// is refused. An admitted probe shows that the slow queries have not all taken their permits, and
+// a ConflictError shows that every permit is held. It fails after `ms` milliseconds.
+async function waitUntilPermitsHeld(ds, ms = 10000) {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    try {
+      const probe = await ds.select('SELECT * { ?s ?p ?o } LIMIT 1', { noWait: true });
+      await probe.toArray();
+    } catch (e) {
+      if (e instanceof ConflictError) return;
+      throw e;
+    }
+    assert.ok(Date.now() < deadline, `the slow queries did not take every permit within ${ms} ms`);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
 test(
   'explicit streaming queries pin snapshots and expose unknown size',
   { timeout: 30000 },
@@ -223,20 +241,25 @@ test(
     assert.throws(() => configure({ maxConcurrentQueries: 0 }), InvalidInputError);
     assert.throws(() => configure({ maxConcurrentQueries: 1.5 }), InvalidInputError);
     const ds = Dataset.memory();
+    const controller = new AbortController();
+    let slow;
     configure({ maxConcurrentQueries: 1 });
     try {
       const data = Array.from({ length: 10000 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
       await ds.load(data, { format: 'ttl' });
-      // A join of 10^8 rows holds the only permit until its timeout.
-      const slow = ds
+      // A join of 10^8 rows holds the only permit until it is cancelled. Its timeout is longer
+      // than the poll, so it cannot end before the poll sees its permit held.
+      slow = ds
         .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
-          timeout: 5000,
+          timeout: 20000,
+          signal: controller.signal,
         })
         .catch((e) => e);
-      await new Promise((resolve) => setTimeout(resolve, 200));
+      await waitUntilPermitsHeld(ds);
       await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
-      await slow;
     } finally {
+      controller.abort();
+      await slow;
       configure({ maxConcurrentQueries: availableParallelism() });
       await ds.close();
     }
@@ -245,24 +268,31 @@ test(
 
 test('graph overview waits for a query permit', { timeout: 30000 }, async () => {
   const ds = Dataset.memory();
+  const controller = new AbortController();
+  let slow;
   configure({ maxConcurrentQueries: 1 });
   try {
     const data = Array.from({ length: 10000 }, (_, i) => `<urn:s${i}> <urn:p> ${i} .`).join('\n');
     await ds.load(data, { format: 'ttl' });
-    // A join of 10^8 rows holds the only permit until its timeout.
-    const slow = ds
+    // A join of 10^8 rows holds the only permit until it is cancelled. Its timeout is longer
+    // than the poll, so it cannot end before the poll sees its permit held.
+    slow = ds
       .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
-        timeout: 5000,
+        timeout: 20000,
+        signal: controller.signal,
       })
       .catch((e) => e);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitUntilPermitsHeld(ds);
     await assert.rejects(
       ds.graph.groups({ within: { class: 'urn:C' } }, { noWait: true }),
       ConflictError,
     );
+    controller.abort();
     await slow;
     assert.equal((await ds.graph.groups({ within: { class: 'urn:C' } })).within.size, 0);
   } finally {
+    controller.abort();
+    await slow;
     configure({ maxConcurrentQueries: availableParallelism() });
     await ds.close();
   }
@@ -291,11 +321,12 @@ test('existing cursors use the query limit after reconfiguration', { timeout: 30
     configure({ maxConcurrentQueries: 1 });
     slow = ds
       .select('SELECT (COUNT(*) AS ?n) { ?a <urn:p> ?x . ?b <urn:p> ?y FILTER(?x + ?y < 0) }', {
-        timeout: 10000,
+        // Longer than the 10 s poll below, so the slow query cannot time out before it.
+        timeout: 20000,
         signal: controller.signal,
       })
       .catch((e) => e);
-    await new Promise((resolve) => setTimeout(resolve, 200));
+    await waitUntilPermitsHeld(ds);
     await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
     let delivered = false;
     const next = cursor.next().then((row) => {
@@ -344,21 +375,8 @@ test('a lowered query limit is not exceeded by running queries', { timeout: 3000
         })
         .catch((e) => e),
     );
-    // The engine exposes no count of running queries, so probe at the original limit of 2. A
-    // probe that is admitted proves a slow query has not taken its permit yet, and a
-    // ConflictError proves that both have.
-    const deadline = Date.now() + 10000;
-    for (;;) {
-      try {
-        const probe = await ds.select('SELECT * { ?s ?p ?o } LIMIT 1', { noWait: true });
-        await probe.toArray();
-      } catch (e) {
-        if (e instanceof ConflictError) break;
-        throw e;
-      }
-      assert.ok(Date.now() < deadline, 'the slow queries did not take both permits within 10 s');
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
+    // Probing at the original limit of 2 shows when both slow queries hold a permit.
+    await waitUntilPermitsHeld(ds);
     // Both running queries keep their permits, so the lowered limit owes one.
     configure({ maxConcurrentQueries: 1 });
     await assert.rejects(ds.select('SELECT * { ?s ?p ?o }', { noWait: true }), ConflictError);
