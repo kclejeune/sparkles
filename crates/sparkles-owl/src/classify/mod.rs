@@ -79,6 +79,7 @@ mod dl_norm;
 mod dl_reduce;
 mod dl_root;
 mod dl_rules;
+mod dtcheck;
 mod horn;
 mod horn_rules;
 mod index;

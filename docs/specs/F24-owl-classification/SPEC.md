@@ -3837,6 +3837,327 @@ thread the fallback of ore_ont_6485 takes 55 ms longer, and that of ore_ont_1481
 10 s against 132 s without steps. The times above are from one host under load, and
 none is from the benchmark host.
 
+### The datatype checker
+
+Items 768 and 972 add a datatype checker that every tier of the classifier shares. This
+subsection is their design, and its outcome follows as the phases land. The checker
+decides, for one context, the data restrictions, data ranges, data cardinalities,
+functional data properties and data-property keys that apply there, over the whole OWL 2
+datatype map with its facets. The EL and Horn tiers call it for the meets and inclusions
+of their data lattice and for the covers that would need a case analysis, Tier D and the
+rooted run call it through a theory rule over the data atoms of each context, and the
+worlds of the Horn rules with individuals call it for the values of keys and
+functional properties. It is written from the OWL 2 Structural Specification §4, §5.7,
+§9.3.6, §9.4 and §11.2, the Direct Semantics §2.2 and §2.3, and XML Schema 1.1 Part 2,
+and the Hyper rule of the clause calculus. No other reasoner's source is read.
+
+**Why it is needed.** On the ORE 2015 DL development files that the census of item 1272
+found leaving axioms out for data, the datatypes in use are `xsd:int`, `xsd:string`,
+`xsd:anyURI`, `xsd:double`, `xsd:integer`, `xsd:float`, `xsd:boolean`, `xsd:dateTime`,
+`xsd:nonNegativeInteger`, `xsd:decimal`, `owl:real` and `xsd:positiveInteger`, in that
+order of use. Only two files restrict a datatype with facets, and both use the four
+bounds. No file uses `pattern` or a length facet, data unions or complements, keys or
+`DisjointDataProperties`. Functional data properties appear in 21 files, exact data
+cardinalities in 21 and maximum data cardinalities in 9. Item 972 is mostly `xsd:int`,
+which is outside OWL 2 EL because its value space is finite, and the floating-point and
+Boolean datatypes. The checker covers the whole map so that the remaining gaps are named
+and small, and its first phases favour these datatypes.
+
+**Values and identity.** A data value is compared by identity, as §9.3.6 requires of
+cardinality restrictions and functional data properties, and a facet is compared by the
+datatype's equality and order. The two differ in three places. The values `+0` and `-0`
+of `xsd:float` or `xsd:double` are equal and not identical, so a functional property
+with both values is inconsistent, while `minInclusive 0` admits both. NaN is identical to
+itself and is excluded by every bound facet, since it is incomparable with every value.
+Two date-times that denote the same instant with different offsets are equal and not
+identical (§4.7). The checker therefore computes an exact value of each literal as its
+identity key, with rationals of any size and date-times with years of any length and
+seconds of any precision, and keeps the order that the facets use beside it.
+
+**Families and value spaces.** The checker reads the map as disjoint families. Within a
+family the datatypes nest or are intervals, and between families the value spaces are
+disjoint. §4.2 states that `xsd:double`, `xsd:float` and `owl:real` are pairwise
+disjoint, §4.5 and §4.6 state it of the two binary datatypes and of `xsd:anyURI` and
+`xsd:string`, and the families of `xsd:boolean`, `xsd:dateTime` and `rdf:XMLLiteral` are
+disjoint from the others, the first two as primitive datatypes of XML Schema. The
+disjointness of `rdf:XMLLiteral` rests on its definition in RDF and is verified in phase 1. The families are these.
+
+| Family | Datatypes | Representation |
+|---|---|---|
+| Real | `owl:real`, `owl:rational`, `xsd:decimal`, `xsd:integer` and its twelve subtypes | Four strata, the integers, the decimals that are not integers, the rationals that are not decimals and the reals that are not rationals. Each stratum holds a finite union of intervals with exact rational ends, each end open or closed. |
+| Double, Float | `xsd:double`, `xsd:float` | A finite union of intervals over the values in their total order, with `-0` below `+0` and NaN as a separate point. |
+| Plain | `rdf:PlainLiteral`, `xsd:string`, `normalizedString`, `token`, `NMTOKEN`, `Name`, `NCName`, `language` | Untagged strings by a set of lengths for each cell of the string chain. Tagged strings by a set of lengths for each tag, given by the longest basic language range of a finite map that matches the tag or by a default, so that a range minus a narrower range is represented. `rdf:langString` is the tagged strings alone. |
+| URI | `xsd:anyURI` | Strings with a set of lengths and finite included and excluded values. |
+| Hex, Base64 | `xsd:hexBinary`, `xsd:base64Binary` | Octet sequences with a set of lengths and finite included and excluded values. |
+| Boolean | `xsd:boolean` | A subset of the two values. |
+| Time | `xsd:dateTime`, `xsd:dateTimeStamp` | Values with an offset by intervals of instants, values without one by intervals of local times, and finite included and excluded identities. |
+| XML | `rdf:XMLLiteral` | Opaque values, as today. |
+
+The integer subtypes are intervals of the integer stratum with the bounds of XML Schema
+1.1 §3.4, so `xsd:int` is the integers from -2147483648 to 2147483647. The string
+datatypes form one chain, `xsd:string ⊃ normalizedString ⊃ token ⊃ NMTOKEN ⊃ Name ⊃
+NCName ⊃ language`, since every language tag starts with a letter and holds only
+letters, digits and hyphens. A cell of the chain is the strings at one level and not at
+the next. A range in normal form is a union over the families of these pieces, with finite sets of
+values included beyond them and excluded from them, which is closed under intersection,
+union and complement. `rdfs:Literal` is the whole data domain, which the Direct
+Semantics §2.2 requires only to contain the value spaces of the map. The normal form
+therefore has one more region, the values outside every datatype of the map, which no
+literal denotes and which is infinite for the checker, since an interpretation can
+always add values there. A complement is taken within the data domain, as Table 3 of the
+Direct Semantics defines `DataComplementOf`, so `DataComplementOf(xsd:int)` holds every
+string, and the complement of the union of every datatype of the map is not empty.
+A datatype definition is replaced by its range, which §11.2 keeps acyclic. Normal forms
+are interned, and the meet, inclusion and emptiness of two ids are computed once and
+cached. The values that a family's base holds as points are never held among the
+included or excluded values. These are the numbers, the floating-point and Boolean
+values, the date-times without an offset and the members of the classes of at most
+three values, which are the empty string, the space, `:`, the tab, line feed and carriage
+return, and the empty values of `xsd:anyURI`, `xsd:hexBinary` and `xsd:base64Binary`.
+The tests check that equal ranges of these families have one id. A larger finite class,
+such as `xsd:hexBinary` of length 1, can be held whole in the base by one form and value
+by value by another, so equal ranges can have two ids. Ids are therefore cache keys, and
+whether a range lies within another is decided through sizes, never by comparing ids.
+
+**Facets.** The bound facets of the real, floating-point and time families cut their
+intervals. A bound of the time family on a value without an offset follows the partial order of
+§4.7, under which a local time and an instant are never equal, a local time is below an
+instant only when it is below it with the offset `-14:00`, the latest instant it can
+denote, and above it only when it is above it with `+14:00`, the earliest. A bound with
+an offset therefore narrows the local times by fourteen hours on that side and becomes
+strict there, and a bound without an offset does the same to the instants. Under the
+§4.7 example, `minInclusive "1956-01-01T04:00:00-05:00"` holds `1956-01-01T10:00:00Z`
+and not `1956-01-01T10:00:00`. The length facets
+of the string, URI and binary families cut their sets of lengths, counted in characters
+for strings and in octets for binary data, and `rdf:langRange` keeps the tags that a
+basic language range matches. The tags are the well-formed language tags of BCP 47, which
+RDF requires, so the range `a` matches no tag and keeps nothing, while `en-a` matches
+`en-a-bb`. The `pattern` facet needs an automaton for an XML Schema
+regular expression, which the first phases do not build. Until a later item builds it, a
+range with a pattern, like an unknown datatype, is not passed to the checker, and its
+axiom is left out and reported as used in part.
+
+**Sizes.** Every range has a size, the number of its values saturating at 2^63, given as
+a lower and an upper bound. The model's cardinalities are 32-bit numbers, so their sums
+stay far below the saturation, and the checker declines a problem whose counts reach it.
+A size also says whether the range is infinite, which only an unbounded source sets, so a
+finite count that saturates stays a lower bound that removing values lowers. A
+bounded interval of the integer stratum, every range of the floating-point and Boolean
+families and every finite set of values have finite sizes. An interval of a dense stratum of the reals is empty when it holds no value of
+the stratum, one value when it is a point of the stratum, such as `xsd:decimal[≥0.5,
+≤0.5]`, and infinite otherwise, so `owl:real[≥1/3, ≤1/3]` without `owl:rational` is
+empty. The seconds of a date-time are a decimal of unbounded precision, so an interval
+of instants is infinite unless it is one instant, which has one value for each of the
+1,681 offsets from `-14:00` to `+14:00`. A length of `xsd:anyURI` holds at least the strings of ASCII letters of that
+length, which are relative IRIs, and at most every string of it, since XML Schema 1.1
+makes every string a value and OWL 2 §4.6 calls the value space the set of IRIs. The cells of the string chain are small at short lengths. The empty string is
+the only string of length 0, `normalizedString` without `token` holds only the space at
+length 1, `string` without `normalizedString` holds three strings of length 1, and
+`language` holds 52 of length 1 and caps each subtag at 8 characters. The checker counts
+the cells of bounded length exactly up to a small length and reports an axiom as used in
+part when it would compare a cardinality with a string or binary cell it has not
+counted. The tagged strings are counted by tag. Each irregular grandfathered tag, such
+as `i-klingon`, is a whole tag that nothing extends, so `rdf:PlainLiteral[rdf:langRange
+"i-klingon", length 0]` has one value. A range that matches any other tag matches
+infinitely many. The other strata, unbounded lengths and the reals are infinite. An
+underestimate of a size would be unsound and an overestimate incomplete, so each
+family's size function has its own tests at the boundaries.
+
+**Literals.** A literal of a datatype in the map has the value of its lexical form,
+which `datatypes::lexical` checks. Date-times are checked by the checker's own parser,
+since `datatypes::lexical` refuses fractions of a second past eighteen digits, which
+XML Schema 1.1 allows, and item 1289 corrects it for the other readers. The bound facets
+of the time family are checked by the same parser. A language-tagged literal has a value
+when its string is of XML characters and its tag is well-formed under BCP 47, in either
+of its forms, and item 1290 brings the other readers to the same rule. A number or
+date-time whose lexical form is longer than 4,096 characters is not passed to the
+checker, which bounds the cost of its exact arithmetic, and its axioms are left out and
+reported as used in part. A literal whose lexical form is outside the
+lexical space of its datatype violates §5.7, so the ontology is not in OWL 2 DL and the
+Direct Semantics gives the literal no value. Reading it as the empty range would draw
+entailments from an input the semantics does not define, since its complement would hold
+every value and a negative assertion with it would say nothing. Such a literal is
+therefore never passed to the checker, nor is an XML literal or a literal of a
+datatype outside the map, since the checker cannot tell which of them denote the same
+value. Their axioms are left out and reported as used in part.
+
+**Data restrictions are atoms.** Every data restriction of the ontology,
+`DataSomeValuesFrom`, `DataAllValuesFrom`, `DataHasValue`, `DataMinCardinality` and
+`DataMaxCardinality`, is an atom over x in every tier, and `DataExactCardinality` is the
+conjunction of its minimum and maximum, since its complement is no atom. A minimum of
+zero holds of every element and is replaced by `owl:Thing` before the atoms are formed,
+and its complement by `owl:Nothing`, as the object cardinalities already are. A functional
+data property is the restriction `≤1 d` on `owl:Thing`. A data value has no successors,
+and the data property hierarchy, disjointness, ranges and functionality all apply to one
+element, so the data successors of an element exist only inside the checker. The top
+data property, which OWL 2 DL allows only as a superproperty, relates every element to
+every value and adds no constraint between elements. The complement of a data atom is a
+data atom, `∀d.¬R` for `∃d.R` and `≤(n-1) d.R` for `≥n d.R`. The normalization keeps
+one invariant that the theory rule needs. Every data atom in the body of a clause is of
+the at-least kind, an existential, a value or a minimum, since a universal or a maximum
+in a negative position becomes its dual in the head, as `∀d.R ⊑ A` becomes `⊤ ⊑ A ⊔
+∃d.¬R`. No disjunction of at-least atoms is valid on its own, because an element without
+data values satisfies none of them, so no valid clause with an empty body is needed.
+
+**The local problem.** The checker decides whether a set of data atoms can hold of one
+element together with the negations of another set. It counts values by type. A type is
+a cell of the ranges involved, a nonempty intersection of each range or its complement,
+together with an upward-closed set of the data properties involved, which are the
+properties that relate the element to a value of the type. The unknowns are one
+nonnegative integer for each type, the number of distinct values of that type. A minimum
+`≥n d.R` says that the types whose cell is within `R` and whose property set holds `d`
+sum to at least n, an existential is a minimum of one, and a maximum is the same sum
+bounded above. A universal `∀d.R` and a range of `d` set to zero every type with `d`
+whose cell is outside `R`, and `DisjointDataProperties` sets to zero every type whose
+property set holds two of its properties. The types of one cell sum to at most the
+cell's size. Each cell records, for every range involved, whether it lies within the
+range or its complement, which its construction decides, so no test of inclusion rests on
+comparing ids. The answer is whether this small integer program has a solution, which
+the checker finds exactly by a bounded search over the types that some bound mentions.
+The search bounds each count by what the other counts leave to each minimum and maximum,
+and prunes a minimum whose counts all lie under a maximum with a smaller bound.
+The counts make no assumption about which witnesses are the same value, so two
+existentials under a functional property are satisfiable with one value in the meet of
+their ranges, and large minimums need no enumeration of witnesses. A search past its
+bound answers that the bound was passed, which the callers treat as their work bounds.
+
+**The theory rule.** A context's clauses hold data atoms like any other atoms over x, and
+the context's units held in the EL index count as clauses with an empty body. When a
+processed clause's maximal literal is a data atom P, the rule takes P with the data
+atoms that are maximal in the context's other clauses and with the body atoms, the data
+atoms in the bodies of ontology clauses, in the told subsumers of the EL index such as
+the `∃d.rdfs:Literal` of a domain, and in the key clauses. The atoms it takes are those
+of P's component, the data properties connected by the hierarchy and by disjointness. It
+asks the checker for the pairs of a set of maximal atoms containing P and a set of body
+atoms whose negations make them unsatisfiable, minimal in both sets at once, so that a
+pair with a smaller head set and a larger body set is kept beside one with a smaller
+body set and a larger head set. For each pair and each choice of one clause for each
+maximal atom, it derives the union of those clauses' other literals and the pair's body
+atoms under the union of their bodies. A pair without body atoms is a conflict, such
+as a minimum above the size of its range, one body atom is an entailment such as
+`≥2 d.xsd:boolean ⊑ ∃d.{true}`, and two or more are a cover, such as `∃d.xsd:boolean
+⊑ ∃d.{true} ⊔ ∃d.{false}`. A cover needs two body atoms that overlap
+the maximal atoms partially, so it is tested only when there are two. After an equality
+rewrites a term, the rule reads the atoms of the term that remains.
+
+**Completeness.** The rule is Hyper over the clauses `P_1(x) ∧ … ∧ P_k(x) → Q_1(x) ∨ … ∨
+Q_m(x)` that are valid in the datatype map, with the `P_i` among the ontology's finitely
+many data atoms and the `Q_j` among its body atoms. Added to the ontology they give it
+the same models, since an element whose data atoms are true cannot be given values with
+its other body atoms false only when one of these clauses is violated, and a data atom
+that occurs in no body triggers no ontology clause. The calculus with them is complete
+by its own theorem, since they are ordinary ontology clauses over x, and the invariant
+above makes the clauses with an empty body unnecessary. The rule computes them lazily
+and fires on exactly the premises that Hyper would take with them, since a valid clause
+whose body atoms are not all maximal in the context cannot fire there. This makes the
+unrooted run complete in the sense of the existing tiers. The rooted run takes the same
+rule, and its completeness rests on the rooted calculus, which item 1231 records as not
+proved. A search or a set of minimal pairs past its bound passes the work bound as the
+case analysis of an inference does. An earlier design kept the data successors as terms
+of the clauses, with data function symbols, equalities between data terms and a data
+at-most rule over every set of n + 1 neighbours. It needs new rules and an argument that
+theory literals entailed by later ones do not break the model construction, and it buys
+nothing that the atoms do not, since no data term is shared between contexts.
+
+**The EL and Horn tiers.** The data properties fall into components connected by the
+hierarchy and by disjointness. A component whose ranges are all in the OWL 2 EL map and
+that has no universal restriction, cardinality, enumeration of several values, facet or
+`DisjointDataProperties` axiom stays with the EL lattice of `classify/data.rs`, which is convex
+there, since every value space of the profile is infinite and no union of its ranges
+covers another, and the lattice already meets the ranges under a functional data
+property. An ontology whose data is within OWL 2 EL therefore runs the code it runs
+today. Every other component is all data atoms. A lattice over the whole map
+would not be convex, since `∃d.xsd:boolean` entails a class that both `∃d.{true}` and
+`∃d.{false}` imply, and `∃d.xsd:integer` one that `∃d.xsd:integer[≤0]` and
+`∃d.xsd:positiveInteger` imply. The Horn tier applies the theory rule to the data atoms
+of its contexts. A conflict gives `owl:Nothing` and an entailment gives its body atom,
+which the Horn rules can take. A cover gives one class when each of its body atoms is the
+only body atom of the clauses it occurs in and they all have that class as their head,
+as for negative data assertions that all give `owl:Nothing`. Any other cover needs a
+case analysis, so the Horn tier reports its axioms as used in part and a run that Tier D
+takes decides them there. With these rules the Horn tier is complete when it reports
+nothing, since several successors and pigeonholes come out as entailments of one body
+atom. A data restriction in a negative position whose negation is not Horn, a universal
+restriction or a maximum on the left, stays with Tier D. On the 67 ORE 2015 DL files
+that the census found leaving axioms out for 768 or 972, all 27 files with data
+restrictions outside OWL 2 EL have them only in positive positions, so no negative
+universal or cardinality keeps them from the Horn tier. Covers can still arise from
+values on the left, such as a Boolean property whose two values define different
+classes, and phase 2 counts the files where a property with a finite range has two or
+more such values with different classes. The worlds of the Horn rules with individuals compare key values
+and functional values by identity through the checker.
+
+**Tier D.** Tier D's eligibility drops its refusal of data roles and keeps its refusal of
+the top data property. Data atoms are atoms of the index like named classes, ordered
+above them by id, and the theory rule runs beside Hyper in every context that holds a
+data atom.
+
+**Keys.** A key constrains only named individuals (Direct Semantics Table 9), so it adds
+nothing to a run without individuals, and Tier D without individuals ignores keys. In a
+rooted run, a key `HasKey(K (p…) (d…))` relates two constants u and v of K with one
+clause for the pair, `K(u) ∧ K(v) → u ≈ v ∨ D`, where D holds, for each key property,
+the literal that u and v share no value of it. For an object property that literal is
+the difference of their named fillers. For a data property the first phases take only
+keys whose properties, and the subproperties of those, have no positive restriction
+other than a single value, so that a shared value is the same value on both sides, as
+the worlds take today. A hash of the constants by their key values finds the pairs.
+Every other key is reported as used in part, since a range such as `xsd:int[5, 6]` on
+one side could need the cover `∃d.{5} ⊔ ∃d.{6}` to decide the pair.
+
+**The rooted run.** A data assertion `DataPropertyAssertion(d a v)` is the atom
+`∃d.{v}` on the constant a, and its negative form is `{a} ⊓ ∃d.{v} ⊑ ⊥`, as in the EL
+index. Hyper binds x to a constant, and the theory rule does the same, so each context
+decides the ground data atoms of each constant as it decides those over x.
+
+**Representation and incremental checking.** A run builds the data tables only when its
+index has a data atom. A context then keeps its processed clauses with a maximal data
+atom by the component of the atom's property, with the cached answers of the checker for
+the sets it has asked about, and the run keeps the cells of each component's ranges. A
+new maximal data atom is checked only with the atoms of its component, and the answers
+for the same sets of atoms are shared by every context through a run-level cache. The
+checks and the minimal pairs count toward the run's work bound and memory budget as the
+case analysis of an inference does.
+
+**Cost without data.** An ontology without data atoms builds no data tables, interns no
+ranges and adds no rule. The run chooses its clause loop once, before saturation, so a
+run without data atoms executes no added test per processed clause. Phase 3 compares instruction counts of the
+disjunctive fixtures with and without the change, and its timing A/B runs on a quiet
+Intel host.
+
+**Cost with data.** Item 768's experiment took the EL data restrictions as atoms in Tier
+D, which is this design without the checker, and found that sending these files to Tier
+D costs far more than leaving their data axioms out, 442 ms against 6 ms on
+ore_ont_3231. It also found that ore_ont_8273 did not finish in 120 s and that
+ore_ont_13306 left more axioms out, because Tier D leaves out Horn axioms that the Horn
+rules took. Where that cost goes is not measured, so phase 3 first profiles `2f8080e5`
+on these files with `dl_contexts`, `dl_tests` and `dl_testing`. Phase 2's Horn tier
+takes the files whose only case analysis would be in their data. For the rest, phase 3
+weighs a hybrid in which the Horn tier records the contexts where a reported cover or
+other left-out axiom fired. A class whose Horn saturation reaches no such context would
+be complete, and Tier D would test only the classes that reach one, with the union of
+the two tiers' subsumptions as the answer, since both are sound. The proof that a class
+reaching no such context is complete is that phase's obligation before it is kept.
+
+**What stays out.** The `pattern` facet until its automaton is built, ill-typed literals,
+XML literals and datatypes outside the map stay out of the checker and are reported as used in part,
+and so do cardinalities compared with string cells the checker has not counted. The top data
+property stays with the EL index and declines Tier D, as the top object property does.
+Keys outside the forced singleton case are reported as used in part.
+
+**Phases and tests.** Phase 1 builds the checker as a module with unit tests from the
+W3C OWL 2 test cases that involve datatypes, among them `Datatype-Float-Discrete-001`,
+`Plus and Minus Zero Integer`, `Minus Infinity is not in owl:real`,
+`Qualified-cardinality-boolean`, `inconsistent-integer-filler`,
+`Contradicting-dateTime-restrictions`, `New-Feature-DataQCR-001`, the
+`New-Feature-DisjointDataProperties` and `New-Feature-Keys` cases and
+`string-integer-clash`, with tests of the zeros, such as `minExclusive "-0"` excluding
+`+0`. A differential test compares the checker's answers on random small sets of atoms
+with a brute-force model finder over small finite stand-ins for the value spaces, and a
+second one does the same for the theory rule's clauses. Phase 2 is item 972 with the
+Horn tier's data atoms, checked against HermiT on the OML probes and the census files.
+Phase 3 is item 768, data atoms in Tier D and the rooted run, with the census tool run
+on the 61 files before and after.
+
 ### Nominals in the disjunctive rules
 
 This section is the design of item 603's sixth phase, which extends the disjunctive rules
