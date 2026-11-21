@@ -778,6 +778,11 @@ pub(crate) fn finish_classify(
             j["incompleteCount"].as_u64().unwrap_or(0),
             j["consistency"].as_str().unwrap_or("unknown"),
         );
+    } else if j["stats"]["coverageStopped"].as_bool() == Some(true) {
+        eprintln!(
+            "incomplete answer: a deadline or cancellation stopped the check of which classes keep their answer, so all {} classes may miss entailments, consistency unknown",
+            j["incompleteCount"].as_u64().unwrap_or(0),
+        );
     } else if j["complete"].as_bool() == Some(false) {
         // as ELK warns of the axioms outside its fragment
         eprintln!(
@@ -1082,15 +1087,18 @@ fn print_classify(j: &J) {
                 });
             println!("  {why}\n    {}", e["ofn"].as_str().unwrap_or(""));
         }
-        if j["partial"].as_bool() != Some(true) {
-            println!(
-                "  {} classes may miss entailments, consistency {}",
-                n("incompleteCount"),
-                j["consistency"].as_str().unwrap_or("unknown")
-            );
-            for c in j["incomplete"].as_array().into_iter().flatten() {
-                println!("  incomplete {}", c.as_str().unwrap_or(""));
-            }
+    }
+    if j["complete"].as_bool() != Some(true)
+        && j["partial"].as_bool() != Some(true)
+        && (n("excludedCount") > 0 || n("incompleteCount") > 0)
+    {
+        println!(
+            "  {} classes may miss entailments, consistency {}",
+            n("incompleteCount"),
+            j["consistency"].as_str().unwrap_or("unknown")
+        );
+        for c in j["incomplete"].as_array().into_iter().flatten() {
+            println!("  incomplete {}", c.as_str().unwrap_or(""));
         }
     }
     let s = &j["stats"];

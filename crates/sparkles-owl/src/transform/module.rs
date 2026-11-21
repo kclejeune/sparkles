@@ -34,7 +34,9 @@
 //! and the run finds `D ⊑ C`. Every superclass of a satisfiable complete class is complete
 //! for the same reason, so its direct superclasses are exact. An unsatisfiable complete
 //! class is exact, but the other unsatisfiable classes, which share its node, need not
-//! be.
+//! be, so when any class is incomplete
+//! [`Classification::cover`](crate::classify::Classification::cover) lists every
+//! unsatisfiable class as incomplete too.
 //!
 //! *Layer 2, consistency.* The run's verdict of inconsistent is sound for `O`. When it
 //! finds `T` consistent, `O` is consistent if `L` misses the bottom module of the empty
@@ -231,7 +233,7 @@ pub(crate) fn coverage<'c>(
             }
             look(k)
         });
-        if !finished && !halted && work.halted.get().is_none() {
+        if !finished && !halted {
             return Err(Stopped);
         }
         if work.halted.get() == Some(Halt::Stopped) {
@@ -361,12 +363,19 @@ pub(crate) fn coverage<'c>(
         });
     }
     // the dropped axioms are now assertions and keys that layer 3 leaves out, or none
-    // with logical content
+    // with logical content, so with nothing left out of the terminology every class is
+    // complete
+    if left_out.is_empty() && terminology.is_some() {
+        return Ok(Coverage {
+            consistency_known,
+            ..Coverage::default()
+        });
+    }
     let (mut base, base_hit) = match &terminology {
         Some(mask) => {
             let mut t = Extraction::new(&ix, Mode::Bottom, Some(mask), &work);
             let Some(hit) = hits(&mut t) else {
-                return halted(None);
+                return halted(witness);
             };
             (t, hit)
         }
@@ -561,7 +570,8 @@ impl<'a> Index<'a> {
             ix.sigs.push(sig);
             // an IRI without a number is in no signature, so a set holding it is never
             // inside one and drops out
-            let needs = bottom_needs(k).map(|alts| {
+            // an axiom with an ill-typed literal is never local, so nothing it needs
+            let needs = bottom_needs(k).filter(|_| !ill_literal(k)).map(|alts| {
                 alts.into_iter()
                     .filter_map(|set| {
                         set.into_iter()
@@ -1250,10 +1260,67 @@ fn ce_top_deps<'k>(c: &'k ClassExpression, out: &mut Vec<&'k str>) {
     }
 }
 
+/// Whether a literal is outside the lexical space of its datatype, which no
+/// interpretation gives a value, so that an axiom holding it is never local.
+fn ill_typed(l: &Literal) -> bool {
+    crate::datatypes::lexical(l.datatype(), l.value()) == Some(false)
+}
+
+fn ill_range(r: &DataRange) -> bool {
+    match r {
+        DataRange::Datatype(_) => false,
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => rs.iter().any(ill_range),
+        DataRange::ComplementOf(r) => ill_range(r),
+        DataRange::OneOf(ls) => ls.iter().any(ill_typed),
+        DataRange::DatatypeRestriction(_, fs) => fs.iter().any(|f| ill_typed(&f.value)),
+    }
+}
+
+fn ill_class(c: &ClassExpression) -> bool {
+    use ClassExpression as C;
+    match c {
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().any(ill_class),
+        C::ObjectComplementOf(c) => ill_class(c),
+        C::ObjectSomeValuesFrom(_, c) | C::ObjectAllValuesFrom(_, c) => ill_class(c),
+        C::ObjectMinCardinality(_, _, c)
+        | C::ObjectMaxCardinality(_, _, c)
+        | C::ObjectExactCardinality(_, _, c) => c.as_deref().is_some_and(ill_class),
+        C::DataSomeValuesFrom(_, r) | C::DataAllValuesFrom(_, r) => ill_range(r),
+        C::DataHasValue(_, l) => ill_typed(l),
+        C::DataMinCardinality(_, _, r)
+        | C::DataMaxCardinality(_, _, r)
+        | C::DataExactCardinality(_, _, r) => r.as_ref().is_some_and(ill_range),
+        _ => false,
+    }
+}
+
+/// Whether an axiom holds an ill-typed literal ([`ill_typed`]).
+fn ill_literal(k: &AxiomKind) -> bool {
+    use AxiomKind as K;
+    match k {
+        K::SubClassOf(a, b) => ill_class(a) || ill_class(b),
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().any(ill_class),
+        K::DisjointUnion(_, cs) => cs.iter().any(ill_class),
+        K::ObjectPropertyDomain(_, c)
+        | K::ObjectPropertyRange(_, c)
+        | K::DataPropertyDomain(_, c)
+        | K::ClassAssertion(c, _)
+        | K::HasKey(c, _, _) => ill_class(c),
+        K::DataPropertyRange(_, r) | K::DatatypeDefinition(_, r) => ill_range(r),
+        K::DataPropertyAssertion(_, _, l) | K::NegativeDataPropertyAssertion(_, _, l) => {
+            ill_typed(l)
+        }
+        _ => false,
+    }
+}
+
 /// Whether the axiom is bottom-local for the signature: a tautology once every entity
 /// outside it is empty.
 fn bottom_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
     use AxiomKind as K;
+    if ill_literal(k) {
+        return false;
+    }
     let sub_ope = |p: &SubObjectPropertyExpression| match p {
         SubObjectPropertyExpression::Expression(p) => s.outside_ope(p),
         SubObjectPropertyExpression::Chain(ps) => ps.iter().any(|p| s.outside_ope(p)),
@@ -1303,6 +1370,9 @@ fn bottom_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
 /// outside it is everything and every property outside it every pair.
 fn top_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
     use AxiomKind as K;
+    if ill_literal(k) {
+        return false;
+    }
     match k {
         K::SubClassOf(a, b) => s.t_bottom(a) || s.t_top(b),
         K::EquivalentClasses(cs) => {
@@ -1323,9 +1393,7 @@ fn top_local(k: &AxiomKind, s: &Sig<'_>) -> bool {
         K::ObjectPropertyAssertion(p, _, _) => s.full_ope(p),
         // every element has every data value, so a literal that has a value
         K::DataPropertyAssertion(p, _, l) => {
-            s.full_dp(p)
-                && (l.language().is_some()
-                    || crate::datatypes::lexical(l.datatype(), l.value()) == Some(true))
+            s.full_dp(p) && crate::datatypes::lexical(l.datatype(), l.value()) == Some(true)
         }
         K::Declaration(_) => true,
         K::AnnotationAssertion(..)

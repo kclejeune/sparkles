@@ -214,7 +214,7 @@ fn timeless(mut j: J) -> J {
         object.remove("classificationSource");
         object.remove("resultId");
     }
-    for k in ["indexMs", "saturationMs", "taxonomyMs"] {
+    for k in ["indexMs", "saturationMs", "taxonomyMs", "coverageMs"] {
         if let Some(s) = j["stats"].as_object_mut() {
             s.remove(k);
         }

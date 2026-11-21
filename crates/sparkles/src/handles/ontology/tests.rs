@@ -2032,6 +2032,21 @@ mod classification {
             h.classify(&OntologyRequest::default(), &strict, &opts())
                 .is_ok()
         );
+        // a run that skips the modules' pass is not kept for the next caller
+        let skip = ClassifyRequest {
+            skip_coverage: true,
+            ..Default::default()
+        };
+        let fresh = dataset(&format!(
+            "{ONTO} :Cell rdfs:subClassOf :Thing2 . :x a :Cell ; :partOf :y . :y :size 3 ."
+        ));
+        let f = fresh.ontology();
+        f.classify(&OntologyRequest::default(), &skip, &opts())
+            .unwrap();
+        let after = f
+            .classify(&OntologyRequest::default(), &strict, &opts())
+            .unwrap();
+        assert!(after.classification.complete && !after.reused);
     }
 
     #[test]

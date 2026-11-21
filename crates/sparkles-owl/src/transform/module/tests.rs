@@ -696,3 +696,24 @@ fn a_terminology_without_assertions_takes_no_extraction() {
         }
     );
 }
+
+#[test]
+fn an_ill_typed_literal_is_never_local() {
+    let none = |_: &str| false;
+    let s = Sig(&none);
+    let (k, _) = read(
+        "NegativeDataPropertyAssertion(:d :x \"seven\"^^<http://www.w3.org/2001/XMLSchema#integer>)
+         SubClassOf(:A DataHasValue(:d \"seven\"^^<http://www.w3.org/2001/XMLSchema#integer>))
+         NegativeDataPropertyAssertion(:d :x \"7\"^^<http://www.w3.org/2001/XMLSchema#integer>)",
+    );
+    assert!(!bottom_local(&k[0], &s) && !top_local(&k[0], &s));
+    assert!(!bottom_local(&k[1], &s) && !top_local(&k[1], &s));
+    assert!(bottom_local(&k[2], &s));
+    // a language-tagged literal outside the XML characters has no value either
+    let bad = AxiomKind::DataPropertyAssertion(
+        DataProperty::new("http://e/#d"),
+        Individual::Named(NamedIndividual::new("http://e/#x")),
+        Literal::lang("a\u{0}b", "en").unwrap(),
+    );
+    assert!(!top_local(&bad, &s));
+}

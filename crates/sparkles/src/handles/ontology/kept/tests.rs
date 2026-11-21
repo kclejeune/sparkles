@@ -1400,10 +1400,18 @@ fn raw_and_structured_kept_selectors_reject_duplicates_overflow_and_inferences()
 fn a_stopped_coverage_pass_keeps_the_saturation_and_publishes_nothing() {
     let ds = ds(":A a owl:Class ; rdfs:subClassOf :B . :B a owl:Class .");
     super::super::classify::FORCE_COVERAGE_STOP.with(|f| f.set(true));
+    // the hook sets this cancellation, which the stopped pass acknowledged, so the
+    // metadata and the answer finish without it
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = QueryOptions {
+        cancel: Some(stop.clone()),
+        ..opts()
+    };
     let first = ds
         .ontology()
-        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .classify(&req(), &ClassifyRequest::default(), &stopping)
         .unwrap();
+    assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
     assert!(first.classification.stats.coverage_stopped);
     assert!(!first.classification.complete && first.classification.complete_for_taken);
     assert!(!first.retained && !first.reused);

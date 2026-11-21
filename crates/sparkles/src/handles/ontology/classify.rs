@@ -120,6 +120,22 @@ pub const STRICT_CODE: &str = "classification-incomplete";
 /// The refusal of a strict classification whose answer is not complete for the whole
 /// ontology: the axioms left out, which the error's source holds as
 /// [`sparkles_owl::classify::Error::Incomplete`], or the run that stopped.
+/// A strict request's answer to a run that is not complete for the whole ontology: the
+/// caller's own deadline or cancellation when it stopped the modules' pass, which is no
+/// refusal of the ontology, and otherwise [`strict_refusal`].
+pub(super) fn refuse_strict(
+    classification: &Classification,
+    excluded: &[Excluded],
+    opts: &QueryOptions,
+) -> Error {
+    if classification.stats.coverage_stopped
+        && let Err(e) = check(opts)
+    {
+        return e;
+    }
+    strict_refusal(classification, excluded)
+}
+
 pub fn strict_refusal(classification: &Classification, excluded: &[Excluded]) -> Error {
     let message = if excluded.is_empty() {
         format!(
@@ -177,6 +193,17 @@ impl Classified {
 /// its immutable metadata/answer as the existing partial API requires. This
 /// changes only result-local options, never the shared flags, workers or cache.
 pub(super) fn result_options(opts: &QueryOptions, complete: bool) -> QueryOptions {
+    result_controls(opts, complete)
+}
+
+/// Whether a run acknowledged a stop of its caller: a partial answer, or a modules' pass
+/// that the deadline or a cancellation stopped. Its metadata and answer then finish
+/// without the stop controls ([`result_options`]).
+pub(super) fn acknowledged_stop(c: &Classification) -> bool {
+    !c.complete_for_taken || c.stats.coverage_stopped
+}
+
+fn result_controls(opts: &QueryOptions, complete: bool) -> QueryOptions {
     QueryOptions {
         graphs: opts.graphs.clone(),
         cancel: if complete { opts.cancel.clone() } else { None },
@@ -330,7 +357,12 @@ impl Ontologies {
         // triples can be absent. Re-deciding there could widen the graph grant.
         opts.graphs = opts.graphs.as_ref().map(|access| access.bound(&snap));
         let o = self.open_at(&snap, req, &opts)?;
-        let keep = opts.graphs.is_none() && snap.cacheable && !c.assertions && !c.el_only;
+        // a run that skips the modules' pass answers differently, so it is not kept
+        let keep = opts.graphs.is_none()
+            && snap.cacheable
+            && !c.assertions
+            && !c.el_only
+            && !c.skip_coverage;
         let (publication, reused) = if keep {
             self.classify_kept(&o, req, c, &opts)?
         } else {
@@ -362,9 +394,10 @@ impl Ontologies {
             )
         };
         if c.strict && !publication.classification.complete {
-            return Err(strict_refusal(
+            return Err(refuse_strict(
                 &publication.classification,
                 &publication.excluded,
+                &opts,
             ));
         }
         if let Some(about) = &c.about
@@ -387,7 +420,7 @@ impl Ontologies {
                 .publication
                 .as_ref()
                 .is_some_and(|p| p.id == publication.id);
-        let classified_complete = publication.classification.complete_for_taken;
+        let classified_complete = !acknowledged_stop(&publication.classification);
         let mut classified = Classified {
             opened: o,
             classification: publication.classification.clone(),
@@ -458,6 +491,10 @@ impl Ontologies {
             };
             #[cfg(test)]
             let out = if FORCE_COVERAGE_STOP.with(|f| f.replace(false)) {
+                // the caller's stop that the pass acknowledged
+                if let Some(c) = &opts.cancel {
+                    c.store(true, Ordering::Relaxed);
+                }
                 let mut stopped = out;
                 stopped.complete = false;
                 stopped.stats.coverage_stopped = true;

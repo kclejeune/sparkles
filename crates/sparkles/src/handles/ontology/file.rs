@@ -389,7 +389,11 @@ impl OntologyFile {
         let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
         let (classification, excluded) = classify_once(&axioms, c, &opts, dropped)?;
         if c.strict && !classification.complete {
-            return Err(super::classify::strict_refusal(&classification, &excluded));
+            return Err(super::classify::refuse_strict(
+                &classification,
+                &excluded,
+                &opts,
+            ));
         }
         if let Some(about) = &c.about
             && classification

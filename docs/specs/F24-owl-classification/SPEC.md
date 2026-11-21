@@ -4596,7 +4596,9 @@ module's signature and makes every other class empty, so the named superclasses 
 that `O` entails are those that `M_C` entails. When `L` misses `M_C`, `M_C` is inside `T`,
 and the run, which is complete for `T`, finds them all. Equivalent classes and
 unsatisfiability follow. A satisfiable class equivalent to such a class is in its module's
-signature, so its own module is inside `M_C`. The answer is exact for the superclasses,
+signature, so its own module is inside `M_C`. Every unsatisfiable class shares the node of
+`owl:Nothing`, which a missed unsatisfiable class leaves short, so when any class is
+incomplete every unsatisfiable class is listed too. The answer is exact for the superclasses,
 equivalents and satisfiability of a class outside `incomplete`, and not for its
 subclasses. A class can be complete while a subclass of it is missed, since the subclass's
 module can hold a left-out axiom. On item 1271's `irl1`, which a plain run classifies
@@ -4625,7 +4627,8 @@ part of its ontology. They count as left out unless the same layers show that th
 change an answer, which needs a consistency known for the whole ontology and the
 third layer's gates. A run then streams the assertions after the terminology's modules,
 stops at the first that matters, and reports it in `excluded` under the rule
-`assertion-not-read`, with one entry for all of them. Class and property assertions over a
+`assertion-not-read`, with one entry for all of them. An assertion of a class that the
+terminology does not name counts too, since the taxonomy lacks that class. Class and property assertions over a
 terminology of subclass axioms and existential restrictions, which nothing in it can
 contradict, change nothing and leave the run complete. An ontology with disjoint classes and typed individuals answers with
 `consistency` `unknown` and every class incomplete, since its assertions could make it

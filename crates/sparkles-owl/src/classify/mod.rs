@@ -637,7 +637,10 @@ impl Classification {
         // and neither does a run that asks for none: every class is then incomplete.
         if self.consistency == Consistency::Unknown || !self.complete_for_taken || !limits.coverage
         {
-            let witness = dropped.and_then(|d| first_logical(d));
+            let Ok(witness) = dropped.map_or(Ok(None), first_logical) else {
+                self.stopped_pass();
+                return None;
+            };
             if !excluded.is_empty() || witness.is_some() {
                 self.complete = false;
                 self.all_incomplete();
@@ -653,6 +656,20 @@ impl Classification {
                 .max(COVERAGE_WORK_MIN)
         });
         let stop = || poll(limits).is_err();
+        // the first dropped axiom that names a class the taxonomy does not hold
+        let unnamed: std::cell::RefCell<Option<AxiomKind>> = std::cell::RefCell::new(None);
+        let taxonomy = &self.taxonomy;
+        let seen = &unnamed;
+        let mut watched = dropped.map(|d| {
+            move |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+                d(&mut |k| {
+                    if seen.borrow().is_none() && names_unknown_class(taxonomy, k) {
+                        *seen.borrow_mut() = Some(k.clone());
+                    }
+                    f(k)
+                })
+            }
+        });
         let c = crate::transform::coverage(
             axioms,
             &left,
@@ -660,32 +677,50 @@ impl Classification {
             by_depth(&self.taxonomy),
             budget,
             &stop,
-            dropped,
+            watched
+                .as_mut()
+                .map(|w| w as &mut crate::transform::Dropped<'_>),
         );
         self.stats.coverage = start.elapsed();
         let Ok(c) = c else {
-            self.stats.coverage_stopped = true;
-            self.complete = false;
-            self.all_incomplete();
-            self.consistency = Consistency::Unknown;
+            self.stopped_pass();
             return None;
         };
         if !c.consistency_known {
             self.consistency = Consistency::Unknown;
         }
         self.stats.coverage_over = c.over_budget;
-        let witness = c.dropped.map(not_read);
-        if witness.is_some() {
+        // a dropped axiom that names a class the taxonomy lacks leaves that class out,
+        // and every unsatisfiable class below it
+        let witness = c.dropped.or(unnamed.into_inner()).map(not_read);
+        if witness.is_some() || !c.consistency_known || !c.incomplete.is_empty() {
             self.complete = false;
         }
         if !c.incomplete.is_empty() {
             let mut all = std::mem::take(&mut self.incomplete);
             all.extend(c.incomplete);
+            // The node of the unsatisfiable classes is exact only when every one of them
+            // is found, which an incomplete class may not be.
+            all.extend(
+                self.taxonomy
+                    .unsatisfiable()
+                    .filter(|k| k.as_str() != crate::vocab::OWL_NOTHING)
+                    .cloned(),
+            );
             all.sort();
             all.dedup();
             self.incomplete = all;
         }
         witness
+    }
+
+    /// The answer of a modules' pass that its deadline, its cancellation or its stream of
+    /// dropped axioms stopped: every class incomplete and the consistency unknown.
+    fn stopped_pass(&mut self) {
+        self.stats.coverage_stopped = true;
+        self.complete = false;
+        self.all_incomplete();
+        self.consistency = Consistency::Unknown;
     }
 
     /// Every class but owl:Thing and owl:Nothing incomplete, in IRI order.
@@ -707,10 +742,11 @@ impl Classification {
     }
 }
 
-/// The first dropped axiom with logical content.
-fn first_logical(d: &mut crate::transform::Dropped<'_>) -> Option<AxiomKind> {
+/// The first dropped axiom with logical content, or `Err` when the stream could not
+/// finish.
+fn first_logical(d: &mut crate::transform::Dropped<'_>) -> Result<Option<AxiomKind>, ()> {
     let mut first = None;
-    d(&mut |k| {
+    let finished = d(&mut |k| {
         if logical(k) && !matches!(k, AxiomKind::Declaration(_)) {
             first = Some(k.clone());
             false
@@ -718,7 +754,18 @@ fn first_logical(d: &mut crate::transform::Dropped<'_>) -> Option<AxiomKind> {
             true
         }
     });
-    first
+    if finished { Ok(first) } else { Err(()) }
+}
+
+/// Whether a logical axiom names a class that the taxonomy does not hold.
+fn names_unknown_class(t: &Taxonomy, k: &AxiomKind) -> bool {
+    if !logical(k) || matches!(k, AxiomKind::Declaration(_)) {
+        return false;
+    }
+    let mut s = crate::model::Signature::default();
+    s.axiom(k);
+    s.0.iter()
+        .any(|e| matches!(e, crate::model::Entity::Class(c) if t.node_of(c).is_none()))
 }
 
 /// The rule of an axiom that a classification of the terminology alone did not read
@@ -779,6 +826,10 @@ fn by_depth(t: &Taxonomy) -> Vec<&Class> {
 /// left out or used only in part, and the first of them with the rule each breaks.
 pub fn refusal(excluded: &[Excluded]) -> String {
     const SHOWN: usize = 10;
+    if excluded.is_empty() {
+        return "the classification would not be complete: the run stopped before it decided every class"
+            .to_string();
+    }
     let mut m = format!(
         "the classification would not be complete: it leaves out or uses only in part {} axiom{}",
         excluded.len(),
@@ -1338,6 +1389,9 @@ impl Classifier {
                 out.cover(&held, excluded, None, limits);
             }
         }
+        if limits.strict && !limits.cover_later && !out.complete {
+            return Err(Error::Incomplete(excluded.to_vec()));
+        }
         Ok(out)
     }
 
@@ -1470,6 +1524,9 @@ impl Saturation {
             if !limits.cover_later {
                 out.cover(axioms, &self.excluded, None, limits);
             }
+        }
+        if limits.strict && !limits.cover_later && !out.complete {
+            return Err(Error::Incomplete(self.excluded.clone()));
         }
         Ok(out)
     }
@@ -4249,6 +4306,158 @@ mod tests {
                 answered,
                 "{threads} threads: no poll reached the saturation"
             );
+        }
+    }
+
+    /// A strict run refuses a partial answer, which has no exclusion to name.
+    #[test]
+    fn a_strict_run_refuses_a_partial_answer() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+             ClassAssertion(ObjectUnionOf(:B :C) :a)
+             ClassAssertion(ObjectComplementOf(:C) :a)
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+             SubClassOf(ObjectSomeValuesFrom(:r :B) :D)
+             )",
+        )
+        .unwrap();
+        let mut refused = false;
+        for n in 0..64 {
+            let mut k = Classifier::of(&doc.axioms);
+            let polls = Arc::new(AtomicUsize::new(0));
+            let p = polls.clone();
+            let out = k.classify(&Limits {
+                threads: 1,
+                rooted: true,
+                partial: true,
+                strict: true,
+                cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= n)),
+                ..Limits::default()
+            });
+            match out {
+                Err(Error::Cancelled) => continue,
+                Err(Error::Incomplete(e)) => {
+                    assert!(e.is_empty() && refusal(&e).contains("stopped"));
+                    refused = true;
+                    break;
+                }
+                Err(e) => panic!("poll {n}: {e:?}"),
+                Ok(out) => assert!(out.complete, "poll {n}: a strict run answered in part"),
+            }
+        }
+        assert!(refused);
+    }
+
+    fn ofn(body: &str) -> Vec<Axiom> {
+        crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://e/#>)\nOntology(<http://e/o>\n{body}\n)"
+        ))
+        .unwrap()
+        .axioms
+    }
+
+    /// A dropped assertion that names a class the terminology does not is left out: the
+    /// taxonomy lacks the class, and the unsatisfiable classes below it.
+    #[test]
+    fn a_dropped_assertion_of_a_class_the_taxonomy_lacks_is_left_out() {
+        let t = ofn("SubClassOf(:A owl:Nothing)");
+        let d = ofn("ClassAssertion(:B :a)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::new();
+        let limits = Limits {
+            cover_later: true,
+            ..Limits::default()
+        };
+        let mut out = s.classify(&kinds, None, &limits).unwrap();
+        let mut stream = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+            for a in &d {
+                if !f(&a.kind) {
+                    break;
+                }
+            }
+            true
+        };
+        let w = out.cover(&kinds, s.excluded(), Some(&mut stream), &limits);
+        assert!(w.is_some() && !out.complete, "{:?}", out.incomplete);
+    }
+
+    /// When a class is incomplete, the node of the unsatisfiable classes may miss one, so
+    /// no unsatisfiable class is complete.
+    #[test]
+    fn an_incomplete_class_leaves_the_unsatisfiable_node_incomplete() {
+        let t = ofn("SubClassOf(:A owl:Nothing)
+                     SubClassOf(:B ObjectUnionOf(:C :D))
+                     SubClassOf(:C owl:Nothing)
+                     SubClassOf(:D owl:Nothing)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::new();
+        let out = s
+            .classify(
+                &kinds,
+                None,
+                &Limits {
+                    el_only: true,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        let names: Vec<&str> = out.incomplete.iter().map(|c| c.as_str()).collect();
+        assert!(names.contains(&"http://e/#B"), "{names:?}");
+        assert!(names.contains(&"http://e/#A"), "{names:?}");
+    }
+
+    /// A pass over dropped assertions that passes its bound leaves the answer incomplete.
+    #[test]
+    fn a_dropped_pass_past_its_bound_is_not_complete() {
+        let mut body = String::new();
+        for i in 0..100 {
+            body += &format!("SubClassOf(:A{i} :A{})\n", i + 1);
+        }
+        let t = ofn(&body);
+        let d = ofn("ClassAssertion(:A0 :x)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::new();
+        let limits = Limits {
+            cover_later: true,
+            coverage_work: Some(50),
+            ..Limits::default()
+        };
+        let mut out = s.classify(&kinds, None, &limits).unwrap();
+        let mut stream = |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+            for a in &d {
+                if !f(&a.kind) {
+                    break;
+                }
+            }
+            true
+        };
+        out.cover(&kinds, s.excluded(), Some(&mut stream), &limits);
+        assert!(out.stats.coverage_over && !out.complete);
+    }
+
+    /// A stream of dropped axioms that cannot finish leaves the answer incomplete, even
+    /// for a run that takes no modules' pass.
+    #[test]
+    fn a_dropped_stream_that_fails_leaves_every_class_incomplete() {
+        let t = ofn("SubClassOf(:A :B)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        for coverage in [true, false] {
+            let mut s = Saturation::new();
+            let limits = Limits {
+                cover_later: true,
+                coverage,
+                ..Limits::default()
+            };
+            let mut out = s.classify(&kinds, None, &limits).unwrap();
+            let mut stream = |_: &mut dyn FnMut(&AxiomKind) -> bool| false;
+            out.cover(&kinds, s.excluded(), Some(&mut stream), &limits);
+            assert!(
+                out.stats.coverage_stopped && !out.complete,
+                "coverage {coverage}"
+            );
+            assert_eq!(out.consistency, Consistency::Unknown);
+            assert!(!out.incomplete.is_empty());
         }
     }
 

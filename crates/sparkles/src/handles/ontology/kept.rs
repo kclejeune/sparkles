@@ -285,7 +285,10 @@ impl KeptClassification {
         excluded: Arc<Vec<Excluded>>,
         opts: &QueryOptions,
     ) -> Result<Arc<Self>> {
-        let controls = super::classify::result_options(opts, classification.complete_for_taken);
+        let controls = super::classify::result_options(
+            opts,
+            !super::classify::acknowledged_stop(&classification),
+        );
         let opts = &controls;
         let source = Arc::new(Provenance::capture(h, req, c, o, opts)?);
         let content_fingerprint = content_fingerprint(&classification, &excluded, opts)?;
