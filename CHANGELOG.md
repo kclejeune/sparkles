@@ -18,7 +18,8 @@ without `assertions` counts the file's assertions as left out under the rule
 classes and typed individuals answers `unknown` until it is classified with them. The
 new `strict` option, `--strict` on `sparkles ontology classify` and `--strict true` on
 ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the error
-`classification-incomplete`, HTTP 422. The answers' stats gain `coverageMs`,
+`classification-incomplete`, HTTP 422. ROBOT's commands are strict by default with
+`--reasoner hermit` or `jfact`, and `--strict false` turns that off. The answers' stats gain `coverageMs`,
 `coverageOver` and `coverageStopped`, and the content fingerprint of a retained
 classification is version 2, as roadmap item 1271.
 

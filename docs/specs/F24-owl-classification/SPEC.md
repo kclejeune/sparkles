@@ -4652,7 +4652,9 @@ do since they read only the taxonomy.
 ontology. The refusal is the component error `classification-incomplete`, HTTP 422, which
 names the axioms and the rule each breaks, `UnsupportedError` in Python and Node.js, an
 unsupported error in the JVM and the FFI, and ROBOT's `INCOMPLETE REASONING ERROR`. The
-default stays non-strict. The content fingerprint of a retained classification is
+default stays non-strict, except that ROBOT's commands are strict when they name HermiT
+or JFact as the reasoner, since a caller who asks for those expects a complete answer or
+an error. `--strict false` turns that off, and ELK and the other names keep the warning. The content fingerprint of a retained classification is
 version 2, since it now covers both flags. The server computes it in memory and stores it
 nowhere, so only a client that kept an older fingerprint sees a new value.
 

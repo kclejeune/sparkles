@@ -684,7 +684,8 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   and the file's assertions count as left out under the rule `assertion-not-read` unless
   they cannot change an answer, as for an ontology whose disjoint classes they could
   contradict. `strict` on the request, `--strict` on `sparkles ontology classify` and
-  `--strict true` on ROBOT's `reason`, `reduce` and `materialize` refuse such a run with
+  `--strict true` on ROBOT's `reason`, `reduce` and `materialize`, which is their default
+  with `--reasoner hermit` or `jfact`, refuse such a run with
   the error `classification-incomplete`, HTTP 422, naming the axioms. The pass that decides
   `incomplete` costs nothing when nothing is left out and no assertion goes unread, has a bound on its work that
   `coverageOver` reports, and answers with every class incomplete and `coverageStopped` set
@@ -752,7 +753,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `--reasoner ELK`, which `materialize` takes by default as ROBOT's does, and `emr`, which
   ROBOT builds on ELK, run the OWL 2 EL rules alone and leave those axioms out, as ELK
   does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk` and `structural` run
-  the default classifier with a warning. The library has the same switch as
+  the default classifier with a warning. With `hermit` or `jfact` the run is strict unless
+  `--strict false` is given, so it refuses an answer that is not complete for the whole
+  ontology, as those reasoners give a complete answer or an error. The library has the same switch as
   `ClassifyRequest::el_only` and `Limits::el_only`. The queries ELK does not answer, such
   as the disjoint classes and the property hierarchy, add no axioms, as they add none in
   ROBOT. Errors and the exit status 1 follow ROBOT's, and a malformed command line exits

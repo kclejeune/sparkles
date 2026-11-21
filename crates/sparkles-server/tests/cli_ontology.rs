@@ -586,6 +586,85 @@ fn a_classification_that_leaves_an_axiom_out_is_incomplete_or_refused() {
     );
     assert_eq!(o.status.code(), Some(0), "{}", err(&o));
     assert!(err(&o).contains("--strict true refuses"), "{}", err(&o));
+    std::fs::remove_file(dir.join("out.ofn")).unwrap();
+    // HermiT and JFact are strict by default, and --strict false answers as before.
+    // `reduce` classifies ROBOT's subset of the subclass axioms and the property
+    // characteristics, which in irl1 the classifier takes whole, so its input holds a
+    // maximum of two, which needs counting.
+    std::fs::write(
+        dir.join("count.ofn"),
+        "Prefix(:=<http://example.org/c#>)
+Ontology(<http://example.org/c>
+Declaration(Class(:A)) Declaration(Class(:B)) Declaration(ObjectProperty(:r))
+SubClassOf(:A ObjectMaxCardinality(2 :r :B))
+)
+",
+    )
+    .unwrap();
+    for (cmd, r, input) in [
+        ("reason", "hermit", "irl1.ofn"),
+        ("reduce", "JFact", "count.ofn"),
+        ("materialize", "hermit", "irl1.ofn"),
+    ] {
+        let o = sparkles(
+            dir,
+            &[
+                "ontology",
+                cmd,
+                "--input",
+                input,
+                "--reasoner",
+                r,
+                "--output",
+                "out.ofn",
+            ],
+        );
+        assert_ne!(o.status.code(), Some(0), "{cmd} {r}: {}", err(&o));
+        assert!(
+            err(&o).contains("INCOMPLETE REASONING ERROR"),
+            "{cmd} {r}: {}",
+            err(&o)
+        );
+        assert!(!dir.join("out.ofn").exists(), "{cmd} {r}");
+        let o = sparkles(
+            dir,
+            &[
+                "ontology",
+                cmd,
+                "--input",
+                input,
+                "--reasoner",
+                r,
+                "--strict",
+                "false",
+                "--output",
+                "out.ofn",
+            ],
+        );
+        assert_eq!(o.status.code(), Some(0), "{cmd} {r}: {}", err(&o));
+        assert!(
+            err(&o).contains("--strict true refuses"),
+            "{cmd} {r}: {}",
+            err(&o)
+        );
+        std::fs::remove_file(dir.join("out.ofn")).unwrap();
+    }
+    // ELK stays a warning
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "reason",
+            "--input",
+            "irl1.ofn",
+            "--reasoner",
+            "ELK",
+            "--output",
+            "out.ofn",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    assert!(err(&o).contains("--strict true refuses"), "{}", err(&o));
     // an ontology the classifier takes whole is complete, strict or not
     std::fs::write(
         dir.join("el.ofn"),

@@ -101,9 +101,10 @@ pub struct ReasonArgs {
     pub prevent_invalid_references: String,
     /// true: refuse with an error naming the axioms when the classifier would leave an
     /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
-    /// not support, so that the output is complete for the whole ontology
-    #[arg(long, default_value = "false")]
-    pub strict: String,
+    /// not support, so that the output is complete for the whole ontology. The default
+    /// is true with --reasoner hermit or jfact and false otherwise
+    #[arg(long)]
+    pub strict: Option<String>,
     #[command(flatten)]
     pub io: Io,
 }
@@ -125,9 +126,10 @@ pub struct ReduceArgs {
     pub include_subproperties: String,
     /// true: refuse with an error naming the axioms when the classifier would leave an
     /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
-    /// not support, so that the output is complete for the whole ontology
-    #[arg(long, default_value = "false")]
-    pub strict: String,
+    /// not support, so that the output is complete for the whole ontology. The default
+    /// is true with --reasoner hermit or jfact and false otherwise
+    #[arg(long)]
+    pub strict: Option<String>,
     #[command(flatten)]
     pub io: Io,
 }
@@ -172,9 +174,10 @@ pub struct MaterializeArgs {
     pub annotate_inferred_axioms: String,
     /// true: refuse with an error naming the axioms when the classifier would leave an
     /// axiom out or use one only in part, as HermiT and the OWL API refuse what they do
-    /// not support, so that the output is complete for the whole ontology
-    #[arg(long, default_value = "false")]
-    pub strict: String,
+    /// not support, so that the output is complete for the whole ontology. The default
+    /// is true with --reasoner hermit or jfact and false otherwise
+    #[arg(long)]
+    pub strict: Option<String>,
     #[command(flatten)]
     pub io: Io,
 }
@@ -337,7 +340,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             let o = reason_options(&a)?;
             let c = ClassifyRequest {
                 el_only: reasoner(a.reasoner.as_deref(), true)?,
-                strict: boolean(&a.strict, "strict")?,
+                strict: strict(a.strict.as_deref(), a.reasoner.as_deref())?,
                 ..c.clone()
             };
             match w.reason(&o, &c, &q) {
@@ -348,7 +351,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
         Step::Reduce(a) => {
             let c = ClassifyRequest {
                 el_only: reasoner(a.reasoner.as_deref(), false)?,
-                strict: boolean(&a.strict, "strict")?,
+                strict: strict(a.strict.as_deref(), a.reasoner.as_deref())?,
                 ..c.clone()
             };
             let o = ReduceOptions {
@@ -373,7 +376,7 @@ fn run_step(step: Step, state: &mut Option<WorkingOntology>, opts: &StoreOptions
             // ELK by default, as ROBOT's materialize, so the EL rules alone
             let c = ClassifyRequest {
                 el_only: reasoner(Some(&a.reasoner), false)?,
-                strict: boolean(&a.strict, "strict")?,
+                strict: strict(a.strict.as_deref(), Some(&a.reasoner))?,
                 ..c.clone()
             };
             let o = materialize_options(&a)?;
@@ -472,6 +475,17 @@ fn boolean(s: &str, name: &str) -> Result<bool> {
     }
 }
 
+/// Whether a run refuses an answer that is not complete for the whole ontology: the
+/// value of `--strict`, or without one, whether the reasoner named is HermiT or JFact,
+/// whose users expect a complete answer or an error, as the OWL API gives.
+fn strict(value: Option<&str>, reasoner: Option<&str>) -> Result<bool> {
+    match value {
+        Some(v) => boolean(v, "strict"),
+        None => Ok(reasoner
+            .is_some_and(|r| matches!(r.trim().to_lowercase().as_str(), "hermit" | "jfact"))),
+    }
+}
+
 /// ROBOT's reasoner names, and whether the run takes the OWL 2 EL rules alone. ELK and
 /// emr, which ROBOT builds on ELK, do, so that the output is ROBOT's with ELK. Without a
 /// name the classifier also takes the Horn axioms outside OWL 2 EL, and the DL
@@ -483,7 +497,13 @@ fn reasoner(name: Option<&str>, emr: bool) -> Result<bool> {
     let n = name.trim().to_lowercase();
     match n.as_str() {
         "elk" => Ok(true),
-        "hermit" | "jfact" | "whelk" | "structural" => {
+        "hermit" | "jfact" => {
+            eprintln!(
+                "WARN --reasoner {name} is ignored: the classifier runs with its Horn rules in its place, and refuses an incomplete answer unless --strict false is given"
+            );
+            Ok(false)
+        }
+        "whelk" | "structural" => {
             eprintln!(
                 "WARN --reasoner {name} is ignored: the classifier runs with its Horn rules in its place"
             );
