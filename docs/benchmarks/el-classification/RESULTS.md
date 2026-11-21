@@ -1949,7 +1949,57 @@ ChEBI lite gave the base's taxonomies on one and four threads with commit 3f20f7
 commit 05838a64, whose engine code is the build's, where both sides refuse one file at
 the reader and stop one at its memory budget.
 
+### Anonymous individuals and top-property inclusions
+
+Roadmap items 1281 and 1282 take the axioms with anonymous individuals and the
+inclusions in a top property that the classifier left out, as
+[F24](../../specs/F24-owl-classification/SPEC.md#anonymous-individuals-and-top-property-inclusions)
+describes. On `atlas` three rounds of alternating order compared the base, commit
+0779d666, with commit 781da4c8 on the 59 files of the ORE 2015 DL development set that
+hold either, one process per side, file and run with three classifications each on four
+threads. Each time is the median of a side's nine classifications. Of the 118 cells, 34
+are faster in every classification and 6 slower, and the rest overlap. The table gives
+the files above 100 ms and the files that are slower.
+
+| Ontology | Run | Base ms | Tip ms | Ratio | Left out before | Left out after |
+|---|---|---:|---:|---:|---:|---:|
+| `ore_ont_10073` | default | 756.4 | 87.7 | 0.116 | 457,662 | 0 |
+| `ore_ont_10073` | rooted | 774.4 | 89.5 | 0.116 | 457,662 | 0 |
+| `ore_ont_5481` | default | 759.5 | 89.9 | 0.118 | 457,662 | 0 |
+| `ore_ont_5481` | rooted | 774.3 | 89.4 | 0.116 | 457,662 | 0 |
+| `ore_ont_1370` | default | 420.8 | 67.0 | 0.159 | 243,972 | 0 |
+| `ore_ont_1370` | rooted | 426.8 | 69.1 | 0.162 | 243,972 | 0 |
+| `ore_ont_4755` | default | 383.2 | 78.5 | 0.205 | 244,174 | 0 |
+| `ore_ont_4755` | rooted | 389.1 | 81.7 | 0.210 | 244,174 | 0 |
+| `ore_ont_5857` | default | 1,392.2 | 241.7 | 0.174 | 723,843 | 38 |
+| `ore_ont_5857` | rooted | 3,386.5 | 1,930.3 | 0.570 | 723,805 | 0 |
+| `ore_ont_12414` | default | 228.0 | 49.4 | 0.217 | 163,237 | 0 |
+| `ore_ont_12414` | rooted | 235.3 | 48.9 | 0.208 | 163,237 | 0 |
+| `ore_ont_7914` | default | 351.8 | 237.4 | 0.675 | 108,542 | 41 |
+| `ore_ont_7914` | rooted | 1,128.3 | 904.0 | 0.801 | 108,542 | 41 |
+| `ore_ont_9654` | default | 324.8 | 394.4 | 1.214 | 3,993 | 12 |
+| `ore_ont_9654` | rooted | 321.3 | 385.1 | 1.199 | 3,993 | 12 |
+| `ore_ont_4510` | default | 122.3 | 145.8 | 1.193 | 2,505 | 0 |
+| `ore_ont_4510` | rooted | 124.9 | 148.5 | 1.189 | 2,505 | 0 |
+| `ore_ont_12901` | default | 97.1 | 115.4 | 1.188 | 975 | 0 |
+| `ore_ont_12901` | rooted | 99.7 | 118.1 | 1.184 | 975 | 0 |
+| `ore_ont_14375` | default | 20.7 | 25.4 | 1.226 | 479 | 0 |
+| `ore_ont_14375` | rooted | 21.1 | 25.2 | 1.194 | 479 | 0 |
+
+The files whose anonymous individuals are reifications that occur in one class assertion
+each classify in 0.12 to 0.29 times the base's time, since one individual stands for
+each class and the EL rules take them. `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375`
+and `ore_ont_9654` take 1.18 to 1.23 times as long while they take the 479 to 3,981 axioms
+that the base left out, which roadmap item 1300 follows. On the 29 files with a HermiT
+reference whose anonymous individuals were all they left out, the tip's taxonomy equals
+HermiT's in both runs.
+
 ## Records
+
+The [record of items 1281 and 1282](runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
+holds every classification of the rounds on `atlas` with its report, the binary hashes,
+the host's state before and after, the census of both builds on the laptop with its
+left-out counts and peak memory, the HermiT judgements and the scripts that ran.
 
 The [record of item 956's left-linear chains](runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json)
 holds every process of the rounds on forge with its report, the rules fixed before the

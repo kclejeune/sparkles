@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# timing.sh: base 0779d666 against the lane tip on the 59 files of rows 1281 and 1282, in alternating
+# rounds, one process per side, file and mode, four threads, three classifications each.
+# The caller holds ~/lanes/.heavy.lock.
+set -u
+D=$HOME/lanes/outside-ab
+F=$HOME/lanes/el-cost-720/data/dev
+OUT=$D/out; mkdir -p $OUT
+{ echo "host=$(hostname) start=$(date -Is)"; uptime; free -g; sha256sum $D/bin/base $D/bin/tip; } > $OUT/before.txt
+for round in 1 2 3; do
+  order="base tip"; [ $((round % 2)) -eq 0 ] && order="tip base"
+  for n in $(cat $D/files.txt); do
+    for mode in default rooted; do
+      flag=; [ $mode = rooted ] && flag=--rooted
+      for tag in $order; do
+        mkdir -p $OUT/r$round/$tag
+        systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 $D/bin/$tag --threads 4 --repeat 3 $flag $F/$n > $OUT/r$round/$tag/$n.$mode.json 2> $OUT/r$round/$tag/$n.$mode.err
+        echo "r$round $tag $n $mode status=$?" >> $OUT/log.txt
+      done
+    done
+  done
+done
+{ echo "end=$(date -Is)"; uptime; } > $OUT/after.txt
+echo TIME-DONE >> $OUT/log.txt

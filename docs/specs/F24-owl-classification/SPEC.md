@@ -4436,7 +4436,15 @@ to 196 MiB on `ore_ont_10073` and `ore_ont_5481`, from 1,674 to 501 MiB on
 `ore_ont_5857` and by a sixth to two thirds on the other files above 400 MiB. It rises
 by 6 to 7% on `ore_ont_4510` and `ore_ont_9654`, whose anonymous individuals occur in
 other axioms and become individuals of the run, and by 4 to 5 MiB on six files of about
-22 MiB. HermiT
+22 MiB. On `atlas`
+with four threads, in three alternating rounds of three classifications a side of
+781da4c8 against 0779d666, 34 of the 118 file and run cells are faster in every
+classification and 6 slower. The tip classifies `ore_ont_10073` and `ore_ont_5481` in 88
+to 90 ms against 756 to 774 ms, `ore_ont_5857` in 242 against 1,392 ms by default and in
+1,930 against 3,387 ms rooted, and the other files above 100 ms in 0.16 to 0.80 times the
+base's time. `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_9654` take 1.18
+to 1.23 times as long while they take the 479 to 3,981 axioms that the base left out,
+since their anonymous individuals occur in several axioms, which item 1300 follows. HermiT
 1.4.5.519 references exist for 29 of the 31 files that anonymous individuals alone kept
 from a full answer, and the tip's taxonomy equals HermiT's on all 29 in both runs on four
 threads, with the same consistency. The hand cases of `tests/anonymous_individuals.rs`
@@ -4444,8 +4452,11 @@ cover each position of an anonymous individual in each tier, keys with anonymous
 and values, the hiding in descriptions, edits, the shared individual and its budget, and
 the reports and counts of a run that starts again. `dl_tier_d` and `dl_nominals` cover
 the inclusions in each form, a chain beside a range of the top property and item 805's
-rewriting beside a data inclusion. The census, the judgements and the logs are in the
-lane's records.
+rewriting beside a data inclusion. The
+[record](../../benchmarks/el-classification/runs/2026-11-21-anonymous-individuals-atlas-781da4c8/record.json)
+holds the timings, the census and the judgements, which the
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#anonymous-individuals-and-top-property-inclusions)
+discusses.
 
 ### ROBOT-compatible commands
 

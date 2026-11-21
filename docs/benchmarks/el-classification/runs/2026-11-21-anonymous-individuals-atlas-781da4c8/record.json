@@ -1,0 +1,2052 @@
+{
+ "suite": "el-classification",
+ "kind": "measurement",
+ "scale": "the 59 files of the ORE 2015 DL development set that hold anonymous individuals or inclusions in a top property (files.txt)",
+ "host": {
+  "name": "atlas",
+  "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+  "cpus": 20,
+  "ram_mib": 15620,
+  "kernel": "7.2.9"
+ },
+ "manifest": {
+  "commit": "781da4c8",
+  "base_commit": "0779d666",
+  "binary": "crates/sparkles-owl/examples/el_classify.rs",
+  "binary_sha256": {
+   "base": "fa27acf7955c369687734150a36c5fb57f08cbe47f70b9876201a50e3a5e7879",
+   "tip": "1fc80ef0ac43de64c5b719ec0a033e4ed1227002b03e9d29ae49ae3bbebbd2f6"
+  },
+  "build": "mbx build --release -p sparkles-owl --example el_classify on stanley, copied to atlas",
+  "fix_commit_note": "the review fixes of 99489a29 narrow the shared individuals to class assertions of named classes, which every merged assertion of these files is, and bound the pre-pass; they were not timed"
+ },
+ "settings": {
+  "repeat": 3,
+  "rounds": 3,
+  "threads": [
+   4
+  ],
+  "runs": [
+   "default",
+   "rooted"
+  ],
+  "memory_max": "12G"
+ },
+ "method": "timing.sh.txt runs under flock ~/lanes/.heavy.lock as the systemd user unit outside-ab-timing: three rounds over files.txt, base and tip in turn with the order alternating by round, one process of three classifications each on four threads for each file and run. A cell is faster or slower when every classification of one side is below every one of the other. The census (census.rs.txt, run-census.sh.txt) ran on stanley on two threads with both builds; census-base-tip.txt has its outside counts, tiers, single-run times and peak RSS. hermit.judge.jsonl judges the tip taxonomy on four threads against the HermiT 1.4.5.519 references of item 692 with scripts/elk-compare/ours-compare.py.",
+ "started": "2026-11-21T16:01:17Z",
+ "ended": "2026-11-21T16:05:35Z",
+ "results": {
+  "ore_ont_15516.owl default": {
+   "base_ms": 2.689,
+   "tip_ms": 3.445,
+   "ratio": 1.281,
+   "base_range": [
+    1.309,
+    4.458
+   ],
+   "tip_range": [
+    2.207,
+    5.094
+   ],
+   "outside_base": 17,
+   "outside_tip": 17,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_1823.owl default": {
+   "base_ms": 0.587,
+   "tip_ms": 0.748,
+   "ratio": 1.273,
+   "base_range": [
+    0.305,
+    2.027
+   ],
+   "tip_range": [
+    0.321,
+    1.709
+   ],
+   "outside_base": 43,
+   "outside_tip": 42,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_9890.owl rooted": {
+   "base_ms": 3.959,
+   "tip_ms": 4.98,
+   "ratio": 1.258,
+   "base_range": [
+    3.736,
+    8.232
+   ],
+   "tip_range": [
+    3.611,
+    12.636
+   ],
+   "outside_base": 124,
+   "outside_tip": 88,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_14375.owl default": {
+   "base_ms": 20.723,
+   "tip_ms": 25.407,
+   "ratio": 1.226,
+   "base_range": [
+    17.656,
+    22.662
+   ],
+   "tip_range": [
+    22.971,
+    27.972
+   ],
+   "outside_base": 479,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_9654.owl default": {
+   "base_ms": 324.793,
+   "tip_ms": 394.375,
+   "ratio": 1.214,
+   "base_range": [
+    311.227,
+    334.078
+   ],
+   "tip_range": [
+    370.203,
+    422.6
+   ],
+   "outside_base": 3993,
+   "outside_tip": 12,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_15516.owl rooted": {
+   "base_ms": 3.249,
+   "tip_ms": 3.943,
+   "ratio": 1.213,
+   "base_range": [
+    1.817,
+    5.165
+   ],
+   "tip_range": [
+    1.267,
+    4.878
+   ],
+   "outside_base": 17,
+   "outside_tip": 17,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3795.owl default": {
+   "base_ms": 8.43,
+   "tip_ms": 10.191,
+   "ratio": 1.209,
+   "base_range": [
+    7.919,
+    11.782
+   ],
+   "tip_range": [
+    7.865,
+    18.829
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_10594.owl rooted": {
+   "base_ms": 8.719,
+   "tip_ms": 10.531,
+   "ratio": 1.208,
+   "base_range": [
+    8.176,
+    12.623
+   ],
+   "tip_range": [
+    8.346,
+    11.49
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_9654.owl rooted": {
+   "base_ms": 321.3,
+   "tip_ms": 385.148,
+   "ratio": 1.199,
+   "base_range": [
+    306.787,
+    340.02
+   ],
+   "tip_range": [
+    368.151,
+    416.545
+   ],
+   "outside_base": 3993,
+   "outside_tip": 12,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_14375.owl rooted": {
+   "base_ms": 21.112,
+   "tip_ms": 25.2,
+   "ratio": 1.194,
+   "base_range": [
+    17.341,
+    24.928
+   ],
+   "tip_range": [
+    22.738,
+    27.9
+   ],
+   "outside_base": 479,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_4510.owl default": {
+   "base_ms": 122.283,
+   "tip_ms": 145.838,
+   "ratio": 1.193,
+   "base_range": [
+    117.198,
+    131.918
+   ],
+   "tip_range": [
+    136.573,
+    155.358
+   ],
+   "outside_base": 2505,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_4510.owl rooted": {
+   "base_ms": 124.941,
+   "tip_ms": 148.512,
+   "ratio": 1.189,
+   "base_range": [
+    119.758,
+    137.846
+   ],
+   "tip_range": [
+    140.588,
+    160.522
+   ],
+   "outside_base": 2505,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_12901.owl default": {
+   "base_ms": 97.137,
+   "tip_ms": 115.43,
+   "ratio": 1.188,
+   "base_range": [
+    87.909,
+    137.227
+   ],
+   "tip_range": [
+    108.619,
+    126.34
+   ],
+   "outside_base": 975,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_3357.owl rooted": {
+   "base_ms": 10.424,
+   "tip_ms": 12.364,
+   "ratio": 1.186,
+   "base_range": [
+    7.606,
+    17.667
+   ],
+   "tip_range": [
+    8.681,
+    15.763
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_12901.owl rooted": {
+   "base_ms": 99.722,
+   "tip_ms": 118.066,
+   "ratio": 1.184,
+   "base_range": [
+    95.374,
+    105.593
+   ],
+   "tip_range": [
+    109.2,
+    125.175
+   ],
+   "outside_base": 975,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_2700.owl rooted": {
+   "base_ms": 9.863,
+   "tip_ms": 11.598,
+   "ratio": 1.176,
+   "base_range": [
+    8.058,
+    15.413
+   ],
+   "tip_range": [
+    7.863,
+    18.866
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_13755.owl default": {
+   "base_ms": 5.137,
+   "tip_ms": 6.027,
+   "ratio": 1.173,
+   "base_range": [
+    3.265,
+    7.655
+   ],
+   "tip_range": [
+    4.825,
+    12.443
+   ],
+   "outside_base": 315,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_2700.owl default": {
+   "base_ms": 8.167,
+   "tip_ms": 9.556,
+   "ratio": 1.17,
+   "base_range": [
+    7.546,
+    12.698
+   ],
+   "tip_range": [
+    8.405,
+    13.022
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_13545.owl rooted": {
+   "base_ms": 10.911,
+   "tip_ms": 12.229,
+   "ratio": 1.121,
+   "base_range": [
+    5.001,
+    18.266
+   ],
+   "tip_range": [
+    4.681,
+    14.88
+   ],
+   "outside_base": 62,
+   "outside_tip": 62,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3795.owl rooted": {
+   "base_ms": 8.974,
+   "tip_ms": 10.043,
+   "ratio": 1.119,
+   "base_range": [
+    7.798,
+    16.483
+   ],
+   "tip_range": [
+    8.4,
+    10.905
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_580.owl rooted": {
+   "base_ms": 0.333,
+   "tip_ms": 0.366,
+   "ratio": 1.099,
+   "base_range": [
+    0.248,
+    0.668
+   ],
+   "tip_range": [
+    0.289,
+    0.699
+   ],
+   "outside_base": 3,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_4210.owl rooted": {
+   "base_ms": 8.582,
+   "tip_ms": 9.351,
+   "ratio": 1.09,
+   "base_range": [
+    7.917,
+    11.87
+   ],
+   "tip_range": [
+    8.12,
+    11.059
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_14551.owl default": {
+   "base_ms": 13.302,
+   "tip_ms": 14.4,
+   "ratio": 1.083,
+   "base_range": [
+    12.194,
+    15.965
+   ],
+   "tip_range": [
+    11.973,
+    19.139
+   ],
+   "outside_base": 154,
+   "outside_tip": 146,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_10594.owl default": {
+   "base_ms": 9.834,
+   "tip_ms": 10.589,
+   "ratio": 1.077,
+   "base_range": [
+    8.509,
+    11.705
+   ],
+   "tip_range": [
+    7.859,
+    14.407
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_14551.owl rooted": {
+   "base_ms": 13.746,
+   "tip_ms": 14.459,
+   "ratio": 1.052,
+   "base_range": [
+    11.91,
+    15.987
+   ],
+   "tip_range": [
+    12.53,
+    16.903
+   ],
+   "outside_base": 154,
+   "outside_tip": 146,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_2817.owl default": {
+   "base_ms": 20.831,
+   "tip_ms": 21.782,
+   "ratio": 1.046,
+   "base_range": [
+    19.313,
+    30.98
+   ],
+   "tip_range": [
+    19.151,
+    26.731
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_10985.owl default": {
+   "base_ms": 20.776,
+   "tip_ms": 21.694,
+   "ratio": 1.044,
+   "base_range": [
+    19.067,
+    27.93
+   ],
+   "tip_range": [
+    19.551,
+    27.222
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_2817.owl rooted": {
+   "base_ms": 21.004,
+   "tip_ms": 21.652,
+   "ratio": 1.031,
+   "base_range": [
+    18.955,
+    23.887
+   ],
+   "tip_range": [
+    19.21,
+    26.105
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_16642.owl rooted": {
+   "base_ms": 8.733,
+   "tip_ms": 8.965,
+   "ratio": 1.027,
+   "base_range": [
+    7.864,
+    11.009
+   ],
+   "tip_range": [
+    8.115,
+    18.078
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_14767.owl rooted": {
+   "base_ms": 10.257,
+   "tip_ms": 10.526,
+   "ratio": 1.026,
+   "base_range": [
+    7.828,
+    12.694
+   ],
+   "tip_range": [
+    8.264,
+    18.672
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3050.owl default": {
+   "base_ms": 21.049,
+   "tip_ms": 21.583,
+   "ratio": 1.025,
+   "base_range": [
+    19.286,
+    24.732
+   ],
+   "tip_range": [
+    20.04,
+    27.257
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3050.owl rooted": {
+   "base_ms": 21.829,
+   "tip_ms": 22.319,
+   "ratio": 1.022,
+   "base_range": [
+    19.146,
+    30.983
+   ],
+   "tip_range": [
+    20.09,
+    26.725
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_9151.owl default": {
+   "base_ms": 76.22,
+   "tip_ms": 77.83,
+   "ratio": 1.021,
+   "base_range": [
+    73.639,
+    85.353
+   ],
+   "tip_range": [
+    76.764,
+    84.11
+   ],
+   "outside_base": 1076,
+   "outside_tip": 1075,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_6765.owl rooted": {
+   "base_ms": 21.01,
+   "tip_ms": 21.396,
+   "ratio": 1.018,
+   "base_range": [
+    19.076,
+    24.208
+   ],
+   "tip_range": [
+    19.39,
+    25.155
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_10985.owl rooted": {
+   "base_ms": 20.192,
+   "tip_ms": 20.492,
+   "ratio": 1.015,
+   "base_range": [
+    18.809,
+    26.912
+   ],
+   "tip_range": [
+    18.743,
+    29.838
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_10409.owl rooted": {
+   "base_ms": 20.793,
+   "tip_ms": 21.022,
+   "ratio": 1.011,
+   "base_range": [
+    19.646,
+    23.965
+   ],
+   "tip_range": [
+    19.443,
+    22.223
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_15544.owl rooted": {
+   "base_ms": 20.965,
+   "tip_ms": 21.16,
+   "ratio": 1.009,
+   "base_range": [
+    19.36,
+    36.55
+   ],
+   "tip_range": [
+    19.131,
+    27.567
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_9151.owl rooted": {
+   "base_ms": 78.032,
+   "tip_ms": 78.502,
+   "ratio": 1.006,
+   "base_range": [
+    74.067,
+    88.255
+   ],
+   "tip_range": [
+    74.932,
+    84.963
+   ],
+   "outside_base": 1076,
+   "outside_tip": 1075,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_5448.owl rooted": {
+   "base_ms": 21.088,
+   "tip_ms": 21.189,
+   "ratio": 1.005,
+   "base_range": [
+    19.803,
+    28.103
+   ],
+   "tip_range": [
+    19.373,
+    28.772
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_14767.owl default": {
+   "base_ms": 9.863,
+   "tip_ms": 9.864,
+   "ratio": 1.0,
+   "base_range": [
+    7.996,
+    16.303
+   ],
+   "tip_range": [
+    7.931,
+    18.061
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_580.owl default": {
+   "base_ms": 0.381,
+   "tip_ms": 0.38,
+   "ratio": 0.999,
+   "base_range": [
+    0.167,
+    0.69
+   ],
+   "tip_range": [
+    0.237,
+    0.704
+   ],
+   "outside_base": 3,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_1790.owl default": {
+   "base_ms": 20.677,
+   "tip_ms": 20.613,
+   "ratio": 0.997,
+   "base_range": [
+    18.94,
+    25.715
+   ],
+   "tip_range": [
+    19.968,
+    28.663
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3357.owl default": {
+   "base_ms": 10.524,
+   "tip_ms": 10.469,
+   "ratio": 0.995,
+   "base_range": [
+    8.029,
+    14.741
+   ],
+   "tip_range": [
+    8.27,
+    19.046
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_15544.owl default": {
+   "base_ms": 21.031,
+   "tip_ms": 20.832,
+   "ratio": 0.991,
+   "base_range": [
+    18.996,
+    24.245
+   ],
+   "tip_range": [
+    19.401,
+    25.86
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_6266.owl default": {
+   "base_ms": 20.873,
+   "tip_ms": 20.621,
+   "ratio": 0.988,
+   "base_range": [
+    19.585,
+    24.966
+   ],
+   "tip_range": [
+    19.451,
+    24.898
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_10409.owl default": {
+   "base_ms": 20.608,
+   "tip_ms": 20.347,
+   "ratio": 0.987,
+   "base_range": [
+    18.713,
+    25.004
+   ],
+   "tip_range": [
+    18.564,
+    27.391
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_6266.owl rooted": {
+   "base_ms": 21.1,
+   "tip_ms": 20.831,
+   "ratio": 0.987,
+   "base_range": [
+    19.322,
+    22.96
+   ],
+   "tip_range": [
+    19.495,
+    30.151
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3114.owl default": {
+   "base_ms": 20.825,
+   "tip_ms": 20.45,
+   "ratio": 0.982,
+   "base_range": [
+    19.279,
+    32.03
+   ],
+   "tip_range": [
+    19.136,
+    30.932
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_1790.owl rooted": {
+   "base_ms": 21.012,
+   "tip_ms": 20.517,
+   "ratio": 0.976,
+   "base_range": [
+    19.161,
+    23.622
+   ],
+   "tip_range": [
+    19.411,
+    22.418
+   ],
+   "outside_base": 127,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3114.owl rooted": {
+   "base_ms": 20.887,
+   "tip_ms": 20.363,
+   "ratio": 0.975,
+   "base_range": [
+    19.419,
+    23.063
+   ],
+   "tip_range": [
+    19.449,
+    25.635
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_16642.owl default": {
+   "base_ms": 9.649,
+   "tip_ms": 9.365,
+   "ratio": 0.971,
+   "base_range": [
+    8.638,
+    13.231
+   ],
+   "tip_range": [
+    7.963,
+    12.003
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_5448.owl default": {
+   "base_ms": 21.209,
+   "tip_ms": 20.47,
+   "ratio": 0.965,
+   "base_range": [
+    19.187,
+    27.158
+   ],
+   "tip_range": [
+    19.072,
+    23.795
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_6765.owl default": {
+   "base_ms": 21.308,
+   "tip_ms": 20.266,
+   "ratio": 0.951,
+   "base_range": [
+    19.32,
+    28.861
+   ],
+   "tip_range": [
+    19.433,
+    28.429
+   ],
+   "outside_base": 123,
+   "outside_tip": 83,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_3529.owl default": {
+   "base_ms": 12.705,
+   "tip_ms": 11.995,
+   "ratio": 0.944,
+   "base_range": [
+    10.311,
+    13.535
+   ],
+   "tip_range": [
+    8.938,
+    19.104
+   ],
+   "outside_base": 4346,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_15993.owl default": {
+   "base_ms": 2.382,
+   "tip_ms": 2.23,
+   "ratio": 0.936,
+   "base_range": [
+    1.488,
+    3.498
+   ],
+   "tip_range": [
+    0.946,
+    3.382
+   ],
+   "outside_base": 48,
+   "outside_tip": 48,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_980.owl default": {
+   "base_ms": 9.365,
+   "tip_ms": 8.748,
+   "ratio": 0.934,
+   "base_range": [
+    8.075,
+    15.45
+   ],
+   "tip_range": [
+    8.194,
+    16.738
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_13755.owl rooted": {
+   "base_ms": 5.54,
+   "tip_ms": 5.029,
+   "ratio": 0.908,
+   "base_range": [
+    3.022,
+    11.143
+   ],
+   "tip_range": [
+    3.227,
+    6.856
+   ],
+   "outside_base": 315,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_8203.owl default": {
+   "base_ms": 7.605,
+   "tip_ms": 6.751,
+   "ratio": 0.888,
+   "base_range": [
+    3.273,
+    10.965
+   ],
+   "tip_range": [
+    4.184,
+    13.201
+   ],
+   "outside_base": 502,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_8203.owl rooted": {
+   "base_ms": 8.177,
+   "tip_ms": 7.161,
+   "ratio": 0.876,
+   "base_range": [
+    2.955,
+    13.212
+   ],
+   "tip_range": [
+    4.701,
+    9.33
+   ],
+   "outside_base": 502,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_4210.owl default": {
+   "base_ms": 10.232,
+   "tip_ms": 8.771,
+   "ratio": 0.857,
+   "base_range": [
+    8.17,
+    11.156
+   ],
+   "tip_range": [
+    8.1,
+    11.376
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_980.owl rooted": {
+   "base_ms": 10.607,
+   "tip_ms": 9.048,
+   "ratio": 0.853,
+   "base_range": [
+    7.765,
+    17.291
+   ],
+   "tip_range": [
+    8.035,
+    13.685
+   ],
+   "outside_base": 115,
+   "outside_tip": 11,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_5502.owl rooted": {
+   "base_ms": 7.188,
+   "tip_ms": 6.12,
+   "ratio": 0.851,
+   "base_range": [
+    4.879,
+    14.587
+   ],
+   "tip_range": [
+    4.988,
+    11.206
+   ],
+   "outside_base": 56,
+   "outside_tip": 56,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_5502.owl default": {
+   "base_ms": 11.036,
+   "tip_ms": 9.201,
+   "ratio": 0.834,
+   "base_range": [
+    9.407,
+    14.089
+   ],
+   "tip_range": [
+    5.574,
+    11.682
+   ],
+   "outside_base": 56,
+   "outside_tip": 56,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_7417.owl default": {
+   "base_ms": 1.06,
+   "tip_ms": 0.865,
+   "ratio": 0.816,
+   "base_range": [
+    0.897,
+    1.624
+   ],
+   "tip_range": [
+    0.71,
+    1.241
+   ],
+   "outside_base": 12,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_7914.owl rooted": {
+   "base_ms": 1128.306,
+   "tip_ms": 903.966,
+   "ratio": 0.801,
+   "base_range": [
+    1120.619,
+    1169.331
+   ],
+   "tip_range": [
+    861.687,
+    925.496
+   ],
+   "outside_base": 108542,
+   "outside_tip": 41,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_1823.owl rooted": {
+   "base_ms": 1.259,
+   "tip_ms": 1.003,
+   "ratio": 0.796,
+   "base_range": [
+    0.448,
+    2.298
+   ],
+   "tip_range": [
+    0.353,
+    2.344
+   ],
+   "outside_base": 43,
+   "outside_tip": 42,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_7663.owl rooted": {
+   "base_ms": 1.059,
+   "tip_ms": 0.839,
+   "ratio": 0.792,
+   "base_range": [
+    0.427,
+    2.594
+   ],
+   "tip_range": [
+    0.335,
+    1.47
+   ],
+   "outside_base": 414,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_3529.owl rooted": {
+   "base_ms": 12.235,
+   "tip_ms": 9.522,
+   "ratio": 0.778,
+   "base_range": [
+    10.308,
+    19.975
+   ],
+   "tip_range": [
+    7.78,
+    10.849
+   ],
+   "outside_base": 4346,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_2456.owl default": {
+   "base_ms": 1.807,
+   "tip_ms": 1.334,
+   "ratio": 0.739,
+   "base_range": [
+    0.481,
+    3.089
+   ],
+   "tip_range": [
+    0.384,
+    2.055
+   ],
+   "outside_base": 279,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_9890.owl default": {
+   "base_ms": 5.745,
+   "tip_ms": 4.082,
+   "ratio": 0.71,
+   "base_range": [
+    3.633,
+    9.181
+   ],
+   "tip_range": [
+    3.596,
+    11.441
+   ],
+   "outside_base": 124,
+   "outside_tip": 88,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_13545.owl default": {
+   "base_ms": 11.573,
+   "tip_ms": 8.165,
+   "ratio": 0.706,
+   "base_range": [
+    5.783,
+    14.163
+   ],
+   "tip_range": [
+    5.197,
+    12.888
+   ],
+   "outside_base": 62,
+   "outside_tip": 62,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_7914.owl default": {
+   "base_ms": 351.81,
+   "tip_ms": 237.355,
+   "ratio": 0.675,
+   "base_range": [
+    320.939,
+    367.224
+   ],
+   "tip_range": [
+    216.485,
+    260.003
+   ],
+   "outside_base": 108542,
+   "outside_tip": 41,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_15231.owl default": {
+   "base_ms": 1.475,
+   "tip_ms": 0.964,
+   "ratio": 0.654,
+   "base_range": [
+    0.58,
+    2.724
+   ],
+   "tip_range": [
+    0.234,
+    1.746
+   ],
+   "outside_base": 537,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_2775.owl rooted": {
+   "base_ms": 0.894,
+   "tip_ms": 0.569,
+   "ratio": 0.636,
+   "base_range": [
+    0.239,
+    1.811
+   ],
+   "tip_range": [
+    0.498,
+    0.929
+   ],
+   "outside_base": 166,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_2775.owl default": {
+   "base_ms": 0.9,
+   "tip_ms": 0.564,
+   "ratio": 0.627,
+   "base_range": [
+    0.38,
+    1.858
+   ],
+   "tip_range": [
+    0.38,
+    0.861
+   ],
+   "outside_base": 166,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_7417.owl rooted": {
+   "base_ms": 1.081,
+   "tip_ms": 0.636,
+   "ratio": 0.588,
+   "base_range": [
+    0.313,
+    1.506
+   ],
+   "tip_range": [
+    0.318,
+    1.354
+   ],
+   "outside_base": 12,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_7663.owl default": {
+   "base_ms": 1.386,
+   "tip_ms": 0.815,
+   "ratio": 0.588,
+   "base_range": [
+    0.4,
+    2.599
+   ],
+   "tip_range": [
+    0.224,
+    1.401
+   ],
+   "outside_base": 414,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_5857.owl rooted": {
+   "base_ms": 3386.526,
+   "tip_ms": 1930.284,
+   "ratio": 0.57,
+   "base_range": [
+    3361.532,
+    3439.651
+   ],
+   "tip_range": [
+    1919.437,
+    1945.7
+   ],
+   "outside_base": 723805,
+   "outside_tip": 0,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_7195.owl default": {
+   "base_ms": 12.534,
+   "tip_ms": 7.09,
+   "ratio": 0.566,
+   "base_range": [
+    11.15,
+    19.723
+   ],
+   "tip_range": [
+    4.483,
+    12.154
+   ],
+   "outside_base": 11267,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_15733.owl default": {
+   "base_ms": 33.111,
+   "tip_ms": 18.668,
+   "ratio": 0.564,
+   "base_range": [
+    31.278,
+    36.976
+   ],
+   "tip_range": [
+    16.124,
+    22.665
+   ],
+   "outside_base": 23100,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_9761.owl default": {
+   "base_ms": 11.147,
+   "tip_ms": 6.237,
+   "ratio": 0.559,
+   "base_range": [
+    8.008,
+    19.622
+   ],
+   "tip_range": [
+    4.368,
+    15.141
+   ],
+   "outside_base": 6868,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_15231.owl rooted": {
+   "base_ms": 1.744,
+   "tip_ms": 0.952,
+   "ratio": 0.546,
+   "base_range": [
+    0.794,
+    3.697
+   ],
+   "tip_range": [
+    0.233,
+    1.683
+   ],
+   "outside_base": 537,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_2456.owl rooted": {
+   "base_ms": 1.845,
+   "tip_ms": 0.972,
+   "ratio": 0.527,
+   "base_range": [
+    0.463,
+    2.771
+   ],
+   "tip_range": [
+    0.33,
+    1.764
+   ],
+   "outside_base": 279,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_4527.owl rooted": {
+   "base_ms": 6.748,
+   "tip_ms": 3.525,
+   "ratio": 0.522,
+   "base_range": [
+    5.488,
+    12.588
+   ],
+   "tip_range": [
+    2.803,
+    6.722
+   ],
+   "outside_base": 1826,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_7195.owl rooted": {
+   "base_ms": 14.683,
+   "tip_ms": 7.568,
+   "ratio": 0.515,
+   "base_range": [
+    13.614,
+    17.794
+   ],
+   "tip_range": [
+    6.184,
+    9.414
+   ],
+   "outside_base": 11267,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_15733.owl rooted": {
+   "base_ms": 33.769,
+   "tip_ms": 17.144,
+   "ratio": 0.508,
+   "base_range": [
+    31.047,
+    37.78
+   ],
+   "tip_range": [
+    14.89,
+    21.986
+   ],
+   "outside_base": 23100,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_9761.owl rooted": {
+   "base_ms": 10.516,
+   "tip_ms": 5.156,
+   "ratio": 0.49,
+   "base_range": [
+    8.39,
+    20.555
+   ],
+   "tip_range": [
+    3.916,
+    6.117
+   ],
+   "outside_base": 6868,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_11311.owl default": {
+   "base_ms": 60.813,
+   "tip_ms": 29.769,
+   "ratio": 0.49,
+   "base_range": [
+    58.75,
+    66.94
+   ],
+   "tip_range": [
+    26.632,
+    33.238
+   ],
+   "outside_base": 45157,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_4527.owl default": {
+   "base_ms": 5.581,
+   "tip_ms": 2.677,
+   "ratio": 0.48,
+   "base_range": [
+    4.261,
+    9.58
+   ],
+   "tip_range": [
+    1.896,
+    5.623
+   ],
+   "outside_base": 1826,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_11311.owl rooted": {
+   "base_ms": 63.647,
+   "tip_ms": 29.734,
+   "ratio": 0.467,
+   "base_range": [
+    61.401,
+    70.189
+   ],
+   "tip_range": [
+    26.997,
+    36.337
+   ],
+   "outside_base": 45157,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "horn"
+  },
+  "ore_ont_4662.owl rooted": {
+   "base_ms": 20.609,
+   "tip_ms": 9.111,
+   "ratio": 0.442,
+   "base_range": [
+    18.963,
+    24.39
+   ],
+   "tip_range": [
+    6.298,
+    15.704
+   ],
+   "outside_base": 16685,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_7858.owl rooted": {
+   "base_ms": 19.767,
+   "tip_ms": 8.58,
+   "ratio": 0.434,
+   "base_range": [
+    18.377,
+    30.78
+   ],
+   "tip_range": [
+    6.781,
+    9.852
+   ],
+   "outside_base": 16685,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_2624.owl default": {
+   "base_ms": 14.21,
+   "tip_ms": 6.093,
+   "ratio": 0.429,
+   "base_range": [
+    12.731,
+    26.873
+   ],
+   "tip_range": [
+    4.621,
+    7.58
+   ],
+   "outside_base": 12278,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_6817.owl default": {
+   "base_ms": 4.45,
+   "tip_ms": 1.876,
+   "ratio": 0.422,
+   "base_range": [
+    3.215,
+    7.003
+   ],
+   "tip_range": [
+    1.112,
+    3.47
+   ],
+   "outside_base": 2915,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_7251.owl rooted": {
+   "base_ms": 18.571,
+   "tip_ms": 7.776,
+   "ratio": 0.419,
+   "base_range": [
+    15.496,
+    25.231
+   ],
+   "tip_range": [
+    6.212,
+    10.223
+   ],
+   "outside_base": 14187,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_7858.owl default": {
+   "base_ms": 20.428,
+   "tip_ms": 8.169,
+   "ratio": 0.4,
+   "base_range": [
+    18.293,
+    26.096
+   ],
+   "tip_range": [
+    5.975,
+    12.682
+   ],
+   "outside_base": 16685,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_7251.owl default": {
+   "base_ms": 19.046,
+   "tip_ms": 7.597,
+   "ratio": 0.399,
+   "base_range": [
+    15.263,
+    25.779
+   ],
+   "tip_range": [
+    6.526,
+    8.854
+   ],
+   "outside_base": 14187,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_2624.owl rooted": {
+   "base_ms": 18.422,
+   "tip_ms": 6.944,
+   "ratio": 0.377,
+   "base_range": [
+    13.619,
+    31.766
+   ],
+   "tip_range": [
+    4.94,
+    8.79
+   ],
+   "outside_base": 12278,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_6817.owl rooted": {
+   "base_ms": 4.638,
+   "tip_ms": 1.676,
+   "ratio": 0.361,
+   "base_range": [
+    3.175,
+    11.564
+   ],
+   "tip_range": [
+    1.166,
+    3.221
+   ],
+   "outside_base": 2915,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_15993.owl rooted": {
+   "base_ms": 2.438,
+   "tip_ms": 0.836,
+   "ratio": 0.343,
+   "base_range": [
+    1.757,
+    4.444
+   ],
+   "tip_range": [
+    0.496,
+    3.818
+   ],
+   "outside_base": 48,
+   "outside_tip": 48,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_4662.owl default": {
+   "base_ms": 21.859,
+   "tip_ms": 7.223,
+   "ratio": 0.33,
+   "base_range": [
+    18.615,
+    28.785
+   ],
+   "tip_range": [
+    5.706,
+    9.758
+   ],
+   "outside_base": 16685,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_11110.owl default": {
+   "base_ms": 94.877,
+   "tip_ms": 29.016,
+   "ratio": 0.306,
+   "base_range": [
+    90.873,
+    103.293
+   ],
+   "tip_range": [
+    26.135,
+    31.087
+   ],
+   "outside_base": 81045,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_11110.owl rooted": {
+   "base_ms": 96.468,
+   "tip_ms": 28.657,
+   "ratio": 0.297,
+   "base_range": [
+    93.515,
+    99.707
+   ],
+   "tip_range": [
+    26.554,
+    35.059
+   ],
+   "outside_base": 81045,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_12448.owl default": {
+   "base_ms": 132.132,
+   "tip_ms": 37.801,
+   "ratio": 0.286,
+   "base_range": [
+    128.921,
+    135.819
+   ],
+   "tip_range": [
+    34.698,
+    40.688
+   ],
+   "outside_base": 102961,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_12448.owl rooted": {
+   "base_ms": 135.059,
+   "tip_ms": 37.895,
+   "ratio": 0.281,
+   "base_range": [
+    131.796,
+    139.757
+   ],
+   "tip_range": [
+    35.192,
+    42.182
+   ],
+   "outside_base": 102961,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_12414.owl default": {
+   "base_ms": 227.99,
+   "tip_ms": 49.441,
+   "ratio": 0.217,
+   "base_range": [
+    216.901,
+    233.914
+   ],
+   "tip_range": [
+    46.947,
+    51.983
+   ],
+   "outside_base": 163237,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_4755.owl rooted": {
+   "base_ms": 389.102,
+   "tip_ms": 81.675,
+   "ratio": 0.21,
+   "base_range": [
+    364.12,
+    399.294
+   ],
+   "tip_range": [
+    75.18,
+    86.107
+   ],
+   "outside_base": 244174,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_6478.owl rooted": {
+   "base_ms": 78.324,
+   "tip_ms": 16.293,
+   "ratio": 0.208,
+   "base_range": [
+    77.226,
+    86.043
+   ],
+   "tip_range": [
+    13.882,
+    20.67
+   ],
+   "outside_base": 77611,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_12414.owl rooted": {
+   "base_ms": 235.315,
+   "tip_ms": 48.894,
+   "ratio": 0.208,
+   "base_range": [
+    233.127,
+    242.341
+   ],
+   "tip_range": [
+    46.604,
+    51.784
+   ],
+   "outside_base": 163237,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_4755.owl default": {
+   "base_ms": 383.16,
+   "tip_ms": 78.497,
+   "ratio": 0.205,
+   "base_range": [
+    369.665,
+    389.989
+   ],
+   "tip_range": [
+    76.5,
+    84.426
+   ],
+   "outside_base": 244174,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_6478.owl default": {
+   "base_ms": 77.668,
+   "tip_ms": 15.641,
+   "ratio": 0.201,
+   "base_range": [
+    74.214,
+    80.029
+   ],
+   "tip_range": [
+    14.192,
+    16.159
+   ],
+   "outside_base": 77611,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_5857.owl default": {
+   "base_ms": 1392.217,
+   "tip_ms": 241.729,
+   "ratio": 0.174,
+   "base_range": [
+    1381.238,
+    1407.455
+   ],
+   "tip_range": [
+    229.556,
+    247.23
+   ],
+   "outside_base": 723843,
+   "outside_tip": 38,
+   "tier_base": "disjunctive",
+   "tier_tip": "disjunctive"
+  },
+  "ore_ont_1370.owl rooted": {
+   "base_ms": 426.826,
+   "tip_ms": 69.103,
+   "ratio": 0.162,
+   "base_range": [
+    414.983,
+    438.276
+   ],
+   "tip_range": [
+    66.231,
+    76.85
+   ],
+   "outside_base": 243972,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_1370.owl default": {
+   "base_ms": 420.819,
+   "tip_ms": 67.018,
+   "ratio": 0.159,
+   "base_range": [
+    411.202,
+    423.413
+   ],
+   "tip_range": [
+    63.435,
+    69.776
+   ],
+   "outside_base": 243972,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_5481.owl default": {
+   "base_ms": 759.477,
+   "tip_ms": 89.88,
+   "ratio": 0.118,
+   "base_range": [
+    701.597,
+    766.645
+   ],
+   "tip_range": [
+    87.458,
+    91.183
+   ],
+   "outside_base": 457662,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_10073.owl default": {
+   "base_ms": 756.378,
+   "tip_ms": 87.728,
+   "ratio": 0.116,
+   "base_range": [
+    752.692,
+    760.189
+   ],
+   "tip_range": [
+    84.279,
+    89.696
+   ],
+   "outside_base": 457662,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_10073.owl rooted": {
+   "base_ms": 774.384,
+   "tip_ms": 89.537,
+   "ratio": 0.116,
+   "base_range": [
+    763.626,
+    827.216
+   ],
+   "tip_range": [
+    85.613,
+    91.198
+   ],
+   "outside_base": 457662,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  },
+  "ore_ont_5481.owl rooted": {
+   "base_ms": 774.269,
+   "tip_ms": 89.429,
+   "ratio": 0.116,
+   "base_range": [
+    762.337,
+    787.729
+   ],
+   "tip_range": [
+    84.831,
+    95.768
+   ],
+   "outside_base": 457662,
+   "outside_tip": 0,
+   "tier_base": "horn",
+   "tier_tip": "el"
+  }
+ },
+ "checks": {
+  "hermit": "29 files with a reference, default and rooted: 58 equal, same consistency",
+  "census": "left-out axioms 5,659,868 to 5,048 over both runs; files with nothing left out: 0 to 30 default, 0 to 31 rooted; no non-anonymous left-out count rises",
+  "processes": 708
+ },
+ "notes": "atlas rebooted at 11:06 local time, after the run ended at 11:05."
+}
