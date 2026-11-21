@@ -1410,7 +1410,7 @@ the final states of the closure over the ε-transitions before them. It finds th
 the transitions between a state that the start reaches and one whose ε-transitions reach
 the end, without building the closure, in time linear in the automaton apart from the sort
 of the labels and with polls of the run's deadline and cancellation, and it refuses
-scratch past the run's memory limit as the property closure does. When the left-out universals were a run's only
+scratch whose upper bound passes the run's memory limit, as the property closure does. When the left-out universals were a run's only
 universal restrictions and no other Horn rule can fire, the run takes the EL rules, which
 compose every chain, as for any such run. A change to the axioms after a run with the
 Horn rules normalizes them again, so a removed range that covered a universal brings the

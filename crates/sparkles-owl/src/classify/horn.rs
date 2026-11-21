@@ -257,16 +257,18 @@ impl Nfa {
     /// transition from a state that the start reaches to one whose ε-transitions reach the
     /// end. The work is linear in the automaton up to the sort of the labels, and it polls
     /// `stop` every [`POLL_WORK`] steps and once more after the sort. Its scratch is a few
-    /// words for each state and transition, which it counts before it allocates and
-    /// refuses past `limit` bytes, as the role box refuses its closure.
+    /// words for each state and transition, of which it counts an upper bound before it
+    /// allocates and refuses past `limit` bytes, as the role box refuses its closure.
     pub fn final_labels(
         &self,
         limit: Option<usize>,
         stop: &dyn Fn() -> bool,
     ) -> Result<Option<Vec<Role>>, Halt> {
-        // the lists of each state, the marks and the stack, the transitions in the lists
-        // and the labels
-        let bytes = self.states as usize * (2 * 24 + 2 + 2 * 4) + self.trans.len() * (2 * 4 + 4);
+        // an upper bound: the two lists of each state and their entries, the two marks of
+        // each state, a stack that holds at most every transition's target once more than
+        // the transitions, and the labels, each vector at up to twice its length by growth
+        let (n, m) = (self.states as usize, self.trans.len());
+        let bytes = n * (2 * 24 + 2) + 2 * (2 * m * 4 + (m + 1) * 4 + m * 4);
         if limit.is_some_and(|l| bytes > l) {
             return Err(Halt::Memory(bytes));
         }
