@@ -312,6 +312,49 @@ fn generate(seed: u64) -> Case {
         add(&mut r, &mut st, ":pp rdfs:range :A .".into());
     }
 
+    // other declaring types and OWL 1 forms
+    for (s_, ty, p_) in [
+        (":op", "owl:OntologyProperty", 0.1),
+        (":dp", "owl:DatatypeProperty", 0.2),
+        (":dt", "rdfs:Datatype", 0.15),
+        (":dr", "owl:DataRange", 0.05),
+        (":ni", "owl:NamedIndividual", 0.15),
+        (":fp", "owl:FunctionalProperty", 0.1),
+        (":sp", "owl:SymmetricProperty", 0.1),
+        (":ifp", "owl:InverseFunctionalProperty", 0.08),
+    ] {
+        if r.p(p_) {
+            triple(&mut r, &mut st, &mut reifiable, s_, "rdf:type", ty);
+        }
+    }
+    if r.p(0.1) && !onodes.is_empty() {
+        triple(&mut r, &mut st, &mut reifiable, onodes[0], ":op", "\"o\"");
+    }
+    if r.p(0.02) {
+        add(
+            &mut r,
+            &mut st,
+            "rdfs:subClassOf a owl:ObjectProperty .".into(),
+        );
+    }
+    if r.p(0.04) && !onodes.is_empty() {
+        add(
+            &mut r,
+            &mut st,
+            format!("{} a _:c . _:c a owl:Class .", onodes[0]),
+        );
+    }
+    if r.p(0.1) && !onodes.is_empty() {
+        triple(
+            &mut r,
+            &mut st,
+            &mut reifiable,
+            onodes[0],
+            "owl:imports",
+            "<http://ex.org/g2>",
+        );
+    }
+
     // reifiers, which may name each other
     let reifiers = (r.next() % 4) as usize;
     for k in 0..reifiers {
@@ -351,11 +394,23 @@ fn generate(seed: u64) -> Case {
         }
         parts.push(format!("owl:annotatedSource {s}"));
         parts.push(format!("owl:annotatedProperty {p}"));
-        parts.push(format!("owl:annotatedTarget {o}"));
+        if r.p(0.97) {
+            parts.push(format!("owl:annotatedTarget {o}"));
+        }
+        if r.p(0.03) {
+            parts.push("owl:annotatedTarget \"other\"".into());
+        }
         if r.p(0.03) {
             parts.push("owl:annotatedSource :A".into());
         }
-        st.push((g, format!("{node} {} .", parts.join(" ; "))));
+        if r.p(0.1) {
+            // the reifier's triples split across graphs
+            let last = parts.pop().unwrap();
+            st.push((g, format!("{node} {} .", parts.join(" ; "))));
+            add(&mut r, &mut st, format!("{node} {last} ."));
+        } else {
+            st.push((g, format!("{node} {} .", parts.join(" ; "))));
+        }
         if r.p(0.7) {
             let c = format!("\"c{k}\"");
             st.push((g, format!("{node} rdfs:comment {c} .")));
@@ -387,6 +442,20 @@ fn generate(seed: u64) -> Case {
             add(&mut r, &mut st, format!("{node} a owl:Class ."));
         }
         if r.p(0.04) {
+            add(
+                &mut r,
+                &mut st,
+                format!("{node} a owl:AllDifferent ; owl:distinctMembers (:a :c) ."),
+            );
+        }
+        if r.p(0.04) {
+            add(
+                &mut r,
+                &mut st,
+                format!("{node} a owl:AllDisjointProperties ; owl:members (:pp :dp) ."),
+            );
+        }
+        if r.p(0.04) {
             add(&mut r, &mut st, format!(":C rdfs:subClassOf {node} ."));
         }
         if r.p(0.03) {
@@ -407,8 +476,9 @@ fn generate(seed: u64) -> Case {
     }
 }
 
-/// The summary's answer and the head's for `case`, as results.
-fn answers(case: &Case) -> (Result<J, String>, Result<J, String>) {
+/// The summary's answer and the head's for `case`, as results, and whether the head
+/// opened the ontology.
+fn answers(case: &Case) -> (Result<J, String>, Result<J, String>, bool) {
     let ds = dataset(&case.data());
     let o = QueryOptions::default();
     let full = wire::call(&ds, "summary", &case.args, &o)
@@ -417,7 +487,10 @@ fn answers(case: &Case) -> (Result<J, String>, Result<J, String>) {
     let mut args = case.args.clone();
     args["view"] = json!("head");
     let head = wire::call(&ds, "summary", &args, &o).map_err(|e| e.to_string());
-    (full, head)
+    let opened = wire::request_of(case.args.as_object().unwrap())
+        .and_then(|req| ds.ontology().head(&req, &o))
+        .is_ok_and(|h| h.opened);
+    (full, head, opened)
 }
 
 fn env_u64(name: &str, default: u64) -> u64 {
@@ -434,7 +507,7 @@ fn the_head_answers_what_the_summary_does_on_generated_ontologies() {
     let mut read = 0u64;
     for seed in first..first + cases {
         let case = generate(seed);
-        let (full, head) = answers(&case);
+        let (full, head, opened) = answers(&case);
         assert_eq!(
             head,
             full,
@@ -442,11 +515,7 @@ fn the_head_answers_what_the_summary_does_on_generated_ontologies() {
             case.args,
             case.data()
         );
-        let ds = dataset(&case.data());
-        if let Ok(req) = wire::request_of(case.args.as_object().unwrap())
-            && let Ok(h) = ds.ontology().head(&req, &QueryOptions::default())
-            && !h.opened
-        {
+        if !opened {
             read += 1;
         }
     }

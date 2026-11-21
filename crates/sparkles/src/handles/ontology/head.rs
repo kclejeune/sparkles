@@ -142,13 +142,22 @@ impl Ontologies {
             },
         };
         check(opts)?;
-        let (header, entities, opened) = match read {
-            Some((h, e)) => (h, e, false),
-            None => {
-                let o = self.open_at(snap, req, opts)?;
-                let s = o.summary();
-                (s.header, s.entities, true)
-            }
+        let Some((header, entities)) = read else {
+            // the whole answer from the open ontology, whose reasoning record can be newer
+            // than the one read above
+            let o = self.open_at(snap, req, opts)?;
+            let s = o.summary();
+            return Ok(Head {
+                commit: o.snapshot.commit,
+                graphs: o.graphs.clone(),
+                imports: o.imports.clone(),
+                closure: o.closure.clone(),
+                warnings: o.warnings.clone(),
+                inferences: o.inferences.clone(),
+                header: s.header,
+                entities: s.entities,
+                opened: true,
+            });
         };
         Ok(Head {
             commit: view.commit,
@@ -159,7 +168,7 @@ impl Ontologies {
             inferences,
             header,
             entities,
-            opened,
+            opened: false,
         })
     }
 }
@@ -206,8 +215,6 @@ struct Reader<'a> {
     /// annotation predicates
     reserved: FxHashSet<Id>,
     rdf_type: Option<Id>,
-    /// the annotation properties declared in the graphs read
-    declared: FxHashSet<Id>,
     n: Cell<usize>,
 }
 
@@ -235,7 +242,6 @@ impl<'a> Reader<'a> {
             structural: FxHashSet::default(),
             reserved: FxHashSet::default(),
             rdf_type: snap.lookup_iri(vocab::RDF_TYPE),
-            declared: FxHashSet::default(),
             n: Cell::new(0),
         };
         for p in vocab::STRUCTURAL_PREDICATES
@@ -267,8 +273,7 @@ impl<'a> Reader<'a> {
                 declared.push(q[0]);
                 Ok(true)
             })?;
-            r.terminological.extend(declared.iter().copied());
-            r.declared.extend(declared);
+            r.terminological.extend(declared);
         }
         Ok(r)
     }
