@@ -2418,7 +2418,10 @@ impl Index {
         // from chains that compose loops, from individuals linked to themselves and from
         // the Horn rules, by roles that need not occur in any positive existential, so
         // every range occurs positively (roadmap item 1262). A range that no context
-        // takes costs its successor entries only.
+        // takes still costs its index entries, such as the intersections of the fillers
+        // of its existentials with their roles' ranges, their heads and successor
+        // entries and the told subsumers of its data restrictions, but no context is
+        // saturated for it.
         let ranges: Vec<Ex> = ix.roles.range.iter().flatten().copied().collect();
         for c in ranges {
             b.positive(c, it, &mut ix);

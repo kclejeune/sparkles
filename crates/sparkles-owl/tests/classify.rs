@@ -2356,6 +2356,14 @@ fn a_range_on_links_that_are_not_loops() {
                     ..Limits::default()
                 };
                 let o = Classifier::of(&ofn(body)).classify(&limits).unwrap();
+                // a datatype restriction with a facet is outside OWL 2 EL, and no tier
+                // takes it: the run leaves it out and reports it
+                if name == "data told" || name == "data range exist" {
+                    let out = &o.stats.outside_el;
+                    if !(o.complete && out.horn == 1 && out.taken == 0) {
+                        bad.push(format!("{name} el_only={el_only}: not left out"));
+                    }
+                }
                 let ok = o.taxonomy.is_subclass(&c(a), &c(g));
                 if took_all(&o) && !ok {
                     bad.push(format!("{name} el_only={el_only} threads={threads}"));

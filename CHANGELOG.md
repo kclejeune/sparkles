@@ -4,14 +4,14 @@
 
 ### A range that only a loop reaches is classified in full
 
-A context with a role loop, from a self restriction, a chain of loops or the Horn rules,
-takes the role's range. The OWL 2 EL classifier registered a range as a positive
+A context with a role loop, from a self restriction or the Horn rules, takes the role's
+range. The OWL 2 EL classifier registered a range as a positive
 occurrence only through a positive existential on the role, so the existentials of such a
 range had no successor contexts and its data restrictions no told subsumers. A full run
 could miss a subsumption or an unsatisfiable class while reporting itself complete, and a
 kept run could differ from a fresh one after an unrelated edit. The index now registers
 every range, as roadmap item 1262. The taxonomies of `ore_ont_13482` and `ore_ont_9499`
-are unchanged, and their cold classification times show no measurable change.
+are unchanged.
 
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
