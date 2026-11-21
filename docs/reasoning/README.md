@@ -540,8 +540,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   in every run that finishes, and the larger generated corpora derive 2 to 13% more
   conclusions, so that a few of their runs pass the work bound. With the selection of
   ground body literals turned off for measurement, the repair makes the generated ontology
-  g1-051_p0012 grow past every bound tried, and the work and memory bounds stop it.
-  Roadmap item 1231 turns the repair on by default and the check off, after item 1250. A
+  g1-051_p0012 grow past every bound tried, and the work and memory bounds stop it. The
+  repair checks the run's bounds at the same cooperative checkpoints as the other rules,
+  and some of its preparation reads premise lists between two checks without counting
+  the reads, which item 1280 meters. Roadmap item 1231 turns the repair on by default and
+  the check off, after items 1250 and 1280. A
   rooted run without counting has a bound of 524,288 derived conclusions,
   `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes

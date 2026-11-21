@@ -242,13 +242,38 @@ bound at 4 million conclusions and the memory budget of 1 GiB at 400 million, ag
 455,967 conclusions without the repair. `SPARKLES_ROOTED_MARKER_REPAIR=129` resolves a
 returned clause only with premises whose body has no ground literal. It loses no answer on
 the corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten
-runs that the repair alone takes past the bound, but g1-051_p0012 still passes the bound,
-where the growth is in Pred over successor terms of constants and in Join, which item 1250
+runs that the repair alone takes past the bound, but g1-051_p0012 still passes the bound of 4
+million and finishes only at 63.2 million conclusions under a bound of 400 million. Its
+growth is in Pred over successor terms of constants and in Join, which item 1250
 follows, and g1-051_p0121 derives 1.42 million conclusions against 1.17 million with the
 repair alone. The repair's state costs 8 bytes per context with the repair off, which item
 1247 removes, and a synthetic family whose conditions nest two or more deep grows with the
 repair's sends, which is item 1251. The repair's completeness is not proved, and the check
 stays on by default.
+
+The repair keeps the resource contract of the rest of Tier D, and the contract is
+cooperative. A run charges each conclusion that it derives to the work bound, and the
+repair's own scans also charge one conclusion for every 16 entries that they read. The
+preparation of an inference, such as the premise lists of a rule and their pruning, takes
+time and memory in proportion to the clauses that the context already holds and is not
+charged while it runs. Growth of the retained indexes is added to the memory estimate
+after the allocation. The run checks the work bound, the memory budget, the deadline and
+a cancellation at cooperative checkpoints, which come after every 256 choices of a
+product, after every 64 sends of a loop and whenever a worker adds its counts of applied
+conclusions to the run's totals. The contract therefore bounds neither the time between
+two checks by a fixed number of reads nor the allocated bytes by the memory budget, which
+is an estimate.
+
+Some steps of the repair and of the rooted rules read between two checks without
+counting what they read. The index of a clause that the root offers to its holders is
+built for the whole body before the first check, so that step is bounded by one clause's
+body. With `SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test of each of the
+diagnostic's products scans the context's stored clauses without a count, and the
+diagnostic's other reads are counted and checked after every 4,096. The marker pass that
+the diagnostic and the decline check run after a rooted run saturates checks no bound.
+The decline check runs it on every rooted run with the check on, with the repair on or
+off, and item 1260 follows its stop latency. Item 1280 gives the repair and the store's
+premise lists one meter that counts these reads.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position

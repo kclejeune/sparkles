@@ -1551,6 +1551,9 @@ fn m_note<S: Sink>(
 /// the run's bounds, and a batch with nothing to admit polls them instead. A refusal, or a
 /// drain that stopped, ends the replay with the store interrupted, as [`drain`] leaves it,
 /// and the function is false. The conclusions are charged as `drain` charges them.
+/// The premise lists of a batch's returns are read without a count of the reads, as the
+/// premise lists of the other rules are, so up to [`M_POLL`] returns' preparation runs between
+/// two checks (roadmap item 1280).
 fn m_late<S: Sink>(ix: &Index, st: &mut State, l: Lit, prem: &Side, out: &mut S) -> bool {
     let mut batch = Found::default();
     let mut since = 0;
@@ -2538,7 +2541,9 @@ const DIAG_POLL: usize = 4096;
 
 /// The diagnostic's count of what it reads: it charges `poll` a conclusion for each
 /// [`WORK_READS`] reads, after every [`DIAG_POLL`] of them, and stops once poll answers
-/// false.
+/// false. The redundancy test of each product in [`products_held`] scans the store's
+/// candidates outside this count, and [`marker_trips`] counts nothing (roadmap items 1260
+/// and 1280).
 struct Reads<'a> {
     n: usize,
     poll: &'a mut dyn FnMut(usize) -> bool,
