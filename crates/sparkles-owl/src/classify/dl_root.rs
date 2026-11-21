@@ -4039,6 +4039,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_deficit_count_reads_each_successor_and_copy() {
+        // a root's 50,000 successor entries, and 50,000 copies to total, are read one by one
+        // under the run's checks
+        let sig = Sig::new();
+        let (ix, root) = probe_ix(sig);
+        let run = DlRun::new(false, Default::default());
+        let none = |me: Ex, succ: Vec<Ex>| MarkerCtx {
+            me,
+            held: vec![],
+            succ,
+            edges: vec![],
+            units: vec![],
+        };
+        let def = || {
+            Some(MarkerDef {
+                bottom: false,
+                marks: vec![],
+                owed: 1,
+                unchecked: 0,
+            })
+        };
+        for (succ, copies) in [(50_000, 1), (0, 50_000)] {
+            // one successor listed 50,000 times, which the reach meets once
+            let cs = [none(root, std::iter::repeat_n(100_000, succ).collect())];
+            let defs: Vec<Option<MarkerDef>> = (0..copies).map(|_| def()).collect();
+            let mut polls = 0;
+            let n = marker_deficits(&ix, &cs, &defs, &run.lits, &mut |_| {
+                polls += 1;
+                true
+            });
+            assert_eq!(n, Some([0, copies as usize, 0]));
+            assert!(
+                polls >= 50_000 / DIAG_POLL,
+                "{polls} checks for {succ} successors and {copies} copies"
+            );
+        }
+    }
+
     /// A small signature: classes, individuals and roles by name.
     struct Sig {
         it: Interner,
