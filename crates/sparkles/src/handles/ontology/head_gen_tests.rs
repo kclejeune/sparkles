@@ -408,7 +408,7 @@ fn generate(seed: u64) -> Case {
         if r.p(0.03) {
             parts.push("owl:annotatedSource :A".into());
         }
-        if r.p(0.1) {
+        if parts.len() > 1 && r.p(0.1) {
             // the reifier's triples split across graphs
             let last = parts.pop().unwrap();
             st.push((g, format!("{node} {} .", parts.join(" ; "))));
