@@ -23,7 +23,7 @@ has changed unittest's suite classes or put other classes under their names, and
 classes of one module run in more than one entry, as when one test module imports another's
 class, since they can share that module's state. The runner does not ask what such a hook
 or suite does, and counts a suite of a kind of its own as one occurrence. A default suite
-that replaces its own run() or countTestCases() and also hides its tests, for instance by
+that replaces both its own run() and countTestCases() and hides its tests, for instance by
 setting _tests to None, is outside this contract. The runner fails the run with exit 1 while
 describing such a suite, before the whole-suite run could start, and never passes it.
 

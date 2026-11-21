@@ -383,12 +383,13 @@ than default suites and `TestCase` tests, including a suite given its own `run`,
 module changes unittest's suite classes or rebinds their names, or when test classes of one
 module run under more than one module, as when one test module imports another's class. Such
 a suite or test can depend on what ran before it, and the runner does not try to tell
-whether it does. A default suite that replaces its own `run` or `countTestCases` and also
+whether it does. A default suite that replaces both its own `run` and `countTestCases` and
 hides its tests, for instance by setting `_tests` to `None`, is outside what the runner
-supports, and the runner fails the run with exit 1 instead of passing it. Tests that share state in another way, such as a helper module's globals,
-are not detected. The runner therefore reaches the serial verdict only when no test depends
-on state that a test in another process left behind, and passing alone does not show this,
-since such a test can skip instead of fail. The same holds for the tests of a split module.
+supports, and the runner fails the run with exit 1 instead of passing it. Tests that share
+state in another way, such as a helper module's globals, are not detected. The runner
+therefore reaches the serial verdict only when no test depends on state that a test in
+another process left behind, and passing alone does not show this, since such a test can
+skip instead of fail. The same holds for the tests of a split module.
 The runner also assumes that a test's own `run` method reads only its own test's result, and
 that test code does not react to being inspected or imported more than once, since each
 process imports every module and asks each test for its id and attributes again. The
