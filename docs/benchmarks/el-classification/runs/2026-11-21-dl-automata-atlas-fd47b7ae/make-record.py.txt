@@ -49,6 +49,18 @@ for lv in (0, 2):
         for l in open(os.path.join(E, "counts", f"l{lv}.err")) if l.startswith("MEAS ")
     }
 
+A = os.path.join(E, "automata712")
+automata = {}
+for lv in (0, 1, 2):
+    automata[f"level{lv}"] = [l.rstrip("\n") for l in open(os.path.join(A, f"l{lv}.r1.err"))
+                             if l.startswith("MEASURE dl-")]
+instructions = {
+    "binary": "the meas build of lane perf-stuck-measure, fd47b7ae with automata_patch, sha256 "
+              + open(os.path.join(A, "meas.sha256")).read().split()[0],
+    "method": "perf stat -e cpu_core/instructions/u of one whole el_classify process with --repeat 5 on BioTop, pinned to the laptop's P-cores, three runs per level in the order of the lines, with SPARKLES_DL_AUTOMATA at each level; each line gives the level, the run, the user instructions and the process's classification times in ms",
+    "runs": open(os.path.join(A, "insn.txt")).read().splitlines(),
+}
+
 record = {
     "suite": "el-classification",
     "kind": "measurement",
@@ -81,6 +93,10 @@ record = {
         "counter_patch": open(os.path.join(E, "counts", "meas.patch")).read(),
         "profile_self": open(os.path.join(E, "counts", "perf.l2.self.txt")).read(),
         "profile_children": open(os.path.join(E, "counts", "perf.l2.children.txt")).read(),
+        "automata": automata,
+        "automata_method": "one run per level on one thread of the same meas build, whose dl-auto lines give each automaton's states and transitions before and after the reduction and whose dl-unfold line gives the unfoldings, the fresh state classes and the transition axioms of the whole ontology",
+        "automata_patch": open(os.path.join(A, "meas.patch")).read(),
+        "instructions": instructions,
     },
 }
 os.makedirs(OUT, exist_ok=True)

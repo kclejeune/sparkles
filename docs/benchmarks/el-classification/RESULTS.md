@@ -1881,11 +1881,11 @@ The 22 unfoldings of BioTop's 11 automata make 62 fresh classes and 77 transitio
 at level 2 against 111 and 357 at level 0. On one thread the attempt does 66,200 units of
 work against 136,117 and stores 42,242 clauses against 75,182, and the run derives 118,814
 conclusions against 191,508, with estimated bytes of 12.8 against 21.2 MB. The median
-peak resident set of a process is 34 against 69 MiB on one thread and 76 against 88 MiB on
+peak resident set of a process is 34 against 68 MiB on one thread and 74 against 86 MiB on
 four. Every process exited normally with a complete answer from the disjunctive rules,
 and on four threads the work ranged from 138,487 to 154,001 at level 0 and from 67,727 to
-75,976 at level 2. The rounds wrote no taxonomies, which the sweep below compares. A pinned process on the laptop executes 49%
-fewer user instructions at level 2. The binary of the rounds is the measurement build of
+75,976 at level 2. The rounds wrote no taxonomies, which the sweep below compares. A pinned process of the measurement build that counts the automata executes 49%
+fewer user instructions at level 2 on the laptop. The binary of the rounds is the measurement build of
 the same reduction on commit fd47b7ae, and the item's build gives the same work, stored
 clauses, conclusions and taxonomy on one thread.
 
@@ -2051,8 +2051,9 @@ sorts could save only part.
 The [record of item 712's reduced automata](runs/2026-11-21-dl-automata-atlas-fd47b7ae/record.json)
 holds every process of the twelve rounds on `atlas` with its report, the analysis, the hash
 checks of the binary and the input, the host's state before and after, the laptop's corpus
-sweep at both levels with the item's build, its counters and profile of the reduced run and
-the scripts that ran.
+sweep at both levels with the item's build, its counters and profile of the reduced run,
+the automata and instruction counts of the measurement build at each level and the scripts
+that ran.
 
 The [record of item 1269's index allocations](runs/2026-11-21-el-index-alloc-forge-89deb60f/record.json)
 holds every process of the nine rounds on forge with its report, the analysis, the hash

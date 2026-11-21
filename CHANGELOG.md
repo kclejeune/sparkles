@@ -13,10 +13,11 @@ property in both directions, so a state stands for the same restriction after ei
 `Limits::dl_automata` and `SPARKLES_DL_AUTOMATA` select level 0 or 1 for a comparison. On
 `atlas` BioTop, `ore_ont_12141`, classifies in 31.0 against 56.2 ms on one thread, a
 median paired ratio of 0.552, and in 14.3 against 23.7 ms on four, 0.599, with half the
-work and fewer than half the estimated bytes. The taxonomies are equal at both levels on
-the development and final files of the ORE 2015 DL sample and on 207 new fixtures checked
+work and about 40% fewer estimated bytes. The taxonomies are equal at both levels on
+the development and final files of the ORE 2015 DL sample and on 208 new fixtures checked
 against HermiT and Konclude. An earlier experiment had attributed BioTop's halved work to
 schedule noise, and the experiments page now records the correction.
+
 ### Cold small scans at 1.05M measured again against Fluree
 
 Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M

@@ -576,7 +576,7 @@ binary with `SPARKLES_DL_AUTOMATA` at 0 and at 2 took BioTop's classification fr
 The run's estimated bytes fall from 21.2 to 12.8 MB. Two other releases of BioTop among
 the final files of the ORE sample, ore_ont_16847 and ore_ont_9024, halve their work in the
 same way. Every taxonomy is equal at both levels on the 205 development files and the 183
-final files that both classify and on the 874 fixtures of items 603, 897 and 712. Item 712 stays open for
+final files that both classify and on the 875 fixtures of items 603, 897 and 712. Item 712 stays open for
 its aim of three times Konclude's speed, which a comparison on one host decides.
 
 The rule for a new universal no longer searches the context's universals for the same
@@ -3886,21 +3886,26 @@ They read only the property axioms, so the positions of an unfolding's fresh cla
 a kept run reuses, depend on the property axioms and the level alone, and the level is one
 of the options that a kept run must share with the last one.
 
-`tests/dl_automata.rs` checks the reductions. Seven hand-written cases combine transitive
+`tests/dl_automata.rs` checks the reductions. Eight hand-written cases combine transitive
 properties under transitive properties, inverses, negative existential restrictions, a
-chain, equivalent properties and a nominal with unions. Each is taken whole by the
+chain, equivalent properties, a nominal and a qualified maximum with unions. In the
+counting case two links of a simple subproperty merge under the maximum, and the merged
+successor needs the universal that the reduced automaton carries over them. Each is taken whole by the
 disjunctive rules at every level on one and four threads with the answer of the reference
 reasoners, HermiT 1.4.5 and Konclude 0.7.0, whose union is the reference because each
 misses subsumptions that the other finds. The reduced automata derive fewer conclusions on
 each case. A merge that ignores which states are final and a covered transition dropped
-by the superproperty each fail all seven, the backward cases through a holder that only a
+by the superproperty each fail all eight, the backward cases through a holder that only a
 union gives, so that the EL rules cannot answer them. 200 generated cases with transitive
 properties, chains and inclusions between properties and between their inverses are taken
 whole at levels 0 and 2 on one thread with the reference answer, and the reduction changes
 the conclusions of 107 of them. The wrong merge fails 172 of them and the wrong drop none,
 so the hand-written cases alone guard the second reduction. Levels 0 and 2 give one answer on every fixture of items
 603, 897 and 712 on which neither run falls back, and none of the fixtures of items 603
-and 897 has an automaton that the reduction changes.
+and 897 has an automaton that the reduction changes. A classifier kept across runs answers
+as a fresh one at every level while a universal is added and removed, reuses its contexts
+between runs at one level and starts afresh when the level changes, since the fresh
+classes of an unfolding are numbered by its automaton's states.
 
 ### Nominals in the disjunctive rules
 

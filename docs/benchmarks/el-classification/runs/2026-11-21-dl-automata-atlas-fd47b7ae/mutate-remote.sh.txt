@@ -1,0 +1,9 @@
+N=crates/sparkles-owl/src/classify/dl_norm.rs; H=crates/sparkles-owl/src/classify/horn.rs; M=crates/sparkles-owl/src/classify/mod.rs
+t() { echo "=== MUTATION $1"; mbx test -p sparkles-owl --test dl_automata > /tmp/mut-$1.log 2>&1; echo "exit $?"; grep -E "^(hand|gen)-|^test |test result|taken whole|cases with" /tmp/mut-$1.log | cut -c1-220 | sort -u | head -60; }
+t none; base=$(grep -c "test result: ok" /tmp/mut-none.log)
+echo "=== LIB"; mbx test -p sparkles-owl --lib tier_d_unfolds 2>&1 | grep -E "^test |test result"
+sed -i 's/rb.sub(x, y), cost)/rb.sub(y, x), cost)/' $N; grep -q 'rb.sub(y, x), cost' $N && t reversed-sub; git checkout -- $N
+sed -i 's/let mut block: Vec<u32> = self.finals.iter().map(|&f| f as u32).collect();/let mut block: Vec<u32> = self.finals.iter().map(|_| 0).collect();/' $H; grep -q 'map(|_| 0)' $H && t merge-ignores-finals; git checkout -- $H
+sed -i 's/            dl_automata: limits.dl_automata_level(),/            dl_automata: 0,/' $M; grep -q '            dl_automata: 0,' $M && t rulekey-ignores-level; git checkout -- $M
+git status --short -- crates
+echo MUTATE-DONE; grep -q "test result: FAILED" /tmp/mut-none.log && exit 1; exit 0
