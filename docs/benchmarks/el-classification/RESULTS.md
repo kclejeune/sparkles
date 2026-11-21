@@ -1903,7 +1903,10 @@ A sweep on the laptop ran the build with the rule and with every universal kept 
 development and 187 final-set files of the ORE 2015 DL sample on one thread, with the
 attempt bounded at 1 and an 8 GiB cap. None of them is in the sealed held-out third. The
 taxonomies are equal on the 389 files that both sides classify, and the rule leaves out
-1,086 universals on 135 of them. `ore_ont_7646` classifies within the cap only with the
+1,082 universals on 135 of them. The build that counts them is the final one, which counts
+each pair of a property and a range once and leaves ranges of `owl:Thing` to their
+universals, and it gives the same taxonomies and conclusion counts as the build the timing
+used. `ore_ont_7646` classifies within the cap only with the
 rule, with the attempt bounded at 1 as in the whole sweep. The build before the change,
 commit fd47b7ae, gives the same taxonomy and the same conclusion count as the side with
 every universal kept on each of the 389 files. With an 18 GiB cap the side with every universal kept gives the same taxonomy, with

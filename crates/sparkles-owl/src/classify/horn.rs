@@ -482,9 +482,21 @@ fn ends_in_range(
     let Some(ls) = ls else {
         return Ok(false);
     };
-    Ok(ls
-        .iter()
-        .all(|&l| !tops.contains(&l) && told.iter().any(|&l2| rb.sub(l, l2))))
+    // a test for each pair of a label and a top or told property, polling the stop
+    let mut work = 0usize;
+    for &l in ls.iter() {
+        work += tops.len() + told.len();
+        if work >= POLL_WORK {
+            work = 0;
+            if stop() {
+                return Err(Halt::Stopped);
+            }
+        }
+        if tops.contains(&l) || !told.iter().any(|&l2| rb.sub(l, l2)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// How far a run reduces the automata that unfold its universals (roadmap item 693):
@@ -1876,6 +1888,22 @@ mod reduction_tests {
             a.final_labels(None, &|| false).unwrap().map(|v| v.len()),
             Some(4 * POLL_WORK)
         );
+    }
+
+    /// The match of cached labels against the told properties stops when the run stops.
+    #[test]
+    fn ends_in_range_polls_over_cached_labels() {
+        let it = Interner::new();
+        let mut rb = RoleBox::new(&it, &[], &[], None, &|| false).unwrap();
+        let n = 400 as Role;
+        let mut labels = FxHashMap::default();
+        labels.insert(n * 2, Some((0..n).collect::<Vec<Role>>()));
+        // every label is told, found after the told properties that no label is
+        let told: Vec<Role> = (n..2 * n).chain(0..n).collect();
+        let go = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| false);
+        assert_eq!(go, Ok(true));
+        let halt = ends_in_range(&mut rb, &mut labels, &told, &[], n * 2, None, &|| true);
+        assert_eq!(halt, Err(Halt::Stopped));
     }
 
     /// The labels into final states read from the automaton equal those of its closure

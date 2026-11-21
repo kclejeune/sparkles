@@ -21,12 +21,12 @@ rec = {
   'host': {'name': 'atlas', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15614},
   'manifest': {
     'sides': {'base': '378127e2, the build of the last forge record of item 693',
-              'tip': '27471426, the lane tip, which leaves out the range universals that the ranges of the final links cover',
+              'tip': '27471426, the build the timing used, which leaves out the range universals that the ranges of the final links cover',
               'keep': '27471426 with SPARKLES_HORN_RANGES=keep, which keeps every range universal, so that tip against keep isolates the rule on one binary'},
     'build': 'mbx build --release -p sparkles-owl --example el_classify on stanley, the laptop, with mbx 1.29.1 and the pinned toolchain, copied to atlas',
     'binaries_sha256': {k.split('/')[-1]: v for k, v in sums.items() if k.startswith('bin/')},
     'data_sha256': {k.split('/')[-1]: v for k, v in sums.items() if k.startswith('files/')},
-    'scripts': ['run.sh.txt', 'timing.sh.txt', 'analyze.py.txt', 'make-record.py.txt', 'sweep.sh.txt', 'insn.sh.txt', 'gen.py.txt', 'cmp.sh.txt', 'hermit.sh.txt', 'closure.py.txt', 'sweep-base.sh.txt']},
+    'scripts': ['run.sh.txt', 'timing.sh.txt', 'analyze.py.txt', 'make-record.py.txt', 'sweep.sh.txt', 'insn.sh.txt', 'gen.py.txt', 'cmp.sh.txt', 'hermit.sh.txt', 'closure.py.txt', 'sweep-base.sh.txt', 'sweep-tip.sh.txt']},
   'settings': {'threads': 'one and four',
                'pinning': 'taskset, cpu 2 on one thread and cpus 2, 4, 6 and 8 on four',
                'scope': 'one process per run in a 12 GiB systemd scope without swap, with a 900 s timeout',
@@ -50,12 +50,15 @@ rec = {
                      'rule_report': text(os.path.join(lane, 'out', 'sweep', 'ore_ont_7646.covered.json'))},
     'base_sweep': 'sweep-base.sh ran fd47b7ae, the build before the change, over the same files; base_sweep_log gives its lines in the form of corpus_log, whose taxonomy hashes and conclusion counts equal those of the side with every universal kept on the 389 files that both classify',
     'base_sweep_log': text(os.path.join(lane, 'out', 'sweep-base', 'log.txt')),
+    'final_sweep': 'sweep-tip.sh ran the rule arm of the final build, 1580ce54, which counts each pair of a property and a range once and leaves ranges of owl:Thing to their universals; final_sweep_log gives its lines, with the taxonomy hashes and conclusion counts of corpus_log, 1,082 universals on 135 files and 25 on ore_ont_7646; final_generated gives each generated case with the final build as name, hash, earlier hash, final count and earlier counts, all taxonomies equal and 886 cases leaving a universal out',
+    'final_sweep_log': text(os.path.join(lane, 'out', 'sweep-tip', 'log.txt')),
+    'final_generated': text(os.path.join(lane, 'gen', 'tip4.txt')),
     'generated_base': 'the conclusions of each valid generated case with every universal kept and on fd47b7ae; they differ on 27 cases, where the rules for the links of negative existentials made positive add conclusions, and those 27 taxonomies are equal',
     'generated_base_counts': text(os.path.join(lane, 'gen', 'base-concl.txt'))},
   'hosts': {f: text(os.path.join(src, 'out', f)) for f in ['before.txt', 'after.txt', 'sha-check.txt']} | {'queue.log': text(os.path.join(src, 'queue.log')), 'DONE': text(os.path.join(src, 'DONE'))},
 }
 os.makedirs(dest, exist_ok=True)
-for s, name in [('atlas/run.sh', 'run.sh'), ('atlas/timing.sh', 'timing.sh'), ('atlas/analyze.py', 'analyze.py'), ('make-record.py', 'make-record.py'), ('sweep.sh', 'sweep.sh'), ('insn.sh', 'insn.sh'), ('gen/gen.py', 'gen.py'), ('gen/cmp.sh', 'cmp.sh'), ('gen/hermit.sh', 'hermit.sh'), ('gen/closure.py', 'closure.py'), ('sweep-base.sh', 'sweep-base.sh')]:
+for s, name in [('atlas/run.sh', 'run.sh'), ('atlas/timing.sh', 'timing.sh'), ('atlas/analyze.py', 'analyze.py'), ('make-record.py', 'make-record.py'), ('sweep.sh', 'sweep.sh'), ('insn.sh', 'insn.sh'), ('gen/gen.py', 'gen.py'), ('gen/cmp.sh', 'cmp.sh'), ('gen/hermit.sh', 'hermit.sh'), ('gen/closure.py', 'closure.py'), ('sweep-base.sh', 'sweep-base.sh'), ('sweep-tip.sh', 'sweep-tip.sh')]:
     shutil.copyfile(os.path.join(lane, s), os.path.join(dest, name + '.txt'))
 json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
 print('timing', len(rec['timing']))
