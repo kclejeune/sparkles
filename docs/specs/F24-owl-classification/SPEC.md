@@ -746,7 +746,11 @@ that an edit adds or removes has its filler among the changed parts, so every co
 that takes it from the index is cleared, and a kept context renumbers the disjointness
 sets it meets only when the run's sets differ from the last run's (item 1256). A change to the property
 hierarchy, chains, reflexivity or ranges saturates everything again, and so does a
-change to an axiom with an individual, a data property, a datatype or a key. So does any
+change to an axiom with an individual, a data property, a datatype, a key or a self
+restriction. A context can have a loop by a role without holding the self restriction
+whose subsumer the loop gives, since a loop also comes from a self restriction on a
+subrole, a reflexive role or a chain, so the invalidation could not find the contexts
+that a changed self restriction reaches. So does any
 change after a run that marked the real contexts, which merges, worlds, keys and the
 facts of universal roles tie together in ways the invalidation does not follow, and a
 run after a run that stopped before its saturation ended. A run that stops later keeps
@@ -983,7 +987,9 @@ report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the r
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
 comparison with an independent naive completion procedure for EL++ on random ontologies
 of up to twenty axioms, incremental against full runs on random changes for both
-`Classifier` and `Saturation`, the same taxonomy on one, two and eight threads for an
+`Classifier` and `Saturation`, and in `tests/incremental_sweep.rs` incremental against
+full runs on edits of class axioms beside fixed self restrictions, reflexive roles,
+chains, ranges, individuals and the top and bottom properties, the same taxonomy on one, two and eight threads for an
 ontology of 3,000 classes, and an estimate that bounds a run with its taxonomy. Unit
 tests of the taxonomy check that the estimate counts every link of a wide hierarchy,
 that an inconsistent ontology's taxonomy asks the budget and that every stage polls the

@@ -15,6 +15,22 @@ reasoning guide states the higher peak of a kept run, whose contexts stay live b
 second build of the index, and roadmap item 1254 covers incremental normalization and
 indexing, which items 590 and 664 now wait for.
 
+### Incremental EL classification runs again after a change to a self restriction
+
+An incremental OWL 2 EL classification could miss entailments after an axiom with
+`ObjectHasSelf` was added, as roadmap item 1258 found. A negative self restriction gives
+its class to every context with a loop by the role or a subrole, and a kept context can
+have that loop from a self restriction on a subrole, a reflexive role or a chain without
+holding the restriction that the invalidation looks for. With `r ⊑ s` and
+`owl:Thing ⊑ ObjectHasSelf(r)` fixed, adding `ObjectHasSelf(s) ⊑ C` cleared no context and
+left out `owl:Thing ⊑ C`, and a reflexive `r` with an added `ObjectHasSelf(r) ⊑ C` did the
+same. A change to an axiom with a self restriction now saturates everything again, as a
+change to an axiom with an individual does. Runs with the Horn or disjunctive rules
+already started again, since they compare the self restrictions of the two indexes. A new
+differential sweep, `tests/incremental_sweep.rs`, compares kept runs with fresh ones on
+edits of class axioms beside fixed self restrictions, reflexive roles, chains, ranges,
+individuals and the top and bottom properties.
+
 ### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
 
 Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
