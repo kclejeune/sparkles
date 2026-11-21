@@ -863,6 +863,17 @@ fn role_axiom(ax: &AxiomKind) -> bool {
     )
 }
 
+/// The first rule of OWL 2 EL that the classifier holds the axiom to and that it breaks,
+/// without the global restriction on the ranges of property chains. The classifier takes
+/// an inclusion in a top property as an axiom of OWL 2 EL whatever its subproperty
+/// expression, since it holds of every ontology ([`index::top_inclusion`]).
+fn el_break(ax: &AxiomKind) -> Option<profiles::Broken> {
+    if index::top_inclusion(ax) {
+        return None;
+    }
+    profiles::el_axiom(ax).into_iter().next()
+}
+
 /// Whether the axiom has logical content for classification.
 pub fn logical(ax: &AxiomKind) -> bool {
     !matches!(
@@ -2060,7 +2071,7 @@ impl Saturation {
                 let mut out = Vec::new();
                 for (i, k) in chunk.iter().enumerate() {
                     if logical(k)
-                        && let Some(b) = profiles::el_axiom(k).into_iter().next()
+                        && let Some(b) = el_break(k)
                     {
                         out.push((at + i, (b.rule.to_string(), b.message)));
                     }
@@ -2094,9 +2105,9 @@ impl Saturation {
         let stale = self.stale_tier
             || changes.is_some_and(|c| {
                 c.removed.iter().any(|k| !tier_neutral(k))
-                    || c.added.iter().any(|k| {
-                        !tier_neutral(k) && profiles::el_axiom(k).into_iter().next().is_some()
-                    })
+                    || c.added
+                        .iter()
+                        .any(|k| !tier_neutral(k) && el_break(k).is_some())
             });
         let full = self.entangled
             || match (&kept, changes) {
@@ -3198,7 +3209,7 @@ impl Saturation {
             return true;
         }
         let outside: Vec<&AxiomKind> = changed()
-            .filter(|a| logical(a) && profiles::el_axiom(a).into_iter().next().is_some())
+            .filter(|a| logical(a) && el_break(a).is_some())
             .collect();
         let in_play = k.outside || !outside.is_empty();
         if in_play && changed().any(|a| logical(a) && !tier_neutral(a)) {
@@ -4494,7 +4505,7 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(i, k)| {
-                let b = profiles::el_axiom(k).into_iter().next()?;
+                let b = el_break(k)?;
                 Some((i, (b.rule.to_string(), b.message)))
             })
             .collect();

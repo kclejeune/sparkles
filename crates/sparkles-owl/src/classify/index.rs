@@ -1347,6 +1347,22 @@ pub fn normalize(ax: &AxiomKind, it: &mut Interner, out: &mut Axioms) -> Option<
     partial
 }
 
+/// Whether the axiom is an inclusion in the top object property or the top data
+/// property, `r ⊑ U`, whatever its subproperty expression: it holds of every ontology,
+/// and the role table puts every role below a top property that another axiom names
+/// (roadmap item 1282). The classifier takes it as an axiom of OWL 2 EL that adds
+/// nothing, and does not intern the top property for it, so that it keeps no run from
+/// the tiers that the top property closes.
+pub fn top_inclusion(ax: &AxiomKind) -> bool {
+    match ax {
+        AxiomKind::SubObjectPropertyOf(_, sup) => {
+            sup.named().as_str() == vocab::OWL_TOP_OBJECT_PROPERTY
+        }
+        AxiomKind::SubDataPropertyOf(_, sup) => sup.as_str() == vocab::OWL_TOP_DATA_PROPERTY,
+        _ => false,
+    }
+}
+
 /// Interns the classes of an axiom's signature.
 pub fn intern_signature(ax: &AxiomKind, it: &mut Interner) {
     let mut sig = crate::model::Signature::default();
@@ -1367,6 +1383,9 @@ fn normalize_axiom(
     out: &mut Axioms,
 ) -> Result<(Option<&'static str>, bool), &'static str> {
     use AxiomKind as K;
+    if top_inclusion(ax) {
+        return Ok((None, true));
+    }
     let mut partial: Option<&'static str> = None;
     let mut whole = true;
     fn ce(

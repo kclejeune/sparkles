@@ -2511,3 +2511,22 @@ fn a_late_restriction_that_shares_an_eager_successor_counts_with_it() {
         );
     }
 }
+
+#[test]
+fn an_inclusion_in_a_top_property_keeps_no_run_from_tier_d() {
+    // roadmap item 1282: `r ⊑ U` holds of every ontology, in each of its forms and for the
+    // top data property, so it leaves the disjunctive rules open to the run
+    check(
+        &format!(
+            "SubObjectPropertyOf(:r owl:topObjectProperty)
+             SubObjectPropertyOf(ObjectPropertyChain(:r :s) owl:topObjectProperty)
+             SubObjectPropertyOf(ObjectInverseOf(:s) owl:topObjectProperty)
+             SubDataPropertyOf(:d owl:topDataProperty)
+             SubClassOf(:A ObjectUnionOf(:B :C)) SubClassOf(:B :D) SubClassOf(:C :D)
+             SubClassOf(:X ObjectSomeValuesFrom(:r :A))
+             SubClassOf(ObjectSomeValuesFrom(:r :D) :Y) {UNION}"
+        ),
+        &[("A", "D"), ("X", "Y")],
+        &[("A", "B"), ("Y", "X")],
+    );
+}
