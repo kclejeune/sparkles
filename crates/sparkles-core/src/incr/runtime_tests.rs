@@ -2308,10 +2308,17 @@ fn a_failed_window_pass_publishes_nothing(
     let (_, rows) = live_rows(&first);
     assert_eq!(rows.len(), 2);
     upd(&s, change);
+    struct ClearHooks;
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = None);
+            super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    let clear = ClearHooks;
     arm();
     rt.round(&s);
-    super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = None);
-    super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = None);
+    drop(clear);
     let events = drain(&l);
     assert!(
         matches!(&events[..], [LiveEvent::Error { code: c, .. }] if c == code),
