@@ -2817,12 +2817,20 @@ fn dt_index(
     refire: FxHashMap<Ex, Vec<u32>>,
 ) -> Result<super::dt_sat::DtIx, Halt> {
     use super::dt_sat::{Body, DtIx, RoleIx};
-    let supers_bytes: usize = ix.roles.sup.iter().map(|v| v.len().saturating_mul(4)).sum();
-    let roles_est = it
+    use super::dtcheck::range::{map_backing_bytes, map_buckets_for};
+    let n_checker_roles = it
         .roles
-        .len()
-        .saturating_mul(2)
-        .saturating_mul(std::mem::size_of::<(Role, RoleIx)>() + 64)
+        .iter()
+        .filter(|name| {
+            matches!(name, RoleName::Data(d) if run.comps.checker(d) && run.comps.component(d).is_some())
+        })
+        .count();
+    let supers_bytes: usize = ix.roles.sup.iter().map(|v| v.len().saturating_mul(4)).sum();
+    let roles_backing = map_buckets_for(n_checker_roles)
+        .saturating_mul(std::mem::size_of::<(Role, RoleIx)>() + 1)
+        .saturating_add(16);
+    let roles_est = roles_backing
+        .saturating_add(n_checker_roles.saturating_mul(std::mem::size_of::<Role>()))
         .saturating_add(supers_bytes.saturating_mul(2))
         .saturating_add(ax.dt_ranges.len().saturating_mul(8));
     let told_bytes: usize = b
@@ -2830,26 +2838,36 @@ fn dt_index(
         .iter()
         .map(|&e| ix.told_of(ix.head(e)).len().saturating_mul(4))
         .sum();
-    let body_est = run
-        .comps
-        .len()
-        .saturating_mul(std::mem::size_of::<Vec<Body>>())
+    let ncomps = run.comps.len();
+    let body_est = ncomps
+        .saturating_mul(std::mem::size_of::<Vec<Body>>() + 4 * std::mem::size_of::<Body>() + 1)
         .saturating_add(
             b.dt_body
                 .len()
                 .saturating_mul(2)
-                .saturating_mul(std::mem::size_of::<Body>() + 32),
+                .saturating_mul(std::mem::size_of::<Body>()),
         )
         .saturating_add(told_bytes);
-    let disjoint_est = ax.dt_disjoint.len().saturating_mul(16);
-    let clone_est = it
-        .dt
-        .atoms
+    let disjoint_est = ax
+        .dt_disjoint
         .len()
-        .saturating_mul(std::mem::size_of::<DtKey>())
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<(Role, Role)>());
+    let clone_est = std::mem::size_of::<DtIx>()
+        .saturating_add(
+            it.dt
+                .atoms
+                .len()
+                .saturating_mul(std::mem::size_of::<DtKey>()),
+        )
         .saturating_add(it.dt.ranges().map_or(0, |r| r.bytes()))
         .saturating_add(run.comps.bytes());
-    let refire_est: usize = refire.values().map(|v| 16 + v.capacity() * 4).sum();
+    let refire_est = map_backing_bytes(&refire).saturating_add(
+        refire
+            .values()
+            .map(|v| v.capacity().saturating_mul(std::mem::size_of::<u32>()))
+            .sum::<usize>(),
+    );
     let total_est = roles_est
         .saturating_add(body_est)
         .saturating_add(disjoint_est)
@@ -2863,7 +2881,8 @@ fn dt_index(
             _ => Halt::Stopped,
         })?;
     }
-    let mut roles: FxHashMap<Role, RoleIx> = FxHashMap::default();
+    let mut roles: FxHashMap<Role, RoleIx> =
+        FxHashMap::with_capacity_and_hasher(n_checker_roles, Default::default());
     for (r, name) in it.roles.iter().enumerate() {
         if let RoleName::Data(d) = name
             && run.comps.checker(d)
@@ -2906,7 +2925,6 @@ fn dt_index(
             ri.functional = true;
         }
     }
-    let ncomps = run.comps.len();
     let mut body: Vec<Vec<Body>> = (0..ncomps).map(|_| Vec::new()).collect();
     for &e in &b.dt_body {
         let Node::DtAtom(id) = it.nodes[e as usize] else {

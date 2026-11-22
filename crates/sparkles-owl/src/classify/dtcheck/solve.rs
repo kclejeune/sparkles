@@ -495,7 +495,7 @@ pub fn check_bounded(
         let Ok(nx) = r.not_bounded(x, admit_ranges) else {
             return Answer::Unknown(Why::Stopped);
         };
-        let next_cap = cells.len().saturating_mul(2);
+        let next_cap = cells.len().saturating_mul(2).min(b.types);
         let next_est = next_cap
             .saturating_mul(std::mem::size_of::<(Rid, Vec<bool>)>() + step.saturating_add(1));
         let mut next_scope = MemScope::new(mem);
@@ -515,12 +515,13 @@ pub fn check_bounded(
                     return Answer::Unknown(Why::Stopped);
                 };
                 if empty != Some(true) {
-                    let mut s = sides.clone();
-                    s.push(inside);
-                    next.push((part, s));
-                    if next.len() > b.types {
+                    if next.len() == b.types {
                         return Answer::Unknown(Why::Bound);
                     }
+                    let mut s = Vec::with_capacity(step + 1);
+                    s.extend_from_slice(sides);
+                    s.push(inside);
+                    next.push((part, s));
                 }
             }
         }
@@ -529,13 +530,12 @@ pub fn check_bounded(
     }
     let within = |ci: usize, x: Rid| cells[ci].1[index[&x]];
     // the upward-closed sets of properties without a disjoint pair
-    let sets_est = 1usize
-        .checked_shl(np as u32)
-        .map_or(usize::MAX, |n| n.saturating_mul(8));
+    let sets_cap = 1usize.checked_shl(np as u32).unwrap_or(usize::MAX);
+    let sets_est = sets_cap.saturating_mul(std::mem::size_of::<u64>());
     if !scope.take(sets_est) {
         return Answer::Unknown(Why::Stopped);
     }
-    let mut sets = Vec::new();
+    let mut sets = Vec::with_capacity(sets_cap);
     for s in 1u64..(1 << np) {
         let closed = (0..np).all(|i| s & (1 << i) == 0 || s & up[i] == up[i]);
         let apart = p
@@ -549,50 +549,64 @@ pub fn check_bounded(
     if cells.len().saturating_mul(sets.len()) > b.types.saturating_mul(64) {
         return Answer::Unknown(Why::Bound);
     }
-    let types_est = cells
-        .len()
-        .saturating_mul(sets.len())
-        .min(b.types)
-        .saturating_mul(std::mem::size_of::<(usize, u64)>());
+    let types_cap = cells.len().saturating_mul(sets.len()).min(b.types);
+    let types_est = types_cap.saturating_mul(std::mem::size_of::<(usize, u64)>());
     if !scope.take(types_est) {
         return Answer::Unknown(Why::Stopped);
     }
-    let mut types = Vec::new();
+    let mut types = Vec::with_capacity(types_cap);
     for ci in 0..cells.len() {
         for &s in &sets {
             let ok = (0..np)
                 .filter(|i| s & (1 << i) != 0)
                 .all(|i| p.props[i].ranges.iter().all(|&x| within(ci, x)));
             if ok {
-                types.push((ci, s));
-                if types.len() > b.types {
+                if types.len() == b.types {
                     return Answer::Unknown(Why::Bound);
                 }
+                types.push((ci, s));
             }
         }
     }
-    let cons_est = p.atoms.len().saturating_add(cells.len()).saturating_mul(
-        std::mem::size_of::<Lin>() + types.len().saturating_mul(std::mem::size_of::<usize>()),
-    );
+    let cons_est = p
+        .atoms
+        .len()
+        .saturating_add(cells.len())
+        .saturating_mul(
+            std::mem::size_of::<Lin>() + types.len().saturating_mul(std::mem::size_of::<usize>()),
+        )
+        .saturating_add(cells.len().saturating_mul(
+            std::mem::size_of::<Rid>()
+                + std::mem::size_of::<super::sets::Size>()
+                + std::mem::size_of::<usize>(),
+        ));
     if !scope.take(cons_est) {
         return Answer::Unknown(Why::Stopped);
     }
-    let mut cons = Vec::new();
+    let mut cons = Vec::with_capacity(p.atoms.len());
     for a in &p.atoms {
         let (Atom::AtLeast(d, n, x) | Atom::AtMost(d, n, x)) = *a;
-        let vars = types
+        let nvars = types
             .iter()
-            .enumerate()
-            .filter(|(_, (ci, s))| s & (1 << d) != 0 && within(*ci, x))
-            .map(|(t, _)| t)
-            .collect();
+            .filter(|&&(ci, s)| s & (1 << d) != 0 && within(ci, x))
+            .count();
+        let mut vars = Vec::with_capacity(nvars);
+        for (t, &(ci, s)) in types.iter().enumerate() {
+            if s & (1 << d) != 0 && within(ci, x) {
+                vars.push(t);
+            }
+        }
         cons.push(Lin {
             vars,
             at_least: matches!(a, Atom::AtLeast(..)),
             n: u128::from(n),
         });
     }
-    let mut by_cell: Vec<Vec<usize>> = vec![Vec::new(); cells.len()];
+    let mut cell_counts = vec![0usize; cells.len()];
+    for &(ci, _) in &types {
+        cell_counts[ci] += 1;
+    }
+    let mut by_cell: Vec<Vec<usize>> = cell_counts.into_iter().map(Vec::with_capacity).collect();
     for (t, (ci, _)) in types.iter().enumerate() {
         by_cell[*ci].push(t);
     }
@@ -621,7 +635,8 @@ pub fn check_bounded(
         if !cap_scope.take(cons_clone_bytes) {
             return Run::Stopped;
         }
-        let mut all = cons.clone();
+        let mut all = Vec::with_capacity(cons.len() + by_cell.len());
+        all.extend(cons.iter().cloned());
         for (ci, vars) in by_cell.iter().enumerate() {
             if let Some(n) = cap(ci) {
                 all.push(Lin {

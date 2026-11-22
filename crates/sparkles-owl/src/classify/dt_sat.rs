@@ -12,14 +12,13 @@
 
 use super::dtcheck::atoms::DtKey;
 use super::dtcheck::comp::Comps;
-use super::dtcheck::range::{Ranges, Rid};
+use super::dtcheck::range::{Ranges, Rid, map_backing_bytes, map_buckets_for, map_growth};
 use super::dtcheck::rule::{self, Group, Units};
 use super::dtcheck::solve::{Atom, Bounds, Problem, Prop, Why};
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
 use super::saturate::{Concl, Contexts, Dynamic, Sink, State};
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
 /// A role of a checker component.
@@ -87,12 +86,6 @@ pub struct DtSt {
     pub last: u8,
 }
 
-impl DtSt {
-    pub fn bytes(&self) -> usize {
-        std::mem::size_of::<DtSt>() + self.held.capacity() * 4
-    }
-}
-
 impl DtIx {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -130,37 +123,74 @@ impl DtIx {
     /// that read this, the base before the saturation and the retained state after it,
     /// are built from the tables alone, so nothing is counted twice.
     pub fn bytes(&self) -> usize {
-        let key = std::mem::size_of::<DtKey>();
-        self.keys.capacity() * key
-            + self
-                .roles
-                .values()
-                .map(|r| {
-                    std::mem::size_of::<RoleIx>()
-                        + 4
-                        + (r.supers.capacity() + r.ranges.capacity()) * 4
-                })
-                .sum::<usize>()
-            + self
-                .body
+        let cache = self.cache.lock();
+        let cache_bytes = map_backing_bytes(&cache).saturating_add(
+            cache
                 .iter()
-                .flatten()
-                .map(|b| std::mem::size_of::<Body>() + b.told.as_ref().map_or(0, |t| t.len() * 4))
-                .sum::<usize>()
-            + self.disjoint.capacity() * 8
-            + self
-                .refire
-                .values()
-                .map(|v| 16 + v.capacity() * 4)
-                .sum::<usize>()
-            + self.comps.bytes()
-            + self.ranges.lock().bytes()
-            + self
-                .cache
-                .lock()
-                .iter()
-                .map(|(k, v)| entry_bytes(k, v))
-                .sum::<usize>()
+                .map(|(k, v)| entry_payload_bytes(k, v))
+                .sum::<usize>(),
+        );
+        std::mem::size_of::<DtIx>()
+            .saturating_add(
+                self.keys
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<DtKey>()),
+            )
+            .saturating_add(map_backing_bytes(&self.roles))
+            .saturating_add(
+                self.roles
+                    .values()
+                    .map(|r| {
+                        r.supers
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Role>())
+                            .saturating_add(
+                                r.ranges
+                                    .capacity()
+                                    .saturating_mul(std::mem::size_of::<Rid>()),
+                            )
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.body
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<Vec<Body>>()),
+            )
+            .saturating_add(
+                self.body
+                    .iter()
+                    .map(|v| {
+                        v.capacity()
+                            .saturating_mul(std::mem::size_of::<Body>())
+                            .saturating_add(
+                                v.iter()
+                                    .map(|b| {
+                                        b.told
+                                            .as_ref()
+                                            .map_or(0, |t| t.len() * std::mem::size_of::<Ex>())
+                                    })
+                                    .sum::<usize>(),
+                            )
+                    })
+                    .sum::<usize>(),
+            )
+            .saturating_add(
+                self.disjoint
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(Role, Role)>()),
+            )
+            .saturating_add(map_backing_bytes(&self.refire))
+            .saturating_add(
+                self.refire
+                    .values()
+                    .map(|v| v.capacity().saturating_mul(std::mem::size_of::<u32>()))
+                    .sum::<usize>(),
+            )
+            .saturating_add(self.sticky.lock().capacity())
+            .saturating_add(self.comps.bytes())
+            .saturating_add(self.ranges.lock().bytes())
+            .saturating_add(cache_bytes)
     }
 
     fn atom(&self, a: DtKey, at: &FxHashMap<Role, usize>) -> Atom {
@@ -184,13 +214,10 @@ fn answer_bytes(a: &Result<Units, Why>) -> usize {
     }
 }
 
-pub(super) fn entry_bytes(k: &Key, a: &Result<Units, Why>) -> usize {
-    std::mem::size_of::<Key>()
-        + k.1.len() * 4
+pub(super) fn entry_payload_bytes(k: &Key, a: &Result<Units, Why>) -> usize {
+    k.1.len() * std::mem::size_of::<Ex>()
         + k.2.len() * std::mem::size_of::<(Ex, Group)>()
-        + std::mem::size_of::<Arc<Result<Units, Why>>>()
         + answer_bytes(a)
-        + 64
 }
 
 /// A new data atom `d`, atom `id` of the interner, in the context: the rule on the
@@ -271,27 +298,34 @@ fn publish_after_miss<S: Sink>(
     a: Result<Units, Why>,
     out: &mut S,
 ) -> Arc<Result<Units, Why>> {
-    let bytes = entry_bytes(key, &a);
-    if !out.admit_data(bytes) {
-        out.release_data(bytes);
+    let mut cache = dt.cache.lock();
+    if let Some(existing) = cache.get(key).cloned() {
+        return existing;
+    }
+    let payload = entry_payload_bytes(key, &a);
+    let table_growth = map_growth(&cache);
+    let admit = payload.saturating_add(table_growth);
+    if !out.admit_data(admit) {
+        drop(cache);
+        out.release_data(admit);
         return Arc::new(Err(Why::Stopped));
     }
-    let mut cache = dt.cache.lock();
-    match cache.entry(key.clone()) {
-        Entry::Occupied(e) => {
-            let existing = e.get().clone();
-            drop(cache);
-            out.release_data(bytes);
-            existing
+    let before_backing = map_backing_bytes(&cache);
+    let arc = Arc::new(a);
+    cache.insert(key.clone(), arc.clone());
+    let added_backing = map_backing_bytes(&cache).saturating_sub(before_backing);
+    drop(cache);
+    let retained = payload.saturating_add(added_backing);
+    if retained <= admit {
+        out.retain_shared(retained);
+        if admit > retained {
+            out.release_data(admit - retained);
         }
-        Entry::Vacant(e) => {
-            let arc = Arc::new(a);
-            e.insert(arc.clone());
-            drop(cache);
-            out.retain_shared(bytes);
-            arc
-        }
+    } else {
+        out.retain_shared(admit);
+        out.keep_shared(retained - admit);
     }
+    arc
 }
 
 /// The rule on the context's atoms of the component at `at` in its checker state.
@@ -404,7 +438,7 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> (Result<Unit
             && !roles.contains(&k.role)
         {
             let supers_len = dt.roles.get(&k.role).map_or(0, |ri| ri.supers.len());
-            let step_est = (1 + supers_len).saturating_mul(std::mem::size_of::<Role>() + 4);
+            let step_est = (1 + supers_len).saturating_mul(std::mem::size_of::<Role>() * 3);
             if !reserve(out, step_est) {
                 out.release_data(setup_reserved);
                 return (Err(Why::Stopped), 0);
@@ -430,11 +464,16 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> (Result<Unit
             })
         })
         .sum();
-    let build_est = roles
-        .len()
-        .saturating_mul(std::mem::size_of::<(Role, usize)>() + 16)
+    let at_backing = map_buckets_for(roles.len())
+        .saturating_mul(std::mem::size_of::<(Role, usize)>() + 1)
+        .saturating_add(16);
+    let build_est = at_backing
         .saturating_add(props_bytes)
-        .saturating_add(dt.disjoint.len().saturating_mul(16))
+        .saturating_add(
+            dt.disjoint
+                .len()
+                .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+        )
         .saturating_add(
             held.len()
                 .saturating_add(roles.len())
@@ -451,17 +490,29 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> (Result<Unit
     }
     setup_reserved = setup_reserved.saturating_add(build_est);
     roles.sort_unstable();
-    let at: FxHashMap<Role, usize> = roles.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-    let mut p = Problem::default();
+    let mut at: FxHashMap<Role, usize> =
+        FxHashMap::with_capacity_and_hasher(roles.len(), Default::default());
+    for (i, &r) in roles.iter().enumerate() {
+        at.insert(r, i);
+    }
+    let mut p = Problem {
+        props: Vec::with_capacity(roles.len()),
+        disjoint: Vec::with_capacity(dt.disjoint.len()),
+        atoms: Vec::with_capacity(held.len().saturating_add(roles.len())),
+    };
     for &r in &roles {
         let ri = dt.roles.get(&r);
+        let supers = ri.map_or(Vec::new(), |ri| {
+            let mut v = Vec::with_capacity(ri.supers.len());
+            for s in &ri.supers {
+                if let Some(&idx) = at.get(s) {
+                    v.push(idx);
+                }
+            }
+            v
+        });
         p.props.push(Prop {
-            supers: ri.map_or(Vec::new(), |ri| {
-                ri.supers
-                    .iter()
-                    .filter_map(|s| at.get(s).copied())
-                    .collect()
-            }),
+            supers,
             ranges: ri.map_or(Vec::new(), |ri| ri.ranges.clone()),
         });
         if ri.is_some_and(|ri| ri.functional) {
@@ -478,10 +529,12 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> (Result<Unit
             p.atoms.push(dt.atom(k, &at));
         }
     }
-    let tests: Vec<(Atom, Group)> = body
-        .iter()
-        .filter_map(|&(e, g)| key_of(ix, dt, e).map(|k| (dt.atom(k, &at), g)))
-        .collect();
+    let mut tests: Vec<(Atom, Group)> = Vec::with_capacity(body.len());
+    for &(e, g) in body.iter() {
+        if let Some(k) = key_of(ix, dt, e) {
+            tests.push((dt.atom(k, &at), g));
+        }
+    }
     debug_assert_eq!(tests.len(), body.len());
     let mut ranges = dt.ranges.lock();
     let before = ranges.bytes();
@@ -672,9 +725,10 @@ mod tests {
                 cover: false,
             })
         };
-        let expected = entry_bytes(&key, &make_ans());
-        let empty_ans = entry_bytes(&key, &Ok(Units::default()));
-        assert!(expected >= empty_ans + 256 * std::mem::size_of::<usize>());
+        let before_bytes = dt.bytes();
+        let payload = entry_payload_bytes(&key, &make_ans());
+        let empty_payload = entry_payload_bytes(&key, &Ok(Units::default()));
+        assert!(payload >= empty_payload + 256 * std::mem::size_of::<usize>());
 
         let total_shared = AtomicUsize::new(0);
         let barrier = Barrier::new(2);
@@ -694,8 +748,9 @@ mod tests {
                 });
             }
         });
-        assert_eq!(total_shared.load(Ordering::Relaxed), expected);
-        assert!(dt.bytes() >= expected);
+        let added = dt.bytes() - before_bytes;
+        assert_eq!(total_shared.load(Ordering::Relaxed), added);
+        assert!(added >= payload);
     }
 
     #[test]
@@ -1153,5 +1208,293 @@ mod tests {
             "first_admit {} must cover actual backing >= {actual_backing}",
             first_admit.get()
         );
+    }
+
+    #[test]
+    fn cache_rehash_publish_admits_table_growth_before_inserting() {
+        struct CapSink {
+            cap: usize,
+            held: isize,
+            peak: usize,
+            shared: usize,
+        }
+        impl Sink for CapSink {
+            fn reserve_data(&mut self, bytes: usize) -> bool {
+                self.held += bytes as isize;
+                let ok = self.held as usize <= self.cap;
+                if ok {
+                    self.peak = self.peak.max(self.held as usize);
+                }
+                ok
+            }
+            fn release_data(&mut self, bytes: usize) {
+                self.held -= bytes as isize;
+            }
+            fn retain_shared(&mut self, bytes: usize) {
+                self.held -= bytes as isize;
+                self.shared += bytes;
+            }
+            fn keep_shared(&mut self, bytes: usize) {
+                self.shared += bytes;
+            }
+            fn send(&mut self, _to: Ex, _c: Concl) {}
+            fn me(&mut self, _c: Concl) {}
+        }
+
+        let dt = DtIx::new(
+            Vec::new(),
+            FxHashMap::default(),
+            vec![Vec::new()],
+            Vec::new(),
+            Ranges::new(),
+            Comps::default(),
+            FxHashMap::default(),
+        );
+        // Fill `cache` to exact capacity boundary 896 (1024 buckets -> next insert rehashes to 2048).
+        {
+            let mut cache = dt.cache.lock();
+            for i in 0..896u32 {
+                let k: Key = (0, vec![i].into_boxed_slice(), Box::new([]));
+                cache.insert(k, Arc::new(Ok(Units::default())));
+            }
+            assert_eq!(cache.len(), 896);
+            assert_eq!(cache.capacity(), 896);
+        }
+        let next_key: Key = (0, vec![896u32].into_boxed_slice(), Box::new([]));
+        let ans = Ok(Units::default());
+        let payload = entry_payload_bytes(&next_key, &ans);
+        let growth = map_growth(&dt.cache.lock());
+        assert!(growth >= 2048 * (std::mem::size_of::<(Key, Arc<Result<Units, Why>>)>() + 1));
+
+        // Old single-entry estimate (payload + inline slot + 64) must be refused BEFORE rehash.
+        let old_est = payload
+            + std::mem::size_of::<Key>()
+            + std::mem::size_of::<Arc<Result<Units, Why>>>()
+            + 64;
+        assert!(old_est < payload + growth);
+        let mut tight = CapSink {
+            cap: old_est + 256,
+            held: 0,
+            peak: 0,
+            shared: 0,
+        };
+        let refused = publish_after_miss(&dt, &next_key, ans.clone(), &mut tight);
+        assert_eq!(*refused, Err(Why::Stopped));
+        assert_eq!(tight.held, 0);
+        assert_eq!(tight.shared, 0);
+        {
+            let cache = dt.cache.lock();
+            assert_eq!(cache.len(), 896);
+            assert_eq!(cache.capacity(), 896);
+        }
+
+        // With exact rehash budget, publish succeeds and retains exact `DtIx::bytes()` delta.
+        let before = dt.bytes();
+        let mut exact = CapSink {
+            cap: payload + growth,
+            held: 0,
+            peak: 0,
+            shared: 0,
+        };
+        let ok = publish_after_miss(&dt, &next_key, ans, &mut exact);
+        assert!(ok.is_ok());
+        assert_eq!(exact.held, 0);
+        assert_eq!(exact.peak, payload + growth);
+        assert_eq!(exact.shared, dt.bytes() - before);
+        assert_eq!(dt.cache.lock().len(), 897);
+    }
+
+    #[test]
+    fn dt_ix_and_extra_bytes_cover_backing_capacities_and_sticky() {
+        // Build a `DtIx` with 897 roles (2048 buckets), 897 refire keys (2048 buckets),
+        // 256 components (outer `body` Vec + `sticky` Vec) and spare inner `body` capacity.
+        let mut roles = FxHashMap::default();
+        let mut refire = FxHashMap::default();
+        for i in 0..897u32 {
+            roles.insert(
+                i,
+                RoleIx {
+                    comp: i % 256,
+                    supers: Vec::new(),
+                    ranges: Vec::new(),
+                    functional: false,
+                },
+            );
+            refire.insert(i, vec![i % 256]);
+        }
+        let mut body: Vec<Vec<Body>> = (0..256).map(|_| Vec::new()).collect();
+        body[0].reserve(512);
+        let expected_min = std::mem::size_of::<DtIx>()
+            + map_backing_bytes(&roles)
+            + body.capacity() * std::mem::size_of::<Vec<Body>>()
+            + body[0].capacity() * std::mem::size_of::<Body>()
+            + map_backing_bytes(&refire)
+            + refire
+                .values()
+                .map(|v| v.capacity() * std::mem::size_of::<u32>())
+                .sum::<usize>()
+            + 256; // sticky
+        // Build `DtIx` with `body.len() == 256`; `sticky` has length `comps.len()`.
+        let dt = DtIx::new(
+            Vec::new(),
+            roles,
+            body,
+            Vec::new(),
+            Ranges::new(),
+            Comps::default(),
+            refire,
+        );
+        // Reserve 256 bytes in `sticky` to mirror 256 components.
+        dt.sticky.lock().resize(256, FINE);
+        assert!(
+            dt.bytes() >= expected_min,
+            "DtIx::bytes() {} must cover backing capacities + sticky >= {expected_min}",
+            dt.bytes()
+        );
+
+        // `Extra::bytes()` must include spare `Extra::dt` vector slots, not only occupied entries.
+        let mut st = State::default();
+        let base = st.bytes();
+        {
+            let x = st.extra();
+            x.dt.reserve(128);
+            x.dt.push(DtSt {
+                comp: 0,
+                held: Vec::new(),
+                last: FINE,
+            });
+        }
+        let cap = st.extra.as_ref().unwrap().dt.capacity();
+        assert!(cap >= 128);
+        let grown = st.bytes() - base;
+        assert!(
+            grown >= cap * std::mem::size_of::<DtSt>(),
+            "State::bytes() growth {grown} must include spare Extra::dt slots >= {}",
+            cap * std::mem::size_of::<DtSt>()
+        );
+    }
+
+    #[test]
+    fn rule_units_513_body_and_solve_types_cap_admit_without_doubling() {
+        // 1. 513 unentailed non-free body atoms in `rule::units_bounded`: refuses old
+        // length-only underestimate before allocating `left` + `classes` + `w` + `out`.
+        let mut r = Ranges::new();
+        let base = Problem {
+            props: vec![Prop {
+                supers: Vec::new(),
+                ranges: Vec::new(),
+            }],
+            disjoint: Vec::new(),
+            atoms: Vec::new(),
+        };
+        let body: Vec<(Atom, Group)> = (0..513)
+            .map(|_| (Atom::AtLeast(0, 1, Ranges::FULL), Group::Only(1)))
+            .collect();
+        let old_body_est =
+            513 * (std::mem::size_of::<(Atom, Group)>() + std::mem::size_of::<usize>() + 16);
+        let live = std::cell::Cell::new(0isize);
+        let cap = old_body_est + 512;
+        let refused = rule::units_bounded(
+            &mut r,
+            &base,
+            &body,
+            &Bounds::default(),
+            &|| false,
+            &|_| true,
+            &|d| {
+                let next = live.get() + d;
+                if d > 0 && next as usize > cap {
+                    return false;
+                }
+                live.set(next);
+                true
+            },
+            &|_| true,
+        );
+        assert_eq!(refused, Err(Why::Stopped));
+        assert_eq!(live.get(), 0);
+
+        // Under unbounded `mem`, 513 body atoms run cleanly with zero leaked `mem`.
+        let peak = std::cell::Cell::new(0usize);
+        let ok = rule::units_bounded(
+            &mut r,
+            &base,
+            &body,
+            &Bounds::default(),
+            &|| false,
+            &|_| true,
+            &|d| {
+                let next = live.get() + d;
+                live.set(next);
+                if next > 0 {
+                    peak.set(peak.get().max(next as usize));
+                }
+                true
+            },
+            &|_| true,
+        );
+        assert!(ok.is_ok());
+        assert_eq!(live.get(), 0);
+        // Peak must cover simultaneous `left`, `classes`, `w`, and `refutes` atoms (513 negs).
+        let min_simultaneous = 513
+            * (std::mem::size_of::<(Atom, Group)>()
+                + std::mem::size_of::<u32>()
+                + 2 * std::mem::size_of::<Atom>());
+        assert!(
+            peak.get() >= min_simultaneous,
+            "peak {} must cover simultaneous vectors + refutes atoms >= {min_simultaneous}",
+            peak.get()
+        );
+
+        // 2. `solve::check_bounded` checks `types.len() == b.types` BEFORE pushing type
+        // `b.types + 1`: 10 independent properties yield 1023 valid sets on 1 cell,
+        // exceeding `b.types = 512` (within the 512 * 64 pre-check) without doubling to 1024.
+        let props10: Vec<Prop> = (0..10)
+            .map(|_| Prop {
+                supers: Vec::new(),
+                ranges: Vec::new(),
+            })
+            .collect();
+        let p10 = Problem {
+            props: props10,
+            disjoint: Vec::new(),
+            atoms: Vec::new(),
+        };
+        let bounds512 = Bounds {
+            types: 512,
+            ..Bounds::default()
+        };
+        // Exact budget for init + 1024 sets + 512 types (NOT 1024 doubled types!).
+        let exact_cap = 10 * std::mem::size_of::<u64>()
+            + std::mem::size_of::<(Rid, Vec<bool>)>()
+            + 64
+            + (1usize << 10) * std::mem::size_of::<u64>()
+            + 512 * std::mem::size_of::<(usize, u64)>();
+        let live2 = std::cell::Cell::new(0isize);
+        let peak2 = std::cell::Cell::new(0usize);
+        let ans = super::super::dtcheck::solve::check_bounded(
+            &mut r,
+            &p10,
+            &bounds512,
+            &|| false,
+            &|_| true,
+            &|d| {
+                let next = live2.get() + d;
+                if d > 0 && next as usize > exact_cap {
+                    return false;
+                }
+                live2.set(next);
+                if next > 0 {
+                    peak2.set(peak2.get().max(next as usize));
+                }
+                true
+            },
+        );
+        assert_eq!(
+            ans,
+            super::super::dtcheck::solve::Answer::Unknown(Why::Bound)
+        );
+        assert_eq!(live2.get(), 0);
+        assert!(peak2.get() <= exact_cap);
     }
 }

@@ -1694,7 +1694,7 @@ mod units_rule {
             }
         });
         assert_eq!(got, Err(Fail::Memory));
-        assert!(admitted.get() <= cap);
+        assert_eq!(admitted.get(), 0);
         assert_eq!(r.bytes(), Ranges::new().bytes());
     }
 
@@ -1831,7 +1831,7 @@ mod units_rule {
             }
         });
         assert_eq!(got, Err(Fail::Memory));
-        assert!(admitted.get() <= cap);
+        assert_eq!(admitted.get(), 0);
         assert_eq!(r.bytes(), Ranges::new().bytes());
     }
 

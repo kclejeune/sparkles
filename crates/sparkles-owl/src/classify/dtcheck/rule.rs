@@ -36,6 +36,15 @@ pub struct Units {
     pub cover: bool,
 }
 
+/// Upper bound on the capacity a `Vec` reaches after pushing up to `n` elements.
+fn vec_max_cap(n: usize) -> usize {
+    if n == 0 {
+        0
+    } else {
+        n.checked_next_power_of_two().unwrap_or(usize::MAX).max(4)
+    }
+}
+
 /// Whether the units with the negations of `negs` are unsatisfiable.
 fn refutes(
     r: &mut Ranges,
@@ -56,24 +65,32 @@ fn refutes(
                 + p.ranges.len() * 4
         })
         .sum();
-    let clone_est = base
-        .atoms
-        .len()
-        .saturating_add(negs.len())
+    let atoms_cap = base.atoms.len().saturating_add(negs.len());
+    let clone_est = atoms_cap
         .saturating_mul(std::mem::size_of::<Atom>())
         .saturating_add(props_bytes)
-        .saturating_add(base.disjoint.len().saturating_mul(16));
+        .saturating_add(
+            base.disjoint
+                .len()
+                .saturating_mul(std::mem::size_of::<(usize, usize)>()),
+        );
     if !scope.take(clone_est) {
         return Err(Why::Stopped);
     }
-    let mut p = base.clone();
+    let mut atoms = Vec::with_capacity(atoms_cap);
+    atoms.extend_from_slice(&base.atoms);
     for &q in negs {
         match q.negate() {
-            Some(n) => p.atoms.push(n),
+            Some(n) => atoms.push(n),
             // the atom holds of every element, so its negation is unsatisfiable
             None => return Ok(true),
         }
     }
+    let p = Problem {
+        props: base.props.clone(),
+        disjoint: base.disjoint.clone(),
+        atoms,
+    };
     match check_bounded(r, &p, b, stop, admit_ranges, mem) {
         Answer::Sat => Ok(false),
         Answer::Unsat => Ok(true),
@@ -116,9 +133,21 @@ pub fn units_bounded(
         return Ok(out);
     }
     let mut body_scope = MemScope::new(mem);
+    let out_cap = vec_max_cap(body.len());
+    // Covers preallocated `left`, `classes`, and `w` (simultaneously live) plus the
+    // doubling scratch of `out.entailed` and `out.classes`.
     let body_est = body
         .len()
-        .saturating_mul(std::mem::size_of::<(Atom, Group)>() + std::mem::size_of::<usize>() + 16);
+        .saturating_mul(
+            std::mem::size_of::<(Atom, Group)>()
+                + std::mem::size_of::<u32>()
+                + std::mem::size_of::<Atom>(),
+        )
+        .saturating_add(
+            out_cap
+                .saturating_mul(2)
+                .saturating_mul(std::mem::size_of::<usize>() + std::mem::size_of::<u32>()),
+        );
     if !body_scope.take(body_est) {
         return Err(Why::Stopped);
     }
@@ -137,7 +166,7 @@ pub fn units_bounded(
         }
         Ok(out)
     };
-    let mut left: Vec<(Atom, Group)> = Vec::new();
+    let mut left: Vec<(Atom, Group)> = Vec::with_capacity(body.len());
     for (i, &(q, g)) in body.iter().enumerate() {
         if refutes(r, base, &[q], b, stop, admit_ranges, mem)? {
             out.entailed.push(i);
@@ -148,28 +177,32 @@ pub fn units_bounded(
     if left.len() < 2 {
         return finish(out);
     }
-    let mut classes: Vec<u32> = left
-        .iter()
-        .filter_map(|&(_, g)| match g {
-            Group::Only(c) => Some(c),
-            _ => None,
-        })
-        .collect();
+    let mut classes: Vec<u32> = Vec::with_capacity(left.len());
+    for &(_, g) in &left {
+        if let Group::Only(c) = g {
+            classes.push(c);
+        }
+    }
     classes.sort_unstable();
     classes.dedup();
+    let mut w: Vec<Atom> = Vec::with_capacity(left.len());
     for c in classes {
-        let w: Vec<Atom> = left
-            .iter()
-            .filter(|&&(_, g)| g == Group::Only(c))
-            .map(|&(q, _)| q)
-            .collect();
+        w.clear();
+        for &(q, g) in &left {
+            if g == Group::Only(c) {
+                w.push(q);
+            }
+        }
         if w.len() >= 2 && refutes(r, base, &w, b, stop, admit_ranges, mem)? {
             out.classes.push(c);
             left.retain(|&(_, g)| g != Group::Only(c));
         }
     }
     if left.len() >= 2 {
-        let w: Vec<Atom> = left.iter().map(|&(q, _)| q).collect();
+        w.clear();
+        for &(q, _) in &left {
+            w.push(q);
+        }
         out.cover = refutes(r, base, &w, b, stop, admit_ranges, mem)?;
     }
     finish(out)

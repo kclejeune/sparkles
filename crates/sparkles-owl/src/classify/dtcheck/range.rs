@@ -1120,7 +1120,7 @@ fn time_facet(dt: &str, facet: &str, value: &Literal) -> Result<(), Unsupported>
 pub type Rid = u32;
 
 /// Exact upper bound on the power-of-two bucket count hashbrown allocates for `cap`.
-pub(super) fn map_buckets_for(cap: usize) -> usize {
+pub(in super::super) fn map_buckets_for(cap: usize) -> usize {
     if cap == 0 {
         0
     } else {
@@ -1129,7 +1129,7 @@ pub(super) fn map_buckets_for(cap: usize) -> usize {
 }
 
 /// Backing bucket + control byte allocation of a hashbrown `FxHashMap` (preserved by `clone`).
-pub(super) fn map_backing_bytes<K, V>(m: &FxHashMap<K, V>) -> usize {
+pub(in super::super) fn map_backing_bytes<K, V>(m: &FxHashMap<K, V>) -> usize {
     let buckets = map_buckets_for(m.capacity());
     if buckets == 0 {
         0
@@ -1142,7 +1142,7 @@ pub(super) fn map_backing_bytes<K, V>(m: &FxHashMap<K, V>) -> usize {
 
 /// Worst-case allocation when inserting into `m` at its capacity boundary (covers the
 /// doubled destination table during rehash).
-pub(super) fn map_growth<K, V>(m: &FxHashMap<K, V>) -> usize {
+pub(in super::super) fn map_growth<K, V>(m: &FxHashMap<K, V>) -> usize {
     if m.len() == m.capacity() {
         let next_buckets = map_buckets_for(m.capacity()).saturating_mul(2).max(8);
         next_buckets

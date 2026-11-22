@@ -4214,9 +4214,9 @@ W3C OWL 2 test cases that involve datatypes, among them `Datatype-Float-Discrete
 `+0`. A differential test compares the checker's answers on random small sets of atoms
 with a brute-force model finder over small finite stand-ins for the value spaces, and a
 second one does the same for the theory rule's clauses. Phase 2 is item 972 with the
-Horn tier's data atoms, checked against HermiT on the thirteen OML probes and on the 222
-non-held-out census files whose default run left out data axioms, as the Outcome above
-records. Phase 3 is item 768, data atoms in Tier D and the rooted run, with the census
+Horn tier's data atoms, checked against HermiT on the thirteen OML probes and compared
+before and after on the 222 non-held-out census files whose default run left out data
+axioms, with HermiT checking the consistency changes, as the Outcome above records. Phase 3 is item 768, data atoms in Tier D and the rooted run, with the census
 tool run on the 61 files before and after.
 
 ### Nominals in the disjunctive rules

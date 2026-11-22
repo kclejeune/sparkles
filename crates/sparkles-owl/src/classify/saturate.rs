@@ -378,7 +378,12 @@ impl Extra {
             + self.groups.capacity() * std::mem::size_of::<Group>()
             + self.horn.bytes()
             + self.dl.as_ref().map_or(0, |d| d.bytes())
-            + self.dt.iter().map(|s| s.bytes()).sum::<usize>()
+            + self.dt.capacity() * std::mem::size_of::<super::dt_sat::DtSt>()
+            + self
+                .dt
+                .iter()
+                .map(|s| s.held.capacity() * std::mem::size_of::<Ex>())
+                .sum::<usize>()
     }
 }
 
