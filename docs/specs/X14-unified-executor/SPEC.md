@@ -1262,7 +1262,10 @@ the query's deadline leaves out the time a consumer keeps the cursor waiting, so
 consumer can expire a transfer that an eager run would finish. The strict policy refuses
 a SILENT SERVICE, which needs its whole answer before its first row, and a JSON response
 whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in either
-order. Its refusal inside an EXISTS fails the query, as it does outside one.
+order. Under the permissive policy, a late-head JSON response is buffered under a memory
+charge, and the runtime plan reports and retains `fullInputBeforeOutput` on that SERVICE
+node after the response is released. Its refusal inside an EXISTS fails the query, as it
+does outside one.
 
 A text search with a constant query and no limit, in `cursor/text.rs`, collects its
 scored hits in one pass over each index segment, charging the hit list before each growth,

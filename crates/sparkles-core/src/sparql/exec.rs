@@ -9300,6 +9300,8 @@ pub(super) struct RemoteAnswer {
     solutions: Option<sparesults::ReaderSolutionsParser<Box<dyn std::io::Read + Send>>>,
     /// what the reader under the parser charges by, for a streamed answer
     window: Option<std::sync::Arc<super::svcread::Window>>,
+    /// whether the metered JSON route had to buffer the solution sequence before output
+    buffered_before_output: bool,
 }
 
 /// How a streamed SERVICE answer is charged to its query (see [`super::svcread`]). An
@@ -9391,6 +9393,7 @@ impl RemoteAnswer {
         );
         // A streamed answer reads the start of a JSON response first to see whether
         // sparesults would buffer it, and charges what the parser holds as it reads.
+        let mut buffered_before_output = false;
         let (body, window): (Box<dyn std::io::Read + Send>, _) = match meter {
             None => (Box::new(body), None),
             Some(meter) => {
@@ -9409,6 +9412,7 @@ impl RemoteAnswer {
                             url.as_str()
                         )));
                     }
+                    buffered_before_output = start.late;
                     let base = (start.decided as u64).saturating_mul(super::svcread::head_factor());
                     let bytes = std::io::Cursor::new(start.bytes);
                     Box::new(super::svcread::Metered::new(
@@ -9445,7 +9449,14 @@ impl RemoteAnswer {
             url: url.as_str().to_string(),
             solutions,
             window,
+            buffered_before_output,
         })
+    }
+
+    /// Whether the metered parser route buffers the solution sequence before yielding
+    /// its first solution (for example, JSON results preceding head variables).
+    pub(super) fn buffered_before_output(&self) -> bool {
+        self.buffered_before_output
     }
 
     /// The next solution of the response, or `None` once it has ended. A failure ends

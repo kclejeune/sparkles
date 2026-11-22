@@ -49,6 +49,11 @@ pub(super) fn eligible(node: &Node) -> bool {
     matches!(node.kind, Kind::Service { silent: false, .. }) && node.children.is_empty()
 }
 
+/// Fixed runtime plan explanation when a permissive SERVICE reader discovers a JSON
+/// response whose results precede its head variables.
+pub(super) const BUFFERED_REASON: &str =
+    "SERVICE JSON results precede head variables and are buffered before output";
+
 pub(super) struct Service {
     endpoint: PathEnd,
     query: String,
@@ -59,6 +64,9 @@ pub(super) struct Service {
     /// the policy an in-process call runs under
     fallback: FallbackPolicy,
     opened: bool,
+    /// whether the opened remote answer had to buffer its solution sequence before
+    /// yielding its first row; retained after the source is released
+    buffered_before_output: bool,
     source: Option<Source>,
     /// the blank node of this query for each label of the endpoint's answer
     bnodes: FxHashMap<String, Id>,
@@ -223,9 +231,16 @@ impl Service {
             names: node.vars.iter().map(|v| ctx.var_name(*v)).collect(),
             fallback,
             opened: false,
+            buffered_before_output: false,
             source: None,
             bnodes: FxHashMap::default(),
         }
+    }
+
+    /// Whether this reader discovered that its remote response buffers its solution
+    /// sequence before yielding its first row.
+    pub(super) fn full_input_before_output(&self) -> bool {
+        self.buffered_before_output
     }
 
     /// Close the answer, its response, copy, entry or in-process call, once nothing
@@ -324,6 +339,7 @@ impl Service {
             strict: self.fallback.at_pull(ctx) == FallbackPolicy::RejectMaterialization,
         };
         let answer = RemoteAnswer::open(ctx, &url, &self.query, Some(meter))?;
+        self.buffered_before_output = answer.buffered_before_output();
         self.source = Some(Source::Remote {
             answer: Box::new(answer),
             tee,

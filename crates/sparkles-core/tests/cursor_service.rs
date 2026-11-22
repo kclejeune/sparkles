@@ -206,6 +206,46 @@ fn materializes(plan: &CursorPlan) -> bool {
     plan.materializes || plan.children.iter().any(materializes)
 }
 
+fn service_node(plan: &CursorPlan) -> &CursorPlan {
+    fn find<'a>(plan: &'a CursorPlan, out: &mut Vec<&'a CursorPlan>) {
+        if plan.operator.operator == "Service" {
+            out.push(plan);
+        }
+        for child in &plan.children {
+            find(child, out);
+        }
+    }
+    let mut found = Vec::new();
+    find(plan, &mut found);
+    assert_eq!(
+        found.len(),
+        1,
+        "expected one Service node in plan: {plan:#?}"
+    );
+    found[0]
+}
+
+fn assert_service_streaming(plan: &CursorPlan, phase: &str) {
+    let svc = service_node(plan);
+    assert!(
+        !svc.full_input_before_output && !svc.materializes && svc.reason.is_none(),
+        "{phase}: expected streaming Service node, got {svc:#?}"
+    );
+}
+
+fn assert_service_buffered(plan: &CursorPlan, phase: &str) {
+    let svc = service_node(plan);
+    assert!(
+        svc.full_input_before_output
+            && !svc.materializes
+            && svc
+                .reason
+                .as_deref()
+                .is_some_and(|r| r.contains("buffered before output")),
+        "{phase}: expected buffered-before-output Service node with reason, got {svc:#?}"
+    );
+}
+
 /// The strict cursor hands out its first batch while the endpoint still holds the rest
 /// of the response back, and the drained answer is eager's, in eager's order, at every
 /// batch size, with no node of the plan materializing.
@@ -237,8 +277,11 @@ fn a_service_streams_its_first_batch_before_the_answer_ends() {
     let q = format!("SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }}", ep.url);
     let began = Instant::now();
     let mut cursor = select_cursor(snap.clone(), &q, &opts(), &strict(1)).unwrap();
+    assert_service_streaming(cursor.plan(), "head-first initial");
     let first = cursor.next_batch().unwrap().expect("a first row");
     assert_eq!(first.len(), 1);
+    drop(first);
+    assert_service_streaming(cursor.plan(), "head-first after first batch");
     assert!(
         began.elapsed() < Duration::from_secs(5),
         "the first batch waited for the rest of the response"
@@ -250,6 +293,7 @@ fn a_service_streams_its_first_batch_before_the_answer_ends() {
     }
     assert_eq!(n, 50);
     assert!(!materializes(cursor.plan()), "{:#?}", cursor.plan());
+    assert_service_streaming(cursor.plan(), "head-first drained");
     let expected = eager(&snap, &q, &opts()).unwrap();
     for rows in [1, 2, 3, 4096] {
         let (answer, plan) = streamed(&snap, &q, &opts(), &strict(rows)).unwrap();
@@ -487,6 +531,21 @@ fn a_service_is_cached_only_when_drained() {
     assert!(!materializes(&plan));
     assert_eq!(ep.calls(), 3);
     assert_eq!(service.entries(), 1);
+    {
+        let mut cursor = select_cursor(snap.clone(), &q, &cached, &strict(3)).unwrap();
+        assert_service_streaming(cursor.plan(), "cache hit initial");
+        let first = cursor.next_batch().unwrap().expect("first cached batch");
+        assert_eq!(first.len(), 3);
+        drop(first);
+        assert_service_streaming(cursor.plan(), "cache hit after first batch");
+        let mut n = 3;
+        while let Some(b) = cursor.next_batch().unwrap() {
+            n += b.len();
+        }
+        assert_eq!(n, expected.len());
+        assert_service_streaming(cursor.plan(), "cache hit drained");
+        assert_eq!(ep.calls(), 3, "the cache answered");
+    }
     for rows in [1, 4096] {
         assert_eq!(
             streamed(&snap, &q, &cached, &strict(rows)).unwrap().0,
@@ -502,6 +561,48 @@ fn a_service_is_cached_only_when_drained() {
         expected
     );
     assert_eq!(ep.calls(), 4);
+    // An entry seeded by a permissive late-head run does not mark a later cache hit as
+    // full-input: reading the cached entry does not reparse or buffer the response.
+    let late = Endpoint::start(Arc::new(|| {
+        (
+            200,
+            vec![Part::Bytes(
+                format!(
+                    r#"{{"results":{{"bindings":[{}]}},"head":{{"vars":["s","o"]}}}}"#,
+                    rows(10)
+                )
+                .into_bytes(),
+            )],
+        )
+    }));
+    let q_late = format!(
+        "SELECT ?s ?o {{ SERVICE <cache:{}> {{ ?s ?p ?o }} }}",
+        late.url
+    );
+    let allow = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(3)
+    };
+    let (seeded, seed_plan) = streamed(&snap, &q_late, &cached, &allow).unwrap();
+    assert_eq!(seeded.len(), 10);
+    assert_eq!(late.calls(), 1);
+    assert_service_buffered(&seed_plan, "late-head cache seed");
+    let mut hit_cursor = select_cursor(snap.clone(), &q_late, &cached, &strict(3)).unwrap();
+    assert_service_streaming(hit_cursor.plan(), "late-head cache hit initial");
+    let first = hit_cursor
+        .next_batch()
+        .unwrap()
+        .expect("first late-head cached batch");
+    assert_eq!(first.len(), 3);
+    drop(first);
+    assert_service_streaming(hit_cursor.plan(), "late-head cache hit after first batch");
+    let mut n = 3;
+    while let Some(b) = hit_cursor.next_batch().unwrap() {
+        n += b.len();
+    }
+    assert_eq!(n, 10);
+    assert_service_streaming(hit_cursor.plan(), "late-head cache hit drained");
+    assert_eq!(late.calls(), 1, "strict cache hit sent no new request");
 }
 
 /// A remote transfer's timeout counts from the start of its request, while the cursor's
@@ -641,6 +742,21 @@ fn an_in_process_call_runs_under_the_callers_policy_and_deadline() {
         let (answer, plan) = streamed(&snap, plain, &o, &strict(rows)).unwrap();
         assert_eq!(answer, expected, "{rows}");
         assert!(!materializes(&plan));
+        assert_service_streaming(&plan, "local drained");
+    }
+    {
+        let mut cursor = select_cursor(snap.clone(), plain, &o, &strict(9)).unwrap();
+        assert_service_streaming(cursor.plan(), "local initial");
+        let first = cursor.next_batch().unwrap().expect("first local batch");
+        assert_eq!(first.len(), 9);
+        drop(first);
+        assert_service_streaming(cursor.plan(), "local after first batch");
+        let mut n = 9;
+        while let Some(b) = cursor.next_batch().unwrap() {
+            n += b.len();
+        }
+        assert_eq!(n, 100);
+        assert_service_streaming(cursor.plan(), "local after none");
     }
     // the callee holds a SILENT SERVICE, which the strict policy refuses
     let failing = Endpoint::start(Arc::new(|| (500, vec![Part::Bytes(b"no".to_vec())])));
@@ -959,9 +1075,85 @@ fn a_response_whose_head_comes_late_is_refused_or_charged() {
         fallback: FallbackPolicy::AllowMaterialization,
         ..strict(4)
     };
-    let (answer, _) = streamed(&snap, &q, &opts(), &allow).unwrap();
-    assert_eq!(answer, eager(&snap, &q, &opts()).unwrap());
-    assert_eq!(answer.len(), 10);
+    let expected = eager(&snap, &q, &opts()).unwrap();
+    assert_eq!(expected.len(), 10);
+    // Drive the permissive ten-row cursor directly so we inspect the Service plan node
+    // initially, immediately after the first batch, after the last rows, and after None.
+    let mut cursor = select_cursor(snap.clone(), &q, &opts(), &allow).unwrap();
+    assert_service_streaming(cursor.plan(), "late-head initial");
+    let mut answer = Vec::new();
+    let first = cursor.next_batch().unwrap().expect("first late-head batch");
+    assert_eq!(first.len(), 4);
+    for r in 0..first.len() {
+        answer.push(first.row(r).unwrap().values().to_vec());
+    }
+    drop(first);
+    assert_service_buffered(cursor.plan(), "late-head after first batch");
+    let second = cursor
+        .next_batch()
+        .unwrap()
+        .expect("second late-head batch");
+    assert_eq!(second.len(), 4);
+    for r in 0..second.len() {
+        answer.push(second.row(r).unwrap().values().to_vec());
+    }
+    drop(second);
+    let third = cursor.next_batch().unwrap().expect("last late-head batch");
+    assert_eq!(third.len(), 2);
+    for r in 0..third.len() {
+        answer.push(third.row(r).unwrap().values().to_vec());
+    }
+    drop(third);
+    assert_service_buffered(cursor.plan(), "late-head after last rows");
+    assert!(cursor.next_batch().unwrap().is_none());
+    assert_service_buffered(cursor.plan(), "late-head completed plan");
+    assert_eq!(answer, expected);
+    // Batch capacity larger than the ten-row answer releases the source during the first
+    // pull; the runtime plan still retains the discovered buffering flag.
+    let allow_wide = CursorOptions {
+        fallback: FallbackPolicy::AllowMaterialization,
+        ..strict(64)
+    };
+    let mut wide = select_cursor(snap.clone(), &q, &opts(), &allow_wide).unwrap();
+    assert_service_streaming(wide.plan(), "late-head wide initial");
+    let all = wide.next_batch().unwrap().expect("single wide batch");
+    assert_eq!(all.len(), 10);
+    drop(all);
+    assert_service_buffered(wide.plan(), "late-head wide after single batch");
+    assert!(wide.next_batch().unwrap().is_none());
+    assert_service_buffered(wide.plan(), "late-head wide completed plan");
+    // Empty bindings array with late head: no nonempty batch is emitted, yet the
+    // completed plan still reports the buffering startup barrier.
+    let empty_late = Endpoint::start(Arc::new(|| {
+        (
+            200,
+            vec![Part::Bytes(
+                br#"{"results":{"bindings":[]},"head":{"vars":["s","o"]}}"#.to_vec(),
+            )],
+        )
+    }));
+    let q_empty = format!(
+        "SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }}",
+        empty_late.url
+    );
+    let mut empty_cursor = select_cursor(snap.clone(), &q_empty, &opts(), &allow).unwrap();
+    assert_service_streaming(empty_cursor.plan(), "late-head empty initial");
+    assert!(empty_cursor.next_batch().unwrap().is_none());
+    assert_service_buffered(empty_cursor.plan(), "late-head empty completed plan");
+    // Outer LIMIT 1 releases the Service source via release_finished while preserving
+    // the discovered buffering flag on the child Service node.
+    let q_limit = format!(
+        "SELECT ?s ?o {{ SERVICE <{}> {{ ?s ?p ?o }} }} LIMIT 1",
+        late.url
+    );
+    let mut limited = select_cursor(snap.clone(), &q_limit, &opts(), &allow).unwrap();
+    assert_service_streaming(limited.plan(), "late-head limit initial");
+    let one = limited.next_batch().unwrap().expect("limited batch");
+    assert_eq!(one.len(), 1);
+    drop(one);
+    assert_service_buffered(limited.plan(), "late-head limit after first batch");
+    assert!(limited.next_batch().unwrap().is_none());
+    assert_service_buffered(limited.plan(), "late-head limit completed plan");
     // Empty bindings, which a buffered answer keeps at many times their bytes: the
     // budget holds the bytes many times over, but not what sparesults keeps of them.
     let body = format!(

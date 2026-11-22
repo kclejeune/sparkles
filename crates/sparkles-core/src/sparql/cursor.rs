@@ -4003,11 +4003,18 @@ impl Operator {
                     | State::IndexTopK(_)
                     | State::Text(_)
             )
+            || matches!(&self.state, State::Service(service) if service.full_input_before_output())
     }
 
     fn update_plan(&mut self, plan: &mut CursorPlan) {
         plan.materializes = self.materializes;
         plan.full_input_before_output = self.full_input_before_output();
+        if let State::Service(service) = &self.state
+            && service.full_input_before_output()
+            && plan.reason.is_none()
+        {
+            plan.reason = Some(service::BUFFERED_REASON.to_string());
+        }
         plan.growing_state = self.growing;
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
