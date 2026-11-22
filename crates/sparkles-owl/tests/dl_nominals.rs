@@ -633,6 +633,205 @@ fn an_existential_over_the_universal_property_reaches_a_nominal() {
     );
 }
 
+/// `∃top.A` and `≥1 top.A` are the same class, and the rewriting gives both `∃U.A`. Their
+/// disjointness makes that class empty, and with an element in the domain A is empty,
+/// as HermiT answers for this ontology (row 1304). The set of images alone held one
+/// member, which the normaliser drops, and the run answered A satisfiable.
+#[test]
+fn a_disjointness_of_two_members_with_one_image_makes_the_image_empty() {
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A))
+         SubClassOf(:K :A)
+         ClassAssertion(:B :b)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")), "A is empty");
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")), "K is empty");
+    assert!(!out.taxonomy.is_unsatisfiable(&c("B")));
+}
+
+/// The control of the case above, with members whose images differ (row 1304). HermiT
+/// answers A and K empty.
+#[test]
+fn a_disjointness_of_two_members_with_distinct_images_keeps_both() {
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :B))
+         EquivalentClasses(:A :B)
+         SubClassOf(:K :A)
+         ClassAssertion(:C :b)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+}
+
+/// `≥0 top.X` holds of every element, so it is `owl:Thing`, and the disjointness says the
+/// domain is empty, which no interpretation allows. The ontology is inconsistent by this
+/// derivation, since HermiT fails on it and Konclude is not at hand (row 1304). HermiT
+/// does answer the variants below with a third member or two such members inconsistent.
+#[test]
+fn a_disjointness_of_owl_thing_and_at_least_none_is_inconsistent() {
+    inconsistent(
+        "DisjointClasses(owl:Thing ObjectMinCardinality(0 owl:topObjectProperty :X))
+         SubClassOf(:A :X)",
+    );
+}
+
+/// The control of the case above without a merge: `⊤ ⊑ ¬(≥0 top.X)` is `⊤ ⊑ ⊥`.
+#[test]
+fn owl_thing_below_the_complement_of_at_least_none_is_inconsistent() {
+    inconsistent(
+        "SubClassOf(owl:Thing ObjectComplementOf(ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         SubClassOf(:A :X)",
+    );
+}
+
+/// Three members with one image and a fourth with another: the shared image is empty and
+/// the other stays satisfiable. `≥0 top.X` and `≥0 top.Y` are both `owl:Thing`, so the
+/// third case is inconsistent too. HermiT gives the same answers.
+#[test]
+fn a_disjointness_of_three_members_with_one_image_makes_it_empty() {
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty owl:Thing)
+             ObjectMinCardinality(1 owl:topObjectProperty)
+             ObjectMinCardinality(1 owl:topObjectProperty owl:Thing)
+             :D)
+         SubClassOf(:A :D)",
+        false,
+        &[],
+    );
+    // ∃top.⊤ holds of every element, so the domain is empty
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :E)
+             ObjectMinCardinality(1 owl:topObjectProperty :E)
+             ObjectSomeValuesFrom(:r ObjectMinCardinality(1 owl:topObjectProperty :E))
+             :D)
+         SubClassOf(:A :D)
+         SubClassOf(:K :E)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    inconsistent(
+        "DisjointClasses(ObjectMinCardinality(0 owl:topObjectProperty :X)
+             ObjectMinCardinality(0 owl:topObjectProperty :Y))
+         SubClassOf(:A :X)",
+    );
+}
+
+/// The disjointness part of a disjoint union follows the rule of `DisjointClasses`, and
+/// the union part keeps the set of images: C is the union of two equal classes that are
+/// disjoint, so C and its members are empty. HermiT gives the same answers.
+#[test]
+fn a_disjoint_union_of_two_members_with_one_image_is_empty() {
+    let out = rooted(
+        "DisjointUnion(:C ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A))
+         SubClassOf(:K :A)
+         SubClassOf(:L :C)
+         ClassAssertion(:B :b)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    for name in ["A", "K", "C", "L"] {
+        assert!(out.taxonomy.is_unsatisfiable(&c(name)), "{name} is empty");
+    }
+    assert!(!out.taxonomy.is_unsatisfiable(&c("B")));
+    // with a third member of another image, C is that member and stays satisfiable
+    let out = rooted(
+        "DisjointUnion(:C ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A) :D)
+         SubClassOf(:K :A)",
+        false,
+        &[("C", "D"), ("D", "C")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("D")));
+    assert!(out.taxonomy.is_subclass(&c("D"), &c("C")));
+}
+
+/// A rewritten axiom can equal an axiom the ontology states as it is. Here both members of
+/// the disjointness rewrite to `≥2 r.⊤`, so the rewriting adds `≥2 r.⊤ ⊑ ⊥`, which the
+/// first axiom states too. Without counting the run leaves that axiom out, and the report
+/// names both original axioms (row 1304).
+#[test]
+fn the_report_names_every_original_axiom_of_a_rewritten_one_left_out() {
+    let ax = axioms(
+        "SubClassOf(ObjectMinCardinality(2 :r owl:Thing) owl:Nothing)
+         DisjointClasses(ObjectMinCardinality(2 :r owl:Thing)
+             ObjectMinCardinality(2 :r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         ClassAssertion(:B :b)",
+    );
+    let find = |f: fn(&AxiomKind) -> bool| ax.iter().map(|a| a.kind.clone()).find(f).unwrap();
+    let stated = find(|k| matches!(k, AxiomKind::SubClassOf(_, ClassExpression::Class(_))));
+    let disjoint = find(|k| matches!(k, AxiomKind::DisjointClasses(_)));
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
+    assert!(left.contains(&stated), "{left:#?}");
+    assert!(left.contains(&disjoint), "{left:#?}");
+    assert_eq!(left.len(), 2, "{left:#?}");
+    // the disjunction is the only axiom outside OWL 2 EL that the run takes
+    assert_eq!(out.stats.outside_el.taken, 1);
+}
+
+/// Two replaced axioms can rewrite to one axiom, here `≥2 r.∃U.A ⊑ ⊥`, and the report
+/// names both when the run leaves it out (row 1304).
+#[test]
+fn the_report_names_both_replaced_axioms_of_one_rewritten_axiom() {
+    let ax = axioms(
+        "DisjointClasses(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A)))
+         SubClassOf(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             owl:Nothing)
+         ClassAssertion(:B :b)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
+    assert_eq!(left.len(), 2, "{left:#?}");
+    assert!(
+        left.iter()
+            .any(|k| matches!(k, AxiomKind::DisjointClasses(_)))
+    );
+    assert!(left.iter().any(|k| matches!(k, AxiomKind::SubClassOf(..))));
+    assert_eq!(out.stats.outside_el.taken, 1);
+}
+
+/// A disjoint union whose rewritten axioms are left out for two rules is reported once.
+#[test]
+fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
+    let ax = axioms(
+        "DisjointUnion(:C
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A))
+             :D)
+         ClassAssertion(:B :b)",
+    );
+    let mut k = Classifier::of(&ax);
+    k.classify(&rooted_limits()).unwrap();
+    let left = k.excluded();
+    assert_eq!(left.len(), 1, "{left:#?}");
+    assert!(matches!(left[0].axiom, AxiomKind::DisjointUnion(..)));
+}
+
 const INTERNAL: &str = "urn:sparkles:internal:";
 
 fn rooted_limits() -> Limits {

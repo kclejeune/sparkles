@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Rooted runs keep the disjointness of members that the rewriting merges
+
+The rewriting of item 805 gives `∃top.A` and `≥1 top.A` the same image, and `≥0 top.X`
+the image `owl:Thing`, so two members of a `DisjointClasses` or `DisjointUnion` axiom
+could become one and the axiom was dropped. A rooted run of `DisjointClasses(∃top.A,
+≥1 top.A)` with `K ⊑ A` answered A and K satisfiable where HermiT finds them empty, and
+`DisjointClasses(owl:Thing, ≥0 top.X)` came out consistent, with each run reporting itself
+complete. The rewriting now makes an image of more than one member empty and keeps the
+disjointness of the distinct images, as roadmap item 1304. The report of the axioms
+left out names every original axiom that a left-out rewritten axiom stands for, where it
+named only the first, and no longer drops an axiom that the ontology states unchanged.
+Runs without `Limits::rooted` were not affected.
+
 ### Views keep ORDER BY with LIMIT as an ordered window
 
 A view or live query whose SELECT has `ORDER BY` with `LIMIT` and `OFFSET` no longer
