@@ -3501,7 +3501,10 @@ impl Operator {
             || expanding
             || walking
             || whole_input
-            || exists;
+            || exists
+            || service_reader
+            || text_reader
+            || history_reader;
         let mut order = output_order(
             &node,
             &children,

@@ -137,22 +137,16 @@ impl ReadOnlyLog {
 
 /// Positional reads do not share a cursor across concurrent queries. Every kernel
 /// request is at most 64 KiB, and an interrupted syscall polls controls before retry.
-fn read_exact_at_checked(
-    file: &File,
+pub(super) fn read_exact_at_checked_with(
     mut output: &mut [u8],
     mut offset: u64,
     check: &mut dyn FnMut() -> Result<()>,
+    mut read_at: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
 ) -> Result<()> {
     while !output.is_empty() {
         check()?;
         let length = output.len().min(64 << 10);
-        #[cfg(unix)]
-        let result = std::os::unix::fs::FileExt::read_at(file, &mut output[..length], offset);
-        #[cfg(windows)]
-        let result = std::os::windows::fs::FileExt::seek_read(file, &mut output[..length], offset);
-        #[cfg(not(any(unix, windows)))]
-        let result: std::io::Result<usize> = Err(std::io::ErrorKind::Unsupported.into());
-        match result {
+        match read_at(&mut output[..length], offset) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into()),
             Ok(count) => {
                 offset = offset
@@ -165,6 +159,29 @@ fn read_exact_at_checked(
         }
     }
     check()
+}
+
+pub(super) fn read_exact_at_checked(
+    file: &File,
+    output: &mut [u8],
+    offset: u64,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    read_exact_at_checked_with(output, offset, check, |buf, at| {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(file, buf, at)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(file, buf, at)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = (file, buf, at);
+            Err(std::io::ErrorKind::Unsupported.into())
+        }
+    })
 }
 
 impl CapturedSegment {
@@ -914,7 +931,10 @@ mod tests {
 
 /// Copy opaque term payloads cooperatively. Allocation is owned by this query;
 /// no owner capability or trust is derived from these bytes.
-fn arc_bytes_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Result<Arc<[u8]>> {
+pub(super) fn arc_bytes_checked(
+    bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Arc<[u8]>> {
     check()?;
     let mut owned = Arc::<[u8]>::new_uninit_slice(bytes.len());
     let output = Arc::get_mut(&mut owned).expect("new byte storage is uniquely owned");
@@ -930,7 +950,10 @@ fn arc_bytes_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Res
     Ok(unsafe { owned.assume_init() })
 }
 
-fn valid_utf8_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Result<bool> {
+pub(super) fn valid_utf8_checked(
+    bytes: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<bool> {
     let mut start = 0;
     while start < bytes.len() {
         check()?;
@@ -951,7 +974,7 @@ fn valid_utf8_checked(bytes: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Re
     Ok(true)
 }
 
-fn arc_text_checked(
+pub(super) fn arc_text_checked(
     bytes: &[u8],
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<Arc<str>>> {
@@ -968,7 +991,7 @@ fn arc_text_checked(
     Ok(Some(text))
 }
 
-fn meta_checked(
+pub(super) fn meta_checked(
     c: &mut Cur<'_>,
     seq: u64,
     check: &mut dyn FnMut() -> Result<()>,
@@ -1040,7 +1063,7 @@ fn decode_checked<'a>(
 }
 
 /// [`decode_checked`]; `exact` reserves the term table at its count, which the caller
-/// has admitted from [`footprint`] (item 829).
+/// has admitted from [`footprint_checked`] (item 829).
 fn decode_checked_with<'a>(
     body: &'a [u8],
     check: &mut dyn FnMut() -> Result<()>,
@@ -1703,10 +1726,11 @@ impl ReadOnlyLog {
         else {
             return Ok(None);
         };
-        let Some(f) = footprint(&body) else {
+        let Some(f) = footprint_checked(&body, check)? else {
             return Ok(None);
         };
         held.record(body.capacity() as u64 + f.meta + f.terms)?;
+        check()?;
         Ok(Some(body))
     }
 
@@ -1739,6 +1763,10 @@ impl ReadOnlyLog {
         let damaged = || Error::Corrupt("captured history record is no longer valid".into());
         if !descending {
             while cur.seg < self.segments.len() {
+                check()?;
+                if self.segments[cur.seg].first > to {
+                    return Ok(true);
+                }
                 let mut offset = cur.offset.unwrap_or(SEG_HEADER as u64);
                 loop {
                     if held.len.get() >= budget {
@@ -1759,6 +1787,9 @@ impl ReadOnlyLog {
                         break;
                     }
                     if record.first() > to {
+                        drop(record);
+                        drop(body);
+                        held.record(0)?;
                         return Ok(true);
                     }
                     if record.last() >= from
@@ -1768,6 +1799,7 @@ impl ReadOnlyLog {
                         cur.offset = Some(offset);
                         return Ok(false);
                     }
+                    let covered_to = record.last() >= to;
                     cur.previous = Some(record.last());
                     offset = offset
                         .checked_add(8 + body.len() as u64)
@@ -1775,6 +1807,9 @@ impl ReadOnlyLog {
                     drop(record);
                     drop(body);
                     held.record(0)?;
+                    if covered_to {
+                        return Ok(true);
+                    }
                 }
                 held.record(0)?;
                 cur.seg += 1;
@@ -1812,8 +1847,12 @@ impl ReadOnlyLog {
             if held.len.get() >= budget {
                 return Ok(false);
             }
+            check()?;
             let segment = next - 1;
             cur.rev_seg = Some(segment);
+            if self.segments[segment].first > to {
+                continue;
+            }
             let mut offset = SEG_HEADER as u64;
             let mut previous = None;
             loop {
@@ -1824,14 +1863,13 @@ impl ReadOnlyLog {
                     break;
                 };
                 if previous.is_some_and(|last: u64| last.checked_add(1) != Some(record.first()))
-                    || record.first() > self.through
+                    || record.first() > to
                 {
+                    drop(record);
+                    drop(body);
                     break;
                 }
-                if record.last() >= from
-                    && record.first() <= to
-                    && matches!(record, RecordView::Changes { .. })
-                {
+                if record.last() >= from && matches!(record, RecordView::Changes { .. }) {
                     if cur.rev.len() == cur.rev.capacity() {
                         // a reallocation holds the old offsets beside the new ones
                         let size = std::mem::size_of::<RecordOffset>() as u64;
@@ -1848,6 +1886,7 @@ impl ReadOnlyLog {
                     }
                     cur.rev.push(RecordOffset { segment, offset });
                 }
+                let covered_to = record.last() >= to;
                 previous = Some(record.last());
                 offset = offset
                     .checked_add(8 + body.len() as u64)
@@ -1855,6 +1894,9 @@ impl ReadOnlyLog {
                 drop(record);
                 drop(body);
                 held.record(0)?;
+                if covered_to {
+                    break;
+                }
             }
             held.record(0)?;
         }

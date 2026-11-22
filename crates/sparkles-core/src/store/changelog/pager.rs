@@ -195,6 +195,11 @@ impl HistoryPages {
         self.done
     }
 
+    /// Refresh the query deadline, for example after a consumer pause was credited.
+    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.q.deadline = deadline;
+    }
+
     /// What the reader keeps allocated between pages: for a read-only log read newest
     /// first, the offsets of a segment's records.
     fn kept_bytes(&self) -> u64 {
@@ -208,22 +213,25 @@ impl HistoryPages {
     }
 
     /// The next page, of at least `budget` changes unless the range ends, and at most
-    /// `limit`: a page that reaches `limit` is `truncated`, and ends the read. `admit`
-    /// is told the bytes the page holds before each allocation. The page stops before
-    /// it reads a record of a commit after the budget is met. An empty page ends the
-    /// read, and the pin goes with the read's end.
+    /// `limit`: a page that reaches `limit` is `truncated`, and ends the read. A zero
+    /// page budget means at least one matching change, with whole commits still retained.
+    /// `admit` is told the bytes the page holds before each allocation. The page stops
+    /// before it reads a record of a commit after the budget is met. An empty page ends
+    /// the read, and the pin goes with the read's end.
     pub(crate) fn next(
         &mut self,
         budget: usize,
         limit: usize,
         admit: &mut Admit<'_>,
     ) -> Result<Page> {
+        let budget = budget.max(1);
         if self.done {
             return Ok(Page {
                 changes: Vec::new(),
                 truncated: false,
             });
         }
+        self.q.check()?;
         if limit == 0 {
             // the page has reached its limit before it reads anything
             self.done = true;
@@ -258,6 +266,7 @@ impl HistoryPages {
             stop
         };
         let mut visit = |c: &Arc<ChangeCommit>, add: bool, k: &QuadKey| -> Result<bool> {
+            q.check()?;
             if current.get() != Some(c.seq) {
                 if current.get().is_some() && changes.len() >= budget {
                     resume.set(Some(c.seq));
@@ -280,6 +289,7 @@ impl HistoryPages {
                         let new = memo_table_bytes(readable.capacity() + 1);
                         held.memo.set(memo + new);
                         held.admit()?;
+                        q.check()?;
                         readable.try_reserve(1).map_err(|_| {
                             Error::HistoryUnsupported(
                                 "history access memo allocation was refused".into(),
@@ -289,6 +299,7 @@ impl HistoryPages {
                     }
                     held.memo.set(memo);
                     held.admit()?;
+                    q.check()?;
                 }
                 if !visible_key(a, &mut readable, k) {
                     return Ok(true);
@@ -313,14 +324,17 @@ impl HistoryPages {
                 let grown = held.page.get() + more as u64 * size;
                 held.page.set(grown + old);
                 held.admit()?;
+                q.check()?;
                 changes.try_reserve_exact(more).map_err(|_| {
                     Error::HistoryUnsupported("history page allocation was refused".into())
                 })?;
                 held.page.set(grown);
                 held.admit()?;
+                q.check()?;
             }
             held.page.set(held.page.get() + add_bytes);
             held.admit()?;
+            q.check()?;
             if let Some(quad) = key_quad(k) {
                 changes.push(HistoryChange {
                     commit: c.clone(),
@@ -370,6 +384,7 @@ impl HistoryPages {
         // the memo goes with the page's read
         drop(readable);
         held.memo.set(0);
+        self.q.check()?;
         let ended = if self.log.readonly.is_some() {
             ro_ended
         } else {
@@ -1209,6 +1224,602 @@ mod tests {
             drop(later);
             log.enforce(None).unwrap();
             assert_eq!(oldest(), kept(35), "{segs:?}");
+        }
+    }
+
+    fn cap_admit(limit: u64) -> impl FnMut(u64) -> Result<()> {
+        move |bytes| {
+            if bytes > limit {
+                Err(Error::BudgetExceeded(crate::error::Budget {
+                    kind: crate::BudgetKind::Memory,
+                    limit,
+                    requested: bytes,
+                }))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn drain_capped(
+        log: &Arc<ChangeLog>,
+        q: &HistoryQuery,
+        upto: u64,
+        budget: usize,
+        cap: u64,
+    ) -> Result<(Vec<Key>, u64)> {
+        let mut pages = log.pages(q.clone(), upto)?;
+        let mut out = Vec::new();
+        let mut peak = 0u64;
+        let mut admit = cap_admit(cap);
+        loop {
+            let page = pages.next(budget, usize::MAX, &mut |b| {
+                peak = peak.max(b);
+                admit(b)
+            })?;
+            assert!(!page.truncated);
+            if page.changes.is_empty() {
+                assert!(pages.done(), "empty page must end the read");
+                break;
+            }
+            out.extend(page.changes.iter().map(key));
+        }
+        Ok((out, peak))
+    }
+
+    /// Descending read-only paging skips segments whose `first > to`, never admitting
+    /// oversized commits from later segments outside the requested commit range.
+    #[test]
+    fn readonly_descending_skips_segments_above_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(dir.path(), options()).unwrap();
+        s.change_log().unwrap().set_background(false);
+        for i in 1..=5u32 {
+            upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> \"{i}\" }}"));
+        }
+        // Seal the first segment before placing a 2 MiB record in a later segment (first > 5).
+        upd(
+            &s,
+            &format!(
+                "INSERT DATA {{ <urn:seal> <urn:p> \"{}\" }}",
+                "x".repeat(6000)
+            ),
+        );
+        upd(
+            &s,
+            &format!(
+                "INSERT DATA {{ <urn:huge> <urn:p> \"{}\" }}",
+                "y".repeat(2 << 20)
+            ),
+        );
+        s.flush_change_log().unwrap();
+        let head = s.head_commit().seq;
+        assert_eq!(head, 7);
+        let normal = s.change_log().unwrap().clone();
+        assert!(
+            normal
+                .inner
+                .lock()
+                .segs
+                .iter()
+                .any(|seg| seg.first > 5 && seg.bytes >= (2 << 20)),
+            "fixture must place the 2 MiB commit in a segment with first > 5"
+        );
+        let ro = read_only(dir.path(), &normal, head, head);
+        let cap = 256 << 10;
+        for descending in [false, true] {
+            let q = HistoryQuery {
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(5)),
+                descending,
+                ..Default::default()
+            };
+            let want: Vec<Key> = normal
+                .query(&q, head)
+                .unwrap()
+                .changes
+                .iter()
+                .map(key)
+                .collect();
+            assert_eq!(want.len(), 5);
+            for budget in [1, 4096] {
+                let (got, peak) = drain_capped(&ro, &q, head, budget, cap)
+                    .unwrap_or_else(|e| panic!("descending={descending} budget={budget}: {e}"));
+                assert_eq!(got, want, "descending={descending} budget={budget}");
+                assert!(peak <= cap, "peak {peak} > cap {cap}");
+            }
+        }
+    }
+
+    /// Both ascending and descending read-only paging stop once a validated record covers
+    /// `to`, never admitting an oversized commit `to + 1` in the same segment.
+    #[test]
+    fn readonly_pages_stop_before_the_record_after_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open(
+            dir.path(),
+            StoreOptions {
+                change_log_segment_bytes: 16 << 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        s.change_log().unwrap().set_background(false);
+        for i in 1..=5u32 {
+            upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> \"{i}\" }}"));
+        }
+        upd(
+            &s,
+            &format!(
+                "INSERT DATA {{ <urn:huge> <urn:p> \"{}\" }}",
+                "z".repeat(2 << 20)
+            ),
+        );
+        s.flush_change_log().unwrap();
+        let head = s.head_commit().seq;
+        assert_eq!(head, 6);
+        let normal = s.change_log().unwrap().clone();
+        assert_eq!(
+            normal.status().segments,
+            1,
+            "fixture must hold commits 1..=6 in one segment"
+        );
+        let ro = read_only(dir.path(), &normal, head, head);
+        let cap = 256 << 10;
+        for descending in [false, true] {
+            let q = HistoryQuery {
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(5)),
+                descending,
+                ..Default::default()
+            };
+            let want: Vec<Key> = normal
+                .query(&q, head)
+                .unwrap()
+                .changes
+                .iter()
+                .map(key)
+                .collect();
+            assert_eq!(want.len(), 5);
+            for budget in [1, 4096] {
+                let (got, peak) = drain_capped(&ro, &q, head, budget, cap)
+                    .unwrap_or_else(|e| panic!("descending={descending} budget={budget}: {e}"));
+                assert_eq!(got, want, "descending={descending} budget={budget}");
+                assert!(peak <= cap, "peak {peak} > cap {cap}");
+            }
+        }
+    }
+
+    /// A zero page budget makes progress in every log kind and direction, while `limit == 0`
+    /// and a filter matching no rows return terminal empty pages.
+    #[test]
+    fn zero_page_budget_makes_progress_in_every_log_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mem = Store::in_memory(options());
+        let disk = Store::open(dir.path(), options()).unwrap();
+        for s in [&mem, &disk] {
+            s.change_log().unwrap().set_background(false);
+            for i in 1..=4u32 {
+                upd(
+                    s,
+                    &format!("INSERT DATA {{ <urn:s{i}> <urn:p> \"{i}a\" , \"{i}b\" }}"),
+                );
+            }
+            s.flush_change_log().unwrap();
+        }
+        let mem_log = mem.change_log().unwrap().clone();
+        let disk_log = disk.change_log().unwrap().clone();
+        let ro_log = read_only(dir.path(), &disk_log, 4, 4);
+        let logs = [
+            ("memory", mem_log),
+            ("persistent", disk_log),
+            ("read-only", ro_log),
+        ];
+        for (kind, log) in logs {
+            for descending in [false, true] {
+                let q = HistoryQuery {
+                    descending,
+                    ..Default::default()
+                };
+                let want: Vec<Key> = log.query(&q, 4).unwrap().changes.iter().map(key).collect();
+                assert_eq!(want.len(), 8);
+                let mut pages = log.pages(q.clone(), 4).unwrap();
+                let mut got = Vec::new();
+                let mut ended = false;
+                for _ in 0..want.len() + 2 {
+                    let page = pages.next(0, usize::MAX, &mut |_| Ok(())).unwrap();
+                    assert!(!page.truncated, "{kind} descending={descending}");
+                    if page.changes.is_empty() {
+                        assert!(
+                            pages.done(),
+                            "{kind} descending={descending}: empty page was not terminal"
+                        );
+                        ended = true;
+                        break;
+                    }
+                    got.extend(page.changes.iter().map(key));
+                }
+                assert!(
+                    ended,
+                    "{kind} descending={descending}: bounded loop did not finish"
+                );
+                assert_eq!(got, want, "{kind} descending={descending}");
+                let extra = pages.next(0, usize::MAX, &mut |_| Ok(())).unwrap();
+                assert!(extra.changes.is_empty() && !extra.truncated && pages.done());
+
+                // limit == 0 is terminal and truncated
+                let mut lim0 = log.pages(q.clone(), 4).unwrap();
+                let p0 = lim0.next(0, 0, &mut |_| Ok(())).unwrap();
+                assert!(p0.changes.is_empty() && p0.truncated && lim0.done());
+
+                // filter matching no rows returns a terminal empty page
+                let none_q = HistoryQuery {
+                    predicates: vec![oxrdf::NamedNode::new("urn:no-such-pred").unwrap()],
+                    descending,
+                    ..Default::default()
+                };
+                let mut none = log.pages(none_q, 4).unwrap();
+                let pn = none.next(0, usize::MAX, &mut |_| Ok(())).unwrap();
+                assert!(pn.changes.is_empty() && !pn.truncated && none.done());
+            }
+        }
+    }
+
+    /// Writable history paging stops immediately with `Error::Cancelled` when cancellation is
+    /// raised during the first nonzero record admission, with no subsequent growth and no
+    /// leaked reader pin after drop.
+    #[test]
+    fn a_writable_page_observes_cancellation_during_record_admission() {
+        use std::sync::atomic::AtomicBool;
+
+        for persistent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = match persistent {
+                true => Store::open(dir.path(), options()).unwrap(),
+                false => Store::in_memory(options()),
+            };
+            s.change_log().unwrap().set_background(false);
+            let body: String = (0..4_200)
+                .map(|j| format!("<urn:s> <urn:p> {j} . "))
+                .collect();
+            upd(&s, &format!("INSERT DATA {{ {body} }}"));
+            s.flush_change_log().unwrap();
+            let log = s.change_log().unwrap().clone();
+
+            for descending in [false, true] {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let q = HistoryQuery {
+                    cancel: Some(cancel.clone()),
+                    descending,
+                    ..Default::default()
+                };
+                let mut pages = log.pages(q, 1).unwrap();
+                let mut flagged = false;
+                let mut after_flag = 0usize;
+                let res = pages.next(4096, usize::MAX, &mut |b| {
+                    if flagged {
+                        after_flag += 1;
+                    } else if b > 0 {
+                        flagged = true;
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                    Ok(())
+                });
+                assert!(
+                    matches!(res, Err(Error::Cancelled)),
+                    "persistent={persistent} descending={descending}: got {:?}",
+                    res.map(|p| p.changes.len())
+                );
+                assert!(flagged, "persistent={persistent} descending={descending}");
+                assert_eq!(
+                    after_flag, 0,
+                    "persistent={persistent} descending={descending}: admissions continued after cancellation"
+                );
+                drop(pages);
+                assert!(log.pins.lock().is_empty());
+            }
+            turn_off(&s).unwrap();
+        }
+    }
+
+    /// Writable history paging stops immediately with `Error::Cancelled` when cancellation is
+    /// raised during page/change growth admission after record decode.
+    #[test]
+    fn a_writable_page_observes_cancellation_during_change_admission() {
+        use std::sync::atomic::AtomicBool;
+
+        for persistent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let s = match persistent {
+                true => Store::open(dir.path(), options()).unwrap(),
+                false => Store::in_memory(options()),
+            };
+            s.change_log().unwrap().set_background(false);
+            let body: String = (0..4_200)
+                .map(|j| format!("<urn:s> <urn:p> {j} . "))
+                .collect();
+            upd(&s, &format!("INSERT DATA {{ {body} }}"));
+            s.flush_change_log().unwrap();
+            let log = s.change_log().unwrap().clone();
+
+            for descending in [false, true] {
+                let cancel = Arc::new(AtomicBool::new(false));
+                let q = HistoryQuery {
+                    cancel: Some(cancel.clone()),
+                    descending,
+                    ..Default::default()
+                };
+                let mut pages = log.pages(q, 1).unwrap();
+                let mut nonzero = 0usize;
+                let mut flagged = false;
+                let mut after_flag = 0usize;
+                let res = pages.next(4096, usize::MAX, &mut |b| {
+                    if flagged {
+                        after_flag += 1;
+                    } else if b > 0 {
+                        nonzero += 1;
+                        // Past record decode (1..3 admissions) and initial 64-slot reserve,
+                        // right inside change/page-growth admission well before change 4,200.
+                        if nonzero == 70 {
+                            flagged = true;
+                            cancel.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    Ok(())
+                });
+                assert!(
+                    matches!(res, Err(Error::Cancelled)),
+                    "persistent={persistent} descending={descending}: got {:?}",
+                    res.map(|p| p.changes.len())
+                );
+                assert!(flagged, "persistent={persistent} descending={descending}");
+                assert_eq!(
+                    after_flag, 0,
+                    "persistent={persistent} descending={descending}: change admissions continued after cancellation"
+                );
+                drop(pages);
+                assert!(log.pins.lock().is_empty());
+            }
+            turn_off(&s).unwrap();
+        }
+    }
+
+    /// Updating `HistoryPages::set_deadline` to `None` clears an expired deadline without
+    /// weakening the original cancellation source.
+    #[test]
+    fn set_deadline_clears_expired_deadline_while_preserving_cancellation() {
+        use std::sync::atomic::AtomicBool;
+
+        let s = Store::in_memory(options());
+        fill(&s);
+        let log = s.change_log().unwrap().clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let q = HistoryQuery {
+            cancel: Some(cancel.clone()),
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            ..Default::default()
+        };
+        let mut pages = log.pages(q, 36).unwrap();
+        assert!(matches!(
+            pages.next(3, usize::MAX, &mut |_| Ok(())),
+            Err(Error::Timeout)
+        ));
+        pages.set_deadline(None);
+        let page = pages.next(3, usize::MAX, &mut |_| Ok(())).unwrap();
+        assert!(!page.changes.is_empty());
+        assert!(!pages.done());
+        cancel.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            pages.next(3, usize::MAX, &mut |_| Ok(())),
+            Err(Error::Cancelled)
+        ));
+    }
+
+    /// Additional coverage for read-only upper-bound stopping: `to` inside a gap,
+    /// `to == through`, `from > to`, unmatched filter, damaged tail after `to`, damage
+    /// before `to`, and multiple page resumptions within one reverse offset list.
+    #[test]
+    fn readonly_upper_bound_edge_cases() {
+        let cap = 256 << 10;
+
+        // 1. Upper bound inside a gap, followed by an oversized commit in the same segment.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Store::open(
+                dir.path(),
+                StoreOptions {
+                    change_log_segment_bytes: 16 << 20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            s.change_log().unwrap().set_background(false);
+            turn_off(&s).unwrap();
+            for i in 1..=8u32 {
+                upd(&s, &format!("INSERT DATA {{ <urn:lost:{i}> <urn:p> {i} }}"));
+            }
+            s.set_change_log_settings(ChangeLogSettings::default())
+                .unwrap();
+            upd(
+                &s,
+                &format!(
+                    "INSERT DATA {{ <urn:huge9> <urn:p> \"{}\" }}",
+                    "g".repeat(2 << 20)
+                ),
+            );
+            s.flush_change_log().unwrap();
+            let normal = s.change_log().unwrap().clone();
+            assert_eq!(normal.status().segments, 1);
+            let ro = read_only(dir.path(), &normal, 9, 9);
+            for descending in [false, true] {
+                let q = HistoryQuery {
+                    from: Some(HistoryBound::Commit(1)),
+                    to: Some(HistoryBound::Commit(5)),
+                    descending,
+                    ..Default::default()
+                };
+                let (got, peak) = drain_capped(&ro, &q, 9, 1, cap).unwrap();
+                assert!(got.is_empty(), "descending={descending}");
+                assert!(peak <= cap, "peak {peak} > cap {cap}");
+            }
+        }
+
+        // 2. Same-segment commits 1..=5 + oversized 6: to == through (when captured through 5),
+        //    from > to, unmatched filter, and multiple page resumptions within one reverse list.
+        {
+            let dir = tempfile::tempdir().unwrap();
+            let s = Store::open(
+                dir.path(),
+                StoreOptions {
+                    change_log_segment_bytes: 16 << 20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            s.change_log().unwrap().set_background(false);
+            for i in 1..=5u32 {
+                upd(&s, &format!("INSERT DATA {{ <urn:s{i}> <urn:p> \"{i}\" }}"));
+            }
+            upd(
+                &s,
+                &format!(
+                    "INSERT DATA {{ <urn:huge6> <urn:p> \"{}\" }}",
+                    "h".repeat(2 << 20)
+                ),
+            );
+            s.flush_change_log().unwrap();
+            let normal = s.change_log().unwrap().clone();
+            assert_eq!(normal.status().segments, 1);
+
+            // to == through (through = 5, head = 6) never admits commit 6
+            let ro5 = read_only(dir.path(), &normal, 5, 6);
+            for descending in [false, true] {
+                let q = HistoryQuery {
+                    from: Some(HistoryBound::Commit(1)),
+                    to: Some(HistoryBound::Commit(5)),
+                    descending,
+                    ..Default::default()
+                };
+                let want: Vec<Key> = normal
+                    .query(&q, 5)
+                    .unwrap()
+                    .changes
+                    .iter()
+                    .map(key)
+                    .collect();
+                let (got, peak) = drain_capped(&ro5, &q, 6, 1, cap).unwrap();
+                assert_eq!(got, want, "to == through descending={descending}");
+                assert!(peak <= cap);
+            }
+
+            let ro6 = read_only(dir.path(), &normal, 6, 6);
+            // from > to
+            for descending in [false, true] {
+                let q = HistoryQuery {
+                    from: Some(HistoryBound::Commit(5)),
+                    to: Some(HistoryBound::Commit(2)),
+                    descending,
+                    ..Default::default()
+                };
+                let (got, peak) = drain_capped(&ro6, &q, 6, 1, cap).unwrap();
+                assert!(got.is_empty());
+                assert_eq!(peak, 0);
+            }
+            // No matching filter rows with oversized commit 6 after `to = 5`
+            for descending in [false, true] {
+                let q = HistoryQuery {
+                    from: Some(HistoryBound::Commit(1)),
+                    to: Some(HistoryBound::Commit(5)),
+                    predicates: vec![oxrdf::NamedNode::new("urn:unmatched").unwrap()],
+                    descending,
+                    ..Default::default()
+                };
+                let (got, peak) = drain_capped(&ro6, &q, 6, 1, cap).unwrap();
+                assert!(got.is_empty());
+                assert!(peak <= cap);
+            }
+            // Multiple page resumptions within one reverse offset list (commits 5, 4, 3, 2, 1)
+            let desc = HistoryQuery {
+                from: Some(HistoryBound::Commit(1)),
+                to: Some(HistoryBound::Commit(5)),
+                descending: true,
+                ..Default::default()
+            };
+            let mut pages = ro6.pages(desc, 6).unwrap();
+            let mut seqs = Vec::new();
+            loop {
+                let page = pages.next(1, usize::MAX, &mut cap_admit(cap)).unwrap();
+                if page.changes.is_empty() {
+                    assert!(pages.done());
+                    break;
+                }
+                assert_eq!(page.changes.len(), 1);
+                seqs.push(page.changes[0].commit.seq);
+            }
+            assert_eq!(seqs, vec![5, 4, 3, 2, 1]);
+
+            // 3. Damaged tail after `to`: corrupt commit 6's body on disk, commits 1..=5 stay readable.
+            let seg_path = dir.path().join(CHANGES_DIR).join(seg_name(1));
+            let offset6 = {
+                let mut inner = normal.inner.lock();
+                let ix = normal.index(&mut inner, 0).unwrap();
+                ix.recs[5].offset
+            };
+            let mut raw = std::fs::read(&seg_path).unwrap();
+            let corrupt_at = offset6 as usize + 12;
+            raw[corrupt_at] ^= 0xff;
+            std::fs::write(&seg_path, &raw).unwrap();
+            let ro_tail = read_only(dir.path(), &normal, 6, 6);
+            for descending in [false, true] {
+                let q = HistoryQuery {
+                    from: Some(HistoryBound::Commit(1)),
+                    to: Some(HistoryBound::Commit(5)),
+                    descending,
+                    ..Default::default()
+                };
+                let (got, peak) = drain_capped(&ro_tail, &q, 6, 1, cap).unwrap();
+                let expected_seqs: Vec<u64> = if descending {
+                    vec![5, 4, 3, 2, 1]
+                } else {
+                    vec![1, 2, 3, 4, 5]
+                };
+                assert_eq!(
+                    got.iter().map(|k| k.0).collect::<Vec<_>>(),
+                    expected_seqs,
+                    "damaged tail after to descending={descending}"
+                );
+                assert!(peak <= cap);
+            }
+
+            // 4. Damage before `to`: corrupt commit 4 on disk -> stops at valid prefix 1..=3.
+            let offset4 = {
+                let mut inner = normal.inner.lock();
+                let ix = normal.index(&mut inner, 0).unwrap();
+                ix.recs[3].offset
+            };
+            raw[offset4 as usize + 12] ^= 0xff;
+            std::fs::write(&seg_path, &raw).unwrap();
+            let ro_mid = read_only(dir.path(), &normal, 6, 6);
+            for descending in [false, true] {
+                let q = HistoryQuery {
+                    from: Some(HistoryBound::Commit(1)),
+                    to: Some(HistoryBound::Commit(5)),
+                    descending,
+                    ..Default::default()
+                };
+                let (got, peak) = drain_capped(&ro_mid, &q, 6, 1, cap).unwrap();
+                let expected_seqs: Vec<u64> = if descending {
+                    vec![3, 2, 1]
+                } else {
+                    vec![1, 2, 3]
+                };
+                assert_eq!(
+                    got.iter().map(|k| k.0).collect::<Vec<_>>(),
+                    expected_seqs,
+                    "damage before to descending={descending}"
+                );
+                assert!(peak <= cap);
+            }
         }
     }
 }

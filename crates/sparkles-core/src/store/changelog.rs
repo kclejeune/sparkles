@@ -463,56 +463,87 @@ pub(super) struct Footprint {
     pub(super) changes: u64,
 }
 
-pub(super) fn footprint(body: &[u8]) -> Option<Footprint> {
+/// Maximum term or change entries processed between cooperative cancellation polls in
+/// admitted history reads and decoding.
+const CHECK_STRIDE: usize = 1024;
+
+pub(super) fn footprint_checked(
+    body: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<Footprint>> {
+    check()?;
     let mut c = Cur { b: body, i: 0 };
-    let ty = c.u8()?;
-    c.u64()?;
+    let Some((ty, _)) = c.u8().zip(c.u64()) else {
+        return Ok(None);
+    };
     let mut f = Footprint::default();
     if ty == REC_GAP {
-        return Some(f);
+        check()?;
+        return Ok(Some(f));
     }
     if ty != REC_SUMMARY && ty != REC_CHANGES {
-        return None;
+        return Ok(None);
     }
-    c.u64()?;
-    c.u8()?;
-    c.u8()?;
-    c.varint()?;
-    c.varint()?;
+    if c.u64().is_none()
+        || c.u8().is_none()
+        || c.u8().is_none()
+        || c.varint().is_none()
+        || c.varint().is_none()
+    {
+        return Ok(None);
+    }
     f.meta = arc_slice_bytes(std::mem::size_of::<ChangeCommit>());
     for _ in 0..2 {
-        let n = usize::try_from(c.varint()?).ok()?;
-        c.bytes(n)?;
+        let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+            return Ok(None);
+        };
+        if c.bytes(n).is_none() {
+            return Ok(None);
+        }
         if n > 0 {
             f.meta += arc_slice_bytes(n);
         }
     }
     if ty == REC_SUMMARY {
-        return Some(f);
+        check()?;
+        return Ok(Some(f));
     }
-    let n = usize::try_from(c.varint()?).ok()?;
+    let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+        return Ok(None);
+    };
     // each term takes at least its one-byte length
     if n > body.len() - c.i {
-        return None;
+        return Ok(None);
     }
     f.terms = n as u64 * std::mem::size_of::<Arc<[u8]>>() as u64;
-    for _ in 0..n {
-        let len = usize::try_from(c.varint()?).ok()?;
-        c.bytes(len)?;
+    for idx in 0..n {
+        if idx.is_multiple_of(CHECK_STRIDE) {
+            check()?;
+        }
+        let Some(len) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+            return Ok(None);
+        };
+        if c.bytes(len).is_none() {
+            return Ok(None);
+        }
         f.terms += arc_slice_bytes(len);
     }
-    let m = usize::try_from(c.varint()?).ok()?;
+    let Some(m) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+        return Ok(None);
+    };
     // each change takes at least five bytes
     if m > (body.len() - c.i) / 5 {
-        return None;
+        return Ok(None);
     }
     f.changes = m as u64 * std::mem::size_of::<(bool, QuadKey)>() as u64;
-    Some(f)
+    check()?;
+    Ok(Some(f))
 }
 
 /// Decode a record body. `exact` reserves the term table and the changes at their
-/// counts, which the caller has admitted from [`footprint`]; otherwise each reservation
-/// is capped, since a damaged count must not allocate before the bytes run out.
+/// counts, which the caller has admitted from [`footprint_checked`]; otherwise each
+/// reservation is capped, since a damaged count must not allocate before the bytes run
+/// out.
 fn decode_with(body: &[u8], exact: bool) -> Option<Record> {
     let cap = |n: usize| if exact { n } else { n.min(1 << 16) };
     let mut c = Cur { b: body, i: 0 };
@@ -550,6 +581,150 @@ fn decode_with(body: &[u8], exact: bool) -> Option<Record> {
         _ => return None,
     };
     (c.i == body.len()).then_some(r)
+}
+
+/// Checked variant of `decode_with(body, true)` for admitted paged reads. Polls `check`
+/// at entry and exit, at most every [`CHECK_STRIDE`] term or change entries, and in
+/// 64 KiB chunks while validating UTF-8 or copying metadata and term payloads so stop
+/// errors propagate as `Err` instead of being mistaken for corruption.
+fn decode_admitted_checked(
+    body: &[u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<Record>> {
+    check()?;
+    let mut c = Cur { b: body, i: 0 };
+    let Some((ty, seq)) = c.u8().zip(c.u64()) else {
+        return Ok(None);
+    };
+    let r = match ty {
+        REC_GAP => {
+            let Some(from) = c.u64() else {
+                return Ok(None);
+            };
+            if from > seq {
+                return Ok(None);
+            }
+            Record::Gap { from, through: seq }
+        }
+        REC_SUMMARY => {
+            let Some(meta) = readonly::meta_checked(&mut c, seq, check)? else {
+                return Ok(None);
+            };
+            Record::Summary(meta)
+        }
+        REC_CHANGES => {
+            let Some(meta) = readonly::meta_checked(&mut c, seq, check)? else {
+                return Ok(None);
+            };
+            let Some(n) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                return Ok(None);
+            };
+            if n > body.len() - c.i {
+                return Ok(None);
+            }
+            let mut terms: Vec<Arc<[u8]>> = Vec::new();
+            terms.try_reserve_exact(n).map_err(|_| {
+                Error::HistoryUnsupported("history term-table allocation was refused".into())
+            })?;
+            let mut bytes_since_check: usize = 0;
+            for idx in 0..n {
+                if idx.is_multiple_of(CHECK_STRIDE) {
+                    check()?;
+                    bytes_since_check = 0;
+                }
+                let Some(len) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                    return Ok(None);
+                };
+                let Some(raw) = c.bytes(len) else {
+                    return Ok(None);
+                };
+                if len > (64 << 10) {
+                    terms.push(readonly::arc_bytes_checked(raw, check)?);
+                    bytes_since_check = 0;
+                } else {
+                    if bytes_since_check.saturating_add(len) > (64 << 10) {
+                        check()?;
+                        bytes_since_check = 0;
+                    }
+                    terms.push(Arc::from(raw));
+                    bytes_since_check = bytes_since_check.saturating_add(len);
+                }
+            }
+            let Some(m) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                return Ok(None);
+            };
+            if m > (body.len() - c.i) / 5 {
+                return Ok(None);
+            }
+            check()?;
+            let mut changes = Vec::new();
+            changes.try_reserve_exact(m).map_err(|_| {
+                Error::HistoryUnsupported("history change-table allocation was refused".into())
+            })?;
+            for idx in 0..m {
+                if idx.is_multiple_of(CHECK_STRIDE) {
+                    check()?;
+                }
+                let Some(add_byte) = c.u8() else {
+                    return Ok(None);
+                };
+                let add = add_byte == 1;
+                let mut k: [Option<Arc<[u8]>>; 4] = Default::default();
+                for slot in &mut k {
+                    let Some(tid) = c.varint().and_then(|v| usize::try_from(v).ok()) else {
+                        return Ok(None);
+                    };
+                    let Some(term) = terms.get(tid) else {
+                        return Ok(None);
+                    };
+                    *slot = Some(term.clone());
+                }
+                changes.push((add, k.map(|t| t.expect("filled above"))));
+            }
+            Record::Changes(meta, changes)
+        }
+        _ => return Ok(None),
+    };
+    check()?;
+    Ok((c.i == body.len()).then_some(r))
+}
+
+fn crc32_checked(body: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Result<u32> {
+    check()?;
+    let mut crc = flate2::Crc::new();
+    for chunk in body.chunks(64 << 10) {
+        check()?;
+        crc.update(chunk);
+    }
+    check()?;
+    Ok(crc.sum())
+}
+
+/// Checked variant of [`frame`] that hashes the body in 64 KiB chunks with stop polls.
+fn frame_checked<'a>(
+    buf: &'a [u8],
+    at: usize,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<(&'a [u8], usize)>> {
+    check()?;
+    let Some(end_h) = at.checked_add(8) else {
+        return Ok(None);
+    };
+    let Some(h) = buf.get(at..end_h) else {
+        return Ok(None);
+    };
+    let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+    let crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
+    if len == 0 {
+        return Ok(None);
+    }
+    let Some(end) = end_h.checked_add(len) else {
+        return Ok(None);
+    };
+    let Some(body) = buf.get(end_h..end) else {
+        return Ok(None);
+    };
+    Ok((crc32_checked(body, check)? == crc).then_some((body, end)))
 }
 
 /// The next framed record of `buf` at `at`: (body, the offset after it). `None` at the
@@ -1372,16 +1547,19 @@ impl ChangeLog {
 
     /// Read the record of segment `i` at `offset` as [`ChangeLog::read`] does, admitting
     /// each allocation before it is made (item 829): the frame of a file-backed segment
-    /// before it is read, then the decoded record from its [`footprint`] before it is
-    /// decoded. `admit` is told the bytes the record holds at each step, the frame
-    /// included until decoding ends.
+    /// before it is read, then the decoded record from its [`footprint_checked`] before
+    /// it is decoded. `admit` is told the bytes the record holds at each step, the frame
+    /// included until decoding ends, and `check` is polled across reads, CRC chunks,
+    /// admissions, footprint scanning and decoding.
     fn read_admitted(
         &self,
         inner: &Inner,
         i: usize,
         offset: u64,
         admit: &mut Admit<'_>,
+        check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Record> {
+        check()?;
         let seg = &inner.segs[i];
         let damaged = || {
             Error::Corrupt(format!(
@@ -1389,30 +1567,61 @@ impl ChangeLog {
                 seg.first
             ))
         };
-        let decode_admitted = |body: &[u8], frame: u64, admit: &mut Admit<'_>| {
-            let f = footprint(body).ok_or_else(damaged)?;
-            let held = f.meta + f.terms + f.changes;
-            admit(frame + held)?;
-            let r = decode_with(body, true).ok_or_else(damaged)?;
-            Ok::<_, Error>((r, held))
-        };
+        let decode_admitted =
+            |body: &[u8],
+             frame: u64,
+             admit: &mut Admit<'_>,
+             check: &mut dyn FnMut() -> Result<()>| {
+                let f = footprint_checked(body, check)?.ok_or_else(damaged)?;
+                let held = f.meta + f.terms + f.changes;
+                check()?;
+                admit(frame + held)?;
+                check()?;
+                let r = decode_admitted_checked(body, check)?.ok_or_else(damaged)?;
+                Ok::<_, Error>((r, held))
+            };
         if seg.path.is_none() {
-            let (body, _) = frame(&seg.mem, offset as usize).ok_or_else(damaged)?;
-            return Ok(decode_admitted(body, 0, admit)?.0);
+            let (body, _) = frame_checked(&seg.mem, offset as usize, check)?.ok_or_else(damaged)?;
+            return Ok(decode_admitted(body, 0, admit, check)?.0);
         }
         let path = seg.path.as_ref().expect("checked");
         let f = File::open(path)?;
         let mut h = [0u8; 8];
-        read_exact_at(&f, &mut h, offset)?;
+        readonly::read_exact_at_checked(&f, &mut h, offset, check)?;
         let len = u32::from_le_bytes(h[0..4].try_into().unwrap()) as usize;
+        let expected_crc = u32::from_le_bytes(h[4..8].try_into().unwrap());
+        if len == 0 {
+            return Err(damaged());
+        }
+        check()?;
         admit(8 + len as u64)?;
-        let mut buf = vec![0u8; 8 + len];
-        buf[..8].copy_from_slice(&h);
-        read_exact_at(&f, &mut buf[8..], offset + 8)?;
-        let (body, _) = frame(&buf, 0).ok_or_else(damaged)?;
-        let (r, held) = decode_admitted(body, buf.len() as u64, admit)?;
-        drop(buf);
+        check()?;
+        let mut body = Vec::new();
+        body.try_reserve_exact(len).map_err(|_| {
+            Error::HistoryUnsupported("history-log record allocation was refused".into())
+        })?;
+        let mut crc = flate2::Crc::new();
+        while body.len() < len {
+            check()?;
+            let start = body.len();
+            let end = start.saturating_add(64 << 10).min(len);
+            body.resize(end, 0);
+            let read_offset = offset
+                .checked_add(8)
+                .and_then(|n| n.checked_add(start as u64))
+                .ok_or_else(|| Error::Corrupt("history-log offset overflow".into()))?;
+            readonly::read_exact_at_checked(&f, &mut body[start..end], read_offset, check)?;
+            check()?;
+            crc.update(&body[start..end]);
+        }
+        check()?;
+        if crc.sum() != expected_crc {
+            return Err(damaged());
+        }
+        let (r, held) = decode_admitted(&body, 8 + body.len() as u64, admit, check)?;
+        drop(body);
         admit(held)?;
+        check()?;
         Ok(r)
     }
 
@@ -1660,6 +1869,9 @@ impl ChangeLog {
         };
         let mut stop = false;
         'segs: for i in order {
+            if paged.is_some() {
+                check()?;
+            }
             let (sf, sl) = (inner.segs[i].first, inner.segs[i].last);
             if sl < from || sf > to {
                 continue;
@@ -1752,11 +1964,15 @@ impl ChangeLog {
                     break;
                 }
                 let record = match paged.as_deref_mut() {
-                    Some(p) => self.read_admitted(&inner, i, e.offset, p.admit)?,
+                    Some(p) => self.read_admitted(&inner, i, e.offset, p.admit, check)?,
                     None => self.read(&inner, i, e.offset)?,
                 };
                 if let Record::Changes(c, changes) = &record {
-                    for (add, k) in changes {
+                    let is_paged = paged.is_some();
+                    for (idx, (add, k)) in changes.iter().enumerate() {
+                        if is_paged && idx.is_multiple_of(CHECK_STRIDE) {
+                            check()?;
+                        }
                         if filter.matches(k) && !visit(c, *add, k)? {
                             stop = true;
                             break;
@@ -1766,6 +1982,7 @@ impl ChangeLog {
                 drop(record);
                 if let Some(p) = paged.as_deref_mut() {
                     (p.admit)(0)?;
+                    check()?;
                 }
                 if stop {
                     if descending {
@@ -2363,5 +2580,473 @@ mod settings_format_tests {
         ));
         std::fs::write(dir.path().join(CHANGE_LOG_FILE), r#"{"keepCommits": 5}"#).unwrap();
         assert_eq!(read_settings(dir.path()).unwrap().keep_commits, Some(5));
+    }
+
+    fn test_commit(seq: u64, author: Option<String>, message: Option<String>) -> Arc<ChangeCommit> {
+        Arc::new(ChangeCommit {
+            seq,
+            timestamp_ms: 1_700_000_000_000,
+            kind: CommitKind::Update,
+            bulk: false,
+            inserted: 1,
+            deleted: 0,
+            author: author.map(Arc::from),
+            message: message.map(Arc::from),
+        })
+    }
+
+    /// Checked footprint, CRC, decode and filtered-scan helpers poll within the 1,024-entry
+    /// and 64 KiB bounds and propagate typed stop errors instead of `Corrupt`.
+    #[test]
+    fn admitted_history_decode_checks_inside_large_records() {
+        let g: Arc<[u8]> = Arc::from(&[][..]);
+        let s: Arc<[u8]> = Arc::from(id::iri_key("urn:s"));
+        let p: Arc<[u8]> = Arc::from(id::iri_key("urn:p"));
+
+        // 1. Large single term (256 KiB): CRC and decode both poll in <= 64 KiB chunks.
+        let big_term: Arc<[u8]> = Arc::from(id::term_key(&Term::Literal(
+            oxrdf::Literal::new_simple_literal("t".repeat(256 << 10)),
+        )));
+        let big_frame = encode(&Record::Changes(
+            test_commit(1, None, None),
+            vec![(true, [g.clone(), s.clone(), p.clone(), big_term])],
+        ));
+        let mut crc_polls = 0usize;
+        let (big_body, _) = frame_checked(&big_frame, 0, &mut || {
+            crc_polls += 1;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(crc_polls >= 6, "expected >= 6 CRC polls, got {crc_polls}");
+        let mut stop_at = 0usize;
+        let err = frame_checked(&big_frame, 0, &mut || {
+            stop_at += 1;
+            if stop_at == 3 {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            }
+        });
+        assert!(matches!(err, Err(Error::Cancelled)));
+
+        let mut decode_polls = 0usize;
+        assert!(
+            decode_admitted_checked(big_body, &mut || {
+                decode_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            decode_polls >= 6,
+            "expected >= 6 decode polls for 256 KiB term, got {decode_polls}"
+        );
+        for fail_on in [2usize, 4] {
+            let mut n = 0usize;
+            let res = decode_admitted_checked(big_body, &mut || {
+                n += 1;
+                if n == fail_on {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            });
+            assert!(matches!(res, Err(Error::Cancelled)), "fail_on={fail_on}");
+        }
+
+        // 2. Many terms (3,000 distinct terms): footprint and decode poll every <= 1,024 terms.
+        let many_terms_changes: Vec<(bool, QuadKey)> = (0..3_000u32)
+            .map(|i| {
+                let o: Arc<[u8]> = Arc::from(id::iri_key(&format!("urn:o:{i}")));
+                (true, [g.clone(), s.clone(), p.clone(), o])
+            })
+            .collect();
+        let many_terms_frame = encode(&Record::Changes(
+            test_commit(2, None, None),
+            many_terms_changes,
+        ));
+        let many_terms_body = &many_terms_frame[8..];
+        let mut fp_polls = 0usize;
+        assert!(
+            footprint_checked(many_terms_body, &mut || {
+                fp_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            fp_polls >= 3_000 / CHECK_STRIDE + 2,
+            "expected >= {} footprint polls, got {fp_polls}",
+            3_000 / CHECK_STRIDE + 2
+        );
+        let mut n = 0usize;
+        assert!(matches!(
+            footprint_checked(many_terms_body, &mut || {
+                n += 1;
+                if n == 2 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Cancelled)
+        ));
+
+        let mut dt_polls = 0usize;
+        assert!(
+            decode_admitted_checked(many_terms_body, &mut || {
+                dt_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            dt_polls >= 2 * (3_000 / CHECK_STRIDE) + 2,
+            "expected polls across both terms and changes, got {dt_polls}"
+        );
+
+        // 3. Many changes (3,000 changes over a 4-term table): change loop polls every <= 1,024.
+        let o0: Arc<[u8]> = Arc::from(id::iri_key("urn:o:0"));
+        let many_changes: Vec<(bool, QuadKey)> = (0..3_000usize)
+            .map(|i| {
+                (
+                    i.is_multiple_of(2),
+                    [g.clone(), s.clone(), p.clone(), o0.clone()],
+                )
+            })
+            .collect();
+        let many_changes_frame = encode(&Record::Changes(test_commit(3, None, None), many_changes));
+        let many_changes_body = &many_changes_frame[8..];
+        let mut mc_polls = 0usize;
+        assert!(
+            decode_admitted_checked(many_changes_body, &mut || {
+                mc_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        assert!(
+            mc_polls >= 3_000 / CHECK_STRIDE + 3,
+            "expected >= {} change-loop polls, got {mc_polls}",
+            3_000 / CHECK_STRIDE + 3
+        );
+        let mut n = 0usize;
+        assert!(matches!(
+            decode_admitted_checked(many_changes_body, &mut || {
+                n += 1;
+                if n == 4 { Err(Error::Timeout) } else { Ok(()) }
+            }),
+            Err(Error::Timeout)
+        ));
+
+        // 4. Large author and message (256 KiB each): UTF-8 and copy walks poll every <= 64 KiB.
+        let big_meta_frame = encode(&Record::Summary(test_commit(
+            4,
+            Some("a".repeat(256 << 10)),
+            Some("m".repeat(256 << 10)),
+        )));
+        let big_meta_body = &big_meta_frame[8..];
+        let mut meta_polls = 0usize;
+        assert!(
+            decode_admitted_checked(big_meta_body, &mut || {
+                meta_polls += 1;
+                Ok(())
+            })
+            .unwrap()
+            .is_some()
+        );
+        // 2 fields * (UTF-8 4 chunks + copy 4 chunks) >= 16 polls
+        assert!(
+            meta_polls >= 16,
+            "expected >= 16 metadata polls, got {meta_polls}"
+        );
+        let mut n = 0usize;
+        assert!(matches!(
+            decode_admitted_checked(big_meta_body, &mut || {
+                n += 1;
+                if n == 8 {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            }),
+            Err(Error::Cancelled)
+        ));
+
+        // 5. All changes rejected by a filter in paged scan still poll every <= 1,024 changes.
+        let store = Store::in_memory(StoreOptions::default());
+        store.change_log().unwrap().set_background(false);
+        let mut mixed =
+            String::from("<urn:s_match> <urn:p_other> 1 . <urn:s_other> <urn:p_match> 2 . ");
+        for j in 0..3_500 {
+            mixed.push_str(&format!("<urn:s_match> <urn:p_other> {j} . "));
+        }
+        crate::sparql::update::update(
+            &store,
+            &format!("INSERT DATA {{ {mixed} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let log = store.change_log().unwrap().clone();
+        // Both `<urn:s_match>` and `<urn:p_match>` appear in commit 1, so the segment index
+        // selects commit 1, yet no quad has both subject `<urn:s_match>` and predicate `<urn:p_match>`.
+        let reject_all = LogFilter {
+            keys: [
+                None,
+                Some(vec![id::iri_key("urn:s_match")]),
+                Some(vec![id::iri_key("urn:p_match")]),
+                None,
+            ],
+        };
+        let mut visited = 0usize;
+        let mut scan_polls = 0usize;
+        let mut admit = |_: u64| Ok(());
+        let mut full = |_: u64| false;
+        log.scan(
+            1,
+            1,
+            &reject_all,
+            false,
+            false,
+            &mut || {
+                scan_polls += 1;
+                Ok(())
+            },
+            Some(&mut PageHooks {
+                admit: &mut admit,
+                full: &mut full,
+            }),
+            &mut |_, _, _| {
+                visited += 1;
+                Ok(true)
+            },
+        )
+        .unwrap();
+        assert_eq!(visited, 0, "filter must reject every change");
+        assert!(
+            scan_polls >= 3_500 / CHECK_STRIDE + 3,
+            "expected filtered-change polls, got {scan_polls}"
+        );
+        // Verify cancelling mid-filter-loop stops with Cancelled.
+        let cancel_poll = scan_polls - 2;
+        let mut polls_to_cancel = 0usize;
+        let mut admit2 = |_: u64| Ok(());
+        let mut full2 = |_: u64| false;
+        let res = log.scan(
+            1,
+            1,
+            &reject_all,
+            false,
+            false,
+            &mut || {
+                polls_to_cancel += 1;
+                if polls_to_cancel == cancel_poll {
+                    Err(Error::Cancelled)
+                } else {
+                    Ok(())
+                }
+            },
+            Some(&mut PageHooks {
+                admit: &mut admit2,
+                full: &mut full2,
+            }),
+            &mut |_, _, _| Ok(true),
+        );
+        assert!(matches!(res, Err(Error::Cancelled)));
+        assert_eq!(polls_to_cancel, cancel_poll);
+
+        // 6. Malformed trailing reference: Ok(None) without stop, Cancelled if stopped earlier.
+        let mut bad_body = many_changes_body.to_vec();
+        // The last byte is the object term index varint (0..3) of the 3,000th change; set to 99.
+        *bad_body.last_mut().unwrap() = 99;
+        assert!(
+            decode_admitted_checked(&bad_body, &mut || Ok(()))
+                .unwrap()
+                .is_none(),
+            "malformed trailing term reference must decode as None (corrupt)"
+        );
+        let mut n = 0usize;
+        assert!(
+            matches!(
+                decode_admitted_checked(&bad_body, &mut || {
+                    n += 1;
+                    if n == 3 {
+                        Err(Error::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                }),
+                Err(Error::Cancelled)
+            ),
+            "cancellation before the malformed tail must report Cancelled, not Corrupt"
+        );
+    }
+
+    /// Positional chunked reads bound each kernel read and advance between polls to 64 KiB,
+    /// poll before retrying an `Interrupted` read, and stop file-backed `read_admitted` with
+    /// the typed stop error.
+    #[test]
+    fn admitted_history_reads_check_between_chunks() {
+        use std::cell::Cell;
+
+        // 1. Direct chunk-size, offset-stride and EINTR retry test via `read_exact_at_checked_with`.
+        let src: Vec<u8> = (0..(256 << 10)).map(|i| (i % 251) as u8).collect();
+        let mut dst = vec![0u8; src.len()];
+        let mut calls = 0usize;
+        let mut max_chunk = 0usize;
+        let mut last_polled_offset = 0u64;
+        let current_offset = Cell::new(0u64);
+        let mut max_advance = 0u64;
+        let mut interrupted_once = false;
+        let polls = Cell::new(0usize);
+        let mut polls_at_eintr = 0usize;
+        readonly::read_exact_at_checked_with(
+            &mut dst,
+            0,
+            &mut || {
+                polls.set(polls.get() + 1);
+                let cur = current_offset.get();
+                max_advance = max_advance.max(cur - last_polled_offset);
+                last_polled_offset = cur;
+                Ok(())
+            },
+            |buf, at| {
+                calls += 1;
+                max_chunk = max_chunk.max(buf.len());
+                if calls == 2 && !interrupted_once {
+                    interrupted_once = true;
+                    polls_at_eintr = polls.get();
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                let start = at as usize;
+                buf.copy_from_slice(&src[start..start + buf.len()]);
+                current_offset.set(at + buf.len() as u64);
+                Ok(buf.len())
+            },
+        )
+        .unwrap();
+        assert_eq!(dst, src);
+        assert!(interrupted_once);
+        assert!(max_chunk <= (64 << 10), "max_chunk={max_chunk}");
+        assert!(max_advance <= (64 << 10), "max_advance={max_advance}");
+        assert!(polls.get() > polls_at_eintr);
+
+        // Cancel on the poll immediately after EINTR: must not retry another read.
+        let mut dst2 = vec![0u8; src.len()];
+        let mut calls2 = 0usize;
+        let mut polls2 = 0usize;
+        let eintr_hit = Cell::new(false);
+        let mut saw_retry_after_cancel = false;
+        let res = readonly::read_exact_at_checked_with(
+            &mut dst2,
+            0,
+            &mut || {
+                polls2 += 1;
+                if eintr_hit.get() {
+                    return Err(Error::Cancelled);
+                }
+                Ok(())
+            },
+            |buf, at| {
+                calls2 += 1;
+                if eintr_hit.get() {
+                    saw_retry_after_cancel = true;
+                }
+                if calls2 == 2 {
+                    eintr_hit.set(true);
+                    return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+                }
+                let start = at as usize;
+                buf.copy_from_slice(&src[start..start + buf.len()]);
+                Ok(buf.len())
+            },
+        );
+        assert!(matches!(res, Err(Error::Cancelled)));
+        assert!(eintr_hit.get());
+        assert!(!saw_retry_after_cancel);
+        assert_eq!(calls2, 2);
+        assert_eq!(polls2, 3);
+
+        // 2. File-backed `ChangeLog::read_admitted` over a > 256 KiB record.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), StoreOptions::default()).unwrap();
+        store.change_log().unwrap().set_background(false);
+        crate::sparql::update::update(
+            &store,
+            &format!(
+                "INSERT DATA {{ <urn:s> <urn:p> \"{}\" }}",
+                "q".repeat(256 << 10)
+            ),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+        let log = store.change_log().unwrap().clone();
+        let inner = log.inner.lock();
+        let mut total_polls = 0usize;
+        let mut total_admits = 0usize;
+        let rec = log
+            .read_admitted(
+                &inner,
+                0,
+                SEG_HEADER as u64,
+                &mut |_| {
+                    total_admits += 1;
+                    Ok(())
+                },
+                &mut || {
+                    total_polls += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(matches!(rec, Record::Changes(_, ref c) if c.len() == 1));
+        assert!(total_polls >= 12, "expected >= 12 polls, got {total_polls}");
+        assert_eq!(total_admits, 3);
+
+        // Cancelling mid-read returns Cancelled (never Corrupt) and stops before decoded admission.
+        for (fail_poll, expected_timeout) in [(2usize, false), (5, false), (7, true)] {
+            let mut n = 0usize;
+            let mut admits = 0usize;
+            let res = log.read_admitted(
+                &inner,
+                0,
+                SEG_HEADER as u64,
+                &mut |_| {
+                    admits += 1;
+                    Ok(())
+                },
+                &mut || {
+                    n += 1;
+                    if n == fail_poll {
+                        Err(if expected_timeout {
+                            Error::Timeout
+                        } else {
+                            Error::Cancelled
+                        })
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            if expected_timeout {
+                assert!(matches!(res, Err(Error::Timeout)), "fail_poll={fail_poll}");
+            } else {
+                assert!(
+                    matches!(res, Err(Error::Cancelled)),
+                    "fail_poll={fail_poll}"
+                );
+            }
+            assert!(
+                admits <= 1,
+                "fail_poll={fail_poll}: expected at most frame admission before decode, got {admits}"
+            );
+        }
     }
 }

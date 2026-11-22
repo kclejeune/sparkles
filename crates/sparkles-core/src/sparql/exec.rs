@@ -9223,6 +9223,7 @@ impl LocalCall {
         opts.cancel = Some(ctx.cancel.clone());
         opts.cancellation = ctx.cancellation.clone();
         opts.grant = ctx.grant().cloned();
+        opts.pool = None;
         opts.work = Some(ctx.rows_produced.clone());
         opts.outbound_budget = Some(ctx.outbound_budget.clone());
         opts.service_depth = ctx.service_depth + 1;
@@ -9457,6 +9458,31 @@ impl RemoteAnswer {
     /// its first solution (for example, JSON results preceding head variables).
     pub(super) fn buffered_before_output(&self) -> bool {
         self.buffered_before_output
+    }
+
+    /// Construct a `RemoteAnswer` directly over an arbitrary reader for unit tests of
+    /// `Service::fill`, using the ordinary `sparesults` parser with no network state.
+    #[cfg(test)]
+    pub(super) fn from_reader(
+        reader: Box<dyn std::io::Read + Send>,
+        format: sparesults::QueryResultsFormat,
+        url: &str,
+    ) -> Result<Self> {
+        let parser = sparesults::QueryResultsParser::from_format(format);
+        let solutions = match parser
+            .for_reader(reader)
+            .map_err(|e| Self::failed(url, e))?
+        {
+            sparesults::ReaderQueryResultsParserOutput::Solutions(sols) => Some(sols),
+            sparesults::ReaderQueryResultsParserOutput::Boolean(_) => None,
+        };
+        Ok(Self {
+            span: tracing::Span::none(),
+            url: url.to_string(),
+            solutions,
+            window: None,
+            buffered_before_output: false,
+        })
     }
 
     /// The next solution of the response, or `None` once it has ended. A failure ends

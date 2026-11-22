@@ -335,7 +335,8 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   The SERVICE cache keeps an answer only when it was read to its end, and a slow
   consumer can let a remote transfer reach its outbound timeout. While a streamed
   history query reads, retention keeps the commits it has still to read and the change
-  log cannot be turned off.
+  log cannot be turned off. All three streamed readers report `growingState` because
+  the output batch size does not bound their retained state.
 * A SILENT SERVICE, a SERVICE response whose results come before its head, a view
   read, a spatial scan or relation over constants, a spatial join, a vector ORDER BY, a
   nearest-neighbour search, a path search without a limit and a property function over

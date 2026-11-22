@@ -117,7 +117,33 @@ fn a_search_without_a_limit_reads_eagers_rows_at_every_batch_size() {
             assert!(ranks.len() < 100, "ties share a rank");
         }
         for rows in [1, 2, 3, 7, 1000, 4096] {
-            let (answer, sizes, plan) = streamed(&snap, q, &opts(), &strict(rows)).unwrap();
+            let mut cursor =
+                select_cursor(snap.clone(), &format!("{P}{q}"), &opts(), &strict(rows)).unwrap();
+            let initial = find(cursor.plan(), "TextSearch").expect("initial text search node");
+            assert!(
+                initial.growing_state,
+                "initial plan batch {rows}: {initial:#?}"
+            );
+            let mut answer = Vec::new();
+            let mut sizes = Vec::new();
+            let mut checked_first = false;
+            while let Some(b) = cursor.next_batch().unwrap() {
+                sizes.push(b.len());
+                for r in 0..b.len() {
+                    answer.push(b.row(r).unwrap().values().to_vec());
+                }
+                drop(b);
+                if !checked_first {
+                    checked_first = true;
+                    let after_first =
+                        find(cursor.plan(), "TextSearch").expect("first-batch text search node");
+                    assert!(
+                        after_first.growing_state,
+                        "first-batch plan batch {rows}: {after_first:#?}"
+                    );
+                }
+            }
+            let plan = cursor.plan().clone();
             assert_eq!(answer, expected, "batch {rows}: {q}");
             let (last, full) = sizes.split_last().unwrap();
             assert!(full.iter().all(|&n| n == rows), "batch {rows}: {sizes:?}");
@@ -131,6 +157,7 @@ fn a_search_without_a_limit_reads_eagers_rows_at_every_batch_size() {
                 "{node:#?}"
             );
             assert!(node.full_input_before_output);
+            assert!(node.growing_state, "drained plan batch {rows}: {node:#?}");
             assert_eq!(node.operator.actual_rows, n as i64);
         }
     }

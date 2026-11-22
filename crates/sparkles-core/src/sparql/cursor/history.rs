@@ -107,13 +107,14 @@ impl History {
                 let mut b = Buffer::new(ctx, &self.node.vars, n)?;
                 let mut row = vec![Id::UNDEF; self.node.vars.len()];
                 for c in &self.page[self.at..self.at + n] {
+                    ctx.check()?;
                     if rows.fill(ctx, c, &mut row) {
                         b.table.push_row(&row);
                     }
+                    // a term that could not be interned within the budget fails here
+                    ctx.check()?;
                 }
                 self.at += n;
-                // a term that could not be interned within the budget fails here
-                ctx.check()?;
                 if self.at == self.page.len() {
                     self.drop_page()?;
                 }
@@ -141,6 +142,7 @@ impl History {
                 .saturating_add(1)
                 .saturating_sub(self.total)
                 .max(1);
+            pages.set_deadline(ctx.current_deadline());
             let page = pages.next(PAGE, limit, &mut |b| charge.resize(b))?;
             self.total = self.total.saturating_add(page.changes.len());
             ctx.check_rows(self.total)?;

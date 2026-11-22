@@ -150,7 +150,33 @@ fn a_history_query_without_a_limit_reads_eagers_rows_at_every_batch_size() {
             assert_eq!(expected.len(), n, "{q}");
         }
         for rows in [1, 7, 5000] {
-            let (answer, sizes, plan) = streamed(&snap, q, &opts(), &strict(rows)).unwrap();
+            let mut cursor =
+                select_cursor(snap.clone(), &format!("{P}{q}"), &opts(), &strict(rows)).unwrap();
+            let initial = find(cursor.plan(), "HistoryChanges").expect("initial history node");
+            assert!(
+                initial.growing_state,
+                "initial plan {q} at batch {rows}: {initial:#?}"
+            );
+            let mut answer = Vec::new();
+            let mut sizes = Vec::new();
+            let mut checked_first = false;
+            while let Some(b) = cursor.next_batch().unwrap() {
+                sizes.push(b.len());
+                for r in 0..b.len() {
+                    answer.push(b.row(r).unwrap().values().to_vec());
+                }
+                drop(b);
+                if !checked_first {
+                    checked_first = true;
+                    let after_first =
+                        find(cursor.plan(), "HistoryChanges").expect("first-batch history node");
+                    assert!(
+                        after_first.growing_state,
+                        "first-batch plan {q} at batch {rows}: {after_first:#?}"
+                    );
+                }
+            }
+            let plan = cursor.plan().clone();
             assert_eq!(answer, expected, "{q} at batch {rows}");
             assert!(sizes.iter().all(|&b| b > 0 && b <= rows), "{q}: {sizes:?}");
             assert!(!materializes(&plan), "{q}");
@@ -160,6 +186,10 @@ fn a_history_query_without_a_limit_reads_eagers_rows_at_every_batch_size() {
                     .as_deref()
                     .is_some_and(|r| r.contains("a page of whole commits")),
                 "{op:?}"
+            );
+            assert!(
+                op.growing_state,
+                "drained plan {q} at batch {rows}: {op:#?}"
             );
         }
     }
@@ -358,4 +388,86 @@ fn deleting_the_branch_under_a_reading_cursor_fails_or_reads_all() {
         Some(e) => panic!("{e}"),
         None => assert_eq!(answer, expected, "rows went missing without an error"),
     }
+}
+
+/// Crediting consumer wait time to `deadline_pause` extends the history reader's effective
+/// deadline across subsequent page scans in both orders, while omitting the pause still
+/// times out with `Error::Timeout`.
+#[test]
+fn a_paused_history_cursor_does_not_time_out_on_later_pages() {
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+
+    let dir = tempfile::tempdir().unwrap();
+    let s = store(dir.path());
+    let snap = s.snapshot();
+    let desc = "SELECT ?s ?p ?o ?op ?c { SERVICE hist:changes { << ?s ?p ?o >> hist:op ?op ; hist:commit ?c ; hist:order hist:descending } }";
+    let hour_ns = 3_600_000_000_000u64;
+
+    for (label, q) in [("ascending", ALL), ("descending", desc)] {
+        let expected = eager(&snap, q, &opts()).unwrap();
+        assert_eq!(expected.len(), 11_503, "{label}");
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let timed = QueryOptions {
+            deadline: Some(deadline),
+            ..opts()
+        };
+        let mut cursor =
+            select_cursor(snap.clone(), &format!("{P}{q}"), &timed, &strict(100)).unwrap();
+        let first = cursor
+            .next_batch()
+            .unwrap_or_else(|e| panic!("{label}: first batch before deadline failed: {e}"))
+            .expect("first batch");
+        assert_eq!(first.len(), 100, "{label}");
+        let mut answer = Vec::with_capacity(11_503);
+        for r in 0..first.len() {
+            answer.push(first.row(r).unwrap().values().to_vec());
+        }
+        drop(first);
+
+        cursor.deadline_pause().store(hour_ns, Ordering::Relaxed);
+        let past = deadline + Duration::from_millis(100);
+        if let Some(wait) = past.checked_duration_since(Instant::now()) {
+            std::thread::sleep(wait);
+        }
+
+        while let Some(b) = cursor
+            .next_batch()
+            .unwrap_or_else(|e| panic!("{label}: paused cursor failed on later page: {e}"))
+        {
+            for r in 0..b.len() {
+                answer.push(b.row(r).unwrap().values().to_vec());
+            }
+        }
+        assert_eq!(answer.len(), 11_503, "{label}");
+        assert_eq!(answer, expected, "{label}");
+    }
+
+    // No-pause control: crossing past the original deadline without crediting a pause fails.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let timed = QueryOptions {
+        deadline: Some(deadline),
+        ..opts()
+    };
+    let mut cursor =
+        select_cursor(snap.clone(), &format!("{P}{ALL}"), &timed, &strict(100)).unwrap();
+    let first = cursor.next_batch().unwrap().expect("first batch");
+    assert_eq!(first.len(), 100);
+    drop(first);
+    let past = deadline + Duration::from_millis(100);
+    if let Some(wait) = past.checked_duration_since(Instant::now()) {
+        std::thread::sleep(wait);
+    }
+    let err = loop {
+        match cursor.next_batch() {
+            Ok(Some(_)) => {}
+            Ok(None) => break None,
+            Err(e) => break Some(e),
+        }
+    };
+    assert!(
+        matches!(err, Some(Error::Timeout)),
+        "expected Timeout without pause credit, got {err:?}"
+    );
 }

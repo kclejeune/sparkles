@@ -389,17 +389,21 @@ impl Service {
                     if b.table.len >= cap {
                         break false;
                     }
+                    ctx.check()?;
                     let Some(solution) = answer.next_solution() else {
+                        ctx.check()?;
                         if let Some(tee) = tee.take() {
                             ctx.snap.results.service.put(tee.key, Arc::new(tee.rows));
                         }
                         break true;
                     };
                     let solution = solution?;
+                    ctx.check()?;
                     if let Some(copy) = tee.take() {
                         *tee = copy.push(&solution)?;
                     }
                     push(&mut b, bnodes, &ServiceSolution::Remote(&solution));
+                    ctx.check()?;
                 }
             }
             Source::Local {
@@ -411,8 +415,10 @@ impl Service {
                 if b.table.len >= cap {
                     break false;
                 }
+                ctx.check()?;
                 if batch.as_ref().is_none_or(|(rows, at)| *at >= rows.len()) {
                     *batch = None;
+                    ctx.check()?;
                     cursor.deadline_pause().store(
                         ctx.deadline_pause
                             .load(Ordering::Relaxed)
@@ -423,28 +429,35 @@ impl Service {
                         Some(next) => *batch = Some((next, 0)),
                         None => break true,
                     }
+                    ctx.check()?;
                 }
                 let (rows, at) = batch.as_mut().expect("a callee batch");
                 let names = rows.variables();
                 while *at < rows.len() && b.table.len < cap {
+                    ctx.check()?;
                     let row = rows.row(*at)?;
                     push(&mut b, bnodes, &ServiceSolution::Local { names, row: &row });
+                    ctx.check()?;
                     *at += 1;
                 }
             },
             Source::Cached { rows, cols, at, .. } => {
+                ctx.check()?;
                 let end = rows.rows.len().min(*at + cap);
                 let mut ids = vec![Id::UNDEF; cols.len()];
-                for r in &rows.rows[*at..end] {
+                while *at < end {
+                    ctx.check()?;
+                    let r = &rows.rows[*at];
                     for (to, c) in ids.iter_mut().zip(cols.iter()) {
                         *to = c
                             .and_then(|c| r[c].as_ref())
                             .map_or(Id::UNDEF, |term| ctx.intern_remote_term(term, bnodes));
                     }
+                    ctx.check()?;
                     b.table.push_row(&ids);
+                    *at += 1;
                 }
-                *at = end;
-                end == rows.rows.len()
+                *at == rows.rows.len()
             }
         };
         if ended {
@@ -504,5 +517,258 @@ mod tests {
         assert_eq!(COPIES.with(std::cell::Cell::get), 2);
         assert_eq!(tee.rows.rows.len(), 1);
         assert_eq!(tee.rows.vars.len(), width);
+    }
+
+    struct ChunkedReader {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        armed: Arc<std::sync::atomic::AtomicBool>,
+        cancel_on_first_armed_read: Option<Arc<std::sync::atomic::AtomicBool>>,
+        triggered: bool,
+        reads_after_first_armed: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl std::io::Read for ChunkedReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.triggered {
+                self.reads_after_first_armed.fetch_add(1, Ordering::SeqCst);
+            }
+            let Some(mut chunk) = self.chunks.pop_front() else {
+                return Ok(0);
+            };
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            if n < chunk.len() {
+                self.chunks.push_front(chunk.split_off(n));
+            } else if self.armed.load(Ordering::SeqCst) && !self.triggered {
+                self.triggered = true;
+                if let Some(cancel) = &self.cancel_on_first_armed_read {
+                    cancel.store(true, Ordering::SeqCst);
+                }
+            }
+            Ok(n)
+        }
+    }
+
+    fn test_service(ctx: &Ctx, var: VarId, source: Source) -> Service {
+        Service {
+            endpoint: PathEnd::Const(Id::UNDEF),
+            query: "SELECT ?s { ?s ?p ?o }".into(),
+            cache: CacheMode::Default,
+            vars: vec![var],
+            names: vec![ctx.var_name(var)],
+            fallback: FallbackPolicy::RejectMaterialization,
+            opened: true,
+            buffered_before_output: false,
+            source: Some(source),
+            bnodes: FxHashMap::default(),
+        }
+    }
+
+    /// Cancellation raised while completing a remote solution stops `Service::fill`
+    /// before reading any later solution in the batch.
+    #[test]
+    fn remote_fill_checks_cancellation_between_solutions() {
+        let ctx = ctx(16 << 20);
+        let var = ctx.var("s");
+        let mut chunks = std::collections::VecDeque::new();
+        chunks.push_back(br#"{"head":{"vars":["s"]},"results":{"bindings":["#.to_vec());
+        for i in 0..12usize {
+            let prefix = if i == 0 { "" } else { "," };
+            chunks.push_back(
+                format!(r#"{prefix}{{"s":{{"type":"uri","value":"urn:s:{i}"}}}}"#).into_bytes(),
+            );
+        }
+        chunks.push_back(b"]}}".to_vec());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads_after = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = ChunkedReader {
+            chunks,
+            armed: armed.clone(),
+            cancel_on_first_armed_read: Some(ctx.cancel.clone()),
+            triggered: false,
+            reads_after_first_armed: reads_after.clone(),
+        };
+        let answer = RemoteAnswer::from_reader(
+            Box::new(reader),
+            sparesults::QueryResultsFormat::Json,
+            "http://test.invalid/sparql",
+        )
+        .unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let mut svc = test_service(
+            &ctx,
+            var,
+            Source::Remote {
+                answer: Box::new(answer),
+                tee: None,
+            },
+        );
+        let err = svc.fill(&ctx, 10).err();
+        assert!(
+            matches!(err, Some(Error::Cancelled)),
+            "expected Cancelled, got {err:?}"
+        );
+        assert!(ctx.cancel.load(Ordering::SeqCst));
+        assert_eq!(
+            reads_after.load(Ordering::SeqCst),
+            0,
+            "fill read past the cancelled solution boundary"
+        );
+    }
+
+    /// A sticky memory refusal during query-local term interning stops `Service::fill`
+    /// before reading any later solution and never publishes the cache tee.
+    #[test]
+    fn remote_fill_does_not_cache_after_an_interning_refusal() {
+        // Enough credit for Buffer + Tee(sol_0) + Tee(sol_1), but not also interning sol_0's 8 KiB literal.
+        let ctx = ctx(12_000);
+        let var = ctx.var("s");
+        let big = "a".repeat(8_000);
+        let mut chunks = std::collections::VecDeque::new();
+        chunks.push_back(br#"{"head":{"vars":["s"]},"results":{"bindings":["#.to_vec());
+        chunks.push_back(format!(r#"{{"s":{{"type":"literal","value":"{big}"}}}}"#).into_bytes());
+        chunks.push_back(br#",{"s":{"type":"literal","value":"b"}}"#.to_vec());
+        chunks.push_back(b"]}}".to_vec());
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let reads_after = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reader = ChunkedReader {
+            chunks,
+            armed: armed.clone(),
+            cancel_on_first_armed_read: None,
+            triggered: false,
+            reads_after_first_armed: reads_after.clone(),
+        };
+        let answer = RemoteAnswer::from_reader(
+            Box::new(reader),
+            sparesults::QueryResultsFormat::Json,
+            "http://test.invalid/sparql",
+        )
+        .unwrap();
+        let tee = Tee::new(
+            &ctx,
+            "test-interning-refusal".into(),
+            ctx.snap.results.service.max_entry_bytes(),
+        )
+        .unwrap();
+        armed.store(true, Ordering::SeqCst);
+        let mut svc = test_service(
+            &ctx,
+            var,
+            Source::Remote {
+                answer: Box::new(answer),
+                tee: Some(tee),
+            },
+        );
+        let err = svc.fill(&ctx, 4).err();
+        assert!(
+            matches!(
+                err,
+                Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+            ),
+            "expected Memory BudgetExceeded, got {err:?}"
+        );
+        assert_eq!(
+            reads_after.load(Ordering::SeqCst),
+            0,
+            "fill read another solution after interning failed"
+        );
+        assert_eq!(
+            ctx.snap.results.service.entries(),
+            0,
+            "a failed fill must not publish its cache tee"
+        );
+    }
+
+    /// `Source::Cached` checks pending cancellation, expired deadline, and sticky memory
+    /// refusal before advancing `at`.
+    #[test]
+    fn cached_fill_checks_pending_stop() {
+        let make_rows = || {
+            Arc::new(Rows {
+                vars: vec!["s".into()],
+                rows: (0..4)
+                    .map(|i| {
+                        vec![Some(Term::NamedNode(
+                            oxrdf::NamedNode::new(format!("urn:s:{i}")).unwrap(),
+                        ))]
+                    })
+                    .collect(),
+            })
+        };
+        // 1. Pre-set cancellation
+        {
+            let ctx = ctx(16 << 20);
+            let var = ctx.var("s");
+            let rows = make_rows();
+            let charge = OwnedCharge::new(&ctx, rows.retained_bytes()).unwrap();
+            let mut svc = test_service(
+                &ctx,
+                var,
+                Source::Cached {
+                    rows,
+                    cols: vec![Some(0)],
+                    at: 0,
+                    _charge: charge,
+                },
+            );
+            ctx.cancel.store(true, Ordering::Relaxed);
+            let err = svc.fill(&ctx, 4).err();
+            assert!(matches!(err, Some(Error::Cancelled)), "{err:?}");
+            assert!(matches!(svc.source, Some(Source::Cached { at: 0, .. })));
+        }
+        // 2. Expired deadline
+        {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut raw = Ctx::new(store.snapshot());
+            raw.mem_limit = 16 << 20;
+            raw.deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            raw.enable_cursor_accounting().unwrap();
+            let ctx = Arc::new(raw);
+            ctx.attach_owner();
+            let var = ctx.var("s");
+            let rows = make_rows();
+            let charge = OwnedCharge::new(&ctx, rows.retained_bytes()).unwrap();
+            let mut svc = test_service(
+                &ctx,
+                var,
+                Source::Cached {
+                    rows,
+                    cols: vec![Some(0)],
+                    at: 0,
+                    _charge: charge,
+                },
+            );
+            let err = svc.fill(&ctx, 4).err();
+            assert!(matches!(err, Some(Error::Timeout)), "{err:?}");
+            assert!(matches!(svc.source, Some(Source::Cached { at: 0, .. })));
+        }
+        // 3. Sticky memory refusal from a failed `intern_term` while Buffer headroom remains
+        {
+            let ctx = ctx(16 << 10);
+            let var = ctx.var("s");
+            let rows = make_rows();
+            let charge = OwnedCharge::new(&ctx, rows.retained_bytes()).unwrap();
+            let mut svc = test_service(
+                &ctx,
+                var,
+                Source::Cached {
+                    rows,
+                    cols: vec![Some(0)],
+                    at: 0,
+                    _charge: charge,
+                },
+            );
+            let oversized = Term::Literal(Literal::new_simple_literal("x".repeat(32 << 10)));
+            assert_eq!(ctx.intern_term(&oversized), Id::UNDEF);
+            let err = svc.fill(&ctx, 4).err();
+            assert!(
+                matches!(
+                    err,
+                    Some(Error::BudgetExceeded(b)) if b.kind == crate::BudgetKind::Memory
+                ),
+                "{err:?}"
+            );
+            assert!(matches!(svc.source, Some(Source::Cached { at: 0, .. })));
+        }
     }
 }

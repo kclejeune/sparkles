@@ -1305,6 +1305,20 @@ its ledger in `cursor_text_heap.rs`, `cursor_history_heap.rs` and
 `cursor_memory_audit.rs`, and cover retention and disabling between pulls, a branch
 deleted under a read, endpoint failures, timeouts, cancellation and the cache.
 
+All three streamed readers report `growingState` from construction onward because the
+batch cap does not bound their retained state. An in-process SERVICE call clears the
+target's pool alongside inheriting the caller's grant so an unpooled caller keeps its
+unpooled accounting domain and a pooled caller charges only its own grant, and
+`Service::fill` polls stop conditions between remote solutions, before cache
+publication and across cached and local rows. The history reader refreshes
+`HistoryPages`'s deadline from `ctx.current_deadline()` before each page pull so
+credited consumer pauses extend later page scans, normalizes a zero internal page
+budget to one matching change, and polls stop controls inside writable record reads,
+CRC, footprint, decoding, filtered scans and row conversion. Read-only paging skips
+segments above the clamped upper commit bound and stops once a validated record covers
+that bound, while [item 1175](../../ROADMAP.md) retains the valid-prefix limitation for
+earlier records in an overlapping segment.
+
 ### Readings of errors in aggregates
 
 Item 1064 makes the treatment of errors in MIN, MAX, AVG and GROUP_CONCAT a setting,

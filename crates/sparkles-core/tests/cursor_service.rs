@@ -228,8 +228,11 @@ fn service_node(plan: &CursorPlan) -> &CursorPlan {
 fn assert_service_streaming(plan: &CursorPlan, phase: &str) {
     let svc = service_node(plan);
     assert!(
-        !svc.full_input_before_output && !svc.materializes && svc.reason.is_none(),
-        "{phase}: expected streaming Service node, got {svc:#?}"
+        !svc.full_input_before_output
+            && !svc.materializes
+            && svc.growing_state
+            && svc.reason.is_none(),
+        "{phase}: expected streaming Service node with growingState, got {svc:#?}"
     );
 }
 
@@ -238,11 +241,12 @@ fn assert_service_buffered(plan: &CursorPlan, phase: &str) {
     assert!(
         svc.full_input_before_output
             && !svc.materializes
+            && svc.growing_state
             && svc
                 .reason
                 .as_deref()
                 .is_some_and(|r| r.contains("buffered before output")),
-        "{phase}: expected buffered-before-output Service node with reason, got {svc:#?}"
+        "{phase}: expected buffered-before-output Service node with growingState and reason, got {svc:#?}"
     );
 }
 
@@ -1377,4 +1381,125 @@ fn a_copy_the_budget_cannot_hold_is_dropped() {
         expected
     );
     assert_eq!(s.result_cache().service.entries(), 1);
+}
+
+/// An unpooled caller keeps its unpooled accounting domain even when the local target's
+/// options carry a `QueryPool`, and a pooled caller charges only its own pool grant while
+/// leaving the target's pool untouched.
+#[test]
+fn unpooled_caller_can_call_local_target_with_pool_configured() {
+    use sparkles_core::sparql::pool::QueryPool;
+
+    struct PooledLocal(Arc<Snapshot>, Arc<QueryPool>);
+
+    impl std::fmt::Debug for PooledLocal {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("PooledLocal")
+        }
+    }
+
+    impl LocalEndpoints for PooledLocal {
+        fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>> {
+            (iri == "http://local/sparql").then(|| {
+                Ok(LocalTarget {
+                    snap: self.0.clone(),
+                    options: QueryOptions {
+                        pool: Some(self.1.clone()),
+                        ..Default::default()
+                    },
+                    hold: None,
+                })
+            })
+        }
+    }
+
+    let s = store();
+    let snap = s.snapshot();
+    let remote = Store::in_memory(StoreOptions::default());
+    let mut nt = String::new();
+    for i in 0..10 {
+        nt.push_str(&format!("<urn:s:{i}> <urn:p> \"val-{i:04}\" .\n"));
+    }
+    remote
+        .load(&[Source::from_bytes(nt.into_bytes(), RdfFormat::Turtle, None)])
+        .unwrap();
+
+    // 1. Unpooled caller calling a pooled local target.
+    let target_pool = QueryPool::new(16 << 20);
+    let o = QueryOptions {
+        local_endpoints: Some(Arc::new(PooledLocal(
+            remote.snapshot(),
+            target_pool.clone(),
+        ))),
+        ..opts()
+    };
+    let q = "SELECT ?s ?o { SERVICE <http://local/sparql> { ?s <urn:p> ?o } }";
+    let expected = eager(&snap, q, &o).unwrap();
+    assert_eq!(expected.len(), 10);
+    for rows in [1, 4] {
+        let (answer, plan) = streamed(&snap, q, &o, &strict(rows)).unwrap();
+        assert_eq!(answer, expected, "batch {rows}");
+        assert!(!materializes(&plan));
+        assert_service_streaming(&plan, "unpooled caller against pooled target");
+    }
+    assert_eq!(target_pool.granted(), 0);
+
+    // Additional coverage: SELECT ... LIMIT 1 and ASK parity.
+    let q_lim = "SELECT ?s ?o { SERVICE <http://local/sparql> { ?s <urn:p> ?o } } LIMIT 1";
+    let expected_lim = eager(&snap, q_lim, &o).unwrap();
+    assert_eq!(expected_lim.len(), 1);
+    for rows in [1, 4] {
+        let (answer, _) = streamed(&snap, q_lim, &o, &strict(rows)).unwrap();
+        assert_eq!(answer, expected_lim, "LIMIT 1 batch {rows}");
+    }
+    let q_ask = "ASK { SERVICE <http://local/sparql> { ?s <urn:p> ?o } }";
+    let eager_ask = query(snap.clone(), q_ask, &o).unwrap().boolean;
+    assert!(eager_ask);
+    let streamed_ask = match query_execution(
+        snap.clone(),
+        q_ask,
+        &o,
+        &strict(1),
+        ExecutionMode::Streaming,
+    )
+    .unwrap()
+    {
+        QueryExecution::Ask(r) => r.into_result().boolean,
+        other => panic!("expected Ask execution, got {:?}", other.kind()),
+    };
+    assert_eq!(streamed_ask, eager_ask);
+    assert_eq!(target_pool.granted(), 0);
+
+    // 2. Caller with a grant from pool A calling a target whose options carry pool B.
+    let pool_a = QueryPool::new(64 << 20);
+    let pool_b = QueryPool::new(64 << 20);
+    let grant_a = Arc::new(pool_a.empty_grant());
+    let o_pooled = QueryOptions {
+        grant: Some(grant_a.clone()),
+        local_endpoints: Some(Arc::new(PooledLocal(remote.snapshot(), pool_b.clone()))),
+        ..opts()
+    };
+    let q_sorted = "SELECT ?s ?o { SERVICE <http://local/sparql> { SELECT ?s ?o { ?s <urn:p> ?o } ORDER BY DESC(?o) } }";
+    let mut cursor = select_cursor(snap.clone(), q_sorted, &o_pooled, &strict(4)).unwrap();
+    let first = cursor.next_batch().unwrap().expect("first batch");
+    assert_eq!(first.len(), 4);
+    assert!(
+        grant_a.used() > 0,
+        "caller grant from pool A should be charged while cursor is live"
+    );
+    assert_eq!(pool_b.granted(), 0, "target pool B must remain uncharged");
+    drop(first);
+    let mut total = 4;
+    while let Some(b) = cursor.next_batch().unwrap() {
+        total += b.len();
+    }
+    assert_eq!(total, 10);
+    cursor.close();
+    drop(cursor);
+    assert_eq!(
+        grant_a.used(),
+        0,
+        "dropping the cursor must return its owned contribution to pool A"
+    );
+    assert_eq!(pool_b.granted(), 0);
 }
