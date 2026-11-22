@@ -596,6 +596,9 @@ fn decide_fixed(ctx: &Ctx, width: usize) -> u64 {
     128 + width as u64 * 28 + ctx.nvars() as u64 * 16 + 256
 }
 
+/// Candidates scanned between cancellation and deadline checks in the deciding path.
+const DECIDE_POLL: usize = 1024;
+
 /// Test the condition of an OPTIONAL on the pairs `lrows` and `rrows` that the merge
 /// kernel gave for whole left rows, before any output row is copied: the pairs that pass
 /// stay, and a left row none of whose pairs passed stays once with no right row, as in
@@ -612,8 +615,14 @@ fn decide_pairs(
     lrows: &mut Vec<u32>,
     rrows: &mut Vec<u32>,
 ) -> Result<()> {
-    let pairs = rrows.iter().filter(|j| **j != NO_ROW).count();
+    ctx.check()?;
+    let mut pairs = 0usize;
+    for chunk in rrows.chunks(DECIDE_POLL) {
+        pairs += chunk.iter().filter(|j| **j != NO_ROW).count();
+        ctx.check()?;
+    }
     if pairs == 0 {
+        ctx.check()?;
         return Ok(());
     }
     let mut matched = Table::new(vars.to_vec());
@@ -622,23 +631,35 @@ fn decide_pairs(
         match (l, r) {
             (Some(c), _) => {
                 let source = &left.cols[c];
-                let rows = lrows
-                    .iter()
-                    .zip(rrows.iter())
-                    .filter(|(_, j)| **j != NO_ROW);
-                to.extend(rows.map(|(&i, _)| source[li + i as usize]));
+                for (lc, rc) in lrows.chunks(DECIDE_POLL).zip(rrows.chunks(DECIDE_POLL)) {
+                    let rows = lc.iter().zip(rc.iter()).filter(|(_, j)| **j != NO_ROW);
+                    to.extend(rows.map(|(&i, _)| source[li + i as usize]));
+                    ctx.check()?;
+                }
             }
             (None, Some(c)) => {
                 let source = &right.cols[c];
-                let rows = rrows.iter().filter(|j| **j != NO_ROW);
-                to.extend(rows.map(|&j| source[ri + j as usize]));
+                for rc in rrows.chunks(DECIDE_POLL) {
+                    let rows = rc.iter().filter(|j| **j != NO_ROW);
+                    to.extend(rows.map(|&j| source[ri + j as usize]));
+                    ctx.check()?;
+                }
             }
-            (None, None) => to.resize(pairs, Id::UNDEF),
+            (None, None) => {
+                let mut left_pairs = pairs;
+                while left_pairs > 0 {
+                    let step = left_pairs.min(DECIDE_POLL);
+                    to.extend(std::iter::repeat_n(Id::UNDEF, step));
+                    left_pairs -= step;
+                    ctx.check()?;
+                }
+            }
         }
     }
     matched.len = pairs;
     let pass = super::super::exec::condition_mask(ctx, &matched, condition)?;
     drop(matched);
+    ctx.check()?;
     let mut verdicts = pass.into_iter();
     // The rows kept are no more than the rows read, so they are written in place.
     let (mut w, mut k) = (0, 0);
@@ -652,6 +673,9 @@ fn decide_pairs(
                 w += 1;
             }
             k += 1;
+            if k.is_multiple_of(DECIDE_POLL) {
+                ctx.check()?;
+            }
         }
         if w == start {
             lrows[w] = row;
@@ -661,6 +685,7 @@ fn decide_pairs(
     }
     lrows.truncate(w);
     rrows.truncate(w);
+    ctx.check()?;
     Ok(())
 }
 
@@ -948,15 +973,16 @@ impl Merge {
         if decide {
             // The batch began with room for the scratch of every pair, but a run held
             // or an input batch loaded since may have taken it. No more pairs are
-            // decided than the room left holds, and with none the general path stages
-            // the next run, as it does with the switch off.
+            // decided than the room left holds; when none fit and the batch already
+            // holds rows, flush those rows rather than staging pairs into a tight
+            // batch, and leave an empty batch to the general path.
             let fit =
                 ctx.memory_room().saturating_sub(decide_fixed(ctx, width)) / decide_row(width);
             room = room.min(usize::try_from(fit).unwrap_or(usize::MAX));
         }
         let end = covered.min(li.saturating_add(room));
         let (mut next_li, mut next_ri) = (li, ri);
-        let mut full = false;
+        let mut full = decide && out.table.len > 0 && covered > li && room == 0;
         if end > li && room > 0 {
             let scratch = if decide {
                 // the bounds, the pairs and what [`decide_pairs`] builds from them
@@ -1007,36 +1033,78 @@ impl Merge {
                 (lrows, rrows) = with_extensions(&lrows, &rrows);
             }
             if done > 0 {
-                let marker = if decide {
-                    self.columns.len() - 1
-                } else {
-                    usize::MAX
-                };
-                for (at, (column, &(l, r))) in
-                    out.table.cols.iter_mut().zip(&self.columns).enumerate()
-                {
-                    if at == marker {
-                        // Decided rows carry no marker, so the later test keeps them as
-                        // it keeps the extension of a left row none of whose pairs passed.
-                        column.extend(std::iter::repeat_n(Id::UNDEF, lrows.len()));
-                        continue;
-                    }
-                    match (l, r) {
-                        (Some(c), _) => {
-                            let source = &left.cols[c];
-                            column.extend(lrows.iter().map(|&i| source[li + i as usize]));
+                if decide {
+                    ctx.check()?;
+                    let marker = self.columns.len() - 1;
+                    for (at, (column, &(l, r))) in
+                        out.table.cols.iter_mut().zip(&self.columns).enumerate()
+                    {
+                        if at == marker {
+                            // Decided rows carry no marker, so the later test keeps them as
+                            // it keeps the extension of a left row none of whose pairs passed.
+                            let mut left_rows = lrows.len();
+                            while left_rows > 0 {
+                                let step = left_rows.min(DECIDE_POLL);
+                                column.extend(std::iter::repeat_n(Id::UNDEF, step));
+                                left_rows -= step;
+                                ctx.check()?;
+                            }
+                            continue;
                         }
-                        (None, Some(c)) => {
-                            let source = &right.cols[c];
-                            column.extend(rrows.iter().map(|&j| {
-                                if j == NO_ROW {
-                                    Id::UNDEF
-                                } else {
-                                    source[ri + j as usize]
+                        match (l, r) {
+                            (Some(c), _) => {
+                                let source = &left.cols[c];
+                                for chunk in lrows.chunks(DECIDE_POLL) {
+                                    column.extend(chunk.iter().map(|&i| source[li + i as usize]));
+                                    ctx.check()?;
                                 }
-                            }));
+                            }
+                            (None, Some(c)) => {
+                                let source = &right.cols[c];
+                                for chunk in rrows.chunks(DECIDE_POLL) {
+                                    column.extend(chunk.iter().map(|&j| {
+                                        if j == NO_ROW {
+                                            Id::UNDEF
+                                        } else {
+                                            source[ri + j as usize]
+                                        }
+                                    }));
+                                    ctx.check()?;
+                                }
+                            }
+                            (None, None) => {
+                                let mut left_rows = lrows.len();
+                                while left_rows > 0 {
+                                    let step = left_rows.min(DECIDE_POLL);
+                                    column.extend(std::iter::repeat_n(Id::UNDEF, step));
+                                    left_rows -= step;
+                                    ctx.check()?;
+                                }
+                            }
                         }
-                        (None, None) => column.extend(std::iter::repeat_n(Id::UNDEF, lrows.len())),
+                    }
+                    ctx.check()?;
+                } else {
+                    for (column, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
+                        match (l, r) {
+                            (Some(c), _) => {
+                                let source = &left.cols[c];
+                                column.extend(lrows.iter().map(|&i| source[li + i as usize]));
+                            }
+                            (None, Some(c)) => {
+                                let source = &right.cols[c];
+                                column.extend(rrows.iter().map(|&j| {
+                                    if j == NO_ROW {
+                                        Id::UNDEF
+                                    } else {
+                                        source[ri + j as usize]
+                                    }
+                                }));
+                            }
+                            (None, None) => {
+                                column.extend(std::iter::repeat_n(Id::UNDEF, lrows.len()));
+                            }
+                        }
                     }
                 }
                 out.table.len += lrows.len();
@@ -1434,6 +1502,7 @@ impl Merge {
             out.reconcile()?;
             return Ok((!out.table.is_empty()).then_some(out));
         }
+        let mut staged = self.passed;
         let mut steps = 0usize;
         while out.table.len < cap {
             if steps.is_multiple_of(1024) {
@@ -1441,7 +1510,9 @@ impl Merge {
             }
             steps += 1;
             if let Some(spooled) = &mut self.spooled {
+                let before = out.table.len;
                 spooled.fill(ctx, &self.columns, self.optional, extend, &mut out, cap)?;
+                staged |= extend && out.table.len > before;
                 if spooled.done {
                     self.spooled = None;
                 }
@@ -1528,6 +1599,7 @@ impl Merge {
                             });
                         }
                         out.table.len += 1;
+                        staged = true;
                     }
                     if compatible || self.optional {
                         for (col, &(l, r)) in out.table.cols.iter_mut().zip(&self.columns) {
@@ -1544,6 +1616,12 @@ impl Merge {
                     self.inputs[1].at += 1;
                     continue;
                 }
+                if decide && staged && out.table.len > 0 {
+                    // End a deciding batch before collecting another general run when it
+                    // already holds staged pairs or an open passed row, so held or
+                    // spooled runs cannot coexist with [`Merge::settle`]'s scratch.
+                    break;
+                }
                 let left =
                     self.inputs[0].run(ctx, &mut children[0], options, pull, &self.keys[0])?;
                 let right =
@@ -1557,13 +1635,18 @@ impl Merge {
                     }
                     let spooled = SpooledPair::new(ctx, left, right, &self.inputs, self.widths)?;
                     self.spooled = Some(Box::new(spooled));
+                    if decide && out.table.len > 0 {
+                        // Flush already-decided rows (which settle without scratch)
+                        // before streaming the spooled run, so `self.spooled` cannot
+                        // coexist with [`Merge::settle`]'s scratch.
+                        break;
+                    }
                     continue;
                 }
+                let rows = (left.rows.end - left.rows.start).saturating_mul(
+                    (right.rows.end - right.rows.start).saturating_add(usize::from(extend)),
+                );
                 let (li, ri) = (left.rows.start, right.rows.start);
-                let rows = left
-                    .rows
-                    .len()
-                    .saturating_mul(right.rows.len() + usize::from(extend));
                 self.pair = Some(Pair {
                     left,
                     right,
@@ -1572,11 +1655,8 @@ impl Merge {
                     matched: false,
                 });
                 if decide && out.table.len > 0 && rows > cap - out.table.len {
-                    // The rows of the two runs do not fit the rest of the batch, which
-                    // would end with the runs held and their rows staged, and the test
-                    // would then take its scratch beside the runs. The pair starts the
-                    // next batch instead, as a run that [`Merge::interior`] cannot fit
-                    // does.
+                    // Flush already-decided rows (which settle without scratch) before
+                    // emitting a run that would stay held across [`Merge::settle`].
                     break;
                 }
             }
@@ -1586,6 +1666,7 @@ impl Merge {
             let pair = self.pair.as_mut().expect("matched runs");
             let left = pair.left.table(&self.inputs[0]);
             let right = pair.right.table(&self.inputs[1]);
+            let before = out.table.len;
             while pair.li < pair.left.rows.end && out.table.len < cap {
                 if steps.is_multiple_of(1024) {
                     ctx.check()?;
@@ -1641,6 +1722,7 @@ impl Merge {
                 }
                 pair.ri += 1;
             }
+            staged |= extend && out.table.len > before;
             if pair.li == pair.left.rows.end {
                 self.pair = None;
             }
@@ -3352,6 +3434,887 @@ mod tests {
         }
         assert!(spooled >= 18, "{spooled} runs spooled");
         assert_eq!(spill.reserved_bytes(), 0);
+    }
+
+    /// A deciding merge ends its batch before collecting another general run when it
+    /// already holds staged pairs or an open passed row, so held or spooled runs cannot
+    /// overlap with [`Merge::settle`]'s scratch.
+    #[test]
+    fn pair_conditions_flush_before_collecting_another_run() {
+        use crate::sparql::expr::Func;
+        use spargebra::algebra::Function;
+
+        let cap = 8usize;
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(1)),
+            Box::new(Expr::Const(Id::from_i64(0).unwrap())),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        let left_keys: Vec<i64> = (0..=7)
+            .chain([12])
+            .chain(std::iter::repeat_n(15, 16))
+            .chain([16])
+            .collect();
+        let right_keys: Vec<i64> = [0, 1, 2, 8, 9, 10, 11]
+            .into_iter()
+            .chain(std::iter::repeat_n(12, 6))
+            .chain([13, 14])
+            .chain(std::iter::repeat_n(15, 16))
+            .chain([16])
+            .collect();
+        let left_rows: Vec<Vec<i64>> = left_keys.iter().map(|&k| vec![k, 1]).collect();
+        let right_rows: Vec<Vec<i64>> = right_keys
+            .iter()
+            .enumerate()
+            .map(|(j, &k)| vec![k, 100 + j as i64])
+            .collect();
+        let make_node = |expr: Expr| {
+            let mut node = join(
+                values(vec![0, 1], &left_rows),
+                values(vec![0, 2], &right_rows),
+            );
+            node.kind = Kind::LeftJoin { expr: Some(expr) };
+            node
+        };
+        let node = make_node(condition.clone());
+        assert_eq!(node.vars, vec![0, 1, 2]);
+        let expected = rows(
+            &exec::execute_materialized(&context(u64::MAX), &node)
+                .unwrap()
+                .0
+                .table,
+        );
+
+        // Inspect raw staged output and pending run state across the crossing runs.
+        let ctx = context(8 << 20);
+        let mut op =
+            Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization).unwrap();
+        let super::super::State::Merge(merge) = &mut op.state else {
+            unreachable!()
+        };
+        let options = CursorOptions {
+            batch_rows: cap,
+            ..Default::default()
+        };
+        let staged = vec![0, 1, 2, VarId::MAX];
+        let mut first = merge
+            .merged(
+                &ctx,
+                &mut op.children,
+                &options,
+                &staged,
+                cap,
+                Some(&condition),
+            )
+            .unwrap()
+            .expect("first deciding batch");
+        assert_eq!(first.table.len, 8);
+        assert!(first.table.cols[3].iter().all(|id| id.is_undef()));
+        merge.test(&ctx, &mut first, &condition).unwrap();
+        assert_eq!(first.table.len, 8);
+        assert_eq!(first.table.width(), 3);
+
+        // Hold `first` across the second pull, where key 12 crosses the right batch as
+        // 1 + 5 and stages six pairs plus its extension ahead of key 15's general run.
+        let mut second = merge
+            .merged(
+                &ctx,
+                &mut op.children,
+                &options,
+                &staged,
+                cap,
+                Some(&condition),
+            )
+            .unwrap()
+            .expect("second batch staging crossing run 12");
+        assert_eq!(second.table.len, 7);
+        let staged_pairs = second.table.cols[3]
+            .iter()
+            .filter(|id| !id.is_undef())
+            .count();
+        assert_eq!(staged_pairs, 6);
+        assert!(
+            merge.pair.is_none(),
+            "key 15 run must not be collected before settling staged key 12"
+        );
+        assert!(merge.spooled.is_none());
+        assert_eq!(
+            merge.inputs[0].table().cols[0][merge.inputs[0].at],
+            Id::from_i64(15).unwrap()
+        );
+        assert_eq!(
+            merge.inputs[1].table().cols[0][merge.inputs[1].at],
+            Id::from_i64(15).unwrap()
+        );
+
+        merge.test(&ctx, &mut second, &condition).unwrap();
+        assert_eq!(second.table.len, 6);
+        assert_eq!(second.table.width(), 3);
+        let mut expected_key12: Vec<Vec<Id>> = (0..6)
+            .map(|j| {
+                vec![
+                    Id::from_i64(12).unwrap(),
+                    Id::from_i64(1).unwrap(),
+                    Id::from_i64(107 + j).unwrap(),
+                ]
+            })
+            .collect();
+        expected_key12.sort();
+        assert_eq!(rows(&second.table), expected_key12);
+
+        let collect_in_order = |table: &Table, out: &mut Vec<Vec<Id>>| {
+            out.extend((0..table.len).map(|i| table.cols.iter().map(|c| c[i]).collect()));
+        };
+        let mut drained = Vec::new();
+        collect_in_order(&first.table, &mut drained);
+        collect_in_order(&second.table, &mut drained);
+        drop(first);
+        drop(second);
+        while let Some(batch) = merge
+            .next(&ctx, &mut op.children, &options, &node.vars, cap)
+            .unwrap()
+        {
+            assert!(batch.table.len <= cap && batch.table.len > 0);
+            collect_in_order(&batch.table, &mut drained);
+        }
+        let keys: Vec<Id> = drained.iter().map(|row| row[0]).collect();
+        assert!(keys.is_sorted());
+        drained.sort();
+        assert_eq!(drained, expected);
+
+        // Normal `next` path across switch settings and hold/release consumers.
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        for pairs in [false, true] {
+            for hold in [false, true] {
+                let (mut bag, _) = pulled(&snap, &node, &[cap], 8 << 20, pairs, hold).unwrap();
+                let keys: Vec<Id> = bag.iter().map(|row| row[0]).collect();
+                assert!(keys.is_sorted(), "pairs {pairs} hold {hold}");
+                bag.sort();
+                assert_eq!(bag, expected, "pairs {pairs} hold {hold}");
+            }
+        }
+
+        // A first general run on an empty output still proceeds and drains cleanly.
+        let first_run_left: Vec<Vec<i64>> = (0..16).map(|_| vec![15, 1]).collect();
+        let first_run_right: Vec<Vec<i64>> = (0..16).map(|j| vec![15, 200 + j]).collect();
+        let mut first_run_node = join(
+            values(vec![0, 1], &first_run_left),
+            values(vec![0, 2], &first_run_right),
+        );
+        first_run_node.kind = Kind::LeftJoin {
+            expr: Some(condition.clone()),
+        };
+        let first_run_expected = rows(
+            &exec::execute_materialized(&context(u64::MAX), &first_run_node)
+                .unwrap()
+                .0
+                .table,
+        );
+        let (mut first_run_bag, _) =
+            pulled(&snap, &first_run_node, &[cap], 8 << 20, true, true).unwrap();
+        first_run_bag.sort();
+        assert_eq!(first_run_bag, first_run_expected);
+
+        // An observable condition keeps the exact switch-off batches.
+        let observable = Expr::Cmp(
+            Box::new(Expr::Call(Func::Builtin(Function::Rand), vec![])),
+            Box::new(Expr::Const(Id::from_i64(2).unwrap())),
+            crate::sparql::expr::CmpOp::Lt,
+        );
+        let obs_node = make_node(observable);
+        let (off_bag, off_sizes) = pulled(&snap, &obs_node, &[cap], 8 << 20, false, true).unwrap();
+        let (on_bag, on_sizes) = pulled(&snap, &obs_node, &[cap], 8 << 20, true, true).unwrap();
+        assert_eq!(on_sizes, off_sizes);
+        assert_eq!(on_bag, off_bag);
+    }
+
+    /// When remaining memory leaves zero deciding room beside already-decided rows,
+    /// [`Merge::interior`] returns [`Step::Full`] so those rows flush without charging
+    /// settlement scratch, while an empty batch still returns [`Step::Stuck`] and
+    /// `covered == li` preserves right-only advancement.
+    #[test]
+    fn pair_conditions_flush_when_deciding_room_is_zero() {
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(3)),
+            Box::new(Expr::Var(2)),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        let make_merge = |ctx: &Arc<Ctx>, left_rows: &[Vec<i64>], right_rows: &[Vec<i64>]| {
+            let mut node = join(
+                values(vec![0, 2], left_rows),
+                values(vec![0, 3], right_rows),
+            );
+            node.kind = Kind::LeftJoin {
+                expr: Some(condition.clone()),
+            };
+            let mut op =
+                Operator::build(ctx, node.clone(), FallbackPolicy::RejectMaterialization).unwrap();
+            let options = CursorOptions {
+                batch_rows: 4096,
+                ..Default::default()
+            };
+            let super::super::State::Merge(merge) = &mut op.state else {
+                unreachable!()
+            };
+            assert!(
+                merge.inputs[0]
+                    .ensure(ctx, &mut op.children[0], &options, 4096)
+                    .unwrap()
+            );
+            assert!(
+                merge.inputs[1]
+                    .ensure(ctx, &mut op.children[1], &options, 4096)
+                    .unwrap()
+            );
+            (op, node, options)
+        };
+
+        let ctx = context(1 << 20);
+        let left_rows = [vec![10, 5], vec![11, 5]];
+        let right_rows = [vec![10, 1], vec![10, 9], vec![11, 2]];
+        let (mut op, node, options) = make_merge(&ctx, &left_rows, &right_rows);
+        let super::super::State::Merge(merge) = &mut op.state else {
+            unreachable!()
+        };
+        assert_eq!(merge.inputs[0].at, 0);
+        assert_eq!(merge.inputs[1].at, 0);
+        assert!(!merge.passed);
+
+        let staged = [0, 2, 3, VarId::MAX];
+        let mut out = Buffer::new(&ctx, &staged, 4096).unwrap();
+        for k in 0..200i64 {
+            out.table.cols[0].push(Id::from_i64(k).unwrap());
+            out.table.cols[1].push(Id::from_i64(1).unwrap());
+            out.table.cols[2].push(Id::from_i64(2).unwrap());
+            out.table.cols[3].push(Id::UNDEF);
+        }
+        out.table.len = 200;
+
+        let fixed = decide_fixed(&ctx, 3);
+        let row = decide_row(3);
+        for leave in [0, fixed - 1, fixed + row - 1] {
+            let held = ctx.charge(ctx.memory_room() - leave).unwrap();
+            assert_eq!(ctx.memory_room(), leave);
+            let before = (merge.inputs[0].at, merge.inputs[1].at);
+            let step = merge.interior(&ctx, &mut out, 4096, false, true).unwrap();
+            assert!(
+                matches!(step, Step::Full),
+                "zero deciding room (leave {leave}) must flush already-decided rows"
+            );
+            assert_eq!((merge.inputs[0].at, merge.inputs[1].at), before);
+            assert_eq!(out.table.len, 200);
+            assert!(out.table.cols[3].iter().all(|id| id.is_undef()));
+
+            // Settling the decided-only table succeeds without taking scratch or dropping rows.
+            merge.settle(&ctx, &mut out.table, &condition).unwrap();
+            assert_eq!(ctx.memory_room(), leave);
+            assert_eq!(out.table.len, 200);
+            assert!(!merge.passed);
+            assert!(out.table.cols[3].iter().all(|id| id.is_undef()));
+            drop(held);
+        }
+
+        // One byte higher permits fit == 1, which still cannot hold key 10's two-row run.
+        let one_more = fixed + row;
+        let held = ctx.charge(ctx.memory_room() - one_more).unwrap();
+        let before = (merge.inputs[0].at, merge.inputs[1].at);
+        let step = merge.interior(&ctx, &mut out, 4096, false, true).unwrap();
+        assert!(matches!(step, Step::Full));
+        assert_eq!((merge.inputs[0].at, merge.inputs[1].at), before);
+        assert_eq!(out.table.len, 200);
+        drop(held);
+
+        // With an empty output, zero deciding room still returns Step::Stuck for progress.
+        let mut empty = Buffer::new(&ctx, &staged, 4096).unwrap();
+        let held = ctx.charge(ctx.memory_room() - (fixed + row - 1)).unwrap();
+        let step = merge.interior(&ctx, &mut empty, 4096, false, true).unwrap();
+        assert!(matches!(step, Step::Stuck));
+        assert_eq!((merge.inputs[0].at, merge.inputs[1].at), (0, 0));
+        assert_eq!(empty.table.len, 0);
+        drop(held);
+        drop(empty);
+
+        // When `covered == li`, zero deciding room keeps right-only advancement intact.
+        {
+            let ctx_cov = context(1 << 20);
+            let (mut cov_op, _, _) = make_merge(
+                &ctx_cov,
+                &[vec![11, 5], vec![12, 5]],
+                &[vec![9, 1], vec![10, 2], vec![11, 3]],
+            );
+            let super::super::State::Merge(cov_merge) = &mut cov_op.state else {
+                unreachable!()
+            };
+            let mut cov_out = Buffer::new(&ctx_cov, &staged, 4096).unwrap();
+            for k in 0..200i64 {
+                cov_out.table.cols[0].push(Id::from_i64(k).unwrap());
+                cov_out.table.cols[1].push(Id::from_i64(1).unwrap());
+                cov_out.table.cols[2].push(Id::from_i64(2).unwrap());
+                cov_out.table.cols[3].push(Id::UNDEF);
+            }
+            cov_out.table.len = 200;
+            let held = ctx_cov
+                .charge(ctx_cov.memory_room() - (decide_fixed(&ctx_cov, 3) + row - 1))
+                .unwrap();
+            let step = cov_merge
+                .interior(&ctx_cov, &mut cov_out, 4096, false, true)
+                .unwrap();
+            assert!(matches!(step, Step::Advanced));
+            assert_eq!(cov_merge.inputs[0].at, 0);
+            assert_eq!(cov_merge.inputs[1].at, 2);
+            let step2 = cov_merge
+                .interior(&ctx_cov, &mut cov_out, 4096, false, true)
+                .unwrap();
+            assert!(matches!(step2, Step::Stuck));
+            drop(held);
+        }
+
+        // Release the synthetic buffer and resume normally to check exact pairs and extensions.
+        drop(out);
+        let mut resumed = Vec::new();
+        while let Some(batch) = merge
+            .next(&ctx, &mut op.children, &options, &node.vars, 4096)
+            .unwrap()
+        {
+            resumed.extend(
+                (0..batch.table.len)
+                    .map(|i| batch.table.cols.iter().map(|c| c[i]).collect::<Vec<_>>()),
+            );
+        }
+        assert_eq!(
+            resumed,
+            vec![
+                vec![
+                    Id::from_i64(10).unwrap(),
+                    Id::from_i64(5).unwrap(),
+                    Id::from_i64(9).unwrap(),
+                ],
+                vec![
+                    Id::from_i64(11).unwrap(),
+                    Id::from_i64(5).unwrap(),
+                    Id::UNDEF
+                ],
+            ]
+        );
+    }
+
+    /// [`decide_pairs`] polls cancellation periodically even when every candidate is an
+    /// unmatched `NO_ROW` extension and the condition evaluator never runs.
+    #[test]
+    fn pair_conditions_check_unmatched_decisions_for_cancellation() {
+        let n = 8192usize;
+        let ctx = context(8 << 20);
+        let mut left = Table::new(vec![0, 2]);
+        for i in 0..n as i64 {
+            left.push_row(&[Id::from_i64(i).unwrap(), Id::from_i64(1).unwrap()]);
+        }
+        let right = Table::new(vec![0, 3]);
+        let vars = [0, 2, 3];
+        let columns = [(Some(0), Some(0)), (Some(1), None), (None, Some(1))];
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(3)),
+            Box::new(Expr::Var(2)),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+
+        let mut lrows: Vec<u32> = (0..n as u32).collect();
+        let mut rrows: Vec<u32> = vec![NO_ROW; n];
+        ctx.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = decide_pairs(
+            &ctx,
+            &condition,
+            &vars,
+            &columns,
+            (&left, &right, 0, 0),
+            &mut lrows,
+            &mut rrows,
+        );
+        assert!(
+            matches!(err, Err(Error::Cancelled)),
+            "expected Err(Error::Cancelled), got {err:?}"
+        );
+
+        ctx.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let expected_l = lrows.clone();
+        let expected_r = rrows.clone();
+        let before = crate::sparql::ctx::CHECKS.with(|c| c.get());
+        decide_pairs(
+            &ctx,
+            &condition,
+            &vars,
+            &columns,
+            (&left, &right, 0, 0),
+            &mut lrows,
+            &mut rrows,
+        )
+        .unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|c| c.get()) - before;
+        assert!(
+            checks >= 8,
+            "expected at least 8 cancellation checks for {n} unmatched rows, saw {checks}"
+        );
+        assert_eq!(lrows, expected_l);
+        assert_eq!(rrows, expected_r);
+    }
+
+    /// [`decide_pairs`] observes an expired deadline on all-`NO_ROW` inputs and follows
+    /// its entry/exit stop policy on zero-length inputs too.
+    #[test]
+    fn pair_conditions_check_decisions_for_deadline() {
+        let n = 8192usize;
+        let expired = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap_or_else(std::time::Instant::now);
+        let ctx = context_set(8 << 20, None, true, |ctx| {
+            ctx.deadline = Some(expired);
+        });
+        let mut left = Table::new(vec![0, 2]);
+        for i in 0..n as i64 {
+            left.push_row(&[Id::from_i64(i).unwrap(), Id::from_i64(1).unwrap()]);
+        }
+        let right = Table::new(vec![0, 3]);
+        let vars = [0, 2, 3];
+        let columns = [(Some(0), Some(0)), (Some(1), None), (None, Some(1))];
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(3)),
+            Box::new(Expr::Var(2)),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+
+        let mut lrows: Vec<u32> = (0..n as u32).collect();
+        let mut rrows: Vec<u32> = vec![NO_ROW; n];
+        let err = decide_pairs(
+            &ctx,
+            &condition,
+            &vars,
+            &columns,
+            (&left, &right, 0, 0),
+            &mut lrows,
+            &mut rrows,
+        );
+        assert!(
+            matches!(err, Err(Error::Timeout)),
+            "expected Err(Error::Timeout), got {err:?}"
+        );
+
+        // Zero-length inputs still observe entry/exit stop checks.
+        let mut empty_l = Vec::new();
+        let mut empty_r = Vec::new();
+        let err = decide_pairs(
+            &ctx,
+            &condition,
+            &vars,
+            &columns,
+            (&left, &right, 0, 0),
+            &mut empty_l,
+            &mut empty_r,
+        );
+        assert!(
+            matches!(err, Err(Error::Timeout)),
+            "zero-length input must observe expired deadline, got {err:?}"
+        );
+
+        let live = context(8 << 20);
+        live.cancel
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        let err = decide_pairs(
+            &live,
+            &condition,
+            &vars,
+            &columns,
+            (&left, &right, 0, 0),
+            &mut empty_l,
+            &mut empty_r,
+        );
+        assert!(matches!(err, Err(Error::Cancelled)));
+
+        live.cancel
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        let before = crate::sparql::ctx::CHECKS.with(|c| c.get());
+        decide_pairs(
+            &live,
+            &condition,
+            &vars,
+            &columns,
+            (&left, &right, 0, 0),
+            &mut empty_l,
+            &mut empty_r,
+        )
+        .unwrap();
+        let checks = crate::sparql::ctx::CHECKS.with(|c| c.get()) - before;
+        assert!(
+            checks >= 1,
+            "zero-length decide_pairs must check at entry/exit, saw {checks}"
+        );
+    }
+
+    /// On a single-threaded Rayon pool, [`decide_pairs`] and the deciding output copy in
+    /// [`Merge::interior`] add periodic stop checks beyond condition evaluation across
+    /// all-pass, all-fail and alternating verdicts, including a single left row with a
+    /// long right run, while preserving exact compacted pairs and unmatched extensions.
+    #[test]
+    fn pair_conditions_check_long_decision_passes() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let long_run = 4096usize;
+            let singles = 4096usize;
+            let total = long_run + singles;
+            let vars = [0, 2, 3];
+            let columns = [(Some(0), Some(0)), (Some(1), None), (None, Some(1))];
+            let condition = Expr::Cmp(
+                Box::new(Expr::Var(3)),
+                Box::new(Expr::Var(2)),
+                crate::sparql::expr::CmpOp::Gt,
+            );
+            let ctx = context(64 << 20);
+
+            for mode in ["all-pass", "all-fail", "alternating"] {
+                let left_val = match mode {
+                    "all-pass" => 0i64,
+                    "all-fail" => 10,
+                    "alternating" => 5,
+                    _ => unreachable!(),
+                };
+                let mut left = Table::new(vec![0, 2]);
+                left.push_row(&[Id::from_i64(0).unwrap(), Id::from_i64(left_val).unwrap()]);
+                for k in 1..=singles as i64 {
+                    left.push_row(&[Id::from_i64(k).unwrap(), Id::from_i64(left_val).unwrap()]);
+                }
+                let mut right = Table::new(vec![0, 3]);
+                for j in 0..total {
+                    let key = if j < long_run {
+                        0i64
+                    } else {
+                        (j - long_run + 1) as i64
+                    };
+                    let rv = match mode {
+                        "all-pass" => 10i64,
+                        "all-fail" => 0,
+                        "alternating" => {
+                            if j.is_multiple_of(2) {
+                                10
+                            } else {
+                                0
+                            }
+                        }
+                        _ => unreachable!(),
+                    };
+                    right.push_row(&[Id::from_i64(key).unwrap(), Id::from_i64(rv).unwrap()]);
+                }
+
+                let mut lrows = Vec::with_capacity(total);
+                let mut rrows = Vec::with_capacity(total);
+                for j in 0..long_run {
+                    lrows.push(0u32);
+                    rrows.push(j as u32);
+                }
+                for i in 0..singles {
+                    lrows.push((i + 1) as u32);
+                    rrows.push((long_run + i) as u32);
+                }
+                let mut matched = Table::new(vars.to_vec());
+                for (&li_row, &ri_row) in lrows.iter().zip(&rrows) {
+                    matched.push_row(&[
+                        left.cols[0][li_row as usize],
+                        left.cols[1][li_row as usize],
+                        right.cols[1][ri_row as usize],
+                    ]);
+                }
+
+                let before_eval = crate::sparql::ctx::CHECKS.with(|c| c.get());
+                let pass = exec::condition_mask(&ctx, &matched, &condition).unwrap();
+                let eval_checks = crate::sparql::ctx::CHECKS.with(|c| c.get()) - before_eval;
+                assert_eq!(pass.len(), total);
+
+                let before_decide = crate::sparql::ctx::CHECKS.with(|c| c.get());
+                decide_pairs(
+                    &ctx,
+                    &condition,
+                    &vars,
+                    &columns,
+                    (&left, &right, 0, 0),
+                    &mut lrows,
+                    &mut rrows,
+                )
+                .unwrap();
+                let decide_checks = crate::sparql::ctx::CHECKS.with(|c| c.get()) - before_decide;
+                assert!(
+                    decide_checks >= eval_checks + (total / 1024),
+                    "{mode}: decide_pairs made {decide_checks} checks vs {eval_checks} in condition_mask"
+                );
+
+                // Verify exact compacted pairs and unmatched extensions.
+                let mut expected_l = Vec::new();
+                let mut expected_r = Vec::new();
+                match mode {
+                    "all-pass" => {
+                        for j in 0..long_run {
+                            expected_l.push(0u32);
+                            expected_r.push(j as u32);
+                        }
+                        for i in 0..singles {
+                            expected_l.push((i + 1) as u32);
+                            expected_r.push((long_run + i) as u32);
+                        }
+                    }
+                    "all-fail" => {
+                        for i in 0..=(singles as u32) {
+                            expected_l.push(i);
+                            expected_r.push(NO_ROW);
+                        }
+                    }
+                    "alternating" => {
+                        for j in (0..long_run).step_by(2) {
+                            expected_l.push(0u32);
+                            expected_r.push(j as u32);
+                        }
+                        for i in 0..singles {
+                            let ri = long_run + i;
+                            expected_l.push((i + 1) as u32);
+                            expected_r.push(if ri.is_multiple_of(2) {
+                                ri as u32
+                            } else {
+                                NO_ROW
+                            });
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                assert_eq!(lrows, expected_l, "{mode}: compacted left rows");
+                assert_eq!(rrows, expected_r, "{mode}: compacted right rows");
+            }
+
+            // Exercise the subsequent decided output copy in Merge::interior above 1,024 rows.
+            let copy_rows = 4096usize;
+            let l_data: Vec<Vec<i64>> = (0..copy_rows as i64).map(|k| vec![k, 0]).collect();
+            let r_data: Vec<Vec<i64>> = (0..copy_rows as i64).map(|k| vec![k, 10]).collect();
+            let mut node = join(values(vec![0, 2], &l_data), values(vec![0, 3], &r_data));
+            node.kind = Kind::LeftJoin {
+                expr: Some(condition.clone()),
+            };
+            let mut op =
+                Operator::build(&ctx, node, FallbackPolicy::RejectMaterialization).unwrap();
+            let options = CursorOptions {
+                batch_rows: copy_rows,
+                ..Default::default()
+            };
+            let super::super::State::Merge(merge) = &mut op.state else {
+                unreachable!()
+            };
+            assert!(
+                merge.inputs[0]
+                    .ensure(&ctx, &mut op.children[0], &options, copy_rows)
+                    .unwrap()
+            );
+            assert!(
+                merge.inputs[1]
+                    .ensure(&ctx, &mut op.children[1], &options, copy_rows)
+                    .unwrap()
+            );
+
+            // Measure pre-copy work (bounds + expand + decide_pairs) on the same prebuilt inputs.
+            let before_pre = crate::sparql::ctx::CHECKS.with(|c| c.get());
+            let (lt, rt) = (merge.inputs[0].table(), merge.inputs[1].table());
+            let first = kernel::bounds(&ctx, &lt.cols[0], &rt.cols[0]).unwrap();
+            let mut tl = Vec::with_capacity(copy_rows);
+            let mut tr = Vec::with_capacity(copy_rows);
+            let done = kernel::expand(
+                &ctx,
+                &lt.cols[0],
+                &rt.cols[0],
+                &first,
+                0,
+                true,
+                copy_rows,
+                |_, _| true,
+                &mut tl,
+                &mut tr,
+            )
+            .unwrap();
+            assert_eq!(done, copy_rows);
+            decide_pairs(
+                &ctx,
+                &condition,
+                &vars,
+                &merge.columns,
+                (lt, rt, 0, 0),
+                &mut tl,
+                &mut tr,
+            )
+            .unwrap();
+            let pre_checks = crate::sparql::ctx::CHECKS.with(|c| c.get()) - before_pre;
+
+            let staged = [0, 2, 3, VarId::MAX];
+            let mut out = Buffer::new(&ctx, &staged, copy_rows).unwrap();
+            let before_interior = crate::sparql::ctx::CHECKS.with(|c| c.get());
+            let step = merge.interior(&ctx, &mut out, copy_rows, true, true).unwrap();
+            let interior_checks = crate::sparql::ctx::CHECKS.with(|c| c.get()) - before_interior;
+            assert!(matches!(step, Step::Advanced));
+            assert_eq!(out.table.len, copy_rows);
+            assert!(out.table.cols[3].iter().all(|id| id.is_undef()));
+            assert!(
+                interior_checks >= pre_checks + (copy_rows / 1024),
+                "decided output copy made {} extra checks, expected at least {}",
+                interior_checks.saturating_sub(pre_checks),
+                copy_rows / 1024
+            );
+            for i in 0..copy_rows {
+                assert_eq!(out.table.cols[0][i], Id::from_i64(i as i64).unwrap());
+                assert_eq!(out.table.cols[1][i], Id::from_i64(0).unwrap());
+                assert_eq!(out.table.cols[2][i], Id::from_i64(10).unwrap());
+            }
+        });
+    }
+
+    /// Wide width-31 variant of the crossing-run fixture with all 31 variables
+    /// registered and a 512-row crossing run, checked across fixed budgets, constant
+    /// and changing cap schedules, and held or released consumer batches.
+    #[test]
+    fn pair_conditions_wide_crossing_runs_stay_within_budget() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let make_ctx = |limit: u64, pairs: bool| {
+            let mut ctx = Ctx::new(Arc::clone(&snap));
+            ctx.opt.merge_pair_conditions = pairs;
+            for i in 0..31 {
+                ctx.var(&format!("v{i}"));
+            }
+            ctx.mem_limit = limit;
+            ctx.extension_failure = Some(Default::default());
+            ctx.enable_cursor_accounting().unwrap();
+            let ctx = Arc::new(ctx);
+            ctx.attach_owner();
+            assert_eq!(ctx.nvars(), 31);
+            ctx
+        };
+
+        let left_vars: Vec<VarId> = (0..16).collect();
+        let right_vars: Vec<VarId> = [0].into_iter().chain(16..31).collect();
+        let wide_left = |key: i64, v1: i64, tag: i64| -> Vec<i64> {
+            let mut row = Vec::with_capacity(16);
+            row.push(key);
+            row.push(v1);
+            for col in 2..16 {
+                row.push(tag * 16 + col as i64);
+            }
+            row
+        };
+        let wide_right = |key: i64, tag: i64| -> Vec<i64> {
+            let mut row = Vec::with_capacity(16);
+            row.push(key);
+            for col in 1..16 {
+                row.push(10_000 + tag * 16 + col as i64);
+            }
+            row
+        };
+
+        // 256 prefix left rows, key 300 crossing right batch 0->1 as 1 + 253,
+        // key 400 crossing three batches on both sides with 512 rows each, and key 401.
+        let mut left_rows = Vec::with_capacity(770);
+        for k in 0..256i64 {
+            left_rows.push(wide_left(k, 1, k));
+        }
+        left_rows.push(wide_left(300, 1, 300));
+        for i in 0..512i64 {
+            // Two rows pass `?v1 > 0` and 510 rows fail, exercising both passing pairs
+            // and unmatched extensions across the 512x512 crossing run.
+            let v1 = i64::from(i < 2);
+            left_rows.push(wide_left(400, v1, 400 + i));
+        }
+        left_rows.push(wide_left(401, 1, 999));
+
+        let mut right_rows = Vec::with_capacity(1024);
+        for k in 0..253i64 {
+            right_rows.push(wide_right(k, k));
+        }
+        right_rows.push(wide_right(256, 256));
+        right_rows.push(wide_right(257, 257));
+        for j in 0..254i64 {
+            right_rows.push(wide_right(300, 300 + j));
+        }
+        right_rows.push(wide_right(301, 601));
+        right_rows.push(wide_right(302, 602));
+        for j in 0..512i64 {
+            right_rows.push(wide_right(400, 1000 + j));
+        }
+        right_rows.push(wide_right(401, 2000));
+
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(1)),
+            Box::new(Expr::Const(Id::from_i64(0).unwrap())),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        let mut node = join(
+            values(left_vars, &left_rows),
+            values(right_vars, &right_rows),
+        );
+        node.kind = Kind::LeftJoin {
+            expr: Some(condition),
+        };
+        assert_eq!(node.vars.len(), 31);
+
+        let expected = rows(
+            &exec::execute_materialized(&make_ctx(u64::MAX, false), &node)
+                .unwrap()
+                .0
+                .table,
+        );
+        assert_eq!(expected.len(), 253 + 3 + 254 + 2 * 512 + 510 + 1);
+
+        let schedules: [&[usize]; 2] = [&[256], &[256, 256, 2, 2]];
+        for pairs in [false, true] {
+            for limit in [512 << 10, 1 << 20, u64::MAX] {
+                for caps in schedules {
+                    for hold in [false, true] {
+                        let ctx = make_ctx(limit, pairs);
+                        let mut op = Operator::build(
+                            &ctx,
+                            node.clone(),
+                            FallbackPolicy::RejectMaterialization,
+                        )
+                        .unwrap();
+                        assert!(matches!(op.state, super::super::State::Merge(_)));
+                        let (mut out, mut previous) = (Vec::new(), None);
+                        for pull in 0.. {
+                            let cap = caps[pull % caps.len()];
+                            let options = CursorOptions {
+                                batch_rows: cap,
+                                ..Default::default()
+                            };
+                            let Some(batch) = op.next(&ctx, &options, cap).unwrap() else {
+                                break;
+                            };
+                            assert!(batch.table.len <= cap && batch.table.len > 0);
+                            assert_eq!(batch.table.width(), 31);
+                            assert!(batch.charge.bytes() >= capacity_bytes(&batch.table));
+                            let table = &batch.table;
+                            out.extend(
+                                (0..table.len).map(|i| table.cols.iter().map(|c| c[i]).collect()),
+                            );
+                            if hold {
+                                previous = Some(batch);
+                            }
+                        }
+                        drop(previous);
+                        let case = format!("pairs {pairs} limit {limit} caps {caps:?} hold {hold}");
+                        assert!(
+                            ctx.mem_peak() <= limit,
+                            "{case}: peak {} > {limit}",
+                            ctx.mem_peak()
+                        );
+                        let keys: Vec<Id> = out.iter().map(|row: &Vec<Id>| row[0]).collect();
+                        assert!(keys.is_sorted(), "{case}");
+                        out.sort();
+                        assert_eq!(out, expected, "{case}");
+                    }
+                }
+            }
+        }
     }
 
     #[cfg(debug_assertions)]
