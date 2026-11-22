@@ -1845,6 +1845,12 @@ Unit tests in `cursor/merge.rs` compare the conditional merge with eager executi
 batch caps from one row up, with left rows whose failing pairs span batches, unmatched
 rows and a second shared variable, and hold its peak within the budget at small batch
 caps over long runs of failing pairs.
+They check that a deciding batch ends before it collects a second crossing run beside
+staged pairs and flushes its results when the deciding scratch has no room. The stop
+checks cover cancellation and deadlines on unmatched rows and periodic polling in the
+pair scan, column gathering, pair compaction and output copy. A 31-column fixture checks
+fixed memory budgets with constant and changing batch caps while the consumer holds
+or releases earlier output.
 `tests/exists_auto.rs` checks that automatic execution keeps the EXISTS conditions
 eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
 per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the

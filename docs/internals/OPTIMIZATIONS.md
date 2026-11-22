@@ -429,10 +429,11 @@ implementation and always apply. EXPLAIN shows which ones ran.
   holds them beside the table that the condition reads, which takes more scratch memory
   for a row than the second path, so a batch that the memory budget cannot hold together
   with that scratch is built on the second path. Once a deciding batch holds staged pairs
-  or an open passed row, it ends before collecting another general run, and it flushes
-  decided rows before streaming a spooled run or an oversized held run so held or spooled
-  runs do not overlap with settling staged pairs. It also flushes its existing rows when
-  remaining memory leaves no room for deciding scratch. The two paths end their batches at
+  or an open passed row, it ends before collecting another general run. It flushes decided
+  rows before streaming a newly collected spooled or oversized held run. A run that
+  produced staged pairs in the current batch can stay live during settlement and resume
+  in the next batch. The merge also flushes existing rows when remaining memory leaves
+  no room for deciding scratch. The two paths end their batches at
   different left rows, so a run of equal keys can be held beside a fuller batch with the
   switch on. The merge's own buffers can therefore need more of a tight memory budget
   with the switch on, by at most one output batch and the scratch for testing its

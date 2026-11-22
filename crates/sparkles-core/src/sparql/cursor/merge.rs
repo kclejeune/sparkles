@@ -1618,8 +1618,7 @@ impl Merge {
                 }
                 if decide && staged && out.table.len > 0 {
                     // End a deciding batch before collecting another general run when it
-                    // already holds staged pairs or an open passed row, so held or
-                    // spooled runs cannot coexist with [`Merge::settle`]'s scratch.
+                    // already holds staged pairs or an open passed row.
                     break;
                 }
                 let left =
@@ -1636,9 +1635,8 @@ impl Merge {
                     let spooled = SpooledPair::new(ctx, left, right, &self.inputs, self.widths)?;
                     self.spooled = Some(Box::new(spooled));
                     if decide && out.table.len > 0 {
-                        // Flush already-decided rows (which settle without scratch)
-                        // before streaming the spooled run, so `self.spooled` cannot
-                        // coexist with [`Merge::settle`]'s scratch.
+                        // Flush already-decided rows without settlement scratch before
+                        // streaming the newly spooled run.
                         break;
                     }
                     continue;
@@ -2307,9 +2305,9 @@ mod tests {
     /// pairs before it copies output rows (`merge_pair_conditions`). The rows it decides
     /// there share batches with the rows of held and spooled runs, which the test after
     /// the merge decides, and the bag is the eager one at every batch size with the
-    /// switch on and off. With the switch on, a batch ends only when the pairs of the
-    /// next left row, or the rows of the next held runs, do not fit it, so no batch but
-    /// the last is short.
+    /// switch on and off. Short batches can end at a general run boundary, when the
+    /// next left row's pairs exceed the available slots, or when deciding scratch
+    /// exhausts the available room.
     #[test]
     fn pair_conditions_match_the_staged_test_beside_held_and_spooled_runs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2426,6 +2424,87 @@ mod tests {
             }
         }
         assert!(spooled > 0, "{spooled} runs spooled");
+        assert_eq!(spill.reserved_bytes(), 0);
+    }
+
+    #[test]
+    fn pair_conditions_flush_decided_rows_before_streaming_a_new_spool() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 34,
+            query_bytes: 1 << 34,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let condition = Expr::Cmp(
+            Box::new(Expr::Var(2)),
+            Box::new(Expr::Var(1)),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        let right: Vec<_> = [vec![0, 1]]
+            .into_iter()
+            .chain((1..=4096).map(|value| vec![15, value]))
+            .chain([vec![16, 1]])
+            .collect();
+        let mut node = join(
+            values(vec![0, 1], &[vec![0, 0], vec![15, 0], vec![16, 0]]),
+            values(vec![0, 2], &right),
+        );
+        node.kind = Kind::LeftJoin {
+            expr: Some(condition.clone()),
+        };
+        let expected = rows(
+            &exec::execute_materialized(&context(u64::MAX), &node)
+                .unwrap()
+                .0
+                .table,
+        );
+        let ctx = context_with_spill(128 << 10, Some(&spill));
+        let mut op =
+            Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization).unwrap();
+        let super::super::State::Merge(merge) = &mut op.state else {
+            unreachable!()
+        };
+        let cap = 8;
+        let options = CursorOptions {
+            batch_rows: cap,
+            ..Default::default()
+        };
+        let staged = [0, 1, 2, VarId::MAX];
+        let mut first = merge
+            .merged(
+                &ctx,
+                &mut op.children,
+                &options,
+                &staged,
+                cap,
+                Some(&condition),
+            )
+            .unwrap()
+            .expect("decided prefix");
+        assert!(merge.spooled.is_some(), "the crossing run should spool");
+        assert_eq!(first.table.cols[0], [Id::from_i64(0).unwrap()]);
+        assert_eq!(first.table.cols[3], [Id::UNDEF]);
+        merge.test(&ctx, &mut first, &condition).unwrap();
+
+        let mut result = rows(&first.table);
+        let next = merge
+            .next(&ctx, &mut op.children, &options, &node.vars, cap)
+            .unwrap()
+            .expect("first spooled pairs while the decided prefix is held");
+        result.extend(rows(&next.table));
+        drop(next);
+        drop(first);
+        while let Some(batch) = merge
+            .next(&ctx, &mut op.children, &options, &node.vars, cap)
+            .unwrap()
+        {
+            result.extend(rows(&batch.table));
+        }
+        result.sort();
+        assert_eq!(result, expected);
         assert_eq!(spill.reserved_bytes(), 0);
     }
 
@@ -4043,9 +4122,13 @@ mod tests {
                 )
                 .unwrap();
                 let decide_checks = crate::sparql::ctx::CHECKS.with(|c| c.get()) - before_decide;
+                let chunks = total.div_ceil(1024);
+                // Count and compact the pairs once each, gather every matched column,
+                // and check at entry, after condition evaluation, and at exit.
+                let expected_checks = eval_checks + chunks * (2 + columns.len()) + 3;
                 assert!(
-                    decide_checks >= eval_checks + (total / 1024),
-                    "{mode}: decide_pairs made {decide_checks} checks vs {eval_checks} in condition_mask"
+                    decide_checks >= expected_checks,
+                    "{mode}: decide_pairs made {decide_checks} checks, expected at least {expected_checks}"
                 );
 
                 // Verify exact compacted pairs and unmatched extensions.
@@ -4157,11 +4240,11 @@ mod tests {
             assert!(matches!(step, Step::Advanced));
             assert_eq!(out.table.len, copy_rows);
             assert!(out.table.cols[3].iter().all(|id| id.is_undef()));
+            let copy_checks = copy_rows.div_ceil(1024) * staged.len() + 2;
             assert!(
-                interior_checks >= pre_checks + (copy_rows / 1024),
-                "decided output copy made {} extra checks, expected at least {}",
+                interior_checks >= pre_checks + copy_checks,
+                "decided output copy made {} extra checks, expected at least {copy_checks}",
                 interior_checks.saturating_sub(pre_checks),
-                copy_rows / 1024
             );
             for i in 0..copy_rows {
                 assert_eq!(out.table.cols[0][i], Id::from_i64(i as i64).unwrap());
