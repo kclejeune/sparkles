@@ -1690,8 +1690,10 @@ fn dt_index_absent_ranges_prices_default_without_allocating() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    // Compile-time default table estimate matches a freshly constructed `Ranges::new()`.
-    assert_eq!(Ranges::default_bytes(), Ranges::new().bytes());
+    // Compile-time default table estimate matches a freshly constructed `Ranges::new()`,
+    // and evaluating it in a `const` item prevents any lazy/allocating runtime fallback.
+    const DEFAULT_BYTES: usize = Ranges::default_bytes();
+    assert_eq!(DEFAULT_BYTES, Ranges::new().bytes());
 
     // Unqualified `DataMinCardinality(2 :d)` activates a checker component without
     // converting any data range, so `it.dt.ranges()` stays `None` when `dt_index` runs.
@@ -1720,12 +1722,12 @@ fn dt_index_absent_ranges_prices_default_without_allocating() {
     assert!(uncap.index.as_ref().unwrap().dt.is_some());
     // Exactly one `Ranges::new()` for the retained `DtIx`, never an extra pre-admission table.
     assert_eq!(Ranges::new_calls(), 1);
-    assert!(full.stats.peak_memory >= Ranges::default_bytes());
+    assert!(full.stats.peak_memory >= DEFAULT_BYTES);
 
     // Under a cap large enough for pre-pass/normalization (~2-3 KiB) but strictly below
-    // `Ranges::default_bytes()` (~10 KiB), `dt_index` must refuse inside `g.grow(total_est)`
+    // `DEFAULT_BYTES` (~10 KiB), `dt_index` must refuse inside `g.grow(total_est)`
     // before `Ranges::new()` is ever called.
-    let cap = Ranges::default_bytes().saturating_sub(1);
+    let cap = DEFAULT_BYTES.saturating_sub(1);
     let granted = Arc::new(AtomicUsize::new(0));
     let g = granted.clone();
     let limits = Limits {
