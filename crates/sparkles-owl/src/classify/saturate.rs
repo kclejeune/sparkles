@@ -27,7 +27,8 @@ use super::dl_rules;
 use super::horn::HornIx;
 use super::horn_rules;
 use super::index::{BOTTOM, Ex, Index, NO_ROLE, Node, Role, TOP};
-use parking_lot::{Condvar, Mutex, RwLock};
+use super::unwinds;
+use parking_lot::{Condvar, Mutex, MutexGuard, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 use std::collections::hash_map::Entry;
@@ -672,6 +673,19 @@ pub enum Stop {
     },
 }
 
+/// Estimates the live overlap at a saturation check or after the workers have joined.
+pub(super) fn live_memory(
+    held: usize,
+    waiting: usize,
+    dynamic: Option<&Dynamic>,
+    dl: Option<&super::dl_rules::DlRun>,
+) -> Option<usize> {
+    let queue = waiting.checked_mul(std::mem::size_of::<Concl>())?;
+    held.checked_add(dynamic.map_or(0, Dynamic::bytes))?
+        .checked_add(dl.map_or(0, |d| d.bytes()))?
+        .checked_add(queue)
+}
+
 /// What bounds a saturation.
 pub struct Bounds<'a> {
     pub threads: usize,
@@ -683,9 +697,12 @@ pub struct Bounds<'a> {
     pub charge: Option<&'a (dyn Fn(usize) -> bool + Sync)>,
     /// the bytes held before the saturation starts
     pub base_memory: usize,
-    /// the peak the run reached before the saturation, which the pool has been charged
-    /// for, so that only growth past it is charged
+    /// the waiting messages already present when a pooled round starts
+    pub base_queued: usize,
+    /// the peak observed before this saturation
     pub peak_memory: usize,
+    /// memory covered by successful pool charges before this saturation
+    pub paid_memory: usize,
     /// the contexts of conjunctions that the Horn rules create, in a run with them
     pub dynamic: Option<&'a Dynamic>,
     /// what the contexts of Tier D share, in a run with it
@@ -810,8 +827,10 @@ struct Run<'a> {
     memory: AtomicUsize,
     /// the messages waiting in to-do lists, which count as memory while they wait
     queued: AtomicIsize,
-    /// the most memory counted so far, which the pool's grant covers
+    /// the most memory counted so far
     peak: AtomicUsize,
+    /// the pool's coverage and the lock ordering pooled observations and charges
+    paid: Mutex<usize>,
     applied: AtomicUsize,
     /// whether a context derived an individual other than its root
     merged: AtomicBool,
@@ -875,13 +894,6 @@ const STEP_ACTIVATE: u8 = 0;
 const STEP_DELIVER: u8 = 1;
 const STEP_DONE: u8 = 2;
 
-/// Whether the thread began to unwind since `before` was read from
-/// [`std::thread::panicking`], which is true from the start for a saturation that a
-/// destructor runs while its thread unwinds.
-fn unwinds(before: bool) -> bool {
-    !before && std::thread::panicking()
-}
-
 /// Stops the run when its thread unwinds, so that the other workers of the saturation
 /// end and the panic reaches the caller. A worker that panicked was otherwise waited for
 /// without end.
@@ -898,6 +910,38 @@ impl Drop for HaltOnPanic<'_, '_> {
         if unwinds(self.1) {
             self.0.halt(STOP_CANCEL);
         }
+    }
+}
+
+/// Publishes a charge panic before another worker can enter paid admission. The
+/// queue lock pairs with the idle workers' wait and must follow the paid unlock.
+struct PaidAdmission<'r, 'a> {
+    run: &'r Run<'a>,
+    paid: Option<MutexGuard<'r, usize>>,
+    already_panicking: bool,
+}
+
+impl Drop for PaidAdmission<'_, '_> {
+    fn drop(&mut self) {
+        if unwinds(self.already_panicking) {
+            self.run.publish_stop(STOP_CANCEL);
+            drop(self.paid.take());
+            #[cfg(test)]
+            super::admission_test::hit(super::admission_test::Point::BeforePanicWake);
+            self.run.notify_stopped();
+        }
+    }
+}
+
+/// Owns the speculative debit until the full reservation has been granted.
+struct ReservationDebit<'r, 'a> {
+    run: &'r Run<'a>,
+    bytes: usize,
+}
+
+impl Drop for ReservationDebit<'_, '_> {
+    fn drop(&mut self) {
+        self.run.credit(self.bytes);
     }
 }
 
@@ -978,6 +1022,8 @@ pub struct Totals {
     pub memory: usize,
     /// the most memory counted, waiting messages included
     pub peak: usize,
+    /// the part covered by successful pool charges
+    pub paid: usize,
     /// whether a context derived an individual other than its root
     pub merged: bool,
 }
@@ -1022,8 +1068,9 @@ pub fn saturate_counted(
         idle: AtomicUsize::new(0),
         stop: AtomicU8::new(STOP_NONE),
         memory: AtomicUsize::new(bounds.base_memory),
-        queued: AtomicIsize::new(0),
+        queued: AtomicIsize::new(bounds.base_queued as isize),
         peak: AtomicUsize::new(bounds.base_memory.max(bounds.peak_memory)),
+        paid: Mutex::new(bounds.paid_memory),
         applied: AtomicUsize::new(0),
         merged: AtomicBool::new(false),
         batch: AtomicBool::new(bounds.threads > 1),
@@ -1040,28 +1087,42 @@ pub fn saturate_counted(
         #[cfg(test)]
         always_congested: ALWAYS_CONGESTED.get(),
     };
+    // An empty pooled round still holds its inherited tables and queued messages.
+    if bounds.charge.is_none()
+        || run
+            .record_memory(bounds.base_memory, bounds.base_queued as isize)
+            .is_some_and(|used| run.within_memory(used))
     {
-        let mut q = run.queue.lock();
-        for &e in seeds {
-            if run.mark(run.get(e)) {
-                q.push(e);
+        {
+            let mut q = run.queue.lock();
+            for &e in seeds {
+                if run.mark(run.get(e)) {
+                    q.push(e);
+                }
             }
+            run.pending.fetch_add(q.len(), Ordering::SeqCst);
         }
-        run.pending.fetch_add(q.len(), Ordering::SeqCst);
-    }
-    let threads = bounds.threads.max(1);
-    if run.horn && run.plain {
-        run.workers::<Horn>(threads);
-    } else if run.horn {
-        run.workers::<HornFull>(threads);
-    } else if run.steps {
-        run.steps::<Disj>(threads);
-    } else if run.disj {
-        run.workers::<Disj>(threads);
-    } else if run.plain {
-        run.workers::<Plain>(threads);
-    } else {
-        run.workers::<Full>(threads);
+        let threads = bounds.threads.max(1);
+        if run.horn && run.plain {
+            run.workers::<Horn>(threads);
+        } else if run.horn {
+            run.workers::<HornFull>(threads);
+        } else if run.steps {
+            run.steps::<Disj>(threads);
+        } else if run.disj {
+            #[cfg(test)]
+            if super::admission_test::individual_rules() {
+                run.workers::<DisjWithIndividuals>(threads);
+            } else {
+                run.workers::<Disj>(threads);
+            }
+            #[cfg(not(test))]
+            run.workers::<Disj>(threads);
+        } else if run.plain {
+            run.workers::<Plain>(threads);
+        } else {
+            run.workers::<Full>(threads);
+        }
     }
     let memory = run.memory.load(Ordering::Relaxed);
     let peak = run.peak.load(Ordering::Relaxed).max(memory);
@@ -1069,6 +1130,7 @@ pub fn saturate_counted(
         conclusions: run.applied.load(Ordering::Relaxed),
         memory,
         peak,
+        paid: run.paid.into_inner(),
         merged: run.merged.load(Ordering::Relaxed),
     };
     let stop = match run.stop.load(Ordering::SeqCst) {
@@ -1385,17 +1447,21 @@ impl Sink for Out<'_, '_> {
             self.data_overflow();
             return false;
         }
-        // An inference of a run in steps that reserves as it goes ends as one that does
-        // not: once the activation alone has derived more than the run's bound
-        // ([`Sink::go_on`]). Any debit added before a refusal is rolled back here directly
-        // on `run.memory` (leaving `self.kept` intact), so callers release only granted
-        // reservations.
-        let (debited, ok) = self.run.check_debit(0, bytes, 0);
-        let granted = ok && !(self.run.steps && self.dl().past(self.work));
-        if !granted && debited {
-            self.run.credit(bytes);
+        let waiting = self.run.queued.load(Ordering::Relaxed);
+        let Some(held) = self.run.debit_or_stop(bytes) else {
+            return false;
+        };
+        let mut debit = ReservationDebit {
+            run: self.run,
+            bytes,
+        };
+        // The step-local work check is part of the reservation. Keep the debit
+        // guarded until both checks pass, including if a caller's poll unwinds.
+        if !self.run.check_held(held, waiting) || self.run.steps && self.dl().past(self.work) {
+            return false;
         }
-        granted
+        debit.bytes = 0;
+        true
     }
     fn data_overflow(&mut self) {
         self.run.peak.fetch_max(usize::MAX, Ordering::Relaxed);
@@ -2011,16 +2077,28 @@ impl<'a> Run<'a> {
     }
 
     fn halt(&self, why: u8) {
-        if super::dl_rules::tracing() {
+        self.publish_stop(why);
+        self.wake_stopped(why);
+    }
+
+    fn publish_stop(&self, why: u8) {
+        let _ = self
+            .stop
+            .compare_exchange(STOP_NONE, why, Ordering::SeqCst, Ordering::SeqCst);
+    }
+
+    fn wake_stopped(&self, why: u8) {
+        if !std::thread::panicking() && super::dl_rules::tracing() {
             eprintln!(
                 "TR HALT why={why} peak={} memory={}",
                 self.peak.load(Ordering::Relaxed),
                 self.memory.load(Ordering::Relaxed)
             );
         }
-        let _ = self
-            .stop
-            .compare_exchange(STOP_NONE, why, Ordering::SeqCst, Ordering::SeqCst);
+        self.notify_stopped();
+    }
+
+    fn notify_stopped(&self) {
         let _q = self.queue.lock();
         self.ready.notify_all();
     }
@@ -2156,6 +2234,8 @@ impl<'a> Run<'a> {
                         return;
                     }
                     self.idle.fetch_add(1, Ordering::SeqCst);
+                    #[cfg(test)]
+                    super::admission_test::hit(super::admission_test::Point::Idle);
                     self.ready.wait(&mut q);
                     self.idle.fetch_sub(1, Ordering::SeqCst);
                 }
@@ -2177,6 +2257,14 @@ impl<'a> Run<'a> {
                 &mut outbox,
                 &mut marks,
             );
+            #[cfg(test)]
+            if self.bounds.partial
+                && !self.stopped()
+                && let Some(probe) =
+                    super::admission_test::probe(self.merged.load(Ordering::Relaxed))
+            {
+                self.probe_pending(next, probe.messages, &mut mine);
+            }
             // a Horn or disjunctive activation can take tens of microseconds, so the
             // first worker looks at the clock after each
             if let Some(start) = others
@@ -2189,6 +2277,46 @@ impl<'a> Run<'a> {
                 self.deliver(&mut outbox, &mut mine);
             }
             self.share(&mut mine);
+        }
+    }
+
+    #[cfg(test)]
+    fn probe_pending(&self, from: Ex, messages: usize, mine: &mut VecDeque<Ex>) {
+        use super::admission_test::{Attempt, observe};
+        let to = self
+            .roots
+            .iter()
+            .copied()
+            .find(|&to| {
+                matches!(self.ix.head(to).node, Node::Class(_))
+                    && !self.get(to).started.load(Ordering::Acquire)
+            })
+            .expect("an unprocessed named root");
+        let mut out = Out {
+            run: self,
+            me: from,
+            local: &mut Vec::new(),
+            woke: mine,
+            outbox: &mut Outbox::default(),
+            marks: &mut Marks::default(),
+            pending: false,
+            sent: 0,
+            work: 0,
+            kept: 0,
+        };
+        for _ in 0..messages {
+            out.send(to, Concl::Sub(to));
+        }
+        self.deliver(out.outbox, out.woke);
+        let queued = out.sent as isize;
+        drop(out);
+
+        let paid = *self.paid.lock();
+        let probe = paid + 1;
+        observe(Attempt::Probe { paid });
+        let (debited, ok) = self.check_debit(0, probe, queued);
+        if debited && !ok {
+            self.credit(probe);
         }
     }
 
@@ -2428,7 +2556,10 @@ impl<'a> Run<'a> {
     /// the addition would overflow `usize`.
     fn try_debit(&self, bytes: usize) -> Option<usize> {
         #[cfg(test)]
-        before_debit();
+        {
+            before_debit();
+            super::admission_test::hit(super::admission_test::Point::BeforeDebit);
+        }
         if bytes == 0 {
             return Some(self.memory.load(Ordering::Relaxed));
         }
@@ -2466,55 +2597,117 @@ impl<'a> Run<'a> {
                 .fetch_add(queued, Ordering::Relaxed)
                 .saturating_add(queued)
         };
-        let Some(held) = self.try_debit(bytes) else {
-            self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
-            self.halt(STOP_MEMORY);
+        let Some(held) = self.debit_or_stop(bytes) else {
             return (false, false);
         };
-        let dynamic = self
-            .dynamic
-            .map_or(0, |d| d.bytes())
-            .checked_add(self.bounds.dl.map_or(0, |d| d.bytes()));
-        let queue_bytes = (waiting.max(0) as usize).checked_mul(std::mem::size_of::<Concl>());
-        let Some(used) = dynamic
-            .and_then(|d| held.checked_add(d))
-            .and_then(|t| queue_bytes.and_then(|q| t.checked_add(q)))
-        else {
+        (true, self.check_held(held, waiting))
+    }
+
+    fn debit_or_stop(&self, bytes: usize) -> Option<usize> {
+        let held = self.try_debit(bytes);
+        if held.is_none() {
             self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
             self.halt(STOP_MEMORY);
-            return (true, false);
+        }
+        held
+    }
+
+    fn check_held(&self, held: usize, waiting: isize) -> bool {
+        let Some(used) = self.record_memory(held, waiting) else {
+            return false;
         };
-        let before = self.peak.fetch_max(used, Ordering::Relaxed);
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::Observed);
         if self.stopped() {
-            return (true, false);
+            return false;
         }
         if !self.batch.load(Ordering::Relaxed) {
             self.batch_if_congested();
         }
-        let b = self.bounds;
-        let grown = used.saturating_sub(before);
-        if b.max_memory.is_some_and(|m| used > m)
-            || b.charge.is_some_and(|f| grown > 0 && !f(grown))
-        {
-            self.halt(STOP_MEMORY);
-            return (true, false);
+        if !self.within_memory(used) {
+            return false;
         }
+        let b = self.bounds;
         // the work bound is its own reason, so that the first stop published decides
         // whether the run falls back or answers in part; a run in steps compares it
         // between steps only
         if !self.steps && b.dl.is_some_and(|d| d.over_work()) {
             self.halt(STOP_WORK);
-            return (true, false);
+            return false;
         }
         if b.deadline.is_some_and(|d| Instant::now() >= d) {
             self.halt(STOP_TIMEOUT);
-            return (true, false);
+            return false;
         }
         if b.cancelled.is_some_and(|f| f()) {
             self.halt(STOP_CANCEL);
-            return (true, false);
+            return false;
         }
-        (true, true)
+        true
+    }
+
+    fn estimate_memory(&self, held: usize, waiting: isize) -> Option<usize> {
+        live_memory(held, waiting.max(0) as usize, self.dynamic, self.bounds.dl)
+    }
+
+    fn record_memory(&self, held: usize, waiting: isize) -> Option<usize> {
+        let Some(used) = self.estimate_memory(held, waiting) else {
+            self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
+            self.halt(STOP_MEMORY);
+            return None;
+        };
+        self.peak.fetch_max(used, Ordering::Relaxed);
+        Some(used)
+    }
+
+    fn within_memory(&self, attempted: usize) -> bool {
+        let max = self.bounds.max_memory;
+        let Some(charge) = self.bounds.charge else {
+            if max.is_some_and(|m| attempted > m) {
+                self.halt(STOP_MEMORY);
+                return false;
+            }
+            return true;
+        };
+        self.admit_pooled(attempted, max, charge)
+    }
+
+    #[inline(never)]
+    fn admit_pooled(
+        &self,
+        attempted: usize,
+        max: Option<usize>,
+        charge: &(dyn Fn(usize) -> bool + Sync),
+    ) -> bool {
+        // Every pooled decision orders its fresh reads after earlier admissions across
+        // both ledgers. A later publisher still has to pass its own ordered check.
+        let already_panicking = std::thread::panicking();
+        let mut admission = PaidAdmission {
+            run: self,
+            paid: Some(super::lock_admission(&self.paid)),
+            already_panicking,
+        };
+        let used = self
+            .estimate_memory(
+                self.memory.load(Ordering::Relaxed),
+                self.queued.load(Ordering::Relaxed),
+            )
+            .map(|live| live.max(attempted));
+        self.peak
+            .fetch_max(used.unwrap_or(usize::MAX), Ordering::Relaxed);
+        if self.stopped() {
+            return false;
+        }
+        if used.is_some_and(|used| {
+            super::cover_memory(used, max, Some(charge), admission.paid.as_mut().unwrap())
+        }) {
+            return !self.stopped();
+        }
+        self.publish_stop(STOP_MEMORY);
+        drop(admission);
+        // The admission lock must never nest the queue lock.
+        self.wake_stopped(STOP_MEMORY);
+        false
     }
 
     /// Checks the bounds, and stops the run when one is reached. `bytes` is the growth
@@ -2848,6 +3041,18 @@ struct Disj;
 
 impl Rules for Disj {
     const FULL: bool = false;
+    const DISJ: bool = true;
+}
+
+/// Rooted Tier D does not use the ordinary nominal bookkeeping. This fixture
+/// also enables those rules to exercise real marking and conditional worlds
+/// in the same attempt as the rooted marker scan.
+#[cfg(test)]
+struct DisjWithIndividuals;
+
+#[cfg(test)]
+impl Rules for DisjWithIndividuals {
+    const FULL: bool = true;
     const DISJ: bool = true;
 }
 
@@ -3631,6 +3836,7 @@ mod horn_accounting_tests {
             memory: AtomicUsize::new(bounds.base_memory),
             queued: AtomicIsize::new(1),
             peak: AtomicUsize::new(bounds.peak_memory),
+            paid: Mutex::new(bounds.paid_memory),
             applied: AtomicUsize::new(0),
             merged: AtomicBool::new(false),
             batch: AtomicBool::new(false),
@@ -3766,7 +3972,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: 0,
+            base_queued: 0,
             peak_memory: 0,
+            paid_memory: 0,
             dynamic: None,
             dl: None,
             partial: false,
@@ -3821,7 +4029,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: 0,
+            base_queued: 0,
             peak_memory: 0,
+            paid_memory: 0,
             dynamic: None,
             dl: None,
             partial: false,
@@ -3870,7 +4080,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: base,
+            base_queued: 0,
             peak_memory: base,
+            paid_memory: base,
             dynamic: None,
             dl: None,
             partial: false,
@@ -3923,6 +4135,397 @@ mod horn_accounting_tests {
         assert_eq!(run.memory.load(Ordering::Relaxed), base);
     }
 
+    fn reserve_for_test(run: &Run<'_>, root: Ex, bytes: usize) -> bool {
+        let mut out = Out {
+            run,
+            me: root,
+            local: &mut Vec::new(),
+            woke: &mut VecDeque::new(),
+            outbox: &mut Outbox::default(),
+            marks: &mut Marks::default(),
+            pending: false,
+            sent: 0,
+            work: 0,
+            kept: 0,
+        };
+        out.kept = 13;
+        let ok = out.reserve_data(bytes);
+        assert_eq!(out.kept, 13);
+        // The driver releases granted debits only after it has inspected both results.
+        out.kept = 0;
+        ok
+    }
+
+    #[test]
+    fn data_reservation_panic_does_not_charge_pending_kept_again() {
+        use super::super::admission_test::{ChargePanic, FirstCharge, WAIT};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let gate = FirstCharge::new();
+        let charge = gate.charge(true);
+        let bounds = Bounds {
+            charge: Some(&charge),
+            base_memory: 4096,
+            peak_memory: 4096,
+            paid_memory: 4096,
+            ..bounds(false)
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        run.queued.store(0, Ordering::Relaxed);
+        let root = f.root;
+        let (requested, caught) = std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                catch_unwind(AssertUnwindSafe(|| {
+                    let _worker = HaltOnPanic::new(&run);
+                    let mut out = Out {
+                        run: &run,
+                        me: root,
+                        local: &mut Vec::new(),
+                        woke: &mut VecDeque::new(),
+                        outbox: &mut Outbox::default(),
+                        marks: &mut Marks::default(),
+                        pending: false,
+                        sent: 0,
+                        work: 0,
+                        kept: 0,
+                    };
+                    out.keep_data(13);
+                    out.reserve_data(64)
+                }))
+            });
+            let requested = gate.entered.recv_timeout(WAIT);
+            run.credit(32);
+            let _ = gate.release.send(());
+            (requested, a.join().unwrap())
+        });
+        assert_eq!(requested.unwrap(), 64);
+        let panic = caught.unwrap_err();
+        assert_eq!(panic.downcast_ref::<ChargePanic>(), Some(&ChargePanic));
+        assert_eq!(*gate.requests.lock(), [64]);
+        assert_eq!(run.stop.load(Ordering::Relaxed), STOP_CANCEL);
+        assert_eq!(run.memory.load(Ordering::Relaxed), 4077);
+        assert_eq!(*run.paid.lock(), 4096);
+        assert_eq!(run.peak.load(Ordering::Relaxed), 4160);
+    }
+
+    #[test]
+    fn data_reservation_panic_releases_debit_after_successful_payment() {
+        use super::super::admission_test::ChargePanic;
+        use std::panic::{AssertUnwindSafe, catch_unwind, panic_any};
+
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let requests = Mutex::new(Vec::new());
+        let charge = |n| {
+            requests.lock().push(n);
+            true
+        };
+        let bounds = Bounds {
+            charge: Some(&charge),
+            cancelled: Some(&|| panic_any(ChargePanic)),
+            base_memory: 4096,
+            peak_memory: 4096,
+            paid_memory: 4096,
+            ..bounds(false)
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        run.queued.store(0, Ordering::Relaxed);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            let _worker = HaltOnPanic::new(&run);
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut Vec::new(),
+                woke: &mut VecDeque::new(),
+                outbox: &mut Outbox::default(),
+                marks: &mut Marks::default(),
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            out.reserve_data(64)
+        }));
+        assert_eq!(
+            caught.unwrap_err().downcast_ref::<ChargePanic>(),
+            Some(&ChargePanic)
+        );
+        assert_eq!(*requests.lock(), [64]);
+        assert_eq!(*run.paid.lock(), 4160);
+        assert_eq!(run.memory.load(Ordering::Relaxed), 4096);
+        assert_eq!(run.stop.load(Ordering::Relaxed), STOP_CANCEL);
+    }
+
+    #[test]
+    fn pooled_charge_panic_stops_a_contender_before_waking_idle_workers() {
+        use super::super::admission_test::{ChargePanic, FirstCharge, Point, WAIT, set_hook};
+        use std::panic::{AssertUnwindSafe, catch_unwind};
+        use std::sync::mpsc;
+
+        for prior_stop in [false, true] {
+            let f = fixture();
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let first = FirstCharge::new();
+            let charge = first.charge(true);
+            let bounds = Bounds {
+                charge: Some(&charge),
+                base_memory: 4096,
+                peak_memory: 4096,
+                paid_memory: 4096,
+                ..bounds(false)
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            run.queued.store(0, Ordering::Relaxed);
+            run.pending.store(2, Ordering::Relaxed);
+            std::thread::scope(|scope| {
+                let r = &run;
+                let (waiting, idle) = mpsc::channel();
+                let (exited, left) = mpsc::channel();
+                let waiter = scope.spawn(move || {
+                    set_hook(move |point| {
+                        if point == Point::Idle {
+                            let _ = waiting.send(());
+                        }
+                    });
+                    r.worker::<Plain>(None);
+                    let _ = exited.send(r.stop.load(Ordering::Relaxed));
+                });
+                let idle = idle.recv_timeout(WAIT);
+                // Taking the mutex after Idle confirms the worker released it in wait.
+                // Keep it held until another worker has passed through paid admission.
+                let queue = run.queue.lock();
+                let (unlocked, unlocked_at) = mpsc::channel();
+                let (wake, may_wake) = mpsc::channel();
+                let a = scope.spawn(move || {
+                    set_hook(move |point| {
+                        if point == Point::BeforePanicWake {
+                            let _ = unlocked.send(());
+                            let _ = may_wake.recv_timeout(WAIT);
+                        }
+                    });
+                    // Catch inside the outer guard so only paid admission can wake
+                    // the idle worker when the charge unwinds.
+                    let _worker = HaltOnPanic::new(r);
+                    catch_unwind(AssertUnwindSafe(|| r.check(0, 64, 0)))
+                });
+                let requested = first.entered.recv_timeout(WAIT);
+                let (blocked, contended) = mpsc::channel();
+                let (finished, passed) = mpsc::channel();
+                let b = scope.spawn(move || {
+                    set_hook(move |point| {
+                        if point == Point::Contended {
+                            let _ = blocked.send(());
+                        }
+                    });
+                    let ok = r.check(0, 0, 0);
+                    let _ = finished.send((ok, r.stop.load(Ordering::Relaxed)));
+                });
+                let contended = contended.recv_timeout(WAIT);
+                if prior_stop {
+                    run.publish_stop(STOP_TIMEOUT);
+                }
+                let _ = first.release.send(());
+                let unlocked_at = unlocked_at.recv_timeout(WAIT);
+                let passed = passed.recv_timeout(WAIT);
+                drop(queue);
+                let _ = wake.send(());
+                let left = left.recv_timeout(WAIT);
+                if left.is_err() {
+                    // Release the worker even if a regression removed the wakeup.
+                    run.halt(STOP_CANCEL);
+                }
+                let caught = a.join().unwrap();
+                b.join().unwrap();
+                waiter.join().unwrap();
+
+                let stop = if prior_stop {
+                    STOP_TIMEOUT
+                } else {
+                    STOP_CANCEL
+                };
+                idle.unwrap();
+                assert_eq!(requested.unwrap(), 64);
+                contended.unwrap();
+                unlocked_at.unwrap();
+                assert_eq!(passed.unwrap(), (false, stop));
+                assert_eq!(left.unwrap(), stop);
+                assert_eq!(
+                    caught.unwrap_err().downcast_ref::<ChargePanic>(),
+                    Some(&ChargePanic)
+                );
+                assert_eq!(*first.requests.lock(), [64]);
+                assert_eq!(*run.paid.lock(), 4096);
+            });
+        }
+    }
+
+    #[test]
+    fn data_reservation_waits_for_pool_admission() {
+        data_reservation_race(false);
+    }
+
+    #[test]
+    fn data_reservation_cannot_buy_an_unpaid_suffix() {
+        data_reservation_race(true);
+    }
+
+    fn data_reservation_race(smaller_first: bool) {
+        use super::super::admission_test::Race;
+
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        for accept in [false, true] {
+            let race = Race::new(accept);
+            let charge = race.charge();
+            let bounds = Bounds {
+                charge: Some(&charge),
+                base_memory: 4096,
+                base_queued: 0,
+                peak_memory: 4096,
+                paid_memory: 4096,
+                ..bounds(false)
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            run.queued.store(0, Ordering::Relaxed);
+            race.run(
+                || reserve_for_test(&run, f.root, 64),
+                || reserve_for_test(&run, f.root, 128),
+                smaller_first,
+            );
+            assert_eq!(run.peak.load(Ordering::Relaxed), 4288);
+            assert_eq!(*run.paid.lock(), if accept { 4288 } else { 4096 });
+            assert_eq!(
+                run.stop.load(Ordering::Relaxed),
+                if accept { STOP_NONE } else { STOP_MEMORY }
+            );
+            if accept {
+                assert_eq!(run.memory.load(Ordering::Relaxed), 4288);
+                run.credit(192);
+                assert!(reserve_for_test(&run, f.root, 192));
+                run.credit(192);
+            }
+            assert_eq!(run.memory.load(Ordering::Relaxed), 4096);
+        }
+    }
+
+    #[test]
+    fn data_reservation_orders_queue_and_data_even_with_no_charge_in_flight() {
+        use super::super::admission_test::{Point, WAIT, set_hook};
+        use std::sync::mpsc;
+
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let q = std::mem::size_of::<Concl>();
+        for accept in [false, true] {
+            let requests = Mutex::new(Vec::new());
+            let charge = |n| {
+                requests.lock().push(n);
+                accept
+            };
+            let bounds = Bounds {
+                charge: Some(&charge),
+                base_memory: 4096,
+                base_queued: 0,
+                peak_memory: 4096 + q,
+                paid_memory: 4096 + q,
+                ..bounds(false)
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            run.queued.store(0, Ordering::Relaxed);
+            let (waiting, paused) = mpsc::channel();
+            let (resume, proceed) = mpsc::channel();
+            let (paused, queued, reservation) = std::thread::scope(|s| {
+                let r = &run;
+                let a = s.spawn(move || {
+                    set_hook(move |point| {
+                        if point == Point::BeforeDebit {
+                            waiting.send(()).unwrap();
+                            proceed.recv_timeout(WAIT).unwrap();
+                        }
+                    });
+                    reserve_for_test(r, f.root, q)
+                });
+                let paused = paused.recv_timeout(WAIT);
+                let queued = run.check(0, 0, 1);
+                let _ = resume.send(());
+                (paused, queued, a.join())
+            });
+            paused.unwrap();
+            assert!(queued);
+            assert_eq!(reservation.unwrap(), accept);
+            assert_eq!(*requests.lock(), [q]);
+            assert_eq!(run.queued.load(Ordering::Relaxed), 1);
+            assert_eq!(run.peak.load(Ordering::Relaxed), 4096 + 2 * q);
+            if accept {
+                run.credit(q);
+            }
+            assert_eq!(run.memory.load(Ordering::Relaxed), 4096);
+        }
+    }
+
+    #[test]
+    fn data_reservation_keeps_successful_payment_when_cancellation_wins() {
+        use super::super::admission_test::WAIT;
+        use std::sync::mpsc;
+
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let (called, request) = mpsc::channel();
+        let (allow, blocked) = mpsc::channel();
+        let blocked = Mutex::new(blocked);
+        let charge = |n| {
+            called.send(n).unwrap();
+            blocked.lock().recv_timeout(WAIT).unwrap();
+            true
+        };
+        let bounds = Bounds {
+            charge: Some(&charge),
+            base_memory: 4096,
+            peak_memory: 4096,
+            paid_memory: 4096,
+            ..bounds(false)
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        run.queued.store(0, Ordering::Relaxed);
+        let (request, reservation) = std::thread::scope(|s| {
+            let a = s.spawn(|| reserve_for_test(&run, f.root, 64));
+            let request = request.recv_timeout(WAIT);
+            run.halt(STOP_CANCEL);
+            let _ = allow.send(());
+            (request, a.join())
+        });
+        assert_eq!(request.unwrap(), 64);
+        assert!(!reservation.unwrap());
+        assert_eq!(run.stop.load(Ordering::Relaxed), STOP_CANCEL);
+        assert_eq!(*run.paid.lock(), 4160);
+        assert_eq!(run.memory.load(Ordering::Relaxed), 4096);
+    }
+
+    #[test]
+    fn an_empty_pooled_round_admits_its_live_base_against_paid_coverage() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let charges = Mutex::new(Vec::new());
+        let charge = |n| {
+            charges.lock().push(n);
+            true
+        };
+        let bounds = Bounds {
+            charge: Some(&charge),
+            base_memory: 4160,
+            peak_memory: 4288,
+            paid_memory: 4096,
+            ..bounds(false)
+        };
+        let (totals, stop) = saturate_counted(&f.ix, &ctx, &[], &[], &[], &bounds);
+        assert_eq!(stop, None);
+        assert_eq!(*charges.lock(), [64]);
+        assert_eq!(totals.peak, 4288);
+        assert_eq!(totals.paid, 4160);
+    }
+
     #[test]
     fn data_reservation_concurrent_overflow_stops_and_preserves_accounting() {
         let f = fixture();
@@ -3935,7 +4538,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: base,
+            base_queued: 0,
             peak_memory: base,
+            paid_memory: base,
             dynamic: None,
             dl: None,
             partial: false,
@@ -4040,7 +4645,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: base,
+            base_queued: 0,
             peak_memory: base,
+            paid_memory: base,
             dynamic: None,
             dl: Some(&dl),
             partial: false,
@@ -4122,7 +4729,9 @@ mod horn_accounting_tests {
                 cancelled: None,
                 charge: None,
                 base_memory: base,
+                base_queued: 0,
                 peak_memory: 0,
+                paid_memory: 0,
                 dynamic: None,
                 dl: None,
                 partial: false,
@@ -4170,7 +4779,9 @@ mod horn_accounting_tests {
                 cancelled: None,
                 charge: None,
                 base_memory: base,
+                base_queued: 0,
                 peak_memory: 0,
+                paid_memory: 0,
                 dynamic: None,
                 dl: Some(&dl),
                 partial: false,
@@ -4208,7 +4819,9 @@ mod horn_accounting_tests {
                 cancelled: None,
                 charge: None,
                 base_memory: base,
+                base_queued: 0,
                 peak_memory: 0,
+                paid_memory: 0,
                 dynamic: None,
                 dl: None,
                 partial: false,
@@ -4241,7 +4854,9 @@ mod horn_accounting_tests {
                 cancelled: None,
                 charge: None,
                 base_memory: base,
+                base_queued: 0,
                 peak_memory: base,
+                paid_memory: base,
                 dynamic: None,
                 dl: None,
                 partial: false,
@@ -4290,7 +4905,9 @@ mod horn_accounting_tests {
                 cancelled: None,
                 charge: Some(&charge),
                 base_memory: base,
+                base_queued: 0,
                 peak_memory: base,
+                paid_memory: base,
                 dynamic: None,
                 dl: None,
                 partial: false,
@@ -4336,7 +4953,9 @@ mod horn_accounting_tests {
                 cancelled: None,
                 charge: Some(&charge),
                 base_memory: base,
+                base_queued: 0,
                 peak_memory: base,
+                paid_memory: base,
                 dynamic: None,
                 dl: None,
                 partial: false,
@@ -4400,7 +5019,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: 0,
+            base_queued: 0,
             peak_memory: 0,
+            paid_memory: 0,
             dynamic: None,
             dl: None,
             partial: false,
@@ -4635,7 +5256,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: 0,
+            base_queued: 0,
             peak_memory: 0,
+            paid_memory: 0,
             dynamic: None,
             dl: None,
             partial,
@@ -4780,7 +5403,9 @@ mod horn_accounting_tests {
             cancelled: None,
             charge: None,
             base_memory: base,
+            base_queued: 0,
             peak_memory: cap,
+            paid_memory: cap,
             dynamic: None,
             dl: None,
             partial: false,
@@ -4847,7 +5472,9 @@ mod horn_accounting_tests {
                         cancelled: None,
                         charge: Some(&charge),
                         base_memory: base,
+                        base_queued: 0,
                         peak_memory: initial_peak,
+                        paid_memory: initial_peak,
                         dynamic: None,
                         dl: None,
                         partial: false,
@@ -4927,7 +5554,9 @@ mod horn_accounting_tests {
                 cancelled: None,
                 charge: Some(&charge),
                 base_memory: base,
+                base_queued: 0,
                 peak_memory: base + queued_bytes,
+                paid_memory: base + queued_bytes,
                 dynamic: None,
                 dl: None,
                 partial: false,
@@ -5485,7 +6114,9 @@ mod linear_chain_tests {
             cancelled: None,
             charge: None,
             base_memory: 0,
+            base_queued: 0,
             peak_memory: 0,
+            paid_memory: 0,
             dynamic: None,
             dl: None,
             partial: false,

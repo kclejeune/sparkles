@@ -987,6 +987,12 @@ fn partial_memory_pool_and_taxonomy_refusals_preserve_tier_and_reuse() {
                 assert_eq!(out.stats.tier, Tier::Disjunctive);
                 assert!(!out.stats.dl_over_budget);
                 assert!(k.excluded().is_empty());
+                let covered = accepted.load(Ordering::SeqCst);
+                assert!(
+                    out.stats.memory <= covered,
+                    "threads {threads}: {} output bytes against {covered} paid",
+                    out.stats.memory,
+                );
                 check_partial(&out, &full, &cs);
             }
         }

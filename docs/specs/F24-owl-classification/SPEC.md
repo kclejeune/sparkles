@@ -965,7 +965,9 @@ waiting messages while they run, and the subsumers they keep once they end. The 
 of a parallel normalization count their interners and axioms with room for what their
 merge adds, the merge counts what it adds past that room, and a run whose chunks pass
 the budget or a refused grant normalizes on one thread instead. The memory pool is
-charged for the growth of the peak, once, from the normalization on.
+charged for the growth of the peak, once, from the normalization on. A refused
+estimate can raise the reported peak. Only successful grants count toward the
+coverage that later phases reuse.
 Numeric parsing and reduction poll cancellation and deadlines and admit construction
 scratch before allocation. Large canonical values share immutable limbs whose live
 storage remains counted until the last alias drops. Index copies, functional-data
