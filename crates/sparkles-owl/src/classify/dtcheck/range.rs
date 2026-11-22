@@ -1229,6 +1229,12 @@ impl Ranges {
     pub fn nf(&self, id: Rid) -> &Nf {
         &self.nfs[id as usize]
     }
+    /// Exact [`Ranges::bytes`] of a freshly constructed [`Ranges::new`], cached once so
+    /// admission can price `unwrap_or_default()` without allocating first.
+    pub(in super::super) fn default_bytes() -> usize {
+        static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *BYTES.get_or_init(|| Ranges::new().bytes())
+    }
     /// The bytes the table retains, including allocated vector and hash-table bucket
     /// capacities preserved by [`Clone`], for the run's memory budget.
     pub fn bytes(&self) -> usize {

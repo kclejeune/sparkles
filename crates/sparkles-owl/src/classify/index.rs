@@ -2818,21 +2818,54 @@ fn dt_index(
 ) -> Result<super::dt_sat::DtIx, Halt> {
     use super::dt_sat::{Body, DtIx, RoleIx};
     use super::dtcheck::range::{map_backing_bytes, map_buckets_for};
-    let n_checker_roles = it
-        .roles
+    let checker_comp = |r: Role| -> Option<u32> {
+        match it.roles.get(r as usize) {
+            Some(RoleName::Data(d)) if run.comps.checker(d) => run.comps.component(d),
+            _ => None,
+        }
+    };
+    let mut n_checker_roles = 0usize;
+    let mut exact_supers = 0usize;
+    for r in 0..it.roles.len() {
+        let role = r as Role;
+        if let Some(comp) = checker_comp(role) {
+            n_checker_roles += 1;
+            if let Some(sup) = ix.roles.sup.get(r) {
+                exact_supers = exact_supers.saturating_add(
+                    sup.iter()
+                        .filter(|&&s| s != role && checker_comp(s) == Some(comp))
+                        .count(),
+                );
+            }
+        }
+    }
+    let exact_ranges = ax
+        .dt_ranges
         .iter()
-        .filter(|name| {
-            matches!(name, RoleName::Data(d) if run.comps.checker(d) && run.comps.component(d).is_some())
-        })
+        .filter(|&&(r, _)| checker_comp(r).is_some())
         .count();
-    let supers_bytes: usize = ix.roles.sup.iter().map(|v| v.len().saturating_mul(4)).sum();
-    let roles_backing = map_buckets_for(n_checker_roles)
-        .saturating_mul(std::mem::size_of::<(Role, RoleIx)>() + 1)
-        .saturating_add(16);
+    let exact_disjoint = ax
+        .dt_disjoint
+        .iter()
+        .filter(|&&(a, b)| checker_comp(a).is_some() && checker_comp(b).is_some())
+        .count();
+    let roles_backing = if n_checker_roles == 0 {
+        0
+    } else {
+        map_buckets_for(n_checker_roles)
+            .saturating_mul(std::mem::size_of::<(Role, RoleIx)>() + 1)
+            .saturating_add(16)
+    };
+    // Pushing `k` items into `Vec::new()` reaches capacity <= 4*k (including min-4 for k=1)
+    // and peak growth <= 4*k for every k >= 0; `supers` is preallocated to exact length.
     let roles_est = roles_backing
         .saturating_add(n_checker_roles.saturating_mul(std::mem::size_of::<Role>()))
-        .saturating_add(supers_bytes.saturating_mul(2))
-        .saturating_add(ax.dt_ranges.len().saturating_mul(8));
+        .saturating_add(exact_supers.saturating_mul(std::mem::size_of::<Role>()))
+        .saturating_add(
+            exact_ranges
+                .saturating_mul(4)
+                .saturating_mul(std::mem::size_of::<super::dtcheck::range::Rid>()),
+        );
     let told_bytes: usize = b
         .dt_body
         .iter()
@@ -2840,19 +2873,15 @@ fn dt_index(
         .sum();
     let ncomps = run.comps.len();
     let body_est = ncomps
-        .saturating_mul(std::mem::size_of::<Vec<Body>>() + 4 * std::mem::size_of::<Body>() + 1)
+        .saturating_mul(std::mem::size_of::<Vec<Body>>() + 1)
         .saturating_add(
             b.dt_body
                 .len()
-                .saturating_mul(2)
+                .saturating_mul(4)
                 .saturating_mul(std::mem::size_of::<Body>()),
         )
         .saturating_add(told_bytes);
-    let disjoint_est = ax
-        .dt_disjoint
-        .len()
-        .saturating_mul(2)
-        .saturating_mul(std::mem::size_of::<(Role, Role)>());
+    let disjoint_est = exact_disjoint.saturating_mul(std::mem::size_of::<(Role, Role)>());
     let clone_est = std::mem::size_of::<DtIx>()
         .saturating_add(
             it.dt
@@ -2860,7 +2889,11 @@ fn dt_index(
                 .len()
                 .saturating_mul(std::mem::size_of::<DtKey>()),
         )
-        .saturating_add(it.dt.ranges().map_or(0, |r| r.bytes()))
+        .saturating_add(
+            it.dt
+                .ranges()
+                .map_or_else(super::dtcheck::range::Ranges::default_bytes, |r| r.bytes()),
+        )
         .saturating_add(run.comps.bytes());
     let refire_est = map_backing_bytes(&refire).saturating_add(
         refire
@@ -2902,15 +2935,21 @@ fn dt_index(
     let ids: Vec<Role> = roles.keys().copied().collect();
     for r in ids {
         let comp = roles[&r].comp;
-        let supers: Vec<Role> = ix
+        let sup_slice = ix
             .roles
             .sup
             .get(r as usize)
-            .map_or(&[][..], |v| v.as_slice())
+            .map_or(&[][..], |v| v.as_slice());
+        let nsup = sup_slice
             .iter()
-            .copied()
-            .filter(|&s| s != r && roles.get(&s).is_some_and(|x| x.comp == comp))
-            .collect();
+            .filter(|&&s| s != r && roles.get(&s).is_some_and(|x| x.comp == comp))
+            .count();
+        let mut supers = Vec::with_capacity(nsup);
+        for &s in sup_slice {
+            if s != r && roles.get(&s).is_some_and(|x| x.comp == comp) {
+                supers.push(s);
+            }
+        }
         if let Some(x) = roles.get_mut(&r) {
             x.supers = supers;
         }
@@ -2945,11 +2984,18 @@ fn dt_index(
         // depend on the order of the conclusions, so the atom has more than its told uses
         let told: Option<Box<[Ex]>> = (!other)
             .then(|| {
-                ix.told_of(ix.head(e))
+                let raw = ix.told_of(ix.head(e));
+                let ntold = raw
                     .iter()
-                    .copied()
-                    .filter(|&t| !matches!(it.nodes[t as usize], Node::DtFire(_)))
-                    .collect::<Box<[Ex]>>()
+                    .filter(|&&t| !matches!(it.nodes[t as usize], Node::DtFire(_)))
+                    .count();
+                let mut v = Vec::with_capacity(ntold);
+                for &t in raw {
+                    if !matches!(it.nodes[t as usize], Node::DtFire(_)) {
+                        v.push(t);
+                    }
+                }
+                v.into_boxed_slice()
             })
             .filter(|ts| {
                 ts.iter()
@@ -2961,12 +3007,12 @@ fn dt_index(
         );
         body[comp as usize].push(Body { e, told });
     }
-    let mut disjoint: Vec<(Role, Role)> = ax
-        .dt_disjoint
-        .iter()
-        .copied()
-        .filter(|(a, b)| roles.contains_key(a) && roles.contains_key(b))
-        .collect();
+    let mut disjoint: Vec<(Role, Role)> = Vec::with_capacity(exact_disjoint);
+    for &(a, b) in &ax.dt_disjoint {
+        if roles.contains_key(&a) && roles.contains_key(&b) {
+            disjoint.push((a, b));
+        }
+    }
     disjoint.sort_unstable();
     disjoint.dedup();
     let dt_ix = DtIx::new(
@@ -2978,8 +3024,13 @@ fn dt_index(
         run.comps.clone(),
         refire,
     );
+    let retained = dt_ix.bytes();
+    debug_assert!(
+        total_est >= retained,
+        "dt_index upfront estimate {total_est} must cover retained DtIx::bytes() {retained}"
+    );
     if let Some(g) = guard {
-        g.commit_retained(dt_ix.bytes()).map_err(|e| match e {
+        g.commit_retained(retained).map_err(|e| match e {
             super::Error::Memory { used, .. } => Halt::Memory(used),
             _ => Halt::Stopped,
         })?;

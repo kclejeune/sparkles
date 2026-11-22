@@ -123,13 +123,15 @@ impl DtIx {
     /// that read this, the base before the saturation and the retained state after it,
     /// are built from the tables alone, so nothing is counted twice.
     pub fn bytes(&self) -> usize {
-        let cache = self.cache.lock();
-        let cache_bytes = map_backing_bytes(&cache).saturating_add(
-            cache
-                .iter()
-                .map(|(k, v)| entry_payload_bytes(k, v))
-                .sum::<usize>(),
-        );
+        let cache_bytes = {
+            let cache = self.cache.lock();
+            map_backing_bytes(&cache).saturating_add(
+                cache
+                    .iter()
+                    .map(|(k, v)| entry_payload_bytes(k, v))
+                    .sum::<usize>(),
+            )
+        };
         std::mem::size_of::<DtIx>()
             .saturating_add(
                 self.keys
@@ -1376,8 +1378,9 @@ mod tests {
 
     #[test]
     fn rule_units_513_body_and_solve_types_cap_admit_without_doubling() {
-        // 1. 513 unentailed non-free body atoms in `rule::units_bounded`: refuses old
-        // length-only underestimate before allocating `left` + `classes` + `w` + `out`.
+        // 1. 513 unentailed non-free body atoms in `rule::units_bounded`: verify refusal
+        // happens specifically on the `body_est` reservation right after the base
+        // `refutes(r, base, &[], ...)` completes (not later in the first atom refutation).
         let mut r = Ranges::new();
         let base = Problem {
             props: vec![Prop {
@@ -1393,6 +1396,9 @@ mod tests {
         let old_body_est =
             513 * (std::mem::size_of::<(Atom, Group)>() + std::mem::size_of::<usize>() + 16);
         let live = std::cell::Cell::new(0isize);
+        let base_done = std::cell::Cell::new(false);
+        let body_req = std::cell::Cell::new(0usize);
+        let calls_after_body_refusal = std::cell::Cell::new(0usize);
         let cap = old_body_est + 512;
         let refused = rule::units_bounded(
             &mut r,
@@ -1402,20 +1408,38 @@ mod tests {
             &|| false,
             &|_| true,
             &|d| {
+                if body_req.get() > 0 {
+                    calls_after_body_refusal.set(calls_after_body_refusal.get() + 1);
+                }
                 let next = live.get() + d;
+                if d > 0 && base_done.get() && body_req.get() == 0 {
+                    body_req.set(d as usize);
+                }
                 if d > 0 && next as usize > cap {
                     return false;
                 }
                 live.set(next);
+                if d < 0 && next == 0 {
+                    base_done.set(true);
+                }
                 true
             },
             &|_| true,
         );
         assert_eq!(refused, Err(Why::Stopped));
         assert_eq!(live.get(), 0);
+        // Refusal must occur on `body_est` itself with zero subsequent `mem` calls.
+        assert!(
+            body_req.get() > cap,
+            "body_est {} must exceed old cap {cap} and refuse immediately",
+            body_req.get()
+        );
+        assert_eq!(calls_after_body_refusal.get(), 0);
 
-        // Under unbounded `mem`, 513 body atoms run cleanly with zero leaked `mem`.
-        let peak = std::cell::Cell::new(0usize);
+        // Unbounded 513-body run: directly assert the isolated `body_est` reservation
+        // covers simultaneous `left`, `classes`, `w`, and doubling scratch of `out`.
+        let base_done2 = std::cell::Cell::new(false);
+        let body_req2 = std::cell::Cell::new(0usize);
         let ok = rule::units_bounded(
             &mut r,
             &base,
@@ -1425,9 +1449,12 @@ mod tests {
             &|_| true,
             &|d| {
                 let next = live.get() + d;
+                if d > 0 && base_done2.get() && body_req2.get() == 0 {
+                    body_req2.set(d as usize);
+                }
                 live.set(next);
-                if next > 0 {
-                    peak.set(peak.get().max(next as usize));
+                if d < 0 && next == 0 {
+                    base_done2.set(true);
                 }
                 true
             },
@@ -1435,20 +1462,20 @@ mod tests {
         );
         assert!(ok.is_ok());
         assert_eq!(live.get(), 0);
-        // Peak must cover simultaneous `left`, `classes`, `w`, and `refutes` atoms (513 negs).
-        let min_simultaneous = 513
+        let min_body_est = 513
             * (std::mem::size_of::<(Atom, Group)>()
                 + std::mem::size_of::<u32>()
-                + 2 * std::mem::size_of::<Atom>());
+                + std::mem::size_of::<Atom>())
+            + 2 * 1024 * (std::mem::size_of::<usize>() + std::mem::size_of::<u32>());
         assert!(
-            peak.get() >= min_simultaneous,
-            "peak {} must cover simultaneous vectors + refutes atoms >= {min_simultaneous}",
-            peak.get()
+            body_req2.get() >= min_body_est,
+            "body_est {} must cover simultaneous vectors + out doubling >= {min_body_est}",
+            body_req2.get()
         );
 
         // 2. `solve::check_bounded` checks `types.len() == b.types` BEFORE pushing type
         // `b.types + 1`: 10 independent properties yield 1023 valid sets on 1 cell,
-        // exceeding `b.types = 512` (within the 512 * 64 pre-check) without doubling to 1024.
+        // exceeding `b.types = 512` without pushing type 513 or doubling capacity to 1024.
         let props10: Vec<Prop> = (0..10)
             .map(|_| Prop {
                 supers: Vec::new(),
@@ -1464,14 +1491,12 @@ mod tests {
             types: 512,
             ..Bounds::default()
         };
-        // Exact budget for init + 1024 sets + 512 types (NOT 1024 doubled types!).
         let exact_cap = 10 * std::mem::size_of::<u64>()
             + std::mem::size_of::<(Rid, Vec<bool>)>()
             + 64
             + (1usize << 10) * std::mem::size_of::<u64>()
             + 512 * std::mem::size_of::<(usize, u64)>();
         let live2 = std::cell::Cell::new(0isize);
-        let peak2 = std::cell::Cell::new(0usize);
         let ans = super::super::dtcheck::solve::check_bounded(
             &mut r,
             &p10,
@@ -1484,9 +1509,6 @@ mod tests {
                     return false;
                 }
                 live2.set(next);
-                if next > 0 {
-                    peak2.set(peak2.get().max(next as usize));
-                }
                 true
             },
         );
@@ -1495,6 +1517,58 @@ mod tests {
             super::super::dtcheck::solve::Answer::Unknown(Why::Bound)
         );
         assert_eq!(live2.get(), 0);
-        assert!(peak2.get() <= exact_cap);
+        // Must observe exact pre-push length and capacity 512 (not 513 / 1024).
+        assert_eq!(
+            super::super::dtcheck::solve::last_bound_caps(),
+            (0, 0, 512, 512)
+        );
+
+        // 3. Cell-split loop checks `next.len() == b.types` BEFORE pushing cell
+        // `b.types + 1`: 5 independent integer ranges split into 32 cells, exceeding
+        // `b.types = 16` at exact length and capacity 16 (not 17 / 32).
+        let mut rcells = Ranges::new();
+        let mut cell_atoms = Vec::new();
+        for bit in 0..5u32 {
+            // Integers in [0, 31] whose `bit` is set -> 5 independent sets -> 32 cells.
+            let lits: std::collections::BTreeSet<crate::model::Literal> = (0..32u32)
+                .filter(|v| (v >> bit) & 1 != 0)
+                .map(|v| crate::model::Literal::typed(format!("{v}"), crate::vocab::XSD_INTEGER))
+                .collect();
+            let rid = rcells.of(&crate::model::DataRange::OneOf(lits)).unwrap();
+            cell_atoms.push(Atom::AtLeast(0, 1, rid));
+        }
+        let pcells = Problem {
+            props: vec![Prop {
+                supers: Vec::new(),
+                ranges: Vec::new(),
+            }],
+            disjoint: Vec::new(),
+            atoms: cell_atoms,
+        };
+        let bounds16 = Bounds {
+            types: 16,
+            ..Bounds::default()
+        };
+        let live3 = std::cell::Cell::new(0isize);
+        let ans_cells = super::super::dtcheck::solve::check_bounded(
+            &mut rcells,
+            &pcells,
+            &bounds16,
+            &|| false,
+            &|_| true,
+            &|d| {
+                live3.set(live3.get() + d);
+                true
+            },
+        );
+        assert_eq!(
+            ans_cells,
+            super::super::dtcheck::solve::Answer::Unknown(Why::Bound)
+        );
+        assert_eq!(live3.get(), 0);
+        assert_eq!(
+            super::super::dtcheck::solve::last_bound_caps(),
+            (16, 16, 0, 0)
+        );
     }
 }

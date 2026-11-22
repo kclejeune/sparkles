@@ -391,6 +391,19 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
     check_bounded(r, p, b, stop, &|_| true, &|_| true)
 }
 
+#[cfg(test)]
+thread_local! {
+    static LAST_BOUND_CAPS: std::cell::Cell<(usize, usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+/// Test-only observation of `(next.len(), next.capacity(), types.len(), types.capacity())`
+/// recorded immediately before returning `Answer::Unknown(Why::Bound)`.
+#[cfg(test)]
+pub(crate) fn last_bound_caps() -> (usize, usize, usize, usize) {
+    LAST_BOUND_CAPS.with(|c| c.get())
+}
+
 /// [`check_stopping`], also calling `admit_ranges(bytes)` before growing `r` and
 /// `mem(+/-bytes)` around scoped temporary solver allocations, returning
 /// [`Why::Stopped`] on refusal.
@@ -516,6 +529,8 @@ pub fn check_bounded(
                 };
                 if empty != Some(true) {
                     if next.len() == b.types {
+                        #[cfg(test)]
+                        LAST_BOUND_CAPS.with(|c| c.set((next.len(), next.capacity(), 0, 0)));
                         return Answer::Unknown(Why::Bound);
                     }
                     let mut s = Vec::with_capacity(step + 1);
@@ -562,6 +577,8 @@ pub fn check_bounded(
                 .all(|i| p.props[i].ranges.iter().all(|&x| within(ci, x)));
             if ok {
                 if types.len() == b.types {
+                    #[cfg(test)]
+                    LAST_BOUND_CAPS.with(|c| c.set((0, 0, types.len(), types.capacity())));
                     return Answer::Unknown(Why::Bound);
                 }
                 types.push((ci, s));

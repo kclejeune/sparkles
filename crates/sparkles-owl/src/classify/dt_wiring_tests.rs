@@ -1605,3 +1605,81 @@ fn dt_index_copy_admits_memory_before_cloning() {
     );
     assert!(granted.load(Ordering::Relaxed) <= cap);
 }
+
+#[test]
+fn dt_index_star_hierarchy_upfront_admission_covers_per_role_vector_capacities() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // 256 child data properties under one root, each with a shared DataPropertyRange, and
+    // a DataMinCardinality(2) on the root putting all 257 properties in one component.
+    let mut ofn = String::from(
+        "Prefix(:=<http://example.org/>)\nPrefix(xsd:=<http://www.w3.org/2001/XMLSchema#>)\nOntology(\n",
+    );
+    ofn.push_str("  Declaration(Class(:A))\n  Declaration(DataProperty(:root))\n");
+    ofn.push_str("  SubClassOf(:A DataMinCardinality(2 :root xsd:integer))\n");
+    for i in 0..256usize {
+        ofn.push_str(&format!(
+            "  Declaration(DataProperty(:p{i}))\n  SubDataPropertyOf(:p{i} :root)\n  DataPropertyRange(:p{i} xsd:integer)\n"
+        ));
+    }
+    ofn.push_str(")\n");
+    let doc = crate::ofn_read::parse(&ofn).unwrap();
+    let refs: Vec<_> = doc.axioms.iter().map(|a| &a.kind).collect();
+
+    // Uncapped run exercises `debug_assert!(total_est >= retained)` inside `dt_index`.
+    let mut uncap = Saturation::new();
+    let full = uncap
+        .saturate(
+            &refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    let dt = uncap.index.as_ref().unwrap().dt.as_ref().unwrap();
+    assert_eq!(dt.roles.len(), 257);
+    let ix_dt_bytes = dt.bytes();
+    assert!(full.stats.peak_memory >= ix_dt_bytes);
+    // Every child has exact 1-slot preallocated `supers` and min-4 `ranges` capacity.
+    let mut children = 0usize;
+    for ri in dt.roles.values() {
+        if !ri.supers.is_empty() {
+            children += 1;
+            assert_eq!(ri.supers.len(), 1);
+            assert_eq!(ri.supers.capacity(), 1);
+            assert_eq!(ri.ranges.len(), 1);
+            assert!(ri.ranges.capacity() >= 4);
+        }
+    }
+    assert_eq!(children, 256);
+
+    // Tight budget just below peak refuses cleanly without exceeding the pool cap.
+    let cap = full.stats.peak_memory.saturating_sub(ix_dt_bytes / 4);
+    let granted = Arc::new(AtomicUsize::new(0));
+    let g = granted.clone();
+    let limits = Limits {
+        threads: 1,
+        max_memory: Some(cap),
+        charge: Some(Arc::new(move |bytes| {
+            let prev = g.fetch_add(bytes, Ordering::Relaxed);
+            if prev.saturating_add(bytes) > cap {
+                g.fetch_sub(bytes, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        })),
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let res = sat.saturate(&refs, None, &limits);
+    assert!(
+        matches!(res, Err(Error::Memory { .. }))
+            || matches!(res, Ok(ref o) if o.stats.horn_over_budget),
+        "expected memory refusal or Horn fallback under cap {cap}, got {res:?}"
+    );
+    assert!(granted.load(Ordering::Relaxed) <= cap);
+}
