@@ -59,6 +59,7 @@
     ontologyKindLabels,
     ontologyLabelsFor,
     ontologyEntity,
+    ontologyHead,
     ontologySummary,
     RDFS_LABEL,
     renameUpdate,
@@ -84,6 +85,7 @@
     type IriPolicy,
     type Lit,
     type Op,
+    type OntologyHead,
     type OntologySummary,
     type Selection,
   } from '$lib/ontology';
@@ -185,7 +187,18 @@
   });
 
   // --- what the page read -------------------------------------------------------------
-  let summary = $state<OntologySummary | null>(null);
+  // the head of the ontology, read from the index without mapping it (ROADMAP item 735): its
+  // header, entity counts, graphs and imports head the page and feed the views
+  let summary = $state<OntologyHead | null>(null);
+  // the full summary, whose axiom counts and diagnostics map the whole ontology, read only for
+  // the Header tab or when asked
+  // the full summary and the last failure, each with the key of the head they belong to: its
+  // target, graph, imports switch, import map revision and commit, and the scope of the read in
+  // flight, which holds through the head's next read whatever commit that read lands on
+  let full = $state<{ key: string; summary: OntologySummary } | null>(null);
+  let fullLoadingScope = $state<string | null>(null);
+  let fullError = $state<{ key: string; error: Error } | null>(null);
+  let fullSeq = 0;
   const inferredPins = $derived(
     new InferredPins(JSON.stringify([target, graph, sel.imports, summary?.commit])),
   );
@@ -269,8 +282,8 @@
     const my = ++loadSeq;
     loading = true;
     try {
-      // the summary alone: its counts head the page, and the tree reads its own levels
-      const r = await ontologySummary(t, s);
+      // the head alone: its counts head the page, and the tree reads its own levels
+      const r = await ontologyHead(t, s);
       if (my !== loadSeq) return;
       // what was read for the commit before is read again when a view needs it, and what the
       // first summary of a scope arrives beside, such as the labels of the tree, is kept
@@ -287,6 +300,66 @@
       if (my === loadSeq) loading = false;
     }
   }
+
+  /**
+   * Read the full summary of the head on screen. A summary of a newer commit reads the head
+   * again, so the page never shows the counts of two commits.
+   */
+  async function loadFull() {
+    const key = headKey;
+    const head = summary;
+    if (!name || !head || !key) return;
+    const t = target;
+    const s = { ...sel };
+    const scope = scopeKey();
+    const my = ++fullSeq;
+    fullLoadingScope = scope;
+    fullError = null;
+    try {
+      const r = await ontologySummary(t, s);
+      if (my !== fullSeq) return;
+      full = { key: JSON.stringify([scope, r.summary.commit]), summary: r.summary };
+      if (r.summary.commit !== head.commit) {
+        // a newer commit: the head is read again, and the read stays pending until it lands
+        await loadAll();
+        if (my !== fullSeq) return;
+        // a head that failed or moved on is not paired with this summary, and the failure
+        // waits for Count the axioms instead of reading again by itself
+        if (headKey && full?.key !== headKey)
+          fullError = {
+            key: headKey,
+            error: new Error('The ontology changed while its axioms were counted.'),
+          };
+      }
+    } catch (e) {
+      if (my === fullSeq) fullError = { key, error: e as Error };
+    } finally {
+      if (my === fullSeq) fullLoadingScope = null;
+    }
+  }
+  /** Forget the full summary, which belongs to a scope the page left. */
+  function forgetFull() {
+    full = null;
+    fullError = null;
+    fullLoadingScope = null;
+    fullSeq++;
+  }
+  /** The scope the page reads: target, graph, imports switch and import map revision. */
+  const scopeKey = () => JSON.stringify([target, sel.graph ?? null, sel.imports, importsRev]);
+  /** The key of the head on screen, or `null` while a new scope's head is read. */
+  const headKey = $derived(
+    summary && !summaryStale ? JSON.stringify([scopeKey(), summary.commit]) : null,
+  );
+  /** The full summary when it was read for the head on screen. */
+  const fullShown = $derived(full && headKey && full.key === headKey ? full.summary : null);
+  const fullLoading = $derived(headKey != null && fullLoadingScope === scopeKey());
+  const fullFailed = $derived(fullError && fullError.key === headKey ? fullError.error : null);
+  $effect(() => {
+    if (tab !== 'header' || !headKey) return;
+    // a read of this scope in flight, its head's next read included, records its own outcome
+    if (fullShown || fullLoadingScope === scopeKey() || fullError?.key === headKey) return;
+    untrack(() => void loadFull());
+  });
 
   /** Forget the lists and labels read, which belong to a commit or graph the page left. */
   function resetLazy() {
@@ -368,6 +441,7 @@
     untrack(() => {
       // a preview belongs to the target and graph it ran on
       summary = null;
+      forgetFull();
       shown = 0;
       loadedTarget = null;
       // the names, lists and levels of the scope before are another scope's, and a read of a
@@ -390,6 +464,7 @@
     // the summary stays on screen until its next read lands, so the Imports tab keeps its
     // form state; the reset below forgets what the views read
     summaryStale = true;
+    forgetFull();
     loadedTarget = null;
     resetLazy();
     for (const lt of levelTrees.values()) lt.drop();
@@ -1551,6 +1626,10 @@
             {target}
             {sel}
             {summary}
+            full={fullShown}
+            {fullLoading}
+            fullError={fullFailed}
+            onfull={loadFull}
             name={nameOf}
             {prefixes}
             {annotationProperties}
@@ -1879,6 +1958,10 @@
                   {target}
                   {sel}
                   {summary}
+                  full={fullShown}
+                  {fullLoading}
+                  fullError={fullFailed}
+                  onfull={loadFull}
                   name={nameOf}
                   {prefixes}
                   {annotationProperties}

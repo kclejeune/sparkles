@@ -286,8 +286,10 @@ impl PyOntologies {
 #[pymethods]
 impl PyOntologies {
     /// The ontology header, the counts of entities by kind and of axioms by type, the
-    /// graphs read and the diagnostics of the read.
-    #[pyo3(signature=(graph=None, *, imports=true, mode="lenient", at=None, inferences=false, cancel=None, timeout=None))]
+    /// graphs read and the diagnostics of the read. `view="head"` answers the header, the
+    /// entity counts, the graphs and the imports alone, from bounded reads, without
+    /// mapping the whole graph into axioms.
+    #[pyo3(signature=(graph=None, *, imports=true, mode="lenient", at=None, inferences=false, view="full", cancel=None, timeout=None))]
     #[allow(clippy::too_many_arguments)]
     fn summary<'py>(
         &self,
@@ -297,11 +299,13 @@ impl PyOntologies {
         mode: &str,
         at: Option<&Bound<'py, PyAny>>,
         inferences: bool,
+        view: &str,
         cancel: Option<&Bound<'py, PyAny>>,
         timeout: Option<f64>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let mut a = base(graph, imports, mode, inferences)?;
         a.insert("at".into(), at_json(at)?);
+        a.insert("view".into(), serde_json::Value::from(view));
         let j = self.run(py, "summary", a, cancel, timeout, false)?;
         answer(py, j, &[])
     }

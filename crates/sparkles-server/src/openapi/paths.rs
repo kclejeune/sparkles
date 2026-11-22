@@ -713,6 +713,7 @@ fn ontology(p: &mut Paths) {
             .param("at")
             .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.")
             .param("ifNoneMatch")
+            .query("view", json!({ "type": "string", "enum": ["full", "head"] }), "`full` (the default) or `head`. The head answers the header, the counts of declared entities, the graphs read, the imports and the imports closure from bounded index reads, without mapping the whole graph into axioms, and leaves out `axioms`, `axiomCount`, `triples`, `unmapped`, `diagnostics` and `cached`. Its entity tag also names the commit for an edit's `If-Match`. It refuses `metrics`.")
             .query("metrics", boolean(), "Also stream assertions and return scoped axiom counts, distinct signature entities, a conservative containing DL and bounded EL, QL, RL and DL reports in metrics. Refuses scopes over 1000000 mapped axioms and assertion triples or signature entities. Ordinary summaries omit this work.")
             .resp("200", "The summary.", Some(object.clone()))
             .resp("304", "The summary is still at the tagged commit.", None)

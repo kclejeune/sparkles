@@ -24,8 +24,9 @@ use sparkles::owl::{self, Axiom, ofn::Renderer, profiles::Profile};
 use sparkles_reasoner::inputs::{GraphRef, ImportMode};
 
 pub(crate) use onto::wire::{
-    AxiomQuery, ClassifyQuery, DEFAULT_LIMIT, MAX_LIMIT, axiom_page, check_body, classify_body,
-    diff_body, diff_lines, edit_body, expansion_of, mentioned, page_body, summary_body,
+    AxiomQuery, ClassifyQuery, DEFAULT_LIMIT, MAX_LIMIT, SummaryView, axiom_page, check_body,
+    classify_body, diff_body, diff_lines, edit_body, expansion_of, head_body, mentioned, page_body,
+    summary_body,
 };
 
 fn bad(m: impl Into<String>) -> ApiError {
@@ -199,7 +200,8 @@ fn ontology_error(e: Error) -> ApiError {
 }
 
 /// `GET /$/ontology/{ds}`: the header, the counts of entities and axioms, the graphs
-/// read and the unmapped triples.
+/// read and the unmapped triples. `view=head` answers the header, the entity counts, the
+/// graphs and the imports alone, from bounded reads (roadmap item 735).
 pub(super) async fn summary(
     State(st): St,
     Path(name): Path<String>,
@@ -215,6 +217,10 @@ pub(super) async fn summary(
         Some("true") => true,
         Some(_) => return Err(bad("metrics must be true or false")),
     };
+    let view = onto::wire::summary_view(params.get("view")).map_err(ontology_error)?;
+    if view == SummaryView::Head && metrics {
+        return Err(bad("metrics needs the full view"));
+    }
     let opts = CallerContext::for_caller(&st, &ds, &p).options(&params, Endpoint::Query);
     blocking(move || {
         // one deadline for the read and everything after it
@@ -223,6 +229,23 @@ pub(super) async fn summary(
             .ontology()
             .anchored(&opts)
             .map_err(ontology_error)?;
+        if view == SummaryView::Head {
+            let h = ds
+                .dataset
+                .ontology()
+                .head(&req, &opts)
+                .map_err(ontology_error)?;
+            let j = head_body(&ds.name, &h, &req, &renderer(&ds));
+            let seq = h.commit;
+            let tag = conditional::etag(ds.store.dataset_id(), seq, &tag_format("owl-head", &req));
+            let resp = match conditional::check_read(&headers, ds.store.dataset_id(), seq, &tag)? {
+                conditional::ReadOutcome::NotModified => conditional::not_modified(&tag),
+                conditional::ReadOutcome::Send => {
+                    conditional::with_etag(Json(j).into_response(), &tag, false)
+                }
+            };
+            return Ok(with_commit(resp, &ds, seq));
+        }
         let o = ds
             .dataset
             .ontology()

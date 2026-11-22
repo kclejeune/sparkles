@@ -1859,6 +1859,30 @@ the commit it read.
 }
 ```
 
+`view=head` answers the head of the summary, which has the members above that need no
+mapping of the whole graph. These are `dataset`, `commit`, `mode`, `graphs`, `imports`,
+`warnings`, `inferences`, `header`, `entities` and `closure`, with `"view": "head"`, and
+`axioms`, `axiomCount`, `triples`, `unmapped`, `diagnostics` and `cached` are left out.
+The server reads the header from the quads of the ontology nodes and of the `owl:Axiom`
+and `owl:Annotation` nodes that annotate their triples, and the entity counts from the
+`rdf:type` triples of each declaring type, so its time grows with the header and the
+declarations and not with the axioms, which the full summary maps first. Its values equal
+the full summary's. The server answers from these reads only when no other triple can
+change the answer. An ontology node may hold its type, `owl:imports`, `owl:versionIRI` and
+annotations. An annotation node may hold one type, one source, the property and target it
+annotates and its own annotations, and only the annotation nodes that annotate its own
+annotations may name it. Any other part in the
+mapping opens the ontology and answers from the mapping. Examples are an
+`owl:AllDisjointClasses` type on an ontology or annotation node, an `owl:Axiom` node that
+annotates another annotation node, and the reification of a predicate other than an
+annotation property, `owl:imports` or `owl:versionIRI` on an ontology node, or `rdf:type` with a structural OWL, RDF Schema or RDF type on a root triple. The ontology also opens when a graph types `rdf:type` or another
+structural predicate as an OWL property, when an IRI the header uses has an annotated
+declaration, and past the head's bounds, such as more than 1,000 ontology nodes or 10,000
+reified type triples.
+The head has its own entity tag, which an edit's `If-Match` can name as it names the
+summary's. `view=full` is the default, and `view=head` refuses `metrics`. The Rust JSON `summary` operation and the
+Python `summary()` take the same `view`.
+
 `metrics=true` adds an on-demand `metrics` object without changing the ordinary
 summary. The Rust JSON `summary` operation accepts the same boolean. Counts, signature entities, expressivity and the four OWL 2 profile reports
 read one authorized revision and the same graphs and resolved dataset-local imports.

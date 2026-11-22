@@ -93,6 +93,12 @@ def test_summary_and_axioms(ds: sparkles.Dataset) -> None:
     s = ds.ontology.summary()
     assert s["header"]["iri"] == EX + "o"
     assert s["axioms"]["SubClassOf"] == 1
+    head = ds.ontology.summary(view="head")
+    assert head["view"] == "head"
+    assert head["header"] == s["header"] and head["entities"] == s["entities"]
+    assert head["commit"] == s["commit"] and "axioms" not in head
+    with pytest.raises(ValueError):
+        ds.ontology.summary(view="light")
     page = ds.ontology.axioms(type="SubClassOf")
     assert page["total"] == 1
     entry = page["axioms"][0]

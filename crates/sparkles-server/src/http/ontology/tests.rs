@@ -138,6 +138,82 @@ async fn the_summary_counts_the_terminology() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
+/// Roadmap item 735: `view=head` answers the summary's header, entity counts, graphs
+/// and imports without the axiom counts, under its own tag, which an edit can name.
+#[tokio::test]
+async fn the_summary_head_answers_the_header_and_counts() {
+    let s = server();
+    let full = get(&s.app, "/$/ontology/t").await.json();
+    let r = get(&s.app, "/$/ontology/t?view=head").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["view"], "head");
+    for k in [
+        "dataset", "commit", "mode", "graphs", "imports", "warnings", "header", "entities",
+        "closure",
+    ] {
+        assert_eq!(j[k], full[k], "{k}");
+    }
+    for k in [
+        "axioms",
+        "axiomCount",
+        "triples",
+        "unmapped",
+        "diagnostics",
+        "cached",
+    ] {
+        assert!(j.get(k).is_none(), "{k}");
+    }
+    let tag = r.headers[header::ETAG].to_str().unwrap().to_string();
+    assert!(tag.ends_with(":owl-head\""), "{tag}");
+    assert_eq!(
+        r.headers["sparkles-commit"],
+        full["commit"].to_string().as_str()
+    );
+    let r = send(
+        &s.app,
+        "GET",
+        "/$/ontology/t?view=head",
+        &[("if-none-match", &tag)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    let r = get(&s.app, "/$/ontology/t?view=full").await;
+    assert_eq!(r.json()["axioms"], full["axioms"]);
+    for bad in [
+        "/$/ontology/t?view=light",
+        "/$/ontology/t?view=head&metrics=true",
+    ] {
+        assert_eq!(
+            get(&s.app, bad).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    // an edit's If-Match can name the head's tag
+    let body = json!({"add": [sub("http://ex.org/A", json!("http://ex.org/B"))]}).to_string();
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+}
+
 #[tokio::test]
 async fn axioms_page_and_filter() {
     let s = server();

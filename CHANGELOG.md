@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### The ontology editor's head no longer waits for the whole mapping
+
+`GET /$/ontology/{ds}?view=head` answers the summary's header, entity counts, graphs,
+imports and closure from index reads, without mapping the ontology into axioms, and the Rust
+JSON `summary` operation and Python's `summary()` take the same `view`. The ontology editor
+reads the head when it opens, and its Header tab and **Count the axioms** read the full
+summary. The head answers only when an allow-list shows that no other triple can change its
+answer, and otherwise opens the ontology, so its values always equal the full summary's. On
+`wally` its first call takes 9.6 ms on ChEBI lite and 25.1 ms on a taxonomy of 1 million
+classes, where the full summary takes 2.77 and 5.63 s, as roadmap item 735.
+
 ### The matrix flags of batches 49 and 50 did not reproduce in a same-day run
 
 The forge matrices of b47b582b and 0779d666 ran `order-by-full` and `optional-chain` 1.3 to

@@ -82,6 +82,24 @@ export type AxiomInput = AxiomJson | string;
 /** The graphs the editor reads: one graph (null for the default graph) and its imports. */
 export type Selection = { graph: string | null; imports: boolean };
 
+/**
+ * What `GET /$/ontology/{ds}?view=head` answers: the summary's header, entity counts, graphs
+ * and imports, from bounded reads of the index without mapping the whole graph into axioms.
+ */
+export type OntologyHead = {
+  view?: 'head';
+  dataset: string;
+  commit: number;
+  mode: string;
+  graphs: string[];
+  imports: { iri: string; graph: string | null }[];
+  /** One edge per `owl:imports` triple of a graph read (spec U12, import resolution). */
+  closure?: import('./ontology-imports').ImportEdge[];
+  warnings?: string[];
+  header: OntologySummary['header'];
+  entities: Record<string, number>;
+};
+
 export type OntologySummary = {
   dataset: string;
   commit: number;
@@ -237,6 +255,24 @@ export async function ontologySummary(
     signal,
   });
   return { summary: await readJson<OntologySummary>(res), etag: res.headers.get('ETag') };
+}
+
+/**
+ * `GET /$/ontology/{ds}?view=head`: the header, the entity counts, the graphs and the imports
+ * without the axiom counts, which answers at once on an ontology the full summary takes seconds
+ * to map, and the entity tag an edit's `If-Match` names.
+ */
+export async function ontologyHead(
+  target: string,
+  sel: Selection,
+  signal?: AbortSignal,
+): Promise<{ summary: OntologyHead; etag: string | null }> {
+  const res = await request(`/$/ontology/${enc(target)}?${selParams(sel, { view: 'head' })}`, {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+    signal,
+  });
+  return { summary: await readJson<OntologyHead>(res), etag: res.headers.get('ETag') };
 }
 
 /** The most items the editor reads of one listing, in pages of 10,000. */

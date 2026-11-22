@@ -1326,11 +1326,23 @@ impl Ontologies {
         o: &Opened,
         record: Option<&crate::reasoning::ReasoningRecord>,
     ) -> Option<Inferences> {
+        self.inferences_of(&o.graphs, &o.inner.graph_ids, o.snapshot.commit, record)
+    }
+
+    /// [`inferences`](Self::inferences) of a read of `graphs`, with their store ids, at
+    /// `commit`.
+    fn inferences_of(
+        &self,
+        graphs: &[GraphRef],
+        graph_ids: &[Option<Id>],
+        commit: u64,
+        record: Option<&crate::reasoning::ReasoningRecord>,
+    ) -> Option<Inferences> {
         let record = record?;
         let inferred = GraphRef::Named(INFERRED_GRAPH.to_string());
-        let n = o.graphs.iter().position(|g| *g == inferred)?;
-        o.inner.graph_ids.get(n).copied().flatten()?;
-        let f = crate::reasoning::freshness(record, self.ds.store(), o.snapshot.commit);
+        let n = graphs.iter().position(|g| *g == inferred)?;
+        graph_ids.get(n).copied().flatten()?;
+        let f = crate::reasoning::freshness(record, self.ds.store(), commit);
         Some(Inferences {
             profile: record.profile.clone(),
             graph: n as u32,
@@ -2539,6 +2551,7 @@ pub mod browse;
 pub mod classify;
 pub mod dl_query;
 pub mod file;
+pub mod head;
 pub mod kept;
 pub mod metrics;
 pub mod search;
@@ -2550,3 +2563,9 @@ mod tests;
 
 #[cfg(test)]
 mod individual_lookup_tests;
+
+#[cfg(test)]
+mod head_tests;
+
+#[cfg(test)]
+mod head_gen_tests;
