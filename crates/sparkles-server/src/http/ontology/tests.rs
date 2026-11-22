@@ -628,10 +628,33 @@ async fn classify_answers_the_taxonomy_and_writes_it() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.headers.contains_key("sparkles-commit"), "{:?}", r.headers);
     let j = r.json();
+    // the terminology alone leaves out the assertions about :ada, which a run with the
+    // assertions reads
     assert_eq!(
-        (j["consistent"].as_bool(), j["complete"].as_bool()),
-        (Some(true), Some(true)),
+        (
+            j["consistent"].as_bool(),
+            j["complete"].as_bool(),
+            j["completeForTaken"].as_bool(),
+            j["consistency"].as_str(),
+        ),
+        (Some(true), Some(false), Some(true), Some("unknown")),
         "{j}"
+    );
+    assert_eq!(j["excluded"][0]["rule"], "assertion-not-read", "{j}");
+    let with_assertions = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true}),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (
+            with_assertions["complete"].as_bool(),
+            with_assertions["consistency"].as_str(),
+        ),
+        (Some(true), Some("consistent")),
+        "{with_assertions}"
     );
     assert_eq!(j["nodes"].as_array().unwrap().len(), 2, "{j}");
     assert_eq!(j["next"], 2, "{j}");
@@ -738,7 +761,10 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
     assert_eq!(read.headers[header::CACHE_CONTROL], "no-store");
     let j = read.json();
     assert_eq!(j["status"], "available");
-    assert_eq!(j["outcome"]["consistency"], "consistent");
+    // the fixture holds assertions that a terminology-only run does not read
+    assert_eq!(j["outcome"]["consistency"], "unknown");
+    assert_eq!(j["outcome"]["complete"], false);
+    assert_eq!(j["outcome"]["excludedCount"], 1);
     let pin = format!(
         "at=commit:{}&resultId={}",
         j["commit"],
@@ -1236,7 +1262,7 @@ async fn classify_answers_in_part_under_a_deadline() {
         let j = post(
             &s.app,
             "/$/ontology/t/classify",
-            json!({"partial": true, "expansion": e}),
+            json!({"partial": true, "expansion": e, "assertions": true}),
         )
         .await
         .json();
@@ -2848,8 +2874,32 @@ async fn classify_reports_what_a_left_out_axiom_reaches_and_strict_refuses_it() 
         j["error"].as_str().unwrap().contains("ObjectUnionOf"),
         "{j}"
     );
-    // strict as a query parameter, on an answer that is complete
+    // strict as a query parameter refuses a terminology-only run that leaves assertions unread
     let r = post(&s.app, "/$/ontology/t/classify?strict=true", json!({})).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    assert!(
+        j["error"].as_str().unwrap().contains("assertion-not-read"),
+        "{j}"
+    );
+    // strict as a query parameter, on an answer that is complete
+    let complete = server_of(
+        r#"@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :X a owl:Class . :Y a owl:Class .
+:A rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :B :C ) ] .
+:X rdfs:subClassOf :Y .
+"#,
+    );
+    let r = post(
+        &complete.app,
+        "/$/ontology/t/classify?strict=true",
+        json!({}),
+    )
+    .await;
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["complete"], true);
 }

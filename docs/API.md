@@ -2241,9 +2241,9 @@ assertions, EL-only, partial-request and expansion options, source counts, finit
 capabilities and `justifications: "unavailable"`. Producer-only partial/expansion choices
 are reported as originally used, rather than replaced by a later compatible caller's
 options. A DL query may advance the mutable saturation without relabeling a previously
-published result. `outcome` gives the actual tier, consistency, partial/completeness flags
-and excluded/incomplete counts. Unknown outcomes are null. A completed run with exclusions
-has `partial: false` and `complete: false`. Stopped partial taxonomies are never retained.
+published result. `outcome` gives the actual tier, consistency, partial and completeness flags
+and excluded, incomplete and unmapped counts. Unknown outcomes are null. A completed run with exclusions
+or unmapped triples has `partial: false` and `complete: false`. Stopped partial taxonomies are never retained.
 An available result with an unknown class returns `entity.present: false`, not an empty
 inference success.
 
@@ -2316,8 +2316,18 @@ the rule it breaks. An axiom that the classifier uses only in part, such as one 
 individual in a class expression, a data range, an assertion on a property with a range
 or the top or bottom property, is listed with `partial` and the reason. An axiom with
 an expression nested more than 256 deep is left out and listed as partial too.
-`complete` is false when anything is listed, and for a partial answer. Every subsumption the answer gives
-is entailed, and a complete answer has every entailed subsumption between named classes.
+`complete` is false when anything is listed in `excluded`, when any input triple is
+unmapped (`stats.unmapped` above zero), or for a partial answer, while `completeForTaken`
+stays true whenever the run finished for the axioms it took. Every subsumption the answer
+gives is entailed, a complete answer has every entailed subsumption between named classes
+for the whole input ontology, and a class outside `incomplete` keeps its exact
+superclasses, equivalents and satisfiability even when axioms are left out. A run without
+`assertions: true` reads the terminology alone and reports any unread assertion with
+logical content under the `assertion-not-read` rule, leaving `complete` false, every class
+in `incomplete` and a consistent verdict `unknown` until the ontology is classified with
+`assertions: true`. `strict: true` in the body or query string refuses an incomplete
+answer with `422` and code `classification-incomplete`, naming the left-out axioms and any
+unmapped triples, before writing a target graph.
 The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
 the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
 10,000, and gives the times of the run under `stats`. `about` names a class and answers
@@ -2353,11 +2363,13 @@ failing with `408` or `507`. Runs of the EL and Horn rules fail as before. The a
 such a run has `partial: true` and `complete: false`. Its subsumptions and unsatisfiable
 classes are entailed, `incomplete` lists the classes whose superclasses it may miss, at
 most `limit` of them in IRI order with `incompleteCount` counting them all, and every
-other class has its full answer. `consistency` is `consistent`, `inconsistent` or, for
-a run that stopped before it decided, `unknown`, and then every class is in
-`incomplete`. `consistent` is false only for an ontology proved inconsistent, so a
-caller that needs to know reads `consistency`. A finished run has `partial: false`,
-an empty `incomplete` and a `consistency` that is never `unknown`. A partial taxonomy
+other class has its full answer. `consistency` is `consistent`, `inconsistent` or `unknown`, which occurs when a run
+stopped before deciding, when an excluded axiom, unread assertion or unmapped triple could
+change consistency, or when the coverage pass hit its work bound or deadline, and then
+every class is in `incomplete`. `consistent` is false only for an ontology proved
+inconsistent, so a caller that needs to know reads `consistency`. A finished run has
+`partial: false` and `completeForTaken: true`, and when nothing is left out or unmapped
+its `incomplete` list is empty and `consistency` is never `unknown`. A partial taxonomy
 builds after the deadline that stopped the run. It is never kept, so a later call runs
 again. `partial` is `400` with `target`, which writes a taxonomy as the classifier's,
 and with `format=ofn`, which has no place to say that the taxonomy is partial.
