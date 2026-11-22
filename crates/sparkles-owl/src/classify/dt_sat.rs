@@ -117,6 +117,12 @@ impl DtIx {
         }
     }
 
+    /// Empties the cache, so that a test's next evaluation solves again.
+    #[cfg(test)]
+    pub(super) fn forget(&self) {
+        self.cache.lock().clear();
+    }
+
     /// The bytes the tables hold, the cache and the ranges with them. The saturation
     /// charges the growth of the cache and the ranges as it makes it, and the estimates
     /// that read this, the base before the saturation and the retained state after it,

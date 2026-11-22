@@ -794,3 +794,64 @@ fn a_zero_minimum_in_a_body_holds_of_every_class() {
     assert!(gap_of(&sat, &ax[0]).is_some(), "{:?}", sat.excluded());
     assert!(!sub(&sat, "A", "E"));
 }
+
+#[test]
+fn doubles_and_booleans_decide_consistency() {
+    // xsd:double has a value space of its own, apart from the numbers of owl:real, and
+    // "1.0" and "1" are one double; "1" is a lexical form of true
+    for (body, consistent) in [
+        (
+            "FunctionalDataProperty(:d)\nDataPropertyAssertion(:d :a \"1.5\"^^xsd:double)\n\
+             DataPropertyAssertion(:d :a \"2.5\"^^xsd:double)",
+            false,
+        ),
+        (
+            "FunctionalDataProperty(:d)\nDataPropertyAssertion(:d :a \"1.0\"^^xsd:double)\n\
+             DataPropertyAssertion(:d :a \"1\"^^xsd:double)",
+            true,
+        ),
+        (
+            "FunctionalDataProperty(:d)\nDataPropertyAssertion(:d :a \"1\"^^xsd:double)\n\
+             DataPropertyAssertion(:d :a \"1\"^^xsd:decimal)",
+            false,
+        ),
+        (
+            "DataPropertyRange(:d xsd:boolean)\nDataPropertyAssertion(:d :a \"abc\"^^xsd:string)",
+            false,
+        ),
+        (
+            "FunctionalDataProperty(:d)\nDataPropertyRange(:d xsd:boolean)\n\
+             DataPropertyAssertion(:d :a \"true\"^^xsd:boolean)\n\
+             DataPropertyAssertion(:d :a \"1\"^^xsd:boolean)",
+            true,
+        ),
+    ] {
+        let (sat, _, c) = run_consistent(body, 1);
+        assert!(
+            sat.interner.dt_run.is_none() && !sat.interner.dt.is_empty(),
+            "{body}"
+        );
+        assert_eq!(c, consistent, "{body}");
+        assert!(sat.excluded().is_empty(), "{body}: {:?}", sat.excluded());
+    }
+}
+
+#[test]
+fn what_a_world_adds_to_the_checker_cache_stays_charged_after_it() {
+    use std::sync::atomic::{AtomicIsize, Ordering};
+    let (mut sat, _) = run(&world_cover());
+    let c = sat.interner.class(&Class::new("urn:dt:C"));
+    let ix = sat.index.as_ref().expect("a saturated run");
+    let dt = ix.dt.as_ref().expect("the checker's tables");
+    // the run filled the cache, so the world below solves again only once it is empty
+    dt.forget();
+    let held = AtomicIsize::new(0);
+    let bound = |delta: isize| {
+        held.fetch_add(delta, Ordering::Relaxed);
+        true
+    };
+    let world = super::world::World::new(ix, &sat.ctx, None, &[], &[], &bound);
+    world.classify(c).unwrap();
+    // the world's copies are released when it goes, and the cache entries it made stay
+    assert!(held.load(Ordering::Relaxed) > 0);
+}
