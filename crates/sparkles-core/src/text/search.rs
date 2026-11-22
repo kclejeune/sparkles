@@ -193,7 +193,7 @@ const PAGE: usize = 4096;
 /// column's ordinal per document and the distinct ordinals collected with growth (32),
 /// the values of those ordinals (16), and the id cache's lookup of the missing ones,
 /// their positions, ordinals, ids and the cached ids (48, with growth). The buffer that
-/// a term's key is decoded into is Tantivy's, outside this count (row 1156).
+/// a term's key is decoded into is Tantivy's, outside this count (item 1191).
 const PAGE_HIT_BYTES: u64 = 192;
 
 /// The hits a reader's list first holds, and the least it grows by.

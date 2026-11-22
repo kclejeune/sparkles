@@ -3,9 +3,9 @@
 //! stops at the first commit boundary after a budget of changes, so a commit is never
 //! split across pages and a commit larger than the budget is held whole, as an eager
 //! read holds it. Every allocation a page makes is admitted before it is made: the
-//! frame and the decoded form of each record read, the vector of the page's changes and
-//! each change's quad, and for a read-only log read newest first the offsets of one
-//! segment's records.
+//! frame and the decoded form of each record read, the vector of the page's changes,
+//! each change's quad, the access memo, and for a read-only log read newest first the
+//! offsets of one segment's records.
 //!
 //! The reader pins the log at the first commit of its range ([`LogPin`]), so retention
 //! keeps the commits it has still to read and the log cannot be turned off under it. A

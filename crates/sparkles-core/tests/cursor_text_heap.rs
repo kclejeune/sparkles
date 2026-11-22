@@ -42,7 +42,7 @@ unsafe impl GlobalAlloc for Counting {
 static A: Counting = Counting;
 
 /// What a query may hold outside its ledger: the parsed query and plan, the cursor, and
-/// Tantivy's scorer scratch (row 1156), of which the registry of the automaton built for
+/// Tantivy's scorer scratch (item 1191), of which the registry of the automaton built for
 /// the predicate set, about 1 MB, is the largest.
 const ALLOWANCE: usize = (1 << 20) + (256 << 10);
 

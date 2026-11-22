@@ -1162,7 +1162,7 @@ bounds its answer.
 The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
 spatial scan or relation over constants, a search without a bound, a path search between
 constants without a limit, a spatial join, a property function over constants and a
-registered property function without prefix output. They are the second part of the item. Automatic execution keeps its base
+registered property function without prefix output. They are the second part of the item, whose [readers](#streamed-service-text-and-history-readers) serve a SERVICE without SILENT, a text search without a bound and a history query without a limit. Automatic execution keeps its base
 set of expanding kinds, and each new kind joins it only after a same-host A/B of eager
 against streamed runs. The text, geo and vector benchmark scripts send an `EXECUTION`
 mode with every request, and the vector script fingerprints its exact and approximate
@@ -1238,6 +1238,69 @@ alone, with 12 server processes per build and mode, put the tip at cde29b37 at 0
 its merge base with main, 5f3f69c2, streamed and 1.006 eager, so no query is 5% or more
 slower at 12 threads, which is the stage's acceptance gate. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
+
+### Streamed SERVICE, text and history readers
+
+The second part of item 829 gives three of the refused kinds resumable readers that hold
+one page of their answer between pulls. They serve explicit streaming, and automatic
+execution runs these forms eagerly until a same-host A/B admits them. Each opens nothing
+until its first pull, because operators are also built to learn whether an EXISTS
+pattern streams, so its checks, its request and its errors come when an eager run would
+reach the node.
+
+A SERVICE without SILENT, in `cursor/service.rs`, parses a remote response as it arrives
+and holds one output batch and the parser's buffer. A query endpoint of the same process
+opens as a cursor of its own under the caller's policy, charged to the caller's memory
+budget, and the reader pulls one of its batches per batch. One blank-node map spans the
+whole answer, as in one eager call. A cached answer is read from its entry, which the
+reader keeps charged while it reads, since the cache may evict the entry meanwhile. Three
+things differ from an eager run. A failure after rows were emitted fails the cursor. An
+answer enters the cache only when it was read to its end, and the copy for the cache is
+dropped once it grows past the largest entry the cache keeps or past what the budget
+holds beside the answer. The outbound timeout counts from the start of the request, while
+the query's deadline leaves out the time a consumer keeps the cursor waiting, so a slow
+consumer can expire a transfer that an eager run would finish. The strict policy refuses
+a SILENT SERVICE, which needs its whole answer before its first row, and a JSON response
+whose results come before its head, which [item 1125](../../ROADMAP.md) decodes in either
+order. Its refusal inside an EXISTS fails the query, as it does outside one.
+
+A text search with a constant query and no limit, in `cursor/text.rs`, collects its
+scored hits in one pass over each index segment, charging the hit list before each growth,
+and decodes rows from it a page at a time. The row state that eager execution keeps for
+one call, which holds the duplicate set, the default graph's filter, the stale hits and
+the rank, lasts across pages, so ties and duplicates that span a batch keep their eager
+answers. A search over more hits than the index's `maxHits` fails with eager's row error.
+A search with a limit keeps the bounded leaf of the first part, and
+[item 1155](../../ROADMAP.md) routes a limit above `maxHits` through the reader. An
+earlier form counted the hits without scores before it collected them, which built the
+query's automaton and scorers twice and cost about 2.2 million instructions per request,
+and the [experiments page](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records it.
+
+A history query without a limit or input, in `cursor/history.rs`, reads the change log a
+page of whole commits at a time through `store::HistoryPages`. Each record's frame is
+admitted before it is read and its decoded size before it is decoded, and the page stays
+charged until its rows are handed out. A commit larger than a page is held whole, as eager
+execution holds it. The reader pins the log at the first commit of its range until the
+range ends or the reader is released, so retention keeps the segments it has still to
+read, past `maxBytes` too, and turning the log off is refused meanwhile. It counts the
+changes it accepts and fails past the row budget at the change where an eager run fails.
+Deleting the branch or dataset still removes the segments under a read, which
+[item 1173](../../ROADMAP.md) holds, eager execution does not admit records before it
+decodes them, which [item 1124](../../ROADMAP.md) holds, and a read-only log's newest-first
+walk is [item 1175](../../ROADMAP.md).
+
+View reads stay refused under the strict policy, since a view's result is decoded under
+its lock against the circuit's latest pass, and [item 1121](../../ROADMAP.md) keeps a
+versioned result that a cursor can page through. Path searches that keep a set per pair
+of endpoints and path searches over their input without a limit stay refused under items
+[1122](../../ROADMAP.md) and [1123](../../ROADMAP.md). The inventory test
+`cursor_inventory.rs` lists every form as native or refused with its decision or row.
+
+Tests compare each reader with eager answers at batch sizes down to one row, refuse the
+budget and row limits where eager execution refuses, measure each reader's heap against
+its ledger in `cursor_text_heap.rs`, `cursor_history_heap.rs` and
+`cursor_memory_audit.rs`, and cover retention and disabling between pulls, a branch
+deleted under a read, endpoint failures, timeouts, cancellation and the cache.
 
 ### Readings of errors in aggregates
 
