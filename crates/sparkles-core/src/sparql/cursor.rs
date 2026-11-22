@@ -4545,11 +4545,24 @@ impl Operator {
                         _ => false,
                     };
                     if !reused {
-                        b.table = exec::apply_unary(ctx, node, b.table, &mut report)?;
-                        if let (Some(reuse), Some((rows, distinct))) =
-                            (&mut self.bind_reuse, report.counted())
+                        if let (Some(reuse), Kind::Extend(target, expr)) =
+                            (&mut self.bind_reuse, &node.kind)
                         {
-                            reuse.counted(rows, distinct);
+                            let reuse_ref = &*reuse;
+                            let (col, eval) = exec::compute_column_controlled(
+                                ctx,
+                                &b.table,
+                                expr,
+                                &mut report,
+                                |n| reuse_ref.allow_fallback_split(n, expr),
+                                |n| reuse_ref.want_cost_timing(n, expr),
+                            )?;
+                            ctx.check()?;
+                            b.table.vars.push(*target);
+                            b.table.cols.push(col);
+                            reuse.observe_fallback(b.table.len, eval, report.counted(), expr);
+                        } else {
+                            b.table = exec::apply_unary(ctx, node, b.table, &mut report)?;
                         }
                     }
                     b.reconcile()?;

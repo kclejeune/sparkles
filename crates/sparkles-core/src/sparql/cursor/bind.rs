@@ -5,11 +5,13 @@ use crate::error::Result;
 use crate::id::{Id, PAYLOAD_MASK, Tag};
 use crate::index::{O, P, Perm, S};
 use crate::sparql::ctx::RetainedCharge;
+use crate::sparql::exec::{self, ColumnEval, Split, SplitOutcome};
 use crate::sparql::expr::Expr;
 use crate::sparql::plan::{Kind, Node};
 use crate::sparql::table::VarId;
 use crate::sparql::{Ctx, Table};
 use rustc_hash::{FxHashMap, FxHashSet};
+use std::time::Instant;
 
 pub(super) struct Admission {
     input: VarId,
@@ -36,6 +38,17 @@ const ENTRY_BYTES: u64 = 96;
 const SKETCH_BYTES: u64 = 32;
 /// Charged bytes per row of a batch the map answers, while it runs.
 const SCRATCH_BYTES: u64 = 28 + 40;
+/// Consecutive clear split losses that move a bucket into serial cooldown.
+const SPLIT_LOSSES: u8 = 2;
+/// Default eligible serial evaluations per cooldown before retrying a split.
+const SPLIT_COOLDOWN: u8 = 8;
+/// Largest evaluated row count in the small split/cost bucket (`768..=2047`).
+const SMALL_BUCKET_MAX: usize = 2047;
+/// Minimum estimated per-row evaluation saving (ns) for unhinted weak admission on
+/// parallel-capable expressions (`R * T >= COST_MIN_SAVING_NANOS * N * M`).
+const COST_MIN_SAVING_NANOS: u128 = 50;
+/// Consecutive completed batch decisions that must pass the weak cost rule.
+const WEAK_CONFIRMATIONS: u8 = 2;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -56,8 +69,405 @@ const ADMIT: u32 = 8;
 /// No term carries this tag, so a pending entry cannot be mistaken for a value.
 const PENDING: u64 = !PAYLOAD_MASK;
 
+/// Temporary experiment switches for m6 isolation; removed before landing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitMode {
+    Retry,
+    Legacy,
+    Always,
+    Never,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitScope {
+    Bind,
+    Map,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionMode {
+    Cost,
+    Legacy,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReuseConfig {
+    split: SplitMode,
+    scope: SplitScope,
+    admission: AdmissionMode,
+    cooldown: u8,
+    trace: bool,
+}
+
+impl Default for ReuseConfig {
+    fn default() -> Self {
+        Self {
+            split: SplitMode::Retry,
+            scope: SplitScope::Bind,
+            admission: AdmissionMode::Cost,
+            cooldown: SPLIT_COOLDOWN,
+            trace: false,
+        }
+    }
+}
+
+fn reuse_config() -> ReuseConfig {
+    static CONFIG: std::sync::OnceLock<ReuseConfig> = std::sync::OnceLock::new();
+    *CONFIG.get_or_init(|| {
+        let split = match std::env::var("SPARKLES_BIND_SPLIT").as_deref() {
+            Ok("legacy") => SplitMode::Legacy,
+            Ok("always") => SplitMode::Always,
+            Ok("never") => SplitMode::Never,
+            _ => SplitMode::Retry,
+        };
+        let scope = match std::env::var("SPARKLES_BIND_SCOPE").as_deref() {
+            Ok("map") => SplitScope::Map,
+            _ => SplitScope::Bind,
+        };
+        let admission = match std::env::var("SPARKLES_BIND_ADMISSION").as_deref() {
+            Ok("legacy") => AdmissionMode::Legacy,
+            Ok("off") => AdmissionMode::Off,
+            _ => AdmissionMode::Cost,
+        };
+        let cooldown = std::env::var("SPARKLES_BIND_COOLDOWN")
+            .ok()
+            .and_then(|s| s.parse::<u8>().ok())
+            .filter(|&n| (1..=64).contains(&n))
+            .unwrap_or(SPLIT_COOLDOWN);
+        let trace = matches!(
+            std::env::var("SPARKLES_BIND_TRACE").as_deref(),
+            Ok("1" | "true" | "yes")
+        );
+        ReuseConfig {
+            split,
+            scope,
+            admission,
+            cooldown,
+            trace,
+        }
+    })
+}
+
+/// Two evaluated-row buckets for sampled batch splits (`768..=2047` and `2048..=16384`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SplitBucket {
+    Small,
+    Large,
+}
+
+fn split_bucket(rows: usize) -> Option<SplitBucket> {
+    if !exec::batch_may_split(rows) || rows > exec::PAR_THRESHOLD {
+        return None;
+    }
+    if rows <= SMALL_BUCKET_MAX {
+        Some(SplitBucket::Small)
+    } else {
+        Some(SplitBucket::Large)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketPhase {
+    Active { losses: u8 },
+    Cooldown { remaining: u8 },
+    Retry,
+}
+
+/// Pure query-owned two-bucket split controller shared across map misses, per-batch
+/// distinct columns and ordinary BIND row fallback. Survives [`Reuse::decline`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SplitController {
+    mode: SplitMode,
+    cooldown: u8,
+    small: BucketPhase,
+    large: BucketPhase,
+    legacy_disabled: bool,
+}
+
+impl SplitController {
+    fn new(mode: SplitMode, cooldown: u8) -> Self {
+        Self {
+            mode,
+            cooldown,
+            small: BucketPhase::Active { losses: 0 },
+            large: BucketPhase::Active { losses: 0 },
+            legacy_disabled: false,
+        }
+    }
+
+    fn bucket(&self, b: SplitBucket) -> BucketPhase {
+        match b {
+            SplitBucket::Small => self.small,
+            SplitBucket::Large => self.large,
+        }
+    }
+
+    fn bucket_mut(&mut self, b: SplitBucket) -> &mut BucketPhase {
+        match b {
+            SplitBucket::Small => &mut self.small,
+            SplitBucket::Large => &mut self.large,
+        }
+    }
+
+    /// Cheap guard avoiding `expr.parallel()` traversal when no bucket can suppress.
+    fn may_suppress(&self) -> bool {
+        match self.mode {
+            SplitMode::Always => false,
+            SplitMode::Never => true,
+            SplitMode::Legacy => self.legacy_disabled,
+            SplitMode::Retry => {
+                matches!(self.small, BucketPhase::Cooldown { .. })
+                    || matches!(self.large, BucketPhase::Cooldown { .. })
+            }
+        }
+    }
+
+    /// Whether splitting is permitted for an evaluation of `rows` rows.
+    /// Tables above [`exec::PAR_THRESHOLD`] keep their existing large-table behavior
+    /// and never consume or depend on either sampled-split bucket.
+    fn allow(&self, rows: usize, expr_parallel: bool, multi_worker: bool) -> bool {
+        match self.mode {
+            SplitMode::Never => false,
+            SplitMode::Always => true,
+            SplitMode::Legacy => !self.legacy_disabled,
+            SplitMode::Retry => {
+                if !expr_parallel || !multi_worker {
+                    return true;
+                }
+                match split_bucket(rows) {
+                    Some(b) => !matches!(self.bucket(b), BucketPhase::Cooldown { .. }),
+                    None => true,
+                }
+            }
+        }
+    }
+
+    /// Whether the controller has observed sustained split contention in `rows`'s bucket.
+    fn is_contended(&self, rows: usize) -> bool {
+        match self.mode {
+            SplitMode::Retry => split_bucket(rows).is_some_and(|b| {
+                matches!(
+                    self.bucket(b),
+                    BucketPhase::Cooldown { .. } | BucketPhase::Retry
+                )
+            }),
+            SplitMode::Legacy => self.legacy_disabled,
+            SplitMode::Always | SplitMode::Never => false,
+        }
+    }
+
+    /// Update state after an evaluation and `ctx.check()` have succeeded.
+    fn observe(
+        &mut self,
+        rows: usize,
+        expr_parallel: bool,
+        multi_worker: bool,
+        parallel_allowed: bool,
+        split: Option<Split>,
+    ) -> Option<&'static str> {
+        match self.mode {
+            SplitMode::Always | SplitMode::Never => None,
+            SplitMode::Legacy => {
+                if let Some(split) = split
+                    && !split.paid()
+                    && !self.legacy_disabled
+                {
+                    self.legacy_disabled = true;
+                    return Some("legacy->serial");
+                }
+                None
+            }
+            SplitMode::Retry => {
+                if !expr_parallel || !multi_worker {
+                    return None;
+                }
+                let b = split_bucket(rows)?;
+                let cooldown = self.cooldown;
+                let phase = self.bucket_mut(b);
+                match *phase {
+                    BucketPhase::Cooldown { remaining } => {
+                        if parallel_allowed {
+                            return None;
+                        }
+                        if remaining <= 1 {
+                            *phase = BucketPhase::Retry;
+                            Some("cooldown->retry")
+                        } else {
+                            *phase = BucketPhase::Cooldown {
+                                remaining: remaining - 1,
+                            };
+                            None
+                        }
+                    }
+                    BucketPhase::Active { losses } => {
+                        let split = split?;
+                        match split.classify() {
+                            SplitOutcome::Unknown => None,
+                            SplitOutcome::ClearWin | SplitOutcome::Inconclusive => {
+                                *phase = BucketPhase::Active { losses: 0 };
+                                None
+                            }
+                            SplitOutcome::ClearLoss => {
+                                let next = losses.saturating_add(1);
+                                if next >= SPLIT_LOSSES {
+                                    if cooldown == 0 {
+                                        *phase = BucketPhase::Retry;
+                                        Some("active->retry")
+                                    } else {
+                                        *phase = BucketPhase::Cooldown {
+                                            remaining: cooldown,
+                                        };
+                                        Some("active->cooldown")
+                                    }
+                                } else {
+                                    *phase = BucketPhase::Active { losses: next };
+                                    None
+                                }
+                            }
+                        }
+                    }
+                    BucketPhase::Retry => {
+                        let split = split?;
+                        match split.classify() {
+                            SplitOutcome::Unknown | SplitOutcome::Inconclusive => None,
+                            SplitOutcome::ClearWin => {
+                                *phase = BucketPhase::Active { losses: 0 };
+                                Some("retry->active")
+                            }
+                            SplitOutcome::ClearLoss => {
+                                if cooldown == 0 {
+                                    None
+                                } else {
+                                    *phase = BucketPhase::Cooldown {
+                                        remaining: cooldown,
+                                    };
+                                    Some("retry->cooldown")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Evaluation-size buckets for fallback cost observations (`>= MIN_ROWS`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CostBucket {
+    Small,
+    Large,
+    Huge,
+}
+
+fn cost_bucket(rows: usize) -> Option<CostBucket> {
+    if rows < crate::sparql::exprcache::MIN_ROWS {
+        return None;
+    }
+    if rows <= SMALL_BUCKET_MAX {
+        Some(CostBucket::Small)
+    } else if rows <= exec::PAR_THRESHOLD {
+        Some(CostBucket::Large)
+    } else {
+        Some(CostBucket::Huge)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EvalRate {
+    nanos: u128,
+    rows: usize,
+}
+
+impl EvalRate {
+    fn lower(a: Self, b: Self) -> Option<Self> {
+        let lhs = a.nanos.checked_mul(b.rows as u128)?;
+        let rhs = b.nanos.checked_mul(a.rows as u128)?;
+        Some(if lhs <= rhs { a } else { b })
+    }
+
+    /// Exact rational check `r * E >= COST_MIN_SAVING_NANOS`, i.e.,
+    /// `repeats * self.nanos >= COST_MIN_SAVING_NANOS * observed_rows * self.rows`.
+    fn meets_saving(&self, observed_rows: usize, repeats: usize) -> bool {
+        if observed_rows == 0 || repeats == 0 || self.rows == 0 || self.nanos == 0 {
+            return false;
+        }
+        let Some(lhs) = (repeats as u128).checked_mul(self.nanos) else {
+            return false;
+        };
+        let Some(rhs) = COST_MIN_SAVING_NANOS
+            .checked_mul(observed_rows as u128)
+            .and_then(|v| v.checked_mul(self.rows as u128))
+        else {
+            return false;
+        };
+        lhs >= rhs
+    }
+}
+
+/// Last two usable fallback column-evaluation rates in one evaluation-size bucket.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CostHistory {
+    bucket: Option<CostBucket>,
+    samples: [Option<EvalRate>; 2],
+}
+
+impl CostHistory {
+    fn record(&mut self, rows: usize, nanos: u128) {
+        if nanos == 0 {
+            return;
+        }
+        let Some(bucket) = cost_bucket(rows) else {
+            return;
+        };
+        let rate = EvalRate { nanos, rows };
+        if self.bucket != Some(bucket) {
+            self.bucket = Some(bucket);
+            self.samples = [Some(rate), None];
+            return;
+        }
+        if self.samples[0].is_none() {
+            self.samples[0] = Some(rate);
+        } else if self.samples[1].is_none() {
+            self.samples[1] = Some(rate);
+        } else {
+            self.samples[0] = self.samples[1];
+            self.samples[1] = Some(rate);
+        }
+    }
+
+    fn lower_rate(&self, bucket: CostBucket) -> Option<EvalRate> {
+        if self.bucket != Some(bucket) {
+            return None;
+        }
+        EvalRate::lower(self.samples[0]?, self.samples[1]?)
+    }
+}
+
+/// Opt-in diagnostic counters for m6 (`SPARKLES_BIND_TRACE=1`). Zero extra clocks when off.
+#[derive(Default, Debug)]
+struct TraceStats {
+    admit_batch: Option<u64>,
+    admit_reason: Option<&'static str>,
+    persistent_hits: u64,
+    pending_hits: u64,
+    answer_nanos: u128,
+    eval_nanos: u128,
+    scatter_nanos: u128,
+    retain_nanos: u128,
+    fallback_batches: u64,
+    fallback_eval_rows: u64,
+    splits: u64,
+    split_wins: u64,
+    split_losses: u64,
+    split_inconc: u64,
+    transitions: u64,
+}
+
 pub(super) struct Reuse {
     input: VarId,
+    config: ReuseConfig,
     mode: Mode,
     values: FxHashMap<Id, Id>,
     charge: Option<RetainedCharge>,
@@ -65,39 +475,70 @@ pub(super) struct Reuse {
     max_entries: usize,
     sketch: FxHashSet<Id>,
     /// The sketch filled without admitting the map. The next batch declines, so the
-    /// exact count of the batch that filled it can still admit through [`Reuse::counted`].
+    /// exact count of the batch that filled it can still admit through fallback feedback.
     exhausted: bool,
     /// Sampled rows, and those whose key the sketch held, in the current window.
     window: (u32, u32),
+    /// Completed probe window `(rows, repeats, batch_rows)` waiting for the batch's
+    /// fallback observation so at most one weak decision is counted per batch.
+    batch_probe_window: Option<(usize, usize, usize)>,
+    /// Consecutive completed batch decisions passing the weak cost guard.
+    weak_confirmations: u8,
+    /// Last two usable fallback column-evaluation rates in one size bucket.
+    cost: CostHistory,
     /// Rows, and those answered without an evaluation, since the map's last check.
     map_window: (u32, u32),
     /// Rows the map has seen since it was admitted.
     map_rows: u64,
+    batch_index: u64,
     hits: u64,
     misses: u64,
-    /// Whether the map's misses may still be spread over the pool. A split that ran no
-    /// faster than the calling thread's timed sample keeps the rest of the query's misses
-    /// on the calling thread.
-    split: bool,
+    /// Two-bucket split controller shared across map misses and controlled BIND fallback.
+    split: SplitController,
+    trace: TraceStats,
     #[cfg(test)]
     evaluations: usize,
+    #[cfg(test)]
+    last_miss_dispatch: Option<(bool, Option<Split>)>,
+    #[cfg(test)]
+    last_fallback_dispatch: Option<(usize, bool, Option<Split>)>,
 }
 
-/// The experiment switch `SPARKLES_BIND_SPLIT=measured|never|always`, how the map's
-/// misses use the pool.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SplitPolicy {
-    Measured,
-    Never,
-    Always,
-}
-fn split_policy() -> SplitPolicy {
-    static POLICY: std::sync::OnceLock<SplitPolicy> = std::sync::OnceLock::new();
-    *POLICY.get_or_init(|| match std::env::var("SPARKLES_BIND_SPLIT").as_deref() {
-        Ok("never") => SplitPolicy::Never,
-        Ok("always") => SplitPolicy::Always,
-        _ => SplitPolicy::Measured,
-    })
+impl Drop for Reuse {
+    fn drop(&mut self) {
+        if !self.config.trace {
+            return;
+        }
+        let t = &self.trace;
+        eprintln!(
+            "[bind-reuse] batches={} mode={:?} admit={:?}@{:?} hits={} misses={} \
+             persistent_hits={} pending_hits={} retained={} answer_us={} eval_us={} \
+             scatter_us={} retain_us={} fb_batches={} fb_eval_rows={} splits={} \
+             wins={} losses={} inconc={} transitions={} small={:?} large={:?}",
+            self.batch_index,
+            self.mode,
+            t.admit_reason,
+            t.admit_batch,
+            self.hits,
+            self.misses,
+            t.persistent_hits,
+            t.pending_hits,
+            self.values.len(),
+            t.answer_nanos / 1_000,
+            t.eval_nanos / 1_000,
+            t.scatter_nanos / 1_000,
+            t.retain_nanos / 1_000,
+            t.fallback_batches,
+            t.fallback_eval_rows,
+            t.splits,
+            t.split_wins,
+            t.split_losses,
+            t.split_inconc,
+            t.transitions,
+            self.split.small,
+            self.split.large,
+        );
+    }
 }
 
 impl Reuse {
@@ -116,13 +557,24 @@ impl Reuse {
             }),
         })
     }
+
     pub(super) fn new(ctx: &Ctx, admission: Admission) -> Option<Self> {
+        Self::new_with_config(ctx, admission, reuse_config())
+    }
+
+    fn new_with_config(ctx: &Ctx, admission: Admission, config: ReuseConfig) -> Option<Self> {
         // Compute the hint before building children, but retain optional memory
         // only afterward. Optional caching must not starve child construction.
         let charge = ctx.retained_charge(512).ok()?;
+        let mode = if config.admission == AdmissionMode::Off {
+            Mode::Off
+        } else {
+            Mode::Pilot
+        };
         Some(Self {
             input: admission.input,
-            mode: Mode::Pilot,
+            config,
+            mode,
             values: Default::default(),
             charge,
             expected_reuse: admission.expected_reuse,
@@ -130,35 +582,266 @@ impl Reuse {
             sketch: Default::default(),
             exhausted: false,
             window: (0, 0),
+            batch_probe_window: None,
+            weak_confirmations: 0,
+            cost: CostHistory::default(),
             map_window: (0, 0),
             map_rows: 0,
+            batch_index: 0,
             hits: 0,
             misses: 0,
-            split: split_policy() != SplitPolicy::Never,
+            split: SplitController::new(config.split, config.cooldown),
+            trace: TraceStats::default(),
             #[cfg(test)]
             evaluations: 0,
+            #[cfg(test)]
+            last_miss_dispatch: None,
+            #[cfg(test)]
+            last_fallback_dispatch: None,
         })
     }
 
-    /// Keep the map's later misses on the calling thread once a split of them did not pay.
-    fn observe_split(&mut self, split: Option<crate::sparql::exec::Split>) {
-        if let Some(split) = split
-            && !split.paid()
-            && split_policy() == SplitPolicy::Measured
-        {
-            self.split = false;
+    /// Whether the controlled BIND fallback may split an evaluation of `rows` rows.
+    pub(super) fn allow_fallback_split(&self, rows: usize, expr: &Expr) -> bool {
+        if self.config.scope != SplitScope::Bind {
+            return true;
+        }
+        if !self.split.may_suppress() {
+            return true;
+        }
+        self.split
+            .allow(rows, expr.parallel(), rayon::current_num_threads() > 1)
+    }
+
+    /// Whether map miss evaluation may split an evaluation of `rows` rows.
+    fn allow_map_split(&self, rows: usize, expr: &Expr) -> bool {
+        if !self.split.may_suppress() {
+            return true;
+        }
+        self.split
+            .allow(rows, expr.parallel(), rayon::current_num_threads() > 1)
+    }
+
+    /// Whether the controlled fallback should time full column evaluation for cost-guarded
+    /// admission. Restricted to `>= MIN_ROWS` evaluations while admission is still open
+    /// on parallel-capable expressions (or when diagnostic tracing is enabled).
+    pub(super) fn want_cost_timing(&self, evaluated_rows: usize, expr: &Expr) -> bool {
+        if evaluated_rows < crate::sparql::exprcache::MIN_ROWS {
+            return false;
+        }
+        if self.config.trace {
+            return true;
+        }
+        self.config.admission == AdmissionMode::Cost
+            && matches!(self.mode, Mode::Pilot | Mode::Probe)
+            && expr.parallel()
+            && rayon::current_num_threads() > 1
+    }
+
+    fn record_split_trace(
+        &mut self,
+        source: &'static str,
+        rows: usize,
+        split: Option<Split>,
+        transition: Option<&'static str>,
+    ) {
+        if let Some(s) = split {
+            self.trace.splits += 1;
+            let outcome = s.classify();
+            match outcome {
+                SplitOutcome::ClearWin => self.trace.split_wins += 1,
+                SplitOutcome::ClearLoss => self.trace.split_losses += 1,
+                SplitOutcome::Inconclusive => self.trace.split_inconc += 1,
+                SplitOutcome::Unknown => {}
+            }
+            eprintln!(
+                "[bind-reuse] b={} {source} rows={} split=({}/{}ns,{}/{}ns) outcome={:?} tr={:?}",
+                self.batch_index,
+                rows,
+                s.sample_rows,
+                s.sample_nanos,
+                s.rest_rows,
+                s.rest_nanos,
+                outcome,
+                transition
+            );
+        } else if let Some(tr) = transition {
+            eprintln!(
+                "[bind-reuse] b={} {source} rows={} tr={tr}",
+                self.batch_index, rows
+            );
+        }
+        if transition.is_some() {
+            self.trace.transitions += 1;
         }
     }
 
-    /// The exact count of a batch that the per-batch distinct pass made after
-    /// [`Reuse::apply`] declined it. Repetition within one batch is exact where the
-    /// sampled sketch can miss a few hot keys, so it admits the map for later batches.
-    pub(super) fn counted(&mut self, rows: usize, distinct: usize) {
+    fn observe_map_split(
+        &mut self,
+        rows: usize,
+        expr: &Expr,
+        parallel_allowed: bool,
+        split: Option<Split>,
+    ) {
+        if split.is_none() && !self.split.may_suppress() {
+            return;
+        }
+        let expr_parallel = split.is_some() || expr.parallel();
+        let multi_worker = split.is_some() || rayon::current_num_threads() > 1;
+        let transition =
+            self.split
+                .observe(rows, expr_parallel, multi_worker, parallel_allowed, split);
+        if self.config.trace {
+            self.record_split_trace("map", rows, split, transition);
+        }
+    }
+
+    /// Observe a completed fallback column evaluation after `ctx.check()` has succeeded.
+    /// Updates the shared split controller (even in `Mode::Off`), records fallback cost
+    /// observations while probing, and evaluates at most one weak admission decision for
+    /// this batch.
+    pub(super) fn observe_fallback(
+        &mut self,
+        batch_rows: usize,
+        eval: ColumnEval,
+        counted: Option<(usize, usize)>,
+        expr: &Expr,
+    ) {
+        let expr_parallel = expr.parallel();
+        let multi_worker = rayon::current_num_threads() > 1;
+        self.observe_fallback_with(batch_rows, eval, counted, expr_parallel, multi_worker);
+    }
+
+    fn observe_fallback_with(
+        &mut self,
+        batch_rows: usize,
+        eval: ColumnEval,
+        counted: Option<(usize, usize)>,
+        expr_parallel: bool,
+        multi_worker: bool,
+    ) {
+        if self.config.scope == SplitScope::Bind && eval.evaluated_rows > 0 {
+            #[cfg(test)]
+            {
+                self.last_fallback_dispatch =
+                    Some((eval.evaluated_rows, eval.parallel_allowed, eval.split));
+            }
+            let transition = self.split.observe(
+                eval.evaluated_rows,
+                expr_parallel,
+                multi_worker,
+                eval.parallel_allowed,
+                eval.split,
+            );
+            if self.config.trace {
+                self.trace.fallback_batches += 1;
+                self.trace.fallback_eval_rows += eval.evaluated_rows as u64;
+                if let Some(ns) = eval.elapsed_nanos {
+                    self.trace.eval_nanos += ns;
+                }
+                self.record_split_trace("fb", eval.evaluated_rows, eval.split, transition);
+            }
+        } else if self.config.trace {
+            self.trace.fallback_batches += 1;
+            self.trace.fallback_eval_rows += eval.evaluated_rows as u64;
+            if let Some(ns) = eval.elapsed_nanos {
+                self.trace.eval_nanos += ns;
+            }
+        }
+
+        let parallel_capable = expr_parallel && multi_worker;
         if self.mode == Mode::Probe
-            && rows >= crate::sparql::exprcache::MIN_ROWS
-            && (rows - distinct) * ADMIT as usize >= rows
+            && self.config.admission == AdmissionMode::Cost
+            && parallel_capable
+            && let Some(nanos) = eval.elapsed_nanos
         {
-            self.admit();
+            self.cost.record(eval.evaluated_rows, nanos);
+        }
+
+        let probe_win = self.batch_probe_window.take();
+        if self.mode != Mode::Probe {
+            return;
+        }
+
+        if self.config.admission == AdmissionMode::Legacy || !parallel_capable {
+            if let Some((rows, distinct)) = counted
+                && rows >= crate::sparql::exprcache::MIN_ROWS
+                && rows.saturating_sub(distinct) * ADMIT as usize >= rows
+            {
+                self.admit("counted_legacy");
+            }
+            return;
+        }
+
+        // Exact within-batch repetition >= 1/2 admits immediately.
+        if let Some((rows, distinct)) = counted
+            && rows >= crate::sparql::exprcache::MIN_ROWS
+            && rows.saturating_sub(distinct) * 2 >= rows
+        {
+            self.admit("counted_exact_half");
+            return;
+        }
+
+        let exact_signal = counted.and_then(|(rows, distinct)| {
+            (rows >= crate::sparql::exprcache::MIN_ROWS)
+                .then_some((rows, rows.saturating_sub(distinct)))
+        });
+        if probe_win.is_none() && exact_signal.is_none() {
+            return;
+        }
+
+        let bucket_rows = if eval.evaluated_rows >= crate::sparql::exprcache::MIN_ROWS {
+            eval.evaluated_rows
+        } else {
+            batch_rows
+        };
+
+        let probe_ok = probe_win.is_some_and(|(n, r, _)| self.weak_passes(n, r, bucket_rows, true));
+        let exact_ok = exact_signal.is_some_and(|(n, r)| self.weak_passes(n, r, bucket_rows, true));
+
+        if probe_ok || exact_ok {
+            self.weak_confirmations = self.weak_confirmations.saturating_add(1);
+            if self.weak_confirmations >= WEAK_CONFIRMATIONS {
+                let reason = if exact_ok {
+                    "counted_weak"
+                } else {
+                    "probe_weak"
+                };
+                self.admit(reason);
+            }
+        } else {
+            self.weak_confirmations = 0;
+        }
+    }
+
+    /// Whether a weak unhinted repetition signal `(repeats / observed_rows)` passes the
+    /// `1/8` floor and (for parallel-capable cost mode) either bucket contention or the
+    /// rational `r * E >= 50 ns` guard.
+    fn weak_passes(
+        &self,
+        observed_rows: usize,
+        repeats: usize,
+        bucket_rows: usize,
+        parallel_capable: bool,
+    ) -> bool {
+        if observed_rows == 0 || repeats.saturating_mul(ADMIT as usize) < observed_rows {
+            return false;
+        }
+        match self.config.admission {
+            AdmissionMode::Off => false,
+            AdmissionMode::Legacy => true,
+            AdmissionMode::Cost if !parallel_capable => true,
+            AdmissionMode::Cost => {
+                if self.split.is_contended(bucket_rows) {
+                    return true;
+                }
+                let Some(cb) = cost_bucket(bucket_rows) else {
+                    return false;
+                };
+                self.cost
+                    .lower_rate(cb)
+                    .is_some_and(|rate| rate.meets_saving(observed_rows, repeats))
+            }
         }
     }
 
@@ -177,6 +860,15 @@ impl Reuse {
         let Some(column) = table.col_of(self.input) else {
             return Ok(false);
         };
+        if let Some((w_rows, w_repeats, bucket_rows)) = self.batch_probe_window.take() {
+            let parallel_capable = expr.parallel() && rayon::current_num_threads() > 1;
+            if self.weak_passes(w_rows, w_repeats, bucket_rows, parallel_capable) {
+                self.weak_confirmations = self.weak_confirmations.saturating_add(1);
+            } else {
+                self.weak_confirmations = 0;
+            }
+        }
+        self.batch_index = self.batch_index.saturating_add(1);
         match self.mode {
             Mode::Off => return Ok(false),
             Mode::Map => {}
@@ -187,7 +879,7 @@ impl Reuse {
             Mode::Pilot | Mode::Probe => {
                 if table.len < crate::sparql::exprcache::MIN_ROWS {
                     // Small batches only feed the sketch of a probing map.
-                    if self.mode == Mode::Pilot || !self.probe(ctx, &table.cols[column])? {
+                    if self.mode == Mode::Pilot || !self.probe(ctx, &table.cols[column], expr)? {
                         return Ok(false);
                     }
                 } else if let Some(dense) = dense_integers(ctx, &table.cols[column])? {
@@ -195,12 +887,12 @@ impl Reuse {
                         return Ok(false);
                     }
                     self.max_entries = INTEGER_ENTRIES;
-                    self.admit();
+                    self.admit("dense_int");
                 } else if self.mode == Mode::Pilot {
-                    if !self.pilot(ctx, &table.cols[column])? {
+                    if !self.pilot(ctx, &table.cols[column], expr)? {
                         return Ok(false);
                     }
-                } else if !self.probe(ctx, &table.cols[column])? {
+                } else if !self.probe(ctx, &table.cols[column], expr)? {
                     return Ok(false);
                 }
             }
@@ -208,18 +900,29 @@ impl Reuse {
         self.apply_map(ctx, table, column, target, expr)
     }
 
-    fn admit(&mut self) {
+    fn admit(&mut self, reason: &'static str) {
         self.mode = Mode::Map;
         self.sketch = Default::default();
         self.exhausted = false;
+        self.weak_confirmations = 0;
+        self.batch_probe_window = None;
         self.map_window = (0, 0);
         self.map_rows = 0;
+        if self.config.trace {
+            self.trace.admit_batch = Some(self.batch_index);
+            self.trace.admit_reason = Some(reason);
+            eprintln!("[bind-reuse] b={} admit reason={reason}", self.batch_index);
+        }
     }
 
     fn decline(&mut self) {
         self.mode = Mode::Off;
         self.sketch = Default::default();
         self.values = Default::default();
+        self.exhausted = false;
+        self.weak_confirmations = 0;
+        self.batch_probe_window = None;
+        self.cost = CostHistory::default();
         if let Some(charge) = &mut self.charge {
             // A shrink only releases.
             let _ = charge.resize(512);
@@ -229,7 +932,7 @@ impl Reuse {
     /// The first batch: substantial exact repetition, or a repeated key with the
     /// snapshot hint, admits the map at once. Otherwise the sampled keys of the batch
     /// seed the sketch.
-    fn pilot(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<bool> {
+    fn pilot(&mut self, ctx: &Ctx, keys: &[Id], expr: &Expr) -> Result<bool> {
         // Cheap, mostly distinct inputs do not repay per-row map work.
         // The estimate affects profit only, never physical budget admission.
         let sample = keys.len().min(4096);
@@ -247,9 +950,27 @@ impl Reuse {
                 repeats += 1;
             }
         }
-        if repeats > 0 && (repeats * ADMIT as usize >= sample || self.expected_reuse) {
+        let parallel_capable = expr.parallel() && rayon::current_num_threads() > 1;
+        let immediate = match self.config.admission {
+            AdmissionMode::Off => false,
+            AdmissionMode::Legacy => {
+                repeats > 0 && (repeats * ADMIT as usize >= sample || self.expected_reuse)
+            }
+            AdmissionMode::Cost if !parallel_capable => {
+                repeats > 0 && (repeats * ADMIT as usize >= sample || self.expected_reuse)
+            }
+            AdmissionMode::Cost => repeats > 0 && (repeats * 2 >= sample || self.expected_reuse),
+        };
+        if immediate {
             self.max_entries = MAP_ENTRIES;
-            self.admit();
+            let reason = if repeats * 2 >= sample {
+                "pilot_exact_half"
+            } else if self.expected_reuse {
+                "pilot_hint"
+            } else {
+                "pilot_legacy"
+            };
+            self.admit(reason);
             return Ok(true);
         }
         self.mode = Mode::Probe;
@@ -264,20 +985,41 @@ impl Reuse {
         Ok(false)
     }
 
-    /// Later batches: admit once a window of sampled rows repeats one time in
-    /// [`ADMIT`]. A sketch that fills without that marks itself exhausted, and the next
-    /// batch declines.
-    fn probe(&mut self, ctx: &Ctx, keys: &[Id]) -> Result<bool> {
+    /// Later batches: admit once a window of sampled rows repeats enough to pay. A sketch
+    /// that fills without admitting marks itself exhausted, and the next batch declines.
+    fn probe(&mut self, ctx: &Ctx, keys: &[Id], expr: &Expr) -> Result<bool> {
         self.observe(ctx, keys)?;
+        let parallel_capable = expr.parallel() && rayon::current_num_threads() > 1;
+        if keys.len() < crate::sparql::exprcache::MIN_ROWS
+            && self.config.admission == AdmissionMode::Cost
+            && parallel_capable
+        {
+            return Ok(false);
+        }
         let (rows, repeats) = self.window;
         if rows < WINDOW {
             return Ok(false);
         }
         self.window = (0, 0);
-        if repeats * ADMIT >= rows {
-            self.admit();
+        let rows = rows as usize;
+        let repeats = repeats as usize;
+        if self.config.admission == AdmissionMode::Legacy || !parallel_capable {
+            if repeats * ADMIT as usize >= rows {
+                self.admit("probe_legacy");
+                return Ok(true);
+            }
+            if self.sketch.len() >= SKETCH_KEYS {
+                self.exhausted = true;
+            }
+            return Ok(false);
+        }
+        if self.weak_confirmations >= WEAK_CONFIRMATIONS - 1
+            && self.weak_passes(rows, repeats, keys.len(), true)
+        {
+            self.admit("probe_weak");
             return Ok(true);
         }
+        self.batch_probe_window = Some((rows, repeats, keys.len()));
         if self.sketch.len() >= SKETCH_KEYS {
             self.exhausted = true;
         }
@@ -366,6 +1108,7 @@ impl Reuse {
     ) -> Result<bool> {
         let mut slots: Option<FxHashMap<Id, Id>> =
             (self.values.len() >= self.max_entries).then(FxHashMap::default);
+        let trace = self.config.trace;
         for (row, key) in keys.iter().enumerate() {
             if row.is_multiple_of(4096) {
                 ctx.check()?;
@@ -373,6 +1116,11 @@ impl Reuse {
             if let Some(value) = self.values.get(key) {
                 if value.0 & !PAYLOAD_MASK == PENDING {
                     missed.push(row as u32);
+                    if trace {
+                        self.trace.pending_hits += 1;
+                    }
+                } else if trace {
+                    self.trace.persistent_hits += 1;
                 }
                 output.push(*value);
                 continue;
@@ -387,6 +1135,8 @@ impl Reuse {
             };
             if slot == next {
                 distinct.push(*key);
+            } else if trace {
+                self.trace.pending_hits += 1;
             }
             missed.push(row as u32);
             output.push(slot);
@@ -420,6 +1170,7 @@ impl Reuse {
         let mut distinct = Vec::with_capacity(n);
         // Every pending entry is resolved before this returns, and an error releases the
         // whole map.
+        let t_answer = self.config.trace.then(Instant::now);
         let pending = match self.answer(
             ctx,
             &table.cols[column],
@@ -427,7 +1178,12 @@ impl Reuse {
             &mut missed,
             &mut distinct,
         ) {
-            Ok(pending) => pending,
+            Ok(pending) => {
+                if let Some(t) = t_answer {
+                    self.trace.answer_nanos += t.elapsed().as_nanos();
+                }
+                pending
+            }
             Err(error) => {
                 self.decline();
                 return Err(error);
@@ -442,25 +1198,41 @@ impl Reuse {
             let mut misses = Table::new(vec![self.input]);
             misses.len = distinct.len();
             misses.cols[0] = distinct;
-            let values =
-                match crate::sparql::exec::column_rows_split(ctx, &misses, expr, self.split)
-                    .and_then(|values| ctx.check().map(|()| values))
-                {
-                    Ok((values, split)) => {
-                        self.observe_split(split);
-                        values
+            let par = self.allow_map_split(misses.len(), expr);
+            let t_eval = self.config.trace.then(Instant::now);
+            let values = match exec::column_rows_split(ctx, &misses, expr, par)
+                .and_then(|values| ctx.check().map(|()| values))
+            {
+                Ok((values, split)) => {
+                    #[cfg(test)]
+                    {
+                        self.last_miss_dispatch = Some((par, split));
                     }
-                    Err(error) => {
-                        self.decline();
-                        return Err(error);
+                    if let Some(t) = t_eval {
+                        self.trace.eval_nanos += t.elapsed().as_nanos();
                     }
-                };
+                    self.observe_map_split(misses.len(), expr, par, split);
+                    values
+                }
+                Err(error) => {
+                    self.decline();
+                    return Err(error);
+                }
+            };
+            let t_scatter = self.config.trace.then(Instant::now);
             for row in &missed {
                 let at = &mut output[*row as usize];
                 *at = values[(at.0 & PAYLOAD_MASK) as usize];
             }
+            if let Some(t) = t_scatter {
+                self.trace.scatter_nanos += t.elapsed().as_nanos();
+            }
             if pending {
+                let t_retain = self.config.trace.then(Instant::now);
                 self.retain(ctx, &misses.cols[0], &values);
+                if let Some(t) = t_retain {
+                    self.trace.retain_nanos += t.elapsed().as_nanos();
+                }
             }
             self.misses += misses.len as u64;
         }
@@ -569,11 +1341,41 @@ mod tests {
     use spargebra::algebra::Function;
 
     fn new_reuse(ctx: &Ctx, expr: &Expr, source: Option<&Node>) -> Option<Reuse> {
-        Reuse::new(ctx, Reuse::prepare(ctx, expr, source)?)
+        Reuse::new_with_config(
+            ctx,
+            Reuse::prepare(ctx, expr, source)?,
+            ReuseConfig::default(),
+        )
     }
 
-    fn split(sample_nanos: u128, rest_nanos: u128) -> crate::sparql::exec::Split {
-        crate::sparql::exec::Split {
+    fn new_reuse_config(
+        ctx: &Ctx,
+        expr: &Expr,
+        source: Option<&Node>,
+        config: ReuseConfig,
+    ) -> Option<Reuse> {
+        Reuse::new_with_config(ctx, Reuse::prepare(ctx, expr, source)?, config)
+    }
+
+    impl Reuse {
+        fn counted(&mut self, rows: usize, distinct: usize) {
+            self.observe_fallback_with(
+                rows,
+                ColumnEval {
+                    evaluated_rows: rows,
+                    elapsed_nanos: None,
+                    split: None,
+                    parallel_allowed: true,
+                },
+                Some((rows, distinct)),
+                true,
+                true,
+            );
+        }
+    }
+
+    fn split(sample_nanos: u128, rest_nanos: u128) -> Split {
+        Split {
             sample_rows: 256,
             sample_nanos,
             rest_rows: 1024,
@@ -592,29 +1394,681 @@ mod tests {
         assert!(!split(0, 10).paid());
     }
 
-    /// The map keeps its misses on the calling thread for the rest of the query once a
-    /// split of them did not pay, and a batch that was not split leaves the choice alone.
     #[test]
-    fn a_split_that_did_not_pay_keeps_later_misses_on_the_calling_thread() {
-        let store = Store::in_memory(StoreOptions::default());
-        let ctx = Ctx::new(store.snapshot());
-        let v = ctx.var("v");
-        let mut reuse = Reuse::new(
-            &ctx,
-            Admission {
-                input: v,
-                expected_reuse: false,
+    fn one_split_loss_then_win_keeps_parallelism_available() {
+        let mut ctrl = SplitController::new(SplitMode::Retry, SPLIT_COOLDOWN);
+        for _ in 0..2 {
+            assert!(ctrl.allow(4096, true, true));
+            assert_eq!(
+                ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000))),
+                None
+            );
+            assert_eq!(ctrl.large, BucketPhase::Active { losses: 1 });
+            assert!(
+                ctrl.allow(4096, true, true),
+                "one noisy split loss must not disable parallelism"
+            );
+            assert_eq!(
+                ctrl.observe(4096, true, true, true, Some(split(100_000, 120_000))),
+                None
+            );
+            assert_eq!(ctrl.large, BucketPhase::Active { losses: 0 });
+            assert!(ctrl.allow(4096, true, true));
+        }
+    }
+
+    #[test]
+    fn consecutive_split_losses_pause_exactly_two_eligible_batches() {
+        for cooldown in [2u8, SPLIT_COOLDOWN] {
+            let mut ctrl = SplitController::new(SplitMode::Retry, cooldown);
+            // Two consecutive clear losses enter cooldown.
+            assert!(ctrl.allow(4096, true, true));
+            ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+            assert!(ctrl.allow(4096, true, true));
+            assert_eq!(
+                ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000))),
+                Some("active->cooldown")
+            );
+            assert_eq!(
+                ctrl.large,
+                BucketPhase::Cooldown {
+                    remaining: cooldown
+                }
+            );
+
+            // Repeat several cycles to exclude wraparound or terminal off state.
+            for _ in 0..4 {
+                for step in 0..cooldown {
+                    assert!(
+                        !ctrl.allow(4096, true, true),
+                        "cooldown step {step} of {cooldown} must suppress splitting"
+                    );
+                    ctrl.observe(4096, true, true, false, None);
+                }
+                assert_eq!(ctrl.large, BucketPhase::Retry);
+                assert!(
+                    ctrl.allow(4096, true, true),
+                    "parallelism must recover after cooldown"
+                );
+                // A clearly losing retry immediately restarts cooldown on one probe.
+                assert_eq!(
+                    ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000))),
+                    Some("retry->cooldown")
+                );
+                assert_eq!(
+                    ctrl.large,
+                    BucketPhase::Cooldown {
+                        remaining: cooldown
+                    }
+                );
+            }
+
+            // Drain cooldown once more and recover with a clear win.
+            for _ in 0..cooldown {
+                assert!(!ctrl.allow(4096, true, true));
+                ctrl.observe(4096, true, true, false, None);
+            }
+            assert!(ctrl.allow(4096, true, true));
+            assert_eq!(
+                ctrl.observe(4096, true, true, true, Some(split(100_000, 120_000))),
+                Some("retry->active")
+            );
+            assert_eq!(ctrl.large, BucketPhase::Active { losses: 0 });
+
+            // After a winning retry, one isolated loss keeps splitting allowed.
+            ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+            assert_eq!(ctrl.large, BucketPhase::Active { losses: 1 });
+            assert!(ctrl.allow(4096, true, true));
+        }
+    }
+
+    #[test]
+    fn split_margin_and_missing_evidence_do_not_masquerade_as_losses() {
+        // Sample rate projects 400,000 ns for 1,024 rest rows.
+        // Clear win: <= 90% (360,000 ns); Clear loss: >= 120% (480,000 ns).
+        assert_eq!(split(100_000, 360_000).classify(), SplitOutcome::ClearWin);
+        assert_eq!(
+            split(100_000, 360_001).classify(),
+            SplitOutcome::Inconclusive
+        );
+        assert_eq!(
+            split(100_000, 400_000).classify(),
+            SplitOutcome::Inconclusive
+        );
+        assert_eq!(
+            split(100_000, 479_999).classify(),
+            SplitOutcome::Inconclusive
+        );
+        assert_eq!(split(100_000, 480_000).classify(), SplitOutcome::ClearLoss);
+        assert_eq!(split(100_000, 480_001).classify(), SplitOutcome::ClearLoss);
+
+        // Unequal row counts: 256 sample, 512 rest -> projected 200,000 ns.
+        let s_win = Split {
+            sample_rows: 256,
+            sample_nanos: 100_000,
+            rest_rows: 512,
+            rest_nanos: 180_000,
+        };
+        let s_mid = Split {
+            rest_nanos: 239_999,
+            ..s_win
+        };
+        let s_loss = Split {
+            rest_nanos: 240_000,
+            ..s_win
+        };
+        assert_eq!(s_win.classify(), SplitOutcome::ClearWin);
+        assert_eq!(s_mid.classify(), SplitOutcome::Inconclusive);
+        assert_eq!(s_loss.classify(), SplitOutcome::ClearLoss);
+
+        // Zero or overflowing inputs are unknown and never trigger cooldown.
+        for invalid in [
+            Split {
+                sample_rows: 0,
+                sample_nanos: 100_000,
+                rest_rows: 1024,
+                rest_nanos: 1_000_000,
             },
-        )
-        .unwrap();
-        assert!(reuse.split);
-        reuse.observe_split(None);
-        reuse.observe_split(Some(split(100_000, 120_000)));
-        assert!(reuse.split, "a split that paid keeps splitting");
-        reuse.observe_split(Some(split(100_000, 1_200_000)));
-        assert!(!reuse.split);
-        reuse.observe_split(Some(split(100_000, 120_000)));
-        assert!(!reuse.split, "the choice holds for the rest of the query");
+            Split {
+                sample_rows: 256,
+                sample_nanos: 0,
+                rest_rows: 1024,
+                rest_nanos: 1_000_000,
+            },
+            Split {
+                sample_rows: 256,
+                sample_nanos: 100_000,
+                rest_rows: 0,
+                rest_nanos: 1_000_000,
+            },
+            Split {
+                sample_rows: 256,
+                sample_nanos: 100_000,
+                rest_rows: 1024,
+                rest_nanos: 0,
+            },
+            Split {
+                sample_rows: 256,
+                sample_nanos: u128::MAX,
+                rest_rows: 1024,
+                rest_nanos: u128::MAX,
+            },
+        ] {
+            assert_eq!(invalid.classify(), SplitOutcome::Unknown);
+        }
+
+        // Duration::MAX-derived reachable bounds classify without overflow.
+        let max_ns = std::time::Duration::MAX.as_nanos();
+        assert_eq!(
+            Split {
+                sample_rows: 256,
+                sample_nanos: max_ns,
+                rest_rows: 16_128,
+                rest_nanos: max_ns,
+            }
+            .classify(),
+            SplitOutcome::ClearWin
+        );
+        assert_eq!(
+            Split {
+                sample_rows: 256,
+                sample_nanos: max_ns / 100,
+                rest_rows: 16_128,
+                rest_nanos: max_ns,
+            }
+            .classify(),
+            SplitOutcome::ClearLoss
+        );
+
+        // None preserves single loss; Unknown preserves single loss; Inconclusive resets it.
+        let mut ctrl = SplitController::new(SplitMode::Retry, 2);
+        ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+        assert_eq!(ctrl.large, BucketPhase::Active { losses: 1 });
+        ctrl.observe(4096, true, true, true, None);
+        assert_eq!(ctrl.large, BucketPhase::Active { losses: 1 });
+        ctrl.observe(4096, true, true, true, Some(split(0, 1_200_000)));
+        assert_eq!(ctrl.large, BucketPhase::Active { losses: 1 });
+        ctrl.observe(4096, true, true, true, Some(split(100_000, 410_000)));
+        assert_eq!(ctrl.large, BucketPhase::Active { losses: 0 });
+
+        // In Retry, None and Inconclusive keep Retry pending without re-entering cooldown.
+        ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+        ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+        ctrl.observe(4096, true, true, false, None);
+        ctrl.observe(4096, true, true, false, None);
+        assert_eq!(ctrl.large, BucketPhase::Retry);
+        ctrl.observe(4096, true, true, true, None);
+        assert_eq!(ctrl.large, BucketPhase::Retry);
+        ctrl.observe(4096, true, true, true, Some(split(100_000, 400_000)));
+        assert_eq!(ctrl.large, BucketPhase::Retry);
+        assert!(ctrl.allow(4096, true, true));
+    }
+
+    #[test]
+    fn ineligible_miss_batches_do_not_consume_split_cooldown() {
+        let mut ctrl = SplitController::new(SplitMode::Retry, 2);
+        // Enter cooldown in the Large bucket (2048..=16384).
+        ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+        ctrl.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+        assert_eq!(ctrl.large, BucketPhase::Cooldown { remaining: 2 });
+
+        // Ineligible sizes, one-worker, non-parallel and Small-bucket calls leave Large intact.
+        for rows in [0, 1, 767, 20_000] {
+            assert!(ctrl.allow(rows, true, true));
+            ctrl.observe(rows, true, true, false, None);
+        }
+        ctrl.observe(4096, false, true, false, None);
+        ctrl.observe(4096, true, false, false, None);
+        assert_eq!(ctrl.large, BucketPhase::Cooldown { remaining: 2 });
+
+        // Two-bucket isolation: Small bucket (768..=2047) remains enabled and independent.
+        assert!(ctrl.allow(768, true, true));
+        assert!(ctrl.allow(2047, true, true));
+        ctrl.observe(768, true, true, true, Some(split(100_000, 1_200_000)));
+        ctrl.observe(2047, true, true, true, Some(split(100_000, 1_200_000)));
+        assert_eq!(ctrl.small, BucketPhase::Cooldown { remaining: 2 });
+        assert_eq!(ctrl.large, BucketPhase::Cooldown { remaining: 2 });
+
+        // Exact Large boundaries (2048 and 16384) consume Large cooldown without touching Small.
+        assert!(!ctrl.allow(2048, true, true));
+        ctrl.observe(2048, true, true, false, None);
+        assert_eq!(ctrl.large, BucketPhase::Cooldown { remaining: 1 });
+        assert_eq!(ctrl.small, BucketPhase::Cooldown { remaining: 2 });
+        assert!(!ctrl.allow(exec::PAR_THRESHOLD, true, true));
+        ctrl.observe(exec::PAR_THRESHOLD, true, true, false, None);
+        assert_eq!(ctrl.large, BucketPhase::Retry);
+        assert!(ctrl.allow(4096, true, true));
+        assert!(!ctrl.allow(1024, true, true), "small bucket stays isolated");
+
+        // Always and Never modes behave deterministically without process env mutation.
+        let mut always = SplitController::new(SplitMode::Always, 2);
+        always.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+        always.observe(4096, true, true, true, Some(split(100_000, 1_200_000)));
+        assert!(always.allow(4096, true, true));
+        let never = SplitController::new(SplitMode::Never, 2);
+        assert!(!never.allow(4096, true, true));
+        assert!(!never.allow(20_000, true, true));
+    }
+
+    #[test]
+    fn cooldown_evaluates_later_map_misses_without_a_pool_split() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("date");
+        let target = ctx.var("year");
+        let expr = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
+        let config = ReuseConfig {
+            split: SplitMode::Retry,
+            scope: SplitScope::Bind,
+            admission: AdmissionMode::Cost,
+            cooldown: 2,
+            trace: false,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut reuse = new_reuse_config(&ctx, &expr, None, config).unwrap();
+            // Admit map with a dense first batch (>= 1/2 exact repeat).
+            let seed_dates: Vec<Id> = (1900..1932)
+                .map(|y| {
+                    ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
+                        format!("{y}-01-01+00:00"),
+                        xsd::DATE,
+                    )))
+                })
+                .collect();
+            let mut first = Table::new(vec![input]);
+            first.cols[0] = (0..4096)
+                .map(|i| seed_dates[i % seed_dates.len()])
+                .collect();
+            first.len = 4096;
+            assert!(reuse.apply(&ctx, &mut first, target, &expr).unwrap());
+            assert_eq!(reuse.mode, Mode::Map);
+
+            // Seed two synthetic clear losses in the Small bucket (1,024 distinct misses).
+            reuse.observe_map_split(1024, &expr, true, Some(split(100_000, 1_200_000)));
+            reuse.observe_map_split(1024, &expr, true, Some(split(100_000, 1_200_000)));
+            assert_eq!(reuse.split.small, BucketPhase::Cooldown { remaining: 2 });
+
+            let make_batch = |base_year: usize| -> Table {
+                let keys: Vec<Id> = (0..1024)
+                    .map(|k| {
+                        ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
+                            format!("{:04}-01-01+00:00", base_year + k),
+                            xsd::DATE,
+                        )))
+                    })
+                    .collect();
+                let mut t = Table::new(vec![input]);
+                t.cols[0] = (0..4096).map(|i| keys[i % 1024]).collect();
+                t.len = 4096;
+                t
+            };
+
+            // Cooldown step 1: 1,024 distinct misses evaluated with par = false.
+            let mut b1 = make_batch(3000);
+            let expected1 = exec::column_rows(&ctx, &b1, &expr).unwrap();
+            let before = reuse.evaluations;
+            assert!(reuse.apply(&ctx, &mut b1, target, &expr).unwrap());
+            assert_eq!(b1.cols[1], expected1);
+            assert_eq!(reuse.evaluations - before, 1024);
+            assert_eq!(pending_entries(&reuse), 0);
+            assert_eq!(reuse.last_miss_dispatch, Some((false, None)));
+            assert_eq!(reuse.split.small, BucketPhase::Cooldown { remaining: 1 });
+
+            // Cooldown step 2: consumes final step and transitions to Retry.
+            let mut b2 = make_batch(4500);
+            let expected2 = exec::column_rows(&ctx, &b2, &expr).unwrap();
+            assert!(reuse.apply(&ctx, &mut b2, target, &expr).unwrap());
+            assert_eq!(b2.cols[1], expected2);
+            assert_eq!(pending_entries(&reuse), 0);
+            assert_eq!(reuse.last_miss_dispatch, Some((false, None)));
+            assert_eq!(reuse.split.small, BucketPhase::Retry);
+
+            // Retry: actual production dispatch now passes par = true.
+            let mut b3 = make_batch(6000);
+            assert!(reuse.apply(&ctx, &mut b3, target, &expr).unwrap());
+            assert!(
+                reuse.last_miss_dispatch.unwrap().0,
+                "cooldown expiry must permit a split retry"
+            );
+
+            // Inject synthetic winning observation for deterministic recovery.
+            reuse.observe_map_split(1024, &expr, true, Some(split(100_000, 120_000)));
+            assert_eq!(reuse.split.small, BucketPhase::Active { losses: 0 });
+        });
+    }
+
+    #[test]
+    fn controlled_fallback_reports_dedup_and_row_counts_and_shares_controller_across_map_and_decline()
+     {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("date");
+        let target = ctx.var("year");
+        let expr = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
+        let config = ReuseConfig {
+            split: SplitMode::Retry,
+            scope: SplitScope::Bind,
+            admission: AdmissionMode::Cost,
+            cooldown: 2,
+            trace: false,
+        };
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let mut reuse = new_reuse_config(&ctx, &expr, None, config).unwrap();
+            let dates: Vec<Id> = (2000..6096)
+                .map(|y| {
+                    ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
+                        format!("{y}-01-01+00:00"),
+                        xsd::DATE,
+                    )))
+                })
+                .collect();
+
+            // 1. Declined per-batch dedup: 4,096 distinct keys -> evaluated_rows == 4,096.
+            let unique_table = batch(input, &dates[..4096]);
+            let mut report = crate::sparql::exprcache::Report::default();
+            let (col, eval) = exec::compute_column_controlled(
+                &ctx,
+                &unique_table,
+                &expr,
+                &mut report,
+                |n| reuse.allow_fallback_split(n, &expr),
+                |n| reuse.want_cost_timing(n, &expr),
+            )
+            .unwrap();
+            assert_eq!(col.len(), 4096);
+            assert_eq!(eval.evaluated_rows, 4096);
+            assert_eq!(report.counted(), Some((4096, 4096)));
+
+            // 2. Successful per-batch dedup: 1,024 distinct of 4,096 rows ->
+            //    evaluated_rows == 1,024 while Report::counted keeps (4096, 1024).
+            let dedup_keys: Vec<Id> = (0..4096).map(|i| dates[i % 1024]).collect();
+            let dedup_table = batch(input, &dedup_keys);
+            let mut report = crate::sparql::exprcache::Report::default();
+            let (col, eval) = exec::compute_column_controlled(
+                &ctx,
+                &dedup_table,
+                &expr,
+                &mut report,
+                |n| reuse.allow_fallback_split(n, &expr),
+                |n| reuse.want_cost_timing(n, &expr),
+            )
+            .unwrap();
+            assert_eq!(col, exec::column_rows(&ctx, &dedup_table, &expr).unwrap());
+            assert_eq!(eval.evaluated_rows, 1024);
+            assert_eq!(report.counted(), Some((4096, 1024)));
+
+            // 3. Fallback losses enter cooldown in Large bucket and carry over into Map.
+            let loss_eval = ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: Some(4096 * 1_000),
+                split: Some(split(100_000, 1_200_000)),
+                parallel_allowed: true,
+            };
+            reuse.observe_fallback(4096, loss_eval, None, &expr);
+            reuse.observe_fallback(4096, loss_eval, None, &expr);
+            assert_eq!(reuse.split.large, BucketPhase::Cooldown { remaining: 2 });
+            assert!(!reuse.allow_fallback_split(4096, &expr));
+
+            // Admit map: Large-bucket misses immediately inherit cooldown (no relearning).
+            reuse.admit("test");
+            let mut miss_batch = batch(input, &dates[..3000]);
+            assert!(reuse.apply(&ctx, &mut miss_batch, target, &expr).unwrap());
+            assert_eq!(reuse.last_miss_dispatch, Some((false, None)));
+            assert_eq!(reuse.split.large, BucketPhase::Cooldown { remaining: 1 });
+
+            // 4. Decline to Mode::Off preserves the shared controller for fallback.
+            reuse.decline();
+            assert_eq!(reuse.mode, Mode::Off);
+            assert_eq!(reuse.split.large, BucketPhase::Cooldown { remaining: 1 });
+            assert!(!reuse.allow_fallback_split(4096, &expr));
+            let mut report = crate::sparql::exprcache::Report::default();
+            let (_, eval) = exec::compute_column_controlled(
+                &ctx,
+                &unique_table,
+                &expr,
+                &mut report,
+                |n| reuse.allow_fallback_split(n, &expr),
+                |n| reuse.want_cost_timing(n, &expr),
+            )
+            .unwrap();
+            assert!(!eval.parallel_allowed);
+            assert!(eval.elapsed_nanos.is_none(), "Off must not time fallback");
+            reuse.observe_fallback(4096, eval, report.counted(), &expr);
+            assert_eq!(reuse.last_fallback_dispatch, Some((4096, false, None)));
+            assert_eq!(reuse.split.large, BucketPhase::Retry);
+            assert!(reuse.allow_fallback_split(4096, &expr));
+
+            // 5. Diagnostic memo-off mode keeps Mode::Off while still running the
+            //    shared split controller on fallback.
+            let off_cfg = ReuseConfig {
+                admission: AdmissionMode::Off,
+                ..config
+            };
+            let mut off_reuse = new_reuse_config(&ctx, &expr, None, off_cfg).unwrap();
+            assert_eq!(off_reuse.mode, Mode::Off);
+            let mut dense = dedup_table.clone();
+            assert!(!off_reuse.apply(&ctx, &mut dense, target, &expr).unwrap());
+            assert_eq!(off_reuse.mode, Mode::Off);
+            off_reuse.observe_fallback(4096, loss_eval, None, &expr);
+            off_reuse.observe_fallback(4096, loss_eval, None, &expr);
+            assert!(!off_reuse.allow_fallback_split(4096, &expr));
+        });
+    }
+
+    #[test]
+    fn cost_guard_rational_threshold_and_confirmation_rules() {
+        // Direct rational arithmetic checks around 50 ns/row saving.
+        let mut hist = CostHistory::default();
+        assert!(hist.lower_rate(CostBucket::Large).is_none());
+        // Single slow outlier (2,000 ns/row) alone is not enough.
+        hist.record(4096, 4096 * 2_000);
+        assert!(hist.lower_rate(CostBucket::Large).is_none());
+        // Second observation at 120 ns/row selects the lower rate (120 ns/row).
+        hist.record(4096, 4096 * 120);
+        let low = hist.lower_rate(CostBucket::Large).unwrap();
+        assert!(!low.meets_saving(4096, 512), "1/8 * 120 = 15 ns < 50 ns");
+        assert!(low.meets_saving(4096, 2048), "1/2 * 120 = 60 ns >= 50 ns");
+
+        // Exact 50 ns boundary at 1/8 repeat: 399 ns fails, 400 ns and 480 ns pass.
+        let mut boundary = CostHistory::default();
+        boundary.record(4096, 4096 * 399);
+        boundary.record(4096, 4096 * 500);
+        assert!(
+            !boundary
+                .lower_rate(CostBucket::Large)
+                .unwrap()
+                .meets_saving(4096, 512)
+        );
+        boundary.record(4096, 4096 * 400);
+        assert!(
+            boundary
+                .lower_rate(CostBucket::Large)
+                .unwrap()
+                .meets_saving(4096, 512)
+        );
+        boundary.record(4096, 4096 * 480);
+        assert!(
+            boundary
+                .lower_rate(CostBucket::Large)
+                .unwrap()
+                .meets_saving(4096, 512)
+        );
+
+        // Changing evaluation size bucket requires two new observations.
+        boundary.record(1024, 1024 * 500);
+        assert!(boundary.lower_rate(CostBucket::Large).is_none());
+        assert!(boundary.lower_rate(CostBucket::Small).is_none());
+        boundary.record(1024, 1024 * 500);
+        assert!(
+            boundary
+                .lower_rate(CostBucket::Small)
+                .unwrap()
+                .meets_saving(4096, 512)
+        );
+
+        // Reuse policy checks: counted cannot bypass cost guard or double-confirm one batch.
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        reuse.mode = Mode::Probe;
+
+        // Cheap parallel observations (120 ns/row): counted at 1/8 (512 repeats) must not admit.
+        let cheap_eval = ColumnEval {
+            evaluated_rows: 4096,
+            elapsed_nanos: Some(4096 * 120),
+            split: None,
+            parallel_allowed: true,
+        };
+        reuse.observe_fallback_with(4096, cheap_eval, Some((4096, 3584)), true, true);
+        reuse.observe_fallback_with(4096, cheap_eval, Some((4096, 3584)), true, true);
+        reuse.observe_fallback_with(4096, cheap_eval, Some((4096, 3584)), true, true);
+        assert_eq!(reuse.mode, Mode::Probe);
+        assert_eq!(reuse.weak_confirmations, 0);
+
+        // Expensive parallel observations (480 ns/row): probe + counted on the SAME batch
+        // must count as at most one confirmation, not two.
+        let expensive_eval = ColumnEval {
+            evaluated_rows: 4096,
+            elapsed_nanos: Some(4096 * 480),
+            split: None,
+            parallel_allowed: true,
+        };
+        reuse.cost.record(4096, 4096 * 480);
+        reuse.cost.record(4096, 4096 * 480);
+        reuse.batch_probe_window = Some((256, 64, 4096));
+        reuse.observe_fallback_with(4096, expensive_eval, Some((4096, 3584)), true, true);
+        assert_eq!(
+            reuse.mode,
+            Mode::Probe,
+            "probe and counted on the same batch must not double-confirm"
+        );
+        assert_eq!(reuse.weak_confirmations, 1);
+
+        // Skipped tiny batch (no probe window, no counted) preserves weak_confirmations.
+        let tiny_eval = ColumnEval {
+            evaluated_rows: 128,
+            elapsed_nanos: None,
+            split: None,
+            parallel_allowed: true,
+        };
+        reuse.observe_fallback_with(128, tiny_eval, None, true, true);
+        assert_eq!(reuse.weak_confirmations, 1);
+
+        // Second consecutive passing batch admits.
+        reuse.observe_fallback_with(4096, expensive_eval, Some((4096, 3584)), true, true);
+        assert_eq!(reuse.mode, Mode::Map);
+
+        // Sampled historical >= 1/2 in Probe is NOT exempt from the cost guard (unknown cost
+        // keeps it in Probe), whereas exact within-batch >= 1/2 IS exempt.
+        let mut r2 = new_reuse(&ctx, &expr, None).unwrap();
+        r2.mode = Mode::Probe;
+        r2.batch_probe_window = Some((256, 200, 4096));
+        r2.observe_fallback_with(
+            4096,
+            ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: None,
+                split: None,
+                parallel_allowed: true,
+            },
+            None,
+            true,
+            true,
+        );
+        assert_eq!(
+            r2.mode,
+            Mode::Probe,
+            "sampled historical >= 1/2 must not bypass unknown cost"
+        );
+        r2.observe_fallback_with(
+            4096,
+            ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: None,
+                split: None,
+                parallel_allowed: true,
+            },
+            Some((4096, 2048)),
+            true,
+            true,
+        );
+        assert_eq!(
+            r2.mode,
+            Mode::Map,
+            "exact within-batch >= 1/2 repeat admits immediately"
+        );
+
+        // Single-worker execution preserves the original 1/8 rule without cost observations.
+        let mut r3 = new_reuse(&ctx, &expr, None).unwrap();
+        r3.mode = Mode::Probe;
+        r3.observe_fallback_with(
+            4096,
+            ColumnEval {
+                evaluated_rows: 4096,
+                elapsed_nanos: None,
+                split: None,
+                parallel_allowed: true,
+            },
+            Some((4096, 3584)),
+            true,
+            false,
+        );
+        assert_eq!(r3.mode, Mode::Map);
+    }
+
+    #[test]
+    fn cold_map_after_high_history_low_local_repeat_evaluates_all_uncached_keys() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = cursor_context(&store, 64 << 20);
+        let input = ctx.var("value");
+        let target = ctx.var("bound");
+        let expr = Expr::Call(Func::Builtin(Function::Str), vec![Expr::Var(input)]);
+        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+        // Construct 4,096 distinct keys containing exactly WINDOW sampled keys so each
+        // repeat deterministically completes one probe window.
+        let pool = local_strings(&ctx, 0..16_384);
+        let mut history: Vec<Id> = pool
+            .iter()
+            .copied()
+            .filter(|id| sampled(*id))
+            .take(WINDOW as usize)
+            .collect();
+        assert_eq!(history.len(), WINDOW as usize);
+        history.extend(
+            pool.iter()
+                .copied()
+                .filter(|id| !sampled(*id))
+                .take(4096 - WINDOW as usize),
+        );
+        assert_eq!(history.len(), 4096);
+        // Pilot seeds sketch with 4,096 unique keys.
+        run(&ctx, &mut reuse, input, target, &expr, &history);
+        assert_eq!(reuse.mode, Mode::Probe);
+        // Two repeats of the historical keys confirm and admit the map.
+        run(&ctx, &mut reuse, input, target, &expr, &history);
+        run(&ctx, &mut reuse, input, target, &expr, &history);
+        assert_eq!(reuse.mode, Mode::Map);
+        // A cold batch of completely fresh uncached keys (no local repeats) must evaluate
+        // every key and produce exact answers without phantom hits.
+        let fresh = local_strings(&ctx, 50_000..54_096);
+        let mut table = batch(input, &fresh);
+        let expected = exec::column_rows(&ctx, &table, &expr).unwrap();
+        let evals_before = reuse.evaluations;
+        let hits_before = reuse.hits;
+        assert!(reuse.apply(&ctx, &mut table, target, &expr).unwrap());
+        assert_eq!(table.cols[1], expected);
+        assert_eq!(reuse.evaluations - evals_before, 4096);
+        assert_eq!(reuse.hits - hits_before, 0);
     }
 
     #[test]
@@ -734,17 +2188,26 @@ mod tests {
             })
             .collect();
         table.len = 4096;
-        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
-        assert!(!reuse.apply(&ctx, &mut table, target, &expr).unwrap());
-        assert!(reuse.values.is_empty());
-        assert_eq!(reuse.mode, Mode::Probe);
         // An all-distinct pilot does not retain results, but later skew that the
-        // sketch observes admits the map for the rest of the query.
-        let first = *table.cols[0].iter().find(|id| sampled(**id)).unwrap();
-        table.cols[0].fill(first);
-        assert!(reuse.apply(&ctx, &mut table, target, &expr).unwrap());
-        assert_eq!(reuse.evaluations, 1);
-        assert_eq!(reuse.values.len(), 1);
+        // sketch observes admits the map on single-worker execution without extra clocks.
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        single.install(|| {
+            let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+            let mut pilot = Table::new(vec![input]);
+            pilot.cols[0] = table.cols[0].clone();
+            pilot.len = table.len;
+            assert!(!reuse.apply(&ctx, &mut pilot, target, &expr).unwrap());
+            assert!(reuse.values.is_empty());
+            assert_eq!(reuse.mode, Mode::Probe);
+            let first = *pilot.cols[0].iter().find(|id| sampled(**id)).unwrap();
+            pilot.cols[0].fill(first);
+            assert!(reuse.apply(&ctx, &mut pilot, target, &expr).unwrap());
+            assert_eq!(reuse.evaluations, 1);
+            assert_eq!(reuse.values.len(), 1);
+        });
     }
 
     fn sampled(id: Id) -> bool {
@@ -768,13 +2231,27 @@ mod tests {
     }
 
     /// Runs `keys` through `reuse` in batches of 4,096 and checks every answer against
-    /// row-by-row evaluation of the same rows.
+    /// row-by-row evaluation of the same rows. Feeds deterministic fallback observations
+    /// on declined batches so cross-batch admission tests do not depend on wall clocks.
     fn run(ctx: &Ctx, reuse: &mut Reuse, input: VarId, target: VarId, expr: &Expr, keys: &[Id]) {
         for chunk in keys.chunks(4096) {
             let mut table = batch(input, chunk);
             let expected = crate::sparql::exec::column_rows(ctx, &table, expr).unwrap();
             if reuse.apply(ctx, &mut table, target, expr).unwrap() {
                 assert_eq!(table.cols[1], expected);
+            } else {
+                reuse.observe_fallback_with(
+                    chunk.len(),
+                    ColumnEval {
+                        evaluated_rows: chunk.len(),
+                        elapsed_nanos: Some(chunk.len() as u128 * 200),
+                        split: None,
+                        parallel_allowed: true,
+                    },
+                    None,
+                    expr.parallel(),
+                    rayon::current_num_threads() > 1,
+                );
             }
             ctx.check().unwrap();
         }
@@ -1107,13 +2584,13 @@ mod tests {
             ctx.check().unwrap();
         }
         let mut table = Table::new(vec![input]);
-        table.cols[0] = (0..4096).map(|i| keys[i % 3072]).collect();
+        table.cols[0] = (0..4096).map(|i| keys[i % 2048]).collect();
         table.len = 4096;
         let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
         assert!(reuse.apply(&ctx, &mut table, target, &expr).unwrap());
         assert_eq!(
-            reuse.evaluations, 3072,
-            "substantial general reuse remains eligible"
+            reuse.evaluations, 2048,
+            "strong within-batch reuse remains immediately eligible"
         );
         assert_eq!(
             table.cols[0], table.cols[1],
@@ -1305,70 +2782,76 @@ mod tests {
 
     #[test]
     fn cache_growth_refusal_retains_a_bounded_partial_map_and_normal_evaluation() {
-        let store = Store::in_memory(StoreOptions::default());
-        let ctx = cursor_context(&store, 128 << 10);
-        let input = ctx.var("date");
-        let target = ctx.var("year");
-        let expr = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
-        let date = ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
-            "2000-01-01+00:00",
-            xsd::DATE,
-        )));
-        let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
-        let mut retained = None;
-        for epoch in 0..4 {
-            let mut table = Table::new(vec![input]);
-            table.cols[0] = (0..1024)
-                .map(|row| {
-                    if row < 257 {
-                        date
-                    } else {
-                        Id::from_i64((epoch * 1024 + row) as i64).unwrap()
-                    }
-                })
-                .collect();
-            table.len = 1024;
-            assert!(reuse.apply(&ctx, &mut table, target, &expr).unwrap());
-            assert_eq!(
-                ctx.term(table.cols[1][0]),
-                Some(Term::Literal(Literal::from(2000)))
-            );
-            assert!(table.cols[1][257..].iter().all(|id| *id == Id::UNDEF));
-            assert!(ctx.live_bytes() <= 128 << 10);
-            ctx.check().unwrap();
-            // The table the map allocated, a key and a value per slot, stays within its
-            // retained charge after the batch's scratch is released.
-            assert_eq!(pending_entries(&reuse), 0);
-            // A rebuilt table has a fresh table's room, with no tombstones to use it up.
-            assert_eq!(
-                reuse.values.capacity(),
-                FxHashMap::<Id, Id>::with_capacity_and_hasher(
-                    reuse.values.len(),
-                    Default::default()
-                )
-                .capacity()
-            );
-            assert!(
-                reuse.values.capacity() as u64 * 16 <= reuse.charge.as_ref().unwrap().bytes(),
-                "capacity {} against a charge of {}",
-                reuse.values.capacity(),
-                reuse.charge.as_ref().unwrap().bytes()
-            );
-            if let Some(entries) = retained {
+        let single = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        single.install(|| {
+            let store = Store::in_memory(StoreOptions::default());
+            let ctx = cursor_context(&store, 128 << 10);
+            let input = ctx.var("date");
+            let target = ctx.var("year");
+            let expr = Expr::Call(Func::Builtin(Function::Year), vec![Expr::Var(input)]);
+            let date = ctx.intern_term(&Term::Literal(Literal::new_typed_literal(
+                "2000-01-01+00:00",
+                xsd::DATE,
+            )));
+            let mut reuse = new_reuse(&ctx, &expr, None).unwrap();
+            let mut retained = None;
+            for epoch in 0..4 {
+                let mut table = Table::new(vec![input]);
+                table.cols[0] = (0..1024)
+                    .map(|row| {
+                        if row < 257 {
+                            date
+                        } else {
+                            Id::from_i64((epoch * 1024 + row) as i64).unwrap()
+                        }
+                    })
+                    .collect();
+                table.len = 1024;
+                assert!(reuse.apply(&ctx, &mut table, target, &expr).unwrap());
                 assert_eq!(
-                    reuse.values.len(),
-                    entries,
-                    "a refused optional growth keeps the existing bounded entries"
+                    ctx.term(table.cols[1][0]),
+                    Some(Term::Literal(Literal::from(2000)))
                 );
-            } else {
-                assert!(reuse.values.len() < 768);
-                retained = Some(reuse.values.len());
+                assert!(table.cols[1][257..].iter().all(|id| *id == Id::UNDEF));
+                assert!(ctx.live_bytes() <= 128 << 10);
+                ctx.check().unwrap();
+                // The table the map allocated, a key and a value per slot, stays within its
+                // retained charge after the batch's scratch is released.
+                assert_eq!(pending_entries(&reuse), 0);
+                // A rebuilt table has a fresh table's room, with no tombstones to use it up.
+                assert_eq!(
+                    reuse.values.capacity(),
+                    FxHashMap::<Id, Id>::with_capacity_and_hasher(
+                        reuse.values.len(),
+                        Default::default()
+                    )
+                    .capacity()
+                );
+                assert!(
+                    reuse.values.capacity() as u64 * 16 <= reuse.charge.as_ref().unwrap().bytes(),
+                    "capacity {} against a charge of {}",
+                    reuse.values.capacity(),
+                    reuse.charge.as_ref().unwrap().bytes()
+                );
+                if let Some(entries) = retained {
+                    assert_eq!(
+                        reuse.values.len(),
+                        entries,
+                        "a refused optional growth keeps the existing bounded entries"
+                    );
+                } else {
+                    assert!(reuse.values.len() < 768);
+                    retained = Some(reuse.values.len());
+                }
             }
-        }
-        assert_eq!(
-            reuse.evaluations,
-            1 + 4 * 767,
-            "uncached keys still evaluate normally after the cache fills"
-        );
+            assert_eq!(
+                reuse.evaluations,
+                1 + 4 * 767,
+                "uncached keys still evaluate normally after the cache fills"
+            );
+        });
     }
 }

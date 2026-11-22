@@ -127,12 +127,25 @@ pub(super) fn map_batch<T: Send>(
 
 /// The times of a batch that [`map_batch`] split: its timed sample on the calling thread
 /// and the rest on the pool.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Split {
     pub(super) sample_rows: usize,
     pub(super) sample_nanos: u128,
     pub(super) rest_rows: usize,
     pub(super) rest_nanos: u128,
+}
+
+/// Classification of a [`Split`] observation against its serial sample projection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SplitOutcome {
+    /// Pool finished clearly faster than the serial projection (`10 * Q <= 9 * P`).
+    ClearWin,
+    /// Pool finished clearly slower than the serial projection (`5 * Q >= 6 * P`).
+    ClearLoss,
+    /// Pool finished within the deadband between 90% and 120% of the serial projection.
+    Inconclusive,
+    /// Zero duration, zero row count, or arithmetic overflow: unusable as policy evidence.
+    Unknown,
 }
 
 impl Split {
@@ -142,6 +155,37 @@ impl Split {
     pub(super) fn paid(&self) -> bool {
         self.rest_nanos.saturating_mul(self.sample_rows as u128)
             < self.sample_nanos.saturating_mul(self.rest_rows as u128)
+    }
+
+    /// Classify the split against a 20% clear-loss margin and a 10% clear-win margin,
+    /// treating zero or overflowing inputs as unknown evidence.
+    pub(super) fn classify(&self) -> SplitOutcome {
+        if self.sample_rows == 0
+            || self.rest_rows == 0
+            || self.sample_nanos == 0
+            || self.rest_nanos == 0
+        {
+            return SplitOutcome::Unknown;
+        }
+        let Some(p) = self.sample_nanos.checked_mul(self.rest_rows as u128) else {
+            return SplitOutcome::Unknown;
+        };
+        let Some(q) = self.rest_nanos.checked_mul(self.sample_rows as u128) else {
+            return SplitOutcome::Unknown;
+        };
+        let (Some(q5), Some(p6)) = (q.checked_mul(5), p.checked_mul(6)) else {
+            return SplitOutcome::Unknown;
+        };
+        if q5 >= p6 {
+            return SplitOutcome::ClearLoss;
+        }
+        let (Some(q10), Some(p9)) = (q.checked_mul(10), p.checked_mul(9)) else {
+            return SplitOutcome::Unknown;
+        };
+        if q10 <= p9 {
+            return SplitOutcome::ClearWin;
+        }
+        SplitOutcome::Inconclusive
     }
 }
 
@@ -6004,6 +6048,22 @@ fn string_order_mask(
     Ok(Some(keep))
 }
 
+/// Execution metadata from [`compute_column_controlled`], kept separate from EXPLAIN's
+/// `Report::counted` (which records original input rows and exact distinct inputs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct ColumnEval {
+    /// Rows actually evaluated by the expression closure (distinct rows when per-batch
+    /// reuse ran, or the full input length on row fallback).
+    pub(super) evaluated_rows: usize,
+    /// Full column-evaluation elapsed time in nanoseconds, recorded only when the caller
+    /// requested timing for an evaluation of at least [`super::exprcache::MIN_ROWS`] rows.
+    pub(super) elapsed_nanos: Option<u128>,
+    /// Sampled split timing when the row evaluator actually split a batch onto the pool.
+    pub(super) split: Option<Split>,
+    /// Whether the caller permitted parallel execution for this evaluation.
+    pub(super) parallel_allowed: bool,
+}
+
 /// BIND: the value of `e` on every row (unbound on an error), once per distinct input
 /// value when the expression is pure over one variable.
 pub(super) fn compute_column(
@@ -6020,6 +6080,45 @@ pub(super) fn compute_column(
         Some(ids) => Ok(ids),
         None => column_rows(ctx, t, e),
     }
+}
+
+/// [`compute_column`] under a caller-supplied scheduling policy. The same row-evaluation
+/// callback serves both [`super::exprcache::column`]'s per-batch distinct pass and the
+/// ordinary row fallback, reporting actual evaluated-row count, optional full-column
+/// elapsed time and any sampled [`Split`] separately from `report`.
+pub(super) fn compute_column_controlled(
+    ctx: &Ctx,
+    t: &Table,
+    e: &Expr,
+    report: &mut ExprReport,
+    allow_parallel: impl Fn(usize) -> bool,
+    time_eval: impl Fn(usize) -> bool,
+) -> Result<(Vec<Id>, ColumnEval)> {
+    if let Some(col) = super::exists::column(ctx, t, e)? {
+        return Ok((col, ColumnEval::default()));
+    }
+    let mut obs = ColumnEval::default();
+    let col = {
+        let mut eval_rows = |rows: &Table| -> Result<Vec<Id>> {
+            let n = rows.len();
+            let par = allow_parallel(n);
+            let t0 = (n >= super::exprcache::MIN_ROWS && time_eval(n)).then(Instant::now);
+            let (values, split) = column_rows_split(ctx, rows, e, par)?;
+            let elapsed_nanos = t0.map(|t0| t0.elapsed().as_nanos());
+            obs = ColumnEval {
+                evaluated_rows: n,
+                elapsed_nanos,
+                split,
+                parallel_allowed: par,
+            };
+            Ok(values)
+        };
+        match super::exprcache::column(ctx, t, e, report, &mut eval_rows)? {
+            Some(ids) => ids,
+            None => eval_rows(t)?,
+        }
+    };
+    Ok((col, obs))
 }
 
 pub(super) fn column_rows(ctx: &Ctx, t: &Table, e: &Expr) -> Result<Vec<Id>> {
@@ -11104,5 +11203,48 @@ mod string_order_tests {
             );
             assert!(ctx.check().is_ok(), "cursor {cursor}");
         }
+    }
+}
+
+#[cfg(test)]
+mod map_batch_tests {
+    use super::*;
+    use crate::store::{Store, StoreOptions};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn map_batch_without_parallel_permission_runs_every_row_on_its_caller() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(2)
+            .build()
+            .unwrap();
+        pool.install(|| {
+            let caller = std::thread::current().id();
+            let (out, split) = map_batch_split(&ctx, 4096, false, |i| {
+                assert_eq!(std::thread::current().id(), caller);
+                i * 3 + 1
+            })
+            .unwrap();
+            assert!(split.is_none());
+            assert_eq!(out, (0..4096).map(|i| i * 3 + 1).collect::<Vec<_>>());
+        });
+    }
+
+    #[test]
+    fn map_batch_serial_cancellation_stops_at_next_chunk_check() {
+        let store = Store::in_memory(StoreOptions::default());
+        let ctx = Ctx::new(store.snapshot());
+        let visited = AtomicUsize::new(0);
+        let result = map_batch_split(&ctx, 4096, false, |i| {
+            visited.fetch_add(1, Ordering::Relaxed);
+            if i == 300 {
+                ctx.cancel.store(true, Ordering::Relaxed);
+            }
+            i
+        });
+        assert!(matches!(result, Err(crate::Error::Cancelled)));
+        assert_eq!(visited.load(Ordering::Relaxed), BATCH_SAMPLE_ROWS + 1024);
     }
 }
