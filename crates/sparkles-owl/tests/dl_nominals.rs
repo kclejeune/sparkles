@@ -2711,13 +2711,10 @@ fn the_marker_repair_delivers_in_the_run_without_counting_after_the_bound() {
             out.stats.dl_counting_over,
             "{at}: the run with counting finished"
         );
-        // the bound passed with counting marks the run over budget, which the claim
-        // predicate excludes, and the run without counting leaves the maximum out, so the
-        // rooted answer is checked here as the control above does
-        assert!(
-            out.complete && out.stats.tier == Tier::Disjunctive,
-            "{at}: no answer of Tier D"
-        );
+        // The fallback finishes for the axioms it takes and leaves the maximum out.
+        assert_eq!(out.stats.tier, Tier::Disjunctive, "{at}: unexpected tier");
+        assert!(out.complete_for_taken, "{at}: the fallback did not finish");
+        assert!(!out.complete, "{at}: the fallback left the maximum out");
         assert!(
             !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined,
             "{at}: the run started again without the rooted rules"
