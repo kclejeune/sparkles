@@ -1683,3 +1683,73 @@ fn dt_index_star_hierarchy_upfront_admission_covers_per_role_vector_capacities()
     );
     assert!(granted.load(Ordering::Relaxed) <= cap);
 }
+
+#[test]
+fn dt_index_absent_ranges_prices_default_without_allocating() {
+    use super::dtcheck::range::Ranges;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Compile-time default table estimate matches a freshly constructed `Ranges::new()`.
+    assert_eq!(Ranges::default_bytes(), Ranges::new().bytes());
+
+    // Unqualified `DataMinCardinality(2 :d)` activates a checker component without
+    // converting any data range, so `it.dt.ranges()` stays `None` when `dt_index` runs.
+    let ofn = "Prefix(:=<http://example.org/>)\n\
+               Ontology(\n\
+                 Declaration(Class(:A))\n\
+                 Declaration(DataProperty(:d))\n\
+                 SubClassOf(:A DataMinCardinality(2 :d))\n\
+               )\n";
+    let doc = crate::ofn_read::parse(ofn).unwrap();
+    let refs: Vec<_> = doc.axioms.iter().map(|a| &a.kind).collect();
+
+    Ranges::reset_new_calls();
+    let mut uncap = Saturation::new();
+    let full = uncap
+        .saturate(
+            &refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(uncap.interner.dt.ranges().is_none());
+    assert!(uncap.index.as_ref().unwrap().dt.is_some());
+    // Exactly one `Ranges::new()` for the retained `DtIx`, never an extra pre-admission table.
+    assert_eq!(Ranges::new_calls(), 1);
+    assert!(full.stats.peak_memory >= Ranges::default_bytes());
+
+    // Under a cap large enough for pre-pass/normalization (~2-3 KiB) but strictly below
+    // `Ranges::default_bytes()` (~10 KiB), `dt_index` must refuse inside `g.grow(total_est)`
+    // before `Ranges::new()` is ever called.
+    let cap = Ranges::default_bytes().saturating_sub(1);
+    let granted = Arc::new(AtomicUsize::new(0));
+    let g = granted.clone();
+    let limits = Limits {
+        threads: 1,
+        max_memory: Some(cap),
+        charge: Some(Arc::new(move |bytes| {
+            let prev = g.fetch_add(bytes, Ordering::Relaxed);
+            if prev.saturating_add(bytes) > cap {
+                g.fetch_sub(bytes, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        })),
+        ..Limits::default()
+    };
+    Ranges::reset_new_calls();
+    let mut sat = Saturation::new();
+    let res = sat.saturate(&refs, None, &limits);
+    assert!(
+        matches!(res, Err(Error::Memory { .. }))
+            || matches!(res, Ok(ref o) if o.stats.horn_over_budget),
+        "expected memory refusal or Horn fallback under cap {cap}, got {res:?}"
+    );
+    assert!(granted.load(Ordering::Relaxed) <= cap);
+    assert_eq!(Ranges::new_calls(), 0);
+}

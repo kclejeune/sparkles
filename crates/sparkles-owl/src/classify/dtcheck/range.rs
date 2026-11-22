@@ -1172,11 +1172,28 @@ pub struct Ranges {
     bytes: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    static RANGES_NEW_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Ranges {
     pub const EMPTY: Rid = 0;
     pub const FULL: Rid = 1;
 
+    #[cfg(test)]
+    pub(in super::super) fn reset_new_calls() {
+        RANGES_NEW_CALLS.with(|c| c.set(0));
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn new_calls() -> usize {
+        RANGES_NEW_CALLS.with(|c| c.get())
+    }
+
     pub fn new() -> Ranges {
+        #[cfg(test)]
+        RANGES_NEW_CALLS.with(|c| c.set(c.get() + 1));
         let mut r = Ranges {
             nfs: Vec::new(),
             ids: FxHashMap::default(),
@@ -1229,11 +1246,22 @@ impl Ranges {
     pub fn nf(&self, id: Rid) -> &Nf {
         &self.nfs[id as usize]
     }
-    /// Exact [`Ranges::bytes`] of a freshly constructed [`Ranges::new`], cached once so
-    /// admission can price `unwrap_or_default()` without allocating first.
-    pub(in super::super) fn default_bytes() -> usize {
-        static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *BYTES.get_or_init(|| Ranges::new().bytes())
+    /// Exact [`Ranges::bytes`] of a freshly constructed [`Ranges::new`], computed at
+    /// compile time with zero heap allocation so admission can price `unwrap_or_default()`
+    /// before constructing a table.
+    pub(in super::super) const fn default_bytes() -> usize {
+        let nf_size = size_of::<Nf>();
+        let empty_nf = nf_size + 5;
+        let full_nf = nf_size
+            + size_of::<(End<BigInt>, End<BigInt>)>()
+            + (CELLS + 6) * size_of::<(End<u64>, End<u64>)>()
+            + 5;
+        // `Ranges::new()` interns `empty` and `full` into `nfs` (cap 4 if `nf_size <= 1024`,
+        // else 2) and `ids` (8 hashbrown buckets).
+        let min_vec_cap = if nf_size <= 1024 { 4 } else { 2 };
+        let spare_nfs = (min_vec_cap - 2) * nf_size;
+        let ids_backing = 8 * (size_of::<(Nf, Rid)>() + 1) + 16 - 2 * nf_size;
+        2 * (empty_nf + full_nf) + spare_nfs + ids_backing
     }
     /// The bytes the table retains, including allocated vector and hash-table bucket
     /// capacities preserved by [`Clone`], for the run's memory budget.
