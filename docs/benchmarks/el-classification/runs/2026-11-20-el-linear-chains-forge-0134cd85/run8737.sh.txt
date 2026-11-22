@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# run8737.sh BIN TAG [extra args]: runs ore_ont_8737 el-only and default at 4 threads
+set -u
+BIN=$1 TAG=$2; shift 2
+L=~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/el-956/.artifacts/lanes/el-956
+F=$L/data/dev-files/ore_ont_8737.owl
+mkdir -p $L/out/$TAG
+for mode in el default; do
+  args=(); [ $mode = el ] && args=(--el-only)
+  for t in ${THREADS:-4}; do
+    systemd-run --user --scope -q -p MemoryMax=11G -p MemorySwapMax=1G -p OOMPolicy=continue \
+      "$BIN" --threads $t "${args[@]}" "$@" --taxonomy $L/out/$TAG/8737.$mode.t$t.tax "$F" > $L/out/$TAG/8737.$mode.t$t.json 2> $L/out/$TAG/8737.$mode.t$t.err
+    echo "$mode t$t exit=$?"
+  done
+done

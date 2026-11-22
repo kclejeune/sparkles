@@ -2,7 +2,11 @@
 """The effect of the query memory pool from two A/B runs in opposite orders, which cancels
 the bias of the second position, and the X08 latency gate applied to it.
 
-usage: combine.py pool-on-second.tsv pool-on-first.tsv [same.tsv]
+usage: combine.py [--labels OFF,ON] pool-on-second.tsv pool-on-first.tsv [same.tsv]
+
+With --labels base,tip, as scripts/x08-gates/latency.sh passes in its base-and-tip form,
+the first run has the base as A and the tip as B, the second the tip as A and the base as
+B, and the estimate is the tip's time over the base's.
 
 pool-on-second.tsv has the pool off as A and on as B, so its ratio B/A is the effect times
 the bias. pool-on-first.tsv has the pool on as A and off as B, so its ratio is the bias
@@ -58,18 +62,27 @@ def rounds(path, problems):
 
 
 def main():
+    args = sys.argv[1:]
+    off, on = "pool off", "on"
+    if args[:1] == ["--labels"]:
+        off, on = args[1].split(",")
+        args = args[2:]
+    if len(args) not in (2, 3):
+        sys.exit(__doc__)
     rng = random.Random(42)
     problems = []
-    on_second, q1 = rounds(sys.argv[1], problems)
-    on_first, q2 = rounds(sys.argv[2], problems)
-    same = rounds(sys.argv[3], problems)[0] if len(sys.argv) > 3 else {}
+    on_second, q1 = rounds(args[0], problems)
+    on_first, q2 = rounds(args[1], problems)
+    same = rounds(args[2], problems)[0] if len(args) > 2 else {}
     if q1 != q2:
         problems.append(f"the runs cover different queries: {sorted(q1 ^ q2)}")
     if not q1:
         problems.append("the runs hold no queries")
+    second = "pool-on-second" if on == "on" else f"{on}-second"
+    first = "pool-on-first" if on == "on" else f"{on}-first"
     print(
-        "| query | pool off ms | on/off | 95% interval | added µs "
-        "| pool-on-second ratio | pool-on-first ratio | same-build ratio | gate |"
+        f"| query | {off} ms | {on}/{off.split()[-1]} | 95% interval | added µs "
+        f"| {second} ratio | {first} ratio | same-build ratio | gate |"
     )
     print("|---|--:|--:|---|--:|--:|--:|--:|---|")
     for q in sorted(on_second.keys() & on_first.keys()):
@@ -86,7 +99,7 @@ def main():
         ok = hi <= 1.02 or added_us <= 0.5
         if not ok:
             problems.append(
-                f"{q}: on/off {est:.4f} up to {hi:.4f}, {added_us:.2f} µs added"
+                f"{q}: {on}/{off.split()[-1]} {est:.4f} up to {hi:.4f}, {added_us:.2f} µs added"
             )
         same_ratio = f"{st.median(same[q][0]):.4f}" if q in same else ""
         print(

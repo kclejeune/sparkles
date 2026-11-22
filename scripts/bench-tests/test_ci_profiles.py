@@ -1,4 +1,5 @@
 """Exercise local CI profile selection without building workspace crates."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import os
 import re
 from pathlib import Path

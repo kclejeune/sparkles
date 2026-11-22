@@ -1,0 +1,880 @@
+#!/usr/bin/env python3
+"""Run a directory of unittest modules in several processes at once, with serial discovery's verdict.
+
+    python3 scripts/unittest-parallel.py [--jobs N] [--split MODULE]... [--unit-timeout S]
+        [--discover-timeout S] [--grace S] DIR
+
+The runner first discovers the suite in a child process, the way `python3 -m unittest
+discover -s DIR` does from the caller's working directory, and records the discovered tree:
+one top-level entry for each module or package that discovery loads, and the id of every
+test occurrence in order. The runner's own process imports no test module. Each unit then
+runs in its own process, which discovers the whole suite again, checks that its tree matches
+the recorded one, and runs one top-level entry exactly as discovered. So every module is
+imported in every unit, as in serial discovery, and import errors, import-time skips and class
+and module fixtures behave as they do serially. An entry made only of default suites with no
+test does nothing and gets no process.
+
+The whole suite runs in one process instead, as discovery returned it, and the runner says
+why, when anything in it could make a part of the suite depend on what ran before it. That
+is the case when a module or package that discovery loads has a load_tests hook, when the
+suite holds anything other than default suites and TestCase tests, including a default
+suite with attributes of its own such as a run() given to the instance, when a test module
+has changed unittest's suite classes or put other classes under their names, and when test
+classes of one module run in more than one entry, as when one test module imports another's
+class, since they can share that module's state. The runner does not ask what such a hook
+or suite does, and counts a suite of a kind of its own as one occurrence. A default suite
+that replaces both its own run() and countTestCases() and hides its tests, for instance by
+setting _tests to None, is outside this contract. The runner fails the run with exit 1 while
+describing such a suite, before the whole-suite run could start, and never passes it.
+
+The runner reaches serial discovery's verdict under three assumptions, which it does not
+check. No test depends on state, such as a helper module's globals, that a test in another
+unit left behind, since such a test can pass or skip here and fail serially, and the same
+holds for the tests of a split module. A test's own run() reads only its own test's result.
+Test code does not react to being inspected or imported more than once, since each unit
+imports every module and asks each test for its id() and attributes again.
+scripts/unittest-compare.py, which the nightly gate runs, runs a suite both ways and fails
+when the verdicts or counts differ.
+
+A module named with --split runs one process per test instead, for modules whose few tests
+take most of the suite's time. The split is taken only when the module's entry is plain,
+which means default suites holding only the module's own test classes, with no class or
+module fixtures and no repeated test. Otherwise the module runs whole and the runner says
+why. Units start longest first, using the split tests and then the modules by file size as
+the estimate, and each unit's output is printed whole when it ends.
+
+Each unit writes a result record beside its output: the occurrences it ran, unittest's
+counts and verdict, and a completion mark. A unit fails when its exit status is not 0, its
+record is missing, incomplete or for other occurrences, or unittest's result was not
+successful. A test's own output never counts. The run exits 1 when any unit failed or
+discovery failed, 5 when no test ran and none was skipped, as unittest does, and 0
+otherwise. Discovery and every unit get the interpreter's -W options, and tests run with
+warnings set to 'default' unless the interpreter was given -W.
+
+A test module can share evidence across units. When a module defines parallel_export(),
+each unit calls it after its tests and teardown and puts the result in its record, and a
+missing export fails the unit. A module that defines parallel_absorb(exports) runs after
+every other unit has ended, and its unit calls parallel_absorb with the list of
+(unit, export) pairs before its tests start. The suite's process-leak check uses this, so
+its one test runs once, last, on the evidence of every unit.
+
+Discovery and each unit have deadlines, 300 s and 900 s by default, and the one unit that
+runs the whole suite, when it does, has the longer of --unit-timeout and --suite-timeout,
+2400 s by default. Every duration must be finite. Each runs in its own session with its output in a file. When a deadline
+passes, or the runner gets SIGINT, SIGTERM or SIGHUP, it starts no more units, sends SIGTERM
+to the process group and session of every active unit and to every descendant it finds
+under /proc, follows with SIGKILL after one grace period, 5 s by default, and reports the
+units, including those that never started. A process is signalled only
+while its start time still matches, so a reused pid is left alone. A process that left the
+unit's tree before that, by being orphaned, is not found. An interrupted run exits 128 plus
+the signal number. Discovery and each unit get SIGTERM from the kernel when the runner dies
+without stopping them, as under SIGKILL, and then stop their own descendants the same way
+and exit.
+On a host without /proc or prctl, which the runner needs, it prints a notice and runs the
+suite serially by replacing itself with `python3 -m unittest discover -s DIR`, ignoring the
+options other than DIR, so the run exits as that does, or ends by the signal that ends it.
+It does the same when DIR, or any directory under it, has an entry named as a module that
+discovery and the units load before they discover and serial discovery does not, such as
+json.py, since a test module importing that name, from DIR or from a helper directory under
+it that a test puts on the path, would get the file serially and the runner's module here.
+The runner loads few such modules, json and ctypes with what they import, and imports the
+rest of what its own process uses only there. Serial discovery also puts the working
+directory first on the path before it loads argparse and unittest, so an entry there named
+as any module loaded after interpreter startup, such as locale.py, sends the run to serial
+discovery too. A test that puts a directory outside DIR on the path is not checked, and the
+nightly comparison covers it.
+--keep DIR keeps the discovery, the plan, each unit's output and the result records in a
+new directory under DIR. --jobs 1 runs the units one at a time, in the same processes.
+"""
+
+import sys
+
+# The top-level modules the interpreter has loaded at startup, before either run puts its
+# first directory on the path.
+_STARTUP = frozenset(m.partition(".")[0] for m in sys.modules)
+
+# `python3 -m unittest` has loaded runpy and unittest, with what they import, before it
+# discovers, and has built its command line's argparse parsers, whose translated help and
+# formatter import gettext's locale and shutil. The runner does the same, so test code that
+# imports one of these gets the same module in both runs.
+import argparse
+import runpy  # noqa: F401
+import unittest
+
+argparse.ArgumentParser().add_argument("--discover")
+_SERIAL_MODULES = {m.partition(".")[0] for m in sys.modules}
+
+import ctypes
+import json
+import os
+import signal
+import time
+
+# The top-level modules that discovery and every unit have loaded before they discover and
+# serial discovery has not. A test module that imports one of these names gets a file of
+# that name in the discovery directory serially and the runner's module here, so such a file
+# sends the suite to serial discovery. The modules that only the runner's own process uses
+# are imported where it uses them, so that they are not on this list.
+_OWN_MODULES = frozenset({m.partition(".")[0] for m in sys.modules} - _SERIAL_MODULES)
+
+RUNNER = os.path.abspath(__file__)
+
+# The attributes a default suite instance has, and unittest's suite and test classes as they
+# were before any test module was imported, so that a suite that can behave other than a
+# default one is found even when a test module puts another class under unittest's names.
+_SUITE_KEYS = {"_tests", "_removed_tests"}
+_BASE_SUITE, _SUITE, _CASE = unittest.suite.BaseTestSuite, unittest.suite.TestSuite, unittest.case.TestCase
+_SUITE_CLASSES = (_BASE_SUITE, _SUITE)
+_SUITE_DICTS = {cls: dict(vars(cls)) for cls in _SUITE_CLASSES}
+_SUITE_NAMES = [(unittest, "unittest", "TestSuite", _SUITE), (unittest.suite, "unittest.suite", "TestSuite", _SUITE),
+                (unittest, "unittest", "BaseTestSuite", _BASE_SUITE),
+                (unittest.suite, "unittest.suite", "BaseTestSuite", _BASE_SUITE)]
+
+
+def _default(node):
+    """Whether NODE is of one of unittest's own suite classes, whose contents the runner can
+    list without running code of a test module's."""
+    return type(node) in _SUITE_CLASSES
+
+
+# ----- discovery, in the discovery child and in every unit ---------------------------------
+
+class _TaggingLoader(unittest.TestLoader):
+    """A loader that remembers which module produced each suite, to name the units, and
+    which modules give unittest a load_tests hook."""
+
+    def __init__(self):
+        super().__init__()
+        self.labels = {}
+        self.hooks = []
+
+    def loadTestsFromModule(self, module, *args, **kwargs):
+        # unittest looks for the hook here, for test modules and packages alike, with the
+        # same lookup.
+        if getattr(module, "load_tests", None) is not None:
+            self.hooks.append(f"{module.__name__} defines load_tests")
+        suite = super().loadTestsFromModule(module, *args, **kwargs)
+        # The suite is kept with its name, so that its id is not reused by another.
+        self.labels.setdefault(id(suite), (suite, module.__name__))
+        return suite
+
+
+def _tree(node, deep=True):
+    """NODE's description. A suite of a kind of its own is described by its kind alone, since
+    listing it would run its code."""
+    if isinstance(node, _BASE_SUITE):
+        cls = type(node)
+        tree = {"suite": f"{cls.__module__}.{cls.__qualname__}"}
+        if _default(node):
+            tree["own"] = sorted(set(vars(node)) - _SUITE_KEYS)
+            if deep:
+                tree["tests"] = [_tree(t) for t in node]
+        return tree
+    return _id(node)
+
+
+def _id(test):
+    """TEST's id, or for a suite of a kind of its own or a test with no id(), a name for its
+    kind. A suite is named by its kind even when it is also a TestCase."""
+    if not isinstance(test, _BASE_SUITE) and callable(getattr(test, "id", None)):
+        return test.id()
+    return f"<{type(test).__module__}.{type(test).__qualname__}>"
+
+
+def _custom(node):
+    """Why NODE alone, not counting what it holds, can behave other than a default suite or a
+    TestCase does, or None. A suite of a kind of its own, a default suite with attributes of
+    its own, such as a run() given to the instance, and a test that is not a TestCase can
+    each do anything when they run, including depend on the result of what ran before."""
+    if isinstance(node, _BASE_SUITE):
+        if type(node) is not _SUITE:
+            return f"has a suite of kind {type(node).__module__}.{type(node).__qualname__}"
+        own = sorted(set(vars(node)) - _SUITE_KEYS)
+        if own:
+            return f"has a suite with attributes of its own: {', '.join(own)}"
+        return None
+    if not isinstance(node, _CASE):
+        return f"has a test of kind {type(node).__module__}.{type(node).__qualname__}"
+    return None
+
+
+def _changed_suite_classes():
+    """Which attribute of unittest's suite classes a test module changed, or which of their
+    names it bound to something else, or None."""
+    for module, prefix, name, cls in _SUITE_NAMES:
+        if vars(module).get(name) is not cls:
+            return f"{prefix}.{name} was rebound"
+    for cls, before in _SUITE_DICTS.items():
+        now = vars(cls)
+        for name in sorted(set(before) | set(now)):
+            if before.get(name) is not now.get(name):
+                return f"unittest.{cls.__qualname__}.{name} was changed"
+    return None
+
+
+def _leaves(node):
+    """The occurrences under NODE in order. A suite of a kind of its own counts as one."""
+    if _default(node):
+        for t in node:
+            yield from _leaves(t)
+    else:
+        yield node
+
+
+def _label(loader, entry, index):
+    if id(entry) in loader.labels:
+        return loader.labels[id(entry)][1]
+    for t in _leaves(entry):
+        # Import failures and import-time skips stand in as unittest.loader._FailedTest.MODULE
+        # and unittest.loader.ModuleSkipped.MODULE.
+        if type(t).__module__ == "unittest.loader":
+            return _id(t).rsplit(".", 1)[-1]
+        if isinstance(t, _BASE_SUITE) or not isinstance(t, _CASE):
+            return type(t).__module__
+        return _id(t).rsplit(".", 2)[0]
+    return f"entry-{index}"
+
+
+def _overridden(cls, name):
+    for k in cls.__mro__:
+        if k is _CASE:
+            return False
+        if name in vars(k):
+            return True
+    return False
+
+
+def _plain(label, entry):
+    """Why ENTRY cannot be split into one process per test, or None when it can."""
+    module = sys.modules.get(label)
+    if module is None:
+        return "it is not a module of its own"
+    for hook in ("setUpModule", "tearDownModule", "parallel_absorb"):
+        if hasattr(module, hook):
+            return f"it defines {hook}"
+    if unittest.case._module_cleanups:
+        return "a module cleanup is registered"
+    seen = set()
+
+    def walk(node):
+        if isinstance(node, _BASE_SUITE):
+            for t in node:
+                why = walk(t)
+                if why:
+                    return why
+            return None
+        cls = type(node)
+        if cls.__module__ != label:
+            return f"it runs {cls.__module__}.{cls.__qualname__} from another module"
+        for name in ("setUpClass", "tearDownClass"):
+            if _overridden(cls, name):
+                return f"{cls.__qualname__} has {name}"
+        if getattr(cls, "_class_cleanups", None):
+            return f"{cls.__qualname__} has a class cleanup"
+        if node.id() in seen:
+            return f"it runs {node.id()} more than once"
+        seen.add(node.id())
+        return None
+
+    return walk(entry)
+
+
+def discover(directory):
+    """Discover DIRECTORY as `python3 -m unittest discover -s DIRECTORY` does, and return the
+    suite that discovery returns, its top-level entries and their description."""
+    # `python3 -m unittest` puts the working directory first on the path, where a script puts
+    # its own directory.
+    sys.path[0] = os.getcwd()
+    before = set(sys.modules)
+    loader = _TaggingLoader()
+    suite = loader.discover(str(directory))
+    # A root of a kind of its own is not listed, since listing it would run its code, and it
+    # sends the whole suite to one process.
+    entries = list(suite) if _default(suite) else []
+    changed = _changed_suite_classes()
+    serial = _serial(loader, suite, entries, changed)
+    units = []
+    for i, entry in enumerate(entries):
+        label = _label(loader, entry, i)
+        module = sys.modules.get(label)
+        f = getattr(module, "__file__", None)
+        units.append({
+            "label": label,
+            "tree": _tree(entry),
+            "leaves": [_id(t) for t in _leaves(entry)],
+            # A split check needs default suites and TestCase tests, which the fallback does not.
+            "split": "the whole suite runs in one process" if serial else _plain(label, entry),
+            "size": os.path.getsize(f) if f and os.path.exists(f) else 0,
+            "absorb": callable(getattr(module, "parallel_absorb", None)),
+            # With no custom node anywhere, a part with no test does nothing when it runs.
+            "inert": not any(True for _ in _leaves(entry)),
+        })
+    exports = sorted(m for m in set(sys.modules) - before
+                     if callable(getattr(sys.modules[m], "parallel_export", None)))
+    # The hooks, the root and each suite's own attributes are part of the description, so a
+    # unit whose discovery made them differently fails its comparison with the runner's.
+    return suite, entries, {"root": _tree(suite, deep=False), "leaves": [_id(t) for t in _leaves(suite)],
+                            "changed": changed,
+                            "hooks": loader.hooks, "units": units, "exports": exports,
+                            "serial": serial}
+
+
+def _serial(loader, suite, entries, changed):
+    """Why the whole suite runs in one process, or None. A load_tests hook can build any
+    suite, and a custom suite, which _custom names, can depend on the result of everything
+    run before it, and so can every suite once a test module has changed unittest's suite
+    classes. So any of these, anywhere in the suite that discovery returns, sends the whole
+    suite to one process, without asking what it does. Test classes of one module that run
+    in more than one entry, as when one test module imports another's class, can share that
+    module's state and fixtures, which only one process keeps."""
+    if loader.hooks:
+        return loader.hooks[0]
+    if changed:
+        return changed
+
+    def custom(node, where):
+        why = _custom(node)
+        if why:
+            return f"{where} {why}"
+        if isinstance(node, _BASE_SUITE):
+            for t in node:
+                why = custom(t, where)
+                if why:
+                    return why
+        return None
+
+    why = _custom(suite)
+    if why:
+        return f"the suite that discovery returns {why}"
+    for i, entry in enumerate(entries):
+        why = custom(entry, _label(loader, entry, i))
+        if why:
+            return why
+    where = {}
+    for i, entry in enumerate(entries):
+        for t in _leaves(entry):
+            module = type(t).__module__
+            if module != "unittest.loader":
+                where.setdefault(module, set()).add(i)
+    for module, found in where.items():
+        if len(found) > 1:
+            return f"test classes of {module} run in {len(found)} top-level entries"
+    return None
+
+
+def _write_json(path, value):
+    tmp = f"{path}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(value, f)
+    os.replace(tmp, path)
+
+
+def discover_main(directory, out):
+    # The caller has set up _die_with_parent before any test module is imported.
+    _, _, description = discover(directory)
+    _write_json(out, description)
+    return 0
+
+
+def _die_with_parent(parent, grace):
+    """End this unit, and what it started, when the runner ends without stopping it, as when
+    it is killed with SIGKILL. The kernel sends SIGTERM when the runner dies, and the handler
+    stops this unit's descendants as the runner would have."""
+    me = {os.getpid(): _start_of(os.getpid())}
+
+    def on_term(signum, frame):
+        found = _owned(me)
+        found.pop(os.getpid(), None)
+        stop_all(found, grace)
+        os._exit(128 + signum)
+
+    signal.signal(signal.SIGTERM, on_term)
+    ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0)  # PR_SET_PDEATHSIG
+    if os.getppid() != parent:
+        on_term(signal.SIGTERM, None)
+
+
+def worker_main(directory, plan_path, index, split, record_path, absorb_path):
+    with open(plan_path) as f:
+        plan = json.load(f)
+    suite, entries, description = discover(directory)
+    record = {"complete": True, "index": index, "split": split}
+    if description != plan:
+        record.update(error="the suite discovered here differs from the runner's discovery", ran=[])
+        _write_json(record_path, record)
+        return 1
+    # The whole suite runs as discovery returned it, which may have behaviour of its own.
+    entry = suite if index < 0 else entries[index]
+    if split >= 0:
+        entry = _SUITE([list(_leaves(entry))[split]])
+    if absorb_path:
+        with open(absorb_path) as f:
+            exports = json.load(f)
+        label = plan["units"][index]["label"]
+        sys.modules[label].parallel_absorb(exports.get(label, []))
+    # A suite drops each test once it has run, so the occurrences are listed first.
+    ran = [_id(t) for t in _leaves(entry)]
+    warnings = None if sys.warnoptions else "default"
+    result = unittest.TextTestRunner(stream=sys.stderr, warnings=warnings).run(entry)
+    record.update(
+        ran=ran,
+        testsRun=result.testsRun,
+        failures=len(result.failures),
+        errors=len(result.errors),
+        skipped=len(result.skipped),
+        expectedFailures=len(result.expectedFailures),
+        unexpectedSuccesses=len(result.unexpectedSuccesses),
+        successful=result.wasSuccessful(),
+        exports={m: sys.modules[m].parallel_export() for m in plan["exports"]},
+    )
+    sys.stderr.flush()
+    _write_json(record_path, record)
+    return 0 if result.wasSuccessful() else 1
+
+
+# ----- supervision, in the runner ----------------------------------------------------------
+
+class Interrupted(Exception):
+    def __init__(self, signum):
+        super().__init__(signum)
+        self.signum = signum
+
+
+# The signals received. The handler only records them, and the supervising loops, which poll
+# every 50 ms, raise Interrupted where every started process is already tracked.
+_STOP = []
+
+
+def _on_signal(signum, frame):
+    _STOP.append(signum)
+
+
+def _check_stop():
+    if _STOP:
+        raise Interrupted(_STOP[0])
+
+
+def _process_table():
+    """Each live process's (parent, group, session, start time), read from /proc."""
+    table = {}
+    for d in os.listdir("/proc"):
+        if not d.isdigit():
+            continue
+        try:
+            with open(f"/proc/{d}/stat") as f:
+                fields = f.read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if fields[0] != "Z":
+            table[int(d)] = (int(fields[1]), int(fields[2]), int(fields[3]), int(fields[19]))
+    return table
+
+
+def _start_of(pid):
+    """PID's start time, which with the pid names one process, or None when it has ended."""
+    return _process_table().get(pid, (0, 0, 0, None))[3]
+
+
+def _owned(roots, table=None):
+    """The processes that ROOTS, a {pid: start time} map, own, as {pid: start time}: each root
+    still running as the process recorded, or ended, with its descendants and the members
+    of its group and session and of its descendants'. A root whose pid now names another
+    process is left out, so a reused pid is not taken for the one recorded."""
+    table = _process_table() if table is None else table
+    owned = {}
+    for pid, start in roots.items():
+        now = table.get(pid)
+        if now is None or now[3] == start:
+            owned[pid] = start
+    changed = True
+    while changed:
+        changed = False
+        for pid, (ppid, pgid, sid, start) in table.items():
+            if pid not in owned and (ppid in owned or pgid in owned or sid in owned):
+                owned[pid] = start
+                changed = True
+    owned.pop(os.getpid(), None)
+    return owned
+
+
+def _signal_all(found, sig):
+    """Send SIG to each process of FOUND that is still the one found, by its start time."""
+    table = _process_table()
+    for pid, start in found.items():
+        if start is None or table.get(pid, (0, 0, 0, None))[3] != start:
+            continue
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+
+def stop_all(roots, grace):
+    """Stop ROOTS, a {pid: start time} map, and everything they own: SIGTERM to all, then
+    SIGKILL to what is left after one shared GRACE period. A process keeps the identity it
+    was first found with."""
+    seen = _owned(roots)
+
+    def look(table=None):
+        for pid, start in _owned(roots, table).items():
+            seen.setdefault(pid, start)
+
+    _signal_all(seen, signal.SIGTERM)
+    end = time.monotonic() + grace
+    while time.monotonic() < end:
+        table = _process_table()
+        look(table)
+        if not any(table.get(pid, (0, 0, 0, None))[3] == start for pid, start in seen.items()):
+            return
+        time.sleep(0.05)
+    look()
+    _signal_all(seen, signal.SIGKILL)
+
+
+class Job:
+    """One child process of the runner, in its own session, with its output in a file."""
+
+    count = 0
+
+    def __init__(self, name, argv, deadline, workdir):
+        self.name = name
+        Job.count += 1
+        self.out = open(os.path.join(workdir, f"{Job.count}.out"), "w+")
+        self.t0 = time.monotonic()
+        self.end = self.t0 + deadline
+        self.deadline = deadline
+        self.timed_out = False
+        import subprocess  # the runner's own process only, see _OWN_MODULES
+        self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=self.out,
+                                     stderr=subprocess.STDOUT, start_new_session=True)
+        self.start = _start_of(self.proc.pid)
+        self.halted = False
+
+    def stop(self, grace):
+        stop_all({self.proc.pid: self.start}, grace)
+        self.reap(grace)
+
+    def reap(self, grace):
+        import subprocess
+        try:
+            self.proc.wait(timeout=grace + 5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    def output(self):
+        self.out.seek(0)
+        text = self.out.read()
+        self.out.close()
+        return text
+
+    def seconds(self):
+        return time.monotonic() - self.t0
+
+
+def _warn_args():
+    """The interpreter's -W options, which discovery and every unit get, as serial discovery would."""
+    return [f"-W{w}" for w in sys.warnoptions]
+
+
+def run_discovery(a, workdir, active):
+    path = os.path.join(workdir, "discovery.json")
+    job = Job("discovery", [sys.executable, *_warn_args(), RUNNER, "--_discover", str(os.getpid()), str(a.grace),
+                            path, str(a.directory)],
+              a.discover_timeout, workdir)
+    active.append(job)
+    try:
+        while job.proc.poll() is None:
+            _check_stop()
+            if time.monotonic() >= job.end:
+                job.stop(a.grace)
+                print(f"unittest-parallel: discovery: deadline of {a.discover_timeout:g} s passed")
+                sys.stdout.write(job.output())
+                return None
+            time.sleep(0.05)
+    finally:
+        if job.proc.returncode is not None:
+            active.remove(job)
+    text = job.output()
+    if job.proc.returncode != 0 or not os.path.exists(path):
+        print(f"unittest-parallel: discovery failed with exit {job.proc.returncode}")
+        sys.stdout.write(text)
+        return None
+    if text:
+        sys.stdout.write(text)
+    with open(path) as f:
+        return json.load(f)
+
+
+def plan_units(description, split):
+    """The units to run: (name, entry index, leaf index or -1), longest first, with the
+    absorbing modules' units last."""
+    units = description["units"]
+    if description["serial"]:
+        # A split asks nothing of a suite that runs whole, which may have no named entries.
+        print(f"unittest-parallel: the whole suite runs in one process, since {description['serial']}")
+        return [("the whole suite", -1, -1)], []
+    labels = [u["label"] for u in units]
+    missing = [m for m in split if m not in labels]
+    if missing:
+        raise SystemExit(f"unittest-parallel: no module {', '.join(missing)} in the suite")
+    first, last = [], []
+    for i, u in enumerate(units):
+        if u["inert"]:
+            continue
+        if u["label"] in split and u["split"] is None:
+            first += [(leaf, i, j, 1 << 40) for j, leaf in enumerate(u["leaves"])]
+            continue
+        if u["label"] in split:
+            print(f"unittest-parallel: --split {u['label']} runs whole, since {u['split']}")
+        (last if u["absorb"] else first).append((u["label"], i, -1, u["size"]))
+    first.sort(key=lambda w: -w[3])
+    return [w[:3] for w in first], [w[:3] for w in last]
+
+
+def check(record, assigned, exports):
+    """Why a unit's RECORD fails, or None when it passed."""
+    if record is None:
+        return "it ended with no result record"
+    if not record.get("complete"):
+        return "its result record is incomplete"
+    if record.get("error"):
+        return record["error"]
+    if record.get("ran") != assigned:
+        return "its result record is for other tests than it was assigned"
+    missing = [m for m in exports if m not in record.get("exports", {})]
+    if missing:
+        return f"its result record lacks the export of {', '.join(missing)}"
+    return None  # a failed test is in unittest's own report
+
+
+def _unsupported():
+    """Why this host cannot supervise units, or None. The runner reads /proc and sets a parent
+    death signal with prctl."""
+    if not os.path.exists(f"/proc/{os.getpid()}/stat"):
+        return "this host has no /proc"
+    try:
+        ctypes.CDLL(None).prctl
+    except (AttributeError, OSError, TypeError):
+        return "this host has no prctl"
+    return None
+
+
+def _shadowed(directory):
+    """Why the suite runs serially because a local name is that of a module the runner's
+    processes load, or None. Serial discovery puts the working directory first on the path
+    before it loads argparse and unittest, and the runner does not, so an entry there named
+    as any module loaded after interpreter startup counts. Both runs load the modules before
+    the discovery directory reaches the path, so an entry anywhere under it counts when it is
+    named as a module that the runner's processes load and serial discovery does not, which
+    covers a helper directory that a test puts on the path. Any entry counts, a package, a
+    module file, a compiled module or a directory with no __init__.py alike."""
+    loaded = {m.partition(".")[0] for m in sys.modules} - _STARTUP
+    try:
+        names = [(os.getcwd(), sorted(os.listdir()), loaded)]
+    except OSError:
+        names = []
+    for where, dirs, files in os.walk(os.path.abspath(directory)):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        names.append((where, sorted(dirs + files), _OWN_MODULES))
+    for where, entries, modules in names:
+        for name in entries:
+            if name.partition(".")[0] in modules:
+                return (f"{os.path.join(where, name)} has the name of a module that the runner loads "
+                        f"before discovery")
+    return None
+
+
+def parse_args(argv):
+    import math
+    from pathlib import Path
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1))
+    ap.add_argument("--split", action="append", default=[])
+    ap.add_argument("--unit-timeout", type=float, default=900.0)
+    ap.add_argument("--suite-timeout", type=float, default=2400.0,
+                    help="the deadline of the one process that runs the whole suite, when it does")
+    ap.add_argument("--discover-timeout", type=float, default=300.0)
+    ap.add_argument("--grace", type=float, default=5.0)
+    ap.add_argument("--keep", type=Path, help="keep the discovery, plan, outputs and result records in a new directory under this one")
+    ap.add_argument("directory", type=Path)
+    a = ap.parse_args(argv)
+    if a.jobs < 1:
+        ap.error("--jobs must be at least 1")
+    for opt in ("unit_timeout", "suite_timeout", "discover_timeout", "grace"):
+        if not (math.isfinite(getattr(a, opt)) and getattr(a, opt) > 0):
+            ap.error(f"--{opt.replace('_', '-')} must be a finite number of seconds more than 0")
+    return a
+
+
+def unit_deadline(a, index):
+    """The deadline of the unit that runs entry INDEX, or the whole suite when INDEX is -1.
+    The whole suite takes as long as every unit together, so it gets the longer of the two."""
+    return max(a.unit_timeout, a.suite_timeout) if index < 0 else a.unit_timeout
+
+
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+    if argv[:1] == ["--_discover"]:
+        parent, grace, out, directory = argv[1:]
+        _die_with_parent(int(parent), float(grace))
+        return discover_main(directory, out)
+    if argv[:1] == ["--_unit"]:
+        parent, grace, plan, index, split, record, absorb, directory = argv[1:]
+        _die_with_parent(int(parent), float(grace))
+        return worker_main(directory, plan, int(index), int(split), record, absorb)
+    a = parse_args(argv)
+    why = _unsupported() or _shadowed(a.directory)
+    if why:
+        # Supervision needs /proc and prctl, which only Linux has, and a test module must
+        # import the same modules as it does serially.
+        # unittest takes this process's place, so its exit status, or the signal that ends it,
+        # is the run's.
+        print(f"unittest-parallel: {why}, so the suite runs serially with unittest discover", flush=True)
+        sys.stderr.flush()
+        os.execv(sys.executable, [sys.executable, *_warn_args(), "-m", "unittest",
+                                  "discover", "-s", str(a.directory)])
+    import subprocess
+    import tempfile
+    old = {s: signal.signal(s, _on_signal) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    if a.keep:
+        a.keep.mkdir(parents=True, exist_ok=True)
+        workdir = tempfile.mkdtemp(prefix="run-", dir=a.keep)
+    else:
+        workdir = tempfile.mkdtemp(prefix="unittest-parallel-")
+    active = []
+    try:
+        return supervise(a, workdir, active)
+    except Interrupted as e:
+        names = " ".join(job.name for job in active)
+        stop_all({job.proc.pid: job.start for job in active}, a.grace)
+        for job in active:
+            job.reap(a.grace)
+        print(f"unittest-parallel: interrupted by signal {e.signum}, stopped: {names or 'nothing'}", flush=True)
+        return 128 + e.signum
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+        if a.keep:
+            print(f"unittest-parallel: discovery, plan, outputs and result records are in {workdir}")
+        else:
+            subprocess.run(["rm", "-rf", workdir], check=False)
+
+
+def supervise(a, workdir, active):
+    t0 = time.monotonic()
+    description = run_discovery(a, workdir, active)
+    if description is None:
+        return 1
+    first, last = plan_units(description, a.split)
+    plan_path = os.path.join(workdir, "plan.json")
+    _write_json(plan_path, description)
+    units = description["units"]
+    exports = description["exports"]
+    absorbed = {}  # module -> [(unit, export)]
+    failed = []
+    totals = {"testsRun": 0, "skipped": 0}
+    count = 0
+
+    def start(work, absorb):
+        nonlocal count
+        name, index, split = work
+        record = os.path.join(workdir, f"record-{count}.json")
+        count += 1
+        job = Job(name, [sys.executable, *_warn_args(), RUNNER, "--_unit", str(os.getpid()), str(a.grace),
+                         plan_path, str(index), str(split),
+                         record, absorb, str(a.directory)], unit_deadline(a, index), workdir)
+        job.record, job.index, job.split = record, index, split
+        active.append(job)
+
+    def finish(job):
+        text = job.output()
+        record = None
+        if os.path.exists(job.record):
+            try:
+                with open(job.record) as f:
+                    record = json.load(f)
+            except ValueError:
+                record = {"complete": False}
+        if job.index < 0:
+            leaves = description["leaves"]
+        else:
+            leaves = units[job.index]["leaves"]
+        assigned = leaves if job.split < 0 else [leaves[job.split]]
+        if job.timed_out:
+            why = f"deadline of {job.deadline:g} s passed"
+        elif job.halted:
+            why = "stopped when another unit passed its deadline"
+        else:
+            why = check(record, assigned, exports)
+        n = record.get("testsRun", 0) if record else 0
+        print(f"=== {job.name}: exit {job.proc.returncode}, {n} tests, {job.seconds():.1f} s", flush=True)
+        sys.stdout.write(text)
+        if not why and job.proc.returncode != 0 and record.get("successful"):
+            why = f"its tests passed but it exited {job.proc.returncode}"
+        if why:
+            print(f"unittest-parallel: {job.name}: {why}")
+        if why or job.proc.returncode != 0 or not record.get("successful"):
+            failed.append(job.name)
+        if record and not why:
+            totals["testsRun"] += record["testsRun"]
+            totals["skipped"] += record["skipped"]
+            for m, value in record.get("exports", {}).items():
+                absorbed.setdefault(m, []).append((job.name, value))
+
+    not_started = []
+    halted = []
+
+    def drain(queue, absorb_for):
+        if halted:
+            not_started.extend(w[0] for w in queue)
+            return
+        while queue or active:
+            while queue and len(active) < a.jobs and not halted:
+                _check_stop()
+                start(queue.pop(0), absorb_for())
+            time.sleep(0.05)
+            _check_stop()
+            late = [job for job in active if job.proc.poll() is None and time.monotonic() >= job.end]
+            if late:
+                # A unit past its deadline stops the run: no more units start, and the active
+                # ones stop together, so hung units cannot take one deadline after another.
+                for job in active:
+                    job.timed_out = job in late
+                    job.halted = job not in late
+                halted.append(True)
+                not_started.extend(w[0] for w in queue)
+                queue.clear()
+                stop_all({job.proc.pid: job.start for job in active}, a.grace)
+                for job in active:
+                    job.reap(a.grace)
+            for job in list(active):
+                if job.proc.poll() is not None or job.timed_out or job.halted:
+                    active.remove(job)
+                    finish(job)
+
+    drain(list(first), lambda: "")
+    absorb_path = ""
+    if halted:
+        not_started.extend(w[0] for w in last)
+        last = []
+    if last:
+        absorb_path = os.path.join(workdir, "absorb.json")
+        _write_json(absorb_path, absorbed)
+    drain(list(last), lambda: absorb_path)
+    work = len(first) + len(last)
+    print(f"unittest-parallel: {totals['testsRun']} tests in {work} processes, {a.jobs} at a time, "
+          f"{time.monotonic() - t0:.1f} s")
+    if not_started:
+        print(f"unittest-parallel: not started after a deadline: {' '.join(not_started)}")
+    if failed:
+        print(f"unittest-parallel: failed: {' '.join(failed)}")
+        return 1
+    if totals["testsRun"] == 0 and totals["skipped"] == 0:
+        print("unittest-parallel: NO TESTS RAN")
+        return 5
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

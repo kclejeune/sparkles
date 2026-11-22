@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# cpusample.sh PORT OUT_FILE: until killed, every 0.25 s, record the CPU that each thread of
+# the server listening on PORT last ran on, as "epoch_ms pid comm cpu utime_ticks" lines.
+# Diagnostic for the q9-star fast mode (P-core or E-core placement on a hybrid CPU).
+PORT=$1 OUT=$2
+pid=
+while :; do
+  if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+    pid=$(ss -ltnp 2> /dev/null | grep ":$PORT " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1)
+  fi
+  if [ -n "$pid" ]; then
+    now=$(date +%s%3N)
+    for f in /proc/"$pid"/task/*/stat; do
+      read -r line < "$f" 2> /dev/null || continue
+      comm=${line#*(}
+      comm=${comm%%)*}
+      rest=${line##*) }
+      # fields after the comm: 1=state ... utime is field 14 of stat, processor field 39
+      set -- $rest
+      echo "$now $pid $comm ${37} ${12}"
+    done >> "$OUT"
+  fi
+  sleep 0.25
+done

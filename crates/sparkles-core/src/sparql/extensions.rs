@@ -197,21 +197,55 @@ pub(crate) fn captured_ancestors() -> Vec<Failure> {
 pub(crate) struct CallbackGuard;
 
 impl CallbackGuard {
-    pub(crate) fn enter(ctx: &Ctx) -> Self {
+    /// The guard of a call from `ctx`, or an error when `ctx` was not configured for the
+    /// extensions its query calls. A rewrite that adds a call after configuration is a
+    /// defect, and it fails the query instead of the process.
+    pub(crate) fn enter(ctx: &Ctx) -> Result<Self> {
+        let failure = match &ctx.extension_failure {
+            Some(failure) => failure.clone(),
+            _ => return Err(unconfigured()),
+        };
         with_callbacks(|s| {
             s.borrow_mut().push(CallbackFrame {
                 families: ctx.extension_families.clone(),
-                failure: ctx
-                    .extension_failure
-                    .as_ref()
-                    .expect("active callback context")
-                    .clone(),
+                failure,
                 writers: ctx.extension_writers.clone(),
                 ancestors: ctx.extension_ancestors.clone(),
             })
         });
-        Self
+        Ok(Self)
     }
+
+    /// Drops `inner`, an application value, under the guard of `ctx` and without letting
+    /// its destructor unwind. A panic in the destructor is reported through `failed`, and
+    /// its payload is leaked rather than dropped.
+    /// Without a configured context, which no opened value has, it is dropped unguarded.
+    pub(crate) fn drop_owned<T>(ctx: &Ctx, inner: Option<T>, failed: &str) {
+        let Some(inner) = inner else {
+            return;
+        };
+        let _owner = Self::enter(ctx).ok();
+        if let Err(payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(inner)))
+        {
+            // The payload's own destructor is application code too, and a panic from it
+            // here could unwind out of a destructor, so it is leaked.
+            std::mem::forget(payload);
+            ctx.fail_extension(ScalarError::Execution(failed.into()));
+        }
+    }
+}
+
+const UNCONFIGURED_CALLBACK: &str =
+    "a registered extension was reached outside the calls its query configured";
+
+/// The error of a registered extension reached from a query context that was not
+/// configured to call it.
+pub(crate) fn unconfigured() -> Error {
+    Error::invalid(UNCONFIGURED_CALLBACK)
+}
+
+pub(super) fn is_unconfigured(error: &Error) -> bool {
+    matches!(error, Error::Invalid(message) if message == UNCONFIGURED_CALLBACK)
 }
 
 impl Drop for CallbackGuard {

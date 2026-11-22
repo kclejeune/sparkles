@@ -1,0 +1,13 @@
+14817 t4 run1 tax=c4cce8afad0915e1 [6127.977440000001,true,true] over work=10408483 ms=4560
+over work=10408481 ms=4560
+over work=10408485 ms=4560
+9663 t4 run1 tax=0ca0ab55ef6cbf4a [13907.209254,true,true] over work=22346189 ms=10524
+14817 t4 run2 tax=c4cce8afad0915e1 [10657.69276,true,true] over work=15599377 ms=8699
+9663 t4 run2 tax=0ca0ab55ef6cbf4a [17345.000471,true,true] over work=22346175 ms=14116
+over work=22346184 ms=14116
+over work=22346186 ms=14116
+over work=22346186 ms=14116
+14817 t4 run3 tax=c4cce8afad0915e1 [5059.055873,true,true] over work=9929393 ms=3686
+over work=9929419 ms=3686
+9663 t4 run3 tax=0ca0ab55ef6cbf4a [18695.121252,true,true] over work=22346144 ms=14659
+M4-DONE

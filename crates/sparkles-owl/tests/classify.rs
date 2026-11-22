@@ -365,6 +365,200 @@ fn incremental_runs_reuse_contexts() {
     );
 }
 
+/// Edits `k`, holding `held`, and checks that the run kept contexts and answers as a
+/// fresh classifier does.
+fn edit_agrees(
+    k: &mut Classifier,
+    held: &mut Vec<Axiom>,
+    add: &[Axiom],
+    remove: &[Axiom],
+) -> sparkles_owl::classify::Classification {
+    held.retain(|a| !remove.contains(a));
+    held.extend(add.iter().cloned());
+    k.remove(remove);
+    k.add(add);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    let full = Classifier::of(held.iter())
+        .classify(&Limits::default())
+        .unwrap();
+    assert_eq!(out.consistent, full.consistent);
+    assert_eq!(out.taxonomy, full.taxonomy);
+    out
+}
+
+/// The invalidation's lists of parts, of the walk and of the cleared contexts grow with
+/// the edit and count against the budget before they grow: removing `owl:Thing ⊑ C2000 ⊓
+/// … ⊓ C2031` beside 1,024 classes clears every context, and a limit or a pool one byte
+/// below the run's reported peak refuses the kept run (roadmap item 1256). The kept run
+/// then starts again in full under the same limits (roadmap item 1263), so the call either
+/// fails with a memory error, after which a run with the ordinary limits gives the fresh
+/// taxonomy, or returns a run that is not incremental and equals the fresh one. In a debug
+/// build the invalidation also checks that its lists hold no more than it admitted.
+#[test]
+fn the_invalidation_admits_its_scratch_before_it_grows() {
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut held: Vec<AxiomKind> = (0..1024)
+        .map(|n| Axiom::declaration(Entity::Class(c(&format!("C{n}")))).kind)
+        .collect();
+    let gone = sub(
+        Class::thing(),
+        and((2000..2032).map(|n| ce(&format!("C{n}")))),
+    )
+    .kind;
+    held.push(gone.clone());
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let rest: Vec<&AxiomKind> = held[..held.len() - 1].iter().collect();
+    let removed = [&gone];
+    let change = || Changes {
+        added: &[],
+        removed: &removed,
+    };
+    let mut sat = Saturation::new();
+    sat.saturate(&all, None, &limits).unwrap();
+    let out = sat.saturate(&rest, Some(change()), &limits).unwrap();
+    assert!(
+        out.stats.incremental && out.stats.cleared > 1024,
+        "{:?}",
+        out.stats
+    );
+    let peak = out.stats.peak_memory;
+    let fresh = Saturation::new().classify(&rest, None, &limits).unwrap();
+    for pool in [false, true] {
+        for cap in [peak - 1, peak] {
+            let mut sat = Saturation::new();
+            sat.saturate(&all, None, &limits).unwrap();
+            let total = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let t = total.clone();
+            let bounded = Limits {
+                max_memory: (!pool).then_some(cap),
+                charge: pool.then(|| {
+                    Arc::new(move |n: usize| {
+                        let was = t.load(Ordering::SeqCst);
+                        was + n <= cap && {
+                            t.fetch_add(n, Ordering::SeqCst);
+                            true
+                        }
+                    }) as Arc<dyn Fn(usize) -> bool + Send + Sync>
+                }),
+                ..limits.clone()
+            };
+            let result = sat.saturate(&rest, Some(change()), &bounded);
+            if cap < peak {
+                match result {
+                    Err(Error::Memory { .. }) => {
+                        let retry = sat.classify(&rest, Some(change()), &limits).unwrap();
+                        assert_eq!(retry.taxonomy, fresh.taxonomy);
+                        assert_eq!(retry.consistent, fresh.consistent);
+                    }
+                    Ok(out) => {
+                        assert!(!out.stats.incremental, "pool {pool}: {:?}", out.stats);
+                        assert_eq!(out.consistent, fresh.consistent);
+                        // The run built no taxonomy, so read the saturated state's
+                        // taxonomy through a kept run with nothing changed.
+                        let none = Changes {
+                            added: &[],
+                            removed: &[],
+                        };
+                        let kept = sat.classify(&rest, Some(none), &limits).unwrap();
+                        assert_eq!(kept.taxonomy, fresh.taxonomy);
+                        assert_eq!(kept.consistent, fresh.consistent);
+                    }
+                    Err(e) => panic!("pool {pool}: {e:?}"),
+                }
+            } else {
+                assert!(result.is_ok(), "pool {pool} at the peak: {result:?}");
+            }
+        }
+    }
+}
+
+/// The disjointness sets are numbered by their place among the run's sets, so removing
+/// one moves the numbers of those after it. A kept context that holds a member of a moved
+/// set must know it by its new number: here `a` keeps `B1` from set 1, which becomes set
+/// 0, and then takes `C1` from `b`, whose set takes number 1. By the old number the two
+/// would clash and make the ontology inconsistent (roadmap item 1256).
+#[test]
+fn a_kept_context_follows_the_new_numbers_of_the_disjointness_sets() {
+    let limits = Limits::default();
+    let disjoint = |a: &str, b: &str| Axiom::disjoint_classes([ce(a), ce(b)]).kind;
+    let gone = disjoint("A1", "A2");
+    let mut held: Vec<AxiomKind> = vec![
+        gone.clone(),
+        disjoint("B1", "B2"),
+        disjoint("C1", "C2"),
+        is_a("B1", "a").kind,
+        is_a("E", "b").kind,
+        sub(c("E"), c("C1")).kind,
+        sub(and([ce("E"), ce("H")]), one("a")).kind,
+    ];
+    // the run numbers the sets in the order of the axioms it is given
+    let mut sat = Saturation::new();
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    assert!(sat.classify(&all, None, &limits).unwrap().consistent);
+    let fresh = |held: &[AxiomKind]| {
+        let all: Vec<&AxiomKind> = held.iter().collect();
+        Saturation::new().classify(&all, None, &limits).unwrap()
+    };
+    held.remove(0);
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let changes = Changes {
+        added: &[],
+        removed: &[&gone],
+    };
+    let out = sat.classify(&all, Some(changes), &limits).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    assert!(out.consistent);
+    let added = sub(c("E"), c("H")).kind;
+    held.push(added.clone());
+    let all: Vec<&AxiomKind> = held.iter().collect();
+    let changes = Changes {
+        added: &[&added],
+        removed: &[],
+    };
+    let out = sat.classify(&all, Some(changes), &limits).unwrap();
+    assert!(out.stats.incremental, "{:?}", out.stats);
+    let full = fresh(&held);
+    assert!(full.consistent);
+    assert_eq!(out.consistent, full.consistent);
+    assert_eq!(out.taxonomy, full.taxonomy);
+    assert!(out.taxonomy.is_subclass(&c("E"), &c("B1")));
+}
+
+/// A kept context keeps the negative existential restrictions whose filler it holds,
+/// which reach a context that an edit links to it: `B` holds `B2`, so a new link from
+/// `C` to `B` gives `C` the restriction `∃r.B2` and with it `G`.
+#[test]
+fn a_kept_filler_gives_its_restrictions_to_a_new_predecessor() {
+    let mut held = vec![
+        sub(some("r", c("B2")), c("G")),
+        sub(c("B"), c("B2")),
+        sub(c("C"), c("D")),
+    ];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let out = edit_agrees(&mut k, &mut held, &[sub(c("C"), some("r", c("B")))], &[]);
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("G")));
+    assert_eq!(out.stats.cleared, 1, "{:?}", out.stats);
+}
+
+/// An edit that adds or removes a negative existential restriction clears the
+/// predecessors of the contexts that hold its filler.
+#[test]
+fn a_new_restriction_on_the_left_reaches_the_predecessors_of_its_filler() {
+    let mut held = vec![sub(c("A"), some("r", c("B"))), sub(c("X"), c("Y"))];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let left = sub(some("r", c("B")), c("G"));
+    let out = edit_agrees(&mut k, &mut held, std::slice::from_ref(&left), &[]);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("G")));
+    let out = edit_agrees(&mut k, &mut held, &[], &[left]);
+    assert!(!out.taxonomy.is_subclass(&c("A"), &c("G")));
+}
+
 fn nested(depth: usize, filler: &str) -> ClassExpression {
     let mut e = ce(filler);
     for _ in 0..depth {
@@ -1180,6 +1374,117 @@ fn removing_an_axiom_not_held_does_not_cancel_a_later_addition() {
     assert!(out.taxonomy.is_subclass(&c("A"), &c("B")));
 }
 
+/// Classifies `held`, applies each edit of `edits` as removals then additions, and
+/// checks every incremental run against a run of a new classifier (roadmap item 1258).
+fn edits_agree(mut held: Vec<Axiom>, edits: &[(Vec<Axiom>, Vec<Axiom>)]) {
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&held);
+    k.classify(&limits).unwrap();
+    for (adds, removes) in edits {
+        held.retain(|a| !removes.contains(a));
+        k.remove(removes);
+        k.add(adds);
+        held.extend(adds.iter().cloned());
+        let inc = k.classify(&limits).unwrap();
+        let full = Classifier::of(&held).classify(&limits).unwrap();
+        assert_eq!(
+            inc.taxonomy, full.taxonomy,
+            "after adding {adds:?} and removing {removes:?}"
+        );
+        assert_eq!(inc.consistent, full.consistent);
+    }
+}
+
+fn self_of(r: &str) -> ClassExpression {
+    ClassExpression::ObjectHasSelf(ope(r))
+}
+
+fn subrole(a: &str, b: &str) -> Axiom {
+    ax(AxiomKind::SubObjectPropertyOf(
+        SubObjectPropertyExpression::Expression(ope(a)),
+        ope(b),
+    ))
+}
+
+#[test]
+fn an_added_self_restriction_on_a_superrole_reaches_kept_loops() {
+    let held = vec![
+        subrole("r", "s"),
+        sub(Class::thing(), self_of("r")),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("s"), c("C"));
+    edits_agree(
+        held,
+        &[
+            (vec![edit.clone()], vec![]),
+            (vec![], vec![edit.clone()]),
+            (vec![edit], vec![]),
+        ],
+    );
+}
+
+#[test]
+fn a_change_with_a_self_restriction_runs_everything_again() {
+    let held = vec![sub(c("A"), self_of("r")), sub(self_of("s"), c("C"))];
+    let mut k = Classifier::of(&held);
+    k.classify(&Limits::default()).unwrap();
+    let edit = sub(self_of("s"), c("D"));
+    k.add([&edit]);
+    assert!(!k.classify(&Limits::default()).unwrap().stats.incremental);
+    k.remove([&edit]);
+    assert!(!k.classify(&Limits::default()).unwrap().stats.incremental);
+    let plain = sub(c("A"), c("B"));
+    k.add([&plain]);
+    assert!(k.classify(&Limits::default()).unwrap().stats.incremental);
+    // a role edge that a self restriction reaches changes the role table
+    let edge = subrole("r", "s");
+    k.add([&edge]);
+    let out = k.classify(&Limits::default()).unwrap();
+    assert!(!out.stats.incremental);
+    assert!(out.taxonomy.is_subclass(&c("A"), &c("C")));
+}
+
+#[test]
+fn an_added_self_filler_reaches_a_kept_existential_filler() {
+    let held = vec![
+        subrole("r", "s"),
+        sub(c("D"), self_of("r")),
+        sub(c("A"), some("t", c("D"))),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(some("t", self_of("s")), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
+#[test]
+fn an_added_self_restriction_reaches_the_loops_of_a_reflexive_role() {
+    let held = vec![
+        ax(AxiomKind::ReflexiveObjectProperty(ope("r"))),
+        Axiom::declaration(Entity::Class(c("A"))),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("r"), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
+#[test]
+fn an_added_self_restriction_reaches_the_loops_of_a_chain() {
+    let held = vec![
+        ax(AxiomKind::SubObjectPropertyOf(
+            SubObjectPropertyExpression::Chain(vec![ope("r"), ope("r")]),
+            ope("t"),
+        )),
+        sub(c("A"), self_of("r")),
+        Axiom::declaration(Entity::Class(c("C"))),
+    ];
+    let edit = sub(self_of("t"), c("C"));
+    edits_agree(held, &[(vec![edit.clone()], vec![]), (vec![], vec![edit])]);
+}
+
 // ---------------------------------------------------------------------------------
 // A naive completion procedure for EL++ without concrete domains (Baader, Brandt and
 // Lutz, "Pushing the EL Envelope", IJCAI 2005, with the range rule of their 2008
@@ -1701,6 +2006,49 @@ fn large_ontology(n: usize) -> Vec<Axiom> {
     axioms
 }
 
+/// A run that keeps the contexts of a transitive role's chain, whose composed links keep
+/// no forward links (roadmap item 956), gives a new predecessor the closure through the
+/// kept contexts one link at a time, and a removed link takes it away again.
+#[test]
+fn an_edit_reaches_the_closure_of_a_transitive_role_through_kept_contexts() {
+    let base = vec![
+        ax(AxiomKind::TransitiveObjectProperty(ope("r"))),
+        sub(c("A"), some("r", c("B"))),
+        sub(c("B"), some("r", c("C"))),
+        sub(c("C"), some("r", c("D"))),
+        sub(some("r", c("D")), c("G")),
+    ];
+    let is_sub =
+        |t: &sparkles_owl::classify::Taxonomy, a: &str, b: &str| t.is_subclass(&c(a), &c(b));
+    for threads in [1, 4] {
+        let limits = Limits {
+            threads,
+            ..Limits::default()
+        };
+        let mut held = base.clone();
+        let mut k = Classifier::of(&held);
+        let first = k.classify(&limits).unwrap();
+        assert!(
+            ["A", "B", "C"]
+                .iter()
+                .all(|x| is_sub(&first.taxonomy, x, "G"))
+        );
+        let add = vec![sub(c("Z"), some("r", c("A")))];
+        k.add(&add);
+        held.extend(add);
+        let inc = k.classify(&limits).unwrap();
+        assert!(is_sub(&inc.taxonomy, "Z", "G"), "{threads} threads");
+        let full = Classifier::of(&held).classify(&limits).unwrap();
+        assert_eq!(inc.taxonomy, full.taxonomy, "{threads} threads");
+        let gone = held.remove(3);
+        k.remove(&[gone]);
+        let inc = k.classify(&limits).unwrap();
+        assert!(!is_sub(&inc.taxonomy, "Z", "G"), "{threads} threads");
+        let full = Classifier::of(&held).classify(&limits).unwrap();
+        assert_eq!(inc.taxonomy, full.taxonomy, "{threads} threads, removed");
+    }
+}
+
 #[test]
 fn the_taxonomy_is_the_same_for_every_number_of_threads() {
     let axioms = large_ontology(3000);
@@ -2065,4 +2413,412 @@ fn describe_answers_for_individuals_and_nominals() {
     assert_eq!(b.superclasses, named(&["Thing", "X"]));
     assert_eq!(b.subclasses, named(&["W"]));
     assert_eq!(b.instances, vec![NamedIndividual::new("http://ex.org/d")]);
+}
+
+// ---------------------------------------------------------------------------------
+// Ranges that a loop reaches (roadmap item 1262). A loop by a role is a link from a
+// context to itself, so the context takes the role's range. The index has to register
+// that range as a positive occurrence, with the successors of its existentials, even
+// when no existential restriction on the role occurs positively.
+
+fn ofn(body: &str) -> Vec<Axiom> {
+    sparkles_owl::ofn_read::parse(&format!(
+        "Prefix(:=<http://ex.org/>) Prefix(owl:=<http://www.w3.org/2002/07/owl#>) \
+         Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>) Ontology({body})"
+    ))
+    .unwrap()
+    .axioms
+}
+
+/// The answer a range case asks for: A below G, or A unsatisfiable.
+fn range_answer(o: &sparkles_owl::classify::Classification, empty: bool) -> bool {
+    if empty {
+        o.taxonomy.is_unsatisfiable(&c("A"))
+    } else {
+        o.taxonomy.is_subclass(&c("A"), &c("G"))
+    }
+}
+
+/// The cases of ranges reached through loops: a name, the ontology, whether the answer
+/// is that A is unsatisfiable (else that A is below G), and the edits, each added to a
+/// kept run and then removed again.
+const LOOP_RANGES: &[(&str, &str, bool, &[&str])] = &[
+    (
+        "nested",
+        "ObjectPropertyRange(:r ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) \
+         SubClassOf(:A ObjectHasSelf(:r)) SubClassOf(ObjectIntersectionOf(:X :Y) :Z) \
+         SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &[
+            "SubClassOf(:P ObjectSomeValuesFrom(:r :Q))",
+            "SubClassOf(:P ObjectSomeValuesFrom(:s :Q))",
+            "ObjectPropertyRange(:r :W)",
+            "SubObjectPropertyOf(:r :s)",
+        ],
+    ),
+    (
+        "empty",
+        "SubObjectPropertyOf(:s owl:bottomObjectProperty) \
+         ObjectPropertyRange(:r ObjectSomeValuesFrom(:s :X)) SubClassOf(:A ObjectHasSelf(:r))",
+        true,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:r :Q))"],
+    ),
+    (
+        "data value",
+        "ObjectPropertyRange(:r DataHasValue(:d \"1\"^^xsd:integer)) \
+         SubClassOf(DataHasValue(:d \"1.0\"^^xsd:decimal) :G) SubClassOf(:A ObjectHasSelf(:r))",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:r :Q))"],
+    ),
+    (
+        "data range",
+        "ObjectPropertyRange(:r DataHasValue(:d \"5\"^^xsd:integer)) \
+         SubClassOf(DataSomeValuesFrom(:d xsd:integer) :G) SubClassOf(:A ObjectHasSelf(:r))",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:r :Q))"],
+    ),
+    (
+        "superrole",
+        "SubObjectPropertyOf(:r :t) ObjectPropertyRange(:t ObjectSomeValuesFrom(:s :X)) \
+         ObjectPropertyRange(:s :Y) SubClassOf(:A ObjectHasSelf(:r)) \
+         SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &[
+            "SubClassOf(:P ObjectSomeValuesFrom(:t :Q))",
+            "SubClassOf(:P ObjectSomeValuesFrom(:r :Q))",
+            "ObjectPropertyRange(:t :W)",
+            "SubObjectPropertyOf(:q :r)",
+        ],
+    ),
+    (
+        "chain",
+        "SubClassOf(:A ObjectHasSelf(:r)) SubClassOf(:A ObjectHasSelf(:q)) \
+         SubObjectPropertyOf(ObjectPropertyChain(:r :q) :t) \
+         ObjectPropertyRange(:t ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) \
+         SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:t :Q))"],
+    ),
+    (
+        "inverse",
+        "InverseObjectProperties(:r :ri) SubClassOf(:A ObjectHasSelf(:r)) \
+         ObjectPropertyRange(:ri ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) \
+         SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:ri :Q))"],
+    ),
+    (
+        "nominal loop",
+        "SubClassOf(:A ObjectOneOf(:a)) SubClassOf(:B ObjectSomeValuesFrom(:t :A)) \
+         SubClassOf(ObjectOneOf(:a) :B) \
+         ObjectPropertyRange(:u ObjectSomeValuesFrom(:s :X)) SubObjectPropertyOf(:t :u) \
+         ObjectPropertyRange(:s :Y) SubClassOf(ObjectIntersectionOf(:X :Y) :Z) \
+         SubClassOf(ObjectSomeValuesFrom(:s :Z) :G)",
+        false,
+        &["SubClassOf(:P ObjectSomeValuesFrom(:u :Q))"],
+    ),
+];
+
+/// Whether a run took every axiom, so that its answer is the ontology's: a run leaves
+/// out the axioms outside OWL 2 EL that its rules do not take, and reports them.
+fn took_all(o: &sparkles_owl::classify::Classification) -> bool {
+    let out = &o.stats.outside_el;
+    o.complete && out.horn + out.disjunctive <= out.taken
+}
+
+#[test]
+fn a_range_that_a_loop_reaches_is_indexed() {
+    let mut bad = Vec::new();
+    for (name, body, empty, edits) in LOOP_RANGES {
+        for threads in [1, 4] {
+            for el_only in [false, true] {
+                let limits = Limits {
+                    threads,
+                    el_only,
+                    ..Limits::default()
+                };
+                let name = format!("{name} threads={threads} el_only={el_only}");
+                let check = |bad: &mut Vec<String>,
+                             o: &sparkles_owl::classify::Classification,
+                             what: &str| {
+                    if took_all(o) && !range_answer(o, *empty) {
+                        bad.push(format!("{name}: {what} answer"));
+                    }
+                };
+                let mut axioms = ofn(body);
+                let mut kept = Classifier::of(&axioms);
+                let first = kept.classify(&limits).unwrap();
+                check(&mut bad, &first, "cold");
+                for text in *edits {
+                    let edit = ofn(text).remove(0);
+                    // added to a kept run
+                    kept.add([&edit]);
+                    axioms.push(edit.clone());
+                    let inc = kept.classify(&limits).unwrap();
+                    let fresh = Classifier::of(&axioms).classify(&limits).unwrap();
+                    check(&mut bad, &fresh, &format!("fresh with {text}"));
+                    if inc.taxonomy != fresh.taxonomy || inc.complete != fresh.complete {
+                        bad.push(format!("{name}: kept run after adding {text}"));
+                    }
+                    // removed from a kept run that started cold with it
+                    let mut reverse = Classifier::of(&axioms);
+                    reverse.classify(&limits).unwrap();
+                    reverse.remove([&edit]);
+                    axioms.pop();
+                    let back = reverse.classify(&limits).unwrap();
+                    let fresh = Classifier::of(&axioms).classify(&limits).unwrap();
+                    if back.taxonomy != fresh.taxonomy {
+                        bad.push(format!("{name}: kept run after removing {text}"));
+                    }
+                    // and removed from the first kept run
+                    kept.remove([&edit]);
+                    let again = kept.classify(&limits).unwrap();
+                    if again.taxonomy != fresh.taxonomy {
+                        bad.push(format!("{name}: first kept run after removing {text}"));
+                    }
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
+}
+
+/// Ranges on links that are not loops: a link to an inverse role's successor, a link a
+/// chain composes and a link to an individual, each of which takes the range by another
+/// rule, and data restrictions that the run leaves out and reports.
+#[test]
+fn a_range_on_links_that_are_not_loops() {
+    // the name, the ontology, and the subsumption the run derives when it takes every axiom
+    let cases = [
+        (
+            "inverse succ",
+            "ObjectPropertyRange(:r :G) SubClassOf(:A ObjectSomeValuesFrom(ObjectInverseOf(:r) :B))",
+            "A",
+            "G",
+        ),
+        (
+            "compose",
+            "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t) ObjectPropertyRange(:t :G) SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B))) SubClassOf(ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :G)) :H)",
+            "A",
+            "H",
+        ),
+        (
+            "compose range on last",
+            "SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t) ObjectPropertyRange(:t :G) ObjectPropertyRange(:s :G) SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B))) SubClassOf(ObjectSomeValuesFrom(:t :G) :H)",
+            "A",
+            "H",
+        ),
+        (
+            "transitive",
+            "TransitiveObjectProperty(:t) ObjectPropertyRange(:t :G) SubClassOf(:A ObjectSomeValuesFrom(:t ObjectSomeValuesFrom(:t :B))) SubClassOf(ObjectSomeValuesFrom(:t :B) :H)",
+            "A",
+            "H",
+        ),
+        (
+            "link to nominal",
+            "ObjectPropertyRange(:r :G) SubClassOf(:A ObjectSomeValuesFrom(:r :B)) SubClassOf(:B ObjectOneOf(:b)) ClassAssertion(:A :a)",
+            "B",
+            "G",
+        ),
+        (
+            "link to nominal 2",
+            "ObjectPropertyRange(:r :G) SubClassOf(ObjectOneOf(:a) ObjectSomeValuesFrom(:r :B)) SubClassOf(:B ObjectOneOf(:b)) SubClassOf(:C ObjectOneOf(:b))",
+            "C",
+            "G",
+        ),
+        (
+            "data told",
+            "SubClassOf(:A DataHasValue(:d \"5\"^^xsd:integer)) SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)) :G)",
+            "A",
+            "G",
+        ),
+        (
+            "data told int",
+            "SubClassOf(:A DataHasValue(:d \"5\"^^xsd:integer)) SubClassOf(DataSomeValuesFrom(:d xsd:integer) :G)",
+            "A",
+            "G",
+        ),
+        (
+            "data range exist",
+            "ObjectPropertyRange(:r DataHasValue(:d \"5\"^^xsd:integer)) SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:integer xsd:minInclusive \"0\"^^xsd:integer)) :G) SubClassOf(:B ObjectSomeValuesFrom(:r :A)) SubClassOf(ObjectSomeValuesFrom(:r :G) :H)",
+            "B",
+            "H",
+        ),
+        (
+            "assert self",
+            "ObjectPropertyRange(:r ObjectSomeValuesFrom(:s :X)) ObjectPropertyRange(:s :Y) SubClassOf(ObjectIntersectionOf(:X :Y) :Z) SubClassOf(ObjectSomeValuesFrom(:s :Z) :G) ObjectPropertyAssertion(:r :a :a) SubClassOf(:A ObjectOneOf(:a))",
+            "A",
+            "G",
+        ),
+    ];
+    let mut bad = Vec::new();
+    for (name, body, a, g) in cases {
+        for el_only in [false, true] {
+            for threads in [1, 4] {
+                let limits = Limits {
+                    threads,
+                    el_only,
+                    ..Limits::default()
+                };
+                let o = Classifier::of(&ofn(body)).classify(&limits).unwrap();
+                // a datatype restriction with a facet is outside OWL 2 EL, and no tier
+                // takes it: the run leaves it out and reports it
+                if name == "data told" || name == "data range exist" {
+                    let out = &o.stats.outside_el;
+                    if !(o.complete && out.horn == 1 && out.taken == 0) {
+                        bad.push(format!("{name} el_only={el_only}: not left out"));
+                    }
+                }
+                let ok = o.taxonomy.is_subclass(&c(a), &c(g));
+                if took_all(&o) && !ok {
+                    bad.push(format!("{name} el_only={el_only} threads={threads}"));
+                }
+            }
+        }
+    }
+    assert!(bad.is_empty(), "{bad:?}");
+}
+
+// ---------------------------------------------------------------------------------
+// A kept OWL 2 EL run that passes its memory budget starts again in full under the same
+// limits, as the runs that keep contexts of the Horn rules or Tier D do (roadmap item
+// 1263), so that its answer is that of a fresh run.
+
+/// 5,000 independent subsumptions, and an unrelated one to add.
+fn kept_el_memory_fixture() -> (Vec<Axiom>, Axiom) {
+    let axioms = (0..5000)
+        .map(|i| sub(c(&format!("C{i}")), c(&format!("D{i}"))))
+        .collect();
+    (axioms, sub(c("X"), c("Y")))
+}
+
+#[test]
+fn a_kept_el_run_over_its_memory_limit_starts_again() {
+    let (axioms, edit) = kept_el_memory_fixture();
+    let mut changed = axioms.clone();
+    changed.push(edit.clone());
+    for el_only in [false, true] {
+        let limits = Limits {
+            threads: 1,
+            el_only,
+            ..Limits::default()
+        };
+        let mut kept = Classifier::of(&axioms);
+        let cold = kept.classify(&limits).unwrap();
+        // the kept state and the old index count against the budget, which a fresh run
+        // of the edited axioms does not hold
+        let bounded = Limits {
+            max_memory: Some(cold.stats.peak_memory + 10_000),
+            ..limits.clone()
+        };
+        let fresh = Classifier::of(&changed).classify(&bounded).unwrap();
+        assert!(fresh.taxonomy.is_subclass(&c("X"), &c("Y")));
+        kept.add([&edit]);
+        let out = kept
+            .classify(&bounded)
+            .unwrap_or_else(|e| panic!("el_only={el_only}: {e:?}"));
+        assert!(
+            out.taxonomy.is_subclass(&c("X"), &c("Y")),
+            "el_only={el_only}"
+        );
+        assert_eq!(out.taxonomy, fresh.taxonomy, "el_only={el_only}");
+        assert!(!out.stats.incremental, "el_only={el_only}: a run in full");
+        // a repeated call answers the same, from the contexts of the run in full
+        let again = kept.classify(&bounded).unwrap();
+        assert_eq!(again.taxonomy, fresh.taxonomy, "el_only={el_only}");
+        // and a later edit keeps the contexts again
+        let more = sub(c("X"), c("Z"));
+        kept.add([&more]);
+        let unbounded = kept.classify(&limits).unwrap();
+        assert!(unbounded.stats.incremental, "el_only={el_only}");
+        assert!(unbounded.taxonomy.is_subclass(&c("X"), &c("Z")));
+    }
+}
+
+#[test]
+fn a_kept_el_run_refused_by_its_pool_starts_again_on_the_admitted_credit() {
+    use std::sync::atomic::AtomicUsize;
+    let (axioms, edit) = kept_el_memory_fixture();
+    let mut changed = axioms.clone();
+    changed.push(edit.clone());
+    for el_only in [false, true] {
+        let limits = Limits {
+            threads: 1,
+            el_only,
+            ..Limits::default()
+        };
+        // what a fresh run of the edited axioms asks of a pool
+        let asked = Arc::new(AtomicUsize::new(0));
+        let a = asked.clone();
+        let counting = Limits {
+            charge: Some(Arc::new(move |b| {
+                a.fetch_add(b, Ordering::Relaxed);
+                true
+            })),
+            ..limits.clone()
+        };
+        Classifier::of(&changed).classify(&counting).unwrap();
+        let cap = asked.load(Ordering::Relaxed) + 10_000;
+        let pool = |cap: usize| {
+            let used = Arc::new(AtomicUsize::new(0));
+            Limits {
+                // a refused grant takes nothing from the pool
+                charge: Some(Arc::new(move |b| {
+                    used.try_update(Ordering::Relaxed, Ordering::Relaxed, |u| {
+                        (u + b <= cap).then_some(u + b)
+                    })
+                    .is_ok()
+                })),
+                ..limits.clone()
+            }
+        };
+        let mut kept = Classifier::of(&axioms);
+        kept.classify(&limits).unwrap();
+        kept.add([&edit]);
+        let out = kept
+            .classify(&pool(cap))
+            .unwrap_or_else(|e| panic!("el_only={el_only}: {e:?}"));
+        assert!(
+            out.taxonomy.is_subclass(&c("X"), &c("Y")),
+            "el_only={el_only}"
+        );
+    }
+}
+
+#[test]
+fn a_kept_el_run_over_a_limit_that_a_fresh_run_passes_too_fails() {
+    let (axioms, edit) = kept_el_memory_fixture();
+    let mut changed = axioms.clone();
+    changed.push(edit.clone());
+    for el_only in [false, true] {
+        let limits = Limits {
+            threads: 1,
+            el_only,
+            ..Limits::default()
+        };
+        let mut kept = Classifier::of(&axioms);
+        let cold = kept.classify(&limits).unwrap();
+        let tight = Limits {
+            max_memory: Some(cold.stats.peak_memory / 2),
+            ..limits.clone()
+        };
+        assert!(matches!(
+            Classifier::of(&changed).classify(&tight),
+            Err(Error::Memory { .. })
+        ));
+        kept.add([&edit]);
+        for _ in 0..2 {
+            assert!(
+                matches!(kept.classify(&tight), Err(Error::Memory { .. })),
+                "el_only={el_only}"
+            );
+        }
+        // the failed runs leave nothing that a run within the budget would read
+        let out = kept.classify(&limits).unwrap();
+        assert!(out.taxonomy.is_subclass(&c("X"), &c("Y")));
+        assert_eq!(
+            out.taxonomy,
+            Classifier::of(&changed).classify(&limits).unwrap().taxonomy
+        );
+    }
 }

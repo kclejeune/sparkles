@@ -1,0 +1,81 @@
+diff --git a/crates/sparkles-owl/src/classify/index.rs b/crates/sparkles-owl/src/classify/index.rs
+index d57553ef..42ee1ca1 100644
+--- a/crates/sparkles-owl/src/classify/index.rs
++++ b/crates/sparkles-owl/src/classify/index.rs
+@@ -2354,9 +2354,11 @@ impl Index {
+         let mut told: Vec<(Ex, Ex)> = Vec::with_capacity(ax.subs.len());
+         // the negative occurrences first, so that the data restrictions that occur
+         // positively find every negative one they meet
++        let probe_t = std::time::Instant::now();
+         for &(a, _) in &ax.subs {
+             b.negative(a, it);
+         }
++        if std::env::var_os("EL_PROBE").is_some() { eprintln!("PROBE neg_us={}", probe_t.elapsed().as_micros()); }
+         let mut disj: Vec<(Ex, u32)> = Vec::new();
+         for (s, set) in ax.disjoint.iter().enumerate() {
+             for &e in set {
+@@ -2540,8 +2542,10 @@ impl Index {
+         }
+         told.extend(b.told.iter().copied());
+         // told superexpressions, sorted and without duplicates
++        let probe_t = std::time::Instant::now();
+         told.sort_unstable();
+         told.dedup();
++        if std::env::var_os("EL_PROBE").is_some() { eprintln!("PROBE sort_us={} n={}", probe_t.elapsed().as_micros(), told.len()); }
+         ix.told = group(&told, |h| &mut h.told, &mut ix.heads);
+         ix.conj = group(&b.conj, |h| &mut h.conj, &mut ix.heads);
+         ix.exist = group(&b.exist, |h| &mut h.exist, &mut ix.heads);
+diff --git a/crates/sparkles-owl/src/classify/mod.rs b/crates/sparkles-owl/src/classify/mod.rs
+index 38fd3f99..47b8a1fb 100644
+--- a/crates/sparkles-owl/src/classify/mod.rs
++++ b/crates/sparkles-owl/src/classify/mod.rs
+@@ -1711,6 +1711,7 @@ impl Saturation {
+             }
+             peak = *gauge.peak.lock();
+         }
++        let probe_t = Instant::now();
+         if !merged {
+             let mut out = Normalized {
+                 ax,
+@@ -1729,6 +1730,7 @@ impl Saturation {
+             partial.extend(out.partial);
+             chains.extend(out.chains);
+         }
++        if std::env::var_os("EL_PROBE").is_some() { eprintln!("PROBE norm_us={}", probe_t.elapsed().as_micros()); }
+         poll(limits)?;
+         // the range restriction of OWL 2 EL (Profiles §2.2.6): a chain's superproperty
+         // has no range that its last property lacks
+@@ -1860,7 +1862,9 @@ impl Saturation {
+         if let Some(b) = &self.interner.ranges.budget {
+             b.baseline(self.interner.bytes() + ax.bytes())?;
+         }
++        let probe_t = Instant::now();
+         let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
++        if std::env::var_os("EL_PROBE").is_some() { eprintln!("PROBE ixbuild_us={}", probe_t.elapsed().as_micros()); }
+         self.interner.end_run();
+         let mut excluded: Vec<Excluded> = Vec::new();
+         for (i, (rule, message)) in outside {
+@@ -2034,6 +2038,7 @@ impl Saturation {
+         self.partial_over = false;
+         self.numeric_halt = false;
+         // the profile check of each axiom, which depends on it alone
++        let probe_t = Instant::now();
+         let outside: Vec<(usize, (String, String))> =
+             par_map(axioms, threads, MIN_AXIOMS, |at, chunk| {
+                 let mut out = Vec::new();
+@@ -2049,6 +2054,7 @@ impl Saturation {
+             .into_iter()
+             .flatten()
+             .collect();
++        if std::env::var_os("EL_PROBE").is_some() { eprintln!("PROBE check_us={}", probe_t.elapsed().as_micros()); }
+         poll(limits)?;
+         self.reused = false;
+         let changes = changes.filter(|_| !again);
+@@ -2331,6 +2337,7 @@ impl Saturation {
+         roots.sort_unstable();
+         roots.dedup();
+         stats.index = start.elapsed();
++        if std::env::var_os("EL_PROBE").is_some() { eprintln!("PROBE index_us={}", stats.index.as_micros()); }
+         // the index, the caller's copy of the axioms, the normalized axioms and the roots,
+         // and the contexts kept from the last run
+         let base = self.index_bytes(&ix)

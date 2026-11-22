@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# final-ab-forge.sh NEW: builds every arm on forge (NEW, its base c0948014, the direct probe
+# 971717d2 on that base, and the layout pair 7e272f4d and 75a70587), stages the final A/Bs
+# with forge builds on both sides, and queues them on forge's heavy lock as the unit
+# floor-cache-1069-final-forge. Each build is its own scope under the same lock.
+# Driver done when final-ab-forge.out ends "exit 0". Results done when forge
+# ~/lanes/floor-cache-1069/status-forge ends with DONE (FAILED lines name failed runs).
+set -euo pipefail
+cd "$(dirname "$0")"
+G=$REPO
+NEW=$(git -C $G rev-parse "$1^{commit}")
+C=$HOME/.cache/sparkles-nsc/bin
+MAIN=c0948014705b4bb40aaa7fe4c86c3c671444b7e9 OLD=75a70587acbbbc026f91d279dbabaad1003ab278 BASE=7e272f4dabc6b1b3e5f001690573d90ba07afcba
+PR=$(git -C $G rev-parse "971717d2^{commit}")
+bash forge-build.sh "$NEW" "$MAIN" "$PR" "$BASE" "$OLD"
+for s in "$NEW" "$MAIN" "$PR" "$BASE" "$OLD"; do
+  grep -qx 'build host: forge' "$C/$s-forge/build.txt" || { echo "$s-forge is not a forge build"; exit 1; }
+done
+export HOST=forge EXTRA_Q=$PWD/queries-extra SUFFIX_A=-forge SUFFIX_B=-forge
+SQ="str-pair-lt str-pair-names str-pair-colleague str-filter-two"
+TQ="str-filter-two lang-filter distinct-join employee-docs"
+WQ="str-pair-lt str-pair-names str-pair-colleague str-filter-two bind-two order-lcase"
+bash stage.sh f1-streaming $MAIN $NEW 100000 5 10 streaming - "$SQ"
+bash stage.sh f2-vs-direct $PR $NEW 100000 5 10 eager - "$SQ"
+RAYON=12 bash stage.sh f3-t12-streaming $MAIN $NEW 100000 5 10 streaming - "$WQ"
+RAYON=12 bash stage.sh f4-t12-eager $MAIN $NEW 100000 5 10 eager - "$WQ"
+bash stage.sh f5-screen-streaming $MAIN $NEW 100000 3 10 streaming -
+bash stage.sh f6-screen-auto $MAIN $NEW 100000 3 10 auto -
+bash stage.sh f7-layout-auto $BASE $OLD 100000 5 10 auto - "$TQ"
+bash stage.sh f8-layout-streaming $BASE $OLD 100000 5 10 streaming - "$TQ"
+RUNS="f1-streaming f2-vs-direct f3-t12-streaming f4-t12-eager f7-layout-auto f8-layout-streaming f5-screen-streaming f6-screen-auto"
+H=forge U=floor-cache-1069-final-forge
+ssh $H "systemctl --user is-active -q $U" && { echo "$U already runs on $H"; exit 1; }
+ssh $H 'mkdir -p ~/lanes/floor-cache-1069 && rm -f ~/lanes/floor-cache-1069/status-forge'
+for n in $RUNS; do rsync -a --delete "$PWD/$n/stage/" "$H:lanes/floor-cache-1069/$n/"; done
+ssh $H "systemd-run --user --unit=$U --collect --working-directory=~/lanes/floor-cache-1069 -p MemoryMax=12G \
+  flock ~/lanes/.heavy.lock bash -c 'for n in $RUNS; do (cd \$n && bash nsc-bench-remote.sh) > \$n.log 2>&1 || echo FAILED \$n >> status-forge; echo ended \$n >> status-forge; done; echo DONE >> status-forge'"
+echo "queued on forge as $U"

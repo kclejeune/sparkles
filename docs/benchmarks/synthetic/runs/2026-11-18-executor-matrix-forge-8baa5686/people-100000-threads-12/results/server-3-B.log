@@ -1,0 +1,5 @@
+[2m2026-11-18T09:33:21.874502Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m memory profile default: block cache 1024 MiB, result cache 0 MiB, derived table cache 256 MiB, SERVICE cache 64 MiB, history cache 512 MiB, query budget 8192 MiB, query pool 6882 MiB
+[2m2026-11-18T09:33:21.885121Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m spill directory /home/kclejeune/lanes/forge-backlog/matrix-8baa5686/people-100000-threads-12/srv/.spill/890faff8382545f29098db509101231a-2340591-64ae01966ec9c4a6, 16706 MiB for all queries
+[2m2026-11-18T09:33:21.891702Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m Sparkles 0.1.0 listening on http://127.0.0.1:4181/ (UI at /ui/), opening 0 datasets
+[2m2026-11-18T09:33:21.897478Z[0m [32m INFO[0m [2msparkles::startup[0m[2m:[0m datasets opened in 5.5ms: status ready, ready true
+[2m2026-11-18T09:35:52.068223Z[0m [32m INFO[0m [2msparkles[0m[2m:[0m shutting down: finishing requests in flight (up to 20s)

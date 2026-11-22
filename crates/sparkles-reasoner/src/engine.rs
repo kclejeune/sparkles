@@ -1852,6 +1852,9 @@ pub(crate) struct Limits {
     /// evaluate transitive and equivalence rules with closure operators
     /// ([`crate::closure`]) when the program allows it
     pub closures: bool,
+    /// the magic predicates of a demand program (spec F23 Phase 2): its operators close
+    /// the adorned copies of transitive rules, each for the values its magic facts ask for
+    pub magic: Option<Arc<rustc_hash::FxHashSet<u64>>>,
     /// order rule bodies from sampled bindings ([`sampled`]) where the sample makes an
     /// order clearly cheaper than the greedy one
     pub sampled_planning: bool,
@@ -1885,6 +1888,8 @@ impl Limits {
 #[derive(Debug)]
 pub(crate) struct Outcome {
     pub iterations: usize,
+    /// what the closure operators did
+    pub closure: crate::closure::Stats,
 }
 
 /// In-memory rows per work item.
@@ -2436,7 +2441,10 @@ pub(crate) fn run_program(
                 };
                 iterations = run_from(g, rules, terms, limits, None, None, origin)?.iterations;
             }
-            Ok(Outcome { iterations })
+            Ok(Outcome {
+                iterations,
+                closure: Default::default(),
+            })
         }
     }
 }
@@ -2497,7 +2505,7 @@ pub(crate) fn run_from(
     // an observer of merge boundaries needs every fact to follow from the facts before
     // its boundary in one rule step, which a closure does not
     let mut closures = if limits.closures && boundary.is_none() {
-        crate::closure::Closures::detect(rules, terms, start)?
+        crate::closure::Closures::detect(rules, terms, start, limits.magic.as_deref())?
     } else {
         None
     };
@@ -2937,6 +2945,7 @@ pub(crate) fn run_from(
     );
     Ok(Outcome {
         iterations: iteration,
+        closure: closures.map(|c| c.stats()).unwrap_or_default(),
     })
 }
 // ============================================================== incremental ====
@@ -3162,6 +3171,7 @@ mod tests {
                         progress: None,
                         budget: Budget::unlimited(),
                         closures: false,
+                        magic: None,
                         sampled_planning: false,
                     };
                     run(&mut g, &[r], &t, &lim, None).unwrap();

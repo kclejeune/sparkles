@@ -1,0 +1,10 @@
+02:31:44 matrix of 31 queries into /home/kclejeune/lanes/forge-backlog/matrix-eda22fce
+02:31:44 people-100000-threads-12: start, load 3.38 3.15 3.03
+02:52:50 people-100000-threads-12: done
+02:52:50 people-100000-threads-1: start, load 1.12 1.12 1.56
+03:06:12 people-100000-threads-1: done
+03:06:13 people-1000000-threads-12: start, load 3.17 3.01 2.49
+04:13:48 people-1000000-threads-12: done
+04:13:48 people-1000000-threads-1: start, load 1.07 1.04 1.04
+04:54:54 people-1000000-threads-1: done
+04:54:54 finished: /home/kclejeune/lanes/forge-backlog/matrix-eda22fce/summary.md and /home/kclejeune/lanes/forge-backlog/matrix-eda22fce/record.json

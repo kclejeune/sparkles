@@ -197,7 +197,7 @@ results separately from conversation events.
 | Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
 | Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
 | Easy, nearly trivial tasks and the execution of a plan that fixes every step | GPT-6.1 Terra or Claude Sonnet 5.5 |
-| Code review and finding validation | Prefer GPT-6.1 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
+| Code review and finding validation | Prefer GPT-6.2 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
 | Mechanical tasks with an exact rule | A plain script. |
 | Easy tasks that need a lot of context, such as exploration, broad file scans, searches across many files and log triage | Claude Haiku 5.5 or GPT-6 Luna. |
 
@@ -280,7 +280,7 @@ No lane lands without review, and each step picks its model from the table above
 1. **An independent agent reviews.** `scripts/codex-review.sh NAME TIP BASE "CONTEXT"`
    runs `codex exec review` on `BASE..TIP` in a scratch worktree and writes `review.md`
    under `$AUDIT_DIR/NAME` (default `.artifacts/audits`). CONTEXT names the roadmap item,
-   the specs and what the work was meant to do. The script defaults to Sol at high effort,
+   the specs and what the work was meant to do. The script defaults to GPT-6.2 Sol at high effort,
    and `CODEX_REVIEW_MODEL` and `CODEX_REVIEW_REASONING_EFFORT` select another choice.
 2. **A capable agent validates and plans.** The validating agent checks every finding
    independently and reproduces it where it can. It marks each one confirmed, refuted or
@@ -321,17 +321,18 @@ affect and falls back to the whole workspace when a shared root changes. Lanes d
 full gates of their own.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
-batch. One gate runs on the batch, with a query screen on an admitted
-Boat worker (`mise run bench:remote --executor boat:bx_ID --build-host boat:bx_ID
-origin/main HEAD`), which is the only screen of record. A small or contested effect is
-checked on an Intel host, and timings from different providers are never compared.
+batch. One gate runs on the batch, with a query screen on a quiet Intel benchmark
+worker, which is the screen of record. Both arms and the reruns of flagged queries run on
+that one host with nothing beside them, and timings from different hosts are never
+compared. A Boat screen (`mise run bench:remote --executor boat:bx_ID A B`) is approximate
+and decides nothing.
 `scripts/gate/gate.sh <rev>` runs the gate on the configured gate hosts and selects its checks from the batch's diff against `origin/main`.
 It runs the `scripts/ci.sh` tasks, conformance suites and spill matrices that the changed
 files call for, with Clippy and the Rust tests for the packages they can affect, as the
 [batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Build configuration, the CI
 scripts and files that no rule covers run everything. Push when the tests pass and the
 screen shows no query 10% or more slower after the rerun of the flagged queries with more
-rounds, which the screen runs on the same worker and reports beside the first pass.
+rounds, which the screen runs on the same host and reports beside the first pass.
 The screen is skipped when `gate.sh` prints `skip screen (reason)`, which it does only
 when every changed file is one that cannot reach the server's query path or the screen,
 such as documentation, the CI scripts, tests or the OWL and validation crates. Any change

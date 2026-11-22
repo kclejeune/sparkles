@@ -605,3 +605,289 @@ fn a_limit_reaches_the_remote_query() {
         }
     }
 }
+
+/// A remote loop runs as a cursor operator over its input's batches (item 829). It
+/// holds the rows of a partial bulk request until more inputs arrive and keeps the
+/// answers of the inputs it has sent, so at every batch size it sends the requests one
+/// eager run sends, with the same answer, the same counters and the same note, even
+/// when a later batch repeats an input.
+#[test]
+fn a_streamed_loop_sends_the_requests_of_an_eager_run() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let streamed = |q: &str, rows: usize| {
+        let o = CursorOptions {
+            batch_rows: rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c =
+            select_cursor(data.snapshot(), q, &opts(), &o).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let mut out = Vec::new();
+        while let Some(b) = c.next_batch().unwrap() {
+            for r in 0..b.len() {
+                out.push(
+                    b.row(r)
+                        .unwrap()
+                        .values()
+                        .iter()
+                        .map(short)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+            }
+        }
+        out.sort();
+        (out, format!("{:?}", c.plan()))
+    };
+    for q in [
+        // nine inputs, four to a request
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p FILTER(?p != <urn:person1>) }} }}",
+            ep.url()
+        ),
+        // each input twice, the second time in a later batch
+        format!(
+            "SELECT ?d ?x ?p {{ VALUES ?x {{ 1 2 }} ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p FILTER(?p != <urn:person1>) }} }}",
+            ep.url()
+        ),
+        // an optional loop keeps the rows without solutions
+        format!(
+            "SELECT ?d ?p {{ ?d a <urn:Department> OPTIONAL {{ SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p FILTER(?p = <urn:person5>) }} }} }}",
+            ep.url()
+        ),
+    ] {
+        let expected = rows(&data, &q);
+        let eager = ep.take().len();
+        assert!(eager > 1, "{q}");
+        for batch in [1, 2, 3, 4096] {
+            let (answer, plan) = streamed(&q, batch);
+            assert_eq!(answer, expected, "{q}; {batch}");
+            let sent = ep.take().len();
+            assert_eq!(sent, eager, "{q}; {batch}: requests");
+            let note = format!("9 inputs, {eager} requests, 0 from the cache");
+            assert!(plan.contains(&note), "{q}; {batch}: {plan}");
+            assert!(
+                plan.contains(&format!("\"serviceRequests\": Number({eager})")),
+                "{plan}"
+            );
+        }
+    }
+    // a failing endpoint fails the stream, and SILENT gives each input one empty
+    // solution, as in eager runs
+    ep.failing.store(true, Ordering::SeqCst);
+    let loud = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let o = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let mut c = select_cursor(data.snapshot(), &loud, &opts(), &o).unwrap();
+    let mut failed = None;
+    loop {
+        match c.next_batch() {
+            Ok(Some(_)) => {}
+            Ok(None) => break,
+            Err(e) => {
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+    assert!(matches!(failed, Some(Error::Service(_))), "{failed:?}");
+    let silent = loud.replace("SERVICE <", "SERVICE SILENT <");
+    assert_eq!(streamed(&silent, 1).0.len(), 9);
+    assert_eq!(streamed(&silent, 1).0, rows(&data, &silent));
+}
+
+/// A streamed loop counts the rows it joins against the work limit as an eager run
+/// does: both count the same rows, and a limit one row short of that count stops both
+/// (item 829).
+#[test]
+fn a_streamed_loop_counts_its_rows_as_an_eager_run_does() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::sync::atomic::AtomicU64;
+    let data = store(&departments(9));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p {{ ?d a <urn:Department> SERVICE <loop:bulk+4:{}> {{ ?d <urn:hasEmployee> ?p }} }}",
+        ep.url()
+    );
+    let with = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+        no_cache: true,
+        max_rows_produced: limit,
+        work,
+        ..opts()
+    };
+    let eager = query(data.snapshot(), &q, &with(None, None)).unwrap();
+    let produced = eager.rows_produced;
+    assert!(eager.len() > 9, "{q}");
+    let streamed = |limit: Option<u64>, rows: usize| -> Result<u64, Error> {
+        let work = Arc::new(AtomicU64::new(0));
+        let o = CursorOptions {
+            batch_rows: rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &with(limit, Some(work.clone())), &o)?;
+        while c.next_batch()?.is_some() {}
+        Ok(work.load(Ordering::Relaxed))
+    };
+    for rows in [1, 3, 4096] {
+        assert_eq!(streamed(None, rows).unwrap(), produced, "{rows}");
+        assert!(streamed(Some(produced), rows).is_ok(), "{rows}");
+        assert!(
+            matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+            "{rows}"
+        );
+    }
+    assert!(matches!(
+        query(data.snapshot(), &q, &with(Some(produced - 1), None)),
+        Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced
+    ));
+}
+
+/// A streamed remote loop holds what it keeps across batches under the memory budget:
+/// each distinct key of its input rows, as well as the answers. Blank-node keys all send
+/// the same unbound request, and its answer is empty, so only the keys grow. A budget
+/// that cannot hold the input refuses the eager run, and it refuses the streamed run with
+/// a memory error too, while a larger budget answers (Sol review of item 829, finding 2).
+#[test]
+fn a_streamed_loop_charges_the_keys_it_keeps() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let n = 20_000;
+    let data = store(
+        &(0..n)
+            .map(|i| format!("_:b{i} <urn:q> <urn:x> .\n"))
+            .collect::<String>(),
+    );
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p {{ ?d <urn:q> <urn:x> SERVICE <loop:{}> {{ ?d <urn:none> ?p }} }}",
+        ep.url()
+    );
+    let with = |memory: Option<u64>| QueryOptions {
+        no_cache: true,
+        max_memory_bytes: memory,
+        ..opts()
+    };
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let o = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &with(memory), &o)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    let memory = |r: &Result<usize, Error>| matches!(r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+    let tight = Some(100 << 10);
+    assert_eq!(query(data.snapshot(), &q, &with(None)).unwrap().len(), 0);
+    assert_eq!(streamed(None).unwrap(), 0);
+    assert_eq!(ep.take().len(), 2, "one request per run");
+    let r = query(data.snapshot(), &q, &with(tight)).map(|r| r.len());
+    assert!(memory(&r), "eager: {r:?}");
+    let r = streamed(tight);
+    assert!(memory(&r), "streamed: {r:?}");
+    assert_eq!(streamed(Some(64 << 20)).unwrap(), 0);
+}
+
+/// A streamed remote loop admits each answer as it arrives, so a budget that the answers
+/// outgrow stops the loop before it sends the rest of its requests (Sol review of item
+/// 829, round 2, finding 2).
+#[test]
+fn a_streamed_loop_admits_each_answer_before_the_next_request() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(40));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p ?l {{ ?d a <urn:Department> SERVICE <loop:{}> {{ ?d <urn:hasEmployee> ?p . ?p <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}",
+        ep.url()
+    );
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let o = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: memory,
+            ..opts()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &opts, &o)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    assert_eq!(streamed(None).unwrap(), 820);
+    assert_eq!(ep.take().len(), 40, "one request per department");
+    let r = streamed(Some(48 << 10));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+    let sent = ep.take().len();
+    assert!(sent < 40, "the loop sent {sent} requests past its budget");
+}
+
+/// A bulk request cut short is sent again one input at a time, and the streamed loop
+/// admits each of those answers before it sends the next (Sol review of item 829, round
+/// 3, finding 2).
+#[test]
+fn a_streamed_loop_admits_each_retried_answer() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let data = store(&departments(40));
+    let ep = Endpoint::start(data.clone(), Duration::ZERO);
+    let q = format!(
+        "SELECT ?d ?p ?l {{ ?d a <urn:Department> SERVICE <loop:bulk+40:{}> {{ ?d <urn:hasEmployee> ?p . ?p <http://www.w3.org/2000/01/rdf-schema#label> ?l }} }}",
+        ep.url()
+    );
+    // Every response stops after 30 rows, so the bulk request lacks its end marker.
+    ep.limit.store(30, Ordering::SeqCst);
+    let streamed = |memory: Option<u64>| -> Result<usize, Error> {
+        let o = CursorOptions {
+            batch_rows: 64,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let opts = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: memory,
+            ..opts()
+        };
+        let mut c = select_cursor(data.snapshot(), &q, &opts, &o)?;
+        let mut rows = 0;
+        while let Some(b) = c.next_batch()? {
+            rows += b.len();
+        }
+        Ok(rows)
+    };
+    assert!(streamed(None).unwrap() > 0);
+    assert_eq!(
+        ep.take().len(),
+        41,
+        "a bulk request and one retry per department"
+    );
+    let r = streamed(Some(48 << 10));
+    assert!(
+        matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "{r:?}"
+    );
+    let sent = ep.take().len();
+    assert!(sent < 41, "the loop sent {sent} requests past its budget");
+}

@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# corpus.sh: base (09f6ed15) and w2 (53a51148) on GO, ChEBI lite, the ORE 2015 EL files and the
+# 207 DL development files, on 1 and 4 threads, taxonomy hash and stats per run in
+# out/corpus.txt, which ends with CORPUS-DONE. Compare with corpus-compare.sh.
+set -u
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees
+EL=$W/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/el-files
+D=$W/horn-cost-1025/.artifacts/lanes/horn-cost-1025/data
+DEV=$W/horn-cost-693/.artifacts/lanes/horn-cost-693/data/dev
+O=$L/out/corpus; mkdir -p $O
+for f in $D/go.ofn $D/chebi_lite.ofn $(ls $EL/*) $(ls $DEV/*); do
+  n=$(basename $f); n=${n%.*}
+  for t in 1 4; do for b in base w2; do
+    systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=1G -p OOMPolicy=continue \
+      timeout 600 taskset -c 8-15 $L/bin/$b --threads $t --taxonomy $O/$n.tax $f > $O/$n.json 2>/dev/null
+    st=$?
+    sha=$(LC_ALL=C sort $O/$n.tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $O/$n.tax
+    echo "$n $b t$t $st $sha $(grep '^{' $O/$n.json | jq -c '[.tier,.dlAttemptOver,.dlOverBudget,.hornOverBudget,.outside,.unsatisfiable,.consistency,.classifyMs[0]]')" >> $L/out/corpus.txt
+  done; done
+done
+echo CORPUS-DONE >> $L/out/corpus.txt

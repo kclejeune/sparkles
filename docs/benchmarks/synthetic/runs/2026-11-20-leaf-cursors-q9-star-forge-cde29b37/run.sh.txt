@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Host driver of the item 829 q9-star rerun, for forge or atlas. Run from
+# ~/lanes/leaf-cursors-829-q9 as the systemd user unit leaf-cursors-829-q9. Checks the
+# binaries, waits for the bench lock and then the heavy lock, and runs q9.sh in a 12G
+# scope while holding both. DONE holds exit=N (exit=sha on a checksum failure); 0 only
+# when every step passed. queue.log has the timestamps, run.log the output.
+set -u
+# LANE_DIR and LOCK_DIR exist for a rehearsal elsewhere; the defaults are the real ones.
+cd "${LANE_DIR:-$HOME/lanes/leaf-cursors-829-q9}" || exit 1
+LOCKS=${LOCK_DIR:-$HOME/lanes}
+export MBX_REMOTE_URL=
+rm -f DONE
+echo "$(date -Is) $(hostname) start, checking binaries" >> queue.log
+sha256sum -c SHA256SUMS >> queue.log 2>&1 || { echo "exit=sha" > DONE; exit 1; }
+mkdir -p src && tar -xzf src.tar.gz -C src
+flock "$LOCKS/.bench.lock" flock "$LOCKS/.heavy.lock" bash -c '
+  uptime > uptime-before.txt
+  echo "$(date -Is) locks held" >> queue.log
+  systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=2G -p OOMPolicy=continue \
+    bash q9.sh "$PWD/src" "$PWD/bin/base-bccc5f7b" "$PWD/bin/main-5f3f69c2" "$PWD/bin/tip-cde29b37" "$PWD/out" "${ROUNDS:-6}" "${RUNS:-25}"
+' > run.log 2>&1
+rc=$?
+rm -rf out/work
+echo "$(date -Is) finished rc=$rc" >> queue.log
+echo "exit=$rc" > DONE

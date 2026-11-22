@@ -194,7 +194,7 @@ jobs:
       - name: Benchmark scripts and crash harness (mise run test:bench-scripts)
         if: ${{ !cancelled() }}
         run: |
-          python3 -m unittest discover -s scripts/bench-tests
+          python3 scripts/unittest-parallel.py --split test_x08_latency scripts/bench-tests
           rustc --edition 2024 --test -o "$RUNNER_TEMP/crash-harness-test" scripts/crash-harness.rs
           "$RUNNER_TEMP/crash-harness-test"
       - name: Crate license notices

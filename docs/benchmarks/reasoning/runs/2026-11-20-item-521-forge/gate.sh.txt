@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# gate.sh: the Intel gate of lane reasoner-456-next (F23 Phase 2, item 521 first half) on forge,
+# under ~/lanes/.bench.lock and ~/lanes/.heavy.lock, nothing else running.
+#  1. OWL2Bench(1) demand queries q2, q7, q12, q19 (owl-rl, unmaterialized store), base
+#     5f3f69c2 against the tip, 3 rounds with the arm order alternating, rows compared.
+#  2. bench:reasoning-latency (item 472) harness, 10 universities, 5 rounds x 3 reps, 12
+#     threads, in the order base, tip, tip, base; gate records compared at the 10% threshold.
+# Binaries were built on stanley (bin/*.build-config.json, bin/SHA256SUMS). Expect ~1.5-2 h
+# on forge if base demand queries take ~80-190 s each (base dominates part 1).
+# Last line is GATE-DONE ok, or GATE-FAILED <reasons>: latency-flagged-* means a metric was
+# 10% or more slower in that pair (read compare-*.txt), latency-refused-* that the compare refused.
+set -uo pipefail
+W=$HOME/lanes/reasoner-456-next
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+echo "GATE locks held $(date -u +%FT%TZ) load $(cat /proc/loadavg)"
+if pgrep -x rustc >/dev/null || pgrep -x cargo >/dev/null || pgrep -x sparkles >/dev/null || pgrep -f 'qlever-server|fuseki-server|oxigraph serve|reasoning_latency' >/dev/null; then
+  echo "busy:"; ps -eo pid,args --sort=-pcpu | head -8 | cut -c1-150
+  echo "GATE-FAILED refused: something else is running"; exit 1
+fi
+cd $W/bin && sha256sum -c SHA256SUMS || { echo "GATE-FAILED binaries do not match SHA256SUMS"; exit 1; }
+R=$W/runs/$(date -u +%Y%m%dT%H%M%SZ); mkdir -p $R
+fail=""
+# part 1
+cd $W/owl2bench
+for round in 1 2 3; do
+  if [ $((round % 2)) = 1 ]; then arms="base tip"; else arms="tip base"; fi
+  for q in 2 7 12 19; do
+    for arm in $arms; do
+      o=$R/owl2bench/r$round; mkdir -p $o
+      /run/current-system/sw/bin/time -f "%e s %M KiB" -o $o/q$q.$arm.time \
+        $W/bin/sparkles-$arm query --loc base.db --reasoning demand --profile owl-rl --max-derived 0 \
+        --query queries/q$q.rq --results tsv > $o/q$q.$arm.tsv 2> $o/q$q.$arm.err || { echo "exit $?" >> $o/q$q.$arm.time; fail="$fail q$q-$arm-r$round"; }
+      sort $o/q$q.$arm.tsv > $o/q$q.$arm.sorted
+      echo "r$round q$q $arm $(tr '\n' ' ' < $o/q$q.$arm.time) rows $(($(wc -l < $o/q$q.$arm.tsv) - 1))" | tee -a $R/owl2bench-summary.txt
+    done
+    cmp -s $o/q$q.tip.sorted $o/q$q.base.sorted || { echo "r$round q$q ROWS DIFFER" | tee -a $R/owl2bench-summary.txt; fail="$fail rows-q$q-r$round"; }
+  done
+done
+echo "OWL2BENCH-DONE $(date -u +%FT%TZ)"
+# part 2
+S=$W/scripts
+n=0
+for arm in base tip tip base; do
+  n=$((n + 1)); o=$R/latency/$n-$arm; mkdir -p $o
+  started=$(date -u +%FT%TZ)
+  RAYON_NUM_THREADS=12 $W/bin/reasoning_latency-$arm 10 5 3 $o/metrics.jsonl > $o/output.md 2> $o/err.log || { fail="$fail latency-$n-$arm"; continue; }
+  python3 $S/bench-gate.py metrics $o/metrics.jsonl --gate reasoning-latency --suite lubm-style \
+    --scale "10 universities" --threshold 0.10 --out $o/record.json --binary $W/bin/reasoning_latency-$arm \
+    --manifest commit="$(cat $W/bin/$arm.commit)" --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" \
+    --manifest build_config="$(cat $W/bin/reasoning_latency-$arm.build-config.json)" \
+    --setting universities=10 --setting rounds=5 --setting reps=3 --setting threads=12 \
+    --setting harness="crates/sparkles-reasoner/examples/reasoning_latency.rs" || fail="$fail record-$n-$arm"
+  echo "LATENCY-RUN $n $arm $(date -u +%FT%TZ)"
+done
+for pair in "1-base 2-tip" "4-base 3-tip"; do
+  set -- $pair
+  python3 $S/bench-gate.py compare $R/latency/$1/record.json $R/latency/$2/record.json --threshold 0.10 \
+    > $R/latency/compare-$1-$2.txt 2>&1; rc=$?
+  echo "compare $1 $2 exit $rc" | tee -a $R/latency-summary.txt
+  case $rc in 0) ;; 1) fail="$fail latency-flagged-$1-$2" ;; *) fail="$fail latency-refused-$1-$2" ;; esac
+  tail -5 $R/latency/compare-$1-$2.txt | tee -a $R/latency-summary.txt
+done
+echo "run dir $R"
+if [ -z "$fail" ]; then echo "GATE-DONE ok"; else echo "GATE-FAILED$fail"; exit 1; fi

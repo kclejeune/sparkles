@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Item 829 part 1: confirmation runs on forge after the matrix and the script A/B.
+# Run on forge from ~/lanes/leaf-cursors-829/confirm. Builds one nsc-bench-remote.sh
+# directory per run from the matrix stage (binaries, synthetic data, queries) and the
+# vector work directory (data and query files).
+#
+#   cj-es, cj-se          tip binary on both sides, one shared store, eager against
+#                         streaming in both orders: the streamed CountJoin on two variables
+#                         and over a filter (two-hop-count is a CountJoinFromRuns control)
+#   small-{eager,streaming}-{ab,ba}
+#                         base bccc5f7b against tip 9df856f3 in both orders: the matrix
+#                         queries under 0.3 ms and the ones the matrix flagged above it
+#   vec-{eager,streaming}-{ab,ba}
+#                         base against tip in both orders over the vector script's store
+#                         and queries, with the server's execution time
+set -euo pipefail
+cd "$(dirname "$0")"
+M=../matrix/streaming-t1/stage
+V=../out/work/vector/100000x384
+P='PREFIX ex: <http://example.org/> PREFIX foaf: <http://xmlns.com/foaf/0.1/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>'
+[ -f "$V/data.nt.zst" ] || zstd -q -T4 "$V/data.nt" -o "$V/data.nt.zst"
+mk() { # <name> <A bin.zst> <B bin.zst> <data.nt.zst>
+  rm -rf "$1"
+  mkdir -p "$1/queries"
+  cp "$M/nsc-bench-remote.sh" "$1/"
+  ln -s "$(realpath "$2")" "$1/bin-A.zst"
+  ln -s "$(realpath "$3")" "$1/bin-B.zst"
+  ln -s "$(realpath "$4")" "$1/data.nt.zst"
+}
+env_common() { # <file> <rounds> <reps> <execution> <port>
+  cat > "$1" << EOF
+DYNAMIC_A=0
+DYNAMIC_B=0
+ROUNDS=$2
+REPS=$3
+WARMUP=5
+RAYON_THREADS=1
+SERVER_CPU=2
+CLIENT_CPU=4
+SPIN=1
+SHARE_STORE=1
+EXECUTION=$4
+PORT=$5
+EOF
+}
+BASE=$M/bin-A.zst TIP=$M/bin-B.zst
+port=41960
+for o in es se; do
+  n=cj-$o
+  mk "$n" "$TIP" "$TIP" "$M/data.nt.zst"
+  echo "$P SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b . ?b foaf:knows ?a }" > "$n/queries/cj-two-var.rq"
+  echo "$P SELECT (COUNT(*) AS ?n) WHERE { ?a foaf:knows ?b FILTER(?a != ?b) ?b ex:worksFor ?o }" > "$n/queries/cj-filter.rq"
+  cp "$M/queries/two-hop-count.rq" "$n/queries/"
+  mode=eager,streaming
+  [ $o = se ] && mode=streaming,eager
+  env_common "$n/run.env" 12 100 "$mode" $((port++))
+done
+SMALL="count-all distinct-obj employee-docs path-plus predicate-counts predicate-subjects
+star-lookup subquery-agg types-grouped values-star minus contains distinct-join
+lang-filter regex-iri star-join expr-bind-group"
+for mode in eager streaming; do
+  for o in ab ba; do
+    n=small-$mode-$o
+    a=$BASE b=$TIP
+    [ $o = ba ] && a=$TIP b=$BASE
+    mk "$n" "$a" "$b" "$M/data.nt.zst"
+    for q in $SMALL; do cp "$M/queries/$q.rq" "$n/queries/"; done
+    env_common "$n/run.env" 12 200 "$mode" $((port++))
+  done
+done
+for mode in eager streaming; do
+  for o in ab ba; do
+    n=vec-$mode-$o
+    a=$BASE b=$TIP
+    [ $o = ba ] && a=$TIP b=$BASE
+    mk "$n" "$a" "$b" "$V/data.nt.zst"
+    cp "$V"/q-*.rq "$n/queries/"
+    env_common "$n/run.env" 12 50 "$mode" $((port++))
+    cat >> "$n/run.env" << 'EOF'
+SERVE_ARGS="--vector-memory-mb 65536"
+PREPARE_A="--vector-memory-mb 65536 vector create --name emb --predicate urn:x-bench:emb --dim 384 --m 16 --ef-construction 128"
+EOF
+  done
+done
+ls -d cj-* small-* vec-*

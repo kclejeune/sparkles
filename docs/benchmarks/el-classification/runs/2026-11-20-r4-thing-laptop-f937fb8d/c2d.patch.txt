@@ -1,0 +1,93 @@
+diff --git a/crates/sparkles-owl/src/classify/horn.rs b/crates/sparkles-owl/src/classify/horn.rs
+index a62111fb..ccbab584 100644
+--- a/crates/sparkles-owl/src/classify/horn.rs
++++ b/crates/sparkles-owl/src/classify/horn.rs
+@@ -96,6 +96,10 @@ impl HornIx {
+     /// real context holds it, as a fact of a universal role (F24, "The Horn rules with
+     /// individuals"), so that R3 and R4 pass over it.
+     pub const GLOBAL: u8 = 8;
++    /// The expression is in the told closure of `owl:Thing`, which every context of a run
++    /// without the disjunctive rules derives from its start, so that R4 passes over a
++    /// universal with such a filler, whose predecessors derive it anyway.
++    pub const THING: u8 = 16;
+ 
+     #[inline]
+     pub fn is(&self, e: Ex, flag: u8) -> bool {
+@@ -138,11 +142,9 @@ impl HornIx {
+ /// cancellation came. The work is linear in the told subsumptions: a rejected candidate
+ /// rejects the candidates whose told subsumers it is. A run with individuals marks none,
+ /// since a successor that R3 would extend can stand for an individual, which then takes
+-/// the filler as a subsumer of its own (F24, "The Horn rules with individuals").
++/// the filler as a subsumer of its own (F24, "The Horn rules with individuals"). Every
++/// run marks [`HornIx::THING`] first, unless it stops.
+ pub fn absorb(ix: &mut super::index::Index, stop: &dyn Fn() -> bool) {
+-    if ix.has_individuals() {
+-        return;
+-    }
+     let n = ix
+         .horn
+         .as_ref()
+@@ -166,6 +168,15 @@ pub fn absorb(ix: &mut super::index::Index, stop: &dyn Fn() -> bool) {
+             stack.extend(told.iter().copied());
+         }
+     }
++    let flags = &mut ix.horn.as_mut().expect("a run with the Horn rules").flags;
++    for (e, &g) in global.iter().enumerate() {
++        if g {
++            flags[e] |= HornIx::THING;
++        }
++    }
++    if ix.has_individuals() {
++        return;
++    }
+     let flags = &ix.horn.as_ref().expect("a run with the Horn rules").flags;
+     let inert = |e: Ex| {
+         let h = ix.head(e);
+diff --git a/crates/sparkles-owl/src/classify/horn_rules.rs b/crates/sparkles-owl/src/classify/horn_rules.rs
+index 28d2c32a..1f50993d 100644
+--- a/crates/sparkles-owl/src/classify/horn_rules.rs
++++ b/crates/sparkles-owl/src/classify/horn_rules.rs
+@@ -754,7 +754,27 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S) -> bool {
+ /// The context derives `∀s.a`: R4 to the predecessors, and R3 to the successors.
+ pub fn forall<S: Sink>(ix: &Index, _me: Ex, st: &mut State, s: Role, a: Ex, out: &mut S) {
+     let roles = &ix.roles;
+-    if let Some(i) = roles.inv(s) {
++    {
++        use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++        static CALLS: AtomicU64 = AtomicU64::new(0);
++        static INV: AtomicU64 = AtomicU64::new(0);
++        static HIT: AtomicU64 = AtomicU64::new(0);
++        static SENDS: AtomicU64 = AtomicU64::new(0);
++        let c = CALLS.fetch_add(1, Relaxed) + 1;
++        if let Some(i) = roles.inv(s) {
++            INV.fetch_add(1, Relaxed);
++            if thing(ix, a) {
++                HIT.fetch_add(1, Relaxed);
++                let n: usize = st.back.iter().filter(|(r, _)| roles.sub(*r, i)).map(|(_, v)| v.list.len()).sum();
++                SENDS.fetch_add(n as u64, Relaxed);
++            }
++        }
++        if c.is_power_of_two() && std::env::var_os("SPARKLES_C2_DIAG").is_some() {
++            eprintln!("C2DIAG calls={c} inv={} thing={} sends={} dl={}", INV.load(Relaxed), HIT.load(Relaxed), SENDS.load(Relaxed), ix.dl.is_some());
++        }
++    }
++    // R4 passes over a filler that every predecessor holds from its start
++    if let Some(i) = roles.inv(s).filter(|_| !thing(ix, a)) {
+         st.props.push((i, a));
+         if !out.defer() {
+             for (r, srcs) in &st.back {
+@@ -1100,6 +1120,14 @@ pub fn self_loop<S: Sink>(ix: &Index, me: Ex, st: &mut State, r: Role, out: &mut
+     }
+ }
+ 
++/// Whether every context of the run derives the expression from `owl:Thing`, which
++/// [`HornIx::THING`] describes. A run with the disjunctive rules withholds some told
++/// subsumers until it takes their units, so R4 there keeps every filler.
++#[inline]
++fn thing(ix: &Index, a: Ex) -> bool {
++    ix.dl.is_none() && ix.horn.as_ref().is_some_and(|h| h.is(a, HornIx::THING))
++}
++
+ /// Whether an expression adds nothing that every context does not hold, which
+ /// [`HornIx::ABSORBED`] describes.
+ #[inline]

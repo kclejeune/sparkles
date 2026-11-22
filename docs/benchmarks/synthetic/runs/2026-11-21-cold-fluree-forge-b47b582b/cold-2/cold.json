@@ -1,0 +1,22 @@
+{
+ "fluree": {
+  "count-all": 0.018517,
+  "two-hop-count": 0.036931,
+  "contains": 0.029331,
+  "path-plus": 0.028776,
+  "distinct-obj": 0.019307,
+  "star-lookup": 0.045922,
+  "values-star": 0.035997,
+  "employee-docs": 0.030553
+ },
+ "sparkles": {
+  "count-all": 0.002164,
+  "two-hop-count": 0.013034,
+  "contains": 0.011841,
+  "path-plus": 0.002621,
+  "distinct-obj": 0.001772,
+  "star-lookup": 0.010099,
+  "values-star": 0.005399,
+  "employee-docs": 0.007436
+ }
+}

@@ -2,7 +2,7 @@
 //! reference reasoner and the measurements of `docs/benchmarks/el-classification`.
 //!
 //! ```text
-//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
+//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--dl-attempt-width N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax (`.ofn`, or any file that starts with `Prefix(` or
@@ -86,6 +86,7 @@ fn main() {
     let mut eager = false;
     let mut dl_work: Option<usize> = None;
     let mut dl_attempt_work: Option<usize> = None;
+    let mut dl_attempt_width: Option<usize> = None;
     let mut counting = false;
     let mut number_order = true;
     let mut rooted = false;
@@ -109,12 +110,13 @@ fn main() {
             "--no-dl-steps" => dl_steps = false,
             "--dl-work" => dl_work = args.next().and_then(|v| v.parse().ok()),
             "--dl-attempt-work" => dl_attempt_work = args.next().and_then(|v| v.parse().ok()),
+            "--dl-attempt-width" => dl_attempt_width = args.next().and_then(|v| v.parse().ok()),
             _ => input = Some(a),
         }
     }
     let Some(input) = input else {
         eprintln!(
-            "usage: el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--no-dl-steps] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
+            "usage: el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--dl-attempt-width N] [--no-dl-steps] [--el-only] [--eager] [--ofn-out FILE] [--taxonomy FILE] INPUT"
         );
         std::process::exit(2);
     };
@@ -171,6 +173,7 @@ fn main() {
         },
         dl_work,
         dl_attempt_work,
+        dl_attempt_width,
         counting,
         rooted,
         number_order,
@@ -228,16 +231,6 @@ fn main() {
             eprintln!("excluded {:?}: {:?}", e.gap, e.axiom);
         }
     }
-    let outside = excluded
-        .iter()
-        .filter(|e| matches!(e.gap, Gap::Outside { .. }))
-        .count();
-    let mut partial: std::collections::BTreeMap<&str, usize> = Default::default();
-    for e in &excluded {
-        if let Gap::Partial(why) = e.gap {
-            *partial.entry(why).or_default() += 1;
-        }
-    }
     if let Some(path) = &tax_out {
         let t = &out.taxonomy;
         let mut lines: Vec<String> = Vec::new();
@@ -262,64 +255,232 @@ fn main() {
             writeln!(f, "{l}").expect("write taxonomy");
         }
     }
+    let measured = measures(
+        &out,
+        &input,
+        axioms.len(),
+        read_ms,
+        &times,
+        &add_times,
+        rss_read,
+        heap.then(|| PEAK.load(Ordering::Relaxed)),
+    );
+    println!("{}", report(answer(&out, &excluded, rules), measured));
+}
+
+/// The report's line: the fields of [`answer`] and those of [`measures`].
+fn report(answer: serde_json::Value, measures: serde_json::Value) -> serde_json::Value {
+    let mut report = answer;
+    if let (Some(r), serde_json::Value::Object(m)) = (report.as_object_mut(), measures) {
+        r.extend(m);
+    }
+    report
+}
+
+/// The fields of the report that count and time the run.
+#[allow(clippy::too_many_arguments)]
+fn measures(
+    out: &sparkles_owl::classify::Classification,
+    input: &str,
+    axioms: usize,
+    read_ms: f64,
+    times: &[f64],
+    add_times: &[f64],
+    rss_read: Option<u64>,
+    peak_heap: Option<isize>,
+) -> serde_json::Value {
     let s = &out.stats;
     let median = |times: &[f64]| {
         let mut v = times.to_vec();
         v.sort_by(|a, b| a.total_cmp(b));
-        v[v.len() / 2]
+        v.get(v.len() / 2).copied().unwrap_or(0.0)
     };
-    println!(
-        "{}",
-        serde_json::json!({
-            "input": input,
-            "axioms": axioms.len(),
-            "classes": out.taxonomy.classes().count(),
-            "nodes": out.taxonomy.nodes().len(),
-            "unsatisfiable": out.taxonomy.unsatisfiable().count(),
-            "consistent": out.consistent,
-            "complete": out.complete,
-            "incomplete": out.incomplete.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
-            "consistency": match out.consistency {
-                sparkles_owl::classify::Consistency::Consistent => "consistent",
-                sparkles_owl::classify::Consistency::Inconsistent => "inconsistent",
-                sparkles_owl::classify::Consistency::Unknown => "unknown",
-            },
-            "outside": outside + rules,
-            "rules": rules,
-            "tier": s.tier.as_str(),
-            "outsideHorn": s.outside_el.horn,
-            "outsideDisjunctive": s.outside_el.disjunctive,
-            "outsideGlobal": s.outside_el.global,
-            "outsideTaken": s.outside_el.taken,
-            "conjunctions": s.conjunctions,
-            "hornOverBudget": s.horn_over_budget,
-            "clauses": s.clauses,
-            "dlContexts": s.dl_contexts,
-            "dlOverBudget": s.dl_over_budget,
-            "dlTests": s.dl_tests,
-            "dlStored": s.dl_stored,
-            "dlWork": s.dl_work,
-            "dlCountingOver": s.dl_counting_over,
-            "dlRootedOver": s.dl_rooted_over,
-            "dlAttemptOver": s.dl_attempt_over,
-            "dlTestsHeld": s.dl_tests_held,
-            "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
-            "partial": partial,
-            "threads": s.threads,
-            "readMs": read_ms,
-            "classifyMs": times,
-            "classifyMedianMs": median(&times),
-            "addMs": median(&add_times),
-            "indexMs": s.index.as_secs_f64() * 1000.0,
-            "saturationMs": s.saturation.as_secs_f64() * 1000.0,
-            "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
-            "contexts": s.contexts,
-            "conclusions": s.conclusions,
-            "estimatedBytes": s.memory,
-            "peakEstimatedBytes": s.peak_memory,
-            "peakRssKibAfterRead": rss_read,
-            "peakRssKib": peak_rss_kib(),
-            "peakHeapBytes": heap.then(|| PEAK.load(Ordering::Relaxed)),
-        })
-    );
+    serde_json::json!({
+        "input": input,
+        "axioms": axioms,
+        "classes": out.taxonomy.classes().count(),
+        "nodes": out.taxonomy.nodes().len(),
+        "unsatisfiable": out.taxonomy.unsatisfiable().count(),
+        "consistent": out.consistent,
+        "conjunctions": s.conjunctions,
+        "clauses": s.clauses,
+        "dlContexts": s.dl_contexts,
+        "dlTests": s.dl_tests,
+        "dlStored": s.dl_stored,
+        "dlWork": s.dl_work,
+        "dlTestsHeld": s.dl_tests_held,
+        "dlTestingMs": s.dl_testing.as_secs_f64() * 1000.0,
+        "threads": s.threads,
+        "readMs": read_ms,
+        "classifyMs": times,
+        "classifyMedianMs": median(times),
+        "addMs": median(add_times),
+        "indexMs": s.index.as_secs_f64() * 1000.0,
+        "saturationMs": s.saturation.as_secs_f64() * 1000.0,
+        "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
+        "contexts": s.contexts,
+        "conclusions": s.conclusions,
+        "estimatedBytes": s.memory,
+        "peakEstimatedBytes": s.peak_memory,
+        "peakRssKibAfterRead": rss_read,
+        "peakRssKib": peak_rss_kib(),
+        "peakHeapBytes": peak_heap,
+    })
+}
+
+/// The fields of the report that say what the answer claims: whether it is complete, the
+/// axioms it left out and the fallbacks it took. An answer claims every subsumption only
+/// when `complete` is true, `incomplete` is empty, `outside` is 0 and no fallback is set.
+fn answer(
+    out: &sparkles_owl::classify::Classification,
+    excluded: &[sparkles_owl::classify::Excluded],
+    rules: usize,
+) -> serde_json::Value {
+    let s = &out.stats;
+    let outside = excluded
+        .iter()
+        .filter(|e| matches!(e.gap, Gap::Outside { .. }))
+        .count();
+    let mut partial: std::collections::BTreeMap<&str, usize> = Default::default();
+    for e in excluded {
+        if let Gap::Partial(why) = e.gap {
+            *partial.entry(why).or_default() += 1;
+        }
+    }
+    serde_json::json!({
+        "complete": out.complete,
+        "incomplete": out.incomplete.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        "consistency": match out.consistency {
+            sparkles_owl::classify::Consistency::Consistent => "consistent",
+            sparkles_owl::classify::Consistency::Inconsistent => "inconsistent",
+            sparkles_owl::classify::Consistency::Unknown => "unknown",
+        },
+        "outside": outside + rules,
+        "rules": rules,
+        "tier": s.tier.as_str(),
+        "outsideHorn": s.outside_el.horn,
+        "outsideDisjunctive": s.outside_el.disjunctive,
+        "outsideGlobal": s.outside_el.global,
+        "outsideTaken": s.outside_el.taken,
+        "hornOverBudget": s.horn_over_budget,
+        "dlOverBudget": s.dl_over_budget,
+        "dlCountingOver": s.dl_counting_over,
+        "dlRootedOver": s.dl_rooted_over,
+        "dlRootedDeclined": s.dl_rooted_declined,
+        "dlAttemptOver": s.dl_attempt_over,
+        "partial": partial,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rooted run that withdraws its answer (roadmap item 1231) claims nothing in the
+    /// report, and says why.
+    #[test]
+    fn a_declined_rooted_answer_claims_nothing_in_the_report() {
+        let text = "Prefix(:=<http://example.org/h#>)
+            Ontology(<http://example.org/h>
+            SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+            SubClassOf(:K ObjectHasValue(:q :v))
+            SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+            ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+            SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+            SubClassOf(:E ObjectHasValue(:r2 :w))
+            SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+            SubClassOf(:C2 ObjectHasValue(:s :v))
+            SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+            SubClassOf(:Q ObjectUnionOf(:Q1 :Q2)))";
+        let doc =
+            ofn_read::parse_with(text, ofn_read::Options { skip_rules: true }).expect("parse");
+        for decline in [true, false] {
+            let mut k = Classifier::of(&doc.axioms);
+            let out = k
+                .classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    rooted_decline: decline,
+                    ..Limits::default()
+                })
+                .expect("classify");
+            let r = answer(&out, &k.excluded(), 0);
+            let claim = r["complete"] == true
+                && r["incomplete"].as_array().is_some_and(|v| v.is_empty())
+                && r["outside"] == 0
+                && r["dlOverBudget"] == false
+                && r["dlRootedOver"] == false
+                && r["dlRootedDeclined"] == false;
+            assert_eq!(claim, !decline, "{r}");
+            assert_eq!(r["dlRootedDeclined"], decline, "{r}");
+        }
+    }
+
+    /// The report keeps every field it had, and adds `dlRootedDeclined`.
+    #[test]
+    fn the_report_has_every_field() {
+        let doc = ofn_read::parse_with(
+            "Prefix(:=<http://example.org/h#>) Ontology(SubClassOf(:A :B))",
+            ofn_read::Options { skip_rules: true },
+        )
+        .expect("parse");
+        let mut k = Classifier::of(&doc.axioms);
+        let out = k.classify(&Limits::default()).expect("classify");
+        let r = report(
+            answer(&out, &k.excluded(), 0),
+            measures(&out, "in", 1, 0.0, &[1.0], &[1.0], None, None),
+        );
+        let mut have: Vec<&str> = r.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        have.sort_unstable();
+        let mut want = vec![
+            "addMs",
+            "axioms",
+            "classes",
+            "classifyMedianMs",
+            "classifyMs",
+            "clauses",
+            "complete",
+            "conclusions",
+            "conjunctions",
+            "consistency",
+            "consistent",
+            "contexts",
+            "dlAttemptOver",
+            "dlContexts",
+            "dlCountingOver",
+            "dlOverBudget",
+            "dlRootedDeclined",
+            "dlRootedOver",
+            "dlStored",
+            "dlTests",
+            "dlTestingMs",
+            "dlTestsHeld",
+            "dlWork",
+            "estimatedBytes",
+            "hornOverBudget",
+            "incomplete",
+            "indexMs",
+            "input",
+            "nodes",
+            "outside",
+            "outsideDisjunctive",
+            "outsideGlobal",
+            "outsideHorn",
+            "outsideTaken",
+            "partial",
+            "peakEstimatedBytes",
+            "peakHeapBytes",
+            "peakRssKib",
+            "peakRssKibAfterRead",
+            "readMs",
+            "rules",
+            "saturationMs",
+            "taxonomyMs",
+            "threads",
+            "tier",
+            "unsatisfiable",
+        ];
+        want.sort_unstable();
+        assert_eq!(have, want);
+    }
 }

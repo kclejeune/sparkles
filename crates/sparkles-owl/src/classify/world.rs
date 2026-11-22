@@ -619,7 +619,10 @@ pub fn witnesses(
                             && (subs.iter().any(|s| !st.subs.contains(s))
                                 || loops.iter().any(|l| !st.loops.contains(l))
                                 || succ.iter().any(|s| {
-                                    !st.extra.as_ref().is_some_and(|x| x.horn.succ.contains(s))
+                                    !st.extra.as_ref().is_some_and(|x| {
+                                        x.horn.succ.contains(s)
+                                            || super::horn_rules::covered(ix, &x.horn, s.0, s.1)
+                                    })
                                 }));
                     });
                     more

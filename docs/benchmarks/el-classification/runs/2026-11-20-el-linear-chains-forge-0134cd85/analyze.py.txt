@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Summarizes out/runs.jsonl of timing.py by the rules of RULES.md.
+
+For each cell (kind, ontology, threads) and metric, it takes each side's median over the
+rounds, the tip/base ratio of those medians, and a 95% bootstrap interval of that ratio
+that resamples whole rounds, so a round's base and tip stay paired. The verdict follows the
+AGENTS.md Intel rule: noise when the interval reaches 1.0 or the median added time per
+classification is at most 0.5 us, otherwise faster or slower, except that a cold cell whose
+interval reaches 1.0 with its upper end above 1.005 is "not resolved". Usage: analyze.py OUTDIR"""
+import json, os, random, statistics, sys
+from collections import defaultdict
+
+out = sys.argv[1] if len(sys.argv) > 1 else "out"
+runs = [json.loads(l) for l in open(os.path.join(out, "runs.jsonl"))]
+METRICS = {
+    "warm": ["classifyMedianMs", "saturationMs", "wallS", "maxRssKib"],
+    "cold": ["wallS", "readMs", "classifyMedianMs", "maxRssKib"],
+}
+TIME = {"classifyMedianMs": 1e-3, "saturationMs": 1e-3, "readMs": 1e-3, "wallS": 1.0}
+cells = defaultdict(lambda: defaultdict(dict))  # (kind,name,t) -> round -> side -> rec
+bad = []
+seen = set()
+for r in runs:
+    k = (r["kind"], r["name"], r["threads"], r["round"], r["side"])
+    if k in seen:
+        bad.append(("duplicate",) + k)
+    seen.add(k)
+    if r["status"] != 0 or r["out"] is None or r.get("timedOut"):
+        bad.append(("failed",) + k + (r["status"],))
+        continue
+    if r["kind"] == "taxonomy":
+        continue
+    cells[(r["kind"], r["name"], r["threads"])][r["round"]][r["side"]] = r
+# The cells and rounds that RULES.md fixes; anything missing makes the run invalid.
+EXPECT = {("cold", n, 1): 20 for n in ("ore_ont_3836", "ore_ont_13482")}
+for n, rounds in (("ore_ont_8737", 3), ("go", 6), ("chebi_lite", 6), ("ore_ont_3836", 6),
+                  ("ore_ont_13482", 6), ("ore_ont_9855", 6)):
+    for t in (1, 4, 12):
+        EXPECT[("warm", n, t)] = rounds
+    for side in ("base", "tip"):
+        if ("taxonomy", n, 4, 0, side) not in seen:
+            bad.append(("missing taxonomy run", n, side))
+for key, rounds in EXPECT.items():
+    for rnd in range(1, rounds + 1):
+        for side in ("base", "tip"):
+            if side not in cells[key].get(rnd, {}):
+                bad.append(("missing",) + key + (rnd, side))
+    extra_rounds = set(cells[key]) - set(range(1, rounds + 1))
+    if extra_rounds:
+        bad.append(("unexpected rounds",) + key + (sorted(extra_rounds),))
+extra = set(cells) - set(EXPECT)
+if extra:
+    bad.append(("unexpected cells", sorted(extra)))
+tax = [l for l in open(os.path.join(out, "log.txt")) if " taxonomy " in l]
+if len(tax) != 6 or any(" same " not in l for l in tax):
+    bad.append(("taxonomy check failed or incomplete", len(tax)))
+print("# el-956 forge timing summary\n")
+print("VALID" if not bad else "INVALID: " + repr(bad))
+
+
+def value(rec, m):
+    if m in ("wallS", "maxRssKib"):
+        return rec[m]
+    return rec["out"][m]
+
+
+def summary(rounds, m, kind):
+    pairs = [(value(v["base"], m), value(v["tip"], m)) for v in rounds.values() if "base" in v and "tip" in v]
+    if not pairs:
+        return None
+    b = statistics.median(p[0] for p in pairs)
+    t = statistics.median(p[1] for p in pairs)
+    rng = random.Random(956)
+    boots = []
+    for _ in range(10000):
+        s = [rng.choice(pairs) for _ in pairs]
+        bb = statistics.median(p[0] for p in s)
+        boots.append(statistics.median(p[1] for p in s) / bb if bb else float("nan"))
+    boots.sort()
+    lo, hi = boots[249], boots[9749]
+    q = t / b if b else float("nan")
+    verdict = ""
+    if m in TIME:
+        # Added seconds per classification, or per process for wallS.
+        added_s = (t - b) * TIME[m]
+        if kind == "cold" and lo <= 1.0 <= hi and hi > 1.005:
+            # Too wide to tell the +0.5% to +0.8% reader-side cost from none.
+            verdict = "not resolved"
+        elif lo <= 1.0 <= hi or abs(added_s) <= 0.5e-6:
+            verdict = "noise"
+        else:
+            verdict = "faster" if hi < 1.0 else "SLOWER"
+    return len(pairs), b, t, q, lo, hi, verdict
+
+
+def fmt(x):
+    return f"{x:,.0f}" if abs(x) >= 100 else f"{x:,.3f}" if abs(x) < 10 else f"{x:,.1f}"
+
+
+for kind in ("warm", "cold"):
+    print(f"\n## {kind} runs\n")
+    print("| Ontology | Threads | Metric | Rounds | Base | Tip | Ratio | 95% interval | Verdict |")
+    print("|---|---:|---|---:|---:|---:|---:|---|---|")
+    for key in sorted(k for k in cells if k[0] == kind):
+        for m in METRICS[kind]:
+            s = summary(cells[key], m, kind)
+            if s is None:
+                continue
+            n, b, t, q, lo, hi, v = s
+            print(f"| `{key[1]}` | {key[2]} | {m} | {n} | {fmt(b)} | {fmt(t)} | {q:.3f} | {lo:.3f} to {hi:.3f} | {v} |")
+print("\nfailed, missing or duplicate processes:", bad if bad else "none")
+print("taxonomy checks:\n" + "".join(tax))
+sys.exit(1 if bad else 0)

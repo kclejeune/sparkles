@@ -155,6 +155,24 @@ pub(super) fn candidates(a: &Node, b: &Node, ctx: &Ctx) -> Vec<Node> {
         .collect()
 }
 
+/// The scan under a probe side, without copying the filters over it.
+fn probe_scan(n: &Node) -> Option<(&Node, &ScanSpec)> {
+    let mut n = n;
+    loop {
+        match &n.kind {
+            Kind::Filter(es) if !es.iter().any(Expr::has_exists) => n = &n.children[0],
+            Kind::Scan(spec) | Kind::RangeScan(spec, _) => return Some((n, spec)),
+            _ => return None,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The filters [`probe_leaf`] copied on this thread since the last reset.
+    pub(super) static PROBE_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The scan under a probe side, with the filters over it.
 fn probe_leaf(n: &Node) -> Option<(&Node, &ScanSpec, Vec<Expr>)> {
     let mut filter = Vec::new();
@@ -162,6 +180,8 @@ fn probe_leaf(n: &Node) -> Option<(&Node, &ScanSpec, Vec<Expr>)> {
     loop {
         match &n.kind {
             Kind::Filter(es) if !es.iter().any(Expr::has_exists) => {
+                #[cfg(test)]
+                PROBE_COPIES.with(|copies| copies.set(copies.get() + es.len()));
                 filter.extend(es.iter().cloned());
                 n = &n.children[0];
             }
@@ -196,6 +216,88 @@ fn filter_str(ctx: &Ctx, filter: &[Expr]) -> String {
 fn candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
     let offer = offer(drive, probe, ctx, true)?;
     Some(offer.build(drive.clone(), probe))
+}
+
+/// The one direction that can be offered when a VALUES leaf binds a graph name.
+pub(super) fn graph_binding_candidate(drive: &Node, probe: &Node, ctx: &Ctx) -> Option<Node> {
+    ctx.opt
+        .batched_join
+        .then(|| candidate(drive, probe, ctx))
+        .flatten()
+}
+
+/// The most that [`index_join`] of `drive` into `probe` allocates at once, counting what
+/// the join keeps: the copy of the filters over the pattern,
+/// the keys, the order, the description, which renders the filters, and the operator.
+pub(super) fn index_join_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    drive: &Node,
+    probe: &Node,
+    ctx: &Ctx,
+) -> Result<()> {
+    struct Count(usize);
+    impl std::fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            self.0 = self.0.saturating_add(s.len());
+            Ok(())
+        }
+    }
+    let mut n = probe;
+    let (mut count, mut text) = (0usize, Count(0));
+    let mut filter = |layout: &mut super::checked_layout::Layout<'_>, es: &[Expr]| -> Result<()> {
+        for e in es {
+            count += 1;
+            layout.expression(e)?;
+            text.0 = text.0.saturating_add(8);
+            let _ = e.write_description(ctx, &mut text);
+        }
+        Ok(())
+    };
+    let spec = loop {
+        match &n.kind {
+            Kind::Filter(es) if !es.iter().any(Expr::has_exists) => {
+                filter(layout, es)?;
+                n = &n.children[0];
+            }
+            Kind::Scan(spec) => break Some(spec),
+            Kind::RangeScan(spec, range) => {
+                filter(layout, &range.filter)?;
+                break Some(spec);
+            }
+            _ => break None,
+        }
+    };
+    layout.slots::<Expr>(count.max(4).saturating_mul(6))?;
+    let names = ctx.var_names.read();
+    let name = probe
+        .vars
+        .iter()
+        .map(|&v| names[v as usize].len())
+        .max()
+        .unwrap_or(0);
+    drop(names);
+    // the keys and the order the join keeps
+    layout.slots::<VarId>(probe.vars.len().saturating_add(1).max(4).saturating_mul(3))?;
+    layout.slots::<VarId>(drive.sorted.len().max(4).saturating_mul(3))?;
+    // the spelled key, the rendered filters, their list and the joined description
+    layout.slots::<String>(count)?;
+    layout.add(
+        text.0
+            .saturating_add(name.saturating_mul(2))
+            .saturating_add(n.desc.len())
+            .saturating_add(64)
+            .saturating_mul(6),
+    )?;
+    super::plan::union_bound(layout, drive.vars.len(), probe.vars.len())?;
+    super::plan::union_bound(layout, drive.certain.len(), probe.vars.len())?;
+    super::plan::dist_bound(layout, drive.vars.len(), probe.vars.len())?;
+    layout.slots::<IndexJoinSpec>(1)?;
+    layout.slots::<Probe>(1)?;
+    if let Some(spec) = spec {
+        layout.scan(spec)?;
+        layout.graph(&spec.graph)?;
+    }
+    layout.slots::<Node>(1)
 }
 
 /// The index join of `drive` into the pattern `probe`, or `drive` back when none is
@@ -274,7 +376,7 @@ fn first_rows_fit(
             {
                 let fixed = scan.graph_col < scan.prefix.len()
                     || matches!(scan.graph, GraphFilter::Default | GraphFilter::One(_))
-                    || matches!(&scan.graph, GraphFilter::Set(gs) if gs.len() <= 1);
+                    || scan.graph.set_ids().is_some_and(|ids| ids.len() <= 1);
                 if fixed {
                     return true;
                 }
@@ -489,7 +591,7 @@ pub(super) struct ProbeSide {
 
 /// The pattern under `probe` as the probed side of an index join, if it can be one.
 pub(super) fn probe_side(probe: &Node, ctx: &Ctx) -> Option<ProbeSide> {
-    let (scan, spec, _) = probe_leaf(probe)?;
+    let (scan, spec) = probe_scan(probe)?;
     let &key = probe.sorted.first()?;
     if spec.cols.first() != Some(&(spec.prefix.len(), key)) || spec.graph_col == spec.prefix.len() {
         return None;
@@ -615,7 +717,11 @@ fn offer<'p>(drive: &Node, probe: &'p Node, ctx: &Ctx, gated: bool) -> Option<Of
             .iter()
             .filter(|v| **v != key && drive.vars.contains(v)),
     );
-    let (est, star) = super::plan::join_est_with(drive, probe, &keys, ctx);
+    let (est, star) = {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(8);
+        super::plan::join_est_with(drive, probe, &keys, ctx)
+    };
     // the input's order is kept, except where a shared variable unbound in the input
     // takes the pattern's value
     let sorted = drive

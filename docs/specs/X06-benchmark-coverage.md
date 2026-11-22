@@ -1171,7 +1171,9 @@ starts with its lexical form, does. A smaller id is the smaller string unless it
 at or above the larger string's floor. An eager filter computes the floor once per
 distinct id in a cache of each worker, which holds at most 2^20 ids and is charged to
 the query. A cursor batch compares the two keys directly and charges the keys it
-reads, as its decoding does. Other kinds of values keep the generic comparison.
+reads, as its decoding does. Other kinds of values keep the generic comparison. X14's
+item 1069 later replaced both with a charged floor cache that lasts the query and serves
+eager tables and cursor batches alike.
 
 The answers were checked against other engines and an independent oracle. At 10M the
 `q6` answer has 906,313 rows and the same exact and value digests as Jena's answer in

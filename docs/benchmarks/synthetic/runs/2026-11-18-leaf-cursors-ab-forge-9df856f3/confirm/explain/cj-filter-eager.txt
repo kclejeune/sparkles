@@ -1,0 +1,8 @@
+(project (?n) (extend ((?n ?602c59f50c7f15fd7f36783757847da6)) (group () (((count) ?602c59f50c7f15fd7f36783757847da6)) (filter (! (= ?a ?b)) (bgp (triple ?a <http://xmlns.com/foaf/0.1/knows> ?b) (triple ?b <http://example.org/worksFor> ?o))))))
+
+Project ?n  [est 1 rows, cost 1090028]
+  Bind ?n := ?602c59f50c7f15fd7f36783757847da6  [est 1 rows, cost 1090028]
+    CountJoin on ?b  [est 1 rows, cost 1090027]
+      Filter !(?a = ?b) [selectivity 1.000 of 268 sampled rows]  [est 254762 rows, cost 509524]
+        IndexScan POS ?a <http://xmlns.com/foaf/0.1/knows> ?b  [est 254762 rows, cost 254762]
+      IndexScan PSO ?b <http://example.org/worksFor> ?o  [est 71393 rows, cost 71393]

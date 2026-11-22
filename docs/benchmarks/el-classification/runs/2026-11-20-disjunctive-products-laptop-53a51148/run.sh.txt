@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# run.sh BIN TAG FILE THREADS [args]: one classification, a summary line in out/runs.txt and
+# the taxonomy's hash.
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+bin=$1; tag=$2; f=$3; t=$4; shift 4
+n=$(basename $f); n=${n%.*}
+o=$L/out/$bin.$tag.$n.t$t
+timeout 900 systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=1G -p OOMPolicy=continue \
+  taskset -c ${CPUS:-8-15} $L/bin/$bin --threads $t --taxonomy $o.tax "$@" $f > $o.json 2> $o.err
+st=$?
+sha=$(LC_ALL=C sort $o.tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $o.tax
+line="$n $bin $tag t$t st=$st tax=$sha $(grep '^{' $o.json | jq -c '{ms:.classifyMedianMs,sat:.saturationMs,tier,concl:.conclusions,ctx:.contexts,conj:.conjunctions,rss:.peakRssKib,over:.dlAttemptOver,dlWork,dlctx:.dlContexts,idx:.indexMs}' 2>/dev/null)"
+echo "$line" | tee -a $L/out/runs.txt

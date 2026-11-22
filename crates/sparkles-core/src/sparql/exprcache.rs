@@ -179,11 +179,11 @@ pub fn observable(ctx: &Ctx, e: &Expr) -> Option<&'static str> {
         return Some("a registered extension in the query");
     }
     impurity_with(e, true, &|spec| {
-        (super::cursor::pattern_observable(&spec.pattern)
+        (super::cursor::pattern_observable(spec.pattern())
             || ctx
                 .extensions
                 .as_ref()
-                .is_some_and(|r| r.references(&spec.pattern)))
+                .is_some_and(|r| r.references(spec.pattern())))
         .then_some("a call in an EXISTS")
     })
 }

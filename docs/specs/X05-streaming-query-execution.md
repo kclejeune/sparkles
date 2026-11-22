@@ -1363,9 +1363,14 @@ the pairs against the block grid.
 The cursor's memory for the operator is about one morsel's working set per worker
 thread plus the k rows it keeps, whatever the size of the range. The test
 `ordered_top_k_memory_does_not_grow_with_its_unordered_pieces` reads 300,000 and 900,000
-dictionary values on two threads and requires the second peak to stay within a quarter
-of the first. The peak grows with the number of threads instead, since each holds a
-morsel at once, so the test fixes its pool. Running the morsels in waves of one per
+dictionary values on one thread and on two. On one thread the second peak must stay
+within an eighth of the first. On two threads both peaks must stay within twice the
+one-thread peak of the smaller store, plus an eighth. The peak grows with the number of
+threads instead, since each holds a morsel at once, so the test fixes its pools. A
+two-thread peak depends on how far two morsels overlap in time, so the bound comes from
+the one-thread peaks, which do not. The test does not prove that at most one morsel per
+thread is live, because a third morsel's first charge is smaller than the margin.
+Running the morsels in waves of one per
 thread keeps a waiting worker from starting further morsels by work stealing.
 
 Reading the morsels one after another was 1.72 times slower than eager execution at eight
@@ -1722,15 +1727,16 @@ without a key set, are evaluated by substitution with the memo per distinct key 
 before. The probe answers and the key sets stay charged to the query while the
 expression reads them, and a row evaluated by substitution is counted when the
 expression reaches it. Eager plans report the probes and the rows evaluated per row on
-the filter, extension, grouping and ordering that hold the EXISTS, and the cursor's
-plans report them on a filter.
+the filter, extension, grouping and ordering that hold the EXISTS. The cursor's plans
+report them only on a filter in the internal pull path for an eager ASK or LIMIT, and the
+ordinary streaming SELECT plan carries no such counters.
 
 Automatic execution now streams every FILTER, BIND, ORDER BY and grouping whose EXISTS
 patterns have cursor plans, whether the pattern is answered from a key set or per key.
 Three shapes stay eager. A pattern that calls a SERVICE stays eager because a cursor
 could repeat its effects, an EXISTS nested deeper than four levels stays eager under the
 admission's depth cap, which item 1081 covers, and an OPTIONAL whose condition holds an
-EXISTS stays eager, for the reasons the next section measures.
+EXISTS stays eager, for the reasons that [the conditional merge OPTIONAL outcome](#the-cursors-conditional-merge-optional-2026-11-19) measures.
 
 Probing every row costs a hash lookup per row and EXISTS, also for rows on which the
 expression never reaches the EXISTS. An IF branch that is rarely taken therefore builds
@@ -1829,9 +1835,8 @@ the forced modes, so the cost of that admission is read from the paths each buil
 automatic execution takes, A eager against B streamed. That is 132 against 181 ms for
 `knows-exists` and 549 against 647 ms for `knows-mixed`, so the change keeps such plans
 eager, and item 570 admits them once the merge tests its condition on each key's pairs
-and item 1105 gives admission the build's merge order. An OPTIONAL with a plain
-condition was already streamed on both builds, and the streamed `knows-fail` went from
-304 to 198 ms. The
+and item 1105 gives admission the build's merge order. The plain-condition query `knows-fail` was already streamed automatically on both
+builds, and its streamed time went from 304 to 198 ms. The
 [memory results](../benchmarks/memory/RESULTS.md#automatic-exists) give the table, and the
 [run record](../benchmarks/memory/records/exists-optional-2026-11-19/README.md) holds the
 samples and plans.
@@ -1844,8 +1849,9 @@ caps over long runs of failing pairs.
 eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
 per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the
 conditional OPTIONAL honours `merge_left_join` and names its algorithm in both plans.
-The cursor's EXPLAIN reports EXISTS counters only on a FILTER, so its merge OPTIONAL
-shows none, which item 1106 covers. Without spill,
+The cursor's EXPLAIN reports EXISTS counters only on a FILTER in the internal pull path
+for an eager ASK or LIMIT, so its merge OPTIONAL and its ordinary streaming SELECT plan
+show none, which item 1106 covers. Without spill,
 the eager memory retry of automatic execution uses the admission check and so does not
 retry an OPTIONAL whose condition holds an EXISTS as a cursor, which item 1145 covers.
 

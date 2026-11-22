@@ -437,7 +437,10 @@ struct Pat {
     /// under `auto` with a readable materialization, the source chosen for the pattern
     choice: Option<Decision>,
     /// a seeded pattern derived with its constants alone, since its seeds were too many
+    /// or would be read through a registered call
     fell_to_plain: bool,
+    /// the seeds would be read through a registered property function
+    fell_for_call: bool,
 }
 
 impl Pat {
@@ -921,6 +924,7 @@ fn apply_derive(
                     stored: estimates[i],
                     choice: None,
                     fell_to_plain: false,
+                    fell_for_call: false,
                 });
             } else {
                 pats.push(Pat {
@@ -931,6 +935,7 @@ fn apply_derive(
                     stored: estimates[i],
                     choice: None,
                     fell_to_plain: false,
+                    fell_for_call: false,
                 });
             }
             for v in pattern_vars(t) {
@@ -1172,6 +1177,7 @@ fn apply_derive(
             }
             None => {
                 pats[k].fell_to_plain = true;
+                pats[k].fell_for_call = super::propertyext::has_calls(ctx, &chosen);
                 let plain = pats[k]
                     .plain
                     .expect("an intensional pattern has a plain demand");
@@ -1189,7 +1195,9 @@ fn apply_derive(
     for p in &pats {
         let chosen = match (&p.seeded, p.plain) {
             (Some((d, _)), Some(pl)) => {
-                if p.fell_to_plain {
+                if p.fell_for_call {
+                    Some((pl, "constants (a registered call binds the seeds)"))
+                } else if p.fell_to_plain {
                     Some((pl, "constants (too many seeds)"))
                 } else {
                     Some((*d, "join"))
@@ -1333,7 +1341,9 @@ fn stored_count(snap: &Snapshot, t: &TriplePattern) -> u64 {
 }
 
 /// The distinct values of `var` over the patterns `chosen`, read from the view with the
-/// facts derived so far, or `None` when there are more than [`MAX_SEEDS`].
+/// facts derived so far, or `None` when there are more than [`MAX_SEEDS`] or a chosen
+/// pattern calls a registered property function. Such a call runs only in the query
+/// itself, so the seeded pattern falls back to its demand with constants.
 fn seed_values(
     ctx: &Ctx,
     view: &Overlay,
@@ -1343,6 +1353,9 @@ fn seed_values(
     dataset: Option<&QueryDataset>,
     base: Option<&oxiri::Iri<String>>,
 ) -> Result<Option<Vec<Id>>> {
+    if super::propertyext::has_calls(ctx, chosen) {
+        return Ok(None);
+    }
     let gp = GraphPattern::Slice {
         inner: Box::new(GraphPattern::Distinct {
             inner: Box::new(GraphPattern::Project {

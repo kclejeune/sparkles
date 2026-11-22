@@ -256,6 +256,12 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   an ORDER BY deduplicates below the sort in every mode when the query may spill, and
   `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in every
   mode.
+* A cursor DISTINCT keeps its set in buffers whose memory charge is their allocation
+  ([X19](../specs/X19-charged-buffers/README.md)), so the set is admitted before it grows
+  and a set that may spill stops growing while the operators above it still have room.
+  It fits every budget it fitted when the set was charged by formulas, and some smaller
+  ones. Two streamed DISTINCT queries of two columns take 0.8% and 3.3% longer than
+  before, which [roadmap item 1237](../ROADMAP.md) holds.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](../internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
@@ -316,6 +322,22 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   they have not finished and at most a batch more. A full sort and the
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
+* Under `execution=streaming`, text, hybrid, history and spatial searches whose
+  arguments come from their input, vector searches with a variable query and remote
+  LATERAL loops run over each input batch and keep their caps, their requests and their
+  cache across batches as one eager call does. A vector or hybrid search whose
+  candidates come from its input, a path search under a limit and an algorithm call over
+  their group or a nested edge pattern read that input under the memory budget, run
+  once and serve their answer batch by batch. Searches bounded by `k`, `maxHits` or a
+  limit argument, constant algorithm calls and count joins answer once into a charged
+  table. EXPLAIN states for each such operator
+  that it reads its whole input or what bounds its answer. A SERVICE, a view read, a
+  spatial scan or relation over constants, a spatial join, a search without a bound and
+  a property function over constants and a registered property function without
+  prefix output still need materialization, so
+  the strict policy refuses them and automatic execution runs them eagerly, as
+  [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every kind in this
+  list eagerly until a same-host measurement admits it.
 * A cursor scan keeps its place inside an index block between batches without charging
   the block to the query, since the block cache holds its decoded columns, and it
   decodes the block again when the cache has dropped it. A scan inside a plan therefore
@@ -326,6 +348,19 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   it is closed. The
   decoding of a large term beside such a batch can be refused under a budget at which a
   copy would answer, which [roadmap item 1051](../ROADMAP.md) holds.
+* `FILTER(?x < ?y)` and the other order comparisons of two columns of stored simple
+  literals, over a table or cursor batch of at least 4,096 rows, read the strings' order
+  from their vocabulary ids and each string's floor in both modes, so neither column is
+  decoded. The workers keep the floors they compute in one shared table of a cache that
+  lasts the query and grows when repeated strings evict each other, charged to its
+  budget and capped at 64 MiB or a sixteenth of the budget, which trades that memory for
+  not computing a repeated string's floor again. Once the cache is full, the floors it
+  lacks are computed each time. The comparison covers simple literals of the base
+  vocabulary. When one of the first 64 rows holds another value, the whole table or
+  batch takes the generic comparison, and a later row with another value takes it alone.
+  In streaming execution, the measured `str-pair-colleague`, whose strings rarely
+  repeat, runs 4.2% slower than before roadmap item 1069 with one thread and 6.5% slower
+  with 12, which [roadmap item 1088](../ROADMAP.md) recovers.
 * Property path closures run within the query's memory budget and timeout in both
   executors. A closure counts its visited set, its frontier and the edge relation of a
   sequence or alternative path against the budget, and the walk checks the deadline while

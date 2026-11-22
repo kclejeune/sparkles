@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# build.sh NAME: builds the release el_classify example of this worktree as it stands into bin/NAME
+# (the HEAD and the diff are recorded beside it).
+set -euo pipefail
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost
+L=$W/.artifacts/lanes/horn-cost
+cd $W
+{ git rev-parse HEAD; git diff HEAD -- crates | sha256sum; } > $L/bin/$1.head
+git diff HEAD -- crates > $L/bin/$1.patch
+~/.local/bin/sparkles-heavy-run ${MEM:-8} mbx build --release -p sparkles-owl --example el_classify
+cp target/release/examples/el_classify $L/bin/$1
+echo "BUILD-DONE $1"

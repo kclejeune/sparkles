@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""Interleaved Intel timing of el_classify for item 956, base against tip, on forge.
+
+Run from the timing directory (~/lanes/el-956-timing) inside the unit that holds the
+bench and heavy locks. Rules, fixed before any result (see RULES.md):
+
+* Warm runs are `el_classify --threads T --repeat 5 FILE`, T in 1, 4, 12. ore_ont_8737 runs
+  in rounds 1 to 3, GO, ChEBI lite, ore_ont_3836, ore_ont_13482 and ore_ont_9855 in rounds
+  1 to 6. Cold runs are `el_classify --threads 1 --repeat 1 FILE` of ore_ont_3836 and
+  ore_ont_13482 in rounds 1 to 20, one classification per process, so the process wall
+  time and readMs carry the reader side.
+* Odd rounds run the base first and even rounds the tip first, for every cell.
+* Each process records its wall time and peak RSS through wait4, its exit status, and its
+  JSON line, appended to out/runs.jsonl. One progress line per round goes to out/log.txt.
+* After the timed rounds, one untimed run per file and side at 4 threads writes the
+  taxonomy, and their SHA-256 must match between base and tip.
+"""
+import hashlib, json, os, sys, threading, time
+
+D = os.path.dirname(os.path.abspath(__file__))
+BIN = {s: os.path.join(D, "bin", f"el_classify.{s}") for s in ("base", "tip")}
+F = lambda n: os.path.join(D, "files", n)
+WARM = [  # (name, file, rounds)
+    ("ore_ont_8737", F("ore_ont_8737.owl"), 3),
+    ("go", F("go.ofn"), 6),
+    ("chebi_lite", F("chebi_lite.ofn"), 6),
+    ("ore_ont_3836", F("ore_ont_3836.owl"), 6),
+    ("ore_ont_13482", F("ore_ont_13482.owl"), 6),
+    ("ore_ont_9855", F("ore_ont_9855.owl"), 6),
+]
+COLD = [("ore_ont_3836", F("ore_ont_3836.owl")), ("ore_ont_13482", F("ore_ont_13482.owl"))]
+THREADS = (1, 4, 12)
+ROUNDS = 20
+if os.environ.get("EL956_SMOKE"):  # a short run of the harness itself, not a measurement
+    WARM = [(n, p, 1) for n, p, _ in WARM if n in ("go", "ore_ont_9855")]
+    COLD = []
+    THREADS = (1, 4)
+    ROUNDS = 2
+TIMEOUT = 3600
+OUT = os.path.join(D, "out")
+os.makedirs(OUT, exist_ok=True)
+if os.path.exists(os.path.join(OUT, "runs.jsonl")):
+    sys.exit(f"{OUT}/runs.jsonl exists; a run needs a fresh output directory")
+runs = open(os.path.join(OUT, "runs.jsonl"), "x")
+log = open(os.path.join(OUT, "log.txt"), "a")
+failures = 0
+
+
+def say(msg):
+    log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {msg}\n")
+    log.flush()
+
+
+def run4(side, args, rec):
+    """Runs one process, returns its record with wallS, maxRssKib and status."""
+    global failures
+    so = os.path.join(OUT, "cur.out")
+    se = os.path.join(OUT, "cur.err")
+    fo = os.open(so, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    fe = os.open(se, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    t0 = time.perf_counter()
+    pid = os.fork()
+    if pid == 0:
+        os.dup2(fo, 1)
+        os.dup2(fe, 2)
+        try:
+            os.execv(BIN[side], [BIN[side], *args])
+        finally:
+            os._exit(127)
+    os.close(fo); os.close(fe)
+    # A blocking wait4, so the driver wakes no CPU while the child runs; a timer kills a
+    # child that outlives TIMEOUT.
+    timer = threading.Timer(TIMEOUT, lambda: (rec.__setitem__("timedOut", True), os.kill(pid, 9)))
+    timer.start()
+    _, status, ru = os.wait4(pid, 0)
+    timer.cancel()
+    timer.join()
+    wall = time.perf_counter() - t0
+    out = open(so, "rb").read()
+    err = open(se, "rb").read()
+    code = os.waitstatus_to_exitcode(status)
+    rec.update(side=side, args=args, status=code, wallS=wall, maxRssKib=ru.ru_maxrss)
+    try:
+        rec["out"] = json.loads(out.decode().strip().splitlines()[-1])
+    except Exception:
+        rec["out"] = None
+        rec["stdout"] = out.decode(errors="replace")[-2000:]
+    if code != 0 or rec["out"] is None or rec.get("timedOut"):
+        failures += 1
+        rec["stderr"] = err.decode(errors="replace")[-2000:]
+    runs.write(json.dumps(rec) + "\n")
+    runs.flush()
+    return rec
+
+
+def main():
+    say(f"start host={os.uname().nodename} rounds={ROUNDS}")
+    for rnd in range(1, ROUNDS + 1):
+        order = ("base", "tip") if rnd % 2 else ("tip", "base")
+        t0 = time.time()
+        n = 0
+        for name, path in COLD:
+            for side in order:
+                run4(side, ["--threads", "1", "--repeat", "1", path],
+                     dict(kind="cold", round=rnd, name=name, threads=1, repeat=1)); n += 1
+        for name, path, rounds in WARM:
+            if rnd > rounds:
+                continue
+            for t in THREADS:
+                for side in order:
+                    run4(side, ["--threads", str(t), "--repeat", "5", path],
+                         dict(kind="warm", round=rnd, name=name, threads=t, repeat=5)); n += 1
+        say(f"round {rnd}/{ROUNDS} order={','.join(order)} processes={n} "
+            f"seconds={time.time() - t0:.0f} failures={failures}")
+    tax = os.path.join(OUT, "taxonomy")
+    os.makedirs(tax, exist_ok=True)
+    same = True
+    for name, path, _ in WARM:
+        h = {}
+        for side in ("base", "tip"):
+            f = os.path.join(tax, f"{name}.{side}.tax")
+            run4(side, ["--threads", "4", "--taxonomy", f, path],
+                 dict(kind="taxonomy", round=0, name=name, threads=4, repeat=1))
+            h[side] = hashlib.sha256(open(f, "rb").read()).hexdigest() if os.path.exists(f) else None
+        ok = h["base"] is not None and h["base"] == h["tip"]
+        same &= ok
+        say(f"taxonomy {name} {'same' if ok else 'DIFFERENT'} {h['base']} {h['tip']}")
+    say(f"end failures={failures} taxonomies={'same' if same else 'DIFFERENT'}")
+    return 0 if failures == 0 and same else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,16 @@
+## streaming t12, engine sparkles-plain
+- base: fast share per process 0.00 0.40 0.12 0.08 0.08 0.24 0.20 0.08 0.28 0.12 0.00 0.04; processes with any fast request 10/12; slow-mode median 26.85 ms over 259 requests
+- main: fast share per process 0.08 0.08 0.04 0.08 0.12 0.00 0.00 0.00 0.00 0.04 0.08 0.08; processes with any fast request 8/12; slow-mode median 27.42 ms over 285 requests
+- tip: fast share per process 0.08 0.24 0.04 0.04 0.00 0.36 0.08 0.28 0.12 0.24 0.16 0.16; processes with any fast request 11/12; slow-mode median 26.94 ms over 255 requests
+- main/base slow mode only: 1.021 (95% over processes 0.998 to 1.046)
+- tip/main slow mode only: 0.982 (95% over processes 0.957 to 1.006)
+- tip/base slow mode only: 1.003 (95% over processes 0.974 to 1.032)
+
+## eager t12, engine sparkles-plain
+- base: fast share per process 0.24 0.20 0.08 0.32 0.56 0.04 0.12 0.20 0.04 0.08 0.12 0.04; processes with any fast request 12/12; slow-mode median 26.75 ms over 249 requests
+- main: fast share per process 0.04 0.00 0.08 0.04 0.88 0.08 0.20 0.00 0.32 0.16 0.00 0.16; processes with any fast request 9/12; slow-mode median 26.75 ms over 251 requests
+- tip: fast share per process 0.28 0.00 0.16 0.04 0.36 0.08 0.16 0.00 0.32 0.08 0.12 0.16; processes with any fast request 10/12; slow-mode median 26.48 ms over 256 requests
+- main/base slow mode only: 1.000 (95% over processes 0.977 to 1.020)
+- tip/main slow mode only: 0.990 (95% over processes 0.960 to 1.016)
+- tip/base slow mode only: 0.990 (95% over processes 0.958 to 1.015)
+

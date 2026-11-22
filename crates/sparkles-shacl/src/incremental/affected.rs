@@ -256,7 +256,7 @@ mod tests {
         let (data, ids) = DataGraph::new(store.snapshot(), None, &[], &[], &shapes).unwrap();
         for _ in 0..2 {
             let engine = Engine::new(&shapes, &data, ids.clone(), &normalized).unwrap();
-            assert_eq!(engine.deadline, normalized.deadline);
+            assert_eq!(engine.controls.deadline, normalized.deadline);
         }
         let earlier = start + Duration::from_secs(5);
         let opts = ValidateOptions {

@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Item 829 part 1: targeted rerun of geo q9-star at 12 threads (coordinator ruling of
+# 2026-11-20 after Session 10: q9-star streaming t12 is contested). Three builds: base
+# bccc5f7b (the lane's base), main 5f3f69c2 (the merge base of the tip with main) and tip
+# cde29b37, streaming and eager, ROUNDS rounds (a multiple of 3) whose arm order rotates
+# the builds through the positions (see below). Every arm is its own
+# scripts/bench-geo.sh run with QUERIES=geo-q9-star and RUNS requests, whose indexed
+# server ("sparkles") is the measured process. PLAIN_QUERIES=geo-q9-star makes the
+# rewrites-off server time q9-star as well, a second indexed process per arm (q9-star uses
+# no spatial join or kNN rewrite), in place of the default geo-q7-knn (an empty value
+# selects the default). One work directory (one store) serves every arm; the first arm
+# loads it.
+#
+#   q9.sh ROOT BASE_BIN MAIN_BIN TIP_BIN OUT_DIR [ROUNDS] [RUNS]
+#
+# OUT_DIR/r<N>/geo-<arm>-<mode>-t12.log ends with rc=N, OUT_DIR/r<N>/results/<same>/ keeps
+# that run's results, OUT_DIR/Q9-DONE marks the end and OUT_DIR/FAILED lists failed steps.
+# OUT_DIR/r<N>/cpus-geo-<tag>.txt samples the CPU of every server thread every 0.25 s
+# (CPUSAMPLE=0 turns the sampler off).
+# The exit status is 1 when any step failed.
+set -uo pipefail
+ROOT=${1:?checkout} BASE=${2:?base binary} MAIN=${3:?main binary} TIP=${4:?tip binary} OUT=${5:?output dir}
+ROUNDS=${6:-6} RUNS=${7:-25}
+: "${GEO_N:=100000}" "${THREADS:=12}" "${MODES:=streaming eager}"
+export MBX_REMOTE_URL=
+failed=0
+mkdir -p "$OUT"
+WORK=$OUT/work
+loaded=
+for r in $(seq 1 "$ROUNDS"); do
+  R=$OUT/r$r
+  mkdir -p "$R"
+  # the builds rotate through the positions, so over 3k rounds each build holds each
+  # position pair (first and last, second and fifth, third and fourth) k times
+  case $(((r - 1) % 3)) in
+    0) order="base main tip tip2 main2 base2" ;;
+    1) order="main tip base base2 tip2 main2" ;;
+    2) order="tip base main main2 base2 tip2" ;;
+  esac
+  for mode in $MODES; do
+    for arm in $order; do
+      case $arm in base*) bin=$BASE ;; main*) bin=$MAIN ;; tip*) bin=$TIP ;; esac
+      tag=$arm-$mode-t$THREADS
+      rm -rf "$WORK/results"
+      echo "== $(date -Is) geo-$tag" >> "$R/steps.log"
+      # thread placement of the arm's servers (cpusample.sh), a diagnostic of the fast mode
+      sampler=
+      if [ "${CPUSAMPLE:-1}" = 1 ]; then
+        bash "$(dirname "$0")/cpusample.sh" "${PORT:-3941}" "$R/cpus-geo-$tag.txt" &
+        sampler=$!
+      fi
+      env RAYON_NUM_THREADS="$THREADS" EXECUTION="$mode" SPARKLES="$bin" SKIP_LOAD=$loaded \
+        QUERIES=geo-q9-star PLAIN_QUERIES=geo-q9-star RUNS="$RUNS" \
+        "$ROOT/scripts/bench-geo.sh" "$GEO_N" "$WORK" > "$R/geo-$tag.log" 2>&1
+      rc=$?
+      [ -n "$sampler" ] && { kill "$sampler" 2> /dev/null; wait "$sampler" 2> /dev/null; }
+      echo "rc=$rc" >> "$R/geo-$tag.log"
+      [ $rc = 0 ] || { failed=$((failed + 1)); echo "geo-$tag r$r rc=$rc" >> "$OUT/FAILED"; }
+      loaded=1
+      mkdir -p "$R/results/geo-$tag"
+      cp "$WORK"/results/* "$R/results/geo-$tag/" 2> /dev/null || true
+    done
+  done
+done
+date -Is > "$OUT/Q9-DONE"
+[ $failed = 0 ]

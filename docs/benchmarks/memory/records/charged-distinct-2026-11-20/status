@@ -1,0 +1,8 @@
+2026-11-20T18:17:45Z checksums ok
+2026-11-20T18:17:45Z start pass-streaming: streaming, 8 rounds, 20 reps, 8 queries
+2026-11-20T18:47:31Z done pass-streaming: Validity: valid. Same-binary spread 1.9% over 6 queries of at least 0.3 ms (at most 3%), server-process speed 0.983 to 1.014 of the median (within 5%).
+2026-11-20T18:47:31Z pass-streaming flagged at B/A >= 1.10: none
+2026-11-20T18:47:31Z start pass-auto: auto, 8 rounds, 20 reps, 8 queries
+2026-11-20T19:17:42Z done pass-auto: Validity: valid. Same-binary spread 2.8% over 6 queries of at least 0.3 ms (at most 3%), server-process speed 0.986 to 1.013 of the median (within 5%).
+2026-11-20T19:17:42Z pass-auto flagged at B/A >= 1.10: none
+2026-11-20T19:17:42Z DONE exit=0

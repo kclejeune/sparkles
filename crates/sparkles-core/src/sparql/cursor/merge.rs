@@ -1068,8 +1068,15 @@ impl Merge {
         ctx: &Arc<Ctx>,
         children: &mut [Operator],
         options: &CursorOptions,
+        limit_rows: bool,
     ) -> Result<u64> {
         debug_assert!(self.supports_count());
+        // The pairs a count over a join counts are rows no eager operator holds, so
+        // the row limit applies to them only when the count stands for a join's rows.
+        let check_rows = |n: usize| match limit_rows {
+            true => ctx.check_rows(n),
+            false => Ok(()),
+        };
         for (side, child) in children.iter_mut().enumerate() {
             let key = child.vars[self.keys[side][0]];
             child.restrict_count_scan(ctx, key);
@@ -1086,7 +1093,7 @@ impl Merge {
                 keep_matched,
                 None,
             )?;
-            ctx.check_rows(count)?;
+            check_rows(count)?;
             ctx.check()?;
             return Ok(count as u64);
         }
@@ -1148,7 +1155,7 @@ impl Merge {
                 if li != left.at || ri != right.at {
                     left.at = li;
                     right.at = ri;
-                    ctx.check_rows(
+                    check_rows(
                         usize::try_from(count)
                             .map_err(|_| Error::invalid("join row count overflow"))?,
                     )?;
@@ -1185,7 +1192,7 @@ impl Merge {
                             count = count
                                 .checked_add(1)
                                 .ok_or_else(|| Error::invalid("join count overflow"))?;
-                            ctx.check_rows(
+                            check_rows(
                                 usize::try_from(count)
                                     .map_err(|_| Error::invalid("join row count overflow"))?,
                             )?;
@@ -1215,7 +1222,7 @@ impl Merge {
                     }
                 }
             }
-            ctx.check_rows(
+            check_rows(
                 usize::try_from(count).map_err(|_| Error::invalid("join row count overflow"))?,
             )?;
         }

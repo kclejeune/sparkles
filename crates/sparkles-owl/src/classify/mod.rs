@@ -87,6 +87,8 @@ mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
 mod saturate;
+#[cfg(test)]
+mod scratch_admission_tests;
 mod taxonomy;
 mod world;
 
@@ -174,6 +176,18 @@ const DL_ATTEMPT_FLOOR: usize = 1 << 21;
 /// in a fortieth.
 const DL_ATTEMPT_PER_CLASS: usize = 384;
 
+/// The most choices of one product of a run of Tier D on one thread without counting or
+/// the rooted rules before it ends and the Horn rules answer (roadmap item 1011). On one
+/// thread the ORE 2015 DL development set's 12 attempts that finish make products of at
+/// most 256 choices, and the 2,166 generated ontologies of item 969 with a union of at
+/// most 3,645, while the attempts of ore_ont_14817 and ore_ont_9663 make one of 120
+/// million choices after 0.5 million conclusions and one of 4.2 million after 4 million.
+/// On four and eight threads the finishing attempts make products of up to 22,500
+/// choices, and in three runs on four threads ore_ont_9663 made products of at most 22,707
+/// to 923,521 choices and ore_ont_14817 of 1.3 to 5.1 million, so the width tells them
+/// apart only on one thread, and a run on more threads has no such limit.
+const DL_ATTEMPT_WIDTH: usize = 1 << 20;
+
 /// The least memory budget, in estimated bytes, of a saturation with the Horn rules. The
 /// largest Horn run of the ORE 2015 DL sample's development set peaks at 666 MB, 139 times
 /// its index and axioms, on a small ontology.
@@ -237,6 +251,16 @@ pub struct Limits {
     /// ontology whose run derives about the bound can answer in full on one schedule and
     /// fall back on another.
     pub dl_attempt_work: Option<usize>,
+    /// the most choices of one product, the premises it combines, that a run of Tier D
+    /// on one thread without counting and without the rooted rules makes before it ends
+    /// as past [`dl_attempt_work`](Limits::dl_attempt_work) (roadmap item 1011). `None`
+    /// takes 1,048,576, far above what the attempts that finish make on one thread, and
+    /// `Some(0)` takes no limit. A run on more threads has no such limit, since there the
+    /// width of a product depends on the schedule, so a run on one thread can fall back to
+    /// the Horn rules where a run on several answers in full. A kept run that passes it
+    /// starts again in full, as past the bound, and a kept run whose products stay within
+    /// it can answer in full where a run that starts again passes it.
+    pub dl_attempt_width: Option<usize>,
     /// whether Tier D counts, which is off by default. A run that counts takes number
     /// restrictions, functional and inverse functional properties, disjoint properties and
     /// asymmetric properties into the case analysis, and it is complete for them when it
@@ -261,6 +285,16 @@ pub struct Limits {
     /// option changes nothing for an ontology without individuals, nominals or the
     /// universal object property.
     pub rooted: bool,
+    /// whether a rooted run withdraws an answer that can miss an entailment of a
+    /// conditional ground fact (roadmap item 1231), which is on by default and changes
+    /// nothing without [`rooted`](Limits::rooted). After its saturation the run looks for
+    /// a context that holds a ground literal as a condition and a context registered with
+    /// the root for one of the literal's individuals that the condition does not reach.
+    /// When it finds one, the run starts again without the rooted rules, as past its bound,
+    /// and reports [`Stats::dl_rooted_declined`]. The check is a partial containment: it
+    /// exempts contexts that it assumes the condition reaches some other way, which is
+    /// unproved. A run with the option off keeps the rooted answer, for measurements.
+    pub rooted_decline: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
     /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
@@ -309,8 +343,10 @@ impl Default for Limits {
             expansion: Expansion::default(),
             dl_work: None,
             dl_attempt_work: None,
+            dl_attempt_width: None,
             counting: false,
             rooted: false,
+            rooted_decline: true,
             number_order: true,
             dl_steps: true,
         }
@@ -385,6 +421,12 @@ pub struct Stats {
     pub threads: usize,
     pub index: Duration,
     pub saturation: Duration,
+    /// the part of [`saturation`](Stats::saturation) from the end of the first
+    /// saturation and of Tier D's tests to the end of the stage: the marking of real
+    /// contexts with its rounds, the facts of universal roles, the merges of keys, the
+    /// witnesses and the worlds, and the counts of the contexts and the diagnostics of a
+    /// rooted run that close the stage
+    pub marking: Duration,
     pub taxonomy: Duration,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
@@ -412,6 +454,12 @@ pub struct Stats {
     /// conclusions, so the run classified again without the rooted rules and left the
     /// axioms outside OWL 2 EL out, as a run without the option does
     pub dl_rooted_over: bool,
+    /// a rooted run of Tier D finished with a ground literal held as a condition that does
+    /// not reach a context registered for one of its individuals
+    /// ([`Limits::rooted_decline`]), so its answer could miss entailments and the run
+    /// classified again without the rooted rules, as past its bound, and left the axioms
+    /// outside OWL 2 EL out
+    pub dl_rooted_declined: bool,
     /// a run of Tier D without counting and without the rooted rules passed its bound on
     /// derived conclusions ([`Limits::dl_attempt_work`]), so the run classified with the
     /// Horn rules and left the disjunctive axioms out
@@ -428,7 +476,9 @@ pub struct Stats {
     /// on derived conclusions and the run classified without counting
     /// ([`dl_counting_over`](Stats::dl_counting_over)), or a rooted run passed its bound
     /// and the run classified without the rooted rules
-    /// ([`dl_rooted_over`](Stats::dl_rooted_over))
+    /// ([`dl_rooted_over`](Stats::dl_rooted_over)), or a rooted run withdrew its answer
+    /// and the run classified without the rooted rules
+    /// ([`dl_rooted_declined`](Stats::dl_rooted_declined))
     pub dl_over_budget: bool,
 }
 
@@ -564,6 +614,9 @@ pub struct Saturation {
     consistent: bool,
     /// the contexts of conjunctions that the last run's Horn rules created
     dynamic: Option<saturate::Dynamic>,
+    /// the disjointness sets of the last run's index, whose place among them numbers
+    /// each set in the contexts that the run leaves
+    disjoint: Vec<Vec<Ex>>,
     /// whether the current run's axioms went to the Horn normalization, from its start
     /// until the normalization took none
     horn_tried: bool,
@@ -578,6 +631,9 @@ pub struct Saturation {
     /// set while a run classifies again without the rooted rules, past a rooted run's
     /// bound on derived conclusions, which leaves the axioms outside OWL 2 EL out
     no_rooted: bool,
+    /// set by a rooted run that withdrew its answer (item 1231), which classifies again
+    /// without the rooted rules
+    rooted_declined: bool,
     /// set while a run classifies the axioms that item 805's reductions made, so that the
     /// classes they made up stay out of the taxonomy
     hide_internal: bool,
@@ -608,9 +664,8 @@ pub struct Saturation {
     /// what the last run whose saturation ended was, which decides whether the next
     /// run may keep its contexts (roadmap item 753)
     kept: Option<Kept>,
-    /// whether the current run keeps contexts of a run with the Horn rules or Tier D,
-    /// so that a stop on its memory budget starts again in full before a lower tier
-    /// takes over
+    /// whether the current run keeps contexts of an earlier run, so that a stop on its
+    /// memory budget starts again in full before a lower tier takes over
     reused: bool,
     /// the clause table of the last run of Tier D whose contexts the next run may keep,
     /// which name its clauses by id
@@ -683,20 +738,26 @@ pub struct Changes<'a> {
 
 /// Whether a change to the axiom needs a run that starts again: one that changes the
 /// role table, which a run builds once, one with data, whose told subsumers the index
-/// derives from every data axiom at once, a key, or one with an individual, whose
-/// merges the invalidation does not follow.
+/// derives from every data axiom at once, a key, one with an individual, whose
+/// merges the invalidation does not follow, or one with a self restriction (roadmap
+/// item 1258). A negative self restriction gives its subsumer to every context with a
+/// loop by a subrole, and a loop comes from a self restriction of another role, a
+/// reflexive role or a chain as well as from the restriction itself, so a kept context
+/// can have the loop without holding the changed expression that the invalidation
+/// looks for.
 fn needs_full_run(ax: &AxiomKind) -> bool {
     if role_axiom(ax) || matches!(ax, AxiomKind::HasKey(..)) {
         return true;
     }
     let mut sig = crate::model::Signature::default();
     sig.axiom(ax);
-    sig.0.iter().any(|e| {
-        matches!(
-            e,
-            Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
-        )
-    })
+    sig.2
+        || sig.0.iter().any(|e| {
+            matches!(
+                e,
+                Entity::DataProperty(_) | Entity::Datatype(_) | Entity::NamedIndividual(_)
+            )
+        })
 }
 
 /// Whether an edit of the axiom leaves alone what decides a run's tier and what its
@@ -1086,11 +1147,13 @@ impl Saturation {
             stale_tier: false,
             consistent: true,
             dynamic: None,
+            disjoint: Vec::new(),
             horn_tried: false,
             dl_tried: false,
             skip_dl: false,
             no_counting: false,
             no_rooted: false,
+            rooted_declined: false,
             hide_internal: false,
             chain_ranged: Vec::new(),
             reduced: false,
@@ -1154,12 +1217,12 @@ impl Saturation {
         limits: &Limits,
         with_taxonomy: bool,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
-        // what a pool admitted for a run that may fall back, so that the EL run charges
-        // only what it needs beyond that
+        // what a pool admitted for a run that may fall back or start again, so that the
+        // later run charges only what it needs beyond that
         let admitted = std::sync::Arc::new(AtomicUsize::new(0));
         let counted;
         let first = match &limits.charge {
-            Some(f) if !limits.el_only => {
+            Some(f) => {
                 let (f, a) = (f.clone(), admitted.clone());
                 counted = Limits {
                     charge: Some(std::sync::Arc::new(move |bytes: usize| {
@@ -1173,17 +1236,19 @@ impl Saturation {
                 };
                 &counted
             }
-            _ => limits,
+            None => limits,
         };
         self.dl_worked.store(false, Ordering::Relaxed);
+        self.rooted_declined = false;
         let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
         if let Err(Error::Memory { .. }) = r
             && self.reused
         {
-            // A run that kept contexts of a run with the Horn rules or Tier D passed its
-            // budget, which a run that starts again may not: the last index, which it
-            // holds until the new one is built, and what it keeps of the contexts that
-            // nothing reaches any more count against the budget too. The run starts
+            // A run that kept contexts passed its budget, which a run that starts again
+            // may not: what it keeps of the contexts that nothing reaches any more, and
+            // for a run with the Horn rules or Tier D the last index, which it holds
+            // until the new one is built, count against the budget too. That holds for
+            // a run kept by the EL rules alone as well (roadmap item 1263). The run starts
             // again in full with the same rules before a lower tier takes over, so that
             // its answer is that of a run without the kept contexts (roadmap item 753).
             // That holds for a stop on the budget of exact numeric values too, which
@@ -1191,9 +1256,10 @@ impl Saturation {
             // a run of Tier D that neither counts nor is rooted, which counts the
             // conclusions of the runs that derived the kept contexts (roadmap item 990).
             // Its charges draw first on what the pool admitted. Whether it passed a bound
-            // on derived conclusions is the new run's to say.
+            // on derived conclusions, or withdrew a rooted answer, is the new run's to say.
             self.reset();
             self.dl_worked.store(false, Ordering::Relaxed);
+            self.rooted_declined = false;
             let a = admitted.clone();
             let counting = limits.charge.clone().map(|f| {
                 let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
@@ -1212,6 +1278,18 @@ impl Saturation {
             };
             r = self.run(axioms, None, held_bytes, &again, with_taxonomy);
         }
+        // a rooted run that withdrew its answer starts again without the rooted rules, here
+        // and after each retry below that can run the rooted rules again
+        let mut declined = None;
+        self.restart_declined(
+            &mut r,
+            &mut declined,
+            axioms,
+            held_bytes,
+            limits,
+            &admitted,
+            with_taxonomy,
+        );
         if let Err(Error::Memory { .. }) = r
             && self.dl_tried
             && limits.threads != 1
@@ -1249,6 +1327,15 @@ impl Saturation {
                 ..limits.clone()
             };
             r = self.run(axioms, None, held_bytes, &one, with_taxonomy);
+            self.restart_declined(
+                &mut r,
+                &mut declined,
+                axioms,
+                held_bytes,
+                limits,
+                &admitted,
+                with_taxonomy,
+            );
         }
         let mut counting_over = None;
         if let Err(Error::Memory { used: counted, .. }) = r
@@ -1283,6 +1370,17 @@ impl Saturation {
                 ..limits.clone()
             };
             r = self.run(axioms, None, held_bytes, &without, with_taxonomy);
+            // the run without counting can be rooted and withdraw its answer, and its
+            // restart counts no more than it did
+            self.restart_declined(
+                &mut r,
+                &mut declined,
+                axioms,
+                held_bytes,
+                limits,
+                &admitted,
+                with_taxonomy,
+            );
             self.no_counting = false;
             counting_over = Some(counted);
         }
@@ -1422,7 +1520,67 @@ impl Saturation {
             stats.dl_rooted_over = true;
             stats.dl_over_budget = true;
         }
+        if declined.is_some() {
+            self.no_rooted = false;
+        }
+        if let Some(used) = declined
+            && let Ok((_, _, stats)) = &mut r
+        {
+            // the high-water mark of the rooted run, which the retry's may not reach
+            stats.peak_memory = stats.peak_memory.max(used);
+            stats.dl_rooted_declined = true;
+            stats.dl_over_budget = true;
+        }
         r
+    }
+
+    /// After a rooted run that withdrew its answer (item 1231), which `rooted_declined`
+    /// records, starts the run again without the rooted rules, as past the rooted bound, so
+    /// that the ontology takes the paths it takes without the option and the axioms outside
+    /// OWL 2 EL are left out and reported. `no_rooted` stays set for the fallbacks that
+    /// follow, and `run_with` clears it. `declined` keeps the high-water mark of the first
+    /// rooted run that withdrew. The charges of the new run draw first on what the pool
+    /// admitted.
+    #[allow(clippy::too_many_arguments)]
+    fn restart_declined(
+        &mut self,
+        r: &mut Result<(bool, Option<Taxonomy>, Stats), Error>,
+        declined: &mut Option<usize>,
+        axioms: &[&AxiomKind],
+        held_bytes: usize,
+        limits: &Limits,
+        admitted: &std::sync::Arc<AtomicUsize>,
+        with_taxonomy: bool,
+    ) {
+        if !std::mem::take(&mut self.rooted_declined) {
+            return;
+        }
+        debug_assert!(matches!(r, Err(Error::Memory { .. })));
+        let used = match r {
+            Err(Error::Memory { used, .. }) => *used,
+            _ => 0,
+        };
+        self.reset();
+        self.dl_worked.store(false, Ordering::Relaxed);
+        self.no_rooted = true;
+        let a = admitted.clone();
+        let counting = limits.charge.clone().map(|f| {
+            let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
+                std::sync::Arc::new(move |bytes: usize| {
+                    let ok = f(bytes);
+                    if ok {
+                        a.fetch_add(bytes, Ordering::Relaxed);
+                    }
+                    ok
+                });
+            drawing_on(admitted.load(Ordering::Relaxed), f)
+        });
+        let unrooted = Limits {
+            charge: counting,
+            ..limits.clone()
+        };
+        *r = self.run(axioms, None, held_bytes, &unrooted, with_taxonomy);
+        declined.get_or_insert(used);
     }
 
     /// Drops the state of a run that stopped part way, since the next run starts again.
@@ -1431,6 +1589,7 @@ impl Saturation {
         self.interner = Interner::new();
         self.stale_tier = false;
         self.ctx = Vec::new();
+        self.disjoint = Vec::new();
         self.dynamic = None;
         self.dl_run = None;
     }
@@ -1438,18 +1597,20 @@ impl Saturation {
     /// Normalizes the axioms inside OWL 2 EL and builds the index. `outside` names the
     /// axioms the profile check leaves out.
     /// The answer's last part is the estimated peak of a parallel normalization, with
-    /// `held_bytes`, which the pool has been charged for, or 0.
+    /// `held_bytes`, which the pool has been charged for, or 0. `kept_bytes` are those of
+    /// the contexts the run keeps, [`Saturation::context_bytes`].
     fn build(
         &mut self,
         axioms: &[&AxiomKind],
         outside: &[(usize, (String, String))],
         threads: usize,
         held_bytes: usize,
+        kept_bytes: usize,
         limits: &Limits,
     ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
         let budget = numeric::Budget::new(
             limits,
-            held_bytes + self.context_bytes(),
+            held_bytes + kept_bytes,
             self.interner.ranges.ledger.clone(),
         );
         budget.baseline(self.interner.bytes())?;
@@ -1899,7 +2060,7 @@ impl Saturation {
                 let mut out = Vec::new();
                 for (i, k) in chunk.iter().enumerate() {
                     if logical(k)
-                        && let Some(b) = profiles::el_axiom(k).into_iter().next()
+                        && let Some(b) = profiles::el_first(k)
                     {
                         out.push((at + i, (b.rule.to_string(), b.message)));
                     }
@@ -1933,9 +2094,9 @@ impl Saturation {
         let stale = self.stale_tier
             || changes.is_some_and(|c| {
                 c.removed.iter().any(|k| !tier_neutral(k))
-                    || c.added.iter().any(|k| {
-                        !tier_neutral(k) && profiles::el_axiom(k).into_iter().next().is_some()
-                    })
+                    || c.added
+                        .iter()
+                        .any(|k| !tier_neutral(k) && profiles::el_first(k).is_some())
             });
         let full = self.entangled
             || match (&kept, changes) {
@@ -1960,6 +2121,7 @@ impl Saturation {
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
+            self.disjoint = Vec::new();
             self.dynamic = None;
             self.dl_run = None;
         }
@@ -1975,8 +2137,8 @@ impl Saturation {
             + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
             + self.dl_run.as_ref().map_or(0, |d| d.bytes());
         // from here on a stop on the memory budget may be the kept state's, which a run
-        // that starts again does not hold
-        self.reused = old_ix.is_some();
+        // that starts again does not hold, whatever the tier of the kept contexts
+        self.reused = kept.is_some();
         // the premises of the changed axioms, read from the interner before the index of
         // the new axioms is built
         let premises = match changes {
@@ -1992,9 +2154,34 @@ impl Saturation {
         // The old index is no longer read. Drop its handles before constructing the
         // replacement, while cached contexts retain their shared numeric ledger.
         self.index = None;
-        let (ax, mut ix, mut normalized_peak, outside_el) =
-            self.build(axioms, &outside, threads, held_bytes + old_bytes, limits)?;
+        // the kept contexts, which stay as they are until the invalidation, and the last
+        // run's disjointness sets, which stay until the comparison below
+        let kept_bytes = self.context_bytes();
+        let kept_capacity = self.ctx.capacity();
+        let sets_bytes = self.disjoint.capacity() * 24
+            + self
+                .disjoint
+                .iter()
+                .map(|d| d.capacity() * 4)
+                .sum::<usize>();
+        // the normalized premises of the changed axioms, which stay until the
+        // invalidation
+        let premises_bytes = premises.as_ref().map_or(0, |p| p.bytes());
+        let (mut ax, mut ix, mut normalized_peak, outside_el) = self.build(
+            axioms,
+            &outside,
+            threads,
+            held_bytes + old_bytes + sets_bytes + premises_bytes,
+            kept_bytes,
+            limits,
+        )?;
         drop(outside);
+        // the disjointness sets by their numbers in this index, beside those of the
+        // last run's, by which the contexts it leaves number the sets they meet; the run
+        // reads them only in the build, so they move from the axioms, which the budget
+        // counted, and the last run's are freed
+        let renumbered = self.disjoint != ax.disjoint;
+        self.disjoint = std::mem::take(&mut ax.disjoint);
         stats.outside_el = outside_el;
         stats.tier = stats.outside_el.tier();
         poll(limits)?;
@@ -2127,7 +2314,28 @@ impl Saturation {
         });
         if let Some(scratch) = premises {
             stats.incremental = true;
-            stats.cleared = self.invalidate(&scratch, &ix);
+            // the invalidation's bit sets, one bit for each expression and each context,
+            // beside the kept contexts, the index and the normalized axioms
+            let bits = 8 * (self.interner.len().div_ceil(64) + self.ctx.len().div_ceil(64));
+            // the context table may have grown for the expressions the edit added
+            let slot = std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
+            let kept_bytes = kept_bytes + self.ctx.capacity().saturating_sub(kept_capacity) * slot;
+            let mut budget = Scratch {
+                limits,
+                held: self.index_bytes(&ix)
+                    + held_bytes
+                    + ax.bytes()
+                    + kept_bytes
+                    + premises_bytes
+                    + bits,
+                peak: normalized_peak,
+                lists: 0,
+            };
+            budget.grow(0)?;
+            stats.cleared = self.invalidate(&scratch, &ix, renumbered, &mut budget)?;
+            #[cfg(test)]
+            scratch_audit::premises(premises_bytes);
+            normalized_peak = budget.peak;
             poll(limits)?;
         }
         if let Some(old) = old_ix.filter(|_| reuse) {
@@ -2224,6 +2432,8 @@ impl Saturation {
             // cannot expect to finish soon, before the Horn rules take over; a rooted run
             // without counting has its own bound, past which the run starts again without
             // the rooted rules
+            // only an attempt has a limit on the choices of a product
+            d.set_width_limit(0);
             if self.dl_rooted && !self.dl_counted {
                 d.set_work_limit(limits.dl_work.unwrap_or(ROOTED_WORK_BOUND).max(1));
             } else if self.no_counting {
@@ -2239,6 +2449,11 @@ impl Saturation {
                 d.set_work_limit(limits.dl_attempt_work.unwrap_or_else(|| {
                     DL_ATTEMPT_FLOOR.max(DL_ATTEMPT_PER_CLASS.saturating_mul(classes))
                 }));
+                // and on one thread, whose order is fixed, a product of more choices than
+                // any attempt that finishes makes ends it too (roadmap item 1011)
+                if threads == 1 {
+                    d.set_width_limit(limits.dl_attempt_width.unwrap_or(DL_ATTEMPT_WIDTH));
+                }
             }
         }
         let max_memory = if horn || disj {
@@ -2477,6 +2692,7 @@ impl Saturation {
         // keys and for universal roles. Then owl:Thing and the individuals become real,
         // and so does what they reach, between rounds of the saturation, with the facts
         // of universal roles and the merges of keys, until none is new.
+        let marking_start = Instant::now();
         let mut universal: Vec<Ex> = Vec::new();
         // a run with the Horn rules and individuals always marks them, since R7 reads
         // the real predecessors of the global state (roadmap item 692)
@@ -2664,6 +2880,102 @@ impl Saturation {
                 }
             }
             stats.dl_work = d.work();
+            let decline = dl_root::marker_decline(limits.rooted_decline);
+            if self.dl_rooted && open.is_none() && (dl_root::marker_diag() || decline.is_some()) {
+                // item 1231's decline, and its diagnostic, after a saturation that finished.
+                // A stopped rooted run leaves every class open, so its partial answer
+                // claims nothing.
+                let made = dynamic.iter().flat_map(|dy| {
+                    (0..dy.len() as Ex)
+                        .filter_map(move |i| dy.get_ctx(base + i).map(|c| (base + i, c)))
+                });
+                // The scan's copies of the contexts' successors and triggers, their scratch
+                // sets and the maps and sets of the search count beside the saturated state
+                // and the table of conjunctions, which are still held. Each part is admitted
+                // against the run's budget before it is allocated, and the pool is charged
+                // for what passes the peak.
+                let held = totals.memory + d.bytes() + dynamic.as_ref().map_or(0, |dy| dy.bytes());
+                #[cfg(test)]
+                let mut scan = SCAN_EXTRA.with(|x| x.get()) as isize;
+                #[cfg(not(test))]
+                let mut scan = 0isize;
+                let mut refused = None;
+                let peak = &mut totals.peak;
+                let mut admit = |delta: isize| {
+                    scan += delta;
+                    if delta <= 0 {
+                        return true;
+                    }
+                    let used = held + scan.max(0) as usize;
+                    let grown = used.saturating_sub(*peak);
+                    *peak = (*peak).max(used);
+                    if max_memory.is_some_and(|m| used > m)
+                        || (grown > 0 && charge_fn.is_some_and(|f| !f(grown)))
+                    {
+                        refused = Some(used);
+                        return false;
+                    }
+                    true
+                };
+                // the copies' own vector, reserved for every context before any copy
+                let n = self.ctx.len() + dynamic.as_ref().map_or(0, |dy| dy.len());
+                let mut ok = admit((n * std::mem::size_of::<dl_root::MarkerCtx>()) as isize);
+                let mut cs = Vec::with_capacity(if ok { n } else { 0 });
+                for (e, c) in self
+                    .ctx
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(e, c)| c.get().map(|c| (e as Ex, &**c)))
+                    .chain(made)
+                {
+                    if !ok {
+                        break;
+                    }
+                    match dl_root::marker_ctx(&ix, e, &c.st.lock(), &d.lits, &mut admit) {
+                        Ok(Some(m)) => cs.push(m),
+                        Ok(None) => {}
+                        Err(()) => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                ok = ok && admit(dl_root::marker_search_bytes(&cs) as isize);
+                drop(admit);
+                if !ok {
+                    return Err(Error::Memory {
+                        limit: max_memory.unwrap_or(usize::MAX),
+                        used: refused.unwrap_or(held),
+                    });
+                }
+                let diag = dl_root::marker_diag();
+                let (trips, pr) =
+                    dl_root::marker_trips(&ix, &cs, &d.lits, decline.filter(|_| !diag));
+                if diag {
+                    let t: Vec<String> = trips
+                        .iter()
+                        .map(|t| format!("{}/{}/{}", t[0], t[1], t[2]))
+                        .collect();
+                    eprintln!(
+                        "MARKER-DIAG work={} pr={}/{} tiers={}",
+                        stats.dl_work,
+                        pr[0],
+                        pr[1],
+                        t.join(",")
+                    );
+                }
+                if let Some(t) = decline
+                    && trips.get(t).is_some_and(|t| t[2] > 0)
+                {
+                    // run_with takes the flag first and starts again without the rooted
+                    // rules, whatever the error
+                    self.rooted_declined = true;
+                    return Err(Error::Memory {
+                        limit: limits.max_memory.unwrap_or(usize::MAX),
+                        used: totals.peak,
+                    });
+                }
+            }
             if open.is_some() {
                 // A partial answer has taken its record, and the next run starts again,
                 // so the clause stores and the clause table go before its taxonomy.
@@ -2698,6 +3010,7 @@ impl Saturation {
             }
         }
         self.dynamic = dynamic;
+        stats.marking = marking_start.elapsed();
         stats.saturation = t.elapsed();
         stats.conclusions = totals.conclusions;
         totals.memory += world_bytes;
@@ -2826,6 +3139,12 @@ impl Saturation {
                 .map_or(0, |l| l.bytes())
             + ix.bytes()
             + self.interner.scope_bytes()
+            + self.disjoint.capacity() * 24
+            + self
+                .disjoint
+                .iter()
+                .map(|d| d.capacity() * 4)
+                .sum::<usize>()
     }
 
     fn retained_bytes(&self, held_bytes: usize, root_bytes: usize, world_bytes: usize) -> usize {
@@ -2879,7 +3198,7 @@ impl Saturation {
             return true;
         }
         let outside: Vec<&AxiomKind> = changed()
-            .filter(|a| logical(a) && profiles::el_axiom(a).into_iter().next().is_some())
+            .filter(|a| logical(a) && profiles::el_first(a).is_some())
             .collect();
         let in_play = k.outside || !outside.is_empty();
         if in_play && changed().any(|a| logical(a) && !tier_neutral(a)) {
@@ -3011,55 +3330,72 @@ impl Saturation {
     }
 
     /// Clears the contexts that the changed axioms can affect: those that derived the
-    /// left side of a changed subsumption or part of it, those with a link that a
-    /// changed existential restriction can use, and every context with a link to one of
-    /// them. The other contexts drop their links from cleared contexts and recompute
-    /// what they take from the index. The answer is the number cleared.
-    fn invalidate(&mut self, changed: &Axioms, ix: &Index) -> usize {
+    /// left side of a changed subsumption or part of it, and every context with a link
+    /// to one of them. The parts take in the filler of each existential restriction, so
+    /// a context with a link that a changed restriction can use links to a cleared
+    /// context. The other contexts drop their links from cleared contexts. The answer
+    /// is the number cleared.
+    ///
+    /// What a kept context takes from the index stays as it is (roadmap item 1256). Its
+    /// propagations are the negative existential restrictions `∃s.d` of the index for
+    /// each subsumer `d`. The index finds them among the left sides of the subsumptions,
+    /// the members of the disjointness sets and the classes of keys, and a change to a
+    /// key, a role axiom or a self restriction starts again ([`needs_full_run`]). So a restriction that an
+    /// edit adds or removes has its filler `d` among the parts of the changed left sides
+    /// or sets walked below, and every context that holds `d` is cleared. The
+    /// disjointness sets of the index are numbered by their place among the run's sets,
+    /// so `renumbered` says that they are not those of the last run, by which a kept
+    /// context numbers what it holds. Then a kept context that holds a member of one
+    /// numbers them again. One that holds none still holds none: a member of a new set
+    /// is a part of a changed set, which clears the contexts that hold it.
+    ///
+    /// The search for the contexts that hold a changed part still reads every context,
+    /// as does the pass that drops their links from cleared ones, since no table maps
+    /// an expression to the contexts that hold it.
+    fn invalidate(
+        &mut self,
+        changed: &Axioms,
+        ix: &Index,
+        renumbered: bool,
+        budget: &mut Scratch<'_>,
+    ) -> Result<usize, Error> {
         let nodes = &self.interner.nodes;
-        let mut subs: FxHashSet<Ex> = FxHashSet::default();
-        let mut links: Vec<(index::Role, Ex)> = Vec::new();
+        // the two bit sets are in the budget's start, and the lists ask it as they grow
+        let mut parts = Marks::new(nodes.len());
+        let mut gone = Marks::new(self.ctx.len());
+        let mut few: Vec<Ex> = Vec::new();
         let mut stack: Vec<Ex> = Vec::new();
-        stack.extend(changed.subs.iter().map(|&(a, _)| a));
-        stack.extend(changed.disjoint.iter().flatten().copied());
+        for &(a, _) in &changed.subs {
+            budget.push(&mut stack, a)?;
+        }
+        for &e in changed.disjoint.iter().flatten() {
+            budget.push(&mut stack, e)?;
+        }
         while let Some(e) = stack.pop() {
-            if !subs.insert(e) {
+            if !parts.insert(e) {
                 continue;
             }
+            budget.push(&mut few, e)?;
             match nodes[e as usize] {
                 Node::Conj(a, b) => {
-                    stack.push(a);
-                    stack.push(b);
+                    budget.push(&mut stack, a)?;
+                    budget.push(&mut stack, b)?;
                 }
-                Node::Exist(r, f) => {
-                    links.push((r, f));
-                    stack.push(f);
-                }
+                Node::Exist(_, f) => budget.push(&mut stack, f)?,
                 _ => {}
             }
         }
-        let mut affected: FxHashSet<Ex> = FxHashSet::default();
+        // the contexts that hold a part, then every context with a link into one
+        let mut queue: Vec<Ex> = Vec::new();
         for (e, c) in self.ctx.iter().enumerate() {
             let Some(c) = c.get() else { continue };
             let st = c.st.lock();
-            if !st.init {
-                continue;
-            }
-            if st.subs.iter().any(|s| subs.contains(s)) {
-                affected.insert(e as Ex);
-            }
-            for &(s, f) in &links {
-                if st.subs.contains(&f) {
-                    for (r, srcs) in &st.back {
-                        if ix.roles.sub(*r, s) {
-                            affected.extend(srcs.list.iter().copied());
-                        }
-                    }
-                }
+            if st.init && st.subs.meets(&few, |s| parts.has(s)) {
+                gone.insert(e as Ex);
+                budget.push(&mut queue, e as Ex)?;
             }
         }
-        // every context with a link into an affected context is affected
-        let mut queue: Vec<Ex> = affected.iter().copied().collect();
+        let mut any = !queue.is_empty();
         while let Some(e) = queue.pop() {
             let Some(c) = self.ctx.get(e as usize).and_then(|c| c.get()) else {
                 continue;
@@ -3067,28 +3403,77 @@ impl Saturation {
             let st = c.st.lock();
             for (_, srcs) in &st.back {
                 for &s in &srcs.list {
-                    if affected.insert(s) {
-                        queue.push(s);
+                    if gone.insert(s) {
+                        any = true;
+                        budget.push(&mut queue, s)?;
                     }
                 }
             }
         }
+        debug_assert!(
+            (few.capacity() + stack.capacity() + queue.capacity()) * std::mem::size_of::<Ex>()
+                <= budget.lists
+                && parts.0.len() == nodes.len().div_ceil(64)
+                && gone.0.len() == self.ctx.len().div_ceil(64),
+            "the invalidation's scratch passed what the budget admitted"
+        );
+        #[cfg(test)]
+        let live =
+            (few.capacity() + stack.capacity() + queue.capacity()) * std::mem::size_of::<Ex>();
+        drop((few, stack, queue, parts));
+        if !any && !renumbered {
+            #[cfg(test)]
+            scratch_audit::record(budget, live, 0, 0);
+            return Ok(0);
+        }
+        // the kept contexts that number their sets again may need larger maps, which
+        // the budget admits before any context changes
+        let mut maps = 0;
+        if renumbered {
+            for (e, c) in self.ctx.iter().enumerate() {
+                let Some(c) = c.get() else { continue };
+                let st = c.st.lock();
+                if st.init && !gone.has(e as Ex) && !st.disj.is_empty() {
+                    maps += st.disjoint_growth(ix);
+                }
+            }
+            budget.grow(maps)?;
+        }
+        #[cfg(any(test, debug_assertions))]
+        let mut grown = 0;
         let mut cleared = 0;
         for (e, c) in self.ctx.iter_mut().enumerate() {
             let Some(c) = c.get_mut() else { continue };
             let st = c.st.get_mut();
-            if affected.contains(&(e as Ex)) {
+            if gone.has(e as Ex) {
                 if st.init {
                     cleared += 1;
                 }
                 *st = saturate::State::default();
                 *c.started.get_mut() = false;
             } else if st.init {
-                st.drop_links_from(&affected);
-                st.reindex(ix);
+                if any {
+                    st.drop_links_where(|s| gone.has(s));
+                }
+                if renumbered && !st.disj.is_empty() {
+                    #[cfg(any(test, debug_assertions))]
+                    let had = st.disj.capacity();
+                    st.reindex_disjoint(ix);
+                    #[cfg(any(test, debug_assertions))]
+                    if st.disj.capacity() > had {
+                        grown += saturate::table_bytes(st.disj.capacity(), 8);
+                    }
+                }
             }
         }
-        cleared
+        #[cfg(any(test, debug_assertions))]
+        debug_assert!(
+            grown <= maps,
+            "the disjointness maps grew past what the budget admitted"
+        );
+        #[cfg(test)]
+        scratch_audit::record(budget, live, maps, grown);
+        Ok(cleared)
     }
 
     /// The subsumers of a saturated context that are named classes, with their
@@ -3111,6 +3496,128 @@ impl Saturation {
             .filter(|&s| matches!(self.interner.nodes[s as usize], Node::Class(_) | Node::Top))
             .collect();
         Some((st.bottom, named))
+    }
+}
+
+/// What the last invalidation on a thread admitted and held, which the tests of its
+/// admission read.
+#[cfg(test)]
+mod scratch_audit {
+    use std::cell::Cell;
+
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(super) struct Audit {
+        /// the estimate held after the invalidation, and the run's peak
+        pub held: usize,
+        pub peak: usize,
+        /// the bytes admitted for the lists, and those the lists held
+        pub lists: usize,
+        pub live: usize,
+        /// the bytes admitted for the disjointness maps, and those the maps took
+        pub maps: usize,
+        pub grown: usize,
+        /// the bytes of the normalized premises of the changed axioms
+        pub premises: usize,
+    }
+
+    thread_local! {
+        static LAST: Cell<Option<Audit>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record(b: &super::Scratch<'_>, live: usize, maps: usize, grown: usize) {
+        LAST.set(Some(Audit {
+            held: b.held,
+            peak: b.peak,
+            lists: b.lists,
+            live,
+            maps,
+            grown,
+            premises: 0,
+        }));
+    }
+
+    pub(super) fn premises(bytes: usize) {
+        LAST.set(LAST.get().map(|a| Audit {
+            premises: bytes,
+            ..a
+        }));
+    }
+
+    pub(super) fn take() -> Option<Audit> {
+        LAST.take()
+    }
+}
+
+/// The memory that the invalidation of a run kept by the EL rules holds beside the kept
+/// contexts, the index and the normalized axioms, which it admits against the run's
+/// limit and pool before each list of ids grows.
+struct Scratch<'l> {
+    limits: &'l Limits,
+    /// the estimated bytes held, which grow and are never given back before the run's
+    /// memory is reconciled
+    held: usize,
+    /// the run's peak estimate, past which a growth is charged to the pool
+    peak: usize,
+    /// the bytes admitted for the lists
+    lists: usize,
+}
+
+impl Scratch<'_> {
+    /// Admits `bytes` more, or stops the run with [`Error::Memory`].
+    fn grow(&mut self, bytes: usize) -> Result<(), Error> {
+        self.held += bytes;
+        let more = self.held.saturating_sub(self.peak);
+        if self.limits.max_memory.is_some_and(|m| self.held > m)
+            || more > 0 && self.limits.charge.as_deref().is_some_and(|f| !f(more))
+        {
+            return Err(Error::Memory {
+                limit: self.limits.max_memory.unwrap_or(self.held),
+                used: self.held,
+            });
+        }
+        self.peak = self.peak.max(self.held);
+        Ok(())
+    }
+
+    /// Pushes `e` onto `v`, admitting the list's growth before it allocates.
+    fn push(&mut self, v: &mut Vec<Ex>, e: Ex) -> Result<(), Error> {
+        if v.len() == v.capacity() {
+            let more = v.capacity().max(4);
+            let bytes = more * std::mem::size_of::<Ex>();
+            self.grow(bytes)?;
+            self.lists += bytes;
+            v.reserve_exact(more);
+        }
+        v.push(e);
+        Ok(())
+    }
+}
+
+/// A set of expressions or contexts by id, one bit each, which the invalidation reads
+/// once for each member of every context it passes.
+struct Marks(Vec<u64>);
+
+impl Marks {
+    fn new(n: usize) -> Marks {
+        Marks(vec![0; n.div_ceil(64)])
+    }
+
+    /// Adds `e`, and answers whether it was new.
+    fn insert(&mut self, e: Ex) -> bool {
+        let (w, b) = (e as usize / 64, 1u64 << (e % 64));
+        if w >= self.0.len() {
+            self.0.resize(w + 1, 0);
+        }
+        let new = self.0[w] & b == 0;
+        self.0[w] |= b;
+        new
+    }
+
+    #[inline]
+    fn has(&self, e: Ex) -> bool {
+        self.0
+            .get(e as usize / 64)
+            .is_some_and(|w| w & (1u64 << (e % 64)) != 0)
     }
 }
 
@@ -3381,6 +3888,9 @@ thread_local! {
     /// The conclusions that the last run of Tier D on this thread had derived when it
     /// stopped at its bound on them, so that a test sees how far past the bound it went.
     static PASSED_AT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Bytes that a test adds to the estimate of item 1231's scan, so that it can reach
+    /// the memory budget and the pool's refusal.
+    static SCAN_EXTRA: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn poll(limits: &Limits) -> Result<(), Error> {
@@ -3802,6 +4312,69 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
 
+    /// Item 1231's scan counts against the run's budget. A scan that would pass the
+    /// caller's memory budget, or that the pool refuses, ends the rooted run as past its
+    /// memory budget, which falls back to the Horn rules and reports no decline.
+    #[test]
+    fn the_decline_scan_counts_against_the_memory_budget_and_the_pool() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+             SubClassOf(:K ObjectHasValue(:q :v))
+             SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+             ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+             SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+             SubClassOf(:E ObjectHasValue(:r2 :w))
+             SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+             SubClassOf(:C2 ObjectHasValue(:s :v))
+             SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             )",
+        )
+        .unwrap();
+        let base = Limits {
+            threads: 1,
+            rooted: true,
+            ..Limits::default()
+        };
+        let out = Classifier::of(&doc.axioms).classify(&base).unwrap();
+        assert!(out.stats.dl_rooted_declined);
+        // the pool refuses a grant of 256 MiB, and the scan's 512 MiB stay within the run's
+        // own budget of at least 1 GiB, so that only the pool stops it
+        let charge: Arc<dyn Fn(usize) -> bool + Send + Sync> = Arc::new(|b| b < 1 << 28);
+        for (name, extra, limits) in [
+            (
+                "budget",
+                1usize << 40,
+                Limits {
+                    max_memory: Some(1 << 34),
+                    ..base.clone()
+                },
+            ),
+            (
+                "pool",
+                1 << 29,
+                Limits {
+                    charge: Some(charge),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            // without the scan's extra bytes the run withdraws its answer
+            let out = Classifier::of(&doc.axioms).classify(&limits).unwrap();
+            assert!(out.stats.dl_rooted_declined, "{name}");
+            SCAN_EXTRA.with(|x| x.set(extra));
+            let out = Classifier::of(&doc.axioms).classify(&limits);
+            SCAN_EXTRA.with(|x| x.set(0));
+            let out = out.unwrap();
+            assert!(out.stats.dl_over_budget, "{name}");
+            assert!(!out.stats.dl_rooted_declined, "{name}");
+            assert!(!out.stats.dl_rooted_over, "{name}");
+            assert!(out.stats.peak_memory >= extra, "{name}");
+        }
+    }
+
     #[test]
     fn axioms_outside_el_count_once_however_often_they_occur() {
         let c = |n: &str| ClassExpression::Class(Class::new(format!("http://ex.org/{n}")));
@@ -3921,13 +4494,13 @@ mod tests {
             .iter()
             .enumerate()
             .filter_map(|(i, k)| {
-                let b = profiles::el_axiom(k).into_iter().next()?;
+                let b = profiles::el_first(k)?;
                 Some((i, (b.rule.to_string(), b.message)))
             })
             .collect();
         let mut s = Saturation::default();
         let (_, ix, _, _) = s
-            .build(&axioms, &outside, 1, 0, &Limits::default())
+            .build(&axioms, &outside, 1, 0, 0, &Limits::default())
             .unwrap();
         assert!(ix.horn.is_some());
         ix

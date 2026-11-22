@@ -928,6 +928,35 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
     }
 }
 
+/// A view source with one `table` view whose column ?x holds the integers below `.0`.
+/// A view read has no resumable cursor, so it is the remaining eager fallback leaf.
+#[derive(Debug)]
+struct IntegersView(i64);
+impl sparkles_core::sparql::viewsvc::ViewSource for IntegersView {
+    fn read_view(
+        &self,
+        _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
+    ) -> sparkles_core::Result<sparkles_core::sparql::viewsvc::ViewRows> {
+        Ok(sparkles_core::sparql::viewsvc::ViewRows {
+            columns: vec!["x".into()],
+            rows: (0..self.0)
+                .map(|i| (vec![Some(Term::Literal(oxrdf::Literal::from(i)))], 1))
+                .collect(),
+            commit: 0,
+            evaluated_under: None,
+        })
+    }
+}
+
+fn with_view(rows: i64) -> QueryOptions {
+    QueryOptions {
+        views: Some(Arc::new(IntegersView(rows))),
+        ..Default::default()
+    }
+}
+
+const VIEW_READ: &str = "SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x }";
+
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
@@ -940,32 +969,28 @@ fn eager_fallback_is_visible_lazy_and_budgeted() {
         None,
     )])
     .unwrap();
-    let q =
-        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }";
+    let q = &format!("SELECT ?x WHERE {{ {VIEW_READ} }}");
+    let views = with_view(100);
     assert!(matches!(
-        select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
+        select_cursor(s.snapshot(), q, &views, &options(2)),
         Err(Error::Unsupported(_))
     ));
     let opts = CursorOptions {
         batch_rows: 2,
         ..Default::default()
     };
-    let mut c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+    let mut c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
     assert!(c.plan().has_materialization());
     assert_eq!(c.stats().rows_produced, 0);
     let b = c.next_batch().unwrap().unwrap();
     assert_eq!(
         b.row(0).unwrap().values().to_vec(),
-        query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows()[0]
+        query(s.snapshot(), q, &views).unwrap().application_rows()[0]
     );
     assert!(c.stats().rows_produced >= 100);
     assert_eq!(
-        all(select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap()),
-        query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows()
+        all(select_cursor(s.snapshot(), q, &views, &opts).unwrap()),
+        query(s.snapshot(), q, &views).unwrap().application_rows()
     );
 }
 
@@ -2347,8 +2372,8 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT (COUNT(*) AS ?n) {{?s ?p ?o} UNION {?o ?p ?s} ?s ?q ?t}",
-            &Default::default(),
+            &format!("SELECT ?x {{ {VIEW_READ} }}"),
+            &with_view(3),
             &strict,
             ExecutionMode::Auto,
         ),
@@ -3491,6 +3516,415 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
     differential("masked", &snapshot, &opts, SEEDS, visible);
 }
 
+/// A count over a join runs the join as a cursor operator of its own and counts its
+/// rows, so the strict policy admits it and no operator materializes (item 829).
+#[test]
+fn count_join_counts_a_streamed_join() {
+    use std::sync::atomic::AtomicU64;
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:q> <urn:s:{}> .\n<urn:s:{i}> <urn:r> <urn:g:{}> .\n",
+                (i * 7) % 60,
+                i % 3
+            )
+        })
+        .collect::<String>()
+        // four pairs with `?s <urn:q> ?t` on both variables, then 60 rows that match
+        // nothing
+        + "<urn:s:1> <urn:w> <urn:s:7> .\n<urn:s:2> <urn:w> <urn:s:14> .\n"
+        + "<urn:s:3> <urn:w> <urn:s:21> .\n<urn:s:4> <urn:w> <urn:s:28> .\n"
+        + &(0..60)
+            .map(|i| format!("<urn:z:{i}> <urn:w> <urn:z:{i}> .\n"))
+            .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn has(plan: &sparkles_core::sparql::CursorPlan, op: &str) -> bool {
+        plan.operator.operator == op || plan.children.iter().any(|c| has(c, op))
+    }
+    let pairs = |n: usize, undef: bool| {
+        (0..n)
+            .map(|i| match undef && i % 4 == 0 {
+                true => format!("(UNDEF {i})"),
+                false => format!("(<urn:s:{}> {i})", i % 2),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let two_keys = (0..20)
+        .map(|i| format!("(1 1 {i})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (q, count_join) in [
+        // a merge join on one key, which eager counts from its key runs
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        // a join over a sorted union, which the cursor plans as a merge join
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o > 1000) ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        // 1180 pairs of inputs with at most 60 rows each
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:r> ?g FILTER(?s != <urn:s:0>) ?t <urn:r> ?g }".to_string(),
+            true,
+        ),
+        // two shared variables, 400 pairs
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES (?a ?b ?i) {{ {two_keys} }} VALUES (?a ?b ?j) {{ {two_keys} }} }}"
+            ),
+            false,
+        ),
+        // a hash join on two variables that BIND leaves unsorted, whose four pairs come
+        // before rows that match nothing, so the join reads input after its last pair
+        // (a merge join would stop at the end of one input, which eager reads whole);
+        // eager refuses it at a work limit equal to its own work, as item 1103 records,
+        // and so must the streamed count once it has read that input
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { { ?a <urn:q> ?b BIND(?a AS ?s) BIND(?b AS ?t) } ?s <urn:w> ?t }".to_string(),
+            true,
+        ),
+        // a merge join on two variables, which the eager kernel counts (item 1129)
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?s <urn:w> ?t }".to_string(),
+            true,
+        ),
+        // a key that some rows leave unbound
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES (?s ?i) {{ {} }} ?s <urn:q> ?t }}",
+                pairs(40, true)
+            ),
+            false,
+        ),
+    ] {
+        let q = q.as_str();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
+        for rows in [1, 2, 3, 4096] {
+            let c = open(&s, q, rows);
+            assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
+            if count_join {
+                assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
+            }
+            if q.contains("BIND") {
+                assert!(has(c.plan(), "HashJoin"), "{q}: {:?}", c.plan());
+            }
+            assert_eq!(all(c), expected, "{q}; {rows}");
+        }
+        // The pairs of the join below the count are not rows that the eager count
+        // produces, so they stay out of the work count. The eager count admits them
+        // against the row limit and the work limit when it forms them, and not when it
+        // counts a merge join's key runs, and the streamed count follows it, so both
+        // modes give the same outcome at each limit (Sol review of item 829, findings 1
+        // of rounds 1 and 2).
+        let with = |rows: Option<usize>, limit: Option<u64>, work: Option<Arc<AtomicU64>>| {
+            QueryOptions {
+                no_cache: true,
+                max_rows: rows,
+                max_rows_produced: limit,
+                work,
+                ..Default::default()
+            }
+        };
+        type Outcome = Result<Vec<Vec<Option<Term>>>, Option<BudgetKind>>;
+        let outcome = |r: Result<Vec<Vec<Option<Term>>>, Error>| -> Outcome {
+            r.map_err(|e| match e {
+                Error::BudgetExceeded(b) => Some(b.kind),
+                _ => None,
+            })
+        };
+        let eager = |rows: Option<usize>, limit: Option<u64>| -> Outcome {
+            outcome(query(s.snapshot(), q, &with(rows, limit, None)).map(|r| r.application_rows()))
+        };
+        let streamed = |rows: Option<usize>, limit: Option<u64>, batch: usize| -> (Outcome, u64) {
+            let work = Arc::new(AtomicU64::new(0));
+            let run = || -> Result<_, Error> {
+                let opts = with(rows, limit, Some(work.clone()));
+                let mut c = select_cursor(s.snapshot(), q, &opts, &options(batch))?;
+                let mut answer = Vec::new();
+                while let Some(b) = c.next_batch()? {
+                    for row in 0..b.len() {
+                        answer.push(b.row(row).unwrap().values().to_vec());
+                    }
+                }
+                Ok(answer)
+            };
+            let r = outcome(run());
+            (r, work.load(Ordering::Relaxed))
+        };
+        let produced = query(s.snapshot(), q, &with(None, None, None))
+            .unwrap()
+            .rows_produced;
+        let count = match expected[0][0].as_ref() {
+            Some(Term::Literal(l)) => l.value().parse::<u64>().unwrap(),
+            other => panic!("{q}: {other:?}"),
+        };
+        let mut limits = vec![
+            (None, None),
+            (Some(120), None),
+            (None, Some(produced)),
+            (None, Some(produced - 1)),
+            (None, Some(produced - 2)),
+            (None, Some(produced - 3)),
+            (None, Some(produced + count)),
+        ];
+        if count > 0 {
+            limits.push((None, Some(produced + count - 1)));
+        }
+        for batch in [1, 3, 4096] {
+            let (answer, work) = streamed(None, None, batch);
+            assert_eq!(answer, Ok(expected.clone()), "{q}; {batch}");
+            assert_eq!(work, produced, "{q}; {batch}");
+            for &(rows, limit) in &limits {
+                assert_eq!(
+                    streamed(rows, limit, batch).0,
+                    eager(rows, limit),
+                    "{q}; batch {batch}, max_rows {rows:?}, max_rows_produced {limit:?} (produced {produced}, count {count})"
+                );
+            }
+        }
+    }
+}
+
+/// A count over a merge join on two variables runs its eager kernel as a whole-input
+/// operator under either policy, with no join operator below it, because the streamed
+/// join costs 1.8 times the eager count (item 1129). It gives the eager answer.
+#[test]
+fn a_count_over_a_two_variable_merge_join_runs_the_eager_kernel() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            let o = (i * 7) % 60;
+            let mut t = format!("<urn:s:{i}> <urn:q> <urn:s:{o}> .\n");
+            if i % 3 == 0 {
+                t += &format!("<urn:s:{i}> <urn:w> <urn:s:{o}> .\n");
+            }
+            t + &format!("<urn:s:{i}> <urn:w> <urn:z:{i}> .\n")
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn ops(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<String>) {
+        out.push(plan.operator.operator.clone());
+        for child in &plan.children {
+            ops(child, out);
+        }
+    }
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?s <urn:w> ?t }";
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        expected,
+        vec![vec![Some(Term::Literal(
+            oxrdf::Literal::new_typed_literal("20", oxrdf::vocab::xsd::INTEGER)
+        ))]]
+    );
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 2, 3, 4096] {
+            let opts = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &opts).unwrap();
+            let mut names = Vec::new();
+            ops(c.plan(), &mut names);
+            assert!(
+                !c.plan().has_materialization(),
+                "{fallback:?}: {:?}",
+                c.plan()
+            );
+            assert!(
+                names.iter().any(|n| n == "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.ends_with("Join") && n != "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            fn count_join(
+                plan: &sparkles_core::sparql::CursorPlan,
+            ) -> Option<&sparkles_core::sparql::CursorPlan> {
+                match plan.operator.operator == "CountJoin" {
+                    true => Some(plan),
+                    false => plan.children.iter().find_map(count_join),
+                }
+            }
+            // It holds both of its inputs.
+            assert!(
+                count_join(c.plan()).is_some_and(|p| p.growing_state),
+                "{fallback:?}: {:?}",
+                c.plan()
+            );
+            assert_eq!(all(c), expected, "{fallback:?}; {rows}");
+        }
+    }
+    // With an empty left input the count reads nothing of its right input, as eager
+    // does, so a work limit below the right input's rows refuses neither.
+    let empty = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t FILTER(STRSTARTS(STR(?t), \"urn:absent\")) ?s <urn:w> ?t }";
+    let limited = |limit: u64| QueryOptions {
+        no_cache: true,
+        max_rows_produced: Some(limit),
+        ..Default::default()
+    };
+    let expected = query(s.snapshot(), empty, &limited(65))
+        .unwrap()
+        .application_rows();
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 4096] {
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), empty, &limited(65), &o).unwrap();
+            let mut names = Vec::new();
+            ops(c.plan(), &mut names);
+            assert!(
+                names.iter().any(|n| n == "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.ends_with("Join") && n != "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            let mut c = c;
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(c.status(), CursorStatus::Complete);
+            assert_eq!(answer, expected, "{fallback:?}; {rows}");
+            // The right input never ran, and its plan says so as the eager plan does.
+            fn find<'a>(
+                plan: &'a sparkles_core::sparql::CursorPlan,
+                op: &str,
+            ) -> Option<&'a sparkles_core::sparql::CursorPlan> {
+                match plan.operator.operator == op {
+                    true => Some(plan),
+                    false => plan.children.iter().find_map(|c| find(c, op)),
+                }
+            }
+            fn all_skipped(plan: &sparkles_core::sparql::CursorPlan) -> bool {
+                let f = plan.operator.fidelity();
+                f.skipped.as_deref() == Some("the left side produced no rows")
+                    && !f.stopped_early
+                    && plan.operator.actual_rows == -1
+                    && plan.operator.time_ms == 0.0
+                    && plan.children.iter().all(all_skipped)
+            }
+            let count = find(c.plan(), "CountJoin").expect("a count join");
+            assert_eq!(count.children.len(), 2, "{:?}", count);
+            assert!(all_skipped(&count.children[1]), "{fallback:?}: {:?}", count);
+            assert!(count.children[0].operator.fidelity().skipped.is_none());
+        }
+    }
+}
+
+/// The skipped right input of a count over a two-variable merge join is marked as never
+/// run down to the children that an eager kernel describes without operators, here the
+/// scans of a count from key runs inside a subquery (Sol review of item 829, round 10).
+#[test]
+fn a_skipped_count_input_marks_its_described_children() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:q> <urn:s:{}> .\n<urn:s:{i}> <urn:w> <urn:z:{i}> .\n",
+                (i * 7) % 60
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    type Plan = sparkles_core::sparql::CursorPlan;
+    fn find<'a>(plan: &'a Plan, op: &str) -> Option<&'a Plan> {
+        match plan.operator.operator == op {
+            true => Some(plan),
+            false => plan.children.iter().find_map(|c| find(c, op)),
+        }
+    }
+    fn all_skipped(plan: &Plan) -> bool {
+        let f = plan.operator.fidelity();
+        f.skipped.as_deref() == Some("the left side produced no rows")
+            && !f.stopped_early
+            && !f.incomplete
+            && plan.operator.actual_rows == -1
+            && plan.operator.time_ms == 0.0
+            && plan.children.iter().all(all_skipped)
+    }
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { \
+        ?s <urn:q> ?t FILTER(STRSTARTS(STR(?t), \"urn:absent\")) \
+        { SELECT ?s ?t WHERE { \
+            { SELECT (COUNT(*) AS ?c) WHERE { ?a <urn:q> ?b . ?a <urn:w> ?d } } \
+            VALUES (?s ?t) { (<urn:s:1> <urn:s:7>) } } } }";
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 4096] {
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &o).unwrap();
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(c.status(), CursorStatus::Complete);
+            assert_eq!(answer, expected, "{fallback:?}; {rows}");
+            let count = find(c.plan(), "CountJoin").expect("a count join");
+            assert_eq!(count.children.len(), 2, "{count:?}");
+            let runs = find(&count.children[1], "CountJoinFromRuns")
+                .unwrap_or_else(|| panic!("{fallback:?}: {count:?}"));
+            assert!(!runs.children.is_empty(), "{runs:?}");
+            assert!(all_skipped(&count.children[1]), "{fallback:?}: {count:?}");
+        }
+    }
+}
+
 /// An operator without a cursor implementation materializes only itself. Its inputs
 /// are cursors of their own, and they stream into it.
 #[test]
@@ -3505,31 +3939,45 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         None,
     )])
     .unwrap();
-    fn fallbacks(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<bool>) {
+    // (whether the fallback has inputs, whether an input materializes)
+    fn fallbacks(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<(bool, bool)>) {
         if plan.materializes {
-            out.push(plan.children.iter().any(|c| c.has_materialization()));
+            out.push((
+                !plan.children.is_empty(),
+                plan.children.iter().any(|c| c.has_materialization()),
+            ));
         }
         for child in &plan.children {
             fallbacks(child, out);
         }
     }
+    let views = with_view(30);
     for q in [
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
-        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
+        format!(
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {VIEW_READ} FILTER(?x = ?o) }} }}"
+        ),
+        format!(
+            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {VIEW_READ} FILTER(?x = 3) }} }}"
+        ),
+        // a path search over its group without a limit reads its whole input, and that
+        // input streams into it
+        "SELECT ?s ?b WHERE { ?s <urn:p> ?o FILTER(?o < 5) SERVICE <urn:x-sparkles:path#search> { [] <urn:x-sparkles:path#source> ?s ; <urn:x-sparkles:path#target> ?b ; <urn:x-sparkles:path#predicate> <urn:q> } }".to_string(),
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows());
+        let q = q.as_str();
+        let expected = bag(query(s.snapshot(), q, &views).unwrap().application_rows());
         for rows in [1, 2, 3, 4096] {
             let opts = CursorOptions {
                 batch_rows: rows,
                 ..Default::default()
             };
-            let c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+            let c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
             let mut found = Vec::new();
             fallbacks(c.plan(), &mut found);
             assert!(!found.is_empty(), "{q}");
-            assert!(found.iter().all(|nested| !nested), "{q}: {:?}", c.plan());
+            assert!(found.iter().all(|(_, nested)| !nested), "{q}: {:?}", c.plan());
+            if q.contains("path#search") {
+                assert!(found.iter().any(|(inputs, _)| *inputs), "{q}: {:?}", c.plan());
+            }
             assert_eq!(bag(all(c)), expected, "{q}; {rows}");
         }
     }
@@ -4475,22 +4923,32 @@ fn cursor_node<'a>(
 }
 
 /// The cursor's ordered top-k holds a morsel per worker thread and the rows they keep,
-/// however many rows its pieces without value order hold: two workers read 4 and 12
-/// morsels of a single block with the same peak.
+/// however many rows its pieces without value order hold. On one worker the peak is a
+/// single morsel's, the same for 4 and 12 morsels of a single block. On two workers it is
+/// at most two morsels' peaks, for 4 and 12 morsels alike.
+///
+/// The two-worker bound comes from the one-worker peaks, which do not depend on
+/// scheduling. A two-worker peak is not a fixed baseline, since it depends on how far the
+/// work of two morsels overlaps in time, and an idle or busy worker that overlaps them
+/// less gives a lower peak.
 #[test]
 fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
+    let pools = [1, 2].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    });
     let q = "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 10";
+    // the peaks of one and of two workers, for each store
     let mut peaks = Vec::new();
     for n in [300_000, 900_000] {
         let s = decimal_store(n, 3, "");
         let eager = query(s.snapshot(), q, &Default::default()).unwrap();
         assert!(plan_has(eager.plan(), "IndexTopK"), "{:#?}", eager.plan());
-        let peak = |opts: &QueryOptions| {
-            let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+        let peak = |pool: &rayon::ThreadPool| {
+            let mut c =
+                select_cursor(s.snapshot(), q, &QueryOptions::default(), &options(4096)).unwrap();
             let rows = pool.install(|| {
                 let mut rows = Vec::new();
                 while let Some(b) = c.next_batch().unwrap() {
@@ -4501,9 +4959,16 @@ fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
             assert_eq!(rows, eager.application_rows());
             c.stats().mem_peak_bytes
         };
-        peaks.push(peak(&QueryOptions::default()));
+        peaks.push(pools.each_ref().map(peak));
     }
-    assert!(peaks[1] < peaks[0] * 5 / 4, "{peaks:?}");
+    // one worker: the same morsel peak however many morsels there are
+    assert!(peaks[1][0] < peaks[0][0] * 9 / 8, "{peaks:?}");
+    // two workers: at most twice one worker's peak, with a margin for per-worker state
+    let bound = peaks[0][0] * 2 * 9 / 8;
+    assert!(
+        peaks.iter().all(|p| p[1] < bound),
+        "{peaks:?} against {bound}"
+    );
 }
 
 /// A store whose `<urn:p>` values in `<urn:g1>` are 400,000 inline decimals below 5,
@@ -5177,6 +5642,236 @@ fn optional_merge_names_its_algorithm(s: &Store, q: &str) {
         assert_eq!(plan.contains("[hash join]"), !merge, "{plan}");
         assert_eq!(bag(all(c)), expected, "{q}: merge_left_join {merge}");
         assert_eq!(bag(eager.application_rows()), expected, "{q}");
+    }
+}
+
+/// A whole-input operator counts the rows it produces against the work limit as the
+/// eager kernel does: both modes count the same rows, a limit one row short of that
+/// count stops both, and the count itself passes both (item 829). The forms are a path
+/// search over its group, a path search and an algorithm call over a nested edge
+/// pattern, and an algorithm call over its group.
+#[test]
+fn whole_input_operators_count_their_rows_as_eager_does() {
+    use std::sync::atomic::AtomicU64;
+    let s = store(30);
+    let data = (0..30)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % 30))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let prefixes = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    fn reasons(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<String>) {
+        out.extend(plan.reason.clone());
+        for c in &plan.children {
+            reasons(c, out);
+        }
+    }
+    for (q, reads) in [
+        (
+            "SELECT ?s ?b WHERE { ?s <urn:p> ?o FILTER(?o < 5) SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 7 } }",
+            "all of its input",
+        ),
+        (
+            "SELECT ?b ?i WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 6 ; path:edgeIndex ?i ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+            "all of its edge pattern",
+        ),
+        (
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n ; algo:component ?c . ?a <urn:q> ?b } }",
+            "all of its edge pattern",
+        ),
+        (
+            "SELECT ?src ?n ?d WHERE { ?src <urn:p> ?o FILTER(?o < 3) SERVICE algo:bfs { [] algo:predicate <urn:q> ; algo:source ?src ; algo:node ?n ; algo:depth ?d } }",
+            "all of its input",
+        ),
+    ] {
+        let q = format!("{prefixes}{q}");
+        let opts = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+            no_cache: true,
+            max_rows_produced: limit,
+            work,
+            ..Default::default()
+        };
+        let eager = query(s.snapshot(), &q, &opts(None, None)).unwrap();
+        let produced = eager.rows_produced;
+        assert!(!eager.is_empty(), "{q}");
+        let expected = bag(eager.application_rows());
+        let streamed = |limit: Option<u64>, rows: usize| -> Result<(u64, Vec<String>), Error> {
+            let work = Arc::new(AtomicU64::new(0));
+            let mut c = select_cursor(
+                s.snapshot(),
+                &q,
+                &opts(limit, Some(work.clone())),
+                &options(rows),
+            )?;
+            let mut found = Vec::new();
+            reasons(c.plan(), &mut found);
+            assert!(
+                found
+                    .iter()
+                    .any(|r| r.contains(reads) && r.contains("runs once")),
+                "{q}: {found:?}"
+            );
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch()? {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            Ok((work.load(Ordering::Relaxed), bag(answer)))
+        };
+        for rows in [1, 3, 4096] {
+            let (work, answer) = streamed(None, rows).unwrap();
+            assert_eq!(answer, expected, "{q}; {rows}");
+            assert_eq!(work, produced, "{q}; {rows}");
+            assert!(streamed(Some(produced), rows).is_ok(), "{q}; {rows}");
+            assert!(
+                matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+                "{q}; {rows}"
+            );
+        }
+        assert!(
+            matches!(query(s.snapshot(), &q, &opts(Some(produced - 1), None)), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+            "{q}"
+        );
+    }
+}
+
+/// A whole-input operator holds its input under the memory budget, so a budget that
+/// cannot hold the input refuses the query with a budget error in both modes, while
+/// small batches alone fit (item 829). The forms read their group or their edge pattern.
+#[test]
+fn whole_input_operators_refuse_an_input_over_the_memory_budget() {
+    let n = 6000;
+    let s = store(n);
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % n))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let prefixes = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    for q in [
+        "SELECT ?s ?b WHERE { ?s <urn:p> ?o SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 3 } }",
+        "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 3 ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        "SELECT ?n WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n . ?a <urn:q> ?b } } LIMIT 1",
+    ] {
+        let q = format!("{prefixes}{q}");
+        let tight = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(48 << 10),
+            ..Default::default()
+        };
+        let memory = |r: Result<(), Error>| matches!(r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+        assert!(
+            memory(query(s.snapshot(), &q, &tight).map(drop)),
+            "{q}: eager"
+        );
+        let run = |opts: &QueryOptions| -> Result<(), Error> {
+            let mut c = select_cursor(s.snapshot(), &q, opts, &options(8))?;
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        };
+        run(&QueryOptions::default()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let r = run(&tight);
+        let refused = matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+        assert!(refused, "{q}: {:?}", r.err().map(|e| e.to_string()));
+    }
+}
+
+/// Peak memory and time of the whole-input and bounded-leaf forms against eager runs of
+/// the same queries, for the item 829 measurement. Run it alone in release mode with
+/// `--ignored --nocapture`; LEAF_MEASURE_N sets the graph size (default 200000).
+#[test]
+#[ignore]
+fn measure_whole_input_and_leaf_forms() {
+    use std::time::Instant;
+    let n: usize = std::env::var("LEAF_MEASURE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let s = store(n);
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % n))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let p = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    let forms = [
+        (
+            "path search over its group",
+            "SELECT ?s ?b WHERE { ?s <urn:p> ?o SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 10 } }",
+        ),
+        (
+            "path search over an edge pattern",
+            "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 10 ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        ),
+        (
+            "path search leaf",
+            "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:predicate <urn:q> ; path:limit 10 } }",
+        ),
+        (
+            "algorithm call over its group",
+            "SELECT ?n ?d WHERE { ?src <urn:p> ?o FILTER(?o < 4) SERVICE algo:bfs { [] algo:predicate <urn:q> ; algo:source ?src ; algo:node ?n ; algo:depth ?d } }",
+        ),
+        (
+            "algorithm call over an edge pattern",
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n ; algo:component ?c . ?a <urn:q> ?b } }",
+        ),
+        (
+            "algorithm call leaf",
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:q> ; algo:node ?n ; algo:component ?c } }",
+        ),
+        (
+            "count join of two scans (key runs)",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t }",
+        ),
+        (
+            "count join over a filter",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o >= 0) ?s <urn:q> ?t }",
+        ),
+        (
+            "count join on two variables",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?t <urn:q> ?s }",
+        ),
+    ];
+    println!("| form | rows | eager peak | streamed peak | eager ms | streamed ms |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    for (name, q) in forms {
+        let q = format!("{p}{q}");
+        let opts = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let (mut eager_ms, mut streamed_ms) = (f64::MAX, f64::MAX);
+        let (mut eager_peak, mut streamed_peak, mut rows) = (0, 0, 0);
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = query(s.snapshot(), &q, &opts).unwrap();
+            eager_ms = eager_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            eager_peak = r.mem_peak_bytes;
+            rows = r.len();
+            let t = Instant::now();
+            let mut c = select_cursor(s.snapshot(), &q, &opts, &options(4096)).unwrap();
+            while c.next_batch().unwrap().is_some() {}
+            streamed_ms = streamed_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            streamed_peak = c.stats().mem_peak_bytes;
+        }
+        println!(
+            "| {name} | {rows} | {:.1} MiB | {:.1} MiB | {eager_ms:.1} | {streamed_ms:.1} |",
+            eager_peak as f64 / 1048576.0,
+            streamed_peak as f64 / 1048576.0
+        );
     }
 }
 

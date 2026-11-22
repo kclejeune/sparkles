@@ -31,6 +31,51 @@ impl ValidationResult {
     pub fn message(&self) -> Option<&str> {
         self.messages.first().map(|l| l.value())
     }
+
+    /// Bytes of this entry alone. Detail entries each have their own admission.
+    pub(crate) fn retained_bytes(&self) -> u64 {
+        use sparkles_core::sparql::output::term_bytes;
+        let mut bytes = std::mem::size_of::<Self>() as u64;
+        for term in [
+            Some(&self.focus_node),
+            self.value.as_ref(),
+            Some(&self.source_shape),
+            self.source_constraint.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            bytes = bytes.saturating_add(term_bytes(term).unwrap_or(u64::MAX));
+        }
+        bytes = bytes
+            .saturating_add(self.source_constraint_component.as_str().len() as u64)
+            .saturating_add(self.severity.as_str().len() as u64);
+        for msg in &self.messages {
+            bytes = bytes
+                .saturating_add(std::mem::size_of::<Literal>() as u64)
+                .saturating_add(msg.value().len() as u64)
+                .saturating_add(msg.datatype().as_str().len() as u64)
+                .saturating_add(msg.language().map_or(0, str::len) as u64);
+        }
+        if let Some(path) = &self.result_path {
+            bytes = bytes.saturating_add(path_bytes(path));
+        }
+        bytes
+    }
+}
+
+fn path_bytes(path: &PropertyPath) -> u64 {
+    use PropertyPath as P;
+    let payload = match path {
+        P::Predicate(iri) => iri.as_str().len() as u64,
+        P::Inverse(inner) | P::ZeroOrMore(inner) | P::OneOrMore(inner) | P::ZeroOrOne(inner) => {
+            path_bytes(inner)
+        }
+        P::Sequence(paths) | P::Alternative(paths) => {
+            paths.iter().map(path_bytes).fold(0, u64::saturating_add)
+        }
+    };
+    payload.saturating_add(std::mem::size_of::<PropertyPath>() as u64)
 }
 
 /// A validation report (`sh:ValidationReport`).

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc dd26e76dc39c5c4f38ab765b9e4e1c3ae02100f5c56e4a4dfb226f57c67e3b22 # shrinks to k = ClassAssertion(ObjectIntersectionOf({ObjectHasValue(Property(ObjectProperty(NamedNode { iri: "urn:p0" })), Anonymous(AnonymousIndividual("b0")))}), Named(NamedIndividual(NamedNode { iri: "urn:i0" })))

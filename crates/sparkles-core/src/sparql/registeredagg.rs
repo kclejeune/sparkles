@@ -21,7 +21,7 @@ fn dispatch<T>(
     ctx.check().inspect_err(|error| {
         ctx.fail_extension(ScalarError::from_engine(error));
     })?;
-    let _owner = CallbackGuard::enter(ctx);
+    let _owner = CallbackGuard::enter(ctx)?;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(call))
         .unwrap_or_else(|_| Err(ScalarError::Execution("aggregate callback panicked".into())));
     if let Err(error) = &result {
@@ -49,14 +49,11 @@ impl Drop for OwnedAccumulator<'_> {
     fn drop(&mut self) {
         // Drop must run even when check() already fails. It must also remain
         // guarded: application destructors may otherwise reenter the writer.
-        let _owner = CallbackGuard::enter(self.ctx);
-        if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.inner.take())))
-            .is_err()
-        {
-            self.ctx.fail_extension(ScalarError::Execution(
-                "aggregate accumulator destructor panicked".into(),
-            ));
-        }
+        CallbackGuard::drop_owned(
+            self.ctx,
+            self.inner.take(),
+            "aggregate accumulator destructor panicked",
+        );
     }
 }
 

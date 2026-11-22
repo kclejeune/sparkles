@@ -226,37 +226,94 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped. The
-hierarchical budget of item 675 remains, and so does the cursor exclusion of the string
-floors, which item 1069 removes. Stage 5's
+479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
+shipped, and the hierarchical budget of item 675 remains. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
-Item 678 has shipped in part. The string floors of `string_order_mask` read their keys
+Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
-read fails the comparison with its refusal. Cursor batches still compare two string
-columns key by key and do not use the floors. On atlas with 1.05M triples and one
-thread, comparing through floors cached per batch made streaming `str-pair-lt` 24.8%
-slower and `str-pair-names` 33.4% slower than the direct comparison, in every round. The
-names of `str-pair-names` repeat across batches, with 83,226 and 91,694 distinct values in
-its two columns over 249,868 rows, so each batch computes again floors that an earlier batch had. Every name of
-`str-pair-lt` is distinct, 70,023 in 70,023 rows, and the cause of its loss is not
-established. Item 1069 takes up a floor cache that lasts the query and the exclusion.
-The row-aligned
-pre-decode of `decode_for` decodes its columns through the same sorted pre-decode as the
-dictionary values of top k and the numeric FILTER, which admits each value's storage
-before it builds it, and moves or clones the distinct values to their rows. Indexing the
-rows through the distinct values' slots was considered and not built, because the row
-evaluator reads the decoded column on its hot path and that change would need its own
-Intel measurement. The bounded-reads test counts every read of the mode, eight in all.
+read fails the comparison with its refusal. The row-aligned pre-decode of `decode_for`
+decodes its columns through the same sorted pre-decode as the dictionary values of top k
+and the numeric FILTER, which admits each value's storage before it builds it, and moves
+or clones the distinct values to their rows. Indexing the rows through the distinct
+values' slots was considered and not built, because the row evaluator reads the decoded
+column on its hot path and that change would need its own Intel measurement. Forge
+measured item 678 against the build before it on 36 queries at 1.05M triples with one
+thread, in three A,B,B,A rounds of ten requests, with the same answers and geometric means
+of 1.002 in streaming and 0.993 in automatic execution.
 
-Forge measured the item against the build before it on 36 queries at 1.05M triples with
-one thread, in three A,B,B,A rounds of ten requests, and every answer was the same. The
-geometric mean was 1.002 in streaming execution and 0.993 in automatic execution. A few
-filters that decode values became slower in every round. `str-filter-two` took 2.4% longer
-in streaming and 4.4% longer in automatic execution, `lang-filter` 2.4% and 2.6% longer,
-and streaming `str-pair-lt` 2.1% longer. With 12 threads `str-pair-lt` and `str-pair-names`
-were 2% faster.
+The query's context keeps the floors in a cache that lasts the query, so cursor batches
+compare two string columns through the floors as eager tables do. A floor cache that
+each batch built again had measured 24.8% slower on streaming `str-pair-lt` and 33.4% on
+`str-pair-names` on atlas, since names that repeat across batches had their floors
+computed in every batch. Every worker of a mask reads and writes one direct-mapped table
+of atomic words without a lock, since maps of their own made each worker compute a
+recurring string's floor again. A word holds the id's slot tag, the distance down to its
+floor and a bit set when the floor is read again. The first table has up to 2^16 slots,
+fewer when the vocabulary's strings or the cap need fewer. Before a mask or a part of a
+large eager table it grows up to eightfold, within the same limits, once its estimate of
+the floors it evicted that had been read again reaches a thirty-second of its slots, so
+inputs whose strings rarely repeat keep it. Each table is charged to the query before it is allocated, inside
+the spill threshold, and the cache holds at most 64 MiB or a sixteenth of the query's
+memory budget. This memory buys the speed below, and a table that the budget refuses
+leaves the floors the cache lacks to be computed each time. A cursor reads a key and the key before it in one walk of their block when
+that walk admits at most 4 KiB and the envelope grants it, and otherwise reads the key
+alone. A cursor batch spreads its floor comparison over the pool as the generic filter
+does. The bounded-reads test counts every read of the mode, seven in all.
+
+Forge measured 3a8b7adb, the build with the shared table, against c0948014, the build
+before item 1069, with 1.05M triples in five A,B,B,A rounds of ten requests per cell, and
+every answer was the same. With one thread in streaming execution, `str-pair-names` took
+0.517 of the base's time, 29.8 against 57.7 ms, `str-pair-lt` 0.815 and
+`str-pair-colleague` 1.042. Against the direct comparison of the two keys in eager
+execution, a probe build on the same base that the run record names, they read 0.512,
+0.778 and 0.991. With 12 threads, streaming `str-pair-lt` read 0.935, `str-pair-names`
+0.777 and `str-pair-colleague` 1.065, and eager execution read 0.843, 0.636 and 0.802.
+Every round of these cells agreed in direction with its median.
+
+An earlier build of the item, 174de1f8, gave each worker a map of its own, so a repeated
+name's floor was computed once for each worker that met it, and with 12 threads its
+streaming `str-pair-names` read 1.000 of the base and `str-pair-colleague` 1.118. Against
+that build with one thread, the shared table reads 0.952 on `str-pair-colleague` and
+0.907 on `str-pair-lt` in streaming execution and 0.931 and 0.908 in eager execution,
+while `str-pair-names` takes 5.3% longer in streaming and 9.7% longer in eager execution.
+The names query's table grows from its first 2^16 slots during the query. On wally, a
+first table as large as the vocabulary's clamp closed that gap but made `str-pair-lt`,
+whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
+
+`str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
+floors are nearly all computed once, and in streaming execution they cost more than
+comparing the two keys. A switch that turns the floors off
+when a prefix of the rows repeats few values was considered and not built, because in a
+shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
+`str-pair-colleague` while the whole query repeats many, so the switch would lose the
+names query's 2x. A profile of the per-worker maps put most of the floors' time in
+`Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
+predecessor. The shared table has not been profiled, so that read is the suspected cause
+of its cost, and item 1088 recovers the streaming cost. Its first candidate admits and allocates
+the checked walk's key buffer before the walk instead of growing it from empty and reads the
+predecessor without the copy that `PrevKey::keep` makes, keeping the checked envelope and
+its fallback.
+
+Queries that the floors do not reach also became slower in every round, and item 1089
+holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
+c0948014, and these lines have not been measured on 3a8b7adb. Over three rounds the screens
+had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no query
+was 10% slower. With one thread, 174de1f8 made streaming `str-filter-two` 2.8% slower over
+five rounds, which 3a8b7adb reads at 1.000 with rounds on both sides, and with 12 threads
+3a8b7adb makes streaming `str-filter-two` 1.4% slower in all five rounds. The screens
+found streaming `distinct-join` 2.5% slower, `star-join` 1.7% in streaming and 2.0% in
+automatic execution, automatic `employee-docs` 2.8% at 0.036 ms and automatic
+`star-lookup` 2.5% at 0.062 ms. `range-topk`, `order-lcase`, automatic `two-hop-count`
+and automatic `minus` read 0.8% to 1.3% slower, and streaming `lang-filter`, streaming
+`optional-count` and automatic `order-by-full` 0.2% to 0.4%. With both builds made on
+forge, item 678, 75a70587 against 7e272f4d, made `lang-filter` 2.9% slower in automatic
+and 2.7% in streaming execution, `str-filter-two` 2.1% and 1.8%, and streaming
+`distinct-join` 1.9%, in all five rounds, while `employee-docs` showed no cost. Profiles
+of item 678's costs on the laptop found no function the item changed above 0.14% of the
+samples and the same instruction counts for `lang-filter`. Automatic `str-filter-two`
+changes mode between server processes, which item 1087 holds.
 
 The test-only reference evaluator of item 512 has shipped in
 `crates/sparkles-core/tests/support/reference`. It reads a list of quads and a parsed
@@ -872,22 +929,20 @@ row of the table before it starts, which is more than the 12 bytes and one value
 decoded row that the separate large-input pre-decode admitted. Under a budget with little room left,
 a large column can therefore fall back to its rows where it was decoded before, which
 costs time but no correctness. The comparison of two string columns through cached
-lexicographic floors serves eager tables of at least 4,096 rows. A floor reads its
+lexicographic floors serves eager tables and cursor batches of at least 4,096 rows. A floor reads its
 string's key, the key before it and, for a string that other strings extend, the search
 for the first of them inside the decoding envelope, and a refused read fails the
-comparison with the refusal it recorded. Cursor batches compare the two keys directly
-instead, because the floors with a cache that lasts one batch measured slower than that
-comparison. Item 1069 takes up a cache that lasts the query.
+comparison with the refusal it recorded. The floors last the query in a charged cache,
+which the batches of a cursor share.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 reads of the accounting mode outside tests and fails above its bound. A read is a call of
 `streams()` or `accounting()`, a use of either `Accounting` variant or a direct read of
-the `streams` field outside its accessors. The bound is 8. The first read is the routing
+the `streams` field outside its accessors. The bound is 7. The first read is the routing
 of `query_execution_with_plan` in `cursor.rs`. The second accumulates an EXISTS key set
 across a cursor's batches, which an eager table builds in one batch. The third lets a
 cursor's decoding envelope refuse on the ledger, because eager callers of `term` and
-`value` cannot report a refusal and decode without the envelope instead. The fourth
-keeps cursor batches from the string floors until item 1069. The other four read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
+`value` cannot report a refusal and decode without the envelope instead. The other four read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
 without an owner may keep retained state uncharged, whether an empty release trims the
 ledger and whether a finished query's pool contribution shrinks. `CursorMemory` is gone, and a context in cursor accounting differs
 from an eager one only by its `streams` flag, its ledger retention and its deadline. The
@@ -909,7 +964,7 @@ alive, and it decodes the block again at its row when the cache has dropped it. 
 batches that the cursor root hands out without copying share the block and one charge of
 its decoded columns through one handle. The root scan keeps that handle while it reads
 the block, so a writer that drops each batch before it pulls the next, as the result
-writers do with one Rayon worker, does not charge the block again for every batch. The
+writers do with one Rayon worker, does not charge the block again for every batch. While the root shares a block, the scan keeps no weak handle on it and reads it through the shared handle in place, and it takes the block back from that handle when it switches to owned rows inside the block or a batch declines the shared path, so a scan stopped inside a block always has a way back to it. The
 charge ends when the scan leaves the block, reads it as owned rows or ends, and when the
 last batch handed out from it drops, so a cursor stopped inside a block keeps it charged
 until the cursor closes. The root shares a
@@ -925,6 +980,21 @@ of a term larger than the room the block leaves, under a budget at which a copy 
 answer, and roadmap item 1051 holds that. A cursor over a read-through snapshot, which keeps no blocks,
 decodes its current block again for each batch of copied rows, and no cursor query reads such a
 snapshot.
+
+Roadmap item 1063 removed most of the cost that item 1039 left on root scans. The shared
+path no longer makes and drops a weak handle on the block for each batch, and it reads the
+block in place instead of taking it back at each read. On 100,000 people on atlas with one
+thread, `root-scan`, `export-500k` and `root-limit` became 1.6% to 3.5% faster in server
+time under streaming and automatic execution, and in a cycle profile on stanley the range
+of the scan's cost over four passes overlaps its range before item 1039. Against that
+build, `root-scan` still takes 2.4% longer under streaming, 1.98 µs, and 1.1% under
+automatic execution, 0.89 µs, and streaming `export-500k` 0.5% longer, 1.95 µs. The
+remainder is about the same on both queries although the export reads more blocks, and the
+profile does not show it. Item 1063 stays open for that remainder. `distinct-obj` and `predicate-counts` read 0.3 µs
+slower under streaming and faster under automatic execution, and their plans do not reach
+the changed code. The
+[run record](../../benchmarks/engine/runs/2026-11-19-shared-scan-atlas/README.md) has the
+method and the numbers.
 
 ### One join-kernel library
 
@@ -1056,6 +1126,118 @@ of the A/B, under the 0.5 µs bound of the Intel rule. Both builds
 returned the same answers. The
 [synthetic results](../../benchmarks/synthetic/RESULTS.md#grouping-operator) keep the run
 record.
+
+### Native search and leaf operators
+
+The first part of item 829 classifies each search, call and leaf by its form, from the
+`needs_input` of its specification, in `cursor/leaf.rs`. An expanding operator in
+`cursor/expand.rs` runs the kernel over each input batch for a text, hybrid, history or
+spatial search whose arguments come from its input and for a vector search with a
+variable query. It keeps the distinct query values of earlier batches in a charged set,
+so the caps of the text, hybrid, spatial and vector kernels hold for the whole input as
+they do for one eager call. A remote LATERAL loop runs through `enhancer::RemoteRun`,
+which the eager loop calls once and the cursor calls per batch. The cursor holds the rows
+of a partial bulk request until the request is full or its input ends, so it sends the
+requests and the bulk groups of an eager run, and it keeps the answers it holds charged
+and counts each key's solutions once. Both modes still parse a whole remote response before
+the budget sees it, which [item 1104](../../ROADMAP.md) changes.
+
+The whole-input operator of `cursor/whole.rs` serves a vector or hybrid search whose
+candidates come from its input, a path search under a limit and an algorithm call that
+reads its group or a nested edge pattern. It reads each input into a charged table, so
+an input over the budget refuses the query as a sort without spill does, and then calls
+the kernel once and serves its answer batch by batch. It calls `exec::vector_search`,
+`hybrid::search_bound`, `pathsearch::run` and `algosvc::run` itself rather than
+`run_node`. It adopts an algorithm's lease, charges every other answer, counts its rows
+against the work limit once and redacts its plan under a graph view, which `run_node`
+did for these kinds. It does not read or fill the result cache, so an algorithm call over
+an edge pattern that the cache answered under eager execution runs again when streamed.
+A search bounded by `k`, `maxHits` or its own limit argument, an algorithm call over
+constants and `CountJoin` run their kernel once into a charged table, as decision 2
+admits. The expanding kinds and those leaves still
+run the eager kernel through `execute_with_inputs` or `execute_owned`, so the merge must
+move them. EXPLAIN gives each operator a reason that names what it reads whole or what
+bounds its answer.
+
+The strict policy refuses the unbounded forms, which are a SERVICE, a view read, a
+spatial scan or relation over constants, a search without a bound, a path search between
+constants without a limit, a spatial join, a property function over constants and a
+registered property function without prefix output. They are the second part of the item. Automatic execution keeps its base
+set of expanding kinds, and each new kind joins it only after a same-host A/B of eager
+against streamed runs. The text, geo and vector benchmark scripts send an `EXECUTION`
+mode with every request, and the vector script fingerprints its exact and approximate
+answers, for the A/B of the item's plan. The W3C streaming record of the tip matches its
+base, with 24 eager fallbacks in ARQ's property-function suite and none elsewhere.
+
+Tests compare each form with eager answers at batches of one row to 4,096 rows, count
+the same rows as eager runs against the work limit, refuse an input over the memory
+budget in both modes, read a pending transaction's view in an algorithm call, redact a
+masked plan, and send the requests of an eager remote loop at every batch size, with a
+failing endpoint and with SILENT.
+
+`CountJoin` under streaming groups the rows of its join without keys and asks a merge
+join for its count, so it never holds the pairs that eager execution forms. The two modes
+admit the pairs against the row limit and the work limit by the same rule. The eager count
+counts a merge join on one shared variable from its key runs and forms the pairs of any
+other join, admitting them before it counts them, and the streamed count admits each
+batch of pairs of the same joins and checks the total once more when its join has read
+all of its input. Three differences remain. Eager execution chooses between the key runs
+and the pairs at run time and forms the pairs when a key column holds UNDEF or is not
+sorted, while the cursor chooses from the plan, so a limit can refuse such a join in one
+mode and not in the other. The eager count also admits the memory of its pair indices,
+which the streamed count never holds, so it can refuse under a memory budget that the
+streamed count meets, and the merge removes that difference. A count can refuse at a work
+limit equal to the work that its own run reported, in both modes, and
+[item 1103](../../ROADMAP.md) makes the two counts agree.
+
+A count over a merge join on two or more shared variables runs the eager kernel under a
+cursor instead, as a whole-input operator under either policy, because the streamed join
+writes every pair into its batches and took 1.81 times the eager count on forge. The
+operator reads both inputs under the memory budget and counts once, so it holds both
+inputs and the pair indices where the streamed join held one batch of pairs, and an eager
+run of such a count that exceeds the memory budget with spill on retries into the same
+kernel. [Item 1129](../../ROADMAP.md) counts that join in the cursor without writing its
+pairs and then streams it again.
+
+The ignored test `measure_whole_input_and_leaf_forms` in `query_cursor.rs` measured the
+peak memory and the best of five times of each form on 200,000 subjects in a release
+build on the development laptop, which is not a benchmark host. A path search under a
+limit of 10 over its group or over an edge pattern peaked at 7.1 MiB streamed against 3.1
+MiB eager and took the same time within 1 ms. An algorithm call over its group,
+over an edge pattern or over constants peaked within 1 MiB of eager and took within 1 ms of
+it. A streamed count over a join that eager counts from its pairs peaked at 0.3 MiB
+against 6.1 to 7.6 MiB eager. Over a filtered scan it took 6.0 ms against 6.3 ms, and on
+two shared variables it took 9.8 ms against 8.6 ms, through the streamed join that a
+cursor no longer runs for that shape. Streaming trades that time for the
+memory, and automatic execution keeps such counts eager until the A/B of the item's
+plan admits them. A count of two scans on one variable from their key runs took 12.0 ms
+streamed against 6.1 ms eager.
+
+On forge at 1.05M triples with one thread, 9df856f3, the part-1 tip before a cursor
+returned the count on two variables to the eager kernel, was compared with
+its base, bccc5f7b, in twelve rounds of A,B,B,A in both orders, and the tip's eager and
+streamed counts with each other in the same way. The streamed count on two shared
+variables took 1.81 times the eager count, 9.58 ms against 5.28 ms, and runs 2.26 times
+the instructions per request on stanley, since the cursor writes the merge join's pairs
+into batches that the eager count holds as indices, and item 1129 removes that cost.
+Explicit streaming has since run the eager kernel for that shape, as the paragraph above
+says. The
+streamed count over a filtered scan took 0.15 of the eager time, 8.4 ms against 55.3 ms,
+and automatic execution keeps both counts eager. Against the base, streamed queries that
+run 0.6% to 1.9% more instructions are 1.3% to 5.2% slower, which item 1160 holds, and
+queries that run the same instructions in either mode are 0.6% to 2.8% slower, which item
+1161 holds as likely code layout. Item 1074 holds the costs under 0.3 ms within its cap.
+
+The text, geo and vector scripts ran on forge in three rounds of the two binaries, with six
+pairs per query, as the phase's comparison of wall time. Of 88 configurations, 80 read as
+noise and 5 as faster. Eager `q6-touching-counties` with one thread reads 1.2% slower and
+eager `q-ef-64` with one thread 8.0% slower, which is over the plan's 5% threshold on wall
+time. Its wall times are bimodal, its servers differ from each other by up to 78% and its
+server time is 1.2% longer, and item 1162 holds both costs. Streamed `q9-star` with 12 threads read 1.144, and a rerun of that query
+alone, with 12 server processes per build and mode, put the tip at cde29b37 at 0.966 of
+its merge base with main, 5f3f69c2, streamed and 1.006 eager, so no query is 5% or more
+slower at 12 threads, which is the stage's acceptance gate. The
+[synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
 
 ### Readings of errors in aggregates
 

@@ -10,8 +10,7 @@
 
 use super::codec;
 use crate::error::{Error, Result};
-use crate::index::{Key, read_varint_checked};
-use crate::vocab::write_varint;
+use crate::index::{Key, decode_varints_strided, encode_deltas};
 use rayon::prelude::*;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -95,12 +94,7 @@ fn encode_block(rows: &[Key]) -> Result<Vec<u8>> {
     let mut cols: [Vec<u8>; 4] = Default::default();
     for (c, out) in cols.iter_mut().enumerate() {
         raw.clear();
-        let mut prev = 0u64;
-        for k in rows {
-            let d = k[c].wrapping_sub(prev) as i64;
-            write_varint(&mut raw, ((d << 1) ^ (d >> 63)) as u64);
-            prev = k[c];
-        }
+        encode_deltas(rows.iter().map(|k| k[c]), &mut raw);
         let comp = codec::compress(&raw)?;
         out.reserve_exact(4 + comp.len());
         out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
@@ -118,7 +112,7 @@ fn encode_block(rows: &[Key]) -> Result<Vec<u8>> {
 }
 
 /// Decode one column of `rows` values from `bytes` into the column `c` of `keys`, with
-/// `raw` as a buffer.
+/// `raw` as a buffer. The index's decoder writes the values into the keys in place.
 fn decode_column(bytes: &[u8], c: usize, keys: &mut [Key], raw: &mut Vec<u8>) -> Result<()> {
     let bad = || Error::Corrupt("run block column".into());
     let (len, comp) = bytes.split_first_chunk::<4>().ok_or_else(bad)?;
@@ -128,18 +122,10 @@ fn decode_column(bytes: &[u8], c: usize, keys: &mut [Key], raw: &mut Vec<u8>) ->
         return Err(bad());
     }
     codec::decompress(comp, len, raw, "run")?;
-    let mut pos = 0;
-    let mut prev = 0u64;
-    for k in keys.iter_mut() {
-        let z = read_varint_checked(raw, &mut pos).ok_or_else(bad)?;
-        let d = ((z >> 1) as i64) ^ -((z & 1) as i64);
-        prev = prev.wrapping_add(d as u64);
-        k[c] = prev;
-    }
-    if pos != raw.len() {
-        return Err(bad());
-    }
-    Ok(())
+    let rows = keys.len();
+    // the column's values sit 4 apart in the flattened keys, from position c
+    let out = keys.as_flattened_mut().get_mut(c..).ok_or_else(bad)?;
+    decode_varints_strided::<4>(raw, out, rows).map_err(|_| bad())
 }
 
 /// Reads a run file block by block.
@@ -467,5 +453,173 @@ mod tests {
             assert_eq!(got, want, "budget {budget}");
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    /// A column of the format tests and its zig-zag delta varints, from 0, which the
+    /// index's column frames pin as well.
+    const PINNED: [u64; 6] = [5, 3, 3, 200, 0, u64::MAX];
+    const PINNED_VARINTS: [u8; 8] = [0x0a, 0x03, 0x00, 0x8a, 0x03, 0x8f, 0x03, 0x01];
+
+    #[test]
+    fn run_block_bytes_are_pinned() {
+        let rows: Vec<Key> = PINNED
+            .iter()
+            .chain(&[1 << 63])
+            .map(|&v| [v, v, v, v])
+            .collect();
+        let block = encode_block(&rows).unwrap();
+        let u32_at = |i: usize| u32::from_le_bytes(block[i..i + 4].try_into().unwrap()) as usize;
+        assert_eq!(u32_at(0), rows.len());
+        // the step from u64::MAX to 1 << 63 takes the ten bytes of a 64-bit varint
+        let mut want = PINNED_VARINTS.to_vec();
+        want.extend([0xfd, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01]);
+        let mut at = HEADER;
+        for c in 0..4 {
+            let len = u32_at(4 + 4 * c);
+            let col = &block[at..at + len];
+            assert_eq!(
+                u32::from_le_bytes(col[..4].try_into().unwrap()) as usize,
+                want.len()
+            );
+            let mut raw = Vec::new();
+            codec::decompress(&col[4..], want.len(), &mut raw, "run").unwrap();
+            assert_eq!(raw, want, "column {c}");
+            at += len;
+        }
+        assert_eq!(at, block.len());
+        let mut keys = vec![[0u64; 4]; rows.len()];
+        let mut raw = Vec::new();
+        let mut at = HEADER;
+        for c in 0..4 {
+            let len = u32_at(4 + 4 * c);
+            decode_column(&block[at..at + len], c, &mut keys, &mut raw).unwrap();
+            at += len;
+        }
+        assert_eq!(keys, rows);
+    }
+
+    #[test]
+    fn damaged_run_columns_are_errors() {
+        let rows: Vec<Key> = PINNED.iter().map(|&v| [v, v, v, v]).collect();
+        let column = |raw: &[u8]| {
+            let mut out = (raw.len() as u32).to_le_bytes().to_vec();
+            out.extend(codec::compress(raw).unwrap());
+            out
+        };
+        let decode = |bytes: &[u8]| {
+            let mut keys = vec![[0u64; 4]; rows.len()];
+            let mut raw = Vec::new();
+            decode_column(bytes, 0, &mut keys, &mut raw).map(|()| keys)
+        };
+        let whole = decode(&column(&PINNED_VARINTS)).unwrap();
+        assert!(whole.iter().zip(&rows).all(|(k, r)| k[0] == r[0]));
+        let mut long = PINNED_VARINTS.to_vec();
+        long.push(0);
+        let mut open = PINNED_VARINTS.to_vec();
+        *open.last_mut().unwrap() |= 0x80;
+        let mut overlong = PINNED_VARINTS[..5].to_vec();
+        overlong.extend([0xff; 11]);
+        for (what, raw) in [
+            ("too few values", &PINNED_VARINTS[..7]),
+            ("a value left over", &long[..]),
+            ("an unterminated varint", &open[..]),
+            ("a varint past 64 bits", &overlong[..]),
+        ] {
+            let err = decode(&column(raw)).unwrap_err().to_string();
+            assert!(err.contains("run block column"), "{what}: {err}");
+        }
+        // a length prefix larger than the rows' varints can take
+        let mut big = column(&PINNED_VARINTS);
+        big[..4].copy_from_slice(&1000u32.to_le_bytes());
+        assert!(decode(&big).is_err());
+    }
+
+    /// A measurement of the delta coding of run blocks and index columns, not a check.
+    /// `DELTA_BENCH_CASE` picks `run-encode`, `run-decode`, `index-encode` or
+    /// `index-decode`, and `DELTA_BENCH_REPS` (default 20) the counted passes over 2^20
+    /// sorted keys. Each pass's time goes to stdout. Instruction counts come from
+    /// `perf stat -e instructions:u` on runs with the default and with 0 passes, whose
+    /// difference is the passes alone. Run with `cargo test --release -p sparkles-core
+    /// --lib builder::runs::tests::delta_coder_bench -- --ignored --nocapture --exact`.
+    #[test]
+    #[ignore]
+    fn delta_coder_bench() {
+        let case = std::env::var("DELTA_BENCH_CASE").unwrap_or_else(|_| "run-decode".into());
+        let reps: usize = std::env::var("DELTA_BENCH_REPS")
+            .ok()
+            .map_or(20, |v| v.parse().unwrap());
+        // sorted keys of a permutation: a dense first column, a few hundred values in
+        // the second, a wide third and a constant fourth
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut all: Vec<Key> = (0..1u64 << 20)
+            .map(|_| {
+                x = x
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                [x >> 47, (x >> 20) & 0x1FF, x & 0xFFFF_FFFF, 7]
+            })
+            .collect();
+        all.sort_unstable();
+        let blocks: Vec<&[Key]> = all.chunks(RUN_BLOCK).collect();
+        let columns: Vec<[Vec<u64>; 4]> = blocks
+            .iter()
+            .map(|b| std::array::from_fn(|c| b.iter().map(|k| k[c]).collect()))
+            .collect();
+        let run_blocks: Vec<Vec<u8>> = blocks.iter().map(|b| encode_block(b).unwrap()).collect();
+        let mut scratch = Vec::new();
+        let frames: Vec<[Vec<u8>; 4]> = columns
+            .iter()
+            .map(|cols| {
+                std::array::from_fn(|c| crate::index::encode_column(&cols[c], &mut scratch))
+            })
+            .collect();
+        let mut keys = vec![[0u64; 4]; RUN_BLOCK];
+        let mut out = vec![0u64; RUN_BLOCK];
+        let mut raw = Vec::new();
+        let mut sum = 0u64;
+        for rep in 0..reps {
+            let t = std::time::Instant::now();
+            match case.as_str() {
+                "run-encode" => {
+                    for b in &blocks {
+                        sum += encode_block(b).unwrap().len() as u64;
+                    }
+                }
+                "run-decode" => {
+                    for (b, enc) in blocks.iter().zip(&run_blocks) {
+                        let keys = &mut keys[..b.len()];
+                        let mut at = HEADER;
+                        for c in 0..4 {
+                            let len =
+                                u32::from_le_bytes(enc[4 + 4 * c..8 + 4 * c].try_into().unwrap())
+                                    as usize;
+                            decode_column(&enc[at..at + len], c, keys, &mut raw).unwrap();
+                            at += len;
+                        }
+                        sum = sum.wrapping_add(keys[keys.len() - 1][2]);
+                    }
+                }
+                "index-encode" => {
+                    for cols in &columns {
+                        for col in cols {
+                            sum += crate::index::encode_column(col, &mut scratch).len() as u64;
+                        }
+                    }
+                }
+                "index-decode" => {
+                    for (cols, fs) in columns.iter().zip(&frames) {
+                        let out = &mut out[..cols[0].len()];
+                        for f in fs {
+                            crate::index::decode_frame_into(f, out).unwrap();
+                            sum = sum.wrapping_add(out[out.len() - 1]);
+                        }
+                    }
+                }
+                other => panic!("unknown DELTA_BENCH_CASE {other}"),
+            }
+            let ns = t.elapsed().as_nanos() as f64 / all.len() as f64;
+            println!("{case} pass {rep}: {ns:.3} ns/key");
+        }
+        println!("{case} checksum {sum}");
     }
 }

@@ -1,5 +1,6 @@
 """Oracles and client wire behavior required by X09's native indexed gates."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import csv
 import http.server
 import importlib.util
