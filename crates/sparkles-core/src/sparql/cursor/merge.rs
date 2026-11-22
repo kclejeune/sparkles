@@ -2494,6 +2494,10 @@ mod tests {
             .next(&ctx, &mut op.children, &options, &node.vars, cap)
             .unwrap()
             .expect("first spooled pairs while the decided prefix is held");
+        assert!(
+            merge.passed,
+            "the spooled left row continues in the next batch"
+        );
         result.extend(rows(&next.table));
         drop(next);
         drop(first);
@@ -3516,8 +3520,7 @@ mod tests {
     }
 
     /// A deciding merge ends its batch before collecting another general run when it
-    /// already holds staged pairs or an open passed row, so held or spooled runs cannot
-    /// overlap with [`Merge::settle`]'s scratch.
+    /// already holds staged pairs or an open passed row.
     #[test]
     fn pair_conditions_flush_before_collecting_another_run() {
         use crate::sparql::expr::Func;
