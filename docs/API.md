@@ -2317,7 +2317,7 @@ individual in a class expression, a data range, an assertion on a property with 
 or the top or bottom property, is listed with `partial` and the reason. An axiom with
 an expression nested more than 256 deep is left out and listed as partial too.
 `complete` is false when anything is listed in `excluded`, when any input triple is
-unmapped (`stats.unmapped` above zero), or for a partial answer, while `completeForTaken`
+unmapped with `stats.unmapped` above zero, or for a partial answer, while `completeForTaken`
 stays true whenever the run finished for the axioms it took. Every subsumption the answer
 gives is entailed, a complete answer has every entailed subsumption between named classes
 for the whole input ontology, and a class outside `incomplete` keeps its exact
@@ -2363,11 +2363,14 @@ failing with `408` or `507`. Runs of the EL and Horn rules fail as before. The a
 such a run has `partial: true` and `complete: false`. Its subsumptions and unsatisfiable
 classes are entailed, `incomplete` lists the classes whose superclasses it may miss, at
 most `limit` of them in IRI order with `incompleteCount` counting them all, and every
-other class has its full answer. `consistency` is `consistent`, `inconsistent` or `unknown`, which occurs when a run
-stopped before deciding, when an excluded axiom, unread assertion or unmapped triple could
-change consistency, or when the coverage pass hit its work bound or deadline, and then
-every class is in `incomplete`. `consistent` is false only for an ontology proved
-inconsistent, so a caller that needs to know reads `consistency`. A finished run has
+other class has its full answer. `consistency` is `consistent`, `inconsistent` or `unknown`.
+It is `unknown` when a run stopped before deciding, when an excluded axiom, unread assertion
+or unmapped triple could change consistency, or when the coverage pass hit a deadline or
+cancellation before deciding, and in those cases every class is in `incomplete`. When the
+coverage pass hits its work bound instead, classes not yet decided stay in `incomplete`, and
+`consistency` becomes `unknown` only if consistency had not yet been established. `consistent`
+is false only for an ontology proved inconsistent, so a caller that needs to know reads
+`consistency`. A finished run has
 `partial: false` and `completeForTaken: true`, and when nothing is left out or unmapped
 its `incomplete` list is empty and `consistency` is never `unknown`. A partial taxonomy
 builds after the deadline that stopped the run. It is never kept, so a later call runs
