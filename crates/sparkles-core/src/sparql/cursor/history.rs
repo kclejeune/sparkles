@@ -142,8 +142,12 @@ impl History {
                 .saturating_add(1)
                 .saturating_sub(self.total)
                 .max(1);
-            pages.set_deadline(ctx.current_deadline());
-            let page = pages.next(PAGE, limit, &mut |b| charge.resize(b))?;
+            let page = pages.next_checked(PAGE, limit, Some(&|| ctx.check()), &mut |bytes| {
+                charge.resize(bytes)?;
+                #[cfg(test)]
+                tests::observe_admission(bytes);
+                Ok(())
+            })?;
             self.total = self.total.saturating_add(page.changes.len());
             ctx.check_rows(self.total)?;
             // a page reaches its limit only with one change more than the budget, and
@@ -167,5 +171,213 @@ impl History {
             Some((pages, charge)) => pages.page_dropped(&mut |b| charge.resize(b)),
             None => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Error;
+    use crate::access::{GraphAccess, Preparation};
+    use crate::error::Result;
+    use crate::sparql::update::update;
+    use crate::sparql::{
+        CursorOptions, FallbackPolicy, QueryCursor, QueryOptions, select_source_cursor,
+    };
+    use crate::store::{ChangeLogSettings, Store};
+    use crate::task::Control;
+    use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const QUERY: &str = "PREFIX hist: <urn:x-sparkles:history#>
+        SELECT ?s ?p ?o ?op ?c { SERVICE hist:changes {
+            << ?s ?p ?o >> hist:op ?op ; hist:commit ?c
+        } }";
+
+    type AdmissionObserver = Box<dyn FnMut(u64)>;
+
+    thread_local! {
+        static ADMISSION_OBSERVER: RefCell<Option<AdmissionObserver>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn observe_admission(bytes: u64) {
+        ADMISSION_OBSERVER.with_borrow_mut(|observer| {
+            if let Some(observer) = observer {
+                observer(bytes);
+            }
+        });
+    }
+
+    struct ObserveAdmission;
+
+    impl ObserveAdmission {
+        fn new(observer: impl FnMut(u64) + 'static) -> Self {
+            ADMISSION_OBSERVER.with_borrow_mut(|slot| {
+                assert!(slot.is_none());
+                *slot = Some(Box::new(observer));
+            });
+            Self
+        }
+    }
+
+    impl Drop for ObserveAdmission {
+        fn drop(&mut self) {
+            ADMISSION_OBSERVER.with_borrow_mut(|slot| *slot = None);
+        }
+    }
+
+    fn fill_log(store: &Store) {
+        store.change_log().unwrap().set_background(false);
+        let body: String = (0..4_200)
+            .map(|j| format!("<urn:s> <urn:p> {j} . "))
+            .collect();
+        update(
+            store,
+            &format!("INSERT DATA {{ {body} }}"),
+            &Default::default(),
+        )
+        .unwrap();
+        store.flush_change_log().unwrap();
+    }
+
+    fn strict() -> CursorOptions {
+        CursorOptions {
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        }
+    }
+
+    fn pull_with_stop(
+        cursor: &mut QueryCursor,
+        stop: impl FnOnce() + 'static,
+    ) -> (Result<Option<usize>>, usize) {
+        let admissions_after_stop = Rc::new(Cell::new(None));
+        let count = admissions_after_stop.clone();
+        let mut stop = Some(stop);
+        let observer = ObserveAdmission::new(move |bytes| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            } else if bytes != 0 {
+                count.set(Some(0));
+                stop.take().unwrap()();
+            }
+        });
+        let result = cursor
+            .next_batch()
+            .map(|batch| batch.map(|batch| batch.len()));
+        drop(observer);
+        let admissions_after_stop = admissions_after_stop
+            .get()
+            .expect("the first nonzero admission must occur during the pull");
+        assert_eq!(cursor.stats().emitted_rows, 0);
+        assert!(cursor.next_batch().unwrap().is_none());
+        (result, admissions_after_stop)
+    }
+
+    fn disable_log(store: &Store) {
+        store
+            .set_change_log_settings(ChangeLogSettings {
+                enabled: Some(false),
+                ..Default::default()
+            })
+            .expect("the failed pull must have released the writable pin");
+    }
+
+    #[test]
+    fn checked_history_cursor_stops_during_record_admission() {
+        let mut results = Vec::new();
+        for persistent in [false, true] {
+            for max_rows in [None, Some(1)] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = if persistent {
+                    Store::open(dir.path(), Default::default()).unwrap()
+                } else {
+                    Store::in_memory(Default::default())
+                };
+                fill_log(&store);
+                let flag = Arc::new(AtomicBool::new(false));
+                let preparation =
+                    Preparation::new(Control::with_cancel(flag.clone()), 64 << 20).unwrap();
+                let policy = Arc::new(GraphAccess::all());
+                let view = store.prepare_read(policy.clone(), &preparation).unwrap();
+                let baseline = preparation.inner_used();
+                let mut cursor = select_source_cursor(
+                    view.read_source(),
+                    &store,
+                    QUERY,
+                    &QueryOptions {
+                        graphs: Some(policy),
+                        max_rows,
+                        ..Default::default()
+                    },
+                    &strict(),
+                )
+                .unwrap();
+                let (result, later_admissions) =
+                    pull_with_stop(&mut cursor, move || flag.store(true, Ordering::Relaxed));
+                disable_log(&store);
+                drop(cursor);
+                assert_eq!(preparation.inner_used(), baseline);
+                results.push((persistent, max_rows, result, later_admissions));
+            }
+        }
+        assert!(
+            results.iter().all(
+                |(_, _, result, later)| matches!(result, Err(Error::Cancelled)) && *later == 0
+            ),
+            "each case must cancel without admitting more bytes: {results:?}"
+        );
+    }
+
+    #[test]
+    fn checked_history_cursor_keeps_source_deadline_during_page_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), Default::default()).unwrap();
+        fill_log(&store);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let preparation = Preparation::new(
+            Control {
+                deadline: Some(deadline),
+                ..Control::none()
+            },
+            64 << 20,
+        )
+        .unwrap();
+        let policy = Arc::new(GraphAccess::all());
+        let view = store.prepare_read(policy.clone(), &preparation).unwrap();
+        let baseline = preparation.inner_used();
+        let mut cursor = select_source_cursor(
+            view.read_source(),
+            &store,
+            QUERY,
+            &QueryOptions {
+                graphs: Some(policy),
+                max_rows: Some(1),
+                deadline: Some(deadline + Duration::from_secs(60)),
+                ..Default::default()
+            },
+            &strict(),
+        )
+        .unwrap();
+        cursor
+            .deadline_pause()
+            .store(60_000_000_000, Ordering::Relaxed);
+        let source = preparation.clone();
+        let (result, later_admissions) = pull_with_stop(&mut cursor, move || {
+            source
+                .check()
+                .expect("the deadline must still be live at admission");
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+            assert!(matches!(source.check(), Err(Error::Timeout)));
+        });
+        disable_log(&store);
+        drop(cursor);
+        assert_eq!(preparation.inner_used(), baseline);
+        assert!(
+            matches!(result, Err(Error::Timeout)) && later_admissions == 0,
+            "the source deadline must stop admission: {result:?}, {later_admissions} later admissions"
+        );
     }
 }

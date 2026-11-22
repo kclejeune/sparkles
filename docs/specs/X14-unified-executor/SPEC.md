@@ -1310,11 +1310,12 @@ batch cap does not bound their retained state. An in-process SERVICE call clears
 target's pool alongside inheriting the caller's grant so an unpooled caller keeps its
 unpooled accounting domain and a pooled caller charges only its own grant, and
 `Service::fill` polls stop conditions between remote solutions, before cache
-publication and across cached and local rows. The history reader refreshes
-`HistoryPages`'s deadline from `ctx.current_deadline()` before each page pull so
-credited consumer pauses extend later page scans, normalizes a zero internal page
-budget to one matching change, and polls stop controls inside writable record reads,
-CRC, footprint, decoding, filtered scans and row conversion. Read-only paging skips
+publication and across cached and local rows. The history reader uses the same execution
+check in writable and read-only pages and when converting changes to rows. Both page
+backends poll during record reads, CRC, footprint calculation, decoding and filtering.
+Consumer wait credit still extends ordinary query deadlines. A checked source retains
+its original cancellation controls and absolute source and query deadlines. A zero
+internal page budget asks for at least one matching change. Read-only paging skips
 segments above the clamped upper commit bound and stops once a validated record covers
 that bound, while [item 1175](../../ROADMAP.md) retains the valid-prefix limitation for
 earlier records in an overlapping segment.

@@ -1973,6 +1973,10 @@ impl ChangeLog {
                         if is_paged && idx.is_multiple_of(CHECK_STRIDE) {
                             check()?;
                         }
+                        #[cfg(test)]
+                        if is_paged {
+                            settings_format_tests::observe_paged_filter();
+                        }
                         if filter.matches(k) && !visit(c, *add, k)? {
                             stop = true;
                             break;
@@ -2561,6 +2565,38 @@ pub(crate) fn quad_key(q: &Quad) -> QuadKey {
 #[cfg(test)]
 mod settings_format_tests {
     use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        static PAGED_FILTER_EVALUATIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn observe_paged_filter() {
+        PAGED_FILTER_EVALUATIONS.with(|count| {
+            if let Some(n) = count.get() {
+                count.set(Some(n + 1));
+            }
+        });
+    }
+
+    struct CountPagedFilters;
+
+    impl CountPagedFilters {
+        fn new() -> Self {
+            PAGED_FILTER_EVALUATIONS.with(|count| assert!(count.replace(Some(0)).is_none()));
+            Self
+        }
+
+        fn get(&self) -> usize {
+            PAGED_FILTER_EVALUATIONS.with(|count| count.get().unwrap())
+        }
+    }
+
+    impl Drop for CountPagedFilters {
+        fn drop(&mut self) {
+            PAGED_FILTER_EVALUATIONS.with(|count| count.set(None));
+        }
+    }
 
     #[test]
     fn a_newer_change_log_file_is_refused() {
@@ -2721,28 +2757,43 @@ mod settings_format_tests {
             .collect();
         let many_changes_frame = encode(&Record::Changes(test_commit(3, None, None), many_changes));
         let many_changes_body = &many_changes_frame[8..];
-        let mut mc_polls = 0usize;
         assert!(
-            decode_admitted_checked(many_changes_body, &mut || {
-                mc_polls += 1;
-                Ok(())
-            })
-            .unwrap()
-            .is_some()
+            decode_admitted_checked(many_changes_body, &mut || Ok(()))
+                .unwrap()
+                .is_some()
         );
-        assert!(
-            mc_polls >= 3_000 / CHECK_STRIDE + 3,
-            "expected >= {} change-loop polls, got {mc_polls}",
-            3_000 / CHECK_STRIDE + 3
-        );
-        let mut n = 0usize;
-        assert!(matches!(
-            decode_admitted_checked(many_changes_body, &mut || {
-                n += 1;
-                if n == 4 { Err(Error::Timeout) } else { Ok(()) }
-            }),
-            Err(Error::Timeout)
-        ));
+        // Four polls precede the change loop. Its second poll must occur after
+        // decoding change 1,023 and before decoding change 1,024.
+        let change_bytes = 5;
+        let changes_start = many_changes_body.len() - 3_000 * change_bytes;
+        for index in [1_023, 1_024] {
+            let mut damaged = many_changes_body.to_vec();
+            damaged[changes_start + index * change_bytes + 4] = 99;
+            assert!(matches!(
+                decode_admitted_checked(&damaged, &mut || Ok(())),
+                Ok(None)
+            ));
+            let mut polls = 0;
+            let result = decode_admitted_checked(&damaged, &mut || {
+                polls += 1;
+                if polls == 6 {
+                    Err(Error::Timeout)
+                } else {
+                    Ok(())
+                }
+            });
+            if index == 1_023 {
+                assert!(
+                    matches!(result, Ok(None)),
+                    "damage must precede the stride poll"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(Error::Timeout)),
+                    "the decode stride poll must precede damage"
+                );
+            }
+        }
 
         // 4. Large author and message (256 KiB each): UTF-8 and copy walks poll every <= 64 KiB.
         let big_meta_frame = encode(&Record::Summary(test_commit(
@@ -2805,7 +2856,7 @@ mod settings_format_tests {
             ],
         };
         let mut visited = 0usize;
-        let mut scan_polls = 0usize;
+        let evaluated = CountPagedFilters::new();
         let mut admit = |_: u64| Ok(());
         let mut full = |_: u64| false;
         log.scan(
@@ -2814,10 +2865,7 @@ mod settings_format_tests {
             &reject_all,
             false,
             false,
-            &mut || {
-                scan_polls += 1;
-                Ok(())
-            },
+            &mut || Ok(()),
             Some(&mut PageHooks {
                 admit: &mut admit,
                 full: &mut full,
@@ -2829,15 +2877,12 @@ mod settings_format_tests {
         )
         .unwrap();
         assert_eq!(visited, 0, "filter must reject every change");
-        assert!(
-            scan_polls >= 3_500 / CHECK_STRIDE + 3,
-            "expected filtered-change polls, got {scan_polls}"
-        );
-        // Verify cancelling mid-filter-loop stops with Cancelled.
-        let cancel_poll = scan_polls - 2;
-        let mut polls_to_cancel = 0usize;
-        let mut admit2 = |_: u64| Ok(());
-        let mut full2 = |_: u64| false;
+        // One of the initial changes is also in the generated range.
+        assert_eq!(evaluated.get(), 3_501);
+        drop(evaluated);
+
+        let evaluated = CountPagedFilters::new();
+        let mut released = false;
         let res = log.scan(
             1,
             1,
@@ -2845,21 +2890,35 @@ mod settings_format_tests {
             false,
             false,
             &mut || {
-                polls_to_cancel += 1;
-                if polls_to_cancel == cancel_poll {
+                if evaluated.get() == 1_024 {
                     Err(Error::Cancelled)
                 } else {
                     Ok(())
                 }
             },
             Some(&mut PageHooks {
-                admit: &mut admit2,
-                full: &mut full2,
+                admit: &mut |bytes| {
+                    released |= bytes == 0;
+                    Ok(())
+                },
+                full: &mut full,
             }),
-            &mut |_, _, _| Ok(true),
+            &mut |_, _, _| {
+                visited += 1;
+                Ok(true)
+            },
         );
-        assert!(matches!(res, Err(Error::Cancelled)));
-        assert_eq!(polls_to_cancel, cancel_poll);
+        assert!(
+            matches!(res, Err(Error::Cancelled)),
+            "the filter stride poll must stop the scan: {res:?}"
+        );
+        assert_eq!(evaluated.get(), 1_024);
+        assert_eq!(visited, 0);
+        assert!(
+            !released,
+            "the scan must stop before its record release admission"
+        );
+        drop(evaluated);
 
         // 6. Malformed trailing reference: Ok(None) without stop, Cancelled if stopped earlier.
         let mut bad_body = many_changes_body.to_vec();

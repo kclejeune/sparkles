@@ -195,11 +195,6 @@ impl HistoryPages {
         self.done
     }
 
-    /// Refresh the query deadline, for example after a consumer pause was credited.
-    pub(crate) fn set_deadline(&mut self, deadline: Option<Instant>) {
-        self.q.deadline = deadline;
-    }
-
     /// What the reader keeps allocated between pages: for a read-only log read newest
     /// first, the offsets of a segment's records.
     fn kept_bytes(&self) -> u64 {
@@ -212,16 +207,28 @@ impl HistoryPages {
         resize(self.kept_bytes())
     }
 
-    /// The next page, of at least `budget` changes unless the range ends, and at most
-    /// `limit`: a page that reaches `limit` is `truncated`, and ends the read. A zero
-    /// page budget means at least one matching change, with whole commits still retained.
-    /// `admit` is told the bytes the page holds before each allocation. The page stops
-    /// before it reads a record of a commit after the budget is met. An empty page ends
-    /// the read, and the pin goes with the read's end.
+    #[cfg(test)]
     pub(crate) fn next(
         &mut self,
         budget: usize,
         limit: usize,
+        admit: &mut Admit<'_>,
+    ) -> Result<Page> {
+        self.next_checked(budget, limit, None, admit)
+    }
+
+    /// The next page has at least `budget` changes unless the range ends. A zero budget
+    /// means at least one matching change. The pager keeps whole commits until it meets
+    /// the budget or reaches `limit`. Reaching `limit` truncates and ends the read. A live
+    /// page with a zero limit terminates before any reads or admission.
+    /// `admit` receives the bytes the page holds before each allocation. The pager uses
+    /// the supplied stop check throughout the page, or the history query's own controls
+    /// when no check is supplied. The pin goes with the read's end.
+    pub(crate) fn next_checked(
+        &mut self,
+        budget: usize,
+        limit: usize,
+        check: Option<&dyn Fn() -> Result<()>>,
         admit: &mut Admit<'_>,
     ) -> Result<Page> {
         let budget = budget.max(1);
@@ -231,9 +238,7 @@ impl HistoryPages {
                 truncated: false,
             });
         }
-        self.q.check()?;
         if limit == 0 {
-            // the page has reached its limit before it reads anything
             self.done = true;
             self.pin = None;
             return Ok(Page {
@@ -241,6 +246,10 @@ impl HistoryPages {
                 truncated: true,
             });
         }
+        let q = &self.q;
+        let query_check = || q.check();
+        let check = check.unwrap_or(&query_check);
+        check()?;
         let held = Held {
             page: Cell::new(0),
             record: Cell::new(0),
@@ -249,7 +258,6 @@ impl HistoryPages {
             len: Cell::new(0),
             admit: std::cell::RefCell::new(admit),
         };
-        let q = &self.q;
         let access = q.access.as_ref().filter(|a| !a.reads_everything());
         let mut readable: FxHashMap<Arc<[u8]>, bool> = FxHashMap::default();
         let mut changes: Vec<HistoryChange> = Vec::new();
@@ -266,7 +274,7 @@ impl HistoryPages {
             stop
         };
         let mut visit = |c: &Arc<ChangeCommit>, add: bool, k: &QuadKey| -> Result<bool> {
-            q.check()?;
+            check()?;
             if current.get() != Some(c.seq) {
                 if current.get().is_some() && changes.len() >= budget {
                     resume.set(Some(c.seq));
@@ -289,7 +297,7 @@ impl HistoryPages {
                         let new = memo_table_bytes(readable.capacity() + 1);
                         held.memo.set(memo + new);
                         held.admit()?;
-                        q.check()?;
+                        check()?;
                         readable.try_reserve(1).map_err(|_| {
                             Error::HistoryUnsupported(
                                 "history access memo allocation was refused".into(),
@@ -299,7 +307,7 @@ impl HistoryPages {
                     }
                     held.memo.set(memo);
                     held.admit()?;
-                    q.check()?;
+                    check()?;
                 }
                 if !visible_key(a, &mut readable, k) {
                     return Ok(true);
@@ -324,17 +332,17 @@ impl HistoryPages {
                 let grown = held.page.get() + more as u64 * size;
                 held.page.set(grown + old);
                 held.admit()?;
-                q.check()?;
+                check()?;
                 changes.try_reserve_exact(more).map_err(|_| {
                     Error::HistoryUnsupported("history page allocation was refused".into())
                 })?;
                 held.page.set(grown);
                 held.admit()?;
-                q.check()?;
+                check()?;
             }
             held.page.set(held.page.get() + add_bytes);
             held.admit()?;
-            q.check()?;
+            check()?;
             if let Some(quad) = key_quad(k) {
                 changes.push(HistoryChange {
                     commit: c.clone(),
@@ -350,7 +358,7 @@ impl HistoryPages {
             }
             Ok(true)
         };
-        let mut check = || q.check();
+        let mut storage_check = check;
         let ro_ended = if let Some(reader) = &self.log.readonly {
             reader.page(
                 &mut self.ro,
@@ -359,7 +367,7 @@ impl HistoryPages {
                 &self.filter,
                 q.descending,
                 budget,
-                &mut check,
+                &mut storage_check,
                 &held,
                 &mut visit,
             )?
@@ -371,7 +379,7 @@ impl HistoryPages {
                 &self.filter,
                 q.descending,
                 false,
-                &mut check,
+                &mut storage_check,
                 Some(&mut PageHooks {
                     admit: &mut admit_record,
                     full: &mut full,
@@ -384,7 +392,8 @@ impl HistoryPages {
         // the memo goes with the page's read
         drop(readable);
         held.memo.set(0);
-        self.q.check()?;
+        let _ = held.record(0);
+        check()?;
         let ended = if self.log.readonly.is_some() {
             ro_ended
         } else {
@@ -404,7 +413,6 @@ impl HistoryPages {
             self.done = true;
             self.pin = None;
         }
-        let _ = held.record(0);
         Ok(Page { changes, truncated })
     }
 }
@@ -1447,10 +1455,34 @@ mod tests {
                 let extra = pages.next(0, usize::MAX, &mut |_| Ok(())).unwrap();
                 assert!(extra.changes.is_empty() && !extra.truncated && pages.done());
 
-                // limit == 0 is terminal and truncated
-                let mut lim0 = log.pages(q.clone(), 4).unwrap();
-                let p0 = lim0.next(0, 0, &mut |_| Ok(())).unwrap();
+                // A zero limit ends a live range even with cancellation pending.
+                let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let mut lim0 = log
+                    .pages(
+                        HistoryQuery {
+                            cancel: Some(cancel.clone()),
+                            ..q
+                        },
+                        4,
+                    )
+                    .unwrap();
+                assert!(!lim0.done());
+                assert_eq!(lim0.pin.is_some(), log.readonly.is_none());
+                cancel.store(true, Ordering::Relaxed);
+                let mut admissions = 0;
+                let mut admit = |_| {
+                    admissions += 1;
+                    Ok(())
+                };
+                let p0 = lim0.next(0, 0, &mut admit).unwrap_or_else(|err| {
+                    panic!("{kind} descending={descending}: zero limit must terminate: {err}")
+                });
                 assert!(p0.changes.is_empty() && p0.truncated && lim0.done());
+                assert!(lim0.pin.is_none());
+                assert!(log.pins.lock().is_empty());
+                let extra = lim0.next(1, 1, &mut admit).unwrap();
+                assert!(extra.changes.is_empty() && !extra.truncated && lim0.done());
+                assert_eq!(admissions, 0);
 
                 // filter matching no rows returns a terminal empty page
                 let none_q = HistoryQuery {
@@ -1584,29 +1616,31 @@ mod tests {
         }
     }
 
-    /// Updating `HistoryPages::set_deadline` to `None` clears an expired deadline without
-    /// weakening the original cancellation source.
     #[test]
-    fn set_deadline_clears_expired_deadline_while_preserving_cancellation() {
+    fn pager_only_next_preserves_query_stop_controls() {
         use std::sync::atomic::AtomicBool;
 
         let s = Store::in_memory(options());
         fill(&s);
         let log = s.change_log().unwrap().clone();
-        let cancel = Arc::new(AtomicBool::new(false));
         let q = HistoryQuery {
-            cancel: Some(cancel.clone()),
             deadline: Some(Instant::now() - Duration::from_secs(1)),
             ..Default::default()
         };
         let mut pages = log.pages(q, 36).unwrap();
+        assert!(!pages.done());
         assert!(matches!(
             pages.next(3, usize::MAX, &mut |_| Ok(())),
             Err(Error::Timeout)
         ));
-        pages.set_deadline(None);
-        let page = pages.next(3, usize::MAX, &mut |_| Ok(())).unwrap();
-        assert!(!page.changes.is_empty());
+        drop(pages);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let q = HistoryQuery {
+            cancel: Some(cancel.clone()),
+            ..Default::default()
+        };
+        let mut pages = log.pages(q, 36).unwrap();
         assert!(!pages.done());
         cancel.store(true, Ordering::Relaxed);
         assert!(matches!(
