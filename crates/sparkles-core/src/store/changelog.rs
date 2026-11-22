@@ -56,6 +56,8 @@
 //!
 //! In-memory stores keep the same records in memory.
 
+#[cfg(test)]
+pub(super) mod open_tests;
 mod pager;
 mod readonly;
 
@@ -463,8 +465,8 @@ pub(super) struct Footprint {
     pub(super) changes: u64,
 }
 
-/// Maximum term or change entries processed between cooperative cancellation polls in
-/// admitted history reads and decoding.
+/// Maximum entries processed between cooperative cancellation polls in history
+/// reads and decoding.
 const CHECK_STRIDE: usize = 1024;
 
 pub(super) fn footprint_checked(
@@ -694,6 +696,8 @@ fn crc32_checked(body: &[u8], check: &mut dyn FnMut() -> Result<()>) -> Result<u
     let mut crc = flate2::Crc::new();
     for chunk in body.chunks(64 << 10) {
         check()?;
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::IndexCrcChunk);
         crc.update(chunk);
     }
     check()?;
@@ -764,6 +768,25 @@ struct RecEntry {
     ts: i64,
     /// a summary or gap record: its commits' changes are not recorded
     hole: Option<(u64, UnrecordedReason)>,
+}
+
+impl RecEntry {
+    fn decode(c: &mut Cur<'_>) -> Option<Self> {
+        let seq = c.u64()?;
+        let offset = c.u64()?;
+        let ts = c.u64()? as i64;
+        let hole = match c.u8()? {
+            0 => None,
+            1 => Some((c.u64()?, UnrecordedReason::Bulk)),
+            _ => Some((c.u64()?, UnrecordedReason::Gap)),
+        };
+        Some(Self {
+            seq,
+            offset,
+            ts,
+            hole,
+        })
+    }
 }
 
 /// The index of one segment.
@@ -868,44 +891,74 @@ impl SegIndex {
 
     /// Decode an index file: (first, last, index).
     fn decode(b: &[u8], dataset_id: uuid::Uuid) -> Option<(u64, u64, SegIndex)> {
+        Self::decode_with(b, dataset_id, None).ok().flatten()
+    }
+
+    fn decode_with(
+        b: &[u8],
+        dataset_id: uuid::Uuid,
+        mut check: Option<&mut dyn FnMut() -> Result<()>>,
+    ) -> Result<Option<(u64, u64, SegIndex)>> {
         if b.len() < IDX_HEADER || &b[0..8] != IDX_MAGIC {
-            return None;
+            return Ok(None);
         }
         let u32_at = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
         let u64_at = |i: usize| u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
         if u32_at(8) != FORMAT || b[16..32] != *dataset_id.as_bytes() {
-            return None;
+            return Ok(None);
         }
         let (first, last) = (u64_at(32), u64_at(40));
         let (nrecs, nposts) = (u32_at(48) as usize, u32_at(52) as usize);
         let body = &b[IDX_HEADER..];
-        if crc32(body) != u32_at(56) {
-            return None;
+        let actual_crc = match check.as_deref_mut() {
+            Some(check) => crc32_checked(body, check)?,
+            None => {
+                #[cfg(test)]
+                open_tests::observe(open_tests::Event::IndexCrcChunk);
+                crc32(body)
+            }
+        };
+        if actual_crc != u32_at(56) {
+            return Ok(None);
         }
         let mut c = Cur { b: body, i: 0 };
         let mut ix = SegIndex::default();
-        for _ in 0..nrecs {
-            let seq = c.u64()?;
-            let offset = c.u64()?;
-            let ts = c.u64()? as i64;
-            let hole = match c.u8()? {
-                0 => None,
-                1 => Some((c.u64()?, UnrecordedReason::Bulk)),
-                _ => Some((c.u64()?, UnrecordedReason::Gap)),
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::IndexRecords);
+        for idx in 0..nrecs {
+            if idx.is_multiple_of(CHECK_STRIDE)
+                && let Some(check) = check.as_deref_mut()
+            {
+                check()?;
+            }
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexRecord);
+            let Some(entry) = RecEntry::decode(&mut c) else {
+                return Ok(None);
             };
-            ix.recs.push(RecEntry {
-                seq,
-                offset,
-                ts,
-                hole,
-            });
+            ix.recs.push(entry);
         }
-        for _ in 0..nposts {
-            let h = c.u64()?;
-            let o = u32::from_le_bytes(c.bytes(4)?.try_into().ok()?);
+        for idx in 0..nposts {
+            if idx.is_multiple_of(CHECK_STRIDE)
+                && let Some(check) = check.as_deref_mut()
+            {
+                check()?;
+            }
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexPosting);
+            let Some((h, raw)) = c.u64().zip(c.bytes(4)) else {
+                return Ok(None);
+            };
+            let o = u32::from_le_bytes(raw.try_into().unwrap());
             ix.postings.push((h, o));
         }
-        (c.i == body.len()).then_some((first, last, ix))
+        if c.i != body.len() {
+            return Ok(None);
+        }
+        if let Some(check) = check {
+            check()?;
+        }
+        Ok(Some((first, last, ix)))
     }
 }
 
@@ -1498,6 +1551,15 @@ impl ChangeLog {
 
     /// The index of segment `i`.
     fn index(&self, inner: &mut Inner, i: usize) -> Result<Arc<SegIndex>> {
+        self.index_with(inner, i, None)
+    }
+
+    fn index_with(
+        &self,
+        inner: &mut Inner,
+        i: usize,
+        mut check: Option<&mut dyn FnMut() -> Result<()>>,
+    ) -> Result<Arc<SegIndex>> {
         if let Some(ix) = &inner.segs[i].index {
             return Ok(ix.clone());
         }
@@ -1511,13 +1573,49 @@ impl ChangeLog {
         let path = inner.segs[i]
             .idx_path()
             .expect("a sealed persistent segment");
-        let b = std::fs::read(&path)?;
-        let (_, _, ix) = SegIndex::decode(&b, self.dataset_id)
+        let b = match check.as_deref_mut() {
+            Some(check) => Self::read_index_checked(&path, check)?,
+            None => {
+                #[cfg(test)]
+                open_tests::observe(open_tests::Event::IndexReadAttempt);
+                let bytes = std::fs::read(&path)?;
+                #[cfg(test)]
+                open_tests::observe(open_tests::Event::IndexReadChunk);
+                bytes
+            }
+        };
+        let (_, _, ix) = SegIndex::decode_with(&b, self.dataset_id, check)?
             .ok_or_else(|| Error::Corrupt(format!("{}: damaged index", path.display())))?;
         let ix = Arc::new(ix);
         inner.cache.push_front((first, ix.clone()));
         inner.cache.truncate(INDEX_CACHE);
         Ok(ix)
+    }
+
+    /// Read the entire sidecar, polling before each read and every interrupted retry.
+    fn read_index_checked(path: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<Vec<u8>> {
+        check()?;
+        let mut file = File::open(path)?;
+        let mut bytes = Vec::new();
+        let mut chunk = [0; 64 << 10];
+        loop {
+            check()?;
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::IndexReadAttempt);
+            match file.read(&mut chunk) {
+                Ok(0) => return Ok(bytes),
+                Ok(n) => {
+                    bytes.try_reserve(n).map_err(|error| {
+                        std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+                    })?;
+                    bytes.extend_from_slice(&chunk[..n]);
+                    #[cfg(test)]
+                    open_tests::observe(open_tests::Event::IndexReadChunk);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
     }
 
     /// Read the record of segment `i` at `offset`.
@@ -1792,20 +1890,30 @@ impl ChangeLog {
         let mut inner = self.inner.lock();
         let mut best = None;
         for i in 0..inner.segs.len() {
-            let ix = self.index(&mut inner, i)?;
+            check()?;
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::TimestampIndex);
+            let ix = self.index_with(&mut inner, i, Some(check))?;
             let n = ix.recs.partition_point(|r| r.ts <= ms);
             // a gap tells no time of its own
-            if let Some(r) = ix.recs[..n]
-                .iter()
-                .rev()
-                .find(|r| !matches!(r.hole, Some((_, UnrecordedReason::Gap))))
-            {
-                best = Some(r.seq);
+            for (idx, r) in ix.recs[..n].iter().rev().enumerate() {
+                if idx != 0 && idx.is_multiple_of(CHECK_STRIDE) {
+                    check()?;
+                }
+                #[cfg(test)]
+                open_tests::observe(open_tests::Event::TimestampRecord);
+                if !matches!(r.hole, Some((_, UnrecordedReason::Gap))) {
+                    best = Some(r.seq);
+                    break;
+                }
             }
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::TimestampIndexed);
             if n < ix.recs.len() {
                 break;
             }
         }
+        check()?;
         Ok(best)
     }
 

@@ -1128,6 +1128,8 @@ fn decode_checked_with<'a>(
             // trailing reference must not expose a partial changes record.
             for _ in 0..count {
                 check()?;
+                #[cfg(test)]
+                open_tests::observe(open_tests::Event::ReadOnlyReference(seq));
                 if c.u8().is_none() {
                     return Ok(None);
                 }
@@ -1249,6 +1251,8 @@ impl ReadOnlyLog {
         ms: i64,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<u64>> {
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::ReadOnlyTimestamp);
         let mut best = None;
         self.walk(self.head, check, &mut |_, _, record, _| {
             // Match the ordinary index's last recorded commit at or before time;

@@ -60,17 +60,40 @@ impl ChangeLog {
 
     /// Start reading `q` in pages over the commits up to `upto`. The checks, the flush
     /// and the resolution of the range are those of [`ChangeLog::query`], made once.
+    #[cfg(test)]
     pub(crate) fn pages(self: &Arc<Self>, q: HistoryQuery, upto: u64) -> Result<HistoryPages> {
         self.pages_hooked(q, upto, &mut || Ok(()), &mut || Ok(()))
+    }
+
+    /// Start the lazy cursor's history read with its full execution controls.
+    pub(crate) fn pages_checked(
+        self: &Arc<Self>,
+        q: HistoryQuery,
+        upto: u64,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<HistoryPages> {
+        self.open_pages(q, upto, Some(check), &mut || Ok(()), &mut || Ok(()))
     }
 
     /// [`ChangeLog::pages`], calling `after_prepare` once the flush is done and before
     /// the range is pinned, and `after_range` once the range is resolved and before it
     /// is pinned, which tests use to run retention or a change of settings there.
+    #[cfg(test)]
     fn pages_hooked(
         self: &Arc<Self>,
         q: HistoryQuery,
         upto: u64,
+        after_prepare: &mut dyn FnMut() -> Result<()>,
+        after_range: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<HistoryPages> {
+        self.open_pages(q, upto, None, after_prepare, after_range)
+    }
+
+    fn open_pages(
+        self: &Arc<Self>,
+        q: HistoryQuery,
+        upto: u64,
+        check: Option<&dyn Fn() -> Result<()>>,
         after_prepare: &mut dyn FnMut() -> Result<()>,
         after_range: &mut dyn FnMut() -> Result<()>,
     ) -> Result<HistoryPages> {
@@ -81,7 +104,7 @@ impl ChangeLog {
         // (before `pins`, the lock order), which retention holds while it reads the
         // pins and drops segments: a retention pass that read them before has
         // finished, and every later one sees the pin.
-        let upto = self.prepare(&q, upto)?;
+        let upto = self.prepare(&q, upto, check)?;
         after_prepare()?;
         let hold = {
             let _inner = self.inner.lock();
@@ -91,8 +114,19 @@ impl ChangeLog {
         // `pins` locked, so it either finished before the pin and is seen here, or sees
         // the pin and is refused. The bounds are resolved only against a log that stays.
         self.require_on()?;
-        let (from, to) = self.bounds(&q, upto)?;
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::HoldingPin);
+        let query_check = || q.check();
+        if let Some(check) = check {
+            check()?;
+        }
+        let (from, to) = self.bounds(&q, upto, check.unwrap_or(&query_check))?;
         after_range()?;
+        #[cfg(test)]
+        open_tests::observe(open_tests::Event::ResolvedBounds);
+        if let Some(check) = check {
+            check()?;
+        }
         // an empty range reads nothing and holds no pin
         let pin = (from <= to).then(|| self.pin(from)).flatten();
         drop(hold);

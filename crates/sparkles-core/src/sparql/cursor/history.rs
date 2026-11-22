@@ -96,7 +96,7 @@ impl History {
             let log = history_svc::change_log(ctx)?;
             let q = history_svc::history_query(ctx, spec);
             let charge = OwnedCharge::new(ctx, 0)?;
-            let pages = log.pages(q, ctx.snap.commit)?;
+            let pages = log.pages_checked(q, ctx.snap.commit, &|| ctx.check())?;
             self.rows = Some(RowMaker::new(spec, &self.node.vars));
             self.pages = Some((pages, charge));
         }

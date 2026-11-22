@@ -1311,7 +1311,9 @@ target's pool alongside inheriting the caller's grant so an unpooled caller keep
 unpooled accounting domain and a pooled caller charges only its own grant, and
 `Service::fill` polls stop conditions between remote solutions, before cache
 publication and across cached and local rows. The history reader uses the same execution
-check in writable and read-only pages and when converting changes to rows. Both page
+check when it opens on first demand, resolves timestamp bounds, reads pages and converts
+changes to rows. Writable timestamp lookup polls during cold index reads, CRC and
+decoding. Read-only timestamp lookup polls while walking the captured log. Both page
 backends poll during record reads, CRC, footprint calculation, decoding and filtering.
 Consumer wait credit still extends ordinary query deadlines. A checked source retains
 its original cancellation controls and absolute source and query deadlines. A zero
