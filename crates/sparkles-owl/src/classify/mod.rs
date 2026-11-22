@@ -224,9 +224,26 @@ pub struct Limits {
     pub charge: Option<std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync>>,
     /// a run with Tier D (roadmap item 603) that its deadline, cancellation or memory
     /// budget stops answers with what it proved, in a [`Classification`] whose
-    /// [`complete`](Classification::complete) is false, instead of failing. Runs of the
-    /// other tiers fail as before.
+    /// [`complete_for_taken`](Classification::complete_for_taken) is false, instead of
+    /// failing. Runs of the other tiers fail as before.
     pub partial: bool,
+    /// refuse a run that leaves an axiom out or uses one only in part with
+    /// [`Error::Incomplete`], after the run, as a complete reasoner such as HermiT
+    /// refuses what it does not support. The classifier keeps the run's state.
+    pub strict: bool,
+    /// decide, for a run that leaves axioms out, which classes keep their complete
+    /// answer, from their bottom-locality modules
+    /// ([`Classification::incomplete`]); false leaves every class incomplete and the
+    /// consistency unknown instead, for a caller that reads only the taxonomy, such as
+    /// ROBOT's commands. On by default.
+    pub coverage: bool,
+    /// the most axioms the modules' pass may look at, past which the classes it has not
+    /// decided are incomplete ([`Stats::coverage_over`]); by default
+    /// [`COVERAGE_WORK_PER_AXIOM`] for each axiom of the input
+    pub coverage_work: Option<usize>,
+    /// leave the modules' pass to the caller, which calls [`Classification::cover`]
+    /// after the run with the axioms it did not give the run as well
+    pub cover_later: bool,
     /// the expansion strategy of Tier D's Succ rule
     pub expansion: Expansion,
     /// the most conclusions, kept or redundant, that a run of Tier D with counting derives
@@ -360,6 +377,10 @@ impl Default for Limits {
             cancelled: None,
             charge: None,
             partial: false,
+            strict: false,
+            coverage: true,
+            coverage_work: None,
+            cover_later: false,
             expansion: Expansion::default(),
             dl_work: None,
             dl_attempt_work: None,
@@ -398,6 +419,9 @@ pub enum Error {
         limit: usize,
         used: usize,
     },
+    /// a strict run ([`Limits::strict`]) left out or used only in part these axioms, so
+    /// its answer would not be complete for the whole ontology
+    Incomplete(Vec<Excluded>),
 }
 
 impl std::fmt::Display for Error {
@@ -409,6 +433,7 @@ impl std::fmt::Display for Error {
                 f,
                 "classification needs more than its memory budget of {limit} bytes (at least {used})"
             ),
+            Error::Incomplete(excluded) => f.write_str(&refusal(excluded)),
         }
     }
 }
@@ -449,6 +474,20 @@ pub struct Stats {
     /// rooted run that close the stage
     pub marking: Duration,
     pub taxonomy: Duration,
+    /// the time the locality modules of a run that left axioms out took to decide which
+    /// classes keep their complete answer, 0 for a run that left nothing out
+    pub coverage: Duration,
+    /// the modules' pass passed its bound on work ([`Limits::coverage_work`]), so the
+    /// classes it had not decided are incomplete
+    pub coverage_over: bool,
+    /// the deadline or a cancellation stopped the modules' pass, so every class is
+    /// incomplete and the consistency unknown
+    pub coverage_stopped: bool,
+    /// the triples of the input that map to no axiom, such as a domain of
+    /// a property that is not declared, which the answer counts as left out
+    /// ([`Classification::leave_out_unmapped`]): at least one when the run did not read
+    /// the assertions, whose read stops at the first
+    pub unmapped: usize,
     /// the axioms outside OWL 2 EL, by what classifying them needs, with those the Horn
     /// rules of roadmap item 603 take; the others are left out and reported
     pub outside_el: OutsideEl,
@@ -523,15 +562,78 @@ pub struct Classification {
     pub consistent: bool,
     pub taxonomy: Taxonomy,
     pub stats: Stats,
-    /// false for the partial answer of a run that stopped ([`Limits::partial`]): its
-    /// subsumptions are entailed, and those of the classes not in
-    /// [`incomplete`](Classification::incomplete) are all that hold
+    /// whether every subsumption between named classes and every unsatisfiable class
+    /// that the whole ontology entails is in the taxonomy: false when the run left an
+    /// axiom out or used one only in part ([`Saturation::excluded`]) and for the partial
+    /// answer of a run that stopped ([`Limits::partial`]). Every subsumption the taxonomy
+    /// holds is entailed either way, and the classes not in
+    /// [`incomplete`](Classification::incomplete) have their complete answer.
     pub complete: bool,
-    /// the classes whose subsumers a partial answer may miss, in IRI order
+    /// whether the answer is complete for the axioms the run took: false only for the
+    /// partial answer of a run that stopped. This is what
+    /// [`complete`](Classification::complete) meant before it covered the axioms left
+    /// out, and it is the meaning of a profile reasoner such as ELK, which ignores the
+    /// axioms outside its fragment.
+    pub complete_for_taken: bool,
+    /// the classes whose superclasses, equivalent classes or satisfiability the answer
+    /// may miss, in IRI order: those a partial answer leaves open and those whose
+    /// bottom-locality module holds an axiom left out (see
+    /// [`transform::Coverage`](crate::transform::Coverage)). It can be empty while
+    /// [`complete`](Classification::complete) is false, when no class's answer depends on
+    /// what was left out.
     pub incomplete: Vec<Class>,
     /// whether the ontology has a model, as far as the run knows: a partial answer can
-    /// leave it unknown, and then no class is complete
+    /// leave it unknown, and so can an axiom left out that could make the ontology
+    /// inconsistent, and then no class is complete
     pub consistency: Consistency,
+    /// the first [`UNMAPPED_LISTED`] of the triples that
+    /// [`Stats::unmapped`] counts, in the order the input gave them, and whether there are
+    /// more ([`Classification::leave_out_unmapped`])
+    pub unmapped: Unmapped,
+}
+
+/// The most triples that map to no axiom that a classification lists; it counts the rest.
+pub const UNMAPPED_LISTED: usize = 100;
+
+/// Triples of the input that map to no axiom, counted, with the first
+/// [`UNMAPPED_LISTED`] kept in the order they were added. The OWL API calls such triples
+/// unparsed and reports them through its RDF parser's metadata.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unmapped {
+    pub count: usize,
+    pub triples: Vec<oxrdf::Triple>,
+    /// whether `count` is more than `triples` lists
+    pub truncated: bool,
+}
+
+impl Unmapped {
+    /// Counts `t`, and keeps it while fewer than [`UNMAPPED_LISTED`] are listed.
+    pub fn push(&mut self, t: &oxrdf::Triple) {
+        self.count += 1;
+        if self.triples.len() < UNMAPPED_LISTED {
+            self.triples.push(t.clone());
+        } else {
+            self.truncated = true;
+        }
+    }
+
+    /// Adds `other`'s count and keeps its triples after these, up to the cap.
+    pub fn merge(mut self, other: &Unmapped) -> Unmapped {
+        let room = UNMAPPED_LISTED - self.triples.len();
+        self.count += other.count;
+        self.truncated |= other.truncated || other.triples.len() > room;
+        self.triples
+            .extend(other.triples.iter().take(room).cloned());
+        self
+    }
+
+    /// Counts and keeps each of `ts`, in order.
+    pub fn extend<'a>(mut self, ts: impl IntoIterator<Item = &'a oxrdf::Triple>) -> Unmapped {
+        for t in ts {
+            self.push(t);
+        }
+        self
+    }
 }
 
 /// Whether the ontology has a model, as far as a run knows.
@@ -569,10 +671,275 @@ impl Classification {
             taxonomy: taxonomy.expect("a taxonomy was asked for"),
             stats,
             complete,
+            complete_for_taken: complete,
             incomplete,
             consistency,
+            unmapped: Unmapped::default(),
         }
     }
+
+    /// Takes account of the axioms the run over `axioms` left out or used only in part
+    /// (`excluded`) and of those of the ontology it was not given at all (`dropped`, such
+    /// as the assertions of a classification of the terminology alone): the answer is not
+    /// complete for the whole ontology when one is left out, and the classes whose module
+    /// holds one, or every class when the consistency is no longer known, join
+    /// [`incomplete`](Classification::incomplete).
+    ///
+    /// Any dropped axiom with logical content counts as left out, whether or not it could
+    /// change an answer: the answer is then not complete, every class is incomplete, a
+    /// consistency the run found is unknown, and the answer names that axiom for the
+    /// caller to report beside `excluded`. An inconsistency stays, since it holds for the
+    /// whole ontology too. A class that only a dropped axiom names is in no taxonomy, so
+    /// it is not in `incomplete` and shows only through `complete` and that axiom. A run
+    /// takes this pass itself unless [`Limits::cover_later`] leaves it to its caller.
+    /// Costs nothing when nothing is left out or dropped, and one read of the dropped
+    /// axioms up to the first with logical content when only they are.
+    ///
+    /// A pass that its deadline or cancellation stops leaves every class incomplete and
+    /// the consistency unknown, with [`Stats::coverage_stopped`] set, rather than throw
+    /// away the saturation: such an answer depends on timing.
+    pub fn cover(
+        &mut self,
+        axioms: &[&AxiomKind],
+        excluded: &[Excluded],
+        dropped: Option<&mut crate::transform::Dropped<'_>>,
+        limits: &Limits,
+    ) -> Option<Excluded> {
+        if excluded.is_empty() && dropped.is_none() {
+            return None;
+        }
+        let start = Instant::now();
+        if let Some(d) = dropped {
+            let Ok(witness) = first_logical(d, limits) else {
+                self.stats.coverage = start.elapsed();
+                self.stopped_pass();
+                return None;
+            };
+            if let Some(w) = witness {
+                self.stats.coverage = start.elapsed();
+                self.not_all_read();
+                return Some(not_read(w));
+            }
+            if excluded.is_empty() {
+                self.stats.coverage = start.elapsed();
+                return None;
+            }
+        }
+        self.complete = false;
+        // an inconsistency is sound, and every class's answer is then complete
+        if self.consistency == Consistency::Inconsistent {
+            return None;
+        }
+        // A partial answer that left the consistency unknown has every class open, and
+        // one that stopped is past its deadline, so neither takes the modules' pass,
+        // and neither does a run that asks for none: every class is then incomplete.
+        if self.consistency == Consistency::Unknown || !self.complete_for_taken || !limits.coverage
+        {
+            self.all_incomplete();
+            if self.consistency == Consistency::Consistent {
+                self.consistency = Consistency::Unknown;
+            }
+            return None;
+        }
+        let left: Vec<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
+        let budget = limits.coverage_work.unwrap_or_else(|| {
+            COVERAGE_WORK_PER_AXIOM
+                .saturating_mul(axioms.len())
+                .max(COVERAGE_WORK_MIN)
+        });
+        let stop = || poll(limits).is_err();
+        let c = crate::transform::coverage(
+            axioms,
+            &left,
+            self.consistency == Consistency::Consistent,
+            by_depth(&self.taxonomy),
+            budget,
+            &stop,
+        );
+        self.stats.coverage = start.elapsed();
+        let Ok(c) = c else {
+            self.stopped_pass();
+            return None;
+        };
+        if !c.consistency_known {
+            self.consistency = Consistency::Unknown;
+        }
+        self.stats.coverage_over = c.over_budget;
+        if !c.incomplete.is_empty() {
+            let mut all = std::mem::take(&mut self.incomplete);
+            all.extend(c.incomplete);
+            // The node of the unsatisfiable classes is exact only when every one of them
+            // is found, which an incomplete class may not be.
+            all.extend(
+                self.taxonomy
+                    .unsatisfiable()
+                    .filter(|k| k.as_str() != crate::vocab::OWL_NOTHING)
+                    .cloned(),
+            );
+            all.sort();
+            all.dedup();
+            self.incomplete = all;
+        }
+        None
+    }
+
+    /// Counts the triples of the input that map to no axiom (`u`) as left out: with any,
+    /// the answer is not complete, every class is incomplete and a consistency the run
+    /// found is unknown, since such a triple may carry any logical content. The count goes
+    /// to [`Stats::unmapped`] and the list to [`Classification::unmapped`], as no axiom of
+    /// [`Excluded`] can name them.
+    pub fn leave_out_unmapped(&mut self, u: Unmapped) {
+        if u.count > 0 {
+            self.unmapped = std::mem::take(&mut self.unmapped).merge(&u);
+            self.stats.unmapped = self.unmapped.count;
+            self.not_all_read();
+        }
+    }
+
+    /// The answer when the run did not read part of the ontology that may carry any
+    /// logical content: not complete, every class incomplete, and an inconsistency kept,
+    /// as it holds for the whole ontology too, but a consistency unknown.
+    fn not_all_read(&mut self) {
+        self.complete = false;
+        self.all_incomplete();
+        if self.consistency == Consistency::Consistent {
+            self.consistency = Consistency::Unknown;
+        }
+    }
+
+    /// The answer of a modules' pass that its deadline, its cancellation or its stream of
+    /// dropped axioms stopped: every class incomplete and the consistency unknown.
+    fn stopped_pass(&mut self) {
+        self.stats.coverage_stopped = true;
+        self.complete = false;
+        self.all_incomplete();
+        self.consistency = Consistency::Unknown;
+    }
+
+    /// Every class but owl:Thing and owl:Nothing incomplete, in IRI order.
+    fn all_incomplete(&mut self) {
+        let mut all: Vec<Class> = self
+            .taxonomy
+            .classes()
+            .filter(|c| {
+                !matches!(
+                    c.as_str(),
+                    crate::vocab::OWL_THING | crate::vocab::OWL_NOTHING
+                )
+            })
+            .cloned()
+            .collect();
+        all.sort();
+        all.dedup();
+        self.incomplete = all;
+    }
+}
+
+/// The first dropped axiom with logical content, or `Err` when the stream could not
+/// finish or the run's deadline or cancellation came first. Declarations and annotations
+/// have no logical content, and every other axiom has.
+fn first_logical(
+    d: &mut crate::transform::Dropped<'_>,
+    limits: &Limits,
+) -> Result<Option<AxiomKind>, ()> {
+    let mut first = None;
+    let mut seen = 0usize;
+    let mut stopped = false;
+    let finished = d(&mut |k| {
+        seen += 1;
+        if seen.is_multiple_of(4096) && poll(limits).is_err() {
+            stopped = true;
+            return false;
+        }
+        if logical(k) && !matches!(k, AxiomKind::Declaration(_)) {
+            first = Some(k.clone());
+            false
+        } else {
+            true
+        }
+    });
+    if stopped || !finished {
+        Err(())
+    } else {
+        Ok(first)
+    }
+}
+
+/// The rule of an axiom that a classification of the terminology alone did not read
+/// ([`Classification::cover`]).
+pub const NOT_READ: &str = "assertion-not-read";
+
+/// A dropped axiom that counts as left out, as the run reports it.
+fn not_read(axiom: AxiomKind) -> Excluded {
+    Excluded {
+        axiom,
+        gap: Gap::Outside {
+            rule: NOT_READ.to_string(),
+            message: "the classification read the terminology alone, and an assertion it \
+                did not read can change any class's answer or name a class the taxonomy \
+                lacks: classify with the assertions"
+                .to_string(),
+        },
+    }
+}
+
+/// The axioms the modules' pass of a run that left axioms out may look at for each axiom
+/// of the input by default ([`Limits::coverage_work`]), and the fewest the default allows
+/// in all.
+pub const COVERAGE_WORK_PER_AXIOM: usize = 1024;
+pub const COVERAGE_WORK_MIN: usize = 1 << 20;
+
+/// The classes of a taxonomy by the depth of their node, each node after its parents, and
+/// by IRI within a depth, so that the order depends on the taxonomy alone.
+fn by_depth(t: &Taxonomy) -> Vec<&Class> {
+    let nodes = t.nodes();
+    let mut waiting: Vec<usize> = nodes.iter().map(|n| n.parents.len()).collect();
+    let mut depth = vec![usize::MAX; nodes.len()];
+    let mut queue: std::collections::VecDeque<usize> =
+        (0..nodes.len()).filter(|&i| waiting[i] == 0).collect();
+    for &i in &queue {
+        depth[i] = 0;
+    }
+    while let Some(i) = queue.pop_front() {
+        for &c in &nodes[i].children {
+            waiting[c] = waiting[c].saturating_sub(1);
+            if waiting[c] == 0 {
+                depth[c] = depth[i] + 1;
+                queue.push_back(c);
+            }
+        }
+    }
+    let mut out: Vec<(usize, &Class)> = nodes
+        .iter()
+        .enumerate()
+        .flat_map(|(i, n)| n.classes.iter().map(move |c| (i, c)))
+        .map(|(i, c)| (depth[i], c))
+        .collect();
+    out.sort();
+    out.into_iter().map(|(_, c)| c).collect()
+}
+
+/// The message of a strict run's refusal ([`Error::Incomplete`]): how many axioms were
+/// left out or used only in part, and the first of them with the rule each breaks.
+pub fn refusal(excluded: &[Excluded]) -> String {
+    const SHOWN: usize = 10;
+    if excluded.is_empty() {
+        return "the classification would not be complete: the run stopped before it decided every class"
+            .to_string();
+    }
+    let mut m = format!(
+        "the classification would not be complete: it leaves out or uses only in part {} axiom{}",
+        excluded.len(),
+        if excluded.len() == 1 { "" } else { "s" }
+    );
+    for (i, e) in excluded.iter().take(SHOWN).enumerate() {
+        m.push_str(if i == 0 { ": " } else { "; " });
+        m.push_str(&e.describe());
+    }
+    if excluded.len() > SHOWN {
+        m.push_str(&format!("; and {} more", excluded.len() - SHOWN));
+    }
+    m
 }
 
 /// An axiom the classifier leaves out or uses only in part, and why.
@@ -580,6 +947,18 @@ impl Classification {
 pub struct Excluded {
     pub axiom: AxiomKind,
     pub gap: Gap,
+}
+
+impl Excluded {
+    /// The axiom in functional-style syntax, with the rule it breaks or what the
+    /// classifier misses of it.
+    pub fn describe(&self) -> String {
+        let ax = crate::ofn::Renderer::default().axiom(&Axiom::new(self.axiom.clone()));
+        match &self.gap {
+            Gap::Outside { rule, message } => format!("{ax} ({rule}: {message})"),
+            Gap::Partial(why) => format!("{ax} (used only in part: {why})"),
+        }
+    }
 }
 
 /// One axiom the classifier holds: how many times it is added now and was at the start
@@ -1236,9 +1615,28 @@ impl Classifier {
     pub fn classify(&mut self, limits: &Limits) -> Result<Classification, Error> {
         let r = self.run_held(limits, true);
         let partial = self.sat.partial.take();
-        r.map(|(consistent, taxonomy, stats)| {
+        let mut out = r.map(|(consistent, taxonomy, stats)| {
             Classification::new(consistent, taxonomy, stats, partial)
-        })
+        })?;
+        let excluded = self.sat.excluded();
+        if !excluded.is_empty() {
+            if limits.strict {
+                return Err(Error::Incomplete(excluded.to_vec()));
+            }
+            let held: Vec<&AxiomKind> = self
+                .axioms
+                .iter()
+                .filter(|(_, h)| h.count > 0)
+                .map(|(k, _)| k)
+                .collect();
+            if !limits.cover_later {
+                out.cover(&held, excluded, None, limits);
+            }
+        }
+        if limits.strict && !out.complete {
+            return Err(Error::Incomplete(excluded.to_vec()));
+        }
+        Ok(out)
     }
 
     /// Saturates the axioms held as [`classify`](Self::classify) does, again only what
@@ -1361,9 +1759,21 @@ impl Saturation {
     ) -> Result<Classification, Error> {
         let r = self.run_with(axioms, changes, 0, limits, true);
         let partial = self.partial.take();
-        r.map(|(consistent, taxonomy, stats)| {
+        let mut out = r.map(|(consistent, taxonomy, stats)| {
             Classification::new(consistent, taxonomy, stats, partial)
-        })
+        })?;
+        if !self.excluded.is_empty() {
+            if limits.strict {
+                return Err(Error::Incomplete(self.excluded.clone()));
+            }
+            if !limits.cover_later {
+                out.cover(axioms, &self.excluded, None, limits);
+            }
+        }
+        if limits.strict && !out.complete {
+            return Err(Error::Incomplete(self.excluded.clone()));
+        }
+        Ok(out)
     }
 
     /// Saturates `axioms` as [`classify`](Saturation::classify) does, but builds no
@@ -4194,7 +4604,7 @@ mod tests {
                     Err(e) => panic!("{threads} threads, poll {n}: {e:?}"),
                     Ok(out) => {
                         assert!(
-                            !out.complete,
+                            !out.complete_for_taken,
                             "{threads} threads, poll {n}: the saturation was not cancelled"
                         );
                         assert_eq!(out.consistency, Consistency::Unknown);
@@ -4210,6 +4620,260 @@ mod tests {
                 answered,
                 "{threads} threads: no poll reached the saturation"
             );
+        }
+    }
+
+    /// A strict run refuses a partial answer, which has no exclusion to name.
+    #[test]
+    fn a_strict_run_refuses_a_partial_answer() {
+        let doc = crate::ofn_read::parse(
+            "Prefix(:=<http://ex.org/>)
+             Ontology(
+             ClassAssertion(ObjectUnionOf(:B :C) :a)
+             ClassAssertion(ObjectComplementOf(:C) :a)
+             SubClassOf(:A ObjectSomeValuesFrom(:r ObjectOneOf(:a)))
+             SubClassOf(ObjectSomeValuesFrom(:r :B) :D)
+             )",
+        )
+        .unwrap();
+        for cover_later in [false, true] {
+            let mut refused = false;
+            for n in 0..64 {
+                let mut k = Classifier::of(&doc.axioms);
+                let polls = Arc::new(AtomicUsize::new(0));
+                let p = polls.clone();
+                let out = k.classify(&Limits {
+                    threads: 1,
+                    rooted: true,
+                    partial: true,
+                    strict: true,
+                    cover_later,
+                    cancelled: Some(Arc::new(move || p.fetch_add(1, Ordering::Relaxed) >= n)),
+                    ..Limits::default()
+                });
+                match out {
+                    Err(Error::Cancelled) => continue,
+                    Err(Error::Incomplete(e)) => {
+                        assert!(e.is_empty() && refusal(&e).contains("stopped"));
+                        refused = true;
+                        break;
+                    }
+                    Err(e) => panic!("poll {n}: {e:?}"),
+                    Ok(out) => assert!(out.complete, "poll {n}: a strict run answered in part"),
+                }
+            }
+            assert!(refused);
+        }
+    }
+
+    fn ofn(body: &str) -> Vec<Axiom> {
+        crate::ofn_read::parse(&format!(
+            "Prefix(:=<http://e/#>)\nOntology(<http://e/o>\n{body}\n)"
+        ))
+        .unwrap()
+        .axioms
+    }
+
+    /// A stream over `d`, as a classification of the terminology alone passes the
+    /// assertions it did not read.
+    fn stream_of(d: &[Axiom]) -> impl FnMut(&mut dyn FnMut(&AxiomKind) -> bool) -> bool + '_ {
+        move |f: &mut dyn FnMut(&AxiomKind) -> bool| {
+            for a in d {
+                if !f(&a.kind) {
+                    break;
+                }
+            }
+            true
+        }
+    }
+
+    /// Unmapped triples left out in two calls add up: the count and the list keep the
+    /// first call's triples, and an empty call changes nothing.
+    #[test]
+    fn a_second_set_of_unmapped_triples_adds_to_the_first() {
+        let t = ofn("Declaration(Class(:A)) Declaration(Class(:B)) SubClassOf(:A :B)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let mut out = Saturation::new()
+            .classify(&kinds, None, &Limits::default())
+            .unwrap();
+        assert!(out.complete);
+        let triple = |s: &str| {
+            oxrdf::Triple::new(
+                oxrdf::NamedNode::new_unchecked(format!("http://ex.org/{s}")),
+                oxrdf::NamedNode::new_unchecked(crate::vocab::RDFS_DOMAIN),
+                oxrdf::NamedNode::new_unchecked("http://ex.org/A"),
+            )
+        };
+        let one = |s: &str| Unmapped::default().extend([&triple(s)]);
+        out.leave_out_unmapped(one("p"));
+        out.leave_out_unmapped(Unmapped::default());
+        out.leave_out_unmapped(one("q"));
+        assert_eq!(out.stats.unmapped, 2);
+        assert_eq!(out.unmapped.count, 2);
+        assert_eq!(out.unmapped.triples, vec![triple("p"), triple("q")]);
+        assert!(!out.unmapped.truncated && !out.complete);
+        assert_eq!(out.consistency, Consistency::Unknown);
+        // past the cap the count goes on and the list is truncated
+        let many: Vec<oxrdf::Triple> = (0..UNMAPPED_LISTED)
+            .map(|i| triple(&format!("r{i}")))
+            .collect();
+        out.leave_out_unmapped(Unmapped::default().extend(&many));
+        assert_eq!(out.stats.unmapped, UNMAPPED_LISTED + 2);
+        assert_eq!(out.unmapped.count, UNMAPPED_LISTED + 2);
+        assert_eq!(out.unmapped.triples.len(), UNMAPPED_LISTED);
+        assert_eq!(out.unmapped.triples[..2], [triple("p"), triple("q")]);
+        assert!(out.unmapped.truncated);
+    }
+
+    /// Any dropped axiom with logical content leaves the answer incomplete, every class of
+    /// the taxonomy incomplete and its consistency unknown, whether or not the axiom could
+    /// change an answer. Declarations and annotations count for nothing.
+    #[test]
+    fn any_dropped_assertion_leaves_every_class_incomplete() {
+        let t = ofn("Declaration(Class(:A)) Declaration(Class(:B)) SubClassOf(:A :B)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let limits = Limits {
+            cover_later: true,
+            ..Limits::default()
+        };
+        for body in [
+            // harmless for every answer, and still counted
+            "ClassAssertion(:A :a)",
+            // names a class the taxonomy lacks, which no surface then lists
+            "ClassAssertion(:Z :a)",
+            "Declaration(NamedIndividual(:a)) ObjectPropertyAssertion(:p :a :b)",
+        ] {
+            for coverage in [true, false] {
+                let d = ofn(body);
+                let mut s = Saturation::new();
+                let limits = Limits {
+                    coverage,
+                    ..limits.clone()
+                };
+                let mut out = s.classify(&kinds, None, &limits).unwrap();
+                let w = out.cover(&kinds, s.excluded(), Some(&mut stream_of(&d)), &limits);
+                let w = w.expect(body);
+                assert!(!matches!(w.axiom, AxiomKind::Declaration(_)), "{body}");
+                assert!(
+                    matches!(&w.gap, Gap::Outside { rule, .. } if rule == NOT_READ),
+                    "{body}"
+                );
+                assert!(!out.complete && out.complete_for_taken, "{body}");
+                assert_eq!(out.consistency, Consistency::Unknown, "{body}");
+                let names: Vec<&str> = out.incomplete.iter().map(|c| c.as_str()).collect();
+                assert_eq!(names, ["http://e/#A", "http://e/#B"], "{body}");
+            }
+        }
+        for body in [
+            "Declaration(NamedIndividual(:a))",
+            "AnnotationAssertion(rdfs:label :A \"a\")",
+            "",
+        ] {
+            let d = ofn(body);
+            let mut s = Saturation::new();
+            let mut out = s.classify(&kinds, None, &limits).unwrap();
+            let w = out.cover(&kinds, s.excluded(), Some(&mut stream_of(&d)), &limits);
+            assert!(w.is_none() && out.complete, "{body}");
+            assert_eq!(out.consistency, Consistency::Consistent, "{body}");
+            assert!(out.incomplete.is_empty(), "{body}");
+        }
+    }
+
+    /// An inconsistent terminology stays inconsistent beside a dropped assertion, which
+    /// still leaves the answer incomplete: a class only the assertion names is in no
+    /// taxonomy.
+    #[test]
+    fn an_inconsistent_run_with_a_dropped_assertion_is_not_complete() {
+        let t = ofn("SubClassOf(owl:Thing :A)
+                     SubClassOf(owl:Thing :B)
+                     DisjointClasses(:A :B)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let limits = Limits {
+            cover_later: true,
+            ..Limits::default()
+        };
+        for body in ["ClassAssertion(:C :a)", "ClassAssertion(:A :a)"] {
+            let d = ofn(body);
+            let mut s = Saturation::new();
+            let mut out = s.classify(&kinds, None, &limits).unwrap();
+            assert_eq!(out.consistency, Consistency::Inconsistent);
+            let w = out.cover(&kinds, s.excluded(), Some(&mut stream_of(&d)), &limits);
+            assert!(w.is_some() && !out.complete, "{body}");
+            assert_eq!(out.consistency, Consistency::Inconsistent, "{body}");
+            assert!(!out.incomplete.is_empty(), "{body}");
+        }
+    }
+
+    /// When a class is incomplete, the node of the unsatisfiable classes may miss one, so
+    /// no unsatisfiable class is complete.
+    #[test]
+    fn an_incomplete_class_leaves_the_unsatisfiable_node_incomplete() {
+        let t = ofn("SubClassOf(:A owl:Nothing)
+                     SubClassOf(:B ObjectUnionOf(:C :D))
+                     SubClassOf(:C owl:Nothing)
+                     SubClassOf(:D owl:Nothing)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::new();
+        let out = s
+            .classify(
+                &kinds,
+                None,
+                &Limits {
+                    el_only: true,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        let names: Vec<&str> = out.incomplete.iter().map(|c| c.as_str()).collect();
+        assert!(names.contains(&"http://e/#B"), "{names:?}");
+        assert!(names.contains(&"http://e/#A"), "{names:?}");
+    }
+
+    /// The read of the dropped axioms asks the run's deadline, and one that passed stops
+    /// it with every class incomplete.
+    #[test]
+    fn a_read_of_dropped_axioms_past_the_deadline_stops() {
+        let t = ofn("SubClassOf(:A :B)");
+        let mut body = String::new();
+        for i in 0..10_000 {
+            body += &format!("Declaration(NamedIndividual(:x{i}))\n");
+        }
+        let d = ofn(&body);
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::new();
+        let mut limits = Limits {
+            cover_later: true,
+            ..Limits::default()
+        };
+        let mut out = s.classify(&kinds, None, &limits).unwrap();
+        limits.deadline = Some(Instant::now());
+        let w = out.cover(&kinds, s.excluded(), Some(&mut stream_of(&d)), &limits);
+        assert!(w.is_none() && out.stats.coverage_stopped && !out.complete);
+        assert_eq!(out.consistency, Consistency::Unknown);
+    }
+
+    /// A stream of dropped axioms that cannot finish leaves the answer incomplete, even
+    /// for a run that takes no modules' pass.
+    #[test]
+    fn a_dropped_stream_that_fails_leaves_every_class_incomplete() {
+        let t = ofn("SubClassOf(:A :B)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        for coverage in [true, false] {
+            let mut s = Saturation::new();
+            let limits = Limits {
+                cover_later: true,
+                coverage,
+                ..Limits::default()
+            };
+            let mut out = s.classify(&kinds, None, &limits).unwrap();
+            let mut stream = |_: &mut dyn FnMut(&AxiomKind) -> bool| false;
+            out.cover(&kinds, s.excluded(), Some(&mut stream), &limits);
+            assert!(
+                out.stats.coverage_stopped && !out.complete,
+                "coverage {coverage}"
+            );
+            assert_eq!(out.consistency, Consistency::Unknown);
+            assert!(!out.incomplete.is_empty());
         }
     }
 
@@ -4306,7 +4970,7 @@ mod tests {
                 match stopped {
                     Err(Error::Cancelled) => {}
                     Err(e) => panic!("{threads} threads, poll {at}: {e:?}"),
-                    Ok(out) if out.complete => assert_eq!(outcome(&out), first),
+                    Ok(out) if out.complete_for_taken => assert_eq!(outcome(&out), first),
                     Ok(out) => {
                         for (i, &(p, unsat, h)) in outcome(&out).0.iter().enumerate() {
                             assert!(p <= first.0[i].0 && unsat <= first.0[i].1 && !h);
@@ -4353,7 +5017,7 @@ mod tests {
                     ..limits
                 })
                 .unwrap();
-            assert!(out.complete && !out.stats.dl_over_budget);
+            assert!(out.complete_for_taken && !out.stats.dl_over_budget);
             let answer: Vec<bool> = (0..n)
                 .map(|i| {
                     out.taxonomy
@@ -4553,6 +5217,54 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+
+    /// A modules' pass that its cancellation stops answers with every class incomplete
+    /// and the consistency unknown, instead of failing a finished saturation.
+    #[test]
+    fn a_stopped_coverage_pass_answers_with_every_class_incomplete() {
+        let mut text = String::from("Prefix(:=<http://e/#>)\nOntology(<http://e/o>\n");
+        for i in 0..6000 {
+            text.push_str(&format!("SubClassOf(:A{i} :B{i})\n"));
+        }
+        text.push_str("SubClassOf(:X ObjectUnionOf(:Y :Z))\n)");
+        let doc = crate::ofn_read::parse(&text).unwrap();
+        let kinds: Vec<&AxiomKind> = doc.axioms.iter().map(|a| &a.kind).collect();
+        let mut s = Saturation::new();
+        let limits = Limits {
+            el_only: true,
+            cover_later: true,
+            ..Limits::default()
+        };
+        let mut out = s.classify(&kinds, None, &limits).unwrap();
+        assert!(!s.excluded().is_empty());
+        assert!(
+            out.complete && out.incomplete.is_empty(),
+            "the pass is the caller's"
+        );
+        let stop = Limits {
+            cancelled: Some(Arc::new(|| true)),
+            ..limits.clone()
+        };
+        let witness = out.cover(&kinds, s.excluded(), None, &stop);
+        assert!(witness.is_none());
+        assert!(out.stats.coverage_stopped && !out.complete && out.complete_for_taken);
+        assert_eq!(out.consistency, Consistency::Unknown);
+        assert_eq!(out.incomplete.len(), 12003);
+        // the same pass, not stopped, decides the classes
+        let mut again = s.classify(&kinds, None, &limits).unwrap();
+        again.cover(&kinds, s.excluded(), None, &limits);
+        assert!(!again.stats.coverage_stopped && again.consistency == Consistency::Consistent);
+        assert!(
+            !again
+                .incomplete
+                .iter()
+                .any(|c| c.as_str() == "http://e/#A0"),
+            "{} incomplete, over {}, {:?}",
+            again.incomplete.len(),
+            again.stats.coverage_over,
+            again.incomplete.iter().take(5).collect::<Vec<_>>()
+        );
+    }
 
     /// Item 1231's scan counts against the run's budget. A scan that would pass the
     /// caller's memory budget, or that the pool refuses, ends the rooted run as past its

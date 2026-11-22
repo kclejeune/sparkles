@@ -688,12 +688,51 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   does not cap combined live RSS. Bounded pages limit output/name buffers, not server
   scans or arbitrary scalar sizes. See [API.md](../API.md#ontology) for the read states,
   typed sources, pins and projection selectors.
+* `complete` means that the taxonomy holds every subsumption between named classes and
+  every unsatisfiable class that the whole input ontology entails, as a complete OWL
+  reasoner such as HermiT answers. It is false when the run left out or used only in part
+  an axiom that `excluded` lists, and for a partial answer. `completeForTaken` is true
+  when the answer is complete for the axioms the run took, which is what a profile
+  reasoner such as ELK reports. A class outside `incomplete` has its exact superclasses,
+  equivalent classes and satisfiability even when axioms are left out, since its
+  bottom-locality module holds none of them, but its subclasses can be missed. The test
+  over-approximates, so a class in `incomplete` can still have its exact answer. When a
+  left-out axiom could make the ontology inconsistent, `consistency` is `unknown` and every
+  class is incomplete. A classification without `assertions` reads the terminology alone,
+  and any assertion with logical content that it did not read counts as left out under
+  the rule `assertion-not-read`, whether or not it could change an answer. The answer is
+  then not complete, every class is incomplete and the consistency is `unknown`, while an
+  inconsistent terminology stays `inconsistent`. A class that only such an assertion
+  names is in no taxonomy, so it is not listed in `incomplete` and shows only through
+  `complete` and the `assertion-not-read` entry. A triple that maps to no axiom, such as
+  the domain of a property that is not declared, is counted in the
+  `unmapped` statistic and leaves the answer incomplete in the same way, with or without
+  `assertions`. The answer lists the first 100 such triples in `unmappedTriples`, with
+  `unmappedTruncated` when there are more, as the OWL API reports its unparsed triples.
+  A class assertion of a blank node that no triple describes is such a triple too, and a
+  classification later in a ROBOT chain counts the unmapped triples of the chain's input.
+  A `check` later in a chain checks the mapped document and does not report them.
+  A typing as `rdf:Property` alone, as RDFS vocabularies type their properties, carries
+  no logical content and is not counted.
+  The kept classification's outcome reports the count as `unmappedCount`, and the
+  Workbench notes it. `strict` on the request, `--strict` on `sparkles ontology classify` and
+  `--strict true` on ROBOT's `reason`, `reduce` and `materialize`, which is their default
+  with `--reasoner hermit` or `jfact`, refuse such a run with
+  the error `classification-incomplete`, HTTP 422, naming the axioms and the count of
+  unmapped triples. The JVM binding's `ClassifyQuery` has no reasoner to name, so its
+  `strict` stays off by default. The pass that decides `incomplete` costs nothing when
+  nothing is left out, reads the unread assertions only up to the first with logical
+  content, has a bound on its work that
+  `coverageOver` reports, and answers with every class incomplete and `coverageStopped` set
+  when the deadline stops it. The
+  [F24 outcome](../specs/F24-owl-classification/SPEC.md#completeness-for-the-whole-ontology)
+  gives the argument and its cost.
 * Every classification answer gives `tier`, the rules the axioms need, and `consistency`,
   which is `consistent`, `inconsistent` or `unknown`. `partial` on the request, `--partial`
   on the command line and the bindings' `partial` option ask a run of the disjunctive rules
   that its deadline or cancellation stops to answer what it proved. Such an answer has
   `partial` true and `complete` false, lists the classes whose superclasses it may miss
-  under `incomplete` and gives every other class its full answer. Its consistency is
+  under `incomplete` and gives every other class its full answer for the axioms it took. Its consistency is
   `unknown` when the run stopped before deciding it, and then every class is incomplete.
   After a stopped run, immutable source hashing and response serialization finish over
   its already produced partial result without resuming classification or resetting shared
@@ -749,7 +788,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `--reasoner ELK`, which `materialize` takes by default as ROBOT's does, and `emr`, which
   ROBOT builds on ELK, run the OWL 2 EL rules alone and leave those axioms out, as ELK
   does, so the output is ROBOT's with ELK. `hermit`, `jfact`, `whelk` and `structural` run
-  the default classifier with a warning. The library has the same switch as
+  the default classifier with a warning. With `hermit` or `jfact` the run is strict unless
+  `--strict false` is given, so it refuses an answer that is not complete for the whole
+  ontology, as those reasoners give a complete answer or an error. The library has the same switch as
   `ClassifyRequest::el_only` and `Limits::el_only`. The queries ELK does not answer, such
   as the disjoint classes and the property hierarchy, add no axioms, as they add none in
   ROBOT. Errors and the exit status 1 follow ROBOT's, and a malformed command line exits
@@ -1247,7 +1288,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   dataset keeps only classifications of the terminology. Roadmap item 590.
 * The ontology readers map SWRL rules in RDF to assertions about anonymous individuals,
   and their variables to named individuals. Roadmap item 970. DL-safe SWRL rules do not
-  run in materialization, query-time reasoning or the classifier. Roadmap item 971.
+  run in materialization, query-time reasoning or the classifier. Roadmap item 971. A
+  classification with the assertions reads a rule's triples as assertions, so it can
+  answer complete while it ignores the rule. Roadmap item 1302.
 * A rooted run refuses keys over data properties and functional data properties, which
   OML vocabularies declare for their identifiers, as the Kepler16b sample and its
   metrology library do. Roadmap item 768. The classifier leaves out the literals and

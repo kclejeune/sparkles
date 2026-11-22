@@ -759,6 +759,7 @@ fn members(op: &str) -> &'static [&'static str] {
             "offset",
             "threads",
             "partial",
+            "strict",
             "expansion",
             "projection",
             "lang",
@@ -1153,6 +1154,8 @@ pub fn call(ds: &Dataset, op: &str, args: &J, opts: &QueryOptions) -> Result<J> 
                 about: about.clone(),
                 el_only: false,
                 partial: boolean(a, "partial")?.unwrap_or(false),
+                strict: boolean(a, "strict")?.unwrap_or(false),
+                skip_coverage: false,
                 expansion: expansion_of(string(a, "expansion")?)?,
             };
             let q = ClassifyQuery {
@@ -1643,9 +1646,11 @@ pub fn classification_body(
         Consistency::Inconsistent => "inconsistent",
         Consistency::Unknown => "unknown",
     });
-    // a partial answer is never complete, whatever it left out
+    // complete for the whole ontology: nothing left out and the run not stopped, and
+    // completeForTaken, as a profile reasoner such as ELK reports, only the second
     j["complete"] = json!(c.excluded.is_empty() && cl.complete);
-    j["partial"] = json!(!cl.complete);
+    j["completeForTaken"] = json!(cl.complete_for_taken);
+    j["partial"] = json!(!cl.complete_for_taken);
     j["tier"] = json!(s.tier.as_str());
     j["incompleteCount"] = json!(cl.incomplete.len());
     j["incomplete"] = json!(
@@ -1660,6 +1665,22 @@ pub fn classification_body(
     j["nodeCount"] = json!(t.nodes().len());
     j["unsatisfiableCount"] = json!(unsat.len());
     j["unsatisfiable"] = json!(unsat.iter().take(q.limit).collect::<Vec<_>>());
+    // the triples that map to no axiom, which no `excluded` entry names: the first of
+    // them, as N-Triples terms, and whether `stats.unmapped` counts more
+    j["unmappedTriples"] = J::Array(
+        cl.unmapped
+            .triples
+            .iter()
+            .map(|t| {
+                json!({
+                    "subject": t.subject.to_string(),
+                    "predicate": t.predicate.to_string(),
+                    "object": t.object.to_string(),
+                })
+            })
+            .collect(),
+    );
+    j["unmappedTruncated"] = json!(cl.unmapped.truncated);
     j["excludedCount"] = json!(c.excluded.len());
     j["excluded"] = J::Array(
         c.excluded
@@ -1695,6 +1716,10 @@ pub fn classification_body(
         "indexMs": s.index.as_secs_f64() * 1000.0,
         "saturationMs": s.saturation.as_secs_f64() * 1000.0,
         "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
+        "coverageMs": s.coverage.as_secs_f64() * 1000.0,
+        "coverageOver": s.coverage_over,
+        "coverageStopped": s.coverage_stopped,
+        "unmapped": s.unmapped,
     });
     if q.nodes {
         let total = t.nodes().len();

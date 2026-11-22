@@ -99,7 +99,7 @@ pub fn engine(py: Python<'_>, e: sparkles::Error) -> PyErr {
             "timeout" => "QueryTimeoutError",
             "cancelled" => "CancelledError",
             "invalid" | "invalid-schema" | "invalid-name" => "InvalidInputError",
-            "unsupported" => "UnsupportedError",
+            "unsupported" | "classification-incomplete" => "UnsupportedError",
             _ => "SparklesError",
         },
     };

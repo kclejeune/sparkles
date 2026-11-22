@@ -46,6 +46,7 @@ function available(overrides: Partial<KeptClassification> = {}): KeptClassificat
       consistency: 'consistent',
       excludedCount: 0,
       incompleteCount: 0,
+      unmappedCount: 0,
     },
     entity: { iri: 'urn:A', present: true, unsatisfiable: false },
     activity: null,

@@ -162,10 +162,11 @@ pub(super) fn put_all(put: &mut impl FnMut(&str, J)) {
                 "consistency",
                 "excludedCount",
                 "incompleteCount",
+                "unmappedCount",
             ],
             json!({
                 "tier":string_enum(&["el","horn","disjunctive"]),"partial":{"type":"boolean"},"complete":{"type":"boolean"},
-                "consistency":string_enum(&["consistent","inconsistent","unknown"]),"excludedCount":n,"incompleteCount":n
+                "consistency":string_enum(&["consistent","inconsistent","unknown"]),"excludedCount":n,"incompleteCount":n,"unmappedCount":n
             }),
         ),
     );

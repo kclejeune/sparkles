@@ -2,7 +2,7 @@
 //! reference reasoner and the measurements of `docs/benchmarks/el-classification`.
 //!
 //! ```text
-//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--dl-attempt-work N] [--dl-attempt-width N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
+//! el_classify [--threads N] [--counting] [--no-number-order] [--rooted] [--dl-work N] [--no-coverage] [--coverage-work N] [--dl-attempt-work N] [--dl-attempt-width N] [--no-dl-steps] [--ofn-out FILE] [--taxonomy FILE] [--repeat N] [--heap] [--owned] INPUT
 //! ```
 //!
 //! INPUT is functional-style syntax (`.ofn`, or any file that starts with `Prefix(` or
@@ -16,7 +16,9 @@
 //! ontology, and `--owned` gives them to a classifier that keeps its own copy instead.
 //! `--heap` also counts the bytes allocated, which slows the run, and reports the most
 //! that the last run's classification held at once beyond the axioms read, for the
-//! comparison with the classifier's estimate.
+//! comparison with the classifier's estimate. `classifyMs` includes the modules' pass of a
+//! run that leaves axioms out (`coverageMs`), and `--no-coverage` turns that pass off for a
+//! comparison with a profile reasoner such as ELK, which reports no such pass.
 
 #![recursion_limit = "256"]
 
@@ -85,6 +87,8 @@ fn main() {
     let mut owned = false;
     let mut eager = false;
     let mut dl_work: Option<usize> = None;
+    let mut coverage_work: Option<usize> = None;
+    let mut coverage = true;
     let mut dl_attempt_work: Option<usize> = None;
     let mut dl_attempt_width: Option<usize> = None;
     let mut counting = false;
@@ -109,6 +113,8 @@ fn main() {
             "--dl-steps" => dl_steps = true,
             "--no-dl-steps" => dl_steps = false,
             "--dl-work" => dl_work = args.next().and_then(|v| v.parse().ok()),
+            "--no-coverage" => coverage = false,
+            "--coverage-work" => coverage_work = args.next().and_then(|v| v.parse().ok()),
             "--dl-attempt-work" => dl_attempt_work = args.next().and_then(|v| v.parse().ok()),
             "--dl-attempt-width" => dl_attempt_width = args.next().and_then(|v| v.parse().ok()),
             _ => input = Some(a),
@@ -172,6 +178,8 @@ fn main() {
             sparkles_owl::classify::Expansion::Cautious
         },
         dl_work,
+        coverage,
+        coverage_work,
         dl_attempt_work,
         dl_attempt_width,
         counting,
@@ -318,6 +326,9 @@ fn measures(
         "indexMs": s.index.as_secs_f64() * 1000.0,
         "saturationMs": s.saturation.as_secs_f64() * 1000.0,
         "taxonomyMs": s.taxonomy.as_secs_f64() * 1000.0,
+        "coverageMs": s.coverage.as_secs_f64() * 1000.0,
+        "coverageOver": s.coverage_over,
+        "coverageStopped": s.coverage_stopped,
         "contexts": s.contexts,
         "conclusions": s.conclusions,
         "estimatedBytes": s.memory,
@@ -347,10 +358,25 @@ fn answer(
             *partial.entry(why).or_default() += 1;
         }
     }
+    // the SWRL rules the reader passed over are outside what the coverage can test, so
+    // they leave the consistency unknown and every class incomplete
+    let incomplete: Vec<&str> = if rules > 0 {
+        out.taxonomy
+            .classes()
+            .map(|c| c.as_str())
+            .filter(|c| {
+                *c != sparkles_owl::vocab::OWL_THING && *c != sparkles_owl::vocab::OWL_NOTHING
+            })
+            .collect()
+    } else {
+        out.incomplete.iter().map(|c| c.as_str()).collect()
+    };
     serde_json::json!({
-        "complete": out.complete,
-        "incomplete": out.incomplete.iter().map(|c| c.as_str()).collect::<Vec<_>>(),
+        "complete": out.complete && rules == 0,
+        "completeForTaken": out.complete_for_taken,
+        "incomplete": incomplete,
         "consistency": match out.consistency {
+            _ if rules > 0 => "unknown",
             sparkles_owl::classify::Consistency::Consistent => "consistent",
             sparkles_owl::classify::Consistency::Inconsistent => "inconsistent",
             sparkles_owl::classify::Consistency::Unknown => "unknown",
@@ -441,11 +467,15 @@ mod tests {
             "classifyMs",
             "clauses",
             "complete",
+            "completeForTaken",
             "conclusions",
             "conjunctions",
             "consistency",
             "consistent",
             "contexts",
+            "coverageMs",
+            "coverageOver",
+            "coverageStopped",
             "dlAttemptOver",
             "dlContexts",
             "dlCountingOver",

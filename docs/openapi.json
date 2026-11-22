@@ -4849,6 +4849,10 @@
               "disjunctive"
             ],
             "type": "string"
+          },
+          "unmappedCount": {
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
@@ -4857,7 +4861,8 @@
           "complete",
           "consistency",
           "excludedCount",
-          "incompleteCount"
+          "incompleteCount",
+          "unmappedCount"
         ],
         "type": "object"
       },
@@ -42112,6 +42117,10 @@
                       "null"
                     ]
                   },
+                  "strict": {
+                    "description": "Refuse with `422` and code `classification-incomplete` when the classifier would leave an axiom out or use one only in part, or the run stopped, so that an answer is always complete for the whole ontology, as HermiT refuses what it does not support. The message names the axioms and the rules they break.",
+                    "type": "boolean"
+                  },
                   "target": {
                     "description": "A named graph outside the graphs read that takes the direct taxonomy.",
                     "type": "string"
@@ -42142,15 +42151,48 @@
                           "type": "integer"
                         },
                         "complete": {
+                          "description": "Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way.",
+                          "type": "boolean"
+                        },
+                        "completeForTaken": {
+                          "description": "Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer.",
                           "type": "boolean"
                         },
                         "consistent": {
+                          "type": "boolean"
+                        },
+                        "unmappedTriples": {
+                          "description": "The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.",
+                          "items": {
+                            "properties": {
+                              "object": {
+                                "type": "string"
+                              },
+                              "predicate": {
+                                "type": "string"
+                              },
+                              "subject": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "subject",
+                              "predicate",
+                              "object"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "unmappedTruncated": {
+                          "description": "Whether `stats.unmapped` counts more triples than `unmappedTriples` lists.",
                           "type": "boolean"
                         }
                       },
                       "required": [
                         "consistent",
                         "complete",
+                        "completeForTaken",
                         "classes"
                       ],
                       "type": "object"
@@ -42186,6 +42228,9 @@
           },
           "409": {
             "$ref": "#/components/responses/Conflict"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
           },
           "507": {
             "$ref": "#/components/responses/InsufficientStorage"

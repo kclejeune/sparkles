@@ -941,7 +941,7 @@ fn a_one_shot_cancellation_during_parallel_normalization_is_reported() {
             },
         );
         if seen.load(AtomicOrdering::Relaxed) >= at && !matches!(r, Err(Error::Cancelled)) {
-            swallowed.push((at, r.map(|o| o.complete)));
+            swallowed.push((at, r.map(|o| o.complete_for_taken)));
         }
     }
     assert!(swallowed.is_empty(), "of {total} polls: {swallowed:?}");

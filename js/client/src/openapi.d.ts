@@ -6316,6 +6316,7 @@ export interface components {
             partial: boolean;
             /** @enum {string} */
             tier: "el" | "horn" | "disjunctive";
+            unmappedCount: number;
         };
         ClassificationParent: {
             equivalenceCount: number;
@@ -19956,6 +19957,8 @@ export interface operations {
                      * @enum {string|null}
                      */
                     projection?: "frame" | null;
+                    /** @description Refuse with `422` and code `classification-incomplete` when the classifier would leave an axiom out or use one only in part, or the run stopped, so that an answer is always complete for the whole ontology, as HermiT refuses what it does not support. The message names the axioms and the rules they break. */
+                    strict?: boolean;
                     /** @description A named graph outside the graphs read that takes the direct taxonomy. */
                     target?: string;
                     /** @description The worker threads, within the algorithm pool's grant (0 for the grant). */
@@ -19972,8 +19975,19 @@ export interface operations {
                 content: {
                     "application/json": {
                         classes: number;
+                        /** @description Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way. */
                         complete: boolean;
+                        /** @description Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer. */
+                        completeForTaken: boolean;
                         consistent: boolean;
+                        /** @description The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed. */
+                        unmappedTriples?: {
+                            object: string;
+                            predicate: string;
+                            subject: string;
+                        }[];
+                        /** @description Whether `stats.unmapped` counts more triples than `unmappedTriples` lists. */
+                        unmappedTruncated?: boolean;
                     } | components["schemas"]["OntologyFrameClassification"];
                     "text/owl-functional": string;
                 };
@@ -19984,6 +19998,7 @@ export interface operations {
             404: components["responses"]["NotFound"];
             408: components["responses"]["Timeout"];
             409: components["responses"]["Conflict"];
+            422: components["responses"]["Unprocessable"];
             507: components["responses"]["InsufficientStorage"];
             default: components["responses"]["Error"];
         };

@@ -5211,6 +5211,127 @@ statements. Sparkles' rule parser refuses the adapter's file at its first line, 
 the brackets added it derives exactly Jena's 321 facts. Item 1020 takes the bare
 namespace IRIs.
 
+### Completeness for the whole ontology
+
+Item 1271 aligns `complete` with complete OWL reasoners. HermiT, Pellet, FaCT++ and
+Konclude either answer for the whole ontology or refuse it, and the OWL API's reasoner
+interface has no completeness flag, so its callers read every answer as complete. A
+profile reasoner such as ELK ignores the axioms outside its fragment and warns. Before
+this item `complete` was ELK's weaker statement, true while `outside` listed axioms the run
+left out. It now means that every subsumption between named classes and every
+unsatisfiable class that the whole input ontology entails is in the taxonomy. It is false
+when the run left out or used only in part an axiom, which `excluded` lists, and for the
+partial answer of a stopped run. `completeForTaken` in the wire answers and
+`Classification::complete_for_taken` in Rust keep the old meaning, false only for a
+partial answer. `partial` is its negation, and the dataset retains a run by it.
+
+A class outside `incomplete` keeps its exact answer when axioms are left out. The
+classifier extracts the syntactic bottom-locality module of the class, after Cuenca Grau,
+Horrocks, Kazakov and Sattler, and the class is complete when the module holds no axiom
+the run left out. Let `O` be the ontology, `L` the axioms left out and `T = O \ L`. A model
+of the module `M_C` of `{C}` in `O` extends to a model of `O` that agrees with it on the
+module's signature and makes every other class empty, so the named superclasses of `C`
+that `O` entails are those that `M_C` entails. When `L` misses `M_C`, `M_C` is inside `T`,
+and the run, which is complete for `T`, finds them all. Equivalent classes and
+unsatisfiability follow. A satisfiable class equivalent to such a class is in its module's
+signature, so its own module is inside `M_C`. Every unsatisfiable class shares the node of
+`owl:Nothing`, which a missed unsatisfiable class leaves short, so when any class is
+incomplete every unsatisfiable class is listed too. The answer is exact for the superclasses,
+equivalents and satisfiability of a class outside `incomplete`, and not for its
+subclasses. A class can be complete while a subclass of it is missed, since the subclass's
+module can hold a left-out axiom. On item 1271's `irl1`, which a plain run classifies
+without `K ⊑ Ans`, `Ans` is complete and its children are not.
+
+The consistency verdict needs its own condition, since an inconsistent ontology makes
+every class unsatisfiable. A verdict of inconsistent is sound for `O`. When the run finds
+`T` consistent, `O` is consistent if `L` misses the bottom module of the empty signature in
+`O` or its top module, whose models extend to models of `O` with every class outside the
+signature empty or the whole domain. Otherwise `consistency` is `unknown` and every class is
+incomplete. A third layer decides more classes. Without nominals or `ObjectHasValue`
+outside the assertions and keys, and without the universal object property, a model of
+the terminology's module joins a model of `O` in a disjoint union, so the module of a class
+in `O` without its assertions and keys is enough. The module documentation of
+`transform/module.rs` gives the three arguments in full, and a rule unsure of an axiom's
+locality calls it non-local, which only makes a module larger. The test is syntactic and
+over-approximates, so it can list a class whose answer is exact, such as `S` in `irl1`, and
+never omits a class whose answer can be missed. `dl_fixtures` checks every complete class
+against HermiT on the 640 cases of item 603 with and without the EL-only rules. In 1009
+runs that left axioms out, the consistency stayed known in 379 and 1486 of 5914 classes
+were complete, with no mismatch.
+
+A classification of the terminology alone, which is the default of `ontology classify`,
+HTTP and the bindings without `assertions`, does not read the file's assertions, which are
+part of its ontology. Any assertion with logical content among them counts as left out,
+whether or not it could change an answer. The run reads the assertions up to the first
+such one and reports it in `excluded` under the rule `assertion-not-read`, with one entry
+for all of them. The answer is then not complete, every class of the taxonomy is
+incomplete, and a consistency the run found becomes `unknown`, while an inconsistency
+stays, since it holds for the whole ontology too. A class that only an unread assertion
+names is in no taxonomy, so `incomplete` cannot list it, and it shows through `complete`
+and the `assertion-not-read` entry, and as a class that is not found. An earlier design
+let assertions that the module layers proved harmless leave the run complete. Three
+review rounds each found a case it missed, all of the kind of a class that only an
+assertion names, so it was removed, and roadmap item 1301 records a sound replacement.
+`assertions` true gives the complete answer, and roadmap item 1279 makes it the default.
+
+A triple that maps to no axiom, such as an assertion that a strict read cannot map or
+the domain of a property that is not declared, may carry any logical
+content. Every classification counts such triples, of the terminology and of the
+assertions, in `Stats::unmapped`, and with any of them the answer is not complete, every
+class is incomplete and a consistency found is `unknown`. No `excluded` entry names them,
+since an entry names an axiom, so the wire answers report the count as `stats.unmapped`
+and list the first 100 triples in `unmappedTriples`, in the order the input gave them, as
+N-Triples terms, with `unmappedTruncated` when there are more. The CLI lists the first
+ten, ROBOT's warning the first five and a strict run's refusal the first three. The OWL
+API calls such triples unparsed and reports them through its RDF parser's metadata.
+Sparkles calls them unmapped, since a read of the store maps stored triples and parses
+nothing. A run of the terminology alone reads the assertions only up to the first that
+has logical content or maps to no axiom, so it counts and lists at most one unmapped
+assertion triple. A file in functional-style syntax
+whose entities are all declared reads without the store and has no unmapped triples. One
+with an undeclared entity takes the store's reading, in which a domain or range of an
+undeclared property is such a triple. A class assertion whose class is a blank node that
+no triple of the terminology describes, such as `:x a _:c` alone, is one too. A
+classification later in a ROBOT chain, such as `relax` followed by `classify`, counts the
+unmapped triples of the input that the chain read, while a `check` there checks the
+mapped document, which has lost them, as roadmap item 1311 records. A classification with
+unmapped triples still runs the modules' pass for its left-out axioms, whose answer the
+unmapped triples then override, and roadmap item 1309 records skipping it. A typing as `rdf:Property` alone, as RDFS
+vocabularies type their properties, carries no logical content, so a classification does
+not count it, while the read and the profile checks still report it as unmapped. The GO and ChEBI lite releases in RDF/XML, and stores of
+OWL2Bench and of LUBM with their assertions, count no unmapped triple. The triples of a SWRL rule are not unmapped, since
+the RDF reader maps a rule and its atoms to assertions about anonymous individuals, so a
+classification with `assertions` reads them as assertions and can answer complete while
+it ignores the rule. Roadmap item 1302 records this.
+
+The pass costs nothing when nothing is left out and nothing is dropped. A classification of
+the terminology alone reads the assertions only up to the first with logical content, and
+takes no extraction for them. The pass's extractions share one bound on the
+axioms they examine, 1024 for each axiom of the input and at least about a million, past
+which the classes not yet decided are incomplete, so an answer depends on the input
+alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
+deadline or cancellation during the pass leaves every class incomplete and the
+consistency unknown with `coverageStopped` set, rather than discard the saturation, and the
+dataset retains the saturation but publishes no such answer. On a loaded laptop with four
+threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI lite with the
+EL-only rules, which leave axioms of both out. These are single approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
+do since they read only the taxonomy.
+
+`strict` on the request, `--strict` on `ontology classify` and `--strict true` on ROBOT's
+`reason`, `reduce` and `materialize` refuse a run that is not complete for the whole
+ontology. The refusal is the component error `classification-incomplete`, HTTP 422, which
+names the axioms and the rule each breaks, `UnsupportedError` in Python and Node.js, an
+unsupported error in the JVM and the FFI, and ROBOT's `INCOMPLETE REASONING ERROR`. The
+default stays non-strict, except that ROBOT's commands are strict when they name HermiT
+or JFact as the reasoner, since a caller who asks for those expects a complete answer or
+an error. `--strict false` turns that off, and ELK and the other names keep the warning.
+`reduce` classifies ROBOT's subset of the subclass axioms and the property
+characteristics, so its refusal concerns the axioms of that subset. The JVM binding has
+no OWL API reasoner adapter and its `ClassifyQuery` names no reasoner, so its `strict`
+stays off by default as the opt-in. The content fingerprint of a retained classification is
+version 2, since it now covers both flags. The server computes it in memory and stores it
+nowhere, so only a client that kept an older fingerprint sees a new value.
+
 ### Roadmap follow-ups
 
 #### Incremental native DL classification

@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+### A classification is complete only for the whole ontology
+
+`complete` in a classification answer now means complete for the whole input ontology, as
+HermiT and the OWL API read an answer. It was true before when the run left axioms out
+that `excluded` listed, which is ELK's convention, and that meaning moves to
+`completeForTaken` in the wire answers and `Classification::complete_for_taken` in Rust.
+`partial` and the dataset's retention now follow `completeForTaken`. `incomplete` and a
+`consistency` of `unknown` no longer imply a stopped run. A run that left axioms out lists
+the classes whose bottom-locality module holds one of them in `incomplete`, keeps every
+other class's exact superclasses, and makes the consistency `unknown` with every class
+incomplete when a left-out axiom could make the ontology inconsistent. A classification
+without `assertions` counts any assertion with logical content that it did not read as
+left out under the rule `assertion-not-read`, so an ontology with individuals answers
+incomplete, with every class incomplete and the consistency `unknown`, until it is
+classified with them. A class that only such an assertion names shows only through
+`complete` and that entry. A triple that maps to no axiom, such as the domain of an
+undeclared property or a class assertion of a blank node that no triple describes, is
+counted in the new `unmapped` statistic and leaves the answer incomplete in the same way,
+also in a classification later in a ROBOT chain (roadmap item 1276). The
+new `strict` option, `--strict` on `sparkles ontology classify` and `--strict true` on
+ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the error
+`classification-incomplete`, HTTP 422. ROBOT's commands are strict by default with
+`--reasoner hermit` or `jfact`, and `--strict false` turns that off. The answers' stats gain `coverageMs`,
+`coverageOver`, `coverageStopped` and `unmapped`, the answer lists the first 100 such
+triples in `unmappedTriples` with `unmappedTruncated`, the kept classification's outcome gains
+`unmappedCount`, a classification does not count a typing as `rdf:Property` alone, which has no logical content, and the content fingerprint of a retained
+classification is version 2, as roadmap item 1271.
+
 ### Rooted runs keep the disjointness of members that the rewriting merges
 
 The rewriting of item 805 gives `∃top.A` and `≥1 top.A` the same image, and `≥0 top.X`

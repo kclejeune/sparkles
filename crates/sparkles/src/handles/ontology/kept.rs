@@ -223,7 +223,7 @@ pub(super) fn content_fingerprint(
     excluded: &[Excluded],
     opts: &QueryOptions,
 ) -> Result<String> {
-    let mut hash = start_hash(b"sparkles-classification-content-v1\n");
+    let mut hash = start_hash(b"sparkles-classification-content-v2\n");
     hash_json(
         &mut hash,
         &(
@@ -231,7 +231,9 @@ pub(super) fn content_fingerprint(
             cl.consistent,
             consistency(cl),
             cl.complete,
+            cl.complete_for_taken,
             ClassNames(&cl.incomplete),
+            cl.stats.unmapped,
         ),
     )?;
     for (i, n) in cl.taxonomy.nodes().iter().enumerate() {
@@ -284,7 +286,10 @@ impl KeptClassification {
         excluded: Arc<Vec<Excluded>>,
         opts: &QueryOptions,
     ) -> Result<Arc<Self>> {
-        let controls = super::classify::result_options(opts, classification.complete);
+        let controls = super::classify::result_options(
+            opts,
+            !super::classify::acknowledged_stop(&classification),
+        );
         let opts = &controls;
         let source = Arc::new(Provenance::capture(h, req, c, o, opts)?);
         let content_fingerprint = content_fingerprint(&classification, &excluded, opts)?;
@@ -589,11 +594,12 @@ impl KeptClassification {
         let c = &self.classification;
         Outcome {
             tier: c.stats.tier.as_str(),
-            partial: !c.complete,
+            partial: !c.complete_for_taken,
             complete: c.complete && self.excluded.is_empty(),
             consistency: consistency(c),
             excluded_count: self.excluded.len(),
             incomplete_count: c.incomplete.len(),
+            unmapped_count: c.stats.unmapped,
         }
     }
 }
@@ -606,6 +612,9 @@ pub struct Outcome {
     pub consistency: &'static str,
     pub excluded_count: usize,
     pub incomplete_count: usize,
+    /// The triples of the input that map to no axiom, each of which leaves the answer
+    /// incomplete although no `excluded` entry names it
+    pub unmapped_count: usize,
 }
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

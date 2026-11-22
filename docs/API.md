@@ -2265,9 +2265,9 @@ assertions, EL-only, partial-request and expansion options, source counts, finit
 capabilities and `justifications: "unavailable"`. Producer-only partial/expansion choices
 are reported as originally used, rather than replaced by a later compatible caller's
 options. A DL query may advance the mutable saturation without relabeling a previously
-published result. `outcome` gives the actual tier, consistency, partial/completeness flags
-and excluded/incomplete counts. Unknown outcomes are null. A completed run with exclusions
-has `partial: false` and `complete: false`. Stopped partial taxonomies are never retained.
+published result. `outcome` gives the actual tier, consistency, partial and completeness flags
+and excluded, incomplete and unmapped counts. Unknown outcomes are null. A completed run with exclusions
+or unmapped triples has `partial: false` and `complete: false`. Stopped partial taxonomies are never retained.
 An available result with an unknown class returns `entity.present: false`, not an empty
 inference success.
 
@@ -2340,8 +2340,18 @@ the rule it breaks. An axiom that the classifier uses only in part, such as one 
 individual in a class expression, a data range, an assertion on a property with a range
 or the top or bottom property, is listed with `partial` and the reason. An axiom with
 an expression nested more than 256 deep is left out and listed as partial too.
-`complete` is false when anything is listed, and for a partial answer. Every subsumption the answer gives
-is entailed, and a complete answer has every entailed subsumption between named classes.
+`complete` is false when anything is listed in `excluded`, when any input triple is
+unmapped with `stats.unmapped` above zero, or for a partial answer, while `completeForTaken`
+stays true whenever the run finished for the axioms it took. Every subsumption the answer
+gives is entailed, a complete answer has every entailed subsumption between named classes
+for the whole input ontology, and a class outside `incomplete` keeps its exact
+superclasses, equivalents and satisfiability even when axioms are left out. A run without
+`assertions: true` reads the terminology alone and reports any unread assertion with
+logical content under the `assertion-not-read` rule, leaving `complete` false, every class
+in `incomplete` and a consistent verdict `unknown` until the ontology is classified with
+`assertions: true`. `strict: true` in the body or query string refuses an incomplete
+answer with `422` and code `classification-incomplete`, naming the left-out axioms and any
+unmapped triples, before writing a target graph.
 The answer counts the classes, the nodes of the taxonomy, the unsatisfiable classes and
 the excluded axioms, lists at most `limit` of the last two, 100 by default and at most
 10,000, and gives the times of the run under `stats`. `about` names a class and answers
@@ -2377,11 +2387,16 @@ failing with `408` or `507`. Runs of the EL and Horn rules fail as before. The a
 such a run has `partial: true` and `complete: false`. Its subsumptions and unsatisfiable
 classes are entailed, `incomplete` lists the classes whose superclasses it may miss, at
 most `limit` of them in IRI order with `incompleteCount` counting them all, and every
-other class has its full answer. `consistency` is `consistent`, `inconsistent` or, for
-a run that stopped before it decided, `unknown`, and then every class is in
-`incomplete`. `consistent` is false only for an ontology proved inconsistent, so a
-caller that needs to know reads `consistency`. A finished run has `partial: false`,
-an empty `incomplete` and a `consistency` that is never `unknown`. A partial taxonomy
+other class has its full answer. `consistency` is `consistent`, `inconsistent` or `unknown`.
+It is `unknown` when a run stopped before deciding, when an excluded axiom, unread assertion
+or unmapped triple could change consistency, or when the coverage pass hit a deadline or
+cancellation before deciding, and in those cases every class is in `incomplete`. When the
+coverage pass hits its work bound instead, classes not yet decided stay in `incomplete`, and
+`consistency` becomes `unknown` only if consistency had not yet been established. `consistent`
+is false only for an ontology proved inconsistent, so a caller that needs to know reads
+`consistency`. A finished run has
+`partial: false` and `completeForTaken: true`, and when nothing is left out or unmapped
+its `incomplete` list is empty and `consistency` is never `unknown`. A partial taxonomy
 builds after the deadline that stopped the run. It is never kept, so a later call runs
 again. `partial` is `400` with `target`, which writes a taxonomy as the classifier's,
 and with `format=ofn`, which has no place to say that the taxonomy is partial.
@@ -2407,11 +2422,20 @@ between is `409`. A write takes the parameters of the other writes, such as
 { "dataset": "go", "commit": 3, "mode": "lenient", "graphs": ["default"], "imports": [],
   "warnings": [], "consistent": true, "complete": true, "reused": false,
   "classes": 51986, "nodeCount": 51988, "unsatisfiableCount": 0, "unsatisfiable": [],
-  "excludedCount": 0, "excluded": [],
+  "excludedCount": 0, "excluded": [], "unmappedTriples": [], "unmappedTruncated": false,
   "stats": { "incremental": false, "added": 117650, "removed": 0, "cleared": 0,
     "contexts": 51987, "conclusions": 2801981, "estimatedBytes": 54673800, "threads": 4,
-    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8 } }
+    "indexMs": 453.1, "saturationMs": 402.7, "taxonomyMs": 251.8, "unmapped": 0 } }
 ```
+
+A triple of the input that maps to no axiom, such as the domain of a property that is not
+declared, may carry any logical content, so it leaves the answer incomplete although no
+`excluded` entry names it. `stats.unmapped` counts such triples, and `unmappedTriples`
+lists the first 100 in the order the input gave them, each with its `subject`,
+`predicate` and `object` as N-Triples terms, with `unmappedTruncated` true when there are
+more. The OWL API calls these unparsed triples and reports them through its RDF parser's
+metadata. Sparkles calls them unmapped, since a read of the store maps stored triples and
+parses nothing.
 
 `POST /$/ontology/{ds}/parse` reads `text` in the OWL 2 Manchester Syntax as the value
 that `as` names, which is `classExpression` by default or `dataRange`, `individual`,

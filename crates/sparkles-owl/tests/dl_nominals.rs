@@ -9,6 +9,7 @@
 use sparkles_owl::classify::{Classification, Classifier, Consistency, Expansion, Limits, Tier};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
+use sparkles_owl::vocab;
 
 const EX: &str = "http://ex.org/";
 
@@ -424,7 +425,7 @@ fn a_rooted_run_past_its_bound_answers_without_the_rooted_rules() {
         );
         assert!(out.stats.dl_over_budget);
         assert!(!out.stats.dl_counting_over);
-        assert!(out.complete);
+        assert!(out.complete_for_taken);
         assert_eq!(out.consistency, Consistency::Consistent);
         assert_eq!(k.excluded().len(), left, "{:#?}", k.excluded());
         assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
@@ -460,10 +461,20 @@ fn a_rooted_run_past_its_bound_falls_back_though_it_may_answer_in_part() {
         assert!(out.stats.dl_rooted_over, "{threads} threads");
         assert!(out.stats.dl_over_budget);
         assert!(
-            out.complete,
+            out.complete_for_taken,
             "{threads} threads: a partial answer instead of the fallback"
         );
-        assert!(out.incomplete.is_empty());
+        // the answer is not complete for the whole ontology: the left-out assertion is
+        // in the module of the empty signature, and the nominal keeps the terminology's
+        // modules from deciding, so every class is incomplete, but the consistency holds
+        assert!(!out.complete);
+        let named = out
+            .taxonomy
+            .classes()
+            .filter(|k| !matches!(k.as_str(), vocab::OWL_THING | vocab::OWL_NOTHING))
+            .count();
+        assert_eq!(out.incomplete.len(), named);
+        assert!(out.incomplete.contains(&c("A")));
         assert_eq!(out.consistency, Consistency::Consistent);
         assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
         assert!(!k.excluded().is_empty());
@@ -499,7 +510,7 @@ fn a_rooted_run_that_counts_falls_back_twice_past_a_tiny_bound() {
             assert!(out.stats.dl_counting_over, "{run}");
             assert!(out.stats.dl_rooted_over, "{run}");
             assert!(out.stats.dl_over_budget, "{run}");
-            assert!(out.complete, "{run}");
+            assert!(out.complete_for_taken, "{run}");
             assert_eq!(out.consistency, Consistency::Consistent);
             assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
             assert!(!k.excluded().is_empty());

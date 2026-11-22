@@ -9,6 +9,7 @@ const fixture = vi.hoisted(() => ({
     consistency: 'consistent',
     excludedCount: 0,
     incompleteCount: 0,
+    unmappedCount: 0,
   },
 }));
 vi.mock('./inferred-tree.svelte', () => ({
@@ -43,6 +44,7 @@ beforeEach(() => {
     consistency: 'consistent',
     excludedCount: 0,
     incompleteCount: 0,
+    unmappedCount: 0,
   };
 });
 describe('the actual inferred-tree outcome region', () => {
@@ -53,11 +55,39 @@ describe('the actual inferred-tree outcome region', () => {
       consistency: 'consistent',
       excludedCount: 3,
       incompleteCount: 0,
+      unmappedCount: 0,
     };
     const body = html();
     expect(body).toContain('omitted or partly used axioms');
     expect(body).toContain('3');
     expect(body).not.toContain('Partial classification.');
+  });
+  it('names the unmapped triples of an incomplete run with no excluded axiom', () => {
+    fixture.outcome = {
+      complete: false,
+      partial: false,
+      consistency: 'unknown',
+      excludedCount: 0,
+      incompleteCount: 4,
+      unmappedCount: 2,
+    };
+    const body = html();
+    expect(body).toContain('triples of the input map to no axiom');
+    expect(body).not.toContain('omitted or partly used axioms');
+  });
+  it('names both the excluded axioms and the unmapped triples when there are both', () => {
+    fixture.outcome = {
+      complete: false,
+      partial: false,
+      consistency: 'unknown',
+      excludedCount: 1,
+      incompleteCount: 4,
+      unmappedCount: 1,
+    };
+    const body = html();
+    expect(body).toContain('Classification is incomplete.');
+    expect(body).toContain('omitted or partly used axioms');
+    expect(body).toContain('triple of the input map to no axiom');
   });
   it('retains the complete supported-source notice', () => {
     expect(html()).toContain('Complete for its supported source.');
@@ -69,6 +99,7 @@ describe('the actual inferred-tree outcome region', () => {
       consistency: 'unknown',
       excludedCount: 0,
       incompleteCount: 2,
+      unmappedCount: 0,
     };
     expect(html()).toContain('Partial classification.');
   });
