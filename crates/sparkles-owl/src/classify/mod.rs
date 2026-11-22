@@ -96,6 +96,8 @@ mod taxonomy;
 mod world;
 
 pub use dl::{OutsideEl, Tier};
+#[doc(hidden)]
+pub use dl_root::marker_test_mode;
 pub use index::Gap;
 pub use query::Description;
 pub use taxonomy::{Node as TaxonomyNode, Taxonomy};
@@ -315,6 +317,15 @@ pub struct Limits {
     /// exempts contexts that it assumes the condition reaches some other way, which is
     /// unproved. A run with the option off keeps the rooted answer, for measurements.
     pub rooted_decline: bool,
+    /// whether a rooted run repairs the delivery of conditional ground facts (roadmap item
+    /// 1231), a prototype that is off by default and changes nothing
+    /// without [`rooted`](Limits::rooted). A context that holds a ground literal as a
+    /// condition tells the root, which sends the literal's marker to the contexts
+    /// registered for its individuals, and the root returns its clauses whose bodies are
+    /// such literals to the contexts that hold them. `SPARKLES_ROOTED_MARKER_REPAIR`
+    /// overrides it for measurements, with `0`, `1`, or a sum of the bits of
+    /// [`dl_rules::DlRun::mrepair`].
+    pub rooted_marker_repair: bool,
     /// whether a run that counts without the root orders its number restrictions by
     /// entailment (F24, "The order between number restrictions"), which is on by default
     /// and changes nothing without [`counting`](Limits::counting). `≥m r.F` entails
@@ -388,6 +399,7 @@ impl Default for Limits {
             counting: false,
             rooted: false,
             rooted_decline: true,
+            rooted_marker_repair: false,
             number_order: true,
             dl_steps: true,
             dl_automata: None,
@@ -524,6 +536,9 @@ pub struct Stats {
     /// classified again without the rooted rules, as past its bound, and left the axioms
     /// outside OWL 2 EL out
     pub dl_rooted_declined: bool,
+    /// with row 1231's diagnostic on, the marker repair's deficits at quiescence: the owed
+    /// marker deliveries, the owed returns, and the returns with too many products to check
+    pub dl_marker_deficits: [usize; 3],
     /// a run of Tier D without counting and without the rooted rules passed its bound on
     /// derived conclusions ([`Limits::dl_attempt_work`]), so the run classified with the
     /// Horn rules and left the disjunctive axioms out
@@ -2961,6 +2976,10 @@ impl Saturation {
             }
             _ => dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone()),
         });
+        let dl_run = dl_run.map(|mut d| {
+            d.mrepair = dl_root::marker_repair(limits.rooted_marker_repair);
+            d
+        });
         if let Some(scratch) = premises {
             stats.incremental = true;
             // the invalidation's bit sets, one bit for each expression and each context,
@@ -3570,6 +3589,8 @@ impl Saturation {
                 let n = self.ctx.len() + dynamic.as_ref().map_or(0, |dy| dy.len());
                 let mut ok = admit((n * std::mem::size_of::<dl_root::MarkerCtx>()) as isize);
                 let mut cs = Vec::with_capacity(if ok { n } else { 0 });
+                let diag = dl_root::marker_diag();
+                let mut refs = Vec::new();
                 for (e, c) in self
                     .ctx
                     .iter()
@@ -3580,8 +3601,14 @@ impl Saturation {
                     if !ok {
                         break;
                     }
-                    match dl_root::marker_ctx(&ix, e, &c.st.lock(), &d.lits, &mut admit) {
-                        Ok(Some(m)) => cs.push(m),
+                    let st = c.st.lock();
+                    match dl_root::marker_ctx(&ix, e, &st, &d.lits, &mut admit) {
+                        Ok(Some(m)) => {
+                            cs.push(m);
+                            if diag {
+                                refs.push(c);
+                            }
+                        }
                         Ok(None) => {}
                         Err(()) => {
                             ok = false;
@@ -3591,13 +3618,58 @@ impl Saturation {
                 }
                 ok = ok && admit(dl_root::marker_search_bytes(&cs) as isize);
                 drop(admit);
+                // the deficits' copies, outside the run's memory budget, as the diagnostic's
+                // sets are: the root's live clauses with ground bodies first, which each
+                // holder's copy reads
+                let mut defs = Vec::new();
+                // the deficits' work is counted apart from the run's, whose count a later
+                // run that keeps these contexts carries, and the run's deadline and
+                // cancellation stop it
+                let stop = std::cell::Cell::new(None);
+                let dwork = std::cell::Cell::new(0usize);
+                let mut dpoll = |n: usize| {
+                    dwork.set(dwork.get().saturating_add(n));
+                    poll(limits).map_err(|e| stop.set(Some(e))).is_ok()
+                };
+                let cf = dl_root::marker_def_cf(d.mrepair);
+                if diag && ok {
+                    let rg = cs
+                        .iter()
+                        .zip(&refs)
+                        .find(|(m, _)| dl_root::is_root(&ix, m.me))
+                        .map(|(m, c)| {
+                            dl_root::marker_root_gbody(&ix, m.me, &c.st.lock(), &d.lits, &mut dpoll)
+                        })
+                        .unwrap_or(Some(Vec::new()));
+                    // a refusal recorded its stop, which the run returns below
+                    for (m, c) in cs
+                        .iter()
+                        .zip(&refs)
+                        .take(if rg.is_some() { cs.len() } else { 0 })
+                    {
+                        match dl_root::marker_def(
+                            &ix,
+                            m,
+                            &c.st.lock(),
+                            rg.as_deref().unwrap_or_default(),
+                            &d.lits,
+                            cf,
+                            &mut dpoll,
+                        ) {
+                            Ok(def) => defs.push(def),
+                            Err(()) => break,
+                        }
+                    }
+                }
+                if let Some(e) = stop.take() {
+                    return Err(e);
+                }
                 if !ok {
                     return Err(Error::Memory {
                         limit: max_memory.unwrap_or(usize::MAX),
                         used: refused.unwrap_or(held),
                     });
                 }
-                let diag = dl_root::marker_diag();
                 let (trips, pr) =
                     dl_root::marker_trips(&ix, &cs, &d.lits, decline.filter(|_| !diag));
                 if diag {
@@ -3605,12 +3677,32 @@ impl Saturation {
                         .iter()
                         .map(|t| format!("{}/{}/{}", t[0], t[1], t[2]))
                         .collect();
+                    let m = d
+                        .mcount
+                        .each_ref()
+                        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed));
+                    let Some(def) = dl_root::marker_deficits(&ix, &cs, &defs, &d.lits, &mut dpoll)
+                    else {
+                        return Err(stop.take().unwrap_or(Error::Cancelled));
+                    };
+                    if let Some(e) = stop.take() {
+                        return Err(e);
+                    }
+                    stats.dl_marker_deficits = def;
                     eprintln!(
-                        "MARKER-DIAG work={} pr={}/{} tiers={}",
+                        "MARKER-DIAG work={} pr={}/{} tiers={} repair={} m={}/{}/{} def={}/{}/{} dwork={}",
                         stats.dl_work,
                         pr[0],
                         pr[1],
-                        t.join(",")
+                        t.join(","),
+                        d.mrepair,
+                        m[0],
+                        m[1],
+                        m[2],
+                        def[0],
+                        def[1],
+                        def[2],
+                        dwork.get()
                     );
                 }
                 if let Some(t) = decline

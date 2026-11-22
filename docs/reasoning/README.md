@@ -560,8 +560,21 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   own context, contexts that the root does not reach and the root's direct successors.
   None of these exemptions is proved, so the check is partial containment, and it also
   withdraws some answers that were complete. `Limits::rooted_decline` turns it off for
-  measurements. Roadmap item 1231 repairs the rules. A rooted run without counting has a bound of 524,288 derived
-  conclusions, `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
+  measurements. `Limits::rooted_marker_repair`, which is off by default, repairs the
+  delivery instead. A context that holds such a fact as a condition tells the root, which
+  sends it to the contexts registered for its individual, and the root returns the clauses
+  it derives under the fact to the contexts that hold it. With the repair and without the
+  check, the generated ontologies and fixtures built around the loss give HermiT's answers
+  in every run that finishes, and the larger generated corpora derive 2 to 13% more
+  conclusions, so that a few of their runs pass the work bound. With the selection of
+  ground body literals turned off for measurement, the repair makes the generated ontology
+  g1-051_p0012 grow past every bound tried, and the work and memory bounds stop it. The
+  repair checks the run's bounds at the same cooperative checkpoints as the other rules,
+  and some of its preparation reads premise lists between two checks without counting
+  the reads, which item 1280 meters. Roadmap item 1231 turns the repair on by default and
+  the check off, after items 1250 and 1280. A
+  rooted run without counting has a bound of 524,288 derived conclusions,
+  `Limits::dl_work`, past which it classifies again without the rooted rules, gives the
   default answer and sets `Stats::dl_rooted_over` and `Stats::dl_over_budget`. It takes
   keys over object properties and the universal object property by rewriting them into
   class axioms over fresh names, which never reach an answer, and a run of the rewritten

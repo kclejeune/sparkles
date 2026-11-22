@@ -247,6 +247,120 @@ bound, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` gives the earlie
 which a rooted run classifies again without counting or without the rooted rules when such
 a restriction or edge arrives, and `=0` turns both off, for measurement.
 
+Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
+queried class and concerns an individual reached from another individual must reach the
+contexts registered for that individual, and its consequences there must come back to the
+context, and the departures above keep a context's conditional ground literals in that
+context.
+A rooted run therefore looks after its saturation for such a fact that cannot reach a
+registered context, and when it finds one it classifies again without the rooted rules and
+sets `Stats::dl_rooted_declined`. The check exempts four kinds of context without a proof,
+and it withdraws between 2 and 38 complete answers per generated corpus, so it is partial
+containment, and `Limits::rooted_decline` turns it off for measurement.
+
+`Limits::rooted_marker_repair`, off by default, repairs the delivery. A context that holds
+a ground literal as a condition tells the root, which sends the literal as a marker to the
+contexts registered for its individuals that the root reaches, also to a context that
+registers or becomes reachable later. The root returns its clauses whose bodies hold such
+literals to the contexts that hold them, and each holder resolves a returned clause with
+its own premises for the body, again when a premise comes later. The sends and the returns
+count against the work bound. With the repair on and the check off, the two generated
+corpora built around the loss give 1,168 and 262 runs that differ from HermiT without the
+repair and none with it. Twelve fixtures built for particular orders of arrival fail
+without it and pass with it, although no fixture isolates a returned clause that the root
+subsumes later or a return followed by a late premise that it misses. No run that finishes
+on the other generated corpora, with or without counting and on one and four threads,
+differs from HermiT apart from g2-150. With the repair off, every corpus gives the same
+answers and the same counts of derived conclusions as before. With the diagnostic
+`SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in `Stats::dl_marker_deficits` the markers
+and returned products that its quiescent contexts still owe, and every finished run on the
+corpora owes none with the repair. The repair derives 1.02 to 1.13 times the conclusions
+on the larger generated corpora, up to 1.41 times on corpora of small files, up to 1.28
+times with counting and 1.4 to 1.65 times on the two built around the loss, which now
+derive the missing entailments, so a few runs near the bound pass it and give their
+default answer.
+
+With the selection of ground body literals off, the setting of item 1220's measurements,
+the repair's returns derive more. On one purpose-built ontology they add 24% to the
+derived conclusions, and on the generated ontology g1-051_p0012 the run passes the work
+bound at 4 million conclusions and the memory budget of 1 GiB at 400 million, against
+455,967 conclusions without the repair. `SPARKLES_ROOTED_MARKER_REPAIR=129` resolves a
+returned clause only with premises whose body has no ground literal. It loses no answer on
+the corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten
+runs that the repair alone takes past the bound, but g1-051_p0012 still passes the bound of 4
+million and finishes only at 63.2 million conclusions under a bound of 400 million. Its
+growth is in Pred over successor terms of constants and in Join, which item 1250
+follows, and g1-051_p0121 derives 1.42 million conclusions against 1.17 million with the
+repair alone. The repair's state costs 8 bytes per context with the repair off, which item
+1247 removes, and a synthetic family whose conditions nest two or more deep grows with the
+repair's sends, which is item 1251. The repair's completeness is not proved, and the check
+stays on by default.
+
+The repair keeps the resource contract of the rest of Tier D, and the contract is
+cooperative. A run charges each conclusion that it derives to the work bound, and several
+of the repair's scans also charge one conclusion for every 16 entries that they read,
+while others do not. The preparation of an inference, such as the premise lists of a rule
+and their pruning, takes time and memory in proportion to the clauses that the context
+already holds and is not charged while it runs. The redundancy test of each derived
+conclusion against the stored clauses is not counted either, here as in the rest of Tier
+D. Growth of the retained indexes is added to the memory estimate after the allocation.
+The run checks the work bound, the memory budget, the deadline and a cancellation at
+cooperative checkpoints, which come after every 256 choices of a product, after every 64
+sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
+totals. The contract therefore bounds neither the time between two checks by a fixed
+number of reads nor the allocated bytes by the memory budget, which is an estimate. A counting allocator
+measures the heap 6 to 31% above the charged estimate on the three files named below, with the
+repair on or off, and item 1291 follows that difference.
+
+A returned clause reserves memory before its products run, both on initial arrival and when a
+late premise replays saved returns. The product of a clause that
+is not ground charges each union that it keeps, as every rule does, but not the table that
+records its unions nor the spare capacity of each step's list. These grow with the number of
+unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
+million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
+and 51 MB, and the heap reached 286 MB. Initial arrivals therefore reserve a bound on those
+tables before draining their products and release it after them, and each late-replay batch
+reserves the checked sum of its held products and the largest product's table bound before
+draining. The table model runs in 128-bit arithmetic and saturates once at the end, and an
+unrepresentable bound or estimate overflow stops the run cleanly with a memory stop before
+enumeration rather than clamping the reservation or promising a hard allocation ceiling. A
+refused reservation rolls back any debit it added and stops the run as a refused charge does.
+The bound takes one union per choice of the product,
+which can exceed the unions a step keeps by more than a thousand times. That overcount is
+what makes it a bound. Its model of a step's tables, taken at the unions that the step
+actually keeps, is smaller than the growth of the heap past the estimate in the heaviest
+returns without the reservation, 18.7 MB against 23.3 MB under the budget of 256 MiB and
+24.6 MB against 173.6 MB under the default budget. In the initial-arrival measurements on
+those files, the return reservation stopped g1-051_p0012 earlier at a heap of 179 MB under
+256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
+conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
+stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
+reservation, so that run does not finish under its own budget either way and item 1291
+follows it. The rules of the default
+path leave the same tables uncharged. With the repair off these tables stay at or below
+6.3 KB on these files and at 50 KB on ore_ont_14817 until its Tier D attempt passes its
+bound, and item 1291 covers them.
+
+Some steps of the repair and of the rooted rules read between two checks without counting
+what they read. The steps named here are the ones that were measured or reproduced, and
+other preparation falls under the rule above. The premise lists of a returned clause are
+prepared for one return, and for up to 64 returns when a late premise replays them,
+before the next check. On the three files where the returns derive most, part022 p01,
+g1-051_p0121 and g1-051_p0012 under the containment arm with the repair at 1 and at 129,
+a list read at most 548 premises and kept at most 378, one pruning of a list made at most
+38,226 comparisons, and the preparation of a batch of returns allocated at most 143 KB,
+at most 6.4% of the holder's store at the time. The index of a clause that the root
+offers to its holders is built for the whole body before the first check, so that step is
+bounded by one clause's body. With `SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test
+of each of the diagnostic's products scans the context's stored clauses without a count.
+The marker pass that the diagnostic and the decline check run after a rooted run
+saturates checks no bound. The decline check runs it on every rooted run with the check
+on, with the repair on or off. When the last step of a wide product passes 4,096 unions,
+the product derives the 4,097 unions that it holds before its next check, also with the
+repair off. Item 1260 follows the stop latency of the marker pass and of the wide
+product, and item 1280 gives the repair and the store's premise lists one meter that
+counts these reads.
+
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
 is the calculus's own at-most clause with the neighbours in its body, an exact
