@@ -779,6 +779,12 @@ impl Sink for WorldSink<'_> {
             self.halted.set(true);
         }
     }
+    // `reserve_data` already charged `self.bound` and added `bytes` to `data_growth`;
+    // taking `bytes` out of `data_growth` keeps the bound charged after the world drops.
+    fn retain_shared(&mut self, bytes: usize) {
+        self.data_growth
+            .set(self.data_growth.get() - bytes as isize);
+    }
     fn release_data(&mut self, bytes: usize) {
         self.data_growth
             .set(self.data_growth.get() - bytes as isize);

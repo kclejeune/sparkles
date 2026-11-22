@@ -1621,4 +1621,55 @@ mod units_rule {
         let got = check_stopping(&mut p.t.r, &p.p, &Bounds::default(), &stop);
         assert!(matches!(got, Answer::Sat | Answer::Unknown(Why::Stopped)));
     }
+
+    #[test]
+    fn one_shot_stop_in_search_returns_stopped_not_bound() {
+        // A one-shot stop firing once during search must still report Why::Stopped,
+        // never Why::Bound after a second poll returns false. Using `nodes = 1024` makes
+        // `budget.is_multiple_of(1024)` fire deterministically on the first search node.
+        let mut p = P::new(4);
+        for d in 0..4 {
+            p.min(d, 5, &dt("integer"));
+            p.max(d, 5, &dt("integer"));
+        }
+        // Poll 1: check_bounded entry; poll 2: cell loop; poll 3: first search node.
+        let polls = std::cell::Cell::new(0u32);
+        let one_shot = || {
+            let k = polls.get() + 1;
+            polls.set(k);
+            k == 3
+        };
+        let bounds = Bounds {
+            nodes: 1024,
+            ..Bounds::default()
+        };
+        let got = check_stopping(&mut p.t.r, &p.p, &bounds, &one_shot);
+        assert_eq!(got, Answer::Unknown(Why::Stopped));
+        assert_eq!(polls.get(), 3);
+    }
+
+    #[test]
+    fn large_one_of_stops_before_growing_past_admit_limit() {
+        let mut r = Ranges::new();
+        let mut defs = super::super::range::Defs::default();
+        let lits: std::collections::BTreeSet<Literal> = (0..200)
+            .map(|i| Literal::typed(format!("{i:0>200}"), vocab::XSD_STRING))
+            .collect();
+        let range = DataRange::OneOf(lits);
+        let admitted = std::cell::Cell::new(0usize);
+        let cap = 4096usize;
+        let got = r.of_defined_bounded(&range, &mut defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert_eq!(got, Err(Fail::Memory));
+        assert!(admitted.get() <= cap);
+        // Refusal precedes interning, so no partial OneOf prefix was retained in Ranges.
+        assert_eq!(r.bytes(), Ranges::new().bytes());
+    }
 }

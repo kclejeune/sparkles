@@ -429,28 +429,38 @@ impl Nf {
     /// The range of one value.
     pub fn point(v: &DVal) -> Nf {
         let mut n = Nf::empty();
+        n.insert_point(v);
+        n
+    }
+
+    /// Inserts one value into a finite-union normal form built from [`Nf::empty`],
+    /// mutating `self.inc` in place rather than cloning the existing prefix.
+    pub fn insert_point(&mut self, v: &DVal) {
         match v {
             DVal::Real(q) => {
                 if q.is_int() {
-                    n.int = Disc::point(q.floor());
+                    self.int = Op::Join.disc(&self.int, &Disc::point(q.floor()));
                 } else if q.is_decimal() {
-                    n.dec = Dense::point(q.clone(), dec_m);
+                    self.dec = Op::Join.dense(&self.dec, &Dense::point(q.clone(), dec_m), dec_m);
                 } else {
-                    n.rat = Dense::point(q.clone(), rat_m);
+                    self.rat = Op::Join.dense(&self.rat, &Dense::point(q.clone(), rat_m), rat_m);
                 }
             }
-            DVal::Float(k) if *k == NAN => n.float_nan = true,
-            DVal::Float(k) => n.float = Disc::point(*k),
-            DVal::Double(k) if *k == NAN => n.double_nan = true,
-            DVal::Double(k) => n.double = Disc::point(*k),
-            DVal::Bool(b) => n.boolean = 1 << u8::from(*b),
-            DVal::Time(q, None) => n.tloc = Dense::point(q.clone(), time_m),
-            _ if Tiny::of(v).is_some() => n.tiny = Tiny::of(v).expect("a tiny value"),
+            DVal::Float(k) if *k == NAN => self.float_nan = true,
+            DVal::Float(k) => self.float = Op::Join.disc(&self.float, &Disc::point(*k)),
+            DVal::Double(k) if *k == NAN => self.double_nan = true,
+            DVal::Double(k) => self.double = Op::Join.disc(&self.double, &Disc::point(*k)),
+            DVal::Bool(b) => self.boolean |= 1 << u8::from(*b),
+            DVal::Time(q, None) => {
+                self.tloc = Op::Join.dense(&self.tloc, &Dense::point(q.clone(), time_m), time_m);
+            }
+            _ if Tiny::of(v).is_some() => {
+                self.tiny |= Tiny::of(v).expect("a tiny value");
+            }
             _ => {
-                n.inc.insert(v.clone());
+                self.inc.insert(v.clone());
             }
         }
-        n
     }
 
     fn base(&self, o: &Nf, op: Op) -> Nf {
@@ -1146,6 +1156,20 @@ impl Ranges {
         self.ids.insert(nf, id);
         id
     }
+    pub fn intern_bounded(&mut self, nf: Nf, admit: &dyn Fn(usize) -> bool) -> Result<Rid, Fail> {
+        if let Some(id) = self.ids.get(&nf) {
+            return Ok(*id);
+        }
+        let add = 2 * nf.bytes() + 64;
+        if !admit(add) {
+            return Err(Fail::Memory);
+        }
+        let id = self.nfs.len() as Rid;
+        self.bytes += 2 * nf.bytes();
+        self.nfs.push(nf.clone());
+        self.ids.insert(nf, id);
+        Ok(id)
+    }
 }
 
 impl Default for Ranges {
@@ -1172,6 +1196,29 @@ impl Ranges {
         self.meets.insert(k, r);
         r
     }
+    pub fn meet_bounded(
+        &mut self,
+        a: Rid,
+        b: Rid,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<Rid, Fail> {
+        let k = (a.min(b), a.max(b));
+        if let Some(r) = self.meets.get(&k) {
+            return Ok(*r);
+        }
+        let est = self
+            .nf(a)
+            .bytes()
+            .saturating_add(self.nf(b).bytes())
+            .saturating_add(48);
+        if !admit(est) {
+            return Err(Fail::Memory);
+        }
+        let r = self.nf(a).meet(self.nf(b));
+        let r = self.intern_bounded(r, admit)?;
+        self.meets.insert(k, r);
+        Ok(r)
+    }
     pub fn join(&mut self, a: Rid, b: Rid) -> Rid {
         let k = (a.min(b), a.max(b));
         if let Some(r) = self.joins.get(&k) {
@@ -1182,6 +1229,29 @@ impl Ranges {
         self.joins.insert(k, r);
         r
     }
+    pub fn join_bounded(
+        &mut self,
+        a: Rid,
+        b: Rid,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<Rid, Fail> {
+        let k = (a.min(b), a.max(b));
+        if let Some(r) = self.joins.get(&k) {
+            return Ok(*r);
+        }
+        let est = self
+            .nf(a)
+            .bytes()
+            .saturating_add(self.nf(b).bytes())
+            .saturating_add(48);
+        if !admit(est) {
+            return Err(Fail::Memory);
+        }
+        let r = self.nf(a).join(self.nf(b));
+        let r = self.intern_bounded(r, admit)?;
+        self.joins.insert(k, r);
+        Ok(r)
+    }
     pub fn not(&mut self, a: Rid) -> Rid {
         if let Some(r) = self.nots.get(&a) {
             return *r;
@@ -1191,6 +1261,20 @@ impl Ranges {
         self.nots.insert(a, r);
         self.nots.insert(r, a);
         r
+    }
+    pub fn not_bounded(&mut self, a: Rid, admit: &dyn Fn(usize) -> bool) -> Result<Rid, Fail> {
+        if let Some(r) = self.nots.get(&a) {
+            return Ok(*r);
+        }
+        let est = self.nf(a).bytes().saturating_add(96);
+        if !admit(est) {
+            return Err(Fail::Memory);
+        }
+        let r = self.nf(a).not();
+        let r = self.intern_bounded(r, admit)?;
+        self.nots.insert(a, r);
+        self.nots.insert(r, a);
+        Ok(r)
     }
     pub fn size(&mut self, a: Rid) -> Size {
         if let Some(s) = self.sizes.get(&a) {
@@ -1220,43 +1304,55 @@ impl Ranges {
     pub fn contains(&self, a: Rid, v: &DVal) -> bool {
         self.nf(a).contains(v)
     }
-    pub fn value(&mut self, v: &DVal) -> Rid {
-        self.intern(Nf::point(v))
-    }
-    pub fn literal(&mut self, l: &Literal) -> Result<Rid, Unsupported> {
+    pub fn literal_bounded(
+        &mut self,
+        l: &Literal,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<Rid, Fail> {
+        let est =
+            l.value().len() + l.language().map_or(0, str::len) + std::mem::size_of::<Nf>() + 64;
+        if !admit(est) {
+            return Err(Fail::Memory);
+        }
         let v = value::of_literal(l)?;
-        Ok(self.value(&v))
+        self.intern_bounded(Nf::point(&v), admit)
     }
-    pub fn datatype(&mut self, iri: &str) -> Result<Rid, Unsupported> {
+    pub fn datatype_bounded(
+        &mut self,
+        iri: &str,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<Rid, Fail> {
         let (n, _) = datatype_nf(iri)?;
-        Ok(self.intern(n))
+        self.intern_bounded(n, admit)
     }
     /// The range of a data range of the ontology.
     pub fn of(&mut self, r: &DataRange) -> Result<Rid, Unsupported> {
         match self.of_stopping(r, &|| false) {
             Ok(x) => Ok(x),
             Err(Fail::Unsupported(u)) => Err(u),
-            Err(Fail::Stopped) => unreachable!("the flag is never set"),
+            Err(Fail::Stopped | Fail::Memory) => unreachable!("the flag is never set"),
         }
     }
 
     /// The range of a data range of the ontology, stopping once `stop` returns true. The
     /// flag is read before each operand, since an enumeration of n literals costs n joins.
     pub fn of_stopping(&mut self, r: &DataRange, stop: &dyn Fn() -> bool) -> Result<Rid, Fail> {
-        self.of_in(r, None, 0, stop)
+        self.of_in(r, None, 0, stop, &|_| true)
     }
 
     /// [`Ranges::of_stopping`], with each datatype that `defs` defines standing for its
-    /// definition. Each definition is converted once, so definitions shared by many
-    /// ranges or nested in each other cost their size and not the size of their
-    /// expansion. `defs` must be used with this table only, since it keeps its ids.
-    pub fn of_defined(
+    /// definition and admitting memory growth via `admit` before each allocation. Each
+    /// definition is converted once, so definitions shared by many ranges or nested in
+    /// each other cost their size and not the size of their expansion. `defs` must be
+    /// used with this table only, since it keeps its ids.
+    pub fn of_defined_bounded(
         &mut self,
         r: &DataRange,
         defs: &mut Defs,
         stop: &dyn Fn() -> bool,
+        admit: &dyn Fn(usize) -> bool,
     ) -> Result<Rid, Fail> {
-        self.of_in(r, Some(defs), 0, stop)
+        self.of_in(r, Some(defs), 0, stop, admit)
     }
 
     fn of_in(
@@ -1265,13 +1361,14 @@ impl Ranges {
         mut defs: Option<&mut Defs>,
         depth: usize,
         stop: &dyn Fn() -> bool,
+        admit: &dyn Fn(usize) -> bool,
     ) -> Result<Rid, Fail> {
         if stop() {
             return Err(Fail::Stopped);
         }
         Ok(match r {
             DataRange::Datatype(d) => match defs {
-                Some(defs) if defs.map.contains_key(d) => {
+                Some(defs) if !vocab::is_reserved(d.as_str()) && defs.map.contains_key(d) => {
                     match defs.memo.get(d) {
                         Some(Some(Ok(id))) => return Ok(*id),
                         Some(Some(Err(u))) => return Err(Fail::Unsupported(u.clone())),
@@ -1288,9 +1385,14 @@ impl Ranges {
                             d.0.as_str().to_string(),
                         )));
                     }
+                    let memo_est =
+                        std::mem::size_of::<(Datatype, Option<Result<Rid, Unsupported>>)>() + 16;
+                    if !admit(memo_est) {
+                        return Err(Fail::Memory);
+                    }
                     defs.memo.insert(d.clone(), None);
                     let x = defs.map[d].clone();
-                    match self.of_in(&x, Some(&mut *defs), depth + 1, stop) {
+                    match self.of_in(&x, Some(&mut *defs), depth + 1, stop, admit) {
                         Ok(id) => {
                             defs.memo.insert(d.clone(), Some(Ok(id)));
                             id
@@ -1299,49 +1401,59 @@ impl Ranges {
                             defs.memo.insert(d.clone(), Some(Err(u.clone())));
                             return Err(Fail::Unsupported(u));
                         }
-                        Err(Fail::Stopped) => {
+                        Err(e @ (Fail::Stopped | Fail::Memory)) => {
                             defs.memo.remove(d);
-                            return Err(Fail::Stopped);
+                            return Err(e);
                         }
                     }
                 }
-                _ => self.datatype(d.0.as_str())?,
+                _ => self.datatype_bounded(d.0.as_str(), admit)?,
             },
             DataRange::IntersectionOf(rs) => {
                 let mut acc = Ranges::FULL;
                 for x in rs {
-                    let x = self.of_in(x, defs.as_deref_mut(), depth, stop)?;
-                    acc = self.meet(acc, x);
+                    let x = self.of_in(x, defs.as_deref_mut(), depth, stop, admit)?;
+                    acc = self.meet_bounded(acc, x, admit)?;
                 }
                 acc
             }
             DataRange::UnionOf(rs) => {
                 let mut acc = Ranges::EMPTY;
                 for x in rs {
-                    let x = self.of_in(x, defs.as_deref_mut(), depth, stop)?;
-                    acc = self.join(acc, x);
+                    let x = self.of_in(x, defs.as_deref_mut(), depth, stop, admit)?;
+                    acc = self.join_bounded(acc, x, admit)?;
                 }
                 acc
             }
             DataRange::ComplementOf(x) => {
-                let x = self.of_in(x, defs, depth, stop)?;
-                self.not(x)
+                let x = self.of_in(x, defs, depth, stop, admit)?;
+                self.not_bounded(x, admit)?
             }
             DataRange::OneOf(ls) => {
-                let mut acc = Ranges::EMPTY;
+                let mut n = Nf::empty();
                 for l in ls {
                     if stop() {
                         return Err(Fail::Stopped);
                     }
-                    let x = self.literal(l)?;
-                    acc = self.join(acc, x);
+                    let est = l.value().len()
+                        + l.language().map_or(0, str::len)
+                        + std::mem::size_of::<DVal>()
+                        + 32;
+                    if !admit(est) {
+                        return Err(Fail::Memory);
+                    }
+                    let v = value::of_literal(l)?;
+                    n.insert_point(&v);
                 }
-                acc
+                self.intern_bounded(n, admit)?
             }
             DataRange::DatatypeRestriction(d, fs) => {
                 let dt = d.0.as_str();
                 let (mut n, fam) = datatype_nf(dt)?;
                 for f in fs {
+                    if stop() {
+                        return Err(Fail::Stopped);
+                    }
                     let facet = f.facet.as_str();
                     if fam == Fam::Time {
                         // checked here, since `datatypes::facet_problem` reads date-times
@@ -1352,7 +1464,7 @@ impl Ranges {
                     }
                     n = n.meet(&facet_nf(fam, facet, &f.value)?);
                 }
-                self.intern(n)
+                self.intern_bounded(n, admit)?
             }
         })
     }
@@ -1371,7 +1483,10 @@ impl Defs {
     /// The deepest nesting of definitions a conversion follows.
     pub const MAX_DEPTH: usize = 64;
 
-    pub fn new(map: FxHashMap<Datatype, DataRange>) -> Defs {
+    pub fn new(mut map: FxHashMap<Datatype, DataRange>) -> Defs {
+        // OWL 2 forbids redefining reserved datatype IRIs; never let an illegal
+        // definition shadow a built-in datatype.
+        map.retain(|d, _| !vocab::is_reserved(d.as_str()));
         Defs {
             map,
             memo: FxHashMap::default(),
@@ -1387,10 +1502,53 @@ impl Defs {
         Defs::new(self.map.clone())
     }
 
-    /// The bytes the converted ranges take, the definitions aside.
+    /// The bytes the definitions (including cloned `DataRange` ASTs) and converted ranges
+    /// take.
     pub fn bytes(&self) -> usize {
-        self.memo.capacity()
-            * (std::mem::size_of::<(Datatype, Option<Result<Rid, Unsupported>>)>() + 1)
+        self.map.capacity() * (std::mem::size_of::<(Datatype, DataRange)>() + 1)
+            + self
+                .map
+                .iter()
+                .map(|(d, r)| d.as_str().len() + data_range_bytes(r))
+                .sum::<usize>()
+            + self.memo.capacity()
+                * (std::mem::size_of::<(Datatype, Option<Result<Rid, Unsupported>>)>() + 1)
+    }
+}
+
+/// Recursive size estimate of a [`DataRange`] AST (strings, nested operands and facets),
+/// used to pre-admit definition copies before cloning them.
+pub fn data_range_bytes(r: &DataRange) -> usize {
+    let base = std::mem::size_of::<DataRange>();
+    match r {
+        DataRange::Datatype(d) => base + d.as_str().len(),
+        DataRange::IntersectionOf(rs) | DataRange::UnionOf(rs) => {
+            base + rs.iter().map(data_range_bytes).sum::<usize>()
+        }
+        DataRange::ComplementOf(x) => base + data_range_bytes(x),
+        DataRange::OneOf(ls) => {
+            base + ls
+                .iter()
+                .map(|l| {
+                    std::mem::size_of::<Literal>()
+                        + l.value().len()
+                        + l.datatype().len()
+                        + l.language().map_or(0, str::len)
+                })
+                .sum::<usize>()
+        }
+        DataRange::DatatypeRestriction(d, fs) => {
+            base + d.as_str().len()
+                + fs.iter()
+                    .map(|f| {
+                        std::mem::size_of_val(f)
+                            + f.facet.as_str().len()
+                            + f.value.value().len()
+                            + f.value.datatype().len()
+                            + f.value.language().map_or(0, str::len)
+                    })
+                    .sum::<usize>()
+        }
     }
 }
 
@@ -1401,6 +1559,8 @@ pub enum Fail {
     Unsupported(Unsupported),
     /// the caller's stop flag was set
     Stopped,
+    /// the caller's memory admission callback refused an allocation
+    Memory,
 }
 
 impl From<Unsupported> for Fail {

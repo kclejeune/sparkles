@@ -20,6 +20,15 @@ use rustc_hash::FxHashMap;
 /// The axioms the pre-pass reads between two polls of its stop.
 const POLL: usize = 4096;
 
+/// Why [`Comps::of_bounded`] stopped before finishing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompFail {
+    /// the caller's stop flag was set
+    Stopped,
+    /// the caller's memory admission callback refused an allocation
+    Memory,
+}
+
 /// The components of a run's data properties.
 #[derive(Clone, Debug, Default)]
 pub struct Comps {
@@ -30,30 +39,68 @@ pub struct Comps {
 }
 
 impl Comps {
+    /// Zero-allocation fast check: returns `Ok(false)` only when no axiom in `axioms`
+    /// can possibly trigger a checker component (consistent with [`Walk::el_range`], so
+    /// `rdf:langString` and user-defined datatypes return `Ok(true)`).
+    pub fn may_trigger(axioms: &[&AxiomKind], stop: &dyn Fn() -> bool) -> Result<bool, CompFail> {
+        for (i, &k) in axioms.iter().enumerate() {
+            if i.is_multiple_of(POLL) && stop() {
+                return Err(CompFail::Stopped);
+            }
+            if axiom_may_trigger(k) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// The components of the data properties of `axioms`, with the datatype definitions
     /// that the data ranges naming a defined datatype stand for, or `None` once `stop`
     /// returns true.
     pub fn of(axioms: &[&AxiomKind], defs: &Defs, stop: &dyn Fn() -> bool) -> Option<Comps> {
+        Self::of_bounded(axioms, defs, stop, &|_| true).ok()
+    }
+
+    /// [`Comps::of`], admitting scratch and output memory through `admit` before
+    /// allocation and distinguishing stop-flag halts from memory refusals.
+    pub fn of_bounded(
+        axioms: &[&AxiomKind],
+        defs: &Defs,
+        stop: &dyn Fn() -> bool,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<Comps, CompFail> {
         let mut w = Walk {
             ids: FxHashMap::default(),
             parent: Vec::new(),
             trig: Vec::new(),
-            defs: defs.unconverted(),
+            raw_defs: defs,
+            conv_defs: None,
             el_defs: FxHashMap::default(),
-            scratch: Ranges::new(),
+            scratch: None,
             stop,
-            stopped: false,
+            admit,
+            fail: None,
         };
         for (i, &k) in axioms.iter().enumerate() {
-            if w.stopped || (i.is_multiple_of(POLL) && stop()) {
-                return None;
+            if let Some(f) = w.fail {
+                return Err(f);
+            }
+            if i.is_multiple_of(POLL) && stop() {
+                return Err(CompFail::Stopped);
             }
             w.axiom(k);
         }
-        if w.stopped {
-            return None;
+        if let Some(f) = w.fail {
+            return Err(f);
         }
         let n = w.parent.len();
+        if n == 0 {
+            return Ok(Comps::default());
+        }
+        let out_est = n.saturating_mul(std::mem::size_of::<(DataProperty, u32)>() + 24);
+        if !admit(out_est) {
+            return Err(CompFail::Memory);
+        }
         let mut root_comp: FxHashMap<usize, u32> = FxHashMap::default();
         let mut checker = Vec::new();
         let mut of_id = vec![0u32; n];
@@ -72,7 +119,7 @@ impl Comps {
             }
         }
         let comp = w.ids.into_iter().map(|(d, i)| (d, of_id[i])).collect();
-        Some(Comps { comp, checker })
+        Ok(Comps { comp, checker })
     }
 
     /// The component of a data property, when the axioms name it.
@@ -116,21 +163,40 @@ struct Walk<'a> {
     ids: FxHashMap<DataProperty, usize>,
     parent: Vec<usize>,
     trig: Vec<bool>,
-    defs: Defs,
+    raw_defs: &'a Defs,
+    /// cloned lazily only once a non-EL range actually needs conversion
+    conv_defs: Option<Defs>,
     /// whether each defined datatype has the forms of OWL 2 EL, `None` while it is read
     el_defs: FxHashMap<Datatype, Option<bool>>,
-    scratch: Ranges,
+    /// initialized lazily only once a non-EL range or literal actually needs conversion
+    scratch: Option<Ranges>,
     stop: &'a dyn Fn() -> bool,
-    stopped: bool,
+    admit: &'a dyn Fn(usize) -> bool,
+    fail: Option<CompFail>,
 }
 
 impl Walk<'_> {
+    fn admit_bytes(&mut self, bytes: usize) -> bool {
+        if self.fail.is_some() {
+            return false;
+        }
+        if bytes > 0 && !(self.admit)(bytes) {
+            self.fail = Some(CompFail::Memory);
+            return false;
+        }
+        true
+    }
+
     fn id(&mut self, d: &DataProperty) -> Option<usize> {
-        if is_special(d) {
+        if self.fail.is_some() || is_special(d) {
             return None;
         }
         if let Some(&i) = self.ids.get(d) {
             return Some(i);
+        }
+        let est = std::mem::size_of::<(DataProperty, usize)>() + d.as_str().len() + 32;
+        if !self.admit_bytes(est) {
+            return None;
         }
         let i = self.parent.len();
         self.parent.push(i);
@@ -192,6 +258,14 @@ impl Walk<'_> {
             }
             K::DisjointDataProperties(ps) => {
                 let ps: Vec<&DataProperty> = ps.iter().collect();
+                // DisjointDataProperties involving top/bottom data property is refused
+                // by horn::axiom, so it must not mark or join ordinary properties.
+                if ps.len() < 2 || ps.iter().any(|p| is_special(p)) {
+                    for p in &ps {
+                        self.note(p);
+                    }
+                    return;
+                }
                 for p in &ps {
                     self.mark(p);
                 }
@@ -252,32 +326,103 @@ impl Walk<'_> {
                     self.note(d);
                 }
             }
-            C::DataAllValuesFrom(ps, _) if ps.len() == 1 => self.mark(&ps[0]),
-            C::DataMinCardinality(_, d, _)
-            | C::DataMaxCardinality(_, d, _)
-            | C::DataExactCardinality(_, d, _) => self.mark(d),
+            C::DataAllValuesFrom(ps, r) if ps.len() == 1 => {
+                if self.range_accepted(r) {
+                    self.mark(&ps[0]);
+                } else {
+                    self.note(&ps[0]);
+                }
+            }
+            C::DataMinCardinality(_, d, r)
+            | C::DataMaxCardinality(_, d, r)
+            | C::DataExactCardinality(_, d, r) => {
+                if r.as_ref().is_none_or(|r| self.range_accepted(r)) {
+                    self.mark(d);
+                } else {
+                    self.note(d);
+                }
+            }
             _ => {}
         }
     }
 
+    /// Lazily initializes `scratch` (and `conv_defs` when definitions exist), admitting
+    /// their base storage first.
+    fn ensure_scratch(&mut self) -> bool {
+        if self.fail.is_some() {
+            return false;
+        }
+        if self.scratch.is_none() {
+            let init_est = 4096;
+            if !self.admit_bytes(init_est) {
+                return false;
+            }
+            self.scratch = Some(Ranges::new());
+        }
+        if self.conv_defs.is_none() {
+            let defs_est = self.raw_defs.bytes();
+            if !self.admit_bytes(defs_est) {
+                return false;
+            }
+            self.conv_defs = Some(self.raw_defs.unconverted());
+        }
+        true
+    }
+
     /// Whether a literal is outside the EL map and has a value the checker reads.
     fn literal_triggers(&mut self, l: &Literal) -> bool {
-        !el_literal(l) && self.scratch.literal(l).is_ok()
+        if self.fail.is_some() || el_literal(l) {
+            return false;
+        }
+        if !self.ensure_scratch() {
+            return false;
+        }
+        let scratch = self.scratch.as_mut().expect("scratch initialized");
+        match scratch.literal_bounded(l, self.admit) {
+            Ok(_) => true,
+            Err(Fail::Unsupported(_)) => false,
+            Err(Fail::Stopped) => {
+                self.fail = Some(CompFail::Stopped);
+                false
+            }
+            Err(Fail::Memory) => {
+                self.fail = Some(CompFail::Memory);
+                false
+            }
+        }
+    }
+
+    /// Whether the checker converts `r` (even when `r` itself is an EL range, as on a
+    /// universal or cardinality restriction).
+    fn range_accepted(&mut self, r: &DataRange) -> bool {
+        if self.fail.is_some() {
+            return false;
+        }
+        if !self.ensure_scratch() {
+            return false;
+        }
+        let scratch = self.scratch.as_mut().expect("scratch initialized");
+        let defs = self.conv_defs.as_mut().expect("conv_defs initialized");
+        match scratch.of_defined_bounded(r, defs, self.stop, self.admit) {
+            Ok(_) => true,
+            Err(Fail::Unsupported(_)) => false,
+            Err(Fail::Stopped) => {
+                self.fail = Some(CompFail::Stopped);
+                false
+            }
+            Err(Fail::Memory) => {
+                self.fail = Some(CompFail::Memory);
+                false
+            }
+        }
     }
 
     /// Whether a data range is outside the EL forms and the checker reads it.
     fn range_triggers(&mut self, r: &DataRange) -> bool {
-        if self.el_range(r, 0) {
+        if self.fail.is_some() || self.el_range(r, 0) {
             return false;
         }
-        match self.scratch.of_defined(r, &mut self.defs, self.stop) {
-            Ok(_) => true,
-            Err(Fail::Unsupported(_)) => false,
-            Err(Fail::Stopped) => {
-                self.stopped = true;
-                false
-            }
-        }
+        self.range_accepted(r)
     }
 
     /// Whether a data range has the forms of OWL 2 EL: datatypes of the EL map,
@@ -293,7 +438,7 @@ impl Walk<'_> {
                 if iri == vocab::RDFS_LITERAL || Kind::of(iri).is_some() {
                     return true;
                 }
-                let Some(x) = self.defs.map().get(d).cloned() else {
+                let Some(x) = self.raw_defs.map().get(d).cloned() else {
                     return false;
                 };
                 match self.el_defs.get(d) {
@@ -301,6 +446,11 @@ impl Walk<'_> {
                     // a definition that names itself
                     Some(None) => false,
                     None => {
+                        let est =
+                            std::mem::size_of::<(Datatype, Option<bool>)>() + d.as_str().len() + 16;
+                        if !self.admit_bytes(est) {
+                            return false;
+                        }
                         self.el_defs.insert(d.clone(), None);
                         let b = self.el_range(&x, depth + 1);
                         self.el_defs.insert(d.clone(), Some(b));
@@ -394,6 +544,59 @@ fn el_literal(l: &Literal) -> bool {
     l.0.language().is_some() || Kind::of(l.0.datatype().as_str()).is_some()
 }
 
+/// Whether `r` is built only from built-in OWL 2 EL datatypes without referencing any
+/// defined datatype or `rdf:langString`. Matches the base cases of `Walk::el_range`.
+fn builtin_el_range(r: &DataRange) -> bool {
+    match r {
+        DataRange::Datatype(d) => {
+            let iri = d.0.as_str();
+            iri == vocab::RDFS_LITERAL || Kind::of(iri).is_some()
+        }
+        DataRange::IntersectionOf(rs) => rs.iter().all(builtin_el_range),
+        DataRange::OneOf(ls) => ls.len() == 1 && ls.iter().all(el_literal),
+        _ => false,
+    }
+}
+
+fn axiom_may_trigger(k: &AxiomKind) -> bool {
+    use AxiomKind as K;
+    match k {
+        K::SubClassOf(a, b) => class_may_trigger(a) || class_may_trigger(b),
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+            cs.iter().any(class_may_trigger)
+        }
+        K::ObjectPropertyDomain(_, c)
+        | K::ObjectPropertyRange(_, c)
+        | K::ClassAssertion(c, _)
+        | K::DataPropertyDomain(_, c)
+        | K::HasKey(c, _, _) => class_may_trigger(c),
+        K::DisjointDataProperties(ps) => ps.len() >= 2 && !ps.iter().any(is_special),
+        K::DataPropertyRange(_, r) => !builtin_el_range(r),
+        K::DataPropertyAssertion(_, _, l) | K::NegativeDataPropertyAssertion(_, _, l) => {
+            !el_literal(l)
+        }
+        _ => false,
+    }
+}
+
+fn class_may_trigger(c: &ClassExpression) -> bool {
+    use ClassExpression as C;
+    match c {
+        C::ObjectIntersectionOf(cs) | C::ObjectUnionOf(cs) => cs.iter().any(class_may_trigger),
+        C::ObjectComplementOf(c)
+        | C::ObjectSomeValuesFrom(_, c)
+        | C::ObjectAllValuesFrom(_, c)
+        | C::ObjectMinCardinality(_, _, Some(c))
+        | C::ObjectMaxCardinality(_, _, Some(c))
+        | C::ObjectExactCardinality(_, _, Some(c)) => class_may_trigger(c),
+        C::DataSomeValuesFrom(ps, r) if ps.len() == 1 => !builtin_el_range(r),
+        C::DataHasValue(_, l) => !el_literal(l),
+        C::DataAllValuesFrom(ps, _) if ps.len() == 1 => true,
+        C::DataMinCardinality(..) | C::DataMaxCardinality(..) | C::DataExactCardinality(..) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,9 +674,16 @@ mod tests {
             "SubClassOf(:A DataSomeValuesFrom(:d <http://ex.org/unknown>))",
             "SubClassOf(:A DataHasValue(:d \"x\"^^xsd:int))",
             "DataPropertyRange(:d rdf:XMLLiteral)",
+            "SubClassOf(:A DataAllValuesFrom(:d DatatypeRestriction(xsd:string xsd:pattern \"a*\")))",
+            "SubClassOf(:A DataMinCardinality(2 :d <http://ex.org/unknown>))",
+            "SubClassOf(:A DataMaxCardinality(1 :d xsd:duration))",
+            "SubClassOf(:A DataExactCardinality(1 :d DatatypeRestriction(xsd:string xsd:pattern \"a*\")))",
+            "DisjointDataProperties(:d owl:topDataProperty)",
+            "DisjointDataProperties(:d owl:bottomDataProperty)",
         ] {
             let c = comps(ax);
             assert!(!c.checker(&d("d")), "{ax}");
+            assert!(!c.any(), "{ax}");
         }
     }
 

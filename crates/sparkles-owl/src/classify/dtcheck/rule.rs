@@ -7,7 +7,7 @@
 //! false, and says whether a cover remains among the atoms that are not free.
 
 use super::range::Ranges;
-use super::solve::{Answer, Atom, Bounds, Problem, Why, check_stopping};
+use super::solve::{Answer, Atom, Bounds, MemScope, Problem, Why, check_bounded};
 
 /// What a body atom's negative occurrences make of it, which the caller reads from the
 /// index and the context's units.
@@ -43,7 +43,29 @@ fn refutes(
     negs: &[Atom],
     b: &Bounds,
     stop: &dyn Fn() -> bool,
+    admit_ranges: &dyn Fn(usize) -> bool,
+    mem: &dyn Fn(isize) -> bool,
 ) -> Result<bool, Why> {
+    let mut scope = MemScope::new(mem);
+    let props_bytes: usize = base
+        .props
+        .iter()
+        .map(|p| {
+            std::mem::size_of::<super::solve::Prop>()
+                + p.supers.len() * std::mem::size_of::<usize>()
+                + p.ranges.len() * 4
+        })
+        .sum();
+    let clone_est = base
+        .atoms
+        .len()
+        .saturating_add(negs.len())
+        .saturating_mul(std::mem::size_of::<Atom>())
+        .saturating_add(props_bytes)
+        .saturating_add(base.disjoint.len().saturating_mul(16));
+    if !scope.take(clone_est) {
+        return Err(Why::Stopped);
+    }
     let mut p = base.clone();
     for &q in negs {
         match q.negate() {
@@ -52,7 +74,7 @@ fn refutes(
             None => return Ok(true),
         }
     }
-    match check_stopping(r, &p, b, stop) {
+    match check_bounded(r, &p, b, stop, admit_ranges, mem) {
         Answer::Sat => Ok(false),
         Answer::Unsat => Ok(true),
         Answer::Unknown(w) => Err(w),
@@ -70,14 +92,36 @@ pub fn units(
     b: &Bounds,
     stop: &dyn Fn() -> bool,
 ) -> Result<Units, Why> {
+    units_bounded(r, base, body, b, stop, &|_| true, &|_| true)
+}
+
+/// [`units`], admitting shared [`Ranges`] growth via `admit_ranges` and scoped temporary
+/// solver allocations via `mem` (`+n` reserves, `-n` releases), returning [`Why::Stopped`]
+/// on refusal.
+pub fn units_bounded(
+    r: &mut Ranges,
+    base: &Problem,
+    body: &[(Atom, Group)],
+    b: &Bounds,
+    stop: &dyn Fn() -> bool,
+    admit_ranges: &dyn Fn(usize) -> bool,
+    mem: &dyn Fn(isize) -> bool,
+) -> Result<Units, Why> {
     let mut out = Units::default();
-    if refutes(r, base, &[], b, stop)? {
+    if refutes(r, base, &[], b, stop, admit_ranges, mem)? {
         out.conflict = true;
         return Ok(out);
     }
+    let mut body_scope = MemScope::new(mem);
+    let body_est = body
+        .len()
+        .saturating_mul(std::mem::size_of::<(Atom, Group)>() + std::mem::size_of::<usize>() + 16);
+    if !body_scope.take(body_est) {
+        return Err(Why::Stopped);
+    }
     let mut left: Vec<(Atom, Group)> = Vec::new();
     for (i, &(q, g)) in body.iter().enumerate() {
-        if refutes(r, base, &[q], b, stop)? {
+        if refutes(r, base, &[q], b, stop, admit_ranges, mem)? {
             out.entailed.push(i);
         } else if g != Group::Free {
             left.push((q, g));
@@ -101,14 +145,14 @@ pub fn units(
             .filter(|&&(_, g)| g == Group::Only(c))
             .map(|&(q, _)| q)
             .collect();
-        if w.len() >= 2 && refutes(r, base, &w, b, stop)? {
+        if w.len() >= 2 && refutes(r, base, &w, b, stop, admit_ranges, mem)? {
             out.classes.push(c);
             left.retain(|&(_, g)| g != Group::Only(c));
         }
     }
     if left.len() >= 2 {
         let w: Vec<Atom> = left.iter().map(|&(q, _)| q).collect();
-        out.cover = refutes(r, base, &w, b, stop)?;
+        out.cover = refutes(r, base, &w, b, stop, admit_ranges, mem)?;
     }
     Ok(out)
 }

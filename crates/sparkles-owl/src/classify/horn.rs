@@ -1716,6 +1716,9 @@ pub fn normalize(
         let accepted = n.axiom(k).is_ok();
         n.it.end_scope();
         n.it.ranges.check_halt()?;
+        if n.it.dt_stopped() {
+            return Err(Halt::Stopped);
+        }
         if accepted {
             class_out.push(n.out);
             taken[i] = true;

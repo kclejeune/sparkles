@@ -106,9 +106,58 @@ enum Run {
 /// How many search nodes pass between two reads of the stop flag.
 const POLL: u64 = 1024;
 
+/// Scoped temporary-memory reservation over a signed admission callback (`+n` reserves,
+/// `-n` releases). Releases all bytes it reserved when dropped.
+pub(super) struct MemScope<'a> {
+    mem: &'a dyn Fn(isize) -> bool,
+    held: usize,
+}
+
+impl<'a> MemScope<'a> {
+    pub(super) fn new(mem: &'a dyn Fn(isize) -> bool) -> Self {
+        Self { mem, held: 0 }
+    }
+
+    pub(super) fn take(&mut self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return true;
+        }
+        let Ok(delta) = isize::try_from(bytes) else {
+            return false;
+        };
+        if !(self.mem)(delta) {
+            return false;
+        }
+        self.held = self.held.saturating_add(bytes);
+        true
+    }
+}
+
+impl Drop for MemScope<'_> {
+    fn drop(&mut self) {
+        if self.held != 0 {
+            (self.mem)(-(self.held as isize));
+            self.held = 0;
+        }
+    }
+}
+
 /// Whether the integer program has a solution, by preprocessing and a bounded search.
-fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64, stop: &dyn Fn() -> bool) -> Run {
+fn solve(
+    nvars: usize,
+    mut cons: Vec<Lin>,
+    nodes: u64,
+    stop: &dyn Fn() -> bool,
+    mem: &dyn Fn(isize) -> bool,
+) -> Run {
     const INF: u128 = u128::MAX;
+    let mut scope = MemScope::new(mem);
+    let prep_bytes = nvars
+        .saturating_mul(std::mem::size_of::<u128>() * 2 + 4)
+        .saturating_add(64);
+    if !scope.take(prep_bytes) {
+        return Run::Stopped;
+    }
     // a count fixed at zero by a maximum of zero
     let mut ub = vec![INF; nvars];
     for c in &cons {
@@ -169,6 +218,14 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64, stop: &dyn Fn() -> bool) 
         ub[v] = ub[v].min(most);
     }
     // each minimum whose counts are all among those of a maximum
+    let mins = cons.iter().filter(|c| c.at_least).count();
+    let maxs = cons.len().saturating_sub(mins);
+    let pairs_est = mins
+        .saturating_mul(maxs)
+        .saturating_mul(std::mem::size_of::<(usize, usize)>());
+    if !scope.take(pairs_est) {
+        return Run::Stopped;
+    }
     let mut pairs = Vec::new();
     for (a, ca) in cons.iter().enumerate().filter(|(_, c)| c.at_least) {
         for (b, cb) in cons.iter().enumerate().filter(|(_, c)| !c.at_least) {
@@ -180,6 +237,7 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64, stop: &dyn Fn() -> bool) 
     let mut val = vec![0u128; nvars];
     let mut assigned = vec![false; nvars];
     let mut budget = nodes;
+    let mut stopped = false;
     match search(
         &vars,
         0,
@@ -189,11 +247,12 @@ fn solve(nvars: usize, mut cons: Vec<Lin>, nodes: u64, stop: &dyn Fn() -> bool) 
         &mut val,
         &mut assigned,
         &mut budget,
+        &mut stopped,
         stop,
     ) {
         Some(true) => Run::Sat,
         Some(false) => Run::Unsat,
-        None if stop() => Run::Stopped,
+        None if stopped => Run::Stopped,
         None => Run::Bound,
     }
 }
@@ -244,9 +303,14 @@ fn search(
     val: &mut [u128],
     assigned: &mut [bool],
     budget: &mut u64,
+    stopped: &mut bool,
     stop: &dyn Fn() -> bool,
 ) -> Option<bool> {
-    if *budget == 0 || (budget.is_multiple_of(POLL) && stop()) {
+    if *budget == 0 {
+        return None;
+    }
+    if budget.is_multiple_of(POLL) && stop() {
+        *stopped = true;
         return None;
     }
     *budget -= 1;
@@ -283,7 +347,18 @@ fn search(
     let mut x = hi;
     while x >= lo && hi >= lo {
         val[v] = x;
-        match search(vars, i + 1, cons, pairs, ub, val, assigned, budget, stop) {
+        match search(
+            vars,
+            i + 1,
+            cons,
+            pairs,
+            ub,
+            val,
+            assigned,
+            budget,
+            stopped,
+            stop,
+        ) {
             Some(true) => {
                 out = Some(true);
                 break;
@@ -313,6 +388,20 @@ pub fn check(r: &mut Ranges, p: &Problem, b: &Bounds) -> Answer {
 /// Decides the problem, answering [`Why::Stopped`] once `stop` returns true. The flag is
 /// read between cells and every [`POLL`] search nodes.
 pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -> bool) -> Answer {
+    check_bounded(r, p, b, stop, &|_| true, &|_| true)
+}
+
+/// [`check_stopping`], also calling `admit_ranges(bytes)` before growing `r` and
+/// `mem(+/-bytes)` around scoped temporary solver allocations, returning
+/// [`Why::Stopped`] on refusal.
+pub fn check_bounded(
+    r: &mut Ranges,
+    p: &Problem,
+    b: &Bounds,
+    stop: &dyn Fn() -> bool,
+    admit_ranges: &dyn Fn(usize) -> bool,
+    mem: &dyn Fn(isize) -> bool,
+) -> Answer {
     if stop() {
         return Answer::Unknown(Why::Stopped);
     }
@@ -333,6 +422,7 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
     if demand >= CAP {
         return Answer::Unknown(Why::Uncounted);
     }
+    let mut scope = MemScope::new(mem);
     // upward closure of the hierarchy
     let mut up: Vec<u64> = (0..np).map(|i| 1u64 << i).collect();
     loop {
@@ -373,14 +463,30 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
     // decides: whether a cell is within a range never rests on comparing ids. Cells of
     // different parents are disjoint, so no two are the same set.
     let mut cells: Vec<(Rid, Vec<bool>)> = vec![(Ranges::FULL, Vec::new())];
-    for &x in &ranges {
+    let mut cells_scope = MemScope::new(mem);
+    for (step, &x) in ranges.iter().enumerate() {
         if stop() {
             return Answer::Unknown(Why::Stopped);
         }
-        let nx = r.not(x);
-        let mut next = Vec::with_capacity(cells.len() * 2);
+        let Ok(nx) = r.not_bounded(x, admit_ranges) else {
+            return Answer::Unknown(Why::Stopped);
+        };
+        let next_cap = cells.len().saturating_mul(2);
+        let next_est = next_cap
+            .saturating_mul(std::mem::size_of::<(Rid, Vec<bool>)>() + step.saturating_add(1));
+        let mut next_scope = MemScope::new(mem);
+        if !next_scope.take(next_est) {
+            return Answer::Unknown(Why::Stopped);
+        }
+        let mut next = Vec::with_capacity(next_cap);
         for (c, sides) in &cells {
-            for (part, inside) in [(r.meet(*c, x), true), (r.meet(*c, nx), false)] {
+            let Ok(p_in) = r.meet_bounded(*c, x, admit_ranges) else {
+                return Answer::Unknown(Why::Stopped);
+            };
+            let Ok(p_out) = r.meet_bounded(*c, nx, admit_ranges) else {
+                return Answer::Unknown(Why::Stopped);
+            };
+            for (part, inside) in [(p_in, true), (p_out, false)] {
                 if r.is_empty(part) != Some(true) {
                     let mut s = sides.clone();
                     s.push(inside);
@@ -392,9 +498,16 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
             }
         }
         cells = next;
+        cells_scope = next_scope;
     }
     let within = |ci: usize, x: Rid| cells[ci].1[index[&x]];
     // the upward-closed sets of properties without a disjoint pair
+    let sets_est = 1usize
+        .checked_shl(np as u32)
+        .map_or(usize::MAX, |n| n.saturating_mul(8));
+    if !scope.take(sets_est) {
+        return Answer::Unknown(Why::Stopped);
+    }
     let mut sets = Vec::new();
     for s in 1u64..(1 << np) {
         let closed = (0..np).all(|i| s & (1 << i) == 0 || s & up[i] == up[i]);
@@ -409,6 +522,14 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
     if cells.len().saturating_mul(sets.len()) > b.types.saturating_mul(64) {
         return Answer::Unknown(Why::Bound);
     }
+    let types_est = cells
+        .len()
+        .saturating_mul(sets.len())
+        .min(b.types)
+        .saturating_mul(std::mem::size_of::<(usize, u64)>());
+    if !scope.take(types_est) {
+        return Answer::Unknown(Why::Stopped);
+    }
     let mut types = Vec::new();
     for ci in 0..cells.len() {
         for &s in &sets {
@@ -422,6 +543,12 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
                 }
             }
         }
+    }
+    let cons_est = p.atoms.len().saturating_add(cells.len()).saturating_mul(
+        std::mem::size_of::<Lin>() + types.len().saturating_mul(std::mem::size_of::<usize>()),
+    );
+    if !scope.take(cons_est) {
+        return Answer::Unknown(Why::Stopped);
     }
     let mut cons = Vec::new();
     for a in &p.atoms {
@@ -443,9 +570,24 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
         by_cell[*ci].push(t);
     }
     let cells: Vec<Rid> = cells.into_iter().map(|(c, _)| c).collect();
+    drop(cells_scope);
     let sizes: Vec<_> = cells.iter().map(|&c| r.size(c)).collect();
     let exact = sizes.iter().all(|s| s.is_exact());
+    let cons_clone_bytes: usize = cons
+        .iter()
+        .map(|c| std::mem::size_of::<Lin>() + c.vars.len() * std::mem::size_of::<usize>())
+        .sum::<usize>()
+        .saturating_add(
+            by_cell
+                .iter()
+                .map(|v| std::mem::size_of::<Lin>() + v.len() * std::mem::size_of::<usize>())
+                .sum(),
+        );
     let with_caps = |cap: &dyn Fn(usize) -> Option<u128>| {
+        let mut cap_scope = MemScope::new(mem);
+        if !cap_scope.take(cons_clone_bytes) {
+            return Run::Stopped;
+        }
         let mut all = cons.clone();
         for (ci, vars) in by_cell.iter().enumerate() {
             if let Some(n) = cap(ci) {
@@ -456,7 +598,7 @@ pub fn check_stopping(r: &mut Ranges, p: &Problem, b: &Bounds, stop: &dyn Fn() -
                 });
             }
         }
-        solve(types.len(), all, b.nodes, stop)
+        solve(types.len(), all, b.nodes, stop, mem)
     };
     // at most the upper bound of each cell: unsatisfiable here is unsatisfiable
     let opt = with_caps(&|ci| sizes[ci].hi);
@@ -536,7 +678,7 @@ mod tests {
         ) {
             let most = cons.iter().filter(|c| c.at_least).map(|c| c.n).max().unwrap_or(0);
             let want = brute(nvars, &cons, most);
-            let got = match solve(nvars, cons.clone(), 1_000_000, &|| false) {
+            let got = match solve(nvars, cons.clone(), 1_000_000, &|| false, &|_| true) {
                 Run::Sat => true,
                 Run::Unsat => false,
                 Run::Bound | Run::Stopped => panic!("bound on a small system"),

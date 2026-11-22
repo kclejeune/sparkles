@@ -1261,6 +1261,12 @@ pub trait Sink {
     fn reserve_data(&mut self, _bytes: usize) -> bool {
         true
     }
+    /// Pre-admit data memory growth against the memory budget without polling the
+    /// deadline or cancellation callback, for fine-grained allocations inside a rule
+    /// that polls cancellation at its own checkpoints.
+    fn admit_data(&mut self, bytes: usize) -> bool {
+        self.reserve_data(bytes)
+    }
     /// Charges bytes that the rules keep beside their conclusions, whose charge may wait
     /// for a batch, since the caller does not stop on its answer. A release nets against
     /// what waits first.
@@ -1271,6 +1277,12 @@ pub trait Sink {
     /// datatype checker's cache, which outlive the states the rules run on.
     fn keep_shared(&mut self, bytes: usize) {
         self.keep_data(bytes);
+    }
+    /// Transfers `bytes` previously reserved with [`Sink::reserve_data`] into shared
+    /// retained storage without an uncharged gap between release and charge.
+    fn retain_shared(&mut self, bytes: usize) {
+        self.keep_shared(bytes);
+        self.release_data(bytes);
     }
     fn release_data(&mut self, _bytes: usize) {}
     fn data_overflow(&mut self) {}
@@ -1353,6 +1365,20 @@ impl Sink for Out<'_, '_> {
         // ([`Sink::go_on`]). The caller releases what it reserved.
         self.run.check(0, bytes, 0) && !(self.run.steps && self.dl().past(self.work))
     }
+    fn admit_data(&mut self, bytes: usize) -> bool {
+        if bytes > isize::MAX as usize
+            || self
+                .run
+                .memory
+                .load(Ordering::Relaxed)
+                .checked_add(bytes)
+                .is_none()
+        {
+            self.data_overflow();
+            return false;
+        }
+        self.run.check_memory(bytes) && !(self.run.steps && self.dl().past(self.work))
+    }
     fn data_overflow(&mut self) {
         self.run.peak.fetch_max(usize::MAX, Ordering::Relaxed);
         self.run.halt(STOP_MEMORY);
@@ -1367,6 +1393,9 @@ impl Sink for Out<'_, '_> {
             let _ = self.reserve_data(kept);
         }
     }
+    // `reserve_data` already charged `self.run.memory`, so keeping those bytes shared
+    // needs neither a release nor a second charge.
+    fn retain_shared(&mut self, _bytes: usize) {}
     fn release_data(&mut self, bytes: usize) {
         // what waits uncharged comes off first, and only the rest leaves the count
         let waiting = bytes.min(self.kept);
@@ -2431,6 +2460,29 @@ impl<'a> Run<'a> {
         }
         if b.cancelled.is_some_and(|f| f()) {
             self.halt(STOP_CANCEL);
+            return false;
+        }
+        true
+    }
+
+    /// Adds `bytes` to the run's memory and checks the memory budget and pool grant
+    /// without polling the deadline or cancellation callback.
+    fn check_memory(&self, bytes: usize) -> bool {
+        let held = self.memory.fetch_add(bytes, Ordering::Relaxed) + bytes;
+        let waiting = self.queued.load(Ordering::Relaxed);
+        let dynamic =
+            self.dynamic.map_or(0, |d| d.bytes()) + self.bounds.dl.map_or(0, |d| d.bytes());
+        let used = held + dynamic + waiting.max(0) as usize * std::mem::size_of::<Concl>();
+        let before = self.peak.fetch_max(used, Ordering::Relaxed);
+        if self.stopped() {
+            return false;
+        }
+        let b = self.bounds;
+        let grown = used.saturating_sub(before);
+        if b.max_memory.is_some_and(|m| used > m)
+            || b.charge.is_some_and(|f| grown > 0 && !f(grown))
+        {
+            self.halt(STOP_MEMORY);
             return false;
         }
         true

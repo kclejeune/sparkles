@@ -201,6 +201,32 @@ impl Budget {
             bytes,
         })
     }
+    /// Reserve temporary scratch bytes without adding a redundant public cancellation poll.
+    /// Enforces `max_memory` and the caller's pool grant, updates `peak`, and latches nothing.
+    pub fn charge_scratch(&self, bytes: usize) -> Result<(), Error> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        let mut h = self.held.lock();
+        self.account(&mut h, bytes)?;
+        h.scratch = add(h.scratch, bytes)?;
+        Ok(())
+    }
+    /// Release temporary scratch bytes previously charged with [`Budget::charge_scratch`].
+    pub fn release_scratch(&self, bytes: usize) {
+        if bytes != 0 {
+            let mut h = self.held.lock();
+            h.scratch = h.scratch.saturating_sub(bytes);
+        }
+    }
+    /// A scoped scratch tracker backed by this budget. Releases all charged bytes on drop
+    /// while leaving [`Budget::peak`] intact.
+    pub fn scratch_guard(self: &Arc<Self>) -> ScratchGuard {
+        ScratchGuard {
+            budget: self.clone(),
+            bytes: 0,
+        }
+    }
     fn token(&self, bytes: usize) -> Result<Token, Error> {
         let mut h = self.held.lock();
         let header = if self.ledger.lock().is_none() {
@@ -248,6 +274,47 @@ impl Drop for Reservation {
     fn drop(&mut self) {
         if self.bytes != 0 {
             self.budget.held.lock().scratch -= self.bytes;
+        }
+    }
+}
+
+/// A growable temporary scratch reservation on a [`Budget`].
+pub struct ScratchGuard {
+    budget: Arc<Budget>,
+    bytes: usize,
+}
+
+impl ScratchGuard {
+    pub fn grow(&mut self, more: usize) -> Result<(), Error> {
+        if more == 0 {
+            return Ok(());
+        }
+        self.budget.charge_scratch(more)?;
+        self.bytes = self.bytes.saturating_add(more);
+        Ok(())
+    }
+
+    /// Atomically transfers `retained` bytes from this scratch guard into the budget's
+    /// retained baseline and releases any remaining scratch bytes, without polling
+    /// cancellation or leaving an uncharged window.
+    pub fn commit_retained(mut self, retained: usize) -> Result<(), Error> {
+        let mut h = self.budget.held.lock();
+        let excess = retained.saturating_sub(self.bytes);
+        if excess > 0 {
+            self.budget.account(&mut h, excess)?;
+        }
+        h.scratch = h.scratch.saturating_sub(self.bytes);
+        h.base = add(h.base, retained)?;
+        self.bytes = 0;
+        Ok(())
+    }
+}
+
+impl Drop for ScratchGuard {
+    fn drop(&mut self) {
+        if self.bytes != 0 {
+            self.budget.release_scratch(self.bytes);
+            self.bytes = 0;
         }
     }
 }

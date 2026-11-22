@@ -374,7 +374,8 @@ impl Interner {
             / 7;
         vector
             .checked_add(table)?
-            .checked_add(self.val_opaque_bytes)
+            .checked_add(self.val_opaque_bytes)?
+            .checked_add(self.dt.bytes())
     }
 
     /// The bytes the interner takes, roughly: each expression with its entry in the
@@ -394,7 +395,6 @@ impl Interner {
             + self.and_ops * 4
             + self.scope_bytes()
             + self.prefix_roles.capacity() * 16
-            + self.dt.bytes()
             + self.dt_run.as_ref().map_or(0, |r| r.bytes())
     }
 
@@ -921,12 +921,20 @@ impl Interner {
             _ => {}
         }
         let role = self.role(RoleName::Data(d.clone()));
-        let id = self.dt.id(DtKey {
+        let key = DtKey {
             role,
             at_least,
             n,
             range,
-        });
+        };
+        let id = if let Some(run) = self.dt_run.as_deref_mut() {
+            match run.atom_id(&mut self.dt, key) {
+                Some(id) => id,
+                None => return TOP,
+            }
+        } else {
+            self.dt.id(key)
+        };
         self.node(Node::DtAtom(id))
     }
 
@@ -936,19 +944,45 @@ impl Interner {
             .dt_run
             .as_deref_mut()
             .expect("a checker range in a run with checker components");
-        run.range(&mut self.dt.ranges, r)
+        run.range(&mut self.dt, r)
     }
 
     /// The checker's point range of a literal.
     pub fn dt_literal(&mut self, l: &Literal) -> Result<Rid, &'static str> {
-        DtRun::literal(&mut self.dt.ranges, l)
+        let run = self
+            .dt_run
+            .as_deref_mut()
+            .expect("a checker literal in a run with checker components");
+        run.literal(&mut self.dt, l)
     }
 
     /// `∀d.R`, which is `≤ 0 d.¬R`.
     pub fn dt_universal(&mut self, d: &DataProperty, r: &DataRange) -> Result<Ex, &'static str> {
         let x = self.dt_range(r)?;
-        let not = self.dt.ranges.not(x);
+        let run = self
+            .dt_run
+            .as_deref_mut()
+            .expect("a checker universal in a run with checker components");
+        let not = run.not(&mut self.dt, x)?;
         Ok(self.dt_node(d, false, 0, not))
+    }
+
+    /// Whether a checker range conversion has latched a stop or memory halt.
+    pub fn dt_stopped(&self) -> bool {
+        self.dt_run.as_ref().is_some_and(|r| r.stopped.is_some())
+    }
+
+    /// Returns the latched checker stop or memory halt, if any.
+    pub fn check_dt_stop(&self, limits: &super::Limits) -> Result<(), super::Error> {
+        match self.dt_run.as_ref().and_then(|r| r.stopped) {
+            Some(super::dtcheck::atoms::Halted::Timeout) => Err(super::Error::Timeout),
+            Some(super::dtcheck::atoms::Halted::Cancelled) => Err(super::Error::Cancelled),
+            Some(super::dtcheck::atoms::Halted::Memory(used)) => Err(super::Error::Memory {
+                limit: limits.max_memory.unwrap_or(usize::MAX),
+                used,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// The binary intersection of two expressions, with its operands ordered.
@@ -1674,7 +1708,14 @@ fn normalize_axiom(
         }
         // the definitions are read before the axioms, and the data ranges that name a
         // defined datatype stand for its definition
-        K::DatatypeDefinition(_, range) => {
+        K::DatatypeDefinition(d, range) => {
+            if it
+                .dt_run
+                .as_ref()
+                .is_some_and(|run| run.defs.map().get(d) != Some(range))
+            {
+                partial = Some("another definition of the same datatype supersedes this one");
+            }
             if it.ranges.range(range).1 {
                 partial = Some(OPAQUE);
             }
@@ -2755,7 +2796,9 @@ impl Index {
         if let Some(h) = ix.horn.as_mut() {
             h.dominate = plain;
         }
-        if let Some(run) = it.dt_run.as_deref() {
+        if ax.dl.is_none()
+            && let Some(run) = it.dt_run.as_deref()
+        {
             ix.dt = Some(Box::new(dt_index(ax, it, run, &ix, &b, refire)));
         }
         Ok(ix)
@@ -2867,7 +2910,7 @@ fn dt_index(
         roles,
         body,
         disjoint,
-        it.dt.ranges.clone(),
+        it.dt.ranges().cloned().unwrap_or_default(),
         run.comps.clone(),
         refire,
     )

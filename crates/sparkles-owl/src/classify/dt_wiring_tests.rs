@@ -855,3 +855,454 @@ fn what_a_world_adds_to_the_checker_cache_stays_charged_after_it() {
     // the world's copies are released when it goes, and the cache entries it made stay
     assert!(held.load(Ordering::Relaxed) > 0);
 }
+
+#[test]
+fn el_only_does_not_activate_checker_or_use_excluded_definitions() {
+    // 1. EL HasKey + owl:topDataProperty beside an outside-EL DataAllValuesFrom
+    let body = "HasKey(:K () (:d))\n\
+        ClassAssertion(:K :a)\n\
+        ClassAssertion(:K :b)\n\
+        DataPropertyAssertion(:d :a \"1\"^^xsd:integer)\n\
+        DataPropertyAssertion(:d :b \"1\"^^xsd:integer)\n\
+        DifferentIndividuals(:a :b)\n\
+        SubClassOf(:X DataAllValuesFrom(:d xsd:string))\n\
+        SubClassOf(:Y DataSomeValuesFrom(owl:topDataProperty xsd:integer))";
+    let ax = axioms(body);
+    let refs: Vec<&AxiomKind> = ax.iter().collect();
+    let limits = Limits {
+        el_only: true,
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let out = sat.saturate(&refs, None, &limits).unwrap();
+    assert!(!out.consistent, "EL HasKey must still detect inconsistency");
+    assert!(sat.interner.dt.is_unallocated());
+    assert_eq!(sat.interner.dt.bytes(), 0);
+    // Only the outside-EL DataAllValuesFrom is excluded; neither HasKey nor topDataProperty
+    // should be downgraded to Partial.
+    assert_eq!(sat.excluded().len(), 1, "{:?}", sat.excluded());
+    assert!(matches!(sat.excluded()[0].gap, Gap::Outside { .. }));
+
+    // 2. Excluded faceted DatatypeDefinition must not leak into EL axioms under el_only
+    let body2 = "DatatypeDefinition(:small DatatypeRestriction(xsd:integer xsd:maxInclusive \"5\"^^xsd:integer))\n\
+        DataPropertyRange(:d :small)\n\
+        DataPropertyAssertion(:d :a \"6\"^^xsd:integer)";
+    let ax2 = axioms(body2);
+    let refs2: Vec<&AxiomKind> = ax2.iter().collect();
+    let mut sat2 = Saturation::new();
+    let out2 = sat2.saturate(&refs2, None, &limits).unwrap();
+    assert!(
+        out2.consistent,
+        "excluded definition must not make el_only run inconsistent"
+    );
+    assert!(sat2.interner.dt.is_unallocated());
+    assert!(
+        sat2.excluded()
+            .iter()
+            .any(|e| matches!(e.axiom, AxiomKind::DatatypeDefinition(..)))
+    );
+
+    // 3. Same isolation when the Horn-to-EL fallback triggers under a tight memory cap
+    let mut horn_body = String::from(body2);
+    horn_body.push_str(
+        "\nTransitiveObjectProperty(:part_of)\n\
+         InverseObjectProperties(:part_of :has_part)\n\
+         SubClassOf(:FilopodiumMembrane :Membrane)\n\
+         SubClassOf(:FilopodiumMembrane ObjectSomeValuesFrom(:part_of :Filopodium))\n\
+         SubClassOf(:Filopodium ObjectSomeValuesFrom(:part_of :Cytoskeleton))\n\
+         SubClassOf(:Cytoskeleton :Organelle)\n\
+         EquivalentClasses(:MembraneBounded ObjectIntersectionOf(:Organelle ObjectSomeValuesFrom(:has_part :Membrane)))\n\
+         EquivalentClasses(:OrganelleMembrane ObjectIntersectionOf(:Membrane ObjectSomeValuesFrom(:part_of :MembraneBounded)))",
+    );
+    let ax3 = axioms(&horn_body);
+    let refs3: Vec<&AxiomKind> = ax3.iter().collect();
+    let mut el_sat = Saturation::new();
+    let el_res = el_sat.saturate(&refs3, None, &limits).unwrap();
+    let mut horn_sat = Saturation::new();
+    let horn_res = horn_sat
+        .saturate(
+            &refs3,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(el_res.consistent);
+    assert!(!horn_res.consistent);
+    assert!(
+        horn_res.stats.peak_memory > el_res.stats.peak_memory,
+        "{} vs {}",
+        horn_res.stats.peak_memory,
+        el_res.stats.peak_memory
+    );
+    let mut fb_sat = Saturation::new();
+    let fb = fb_sat
+        .saturate(
+            &refs3,
+            None,
+            &Limits {
+                threads: 1,
+                max_memory: Some(horn_res.stats.peak_memory - 1),
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(fb.stats.horn_over_budget);
+    assert!(
+        fb.consistent,
+        "Horn-to-EL fallback must match EL-only consistency"
+    );
+    assert!(fb_sat.interner.dt.is_unallocated());
+}
+
+#[test]
+fn reserved_datatype_definition_cannot_shadow_builtin() {
+    let body = "DatatypeDefinition(xsd:int xsd:string)\n\
+        SubClassOf(:A DataHasValue(:d \"1\"^^xsd:int))\n\
+        SubClassOf(:A DataAllValuesFrom(:d xsd:int))";
+    let (sat, _) = run(body);
+    let a = sat
+        .describe(&Class::new("urn:dt:A"))
+        .expect("a saturated run");
+    assert!(a.satisfiable, "xsd:int must not be shadowed by xsd:string");
+    assert!(
+        sat.excluded()
+            .iter()
+            .any(|e| matches!(e.axiom, AxiomKind::DatatypeDefinition(..))),
+        "{:?}",
+        sat.excluded()
+    );
+}
+
+#[test]
+fn superseded_el_datatype_definition_is_reported() {
+    let body = "DatatypeDefinition(:t xsd:integer)\n\
+        DatatypeDefinition(:t xsd:int)\n\
+        SubClassOf(:A DataSomeValuesFrom(:d :t))";
+    let (sat, ax) = run(body);
+    assert!(
+        gap_of(&sat, &ax[0]).is_some(),
+        "superseded EL DatatypeDefinition must be reported: {:?}",
+        sat.excluded()
+    );
+}
+
+#[test]
+fn refused_universal_and_top_disjoint_keep_el_haskey() {
+    for extra in [
+        "SubClassOf(:X DataAllValuesFrom(:d DatatypeRestriction(xsd:string xsd:pattern \"a*\")))",
+        "SubClassOf(:X DataMinCardinality(2 :d <urn:dt:unknown>))",
+        "DisjointDataProperties(:d owl:topDataProperty)",
+    ] {
+        let body = format!(
+            "HasKey(:K () (:d))\n\
+             ClassAssertion(:K :a)\n\
+             ClassAssertion(:K :b)\n\
+             DataPropertyAssertion(:d :a \"1\"^^xsd:integer)\n\
+             DataPropertyAssertion(:d :b \"1\"^^xsd:integer)\n\
+             DifferentIndividuals(:a :b)\n\
+             {extra}"
+        );
+        let (sat, _, consistent) = run_consistent(&body, 1);
+        assert!(!consistent, "EL HasKey must stay active for {extra}");
+        assert!(sat.interner.dt.is_unallocated(), "{extra}");
+        assert_eq!(sat.interner.dt.bytes(), 0, "{extra}");
+    }
+}
+
+#[test]
+fn non_checker_runs_allocate_no_checker_tables() {
+    assert!(super::index::Interner::new().dt.is_unallocated());
+    assert_eq!(super::index::Interner::new().dt.bytes(), 0);
+    for body in [
+        "SubClassOf(:A :B)",
+        "SubClassOf(:A DataSomeValuesFrom(:d xsd:integer))\n\
+         SubClassOf(:B DataHasValue(:d \"1\"^^xsd:integer))\n\
+         FunctionalDataProperty(:d)",
+    ] {
+        let (sat, _) = run(body);
+        assert!(sat.interner.dt.is_unallocated(), "{body}");
+        assert_eq!(sat.interner.dt.bytes(), 0, "{body}");
+    }
+}
+
+#[test]
+fn incremental_one_shot_cancellation_is_not_swallowed() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    // Test both a data-free EL incremental edit and an edit adding an outside-EL axiom.
+    for (base_body, added_body) in [
+        ("SubClassOf(:A :B)", "SubClassOf(:B :C)"),
+        (
+            "SubClassOf(:A :B)",
+            "SubClassOf(:A DataSomeValuesFrom(:d xsd:int))",
+        ),
+    ] {
+        let base_ax = axioms(base_body);
+        let add_ax = axioms(added_body);
+        let mut all = base_ax.clone();
+        all.extend(add_ax.clone());
+        let base_refs: Vec<&AxiomKind> = base_ax.iter().collect();
+        let all_refs: Vec<&AxiomKind> = all.iter().collect();
+        let add_refs: Vec<&AxiomKind> = add_ax.iter().collect();
+
+        // Count polls on an uncancelled incremental run, then fire a one-shot cancel at
+        // every poll point.
+        let total = Arc::new(AtomicUsize::new(0));
+        {
+            let mut sat = Saturation::new();
+            sat.saturate(
+                &base_refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+            let c = total.clone();
+            let limits = Limits {
+                threads: 1,
+                cancelled: Some(Arc::new(move || {
+                    c.fetch_add(1, Ordering::Relaxed);
+                    false
+                })),
+                ..Limits::default()
+            };
+            sat.saturate(
+                &all_refs,
+                Some(Changes {
+                    added: &add_refs,
+                    removed: &[],
+                }),
+                &limits,
+            )
+            .unwrap();
+        }
+        let n = total.load(Ordering::Relaxed);
+        assert!(n >= 2, "expected at least 2 poll checkpoints, got {n}");
+        for k in 1..=n {
+            let mut sat = Saturation::new();
+            sat.saturate(
+                &base_refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+            let count = Arc::new(AtomicUsize::new(0));
+            let c = count.clone();
+            let limits = Limits {
+                threads: 1,
+                cancelled: Some(Arc::new(move || c.fetch_add(1, Ordering::Relaxed) + 1 == k)),
+                ..Limits::default()
+            };
+            let res = sat.saturate(
+                &all_refs,
+                Some(Changes {
+                    added: &add_refs,
+                    removed: &[],
+                }),
+                &limits,
+            );
+            assert!(
+                matches!(res, Err(Error::Cancelled)),
+                "one-shot cancel at poll {k}/{n} for ({base_body} + {added_body}) returned {res:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn prepass_and_saturation_admit_memory_before_growing() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let make_pool = |cap: usize| {
+        let granted = Arc::new(AtomicUsize::new(0));
+        let g = granted.clone();
+        let limits = Limits {
+            threads: 1,
+            max_memory: Some(cap),
+            charge: Some(Arc::new(move |bytes| {
+                let prev = g.fetch_add(bytes, Ordering::Relaxed);
+                if prev.saturating_add(bytes) > cap {
+                    g.fetch_sub(bytes, Ordering::Relaxed);
+                    false
+                } else {
+                    true
+                }
+            })),
+            ..Limits::default()
+        };
+        (granted, limits)
+    };
+
+    // 1. Pre-pass on a large string DataOneOf under a tight max_memory + charge callback
+    let lits: String = (0..300)
+        .map(|i| format!("\"{i:0>200}\"^^xsd:string"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let body = format!("SubClassOf(:A DataSomeValuesFrom(:d DataOneOf({lits})))");
+    let ax = axioms(&body);
+    let refs: Vec<&AxiomKind> = ax.iter().collect();
+    let cap = 24 * 1024usize;
+    let (granted, limits) = make_pool(cap);
+    let mut sat = Saturation::new();
+    let res = sat.saturate(&refs, None, &limits);
+    assert!(
+        matches!(res, Err(Error::Memory { .. })),
+        "expected Error::Memory, got {res:?}"
+    );
+    assert!(granted.load(Ordering::Relaxed) <= cap);
+    assert!(sat.interner.dt.is_unallocated());
+
+    // 2. Large DatatypeDefinition cloning is pre-admitted by AST size before copying
+    let def_body = format!(
+        "DatatypeDefinition(:big DataOneOf({lits}))\nSubClassOf(:A DataSomeValuesFrom(:d :big))"
+    );
+    let def_ax = axioms(&def_body);
+    let def_refs: Vec<&AxiomKind> = def_ax.iter().collect();
+    let (granted2, limits2) = make_pool(cap);
+    let mut sat2 = Saturation::new();
+    let res2 = sat2.saturate(&def_refs, None, &limits2);
+    assert!(
+        matches!(res2, Err(Error::Memory { .. })),
+        "expected Error::Memory for huge DatatypeDefinition, got {res2:?}"
+    );
+    assert!(granted2.load(Ordering::Relaxed) <= cap);
+
+    // 3. Superrole fan-out in dt_sat::solve admits memory before expanding superrole constraints
+    let mut fan_body = String::from("SubClassOf(:A DataSomeValuesFrom(:d0 xsd:int))\n");
+    for i in 1..=200 {
+        fan_body.push_str(&format!(
+            "SubDataPropertyOf(:d0 :s{i})\n\
+             DataPropertyRange(:s{i} DatatypeRestriction(xsd:int xsd:minInclusive \"{i}\"^^xsd:int))\n"
+        ));
+    }
+    let fan_ax = axioms(&fan_body);
+    let fan_refs: Vec<&AxiomKind> = fan_ax.iter().collect();
+    let mut uncap = Saturation::new();
+    let full = uncap
+        .saturate(
+            &fan_refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    let tight = full.stats.peak_memory / 2;
+    let (granted3, limits3) = make_pool(tight);
+    let mut sat3 = Saturation::new();
+    let out3 = sat3
+        .saturate(&fan_refs, None, &limits3)
+        .expect("superrole fan-out over Horn budget falls back to EL");
+    assert!(
+        out3.stats.horn_over_budget,
+        "expected horn_over_budget under tight cap {tight}, got {:?}",
+        out3.stats
+    );
+    assert!(granted3.load(Ordering::Relaxed) <= tight);
+    assert!(sat3.interner.dt.is_unallocated());
+}
+
+#[test]
+fn lang_string_range_reaches_checker_fresh_and_incrementally() {
+    // rdf:langString is accepted by profiles::el_axiom (outside is empty), yet Walk::el_range
+    // routes it to the checker, which decides inconsistency with an xsd:string value.
+    let base_ax = axioms("DataPropertyAssertion(:d :a \"x\"^^xsd:string)");
+    let add_ax =
+        axioms("DataPropertyRange(:d <http://www.w3.org/1999/02/22-rdf-syntax-ns#langString>)");
+    let mut all = base_ax.clone();
+    all.extend(add_ax.clone());
+    let base_refs: Vec<&AxiomKind> = base_ax.iter().collect();
+    let all_refs: Vec<&AxiomKind> = all.iter().collect();
+    let add_refs: Vec<&AxiomKind> = add_ax.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+
+    let mut fresh = Saturation::new();
+    let out_fresh = fresh.saturate(&all_refs, None, &limits).unwrap();
+    assert!(!out_fresh.consistent);
+    assert!(fresh.excluded().is_empty(), "{:?}", fresh.excluded());
+
+    let mut inc = Saturation::new();
+    let out0 = inc.saturate(&base_refs, None, &limits).unwrap();
+    assert!(out0.consistent);
+    let out_inc = inc
+        .saturate(
+            &all_refs,
+            Some(Changes {
+                added: &add_refs,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    assert!(!out_inc.consistent);
+    assert!(inc.excluded().is_empty(), "{:?}", inc.excluded());
+}
+
+#[test]
+fn retained_bytes_counts_interner_dt_and_large_cached_answers() {
+    // Many nested at-least body restrictions entailed by one positive restriction
+    let mut body = String::from(
+        "SubClassOf(:A DataSomeValuesFrom(:d DatatypeRestriction(xsd:int xsd:minInclusive \"100\"^^xsd:int)))\n",
+    );
+    for i in 1..=64 {
+        body.push_str(&format!(
+            "SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:int xsd:minInclusive \"{i}\"^^xsd:int)) :C{i})\n"
+        ));
+    }
+    let (sat, _) = run(&body);
+    assert!(sat.interner.dt.bytes() > 0);
+    assert!(sat.interner.data_bytes() >= sat.interner.dt.bytes());
+    let ix = sat.index.as_ref().expect("completed index");
+    let dt = ix.dt.as_ref().expect("checker tables");
+    assert!(dt.bytes() >= dt.comps.bytes() + 64 * std::mem::size_of::<usize>());
+}
+
+#[test]
+fn tier_d_with_excluded_data_keeps_incremental_reuse() {
+    let base = axioms(
+        "SubClassOf(:X ObjectUnionOf(:Y :Z))\n\
+         SubClassOf(:Y :U)\n\
+         SubClassOf(:Z :U)\n\
+         SubClassOf(:A DataHasValue(:d \"1\"^^xsd:int))",
+    );
+    let add = axioms("SubClassOf(:W :V)");
+    let mut all = base.clone();
+    all.extend(add.clone());
+    let base_refs: Vec<&AxiomKind> = base.iter().collect();
+    let all_refs: Vec<&AxiomKind> = all.iter().collect();
+    let add_refs: Vec<&AxiomKind> = add.iter().collect();
+    let limits = Limits {
+        threads: 1,
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    sat.saturate(&base_refs, None, &limits).unwrap();
+    assert!(
+        sat.index.as_ref().unwrap().dt.is_none(),
+        "Tier D run must not build ix.dt"
+    );
+    let out = sat
+        .saturate(
+            &all_refs,
+            Some(Changes {
+                added: &add_refs,
+                removed: &[],
+            }),
+            &limits,
+        )
+        .unwrap();
+    assert!(out.stats.incremental, "Tier D run should stay incremental");
+}
