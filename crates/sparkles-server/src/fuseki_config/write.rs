@@ -60,6 +60,9 @@ pub fn serve_args(plan: &Plan) -> Vec<String> {
     if s.union_default_graph {
         a.push("--union-default-graph".into());
     }
+    if let Some(m) = s.aggregate_errors {
+        a.extend(["--aggregate-errors".into(), m.to_string()]);
+    }
     if let Some(t) = s.timeout {
         a.extend(["--timeout".into(), num(t)]);
         if t > 1800.0 {

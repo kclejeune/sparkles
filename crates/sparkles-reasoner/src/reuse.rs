@@ -135,6 +135,11 @@ impl Relevance {
                 let arg = |k: usize| b.args.get(k).copied().unwrap_or(Slot::Any);
                 match b.kind {
                     BuiltinKind::NoValue => r.add(arg(0), arg(1), arg(2)),
+                    // a negated atom of a rule program (item 839) reads its pattern as
+                    // `noValue` does: a negated triple's input facts, or a relation's
+                    // first column and key, whose facts no store change matches
+                    BuiltinKind::RelAbsent if b.args.len() == 3 => r.add(arg(0), arg(1), arg(2)),
+                    BuiltinKind::RelAbsent => r.add(arg(0), arg(1), Slot::Any),
                     BuiltinKind::ListForAll => r.add(arg(1), arg(2), Slot::Any),
                     _ => {}
                 }

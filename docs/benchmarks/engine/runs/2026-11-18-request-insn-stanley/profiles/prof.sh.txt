@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# prof.sh BIN TAG QUERY N EVENT PERIOD [MODE]: LBR call-graph profile of a pinned server (CPU 0, client CPU 1) over N requests
+set -euo pipefail
+L=.artifacts/worktrees/insn-harness/.artifacts/lanes/insn-harness
+P=.artifacts/worktrees/stream-cost-534/.artifacts/lanes/stream-cost-534/tools/perf/bin/perf
+bin=$1 tag=$2 q=$3 n=$4 ev=$5 period=$6 mode=${7:-streaming}
+port=4391
+rm -rf $L/prof/srv
+RAYON_NUM_THREADS=1 taskset -c 0 $bin --result-cache-mb 0 serve --data $L/prof/srv --loc bench=$L/stores/s100k-9acd-2 --port $port --timeout 600 --no-access-log > $L/prof/server-$tag.log 2>&1 &
+spid=$!
+trap 'kill $spid 2>/dev/null || true' EXIT
+for _ in $(seq 300); do curl -sf -o /dev/null localhost:$port/\$/ready && break; sleep 0.1; done
+cli() { taskset -c 1 python3 - "$port" "$L/queries/$q.rq" "$1" "$mode" <<'PY'
+import http.client, sys, urllib.parse
+port, qf, n, mode = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4]
+body = urllib.parse.urlencode({"query": open(qf).read(), "execution": mode})
+for _ in range(n):
+    c = http.client.HTTPConnection("127.0.0.1", port); c.request("POST", "/bench/sparql", body, {"Accept": "application/x-sparkles+json", "Content-Type": "application/x-www-form-urlencoded"}); r = c.getresponse(); r.read(); c.close()
+PY
+}
+cli 200
+$P record -e "$ev" -c "$period" --call-graph lbr --user-callchains -p $spid -o $L/prof/$tag.data 2> $L/prof/rec-$tag.err &
+ppid=$!
+sleep 1
+cli "$n"
+kill -INT $ppid; wait $ppid || true
+kill $spid; wait $spid 2>/dev/null || true
+echo done $tag

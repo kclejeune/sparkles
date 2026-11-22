@@ -1,0 +1,368 @@
+{
+ "host": "stanley",
+ "kernel": "7.3.3",
+ "cpu": "Intel(R) Core(TM) Ultra X7 358H",
+ "A": {
+  "path": ".artifacts/lanes/leaf-cursors-829/ab/bin/base-bccc5f7b",
+  "sha256": "af1f600cafe20755e0dbc6db5d677a39be0fc82a164453d1957725f7a028ba24",
+  "compilers": "GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 21.1.8; rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+  "label": ""
+ },
+ "B": {
+  "path": ".artifacts/lanes/leaf-cursors-829/ab/bin/tip-9df856f3",
+  "sha256": "5e384d0f108d17bc2fd0f2d4cdae8cdc8abbfdcd520f084f63af3e7ffd3bec14",
+  "compilers": "GCC: (GNU) 16.2.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 21.1.8; rustc version 1.99.1 (58cf8f9c3 2026-10-13)",
+  "label": ""
+ },
+ "store": {
+  "A": ".artifacts/lanes/leaf-cursors-829/insn/out/store-A",
+  "B": ".artifacts/lanes/leaf-cursors-829/insn/out/store-A"
+ },
+ "data": ".artifacts/bench-request-insn/people-100000.nt.zst",
+ "queries": [
+  "cj-filter",
+  "cj-two-var",
+  "contains",
+  "count-all",
+  "distinct-join",
+  "distinct-obj",
+  "employee-docs",
+  "expr-bind-group",
+  "lang-filter",
+  "minus",
+  "path-plus",
+  "predicate-counts",
+  "predicate-subjects",
+  "regex-iri",
+  "star-join",
+  "star-lookup",
+  "subquery-agg",
+  "types-grouped",
+  "values-star"
+ ],
+ "modes": [
+  "eager",
+  "streaming"
+ ],
+ "rounds": 8,
+ "reps": 50,
+ "warmup": 5,
+ "server_cpu": 2,
+ "client_cpu": 3,
+ "rayon_threads": 1,
+ "spinners": true,
+ "kernel_instructions": false,
+ "perf_event_paranoid": "2",
+ "load_before": "8.72 7.06 5.77 7/2103 2471244",
+ "started": "2026-11-20T05:52:55Z",
+ "complete": true,
+ "answers": {
+  "A/cj-filter/eager": [
+   1,
+   "8accbb3f250c552b"
+  ],
+  "A/cj-filter/streaming": [
+   1,
+   "8accbb3f250c552b"
+  ],
+  "A/cj-two-var/eager": [
+   1,
+   "c8cee4d9bbbbcf39"
+  ],
+  "A/cj-two-var/streaming": [
+   1,
+   "c8cee4d9bbbbcf39"
+  ],
+  "A/contains/eager": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "A/contains/streaming": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "A/count-all/eager": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "A/count-all/streaming": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "A/distinct-join/eager": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "A/distinct-join/streaming": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "A/distinct-obj/eager": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "A/distinct-obj/streaming": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "A/employee-docs/eager": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "A/employee-docs/streaming": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "A/expr-bind-group/eager": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "A/expr-bind-group/streaming": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "A/lang-filter/eager": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "A/lang-filter/streaming": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "A/minus/eager": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "A/minus/streaming": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "A/path-plus/eager": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "A/path-plus/streaming": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "A/predicate-counts/eager": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "A/predicate-counts/streaming": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "A/predicate-subjects/eager": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "A/predicate-subjects/streaming": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "A/regex-iri/eager": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "A/regex-iri/streaming": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "A/star-join/eager": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "A/star-join/streaming": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "A/star-lookup/eager": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "A/star-lookup/streaming": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "A/subquery-agg/eager": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "A/subquery-agg/streaming": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "A/types-grouped/eager": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "A/types-grouped/streaming": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "A/values-star/eager": [
+   16,
+   "340fa3c1c352861f"
+  ],
+  "A/values-star/streaming": [
+   16,
+   "340fa3c1c352861f"
+  ],
+  "B/cj-filter/eager": [
+   1,
+   "8accbb3f250c552b"
+  ],
+  "B/cj-filter/streaming": [
+   1,
+   "8accbb3f250c552b"
+  ],
+  "B/cj-two-var/eager": [
+   1,
+   "c8cee4d9bbbbcf39"
+  ],
+  "B/cj-two-var/streaming": [
+   1,
+   "c8cee4d9bbbbcf39"
+  ],
+  "B/contains/eager": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "B/contains/streaming": [
+   1,
+   "e4bd4488a15325cb"
+  ],
+  "B/count-all/eager": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "B/count-all/streaming": [
+   1,
+   "6f2692c4a280aaf0"
+  ],
+  "B/distinct-join/eager": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "B/distinct-join/streaming": [
+   2000,
+   "f72820a802fd915b"
+  ],
+  "B/distinct-obj/eager": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "B/distinct-obj/streaming": [
+   1,
+   "e0d8249e067cf8f5"
+  ],
+  "B/employee-docs/eager": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "B/employee-docs/streaming": [
+   17,
+   "fbc1ec0f032221b6"
+  ],
+  "B/expr-bind-group/eager": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "B/expr-bind-group/streaming": [
+   8,
+   "99439d353a26c7ce"
+  ],
+  "B/lang-filter/eager": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "B/lang-filter/streaming": [
+   1,
+   "4c1f75bc1c276f7a"
+  ],
+  "B/minus/eager": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "B/minus/streaming": [
+   1,
+   "e18bdf87eb198ea2"
+  ],
+  "B/path-plus/eager": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "B/path-plus/streaming": [
+   1,
+   "c01f08c49e6aec1b"
+  ],
+  "B/predicate-counts/eager": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "B/predicate-counts/streaming": [
+   19,
+   "2e4e2359cf3f87f5"
+  ],
+  "B/predicate-subjects/eager": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "B/predicate-subjects/streaming": [
+   19,
+   "04a1e943aae3572f"
+  ],
+  "B/regex-iri/eager": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "B/regex-iri/streaming": [
+   1,
+   "342f64056bd32de1"
+  ],
+  "B/star-join/eager": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "B/star-join/streaming": [
+   2916,
+   "8d5c2ccd7af68942"
+  ],
+  "B/star-lookup/eager": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "B/star-lookup/streaming": [
+   35,
+   "419fd1e7cdf66a41"
+  ],
+  "B/subquery-agg/eager": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "B/subquery-agg/streaming": [
+   2,
+   "01e8b14d598f75a1"
+  ],
+  "B/types-grouped/eager": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "B/types-grouped/streaming": [
+   11,
+   "a9af86fa4c8e984f"
+  ],
+  "B/values-star/eager": [
+   16,
+   "340fa3c1c352861f"
+  ],
+  "B/values-star/streaming": [
+   16,
+   "340fa3c1c352861f"
+  ]
+ },
+ "load_after": "10.02 9.33 7.22 5/2097 2491363",
+ "ended": "2026-11-20T05:58:22Z",
+ "problems": []
+}

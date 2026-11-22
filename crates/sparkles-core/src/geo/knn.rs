@@ -127,6 +127,7 @@ impl Runner<'_, '_> {
                     i,
                     map: &map,
                     dec: None,
+                    exists: None,
                 };
                 eval(&spec.order, &row, self.ctx)
                     .ok()

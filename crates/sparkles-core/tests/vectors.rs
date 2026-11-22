@@ -603,3 +603,151 @@ fn compact_vectors() {
     );
     assert!(e.contains("spk:vectorB64"), "{e}");
 }
+
+/// Vector searches run as cursor operators (item 829). A search with a constant vector is
+/// a leaf bounded by its k. A search whose candidates or query values come from its input
+/// reads the whole input before it ranks, so k of one over candidates split across input
+/// batches of one row still returns the one global winner, as eager execution does.
+#[test]
+fn vector_searches_run_as_cursor_operators() {
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    let s = store(StoreOptions::default());
+    let strict = |rows: usize| CursorOptions {
+        batch_rows: rows,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let bag = |mut c: sparkles_core::sparql::QueryCursor| {
+        let mut out = Vec::new();
+        while let Some(b) = c.next_batch().unwrap() {
+            for r in 0..b.len() {
+                out.push(format!("{:?}", b.row(r).unwrap().values()));
+            }
+        }
+        out.sort();
+        out
+    };
+    let eager = |q: &str| {
+        let r = query(s.snapshot(), q, &QueryOptions::default()).unwrap();
+        let mut out: Vec<String> = r
+            .rows()
+            .unwrap()
+            .iter()
+            .map(|row| format!("{:?}", row.values()))
+            .collect();
+        out.sort();
+        out
+    };
+    for q in [
+        "SELECT ?s ?score { (?s ?score) spk:vectorSearch (ex:emb \"[1,0,0]\"^^spk:vector 3) }",
+        "SELECT ?s ?score { VALUES ?s { ex:a ex:b ex:c ex:d } (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 1 \"candidates:join\") }",
+        "SELECT ?s ?score { ?s a ex:Doc . (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 1 \"candidates:join\") }",
+        "SELECT ?q ?s ?score { VALUES ?q { ex:a ex:c } (?s ?score) spk:vectorSearch (ex:emb ?q 2) }",
+    ] {
+        let q = format!("{P}{q}");
+        let expected = eager(&q);
+        assert!(!expected.is_empty(), "{q}");
+        for rows in [1, 2, 4096] {
+            let c = select_cursor(s.snapshot(), &q, &QueryOptions::default(), &strict(rows))
+                .unwrap_or_else(|e| panic!("{q}: {e}"));
+            assert!(!c.plan().has_materialization(), "{q}");
+            assert_eq!(bag(c), expected, "{q}; {rows}");
+        }
+    }
+    // the global winner of the split candidates
+    let q = format!(
+        "{P}SELECT ?s {{ VALUES ?s {{ ex:a ex:c }} (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 1 \"candidates:join\") }}"
+    );
+    let c = select_cursor(s.snapshot(), &q, &QueryOptions::default(), &strict(1)).unwrap();
+    assert_eq!(bag(c).len(), 1);
+    assert_eq!(eager(&q).len(), 1);
+}
+
+/// A vector search whose query vector its group binds reports the counters of one eager
+/// search however its input splits into batches: work such as `scored` and `searches`
+/// adds up, and properties of the index such as `rows` keep their value (Sol review of
+/// item 829, finding 4).
+#[test]
+fn streamed_vector_search_counters_match_one_search_over_the_input() {
+    use sparkles_core::sparql::{CursorOptions, CursorPlan, FallbackPolicy, select_cursor};
+    let s = store(StoreOptions::default());
+    fn find(plan: &CursorPlan) -> Option<&CursorPlan> {
+        if plan.operator.operator == "VectorSearch" {
+            return Some(plan);
+        }
+        plan.children.iter().find_map(find)
+    }
+    let q = format!(
+        "{P}SELECT ?q ?s ?score {{ VALUES ?q {{ ex:a ex:c }} (?s ?score) spk:vectorSearch (ex:emb ?q 2) }}"
+    );
+    let counters = |rows: usize| {
+        let o = CursorOptions {
+            batch_rows: rows,
+            fallback: FallbackPolicy::RejectMaterialization,
+            ..Default::default()
+        };
+        let mut c = select_cursor(s.snapshot(), &q, &QueryOptions::default(), &o).unwrap();
+        while c.next_batch().unwrap().is_some() {}
+        find(c.plan())
+            .and_then(|p| p.operator.counters.clone())
+            .expect("vector search counters")
+    };
+    let one = counters(4096);
+    assert_eq!(
+        one.get("searches").and_then(|v| v.as_u64()),
+        Some(2),
+        "{one:?}"
+    );
+    for rows in [1, 2] {
+        assert_eq!(counters(rows), one, "{rows}");
+    }
+}
+
+/// Vector searches as cursor operators count the rows they produce against the work
+/// limit as eager runs do: both modes count the same rows, and a limit one row short of
+/// that count stops both (item 829).
+#[test]
+fn streamed_vector_searches_count_their_rows_as_eager_does() {
+    use sparkles_core::BudgetKind;
+    use sparkles_core::sparql::{CursorOptions, FallbackPolicy, select_cursor};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let s = store(StoreOptions::default());
+    for q in [
+        "SELECT ?s ?score { VALUES ?s { ex:a ex:b ex:c ex:d } (?s ?score) spk:vectorSearch (ex:emb \"[0,1,0]\"^^spk:vector 2 \"candidates:join\") }",
+        "SELECT ?q ?s ?score { VALUES ?q { ex:a ex:c } (?s ?score) spk:vectorSearch (ex:emb ?q 2) }",
+    ] {
+        let q = format!("{P}{q}");
+        let with = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+            no_cache: true,
+            max_rows_produced: limit,
+            work,
+            ..Default::default()
+        };
+        let produced = query(s.snapshot(), &q, &with(None, None))
+            .unwrap()
+            .rows_produced;
+        let streamed = |limit: Option<u64>, rows: usize| -> sparkles_core::Result<u64> {
+            let work = Arc::new(AtomicU64::new(0));
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), &q, &with(limit, Some(work.clone())), &o)?;
+            while c.next_batch()?.is_some() {}
+            Ok(work.load(Ordering::Relaxed))
+        };
+        for rows in [1, 4096] {
+            assert_eq!(streamed(None, rows).unwrap(), produced, "{q}; {rows}");
+            assert!(
+                matches!(streamed(Some(produced - 1), rows), Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+                "{q}; {rows}"
+            );
+        }
+        assert!(matches!(
+            query(s.snapshot(), &q, &with(Some(produced - 1), None)),
+            Err(sparkles_core::Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced
+        ));
+    }
+}

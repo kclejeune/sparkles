@@ -370,6 +370,7 @@ fn expected_input_schemas() -> Vec<(&'static str, Value)> {
                 "offset": {"type":"integer","minimum":0,"default":0},
                 "exactTotal": {"type":"boolean","default":true,"description":"false: stop after offset+maxRows+1 solutions (faster; total becomes null)"},
                 "timeoutSeconds": to,
+                "aggregateErrors": {"enum":["jena","sparkles","spec"],"description":"How MIN, MAX, AVG and GROUP_CONCAT treat errors such as unbound values: jena makes MIN and MAX over an error unbound, sparkles passes over errors, spec follows the SPARQL text. Default: the dataset's setting."},
                 "atCommit": at, "at": sel}}),
             ),
         ),

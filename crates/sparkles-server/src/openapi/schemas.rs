@@ -444,6 +444,24 @@ pub(super) fn schemas() -> Map<String, J> {
         ),
     );
     put(
+        "AggregateErrorsSetting",
+        obj(
+            &["mode"],
+            json!({ "mode": string_enum(&["jena", "sparkles", "spec"]) }),
+        ),
+    );
+    put(
+        "AggregateErrorsStatus",
+        obj(
+            &["mode", "source", "modes"],
+            json!({
+                "mode": string_enum(&["jena", "sparkles", "spec"]),
+                "source": string_enum(&["dataset", "default"]),
+                "modes": array(json!({ "type": "string" })),
+            }),
+        ),
+    );
+    put(
         "DescribeSetting",
         obj(
             &[],

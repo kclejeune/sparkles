@@ -1,0 +1,10 @@
+2026-11-19T10:33:26-05:00 cj-es exit=0
+2026-11-19T10:59:44-05:00 cj-se exit=0
+2026-11-19T11:39:02-05:00 small-eager-ab exit=0
+2026-11-19T15:53:56-05:00 small-eager-ba exit=0
+2026-11-19T16:33:48-05:00 small-streaming-ab exit=0
+2026-11-19T17:14:27-05:00 small-streaming-ba exit=0
+2026-11-19T18:10:00-05:00 vec-streaming-ab exit=0
+2026-11-19T18:14:31-05:00 vec-streaming-ba exit=0
+2026-11-19T18:19:01-05:00 vec-eager-ab exit=0
+2026-11-19T18:23:30-05:00 vec-eager-ba exit=0

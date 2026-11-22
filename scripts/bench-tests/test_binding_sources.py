@@ -5,6 +5,7 @@ input group instead of every Rust file, so their cached passes survive changes t
 the bindings do not build. That is only sound while binding-deps names every root crate
 that a binding depends on, so this test follows the path dependencies in cargo metadata.
 """
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 import os
 import shutil

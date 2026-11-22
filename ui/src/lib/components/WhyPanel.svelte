@@ -7,6 +7,7 @@
   import {
     explainTriple,
     footer,
+    deeper,
     graft,
     how,
     maxId,
@@ -16,6 +17,7 @@
     premiseTriples,
     staleNote,
     type Derivation,
+    type RelationAtom,
     type WhyResult,
     type WhyTriple,
   } from '$lib/why';
@@ -55,6 +57,8 @@
   /** `ref` nodes being expanded, by id. */
   let expanding = $state(new Set<number>());
   let refError = $state('');
+  /** The depth the trees were asked for, after a cut relation node was expanded. */
+  let depthLimit = $state<number | undefined>(undefined);
   let announce = $state('');
   let ctl: AbortController | null = null;
   /** The requests of **Expand**, stopped when the explanation they belong to goes. */
@@ -79,6 +83,7 @@
     trees = [];
     folded = new Set();
     refError = '';
+    depthLimit = undefined;
     try {
       const r = await explainTriple(ds, t, { maxTrees: MAX_TREES, signal: c.signal });
       if (c.signal.aborted) return;
@@ -137,8 +142,55 @@
     folded = f;
   }
 
+  /**
+   * A cut relation node: no request can name a relation fact, so the panel asks for the
+   * whole explanation again with a larger depth.
+   */
+  async function expandRelation(d: Derivation) {
+    const depth = deeper(depthLimit, d.depth);
+    if (depth === null) {
+      refError = 'This derivation is deeper than the server explains.';
+      return;
+    }
+    const at = index;
+    const gen = generation;
+    const c = new AbortController();
+    refCtls.add(c);
+    expanding = new Set([...expanding, d.id]);
+    refError = '';
+    try {
+      // the same source as the trees, so that the answer is read the same way
+      const source = explanation?.source;
+      const r = await explainTriple(ds, triple, {
+        maxTrees: MAX_TREES,
+        maxDepth: depth,
+        source: source === 'rdfsOnRead' ? undefined : source,
+        signal: c.signal,
+      });
+      if (gen !== generation) return;
+      if (r.ok && explanation && !sameRead(explanation, r.explanation)) refError = CHANGED;
+      else if (r.ok) {
+        result = r;
+        trees = r.explanation.trees;
+        index = Math.min(at, trees.length - 1);
+        folded = new Set();
+        depthLimit = depth;
+      } else refError = r.message;
+    } catch (e) {
+      if (!(e instanceof DOMException && e.name === 'AbortError')) throw e;
+    } finally {
+      refCtls.delete(c);
+      if (gen === generation) {
+        const e = new Set(expanding);
+        e.delete(d.id);
+        expanding = e;
+      }
+    }
+  }
+
   /** A `ref` node: ask for its own derivation and put it in place. */
   async function expandRef(d: Derivation) {
+    if (d.relation) return expandRelation(d);
     if (expanding.has(d.id)) return;
     // the tree the ref belongs to, which Next may leave while the request runs
     const at = index;
@@ -192,6 +244,16 @@
   </span>
 {/snippet}
 
+{#snippet atom(r: RelationAtom)}
+  <span class="triple mono" data-relation={r.name}>
+    {r.name}(<!-- -->{#each r.args as a, i (i)}{#if i},{' '}{/if}<TermView
+        term={a}
+        {prefixes}
+        {onopen}
+      />{/each})
+  </span>
+{/snippet}
+
 {#snippet node(d: Derivation, root: boolean)}
   {@const kids = d.premises ?? []}
   {@const open = !folded.has(d.id)}
@@ -207,7 +269,7 @@
       {:else}
         <span class="fold-pad" aria-hidden="true"></span>
       {/if}
-      {#if !root}{@render line(d.triple)}{/if}
+      {#if !root}{#if d.relation}{@render atom(d.relation)}{:else}{@render line(d.triple)}{/if}{/if}
       <span class="how faint" class:root>{how(d, graphLabel)}</span>
       {#if d.kind === 'ref'}
         <button class="btn xs ghost" disabled={expanding.has(d.id)} onclick={() => expandRef(d)}>

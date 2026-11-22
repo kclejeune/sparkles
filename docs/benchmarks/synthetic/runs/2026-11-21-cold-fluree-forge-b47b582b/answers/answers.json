@@ -1,0 +1,114 @@
+{
+ "count-all": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "dc01d1fdf6bc3ca8",
+   "value": "4868e331275cc047",
+   "query_sha256": "920525f60d268d48728aa85cafd97b0a52cd584a3a137834696f8d82308cb8ef"
+  },
+  "fluree": {
+   "rows": 1,
+   "exact": "dc01d1fdf6bc3ca8",
+   "value": "4868e331275cc047",
+   "query_sha256": "920525f60d268d48728aa85cafd97b0a52cd584a3a137834696f8d82308cb8ef"
+  }
+ },
+ "two-hop-count": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "7fc459165312a207",
+   "value": "8c0a0422cf5499ae",
+   "query_sha256": "08688547ff57d52458e30357b5550443eaa4e241346e47e67418bbd94fb62ff2"
+  },
+  "fluree": {
+   "rows": 1,
+   "exact": "7fc459165312a207",
+   "value": "8c0a0422cf5499ae",
+   "query_sha256": "08688547ff57d52458e30357b5550443eaa4e241346e47e67418bbd94fb62ff2"
+  }
+ },
+ "contains": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "c53f64ddafb58944",
+   "value": "c15ab9b9da23d5cf",
+   "query_sha256": "fc2b300132e013ea07fb1f399f5110f7a02dd6de7b9d6b2d2ec3ec4cad17afb2"
+  },
+  "fluree": {
+   "rows": 1,
+   "exact": "c53f64ddafb58944",
+   "value": "c15ab9b9da23d5cf",
+   "query_sha256": "fc2b300132e013ea07fb1f399f5110f7a02dd6de7b9d6b2d2ec3ec4cad17afb2"
+  }
+ },
+ "path-plus": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "e5c292f407f701be",
+   "value": "46a9c33d6ec5ee2e",
+   "query_sha256": "eedab7d932cacbb5f14a1e115d0834f9d1c79f59ac62138cca49fa5572838858"
+  },
+  "fluree": {
+   "rows": 1,
+   "exact": "e5c292f407f701be",
+   "value": "46a9c33d6ec5ee2e",
+   "query_sha256": "eedab7d932cacbb5f14a1e115d0834f9d1c79f59ac62138cca49fa5572838858"
+  }
+ },
+ "distinct-obj": {
+  "sparkles": {
+   "rows": 1,
+   "exact": "9a2f4f28936f3b72",
+   "value": "5b61478b1feeba2e",
+   "query_sha256": "c50926f4877516c098c3f3c7e681d599a2b51e42e0f3b3425adf526222364931"
+  },
+  "fluree": {
+   "rows": 1,
+   "exact": "9a2f4f28936f3b72",
+   "value": "5b61478b1feeba2e",
+   "query_sha256": "c50926f4877516c098c3f3c7e681d599a2b51e42e0f3b3425adf526222364931"
+  }
+ },
+ "star-lookup": {
+  "sparkles": {
+   "rows": 35,
+   "exact": "c1ef6f81e6778265",
+   "value": "1e8affe81597c3af",
+   "query_sha256": "359009899a5690ff2838276d3c86d76bdfe56ec22a91a720ad24c85ff9147d1b"
+  },
+  "fluree": {
+   "rows": 35,
+   "exact": "2dce9dd74afc3631",
+   "value": "1e8affe81597c3af",
+   "query_sha256": "359009899a5690ff2838276d3c86d76bdfe56ec22a91a720ad24c85ff9147d1b"
+  }
+ },
+ "values-star": {
+  "sparkles": {
+   "rows": 16,
+   "exact": "877d01a45e17241c",
+   "value": "c50c94599a208f2f",
+   "query_sha256": "681fa482e4a0c727bb012a3acdeac0ebb4a3f00bd8f7d6ba136cd42052a9a8c6"
+  },
+  "fluree": {
+   "rows": 16,
+   "exact": "877d01a45e17241c",
+   "value": "c50c94599a208f2f",
+   "query_sha256": "681fa482e4a0c727bb012a3acdeac0ebb4a3f00bd8f7d6ba136cd42052a9a8c6"
+  }
+ },
+ "employee-docs": {
+  "sparkles": {
+   "rows": 17,
+   "exact": "2471c216de40474e",
+   "value": "2471c216de40474e",
+   "query_sha256": "f23a59a344fb398cd099cc85568ed15acbb34769c94b77b8c8ffb51c75ce1e82"
+  },
+  "fluree": {
+   "rows": 17,
+   "exact": "2471c216de40474e",
+   "value": "2471c216de40474e",
+   "query_sha256": "f23a59a344fb398cd099cc85568ed15acbb34769c94b77b8c8ffb51c75ce1e82"
+  }
+ }
+}

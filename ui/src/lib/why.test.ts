@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Term } from './api';
 import {
+  deeper,
   explainTriple,
   footer,
   graft,
@@ -78,6 +79,30 @@ const explanation = (over: Partial<Explanation> = {}): Explanation => ({
 });
 
 describe('derivation trees (U10 §2.4)', () => {
+  it('leaves relation facts of rule programs out of Show on graph', () => {
+    const rel = `urn:x-sparkles:rel:chain`;
+    const node: Derivation = {
+      id: 9,
+      triple: {
+        s: { type: 'uri', value: rel },
+        p: { type: 'uri', value: rel },
+        o: { type: 'uri', value: rel },
+      },
+      kind: 'derived',
+      depth: 1,
+      relation: { name: 'chain', args: [{ type: 'uri', value: `${EX}a` }] },
+      premises: [A7.premises![1]],
+    };
+    const tree: Derivation = { ...A7, premises: [node] };
+    expect(premiseTriples(tree).map(tripleKey)).toEqual([tripleKey(A7.premises![1].triple)]);
+  });
+
+  it('asks for more depth to expand a cut relation node, up to the server limit', () => {
+    expect(deeper(undefined, 32)).toBe(64);
+    expect(deeper(undefined, 10)).toBe(64);
+    expect(deeper(64, 64)).toBeNull();
+  });
+
   it('lists the premises Show on graph draws, each once, without the explained triple', () => {
     const ps = premiseTriples(A7).map(tripleKey);
     expect(ps).toEqual(

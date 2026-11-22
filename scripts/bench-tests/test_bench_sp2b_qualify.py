@@ -1,5 +1,6 @@
 """Binding regressions for derived SP2Bench records qualified by a source oracle."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import copy
 import hashlib
 import importlib.util

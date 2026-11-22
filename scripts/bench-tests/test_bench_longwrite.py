@@ -4,6 +4,7 @@ scripts/bench-record.py, and the OWL2Bench query extraction (scripts/bench-owl2b
     python3 -m unittest discover -s scripts/bench-tests
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import http.server
 import importlib.util
 import json
@@ -109,8 +110,8 @@ class LongrunTests(unittest.TestCase):
                 "--writers", "2", "--batch", "5", "--live-max", "40", "--sample", "0.5", "--disk-every", "0.5",
                 "--out", out, *extra]
 
-    def run_load(self, url, out, *extra):
-        p = subprocess.run(self.cmd(url, out, 2, *extra), capture_output=True, text=True, timeout=120)
+    def run_load(self, url, out, *extra, seconds=2):
+        p = subprocess.run(self.cmd(url, out, seconds, *extra), capture_output=True, text=True, timeout=120)
         self.assertEqual(p.returncode, 0, p.stderr)
         return json.loads(p.stdout)
 
@@ -122,7 +123,9 @@ class LongrunTests(unittest.TestCase):
     def test_the_writers_state_matches_the_server(self):
         srv, url = self.serve()
         out = os.path.join(self.tmp.name, "run.json")
-        totals = self.run_load(url, out)
+        # One reader process forked for a 2 s window made no read once in a parallel run at a
+        # load average of about 15, so this run, which asserts a read, gets 5 s.
+        totals = self.run_load(url, out, seconds=5)
         self.assertGreater(totals["writes"], 0)
         self.assertGreater(totals["reads"], 0)
         code, r = self.check(url, out)
@@ -204,10 +207,23 @@ class LongrunTests(unittest.TestCase):
         self.assertGreaterEqual(len(kids), 3)
         p.send_signal(signal.SIGKILL)
         p.wait()
-        time.sleep(1)
-        alive = [k for k in kids if os.path.exists(f"/proc/{k}") and "Z" not in
-                 open(f"/proc/{k}/stat").read().split(")")[-1].split()[0]]
-        self.assertEqual(alive, [])
+
+        def alive():
+            left = []
+            for k in kids:
+                try:
+                    if "Z" not in open(f"/proc/{k}/stat").read().split(")")[-1].split()[0]:
+                        left.append(k)
+                except FileNotFoundError:
+                    pass
+            return left
+
+        # A loaded host can take a few seconds to schedule the kill or the parent check, so
+        # the workers get 10 s of the run's 60 to go.
+        end = time.monotonic() + 10
+        while alive() and time.monotonic() < end:
+            time.sleep(0.1)
+        self.assertEqual(alive(), [])
 
     def test_sigterm_ends_the_run_with_its_state(self):
         srv, url = self.serve()

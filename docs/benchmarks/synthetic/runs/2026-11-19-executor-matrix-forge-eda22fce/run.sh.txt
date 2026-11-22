@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# stage2.sh: under ~/lanes/.bench.lock and ~/lanes/.heavy.lock, the post-push matrix of
+# origin/main bccc5f7b (batches 32 and 33), first so a failing binary shows within minutes,
+# and of eda22fce (main before batch 32), with the
+# same scripts (src-8baa5686) and data as stage 1's cc94ac7f and 8baa5686 matrices.
+# Last line is STAGE2-DONE ok, or STAGE2-FAILED <reason>.
+set -uo pipefail
+W=$HOME/lanes/forge-backlog
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+echo "STAGE2 locks held $(date -u +%FT%TZ) load $(cat /proc/loadavg)"
+if pgrep -x rustc >/dev/null || pgrep -x cargo >/dev/null || pgrep -x sparkles >/dev/null || pgrep -f 'qlever-server|fuseki-server|oxigraph serve|nmo ' >/dev/null; then
+  echo "busy:"; ps -eo pid,args --sort=-pcpu | head -8 | cut -c1-150
+  echo "STAGE2-FAILED refused: something else is running"; exit 1
+fi
+S=$W/src-8baa5686
+fail=""
+for rev in bccc5f7b eda22fce; do
+  if [ ! -f $W/bin/$rev-matrix.zst ]; then echo "MATRIX-SKIPPED $rev: no binary"; fail="$fail $rev"; continue; fi
+  zstd -q -d -f $W/bin/$rev-matrix.zst -o $W/bin/sparkles-$rev-matrix && chmod +x $W/bin/sparkles-$rev-matrix || { echo "MATRIX-FAILED $rev unpack"; fail="$fail $rev"; continue; }
+  echo "matrix $rev start $(date -u +%FT%TZ) sha256 $(sha256sum $W/bin/sparkles-$rev-matrix | cut -c1-16) load $(cat /proc/loadavg)"
+  $S/scripts/bench-executors.sh --out $W/matrix-$rev --commit $rev --data-dir $W/data \
+    --build-config "$(cat $W/bin/$rev-matrix.build-config.json)" $W/bin/sparkles-$rev-matrix || { echo "MATRIX-FAILED $rev"; fail="$fail $rev"; continue; }
+  echo "MATRIX-DONE $rev $(date -u +%FT%TZ) load $(cat /proc/loadavg)"
+done
+if [ -z "$fail" ]; then echo "STAGE2-DONE ok"; else echo "STAGE2-FAILED$fail"; exit 1; fi

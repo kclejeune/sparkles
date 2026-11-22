@@ -41,8 +41,10 @@ const drawn = async (page: Page): Promise<Drawn> => {
   const raw = await page.locator('.wrap[data-graph]').getAttribute('data-graph');
   return raw ? JSON.parse(raw) : { nodes: [], edges: [] };
 };
-const look = async (page: Page, label: string) =>
-  (await drawn(page)).nodes.find(([l]) => l === label)?.[2];
+// A node without a label literal is drawn under its prefixed name, or its full IRI when no
+// dataset prefix covers it (the rendering preferences of item 625), as here.
+const look = async (page: Page, local: string) =>
+  (await drawn(page)).nodes.find(([l]) => l === `${EX}${local}`)?.[2];
 
 async function openHub(page: Page) {
   await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), DS);
@@ -59,9 +61,8 @@ open('A3: drawn-graph PageRank makes the hub the largest node', async ({ page, r
   await expect.poll(async () => (await look(page, 'hub'))?.size, { timeout: 15_000 }).toBe(4);
   await expect(page.getByTestId('lens-status-size')).toContainText(/iteration/);
   // the same SERVICE algo:pageRank query, run as a person would in the editor
-  const drawnIris = (await drawn(page)).nodes.map(([l]) =>
-    l === 'hub' ? `${EX}hub` : `${EX}${l}`,
-  );
+  const drawnIris = (await drawn(page)).nodes.map(([l]) => l);
+  expect(drawnIris.every((i) => i.startsWith(EX))).toBe(true);
   const vals = drawnIris.map((i) => `<${i}>`).join(' ');
   const q = `PREFIX algo: <urn:x-sparkles:algo#>
 SELECT ?node ?score WHERE { SERVICE algo:pageRank {

@@ -20,7 +20,9 @@
 # PLAIN_QUERIES (default "geo-q7-knn"; the plain plans of Q5 and Q6 are cross products of
 # 1M x 1,600 and 64k x 64k geometries, hours at N = 1M), PORT (default 3941), SPARKLES
 # (default target/release/sparkles), SPARKLES_ARGS (extra `serve` flags), MAX_TIME
-# (seconds per request, default 300).
+# (seconds per request, default 300), EXECUTION (eager, streaming or auto; empty by
+# default) for the `execution` parameter of every query request, the answer checks and
+# the timed requests alike.
 set -euo pipefail
 
 N=${1:-100000}
@@ -65,12 +67,15 @@ if [ -z "${SKIP_LOAD:-}" ]; then
     --command-name build "$SPARKLES geo-index --loc $DB" --export-json results/geo-build.new.json
   merge results/geo-build.new.json results/geo-build.json
 fi
-"$SPARKLES" geo-index --loc "$DB" > /dev/null 2>&1
+"$SPARKLES" geo-index --loc "$DB" > /dev/null
 "$SPARKLES" geo-index --loc "$DB" --status > results/geo-status.json
 
 SPID=
+# The server holds the store until its process exits, which can be after its port closes,
+# and `geo-index` refuses a store in use, so stop() waits for the server it started.
 stop() {
   [ -n "$SPID" ] && { kill "$SPID" 2> /dev/null || true; }
+  [ -n "$SPID" ] && { wait "$SPID" 2> /dev/null || true; }
   pid=$(ss -ltnp 2> /dev/null | grep ":$PORT " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true)
   [ -n "$pid" ] && { kill "$pid" 2> /dev/null || true; }
   for _ in $(seq 1 100); do
@@ -96,14 +101,15 @@ serve() { # serve <log name> <flags…>: the database on $PORT
 
 mapfile -t NAMES < <(find queries -name '*.rq' -printf '%f\n' | sed 's|\.rq$||' | sort)
 selected() { [ -z "${QUERIES:-}" ] || [[ " $QUERIES " == *" $1 "* ]]; }
-q() { echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$1.rq localhost:$PORT/bench/sparql"; }
+ENDPOINT="localhost:$PORT/bench/sparql${EXECUTION:+?execution=$EXECUTION}"
+q() { echo "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@queries/$1.rq '$ENDPOINT'"; }
 
 # run <engine>: the answer check and the timings against the running server
 run() {
   local engine=$1
   for n in "${NAMES[@]}"; do
     selected "$n" || continue
-    r=$(python3 "$ROOT/scripts/bench-answers.py" "localhost:$PORT/bench/sparql" "queries/$n.rq" results/geo-answers.json "$n" "$engine")
+    r=$(python3 "$ROOT/scripts/bench-answers.py" "$ENDPOINT" "queries/$n.rq" results/geo-answers.json "$n" "$engine")
     printf '%-20s %-14s %s rows\n' "$n" "$engine" "$r"
   done
   for n in "${NAMES[@]}"; do
@@ -119,11 +125,11 @@ serve sparkles --geo bench
 run sparkles
 stop
 # without it (the spatial index disabled, then enabled again for the next run)
-"$SPARKLES" geo-index --loc "$DB" --disable > /dev/null 2>&1
+"$SPARKLES" geo-index --loc "$DB" --disable > /dev/null
 serve sparkles-scan
 run sparkles-scan
 stop
-"$SPARKLES" geo-index --loc "$DB" > /dev/null 2>&1
+"$SPARKLES" geo-index --loc "$DB" > /dev/null
 # with the index, the spatial join and nearest-neighbour rewrites off
 if [ -n "$PLAIN_QUERIES" ]; then
   QUERIES_ALL=${QUERIES:-}

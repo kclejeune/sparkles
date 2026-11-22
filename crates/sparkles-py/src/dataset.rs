@@ -61,6 +61,9 @@ pub struct QueryArgs<'py> {
     pub at: Option<Bound<'py, PyAny>>,
     /// DESCRIBE options over the dataset's setting: a mode, or a dict of options.
     pub describe: Option<Bound<'py, PyAny>>,
+    /// How the query's aggregates treat errors: `"jena"`, `"sparkles"` or `"spec"`
+    /// (`None`: the dataset's setting).
+    pub aggregate_errors: Option<String>,
 }
 
 /// The DESCRIBE options of a query: `base` (the dataset's setting) with the `describe`
@@ -163,6 +166,12 @@ pub fn query_options(args: &QueryArgs<'_>) -> PyResult<(QueryOptions, Option<At>
     if args.include_inferred {
         opts.default_graph_extra = vec![INFERRED_GRAPH.to_string()];
     }
+    opts.aggregate_errors = match &args.aggregate_errors {
+        Some(m) => Some(m.parse().map_err(|e: sparkles::Error| {
+            pyo3::exceptions::PyValueError::new_err(e.to_string())
+        })?),
+        None => None,
+    };
     let at = args.at.as_ref().map(at_from_py).transpose()?;
     Ok((opts, at))
 }
@@ -181,6 +190,9 @@ pub fn apply_defaults(
     }
     opts.algo_projections = defaults.algo_projections.clone();
     opts.describe = describe_options(defaults.describe.clone(), args.describe.as_ref())?;
+    if opts.aggregate_errors.is_none() {
+        opts.aggregate_errors = defaults.aggregate_errors;
+    }
     opts.defaults_applied = true;
     Ok(())
 }
@@ -360,6 +372,7 @@ pub fn query_args<'py>(
     cancel: Option<Bound<'py, PyAny>>,
     at: Option<Bound<'py, PyAny>>,
     describe: Option<Bound<'py, PyAny>>,
+    aggregate_errors: Option<String>,
 ) -> QueryArgs<'py> {
     QueryArgs {
         base_iri,
@@ -375,6 +388,7 @@ pub fn query_args<'py>(
         cancel,
         at,
         describe,
+        aggregate_errors,
     }
 }
 
@@ -587,7 +601,7 @@ impl PyDataset {
 
     /// Run a SPARQL query: `QuerySolutions` for SELECT, `bool` for ASK, `QueryTriples`
     /// for CONSTRUCT and DESCRIBE.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
         &self,
@@ -606,6 +620,7 @@ impl PyDataset {
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
         describe: Option<Bound<'py, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -621,12 +636,13 @@ impl PyDataset {
             cancel,
             at,
             describe,
+            aggregate_errors,
         );
         self.run_query(py, query, args, None)
     }
 
     /// Run a SELECT query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn select<'py>(
         &self,
@@ -645,6 +661,7 @@ impl PyDataset {
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
         describe: Option<Bound<'py, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -660,12 +677,13 @@ impl PyDataset {
             cancel,
             at,
             describe,
+            aggregate_errors,
         );
         self.run_query(py, query, args, Some(&[QueryKind::Select]))
     }
 
     /// Open a fallible SELECT iterator over bounded engine batches.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, batch_rows = 4096, batch_bytes = 1048576, allow_materialization = true))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, aggregate_errors = None, batch_rows = 4096, batch_bytes = 1048576, allow_materialization = true))]
     #[allow(clippy::too_many_arguments)]
     fn select_cursor<'py>(
         &self,
@@ -684,6 +702,7 @@ impl PyDataset {
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
         describe: Option<Bound<'py, PyAny>>,
+        aggregate_errors: Option<String>,
         batch_rows: usize,
         batch_bytes: usize,
         allow_materialization: bool,
@@ -702,6 +721,7 @@ impl PyDataset {
             cancel,
             at,
             describe,
+            aggregate_errors,
         );
         let ds = self.ds_for_write(py)?;
         let (mut opts, at) = query_options(&args)?;
@@ -735,7 +755,7 @@ impl PyDataset {
     }
 
     /// Open a fallible CONSTRUCT / DESCRIBE iterator over bounded engine batches.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, batch_rows = 4096, batch_bytes = 1048576, allow_materialization = true))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, aggregate_errors = None, batch_rows = 4096, batch_bytes = 1048576, allow_materialization = true))]
     #[allow(clippy::too_many_arguments)]
     fn graph_cursor<'py>(
         &self,
@@ -754,6 +774,7 @@ impl PyDataset {
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
         describe: Option<Bound<'py, PyAny>>,
+        aggregate_errors: Option<String>,
         batch_rows: usize,
         batch_bytes: usize,
         allow_materialization: bool,
@@ -772,6 +793,7 @@ impl PyDataset {
             cancel,
             at,
             describe,
+            aggregate_errors,
         );
         let ds = self.ds_for_write(py)?;
         let (mut opts, at) = query_options(&args)?;
@@ -805,7 +827,7 @@ impl PyDataset {
     }
 
     /// Run an ASK query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn ask<'py>(
         &self,
@@ -824,6 +846,7 @@ impl PyDataset {
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
         describe: Option<Bound<'py, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -839,12 +862,13 @@ impl PyDataset {
             cancel,
             at,
             describe,
+            aggregate_errors,
         );
         self.run_query(py, query, args, Some(&[QueryKind::Ask]))
     }
 
     /// Run a CONSTRUCT or DESCRIBE query.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, at = None, describe = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn construct<'py>(
         &self,
@@ -863,6 +887,7 @@ impl PyDataset {
         cancel: Option<Bound<'py, PyAny>>,
         at: Option<Bound<'py, PyAny>>,
         describe: Option<Bound<'py, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -878,6 +903,7 @@ impl PyDataset {
             cancel,
             at,
             describe,
+            aggregate_errors,
         );
         self.run_query(
             py,
@@ -888,7 +914,7 @@ impl PyDataset {
     }
 
     /// Run a SPARQL Update request in one transaction.
-    #[pyo3(signature = (update, *, base_iri = None, prefixes = None, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None))]
+    #[pyo3(signature = (update, *, base_iri = None, prefixes = None, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn update(
         &self,
@@ -901,6 +927,7 @@ impl PyDataset {
         max_memory_bytes: Option<u64>,
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'_, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<PyUpdateStats> {
         let ds = self.ds_for_write(py)?;
         let args = QueryArgs {
@@ -911,6 +938,7 @@ impl PyDataset {
             max_memory_bytes,
             max_rows_produced,
             cancel,
+            aggregate_errors,
             ..Default::default()
         };
         let (opts, _) = query_options(&args)?;

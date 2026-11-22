@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# timing.sh: the Intel A/B of lane horn-cost, run by run.sh under forge's bench and heavy locks.
+# Arms, interleaved in a rotating order in each round, on 1 and 4 threads:
+#   base  bin/base (09f6ed15, the lane base)
+#   tip0  bin/tip (378127e2) with --dl-attempt-width 0: items 990/1011's pruning alone
+#   tip   bin/tip as it runs by default: the pruning and the one-thread width limit
+#   c1    bin/c1 (378127e2 + c1.patch.txt, the debug_assert in horn_rules::forall), uncommitted
+# Files: ore_ont_14817, 9663, 3215 (attempts that fail), 16680, 13103, 5438 (attempts that finish)
+# and GO. One JSON line per process in out/timing/log.txt with its exit status and the taxonomy
+# hash; the log ends with TIMING-DONE. Each process runs in a 12 GiB scope without swap, pinned to
+# P-cores of separate physical cores: cpu 2 on one thread, cpus 2, 4, 6 and 8 on four.
+set -u
+ROUNDS=${ROUNDS:-5}
+O=out/timing; mkdir -p $O
+log=$O/log.txt
+ARMS=(base tip0 tip c1)
+FILES=(${SMOKE_FILES:-ore_ont_14817.owl ore_ont_9663.owl ore_ont_3215.owl ore_ont_16680.owl ore_ont_13103.owl ore_ont_5438.owl go.ofn})
+# classifications per process: more for the files that classify in seconds or less
+reps() { case $1 in go.ofn|ore_ont_5438.owl) echo 5;; ore_ont_13103.owl) echo 3;; *) echo 1;; esac; }
+for r in $(seq 1 $ROUNDS); do
+  for t in 1 4; do
+    for f in "${FILES[@]}"; do
+      n=${f%.*}
+      k=$(( (r + t) % ${#ARMS[@]} ))
+      for i in $(seq 0 $(( ${#ARMS[@]} - 1 ))); do
+        arm=${ARMS[$(( (k + i) % ${#ARMS[@]} ))]}
+        case $arm in base) b=bin/base; x=();; tip0) b=bin/tip; x=(--dl-attempt-width 0);; tip) b=bin/tip; x=();; c1) b=bin/c1; x=();; esac
+        case $t in 1) cpus=2;; *) cpus=2,4,6,8;; esac
+        tax=$O/$arm.$n.t$t.tax; js=$O/$arm.$n.t$t.r$r.json
+        systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 taskset -c $cpus $b --threads $t --repeat $(reps $f) --taxonomy $tax "${x[@]}" files/$f > $js 2> $O/$arm.$n.t$t.r$r.err
+        st=$?
+        sha=$(LC_ALL=C sort $tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $tax
+        rep=$(grep '^{' $js | head -1); [ -n "$rep" ] || rep=null
+        jq -nc --arg arm $arm --arg n $n --argjson r $r --argjson t $t --arg sha $sha --argjson st $st --argjson rep "$rep" \
+          '{round:$r,arm:$arm,file:$n,threads:$t,exit:$st,tax:$sha,ms:($rep|if .==null then null else .classifyMedianMs end),sat:($rep|if .==null then null else .saturationMs end),attemptOver:($rep|if .==null then null else .dlAttemptOver end),rss:($rep|if .==null then null else .peakRssKib end),conclusions:($rep|if .==null then null else .conclusions end)}' >> $log
+      done
+    done
+  done
+done
+echo TIMING-DONE >> $log

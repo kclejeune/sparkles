@@ -779,6 +779,7 @@ const fn named(f: SettingsFile, member: &'static str) -> SettingsFile {
 pub const SETTINGS: &[SettingsFile] = &[
     // a dataset's directory
     ds("describe.json", 1),
+    ds("aggregate-errors.json", 1),
     ds("compaction.json", 1),
     ds("quota.json", 1),
     ds("changelog.json", 1),

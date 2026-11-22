@@ -29,7 +29,9 @@
 # timing queries, DATA=path/to/data.nt to reuse a generated dataset (for example
 # scripts/bench.sh's), PORT_BASE (default 3940; the servers listen on PORT_BASE+1..+3),
 # SPARKLES_LANGUAGE (default en) for the --language argument of Sparkles' index, such as
-# en=english-lucene for the analyzer that follows Lucene's English analyzer.
+# en=english-lucene for the analyzer that follows Lucene's English analyzer, and EXECUTION
+# (eager, streaming or auto; empty by default) for the `execution` parameter of every
+# Sparkles request, the answer checks and the timed requests alike.
 set -euo pipefail
 # Servers run inside a transient systemd scope limited to SERVER_MEM_MAX (for example 12G)
 # when it is set, so an engine that runs out of memory is killed alone (as in bench.sh).
@@ -239,7 +241,7 @@ if has sparkles; then
   PIDS+=($!)
   wait_for "localhost:$SPORT/\$/ready"
   NAME[sparkles]=sparkles
-  URL[sparkles]=localhost:$SPORT/bench/sparql
+  URL[sparkles]=localhost:$SPORT/bench/sparql${EXECUTION:+?execution=$EXECUTION}
 fi
 if has jena; then
   PORT[jena]=$JPORT
@@ -354,7 +356,7 @@ if [ -z "${ANSWERS_ONLY:-}" ]; then
     ARGS=()
     for e in $ENGINES; do
       ARGS+=(--command-name "${NAME[$e]}"
-        "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@$(qfile "$e" "$n") ${URL[$e]}")
+        "curl -sf --max-time ${MAX_TIME:-300} -o /dev/null -H 'Accept: text/tab-separated-values' --data-urlencode query@$(qfile "$e" "$n") '${URL[$e]}'")
     done
     "${CLIENT[@]}" hyperfine --shell=sh --warmup "$WARMUP" --runs "$RUNS" --style basic --ignore-failure --prepare "$CLEAR" \
       "${ARGS[@]}" --export-json "results/text-$n.new.json"

@@ -131,6 +131,7 @@ fn query_params(o: Op) -> Op {
         "describeReifiers",
         "describeMaxTriples",
         "describeMaxDepth",
+        "aggregateErrors",
     ])
     .query(
         "force-accept",
@@ -3469,6 +3470,16 @@ fn settings(p: &mut Paths) {
     );
     setting(
         p,
+        "/$/aggregate-errors/{ds}",
+        "SPARQL",
+        "reading of errors in aggregates",
+        "AggregateErrors",
+        "AggregateErrorsStatus",
+        "AggregateErrorsSetting",
+        "aggregate-errors",
+    );
+    setting(
+        p,
         "/$/quota/{ds}",
         "Datasets",
         "storage quota",
@@ -5349,7 +5360,7 @@ fn protocol(p: &mut Paths) {
         .see("per-dataset-sparql-protocol-fuseki-compatible")
         .query("using-graph-uri", json!({ "type": "array", "items": { "type": "string" } }), "`USING` graphs.")
         .query("using-named-graph-uri", json!({ "type": "array", "items": { "type": "string" } }), "`USING NAMED` graphs.")
-        .params(&["memoryMb", "maxRows", "maxRowsProduced"])
+        .params(&["memoryMb", "maxRows", "maxRowsProduced", "aggregateErrors"])
         .body(
             true,
             "The update.",

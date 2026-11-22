@@ -19,7 +19,10 @@
 # (default 20), WARMUP (default 3), M (default 16), EFC (efConstruction, default 128),
 # CLUSTERS (default 1000), SEED (default 42), PORT (default 4800), SKIP_LOAD=1 to reuse
 # the store and index of an earlier run, SPARKLES (the binary, default
-# target/release/sparkles). Measure on a quiet machine: compiles or other servers running
+# target/release/sparkles), EXECUTION (eager, streaming or auto; empty by default) for the
+# `execution` parameter of every query request. results/fingerprint.json holds a digest of
+# the exact answers and of each EFS value's answers, which runs of other builds or modes
+# over the same store and index must share. Measure on a quiet machine: compiles or other servers running
 # at the same time inflate every number.
 set -euo pipefail
 
@@ -36,6 +39,8 @@ EFC=${EFC:-128}
 CLUSTERS=${CLUSTERS:-1000}
 SEED=${SEED:-42}
 PORT=${PORT:-4800}
+EXECUTION=${EXECUTION:-}
+SPARQL_PATH="/bench/sparql${EXECUTION:+?execution=$EXECUTION}"
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 SPARKLES=${SPARKLES:-$ROOT/target/release/sparkles}
 PRED=urn:x-bench:emb
@@ -120,16 +125,16 @@ echo "-- index $state"
 # ------------------------------------------------- recall and latency (HTTP client)
 echo "-- recall@$K and latency over $QUERIES queries"
 # shellcheck disable=SC2086 # EFS is a list
-python3 - "$PORT" "$PRED" "$K" "$SPID" $EFS << 'EOF'
-import http.client, json, sys, time, urllib.parse
-port, pred, k, spid, efs = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], [int(x) for x in sys.argv[5:]]
+python3 - "$PORT" "$PRED" "$K" "$SPID" "$SPARQL_PATH" $EFS << 'EOF'
+import hashlib, http.client, json, sys, time, urllib.parse
+port, pred, k, spid, path, efs = int(sys.argv[1]), sys.argv[2], int(sys.argv[3]), sys.argv[4], sys.argv[5], [int(x) for x in sys.argv[6:]]
 queries = [l.strip() for l in open("queries.jsonl") if l.strip()]
 conn = http.client.HTTPConnection("127.0.0.1", port, timeout=600)
 def ask(v, opt):
     q = (f'SELECT ?s {{ (?s ?score) <urn:x-sparkles:vectorSearch> '
          f'(<{pred}> "{v}"^^<urn:x-sparkles:vector> {k} "{opt}") }}')
     t = time.perf_counter()
-    conn.request("POST", "/bench/sparql", body=q.encode(),
+    conn.request("POST", path, body=q.encode(),
                  headers={"Content-Type": "application/sparql-query", "Accept": "text/tab-separated-values"})
     r = conn.getresponse()
     body = r.read().decode()
@@ -148,12 +153,19 @@ def stats(ms):
 for v in queries[:20]:
     ask(v, "exact:true")
 truth, ms = zip(*[ask(v, "exact:true") for v in queries])
+def digest(answers):
+    h = hashlib.sha256()
+    for a in answers:
+        h.update("\t".join(sorted(a)).encode() + b"\n")
+    return h.hexdigest()
+fingerprint = {"execution": path, "exact": digest(truth), "hnsw": {}}
 out = {"queries": len(queries), "k": k, "exact": stats(ms), "hnsw": []}
 print(f"   exact        mean {out['exact']['meanMs']:8.2f} ms  p50 {out['exact']['p50Ms']:8.2f}  p99 {out['exact']['p99Ms']:8.2f}")
 for ef in efs:
     for v in queries[:20]:
         ask(v, f"ef:{ef}")
     got, ms = zip(*[ask(v, f"ef:{ef}") for v in queries])
+    fingerprint["hnsw"][str(ef)] = digest(got)
     hits = sum(len(g & t) for g, t in zip(got, truth))
     total = sum(len(t) for t in truth)
     row = {"ef": ef, "recall": round(hits / total, 4), **stats(ms)}
@@ -161,6 +173,7 @@ for ef in efs:
     print(f"   ef={ef:<4}  recall {row['recall']:.4f}  mean {row['meanMs']:8.2f} ms  p50 {row['p50Ms']:8.2f}  p99 {row['p99Ms']:8.2f}")
 out["serverRssMb"] = round(rss_mb(), 1)
 json.dump(out, open("results/recall.json", "w"), indent=1)
+json.dump(fingerprint, open("results/fingerprint.json", "w"), indent=1)
 first = queries[0]
 for opt in ["exact:true"] + [f"ef:{ef}" for ef in efs]:
     name = opt.replace(":", "-")
@@ -173,7 +186,7 @@ EOF
 echo "-- hyperfine: one top-$K query per mode"
 args=()
 for f in q-exact-true.rq $(for ef in $EFS; do echo "q-ef-$ef.rq"; done); do
-  args+=(-n "${f%.rq}" "curl -sf -o /dev/null -H 'Content-Type: application/sparql-query' -H 'Accept: text/tab-separated-values' --data-binary @$f http://127.0.0.1:$PORT/bench/sparql")
+  args+=(-n "${f%.rq}" "curl -sf -o /dev/null -H 'Content-Type: application/sparql-query' -H 'Accept: text/tab-separated-values' --data-binary @$f 'http://127.0.0.1:$PORT$SPARQL_PATH'")
 done
 hyperfine -N --warmup "$WARMUP" --runs "$RUNS" --export-json results/hyperfine.json "${args[@]}" > results/hyperfine.log 2>&1
 

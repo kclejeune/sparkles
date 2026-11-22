@@ -338,6 +338,30 @@ pub struct Finding {
     pub message: String,
 }
 
+impl Finding {
+    fn retained_bytes(&self) -> u64 {
+        use sparkles_core::sparql::output::term_bytes;
+        let payload = |term: &Term| term_bytes(term).unwrap_or(u64::MAX);
+        let mut bytes = (std::mem::size_of::<Self>() as u64)
+            .saturating_add(self.message.len() as u64)
+            .saturating_add(payload(&self.focus));
+        for (_, evidence) in &self.evidence {
+            bytes = bytes.saturating_add(std::mem::size_of::<(&str, Evidence)>() as u64);
+            match evidence {
+                Evidence::One(term) => bytes = bytes.saturating_add(payload(term)),
+                Evidence::Many(terms) => {
+                    for term in terms {
+                        bytes = bytes
+                            .saturating_add(std::mem::size_of::<Term>() as u64)
+                            .saturating_add(payload(term));
+                    }
+                }
+            }
+        }
+        bytes
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReportStatus {
     ViolationsFound,
@@ -682,7 +706,58 @@ pub fn diagnose_controlled(
     typings: Option<&LiteralTypings>,
     controls: &DiagnosticControls,
 ) -> anyhow::Result<DiagnosticsReport> {
+    diagnose_impl(snap, opts, typings, controls, None)
+}
+
+/// Diagnose a gate candidate with native default graph semantics and a report-wide
+/// retention limit. The query deadline, row and memory caps and work counter apply
+/// to every diagnostic query, including asserted evidence rechecks.
+pub fn diagnose_for_gate(
+    snap: Arc<Snapshot>,
+    opts: &DiagnoseOptions,
+    query: &QueryOptions,
+    max_results: Option<usize>,
+    max_report_bytes: Option<u64>,
+) -> anyhow::Result<DiagnosticsReport> {
+    let timeout = query
+        .timeout
+        .map(|timeout| {
+            Instant::now()
+                .checked_add(timeout)
+                .ok_or_else(|| Error::invalid("diagnostic query timeout overflow"))
+        })
+        .transpose()?;
+    let controls = DiagnosticControls {
+        access: query.graphs.clone(),
+        deadline: query.deadline.into_iter().chain(timeout).min(),
+        cancel: query.cancel.clone(),
+        max_memory: query.max_memory_bytes,
+    };
+    let gate = Gate {
+        query,
+        max_results,
+        max_report_bytes,
+    };
+    diagnose_impl(snap, opts, None, &controls, Some(&gate))
+}
+
+struct Gate<'a> {
+    query: &'a QueryOptions,
+    max_results: Option<usize>,
+    max_report_bytes: Option<u64>,
+}
+
+fn diagnose_impl(
+    snap: Arc<Snapshot>,
+    opts: &DiagnoseOptions,
+    typings: Option<&LiteralTypings>,
+    controls: &DiagnosticControls,
+    gate: Option<&Gate<'_>>,
+) -> anyhow::Result<DiagnosticsReport> {
     check_control(controls.deadline, controls.cancel.as_deref())?;
+    if let Some(cancellation) = gate.and_then(|gate| gate.query.cancellation.as_ref()) {
+        cancellation.check()?;
+    }
     let mut visible_options;
     let opts = if controls.access.as_ref().is_some_and(|access| {
         !access.readable(Some(&Term::NamedNode(NamedNode::new_unchecked(
@@ -710,6 +785,9 @@ pub fn diagnose_controlled(
     let names = Names::new(&prefixes);
     let mut outcomes = Vec::new();
     let mut findings = Vec::new();
+    let report_bytes = gate
+        .and_then(|gate| gate.max_report_bytes)
+        .map(sparkles_core::validation::ReportBytes::new);
     for check in checks {
         if controls
             .cancel
@@ -746,7 +824,12 @@ pub fn diagnose_controlled(
             access: controls.access.as_ref(),
             cancel: controls.cancel.as_ref(),
             max_memory: controls.max_memory,
+            gate_query: gate.map(|gate| gate.query),
+            report_bytes: report_bytes.as_ref(),
         };
+        let limit = gate
+            .and_then(|gate| gate.max_results)
+            .map_or(limit, |max| limit.min(max.saturating_sub(findings.len())));
         let found = if check.id == LITERAL_NOT_IN_DATATYPE {
             run.paged_findings(limit)
         } else {
@@ -765,6 +848,9 @@ pub fn diagnose_controlled(
                 findings.extend(found);
             }
             Err(Error::Timeout) => out.status = CheckStatus::Timeout,
+            Err(error @ (Error::BudgetExceeded(_) | Error::Cancelled)) if gate.is_some() => {
+                return Err(error.into());
+            }
             Err(e) => {
                 out.status = CheckStatus::Error;
                 out.error = Some(e.to_string());
@@ -821,6 +907,8 @@ struct Run<'a> {
     access: Option<&'a Arc<sparkles_core::access::GraphAccess>>,
     cancel: Option<&'a Arc<std::sync::atomic::AtomicBool>>,
     max_memory: Option<u64>,
+    gate_query: Option<&'a QueryOptions>,
+    report_bytes: Option<&'a sparkles_core::validation::ReportBytes>,
 }
 
 /// A diagnostic row keeps the genuine decoded payload and original names. Two
@@ -1105,6 +1193,9 @@ thread_local! {
     static PAGE_TIMEOUT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     /// Tests only: replaces [`CANDIDATES_MAX`].
     static CANDIDATES_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Tests only: cancel an asserted-only union query after its setup check.
+    static ASSERTED_QUERY_CANCEL: std::cell::Cell<Option<Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::Cell::new(None) };
     /// Tests only: called after each chunk of the delta vocabulary that [`ill_typed`]
     /// reads, with the lock of the delta vocabulary released.
     static DELTA_CHUNK_HOOK: std::cell::RefCell<Option<ChunkHook>> =
@@ -1152,7 +1243,15 @@ const CANDIDATE_ORDER: &str = "ORDER BY ?x ?p ?range STR(?lit) DATATYPE(?lit) LA
 
 impl Run<'_> {
     fn check(&self) -> sparkles_core::Result<()> {
-        check_control(self.deadline, self.cancel.map(Arc::as_ref))
+        check_control(self.deadline, self.cancel.map(Arc::as_ref))?;
+        if let Some(cancellation) = self.gate_query.and_then(|gate| gate.cancellation.as_ref()) {
+            cancellation.check()?;
+        }
+        Ok(())
+    }
+
+    fn native_union(&self) -> bool {
+        self.gate_query.is_some() && self.snap.union_default_graph && self.graphs.is_empty()
     }
 
     fn options(
@@ -1179,26 +1278,47 @@ impl Run<'_> {
             })
             .collect();
         let mut extra = Vec::new();
-        if inferences {
+        let mut access = self.access.cloned();
+        if self.native_union() {
+            if !inferences {
+                use sparkles_core::access::GraphAccess;
+                let mut allowed = access.as_deref().cloned().unwrap_or_else(GraphAccess::all);
+                allowed.read = allowed.read.without_iri(INFERRED_GRAPH);
+                access = Some(Arc::new(allowed));
+            }
+        } else if inferences {
             if chosen.is_empty() {
                 extra.push(INFERRED_GRAPH.to_string());
             } else {
                 chosen.push(INFERRED_GRAPH.to_string());
             }
         }
-        Ok(QueryOptions {
+        let mut query = QueryOptions {
             timeout,
             no_cache: true,
             default_graph_uris: chosen,
             default_graph_extra: extra,
             initial_bindings: bindings,
             grant: self.grant.cloned(),
-            graphs: self.access.cloned(),
+            graphs: access,
             deadline: self.deadline,
             cancel: self.cancel.cloned(),
             max_memory_bytes: self.max_memory,
             ..Default::default()
-        })
+        };
+        if let Some(gate) = self.gate_query {
+            query.timeout = None;
+            query.cancellation = gate.cancellation.clone();
+            query.grant = gate.grant.clone().or(query.grant);
+            query.pool = gate.pool.clone();
+            query.max_rows = gate.max_rows;
+            query.max_rows_produced = gate.max_rows_produced;
+            query.work = gate.work.clone();
+            query.spill = gate.spill.clone();
+            query.max_spill_bytes = gate.max_spill_bytes;
+            query.forbid_service = gate.forbid_service;
+        }
+        Ok(query)
     }
 
     fn select(
@@ -1208,11 +1328,27 @@ impl Run<'_> {
         bindings: Vec<(String, Term)>,
     ) -> sparkles_core::Result<DecodedRows> {
         let opts = self.options(inferences, bindings)?;
-        let result = sparkles_core::sparql::query(self.snap.clone(), text, &opts)?;
+        let result = if self.native_union() && !inferences {
+            #[cfg(test)]
+            if let Some(flag) = ASSERTED_QUERY_CANCEL.take() {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            sparkles_core::sparql::query_snapshot_prepared(self.snap.clone(), text, opts)?
+        } else {
+            sparkles_core::sparql::query(self.snap.clone(), text, &opts)?
+        };
         self.check()?;
         let values = result.rows()?;
         self.check()?;
         Ok(DecodedRows { result, values })
+    }
+
+    fn push_finding(&self, out: &mut Vec<Finding>, finding: Finding) -> sparkles_core::Result<()> {
+        if let Some(report) = self.report_bytes {
+            report.admit(finding.retained_bytes())?;
+        }
+        out.push(finding);
+        Ok(())
     }
 
     /// The deduplicated findings (at most `limit`) and whether more remain.
@@ -1245,7 +1381,7 @@ impl Run<'_> {
                 Basis::Asserted
             };
             if let Some(f) = self.finding(rows, basis)? {
-                out.push(f);
+                self.push_finding(&mut out, f)?;
             }
         }
         Ok((out, truncated))
@@ -1339,7 +1475,7 @@ impl Run<'_> {
                     f.basis = Basis::UsesInferences;
                 }
                 seen.insert(key);
-                out.push(f);
+                self.push_finding(out, f)?;
             }
         }
         Ok(truncated)
@@ -1413,7 +1549,7 @@ impl Run<'_> {
                     Term::NamedNode((*dt).clone()),
                 );
                 let n = |t: &Term| self.names.show(t);
-                out.push(Finding {
+                self.push_finding(out, Finding {
                     check: self.check.id,
                     rule: self.check.rules[0],
                     severity: self.check.severity,
@@ -1425,7 +1561,7 @@ impl Run<'_> {
                     focus: l.clone(),
                     evidence: vec![("range", Evidence::One(d)), ("literal", Evidence::One(l))],
                     basis: Basis::UsesInferences,
-                });
+                })?;
             }
         }
         Ok(false)
@@ -1501,7 +1637,7 @@ impl Run<'_> {
                     f.basis = Basis::UsesInferences;
                 }
                 seen.insert(key);
-                out.push(f);
+                self.push_finding(out, f)?;
             }
             if !full {
                 return Ok(false);
@@ -2948,6 +3084,128 @@ mod paging_tests {
         assert_eq!(scans_of(&generation), 2);
         assert_eq!(ill_typed(&snap, 2, None).unwrap().len(), 5);
         assert_eq!(scans_of(&generation), 2);
+    }
+
+    #[test]
+    fn gate_asserted_evidence_recheck_propagates_chained_cancellation() {
+        use sparkles_core::io::{RdfFormat, Source};
+        use sparkles_core::store::{Store, StoreOptions};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = Store::in_memory(StoreOptions {
+            union_default_graph: true,
+            ..Default::default()
+        });
+        let dataset = format!(
+            "<urn:asserted> {{
+                 <urn:A> <http://www.w3.org/2002/07/owl#disjointWith> <urn:B> .
+                 <urn:x> a <urn:A> .
+             }}
+             <{INFERRED_GRAPH}> {{ <urn:x> a <urn:B> . }}"
+        );
+        store
+            .load(&[Source::from_bytes(
+                dataset.into_bytes(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let flag = Arc::new(AtomicBool::new(false));
+        let query = QueryOptions {
+            cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+                [flag.clone()],
+            )),
+            ..Default::default()
+        };
+        ASSERTED_QUERY_CANCEL.set(Some(flag.clone()));
+        let result = diagnose_for_gate(
+            store.snapshot(),
+            &DiagnoseOptions {
+                checks: vec!["disjoint-classes".into()],
+                inferences: true,
+                ..Default::default()
+            },
+            &query,
+            None,
+            None,
+        );
+        ASSERTED_QUERY_CANCEL.set(None);
+        assert!(
+            flag.load(Ordering::Relaxed),
+            "the asserted evidence query must run"
+        );
+        assert!(matches!(
+            result
+                .err()
+                .and_then(|error| error.downcast::<Error>().ok()),
+            Some(Error::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn gate_asserted_union_admits_cold_graph_ids_before_trivial_query() {
+        use sparkles_core::io::{RdfFormat, Source};
+        use sparkles_core::store::{Store, StoreOptions};
+        use std::fmt::Write;
+
+        fn select(graph_count: usize) -> sparkles_core::Result<DecodedRows> {
+            let store = Store::in_memory(StoreOptions {
+                union_default_graph: true,
+                ..Default::default()
+            });
+            // Stay in the delta so the refusal is from retained graph IDs, with
+            // no index decoder workspace that could refuse earlier.
+            let mut data = format!("<urn:s> <urn:p> <urn:o> <{INFERRED_GRAPH}> .\n");
+            for n in 0..graph_count {
+                writeln!(data, "<urn:s> <urn:p> <urn:o> <urn:g{n:05}> .").unwrap();
+            }
+            store
+                .load_with(
+                    &[Source::from_bytes(
+                        data.into_bytes(),
+                        RdfFormat::NQuads,
+                        None,
+                    )],
+                    sparkles_core::commit::CommitKind::Load,
+                    &sparkles_core::guard::WriteOptions {
+                        graphs: Some(Arc::new(sparkles_core::access::GraphAccess::all())),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let snap = store.snapshot();
+            assert_eq!(snap.delta.inserts(), graph_count + 1);
+            let query = QueryOptions {
+                max_memory_bytes: Some(64 << 10),
+                ..Default::default()
+            };
+            let run = Run {
+                snap: &snap,
+                check: &CHECKS[0],
+                text: String::new(),
+                deadline: None,
+                inferences: true,
+                graphs: &[],
+                names: &Names::new(&BTreeMap::new()),
+                typings: None,
+                grant: None,
+                access: None,
+                cancel: None,
+                max_memory: query.max_memory_bytes,
+                gate_query: Some(&query),
+                report_bytes: None,
+            };
+            run.select(
+                "SELECT ?probe WHERE { BIND(1 AS ?probe) }",
+                false,
+                Vec::new(),
+            )
+        }
+        assert_eq!(select(1).unwrap().len(), 1);
+        assert!(matches!(
+            select(16_384),
+            Err(Error::BudgetExceeded(budget)) if budget.kind == sparkles_core::error::BudgetKind::Memory
+        ));
     }
 
     /// An ill-typed literal that only the delta vocabulary holds is found in the named

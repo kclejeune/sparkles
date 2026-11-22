@@ -1,0 +1,68 @@
+"""Verify a completed same-snapshot run against its input manifests."""
+from collections import Counter
+from hashlib import sha256
+import json
+from pathlib import Path
+import sys
+
+SOURCE = "c1619c3726f12c64acf9c05a6554de4fe3ff1a55"
+PATCH = "68485372d20d1c45a6d8bb8cc48ed881ad8ced154586d8e56c4c4d17a3ee6e74"
+HAND_CONTROLS = {
+    "s7-horn-witness-01803-reduced.ofn",
+    "s7-horn-witness-07846-reduced.ofn",
+    "s8-horn-witness-13164-m44-reduced.ofn",
+}
+
+
+def digest(path):
+    return sha256(path.read_bytes()).hexdigest()
+
+
+def phase(result, name, inputs):
+    rows = [json.loads(line) for line in (result / f"{name}.jsonl").read_text().splitlines()]
+    by_input = {p.name: digest(p) for p in inputs}
+    seen = Counter((row["name"], row["threads"]) for row in rows)
+    assert seen == Counter((input_name, t) for input_name in by_input for t in (1, 8))
+    for row in rows:
+        assert row["status"] == 0 and "error" not in row
+        assert row["sha256"] == by_input[row["name"]]
+        enabled = set(row["with"])
+        disabled = set(row["without"])
+        assert enabled <= disabled
+        assert row["different_iris"] == sorted(disabled - enabled)
+        if row["name"] in HAND_CONTROLS or row["different_iris"]:
+            print(name, row["name"], row["threads"], row["witness_counts"],
+                  row["with"], row["without"])
+    for threads in (1, 8):
+        selected = [row for row in rows if row["threads"] == threads]
+        print(json.dumps({
+            "phase": name,
+            "threads": threads,
+            "total": len(selected),
+            "entangled": sum(row["entangled"] for row in selected),
+            "changed_witness_sets":
+                sum(row["witness_counts"][0] < row["witness_counts"][1] for row in selected),
+            "changed_world_sets": sum(row["with"] != row["without"] for row in selected),
+            "nonempty_world_sets": sum(bool(row["with"]) for row in selected),
+        }))
+
+
+def main():
+    result = Path(sys.argv[1]).resolve()
+    root = result.parent
+    witness = root.parent
+    assert (result / "exit.txt").read_text().split()[:2] == ["JOB-EXIT", "0"]
+    assert (result / "driver.log").read_text().count("GATE-DONE") == 1
+    assert f"source={SOURCE}" in (result / "source.txt").read_text().splitlines()
+    assert digest(root / "diagnostic.patch") == PATCH
+    assert PATCH in (result / "source.txt").read_text()
+    assert digest(result / "el-classify") == (result / "binary.sha256").read_text().split()[0]
+    first = list((witness / "hand").glob("*.ofn")) + list((witness / "cov/files").glob("*.ofn"))
+    second = list((witness / "cov/all").glob("*.ofn"))
+    assert len(first) == 369 and len(second) == 968
+    phase(result, "hermit-checked", first)
+    phase(result, "generated", second)
+
+
+if __name__ == "__main__":
+    main()

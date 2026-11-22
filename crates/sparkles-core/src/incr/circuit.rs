@@ -280,6 +280,9 @@ pub struct Circuit {
     /// what the dataset's queries read beyond the stored quads: the circuit is then one
     /// `recompute` node evaluated with it
     pub inference: Option<Arc<Inference>>,
+    /// how the circuit's aggregates treat errors (`None`: the snapshot's reading); a
+    /// runtime sets the dataset's
+    pub aggregate_errors: Option<crate::sparql::AggregateErrors>,
     /// the query's pattern and dataset clause
     pub pattern: spargebra::algebra::GraphPattern,
     pub dataset: Option<spargebra::algebra::QueryDataset>,
@@ -329,6 +332,7 @@ impl Circuit {
             max_memory_bytes: None,
             base: c.base,
             inference: None,
+            aggregate_errors: None,
             pattern: c.pattern,
             dataset: c.dataset,
             inferred: InferredFootprint::default(),
@@ -569,6 +573,9 @@ impl Circuit {
         p.max_memory_bytes = self.max_memory_bytes;
         p.base = self.base.clone();
         p.inference = self.inference.clone();
+        if let Some(m) = self.aggregate_errors {
+            p.aggregate_errors = m;
+        }
         p.prov = self.prov;
         if !self.prov.is_none() {
             p.facts = Some(&mut self.facts);

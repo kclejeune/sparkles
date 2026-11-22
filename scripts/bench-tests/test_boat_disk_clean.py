@@ -1,4 +1,6 @@
 """The warm worker's disk cleanup and the stop paths that run it; no provider operation runs."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
+import process_checks
 from pathlib import Path
 import contextlib
 import fcntl
@@ -121,13 +123,7 @@ class Clean(unittest.TestCase):
             code, _ = disk_clean.run_command(['sh', '-c', 'sleep 30 & echo $! > %s; wait' % pidfile.name], None, 1)
             child = int(Path(pidfile.name).read_text())
         self.assertEqual(code, 'timeout'); self.assertLess(time.monotonic() - start, 10)
-        for _ in range(50):
-            try:
-                os.kill(child, 0)
-            except ProcessLookupError:
-                break
-            time.sleep(0.1)
-        else:
+        if not process_checks.ended(child):
             self.fail('the background child outlived its process group')
         self.assertEqual(disk_clean.run_command(['true'], None, 0)[0], 'no_time')
 
@@ -194,13 +190,8 @@ class Clean(unittest.TestCase):
         p.kill(); self.fail('mbx gc did not start')
 
     def gone(self, pid):
-        import time
-        for _ in range(50):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                return True
-            time.sleep(0.1)
+        if process_checks.ended(pid):
+            return True
         os.kill(pid, 9); return False
 
     def test_a_cancelled_or_killed_cleanup_leaves_no_command(self):

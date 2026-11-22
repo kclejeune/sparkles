@@ -1,4 +1,5 @@
 """Exercise the batch gate's selection of checks from a batch's changed files (scripts/gate/select-checks.py)."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import os
 import re

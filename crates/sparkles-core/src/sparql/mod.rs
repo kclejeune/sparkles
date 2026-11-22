@@ -1,5 +1,6 @@
 //! SPARQL 1.1 query & update engine (ARQ equivalent).
 
+pub mod aggerrors;
 pub mod aggext;
 pub mod algorun;
 pub mod algosvc;
@@ -7,7 +8,10 @@ pub mod arqpf;
 pub mod cache;
 pub mod catalog;
 pub mod cdt;
+mod charged;
 pub mod charsets;
+mod checked_layout;
+mod checked_syntax;
 mod constkeys;
 pub mod ctx;
 pub mod cursor;
@@ -61,17 +65,20 @@ pub mod value;
 mod valuespush;
 mod vectortopk;
 pub mod viewsvc;
+mod walk;
 
 use crate::error::{Error, Result};
 use crate::id::Id;
 use crate::ioacct;
 use crate::store::Snapshot;
+use crate::validation::GraphSel;
+pub use aggerrors::AggregateErrors;
 pub use ctx::{Ctx, DatasetSpec, Optimizations};
 pub use cursor::{
     AskResult, CursorOptions, CursorPlan, CursorStats, CursorStatus, ExecutionMode, FallbackPolicy,
-    GraphBatch, GraphCursor, MaterializedResult, QueryBatch, QueryCursor, QueryExecution,
-    ask_streaming, graph_cursor, query_cursor, query_execution, query_execution_with_plan,
-    select_cursor, select_source_cursor,
+    GraphBatch, GraphCursor, MaterializedResult, MemoryMeter, QueryBatch, QueryCursor,
+    QueryExecution, ask_streaming, graph_cursor, query_cursor, query_execution,
+    query_execution_with_plan, select_cursor, select_source_cursor,
 };
 pub use exec::{PlanFidelity, PlanInfo};
 pub use policy::{Consumer, PolicyError, choose_execution};
@@ -93,6 +100,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 pub use table::Table;
+pub use walk::visit_graph_patterns;
 
 #[derive(Clone, Debug, Default)]
 pub struct QueryOptions {
@@ -204,6 +212,9 @@ pub struct QueryOptions {
     /// (`None`: the store's setting). Unlike a protocol dataset whose default graph is
     /// `urn:x-arq:UnionGraph`, it leaves the named graphs as they are.
     pub union_default_graph: Option<bool>,
+    /// How aggregates treat errors and values that are not strings for this request
+    /// (`None`: the snapshot's, which is the store's setting). See [`AggregateErrors`].
+    pub aggregate_errors: Option<AggregateErrors>,
     /// Whether these options already hold a dataset's query defaults, which are RDFS on
     /// read, the overlay of materialized inferences and the DESCRIBE setting.
     /// `sparkles::Dataset::query_options` returns options with this set, and a
@@ -686,7 +697,7 @@ fn make_ctx_input(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<Ctx> {
-    make_ctx_input_policy(snap, opts, dataset, base, source, None)
+    make_ctx_input_policy(snap, opts, dataset, base, source, None, None)
 }
 
 // Only the application root which just prepared this policy supplies the override.
@@ -698,6 +709,7 @@ fn make_ctx_input_policy(
     base: Option<&oxiri::Iri<String>>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    selector_graphs: Option<&GraphSel>,
 ) -> Result<Ctx> {
     #[cfg(feature = "geo")]
     let op_vertices = snap.geo_op_vertices;
@@ -757,7 +769,7 @@ fn make_ctx_input_policy(
         Some(r) => Some(r.schema_controlled(&ctx.snap, &mut || ctx.check())?),
         None => None,
     };
-    ctx.use_cache = !opts.no_cache;
+    ctx.use_cache = !opts.no_cache && selector_graphs.is_none();
     ctx.plan_patterns = !opts.no_plan_patterns;
     ctx.algo_projections = opts.algo_projections.clone();
     ctx.views = opts.views.clone();
@@ -770,9 +782,14 @@ fn make_ctx_input_policy(
     if let Some(o) = opts.optimizations {
         ctx.opt = o;
     }
+    ctx.aggregate_errors = opts.aggregate_errors.unwrap_or(ctx.snap.aggregate_errors);
     ctx.base_iri = base.cloned();
     let mut ds = DatasetSpec::default();
-    if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
+    if let Some(graphs) = selector_graphs {
+        ds.default = Some(resolve_selector_graphs(&mut ctx, graphs)?);
+        ds.named = Some(Vec::new());
+        ctx.selector_default_only = true;
+    } else if !opts.default_graph_uris.is_empty() || !opts.named_graph_uris.is_empty() {
         if opts
             .default_graph_uris
             .iter()
@@ -1002,6 +1019,75 @@ fn resolve_graphs<'a>(
     Ok(ids)
 }
 
+fn resolve_selector_graphs(ctx: &mut Ctx, graphs: &GraphSel) -> Result<Vec<Id>> {
+    let preparation = ctx.source_preparation.as_ref().expect("source controls");
+    let mut selected = crate::access::PreparationBuffer::new(preparation)?;
+    match graphs {
+        GraphSel::Set(ids) => {
+            for &id in ids {
+                selected.push(Id(id))?;
+            }
+        }
+        GraphSel::All | GraphSel::AllExcept(_) => {
+            if graphs.accepts(Id::DEFAULT_GRAPH.0) {
+                selected.push(Id::DEFAULT_GRAPH)?;
+            }
+            ctx.snap.scan_graph_ids_prepared(preparation, |id| {
+                if id != Id::DEFAULT_GRAPH && graphs.accepts(id.0) {
+                    selected.push(id)?;
+                }
+                Ok(())
+            })?;
+        }
+    }
+    let (ids, held) = selected.into_parts();
+    ctx.source_setup
+        .as_mut()
+        .expect("source setup owner")
+        .merge(held);
+    Ok(ids)
+}
+
+/// Prepare an embedded query on the caller's physical validation data. Its selected
+/// graph IDs form the default dataset, while named graph access remains unchanged.
+/// The returned context retains the admission for that dataset.
+pub fn validation_query_context(
+    data: &crate::validation::DataGraph,
+    controls: QueryOptions,
+) -> Result<Ctx> {
+    let opts = QueryOptions {
+        deadline: controls.deadline,
+        cancel: controls.cancel,
+        cancellation: controls.cancellation,
+        max_rows: controls.max_rows,
+        max_memory_bytes: controls.max_memory_bytes,
+        max_rows_produced: controls.max_rows_produced,
+        work: controls.work,
+        ..Default::default()
+    };
+    let preparation = crate::access::Preparation::for_request(&opts)?;
+    let view = crate::access::GraphAccess::all().masked_controlled(&data.snap, &preparation)?;
+    let (mut ctx, access) = make_source_ctx_policy(view.read_source(), &opts, None)?;
+    ctx.use_cache = false;
+    ctx.allow_service = false;
+    ctx.forbid_service = true;
+    if let Some(rows) = opts.max_rows {
+        ctx.max_rows = ctx.max_rows.min(rows);
+    }
+    if let Some(bytes) = opts.max_memory_bytes {
+        ctx.mem_limit = ctx.mem_limit.min(bytes);
+    }
+    if let Some(work) = opts.max_rows_produced {
+        ctx.max_rows_produced = ctx.max_rows_produced.min(work);
+    }
+    if let Some(work) = opts.work {
+        ctx.rows_produced = work;
+    }
+    ctx.dataset.default = Some(resolve_selector_graphs(&mut ctx, &data.sel)?);
+    restrict_source_ctx(&mut ctx, access.as_ref())?;
+    Ok(ctx)
+}
+
 fn restrict_source_ctx(
     ctx: &mut Ctx,
     access: Option<&Arc<crate::access::GraphAccess>>,
@@ -1036,6 +1122,8 @@ fn restrict_source_ctx(
         } else {
             every = false;
         }
+        #[cfg(test)]
+        checked_source_tests::observe_union_graph(graph);
         Ok(true)
     })?;
     #[cfg(test)]
@@ -1176,6 +1264,17 @@ fn split(
     }
 }
 
+/// Refuse any SERVICE operation, including local, SILENT and variable
+/// endpoints, before the query can be evaluated.
+pub fn check_no_service(query: &Query) -> Result<()> {
+    visit_graph_patterns(split(query).0, |pattern| {
+        if matches!(pattern, GraphPattern::Service { .. }) {
+            return Err(Error::invalid("SERVICE is not allowed in this query"));
+        }
+        Ok(())
+    })
+}
+
 /// Execute a SPARQL query against a snapshot.
 pub fn query(snap: Arc<Snapshot>, q: &str, opts: &QueryOptions) -> Result<QueryResult> {
     query_with_plan(snap, q, opts).map_err(|f| f.error)
@@ -1199,10 +1298,42 @@ pub fn query_source(
     let started = Instant::now();
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
     let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let mut result = execute_retained_source(source, &parsed, opts, parse_ms)?;
+    let mut result = execute_retained_source(source, &parsed, opts, parse_ms, None)?;
     if result.kind == QueryKind::Select {
         select_star_order(q, &mut result)?;
     }
+    Ok(result)
+}
+
+/// Query a trusted application's physical snapshot under one preparation and its
+/// retained accounting. The caller supplies the actual snapshot and applicable
+/// current graph policy. This establishes no Store authority or history proof.
+pub fn query_snapshot_prepared(
+    snapshot: Arc<Snapshot>,
+    q: &str,
+    mut opts: QueryOptions,
+) -> Result<QueryResult> {
+    opts.deadline = opts.effective_deadline(Instant::now())?;
+    opts.timeout = None;
+    let preparation = crate::access::Preparation::for_request(&opts)?;
+    let policy = opts.graphs.take();
+    let all = crate::access::GraphAccess::all();
+    let prepared = policy
+        .as_deref()
+        .unwrap_or(&all)
+        .masked_controlled(&snapshot, &preparation)?;
+    // Execution uses exactly the policy bound to the retained source.
+    let source = prepared.read_source();
+    preparation.check()?;
+    let started = Instant::now();
+    let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
+    let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
+    preparation.check()?;
+    let mut result = execute_retained_source(source, &parsed, &opts, parse_ms, None)?;
+    if result.kind == QueryKind::Select {
+        select_star_order(q, &mut result)?;
+    }
+    preparation.check()?;
     Ok(result)
 }
 
@@ -1216,7 +1347,7 @@ pub(crate) fn query_prepared_source(
 ) -> Result<QueryResult> {
     source.query_input().2.check()?;
     let parsed = parse_query(q, opts.base_iri.as_deref(), &opts.prefixes)?;
-    execute_retained_source(source, &parsed, opts, 0.0)
+    execute_retained_source(source, &parsed, opts, 0.0, None)
 }
 
 /// Execute an already parsed query using a genuine physical source and the
@@ -1231,7 +1362,7 @@ pub fn execute_source(
 ) -> Result<QueryResult> {
     source.validate_query_instance(store)?;
     source.query_input().2.check()?;
-    execute_retained_source(source, parsed, opts, parse_ms)
+    execute_retained_source(source, parsed, opts, parse_ms, None)
 }
 
 fn execute_retained_source(
@@ -1239,13 +1370,23 @@ fn execute_retained_source(
     parsed: &Query,
     opts: &QueryOptions,
     parse_ms: f64,
+    selector_graphs: Option<&GraphSel>,
 ) -> Result<QueryResult> {
     source.query_input().2.check()?;
     let stack = depth::check_query(parsed)?;
     depth::with_stack(stack, || {
         let snapshot = source.query_input().0.clone();
         let start = Instant::now();
-        let prepared = prepare_query_input(snapshot, parsed, opts, None, None, Some(source))?;
+        let prepared = prepare_query_input_policy(
+            snapshot,
+            parsed,
+            opts,
+            None,
+            None,
+            Some(source),
+            None,
+            selector_graphs,
+        )?;
         let plan_ms = start.elapsed().as_secs_f64() * 1000.0;
         depth::with_stack(prepared.plan_depth, || {
             execute_prepared(parsed, opts, parse_ms, plan_ms, prepared)
@@ -1484,7 +1625,16 @@ fn prepare_query_input(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
 ) -> Result<PreparedQuery> {
-    prepare_query_input_policy(snap, parsed, opts, cursor_started, automatic, source, None)
+    prepare_query_input_policy(
+        snap,
+        parsed,
+        opts,
+        cursor_started,
+        automatic,
+        source,
+        None,
+        None,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1496,6 +1646,7 @@ fn prepare_query_input_policy(
     automatic: Option<&CursorOptions>,
     source: Option<crate::store::BoundReadSource>,
     prepared_policy: Option<&Arc<crate::access::GraphAccess>>,
+    selector_graphs: Option<&GraphSel>,
 ) -> Result<PreparedQuery> {
     let (_, dataset, base) = split(parsed);
     extensions::check_family(snap.dataset_id)?;
@@ -1507,6 +1658,7 @@ fn prepare_query_input_policy(
         base,
         source,
         prepared_policy,
+        selector_graphs,
     )?;
     if let Some(started) = cursor_started.filter(|_| automatic.is_none()) {
         ctx.enable_cursor_accounting()?;
@@ -2503,6 +2655,8 @@ fn graph_triple_bytes(t: &Triple) -> u64 {
 
 #[cfg(test)]
 mod access_tests;
+#[cfg(test)]
+mod callback_guard_tests;
 #[cfg(test)]
 mod charsets_tests;
 #[cfg(test)]

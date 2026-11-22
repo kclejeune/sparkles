@@ -1,5 +1,6 @@
 """Exercise how scripts/test-partitioned.sh stops a remote share before it releases the
 share's directory and lock."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import os
 import signal
 import subprocess

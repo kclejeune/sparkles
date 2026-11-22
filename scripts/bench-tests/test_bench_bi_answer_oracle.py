@@ -1,4 +1,5 @@
 """Data-backed score and cutoff checks must accept valid differences and reject wrong rows."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import copy
 from fractions import Fraction
 import importlib.util

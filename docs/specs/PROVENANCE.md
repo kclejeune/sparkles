@@ -374,6 +374,13 @@ Read the [design provenance](X17-tiered-segments/SPEC.md#provenance).
 
 Read the [design provenance](X18-fragment-composition/SPEC.md#provenance).
 
+## Formal verification
+
+Read the [design provenance](X20-formal-verification/SPEC.md#provenance).
+## Charged buffers
+
+Read the [provenance record](X19-charged-buffers/SPEC.md#provenance).
+
 ## Reasoner core
 
 Read the [design provenance](F23-reasoner-core/SPEC.md#provenance).

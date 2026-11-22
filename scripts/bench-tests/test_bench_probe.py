@@ -1,5 +1,6 @@
 """Exercise restart-sensitive preparation through the DBpedia query phase."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 import os
 from pathlib import Path

@@ -5,6 +5,7 @@ use super::pool::PoolGrant;
 use super::query_memory::{PRIMARY, QueryMemoryLease, QueryMemoryLedger, same};
 use super::table::VarId;
 use super::value::Value;
+use crate::access::{Preparation, PreparationText, Reservation};
 use crate::error::{Budget, BudgetKind, Error, Result};
 use crate::id::{self, Id, Tag};
 use crate::store::{Snapshot, bnode_for, parse_bnode_label};
@@ -15,6 +16,12 @@ use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Instant;
+
+#[derive(Default)]
+struct PreparedVariables {
+    text: Option<Reservation>,
+    vector: Option<Reservation>,
+}
 
 /// Jena's IRI for the default graph (`Quad.defaultGraphIRI`).
 pub const DEFAULT_GRAPH_IRI: &str = "urn:x-arq:DefaultGraph";
@@ -215,6 +222,312 @@ impl ValueCache {
     #[cfg(test)]
     fn reserved(&self) -> u64 {
         self.charge.reserved()
+    }
+}
+
+/// The most the string floor cache of one query holds, before the memory budget's share
+/// (see [`FloorCache::cap`]).
+const FLOOR_CACHE_BYTES: u64 = 64 << 20;
+
+/// The most reconstruction a cursor's walk of a key and the key before it admits (see
+/// [`Ctx::with_vocab_key_prev`]).
+const PAIR_WALK_BYTES: usize = 4096;
+
+/// The slots of the floor table a query starts with, 512 KiB of words.
+const FLOOR_TABLE_FIRST: usize = 1 << 16;
+
+/// The fewest slots a floor table is worth allocating.
+const FLOOR_TABLE_FEWEST: usize = 1 << 10;
+
+/// A floor table that grows is replaced by one this many times larger.
+const FLOOR_TABLE_GROWTH: usize = 8;
+
+/// A floor table grows once the floors it evicted that had been read again number at
+/// least its slots divided by this.
+const FLOOR_TABLE_EVICTIONS: usize = 32;
+
+/// The query's cache of string floors ([`Ctx::string_floor`]). It lasts the query, so the
+/// batches of a cursor share it as the rows of an eager table do, and every worker of a
+/// mask reads and writes the same [`FloorTable`] without a lock.
+///
+/// The first table has [`FLOOR_TABLE_FIRST`] slots, or fewer when the vocabulary has
+/// fewer strings or the cap allows less. A mask asks before each part of its rows whether
+/// the table should grow ([`Ctx::grow_floor_cache`]), which it does when its estimate of
+/// the floors it evicted that had been read again passes [`FLOOR_TABLE_EVICTIONS`]. A query whose strings
+/// rarely repeat, whose evictions cost nothing, therefore keeps its first table. The new
+/// table is [`FLOOR_TABLE_GROWTH`] times larger and takes the floors of the old one as
+/// they are read. Each table is charged to the query before it is allocated, through a
+/// reservation that grows in steps as the value cache's does, and the old tables stay
+/// charged, since a mask can still hold one. A refused charge, or one past the cache's
+/// cap, keeps the table the query has, or leaves it without one, and the floors it does
+/// not hold are computed each time, which costs about what a direct comparison of the
+/// two keys costs. The reservation is kept until the context drops.
+#[derive(Default)]
+pub(super) struct FloorCache {
+    /// the table the masks write and the one before it, which they read
+    tables: parking_lot::Mutex<FloorTables>,
+    /// the bytes of every table allocated
+    used: AtomicU64,
+    /// the bytes charged for the cache, never fewer than `used`
+    charge: StepReservation,
+    /// the floors computed (for tests that the cache lasts the query)
+    #[cfg(test)]
+    computed: std::sync::atomic::AtomicUsize,
+    /// the slots of the first table, when a test sets them
+    #[cfg(test)]
+    first_slots: std::sync::atomic::AtomicUsize,
+    /// the threads that looked up floors (for tests that a mask spreads over the pool)
+    #[cfg(test)]
+    threads: parking_lot::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+}
+
+#[derive(Default)]
+struct FloorTables {
+    cur: Option<Arc<FloorTable>>,
+    prev: Option<Arc<FloorTable>>,
+    /// a table was refused, so the cache takes no other
+    full: bool,
+}
+
+/// A direct-mapped table of string floors shared by the workers of a query. Slot
+/// `p & mask` holds one word for base id `p`: from the top, `(p >> bits) + 1`, which
+/// tells the ids of a slot apart and is never zero, so an empty slot holds none; then the
+/// distance from `p` down to its floor, all ones for an id that is not a simple literal;
+/// then a bit set once the floor is read again. A floor farther away than the distance
+/// bits can hold is not kept. Each word is written and read whole, so a reader sees a
+/// word some worker wrote for an id of that slot, or zero, and a word whose top part
+/// matches is the floor of that id, which does not change while the query reads one
+/// snapshot. Two workers that compute the same floor store the same word, and a store
+/// that replaces another id's word only loses that floor. The words therefore need no
+/// ordering with other memory.
+pub(super) struct FloorTable {
+    slots: Box<[AtomicU64]>,
+    /// log2 of the slots
+    bits: u32,
+    /// the shift of the top part, above the distance and the read bit
+    shift: u32,
+    /// the distance that marks an id that is not a simple literal
+    none: u64,
+    /// an estimate of the floors evicted that had been read again, counted by the maps
+    /// that end against the word each read before its store, which another worker may
+    /// have replaced in between
+    evicted: std::sync::atomic::AtomicUsize,
+}
+
+impl FloorTable {
+    /// A table of `slots`, a power of two, for base ids below `first_triple`.
+    fn new(slots: usize, first_triple: u64) -> Self {
+        debug_assert!(slots.is_power_of_two());
+        let bits = slots.trailing_zeros();
+        // The top part reaches `(first_triple - 1 >> bits) + 1`, which needs one bit more
+        // than `first_triple >> bits` takes. Base ids have at most `PAYLOAD_BITS`, so the
+        // distance keeps at least two bits.
+        let top_bits = 64 - (first_triple >> bits).leading_zeros() + 1;
+        let delta_bits = 64 - 1 - top_bits;
+        debug_assert!(delta_bits >= 2);
+        FloorTable {
+            slots: (0..slots).map(|_| AtomicU64::new(0)).collect(),
+            bits,
+            shift: delta_bits + 1,
+            none: (1 << delta_bits) - 1,
+            evicted: Default::default(),
+        }
+    }
+
+    /// The bytes of a table of `slots`: its words, the table and the shared counts of
+    /// its `Arc`.
+    fn bytes(slots: usize) -> u64 {
+        (slots as u64)
+            .saturating_mul(8)
+            .saturating_add(Self::OVERHEAD)
+    }
+
+    /// The bytes of a table besides its words.
+    pub(super) const OVERHEAD: u64 =
+        (std::mem::size_of::<FloorTable>() + 2 * std::mem::size_of::<usize>()) as u64;
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    #[inline]
+    fn slot(&self, p: u64) -> &AtomicU64 {
+        &self.slots[(p as usize) & (self.slots.len() - 1)]
+    }
+
+    #[inline]
+    fn top(&self, p: u64) -> u64 {
+        (p >> self.bits) + 1
+    }
+
+    /// The floor of `p` in `word`, when the word is `p`'s: `Some(None)` for an id that is
+    /// not a simple literal.
+    #[inline]
+    fn decode(&self, p: u64, word: u64) -> Option<Option<u64>> {
+        if word >> self.shift != self.top(p) {
+            return None;
+        }
+        let delta = (word >> 1) & self.none;
+        Some((delta != self.none).then(|| p - delta))
+    }
+
+    /// The floor of `p`, when the table holds it.
+    #[inline]
+    fn get(&self, p: u64) -> Option<Option<u64>> {
+        self.decode(p, self.slot(p).load(Ordering::Relaxed))
+    }
+
+    /// The word of `p` with floor `floor`, unless the floor is too far to hold.
+    #[inline]
+    fn encode(&self, p: u64, floor: Option<u64>, read: bool) -> Option<u64> {
+        let delta = floor.map_or(self.none, |f| p - f);
+        (floor.is_none() || delta < self.none)
+            .then(|| (self.top(p) << self.shift) | (delta << 1) | u64::from(read))
+    }
+
+    /// Keep the floor of `p`, unless it is too far to hold. Whether it was kept.
+    #[inline]
+    fn put(&self, p: u64, floor: Option<u64>, read: bool) -> bool {
+        let Some(word) = self.encode(p, floor, read) else {
+            return false;
+        };
+        self.slot(p).store(word, Ordering::Relaxed);
+        true
+    }
+
+    /// The words that hold a floor (for tests).
+    #[cfg(test)]
+    fn entries(&self) -> usize {
+        self.slots
+            .iter()
+            .filter(|w| w.load(Ordering::Relaxed) != 0)
+            .count()
+    }
+}
+
+impl FloorCache {
+    /// The most the cache holds under a memory budget of `mem_limit` bytes.
+    fn cap(mem_limit: u64) -> u64 {
+        FLOOR_CACHE_BYTES.min(mem_limit / 16)
+    }
+
+    /// The bytes charged for the cache.
+    #[cfg(test)]
+    pub(super) fn reserved(&self) -> u64 {
+        self.charge.reserved()
+    }
+
+    /// The floors computed for the cache, whether or not it kept them.
+    #[cfg(test)]
+    pub(super) fn computed(&self) -> usize {
+        self.computed.load(Ordering::Relaxed)
+    }
+
+    /// The floors its current table holds.
+    #[cfg(test)]
+    pub(super) fn entries(&self) -> usize {
+        self.tables.lock().cur.as_ref().map_or(0, |t| t.entries())
+    }
+
+    /// The bytes of every table allocated.
+    #[cfg(test)]
+    pub(super) fn used(&self) -> u64 {
+        self.used.load(Ordering::Relaxed)
+    }
+
+    /// The slots of its current table.
+    #[cfg(test)]
+    pub(super) fn slots(&self) -> usize {
+        self.tables.lock().cur.as_ref().map_or(0, |t| t.len())
+    }
+
+    /// Start the cache with a table of `slots`.
+    #[cfg(test)]
+    pub(super) fn set_first_slots(&self, slots: usize) {
+        self.first_slots.store(slots, Ordering::Relaxed);
+    }
+
+    /// The threads that have looked up floors.
+    #[cfg(test)]
+    pub(super) fn threads(&self) -> usize {
+        self.threads.lock().len()
+    }
+}
+
+/// A worker's view of the query's [`FloorCache`]: the tables it reads and the counts it
+/// adds to the cache when it ends.
+pub(super) struct FloorMap<'a> {
+    ctx: &'a Ctx,
+    cur: Option<Arc<FloorTable>>,
+    prev: Option<Arc<FloorTable>>,
+    /// the floors that had been read again that this map's stores evicted
+    evicted: usize,
+    #[cfg(test)]
+    computed: usize,
+}
+
+impl Drop for FloorMap<'_> {
+    fn drop(&mut self) {
+        if let Some(cur) = &self.cur
+            && self.evicted > 0
+        {
+            cur.evicted.fetch_add(self.evicted, Ordering::Relaxed);
+        }
+        #[cfg(test)]
+        {
+            let cache = &self.ctx.floors;
+            cache.computed.fetch_add(self.computed, Ordering::Relaxed);
+            cache.threads.lock().insert(std::thread::current().id());
+        }
+    }
+}
+
+impl FloorMap<'_> {
+    /// [`Ctx::string_floor`] of `id`, computed once while the table holds it.
+    #[inline]
+    pub(super) fn floor(&mut self, id: Id) -> Option<u64> {
+        let p = id.payload();
+        if id.tag() != Tag::Vocab || p >= self.ctx.snap.generation.vocab.first_triple() {
+            return None;
+        }
+        let Some(cur) = &self.cur else {
+            return self.compute(id);
+        };
+        let slot = cur.slot(p);
+        let word = slot.load(Ordering::Relaxed);
+        if let Some(floor) = cur.decode(p, word) {
+            if word & 1 == 0 {
+                slot.store(word | 1, Ordering::Relaxed);
+            }
+            return floor;
+        }
+        // The slot held another id's floor, which had been read again when its bit is set.
+        let evicts = usize::from(word & 1 == 1);
+        if let Some(floor) = self.prev.as_ref().and_then(|prev| prev.get(p)) {
+            if cur.put(p, floor, true) {
+                self.evicted += evicts;
+            }
+            return floor;
+        }
+        let floor = self.compute(id);
+        // A refused floor recorded a failure that ends the query. It is not kept as the
+        // floor of another kind of value.
+        if (floor.is_some() || self.ctx.check_memory_failure().is_ok())
+            && let Some(cur) = &self.cur
+            && cur.put(p, floor, false)
+        {
+            self.evicted += evicts;
+        }
+        floor
+    }
+
+    #[inline]
+    fn compute(&mut self, id: Id) -> Option<u64> {
+        #[cfg(test)]
+        {
+            self.computed += 1;
+        }
+        self.ctx.string_floor(id)
     }
 }
 
@@ -600,6 +913,7 @@ pub struct Ctx {
     pub snap: Arc<Snapshot>,
     local: RwLock<AppendVocab>,
     values: ValueCache,
+    floors: FloorCache,
     next_bnode: AtomicU64,
     bnode_memo: parking_lot::Mutex<FxHashMap<(Vec<Id>, String), Id>>,
     /// blank nodes given to the query from outside (initial bindings) that are not
@@ -621,6 +935,8 @@ pub struct Ctx {
     pub cancel: Arc<AtomicBool>,
     pub cancellation: Option<crate::task::Cancellation>,
     pub dataset: DatasetSpec,
+    /// A validation selector has only its selected default data, even for ARQ graph aliases.
+    pub(super) selector_default_only: bool,
     /// the request's graph view when it does not read every graph: `dataset` is already
     /// limited to it (see [`DatasetSpec::restrict`]), and plans are redacted
     pub graphs: Option<Arc<crate::access::GraphAccess>>,
@@ -630,6 +946,7 @@ pub struct Ctx {
     now: std::sync::OnceLock<oxsdatatypes::DateTime>,
     pub base_iri: Option<oxiri::Iri<String>>,
     pub var_names: RwLock<Vec<String>>,
+    prepared_var_names: parking_lot::Mutex<PreparedVariables>,
     /// Maximum number of rows any intermediate result may have (memory guard).
     pub max_rows: usize,
     /// Budget for the estimated bytes of intermediate results alive at once
@@ -674,6 +991,9 @@ pub struct Ctx {
     /// RDFS on read (see [`super::rdfs`])
     pub rdfs: Option<Arc<super::rdfs::RdfsSchema>>,
     pub opt: Optimizations,
+    /// How the query's aggregates treat errors and values that are not strings: the
+    /// request's choice, else the snapshot's (see [`super::AggregateErrors`])
+    pub aggregate_errors: super::AggregateErrors,
     /// the I/O counters when the query began, taken only under a profile (see
     /// [`Ctx::io_stats`]); boxed, so that a context without a profile stays small
     io_start: Option<Box<crate::ioacct::IoSnapshot>>,
@@ -822,17 +1142,16 @@ pub(super) enum Accounting {
     Cursor,
 }
 
-/// The first supported resource refusal that infallible code met. Scalar evaluation cannot return
-/// a resource error, so it records the refusal here and the next check fails with it,
-/// which keeps a refused allocation from becoming an unbound value.
+/// The first supported execution refusal that infallible code met. Scalar evaluation
+/// records it here so the next check fails with it even when the expression falls back.
 #[derive(Default)]
 struct MemoryFailure {
     failure: parking_lot::Mutex<Option<ResourceRefusal>>,
     failed: AtomicBool,
 }
 
-/// Only the supported resource outcomes become sticky. Arbitrary scalar/service
-/// errors keep their existing semantics; typed ownership errors never become UNDEF.
+/// Resource and ownership refusals and the unconfigured extension refusal become sticky.
+/// Ordinary expression and service errors keep their existing semantics.
 #[derive(Clone)]
 enum ResourceRefusal {
     Budget(Budget),
@@ -844,6 +1163,7 @@ enum ResourceRefusal {
     },
     Cancelled,
     Timeout,
+    UnconfiguredExtension,
 }
 
 impl ResourceRefusal {
@@ -852,6 +1172,7 @@ impl ResourceRefusal {
             Error::BudgetExceeded(budget) => Some(Self::Budget(*budget)),
             Error::Cancelled => Some(Self::Cancelled),
             Error::Timeout => Some(Self::Timeout),
+            error if super::extensions::is_unconfigured(error) => Some(Self::UnconfiguredExtension),
             Error::Component(component) => component
                 .source
                 .as_ref()
@@ -871,6 +1192,7 @@ impl ResourceRefusal {
             Self::Budget(budget) => Error::BudgetExceeded(budget),
             Self::Cancelled => Error::Cancelled,
             Self::Timeout => Error::Timeout,
+            Self::UnconfiguredExtension => super::extensions::unconfigured(),
             Self::Parent {
                 component,
                 code,
@@ -1131,6 +1453,7 @@ impl Ctx {
     }
 
     pub fn new(snap: Arc<Snapshot>) -> Ctx {
+        let aggregate_errors = snap.aggregate_errors;
         Ctx {
             reasoning: None,
             local_facts: false,
@@ -1160,6 +1483,7 @@ impl Ctx {
             chunk_hook: parking_lot::Mutex::new(None),
             local: RwLock::new(AppendVocab::default()),
             values: Default::default(),
+            floors: Default::default(),
             next_bnode: AtomicU64::new(0),
             bnode_memo: Default::default(),
             outside_bnodes: Default::default(),
@@ -1169,10 +1493,12 @@ impl Ctx {
             cancel: Arc::new(AtomicBool::new(false)),
             cancellation: None,
             dataset: DatasetSpec::default(),
+            selector_default_only: false,
             graphs: None,
             now: std::sync::OnceLock::new(),
             base_iri: None,
             var_names: RwLock::new(Vec::new()),
+            prepared_var_names: Default::default(),
             max_rows: 200_000_000,
             mem_limit: u64::MAX,
             grant: None,
@@ -1192,6 +1518,7 @@ impl Ctx {
             views: None,
             rdfs: None,
             opt: Optimizations::default(),
+            aggregate_errors,
             io_start: crate::ioacct::profiling()
                 .then(|| Box::new(crate::ioacct::IoSnapshot::now())),
             geo: Default::default(),
@@ -1430,6 +1757,12 @@ impl Ctx {
         m.get(text).copied()
     }
 
+    /// Whether some selectivity was measured on a sample while planning this query, so
+    /// that [`Ctx::sampled`] can find one.
+    pub(super) fn has_sampled(&self) -> bool {
+        !self.sampled.lock().is_empty()
+    }
+
     /// Keep the selectivity measured for the conjunct shown as `text` (the first one
     /// measured stays, so that every plan compared sees the same).
     pub(super) fn set_sampled(&self, text: String, s: super::sample::Sampled) {
@@ -1520,8 +1853,7 @@ impl Ctx {
 
     /// Whether the query streams through pull cursors. Both modes charge the same state,
     /// so only the routing of a query, the accumulation of an EXISTS key set across
-    /// batches, whether a decoding envelope can refuse and whether a batch compares
-    /// strings through their floors read it.
+    /// batches and whether a decoding envelope can refuse read it.
     #[inline]
     pub(super) fn streams(&self) -> bool {
         self.accounting() == Accounting::Cursor
@@ -1685,7 +2017,7 @@ impl Ctx {
         }
     }
 
-    /// Fail with the budget refusal that infallible code recorded (see
+    /// Fail with the refusal that infallible code recorded (see
     /// [`Ctx::fail_memory`]).
     #[inline]
     pub(super) fn check_memory_failure(&self) -> Result<()> {
@@ -1706,7 +2038,7 @@ impl Ctx {
         }
     }
 
-    /// Record the first supported resource refusal met by infallible code, so
+    /// Record the first supported execution refusal met by infallible code, so
     /// the next check preserves its original typed outcome in both modes.
     pub(super) fn fail_memory(&self, error: &Error) {
         if self.memory_failure.failed.load(Ordering::Acquire) {
@@ -1853,7 +2185,7 @@ impl Ctx {
     #[inline]
     pub fn check_rows(&self, n: usize) -> Result<()> {
         if n > self.max_rows {
-            return Err(Error::BudgetExceeded(Budget {
+            return Err(self.row_budget_error(Budget {
                 kind: BudgetKind::Rows,
                 limit: self.max_rows as u64,
                 requested: n as u64,
@@ -1888,11 +2220,24 @@ impl Ctx {
     }
 
     fn produced_exceeded(&self, requested: u64) -> Error {
-        Error::BudgetExceeded(Budget {
+        self.row_budget_error(Budget {
             kind: BudgetKind::RowsProduced,
             limit: self.max_rows_produced,
             requested,
         })
+    }
+
+    #[cold]
+    fn row_budget_error(&self, budget: Budget) -> Error {
+        // Row accounting can see a fallback row from a refused expression.
+        if matches!(
+            self.memory_failure.failure.lock().as_ref(),
+            Some(ResourceRefusal::UnconfiguredExtension)
+        ) {
+            super::extensions::unconfigured()
+        } else {
+            Error::BudgetExceeded(budget)
+        }
     }
 
     // --------------------------------------------------------------- memory ------
@@ -2024,6 +2369,61 @@ impl Ctx {
         }
         w.push(name.to_string());
         (w.len() - 1) as VarId
+    }
+
+    /// Intern a checked planner variable with its query-owned vector and text.
+    pub(super) fn var_prepared(&self, name: &str, preparation: &Preparation) -> Result<VarId> {
+        let find = |names: &[String]| -> Result<Option<VarId>> {
+            for (start, part) in names.chunks(256).enumerate() {
+                preparation.check()?;
+                if let Some(offset) = part.iter().position(|current| current == name) {
+                    return Ok(Some((start * 256 + offset) as VarId));
+                }
+            }
+            Ok(None)
+        };
+        if let Some(id) = find(&self.var_names.read())? {
+            return Ok(id);
+        }
+        let mut names = self.var_names.write();
+        if let Some(id) = find(&names)? {
+            return Ok(id);
+        }
+
+        let id = VarId::try_from(names.len()).map_err(|_| preparation.exhausted())?;
+        let mut text = PreparationText::new(preparation)?;
+        text.push_str(name)?;
+        let mut paid = self.prepared_var_names.lock();
+        if names.len() == names.capacity() {
+            let capacity = names
+                .capacity()
+                .checked_mul(2)
+                .map(|capacity| capacity.max(4))
+                .ok_or_else(|| preparation.exhausted())?;
+            let bytes = capacity
+                .checked_mul(size_of::<String>())
+                .ok_or_else(|| preparation.exhausted())?;
+            let vector_credit = preparation.reserve(bytes as u64)?;
+            let mut replacement = Vec::new();
+            replacement
+                .try_reserve_exact(capacity)
+                .map_err(|_| preparation.exhausted())?;
+            // Reallocation is committed as a unit so cancellation cannot remove
+            // names already in use by another part of the query.
+            replacement.append(&mut names);
+            let old = std::mem::replace(&mut *names, replacement);
+            drop(old);
+            paid.vector = Some(vector_credit);
+        }
+        let (name, text_credit) = text.finish()?;
+        names.push(name);
+        if let Some(held) = &mut paid.text {
+            held.merge(text_credit);
+        } else {
+            paid.text = Some(text_credit);
+        }
+        preparation.check()?;
+        Ok(id)
     }
 
     /// A fresh variable that can never clash with user variables.
@@ -2999,18 +3399,174 @@ impl Ctx {
         if p >= v.first_triple() {
             return None;
         }
-        self.with_vocab_key(p, |key| {
+        self.with_vocab_key_prev(p, |prev, key| {
             if key.len() < 2 || key[0] != b'"' || key[key.len() - 1] != id::KEY_SEP {
                 return None;
             }
             let prefix = &key[..key.len() - 1];
-            // most strings extend none: the key before them does not start with them
-            if p == 0 || !self.with_vocab_key(p - 1, |k| k.starts_with(prefix))? {
+            // Most strings extend none, which the key before them shows by not starting
+            // with them. That key comes from the same walk of the block, or is read on its
+            // own when it starts a block or is long.
+            let extended = match prev {
+                Some(k) => k.starts_with(prefix),
+                None if p == 0 => false,
+                None => self.with_vocab_key(p - 1, |k| k.starts_with(prefix))?,
+            };
+            if !extended {
                 return Some(p);
             }
             self.vocab_lower_bound(prefix)
         })
         .flatten()
+    }
+
+    /// `f(prev, key)` of the key of base vocabulary id `id` and, when the same walk of
+    /// its block gives it, the key before it
+    /// ([`crate::vocab::Vocab::get_with_prev`]), with both reconstructions and decodings
+    /// inside the envelope. A refusal records a failure and gives `None`.
+    ///
+    /// A cursor's walk admits at most [`PAIR_WALK_BYTES`] of reconstruction, and only what
+    /// the envelope grants. A longer key on the way, or one the envelope refuses, such as
+    /// a long string before a short language-tagged one that needs no floor, sends the
+    /// read to [`Ctx::with_vocab_key`] of `id` alone with `prev` `None`, so the key before
+    /// is reserved only when the caller reads it. An eager walk cannot be refused, so it
+    /// reads both keys in one walk whatever their length.
+    fn with_vocab_key_prev<T>(
+        &self,
+        id: u64,
+        f: impl FnOnce(Option<&[u8]>, &[u8]) -> T,
+    ) -> Option<T> {
+        let mut f = Some(f);
+        let mut decode = |prev: Option<&[u8]>, key: &[u8]| {
+            let longest = prev.map_or(0, <[u8]>::len).max(key.len());
+            if !self.reserve_decode(longest) {
+                return None;
+            }
+            f.take().map(|f| f(prev, key))
+        };
+        if !self.envelope_refuses() {
+            return self
+                .snap
+                .generation
+                .vocab
+                .get_with_prev(id, &mut decode)
+                .flatten();
+        }
+        // The walk is a shortcut, so a key on the way that is long or that the envelope
+        // refuses records nothing. The key alone is read instead, which records a refusal
+        // of its own reconstruction, and its caller reads the key before when it needs it.
+        let walked = self.snap.generation.vocab.get_with_prev_checked(
+            id,
+            |need| {
+                if need > PAIR_WALK_BYTES {
+                    return Err(());
+                }
+                self.reserve_decode_checked(need).map_err(|_| ())
+            },
+            &mut decode,
+        );
+        match walked {
+            Ok(found) => found.flatten(),
+            Err(()) => {
+                let mut f = f.take();
+                self.with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
+                    .flatten()
+            }
+        }
+    }
+
+    /// The query's floor cache.
+    #[cfg(test)]
+    pub(super) fn floor_cache(&self) -> &FloorCache {
+        &self.floors
+    }
+
+    /// A map of the query's floor cache for one worker of a mask (see [`FloorCache`]),
+    /// which allocates the cache's first table when it has none.
+    pub(super) fn floor_map(&self) -> FloorMap<'_> {
+        let mut tables = self.floors.tables.lock();
+        if tables.cur.is_none() && !tables.full {
+            #[cfg(test)]
+            let first = match self.floors.first_slots.load(Ordering::Relaxed) {
+                0 => FLOOR_TABLE_FIRST,
+                slots => slots,
+            };
+            #[cfg(not(test))]
+            let first = FLOOR_TABLE_FIRST;
+            self.install_floor_table(&mut tables, first);
+        }
+        FloorMap {
+            ctx: self,
+            cur: tables.cur.clone(),
+            prev: tables.prev.clone(),
+            evicted: 0,
+            #[cfg(test)]
+            computed: 0,
+        }
+    }
+
+    /// Replace the floor cache's table by a larger one when the floors it evicted that
+    /// had been read again pass [`FLOOR_TABLE_EVICTIONS`] (see [`FloorCache`]). A mask
+    /// asks before each part of its rows, so that the workers of one part share a table.
+    pub(super) fn grow_floor_cache(&self) {
+        let mut tables = self.floors.tables.lock();
+        let Some(cur) = &tables.cur else {
+            return;
+        };
+        if tables.full || cur.evicted.load(Ordering::Relaxed) < cur.len() / FLOOR_TABLE_EVICTIONS {
+            return;
+        }
+        let slots = cur.len().saturating_mul(FLOOR_TABLE_GROWTH);
+        self.install_floor_table(&mut tables, slots);
+    }
+
+    /// Make a table of at most `slots` the floor cache's current one, charged first, with
+    /// the current table kept for reading. The slots are no more than the vocabulary's
+    /// strings need, since past that no two ids share a slot, and no more than the cap
+    /// holds. A cap that allows fewer than [`FLOOR_TABLE_FEWEST`] slots leaves the cache
+    /// full, unless the vocabulary's strings need no more than the cap allows, and so does
+    /// a refused charge or one past the cap.
+    #[cold]
+    #[inline(never)]
+    fn install_floor_table(&self, tables: &mut FloorTables, slots: usize) {
+        let cache = &self.floors;
+        let first_triple = self.snap.generation.vocab.first_triple();
+        let cap = FloorCache::cap(self.mem_limit);
+        let most = usize::try_from(first_triple)
+            .unwrap_or(usize::MAX)
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX);
+        let room =
+            usize::try_from(cap.saturating_sub(FloorTable::OVERHEAD) / 8).unwrap_or(usize::MAX);
+        // the largest power of two of words that fits the cap with the table's overhead
+        let room = if room == 0 { 0 } else { 1 << room.ilog2() };
+        let wanted = slots.min(most);
+        if room < wanted && room < FLOOR_TABLE_FEWEST {
+            tables.full = true;
+            return;
+        }
+        let slots = wanted.min(room);
+        if tables.cur.as_ref().is_some_and(|cur| slots <= cur.len()) {
+            // the table is as large as the strings or the cap allow
+            tables.full = true;
+            return;
+        }
+        let bytes = FloorTable::bytes(slots);
+        // Every table allocated stays charged, since a mask may still read an old one.
+        let used = cache.used.load(Ordering::Acquire).saturating_add(bytes);
+        if used > cap
+            || (!cache.charge.covers(used)
+                && self
+                    .grow_reservation(&cache.charge, used, cap, false)
+                    .is_err())
+        {
+            tables.full = true;
+            return;
+        }
+        cache.used.store(used, Ordering::Release);
+        tracing::debug!(target: "sparkles::sparql::exec", "string floor table of {slots} slots");
+        let table = Arc::new(FloorTable::new(slots, first_triple));
+        tables.prev = tables.cur.replace(table);
     }
 
     /// The first base id whose key is not below `key`, searched inside the decoding
@@ -3935,13 +4491,12 @@ mod charge_tests {
     /// The executors read the accounting mode in at most this many places outside tests.
     /// Stage 4 of item 453 lowered it as each twin merged, and item 827 took the planning
     /// reads out, so that a query plans alike in every mode. The routing of
-    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches, the
-    /// decoding envelope and the cursor exclusion of `string_order_mask` remain, with the
-    /// four reads of the flag that decide whether a cursor owner exists, whether a context
-    /// without an owner may keep retained state uncharged, whether an empty release trims
-    /// the ledger and whether a finished query's pool contribution shrinks. Item 1069's
-    /// per-query floor cache removes the exclusion of `string_order_mask`.
-    const MODE_CHECKS: usize = 8;
+    /// `query_execution_with_plan`, the EXISTS key set accumulated across batches and the
+    /// decoding envelope remain, with the four reads of the flag that decide whether a
+    /// cursor owner exists, whether a context without an owner may keep retained state
+    /// uncharged, whether an empty release trims the ledger and whether a finished
+    /// query's pool contribution shrinks.
+    const MODE_CHECKS: usize = 7;
 
     /// Counts the reads of the accounting mode in the non-test sources of the SPARQL
     /// engine, and fails when they exceed [`MODE_CHECKS`] (decision D9 of item 453). A
@@ -4393,6 +4948,73 @@ mod charge_tests {
                 assert!(ctx.check().is_ok());
             }
             drop(held);
+        }
+    }
+
+    /// A floor table's words tell apart the ids that share a slot, mark an id that is not
+    /// a simple literal, hold a floor as far as their distance bits reach and no farther,
+    /// and keep the bit of a floor read again only for that floor.
+    #[test]
+    fn floor_table_words_hold_one_id_of_a_slot() {
+        // 16 slots below 2^59 leave the top part 57 bits and the distance 6, so a floor
+        // 62 ids down is the farthest kept
+        let first_triple = 1u64 << 59;
+        let t = FloorTable::new(16, first_triple);
+        assert_eq!(t.none, 63);
+        let p = first_triple - 1;
+        let q = p - 16;
+        assert_eq!(t.get(p), None);
+        assert!(t.put(p, Some(p - 62), false));
+        assert_eq!(t.get(p), Some(Some(p - 62)));
+        assert_eq!(t.get(q), None, "the other id of the slot");
+        assert!(!t.put(q, Some(q - 63), false), "too far to hold");
+        assert_eq!(t.get(p), Some(Some(p - 62)));
+        assert!(t.put(q, None, true));
+        assert_eq!(t.get(q), Some(None));
+        assert_eq!(t.get(p), None, "evicted");
+        let word = t.slot(q).load(Ordering::Relaxed);
+        assert_eq!(word & 1, 1, "read again");
+        assert!(t.put(q, Some(q), false));
+        assert_eq!(t.get(q), Some(Some(q)));
+        assert_eq!(t.entries(), 1);
+        // a hit's store of its read bit that lands after another id's store puts back the
+        // first id's word, which is still that id's floor
+        let a = p;
+        let b = p - 16;
+        assert!(t.put(a, Some(a - 5), false));
+        let seen = t.slot(a).load(Ordering::Relaxed);
+        assert!(t.put(b, Some(b - 7), false));
+        t.slot(a).store(seen | 1, Ordering::Relaxed);
+        assert_eq!(t.get(a), Some(Some(a - 5)));
+        assert_eq!(t.get(b), None);
+        // the widest ids keep a distance of at least two bits in any table, and a floor
+        // read from one table is kept by a larger one with wider distances
+        let top = (1u64 << crate::id::PAYLOAD_BITS) - 1;
+        for log in [0, 1, 4, 10, 16, 23] {
+            let t = FloorTable::new(1 << log, top);
+            assert!(t.none >= 3, "{log}");
+            let p = top - 1;
+            assert!(t.put(p, Some(p - 2), true));
+            assert_eq!(t.get(p), Some(Some(p - 2)), "{log}");
+            assert!(t.put(p, None, false));
+            assert_eq!(t.get(p), Some(None), "{log}");
+        }
+        let (small, large) = (
+            FloorTable::new(16, first_triple),
+            FloorTable::new(1 << 20, first_triple),
+        );
+        assert!(large.none > small.none);
+        let far = small.none - 1;
+        assert!(small.put(p, Some(p - far), false));
+        let floor = small.get(p).unwrap();
+        assert!(large.put(p, floor, true));
+        assert_eq!(large.get(p), Some(Some(p - far)));
+        // a small vocabulary leaves the top part one bit, as every id is below the slots
+        let t = FloorTable::new(1 << 10, 1000);
+        assert_eq!(t.none, (1 << 62) - 1);
+        for p in [0, 1, 999] {
+            assert!(t.put(p, Some(0), false));
+            assert_eq!(t.get(p), Some(Some(0)));
         }
     }
 

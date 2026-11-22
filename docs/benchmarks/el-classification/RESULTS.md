@@ -1675,7 +1675,354 @@ and not to the reductions. It lies within the base's own rounds, which range fro
 to 10.17 s. Roadmap item 1090 follows it with the Uberon files' time outside the
 saturation. The peak resident set of `ore_ont_14375` on one thread is 95 against 87 MiB.
 
+### Guarded Horn rules with individuals
+
+Six Atlas rounds compare commit `8b311a59` with `48344bca`. Stanley built both
+release binaries from clean source with Rust 1.99.1, and Atlas ran them under
+its shared benchmark lock. Each round ran one process per file, thread count
+and arm and reversed arm order from the preceding round. The default of
+`SPARKLES_HORN_RULES` is level 2. Level 0 runs the previous Horn rule bodies
+in the new binary. Level 1 adds the guarded R7 search and reads the at-most
+restrictions without copying the list. The four assertion-heavy files also ran
+with `--el-only` on each binary. The two Uberon files used `--dl-attempt-work 1`.
+All 912 processes finished and each file and mode gave the same sorted taxonomy
+hash across every arm, thread count and round.
+
+Each process contributes its median classification time. The ratios below
+use the median of the six paired round ratios. Horn/EL divides the median
+Horn time by the median EL-only time for the same build.
+
+| Ontology | Threads | Base ms | Level 2 ms | Level 2 / base | Range of round ratios | Base Horn/EL | New Horn/EL |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `ore_ont_10951` | 1 | 14.89 | 13.49 | 0.907 | 0.900–0.909 | 1.865 | 1.678 |
+| `ore_ont_10951` | 4 | 13.22 | 11.08 | 0.819 | 0.750–0.996 | 1.853 | 1.522 |
+| `ore_ont_12901` | 1 | 175.14 | 154.79 | 0.887 | 0.837–0.912 | 1.881 | 1.654 |
+| `ore_ont_12901` | 4 | 122.45 | 94.05 | 0.769 | 0.736–0.906 | 2.007 | 1.537 |
+| `ore_ont_14375` | 1 | 30.82 | 28.20 | 0.914 | 0.910–0.919 | 1.793 | 1.628 |
+| `ore_ont_14375` | 4 | 24.31 | 19.67 | 0.797 | 0.693–0.983 | 1.861 | 1.524 |
+| `ore_ont_4510` | 1 | 235.33 | 207.50 | 0.883 | 0.877–0.888 | 1.914 | 1.682 |
+| `ore_ont_4510` | 4 | 151.60 | 120.49 | 0.797 | 0.760–0.949 | 1.948 | 1.544 |
+
+Level 2 against the same binary at level 0 takes 0.876 to 0.904 times the time
+on one thread and 0.769 to 0.875 times on four for the four files. On one
+thread `ore_ont_4510` derives 2,357,244 conclusions at levels 0 and 1 and
+2,214,952 at level 2. `ore_ont_9654` also gains, with paired ratios of 0.892
+on one thread and 0.755 on four. The two capped Uberon runs at level 2 have
+paired medians of 0.997 and 0.991 on one thread and 0.993 and 1.000 on four.
+
+Two shipped-mode comparisons take longer in all six rounds. Both also meet
+the Intel significance rule. Their percentile interval excludes 1 and their
+median paired time increase exceeds 0.5 µs. The two-sided 95% percentile
+interval resamples the six paired ratios with replacement and enumerates
+all 46,656 resamples.
+
+| Ontology and mode | Threads | Median ratio | Round ratios in order | 95% interval | Added ms |
+|---|---:|---:|---|---:|---:|
+| GO, default Horn | 1 | 1.01473 | 1.01000, 1.01678, 1.01409, 1.00710, 1.01863, 1.01536 | 1.00855–1.01770 | 4.612 |
+| `ore_ont_10951`, EL only | 1 | 1.00706 | 1.00901, 1.01517, 1.00103, 1.00301, 1.00554, 1.00859 | 1.00202–1.01209 | 0.056 |
+
+GO derives 2,947,343 conclusions on both builds and its saturation accounts
+for a paired median increase of 2.747 ms. Level 2 is slower than level 0 in
+five of six GO rounds. The same-binary result leaves the contribution of the
+rule changes unresolved. The EL-only file adds a paired median 0.032 ms in
+the index and 0.021 ms in saturation and still derives 85,225 conclusions.
+[Roadmap item 1028](../../ROADMAP.md#classification-costs-in-item-1028) follows
+both costs.
+
+The within-candidate comparisons below measure the cost of level 2 against
+level 1. The three ORE rows still improve over the old binary by their
+median paired ratio. GO's cost against the old binary is recorded above.
+
+| Ontology | Threads | Level 2 / level 1 | Slower rounds | Range of round ratios | 95% interval | Added ms | Level 2 / base |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GO | 1 | 1.00153 | 5 of 6 | 0.99984–1.00814 | 1.00053–1.00576 | 0.485 | 1.01473 |
+| `ore_ont_10951` | 4 | 1.13814 | 6 of 6 | 1.05769–1.27575 | 1.06925–1.22361 | 1.339 | 0.81871 |
+| `ore_ont_14817`, capped | 1 | 1.00150 | 5 of 6 | 0.99981–1.02215 | 1.00018–1.01270 | 2.986 | 0.99697 |
+| `ore_ont_14817`, capped | 4 | 1.02115 | 6 of 6 | 1.01366–1.13407 | 1.01391–1.08731 | 16.508 | 0.99301 |
+
+A separate correctness run compiled the same Horn rule changes at
+`c1619c37`. HermiT agrees on the named-class taxonomy of 906 ontologies
+tested at levels 0, 1 and 2 on one thread and level 2 on eight, and of 369
+witness cases tested at all three levels on one and eight threads.
+
+A same-snapshot diagnostic built from `c1619c37` on Stanley runs the witness
+predicate with and without covered-successor recognition, then compares the
+IRIs of the named classes that reach each result before running any world.
+Each comparison uses one saturated state. All 2,674 processes succeeded.
+
+| Corpus | Inputs per thread count | Threads | Changed witness sets | Changed named-class sets |
+|---|---:|---:|---:|---:|
+| HermiT-checked hand and generated cases | 369 | 1 | 39 | 0 |
+| HermiT-checked hand and generated cases | 369 | 8 | 36 | 0 |
+| Full generated corpus | 968 | 1 | 18 | 0 |
+| Full generated corpus | 968 | 8 | 16 | 0 |
+
+The full corpus includes 348 of the HermiT-checked cases. The
+`covered_successor_witness.ofn` integration fixture preserves the exact input
+of a checked hand case. With the clause it has one witness and without it
+two, and the world for the same named class is selected in both paths on
+both thread counts. The [witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) retains
+the class sets and the diagnostic patch.
+
+### The default Uberon attempt with unchanged automata
+
+A separate four-round Atlas comparison of `eda22fce` against `48344bca`
+ran both binaries with the default disjunctive attempt. The release binaries
+were built on Wally. The candidate also ran at level 0 of
+`SPARKLES_HORN_AUTOMATA`, which keeps the previous automata.
+
+| Ontology | Threads | Base s | Level 0 s | Level 0 / base | Range of round ratios | Level 3 s |
+|---|---:|---:|---:|---:|---:|---:|
+| `ore_ont_14817` | 1 | 59.11 | 60.20 | 1.016 | 0.988–1.022 | 59.60 |
+| `ore_ont_9663` | 1 | 75.63 | 77.51 | 1.024 | 1.022–1.032 | 76.51 |
+
+Level 0 keeps the base's one-thread conclusion counts. On
+`ore_ont_9663`, the full classification takes longer in all four level 0
+rounds while the median final saturation takes 3.51 against 3.55 s. This build
+incurs the extra time outside the final saturation even with unchanged
+automata. Item 1090 follows the disjunctive attempt. The four Atlas rounds
+qualify this build separately from the six forge rounds of the reduced
+automata.
+
+<a id="products-of-the-disjunctive-attempt"></a>
+
+### Products of the disjunctive attempt
+
+Roadmap items 990 and 1011 made the products of the disjunctive rules cheaper and end a
+one-thread attempt at a product of more than 1,048,576 choices. The counts below are user
+instructions of one classification on one thread on the laptop, pinned to one core, of the
+base, commit 09f6ed15, and of the build of commit 53a51148 with and without the width
+limit. The laptop ran other work beside them, so they compare instructions and not time.
+
+| Ontology | Base G | Without the limit G | With the limit G | Without the limit / base |
+|---|---:|---:|---:|---:|
+| `ore_ont_14817` | 727.6 | 583.6 | 25.6 | 0.802 |
+| `ore_ont_9663` | 857.3 | 700.4 | 51.1 | 0.817 |
+| `ore_ont_3215` | 183.1 | 158.8 | 158.9 | 0.867 |
+| `ore_ont_16680` | 66.4 | 57.4 | 57.4 | 0.865 |
+| `ore_ont_13103` | 22.1 | 20.0 | 20.0 | 0.903 |
+| `ore_ont_5438` | 7.18 | 6.53 | 6.53 | 0.909 |
+
+All three give the same taxonomy on each file. The attempts of `ore_ont_14817` and
+`ore_ont_9663` fail on every build, and the limit ends them after 0.5 and 4 million
+conclusions instead of 22.4 million. The attempt of `ore_ont_3215` fails by its count, and
+the other three finish. A sweep classified GO, ChEBI lite, the 298 ORE 2015 EL files and
+the 207 DL development files once per build on one and four threads, and the 1,010 pairs
+that both builds classified gave the same tier, flags, classes outside the rules, count of unsatisfiable classes,
+consistency and taxonomy bytes. On one thread the 96 disjunctive development files derive the same
+conclusions with the pruning change, and the counters of products and clauses of the 15
+that attempt the rules agree at every doubling of the work.
+
+### The disjunctive attempt and the universals on the benchmark host
+
+Forge ran five rounds of four builds on one and four threads, one process per build, file
+and thread count, in an order that rotates with the round. The base is commit 09f6ed15.
+The tip, commit 378127e2, runs with the pruning of items 990 and 1011 and the one-thread
+width limit, and tip0 is the same binary with the limit off. The fourth build is the tip
+without the check for a repeated universal in the rule for a new universal (item 693),
+which the next section describes. Each cell is the median over the rounds of each
+process's median classification time, and the range is that of the five rounds' ratios.
+
+| Ontology | Base ms | Tip ms | Tip / base | Tip0 / base | Without the check / tip | Range of that ratio |
+|---|---:|---:|---:|---:|---:|---|
+| GO | 307.0 | 303.5 | 0.989 | 0.989 | 1.004 | 1.002 to 1.007 |
+| `ore_ont_13103` | 1,928.7 | 1,743.6 | 0.904 | 0.903 | 1.000 | 0.996 to 1.002 |
+| `ore_ont_14817` | 57,350.4 | 2,325.9 | 0.041 | 0.831 | 0.979 | 0.978 to 0.987 |
+| `ore_ont_16680` | 5,866.2 | 5,140.5 | 0.876 | 0.875 | 0.997 | 0.997 to 1.004 |
+| `ore_ont_3215` | 13,616.4 | 11,652.6 | 0.856 | 0.858 | 1.006 | 0.997 to 1.012 |
+| `ore_ont_5438` | 609.0 | 553.7 | 0.909 | 0.909 | 0.998 | 0.996 to 1.000 |
+| `ore_ont_9663` | 74,250.1 | 4,939.5 | 0.067 | 0.788 | 0.976 | 0.973 to 0.983 |
+
+The table gives the one-thread runs. Every run of every build exited normally and gave the
+same taxonomy on each file. On one thread the pruning alone makes the six ORE files 9% to
+21% faster, and the width limit ends the failing attempts of `ore_ont_14817` and
+`ore_ont_9663` 25 and 15 times sooner. GO has no disjunctive attempt and moves by about 1%.
+
+On four threads the rounds of one binary spread too widely to decide these changes. Tip
+and tip0 are one binary doing the same work above one thread, and their ratio ranges from
+1.02 to 1.17 on `ore_ont_14817` and from 0.76 to 1.07 on `ore_ont_9663`. Against the base,
+the tip's medians are 0.89 and 1.12 on those two files, with ranges of 0.77 to 0.94 and
+0.87 to 1.21, so neither is a speedup or a slowdown. On the other four ORE files the tip
+on four threads is 4% to 12% faster than the base, below 1 in every round.
+
+### The check for a repeated universal
+
+The rule for a new universal searched the context's list of universals for the same role
+and filler before it added one. A context derives each universal once, since each pair of a
+role and a filler has one node, so the build in the table above drops the search and keeps
+it as a debug assertion. A duplicate would only repeat work, because the successor rule
+deduplicates the fillers it collects. The assertion held in the whole test suite, in debug
+classifications of GO, `ore_ont_14817` and `ore_ont_9663` on one and four threads, and the
+corpus sweep of GO, ChEBI lite, the 298 ORE 2015 EL files and the 207 DL development files
+on one and four threads gave the same results with and without the search on the 1,010
+pairs that both builds classified.
+
+On one thread on forge `ore_ont_14817` and `ore_ont_9663` classify 2.1% and 2.4% faster without the
+search, below 1 in every round. GO takes 0.2% to 0.7% longer in each round, a median of
+0.6 ms of 303 ms, although the two arms of one binary on GO range from 0.997 to 1.009.
+Roadmap item 1234 holds that cost. The other files move by less than the spread of their rounds.
+
 ## Records
+
+The [record of the guarded Horn rules](runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json) holds the Atlas process reports and taxonomy hashes, the HermiT comparison summary, the original count-only witness diagnostics and the separate four-round Atlas control of the default Uberon attempt. The [same-snapshot witness record](runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json) holds the later correctness comparison of the named-class sets.
+### Left-linear chains of transitive roles
+
+After item 889 a four-thread saturation of `ore_ont_8737` sent three billion messages,
+since a middle context composed its backward links by a transitive role with every
+forward link it held, including those that chains had composed, and so derived each link
+of the closure once for each intermediate context. Roadmap item 956 makes such a role
+linear when its equivalent roles compose alike and every role that composes with it on the
+left composes again with a further link by it into the same roles, as
+[F24](../../specs/F24-owl-classification/SPEC.md#outcome) describes. A link of a linear
+role that a chain composes from two links by its equivalents keeps no forward link at its
+source, and the saturation stores the same backward links. `SPARKLES_LINEAR_CHAINS=0`
+turns the composition off for measurements.
+
+On forge the base, commit 5f3f69c2, and the build of the item, commit 0134cd85, both built
+on wally with rustc 1.99.1 and mbx 1.29.1, ran under rules fixed before the run. Each
+process ran `el_classify --threads T --repeat 5` in a 12 GiB scope without pinning, the
+base first in odd rounds and the build first in even ones, in three rounds for
+`ore_ont_8737` and six for the other files. Each time below is a side's median over the
+rounds of a process's median classification, or of its last saturation, and the
+interval is a 95% bootstrap interval of the ratio that resamples whole rounds. By the
+[Intel rule](../../specs/X14-unified-executor/PLAN.md#the-intel-rule) a ratio whose
+interval reaches 1.0 is noise. The load average was 3.1 when the run took the host's locks and
+1.8 when it ended, and 0.3 to 0.4 GiB of swap was in use. Both sides of every file take
+the Horn rules except `ore_ont_3836` and `ore_ont_13482`, which take the EL rules.
+
+| Threads | Base saturation, s | Build, s | Base classification, s | Build, s | Base process, s | Build, s | Base peak, GiB | Build peak, GiB |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 25.41 | 2.99 | 28.33 | 3.91 | 143.7 | 22.4 | 3.81 | 2.11 |
+| 4 | 8.22 | 0.94 | 9.07 | 1.39 | 49.0 | 10.1 | 6.33 | 2.27 |
+| 12 | 7.05 | 0.70 | 7.39 | 1.13 | 40.6 | 8.8 | 7.42 | 2.70 |
+
+On `ore_ont_8737` the saturation takes 0.10 to 0.12 times the base's time and the
+classification 0.14 to 0.15 times, and the process, which reads the file and classifies
+it five times, 0.16 to 0.22 times. The peak resident set falls to 0.55 of the base's on
+one thread and 0.36 on four and twelve. A one-thread run takes 263 million conclusions
+against 1.62 billion. On the laptop an early build of the composition with a patch that
+counts them sends 296 million messages on four threads against 2.98 billion with
+`SPARKLES_LINEAR_CHAINS=0`, and stores 15.8 million conclusions against 20.9 million.
+
+| Ontology | Threads | Base classification, ms | Build, ms | Build / base | 95% interval | Base saturation, ms | Build, ms | Build / base | 95% interval |
+|---|---:|---:|---:|---:|---|---:|---:|---:|---|
+| GO | 1 | 315 | 316 | 1.004 | 0.992 to 1.017 | 253 | 255 | 1.005 | 0.984 to 1.019 |
+| | 4 | 123 | 122 | 0.990 | 0.950 to 1.033 | 74.4 | 72.8 | 0.979 | 0.946 to 1.023 |
+| | 12 | 73.9 | 74.1 | 1.002 | 0.980 to 1.044 | 37.6 | 35.7 | 0.952 | 0.929 to 1.033 |
+| ChEBI lite | 1 | 925 | 751 | 0.811 | 0.799 to 0.821 | 566 | 390 | 0.688 | 0.669 to 0.693 |
+| | 4 | 435 | 300 | 0.688 | 0.677 to 0.701 | 233 | 105 | 0.451 | 0.424 to 0.496 |
+| | 12 | 424 | 203 | 0.480 | 0.446 to 0.502 | 244 | 53.0 | 0.217 | 0.168 to 0.259 |
+| `ore_ont_3836` | 1 | 596 | 594 | 0.997 | 0.984 to 1.006 | 134 | 132 | 0.987 | 0.980 to 0.992 |
+| | 4 | 272 | 266 | 0.977 | 0.949 to 1.003 | 38.2 | 36.5 | 0.956 | 0.909 to 1.043 |
+| | 12 | 197 | 199 | 1.008 | 0.995 to 1.010 | 16.0 | 16.3 | 1.014 | 0.973 to 1.027 |
+| `ore_ont_13482` | 1 | 944 | 944 | 1.000 | 0.994 to 1.013 | 569 | 568 | 0.998 | 0.987 to 1.016 |
+| | 4 | 429 | 439 | 1.025 | 1.002 to 1.049 | 165 | 176 | 1.068 | 1.008 to 1.126 |
+| | 12 | 294 | 295 | 1.006 | 0.995 to 1.014 | 77.2 | 79.0 | 1.024 | 0.976 to 1.031 |
+| `ore_ont_9855` | 1 | 925 | 934 | 1.010 | 1.008 to 1.013 | 900 | 908 | 1.009 | 1.004 to 1.018 |
+| | 4 | 346 | 345 | 0.997 | 0.970 to 1.030 | 331 | 317 | 0.957 | 0.940 to 1.014 |
+| | 12 | 176 | 173 | 0.982 | 0.909 to 1.067 | 157 | 149 | 0.952 | 0.852 to 1.079 |
+
+ChEBI lite classifies in 0.81 times the base's time on one thread, 0.69 on four and 0.48
+on twelve, with 17.7 million conclusions against 27.0 million and a peak resident set
+0.93 to 0.96 of the base's. GO takes 0.3% fewer conclusions on one thread, and its times are noise.
+`ore_ont_3836` and `ore_ont_13482` take the same conclusions on both sides in every
+cell, and `ore_ont_9855` on one thread, while its four- and twelve-thread runs vary
+between processes on both sides. Their times are noise or slightly faster except in two
+cells.
+`ore_ont_13482` classifies 2.5% slower on four threads, 10.5 ms, with a saturation 6.8%
+slower, and `ore_ont_9855` classifies 1.0% slower on one thread, 9.4 ms, with its
+saturation and its process 0.9% slower. On the laptop commit 3f20f7db, the composition
+before its table was charged, counts 0.3% and 0.2% fewer instructions per classification
+of the two files than the base on one pinned thread. Roadmap item 1224 follows the two
+costs.
+
+On the laptop commit 3f20f7db also counted 0.5% and 0.8% more instructions than the base
+in whole processes of `ore_ont_13482` and `ore_ont_3836`, an increase that lies outside
+the classification. Twenty rounds of one
+process with one classification per side on one thread put the build's process at 0.978
+of the base's time on `ore_ont_13482`, with an interval of 0.975 to 0.980, and 0.991 on
+`ore_ont_3836`, 0.990 to 0.995, and its read of the file at 0.956 and 0.989, so the count
+costs no time. The untimed runs after the rounds wrote the same taxonomy on both sides for
+each of the six files on four threads. On the laptop the 298 ORE 2015 EL files, GO and
+ChEBI lite gave the base's taxonomies on one and four threads with commit 3f20f7db, and
+205 of the 207 files of the ORE 2015 DL development set gave them on four threads with
+commit 05838a64, whose engine code is the build's, where both sides refuse one file at
+the reader and stop one at its memory budget.
+
+### Allocations of the index stage
+
+The index stage checked every axiom against OWL 2 EL with the profile checker, whose
+datatype pass builds a signature that copies each class and property IRI of the axiom.
+On `ore_ont_13482` on one thread that check took 81 to 88 ms of an index stage of about
+320 ms on the laptop. Roadmap item 1269 answers it with a walk that allocates nothing for
+an axiom that certainly breaks no rule and falls back to the full check for the rest, so
+the rules and messages of the axioms left out are those of the full check. The check
+then takes 16.5 ms. The item also looks up the role of an object property in a table of
+role ids by its IRI, which a lookup of the whole role name hashed and compared before.
+
+Forge ran nine rounds of three builds on one and four threads, one process per build,
+file and thread count, in an order that rotates with the round, under the bench and
+heavy locks with nothing else on the host. The base is commit b47b582b, the check is
+commit 15a9f9b2 and the tip, commit 89deb60f, adds the role lookup. Each cell is the
+median over the rounds of each process's median classification time in ms, the index
+time is that of each process's last classification, and the range is that of the nine
+rounds' ratios of the tip to the base.
+
+| Ontology | Threads | Base | Check | Tip | Tip / base | Range | Index, base | Index, tip |
+|---|---:|---:|---:|---:|---:|---|---:|---:|
+| `ore_ont_13482` | 1 | 999.4 | 961.4 | 898.2 | 0.871 | 0.826 to 0.992 | 345.3 | 215.7 |
+| | 4 | 462.6 | 441.6 | 418.1 | 0.918 | 0.869 to 0.989 | 241.9 | 192.3 |
+| ChEBI lite | 1 | 762.0 | 735.6 | 734.0 | 0.964 | 0.946 to 0.969 | 129.9 | 94.2 |
+| | 4 | 295.3 | 282.9 | 281.0 | 0.956 | 0.933 to 0.963 | 84.2 | 72.9 |
+| GO | 1 | 313.6 | 298.5 | 317.1 | 1.010 | 1.004 to 1.016 | 31.7 | 24.3 |
+| | 4 | 107.2 | 103.1 | 106.0 | 0.988 | 0.982 to 1.003 | 24.5 | 22.2 |
+
+Every process exited normally and each file gave one taxonomy across the builds. On the
+laptop the base and the tip classified GO, ChEBI lite, the 298 ORE 2015 EL files and the
+207 DL development files on one and four threads, and the 1,010 pairs that both builds
+classified gave the same taxonomy, tier, flags, consistency and axioms left out, with the
+same rules and messages in the same order. Axioms are left out or used in part in 242 of
+those pairs. On both builds the reader refuses one DL file for an invalid IRI, and the 10
+GiB cap of its scope ends the process of another. The
+index stage of `ore_ont_13482` on one thread takes 0.625 of the base's time, and the
+whole classification 0.871, the median of the per-round ratios, which is below 1 in every round. The medians of the two builds' times, 898.2 and 999.4 ms, divide to 0.899. Against ELK's 2,766 ms in
+[Against ELK](#against-elk), which was not run again, the tip's 898 ms is 3.08 times
+faster. The base itself takes 999 ms in these rounds, against 897 ms in that table. The
+peak resident set of `ore_ont_13482` falls from 1,304 to 1,289 MiB, and the classifier's
+own estimate does not change.
+
+On the laptop, one pinned thread counts 8.554 billion user instructions per
+classification of `ore_ont_13482` for the base, 7.446 billion for the check and 7.259
+billion for the tip, and 5.332, 5.144 and 5.141 billion on GO. The tip/check index ratio
+of `ore_ont_13482` stays below 1 in every forge round on both thread counts.
+
+GO's saturation takes 262 ms on the tip against 251 ms on the base and 244 ms with the
+check alone, in every round, although no saturation code changed and the tip counts
+fewer instructions than the check. The saturation's worker function has the same size,
+11,475 bytes, in the check and the tip and starts 48 bytes later in the tip, while the
+base's is 10,848 bytes, since the inlining in the crate moved with the check's change. On `atlas`, a build of the tip that
+copies the IRI at each role it finds, as the base did, ran GO at 1.058 of the check's
+time and the tip at 1.057 in seven rounds, so the move comes from where the code lies
+and not from the heap. Roadmap item 1288 holds GO's 1.0% on one thread, with item 722.
+
+Two further ideas for the index stage were not built. The negative occurrences of the whole index
+took 4 ms on `ore_ont_13482` on the laptop, so a reused stack can save less than that,
+and the sort and deduplication of the told subsumptions took 10 ms, of which per-key
+sorts could save only part.
+
+## Records
+
+The [record of item 1269's index allocations](runs/2026-11-21-el-index-alloc-forge-89deb60f/record.json)
+holds every process of the nine rounds on forge with its report, the analysis, the hash
+checks of the binaries and inputs, the host's state before and after, the separate
+`atlas` rounds with the layout probe, the laptop's instruction counts and stage probe,
+the taxonomy and exclusion sweep and the scripts that ran.
+
+The [record of item 956's left-linear chains](runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json)
+holds every process of the rounds on forge with its report, the rules fixed before the
+run, the analysis, the hash checks of the binaries and inputs, the host's state before and
+after, the taxonomy hashes, the laptop's instruction counts, message counts and taxonomy
+sweeps, and the scripts that ran.
 
 The [record of item 693's reduced automata](runs/2026-11-17-horn-automata-forge-7d064abd/record.json)
 holds every classification of the six rounds on forge of the base and of the build at
@@ -1694,6 +2041,19 @@ holds every classification of the rounds on `atlas`, the twelve further rounds a
 one-thread runs of `ore_ont_14817` and `ore_ont_3215`, the sweep's
 taxonomy hashes, the scan of witnesses and worlds of item 868, the runs of `ore_ont_7192`
 and `ore_ont_11378` on the laptop and the scripts that ran.
+
+The [laptop record of items 990 and 1011's products](runs/2026-11-20-disjunctive-products-laptop-53a51148/record.json)
+holds the instruction counts, the corpus sweep with its comparison, the counter sweeps of
+the development set and of the generated ontologies with a union, the profile of
+`ore_ont_14817`, the patches of the diagnostic builds and the scripts. Its times come from
+a loaded laptop and are not measurements.
+
+The [forge record of the disjunctive attempt and the universals](runs/2026-11-20-horn-cost-forge-378127e2/record.json)
+holds every classification of the five rounds on forge of the base, the tip with and
+without the width limit and the build without the check for a repeated universal, with
+their process reports, taxonomy hashes, binary and data hashes, the host state before and
+after, the patch of that build, the laptop's corpus sweep and debug classifications of
+that build and the scripts that ran.
 
 The [record of item 990](runs/2026-11-15-disjunctive-bound-atlas-0decd1de/record.json)
 holds every classification of the rounds on `atlas` of both builds, the attempts that pass

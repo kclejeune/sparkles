@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# insn.sh: instructions of whole el_classify processes on one pinned thread, base and tip,
+# alternating, with --repeat 3, and the user instructions of a run that only reads (--repeat 0 is not
+# supported, so the read cost is the difference of repeat 3 and repeat 1)
+P=/nix/store/ciwqn0d1ybrvzw9sdlklfhg58njv3inc-perf-linux-7.3.3/bin/perf
+cd ~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/el-956/.artifacts/lanes/el-956
+mkdir -p out/insn
+for f in ~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-1025/.artifacts/lanes/horn-cost-1025/data/go.ofn ~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost-1025/.artifacts/lanes/horn-cost-1025/data/chebi_lite.ofn ~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/el-956/.artifacts/lanes/el-956/data/el-files/ore_ont_3836.owl ~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/el-956/.artifacts/lanes/el-956/data/el-files/ore_ont_13482.owl ~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/el-956/.artifacts/lanes/el-956/data/dev-files/ore_ont_9855.owl; do
+  n=$(basename $f); n=${n%.*}
+  for round in 1 2; do for B in base tip; do for rep in 1 3; do
+    taskset -c 2 $P stat -x, -e instructions:u -o out/insn/$n.$B.r$rep.$round.csv bin/el_classify.$B --threads 1 --repeat $rep $f > /dev/null 2>&1
+  done; done; done
+done
+echo INSN-DONE

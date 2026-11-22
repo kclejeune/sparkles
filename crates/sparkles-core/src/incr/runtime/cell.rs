@@ -80,21 +80,22 @@ impl Slot {
         );
         c.max_memory_bytes = self.circuit.max_memory_bytes;
         c.inference = inference;
+        c.aggregate_errors = self.circuit.aggregate_errors;
         Ok(c)
     }
 
-    /// The fingerprint of the circuit's checkpoints: the cell's key, and the inference
-    /// its state was built with.
+    /// The fingerprint of the circuit's checkpoints: the cell's key, the inference its
+    /// state was built with and the reading of errors in aggregates its results follow.
     pub(super) fn fingerprint(&self, key: u64) -> u64 {
-        match &self.circuit.inference {
-            None => key,
-            Some(i) => {
-                let mut h = Sha256::new();
-                h.update(key.to_le_bytes());
-                h.update(i.key().as_bytes());
-                u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
-            }
+        let mut h = Sha256::new();
+        h.update(key.to_le_bytes());
+        if let Some(i) = &self.circuit.inference {
+            h.update(i.key().as_bytes());
         }
+        h.update(b"\0aggregate-errors\0");
+        let errors = self.circuit.aggregate_errors.unwrap_or_default();
+        h.update(errors.as_str().as_bytes());
+        u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
     }
 
     pub(super) fn live_rows(&self, rows: Vec<(Vec<Option<Term>>, i64)>) -> Vec<LiveRow> {

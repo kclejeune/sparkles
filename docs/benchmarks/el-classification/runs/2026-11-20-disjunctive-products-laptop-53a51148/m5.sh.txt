@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+. $L/files.sh
+one() { # BIN TAG FILE THREADS [env]
+  bin=$1; tag=$2; f=$3; t=$4; n=$(basename $f); n=${n%.*}; o=$L/out/m5/$bin.$tag.$n.t$t; mkdir -p $L/out/m5
+  env SPARKLES_DL_DIAG=1 $5 timeout 600 taskset -c 8-15 $L/bin/$bin --threads $t --taxonomy $o.tax $f > $o.json 2> $o.err
+  echo "$n $bin $tag t$t tax=$(LC_ALL=C sort $o.tax | sha256sum | cut -c1-16) $(jq -c '[.classifyMs[0],.dlAttemptOver,.dlOverBudget,.dlWork]' $o.json) $(grep -E 'DLDIAG (over|end) ' $o.err | tail -1 | grep -o 'work=[0-9]*\|maxProd=[0-9]*\|foldChoice=[0-9]*' | tr '\n' ' ')" >> $L/out/m5.txt
+  rm -f $o.tax
+}
+for n in 9663 14817; do one a23d two $DEV/ore_ont_$n.owl 2; done
+one w1d w0 $DEV/ore_ont_14817.owl 1 SPARKLES_DL_ATTEMPT_WIDTH=0
+for t in 4 8; do for i in 1 2 3; do while read -r n; do one w1d r$i $(ls $DEV/$n.* | head -1) $t; done < $L/finishers.txt; done; done
+THREADS=4 $L/gsweep.sh w1d g3
+echo M5-DONE >> $L/out/m5.txt

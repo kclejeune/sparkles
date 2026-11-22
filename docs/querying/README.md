@@ -29,6 +29,11 @@ also pass with `execution=streaming`, through the cursors that a streamed query 
 `mise run test:w3c:streaming` runs that pass alone and reports, for each suite, the
 queries that fall back to eager execution for an operator the cursors do not stream.
 
+A test-only reference evaluator that follows the SPARQL algebra literally, with no part
+of the engine but the parser, answers every SPARQL 1.0, 1.1 and 1.2 query evaluation
+test. The seeded differential queries and the optimizer tests compare the engine's
+answers with it, in eager and streaming execution.
+
 The SPARQL parser is a vendored, patched `spargebra`
 ([`vendor/spargebra/PATCHED.md`](../../vendor/spargebra/PATCHED.md)).
 
@@ -71,6 +76,63 @@ check them against the W3C suites and Jena's own answers.
 * Results come as JSON, XML, CSV, TSV and `x-sparkles+json`, which includes the executed
   plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and as
   Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
+
+### Aggregate errors
+
+SPARQL leaves room for more than one answer when an argument of MIN, MAX, AVG or
+GROUP_CONCAT is an error, such as a variable that OPTIONAL leaves unbound. Each query
+runs under one of three readings, and `jena` is the default on every surface.
+
+| Reading | `MIN(?v)` and `MAX(?v)` with an unbound `?v` | AVG when every argument is an error | `GROUP_CONCAT` over an IRI or a number |
+|---|---|---|---|
+| `jena` | Unbound, as in Apache Jena. | Unbound. | The lexical form. |
+| `sparkles` | The bound values decide. | Unbound. | The lexical form. |
+| `spec` | MIN is unbound and the bound values decide MAX. | `0`. | Unbound. |
+
+The `jena` reading matches ARQ on every aggregate over unbound values, type errors,
+groups of errors alone and empty groups, which a fixture of ARQ's own answers checks. It
+also makes `GROUP_CONCAT(DISTINCT …)` over no rows unbound, as ARQ does, where the other
+readings give `""`. The `sparkles` reading is how the engine answered before the setting
+existed. The `spec` reading takes the text of SPARQL 1.1 and 1.2 literally. MIN and MAX
+order the values as ORDER BY does, which puts errors first. AVG divides Sum by Count, and
+Count leaves errors out. GROUP_CONCAT applies CONCAT, which takes only strings. Under
+every reading an error makes SUM, AVG and GROUP_CONCAT unbound, while COUNT and SAMPLE
+pass over it.
+
+```sparql
+SELECT ?person (MAX(?age) AS ?oldest)
+WHERE { ?person :child ?c . OPTIONAL { ?c :age ?age } }
+GROUP BY ?person
+```
+
+For a parent with one child of unknown age, `?oldest` is unbound under `jena`, while
+`sparkles` and `spec` give the greatest age present. `MIN(?age)` would be unbound under
+`spec` too. A query that wants the values present can ask for the `sparkles` reading,
+or compute the aggregate in a subquery that matches `:age` outside OPTIONAL and join
+that subquery with OPTIONAL, which gives the same answer under every reading.
+
+A query chooses its reading with the `aggregate-errors` request parameter, the library's
+`QueryOptions::aggregate_errors`, the Python keyword `aggregate_errors`, the Node.js
+option `aggregateErrors`, the JVM context symbol `Sparkles.AGGREGATE_ERRORS`, the MCP
+argument `aggregateErrors` or the command line's `--aggregate-errors`. Without one it takes
+the dataset's setting at `/$/aggregate-errors/{ds}`, and a dataset without a setting
+takes the server's default, which `sparkles serve --aggregate-errors` sets. A Fuseki
+configuration sets both with the context symbol `aggregateErrors`
+(`urn:x-sparkles:symbol#aggregateErrors`), in the server's context or a dataset's, and
+the JVM assembler sets a dataset's with `sparkles:aggregateErrors`. Materialized
+views and live queries follow the dataset's reading and evaluate again when it changes. A
+query that names another reading evaluates a view's query from the data and does not
+read the view's maintained state, and its plan says so. [Aggregate
+errors](../API.md#aggregate-errors) in the API reference gives the routes.
+
+The engine's own queries choose the `sparkles` reading where a group mixes rows with and
+without a value, so their answers do not change with the dataset's setting. These are the
+MCP memory tools' queries, the GraphRAG build's choice of a fact's reifier, and the web
+UI's list of memory agents and its nearby-features panel.
+
+Fuseki users get the answers they had from Jena. Users of earlier Sparkles releases see
+MIN and MAX become unbound where an argument was unbound or an error, and can set
+`sparkles` on a dataset or on the server to keep the earlier answers.
 
 ### Jena ARQ extensions
 
@@ -153,7 +215,14 @@ check them against the W3C suites and Jena's own answers.
   pattern costs less than evaluating it for each distinct outer key. A row is evaluated
   on its own when it binds a variable that a FILTER inside the pattern reads and the
   pattern under that FILTER may leave unbound. An EXISTS inside a larger expression, such
-  as IF or OR, is evaluated once per distinct outer key.
+  as IF or OR, an aggregate argument or an ORDER BY key, is answered from the same key
+  set. Every row is probed before the expression is evaluated, also a row on which the
+  expression does not reach the EXISTS. Under the ordinary admission of a SELECT,
+  automatic execution may stream a plan with an EXISTS in a FILTER, a BIND, an aggregate
+  argument or an ORDER BY key unless the pattern calls a SERVICE or the EXISTS is nested
+  more than four levels deep. It keeps an OPTIONAL whose condition holds an EXISTS eager,
+  because the cursor's conditional merge is slower than the eager one at higher fan-out,
+  which roadmap item 570 covers. A strict cursor runs such an OPTIONAL.
 * An ASK and a LIMIT without ORDER BY pull their input through cursor operators in
   every execution mode, so each operator reads its inputs a batch at a time and stops
   once the query has the rows it asks for. A LIMIT over a single scan, a `spk:hasPredicate`
@@ -187,6 +256,12 @@ check them against the W3C suites and Jena's own answers.
   an ORDER BY deduplicates below the sort in every mode when the query may spill, and
   `spk:hasPredicate` reads the predicate patterns a block of subjects at a time in every
   mode.
+* A cursor DISTINCT keeps its set in buffers whose memory charge is their allocation
+  ([X19](../specs/X19-charged-buffers/README.md)), so the set is admitted before it grows
+  and a set that may spill stops growing while the operators above it still have room.
+  It fits every budget it fitted when the set was charged by formulas, and some smaller
+  ones. Two streamed DISTINCT queries of two columns take 0.8% and 3.3% longer than
+  before, which [roadmap item 1237](../ROADMAP.md) holds.
 * An OPTIONAL whose sides share no variable, but whose condition contains `?a = ?b` with
   one variable from each side, pairs its rows through that equality instead of forming
   their product ([internals](../internals/OPTIMIZATIONS.md)). SP²Bench `q6` at 10M tests 7.4
@@ -208,11 +283,16 @@ check them against the W3C suites and Jena's own answers.
   least a thousand rows, groupings of an estimated 20,000 input rows or more and every
   ASK without initial bindings. Other plans run eagerly, and
   `execution=eager` or `execution=streaming` overrides the choice. Both modes join
-  through the same hash, keyed and merge kernels, so an OPTIONAL without a condition over
-  two inputs sorted on their shared variable merges in both when `merge_left_join` is on
-  and hashes in both when it is off, a hash join's OPTIONAL condition is tested once over
-  each chunk of candidate pairs rather than over the whole product, and EXPLAIN names
-  the algorithm that ran in either mode.
+  through the same hash, keyed and merge primitives, so an OPTIONAL over two inputs
+  sorted on their one shared variable, which both bind, merges in both when
+  `merge_left_join` is on and hashes in both when it is off, a hash join's OPTIONAL
+  condition is tested once over each chunk of candidate pairs rather than over the
+  whole product, and EXPLAIN names the algorithm that ran in either mode. The cursor
+  also merges on a leading variable that is certainly bound when the inputs share
+  further variables. The two modes test a merge OPTIONAL's condition in separate
+  implementations, eager execution over all of the matched pairs at once and the cursor
+  over each batch's pairs. In the measured OPTIONALs over `foaf:knows`, with about 2.5
+  pairs per left row, the cursor took 1.18 to 1.36 times the eager time.
 * Both modes group through one operator. COUNT, SUM, AVG, MIN, MAX, SAMPLE,
   GROUP_CONCAT, ARQ's variance and standard-deviation aggregates and their DISTINCT forms
   keep one running state per group, on one key or several and with expression arguments,
@@ -238,6 +318,22 @@ check them against the W3C suites and Jena's own answers.
   they have not finished and at most a batch more. A full sort and the
   shapes the cursor does not support materialize within the budget and fail explicitly
   when they exceed it.
+* Under `execution=streaming`, text, hybrid, history and spatial searches whose
+  arguments come from their input, vector searches with a variable query and remote
+  LATERAL loops run over each input batch and keep their caps, their requests and their
+  cache across batches as one eager call does. A vector or hybrid search whose
+  candidates come from its input, a path search under a limit and an algorithm call over
+  their group or a nested edge pattern read that input under the memory budget, run
+  once and serve their answer batch by batch. Searches bounded by `k`, `maxHits` or a
+  limit argument, constant algorithm calls and count joins answer once into a charged
+  table. EXPLAIN states for each such operator
+  that it reads its whole input or what bounds its answer. A SERVICE, a view read, a
+  spatial scan or relation over constants, a spatial join, a search without a bound and
+  a property function over constants and a registered property function without
+  prefix output still need materialization, so
+  the strict policy refuses them and automatic execution runs them eagerly, as
+  [roadmap item 829](../ROADMAP.md) tracks. Automatic execution runs every kind in this
+  list eagerly until a same-host measurement admits it.
 * A cursor scan keeps its place inside an index block between batches without charging
   the block to the query, since the block cache holds its decoded columns, and it
   decodes the block again when the cache has dropped it. A scan inside a plan therefore
@@ -248,6 +344,19 @@ check them against the W3C suites and Jena's own answers.
   it is closed. The
   decoding of a large term beside such a batch can be refused under a budget at which a
   copy would answer, which [roadmap item 1051](../ROADMAP.md) holds.
+* `FILTER(?x < ?y)` and the other order comparisons of two columns of stored simple
+  literals, over a table or cursor batch of at least 4,096 rows, read the strings' order
+  from their vocabulary ids and each string's floor in both modes, so neither column is
+  decoded. The workers keep the floors they compute in one shared table of a cache that
+  lasts the query and grows when repeated strings evict each other, charged to its
+  budget and capped at 64 MiB or a sixteenth of the budget, which trades that memory for
+  not computing a repeated string's floor again. Once the cache is full, the floors it
+  lacks are computed each time. The comparison covers simple literals of the base
+  vocabulary. When one of the first 64 rows holds another value, the whole table or
+  batch takes the generic comparison, and a later row with another value takes it alone.
+  In streaming execution, the measured `str-pair-colleague`, whose strings rarely
+  repeat, runs 4.2% slower than before roadmap item 1069 with one thread and 6.5% slower
+  with 12, which [roadmap item 1088](../ROADMAP.md) recovers.
 * Property path closures run within the query's memory budget and timeout in both
   executors. A closure counts its visited set, its frontier and the edge relation of a
   sequence or alternative path against the budget, and the walk checks the deadline while
@@ -303,6 +412,12 @@ check them against the W3C suites and Jena's own answers.
   Expiry aborts the transfer and requests cancellation. Actual producer owners remain
   until work stops, and only a successful transfer is a complete answer. The settings
   also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
+* A response that the result-size budget stops after its first bytes, eager or streamed,
+  first sends what its writer had buffered and then aborts the transfer. The access log
+  and the metrics count the rows whose bytes the response writer accepted, which are the
+  rows a client that keeps reading receives. When the client has stopped reading, that
+  last send waits only as long as the idle limit, and if it fails the report leaves out
+  its bytes but still counts the rows of that last chunk.
 * A query that a budget or its timeout stopped keeps its plan in the error body of the
   `application/x-sparkles+json` format.
 * `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the
@@ -434,6 +549,20 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   some of them. It skips an embedded query whose holder is ambiguous, such as the
   same query text on two blank nodes, rather than risk another node's findings. Roadmap
   item 444.
+* An `xsd:integer` or `xsd:decimal` with more digits than the engine's decimal type
+  holds, about 20 before the point, is not read as a number, so comparisons, arithmetic
+  and range filters treat it as an unknown literal. XSD allows a limit of 16 digits, while
+  Jena reads any length. Roadmap item 1065.
+* STRSTARTS, STRENDS, CONTAINS, STRBEFORE and STRAFTER compare only the language tags of
+  two language-tagged arguments, so a directional string and a string of the same language
+  without that direction are compatible arguments. SPARQL 1.2 and Jena also require the
+  same base direction. Roadmap item 1071.
+* `isNumeric("inf"^^xsd:double)` is true, though XSD spells infinity `INF`, and a cast of a
+  double to `xsd:string` gives `"1000000"` for `1e6`, where XPath gives `"1.0E6"`. In
+  REGEX, `.` matches a carriage return, which XPath excludes without the `s` flag. Roadmap
+  item 1077.
+* AVG over decimals divides to 18 digits where Jena divides to 24, so the last digits
+  of such an average can differ from ARQ's. Roadmap item 1084.
 * Sparkles does not evaluate `shortest(…)` paths, which ARQ does not evaluate either.
   Roadmap item 51.
 * Jena's service enhancer has no slice-aware cache and no `se:cacheRm` or `se:cacheLs`
@@ -497,10 +626,11 @@ or library workflows. Exact HTTP contracts remain in the API reference.
 * Read [ARQ syntax extensions](../API.md#arq-syntax-extensions).
 * Read [ARQ's property functions](../API.md#arqs-property-functions).
 * Read [DESCRIBE](../API.md#describe).
+* Read [Aggregate errors](../API.md#aggregate-errors).
 
 ## Roadmap
 
-The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md).
+The remaining work described above refers to [item 17](../ROADMAP.md), [item 20](../ROADMAP.md), [item 38](../ROADMAP.md), [item 43](../ROADMAP.md), [item 51](../ROADMAP.md), [item 69](../ROADMAP.md), [item 72](../ROADMAP.md), [item 221](../ROADMAP.md), [item 222](../ROADMAP.md), [item 223](../ROADMAP.md), [item 224](../ROADMAP.md), [item 227](../ROADMAP.md), [item 230](../ROADMAP.md), [item 231](../ROADMAP.md), [item 233](../ROADMAP.md), [item 234](../ROADMAP.md), [item 236](../ROADMAP.md), [item 237](../ROADMAP.md), [item 238](../ROADMAP.md), [item 239](../ROADMAP.md), [item 450](../ROADMAP.md), [item 454](../ROADMAP.md), [item 293](../ROADMAP.md), [item 401](../ROADMAP.md), [item 1084](../ROADMAP.md).
 The central roadmap owns priority and dependencies. Its
 [completion paths](../ROADMAP.md#completion-paths-for-partially-complete-specs)
 link partially complete specs to their remaining work and acceptance criteria.

@@ -20,6 +20,7 @@ use std::time::Instant;
 
 mod binary;
 mod bind;
+mod countjoin;
 mod distinct;
 mod expand;
 mod extsort;
@@ -27,12 +28,14 @@ mod filter;
 pub mod graph;
 mod group;
 mod joinspill;
+mod leaf;
 pub use graph::{GraphBatch, GraphCursor, graph_cursor};
 pub(super) use joinspill::row_hash;
 mod merge;
 mod ripple;
 mod topk;
 mod walk;
+mod whole;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum FallbackPolicy {
@@ -88,7 +91,7 @@ impl CursorStatus {
 /// the root, as the nodes of an eager plan do (see [`PlanInfo`]). A plan deeper than
 /// [`MAX_ID_DEPTH`](super::exec::MAX_ID_DEPTH) levels is written without ids, in plan
 /// format 2.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct CursorPlan {
     pub operator: PlanInfo,
     pub materializes: bool,
@@ -198,6 +201,21 @@ pub struct CursorStats {
     pub granted_bytes: Option<u64>,
     pub timing: Timing,
     pub error: Option<String>,
+}
+
+/// See [`QueryCursor::memory_meter`]. A meter keeps the query's context, and with it
+/// the snapshot and the grant, alive until it is dropped, so a test drops it with the
+/// cursor.
+#[doc(hidden)]
+pub struct MemoryMeter(Arc<Ctx>);
+
+impl MemoryMeter {
+    /// The admitted bytes now: exact, where a pool grant's `used` is a reservation
+    /// that grows in steps and is given back late. It takes no lock and allocates
+    /// nothing, so an allocator may call it.
+    pub fn live_bytes(&self) -> u64 {
+        self.0.live_bytes()
+    }
 }
 
 /// An immutable batch. Keeping it alive keeps its capacity on the query's budget
@@ -951,6 +969,7 @@ fn open_pattern_cursor_input(
                 None,
                 source,
                 bound_policy.as_ref(),
+                None,
             )?;
             let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
             let levels = levels.max(prepared.plan_depth);
@@ -981,7 +1000,7 @@ fn from_prepared(
     let variables = Variables::new(&ctx, &prepared.pattern, &prepared.node.vars, query)?;
     let spec = graph::Spec::from_parsed(parsed, options)?;
     let root = Operator::build_for(&ctx, prepared.node, cursor.fallback, false)?;
-    let plan = root.describe(&ctx);
+    let plan = root.describe_with_graph_branches(&ctx)?;
     ctx.check()?;
     let shared = kind == QueryKind::Select && prepared.bound.is_empty();
     Ok((
@@ -1041,12 +1060,9 @@ fn finish_ask_with_plan(
             }
             let plan = depth::with_stack(cursor.depth, || {
                 incomplete(&mut cursor.plan);
-                cursor.plan_info()
+                cursor.take_plan_info().ok()
             });
-            return Err(Box::new(super::Failed {
-                error,
-                plan: Some(plan),
-            }));
+            return Err(Box::new(super::Failed { error, plan }));
         }
     };
     finish_ask_result(cursor, boolean).map_err(Into::into)
@@ -1055,7 +1071,7 @@ fn finish_ask_with_plan(
 fn finish_ask_result(mut cursor: QueryCursor, boolean: bool) -> Result<QueryResult> {
     cursor.close();
     let stats = cursor.stats();
-    let plan = depth::with_stack(cursor.depth, || cursor.plan_info());
+    let plan = depth::with_stack(cursor.depth, || cursor.take_plan_info())?;
     super::ResultParts {
         kind: QueryKind::Ask,
         variables: None,
@@ -1394,12 +1410,11 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
         _ if supported(&node.kind) => 0.0,
         _ => rows(node, node.est),
     };
-    // the key sets of a BIND's or an OPTIONAL condition's EXISTS, beside the
-    // operator's own state
+    // the key sets of the EXISTS of a BIND, an ORDER BY key, an aggregate argument or
+    // an OPTIONAL condition, beside the operator's own state
     let keyed = match &node.kind {
-        Kind::Extend(_, e) | Kind::LeftJoin { expr: Some(e) } if e.has_exists() => {
-            keyed_exists_bytes(ctx, node)
-        }
+        Kind::Filter(_) => 0.0,
+        kind if own_exprs(kind).iter().any(|e| e.has_exists()) => keyed_exists_bytes(ctx, node),
         _ => 0.0,
     };
     own + keyed
@@ -1410,8 +1425,11 @@ fn cursor_state_bytes(ctx: &Ctx, node: &Node) -> f64 {
             .sum::<f64>()
 }
 
-/// The estimated bytes of the key sets that answer the EXISTS expressions of `node`,
-/// with the cursor state of their plans, or infinity when one has no key set.
+/// The estimated bytes of the key sets that answer the EXISTS patterns of `node`, with
+/// the cursor state of their plans. A pattern without a key set is evaluated once per
+/// distinct outer key, and its memo holds one entry per key up to its entry cap and an
+/// eighth of the memory budget. A pattern that shares no variable with the rows it tests
+/// keeps one answer.
 fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
     let hashed = |n: &Node| {
         let est = n.est.max(0.0);
@@ -1421,32 +1439,62 @@ fn keyed_exists_bytes(ctx: &Ctx, node: &Node) -> f64 {
             + est * 12.0
             + 1024.0
     };
-    own_exprs(&node.kind)
+    let mut specs = Vec::new();
+    for e in own_exprs(&node.kind) {
+        e.exists_specs(&mut specs);
+    }
+    specs
         .into_iter()
-        .filter(|e| e.has_exists())
-        .map(|e| {
-            keyed_exists(ctx, node, e).map_or(f64::INFINITY, |planned| {
-                hashed(&planned) + cursor_state_bytes(ctx, &planned)
-            })
+        .map(|spec| {
+            keyed_exists(ctx, node, spec).map_or_else(
+                || per_key_exists_bytes(ctx, node, spec),
+                |planned| hashed(&planned) + cursor_state_bytes(ctx, &planned),
+            )
         })
         .sum()
 }
 
-/// The plan of the key set that answers the EXISTS expression `e` of `node`: a FILTER
-/// conjunct, a BIND expression or an OPTIONAL condition. The rows a FILTER or a BIND
-/// tests are its input's, and those an OPTIONAL condition tests are the pairs of its
-/// two sides, which bind every variable that either side always binds.
-fn keyed_exists(ctx: &Ctx, node: &Node, e: &Expr) -> Option<Node> {
+/// The estimated bytes of the memo of an EXISTS that `node` evaluates once per distinct
+/// outer key, which [`super::expr::ExistsSpec`] caps at an eighth of the memory budget
+/// and a fixed number of entries. The rows it tests bound the number of keys, and a
+/// pattern that none of their variables or constants reaches keeps one answer.
+fn per_key_exists_bytes(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> f64 {
+    let (vars, rows): (Vec<VarId>, f64) = match (&node.kind, node.children.as_slice()) {
+        (Kind::LeftJoin { .. }, [left, right]) => (
+            left.vars.iter().chain(&right.vars).copied().collect(),
+            node.est.max(0.0),
+        ),
+        (_, [input]) => (input.vars.clone(), input.est.max(0.0)),
+        _ => return (ctx.mem_limit / 8) as f64,
+    };
+    if spec.bound.is_empty() && !spec.vars.iter().any(|v| vars.contains(v)) {
+        return 1024.0;
+    }
+    let entry = (spec.vars.len() * 8 + 64) as f64;
+    (rows.min(super::expr::EXISTS_MEMO_ENTRIES as f64) * entry + 1024.0)
+        .min((ctx.mem_limit / 8) as f64)
+}
+
+/// The plan of the key set that answers the EXISTS of `spec` in an expression of `node`:
+/// a FILTER, a BIND, an ORDER BY key, an aggregate argument or an OPTIONAL condition. The
+/// rows the first four test are their input's, and those an OPTIONAL condition tests are
+/// the pairs of its two sides, which bind every variable that either side always binds.
+fn keyed_exists(ctx: &Ctx, node: &Node, spec: &super::expr::ExistsSpec) -> Option<Node> {
     match (&node.kind, node.children.as_slice()) {
-        (Kind::Filter(_) | Kind::Extend(..), [input]) => {
-            super::exists::keyed_plan(ctx, e, &input.vars, &input.certain)
-        }
+        (
+            Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::OrderBy { .. }
+            | Kind::Sort(_)
+            | Kind::Group { .. },
+            [input],
+        ) => super::exists::keyed_plan(ctx, spec, &input.vars, &input.certain),
         (Kind::LeftJoin { .. }, [left, right]) => {
             let mut vars = left.vars.clone();
             vars.extend(right.vars.iter().filter(|v| !left.vars.contains(v)));
             let mut certain = left.certain.clone();
             certain.extend(right.certain.iter().filter(|v| !left.certain.contains(v)));
-            super::exists::keyed_plan(ctx, e, &vars, &certain)
+            super::exists::keyed_plan(ctx, spec, &vars, &certain)
         }
         _ => None,
     }
@@ -1467,32 +1515,51 @@ fn largest_output_bytes(node: &Node) -> f64 {
 const AUTO_EXISTS_DEPTH: usize = 4;
 
 /// Whether every operator of `node` has a cursor implementation, so that a cursor over
-/// it runs no eager subtree, where a FILTER conjunct or a BIND expression that is `EXISTS { P }` or
-/// `NOT EXISTS { P }` also counts when the cursor can answer it from a key set and the
-/// plan of `P` counts in turn. The key set is filled by a child cursor under the query's
-/// charges. An EXISTS inside a larger expression, such as IF or OR, is evaluated once
-/// per distinct outer key, which measured slower in the cursor than in eager execution,
-/// so such plans stay eager. So does an OPTIONAL whose condition is an EXISTS. The cursor
-/// answers it from the key set as well, but its conditional OPTIONAL took 3.7 to 4.6
-/// times as long as eager execution on Namespace at 10.5M quads, whatever the condition.
-/// The patterns are planned here only to read their operators. Planning interns their
-/// variables in `ctx` and runs no part of them.
+/// it runs no eager subtree. An EXISTS that a FILTER, a BIND, an ORDER BY key or an
+/// aggregate argument evaluates also counts, alone or inside a larger expression such as
+/// IF or OR, when the plan of its pattern counts in turn. Its pattern is answered from a
+/// key set filled by a child cursor under the query's charges where the key set can
+/// answer it, and otherwise evaluated once per distinct outer key with a charged memo,
+/// as eager execution evaluates it. A pattern that calls a SERVICE keeps the plan eager,
+/// and so does an OPTIONAL whose condition holds an EXISTS. The cursor merges such an
+/// OPTIONAL and tests the condition on each batch's pairs, which matches eager execution
+/// where a left row has about one pair. On an Intel host at 1M people, where a left row
+/// has about 2.5 pairs, it took 1.18 to 1.36 times as long as eager execution, which
+/// tests the condition inside the merge. The patterns are planned here only to read
+/// their operators. Planning interns their variables in `ctx` and runs no part of them.
 pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
+    fn pattern(ctx: &Ctx, node: &Node, e: &Expr, depth: usize) -> bool {
+        let mut specs = Vec::new();
+        e.exists_specs(&mut specs);
+        specs.into_iter().all(|spec| {
+            depth < AUTO_EXISTS_DEPTH
+                && ctx.opt.decorrelate_exists
+                && !spec.calls_service()
+                && keyed_exists(ctx, node, spec)
+                    .or_else(|| {
+                        super::plan::Planner::new(ctx)
+                            .plan(spec.pattern(), &spec.graph, Vec::new())
+                            .ok()
+                    })
+                    .is_some_and(|planned| at(ctx, &planned, depth + 1))
+        })
+    }
     fn at(ctx: &Ctx, node: &Node, depth: usize) -> bool {
         let exists = match &node.kind {
-            Kind::Filter(_) | Kind::Extend(..) => own_exprs(&node.kind).into_iter().all(|e| {
-                !e.has_exists()
-                    || (depth < AUTO_EXISTS_DEPTH
-                        && keyed_exists(ctx, node, e)
-                            .is_some_and(|planned| at(ctx, &planned, depth + 1)))
-            }),
+            Kind::Filter(_)
+            | Kind::Extend(..)
+            | Kind::OrderBy { .. }
+            | Kind::Sort(_)
+            | Kind::Group { .. } => own_exprs(&node.kind)
+                .into_iter()
+                .all(|e| !e.has_exists() || pattern(ctx, node, e, depth)),
             kind => !own_exprs(kind).iter().any(|e| e.has_exists()),
         };
         exists
             && (supported(&node.kind)
                 || binary::eligible(node)
                 || group::eligible(ctx, node)
-                || expand::eligible(node)
+                || expand::auto_eligible(node)
                 || walk::eligible(node)
                 || (matches!(node.kind, Kind::Sort(_) | Kind::OrderBy { .. })
                     && node.children.len() == 1))
@@ -1943,6 +2010,13 @@ impl QueryCursor {
         self.depth
     }
 
+    /// A reader of the bytes the query has admitted to its memory budget, for tests
+    /// that compare them with an allocator's count. It is no part of the API.
+    #[doc(hidden)]
+    pub fn memory_meter(&self) -> MemoryMeter {
+        MemoryMeter(self.ctx.clone())
+    }
+
     pub(super) fn fail_output(&mut self, error: &Error) {
         self.failure = Some(error.to_string());
         if self.status == CursorStatus::Open {
@@ -2080,7 +2154,7 @@ impl QueryCursor {
             match attempt {
                 Ok(SharedAttempt::Unsupported) => self.shared = false,
                 Ok(SharedAttempt::Ready(batch)) => {
-                    let root = self.root.as_ref().expect("open cursor");
+                    let root = self.root.as_mut().expect("open cursor");
                     root.update_plan(&mut self.plan);
                     let complete = root.done || batch.is_none();
                     self.plan.operator.warnings = self.ctx.warnings();
@@ -2100,7 +2174,7 @@ impl QueryCursor {
                 }
                 Err(error) => {
                     // the counts so far, as the pull path keeps them
-                    if let Some(root) = &self.root {
+                    if let Some(root) = &mut self.root {
                         root.update_plan(&mut self.plan);
                     }
                     self.plan.operator.warnings = self.ctx.warnings();
@@ -2150,7 +2224,7 @@ impl QueryCursor {
             Ok(batch)
         });
         self.timing.exec_ms += started.elapsed().as_secs_f64() * 1000.0;
-        if let Some(root) = &self.root {
+        if let Some(root) = &mut self.root {
             root.update_plan(&mut self.plan);
         }
         self.plan.operator.warnings = self.ctx.warnings();
@@ -2228,7 +2302,7 @@ impl QueryCursor {
             output.reconcile()?;
         }
         let stats = self.stats();
-        let plan = self.plan_info();
+        let plan = self.take_plan_info()?;
         let output = super::table::Materialized::with_owned(output.table, output.charge)?
             .into_retained(&self.ctx)?;
         super::ResultParts {
@@ -2250,14 +2324,88 @@ impl QueryCursor {
         .freeze()
     }
 
-    fn plan_info(&self) -> PlanInfo {
-        fn build(p: &CursorPlan) -> PlanInfo {
-            let mut info = p.operator.clone();
-            info.children = p.children.iter().map(build).collect();
-            info
-        }
-        build(&self.plan)
+    fn take_plan_info(&mut self) -> Result<PlanInfo> {
+        let plan = std::mem::take(&mut self.plan);
+        depth::with_stack(self.depth, || {
+            consuming_plan_info(&self.ctx, plan, false, false)
+        })
     }
+}
+
+/// Convert a cursor diagnostic tree to the eager shape, keeping its original
+/// allocations and separately admitting the new vector of child plan records.
+fn consuming_plan_info(
+    ctx: &Ctx,
+    plan: CursorPlan,
+    stopped: bool,
+    failed: bool,
+) -> Result<PlanInfo> {
+    let CursorPlan {
+        operator: mut info,
+        children,
+        complete,
+        ..
+    } = plan;
+    let mut held = if info.prepared_diagnostics.is_some() {
+        let preparation = ctx
+            .source_preparation
+            .as_ref()
+            .expect("checked GRAPH diagnostics");
+        let mut held = exec::graph_diagnostics::owner(preparation)?;
+        let bytes = children
+            .len()
+            .checked_mul(size_of::<PlanInfo>())
+            .ok_or_else(|| preparation.exhausted())?;
+        held.grow_by(bytes as u64)?;
+        Some(held)
+    } else {
+        None
+    };
+    let mut plans = Vec::new();
+    plans
+        .try_reserve_exact(children.len())
+        .map_err(|_| ctx.memory_exceeded(u64::MAX))?;
+    for child in children {
+        plans.push(consuming_plan_info(ctx, child, stopped, failed)?);
+    }
+    if !complete && info.fidelity().skipped.is_none() {
+        if failed {
+            if let Some(held) = &mut held {
+                held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+            }
+            info.fidelity_mut().incomplete = true;
+        } else if stopped
+            && (info.actual_rows < 0 || (info.actual_rows == 0 && info.time_ms == 0.0))
+        {
+            const SKIPPED: &str = "the limit was met before it ran";
+            if let Some(held) = &mut held {
+                let reason = exec::graph_diagnostics::text(held, |out| out.write_str(SKIPPED))?;
+                held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+                info.fidelity_mut().skipped = Some(reason);
+                info.actual_rows = -1;
+            } else {
+                info.children = std::mem::take(&mut plans);
+                return Ok(info.skip(SKIPPED));
+            }
+        } else if stopped && info.actual_rows >= 0 {
+            if let Some(held) = &mut held {
+                let text = exec::graph_diagnostics::text(held, |out| {
+                    out.write_str(&info.description)?;
+                    out.write_str(" [stopped early]")
+                })?;
+                held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+                info.description = text;
+            } else {
+                info.description = format!("{} [stopped early]", info.description);
+            }
+            info.fidelity_mut().stopped_early = true;
+        }
+    }
+    if let Some(held) = held {
+        exec::PreparedDiagnostics::attach(&mut info, held);
+    }
+    info.children = plans;
+    Ok(info)
 }
 
 impl Drop for QueryCursor {
@@ -2364,41 +2512,24 @@ fn pull_planned<'ctx>(
             ended,
         ));
     }
-    let mut plan = root.describe(ctx);
-    root.update_plan(&mut plan);
-    // the plan of what ran, moved out of the cursor's plan rather than copied
-    fn info(plan: CursorPlan, stopped: bool, failed: bool) -> PlanInfo {
-        let CursorPlan {
-            operator: mut out,
-            children,
-            complete,
-            ..
-        } = plan;
-        out.children = children
-            .into_iter()
-            .map(|c| info(c, stopped, failed))
-            .collect();
-        if !complete && out.fidelity().skipped.is_none() {
-            if failed {
-                out.fidelity_mut().incomplete = true;
-            } else if stopped && out.actual_rows == 0 && out.time_ms == 0.0 {
-                // nothing pulled it before the consumer had its rows
-                return out.skip("the limit was met before it ran");
-            } else if stopped && out.actual_rows >= 0 {
-                out.description = format!("{} [stopped early]", out.description);
-                out.fidelity_mut().stopped_early = true;
-            }
+    let mut plan = match root.describe_with_graph_branches(ctx) {
+        Ok(plan) => plan,
+        Err(diagnostic) => {
+            ran?;
+            return Err(diagnostic);
         }
-        out
-    }
+    };
+    root.update_plan(&mut plan);
     if let Err(error) = ran {
-        // the rows the operators gave were not delivered, even when they all ran
-        let mut failed = info(plan, false, true);
-        failed.fidelity_mut().incomplete = true;
-        ctx.set_failed(node, failed);
+        // The rows produced were not delivered. If diagnostics also refuse,
+        // the original execution error still determines the result.
+        if let Ok(mut plan) = consuming_plan_info(ctx, plan, false, true) {
+            plan.fidelity_mut().incomplete = true;
+            ctx.set_failed(node, plan);
+        }
         return Err(error);
     }
-    let mut info = info(plan, !ended, false);
+    let mut info = consuming_plan_info(ctx, plan, !ended, false)?;
     // a filter's EXISTS notes and counters, as the eager filter reports them
     fn annotate(ctx: &Ctx, node: &Node, info: &mut PlanInfo) {
         if let Kind::Filter(exprs) = &node.kind
@@ -2447,7 +2578,7 @@ fn pull_planned<'ctx>(
     Ok((rows, info, ended))
 }
 
-fn plan_bytes(node: &Node) -> u64 {
+pub(super) fn plan_bytes(node: &Node) -> u64 {
     let values = match &node.kind {
         Kind::Values(t) => capacity_bytes(t),
         _ => 0,
@@ -2477,6 +2608,7 @@ enum State {
     RunGroup(Box<group::RunGroup>),
     Filter(Box<filter::Filter>),
     Expand(Box<expand::Expand>),
+    Whole(Box<whole::Whole>),
     Walk(Box<walk::Walk>),
     Scan(Scan),
     /// `spk:hasPredicate` read from the predicate patterns, a block of subjects at a time.
@@ -2490,6 +2622,11 @@ enum State {
         table: Table,
         at: usize,
     },
+    GraphNames {
+        names: Arc<super::plan::PreparedGraphNames>,
+        at: usize,
+    },
+    GraphBranches(Box<GraphBranches>),
     Empty,
     Unary(Node),
     Slice {
@@ -2538,6 +2675,12 @@ struct Operator {
     /// Whether the operator's rows stay out of the produced-row count, because an eager
     /// operator that runs this tree counts them as its own.
     uncounted: bool,
+    /// For the join below a count over a join, whether the eager count admits the pairs
+    /// as an intermediate result (`countjoin::eager_checks_pairs`). Such a join counts
+    /// none of its rows as produced. With `true` it holds the pairs so far to the row
+    /// limit and, with the rows produced so far, to the work limit, as the eager
+    /// admission does once for all of them, and with `false` it checks neither.
+    count_pairs: Option<bool>,
     /// The variables every output batch, and the concatenation of all of them, is
     /// sorted on in raw ID order. It is fixed when the operator is built, and each
     /// output batch carries it.
@@ -2547,6 +2690,14 @@ struct Operator {
     last: Option<Vec<Id>>,
     /// A FILTER that may read ahead of its consumer's demand (see [`Ahead`]).
     ahead: Option<Box<Ahead>>,
+    // The delegated operator's state drops before its clone admission and source plan.
+    singleton_graph: Option<Box<SingletonGraph>>,
+}
+
+struct SingletonGraph {
+    _inner: Option<Box<SingletonGraph>>,
+    _plans: Arc<super::plan::PreparedGraphBranches>,
+    _charge: OwnedCharge,
 }
 
 /// The read-ahead of a FILTER without effects: while its batches come back empty, it
@@ -2558,6 +2709,120 @@ struct Ahead {
     demand: usize,
     pending: Option<Buffer>,
     at: usize,
+}
+
+fn reserve_graph_branch_copy(ctx: &Arc<Ctx>, plan: &Node, header: usize) -> Result<OwnedCharge> {
+    let preparation = ctx
+        .source_preparation
+        .as_ref()
+        .expect("checked GRAPH cursor");
+    let mut layout = super::checked_layout::Layout::new(preparation);
+    layout.add(header)?;
+    layout.node(plan)?;
+    OwnedCharge::new(ctx, layout.bytes())
+}
+
+struct GraphBranches {
+    current: Option<GraphBranchOperator>,
+    completed: crate::access::PreparationBuffer<(usize, CursorPlan)>,
+    at: usize,
+    fallback: FallbackPolicy,
+    plans: Arc<super::plan::PreparedGraphBranches>,
+}
+
+struct GraphBranchOperator {
+    operator: Operator,
+    plan: Option<CursorPlan>,
+    _copy: OwnedCharge,
+}
+
+impl GraphBranches {
+    fn next(
+        &mut self,
+        ctx: &Arc<Ctx>,
+        options: &CursorOptions,
+        vars: &[VarId],
+        cap: usize,
+    ) -> Result<Option<Buffer>> {
+        while let Some(plan) = self.plans.inputs.get(self.at) {
+            ctx.check()?;
+            if self.current.is_none() {
+                let copy = reserve_graph_branch_copy(ctx, plan, 0)?;
+                let operator = Operator::build(ctx, plan.clone(), self.fallback)?;
+                let diagnostic = planned_graph_cursor(ctx, plan)?;
+                self.current = Some(GraphBranchOperator {
+                    operator,
+                    plan: Some(diagnostic),
+                    _copy: copy,
+                });
+            }
+            let current = self.current.as_mut().expect("current graph branch");
+            let batch = current.operator.next(ctx, options, cap)?;
+            if current.operator.done || batch.is_none() {
+                let mut diagnostic = match current.plan.take() {
+                    Some(plan) => plan,
+                    None => planned_graph_cursor(ctx, plan)?,
+                };
+                current.operator.update_plan(&mut diagnostic);
+                self.completed.push((self.at, diagnostic))?;
+                self.current = None;
+                self.at += 1;
+            }
+            if let Some(mut batch) = batch {
+                batch.project(vars)?;
+                return Ok(Some(batch));
+            }
+        }
+        Ok(None)
+    }
+
+    fn update_plan(&mut self, plan: &mut CursorPlan) {
+        while let Some((index, completed)) = self.completed.pop() {
+            if let Some(slot) = plan.children.get_mut(index) {
+                *slot = completed;
+            }
+        }
+        if let (Some(current), Some(slot)) = (&mut self.current, plan.children.get_mut(self.at)) {
+            if let Some(built) = current.plan.take() {
+                *slot = built;
+            }
+            current.operator.update_plan(slot);
+        }
+    }
+}
+
+fn planned_graph_cursor(ctx: &Ctx, mut node: &Node) -> Result<CursorPlan> {
+    let preparation = ctx
+        .source_preparation
+        .as_ref()
+        .expect("checked GRAPH cursor");
+    while let Some(branch) = node.graph_singleton() {
+        preparation.check()?;
+        node = branch;
+    }
+    let mut held = exec::graph_diagnostics::owner(preparation)?;
+    // Termination can add a fidelity marker without another allocation decision.
+    held.grow_by(size_of::<super::PlanFidelity>() as u64)?;
+    let mut operator = exec::graph_diagnostics::leaf(ctx, node, &mut held, None)?;
+    if ctx.graphs.is_some() {
+        operator.redact();
+    }
+    let mut children = crate::access::PreparationBuffer::new(preparation)?;
+    for child in node.graph_diagnostic_children() {
+        children.push(planned_graph_cursor(ctx, child)?)?;
+    }
+    let (children, credit) = children.into_parts();
+    held.merge(credit);
+    exec::PreparedDiagnostics::attach(&mut operator, held);
+    Ok(CursorPlan {
+        operator,
+        materializes: false,
+        full_input_before_output: false,
+        growing_state: false,
+        complete: false,
+        reason: None,
+        children,
+    })
 }
 
 /// The most cursor batches a FILTER that reads ahead asks its input for at once.
@@ -2579,6 +2844,8 @@ fn supported(kind: &Kind) -> bool {
         kind,
         Kind::Scan(_)
             | Kind::Values(_)
+            | Kind::GraphNames(_)
+            | Kind::GraphBranches(_)
             | Kind::Empty
             | Kind::Project(_)
             | Kind::Distinct
@@ -2635,7 +2902,13 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
         expr.exists_specs(&mut specs);
     }
     for spec in specs {
-        let planned = super::plan::Planner::new(ctx).plan(&spec.pattern, &spec.graph, Vec::new());
+        let planned = super::plan::Planner::new(ctx).plan(spec.pattern(), &spec.graph, Vec::new());
+        if let Err(error) = &planned
+            && super::extensions::is_unconfigured(error)
+        {
+            // This pattern needs no materialization. Its refusal matters only if it is evaluated.
+            continue;
+        }
         let built = planned
             .and_then(|node| Operator::build(ctx, node, FallbackPolicy::RejectMaterialization));
         match built {
@@ -2825,7 +3098,25 @@ impl Operator {
         needed: bool,
     ) -> Result<Self> {
         ctx.check()?;
-        let mut node = node;
+        if let Kind::GraphBranches(plans) = &node.kind
+            && let [branch] = plans.inputs.as_slice()
+        {
+            let charge = reserve_graph_branch_copy(ctx, branch, size_of::<SingletonGraph>())?;
+            let mut operator = Self::build_for(ctx, branch.clone(), fallback, needed)?;
+            let inner = operator.singleton_graph.take();
+            operator.singleton_graph = Some(Box::new(SingletonGraph {
+                _inner: inner,
+                _plans: plans.clone(),
+                _charge: charge,
+            }));
+            return Ok(operator);
+        }
+        // A count over a join runs the join and counts its rows.
+        let count_join = matches!(node.kind, Kind::CountJoin { .. });
+        // A count whose eager kernel runs holds no join below it (see `whole`).
+        let count_pairs =
+            countjoin::eager_checks_pairs(&node).filter(|_| !countjoin::eager_kernel(&node));
+        let mut node = countjoin::rewrite(ctx, node);
         // Every merge-eligible join is also binary-eligible, so whether the node
         // materializes does not depend on the order its children turn out to have.
         // An operator that evaluates EXISTS streams when every EXISTS pattern does.
@@ -2837,6 +3128,8 @@ impl Operator {
         let run_group = exists_streams && group::runs_eligible(ctx, &node);
         let expanding = exists_streams && expand::eligible(&node);
         let walking = walk::eligible(&node);
+        // A bounded kernel that needs all of its input reads it under a charge first.
+        let whole_input = exists_streams && whole::eligible(&node);
         // A pattern count over an input reads all of it, as a sort does, and then has one
         // row per predicate.
         let native_blocking = matches!(
@@ -2856,16 +3149,41 @@ impl Operator {
             && !run_group
             && !expanding
             && !walking
+            && !whole_input
             && !index_topk
             && !pattern_counts
             && (!native_blocking || !exists_streams);
-        if materializes && fallback == FallbackPolicy::RejectMaterialization {
+        // A kernel that answers whole tables runs as a native operator when its form is
+        // a whole-input one or a bounded leaf (see `leaf`).
+        let native = materializes
+            && exists_streams
+            && leaf::form(&node).is_some_and(|form| {
+                form.native()
+                    && (form != leaf::Form::WholeInput
+                        || (!native_blocking && exec::reads_inputs(&node)))
+            });
+        if materializes && !native && fallback == FallbackPolicy::RejectMaterialization {
             return Err(Error::Unsupported(format!(
                 "cursor requires materialization at {}; use AllowMaterialization or eager execution",
                 node.operator()
             )));
         }
+        if fallback == FallbackPolicy::RejectMaterialization
+            && let Kind::GraphBranches(plans) = &node.kind
+        {
+            // The runtime opens branches on demand. Strict cursors still reject a
+            // known eager branch before emitting any output.
+            for plan in &plans.inputs {
+                ctx.check()?;
+                let _charge = reserve_graph_branch_copy(ctx, plan, 0)?;
+                Operator::build(ctx, plan.clone(), fallback)?;
+            }
+        }
         let mut info = exec::describe_node(ctx, &node);
+        if count_join && matches!(node.kind, Kind::Group { .. }) {
+            info.operator = countjoin::OPERATOR.into();
+            info.description = format!("{} [counts the rows of the join below]", info.description);
+        }
         if let Kind::PatternScan(spec) = &node.kind {
             // the table the scan reads, as the eager plan names it
             info.description = format!("{} {}", info.description, spec.uses.note());
@@ -3012,6 +3330,7 @@ impl Operator {
             || run_group
             || expanding
             || walking
+            || whole_input
             || exists;
         let mut order = output_order(
             &node,
@@ -3031,7 +3350,7 @@ impl Operator {
             },
         );
         let merge = incremental_merge
-            .then(|| merge::Merge::new(ctx, &node))
+            .then(|| merge::Merge::new(ctx, &mut node))
             .transpose()?;
         let group = incremental_group
             .then(|| group::Group::new(ctx, &node))
@@ -3058,7 +3377,7 @@ impl Operator {
                 info.description
             );
         }
-        if let Kind::LeftJoin { expr: None } = node.kind {
+        if let Kind::LeftJoin { .. } = node.kind {
             // the plan names the algorithm the merge_left_join switch selected, as the
             // eager plan does
             if let Some(merge) = &merge {
@@ -3072,7 +3391,7 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group).then(|| {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input).then(|| {
             if let Kind::OrderedTopK(spec) = &node.kind {
                 format!(
                     "{} reads the index in value order where ids follow values, and the rest of its range a morsel at a time, keeping only its best {} rows under the memory budget before output",
@@ -3094,6 +3413,20 @@ impl Operator {
                     "{} reads its input in key order and holds the rows of the groups it has not finished, so each aggregate sees its group's rows in input order",
                     node.operator()
                 )
+            } else if whole_input {
+                let reads = whole::reads(&node);
+                match whole::bound(&node) {
+                    Some(bound) => format!(
+                        "{} reads {reads} under the memory budget, runs once and serves its answer of {bound}",
+                        node.operator()
+                    ),
+                    None => format!(
+                        "{} reads {reads} under the memory budget, runs once and serves its charged answer",
+                        node.operator()
+                    ),
+                }
+            } else if native {
+                leaf::reason(&node, leaf::form(&node).expect("a native form"))
             } else if !materializes {
                 format!(
                     "{} answers EXISTS from a key set of its pattern, built under the memory budget on first demand, or evaluates it once per distinct outer key",
@@ -3124,6 +3457,8 @@ impl Operator {
             State::TopK(Box::new(topk::TopK::new(ctx, &node, &children[0].vars)?))
         } else if expanding {
             State::Expand(Box::new(expand::Expand::new(node)))
+        } else if whole_input {
+            State::Whole(Box::new(whole::Whole::new(node)))
         } else if walking {
             State::Walk(Box::new(walk::Walk::new(ctx, &node)?))
         } else if native_blocking {
@@ -3156,6 +3491,23 @@ impl Operator {
                     };
                     State::Values { table, at: 0 }
                 }
+                Kind::GraphNames(names) => State::GraphNames {
+                    names: names.clone(),
+                    at: 0,
+                },
+                Kind::GraphBranches(plans) => {
+                    let preparation = ctx
+                        .source_preparation
+                        .as_ref()
+                        .expect("checked GRAPH cursor");
+                    State::GraphBranches(Box::new(GraphBranches {
+                        current: None,
+                        completed: crate::access::PreparationBuffer::new(preparation)?,
+                        at: 0,
+                        fallback,
+                        plans: plans.clone(),
+                    }))
+                }
                 Kind::Empty => State::Empty,
                 Kind::CountScan { .. }
                 | Kind::CountDistinctScan { .. }
@@ -3186,6 +3538,13 @@ impl Operator {
         {
             order.clear();
         }
+        // The pairs of the join below a count over a join are no rows the eager count
+        // produces, and it admits them only when it forms them.
+        if let Some(checks) = count_pairs
+            && let Some(join) = children.first_mut()
+        {
+            join.count_pairs = Some(checks);
+        }
         let ahead = (reads_ahead && matches!(state, State::Unary(_))).then(Box::default);
         Ok(Self {
             state,
@@ -3194,16 +3553,18 @@ impl Operator {
             vars,
             rows: 0,
             done: false,
-            materializes,
+            materializes: materializes && !native,
             growing,
             reason,
             bind_reuse,
             released: false,
             uncounted: false,
+            count_pairs: None,
             order,
             #[cfg(debug_assertions)]
             last: None,
             ahead,
+            singleton_graph: None,
         })
     }
 
@@ -3250,10 +3611,12 @@ impl Operator {
             bind_reuse: None,
             released: false,
             uncounted: false,
+            count_pairs: None,
             order,
             #[cfg(debug_assertions)]
             last: None,
             ahead: None,
+            singleton_graph: None,
         })
     }
 
@@ -3272,6 +3635,11 @@ impl Operator {
         self.released = true;
         match &mut self.state {
             State::Scan(scan) => scan.base = None,
+            State::GraphBranches(branches) => {
+                if let Some(current) = &mut branches.current {
+                    current.operator.release_finished();
+                }
+            }
             State::Binary(binary) => binary.release_working_sets(),
             State::Ripple(ripple) => ripple.release_working_sets(),
             _ => {}
@@ -3372,17 +3740,7 @@ impl Operator {
         CursorPlan {
             operator: self.info.clone(),
             materializes: self.materializes,
-            full_input_before_output: self.materializes
-                || matches!(
-                    self.state,
-                    State::Binary(_)
-                        | State::Group(_)
-                        | State::Scalar(_)
-                        | State::Counts { .. }
-                        | State::Blocking { .. }
-                        | State::TopK(_)
-                        | State::IndexTopK(_)
-                ),
+            full_input_before_output: self.full_input_before_output(),
             growing_state: self.growing,
             complete: false,
             reason: self.reason.clone(),
@@ -3390,12 +3748,94 @@ impl Operator {
         }
     }
 
-    fn update_plan(&self, plan: &mut CursorPlan) {
+    /// Mark this operator and those below it as never run, for `why`, as the eager plan
+    /// marks an input that its parent did not need.
+    fn mark_skipped(&mut self, why: &str) {
+        self.info.actual_rows = -1;
+        self.info.time_ms = 0.0;
+        self.info.fidelity_mut().skipped = Some(why.to_string());
+        self.done = true;
+        for child in &mut self.children {
+            child.mark_skipped(why);
+        }
+    }
+
+    fn describe_with_graph_branches(&self, ctx: &Ctx) -> Result<CursorPlan> {
+        let mut plan = self.describe(ctx);
+        self.add_graph_descriptions(ctx, &mut plan)?;
+        Ok(plan)
+    }
+
+    fn add_graph_descriptions(&self, ctx: &Ctx, plan: &mut CursorPlan) -> Result<()> {
+        if let State::GraphBranches(branches) = &self.state {
+            let preparation = ctx
+                .source_preparation
+                .as_ref()
+                .expect("checked GRAPH cursor");
+            let mut held = exec::graph_diagnostics::owner(preparation)?;
+            let mut children = crate::access::PreparationBuffer::new(preparation)?;
+            for branch in &branches.plans.inputs {
+                children.push(planned_graph_cursor(ctx, branch)?)?;
+            }
+            let (children, credit) = children.into_parts();
+            held.merge(credit);
+            plan.children = children;
+            exec::PreparedDiagnostics::attach(&mut plan.operator, held);
+        }
+        for (operator, child) in self.children.iter().zip(&mut plan.children) {
+            operator.add_graph_descriptions(ctx, child)?;
+        }
+        Ok(())
+    }
+
+    /// Whether this operator reads its whole input before its first output, as its plan
+    /// reports both when it is described and after each pull.
+    fn full_input_before_output(&self) -> bool {
+        self.materializes
+            || matches!(
+                self.state,
+                State::Fallback { .. }
+                    | State::Binary(_)
+                    | State::Group(_)
+                    | State::Scalar(_)
+                    | State::Counts { .. }
+                    | State::Blocking { .. }
+                    | State::Whole(_)
+                    | State::TopK(_)
+                    | State::IndexTopK(_)
+            )
+    }
+
+    fn update_plan(&mut self, plan: &mut CursorPlan) {
+        plan.materializes = self.materializes;
+        plan.full_input_before_output = self.full_input_before_output();
+        plan.growing_state = self.growing;
         plan.operator.actual_rows = self.info.actual_rows;
         plan.operator.time_ms = self.info.time_ms;
         plan.complete = self.done;
+        // A skipped operator never ran, and nor did anything its plan shows below it,
+        // including the children that an eager kernel describes without operators.
+        if let Some(why) = self.info.fidelity.as_ref().and_then(|f| f.skipped.clone()) {
+            fn mark(plan: &mut CursorPlan, why: &str) {
+                plan.operator.actual_rows = -1;
+                plan.operator.time_ms = 0.0;
+                plan.operator.fidelity_mut().skipped = Some(why.to_string());
+                plan.complete = true;
+                for child in &mut plan.children {
+                    mark(child, why);
+                }
+            }
+            mark(plan, &why);
+            return;
+        }
         if self.info.counters.is_some() {
             plan.operator.counters.clone_from(&self.info.counters);
+        }
+        // An expanding or whole-input kernel notes its runs in its description.
+        if matches!(self.state, State::Expand(_) | State::Whole(_))
+            && plan.operator.description != self.info.description
+        {
+            plan.operator.description.clone_from(&self.info.description);
         }
         fn update(info: &PlanInfo, plan: &mut CursorPlan) {
             plan.operator.actual_rows = info.actual_rows;
@@ -3414,7 +3854,7 @@ impl Operator {
         match &self.state {
             State::Fallback {
                 loaded: Some(_), ..
-            } if self.materializes => update(&self.info, plan),
+            } => update(&self.info, plan),
             State::Scalar(_) if self.done => {
                 for (info, plan) in self.info.children.iter().zip(&mut plan.children) {
                     update(info, plan);
@@ -3429,7 +3869,10 @@ impl Operator {
         {
             plan.children.push(generic.clone());
         }
-        for (child, plan) in self.children.iter().zip(&mut plan.children) {
+        if let State::GraphBranches(branches) = &mut self.state {
+            branches.update_plan(plan);
+        }
+        for (child, plan) in self.children.iter_mut().zip(&mut plan.children) {
             child.update_plan(plan);
         }
     }
@@ -3456,12 +3899,25 @@ impl Operator {
             return Ok(None);
         }
         let began = Instant::now();
-        let count = merge.count(ctx, &mut self.children, options)?;
+        let count = merge.count(
+            ctx,
+            &mut self.children,
+            options,
+            self.count_pairs != Some(false),
+        )?;
         self.info.time_ms += began.elapsed().as_secs_f64() * 1000.0;
         self.rows =
             usize::try_from(count).map_err(|_| Error::invalid("cursor row count overflow"))?;
-        ctx.check_rows(self.rows)?;
-        ctx.produced(self.rows)?;
+        match self.count_pairs {
+            None => {
+                ctx.check_rows(self.rows)?;
+                if !self.uncounted {
+                    ctx.produced(self.rows)?;
+                }
+            }
+            Some(true) => ctx.check_output_rows(self.rows)?,
+            Some(false) => {}
+        }
         self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
         self.done = true;
         self.release_finished();
@@ -3530,12 +3986,23 @@ impl Operator {
                     .rows
                     .checked_add(rows)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                ctx.check_rows(self.rows)?;
-                if !self.uncounted {
-                    ctx.produced(rows)?;
+                match self.count_pairs {
+                    None => {
+                        ctx.check_rows(self.rows)?;
+                        if !self.uncounted {
+                            ctx.produced(rows)?;
+                        }
+                    }
+                    Some(true) => ctx.check_output_rows(self.rows)?,
+                    Some(false) => {}
                 }
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
+                // The inputs' last rows count once the pairs are all out, as they
+                // counted before the eager count admitted the pairs.
+                if self.count_pairs == Some(true) {
+                    ctx.check_output_rows(self.rows)?;
+                }
                 self.done = true;
                 self.release_finished();
             }
@@ -3573,9 +4040,14 @@ impl Operator {
                     .rows
                     .checked_add(b.table.len)
                     .ok_or_else(|| Error::invalid("cursor operator row count overflow"))?;
-                ctx.check_rows(self.rows)?;
+                match self.count_pairs {
+                    None => ctx.check_rows(self.rows)?,
+                    Some(true) => ctx.check_output_rows(self.rows)?,
+                    Some(false) => {}
+                }
                 // Eager kernels already counted all their operator work during execution.
                 if !self.uncounted
+                    && self.count_pairs.is_none()
                     && !matches!(
                         self.state,
                         State::Fallback { .. }
@@ -3589,6 +4061,11 @@ impl Operator {
                 // a fallback counts the rows it emitted; `materializedRows` holds its table
                 self.info.actual_rows = self.rows.min(i64::MAX as usize) as i64;
             } else {
+                // The inputs' last rows count once the pairs are all out, as they
+                // counted before the eager count admitted the pairs.
+                if self.count_pairs == Some(true) {
+                    ctx.check_output_rows(self.rows)?;
+                }
                 self.done = true;
                 self.release_finished();
             }
@@ -3715,8 +4192,39 @@ impl Operator {
                     self.done = walk.done();
                     batch
                 }
+                State::Whole(whole) => {
+                    let batch = whole.next(
+                        ctx,
+                        &mut self.children,
+                        options,
+                        &self.order,
+                        &self.vars,
+                        cap,
+                    )?;
+                    if let Some(counters) = &whole.counters {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(description) = whole.description() {
+                        self.info.description = description;
+                    }
+                    // A graph view's plan tells nothing a kernel saw of other graphs.
+                    if ctx.graphs.is_some() {
+                        self.info.redact();
+                    }
+                    self.done = whole.done();
+                    batch
+                }
                 State::Expand(expand) => {
                     let batch = expand.next(ctx, &mut self.children, options, &self.vars, cap)?;
+                    if let Some(counters) = expand.counters() {
+                        self.info.counters = Some(counters.clone());
+                    }
+                    if let Some(description) = expand.description() {
+                        self.info.description = description;
+                    }
+                    if ctx.graphs.is_some() {
+                        self.info.redact();
+                    }
                     let input = self.children.last().is_none_or(|c| c.done);
                     self.done = expand.done(input);
                     batch
@@ -3755,6 +4263,19 @@ impl Operator {
                     }
                     self.done = *at == table.len;
                     b
+                }
+                State::GraphNames { names, at } => {
+                    let b = copy_rows(ctx, &names.table, *at, cap)?;
+                    if let Some(b) = &b {
+                        *at += b.table.len;
+                    }
+                    self.done = *at == names.table.len;
+                    b
+                }
+                State::GraphBranches(branches) => {
+                    let batch = branches.next(ctx, options, &self.vars, cap)?;
+                    self.done = branches.at == branches.plans.inputs.len();
+                    batch
                 }
                 State::Scan(scan) => {
                     let b = scan.next(ctx, &self.vars, cap)?;
@@ -4184,7 +4705,8 @@ struct BaseScan {
     end: usize,
     /// the block being read, held only during a read
     block: Option<crate::index::Block>,
-    /// between reads, a handle on the block that does not keep it
+    /// between reads, a handle on the block that does not keep it, none while the block
+    /// is shared
     parked: Option<crate::index::WeakBlock>,
     /// the columns the block was read with
     wanted: crate::index::ColMask,
@@ -4236,6 +4758,22 @@ impl BaseScan {
     fn park(&mut self) {
         self.remember_block();
         self.block = None;
+        debug_assert!(
+            self.row == self.row_end || self.shared.is_some() || self.parked.is_some(),
+            "a scan stopped inside a block without a way back to it"
+        );
+    }
+
+    /// Stop sharing the block being read, taking it back as the block of the read. While
+    /// it shares a block the scan keeps no weak handle on it, since the shared block keeps
+    /// it, so a scan that goes on inside the block takes it back here, and the next
+    /// [`park`](Self::park) makes the handle.
+    fn unshare(&mut self) {
+        if let Some(shared) = self.shared.take()
+            && self.block.is_none()
+        {
+            self.block = Some(shared.block.clone());
+        }
     }
 
     /// Take back the block of the last read, from the cache or by decoding it again.
@@ -4327,39 +4865,47 @@ impl Scan {
         if !self.reads_base(ctx) {
             return Ok(SharedAttempt::Unsupported);
         }
-        let mut base = self.base.take().expect("checked base scan");
-        let held = base.shared.clone();
-        let result = if held.is_some() {
+        // The base scan is borrowed in place rather than moved out and back for the read.
+        let Scan {
+            spec,
+            ranges,
+            at,
+            base,
+            ..
+        } = self;
+        let base = base.as_mut().expect("checked base scan");
+        let result = if base.shared.is_some() {
             Ok(())
         } else {
-            base.unpark(ctx, ctx.snap.perm(self.spec.perm))
+            base.unpark(ctx, ctx.snap.perm(spec.perm))
         }
-        .and_then(|()| self.next_shared_base(ctx, vars, columns, cap, &mut base, held));
+        .and_then(|()| Self::next_shared_base(ctx, spec, ranges, at, vars, columns, cap, base));
         base.park();
-        self.base = Some(base);
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn next_shared_base(
-        &mut self,
         ctx: &Arc<Ctx>,
+        spec: &ScanSpec,
+        ranges: &[(Key, Key, bool)],
+        at: &mut usize,
         vars: &[VarId],
         columns: [usize; 4],
         cap: usize,
         base: &mut BaseScan,
-        mut held: Option<Arc<SharedBlock>>,
     ) -> Result<SharedAttempt> {
-        let index = ctx.snap.perm(self.spec.perm);
-        let mask = exec::scan_mask(&self.spec);
-        while self.at < self.ranges.len() {
+        let index = ctx.snap.perm(spec.perm);
+        let mask = exec::scan_mask(spec);
+        while *at < ranges.len() {
             ctx.check()?;
-            let (lo, hi, _) = self.ranges[self.at];
+            let (lo, hi, _) = ranges[*at];
             if base.next == 0 && base.end == 0 && base.block.is_none() {
                 (base.next, base.end) = index.key_block_range(&lo, &hi);
             }
-            if base.block.is_none() && held.is_none() {
+            if base.block.is_none() && base.shared.is_none() {
                 if base.next == base.end {
-                    self.at += 1;
+                    *at += 1;
                     base.next = 0;
                     base.end = 0;
                     base.ahead = Default::default();
@@ -4404,23 +4950,33 @@ impl Scan {
                 base.clear_block();
                 continue;
             }
-            let block = match &held {
+            let block = match &base.shared {
                 Some(shared) => &shared.block,
                 None => base.block.as_ref().expect("loaded immutable block"),
             };
             // Only the rows of this batch are checked, so a small demand does not read
             // the graph column of the whole block.
             let end = base.row_end.min(base.row.saturating_add(cap));
-            if !exec::block_passes(&self.spec, block, base.row, end) {
-                // No row of the batch was consumed: the owned path resumes from it.
-                base.shared = None;
+            if !exec::block_passes(spec, block, base.row, end) {
+                // No row of the batch was consumed: the owned path resumes from it, with
+                // the block taken back from the shared one.
+                base.unshare();
                 return Ok(SharedAttempt::Unsupported);
             }
             // The batches of one block share it and one charge of its decoded columns,
             // which last while any of them is held.
             let bytes = block.decoded_bytes() + 512;
-            let shared = match held.take() {
-                Some(shared) => shared,
+            let batch = match &base.shared {
+                Some(shared) => {
+                    let shared = shared.clone();
+                    SharedBatch {
+                        shared,
+                        columns,
+                        start: base.row,
+                        end,
+                        _charge: OwnedCharge::new(ctx, 512)?,
+                    }
+                }
                 None => {
                     // Leave room for consumers' decoding scratch and an owned fallback.
                     // The room asked for is a whole block's columns, whatever this block
@@ -4435,30 +4991,34 @@ impl Scan {
                     let Ok(charge) = OwnedCharge::new(ctx, bytes) else {
                         return Ok(SharedAttempt::Unsupported);
                     };
+                    // The batch's own charge comes before the block moves, so a refusal
+                    // leaves the scan holding its block.
+                    let batch_charge = OwnedCharge::new(ctx, 512)?;
                     // The batches take the scan's handle on the block, which the scan
-                    // would let go of at the end of this read anyway, and the scan keeps
-                    // a weak one.
-                    base.remember_block();
+                    // would let go of at the end of this read anyway. While the block is
+                    // shared the scan keeps it through the shared block and needs no weak
+                    // handle, and a batch that ends the block leaves the scan none.
                     let shared = Arc::new(SharedBlock {
                         block: base.block.take().expect("loaded immutable block"),
                         _charge: charge,
                     });
-                    base.shared = Some(shared.clone());
-                    shared
+                    if end < base.row_end {
+                        base.shared = Some(shared.clone());
+                    }
+                    SharedBatch {
+                        shared,
+                        columns,
+                        start: base.row,
+                        end,
+                        _charge: batch_charge,
+                    }
                 }
-            };
-            let batch = SharedBatch {
-                shared,
-                columns,
-                start: base.row,
-                end,
-                _charge: OwnedCharge::new(ctx, 512)?,
             };
             base.row = end;
             if base.row == base.row_end {
                 base.clear_block();
                 if base.next == base.end {
-                    self.at += 1;
+                    *at += 1;
                     base.next = 0;
                     base.end = 0;
                     base.ahead = Default::default();
@@ -4609,7 +5169,7 @@ impl Scan {
         if self.reads_base(ctx) {
             let mut base = self.base.take().expect("checked base scan");
             // Owned rows do not keep the block, so its charge for shared batches ends.
-            base.shared = None;
+            base.unshare();
             let result = base
                 .unpark(ctx, ctx.snap.perm(self.spec.perm))
                 .and_then(|()| self.next_base(ctx, vars, cap, &mut base));
@@ -4704,6 +5264,110 @@ fn successor(mut key: Key) -> Option<Key> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn unconfigured_cursor(
+        query: &str,
+        max_rows_produced: Option<u64>,
+    ) -> (Result<QueryCursor>, Arc<AtomicUsize>) {
+        use super::super::callback_guard_tests::{prepare_unconfigured, unconfigured};
+        let parsed = super::super::parse_query(query, None, &[]).unwrap();
+        let (mut ctx, opens) = unconfigured();
+        if let Some(limit) = max_rows_produced {
+            ctx.max_rows_produced = limit;
+        }
+        let prepared = prepare_unconfigured(&parsed, ctx, true);
+        let levels = prepared.plan_depth;
+        let cursor = from_prepared(
+            prepared,
+            &parsed,
+            query,
+            &QueryOptions::default(),
+            &CursorOptions {
+                fallback: FallbackPolicy::RejectMaterialization,
+                ..Default::default()
+            },
+            Instant::now(),
+            0.0,
+            0.0,
+            levels,
+            QueryKind::Select,
+        )
+        .map(|(cursor, _, _)| cursor);
+        (cursor, opens)
+    }
+
+    #[test]
+    fn callback_guard_exists_fails_before_a_cursor_emits_rows() {
+        use super::super::callback_guard_tests::{EXISTS_QUERY, assert_unconfigured};
+        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY, None);
+        let mut cursor = cursor.unwrap();
+        let result = cursor.next_batch();
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        let error = match result {
+            Err(error) => error,
+            Ok(Some(batch)) => panic!(
+                "unexpected batch of {} rows starting with {:?}",
+                batch.len(),
+                batch
+                    .term(0, 0)
+                    .unwrap()
+                    .as_ref()
+                    .map(|value| value.as_term())
+            ),
+            Ok(None) => panic!("the cursor finished without an error"),
+        };
+        assert_unconfigured(error);
+        assert_eq!(cursor.status(), CursorStatus::Failed);
+        assert_eq!(cursor.stats().emitted_rows, 0);
+    }
+
+    #[test]
+    fn callback_guard_cursor_preserves_the_refusal_at_its_produced_row_limit() {
+        use super::super::callback_guard_tests::{EXISTS_QUERY, assert_unconfigured};
+        let (cursor, opens) = unconfigured_cursor(EXISTS_QUERY, Some(1));
+        let mut cursor = cursor.unwrap();
+        let error = cursor.next_batch().err().expect("a refusal on first pull");
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+        assert_eq!(cursor.status(), CursorStatus::Failed);
+        assert_eq!(cursor.stats().emitted_rows, 0);
+        assert_unconfigured(error);
+    }
+
+    #[test]
+    fn callback_guard_cursor_allows_untaken_exists_and_expression_fallback() {
+        use super::super::callback_guard_tests::FALLBACK_QUERY;
+        let (cursor, opens) = unconfigured_cursor(FALLBACK_QUERY, None);
+        let mut cursor = cursor.unwrap();
+        let batch = cursor.next_batch().unwrap().unwrap();
+        assert_eq!(batch.len(), 1);
+        for (column, expected) in [true, false].into_iter().enumerate() {
+            let term = batch.term(0, column).unwrap().unwrap();
+            assert_eq!(
+                term.as_term(),
+                &Term::Literal(oxrdf::Literal::from(expected))
+            );
+        }
+        assert!(cursor.next_batch().unwrap().is_none());
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn callback_guard_cursor_still_checks_other_exists_patterns_for_materialization() {
+        let (cursor, opens) = unconfigured_cursor(
+            "SELECT ?b WHERE {
+                BIND(COALESCE(
+                    EXISTS { <urn:s> <urn:callback> ?x },
+                    EXISTS { SERVICE <urn:remote> { ?s <urn:p> ?o } }
+                ) AS ?b)
+            }",
+            None,
+        );
+        assert!(
+            matches!(cursor, Err(Error::Unsupported(message)) if message.starts_with("cursor requires materialization at Bind"))
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+    }
 
     fn collected_values(
         width: usize,
@@ -5193,6 +5857,174 @@ mod tests {
         (n as u64, ctx.snap.cache.misses() - before, ctx.mem_peak())
     }
 
+    /// A scan that switches between shared batches and owned rows inside a block, with
+    /// the shared batches dropped or held and a view that keeps no blocks, returns every
+    /// row once and in order. A scan keeps no weak handle on a block it shares, so every
+    /// switch to owned rows takes the block back from the shared one (roadmap item 1063).
+    /// Rows of another graph inside the first block make a shared read decline there.
+    #[cfg(unix)]
+    #[test]
+    fn base_scan_switches_between_shared_and_owned_rows_inside_a_block() {
+        use crate::index::{BLOCK_ROWS, BlockCache, Perm, PermIndex, PermWriter};
+        use crate::store::{Store, StoreOptions};
+        let rows = 2 * BLOCK_ROWS + 1_000;
+        let other = |i: usize| i == 1_001 || (5_000..5_003).contains(&i) || i == BLOCK_ROWS + 7_777;
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for i in 0..rows as u64 {
+            let graph = if other(i as usize) { 9 } else { 0 };
+            writer.push([i, i * 3 + 1, 0, graph]).unwrap();
+        }
+        writer.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let expected = (0..rows)
+            .filter(|&i| !other(i))
+            .map(|i| i as u64 * 3 + 1)
+            .collect::<Vec<_>>();
+        for (fill, keep) in [(false, false), (false, true), (true, false), (true, true)] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut snapshot = (*store.snapshot()).clone();
+            drop(store);
+            Arc::get_mut(&mut snapshot.generation)
+                .expect("owned fixture generation")
+                .perms[Perm::Spo.index()] = idx.clone();
+            let cache = BlockCache::new(64 << 20);
+            snapshot.cache = Arc::new(if fill { cache } else { cache.read_through() });
+            let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+            let var = ctx.var("o");
+            let spec = ScanSpec {
+                perm: Perm::Spo,
+                prefix: vec![],
+                cols: vec![(1, var)],
+                eqs: vec![],
+                graph: super::super::plan::GraphFilter::One(0),
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            };
+            let mut scan = Scan::new(spec, None);
+            let mut seen = Vec::new();
+            let mut held = None;
+            let (mut shared, mut owned) = (0, 0);
+            for step in 0.. {
+                if scan.done() {
+                    break;
+                }
+                let cap = [1_000, 3, 4_096, 777][step % 4];
+                // Every third read asks for owned rows, the others for shared batches.
+                let attempt = if step % 3 == 2 {
+                    SharedAttempt::Unsupported
+                } else {
+                    scan.next_shared(&ctx, &[var], cap).unwrap()
+                };
+                match attempt {
+                    SharedAttempt::Ready(Some(batch)) => {
+                        shared += 1;
+                        let column = &batch.shared.block.cols[batch.columns[0]];
+                        seen.extend_from_slice(&column[batch.start..batch.end]);
+                        held = keep.then_some(batch);
+                    }
+                    SharedAttempt::Ready(None) => break,
+                    SharedAttempt::Unsupported => {
+                        let Some(buffer) = scan.next(&ctx, &[var], cap).unwrap() else {
+                            break;
+                        };
+                        owned += 1;
+                        seen.extend(buffer.table.cols[0].iter().map(|id| id.0));
+                    }
+                }
+            }
+            drop(held);
+            assert!(shared > 10 && owned > 10, "{shared} shared, {owned} owned");
+            assert_eq!(seen.len(), expected.len(), "fill {fill}, keep {keep}");
+            assert!(
+                seen == expected,
+                "fill {fill}, keep {keep}: rows out of order"
+            );
+        }
+    }
+
+    /// A shared read that declines right after a partial shared batch, before any owned
+    /// read made a weak handle, leaves its row unconsumed and the block in the scan, and
+    /// the owned read that follows returns the remaining rows once and in order, also when
+    /// the view keeps no blocks and the earlier batch was dropped (roadmap item 1063).
+    #[cfg(unix)]
+    #[test]
+    fn base_scan_declining_while_it_shares_a_block_resumes_at_its_row() {
+        use crate::index::{BLOCK_ROWS, BlockCache, Perm, PermIndex, PermWriter};
+        use crate::store::{Store, StoreOptions};
+        let rows = BLOCK_ROWS + 500;
+        let other = |i: usize| i == 1_005;
+        let dir = tempfile::tempdir().unwrap();
+        let mut writer = PermWriter::create(dir.path(), Perm::Spo).unwrap();
+        for i in 0..rows as u64 {
+            let graph = if other(i as usize) { 9 } else { 0 };
+            writer.push([i, i * 3 + 1, 0, graph]).unwrap();
+        }
+        writer.finish(dir.path(), Perm::Spo).unwrap();
+        let idx = PermIndex::open(dir.path(), Perm::Spo).unwrap();
+        let expected = (0..rows)
+            .filter(|&i| !other(i))
+            .map(|i| i as u64 * 3 + 1)
+            .collect::<Vec<_>>();
+        for (fill, keep) in [(false, false), (false, true), (true, false)] {
+            let store = Store::in_memory(StoreOptions::default());
+            let mut snapshot = (*store.snapshot()).clone();
+            drop(store);
+            Arc::get_mut(&mut snapshot.generation)
+                .expect("owned fixture generation")
+                .perms[Perm::Spo.index()] = idx.clone();
+            let cache = BlockCache::new(64 << 20);
+            snapshot.cache = Arc::new(if fill { cache } else { cache.read_through() });
+            let ctx = Arc::new(Ctx::new(Arc::new(snapshot)));
+            let var = ctx.var("o");
+            let spec = ScanSpec {
+                perm: Perm::Spo,
+                prefix: vec![],
+                cols: vec![(1, var)],
+                eqs: vec![],
+                graph: super::super::plan::GraphFilter::One(0),
+                graph_col: 3,
+                dedup: false,
+                src: None,
+            };
+            let mut scan = Scan::new(spec, None);
+            let ids = |batch: &SharedBatch| {
+                batch.shared.block.cols[batch.columns[0]][batch.start..batch.end].to_vec()
+            };
+            let SharedAttempt::Ready(Some(first)) = scan.next_shared(&ctx, &[var], 1_000).unwrap()
+            else {
+                panic!("the first read shares its block");
+            };
+            let mut seen = ids(&first);
+            let held = keep.then_some(first);
+            let base = scan.base.as_ref().unwrap();
+            assert!(base.shared.is_some() && base.parked.is_none() && base.block.is_none());
+            assert_eq!(base.row, 1_000);
+            assert!(matches!(
+                scan.next_shared(&ctx, &[var], 10).unwrap(),
+                SharedAttempt::Unsupported
+            ));
+            let base = scan.base.as_ref().unwrap();
+            assert_eq!(base.row, 1_000, "the declined read consumed rows");
+            assert!(base.shared.is_none() && base.parked.is_some());
+            drop(held);
+            let owned = scan.next(&ctx, &[var], 2_000).unwrap().unwrap();
+            seen.extend(owned.table.cols[0].iter().map(|id| id.0));
+            while !scan.done() {
+                match scan.next_shared(&ctx, &[var], 4_096).unwrap() {
+                    SharedAttempt::Ready(Some(batch)) => seen.extend(ids(&batch)),
+                    SharedAttempt::Ready(None) => break,
+                    SharedAttempt::Unsupported => panic!("no other row declines"),
+                }
+            }
+            assert!(
+                seen == expected,
+                "fill {fill}, keep {keep}: rows lost or repeated"
+            );
+        }
+    }
+
     /// Between batches a scan keeps its block through the cache, without a charge, and
     /// decodes each block once (roadmap item 1039).
     #[cfg(unix)]
@@ -5360,8 +6192,9 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER NOT EXISTS {?s <urn:q> ?b . FILTER NOT EXISTS {?b <urn:p> ?s}}}",
                 true,
             ),
-            // an EXISTS answered from a key set in BIND, and in an OPTIONAL condition,
-            // whose conditional OPTIONAL is slower in the cursor
+            // an EXISTS answered from a key set in BIND, but not in the condition of an
+            // OPTIONAL, whether or not the cursor can merge it, because the cursor's
+            // conditional merge is slower than eager execution's at higher fan-out
             (
                 "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(EXISTS {?s <urn:q> ?b} AS ?e)} GROUP BY ?e",
                 true,
@@ -5370,9 +6203,30 @@ mod tests {
                 "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
                 false,
             ),
-            // and one evaluated per distinct key inside a larger expression
+            (
+                "SELECT (COUNT(*) AS ?n) {?x <urn:p> ?s OPTIONAL {?s <urn:q> ?b FILTER EXISTS {?b <urn:p> ?c}}}",
+                false,
+            ),
+            // and one inside a larger expression, an aggregate argument or an ORDER BY
+            // key, answered from a key set or per distinct key
             (
                 "SELECT ?e (COUNT(*) AS ?n) {?s <urn:p> ?a BIND(IF(EXISTS {?s <urn:q> ?b}, 1, 0) AS ?e)} GROUP BY ?e",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER(?a = 1 || NOT EXISTS {?s <urn:q> ?b})}",
+                true,
+            ),
+            (
+                "SELECT ?a (SUM(IF(EXISTS {?s <urn:q> ?b}, 1, 0)) AS ?n) {?s <urn:p> ?a} GROUP BY ?a",
+                true,
+            ),
+            (
+                "SELECT ?a (COUNT(?c) AS ?n) {?s <urn:p> ?a OPTIONAL {?s <urn:q> ?c}} GROUP BY ?a ORDER BY DESC(EXISTS {?a <urn:q> ?b}) ?a",
+                true,
+            ),
+            (
+                "SELECT (COUNT(*) AS ?n) {?s <urn:p> ?a FILTER(?a = 1 || EXISTS {SERVICE <http://example.org/sparql> {?s ?p ?o}})}",
                 false,
             ),
             (
@@ -5635,6 +6489,15 @@ mod tests {
         };
         let counted = "SELECT ?f (COUNT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f";
         assert!(memory(counted));
+        // EXISTS patterns without a key set that share no variable with the rows keep
+        // one answer each, so four of them do not take the cursor's room
+        assert!(memory(
+            "SELECT ?f (COUNT(?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f \
+             FILTER EXISTS { { ?a <urn:q> ?b } UNION { ?a <urn:p> ?b } } \
+             FILTER EXISTS { { ?c <urn:q> ?d } UNION { ?c <urn:p> ?d } } \
+             FILTER EXISTS { { ?e <urn:q> ?g } UNION { ?e <urn:p> ?g } } \
+             FILTER EXISTS { { ?h <urn:q> ?i } UNION { ?h <urn:p> ?i } } } GROUP BY ?f"
+        ));
         assert!(!memory(
             "SELECT ?f (COUNT(DISTINCT ?o) AS ?n) { ?s <urn:p> ?o . ?x <urn:q> ?f } GROUP BY ?f"
         ));

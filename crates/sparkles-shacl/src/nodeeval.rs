@@ -136,10 +136,17 @@ impl Engine<'_> {
 
     fn over_budget(&self, cx: &Cx) -> Result<()> {
         if cx.expr_work > self.max_expr_nodes {
-            return fail(format!(
-                "a node expression worked through more than {} units",
-                self.max_expr_nodes
-            ));
+            let budget = sparkles_core::Budget {
+                kind: sparkles_core::BudgetKind::ValidationWork,
+                limit: self.max_expr_nodes,
+                requested: cx.expr_work,
+            };
+            return Err(
+                anyhow::Error::new(sparkles_core::Error::BudgetExceeded(budget)).context(format!(
+                    "a node expression worked through more than {} units",
+                    self.max_expr_nodes
+                )),
+            );
         }
         Ok(())
     }
@@ -202,7 +209,7 @@ impl Engine<'_> {
                     }
                 };
                 match &self.expr_paths[e] {
-                    Some(p) => p.eval(self.data, node),
+                    Some(path) => self.eval_path(path, node),
                     None => Ok(Vec::new()),
                 }
             }
@@ -366,13 +373,15 @@ impl Engine<'_> {
                 let mut out = Vec::new();
                 let mut seen = FxHashSet::default();
                 for t in types {
+                    self.check_limits()?;
                     if !matches!(self.data.term(t), Some(Term::NamedNode(_))) {
                         return fail(format!(
                             "shnex:instancesOf expects classes that are IRIs, found {}",
                             self.show(t)
                         ));
                     }
-                    for i in self.data.instances(t)? {
+                    for i in self.data.instances_checked(t, || self.check_data_scan())? {
+                        self.check_limits()?;
                         if seen.insert(i) {
                             out.push(i);
                         }

@@ -14,6 +14,7 @@ use crate::error::Result;
 use crate::id::Id;
 use crate::sparql::ctx::Ctx;
 use crate::sparql::exec::AggState;
+use crate::sparql::expr::Expr;
 use crate::sparql::plan::Agg;
 use crate::sparql::table::Table;
 use crate::sparql::value::Value;
@@ -312,6 +313,8 @@ impl Accumulator for Running {
 /// form.
 pub(crate) struct Concat {
     separator: String,
+    /// GROUP_CONCAT(DISTINCT …), which some readings make unbound over no rows
+    distinct: bool,
     groups: Vec<ConcatState>,
     growth: u64,
 }
@@ -332,6 +335,7 @@ impl Concat {
         };
         Self {
             separator,
+            distinct: agg.distinct,
             groups: Vec::new(),
             growth: 0,
         }
@@ -366,6 +370,11 @@ impl Accumulator for Concat {
             let Some(value) = ctx.value(id) else {
                 continue;
             };
+            // CONCAT takes only strings
+            if ctx.aggregate_errors.concat_strings_only() && !value.is_string() {
+                state.ok = false;
+                continue;
+            }
             let Ok(lexical) = value.lexical() else {
                 state.ok = false;
                 continue;
@@ -417,7 +426,10 @@ impl Accumulator for Concat {
                 empty: true,
             },
         );
-        Ok(if state.ok {
+        let nothing = state.empty
+            && self.distinct
+            && ctx.aggregate_errors.distinct_concat_of_nothing_unbound();
+        Ok(if state.ok && !nothing {
             // SPARQL 1.1: the result is a simple literal
             ctx.intern_value(&Value::Str(state.text.into()))
         } else {
@@ -571,6 +583,21 @@ impl Accumulator for Rows {
             Arg::Column(values) => Some(values),
             Arg::Star | Arg::Unbound => None,
         };
+        // EXISTS patterns that the aggregate evaluates itself, such as in a FOLD's value
+        // or ORDER BY, answered from their key sets for the batch's rows
+        let evaluated: Vec<&Expr> = self
+            .agg
+            .expr
+            .iter()
+            .filter(|_| arg.is_none())
+            .chain(self.agg.fold.iter().flat_map(|fold| {
+                fold.value
+                    .iter()
+                    .chain(fold.order.iter().map(|(key, _)| key))
+            }))
+            .collect();
+        let nested = crate::sparql::exists::nested(ctx, batch.table, &evaluated)?;
+        let exists = nested.as_ref().map(|n| &n.answers);
         for g in 0..index.groups() {
             ctx.check()?;
             let rows = index.of(g);
@@ -584,7 +611,7 @@ impl Accumulator for Rows {
                     descriptor,
                 )?
             } else {
-                crate::sparql::exec::aggregate(ctx, batch.table, &map, rows, &self.agg, arg)
+                crate::sparql::exec::aggregate(ctx, batch.table, &map, rows, &self.agg, arg, exists)
             };
             if ctx.calls_extensions {
                 ctx.check()?;

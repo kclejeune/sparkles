@@ -9,4 +9,6 @@ Commands and output formats are in the [harness guide](../../BENCHMARKING.md).
 
 The [spill default and execution cost records](records/spill-item-93-2026-10-31/README.md)
 hold the manual records of the forge runs for roadmap item 93. They list their builds,
-configuration and file hashes, and the run catalog does not include them.
+configuration and file hashes, and the run catalog does not include them. The
+[charged DISTINCT records](records/charged-distinct-2026-11-20/README.md) hold the forge
+comparison of DISTINCT before and after its move onto charged buffers in the same way.

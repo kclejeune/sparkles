@@ -1,0 +1,1 @@
+PREFIX ex: <http://example.org/> SELECT ?p WHERE { ?p a ex:Researcher } ORDER BY DESC(EXISTS { ?p ex:authorOf ?d }) ?p LIMIT 10

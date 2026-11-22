@@ -1,0 +1,156 @@
+diff --git a/crates/sparkles-owl/src/classify/horn_rules.rs b/crates/sparkles-owl/src/classify/horn_rules.rs
+index 28d2c32a..e3f9a053 100644
+--- a/crates/sparkles-owl/src/classify/horn_rules.rs
++++ b/crates/sparkles-owl/src/classify/horn_rules.rs
+@@ -480,6 +480,7 @@ pub fn succ<S: Sink>(
+             .as_ref()
+             .is_some_and(|x| x.horn.succ.list.len() <= COVERED_MOST && covered(ix, &x.horn, r, n))
+     {
++        eprintln!("HORNPASSED {me} {r} {n}");
+         return false;
+     }
+     if !hs(st).succ.insert((r, n)) {
+@@ -931,6 +932,9 @@ fn identify<S: Sink>(
+             }
+             // a predecessor holds for good the core it was sent once, and one that is
+             // the successor itself holds its own
++            if m == n2 && spare() >= 2 {
++                eprintln!("HORNSELF {me} {m}");
++            }
+             if (m != n2 || spare() < 2) && told.first(m, n2) {
+                 send_core(ix, m, n2, out);
+             }
+diff --git a/crates/sparkles-owl/src/classify/mod.rs b/crates/sparkles-owl/src/classify/mod.rs
+index 1710691b..c71a36f5 100644
+--- a/crates/sparkles-owl/src/classify/mod.rs
++++ b/crates/sparkles-owl/src/classify/mod.rs
+@@ -2569,6 +2569,7 @@ impl Saturation {
+             let witnesses = world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal);
+             if !witnesses.is_empty() {
+                 let classes = world::reaching(&ix, &self.ctx, dynamic.as_ref(), &witnesses);
++                eprintln!("HORNWORLDS witnesses={} classes={}", witnesses.len(), classes.len());
+                 let mut real: Vec<Ex> = (0..self.ctx.len() as Ex)
+                     .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
+                     .collect();
+diff --git a/crates/sparkles-owl/src/classify/world.rs b/crates/sparkles-owl/src/classify/world.rs
+index c2d3ad5f..719262b4 100644
+--- a/crates/sparkles-owl/src/classify/world.rs
++++ b/crates/sparkles-owl/src/classify/world.rs
+@@ -555,6 +555,8 @@ struct Knows {
+ /// than it, or give a fact of a universal role that is not global. An intersection
+ /// among the subsumers adds nothing beyond its operands, which are subsumers too, so
+ /// only the other subsumers count.
++thread_local! { static DIAG_FLIP: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) }; }
++
+ pub fn witnesses(
+     ix: &Index,
+     ctx: &Contexts,
+@@ -612,23 +614,95 @@ pub fn witnesses(
+                  loops,
+                  noms,
+              }| {
+-                noms.iter().any(|&n| {
+-                    let mut more = true;
++                // diagnostic: every nominal is read, with the clause and without it
++                let mut any_with = false;
++                let mut any_without = false;
++                for &n in noms.iter() {
++                    let mut with = true;
++                    let mut without = true;
+                     view.with(n, &mut |st, _| {
+-                        more = !st.bottom
+-                            && (subs.iter().any(|s| !st.subs.contains(s))
+-                                || loops.iter().any(|l| !st.loops.contains(l))
+-                                || succ.iter().any(|s| {
+-                                    !st.extra.as_ref().is_some_and(|x| {
+-                                        x.horn.succ.contains(s)
+-                                            || super::horn_rules::covered(ix, &x.horn, s.0, s.1)
+-                                    })
+-                                }));
++                        let other = subs.iter().any(|s| !st.subs.contains(s))
++                            || loops.iter().any(|l| !st.loops.contains(l));
++                        let lacks = |cov: bool| {
++                            succ.iter().any(|s| {
++                                !st.extra.as_ref().is_some_and(|x| {
++                                    x.horn.succ.contains(s)
++                                        || (cov
++                                            && super::horn_rules::covered(ix, &x.horn, s.0, s.1))
++                                })
++                            })
++                        };
++                        with = !st.bottom && (other || lacks(true));
++                        without = !st.bottom && (other || lacks(false));
++                        if !st.bottom {
++                            if let Some(x) = st.extra.as_ref() {
++                                for s in succ.iter() {
++                                    if !x.horn.succ.contains(s)
++                                        && super::horn_rules::covered(ix, &x.horn, s.0, s.1)
++                                    {
++                                        let by: Vec<Role> = x
++                                            .horn
++                                            .succ
++                                            .list
++                                            .iter()
++                                            .filter(|t| t.1 == s.1 && t.0 != s.0)
++                                            .map(|t| t.0)
++                                            .collect();
++                                        eprintln!(
++                                            "HORNWITNESS ctx={e} nom={n} r={} m={} by={by:?} nsucc={} other={other} with={with} without={without}",
++                                            s.0,
++                                            s.1,
++                                            x.horn.succ.list.len()
++                                        );
++                                    }
++                                }
++                            }
++                        }
+                     });
+-                    more
+-                })
++                    any_with |= with;
++                    any_without |= without;
++                }
++                if any_with != any_without {
++                    eprintln!("HORNWITNESSMORE ctx={e} with={any_with} without={any_without}");
++                    DIAG_FLIP.with(|c| c.set((any_with, any_without)));
++                }
++                // diagnostic: SPARKLES_DIAG_NOCLAUSE takes the answer without the clause
++                if std::env::var_os("SPARKLES_DIAG_NOCLAUSE").is_some() {
++                    any_without
++                } else {
++                    any_with
++                }
+             },
+         );
++        {
++            let mut line = String::new();
++            view.with(e, &mut |st, real| {
++                if !st.noms().is_empty() && !st.bottom {
++                    let subs: Vec<String> = st
++                        .subs
++                        .iter()
++                        .map(|&s| format!("{s}:{:?}", ix.head(s).node))
++                        .collect();
++                    let succ = st.extra.as_ref().map_or(Vec::new(), |x| x.horn.succ.list.to_vec());
++                    line = format!(
++                        "HORNCTX ctx={e} real={real} dynamic={} noms={:?} more={more} universal={universal_witness} counted={counted} subs={subs:?} succ={succ:?}",
++                        e as usize >= ctx.len(),
++                        st.noms()
++                    );
++                }
++            });
++            if !line.is_empty() {
++                eprintln!("{line}");
++            }
++        }
++        let flip = DIAG_FLIP.with(|c| c.replace((false, false)));
++        if flip.0 != flip.1 {
++            let w = more || universal_witness || counted;
++            let wo = flip.1 || universal_witness || counted;
++            if w != wo {
++                eprintln!("HORNDECISIVE ctx={e} witness_with={w} witness_without={wo}");
++            }
++        }
+         if more || universal_witness || counted {
+             out.push(e);
+         }

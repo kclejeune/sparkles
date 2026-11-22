@@ -199,6 +199,39 @@ mixed. The cursor also holds much less. At 10.5M its ledger peaked at 2.2 MB for
 102.1 MB. A full sort stays eager by default, because the in-memory cursor sort holds its
 whole input with decoded keys, 580 MB in the ledger against 31 MB eagerly.
 
+<a id="charged-distinct-buffers"></a>
+
+#### DISTINCT on charged buffers
+
+DISTINCT keeps its set in `Charged` buffers, which take their charge from their own
+allocations ([X19](../../specs/X19-charged-buffers/SPEC.md#distinct)). This comparison
+ran the build before that change, 74f229b9, as A against 62f72e53 as B on `forge`, at
+1.05M quads with one Rayon thread and no budget that binds. Each mode ran 8 rounds of
+A, B, B, A with a fresh pinned server per process and 20 timed requests per query, both
+passes were valid with a same-binary spread of 1.9% and 2.8%, and both builds returned
+the same answers. The table gives median server execution times and the ratio of B to
+A. A bold ratio was above 1 in every round, or below 1 in every round for a gain.
+
+| 1.05M, ms | Streamed, A | Streamed, B | Ratio | Automatic, A | Automatic, B | Ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| `distinct-one`, DISTINCT of one column | 2.92 | 2.85 | **0.975** | 2.98 | 2.98 | 1.000 |
+| `distinct-two`, DISTINCT of two columns of a join | 6.54 | 6.59 | **1.008** | 7.66 | 7.69 | 1.004 |
+| `distinct-two-wide`, DISTINCT of two columns of a two-hop join | 32.3 | 33.4 | **1.033** | 41.6 | 41.7 | 1.001 |
+| `distinct-join`, DISTINCT of one column of a join | 3.79 | 3.80 | 1.002 | 3.63 | 3.63 | 1.000 |
+| `class-predicate-list`, DISTINCT predicates of a class | 0.935 | 0.903 | **0.965** | 0.938 | 0.906 | **0.965** |
+| `class-predicates`, COUNT(DISTINCT) per predicate of a class | 0.944 | 0.915 | **0.970** | 0.946 | 0.914 | **0.966** |
+
+*Measured on forge.*
+
+Streamed `distinct-two` takes 51 µs longer and streamed `distinct-two-wide` 1.07 ms
+longer, and [roadmap item 1237](../../ROADMAP.md) holds both costs with their recovery.
+In the streamed `distinct-two-wide` pass the processes of B took 32.2 to 33.8 ms by
+median and those of A 31.0 to 33.6 ms, with no trend across the run. The same query
+under automatic execution shows no difference. `distinct-obj` and `predicate-subjects`
+take 4 to 9 µs, below what this harness resolves, and showed no slowdown. The
+[run record](records/charged-distinct-2026-11-20/README.md) holds the samples, the
+answers and the host's frequency and memory readings.
+
 <a id="automatic-exists"></a>
 
 #### Groupings with EXISTS
@@ -238,11 +271,74 @@ returned the same answers.
 
 *Measured on 8-vCPU AMD EPYC Namespace instances on 2026-11-01.*
 
-An EXISTS inside a larger expression is still evaluated once per distinct outer key,
-which is slower in the cursor, so plans with one stay eager. An OPTIONAL whose condition
-is an EXISTS stays eager as well, because the cursor's conditional OPTIONAL takes several
-times as long as the eager one with any condition. Automatic execution already streams
-`optional-filter` at this size, which item 570 covers.
+The cursor's conditional OPTIONAL hashed when these were measured. It now merges, and
+the table of conditional OPTIONALs below measures it.
+
+Both executors also answer an EXISTS inside a larger expression, such as IF, OR, an
+aggregate argument or an ORDER BY key, from the key set of its pattern, and automatic
+execution streams such plans. The next table compares the base 8baa5686 as A with
+c092dddf as B on `atlas`, a 13th-generation Intel Core i5-13500 benchmark worker, at
+10.5M quads with one Rayon thread, three A, B, B, A rounds and seven timed requests in
+each mode. It gives median server execution times, and both builds returned the same
+answers in both modes. The [run record](records/exists-nested-2026-11-18/README.md)
+holds the samples.
+
+| 10.5M, ms | Eager, A | Eager, B | Streamed, A | Streamed, B |
+|---|---:|---:|---:|---:|
+| `exists-agg`, SUM(IF(EXISTS { ?p ex:authorOf ?d }, 1, 0)) over researchers | 885 | **16.0** | 913 | **14.7** |
+| `not-exists`, the bench query | 17.0 | 17.1 | 17.5 | 17.2 |
+| `exists-bind`, as in the table above | 14.5 | 12.5 | 15.1 | **12.2** |
+| `exists-bind-join`, as in the table above | 16.0 | 10.7 | 14.9 | **10.4** |
+| `exists-union`, a COUNT over FILTER EXISTS of a UNION, which has no key set | 2,134 | 2,125 | 2,173 | 2,174 |
+| `exists-union-bind`, a grouping by BIND(EXISTS) of a UNION | 1,549 | 1,538 | 1,521 | 1,545 |
+
+*Measured on `atlas` on 2026-11-18.*
+
+The medians of the short queries spread from 10 to 18 ms between rounds, so their
+differences between builds are within noise. The UNION shapes are evaluated once per
+distinct outer key, and B streams them in 1.00 and 1.015 times their eager time. A
+sequential run of both builds on the laptop at the same size, which other builds kept
+busy, gave `exists-if` 5,025 ms eagerly and 4,243 ms streamed before against 230 and
+84 ms after, `exists-or` 1,010 and 916 ms against 72 and 24 ms, and `exists-order`
+1,324 and 1,268 ms against 152 and 156 ms. An IF branch that is rarely taken,
+`exists-rare`, went from 69 to 76 ms eagerly and from 12 to 26 ms streamed, because
+every row is probed and the key set is built whether or not the expression reaches the
+EXISTS. Item 1080 covers that cost.
+
+The cursor merges an OPTIONAL with a condition over two inputs sorted on their shared
+variable and tests the condition on each batch's pairs. The next table compares
+bc647108 as A, which hashed every conditional OPTIONAL in the cursor, with ca1532ba as
+B on `atlas` at 10.5M quads with one Rayon thread, three A, B, B, A rounds and seven
+timed requests in each mode. It gives median server execution times, and both builds
+returned the same answers in both modes. The
+[run record](records/exists-optional-2026-11-19/README.md) holds the samples and the
+plans.
+
+| 10.5M, ms | Eager, A | Eager, B | Streamed, A | Streamed, B |
+|---|---:|---:|---:|---:|
+| `optional-filter`, students with an OPTIONAL advisor that is not `ex:nobody`, counted | 27.9 | 27.2 | 46.6 | **19.3** |
+| `optional-cond`, the advisors of students other than `ex:x`, listed | 20.5 | **18.6** | 70.1 | 19.4 |
+| `exists-optional`, students with an OPTIONAL advisor who wrote a paper, counted | **19.4** | 21.7 | 49.1 | 19.7 |
+| `knows-fail`, an OPTIONAL `foaf:knows` whose FILTER fails every pair | **148** | 150 | 304 | 198 |
+| `knows-exists`, the same OPTIONAL with FILTER EXISTS on the friend | **132** | 133 | 319 | 181 |
+| `knows-mixed`, the same OPTIONAL with a FILTER that ORs a comparison and a NOT EXISTS | 549 | **547** | 829 | 647 |
+| `class-fail`, a conditional OPTIONAL that hashes in both modes | 82.4 | 83.0 | 78.1 | **77.7** |
+| `class-exists`, the same with FILTER EXISTS | 36.2 | 38.5 | 36.7 | **32.5** |
+
+*Measured on `atlas` on 2026-11-19.*
+
+Where a left row has about one pair, B streams in 0.71 to 1.04 times its eager time. A
+person knows about 2.5 others, and over those pairs B streams in 1.18 to 1.36 times its
+eager time. Eager execution tests the condition over all of the matched pairs at once,
+while the cursor emits every pair and a candidate extension for each left row and then
+tests the batch. Automatic execution therefore keeps an
+OPTIONAL whose condition holds an EXISTS eager, which item 570 covers. The eager
+differences between the builds are within the spread of their server processes, from
+18.9 to 24.0 ms for `exists-optional` and from 31.5 to 45.2 ms for `class-exists`,
+except eager `optional-cond`, which was faster on B in every round. With
+`merge_left_join` off both builds hash. Over two rounds, resampling the medians of
+their server processes gave a 95% interval that reaches 1.0 on every query except
+streamed `knows-fail`, 305.3 ms on B against 302.5 ms on A, which item 1143 holds.
 
 Spill was measured with the cursor under a 64 MiB budget and the eager run unlimited, at
 10.5M, with the spill directory on the instance's local disk.

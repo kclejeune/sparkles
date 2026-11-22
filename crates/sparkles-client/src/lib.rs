@@ -70,7 +70,8 @@ pub use body::{RdfBody, UploadPart};
 pub use client::{CallOptions, Client, ClientBuilder, TokenSource};
 pub use dataset::{CommitsOptions, Dataset, UpdateBatch, UploadOptions};
 pub use endpoint::{
-    Endpoint, Execution, QueryMethod, QueryOptions, ReadOptions, UpdateOptions, WriteOptions,
+    AggregateErrors, Endpoint, Execution, QueryMethod, QueryOptions, ReadOptions, UpdateOptions,
+    WriteOptions,
 };
 pub use error::{Error, Result, StatusError};
 pub use history::{BranchDeleteOptions, DiffOptions, HistoryOptions};

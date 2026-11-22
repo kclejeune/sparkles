@@ -37,7 +37,7 @@ pub const BRANCH_FILE: &str = "branch.json";
 pub const MERGES_FILE: &str = "merges.bin";
 
 /// Configuration files a new branch copies from its upstream.
-const COPIED_FILES: [&str; 15] = [
+const COPIED_FILES: [&str; 16] = [
     "reasoning.json",
     "rdfs.json",
     "rdfs-schema.nt",
@@ -51,6 +51,7 @@ const COPIED_FILES: [&str; 15] = [
     crate::vector::config::CONFIG_FILE,
     compaction::COMPACTION_FILE,
     describe::DESCRIBE_FILE,
+    super::aggregates::AGGREGATE_ERRORS_FILE,
     changelog::CHANGE_LOG_FILE,
     "origin.json",
 ];
@@ -2354,6 +2355,7 @@ impl Store {
         self.failpoint("memory-branch-indexes");
         up.configure_indexes(&store)?;
         *store.describe.write() = up.describe.read().clone();
+        *store.aggregate_errors.write() = *up.aggregate_errors.read();
         *store.compaction.settings.lock() = up.compaction.settings.lock().clone();
         if let (Some(src), Some(dst)) = (&up.mem_history, &store.mem_history) {
             dst.lock().retention = src.lock().retention;

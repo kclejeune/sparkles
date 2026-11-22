@@ -6,7 +6,9 @@ use oxrdf::{NamedNode, Term};
 use sparkles_core::io::{RdfFormat, Source};
 use sparkles_core::store::{Store, StoreOptions};
 use sparkles_shacl::form::{FieldGroup, FieldPath, form_layout, form_layout_with, pick_lang};
+use sparkles_shacl::shapes::Constraint;
 use sparkles_shacl::{Shapes, ValidateOptions, shapes_for_node};
+use std::fmt::Write;
 
 const SHAPES: &str = r#"
 @prefix sh: <http://www.w3.org/ns/shacl#> .
@@ -145,6 +147,77 @@ fn controlled_layout_preserves_cancellation_and_rejects_deep_expansion() {
     let root = shapes.shape_id(&ex("S0").into()).unwrap();
     let failure = form_layout_with(&shapes, &[root], &mut || Ok(())).unwrap_err();
     assert!(failure.to_string().contains("nesting exceeds"));
+}
+
+fn shape_chain(edges: usize) -> String {
+    let mut text = String::from(
+        "@prefix sh: <http://www.w3.org/ns/shacl#> .\n\
+         @prefix ex: <http://ex.org/> .\n\
+         ex:S0 a sh:NodeShape .\n",
+    );
+    for node in 0..edges {
+        writeln!(text, "ex:S{node} sh:node ex:S{} .", node + 1).unwrap();
+    }
+    text
+}
+
+#[test]
+fn parser_keeps_long_cyclic_shape_chains() {
+    let edges = 256;
+    let mut text = shape_chain(edges);
+    writeln!(text, "ex:S{edges} sh:node ex:S0 .").unwrap();
+    let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+    assert_eq!(shapes.shapes().len(), edges + 1);
+    for node in 0..=edges {
+        let current = shapes.shape_id(&ex(&format!("S{node}")).into()).unwrap();
+        let next = shapes
+            .shape_id(&ex(&format!("S{}", (node + 1) % (edges + 1))).into())
+            .unwrap();
+        assert!(matches!(
+            shapes.shapes()[current].constraints.as_slice(),
+            [Constraint::Node(id)] if *id == next
+        ));
+    }
+}
+
+#[test]
+fn controlled_layout_keeps_the_shape_depth_boundary() {
+    let mut text = shape_chain(65);
+    text.push_str("ex:S65 sh:property [ sh:path ex:p ] .");
+    let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+    let within = shapes.shape_id(&ex("S1").into()).unwrap();
+    let layout = form_layout_with(&shapes, &[within], &mut || Ok(())).unwrap();
+    assert_eq!(layout.fields.len(), 1);
+    assert_eq!(layout.fields[0].path, FieldPath::Predicate(ex("p")));
+    let beyond = shapes.shape_id(&ex("S0").into()).unwrap();
+    let failure = form_layout_with(&shapes, &[beyond], &mut || Ok(())).unwrap_err();
+    assert_eq!(
+        failure.to_string(),
+        "form shape nesting exceeds the preparation limit"
+    );
+}
+
+#[test]
+fn parser_keeps_the_path_depth_boundary_after_shape_descent() {
+    for depth in [64, 65] {
+        let mut text = shape_chain(192);
+        text.push_str("ex:S192 sh:property ex:Terminal .\nex:Terminal sh:path _:path0 .\n");
+        for step in 0..depth - 1 {
+            writeln!(text, "_:path{step} sh:inversePath _:path{} .", step + 1).unwrap();
+        }
+        writeln!(text, "_:path{} sh:inversePath ex:p .", depth - 1).unwrap();
+        match depth {
+            64 => {
+                let shapes = Shapes::parse(&text, RdfFormat::Turtle, None).unwrap();
+                assert!(shapes.shape(&ex("Terminal").into()).unwrap().path.is_some());
+            }
+            65 => {
+                let error = Shapes::parse(&text, RdfFormat::Turtle, None).err().unwrap();
+                assert!(format!("{error:#}").contains("property path nested too deeply"));
+            }
+            _ => unreachable!(),
+        }
+    }
 }
 
 #[test]

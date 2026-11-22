@@ -80,6 +80,28 @@ fn check(snap: &Arc<Snapshot>, text: &str) -> (Vec<String>, bool) {
 
 /// Shapes, and whether the rewrite applies to them (when the outer rows bind a key).
 const SHAPES: &[(&str, bool)] = &[
+    // an EXISTS inside a larger expression, an aggregate argument or an ORDER BY key
+    // reads its answers from the key set too, partial bindings included
+    (
+        "SELECT * WHERE { ?x ex:p ?y FILTER(?y = ex:a || EXISTS { ?y ex:q ?z }) }",
+        true,
+    ),
+    (
+        "SELECT * WHERE { ?x ex:p ?y BIND(IF(EXISTS { ?y ex:q ?z }, 1, 0) AS ?e) }",
+        true,
+    ),
+    (
+        "SELECT * WHERE { ?x ex:p ?y OPTIONAL { ?y ex:q ?z } BIND(COALESCE(BOUND(?z) && NOT EXISTS { ?z ex:r ?w }, false) AS ?e) }",
+        true,
+    ),
+    (
+        "SELECT ?x (SUM(IF(EXISTS { ?y ex:q ?z }, 1, 0)) AS ?n) WHERE { ?x ex:p ?y } GROUP BY ?x",
+        true,
+    ),
+    (
+        "SELECT * WHERE { ?x ex:p ?y } ORDER BY DESC(EXISTS { ?y ex:q ?z }) ?x ?y",
+        true,
+    ),
     // BIND computes EXISTS from the key set as well, partial bindings included
     (
         "SELECT * WHERE { ?x ex:p ?y BIND(EXISTS { ?y ex:q ?z } AS ?e) }",
@@ -324,7 +346,7 @@ const SHAPES: &[(&str, bool)] = &[
     ),
     (
         "SELECT * WHERE { ?x ex:p ?y FILTER(EXISTS { ?y ex:q ?z } || ?x = ex:a) }",
-        false,
+        true,
     ),
     // patterns the rewrite does not admit
     (
@@ -503,6 +525,9 @@ fn explain_shows_decorrelation_and_why_not() {
     let mut ttl = String::from("@prefix ex: <http://ex.org/> .\n");
     for i in 0..3000 {
         ttl.push_str(&format!("ex:s{i} ex:p ex:o{} .\n", i % 700));
+        if i % 3 == 0 {
+            ttl.push_str(&format!("ex:s{i} ex:t ex:v .\n"));
+        }
     }
     // 100 objects with a q (50 of them with two)
     for j in (0..700).step_by(7) {
@@ -528,6 +553,46 @@ fn explain_shows_decorrelation_and_why_not() {
     assert_eq!(counter(on.plan(), "existsPerRow"), Some(0));
     assert_eq!(counter(on.plan(), "existsKeys"), Some(100));
     assert_eq!(counter(on.plan(), "existsSolutions"), Some(150));
+    // an EXISTS inside IF probes the same key set for every row
+    let q = "SELECT ?x WHERE { ?x ex:p ?y FILTER(IF(EXISTS { ?y ex:q ?z }, false, true)) }";
+    let nested = explain_of(&s, q, Optimizations::ALL);
+    assert_eq!(rows(&nested, false), rows(&on, false));
+    assert!(
+        has_desc(nested.plan(), "[EXISTS decorrelated on ?y:"),
+        "{:#?}",
+        nested.plan()
+    );
+    assert_eq!(counter(nested.plan(), "existsProbed"), Some(3000));
+    assert_eq!(counter(nested.plan(), "existsPerRow"), Some(0));
+    // a FOLD evaluates its value itself over its group's rows, from the key set as well,
+    // in the row accumulator that the cursor's grouping also runs
+    let q = "SELECT (FOLD(IF(EXISTS { ?y ex:q ?z }, 1, 0)) AS ?l) WHERE { ?x ex:p ?y }";
+    let folded = explain_of(&s, q, Optimizations::ALL);
+    assert_eq!(
+        rows(&folded, false),
+        rows(&explain_of(&s, q, without()), false)
+    );
+    assert_eq!(counter(folded.plan(), "existsProbed"), Some(3000));
+    assert_eq!(counter(folded.plan(), "existsPerRow"), Some(0));
+    // rows that bind a risky variable are left to substitution, and are counted only
+    // when the expression reaches the EXISTS: never here, every one of them here
+    let skip = "SELECT ?x WHERE { ?x ex:p ?y OPTIONAL { ?x ex:t ?v } FILTER(IF(BOUND(?v), true, EXISTS { ?y ex:q ?z FILTER(!BOUND(?v)) })) }";
+    let reach = "SELECT ?x WHERE { ?x ex:p ?y OPTIONAL { ?x ex:t ?v } FILTER(IF(BOUND(?v), EXISTS { ?y ex:q ?z FILTER(!BOUND(?v)) }, true)) }";
+    for (q, per_row) in [(skip, 0), (reach, 1000)] {
+        let r = explain_of(&s, q, Optimizations::ALL);
+        assert_eq!(
+            rows(&r, false),
+            rows(&explain_of(&s, q, without()), false),
+            "{q}"
+        );
+        assert!(
+            has_desc(r.plan(), "[EXISTS decorrelated on ?y:"),
+            "{q}: {:#?}",
+            r.plan()
+        );
+        assert_eq!(counter(r.plan(), "existsProbed"), Some(2000), "{q}");
+        assert_eq!(counter(r.plan(), "existsPerRow"), Some(per_row), "{q}");
+    }
     // a filter over an outer variable the pattern does not bind: per row, and why
     let q = "SELECT ?x WHERE { ?x ex:p ?y FILTER EXISTS { ?y ex:q ?z FILTER(?z != ?x) } }";
     let r = explain_of(&s, q, Optimizations::ALL);

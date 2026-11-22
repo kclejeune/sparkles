@@ -1049,7 +1049,7 @@ pub(super) fn algo_leaf(
             vars.push(*v);
         }
     }
-    let Some((graph, graph_var)) = p.graph_filter(g) else {
+    let Some((graph, graph_var)) = p.graph_filter(g)? else {
         return Ok(Node::empty(vars));
     };
     if let Some(gv) = graph_var {

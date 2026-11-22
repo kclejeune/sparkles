@@ -1,4 +1,5 @@
 """Tests of scripts/x11-iri-encoding.py, the estimate of X11 Phase 2b's IRI encoding."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import struct
 import unittest

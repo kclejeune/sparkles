@@ -975,3 +975,837 @@ fn a_rewritten_run_that_does_not_take_tier_d_answers_as_a_fresh_classifier() {
     assert_eq!(k.excluded(), fresh.excluded());
     no_internal_names(&k, &out, &[Class::thing(), c("A"), c("B")]);
 }
+
+/// The fixtures of roadmap item 1061 in `tests/fixtures/dl1061` each entail `Z ⊑ Ans` by
+/// HermiT 1.4.5. In each, Z holds a hypothetical role atom to the individual a with a class
+/// P whose universal closes a cycle through the fact `R(b)`, its successors and a back-link
+/// `s(a, x)`, so that only the conditional class P(a) under Z's hypothesis reaches the
+/// successors of b. They guard the registration of the root's facts in a
+/// context: a run that narrows which facts a context receives must still find the
+/// subsumption, or must not report the run complete. The `fam-` files come from a family
+/// that varies the chain of role facts from b, the depth of ordinary successors below b's
+/// existential, where Z's role atom to a sits, and a second role atom from Z to b.
+#[test]
+fn a_conditional_class_of_a_nominal_reaches_the_successors_of_a_fact() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/dl1061");
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "ofn"))
+        .collect();
+    files.sort();
+    assert_eq!(files.len(), 9, "{files:?}");
+    let z = Class::new("http://example.org/n#Z");
+    let ans = Class::new("http://example.org/n#Ans");
+    let mut checked = 0;
+    for path in &files {
+        let ax = ofn_read::parse(&std::fs::read_to_string(path).unwrap())
+            .unwrap()
+            .axioms;
+        for (threads, expansion) in [
+            (1, Expansion::Cautious),
+            (4, Expansion::Cautious),
+            (1, Expansion::Eager),
+            (4, Expansion::Eager),
+        ] {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let name = path.file_name().unwrap().to_string_lossy();
+            assert_eq!(out.consistency, Consistency::Consistent, "{name}");
+            if out.complete && k.excluded().is_empty() {
+                checked += 1;
+                assert!(
+                    out.taxonomy.is_subclass(&z, &ans),
+                    "{name}, {threads} threads, {expansion:?}: a complete run misses Z ⊑ Ans"
+                );
+            }
+        }
+    }
+    // a run that reports every answer incomplete would pass the loop above without a check
+    assert!(checked > 0, "no run of the fixtures was complete");
+}
+
+/// Facts over constants that hold only under K, a successor of K that reaches the same
+/// constants, and an inference over the successor whose two premises each come from one
+/// of those facts (item 1220). The successor holds the facts only as markers, so each
+/// premise has a ground literal in its body. With the selection of such literals and
+/// without selected partners in Hyper over x, the two premises never met, and the run
+/// reported itself complete without the subsumption.
+const MEET: &str = "SubClassOf(:K ObjectSomeValuesFrom(:r :D))
+     SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+     SubClassOf(ObjectSomeValuesFrom(:s2 :B2) :F2)
+     SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)";
+
+#[test]
+fn two_facts_under_a_class_meet_at_its_successor_over_two_constants() {
+    check(
+        &format!(
+            "{MEET}
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B)))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :B2)))
+             SubClassOf(:D ObjectHasValue(:s :v))
+             SubClassOf(:D ObjectHasValue(:s2 :w))
+             SubClassOf(ObjectIntersectionOf(:F :F2) :G)"
+        ),
+        &[("K", "Ans")],
+        &[("D", "G"), ("K", "G")],
+    );
+}
+
+#[test]
+fn two_facts_under_a_class_meet_at_its_successor_over_one_constant() {
+    check(
+        &format!(
+            "{MEET}
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B :B2)))
+             SubClassOf(:D ObjectHasValue(:s :v))
+             SubClassOf(:D ObjectHasValue(:s2 :v))
+             SubClassOf(ObjectIntersectionOf(:F :F2) :G)"
+        ),
+        &[("K", "Ans")],
+        &[("D", "G")],
+    );
+}
+
+#[test]
+fn two_facts_under_a_class_meet_even_when_the_predecessor_reads_their_atoms() {
+    // ∃r.F ⊑ X and ∃r.F2 ⊑ Y make the successor's F and F2 triggers of its predecessor,
+    // which still never learns that one successor is in both
+    for extra in [
+        "SubClassOf(ObjectSomeValuesFrom(:r :F) :X)",
+        "SubClassOf(ObjectSomeValuesFrom(:r :F) :X)
+         SubClassOf(ObjectSomeValuesFrom(:r :F2) :Y)",
+    ] {
+        check(
+            &format!(
+                "{MEET}
+                 {extra}
+                 SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B :B2)))
+                 SubClassOf(:D ObjectHasValue(:s :v))
+                 SubClassOf(:D ObjectHasValue(:s2 :v))
+                 SubClassOf(ObjectIntersectionOf(:F :F2) :G)"
+            ),
+            &[("K", "Ans"), ("K", "X")],
+            &[("D", "G")],
+        );
+    }
+}
+
+/// The successor's clash `B(v) ∧ B2(w) → ⊥` reaches K, which holds both facts as its own.
+/// Join resolves one literal at a time, and the restriction on ground inferences dropped
+/// the ground clause with a body that the first Join leaves, although no ancestor of K
+/// holds the facts to make the inference in its place (item 1220).
+#[test]
+fn a_clash_of_two_facts_under_a_class_at_its_successor_makes_the_class_empty() {
+    for (succ, clash) in [
+        (
+            "SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+             SubClassOf(ObjectSomeValuesFrom(:s2 :B2) :F2)",
+            "DisjointClasses(:F :F2)",
+        ),
+        (
+            "SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+             SubClassOf(:B2 ObjectAllValuesFrom(ObjectInverseOf(:s2) :F2))",
+            "DisjointClasses(:F :F2)",
+        ),
+    ] {
+        let out = rooted(
+            &format!(
+                "SubClassOf(:K ObjectSomeValuesFrom(:r :D))
+                 SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B)))
+                 SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :B2)))
+                 SubClassOf(:D ObjectHasValue(:s :v))
+                 SubClassOf(:D ObjectHasValue(:s2 :w))
+                 {succ}
+                 {clash}
+                 SubClassOf(:E ObjectSomeValuesFrom(:r :D))"
+            ),
+            false,
+            &[("K", "Nothing"), ("D", "Nothing"), ("E", "Nothing")],
+        );
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(out.taxonomy.is_unsatisfiable(&c("K")), "{succ} {clash}");
+        assert!(!out.taxonomy.is_unsatisfiable(&c("D")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("E")));
+    }
+}
+
+/// The premise lookups that leave out selected clauses (item 1220): Hyper at a constant,
+/// Pred from a successor over a successor term of a constant, Join, Eq and Factor, and the
+/// universals over role atoms at a constant. In each case the filter leaves out a selected
+/// premise, and the run still finds K ⊑ Ans, with the selection on or off and with or
+/// without selected partners.
+#[test]
+fn selected_premises_left_out_by_a_lookup_are_made_up_for() {
+    for (name, extra) in [
+        // a conjunction at a constant over two selected premises that keep an atom over x
+        (
+            "h41c",
+            "SubClassOf(:F ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A2))))
+             SubClassOf(ObjectIntersectionOf(:A :A2) :G)
+             SubClassOf(ObjectSomeValuesFrom(:q :G) :W)
+             SubClassOf(:Z :W)",
+        ),
+        // the same conjunction when the premises can go to the predecessor
+        (
+            "h41n",
+            "SubClassOf(:F ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A)))
+             SubClassOf(:F2 ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :A2)))
+             SubClassOf(ObjectIntersectionOf(:A :A2) :G)
+             SubClassOf(ObjectSomeValuesFrom(:q :G) :W)",
+        ),
+        // two universals at v over v's successor term, whose conjunction the successor's Pred needs
+        (
+            "h41f",
+            "ClassAssertion(ObjectSomeValuesFrom(:e :E) :v)
+             SubClassOf(:F ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:e :A))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:e :A2))))
+             SubClassOf(ObjectSomeValuesFrom(:e ObjectIntersectionOf(:A :A2)) :G)
+             SubClassOf(ObjectSomeValuesFrom(:s :G) :W)
+             SubClassOf(:Z :W)",
+        ),
+        // a ground head that only a Join with a fact at c discharges, with an atom over x left
+        (
+            "h42",
+            "SubClassOf(:F ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :C))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectSomeValuesFrom(:q ObjectIntersectionOf(ObjectOneOf(:c) :C2))))
+             SubClassOf(ObjectOneOf(:c) ObjectUnionOf(ObjectComplementOf(:C) ObjectComplementOf(:C2) :G))
+             SubClassOf(ObjectSomeValuesFrom(:q :G) :W)
+             SubClassOf(:Z :W)",
+        ),
+        // a selected x ≈ c that meets a marker A(c)
+        (
+            "h43e",
+            "SubClassOf(:K ObjectSomeValuesFrom(:t2 ObjectIntersectionOf(ObjectOneOf(:c) :A)))
+             SubClassOf(:F ObjectUnionOf(:Z ObjectOneOf(:c)))
+             SubClassOf(:Z :W)
+             SubClassOf(:A :W)",
+        ),
+        // x ≈ c ∨ x ≈ d under a selected body, with A at c and d only under K
+        (
+            "h43f",
+            "SubClassOf(:K ObjectSomeValuesFrom(:t2 ObjectIntersectionOf(ObjectOneOf(:c) :A)))
+             SubClassOf(:K ObjectSomeValuesFrom(:t3 ObjectIntersectionOf(ObjectOneOf(:d) :A)))
+             SubClassOf(:F ObjectUnionOf(ObjectOneOf(:c) ObjectOneOf(:d)))
+             SubClassOf(:A :W)",
+        ),
+        // a selected role atom between constants, from x ≈ c in q(x, w)
+        (
+            "h44",
+            "SubClassOf(:D ObjectHasValue(:q :w))
+             SubClassOf(:F ObjectOneOf(:c))
+             SubClassOf(:K ObjectSomeValuesFrom(:t2 ObjectIntersectionOf(ObjectOneOf(:c) ObjectAllValuesFrom(:q :M))))
+             SubClassOf(ObjectSomeValuesFrom(:q :M) :W)",
+        ),
+        // two selected universals at v over a root role atom from v to w
+        (
+            "h44r",
+            "ObjectPropertyAssertion(:p :v :w)
+             SubClassOf(:F ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:p :A))))
+             SubClassOf(:F2 ObjectUnionOf(:Z ObjectAllValuesFrom(:s ObjectAllValuesFrom(:p :A2))))
+             SubClassOf(ObjectIntersectionOf(:A :A2 ObjectOneOf(:w)) :G0)
+             SubClassOf(:D ObjectHasValue(:q :w))
+             SubClassOf(ObjectSomeValuesFrom(:q :G0) :W)
+             SubClassOf(:Z :W)",
+        ),
+    ] {
+        let out = rooted(
+            &format!(
+                "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B :B2)))
+                 SubClassOf(:K ObjectSomeValuesFrom(:r :D))
+                 SubClassOf(:D ObjectHasValue(:s :v))
+                 SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+                 SubClassOf(ObjectSomeValuesFrom(:s :B2) :F2)
+                 SubClassOf(ObjectSomeValuesFrom(:r :W) :Ans)
+                 SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+                 {extra}"
+            ),
+            false,
+            &[("K", "Ans")],
+        );
+        assert_eq!(out.consistency, Consistency::Consistent, "{name}");
+        assert!(out.taxonomy.is_subclass(&c("K"), &c("Ans")), "{name}: K ⊑ Ans is missing");
+        assert!(!out.taxonomy.is_unsatisfiable(&c("K")), "{name}");
+    }
+}
+
+/// A selected premise over a successor term of a constant (item 1220). The equality
+/// `f(x) ≈ w` of E's existential is local, so Eq rewrites it with the marker of B(v) in the
+/// body and gives a head atom over w's successor term, which Pred from that successor needs.
+#[test]
+fn a_selected_premise_over_a_successor_term_of_a_constant_reaches_pred() {
+    check(
+        "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:v) :B)))
+         SubClassOf(:K ObjectSomeValuesFrom(:p :D))
+         SubClassOf(:D ObjectHasValue(:s :v))
+         SubClassOf(ObjectSomeValuesFrom(:s :B) :F)
+         SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+         SubClassOf(:E ObjectUnionOf(ObjectOneOf(:u) ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) ObjectSomeValuesFrom(:e :A)))))
+         SubClassOf(:F ObjectAllValuesFrom(:r :C))
+         SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+         SubClassOf(:C ObjectAllValuesFrom(ObjectInverseOf(:r) :W))
+         SubClassOf(:D ObjectHasValue(:z :w))
+         SubClassOf(ObjectSomeValuesFrom(:z ObjectSomeValuesFrom(:e :A)) :W)
+         SubClassOf(ObjectSomeValuesFrom(:p :W) :Ans)",
+        &[("K", "Ans")],
+        &[("D", "Ans")],
+    );
+}
+
+/// K reaches the successor `{v} ⊓ B0` by t4 at once, and by s7 only after its successor D2
+/// read K's fact B1(v) and sent `∃r1.H` back, so the successor's `x ≈ v` came before the
+/// second restriction did. With counting the restriction has a successor term, which takes
+/// the constant only from that clause. A run that counts either finds K ⊑ Ans or does not
+/// answer in full, which it marks by classifying again without counting (item 1229).
+#[test]
+fn a_late_restriction_into_a_successor_that_already_answered_reads_its_clauses() {
+    let body = "SubClassOf(:K ObjectSomeValuesFrom(:t4 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         SubClassOf(:K ObjectSomeValuesFrom(:t10 ObjectIntersectionOf(ObjectOneOf(:v) :B1)))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 :D2))
+         SubClassOf(:D2 ObjectHasValue(:s9 :v))
+         SubClassOf(ObjectSomeValuesFrom(:s9 :B1) :G0)
+         SubClassOf(:G0 :H)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :H) :A0)
+         SubClassOf(:A0 :A)
+         SubClassOf(:A ObjectSomeValuesFrom(:s7 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         SubClassOf(ObjectSomeValuesFrom(:s7 :B1) :F0)
+         SubClassOf(:F0 :Ans)
+         SubClassOf(:Ctl ObjectSomeValuesFrom(:s7 ObjectIntersectionOf(ObjectOneOf(:v) :B0)))
+         FunctionalObjectProperty(:zz)";
+    let ax = axioms(body);
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        let full = out.complete && k.excluded().is_empty();
+        if full {
+            assert!(!out.stats.dl_counting_over);
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing"
+            );
+        } else {
+            // the run without counting leaves the functional property out and answers
+            assert!(out.stats.dl_counting_over, "{:#?}", k.excluded());
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing"
+            );
+        }
+        for (a, b) in [("Ctl", "Ans"), ("D2", "G0"), ("K", "B0")] {
+            assert!(
+                !out.taxonomy.is_subclass(&c(a), &c(b)),
+                "{a} ⊑ {b} is not entailed"
+            );
+        }
+    }
+}
+
+/// A successor S that is the context of a named class, and so a query context, holds a
+/// selected disjunction of equalities of its element with constants under a marker of a
+/// fact of K (item 1220). The query-form Eq and Factor leave out such a premise, and the
+/// run must still find what a run without the selection finds, which is HermiT's answer.
+#[test]
+fn a_selected_equality_of_a_successor_with_constants_gives_the_answer_of_its_query() {
+    for (body, yes) in [
+        // s5e
+        (
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             SubClassOf(:W ObjectAllValuesFrom(:p :B))
+             ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+             DisjointClasses(:B :D)
+             ClassAssertion(:Cq :u)
+             ClassAssertion(:Cq :v)
+             SubClassOf(ObjectSomeValuesFrom(:r :Cq) :Ans)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SameIndividual(:u :v)",
+            &[("K", "Ans"), ("Z", "Cq")][..],
+        ),
+        // s5g
+        (
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             SubClassOf(:W ObjectAllValuesFrom(:p :B))
+             ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+             DisjointClasses(:B :D)
+             ClassAssertion(:Cq :u)
+             ClassAssertion(:Cq :v)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:S :Y)
+             SubClassOf(:Y ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectOneOf(:v)))",
+            &[("K", "Ans"), ("S", "Y"), ("Z", "Cq")][..],
+        ),
+        // s5h
+        (
+            "SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             SubClassOf(:W ObjectAllValuesFrom(:p :B))
+             ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+             DisjointClasses(:B :D)
+             ClassAssertion(:Cq :u)
+             ClassAssertion(:Cq :v)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:S :Y)
+             SubClassOf(:Y ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SameIndividual(:u :v)",
+            &[("K", "Ans"), ("S", "Y"), ("Z", "Cq")][..],
+        ),
+    ] {
+        check(body, yes, &[("S", "Ans"), ("K", "Cq")]);
+    }
+}
+
+/// The same successor, where S's element answers K only through S's own successor, so
+/// the route through K's equalities with the constants is cut, with two or three
+/// constants, a longer chain, a disjunctive marker and a branch that only an inequality
+/// of the constants closes, for Factor (item 1220).
+#[test]
+fn a_selected_equality_of_a_successor_with_constants_reaches_its_own_successor() {
+    for body in [
+        // q1
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)",
+        // q2
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             SameIndividual(:u :v)",
+        // q3
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) ObjectUnionOf(:M :N))))
+             SubClassOf(:N ObjectAllValuesFrom(ObjectInverseOf(:t) :Ans))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)",
+        // q4
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :R))
+             SubClassOf(:R ObjectSomeValuesFrom(:r2 :S))
+             SubClassOf(ObjectSomeValuesFrom(:r2 :G) :G)
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)",
+        // q5
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v :w))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Cx :v)
+             ClassAssertion(:Cx :w)",
+        // q6
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Bv :v)
+             DisjointClasses(:Bv :S)",
+        // q7
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u :v))
+             ClassAssertion(:Cx :u)
+             ClassAssertion(:Bv :v)
+             SubClassOf(:S ObjectComplementOf(:Bv))
+             DifferentIndividuals(:u :v)",
+        // q8
+        "SubClassOf(:S ObjectSomeValuesFrom(ObjectInverseOf(:s) ObjectOneOf(:u)))
+             SubClassOf(:M ObjectAllValuesFrom(:s :Z))
+             SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))
+             SubClassOf(ObjectSomeValuesFrom(:r :G) :Ans)
+             SubClassOf(:S ObjectSomeValuesFrom(:q :T))
+             SubClassOf(:Cx ObjectAllValuesFrom(:q :Fy))
+             SubClassOf(:Fy ObjectAllValuesFrom(ObjectInverseOf(:q) :G))
+             SubClassOf(:K ObjectSomeValuesFrom(:r :S))
+             SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:u) :M)))
+             SubClassOf(:Z ObjectOneOf(:u))
+             ClassAssertion(:Cx :u)",
+    ] {
+        check(body, &[("K", "Ans")], &[("S", "Ans")]);
+    }
+}
+
+/// K's r-successor is a C and a D, and K derives its s-restriction into C only after a case
+/// analysis. Under the eager strategy both restrictions reach the one successor whose core
+/// is C and D, which sent its clauses over the predecessor when the r-edge was made, and
+/// the s-edge comes later. The functional p makes the two successors one, so K ⊑ ∃s.D ⊑ Ans.
+/// A rooted run that counts either finds K ⊑ Ans or classifies again without counting,
+/// which leaves the functional property out and reports it (item 1229).
+#[test]
+fn a_late_restriction_that_shares_an_eager_successor_reads_its_clauses() {
+    // the repair answers in full with counting, unless `SPARKLES_COUNTING_LATE_UNIT` is 0
+    // or 1
+    let repair = !matches!(
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT").as_deref(),
+        Ok("0" | "1")
+    );
+    let ax = axioms(
+        "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:K ObjectAllValuesFrom(:r :D))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 ObjectUnionOf(:Y1 :Y2)))
+         SubClassOf(:Y1 :Y)
+         SubClassOf(:Y2 :Y)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :Y) :A)
+         SubClassOf(:A :L0)
+         SubClassOf(:L0 :L1)
+         SubClassOf(:L1 ObjectSomeValuesFrom(:s :C))
+         SubClassOf(:C ObjectIntersectionOf(:B :B2))
+         SubObjectPropertyOf(:r :p)
+         SubObjectPropertyOf(:s :p)
+         FunctionalObjectProperty(:p)
+         SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+         SubClassOf(:E ObjectSomeValuesFrom(:s :C))
+         ClassAssertion(:K :a)",
+    );
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        let full = out.complete && k.excluded().is_empty();
+        assert!(full || !repair, "the repair answers in full");
+        if full {
+            assert!(!out.stats.dl_counting_over && !out.stats.dl_over_budget);
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "K ⊑ Ans is missing ({threads}, {expansion:?})"
+            );
+        } else {
+            // the run without counting leaves the functional property out, so K ⊑ Ans with it
+            assert!(out.stats.dl_counting_over && out.stats.dl_over_budget);
+            let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
+            assert!(
+                matches!(left[..], [AxiomKind::FunctionalObjectProperty(_)]),
+                "only the functional axiom is left out: {left:#?}"
+            );
+        }
+        assert!(
+            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+            "E ⊑ Ans is not entailed"
+        );
+    }
+}
+
+/// The same late s-edge into the eager successor whose core is C and D, in a rooted run
+/// without counting, with K ⊑ ∀s.D in place of the functional property. The rooted
+/// context registers with every successor over all its clauses, so the successor's clause
+/// for ∃s.D ⊑ Ans arrived with the r-edge and the s-edge found it taken. The rooted run
+/// finds K ⊑ Ans, and with `SPARKLES_COUNTING_LATE_UNIT=1` it classifies again without
+/// the rooted rules (item 1229).
+#[test]
+fn a_late_edge_of_a_rooted_run_without_counting_reads_its_clauses() {
+    let mode = std::env::var("SPARKLES_COUNTING_LATE_UNIT");
+    let contained = mode.as_deref() == Ok("1");
+    let ax = axioms(
+        "SubClassOf(:K ObjectSomeValuesFrom(:r :C))
+         SubClassOf(:K ObjectAllValuesFrom(:r :D))
+         SubClassOf(:K ObjectAllValuesFrom(:s :D))
+         SubClassOf(:K ObjectSomeValuesFrom(:r1 ObjectUnionOf(:Y1 :Y2)))
+         SubClassOf(:Y1 :Y)
+         SubClassOf(:Y2 :Y)
+         SubClassOf(ObjectSomeValuesFrom(:r1 :Y) :A)
+         SubClassOf(:A :L0)
+         SubClassOf(:L0 :L1)
+         SubClassOf(:L1 ObjectSomeValuesFrom(:s :C))
+         SubClassOf(:C ObjectIntersectionOf(:B :B2))
+         SubObjectPropertyOf(:r :p)
+         SubObjectPropertyOf(:s :p)
+         SubClassOf(ObjectSomeValuesFrom(:s :D) :Ans)
+         SubClassOf(:E ObjectSomeValuesFrom(:s :C))
+         ClassAssertion(:K :a)",
+    );
+    for (threads, expansion) in [
+        (1, Expansion::Cautious),
+        (4, Expansion::Cautious),
+        (1, Expansion::Eager),
+        (4, Expansion::Eager),
+    ] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert_eq!(out.consistency, Consistency::Consistent);
+        if out.stats.dl_rooted_over {
+            assert!(
+                contained,
+                "only the containment falls back ({threads}, {expansion:?})"
+            );
+            continue;
+        }
+        assert!(
+            out.complete && k.excluded().is_empty(),
+            "the rooted run answers in full ({threads}, {expansion:?})"
+        );
+        assert!(
+            out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "K ⊑ Ans is missing ({threads}, {expansion:?})"
+        );
+        assert!(
+            !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+            "E ⊑ Ans is not entailed"
+        );
+    }
+}
+
+/// The axioms of row 1231's regression: a ground fact about a constant that holds only
+/// under the query class, G(w) under K, whose consequence passes through an element that
+/// exists without K and is linked to w two edges below an individual, where the link is no
+/// literal of the root.
+const AV2: &str = "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+     SubClassOf(:Q ObjectUnionOf(:Q1 :Q2))";
+
+/// The configurations of the regression's runs.
+const CONFIGS: [(usize, Expansion); 4] = [
+    (1, Expansion::Cautious),
+    (4, Expansion::Cautious),
+    (1, Expansion::Eager),
+    (4, Expansion::Eager),
+];
+
+/// The claim predicate of the lane harnesses: a complete rooted answer of Tier D that took
+/// every axiom and did not start again without the rooted rules.
+fn rooted_claim(k: &Classifier, out: &Classification) -> bool {
+    out.complete
+        && out.incomplete.is_empty()
+        && k.excluded().is_empty()
+        && out.stats.tier == Tier::Disjunctive
+        && !out.stats.dl_rooted_over
+        && !out.stats.dl_rooted_declined
+        && !out.stats.dl_over_budget
+}
+
+/// Row 1231: the rooted run of [`AV2`] either finds `K ⊑ Ans` or makes no claim of
+/// completeness.
+#[test]
+fn a_conditional_fact_about_a_constant_reaches_an_element_outside_the_query_successors() {
+    let ax = axioms(AV2);
+    for (threads, expansion) in CONFIGS {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            !rooted_claim(&k, &out) || out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{threads} threads {expansion:?}: a complete rooted run misses K ⊑ Ans"
+        );
+    }
+}
+
+/// The control of row 1231's decline: with it off, the rooted run of [`AV2`] claims an
+/// answer that misses `K ⊑ Ans`, so the regression above fails without the decline.
+#[test]
+fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment() {
+    let ax = axioms(AV2);
+    for (threads, expansion) in CONFIGS {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                rooted: true,
+                rooted_decline: false,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            rooted_claim(&k, &out) && !out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{threads} threads {expansion:?}: the control no longer misses K ⊑ Ans"
+        );
+    }
+}
+
+/// Row 1231's decline withdraws the rooted answer on every path a rooted run takes: a
+/// classification, its repetition on the same classifier, a run that counts, a saturation
+/// and a run of axioms that item 805 rewrites. Each reports the decline and its fallback,
+/// leaves axioms out, and answers as the run without the rooted rules does.
+#[test]
+fn the_decline_withdraws_the_rooted_answer_on_every_path() {
+    let keyed = format!("{AV2}\n     HasKey(:K (:q) ())");
+    let counted = format!("{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))");
+    for (name, body, counting) in [
+        ("plain", AV2.to_string(), false),
+        ("counting", counted, true),
+        ("keys", keyed, false),
+    ] {
+        let ax = axioms(&body);
+        for (threads, expansion) in CONFIGS {
+            let limits = Limits {
+                threads,
+                expansion,
+                counting,
+                rooted: true,
+                ..Limits::default()
+            };
+            let at = format!("{name}, {threads} threads {expansion:?}");
+            let mut k = Classifier::of(&ax);
+            for round in 0..2 {
+                let out = k.classify(&limits).unwrap();
+                assert!(out.stats.dl_rooted_declined, "{at}, round {round}");
+                assert!(out.stats.dl_over_budget, "{at}, round {round}");
+                assert!(!out.stats.dl_rooted_over, "{at}, round {round}");
+                assert!(!k.excluded().is_empty(), "{at}, round {round}");
+                assert!(!rooted_claim(&k, &out), "{at}, round {round}");
+                assert!(out.consistent, "{at}, round {round}");
+                assert!(
+                    out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                    "{at}, round {round}: the fallback misses K ⊑ Ans"
+                );
+            }
+            let mut k = Classifier::of(&ax);
+            let sat = k.saturate(&limits).unwrap();
+            assert!(
+                sat.consistent && sat.stats.dl_rooted_declined,
+                "{at}: saturate"
+            );
+            assert!(sat.stats.dl_over_budget, "{at}: saturate");
+        }
+    }
+}
+
+/// A rooted run with counting that passes its bound starts again without counting, and
+/// that run is rooted too: when it withdraws its answer, the run starts again without the
+/// rooted rules and reports both fallbacks. The bound lies between the work of the run
+/// with counting and that of the run without it.
+#[test]
+fn a_rooted_run_without_counting_after_the_bound_withdraws_its_answer_too() {
+    let ax = axioms(&format!(
+        "{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))"
+    ));
+    let limits = Limits {
+        threads: 1,
+        counting: true,
+        rooted: true,
+        dl_work: Some(180),
+        ..Limits::default()
+    };
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&limits).unwrap();
+    assert!(out.stats.dl_counting_over);
+    assert!(out.stats.dl_rooted_declined);
+    assert!(out.stats.dl_over_budget && !out.stats.dl_rooted_over);
+    assert!(!rooted_claim(&k, &out));
+    // the control: without the decline the run without counting answers rooted
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            rooted_decline: false,
+            ..limits
+        })
+        .unwrap();
+    assert!(out.stats.dl_counting_over && !out.stats.dl_rooted_declined);
+    assert!(out.stats.tier == Tier::Disjunctive && !out.stats.dl_rooted_over);
+}

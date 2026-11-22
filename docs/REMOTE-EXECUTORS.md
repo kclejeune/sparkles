@@ -16,11 +16,11 @@ account-wide total.
 ## Qualification boundary
 
 The Boat transport and workload adapters are separate from provider qualification.
-Namespace remains the mandatory query-screen fallback until Boat has real lifecycle,
-build, transport, correctness and full-screen acceptance evidence. Local contract tests
-exercise quoting, exact source identities, result bounds and cleanup. They do not
-establish provider behavior or performance equivalence. Roadmap item 762 tracks the
-remaining qualification.
+The batch query screen runs on Boat and is the only screen of record. Namespace is not
+used. Local contract tests exercise quoting, exact source identities, result bounds and
+cleanup. They do not establish provider behavior or performance equivalence. Roadmap
+item 762 tracks the remaining qualification of the other commands, and item 1134 tracks
+a write screen.
 
 A lifecycle owner must establish startup quiescence, actual tool and source identities,
 cache authentication, available memory and disk, worker exclusivity and a finite
@@ -198,8 +198,8 @@ so a late activation still ends in time. `gate.sh` computes the runtime before i
 start, so a slow dispatch can still carry a gate past the lead, and roadmap item 803 keeps
 the absolute expiry open. Partitions request
 `TEST_PARTITION_TIMEOUT` and check again after archive transfer. Boat caps follow the
-original qualification deadline. The legacy `--duration` screen option controls
-Namespace instance lifetime.
+original qualification deadline. The `--duration` screen option applies only to the
+retired Namespace executor and has no effect on a Boat worker.
 
 A worker kept warm past its jobs runs `boat:closure-watch`, which checks the jobs'
 closure shortly before the guard's present end and finishes the operation, so the
@@ -216,19 +216,40 @@ job's files. The
 A Boat screen builds both revisions on the worker with mbx, because binaries built on a
 host with a newer glibc do not run there. The executor does not choose the build host,
 so the screen names the worker as its build host and passes two revisions rather than
-binary paths. The screen keeps each binary in its local cache with a record of the host
-that built it. A later screen with the same worker as its build host reuses a cached
-binary only when that worker built it, so a repeated screen of the same revisions skips
-both builds. A write screen with a Boat build host keeps its cache entries under a key
-that names the worker, with the same effect.
+binary paths. When the build host is also the executor, each binary stays on the worker in
+its build directory, since a release binary is about 1 GB and the operator's link to a Boat
+worker can carry only a few hundred KB/s. Only the build records come back. The worker reads
+the binary's SHA-256, its compilers and whether it is dynamically linked, so it needs
+`readelf`, `ldd` and `sha256sum`. The local cache entry, under a key that names the worker,
+records the binary's path and SHA-256 there. A later screen on the same worker reuses the
+entry only after the worker confirms that the file still has that SHA-256, and builds again
+when it is gone or changed. The screen links each binary into its own directory on the
+worker, and the remote run records the SHA-256 of what it runs, which must match the
+manifest. A write screen, or a screen whose build host is another worker, still copies each
+binary back and keeps it in the local cache with a record of the worker that built it.
 
 ```sh
 mise run bench:remote --executor "$worker" --build-host "$worker" origin/main HEAD
 ```
 
-A Boat screen and a Namespace screen of the same revisions therefore run different
-binaries, and the Boat screen is judged by its ratios and noise against Namespace rather
-than by identical binaries.
+The worker builds each revision in a scope without swap, with 6 compile jobs. The cap is
+12 GiB by default, the job that qualification admits, but the server's final rustc peaks just
+above 12 GiB at any job count, so that cap runs a cold release build out of memory. A 13 GiB
+build needs a dedicated worker that runs nothing else, whose own job release checks that its
+user slice leaves 14.5 GiB for the build, the metadata service and the host reserve, and whose
+job environment sets `SPARKLES_BOAT_BUILD_MEMORY_MAX=13G`. The build scope keeps its own
+13 GiB cap with `OOMPolicy=continue`, so reaching that cap kills a process of the build and
+nothing outside it, but a host that runs short first leaves the choice to the kernel. The host
+formula is not part of that check while the memory a resumed worker cannot reclaim varies
+(item 1092). The setting takes a cap
+from 8G to 13G and `SPARKLES_BOAT_BUILD_JOBS` a count from 2 to 8, and a value outside either
+range is refused before the worker is admitted. A cold build of both revisions takes most of an hour, so the worker's
+admitted lifetime must cover both builds, the screen and its reruns.
+
+Binaries that a Boat screen builds therefore differ from those built for another host,
+and timings from different providers or hosts are never compared. The Boat and Namespace
+screens of the same two batches disagreed by about 10% in their geometric means, and item
+1133 settles the difference on an Intel host.
 
 The operator establishes actual native/cgroup/lease closure before supplying the fresh
 job-closure receipt. `boat:finish` validates that evidence and observes the guard's
@@ -274,14 +295,38 @@ the unit's runtime from that end immediately before the start and refuses with u
 activation, the job also stops its own unit at that end and takes every wait from it, and the
 unit's shutdown is bounded at 60 seconds, so the closure watch finds the job closed. Starts on
 one host are serialized, and a job of the same name starts only after the earlier unit has
-fully stopped. Under the heavy lock a job on a Boat worker needs `REMOTE_CI_MIN_FREE_GIB`
-free after the disk cleanup, 85 by default, and ends with exit 4 rather than start with
-less. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
+fully stopped. Under the heavy lock a job on any host needs `REMOTE_CI_MIN_FREE_GIB`
+free, 85 by default, and ends with exit 4 rather than start with less. A Boat worker runs
+its disk cleanup first. An ssh host runs `mbx gc` with `gc.min_free_size` raised to the
+floor, which evicts cache objects and managed targets until that much is free, and removes
+nothing else, so a lane's build cannot fill a gate host's disk from a start with too little
+room. On an ssh host the job also reads the free space every `REMOTE_CI_WATCH_SECONDS`
+while the check runs, 30 by default, and once more when a failed check ends. It stops the
+check with exit 5, or marks the failure as exit 5, when less than `REMOTE_CI_RUN_FLOOR_GIB`
+is free, 4 by default. The server's tests keep 1 GiB free and fail below it, so a disk that
+another job fills ends the run as a host problem rather than as test failures. On an ssh host
+the unit is delegated and the check runs in a child cgroup, so a stopped check's processes,
+those that ignore the stop or left its process group included, are killed and gone before
+the job copies its results and removes its worktree. The job sets aside a MiB before the
+check and gives it back before it writes its outcome and exit records, so they fit on a
+disk the check filled. A stopped check whose processes cannot be shown gone ends with exit
+6 and leaves its worktree for a later cleanup. Each start has its own id, which the job
+records first, so the waiting `remote-ci.sh` takes only that start's results and says so
+when another start of the same name replaced them on the host. Its local copy goes to
+`.artifacts/remote-ci/NAME.ID`, which no later fetch replaces, and `NAME` links to the
+newest. Either refusal writes `disk-below-floor` to the job's `outcome` file,
+and `remote-ci.sh` then says that the host's disk was below its floor. The check's `TMPDIR`
+on an ssh host is a new `~/gate/tmp-NAME.XXXXXX` directory beside its worktree, which the job
+creates and removes with the worktree, so its temporary files do not fill the host's `/tmp`. A Boat worker keeps its disk timer's hard limit
+and its own temporary directory. A cold workspace test build of the lane CI added 67.8 GiB to the large worker's disk,
 and the default adds 25% to that. The build cache does not help a second run on the large
 worker, because the test build stores about 48 GiB, more than the store's 40 GiB budget, so
 a rerun of the same commit measured 3 hits in 343 lookups and grew the disk by 65.7 GiB. The worker's disk timer stops any running job at 95% use, which is a recovery rather
 than a guarantee, since it checks once a minute and a build can fill the disk sooner. A job on an ssh host may run 6
-hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. Results
+hours. The benchmark host is refused. `SPARKLES_REMOTE_CI_HOST` sets the default host. `--cmd`
+runs one command in place of `ci.sh` under the same bounds, with the commit's pinned
+compiler, and `--worktree` checks the working tree instead of a commit, which
+`mise run check:remote` combines. Results
 land in `.artifacts/remote-ci/NAME`, with the exit status and the logs.
 
 ## Source, results and cleanup
@@ -348,7 +393,9 @@ worker directories and local receipt paths. Cleanup never stops another job or t
 warm sandbox. The lifecycle owner decides retention and verified stop after evidence
 and leases are closed.
 
-Existing `bench:nsc`, `bench:nsc-writes`, `bench:jena-nsc`, `nsc:MACHINE` test shares and
-SSH build hosts remain explicit compatibility paths. A failed Boat operation never
-silently retries on Namespace or a local host. Historical benchmark records retain
-their actual provider and host attribution.
+The `bench:nsc`, `bench:nsc-writes` and `bench:jena-nsc` tasks, the `nsc` executor and the
+`nsc` and `nsc:MACHINE` test shares are retired and unsupported, and item 1135 removes
+them. The `nsc-*` scripts that `bench:remote`, `bench:remote-writes` and the build hosts
+run keep their names and stay in use, and SSH build hosts remain a local build path. A
+failed Boat operation never silently retries on another provider or a local host.
+Historical benchmark records retain their actual provider and host attribution.

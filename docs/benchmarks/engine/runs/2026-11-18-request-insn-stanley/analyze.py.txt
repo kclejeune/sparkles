@@ -1,0 +1,40 @@
+import csv, statistics as st, collections, sys
+def load(p):
+    d = collections.defaultdict(lambda: collections.defaultdict(lambda: collections.defaultdict(list)))
+    for r in csv.DictReader(open(p), delimiter='\t'):
+        if r['query'] == '_idle': continue
+        n = int(r['reps'])
+        d[(r['query'], r['mode'])][int(r['round'])][r['variant']].append(
+            dict(i=int(r['instr_u'])/n, t=int(r['task_clock_ns'])/n, e=float(r['exec_ms']), w=float(r['wall_ms'])))
+    return d
+def ratios(rounds, k):
+    out = []
+    for rnd, v in sorted(rounds.items()):
+        if v['A'] and v['B']:
+            out.append(st.median(x[k] for x in v['B']) / st.median(x[k] for x in v['A']))
+    return out
+if sys.argv[1] == 'exec':
+    d = load(sys.argv[2])
+    for key in [k for k in sorted(d) if k[0] in sys.argv[3:]]:
+        for k in 'iew':
+            r = ratios(d[key], k)
+            print(key, k, f"med {st.median(r):.4f}", ' '.join(f"{x:.3f}" for x in r))
+else:
+    # null pool: per query |deviation| of the 95% bootstrap-free bound: max |per-round ratio - 1|, and median of rounds
+    import random
+    rows = []
+    for p in sys.argv[2:]:
+        d = load(p)
+        for key, rounds in d.items():
+            r = ratios(rounds, 'i')
+            rng = random.Random(1)
+            b = sorted(st.median(rng.choices(r, k=len(r))) for _ in range(4000))
+            lo, hi = b[100], b[3899]
+            a = [x for v in rounds.values() for x in v['A']]
+            ins = st.median(x['i'] for x in a); ns_per_ins = st.median(x['t'] / x['i'] for x in a)
+            ex = st.median(x['e'] for x in a) * 1000  # µs
+            rows.append((ins, key, max(1 - lo, hi - 1), ns_per_ins, ex, p.split('/')[-2]))
+    rows.sort()
+    print("instr/req  query mode  ci-dev%  ns/instr  exec_us  run")
+    for ins, key, dev, npi, ex, run in rows:
+        print(f"{ins/1e6:9.3f}M {key[0]:20s} {key[1]:9s} {dev*100:6.3f}% {npi:.3f} {ex:9.1f} {run}")

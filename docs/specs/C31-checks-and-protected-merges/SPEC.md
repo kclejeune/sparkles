@@ -1,6 +1,6 @@
 # C31: Checks and protected merges
 
-> **Status:** planned.
+> **Status:** in progress.
 >
 > **Roadmap:** [item 459](../../ROADMAP.md) holds this work. Each candidate phase below gets
 > its own numbered roadmap item when it is ready to start, and the items already numbered
@@ -26,9 +26,9 @@ override recorded otherwise. Check results are kept per commit.
 
 **Ontology quality report pack.** Ship SPARQL and SHACL checks for the ROBOT report set, OOPS! pitfalls, qSKOS and SKOS integrity, OBO principles and FOOPS! FAIR checks with ERROR, WARN and INFO levels, a report UI and sparkles ontology report, usable as a guard and a release gate. The checks are cheap and declarative. It depends on item 31.
 
-**Gate suites.** Define in RDF a suite of checks (SHACL, ShEx, lint, RL diagnostics, unsatisfiable classes, quality packs, stored-query must-be-empty, breaking-change) with severities. It is continuous integration for knowledge graphs.
+**Gate suites.** Define in RDF a suite of checks (SHACL, ShEx, lint, RL diagnostics, unsatisfiable classes, quality packs, stored-query must-be-empty, breaking-change) with severities. It is continuous integration for knowledge graphs. [Item 1136](../../ROADMAP.md) holds this phase.
 
-**Required checks on protected branches.** Run the gate suite on the merge candidate's dry-run state, attach results to the merge request and refuse the merge unless it passes or an authorized override is recorded. Protected branches accept merges but require no checks beyond the write guard.
+**Required checks on protected branches.** Run the gate suite on the merge candidate's dry-run state, attach results to the merge request and refuse the merge unless it passes or an authorized override is recorded. Protected branches accept merges but require no checks beyond the write guard. [Item 1136](../../ROADMAP.md) holds this phase together with gate suites.
 
 **Breaking-change analysis for vocabularies.** Diff a vocabulary release against dependents' pinned usage, classify it as major, minor or patch, and block or warn. Shared vocabularies must not silently break datasets.
 
@@ -73,8 +73,43 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 
 ## Outcome
 
-The checks, workflow and badge phases are not built, and
-[item 459](../../ROADMAP.md) tracks them.
+The gate-suite and required-check phases are in progress under
+[item 1136](../../ROADMAP.md). The other checks, workflow and badge phases are not built,
+and [item 459](../../ROADMAP.md) tracks them.
+
+Item 1136 leaves lint out of the gate suites, since lint reads document text and not a
+dataset state, and [item 1138](../../ROADMAP.md) adds a lint check for stored queries and
+SHACL-SPARQL literals. Gate results attach to the merge response, the task detail and the
+run record in the merge commit, and [item 1139](../../ROADMAP.md) adds a first-class merge
+request.
+
+The Rust gate runner evaluates standalone queries and supported SHACL and ShEx checks
+against the candidate. These checks refuse `SERVICE` even inside an expression. SHACL
+queries read the selected candidate data and refuse explicit `GRAPH`, `FROM` and
+`FROM NAMED` clauses. The SHACL profile also refuses unsupported and malformed targets,
+conflicting node-expression forms and malformed SPARQL constraint deactivation flags.
+ShEx refuses semantic actions and fixed blank-node data selectors. Its SPARQL selectors
+read the full validation data as their default graph and have no named graphs. The
+[reasoning and validation guide](../../reasoning/README.md#gate-suite-validation)
+describes the supported profiles.
+
+The controlled Rust runner shares one deadline and produced-row allowance across each
+check's setup and queries, and bounds retained validation results including SHACL
+details. The deadline covers SHACL list and property path compilation, SPARQL path
+substitution, pinned shapes reads, and physical scans for targets and their
+conformance probes. Each embedded SHACL query's memory ceiling includes preparing
+its default graph IDs and retaining the graph filter shared by its plan. ShEx also shares its
+query memory ceiling across preparation, FOCUS scan
+workspace and retained selector output. Diagnostics with materialized inference reading
+turned off exclude the inferred graph even when the store's SPARQL default is a union.
+
+A suite can name a `chk:UnsatisfiableClassesCheck`, which parses and counts in the suite's
+revision, but no build runs it. Its result is an error with the code `check-unavailable`,
+so a required one fails the suite. The OWL reader cannot yet read a terminology with the
+guarantee that no axiom is lost, and a check that dropped an axiom could pass on a
+terminology with an unsatisfiable class. [Item 1207](../../ROADMAP.md) makes the reader
+fail closed and enables the check, and [item 1163](../../ROADMAP.md) then adds an
+assertion-aware mode.
 
 The storage format of the comments phase is chosen, and the ontology editor's
 discussions of item 618 use it, as the

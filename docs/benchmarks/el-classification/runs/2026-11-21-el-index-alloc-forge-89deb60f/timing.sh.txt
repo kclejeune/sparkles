@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# timing.sh: the Intel A/B of lane el-index-alloc, run by run.sh under the host's bench and heavy locks.
+# Arms, interleaved in a rotating order in each round, on 1 and 4 threads:
+#   base  bin/base (b47b582b, origin/main)
+#   e21   bin/e21 (15a9f9b2, the allocation-free profile check)
+#   tip   bin/tip (89deb60f, e21 and roles looked up by IRI)
+# Files: ore_ont_13482, GO and ChEBI lite. One JSON line per process in out/timing/log.txt with
+# its exit status and taxonomy hash; the log ends with TIMING-DONE. Each process runs in a 12 GiB
+# scope without swap, pinned to P-cores of separate physical cores: cpu 2 on one thread, cpus 2,
+# 4, 6 and 8 on four.
+set -u
+ROUNDS=${ROUNDS:-5}
+O=out/timing; mkdir -p $O
+log=$O/log.txt
+ARMS=(base e21 tip)
+FILES=(ore_ont_13482.owl go.ofn chebi_lite.ofn)
+reps() { case $1 in chebi_lite.ofn) echo 3;; *) echo 5;; esac; }
+for r in $(seq 1 $ROUNDS); do
+  for t in 1 4; do
+    for f in "${FILES[@]}"; do
+      n=${f%.*}
+      k=$(( (r + t) % ${#ARMS[@]} ))
+      for i in $(seq 0 $(( ${#ARMS[@]} - 1 ))); do
+        arm=${ARMS[$(( (k + i) % ${#ARMS[@]} ))]}
+        b=bin/$arm
+        case $t in 1) cpus=2;; *) cpus=2,4,6,8;; esac
+        tax=$O/$arm.$n.t$t.tax; js=$O/$arm.$n.t$t.r$r.json
+        systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=0 -p OOMPolicy=continue \
+          timeout 900 taskset -c $cpus $b --threads $t --repeat $(reps $f) --taxonomy $tax files/$f > $js 2> $O/$arm.$n.t$t.r$r.err
+        st=$?
+        sha=$(LC_ALL=C sort $tax 2>/dev/null | sha256sum | cut -c1-16); rm -f $tax
+        rep=$(grep '^{' $js | head -1); [ -n "$rep" ] || rep=null
+        jq -nc --arg arm $arm --arg n $n --argjson r $r --argjson t $t --arg sha $sha --argjson st $st --argjson rep "$rep" \
+          '{round:$r,arm:$arm,file:$n,threads:$t,exit:$st,tax:$sha,ms:($rep|if .==null then null else .classifyMedianMs end),index:($rep|if .==null then null else .indexMs end),sat:($rep|if .==null then null else .saturationMs end),rss:($rep|if .==null then null else .peakRssKib end),est:($rep|if .==null then null else .peakEstimatedBytes end)}' >> $log
+      done
+    done
+  done
+done
+echo TIMING-DONE >> $log

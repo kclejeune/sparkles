@@ -1007,7 +1007,7 @@ entry point that picks a mode and what it does now.
 | A query that ran in under 10 ms last time | eager, in place | The decision would cost more than any stream can save, and the in-place path stays as it was. |
 | Stored queries, `/{ds}/queries/{name}` | as `/{ds}/sparql` | A run with parameter values has initial bindings, which rule out every automatic plan, so it runs eagerly. |
 | Graph algorithms over HTTP | as `/{ds}/sparql` | Their plans never qualify, so they run eagerly. |
-| UI result table | eager, asked for explicitly | The table shows the full row count and the time slider compares totals, which a streamed answer stopped after `send` rows does not know. |
+| UI result table | the server's default, but eager in a comparison | A streamed answer that the row limit stopped shows its rows with an unknown total. A comparison on the time slider reads both states eagerly, because it compares whole results or their exact counts. |
 | UI downloads | the server's default | A download reads the whole answer. |
 | CLI `sparkles query`, local | `auto`, but eager for the `text` table and `--explain` | The table measures every row before printing one. A plan that stays eager prints exactly what an eager query prints. |
 | CLI `sparkles query --server` | the server's default | It sends `execution` only when `--execution` is given. |
@@ -1363,9 +1363,14 @@ the pairs against the block grid.
 The cursor's memory for the operator is about one morsel's working set per worker
 thread plus the k rows it keeps, whatever the size of the range. The test
 `ordered_top_k_memory_does_not_grow_with_its_unordered_pieces` reads 300,000 and 900,000
-dictionary values on two threads and requires the second peak to stay within a quarter
-of the first. The peak grows with the number of threads instead, since each holds a
-morsel at once, so the test fixes its pool. Running the morsels in waves of one per
+dictionary values on one thread and on two. On one thread the second peak must stay
+within an eighth of the first. On two threads both peaks must stay within twice the
+one-thread peak of the smaller store, plus an eighth. The peak grows with the number of
+threads instead, since each holds a morsel at once, so the test fixes its pools. A
+two-thread peak depends on how far two morsels overlap in time, so the bound comes from
+the one-thread peaks, which do not. The test does not prove that at most one morsel per
+thread is live, because a third morsel's first charge is smaller than the margin.
+Running the morsels in waves of one per
 thread keeps a waiting worker from starting further morsels by work stealing.
 
 Reading the morsels one after another was 1.72 times slower than eager execution at eight
@@ -1711,6 +1716,145 @@ to 26 µs were 7 to 14% slower in server time with spreads of 18 to 80%, and ite
 571 rechecks them on a quiet Intel host.
 
 
+### EXISTS inside larger expressions (2026-11-18)
+
+Both executors now answer an EXISTS inside a larger expression from the key set of its
+pattern, as they answer a FILTER EXISTS. This covers an EXISTS under IF, OR or another
+function, in an aggregate argument and in an ORDER BY key. Before the expression is
+evaluated over a table, every row of the table is probed once for each such EXISTS, and
+the evaluator reads the row's answer. A row that the key set cannot answer, and a pattern
+without a key set, are evaluated by substitution with the memo per distinct key as
+before. The probe answers and the key sets stay charged to the query while the
+expression reads them, and a row evaluated by substitution is counted when the
+expression reaches it. Eager plans report the probes and the rows evaluated per row on
+the filter, extension, grouping and ordering that hold the EXISTS. The cursor's plans
+report them only on a filter in the internal pull path for an eager ASK or LIMIT, and the
+ordinary streaming SELECT plan carries no such counters.
+
+Automatic execution now streams every FILTER, BIND, ORDER BY and grouping whose EXISTS
+patterns have cursor plans, whether the pattern is answered from a key set or per key.
+Three shapes stay eager. A pattern that calls a SERVICE stays eager because a cursor
+could repeat its effects, an EXISTS nested deeper than four levels stays eager under the
+admission's depth cap, which item 1081 covers, and an OPTIONAL whose condition holds an
+EXISTS stays eager, for the reasons that [the conditional merge OPTIONAL outcome](#the-cursors-conditional-merge-optional-2026-11-19) measures.
+
+Probing every row costs a hash lookup per row and EXISTS, also for rows on which the
+expression never reaches the EXISTS. An IF branch that is rarely taken therefore builds
+a key set that it barely uses. On the laptop at 10.5M quads, `exists-rare` took 76 ms
+eagerly against 69 ms before, and 26 ms streamed against 12 ms before. The cost is
+bounded by one evaluation of the pattern, and item 1080 covers it.
+
+A quiet A/B on `atlas`, an Intel benchmark worker, compared the base with this change
+at 10.5M quads with one Rayon thread, over three A, B, B, A rounds of seven timed
+requests in each mode. Both builds returned the same answers in both modes. The
+aggregate `exists-agg` went from 885 to 16 ms eagerly and from 913 to 15 ms streamed. The
+keyed `not-exists`, `exists-bind` and `exists-bind-join` shapes, whose probe path the
+change rewrote, took 0.70 to 0.98 times as long as the base streamed, and the per-key shapes
+`exists-union` and `exists-union-bind`, whose UNION has no key set, took 1.00 and 1.015
+times as long streamed as eagerly. The [memory results](../benchmarks/memory/RESULTS.md#automatic-exists)
+give the table, and the [run record](../benchmarks/memory/records/exists-nested-2026-11-18/README.md)
+holds the samples.
+
+`tests/exists_auto.rs` compares automatic and eager answers for EXISTS under OR, IF and
+COALESCE, in SUM and in an ORDER BY key, with and without a key set, checks that each one
+streams and runs them under the budget loop from 512 KiB to 64 MiB. `exists_tests`
+compares the key-set answers with evaluation per key for the same positions and checks
+the nested counters of EXPLAIN, and the decision tables in `cursor.rs` admit the shapes.
+
+### The UI's table under automatic execution (2026-11-18)
+
+The query page's result table no longer asks for eager execution. It sends no
+`execution`, so the server's default applies, and automatic execution streams the plans
+that measured faster as cursors, such as a plain scan of a thousand rows or more and a
+grouping over 20,000 or more input rows, over a dataset whose updates are compacted. A
+streamed answer that reaches the row limit stops with `status: "stopped"` and a null
+`totalRows`, and the cursor writers stop without looking for another row. The Table tab
+then shows the rows sent with a plus sign, such as `1,000+`, and the notice above the
+table says that there may be more rows and that the total is unknown. A streamed answer
+that ends within the limit reports `complete` and its exact total, as an eager one does.
+
+A comparison on the time slider still asks for eager execution on both reads, because it
+compares two results as bags, or their exact counts when the row limit cut one of them.
+The comparison helper treats a stopped stream as cut, with its count unknown, so a
+caller that compares streamed answers compares counts and marks no row.
+
+A streamed CONSTRUCT or DESCRIBE answer sends an empty `triples` array and every
+statement in `quads`, with a null graph for the default graph. The UI moves those
+statements into `triples`, as an eager answer sends them, so the graph and table views
+draw a streamed graph answer as they draw an eager one. The other pages of the UI, such
+as paths, vector search, the shape editor and the ontology and thesaurus workbenches,
+still ask for eager execution, because they read exact totals or need a whole result.
+
+A streamed answer skips the full-result cache, so running the same streamed query again
+from the table is not served from the cache. Vitest covers the request's mode, the
+stopped metadata, the quads and the comparison of a stopped stream. A mock browser test
+rewrites the mock's answers into the stopped and quads shapes and checks the badge, the
+notice, the graph and a comparison's eager reads, and a browser test against a real
+server streams a grouping over 30,000 rows with a row limit of 1,000 and with a limit
+above the total, and a plain scan of the same rows with a limit of 1,000.
+
+### The cursor's conditional merge OPTIONAL (2026-11-19)
+
+The cursor now merges an OPTIONAL whose condition joins two inputs sorted on their
+shared variable, as eager execution does, and both plans name the merge. Before, the
+cursor merged only an OPTIONAL without a condition and hashed the others. Under a
+condition the merge emits each matched pair and then the left row's unmatched
+extension, with a marker column that only pairs bind. A test step evaluates the
+condition on the pairs of each batch, keeps the passing pairs and keeps a left row's
+extension only when none of its pairs passed, carrying that state across batches. The
+merge reports no count under a condition, holds the condition once for the operator,
+and charges its variable map, its candidate table and the pair and extension of a
+one-row batch before the test. A spooled run drops a consumed frame before it decodes
+the next, but its reservation of eight bytes per encoded cell can fall short for wide,
+poorly compressible frames and for the capacity the reader's buffer keeps, which item
+1144 covers. The variable map is sized before
+planning a nested EXISTS interns more variables, which item 1137 covers.
+
+A quiet A/B on `atlas`, an Intel benchmark worker, compared bc647108, which hashed every
+conditional OPTIONAL in the cursor, as A with ca1532ba as B at 10.5M quads with one
+Rayon thread, over three A, B, B, A rounds of seven timed requests in each mode. Every
+build and mode returned the same answers, and the executed plans of B name the merge in
+both modes for the six merge shapes. Streamed, B took 0.28 to 0.78 times as long as A on
+each of them. The two `class-*` controls, which hash in both modes, and the eager times
+were within the spread of their server processes, except eager `optional-cond`, which
+was faster on B in every round. On the shapes where a left row has about one
+pair, `optional-filter`, `optional-cond` and `exists-optional`, B streamed in 0.71 to
+1.04 times its eager time. On `foaf:knows`, with about 2.5 pairs per left row, B streamed
+in 1.32 times its eager time with a plain FILTER and in 1.18 and 1.36 times with an
+EXISTS. Eager execution tests the condition over all of the matched pairs at once,
+while the cursor emits every pair and a candidate extension for each left row and then
+tests the batch. With `merge_left_join` off both builds hash in both modes. Over two
+rounds, resampling the medians of their server processes gave a 95% interval that
+reaches 1.0 on every query except streamed `knows-fail`, which took 305.3 ms on B
+against 302.5 ms on A. Item 1143 holds that cost.
+
+B also streamed an OPTIONAL whose condition holds an EXISTS under automatic execution,
+which A kept eager. B's recorded plans show its automatic execution choosing the
+cursor, and A's admission check refuses an EXISTS in an OPTIONAL condition. The A/B timed
+the forced modes, so the cost of that admission is read from the paths each build's
+automatic execution takes, A eager against B streamed. That is 132 against 181 ms for
+`knows-exists` and 549 against 647 ms for `knows-mixed`, so the change keeps such plans
+eager, and item 570 admits them once the merge tests its condition on each key's pairs
+and item 1105 gives admission the build's merge order. The plain-condition query `knows-fail` was already streamed automatically on both
+builds, and its streamed time went from 304 to 198 ms. The
+[memory results](../benchmarks/memory/RESULTS.md#automatic-exists) give the table, and the
+[run record](../benchmarks/memory/records/exists-optional-2026-11-19/README.md) holds the
+samples and plans.
+
+Unit tests in `cursor/merge.rs` compare the conditional merge with eager execution at
+batch caps from one row up, with left rows whose failing pairs span batches, unmatched
+rows and a second shared variable, and hold its peak within the budget at small batch
+caps over long runs of failing pairs.
+`tests/exists_auto.rs` checks that automatic execution keeps the EXISTS conditions
+eager and that a strict cursor returns the eager answers at one, three and 1,000 rows
+per batch with the merge on and off. A `tests/query_cursor.rs` test checks that the
+conditional OPTIONAL honours `merge_left_join` and names its algorithm in both plans.
+The cursor's EXPLAIN reports EXISTS counters only on a FILTER in the internal pull path
+for an eager ASK or LIMIT, so its merge OPTIONAL and its ordinary streaming SELECT plan
+show none, which item 1106 covers. Without spill,
+the eager memory retry of automatic execution uses the admission check and so does not
+retry an OPTIONAL whose condition holds an EXISTS as a cursor, which item 1145 covers.
+
 ### Finite HTTP body limits
 
 Finite streamed query, Graph Store export, diff and changes responses use a separate
@@ -1748,3 +1892,17 @@ timer join. Configuration tests isolate environment/CLI precedence in child proc
 A capped response's body-side admission uses a take-once shared lease, adding one small
 shared allocation per response under concurrency caps. No measured negligible-cost
 claim follows from these correctness checks.
+
+### Buffered cursor writers
+
+The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
+through the engine's 8 KiB `Buffered` writer, as the eager writers do, and count the rows
+whose bytes reached the response, so a streamed body that stopped partway reports the
+rows the response writer accepted, as an eager body does. A streamed body that the result-size budget stops after the
+response committed sends what it had buffered before it aborts the transfer, which only
+eager bodies did before. That send waits under the body's idle limit, and when it fails
+the report leaves out its bytes but still counts its rows. On the large answers at 1.05M
+triples a streamed request runs 0.46 to 0.69 times the instructions it ran before, within
+2% of the eager request's count in native JSON or below it, and the
+[X14 Outcome](X14-unified-executor/SPEC.md#the-streamed-response-cost) gives the counts
+and where the short queries' remaining cost lies.

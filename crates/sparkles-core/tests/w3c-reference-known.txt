@@ -1,0 +1,2 @@
+# W3C query evaluation tests that the reference evaluator does not answer like the expected
+# results, one test per line with the reason. The suite fails on any test not listed here.

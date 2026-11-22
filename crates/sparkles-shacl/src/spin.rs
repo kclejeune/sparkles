@@ -141,7 +141,7 @@ pub fn translate(graph: &Graph, prefixes: &[(String, String)]) -> Result<Graph> 
 /// the variable `this` outside its string literals and IRIs.
 fn mentions_this(q: &str) -> bool {
     let b: Vec<char> = q.chars().collect();
-    let word = |c: Option<&char>| c.is_some_and(|c| varname_char(*c));
+    let word = |c: Option<&char>| c.is_some_and(|c| crate::sparql::varname_char(*c));
     let mut quote: Option<char> = None;
     let mut i = 0;
     while i < b.len() {
@@ -166,17 +166,6 @@ fn mentions_this(q: &str) -> bool {
         i += 1;
     }
     false
-}
-
-/// Whether `c` can continue a SPARQL variable name: `PN_CHARS_U`, a digit, `#x00B7`,
-/// `[#x0300-#x036F]` or `[#x203F-#x2040]` of the SPARQL 1.1 grammar.
-fn varname_char(c: char) -> bool {
-    matches!(c,
-        'A'..='Z' | 'a'..='z' | '0'..='9' | '_' | '\u{B7}'
-        | '\u{C0}'..='\u{D6}' | '\u{D8}'..='\u{F6}' | '\u{F8}'..='\u{37D}'
-        | '\u{37F}'..='\u{1FFF}' | '\u{200C}'..='\u{200D}' | '\u{203F}'..='\u{2040}'
-        | '\u{2070}'..='\u{218F}' | '\u{2C00}'..='\u{2FEF}' | '\u{3001}'..='\u{D7FF}'
-        | '\u{F900}'..='\u{FDCF}' | '\u{FDF0}'..='\u{FFFD}' | '\u{10000}'..='\u{EFFFF}')
 }
 
 #[cfg(test)]

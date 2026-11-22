@@ -13,6 +13,11 @@ use std::sync::{
 };
 use std::time::Duration;
 
+// The test-only reference evaluator (roadmap item 512), the oracle of the seeded
+// differential queries.
+#[path = "support/reference/mod.rs"]
+mod reference;
+
 // Explicit application-model copies for semantic comparisons only. Retained
 // ownership regressions below keep their real OwnedTerm/OwnedRow handles.
 trait ApplicationQueryRows {
@@ -923,6 +928,35 @@ fn charged_exists_state_matches_eager_with_budget_decline_and_partial_keys() {
     }
 }
 
+/// A view source with one `table` view whose column ?x holds the integers below `.0`.
+/// A view read has no resumable cursor, so it is the remaining eager fallback leaf.
+#[derive(Debug)]
+struct IntegersView(i64);
+impl sparkles_core::sparql::viewsvc::ViewSource for IntegersView {
+    fn read_view(
+        &self,
+        _: &sparkles_core::sparql::viewsvc::ViewRead<'_>,
+    ) -> sparkles_core::Result<sparkles_core::sparql::viewsvc::ViewRows> {
+        Ok(sparkles_core::sparql::viewsvc::ViewRows {
+            columns: vec!["x".into()],
+            rows: (0..self.0)
+                .map(|i| (vec![Some(Term::Literal(oxrdf::Literal::from(i)))], 1))
+                .collect(),
+            commit: 0,
+            evaluated_under: None,
+        })
+    }
+}
+
+fn with_view(rows: i64) -> QueryOptions {
+    QueryOptions {
+        views: Some(Arc::new(IntegersView(rows))),
+        ..Default::default()
+    }
+}
+
+const VIEW_READ: &str = "SERVICE <urn:x-sparkles:view#read> { [] <urn:x-sparkles:view#name> \"ints\" ; <urn:x-sparkles:view#bind> ?x }";
+
 #[test]
 fn eager_fallback_is_visible_lazy_and_budgeted() {
     let s = store(100);
@@ -935,32 +969,28 @@ fn eager_fallback_is_visible_lazy_and_budgeted() {
         None,
     )])
     .unwrap();
-    let q =
-        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }";
+    let q = &format!("SELECT ?x WHERE {{ {VIEW_READ} }}");
+    let views = with_view(100);
     assert!(matches!(
-        select_cursor(s.snapshot(), q, &Default::default(), &options(2)),
+        select_cursor(s.snapshot(), q, &views, &options(2)),
         Err(Error::Unsupported(_))
     ));
     let opts = CursorOptions {
         batch_rows: 2,
         ..Default::default()
     };
-    let mut c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+    let mut c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
     assert!(c.plan().has_materialization());
     assert_eq!(c.stats().rows_produced, 0);
     let b = c.next_batch().unwrap().unwrap();
     assert_eq!(
         b.row(0).unwrap().values().to_vec(),
-        query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows()[0]
+        query(s.snapshot(), q, &views).unwrap().application_rows()[0]
     );
     assert!(c.stats().rows_produced >= 100);
     assert_eq!(
-        all(select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap()),
-        query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows()
+        all(select_cursor(s.snapshot(), q, &views, &opts).unwrap()),
+        query(s.snapshot(), q, &views).unwrap().application_rows()
     );
 }
 
@@ -1207,6 +1237,60 @@ fn standard_writers_match_eager_and_stop_at_send_without_draining() {
     }
 }
 
+/// A cursor writer goes out through the eager writers' buffer, so a byte budget that
+/// stops it partway leaves `sent` counting the rows of the output the writer took, as
+/// the eager writer's count does, and not the rows of the batches the cursor produced.
+#[test]
+fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
+    use sparkles_core::sparql::results::{
+        LimitedWriter, SolutionsFormat, write_cursor_native_json_counted,
+        write_cursor_solutions_counted, write_solutions_counted,
+    };
+    use std::cell::Cell;
+    let s = store(3000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let eager = query(s.snapshot(), q, &Default::default()).unwrap();
+    for fmt in [SolutionsFormat::Tsv, SolutionsFormat::Csv] {
+        for limit in [1u64, 20_000, 40_000] {
+            let mut cut = LimitedWriter::new(Vec::new(), Some(limit), None);
+            let sent = Cell::new(0);
+            let mut c = open(&s, q, 1024);
+            let result = write_cursor_solutions_counted(&mut c, fmt, &mut cut, None, &sent);
+            assert!(result.is_err(), "{fmt:?} {limit}");
+            let out = cut.get_ref();
+            let lines = out.iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(sent.get(), lines.saturating_sub(1), "{fmt:?} {limit}");
+            assert!(c.stats().emitted_rows >= sent.get());
+            let mut eager_cut = LimitedWriter::new(Vec::new(), Some(limit), None);
+            let eager_sent = Cell::new(0);
+            assert!(
+                write_solutions_counted(&eager, fmt, &mut eager_cut, None, &eager_sent).is_err()
+            );
+            // the cursor's flush after its first batch moves where the buffer's pieces
+            // end, so the bytes may differ, but the rule that counts them is the same
+            let eager_lines = eager_cut.get_ref().iter().filter(|&&b| b == b'\n').count() as u64;
+            assert_eq!(
+                eager_sent.get(),
+                eager_lines.saturating_sub(1),
+                "{fmt:?} {limit}"
+            );
+        }
+        let sent = Cell::new(0);
+        let mut whole = Vec::new();
+        let mut c = open(&s, q, 1024);
+        write_cursor_solutions_counted(&mut c, fmt, &mut whole, None, &sent).unwrap();
+        assert_eq!(sent.get(), 3000);
+    }
+    let mut cut = LimitedWriter::new(Vec::new(), Some(40_000), None);
+    let sent = Cell::new(0);
+    let mut c = open(&s, q, 1024);
+    assert!(write_cursor_native_json_counted(&mut c, &mut cut, None, None, &sent).is_err());
+    // every cell is bound and an object, so each whole row ends with `}]`
+    let rows = cut.get_ref().windows(2).filter(|w| w == b"}]").count() as u64;
+    assert_eq!(sent.get(), rows);
+    assert!(sent.get() > 0 && sent.get() < 3000);
+}
+
 #[test]
 fn batch_writer_decoding_matches_eager_and_declines_under_a_tight_budget() {
     use sparkles_core::sparql::results::{
@@ -1271,7 +1355,9 @@ fn batch_writer_decoding_matches_eager_and_declines_under_a_tight_budget() {
 #[test]
 fn writer_failures_leave_partial_output_and_fuse_production() {
     use sparkles_core::sparql::results::{SolutionsFormat, write_cursor_solutions};
-    let s = store(20);
+    // The writer sees the output in the buffer's pieces of 8 KiB after the first batch's
+    // flush, so the answer must outlast one piece for the failure to reach production.
+    let s = store(2000);
     struct Failing {
         bytes: Vec<u8>,
     }
@@ -2286,8 +2372,8 @@ fn strict_automatic_execution_never_hides_materialization_in_eager_mode() {
     assert!(matches!(
         query_execution(
             s.snapshot(),
-            "SELECT (COUNT(*) AS ?n) {{?s ?p ?o} UNION {?o ?p ?s} ?s ?q ?t}",
-            &Default::default(),
+            &format!("SELECT ?x {{ {VIEW_READ} }}"),
+            &with_view(3),
             &strict,
             ExecutionMode::Auto,
         ),
@@ -2644,7 +2730,8 @@ const VARS: [&str; 4] = ["?a", "?b", "?c", "?d"];
 /// How a generated query fixes the order of its solutions.
 enum Order {
     None,
-    /// ORDER BY on these projected variables, so equal keys may come in any order.
+    /// ORDER BY on these projected variables, each `?v` or `DESC(?v)`, so equal keys may
+    /// come in any order.
     Vars(Vec<String>),
     /// ORDER BY on an expression, compared as a bag.
     Expr,
@@ -2982,7 +3069,7 @@ impl Gen {
                 let keys: Vec<String> = (0..n)
                     .map(|i| projected[(first + i) % projected.len()].clone())
                     .collect();
-                let text = keys
+                let keys: Vec<String> = keys
                     .iter()
                     .map(|k| {
                         if self.rng.below(2) == 0 {
@@ -2991,9 +3078,8 @@ impl Gen {
                             k.clone()
                         }
                     })
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                (format!(" ORDER BY {text}"), Order::Vars(keys))
+                    .collect();
+                (format!(" ORDER BY {}", keys.join(" ")), Order::Vars(keys))
             }
         };
         let limit = (self.rng.below(3) == 0).then(|| self.rng.below(6));
@@ -3095,8 +3181,9 @@ fn compare(shape: &Shape, vars: &[String], expected: &Rows, got: &Rows, unsliced
             let keys: Vec<usize> = keys
                 .iter()
                 .map(|k| {
+                    let k = k.trim_start_matches("DESC(").trim_end_matches(')');
                     vars.iter()
-                        .position(|v| format!("?{v}") == *k || v == k)
+                        .position(|v| format!("?{v}") == k || v == k)
                         .unwrap()
                 })
                 .collect();
@@ -3118,23 +3205,103 @@ fn compare(shape: &Shape, vars: &[String], expected: &Rows, got: &Rows, unsliced
     }
 }
 
-/// Run `seeds` generated queries against one view of the data and compare cursor
-/// answers at several batch sizes with the eager answer.
-fn differential(name: &str, snapshot: &Arc<Snapshot>, opts: &QueryOptions, seeds: u64) {
+/// The quads of a snapshot, for the reference evaluator.
+fn snapshot_quads(snapshot: &Snapshot) -> Vec<oxrdf::Quad> {
+    let mut out = Vec::new();
+    snapshot
+        .for_each_quad(|q| {
+            out.push(snapshot.quad_to_terms(q).expect("a stored quad decodes"));
+            Ok(())
+        })
+        .unwrap();
+    out
+}
+
+fn reference_select(
+    oracle: &reference::Reference,
+    q: &str,
+    context: &str,
+) -> (Vec<String>, Rows, reference::Notes) {
+    match oracle.run_noting_choices(q, None) {
+        Ok((reference::Answer::Select { variables, rows }, notes)) => (variables, rows, notes),
+        other => panic!("{context}, reference: {other:?}: {q}"),
+    }
+}
+
+/// Run `seeds` generated queries against one view of the data and compare the eager
+/// answer and cursor answers at several batch sizes with the answer of the reference
+/// evaluator over `quads`, the quads the view shows. The cursor answers are also
+/// compared with the eager one, including how each breaks ties.
+fn differential(
+    name: &str,
+    snapshot: &Arc<Snapshot>,
+    opts: &QueryOptions,
+    seeds: u64,
+    quads: Vec<oxrdf::Quad>,
+) {
     let seeds = std::env::var("SPARKLES_CURSOR_SEEDS")
         .ok()
         .and_then(|n| n.parse().ok())
         .unwrap_or(seeds);
+    let oracle = reference::Reference::new(quads).with_union_default(snapshot.union_default_graph);
+    // SPARKLES_REFERENCE_KEEP_GOING reports every disagreement with the reference
+    // before failing, for triage.
+    let keep_going = std::env::var_os("SPARKLES_REFERENCE_KEEP_GOING").is_some();
+    let disagreements = std::cell::Cell::new(0);
+    let (mut skipped, mut unordered, mut partial, mut readings) = (0, 0, 0, 0);
+    // the number of answers for each reason the comparison gives, which
+    // SPARKLES_REFERENCE_SKIPS prints
+    let mut reasons: std::collections::BTreeMap<String, usize> = Default::default();
     for seed in 1..=seeds {
         let shape = Gen::new(seed).query();
         let q = &shape.query;
+        let context = format!("{name} seed {seed}");
+        let selected = match reference::check::under_engine_readings(&oracle, q) {
+            Ok((reference::check::Expected::Select(s), taken)) => {
+                readings += usize::from(!taken.is_empty());
+                s
+            }
+            other => panic!("{context}, reference: {other:?}: {q}"),
+        };
         let (vars, expected) = eager(snapshot.clone(), q, opts);
+        let mut check =
+            |got: &Rows, what: &str| match reference::check::check_select(&selected, &vars, got) {
+                Ok(reference::check::Outcome::Compared) => {}
+                Ok(outcome) => {
+                    let (kind, why) = match outcome {
+                        reference::check::Outcome::Skipped(why) => {
+                            skipped += 1;
+                            ("skipped", why)
+                        }
+                        reference::check::Outcome::OrderUnchecked(why) => {
+                            unordered += 1;
+                            ("unordered", why)
+                        }
+                        reference::check::Outcome::Partial(why) => {
+                            partial += 1;
+                            ("partial", why)
+                        }
+                        reference::check::Outcome::Compared => unreachable!(),
+                    };
+                    let why = why.split(':').next().unwrap_or_default();
+                    *reasons.entry(format!("{kind}, {why}")).or_default() += 1;
+                }
+                Err(m) => {
+                    eprintln!("{name} seed {seed}, {what} against the reference: {m}: {q}");
+                    disagreements.set(disagreements.get() + 1);
+                    if !keep_going {
+                        panic!("{name} seed {seed}, {what} against the reference: {m}: {q}");
+                    }
+                }
+            };
+        check(&expected, "eager");
         let unsliced = shape
             .unsliced
             .as_ref()
             .map(|u| eager(snapshot.clone(), u, opts).1);
         for rows in [1, 2, 3, 4096] {
             let got = streamed(snapshot.clone(), q, opts, rows, &vars);
+            check(&got, &format!("cursor of {rows} rows"));
             let message = format!("{name} seed {seed}, {rows} rows");
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 compare(&shape, &vars, &expected, &got, unsliced.as_ref())
@@ -3145,6 +3312,21 @@ fn differential(name: &str, snapshot: &Arc<Snapshot>, opts: &QueryOptions, seeds
             }
         }
     }
+    eprintln!(
+        "{name}: of {seeds} queries and their five answers each, {skipped} answers have rows \
+         that the specification leaves open, {unordered} were compared without their order, \
+         {partial} were compared with some cells only in part, and {readings} queries compare under the engine's reading of an open roadmap item"
+    );
+    if std::env::var_os("SPARKLES_REFERENCE_SKIPS").is_some() {
+        for (why, n) in &reasons {
+            eprintln!("{name}: {n} answers {why}");
+        }
+    }
+    assert_eq!(
+        disagreements.get(),
+        0,
+        "{name}: disagreements with the reference"
+    );
 }
 
 /// The triples the differential queries read, drawn from a fixed seed.
@@ -3195,7 +3377,8 @@ fn random_queries_agree_between_cursor_and_eager_on_a_compacted_base() {
     s.compact().unwrap();
     let snapshot = s.snapshot();
     assert!(snapshot.delta.is_empty());
-    differential("compacted", &snapshot, &Default::default(), SEEDS);
+    let quads = snapshot_quads(&snapshot);
+    differential("compacted", &snapshot, &Default::default(), SEEDS, quads);
 }
 
 /// The same over a base with a pending delta of inserts and deletes.
@@ -3217,7 +3400,8 @@ fn random_queries_agree_between_cursor_and_eager_over_a_pending_delta() {
     .unwrap();
     let snapshot = s.snapshot();
     assert!(!snapshot.delta.is_empty());
-    differential("delta", &snapshot, &Default::default(), SEEDS);
+    let quads = snapshot_quads(&snapshot);
+    differential("delta", &snapshot, &Default::default(), SEEDS, quads);
 }
 
 /// The same over data that spans several index blocks. Copies of each triple in named
@@ -3247,7 +3431,8 @@ fn random_queries_agree_between_cursor_and_eager_across_index_blocks() {
     s.compact().unwrap();
     let snapshot = s.snapshot();
     assert!(snapshot.perm(sparkles_core::index::Perm::Pso).blocks.len() > 1);
-    differential("blocks", &snapshot, &Default::default(), SEEDS / 3);
+    let quads = snapshot_quads(&snapshot);
+    differential("blocks", &snapshot, &Default::default(), SEEDS / 3, quads);
 }
 
 /// The same through a view that hides some triples, which reads a masked snapshot, over
@@ -3306,7 +3491,438 @@ fn random_queries_agree_between_cursor_and_eager_through_a_masked_view() {
                 .unwrap()
                 .len()
     );
-    differential("masked", &snapshot, &opts, SEEDS);
+    // The protection hides the <urn:p> triples of the subjects typed <urn:Hidden>. The
+    // reference reads the quads that remain, which a plain scan through the view must
+    // also return.
+    let all = snapshot_quads(&snapshot);
+    let hidden_subjects: Vec<oxrdf::NamedOrBlankNode> = all
+        .iter()
+        .filter(|q| {
+            q.predicate.as_str() == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"
+                && q.object == Term::NamedNode(oxrdf::NamedNode::new_unchecked("urn:Hidden"))
+        })
+        .map(|q| q.subject.clone())
+        .collect();
+    let visible: Vec<oxrdf::Quad> = all
+        .into_iter()
+        .filter(|q| !(q.predicate.as_str() == "urn:p" && hidden_subjects.contains(&q.subject)))
+        .collect();
+    assert_eq!(
+        query(snapshot.clone(), "SELECT * WHERE { ?s ?p ?o }", &opts)
+            .unwrap()
+            .len(),
+        visible.len()
+    );
+    differential("masked", &snapshot, &opts, SEEDS, visible);
+}
+
+/// A count over a join runs the join as a cursor operator of its own and counts its
+/// rows, so the strict policy admits it and no operator materializes (item 829).
+#[test]
+fn count_join_counts_a_streamed_join() {
+    use std::sync::atomic::AtomicU64;
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:q> <urn:s:{}> .\n<urn:s:{i}> <urn:r> <urn:g:{}> .\n",
+                (i * 7) % 60,
+                i % 3
+            )
+        })
+        .collect::<String>()
+        // four pairs with `?s <urn:q> ?t` on both variables, then 60 rows that match
+        // nothing
+        + "<urn:s:1> <urn:w> <urn:s:7> .\n<urn:s:2> <urn:w> <urn:s:14> .\n"
+        + "<urn:s:3> <urn:w> <urn:s:21> .\n<urn:s:4> <urn:w> <urn:s:28> .\n"
+        + &(0..60)
+            .map(|i| format!("<urn:z:{i}> <urn:w> <urn:z:{i}> .\n"))
+            .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn has(plan: &sparkles_core::sparql::CursorPlan, op: &str) -> bool {
+        plan.operator.operator == op || plan.children.iter().any(|c| has(c, op))
+    }
+    let pairs = |n: usize, undef: bool| {
+        (0..n)
+            .map(|i| match undef && i % 4 == 0 {
+                true => format!("(UNDEF {i})"),
+                false => format!("(<urn:s:{}> {i})", i % 2),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let two_keys = (0..20)
+        .map(|i| format!("(1 1 {i})"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (q, count_join) in [
+        // a merge join on one key, which eager counts from its key runs
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        // a join over a sorted union, which the cursor plans as a merge join
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o > 1000) ?s <urn:q> ?t }".to_string(),
+            true,
+        ),
+        // 1180 pairs of inputs with at most 60 rows each
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:r> ?g FILTER(?s != <urn:s:0>) ?t <urn:r> ?g }".to_string(),
+            true,
+        ),
+        // two shared variables, 400 pairs
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES (?a ?b ?i) {{ {two_keys} }} VALUES (?a ?b ?j) {{ {two_keys} }} }}"
+            ),
+            false,
+        ),
+        // a hash join on two variables that BIND leaves unsorted, whose four pairs come
+        // before rows that match nothing, so the join reads input after its last pair
+        // (a merge join would stop at the end of one input, which eager reads whole);
+        // eager refuses it at a work limit equal to its own work, as item 1103 records,
+        // and so must the streamed count once it has read that input
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { { ?a <urn:q> ?b BIND(?a AS ?s) BIND(?b AS ?t) } ?s <urn:w> ?t }".to_string(),
+            true,
+        ),
+        // a merge join on two variables, which the eager kernel counts (item 1129)
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?s <urn:w> ?t }".to_string(),
+            true,
+        ),
+        // a key that some rows leave unbound
+        (
+            format!(
+                "SELECT (COUNT(*) AS ?n) WHERE {{ VALUES (?s ?i) {{ {} }} ?s <urn:q> ?t }}",
+                pairs(40, true)
+            ),
+            false,
+        ),
+    ] {
+        let q = q.as_str();
+        let expected = query(s.snapshot(), q, &Default::default())
+            .unwrap()
+            .application_rows();
+        for rows in [1, 2, 3, 4096] {
+            let c = open(&s, q, rows);
+            assert!(!c.plan().has_materialization(), "{q}: {:?}", c.plan());
+            if count_join {
+                assert!(has(c.plan(), "CountJoin"), "{q}: {:?}", c.plan());
+            }
+            if q.contains("BIND") {
+                assert!(has(c.plan(), "HashJoin"), "{q}: {:?}", c.plan());
+            }
+            assert_eq!(all(c), expected, "{q}; {rows}");
+        }
+        // The pairs of the join below the count are not rows that the eager count
+        // produces, so they stay out of the work count. The eager count admits them
+        // against the row limit and the work limit when it forms them, and not when it
+        // counts a merge join's key runs, and the streamed count follows it, so both
+        // modes give the same outcome at each limit (Sol review of item 829, findings 1
+        // of rounds 1 and 2).
+        let with = |rows: Option<usize>, limit: Option<u64>, work: Option<Arc<AtomicU64>>| {
+            QueryOptions {
+                no_cache: true,
+                max_rows: rows,
+                max_rows_produced: limit,
+                work,
+                ..Default::default()
+            }
+        };
+        type Outcome = Result<Vec<Vec<Option<Term>>>, Option<BudgetKind>>;
+        let outcome = |r: Result<Vec<Vec<Option<Term>>>, Error>| -> Outcome {
+            r.map_err(|e| match e {
+                Error::BudgetExceeded(b) => Some(b.kind),
+                _ => None,
+            })
+        };
+        let eager = |rows: Option<usize>, limit: Option<u64>| -> Outcome {
+            outcome(query(s.snapshot(), q, &with(rows, limit, None)).map(|r| r.application_rows()))
+        };
+        let streamed = |rows: Option<usize>, limit: Option<u64>, batch: usize| -> (Outcome, u64) {
+            let work = Arc::new(AtomicU64::new(0));
+            let run = || -> Result<_, Error> {
+                let opts = with(rows, limit, Some(work.clone()));
+                let mut c = select_cursor(s.snapshot(), q, &opts, &options(batch))?;
+                let mut answer = Vec::new();
+                while let Some(b) = c.next_batch()? {
+                    for row in 0..b.len() {
+                        answer.push(b.row(row).unwrap().values().to_vec());
+                    }
+                }
+                Ok(answer)
+            };
+            let r = outcome(run());
+            (r, work.load(Ordering::Relaxed))
+        };
+        let produced = query(s.snapshot(), q, &with(None, None, None))
+            .unwrap()
+            .rows_produced;
+        let count = match expected[0][0].as_ref() {
+            Some(Term::Literal(l)) => l.value().parse::<u64>().unwrap(),
+            other => panic!("{q}: {other:?}"),
+        };
+        let mut limits = vec![
+            (None, None),
+            (Some(120), None),
+            (None, Some(produced)),
+            (None, Some(produced - 1)),
+            (None, Some(produced - 2)),
+            (None, Some(produced - 3)),
+            (None, Some(produced + count)),
+        ];
+        if count > 0 {
+            limits.push((None, Some(produced + count - 1)));
+        }
+        for batch in [1, 3, 4096] {
+            let (answer, work) = streamed(None, None, batch);
+            assert_eq!(answer, Ok(expected.clone()), "{q}; {batch}");
+            assert_eq!(work, produced, "{q}; {batch}");
+            for &(rows, limit) in &limits {
+                assert_eq!(
+                    streamed(rows, limit, batch).0,
+                    eager(rows, limit),
+                    "{q}; batch {batch}, max_rows {rows:?}, max_rows_produced {limit:?} (produced {produced}, count {count})"
+                );
+            }
+        }
+    }
+}
+
+/// A count over a merge join on two variables runs its eager kernel as a whole-input
+/// operator under either policy, with no join operator below it, because the streamed
+/// join costs 1.8 times the eager count (item 1129). It gives the eager answer.
+#[test]
+fn a_count_over_a_two_variable_merge_join_runs_the_eager_kernel() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            let o = (i * 7) % 60;
+            let mut t = format!("<urn:s:{i}> <urn:q> <urn:s:{o}> .\n");
+            if i % 3 == 0 {
+                t += &format!("<urn:s:{i}> <urn:w> <urn:s:{o}> .\n");
+            }
+            t + &format!("<urn:s:{i}> <urn:w> <urn:z:{i}> .\n")
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    fn ops(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<String>) {
+        out.push(plan.operator.operator.clone());
+        for child in &plan.children {
+            ops(child, out);
+        }
+    }
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?s <urn:w> ?t }";
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    assert_eq!(
+        expected,
+        vec![vec![Some(Term::Literal(
+            oxrdf::Literal::new_typed_literal("20", oxrdf::vocab::xsd::INTEGER)
+        ))]]
+    );
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 2, 3, 4096] {
+            let opts = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &opts).unwrap();
+            let mut names = Vec::new();
+            ops(c.plan(), &mut names);
+            assert!(
+                !c.plan().has_materialization(),
+                "{fallback:?}: {:?}",
+                c.plan()
+            );
+            assert!(
+                names.iter().any(|n| n == "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.ends_with("Join") && n != "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            fn count_join(
+                plan: &sparkles_core::sparql::CursorPlan,
+            ) -> Option<&sparkles_core::sparql::CursorPlan> {
+                match plan.operator.operator == "CountJoin" {
+                    true => Some(plan),
+                    false => plan.children.iter().find_map(count_join),
+                }
+            }
+            // It holds both of its inputs.
+            assert!(
+                count_join(c.plan()).is_some_and(|p| p.growing_state),
+                "{fallback:?}: {:?}",
+                c.plan()
+            );
+            assert_eq!(all(c), expected, "{fallback:?}; {rows}");
+        }
+    }
+    // With an empty left input the count reads nothing of its right input, as eager
+    // does, so a work limit below the right input's rows refuses neither.
+    let empty = "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t FILTER(STRSTARTS(STR(?t), \"urn:absent\")) ?s <urn:w> ?t }";
+    let limited = |limit: u64| QueryOptions {
+        no_cache: true,
+        max_rows_produced: Some(limit),
+        ..Default::default()
+    };
+    let expected = query(s.snapshot(), empty, &limited(65))
+        .unwrap()
+        .application_rows();
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 4096] {
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let c = select_cursor(s.snapshot(), empty, &limited(65), &o).unwrap();
+            let mut names = Vec::new();
+            ops(c.plan(), &mut names);
+            assert!(
+                names.iter().any(|n| n == "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            assert!(
+                !names
+                    .iter()
+                    .any(|n| n.ends_with("Join") && n != "CountJoin"),
+                "{fallback:?}: {names:?}"
+            );
+            let mut c = c;
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(c.status(), CursorStatus::Complete);
+            assert_eq!(answer, expected, "{fallback:?}; {rows}");
+            // The right input never ran, and its plan says so as the eager plan does.
+            fn find<'a>(
+                plan: &'a sparkles_core::sparql::CursorPlan,
+                op: &str,
+            ) -> Option<&'a sparkles_core::sparql::CursorPlan> {
+                match plan.operator.operator == op {
+                    true => Some(plan),
+                    false => plan.children.iter().find_map(|c| find(c, op)),
+                }
+            }
+            fn all_skipped(plan: &sparkles_core::sparql::CursorPlan) -> bool {
+                let f = plan.operator.fidelity();
+                f.skipped.as_deref() == Some("the left side produced no rows")
+                    && !f.stopped_early
+                    && plan.operator.actual_rows == -1
+                    && plan.operator.time_ms == 0.0
+                    && plan.children.iter().all(all_skipped)
+            }
+            let count = find(c.plan(), "CountJoin").expect("a count join");
+            assert_eq!(count.children.len(), 2, "{:?}", count);
+            assert!(all_skipped(&count.children[1]), "{fallback:?}: {:?}", count);
+            assert!(count.children[0].operator.fidelity().skipped.is_none());
+        }
+    }
+}
+
+/// The skipped right input of a count over a two-variable merge join is marked as never
+/// run down to the children that an eager kernel describes without operators, here the
+/// scans of a count from key runs inside a subquery (Sol review of item 829, round 10).
+#[test]
+fn a_skipped_count_input_marks_its_described_children() {
+    let s = store(60);
+    let data = (0..60)
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:q> <urn:s:{}> .\n<urn:s:{i}> <urn:w> <urn:z:{i}> .\n",
+                (i * 7) % 60
+            )
+        })
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    type Plan = sparkles_core::sparql::CursorPlan;
+    fn find<'a>(plan: &'a Plan, op: &str) -> Option<&'a Plan> {
+        match plan.operator.operator == op {
+            true => Some(plan),
+            false => plan.children.iter().find_map(|c| find(c, op)),
+        }
+    }
+    fn all_skipped(plan: &Plan) -> bool {
+        let f = plan.operator.fidelity();
+        f.skipped.as_deref() == Some("the left side produced no rows")
+            && !f.stopped_early
+            && !f.incomplete
+            && plan.operator.actual_rows == -1
+            && plan.operator.time_ms == 0.0
+            && plan.children.iter().all(all_skipped)
+    }
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { \
+        ?s <urn:q> ?t FILTER(STRSTARTS(STR(?t), \"urn:absent\")) \
+        { SELECT ?s ?t WHERE { \
+            { SELECT (COUNT(*) AS ?c) WHERE { ?a <urn:q> ?b . ?a <urn:w> ?d } } \
+            VALUES (?s ?t) { (<urn:s:1> <urn:s:7>) } } } }";
+    let expected = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    for fallback in [
+        FallbackPolicy::RejectMaterialization,
+        FallbackPolicy::AllowMaterialization,
+    ] {
+        for rows in [1, 4096] {
+            let o = CursorOptions {
+                batch_rows: rows,
+                fallback,
+                ..Default::default()
+            };
+            let mut c = select_cursor(s.snapshot(), q, &QueryOptions::default(), &o).unwrap();
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch().unwrap() {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            assert_eq!(c.status(), CursorStatus::Complete);
+            assert_eq!(answer, expected, "{fallback:?}; {rows}");
+            let count = find(c.plan(), "CountJoin").expect("a count join");
+            assert_eq!(count.children.len(), 2, "{count:?}");
+            let runs = find(&count.children[1], "CountJoinFromRuns")
+                .unwrap_or_else(|| panic!("{fallback:?}: {count:?}"));
+            assert!(!runs.children.is_empty(), "{runs:?}");
+            assert!(all_skipped(&count.children[1]), "{fallback:?}: {count:?}");
+        }
+    }
 }
 
 /// An operator without a cursor implementation materializes only itself. Its inputs
@@ -3323,31 +3939,45 @@ fn a_fallback_materializes_only_its_operator_and_streams_its_inputs() {
         None,
     )])
     .unwrap();
-    fn fallbacks(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<bool>) {
+    // (whether the fallback has inputs, whether an input materializes)
+    fn fallbacks(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<(bool, bool)>) {
         if plan.materializes {
-            out.push(plan.children.iter().any(|c| c.has_materialization()));
+            out.push((
+                !plan.children.is_empty(),
+                plan.children.iter().any(|c| c.has_materialization()),
+            ));
         }
         for child in &plan.children {
             fallbacks(child, out);
         }
     }
+    let views = with_view(30);
     for q in [
-        "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o < 20) ?s <urn:q> ?t }",
-        "SELECT (COUNT(*) AS ?n) WHERE { { ?s <urn:p> ?o } UNION { ?s <urn:q> ?o } ?s <urn:q> ?t }",
+        format!(
+            "SELECT ?s ?o WHERE {{ ?s <urn:p> ?o FILTER EXISTS {{ {VIEW_READ} FILTER(?x = ?o) }} }}"
+        ),
+        format!(
+            "SELECT ?s WHERE {{ ?s <urn:q> ?t FILTER NOT EXISTS {{ {VIEW_READ} FILTER(?x = 3) }} }}"
+        ),
+        // a path search over its group without a limit reads its whole input, and that
+        // input streams into it
+        "SELECT ?s ?b WHERE { ?s <urn:p> ?o FILTER(?o < 5) SERVICE <urn:x-sparkles:path#search> { [] <urn:x-sparkles:path#source> ?s ; <urn:x-sparkles:path#target> ?b ; <urn:x-sparkles:path#predicate> <urn:q> } }".to_string(),
     ] {
-        let expected = bag(query(s.snapshot(), q, &Default::default())
-            .unwrap()
-            .application_rows());
+        let q = q.as_str();
+        let expected = bag(query(s.snapshot(), q, &views).unwrap().application_rows());
         for rows in [1, 2, 3, 4096] {
             let opts = CursorOptions {
                 batch_rows: rows,
                 ..Default::default()
             };
-            let c = select_cursor(s.snapshot(), q, &Default::default(), &opts).unwrap();
+            let c = select_cursor(s.snapshot(), q, &views, &opts).unwrap();
             let mut found = Vec::new();
             fallbacks(c.plan(), &mut found);
             assert!(!found.is_empty(), "{q}");
-            assert!(found.iter().all(|nested| !nested), "{q}: {:?}", c.plan());
+            assert!(found.iter().all(|(_, nested)| !nested), "{q}: {:?}", c.plan());
+            if q.contains("path#search") {
+                assert!(found.iter().any(|(inputs, _)| *inputs), "{q}: {:?}", c.plan());
+            }
             assert_eq!(bag(all(c)), expected, "{q}; {rows}");
         }
     }
@@ -4293,22 +4923,32 @@ fn cursor_node<'a>(
 }
 
 /// The cursor's ordered top-k holds a morsel per worker thread and the rows they keep,
-/// however many rows its pieces without value order hold: two workers read 4 and 12
-/// morsels of a single block with the same peak.
+/// however many rows its pieces without value order hold. On one worker the peak is a
+/// single morsel's, the same for 4 and 12 morsels of a single block. On two workers it is
+/// at most two morsels' peaks, for 4 and 12 morsels alike.
+///
+/// The two-worker bound comes from the one-worker peaks, which do not depend on
+/// scheduling. A two-worker peak is not a fixed baseline, since it depends on how far the
+/// work of two morsels overlaps in time, and an idle or busy worker that overlaps them
+/// less gives a lower peak.
 #[test]
 fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .build()
-        .unwrap();
+    let pools = [1, 2].map(|threads| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap()
+    });
     let q = "SELECT ?s ?v WHERE { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 10";
+    // the peaks of one and of two workers, for each store
     let mut peaks = Vec::new();
     for n in [300_000, 900_000] {
         let s = decimal_store(n, 3, "");
         let eager = query(s.snapshot(), q, &Default::default()).unwrap();
         assert!(plan_has(eager.plan(), "IndexTopK"), "{:#?}", eager.plan());
-        let peak = |opts: &QueryOptions| {
-            let mut c = select_cursor(s.snapshot(), q, opts, &options(4096)).unwrap();
+        let peak = |pool: &rayon::ThreadPool| {
+            let mut c =
+                select_cursor(s.snapshot(), q, &QueryOptions::default(), &options(4096)).unwrap();
             let rows = pool.install(|| {
                 let mut rows = Vec::new();
                 while let Some(b) = c.next_batch().unwrap() {
@@ -4319,9 +4959,16 @@ fn ordered_top_k_memory_does_not_grow_with_its_unordered_pieces() {
             assert_eq!(rows, eager.application_rows());
             c.stats().mem_peak_bytes
         };
-        peaks.push(peak(&QueryOptions::default()));
+        peaks.push(pools.each_ref().map(peak));
     }
-    assert!(peaks[1] < peaks[0] * 5 / 4, "{peaks:?}");
+    // one worker: the same morsel peak however many morsels there are
+    assert!(peaks[1][0] < peaks[0][0] * 9 / 8, "{peaks:?}");
+    // two workers: at most twice one worker's peak, with a margin for per-worker state
+    let bound = peaks[0][0] * 2 * 9 / 8;
+    assert!(
+        peaks.iter().all(|p| p[1] < bound),
+        "{peaks:?} against {bound}"
+    );
 }
 
 /// A store whose `<urn:p>` values in `<urn:g1>` are 400,000 inline decimals below 5,
@@ -4957,7 +5604,17 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
         None,
     )])
     .unwrap();
-    let q = "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }";
+    // The second query's condition reads both sides, and the third's is an EXISTS.
+    for q in [
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x } }",
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x FILTER(?o > 50 && ?x != \"77\") } }",
+        "SELECT ?s ?o ?x WHERE { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?x FILTER EXISTS { ?s <urn:p> ?v FILTER(?v < 120) } } }",
+    ] {
+        optional_merge_names_its_algorithm(&s, q);
+    }
+}
+
+fn optional_merge_names_its_algorithm(s: &Store, q: &str) {
     let expected = bag(query(s.snapshot(), q, &Default::default())
         .unwrap()
         .application_rows());
@@ -4983,7 +5640,883 @@ fn the_cursor_optional_honours_merge_left_join_and_names_its_algorithm() {
             );
         }
         assert_eq!(plan.contains("[hash join]"), !merge, "{plan}");
-        assert_eq!(bag(all(c)), expected, "merge_left_join {merge}");
-        assert_eq!(bag(eager.application_rows()), expected);
+        assert_eq!(bag(all(c)), expected, "{q}: merge_left_join {merge}");
+        assert_eq!(bag(eager.application_rows()), expected, "{q}");
     }
+}
+
+/// A whole-input operator counts the rows it produces against the work limit as the
+/// eager kernel does: both modes count the same rows, a limit one row short of that
+/// count stops both, and the count itself passes both (item 829). The forms are a path
+/// search over its group, a path search and an algorithm call over a nested edge
+/// pattern, and an algorithm call over its group.
+#[test]
+fn whole_input_operators_count_their_rows_as_eager_does() {
+    use std::sync::atomic::AtomicU64;
+    let s = store(30);
+    let data = (0..30)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % 30))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let prefixes = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    fn reasons(plan: &sparkles_core::sparql::CursorPlan, out: &mut Vec<String>) {
+        out.extend(plan.reason.clone());
+        for c in &plan.children {
+            reasons(c, out);
+        }
+    }
+    for (q, reads) in [
+        (
+            "SELECT ?s ?b WHERE { ?s <urn:p> ?o FILTER(?o < 5) SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 7 } }",
+            "all of its input",
+        ),
+        (
+            "SELECT ?b ?i WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 6 ; path:edgeIndex ?i ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+            "all of its edge pattern",
+        ),
+        (
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n ; algo:component ?c . ?a <urn:q> ?b } }",
+            "all of its edge pattern",
+        ),
+        (
+            "SELECT ?src ?n ?d WHERE { ?src <urn:p> ?o FILTER(?o < 3) SERVICE algo:bfs { [] algo:predicate <urn:q> ; algo:source ?src ; algo:node ?n ; algo:depth ?d } }",
+            "all of its input",
+        ),
+    ] {
+        let q = format!("{prefixes}{q}");
+        let opts = |limit: Option<u64>, work: Option<Arc<AtomicU64>>| QueryOptions {
+            no_cache: true,
+            max_rows_produced: limit,
+            work,
+            ..Default::default()
+        };
+        let eager = query(s.snapshot(), &q, &opts(None, None)).unwrap();
+        let produced = eager.rows_produced;
+        assert!(!eager.is_empty(), "{q}");
+        let expected = bag(eager.application_rows());
+        let streamed = |limit: Option<u64>, rows: usize| -> Result<(u64, Vec<String>), Error> {
+            let work = Arc::new(AtomicU64::new(0));
+            let mut c = select_cursor(
+                s.snapshot(),
+                &q,
+                &opts(limit, Some(work.clone())),
+                &options(rows),
+            )?;
+            let mut found = Vec::new();
+            reasons(c.plan(), &mut found);
+            assert!(
+                found
+                    .iter()
+                    .any(|r| r.contains(reads) && r.contains("runs once")),
+                "{q}: {found:?}"
+            );
+            let mut answer = Vec::new();
+            while let Some(batch) = c.next_batch()? {
+                for row in 0..batch.len() {
+                    answer.push(batch.row(row).unwrap().values().to_vec());
+                }
+            }
+            Ok((work.load(Ordering::Relaxed), bag(answer)))
+        };
+        for rows in [1, 3, 4096] {
+            let (work, answer) = streamed(None, rows).unwrap();
+            assert_eq!(answer, expected, "{q}; {rows}");
+            assert_eq!(work, produced, "{q}; {rows}");
+            assert!(streamed(Some(produced), rows).is_ok(), "{q}; {rows}");
+            assert!(
+                matches!(streamed(Some(produced - 1), rows), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+                "{q}; {rows}"
+            );
+        }
+        assert!(
+            matches!(query(s.snapshot(), &q, &opts(Some(produced - 1), None)), Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::RowsProduced),
+            "{q}"
+        );
+    }
+}
+
+/// A whole-input operator holds its input under the memory budget, so a budget that
+/// cannot hold the input refuses the query with a budget error in both modes, while
+/// small batches alone fit (item 829). The forms read their group or their edge pattern.
+#[test]
+fn whole_input_operators_refuse_an_input_over_the_memory_budget() {
+    let n = 6000;
+    let s = store(n);
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % n))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let prefixes = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    for q in [
+        "SELECT ?s ?b WHERE { ?s <urn:p> ?o SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 3 } }",
+        "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 3 ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        "SELECT ?n WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n . ?a <urn:q> ?b } } LIMIT 1",
+    ] {
+        let q = format!("{prefixes}{q}");
+        let tight = QueryOptions {
+            no_cache: true,
+            max_memory_bytes: Some(48 << 10),
+            ..Default::default()
+        };
+        let memory = |r: Result<(), Error>| matches!(r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+        assert!(
+            memory(query(s.snapshot(), &q, &tight).map(drop)),
+            "{q}: eager"
+        );
+        let run = |opts: &QueryOptions| -> Result<(), Error> {
+            let mut c = select_cursor(s.snapshot(), &q, opts, &options(8))?;
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        };
+        run(&QueryOptions::default()).unwrap_or_else(|e| panic!("{q}: {e}"));
+        let r = run(&tight);
+        let refused = matches!(&r, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory);
+        assert!(refused, "{q}: {:?}", r.err().map(|e| e.to_string()));
+    }
+}
+
+/// Peak memory and time of the whole-input and bounded-leaf forms against eager runs of
+/// the same queries, for the item 829 measurement. Run it alone in release mode with
+/// `--ignored --nocapture`; LEAF_MEASURE_N sets the graph size (default 200000).
+#[test]
+#[ignore]
+fn measure_whole_input_and_leaf_forms() {
+    use std::time::Instant;
+    let n: usize = std::env::var("LEAF_MEASURE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200_000);
+    let s = store(n);
+    let data = (0..n)
+        .map(|i| format!("<urn:s:{i}> <urn:q> <urn:s:{}> .\n", (i * 7 + 1) % n))
+        .collect::<String>();
+    s.load(&[Source::from_bytes(
+        data.into_bytes(),
+        RdfFormat::Turtle,
+        None,
+    )])
+    .unwrap();
+    let p = "PREFIX path: <urn:x-sparkles:path#> PREFIX algo: <urn:x-sparkles:algo#> ";
+    let forms = [
+        (
+            "path search over its group",
+            "SELECT ?s ?b WHERE { ?s <urn:p> ?o SERVICE path:search { [] path:source ?s ; path:target ?b ; path:predicate <urn:q> ; path:limit 10 } }",
+        ),
+        (
+            "path search over an edge pattern",
+            "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:limit 10 ; path:start ?x ; path:end ?y . ?x <urn:q> ?y } }",
+        ),
+        (
+            "path search leaf",
+            "SELECT ?b WHERE { SERVICE path:search { [] path:source <urn:s:1> ; path:target ?b ; path:predicate <urn:q> ; path:limit 10 } }",
+        ),
+        (
+            "algorithm call over its group",
+            "SELECT ?n ?d WHERE { ?src <urn:p> ?o FILTER(?o < 4) SERVICE algo:bfs { [] algo:predicate <urn:q> ; algo:source ?src ; algo:node ?n ; algo:depth ?d } }",
+        ),
+        (
+            "algorithm call over an edge pattern",
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:start ?a ; algo:end ?b ; algo:node ?n ; algo:component ?c . ?a <urn:q> ?b } }",
+        ),
+        (
+            "algorithm call leaf",
+            "SELECT ?n ?c WHERE { SERVICE algo:wcc { [] algo:predicate <urn:q> ; algo:node ?n ; algo:component ?c } }",
+        ),
+        (
+            "count join of two scans (key runs)",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o . ?s <urn:q> ?t }",
+        ),
+        (
+            "count join over a filter",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:p> ?o FILTER(?o >= 0) ?s <urn:q> ?t }",
+        ),
+        (
+            "count join on two variables",
+            "SELECT (COUNT(*) AS ?n) WHERE { ?s <urn:q> ?t . ?t <urn:q> ?s }",
+        ),
+    ];
+    println!("| form | rows | eager peak | streamed peak | eager ms | streamed ms |");
+    println!("|---|---:|---:|---:|---:|---:|");
+    for (name, q) in forms {
+        let q = format!("{p}{q}");
+        let opts = QueryOptions {
+            no_cache: true,
+            ..Default::default()
+        };
+        let (mut eager_ms, mut streamed_ms) = (f64::MAX, f64::MAX);
+        let (mut eager_peak, mut streamed_peak, mut rows) = (0, 0, 0);
+        for _ in 0..5 {
+            let t = Instant::now();
+            let r = query(s.snapshot(), &q, &opts).unwrap();
+            eager_ms = eager_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            eager_peak = r.mem_peak_bytes;
+            rows = r.len();
+            let t = Instant::now();
+            let mut c = select_cursor(s.snapshot(), &q, &opts, &options(4096)).unwrap();
+            while c.next_batch().unwrap().is_some() {}
+            streamed_ms = streamed_ms.min(t.elapsed().as_secs_f64() * 1000.0);
+            streamed_peak = c.stats().mem_peak_bytes;
+        }
+        println!(
+            "| {name} | {rows} | {:.1} MiB | {:.1} MiB | {eager_ms:.1} | {streamed_ms:.1} |",
+            eager_peak as f64 / 1048576.0,
+            streamed_peak as f64 / 1048576.0
+        );
+    }
+}
+
+/// The reference evaluator's answers to the cases of its first review, and the
+/// comparison's verdicts on answers that the specification allows and forbids.
+#[test]
+fn reference_evaluator_review_cases() {
+    use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
+    use reference::check::{Outcome, check_select};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let quad =
+        |s: oxrdf::NamedOrBlankNode, p: &str, o: Term, g: GraphName| Quad::new(s, iri(p), o, g);
+    let a = || oxrdf::NamedOrBlankNode::from(iri("urn:a"));
+    let shared = BlankNode::new_unchecked("rb0");
+    let quads = vec![
+        quad(a(), "urn:p", iri("urn:b").into(), GraphName::DefaultGraph),
+        quad(a(), "urn:q", iri("urn:b").into(), GraphName::DefaultGraph),
+        quad(
+            shared.clone().into(),
+            "urn:p",
+            iri("urn:x").into(),
+            iri("urn:g1").into(),
+        ),
+        quad(
+            shared.clone().into(),
+            "urn:q",
+            iri("urn:y").into(),
+            iri("urn:g2").into(),
+        ),
+    ];
+    let r = reference::Reference::new(quads.clone()).with_spec_readings(true);
+    let jena = reference::Reference::new(quads);
+    let rows = |q: &str| reference_select(&r, q, "review").1;
+    let one = |q: &str| rows(q).remove(0).remove(0);
+    let int = |n: i32| Some(Term::Literal(Literal::from(n)));
+    let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
+
+    // 1: a negated property set gives a pair once, and under Jena's reading once for each
+    // triple
+    let nps = "SELECT ?o WHERE { <urn:a> !<urn:z> ?o }";
+    assert_eq!(rows(nps).len(), 1);
+    assert_eq!(reference_select(&jena, nps, "review").1.len(), 2);
+    // 2: BNODE(label) is a new blank node for each solution that an aggregate reads
+    assert_eq!(
+        one("SELECT (COUNT(DISTINCT BNODE(\"x\")) AS ?n) WHERE { VALUES ?v { 1 2 } }"),
+        int(2)
+    );
+    // 3: a made blank node is none of the dataset's
+    assert_eq!(
+        rows("SELECT ?s WHERE { GRAPH ?g { ?s <urn:p> <urn:x> } FILTER(sameTerm(?s, BNODE())) }")
+            .len(),
+        0
+    );
+    // 4: AVG of errors only is zero
+    assert_eq!(
+        one("SELECT (AVG(?x) AS ?a) WHERE { VALUES ?x { UNDEF } }"),
+        int(0)
+    );
+    // 5: GROUP_CONCAT is CONCAT, which takes no IRI, and notes it
+    let (_, g, notes) = reference_select(
+        &r,
+        "SELECT (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES ?x { <urn:a> } }",
+        "review",
+    );
+    assert_eq!(g, vec![vec![None]]);
+    assert!(notes.group_concat_non_string);
+    // 6: the effective boolean value of an ill-formed boolean is an error in SPARQL 1.2
+    let bad = "SELECT (!\"bad\"^^<http://www.w3.org/2001/XMLSchema#boolean> AS ?x) WHERE {}";
+    assert_eq!(one(bad), None);
+    let r11 = reference::Reference::new(Vec::new()).with_sparql11_ebv(true);
+    assert_eq!(
+        reference_select(&r11, bad, "review").1[0][0],
+        Some(Term::Literal(Literal::from(true)))
+    );
+    // 7: inf is not a double
+    assert_eq!(
+        one(
+            "SELECT (isNumeric(\"inf\"^^<http://www.w3.org/2001/XMLSchema#double>) AS ?n) WHERE {}"
+        ),
+        Some(Term::Literal(Literal::from(false)))
+    );
+    // 8: a double casts to a string by the XPath rules
+    let cast = |e: &str| {
+        one(&format!(
+            "SELECT (<http://www.w3.org/2001/XMLSchema#string>({e}) AS ?s) WHERE {{}}"
+        ))
+    };
+    assert_eq!(cast("1e6"), string("1.0E6"));
+    assert_eq!(cast("1.5e0"), string("1.5"));
+    assert_eq!(cast("1.0e-7"), string("1.0E-7"));
+    assert_eq!(cast("2.50"), string("2.5"));
+    // 9: a back-reference is unsupported, not an error, and \b is no XPath escape, which
+    // Jena reads as Java's word boundary
+    assert!(matches!(
+        r.run("SELECT (REGEX(\"aa\", \"(a)\\\\1\") AS ?r) WHERE {}", None),
+        Err(reference::Error::Unsupported(_))
+    ));
+    let boundary = "SELECT (REGEX(\"a b\", \"a\\\\b\") AS ?r) WHERE {}";
+    assert_eq!(one(boundary), None);
+    assert!(matches!(
+        jena.run(boundary, None),
+        Err(reference::Error::Unsupported(_))
+    ));
+    assert_eq!(
+        one("SELECT (REGEX(\"a\\rb\", \"a.b\") AS ?r) WHERE {}"),
+        Some(Term::Literal(Literal::from(false)))
+    );
+    // 10: the default graph of two FROM clauses keeps their blank nodes apart, and Jena's
+    // reading takes their union
+    let from = "SELECT ?s FROM <urn:g1> FROM <urn:g2> WHERE { ?s <urn:p> ?x ; <urn:q> ?y }";
+    assert!(rows(from).is_empty());
+    assert_eq!(reference_select(&jena, from, "review").1.len(), 1);
+    // 11: two triple terms are unordered
+    use reference::value::spec_order;
+    let triple = |s: &str| {
+        Term::Triple(Box::new(oxrdf::Triple::new(
+            iri(s),
+            iri("urn:p"),
+            iri("urn:o"),
+        )))
+    };
+    assert_eq!(
+        spec_order(Some(&triple("urn:a")), Some(&triple("urn:b"))),
+        None
+    );
+    // 12: identical triple terms with NaN are the same value
+    assert_eq!(
+        one(
+            "SELECT (<<( <urn:a> <urn:p> \"NaN\"^^<http://www.w3.org/2001/XMLSchema#double> )>> = <<( <urn:a> <urn:p> \"NaN\"^^<http://www.w3.org/2001/XMLSchema#double> )>> AS ?e) WHERE {}"
+        ),
+        Some(Term::Literal(Literal::from(true)))
+    );
+
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // 13: a RAND column is open, and the rows still count, in a partial comparison
+    let s13 = selected("SELECT ?v (RAND() AS ?r) WHERE { VALUES ?v { 1 2 } }");
+    let rand = |v: i32, x: f64| vec![int(v), Some(Term::Literal(Literal::from(x)))];
+    assert!(matches!(
+        check_select(&s13, &vars(&["v", "r"]), &[rand(1, 0.25), rand(2, 0.5)]),
+        Ok(Outcome::Partial(_))
+    ));
+    assert!(check_select(&s13, &vars(&["v", "r"]), &[rand(1, 0.25)]).is_err());
+    // 14: an open MIN keeps the COUNT beside it compared
+    let s14 = selected("SELECT (MIN(?x) AS ?m) (COUNT(*) AS ?n) WHERE { VALUES ?x { 1 \"a\" } }");
+    assert!(check_select(&s14, &vars(&["m", "n"]), &[]).is_err());
+    assert!(matches!(
+        check_select(&s14, &vars(&["m", "n"]), &[vec![string("a"), int(2)]]),
+        Ok(Outcome::Partial(_))
+    ));
+    // 16: a slice must be one of an order that ORDER BY allows
+    let s16 = selected(
+        "SELECT ?y WHERE { VALUES (?x ?y) { (1 \"a\") (2 \"b\") (2 \"c\") (3 \"d\") } } ORDER BY ?x LIMIT 2",
+    );
+    let col = |v: &[&str]| v.iter().map(|x| vec![string(x)]).collect::<Vec<_>>();
+    assert_eq!(
+        check_select(&s16, &vars(&["y"]), &col(&["a", "c"])),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_select(&s16, &vars(&["y"]), &col(&["b", "d"])).is_err());
+    assert!(check_select(&s16, &vars(&["y"]), &col(&["b", "a"])).is_err());
+    let s16b = selected(
+        "SELECT ?y WHERE { VALUES (?x ?y) { (1 \"a\") (2 \"b\") (2 \"c\") (3 \"d\") } } ORDER BY ?x OFFSET 1 LIMIT 1",
+    );
+    assert_eq!(
+        check_select(&s16b, &vars(&["y"]), &col(&["c"])),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_select(&s16b, &vars(&["y"]), &col(&["a"])).is_err());
+    // 17: an expression key orders the rows
+    let s17 = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY DESC(STR(?x))");
+    assert!(check_select(&s17, &vars(&["x"]), &[vec![int(1)], vec![int(2)]]).is_err());
+    assert_eq!(
+        check_select(&s17, &vars(&["x"]), &[vec![int(2)], vec![int(1)]]),
+        Ok(Outcome::Compared)
+    );
+    // 18: a term of the data keeps its datatype and lexical form
+    let s18 = selected(
+        "SELECT ?x WHERE { VALUES ?x { \"01\"^^<http://www.w3.org/2001/XMLSchema#byte> 1 } }",
+    );
+    assert!(check_select(&s18, &vars(&["x"]), &[vec![int(1)], vec![int(1)]]).is_err());
+    // a computed number keeps its datatype, and its lexical form is free
+    let s18b = selected("SELECT ((?x + 0.0) AS ?y) WHERE { VALUES ?x { 1 } }");
+    let dec = |l: &str| {
+        Some(Term::Literal(Literal::new_typed_literal(
+            l,
+            iri("http://www.w3.org/2001/XMLSchema#decimal"),
+        )))
+    };
+    assert_eq!(
+        check_select(&s18b, &vars(&["y"]), &[vec![dec("1.0")]]),
+        Ok(Outcome::Compared)
+    );
+    assert!(check_select(&s18b, &vars(&["y"]), &[vec![int(1)]]).is_err());
+    // an open value in a FILTER leaves the rows open
+    let open_rows = selected("SELECT ?v WHERE { VALUES ?v { 1 2 } FILTER(RAND() < 0.5) }");
+    assert!(matches!(
+        check_select(&open_rows, &vars(&["v"]), &[]),
+        Ok(Outcome::Skipped(_))
+    ));
+}
+
+/// The cases of the second review of the reference evaluator, each of which the
+/// evaluator or the comparison got wrong before its fix.
+#[test]
+fn reference_evaluator_review_round_2_cases() {
+    use oxrdf::{BlankNode, GraphName, Literal, NamedNode, Quad};
+    use reference::check::{Expected, Outcome, check_select, under_engine_readings};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let int = |n: i64| Some(Term::Literal(Literal::from(n)));
+    let string = |v: &str| Some(Term::Literal(Literal::new_simple_literal(v)));
+    let boolean = |b: bool| Some(Term::Literal(Literal::from(b)));
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let col = |v: Vec<Option<Term>>| v.into_iter().map(|x| vec![x]).collect::<Vec<_>>();
+    let b = BlankNode::new_unchecked("b");
+    let (a1, b2) = (
+        BlankNode::new_unchecked("a1"),
+        BlankNode::new_unchecked("b2"),
+    );
+    let quads = vec![
+        Quad::new(
+            b.clone(),
+            iri("urn:p"),
+            Literal::from(1),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(
+            b.clone(),
+            iri("urn:p"),
+            Literal::from(2),
+            GraphName::DefaultGraph,
+        ),
+        Quad::new(a1.clone(), iri("urn:p"), Literal::from(1), iri("urn:g1")),
+        Quad::new(b2.clone(), iri("urn:q"), Literal::from(2), iri("urn:g2")),
+    ];
+    let r = reference::Reference::new(quads.clone());
+    let spec = reference::Reference::new(quads).with_spec_readings(true);
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+    let regex = |q: &str| r.run(q, None);
+    let one = |q: &str| match r.run(q, None) {
+        Ok(reference::Answer::Select { mut rows, .. }) => rows.remove(0).remove(0),
+        other => panic!("{other:?}: {q}"),
+    };
+
+    // 1: whether an open value is bound is open, in BOUND and in a join
+    let s1 = selected("SELECT ?x WHERE { BIND(IF(RAND() < 0.5, 1, 1/0) AS ?x) FILTER(BOUND(?x)) }");
+    assert!(s1.rows_open);
+    let s1b = selected("SELECT ?x WHERE { BIND(IF(RAND() < 0.5, 1, 1/0) AS ?x) VALUES ?x { 2 } }");
+    assert!(s1b.rows_open);
+    // 2: the readings are taken until no new one is met. MAX passes over the error under
+    // the specification's reading and is unbound under Jena's, the engine's, which alone
+    // reaches the string arguments of different base directions
+    let q2 = "SELECT (IF(!BOUND(?m), STRSTARTS(\"Ada\"@en--ltr, \"A\"@en), false) AS ?x) \
+              WHERE { { SELECT (MAX(?v) AS ?m) WHERE { VALUES ?v { UNDEF 1 } } } }";
+    let Expected::Select(s2) = under_engine_readings(&r, q2).unwrap().0 else {
+        panic!("a SELECT answer");
+    };
+    assert_eq!(s2.rows, vec![vec![boolean(true)]]);
+    // 3: an open second key keeps the order of the first, and an answer that keeps it
+    // is not passed, since the open key decides the rest of the order
+    let s3 = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND()");
+    assert!(check_select(&s3, &vars(&["x"]), &col(vec![int(2), int(1)])).is_err());
+    assert!(matches!(
+        check_select(&s3, &vars(&["x"]), &col(vec![int(1), int(2)])),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    let s3b = selected("SELECT ?x WHERE { VALUES ?x { 1 2 } } ORDER BY ?x RAND() LIMIT 1");
+    assert!(check_select(&s3b, &vars(&["x"]), &col(vec![int(2)])).is_err());
+    assert!(matches!(
+        check_select(&s3b, &vars(&["x"]), &col(vec![int(1)])),
+        Ok(Outcome::Skipped(_))
+    ));
+    // 4: DISTINCT over copies with different keys leaves the order unchecked, not passed
+    let s4 = selected(
+        "SELECT DISTINCT ?y WHERE { VALUES (?x ?y) { (0 \"c\") (1 \"a\") (2 \"b\") (3 \"a\") (4 \"d\") } } ORDER BY ?x",
+    );
+    let got4 = col(["a", "c", "b", "d"].map(string).to_vec());
+    assert!(matches!(
+        check_select(&s4, &vars(&["y"]), &got4),
+        Ok(Outcome::OrderUnchecked(_))
+    ));
+    // 5: the order of numbers is transitive across datatypes
+    let xsd = |l: &str, d: &str| {
+        Term::Literal(Literal::new_typed_literal(
+            l,
+            iri(&format!("http://www.w3.org/2001/XMLSchema#{d}")),
+        ))
+    };
+    let terms = [
+        xsd("16777216", "integer"),
+        xsd("16777217", "decimal"),
+        xsd("16777216", "float"),
+        xsd("16777217", "integer"),
+        xsd("0.1", "decimal"),
+        xsd("0.1", "float"),
+        xsd("0.1", "double"),
+        xsd("1", "integer"),
+        xsd("1.0", "decimal"),
+        xsd("1E0", "double"),
+        xsd("-0", "double"),
+        xsd("0", "integer"),
+        xsd("INF", "float"),
+        xsd("-INF", "double"),
+        xsd("NaN", "double"),
+        xsd("170141183460469231731687303715884105727", "integer"),
+        xsd("1.7014118346046923E38", "double"),
+    ];
+    use reference::value::{spec_order, total_order};
+    use std::cmp::Ordering;
+    for x in &terms {
+        for y in &terms {
+            let o = total_order(Some(x), Some(y));
+            assert_eq!(o, total_order(Some(y), Some(x)).reverse(), "{x} {y}");
+            if spec_order(Some(x), Some(y)) == Some(Ordering::Less) {
+                assert_eq!(o, Ordering::Less, "{x} {y}");
+            }
+            for z in &terms {
+                if o.is_le() && total_order(Some(y), Some(z)).is_le() {
+                    assert!(total_order(Some(x), Some(z)).is_le(), "{x} {y} {z}");
+                }
+            }
+        }
+    }
+    let s5 = selected(
+        "SELECT ?x WHERE { VALUES ?x { 16777216 16777217.0 \"16777216\"^^<http://www.w3.org/2001/XMLSchema#float> } } ORDER BY ?x",
+    );
+    let mut got5: Vec<Vec<Option<Term>>> = s5.rows.clone();
+    got5.reverse();
+    assert!(check_select(&s5, &vars(&["x"]), &got5).is_err());
+    assert_eq!(
+        check_select(&s5, &vars(&["x"]), &s5.rows),
+        Ok(Outcome::Compared)
+    );
+    // 6: one blank node is equal to itself, so the next key orders the rows
+    let s6 = selected("SELECT ?x WHERE { ?b <urn:p> ?x } ORDER BY ?b ?x");
+    assert!(check_select(&s6, &vars(&["x"]), &col(vec![int(2), int(1)])).is_err());
+    // equal values of different terms tie under the text, so the next condition orders
+    // them, and Jena orders them by the terms
+    let ties = "SELECT ?s WHERE { VALUES (?v ?s) { (1.0 <urn:b>) (1 <urn:a>) } } ORDER BY ?v ?s";
+    let ba = col(vec![Some(iri("urn:b").into()), Some(iri("urn:a").into())]);
+    let spec_ties = spec.run_selected(ties, None).unwrap().unwrap();
+    assert!(check_select(&spec_ties, &vars(&["s"]), &ba).is_err());
+    assert_eq!(
+        check_select(&selected(ties), &vars(&["s"]), &ba),
+        Ok(Outcome::Compared)
+    );
+    // 7: COALESCE passes a term through, with its lexical form
+    let s7 = selected(
+        "SELECT (COALESCE(?x, 0) AS ?y) WHERE { VALUES ?x { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } }",
+    );
+    assert!(!matches!(
+        check_select(&s7, &vars(&["y"]), &col(vec![int(1)])),
+        Ok(Outcome::Compared)
+    ));
+    let s7b = selected(
+        "SELECT ?y WHERE { { VALUES ?y { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } } UNION { BIND(1 + 1 AS ?y) } }",
+    );
+    assert!(!matches!(
+        check_select(&s7b, &vars(&["y"]), &[vec![int(1)], vec![int(2)]]),
+        Ok(Outcome::Compared)
+    ));
+    // 8: an open column passes no forbidden value as compared
+    let s8 = selected("SELECT (SAMPLE(?v) AS ?s) (COUNT(*) AS ?n) WHERE { VALUES ?v { 1 2 } }");
+    for wrong in [int(999), None] {
+        assert!(!matches!(
+            check_select(&s8, &vars(&["s", "n"]), &[vec![wrong, int(2)]]),
+            Ok(Outcome::Compared)
+        ));
+    }
+    // 9: aggregates over one solution read the same BNODE
+    assert_eq!(
+        one(
+            "SELECT (sameTerm(?a, ?b) AS ?eq) WHERE { { SELECT (SAMPLE(BNODE(\"x\")) AS ?a) (MIN(BNODE(\"x\")) AS ?b) WHERE {} } }"
+        ),
+        boolean(true)
+    );
+    // 10: the RDF merge keeps its blank nodes apart from the named graphs
+    let q10 = "SELECT (sameTerm(?s, ?t) AS ?eq) FROM <urn:g1> FROM <urn:g2> FROM NAMED <urn:g1> \
+               WHERE { ?s <urn:p> 1 GRAPH <urn:g1> { ?t <urn:p> 1 } }";
+    match spec.run(q10, None) {
+        Ok(reference::Answer::Select { rows, .. }) => assert_eq!(rows, vec![vec![boolean(false)]]),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(one(q10), boolean(true));
+    // 11: the x flag removes whitespace before the pattern is read
+    assert_eq!(
+        one("SELECT (REGEX(\"aa\", \"a{ 2 }\", \"x\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    assert_eq!(
+        one("SELECT (REGEX(\"a b\", \"a[ ]b\", \"x\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    // 12: the i flag with a category, and the m flag with an anchor, are unsupported
+    for q in [
+        "SELECT (REGEX(\"a\", \"\\\\p{Lu}\", \"i\") AS ?r) WHERE {}",
+        "SELECT (REGEX(\"a\\n\", \"^$\", \"m\") AS ?r) WHERE {}",
+        "SELECT (REGEX(\"\u{17f}\", \"s\", \"i\") AS ?r) WHERE {}",
+        "SELECT (REGEX(\"A\", \"[^a]\", \"i\") AS ?r) WHERE {}",
+    ] {
+        assert!(
+            matches!(regex(q), Err(reference::Error::Unsupported(_))),
+            "{q}"
+        );
+    }
+    assert_eq!(
+        one("SELECT (REGEX(\"aBc\", \"b\", \"i\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    // the m flag with an anchor agrees with XPath on text that does not end in a newline
+    assert_eq!(
+        one("SELECT (REGEX(\"a\\nb\", \"^b$\", \"m\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+    // 13: a quantifier after a quantifier is an error
+    assert_eq!(one("SELECT (REGEX(\"a\", \"a**\") AS ?r) WHERE {}"), None);
+    assert_eq!(
+        one("SELECT (REGEX(\"a\", \"a{2}{3}\") AS ?r) WHERE {}"),
+        None
+    );
+    assert_eq!(
+        one("SELECT (REGEX(\"aa\", \"a+?\") AS ?r) WHERE {}"),
+        boolean(true)
+    );
+}
+
+/// The cases of the third review of the reference evaluator, each of which the
+/// comparison passed as compared before its fix although the specification forbids the
+/// engine's answer or allows another.
+#[test]
+fn reference_evaluator_review_round_3_cases() {
+    use oxrdf::{BlankNode, Literal, NamedNode, Quad};
+    use reference::check::{Outcome, check_select};
+    let iri = |s: &str| NamedNode::new_unchecked(s);
+    let int = |n: i64| Some(Term::Literal(Literal::from(n)));
+    let xsd = |l: &str, d: &str| {
+        Some(Term::Literal(Literal::new_typed_literal(
+            l,
+            iri(&format!("http://www.w3.org/2001/XMLSchema#{d}")),
+        )))
+    };
+    let vars = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let col = |v: Vec<Option<Term>>| v.into_iter().map(|x| vec![x]).collect::<Vec<_>>();
+    let r = reference::Reference::new([Quad::new(
+        BlankNode::new_unchecked("b"),
+        iri("urn:p"),
+        Literal::from(1),
+        iri("urn:g1"),
+    )]);
+    let selected = |q: &str| r.run_selected(q, None).unwrap().unwrap();
+    let compared = |o: &Result<Outcome, String>| matches!(o, Ok(Outcome::Compared));
+    let mut failed: Vec<String> = Vec::new();
+    let mut check = |ok: bool, what: String| {
+        if !ok {
+            failed.push(what);
+        }
+    };
+
+    // 1: a condition that reads an open value is dropped from the key, and the rows that
+    // tie on the conditions before it may still be ordered by the ones after it
+    let s1 =
+        selected("SELECT ?x WHERE { { BIND(RAND() AS ?r) } VALUES ?x { 1 2 } } ORDER BY ?r ?x");
+    let o1 = check_select(&s1, &vars(&["x"]), &col(vec![int(2), int(1)]));
+    check(!compared(&o1), format!("1: {o1:?}"));
+    let s1b = selected(
+        "SELECT ?x WHERE { { BIND(RAND() AS ?r) } VALUES ?x { 1 2 } } ORDER BY ?r ?x LIMIT 1",
+    );
+    let o1b = check_select(&s1b, &vars(&["x"]), &col(vec![int(2)]));
+    check(!compared(&o1b), format!("1 LIMIT 1: {o1b:?}"));
+
+    // 2: the constraints between the rows that a slice leaves out still fix its rows
+    let q2 = "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ?x WHERE { VALUES ?x { \
+              16777219 \"16777219.5\"^^xsd:double \"16777220\"^^xsd:float } } \
+              ORDER BY ?x OFFSET 1 LIMIT 1";
+    let s2 = selected(q2);
+    let o2 = check_select(&s2, &vars(&["x"]), &col(vec![int(16777219)]));
+    check(!compared(&o2), format!("2: {o2:?}"));
+    let o2b = check_select(&s2, &vars(&["x"]), &col(vec![xsd("16777219.5", "double")]));
+    check(compared(&o2b), format!("2 allowed: {o2b:?}"));
+    // a weaker outcome of the comparison by value in a mixed column stays as weak
+    let s2c = selected(
+        "SELECT ?y WHERE { { VALUES ?y { \"01\"^^<http://www.w3.org/2001/XMLSchema#integer> } } \
+         UNION { BIND(1 + 1 AS ?y) } } ORDER BY ?y RAND()",
+    );
+    let o2c = check_select(&s2c, &vars(&["y"]), &col(vec![int(1), int(2)]));
+    check(
+        matches!(o2c, Ok(Outcome::OrderUnchecked(_))),
+        format!("2 mixed: {o2c:?}"),
+    );
+
+    // 3: STRDT keeps the lexical form of its argument
+    let s3 = selected(
+        "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT (STRDT(\"01\", xsd:integer) AS ?x) WHERE {}",
+    );
+    let o3 = check_select(&s3, &vars(&["x"]), &col(vec![int(1)]));
+    check(o3.is_err(), format!("3: {o3:?}"));
+    let o3b = check_select(&s3, &vars(&["x"]), &col(vec![xsd("01", "integer")]));
+    check(compared(&o3b), format!("3 allowed: {o3b:?}"));
+
+    // 4: GRAPH joins an open graph name of its inner pattern with the graph's name
+    let s4 = selected(
+        "SELECT ?g WHERE { GRAPH ?g { SELECT (IF(RAND() < 0.5, <urn:g1>, <urn:g2>) AS ?g) WHERE {} } }",
+    );
+    let o4 = check_select(&s4, &vars(&["g"]), &[]);
+    check(!compared(&o4), format!("4: {o4:?}"));
+    let o4b = check_select(&s4, &vars(&["g"]), &col(vec![Some(iri("urn:g1").into())]));
+    check(o4b.is_ok(), format!("4 allowed: {o4b:?}"));
+    assert!(failed.is_empty(), "{failed:#?}");
+}
+
+/// The reference evaluator's own cases: the choices that it notes, the scope of the
+/// solution that LATERAL substitutes, BNODE across a join and its sort order.
+#[test]
+fn reference_evaluator_notes_open_choices_and_keeps_scopes() {
+    let s = Store::in_memory(StoreOptions::default());
+    load_triples(
+        &s,
+        &[
+            "<urn:s:0> <urn:p> <urn:a>".into(),
+            "<urn:s:0> <urn:p> <urn:b>".into(),
+            "<urn:a> <urn:p> <urn:c>".into(),
+            "<urn:b> <urn:p> <urn:c>".into(),
+        ],
+    );
+    let snap = s.snapshot();
+    let oracle = reference::Reference::new(snapshot_quads(&snap));
+    let run = |q: &str| reference_select(&oracle, q, "reference");
+    let int = |n: i32| Some(Term::Literal(oxrdf::Literal::from(n)));
+
+    // two solution numbers of BNODE do not make the sides of a join incompatible
+    let (_, rows, _) =
+        run("SELECT * WHERE { { BIND(BNODE(\"x\") AS ?a) } { BIND(BNODE(\"y\") AS ?b) } }");
+    assert_eq!(rows.len(), 1);
+    let (_, rows, _) =
+        run("SELECT * WHERE { { BIND(BNODE(\"x\") AS ?a) } LATERAL { BIND(BNODE(\"y\") AS ?b) } }");
+    assert_eq!(rows.len(), 1);
+
+    // a sub-SELECT's own ?a is not the ?a that LATERAL substitutes
+    let (_, rows, _) = run(
+        "SELECT ?c WHERE { VALUES ?a { <urn:none> } LATERAL { SELECT ?c WHERE { ?a <urn:p> ?c } } }",
+    );
+    assert_eq!(rows.len(), 4);
+
+    // MIN and MAX over an error follow the order of ORDER BY, and say so
+    let (_, rows, notes) =
+        run("SELECT (MIN(?x) AS ?n) (MAX(?x) AS ?m) WHERE { VALUES ?x { UNDEF 1 2 } }");
+    assert_eq!(rows, vec![vec![None, int(2)]]);
+    assert!(notes.min_max_error && !notes.chose);
+    // the three readings of item 1064
+    use reference::AggregateErrors;
+    let q = "SELECT (MIN(?x) AS ?n) (MAX(?x) AS ?m) (AVG(?u) AS ?a) (GROUP_CONCAT(?x) AS ?g) \
+             WHERE { VALUES ?x { UNDEF 1 2 } }";
+    let reading = |r: AggregateErrors| {
+        let oracle = reference::Reference::new(snapshot_quads(&snap)).with_aggregate_errors(r);
+        reference_select(&oracle, q, "reference").1.remove(0)
+    };
+    let spec = reading(AggregateErrors::Spec);
+    assert_eq!(spec[..3], [None, int(2), int(0)]);
+    assert_eq!(spec[3], None, "GROUP_CONCAT over an error");
+    let jena = reading(AggregateErrors::Jena);
+    assert_eq!(jena[..3], [None, None, None]);
+    let sparkles = reading(AggregateErrors::Sparkles);
+    assert_eq!(sparkles[..3], [int(1), int(2), None]);
+    let concat = "SELECT (GROUP_CONCAT(?x) AS ?g) WHERE { VALUES ?x { <urn:a> } }";
+    for (r, expected) in [
+        (AggregateErrors::Spec, None),
+        (
+            AggregateErrors::Jena,
+            Some(Term::Literal(oxrdf::Literal::new_simple_literal("urn:a"))),
+        ),
+        (
+            AggregateErrors::Sparkles,
+            Some(Term::Literal(oxrdf::Literal::new_simple_literal("urn:a"))),
+        ),
+    ] {
+        let oracle = reference::Reference::new(snapshot_quads(&snap)).with_aggregate_errors(r);
+        assert_eq!(
+            reference_select(&oracle, concat, "reference").1[0][0],
+            expected,
+            "{r:?}"
+        );
+    }
+
+    // the middle of a path sequence arrives as a blank node, which COUNT(DISTINCT *)
+    // cannot tell from one of a basic graph pattern
+    let (_, rows, notes) = run(
+        "SELECT (COUNT(DISTINCT *) AS ?n) (COUNT(*) AS ?m) WHERE { <urn:s:0> <urn:p>/<urn:p> ?d }",
+    );
+    assert_eq!(rows, vec![vec![int(1), int(2)]]);
+    assert!(notes.distinct_over_blank_nodes);
+
+    // a slice through keys that ORDER BY leaves unordered is a choice, and one through
+    // ordered keys is not
+    let (_, _, notes) = run("SELECT ?x WHERE { VALUES ?x { 1 \"a\" } } ORDER BY ?x LIMIT 1");
+    assert!(notes.chose);
+    let (_, rows, notes) = run(
+        "SELECT ?x WHERE { VALUES ?x { 2 1 \"1\"^^<http://www.w3.org/2001/XMLSchema#decimal> } } ORDER BY ?x LIMIT 1",
+    );
+    assert!(notes.chose, "1 and 1.0 tie, and the cut falls between them");
+    assert_eq!(rows.len(), 1);
+    let (_, _, notes) = run(
+        "SELECT ?x WHERE { VALUES ?x { 2 1 \"1\"^^<http://www.w3.org/2001/XMLSchema#decimal> } } ORDER BY ?x LIMIT 2",
+    );
+    assert!(!notes.chose, "the cut between the tie and 2 is fixed");
+    let (_, rows, notes) = run("SELECT ?x WHERE { VALUES ?x { 3 1 2 } } ORDER BY DESC(?x) LIMIT 2");
+    assert_eq!(rows, vec![vec![int(3)], vec![int(2)]]);
+    assert!(!notes.chose);
+    let (_, _, notes) = run("SELECT (SAMPLE(?x) AS ?s) WHERE { VALUES ?x { 1 2 } }");
+    assert!(notes.chose);
+
+    // the sort order is transitive across numbers, strings and other literals
+    let terms: Vec<Option<Term>> = [
+        "1",
+        "\"2.5\"^^<http://www.w3.org/2001/XMLSchema#decimal>",
+        "\"2001\"^^<http://www.w3.org/2001/XMLSchema#gYear>",
+        "\"NaN\"^^<http://www.w3.org/2001/XMLSchema#double>",
+        "\"a\"",
+        "\"a\"@en",
+        "<urn:x>",
+        "true",
+        "\"2001-01-01T00:00:00\"^^<http://www.w3.org/2001/XMLSchema#dateTime>",
+        "\"2001-01-01T00:00:00Z\"^^<http://www.w3.org/2001/XMLSchema#dateTime>",
+    ]
+    .iter()
+    .map(|t| {
+        let (_, rows, _) = run(&format!("SELECT ?x WHERE {{ VALUES ?x {{ {t} }} }}"));
+        rows[0][0].clone()
+    })
+    .collect();
+    use reference::value::{spec_order, total_order};
+    for a in &terms {
+        for b in &terms {
+            if let Some(o) = spec_order(a.as_ref(), b.as_ref())
+                && o.is_ne()
+            {
+                assert_eq!(total_order(a.as_ref(), b.as_ref()), o, "{a:?} {b:?}");
+            }
+            for c in &terms {
+                let (x, y, z) = (a.as_ref(), b.as_ref(), c.as_ref());
+                if total_order(x, y).is_le() && total_order(y, z).is_le() {
+                    assert!(total_order(x, z).is_le(), "{a:?} {b:?} {c:?}");
+                }
+            }
+        }
+    }
+    // NaN is unordered against a number
+    assert_eq!(spec_order(terms[3].as_ref(), terms[0].as_ref()), None);
 }

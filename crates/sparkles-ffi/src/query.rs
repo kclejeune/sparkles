@@ -43,6 +43,9 @@ pub struct QueryOpts {
     pub binding_values: Vec<u8>,
     /// neither read nor write the result cache
     pub no_cache: bool,
+    /// how aggregates treat errors: `jena`, `sparkles` or `spec` (`None`: the
+    /// dataset's setting)
+    pub aggregate_errors: Option<String>,
 }
 
 impl QueryOpts {
@@ -65,6 +68,11 @@ impl QueryOpts {
         }
         .apply(&mut o);
         o.outbound.allow_private = self.allow_private_network;
+        o.aggregate_errors = self
+            .aggregate_errors
+            .as_deref()
+            .map(str::parse)
+            .transpose()?;
         if self.include_inferred {
             o.default_graph_extra = vec![INFERRED_GRAPH.to_string()];
         }

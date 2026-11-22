@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# cold-scan m2: the m1 cold rounds again with a 1 s pause between readiness and the timed
+# request (a copy of the harness with one added sleep), and Sparkles' own server timings
+# (native JSON, no profile) for cold contains and distinct-obj. Last line M2-DONE/M2-FAILED.
+set -uo pipefail
+L=$HOME/lanes/cold-scan
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+echo "locks held $(date -u +%FT%TZ) load $(cat /proc/loadavg)"
+for p in rustc cargo mbx java qlever-server oxigraph sparkles fluree; do
+  if pgrep -x $p > /dev/null; then echo "M2-FAILED busy $p"; exit 1; fi
+done
+rm -rf "$L/srcd" && mkdir -p "$L/srcd" && cp -r "$L/src/scripts" "$L/srcd/scripts"
+sed -i '516a\      sleep "${COLD_DELAY:-0}"' "$L/srcd/scripts/bench-lib.sh"
+sed -n 514,519p "$L/srcd/scripts/bench-lib.sh"
+export SPARKLES=$L/bin/sparkles FLUREE=$L/gcroots/fluree/bin/fluree
+export HYPERFINE=$HOME/.local/share/mise/installs/hyperfine/2.0.0/hyperfine-v2.0.0-x86_64-unknown-linux-gnu/hyperfine
+export PORT_BASE=4331 COLD_DELAY=1
+W=$L/work
+Q="count-all two-hop-count contains distinct-obj employee-docs star-lookup values-star path-plus"
+B="bash $L/srcd/scripts/bench.sh 100000 $W"
+r=0
+for order in "sparkles fluree" "fluree sparkles" "sparkles fluree"; do
+  r=$((r + 1))
+  echo "delayed round $r ($order) $(date -u +%FT%TZ)"
+  rm -f "$W/results/cold.json" "$W/results/cold-runs.json"
+  MODE=cold COLD_RUNS=7 ENGINES="$order" QUERIES="$Q" $B > "$L/dcold-$r.log" 2>&1 || { echo "M2-FAILED round $r"; exit 1; }
+  mkdir -p "$L/dcold-$r" && cp "$W/results/cold.json" "$W/results/cold-runs.json" "$L/dcold-$r/"
+done
+echo "native $(date -u +%FT%TZ)"
+rm -rf "$L/native" && mkdir -p "$L/native" && cp -r "$W/sparkles.db" "$L/native/db"
+python3 "$L/src/scripts/bench-regressions.py" --binary "$SPARKLES" --db "$L/native/db" --queries "$W/queries" \
+  --names count-all distinct-obj contains employee-docs --out "$L/native/native.json" --runs 11 --cold \
+  --format application/x-sparkles+json --port 4371 > "$L/native/native.log" 2>&1 || { echo "M2-FAILED native"; exit 1; }
+echo "M2-DONE $(date -u +%FT%TZ)"

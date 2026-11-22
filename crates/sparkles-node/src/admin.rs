@@ -336,6 +336,7 @@ fn writes(op: &str) -> bool {
             | "history.commit"
             | "history.changes"
             | "settings.describe.get"
+            | "settings.aggregateErrors.get"
             | "settings.compaction.get"
             | "settings.quota.get"
             | "settings.retention.get"
@@ -639,6 +640,19 @@ fn run_admin(
         "settings.describe.reset" => {
             ds.settings().describe().reset()?;
             Value::Null
+        }
+        "settings.aggregateErrors.get" => value(ds.settings().aggregate_errors().status())?,
+        "settings.aggregateErrors.set" => {
+            let m: sparkles::sparql::AggregateErrors = a["mode"]
+                .as_str()
+                .ok_or_else(|| EngineError::invalid("the setting needs a mode"))?
+                .parse()?;
+            ds.settings().aggregate_errors().set(m)?;
+            value(ds.settings().aggregate_errors().status())?
+        }
+        "settings.aggregateErrors.reset" => {
+            ds.settings().aggregate_errors().reset()?;
+            value(ds.settings().aggregate_errors().status())?
         }
         "settings.compaction.get" => value(ds.settings().compaction().get())?,
         "settings.compaction.set" => {

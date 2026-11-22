@@ -4,8 +4,8 @@
 > phase 2 has shipped.
 >
 > **Roadmap:** [item 455](../../ROADMAP.md) holds this work. Items 479 and 830 to 833
-> hold the phases that are ready to start, and each is named in its phase. Item 484 is
-> complete. The later candidate phases get their numbers when their prerequisites land.
+> hold the phases that are ready to start, and each is named in its phase. Items 484 and 832 are
+> complete, and item 1152 takes the last `imbl` maps of Phase 5. The later candidate phases get their numbers when their prerequisites land.
 
 The design covers a first-release format cutoff, budgeted readers through one Control
 trait, a shared commit publish tail, one load plan, partitioned vocabularies with
@@ -272,8 +272,9 @@ check.
 estimate from `estimated_quads`, a batch length or a stream probe against a byte bound,
 whether every source is a small reader, whether the write is restricted to some graphs
 through `WriteOptions::graphs`, whether the transaction checks triple-level write
-protections, which `requested` records, whether it carries a managed admission, whether
-the patch has met a delete row, and `bulk_threshold`. The table below is the current
+protections, which `requested` records, whether it carries the capability to change
+managed graphs or control records, whether the patch has met a delete row, and
+`bulk_threshold`. The table below is the current
 behaviour, which the first commit of the phase encodes as a table test before any rule
 changes, and the second commit unifies the rules by the decisions it records.
 
@@ -281,15 +282,23 @@ changes, and the second commit unifies the rules by the decisions it records.
 |---|---|---|---|
 | `load_with` | The write is unrestricted, the sources are not small streams, and the head is empty or the estimate is above the threshold. Small streams means an empty head, at least one source, every source a reader, and the readers holding at most `SMALL_STREAM_BYTES`, 8 MiB, of decompressed bytes in total when read ahead. | The estimate is strictly above. | It has no probe of large streams against the threshold. |
 | `replace_with` | The write is unrestricted and the estimate is above the threshold or the streams exceed eighty bytes per threshold quad. | The estimate is strictly above. | It has no empty-head case. |
-| `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed admission. | The length is at or above. | It has no size estimate and no small-reader case. |
+| `insert_bulk` | The batch reaches the threshold, and the transaction checks no triple protections and carries no managed capability and no control records. | The length is at or above. | It has no size estimate and no small-reader case. |
 | `patch_apply` | The patch has met no delete row, whether or not the row deleted anything, and its additions reach the threshold, after which `insert_bulk` applies its own rule. | The length is at or above. | It has no estimate and no restriction input of its own. |
 
-The unified rule takes the strict test everywhere, gives `replace_with` the empty-head
-case and the small-stream exception of `load_with`, gives `load_with` the large-stream
-probe of `replace_with`, and treats a graph restriction, a triple protection, a managed
-admission and a delete row as reasons for the transactional path in every entry point. The
-table test includes a patch whose delete row removes nothing and still takes the
-transactional path. The group admission's
+The unified rule takes the strict test everywhere, gives `load_with` the large-stream
+probe of `replace_with` for a store with data, and treats a triple protection, the
+capability to change managed graphs, control records and a delete row as reasons for the
+transactional path of a batch. A load into an empty store keeps the empty-head case of
+`load_with`, a rebuild unless every source is a stream that ends within
+`SMALL_STREAM_BYTES`. The rule as first written also gave `replace_with` that case and its
+small-stream exception. The maintainer kept a replacement into an empty store on its
+earlier rule instead, a transaction unless its estimate or its streams are above the
+threshold, because the rebuild's fixed cost made a first PUT of a few quads many times
+slower, as the outcome below records. A graph restriction keeps sources on the transactional path, since a rebuild from sources
+does not check each quad's graph. A batch from `insert_bulk` or a patch has its graphs
+checked as it is staged, so a restriction does not keep it out of a rebuild, as before the
+phase. The table test includes a patch whose delete row removes nothing and still takes
+the transactional path. The group admission's
 `Fallback::Bulk` reads the same plan. SPARQL `LOAD` keeps inserting per quad, as
 [decision 4](#decisions) records.
 
@@ -706,6 +715,106 @@ vocabulary cases by up to 3.9% through the single codegen unit's inlining, and t
 finished stage does not. The `insn_screen` binary's text grew by 0.08%. The compile
 time of `sparkles-core` before and after the stage is still to be timed on a quiet
 host.
+
+Phase 4 is built. `LoadPlan::choose` in `store/load_plan.rs` takes a `LoadInputs` and a
+`Sizes` that reads a source's estimate or probes its streams only when the plan depends
+on it, and `load_with`, `replace_with`, `insert_bulk` and `patch_apply` ask it. The
+first commit encoded the four earlier rules in the table test, and the second applied
+the unified rule above with the strict test. The maintainer kept one exception to the
+text of the rule. A batch from `insert_bulk` or a patch under a graph restriction checks
+each quad's graph as it is staged and may still take a rebuild, while loads and
+replacements under a restriction stay transactional. `replace_bulk` now returns the
+quads its sources parsed, duplicates included, through `Builder::input_quads`, as the
+transactional replace and `Store::replace` documented, and `rebuild_locked` returns that
+count. Every reader source of a load or a replacement gets its decoder and its
+`Controlled` stream before the plan is chosen, so a stream that never yields a quad stops
+at the write's deadline whichever plan runs. Before, a load into a store with data, a
+restricted write and a probe skipped at a saturated bound parsed such a stream without
+that check. A dry run of a transactional load or replacement into an in-memory store is
+no longer refused by the memory limit while its sources are parsed. The first refusal is
+kept with its sizes and its stage, the parse of a load or the preparation of a
+replacement before its transaction opens, and the preview then gives the outcome and the
+error the write itself gets in the order it meets its checks, with or without a net
+change. On `atlas`, with
+base `8baa5686` and the phase's load path at `2c08d2b0` interleaved, `sparkles load` of
+1.05M quads into an empty store took a median 0.558 s on the base and 0.557 s on the
+phase over seven rounds, and 10.5M quads took 4.448 s and 4.418 s over five, with peak
+RSS within 2%. Another lane's benchmark ran on the host during these rounds, so they
+show parity rather than a publishable time. The ignored `load_plan_timing` test at 1M
+quads, built at `2c08d2b0`, measured a stream load into a store with data at 1.57 s to
+1.63 s on the bulk path against 2.01 s to 2.23 s transactional, persistent and in memory.
+With the empty-head case given to `replace_with`, a first PUT of 10 to 1,000 quads into
+an empty dataset took 21 ms to 34 ms against 0.7 ms to 8.5 ms on the base. A second rule
+that sent every load or replacement of up to 8 MiB into an empty store to a transaction
+removed that cost, but about 150 tests across the workspace failed under it. They, and
+features such as characteristic sets, `sparkles vector create` and the spatial status,
+expect a small first load to build a base generation, while under that rule its quads
+stayed in the delta until a compaction. The phase therefore kept the earlier rule of a
+replacement into an empty store, and item 1097 follows the rebuild cost of a small first
+POST, which both builds pay. On `atlas`, with base `8baa5686` and the phase at `0027d406`
+interleaved over 15 rounds, the median first PUT of 10, 1,000 and 50,000 quads took 1.02,
+0.99 and 0.84 times the base's time on a persistent dataset and 1.00, 1.13 and 0.98 times
+in memory. The in-memory ratio at 1,000 quads swung between 0.56 and 1.79 with the order
+of the arms, so it reads as noise, and item 1127 times it again. The median first POST
+took 1.01, 1.00 and 0.94 times the base's time persistent and 1.02, 0.99 and 0.97 times in
+memory. The gates were the table test, the entry-point tests, the deadline tests at the
+default and the saturated threshold, lane CI and eight review rounds. Durability, the write-ahead
+log and the on-disk formats did not change.
+
+Phase 5 is built apart from the `imbl` maps. `index::encode_deltas` writes the zig-zag
+delta varints of an index column frame and of a run block's column, and
+`index::decode_varints_strided`, the index's decoder with its eight-byte fast path, reads
+both. It writes every `S`th element of its output, so the run reader decodes a column
+straight into every fourth word of the flattened keys and the index's frames use a stride
+of one. Tests pin the varint bytes of a sample column in a column frame and in a run block,
+which the shared coder writes unchanged, and check that the strided decode matches
+the contiguous one in each of the four columns for row counts on both sides of the
+eight-value step. They also check that the strided decode rejects a missing value, a value
+left over and a truncated last value. The new
+`delta_coder_bench` harness times the four cases over 2^20 sorted keys on one P core. The
+first shared version decoded a run column into a 256 KiB scratch vector and copied it into
+the keys. On `atlas`, in five interleaved A,B,B,A rounds, it left the run encode and the
+index's encode and decode within the spread of their rounds, and made the run decode
+slower in every round, 14.35 against 11.98 ns a key in the medians, which is about 20%. An
+instruction count on the laptop had found that version's run decode 4.4% shorter. A profile on the laptop put the extra cycles in that copy, whose stores
+stride 32 bytes through a megabyte of keys. Decoding in place removed the copy. On a
+laptop P core over two interleaved rounds the run decode then took 41.3 million cycles a
+pass against 45.1 million before the sharing, and the index's decode 38.8 million against
+41.4 million, with the encodes unchanged. On `atlas`, in five interleaved A,C,C,A rounds against the
+version before the sharing, the run decode took 11.55 against 11.99 ns a key, 4% faster in
+every round, and the index's decode 11.06 against 11.90 ns, faster in every round, while
+the medians of both encodes stayed within 1%. `bench:insn` reaches neither coder, so the harness stands in for it. It ran with the
+default features, whose run blocks use LZ4, while the server's builder uses zstd.
+The ungated test hooks `set_clock`, `wal_direct_active`, `vocab_direct_active`, the
+vector pause and sequential-build hooks, the full-text failure, checkpoint and tick hooks,
+`Spill::inject_fault` and `io::parse_lines_in_blocks` build only for tests or with the
+`failpoints` feature, and `sparkles-core` and `sparkles` turn the feature on for their own
+tests through a dev-dependency on themselves, so a run of one package keeps every test a
+workspace run has. The `ordinary_sync_probe` points of `publish_log` call empty inline
+functions outside tests in place of their `cfg` blocks. `parse_source` and
+`parse_source_into` choose their first rung, Jena's syntaxes, the functional-style syntax
+or a buffered document, through one `Rung`, and a buffered document of either is parsed by
+one whole-slice parser, with a test that both entry points agree for every parse mode,
+codec and kind of data. The `imbl` maps stay. A `BTreeMap` behind an `Arc` would copy the
+whole map at the first change after a snapshot, which measured 38 µs a commit at 10,000
+predicates and 8.4 ms at a million, against about a microsecond for `imbl`, and 30 ms a
+frame for a control state of a million entries, as
+[PERFORMANCE-EXPERIMENTS](../../PERFORMANCE-EXPERIMENTS.md#writes) records. Item 1152
+takes a persistent ordered map shared with the B+ tree of `KeySet`, after which the
+dependency can leave. No on-disk format changed.
+
+The query matrix on `atlas` compared Phase 5, d05e6b9d, with its base, 5f3f69c2, at 1.05M and
+10.5M triples with one and twelve Rayon threads, in eager and streamed execution. No query of 0.3 ms or
+more read 5% slower with twelve threads. At 1.05M with one thread, a 24-round confirmation run found
+the execution of `lang-filter` 1.08 times as long in both modes, and streamed `optional-chain` 1.063
+times as long in client wall time with its execution time unchanged. At 10.5M with one thread, an
+eight-round first pass without a confirmation run found `lang-filter` 1.08 to 1.09 times as long in both
+modes and both metrics, and `optional-chain` within 2.1%. On `stanley`, the batch 46 commit 416186c8,
+which includes item 1204's ASCII key check, and the same commit with d05e6b9d merged count the same
+user-space instructions per request within the noise floor of the counts, with ratios from 0.9996 to
+1.0012 over the 31 benchmark queries in both modes and eight rounds. These cells therefore point to code
+placement rather than added work, and [item 1246](../../ROADMAP.md) confirms them on the forge matrix
+after the push.
 
 [Item 455](../../ROADMAP.md) tracks the remaining work. The plan above replaced
 the earlier candidate list for the first eight phases on 2026-11-09 after an audit of the

@@ -1,3 +1,4 @@
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import contextlib
 import importlib.util
 import io

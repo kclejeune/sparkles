@@ -1,0 +1,8 @@
+parse 0.37 ms · plan 0.75 ms · exec 34.84 ms · total 35.96 ms
+Project ?c ?w  [1 rows (est 1), 34.79 ms]
+  Bind ?w := ?96d5efecfcf10f0d065f4c53d11a0032  [1 rows (est 1), 34.78 ms]
+    Bind ?c := ?f684be9cdb83d817f3828a8b43a623a1  [1 rows (est 1), 34.77 ms]
+      GroupBy by  aggs ?f684be9cdb83d817f3828a8b43a623a1=Count ?96d5efecfcf10f0d065f4c53d11a0032=Count [incremental]  [1 rows (est 1), 34.75 ms]
+        OptionalJoin filter !(?o = <http://example.org/nobody>) [merge on ?p]  [300191 rows (est 300191), 33.06 ms]
+          IndexScan POS ?p rdf:type <http://example.org/Student> [decodes SG]  [300191 rows (est 300191), 4.16 ms]
+          IndexScan PSO ?p <http://example.org/advisor> ?o [decodes SOG]  [300191 rows (est 300191), 5.92 ms]

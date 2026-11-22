@@ -158,6 +158,7 @@ fn check(s: &Store, q: &str) -> bool {
     let a = solutions(&fast);
     assert_eq!(a, solutions(&run(s, q, without())), "{q}");
     assert_eq!(a, solutions(&run(s, q, Optimizations::NONE)), "{q}");
+    super::opt_tests::same_as_reference(s, q, &fast);
     let counts = Optimizations::ALL.disable("filter_scan_runs").unwrap();
     assert_eq!(a, solutions(&run(s, q, counts)), "{q}");
     has_op(fast.plan(), "CountFilterFromRuns") || has_desc(fast.plan(), "[runs of ?")
@@ -265,7 +266,9 @@ fn id_ranges_match_reading_every_key() {
             let q = shape.replace("{E}", &f.replace("{X}", "?v"));
             let a = solutions(&run(s, &q, generic));
             assert!(!a.is_empty() || f.contains("zzz"), "{q}");
-            assert_eq!(a, solutions(&run(s, &q, Optimizations::NONE)), "{q}");
+            let generic_run = run(s, &q, Optimizations::NONE);
+            assert_eq!(a, solutions(&generic_run), "{q}");
+            super::opt_tests::same_as_reference(s, &q, &generic_run);
         }
     };
     check(&s);
@@ -321,6 +324,7 @@ fn prefix_filters_are_costed_by_their_key_ranges() {
         let cost = filter_cost(fast.plan()).unwrap();
         assert!(cost < 200.0, "{q}: {cost}");
         assert_eq!(a, solutions(&run(&s, &q, Optimizations::NONE)), "{q}");
+        super::opt_tests::same_as_reference(&s, &q, &fast);
     }
 }
 

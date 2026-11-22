@@ -21,32 +21,22 @@
 use super::Buffer;
 use crate::error::{Error, Result};
 use crate::id::Id;
+use crate::sparql::charged::{Charged, Rows};
 use crate::sparql::ctx::{Ctx, RetainedCharge};
 use crate::sparql::table::VarId;
 use crate::spill::{QuerySpill, SpillKind, SpillReader, SpillRun, SpillWriter};
-use rustc_hash::{FxBuildHasher, FxHashSet};
-use std::hash::BuildHasher;
+use rustc_hash::FxBuildHasher;
 use std::sync::Arc;
 
-/// The rows emitted so far. A single column keeps its IDs, which avoids a heap key and
-/// its hashing per row. Wider rows live in one flat arena of IDs, and the table holds
-/// their row numbers.
-enum Seen {
-    One(FxHashSet<Id>),
-    Many {
-        table: hashbrown::HashTable<u32>,
-        rows: Vec<Id>,
-    },
-}
+/// A buffer of the set, charged on the query's retained account (item 1183).
+type Held<V> = Charged<V, Option<RetainedCharge>>;
 
-/// The bytes a hash table of `capacity` entries of `entry` bytes allocates: buckets of a
-/// power of two at most seven eighths full, each with one control byte.
-fn table_bytes(capacity: usize, entry: usize) -> u64 {
-    if capacity == 0 {
-        return 0;
-    }
-    let buckets = (capacity.saturating_mul(8) / 7).next_power_of_two();
-    (buckets as u64).saturating_mul(entry as u64 + 1) + 64
+/// The rows emitted so far. A single column keeps its IDs, which avoids a heap key and
+/// its hashing per row. Wider rows live in one flat arena of IDs, and a table holds
+/// their row numbers, both on one charge of their allocations.
+enum Seen {
+    One(Held<hashbrown::HashSet<Id, FxBuildHasher>>),
+    Many(Held<Rows>),
 }
 
 pub(super) struct Distinct {
@@ -63,10 +53,8 @@ pub(super) struct Distinct {
     run: Option<Id>,
     /// Zero-column input: whether its one distinct row went out.
     emitted_empty: bool,
-    charge: Option<RetainedCharge>,
-    bytes: u64,
-    /// The bytes of the empty state.
-    base: u64,
+    /// The bytes of the empty state. The set's buffers charge their own.
+    _charge: Option<RetainedCharge>,
     /// Where rows go once the set stops growing, when the query may spill.
     query: Option<Arc<QuerySpill>>,
     /// The set's bytes at which it stops growing.
@@ -88,6 +76,16 @@ pub(super) struct Distinct {
     /// What the plan reports.
     pub(super) spilled: u64,
     pub(super) passes: usize,
+}
+
+/// Whether `error` is a refusal of the query's or the server's memory, which a spilling
+/// DISTINCT meets by holding less.
+fn memory_refusal(error: &Error) -> bool {
+    matches!(
+        error,
+        Error::BudgetExceeded(b)
+            if matches!(b.kind, crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory)
+    )
 }
 
 /// The spill files one pass divides the rows it passes on among.
@@ -123,9 +121,7 @@ impl Distinct {
             segment,
             run: None,
             emitted_empty: false,
-            charge: ctx.retained_charge(base)?,
-            bytes: base,
-            base,
+            _charge: ctx.retained_charge(base)?,
             // Rows read back from disk come last, which only unordered input allows.
             query: if adjacent
                 || keys.is_empty()
@@ -208,7 +204,6 @@ impl Distinct {
             // The previous pass's rows went out: free its set and read the next file.
             self.seen = None;
             self.frozen = false;
-            self.retain(self.base)?;
             // The pass sizes its set from the room it has when it starts.
             self.threshold = 0;
             self.depth = depth;
@@ -217,11 +212,16 @@ impl Distinct {
         }
     }
 
-    /// Write the rows of `buffer` marked in `passed` to the partitions of later passes.
-    fn pass_on(&mut self, ctx: &Ctx, buffer: &Buffer, passed: &[usize]) -> Result<()> {
+    /// The bytes [`Self::pass_on`] gathers for `rows` rows of `width` columns.
+    fn gather_bytes(rows: usize, width: usize) -> u64 {
+        rows as u64 * (width as u64 * 8 + 8) + 256
+    }
+
+    /// Write the rows of `buffer` marked in `passed` to the partitions of later passes,
+    /// under a charge of [`Self::gather_bytes`] that the caller holds.
+    fn pass_on(&mut self, buffer: &Buffer, passed: &[usize]) -> Result<()> {
         let query = self.query.clone().expect("a spilling DISTINCT");
         let table = &buffer.table;
-        let _gather = ctx.charge(passed.len() as u64 * (table.cols.len() as u64 * 8 + 8) + 256)?;
         let mut parts: Vec<Vec<usize>> = vec![Vec::new(); PARTITIONS];
         let width = table.width() - usize::from(self.numbered);
         for &row in passed {
@@ -253,14 +253,6 @@ impl Distinct {
                 .expect("an open spill file")
                 .write(&slices, rows.len())?;
         }
-        Ok(())
-    }
-
-    fn retain(&mut self, bytes: u64) -> Result<()> {
-        if let Some(charge) = &mut self.charge {
-            charge.resize(bytes)?;
-        }
-        self.bytes = bytes;
         Ok(())
     }
 
@@ -327,132 +319,76 @@ impl Distinct {
         let oversized = match &self.seen {
             None => return Ok(()),
             Some(Seen::One(ids)) => ids.capacity() > 1024 && ids.len() * 8 < ids.capacity(),
-            Some(Seen::Many { table, .. }) => {
-                table.capacity() > 1024 && table.len() * 8 < table.capacity()
-            }
+            Some(Seen::Many(set)) => set.capacity() > 1024 && set.len() * 8 < set.capacity(),
         };
         if oversized {
             self.seen = None;
-            return self.retain(self.base);
+            return Ok(());
         }
         match self.seen.as_mut().expect("distinct state") {
             Seen::One(ids) => ids.clear(),
-            Seen::Many { table, rows } => {
-                table.clear();
-                rows.clear();
-            }
+            Seen::Many(set) => set.clear(),
         }
         Ok(())
     }
 
-    /// Room in the set for `len` more rows of `width` key columns, reserved before the set
-    /// grows. While a table grows, its old and new allocations coexist. Returns false when
-    /// the set of a query that may spill stops growing instead.
+    /// Room in the set for `len` more rows of `width` key columns. A one-column set
+    /// grows on its charge, which admits its old and new allocations together, and a
+    /// wider set admits its table's and its arena's growth as one before either
+    /// allocates. Returns false when the set of a query that may spill stops growing
+    /// instead, which it does before a growth that would take its predicted size to the
+    /// pass's threshold, or when a growth is refused.
     fn reserve(&mut self, ctx: &Ctx, width: usize, len: usize) -> Result<bool> {
-        let numbered = self.numbered;
-        let seen = self.seen.get_or_insert_with(|| {
-            if width == 1 && !numbered {
-                Seen::One(FxHashSet::default())
+        if self.seen.is_none() {
+            let account = ctx.retained_charge(0)?;
+            self.seen = Some(if width == 1 && !self.numbered {
+                Seen::One(Charged::empty(account)?)
             } else {
-                Seen::Many {
-                    table: hashbrown::HashTable::new(),
-                    rows: Vec::new(),
-                }
-            }
-        });
-        let (size, capacity, entry, arena, has_arena) = match seen {
-            Seen::One(ids) => (ids.len(), ids.capacity(), 8, 0, false),
-            Seen::Many { table, rows } => (table.len(), table.capacity(), 4, rows.capacity(), true),
+                Seen::Many(Charged::rows(width, account)?)
+            });
+        }
+        if self.frozen {
+            return Ok(false);
+        }
+        // What the set holds once it grows now, or zero when it has room, and the bytes
+        // of the new allocations the growth makes.
+        let (size, predicted, allocations) = match self.seen.as_ref().expect("distinct state") {
+            Seen::One(ids) => (ids.len(), ids.growth(len), ids.growth(len)),
+            Seen::Many(set) => (set.len(), set.growth(len), set.allocations(len)),
         };
-        let needed = size.saturating_add(len);
-        let hash_grows = needed > capacity;
-        let hash_target = if hash_grows {
-            needed.max(capacity.saturating_mul(2))
-        } else {
-            capacity
-        };
-        let arena_needed = needed.saturating_mul(width);
-        let arena_target = if !has_arena {
-            0
-        } else if hash_grows {
-            arena.max(hash_target.saturating_mul(width))
-        } else if arena_needed > arena {
-            arena_needed.max(arena.saturating_mul(2))
-        } else {
-            arena
-        };
-        let arena_grows = arena_target > arena;
-        let grows = hash_grows || arena_grows;
+        if predicted == 0 {
+            return Ok(true);
+        }
+        let spills = self.query.is_some() && size > 0;
         if self.query.is_some() && self.threshold == 0 {
             self.threshold = (ctx.memory_room() / 2).max(MIN_PASS_BYTES);
         }
-        if self.query.is_some()
-            && !self.frozen
-            && size > 0
-            && grows
-            && (table_bytes(hash_target, entry).saturating_add(if has_arena {
-                arena_target as u64 * 8
-            } else {
-                hash_target as u64 * width as u64 * 8
-            }) >= self.threshold
-                || ctx.memory_room() < self.threshold / 2)
+        // A set that holds rows also stops growing when the room is less than the
+        // growth's new allocations taken whole. The growth itself needs less, since a
+        // wider set frees its old table before its arena grows, but it would leave the
+        // operators above the set, such as the sort above a numbered DISTINCT, too
+        // little to work in.
+        let room = ctx.memory_room();
+        if spills
+            && (predicted >= self.threshold || room < self.threshold / 2 || room < allocations)
         {
             self.frozen = true;
+            return Ok(false);
         }
-        if grows && !self.frozen {
-            // The hash table and row arena can grow independently: rounded hash
-            // capacity may still have room when the arena needs a replacement.
-            let old = table_bytes(capacity, entry);
-            let new = if hash_grows {
-                table_bytes(hash_target, entry)
-            } else {
-                0
-            };
-            let arena_old = arena as u64 * 8;
-            let arena_new = if arena_grows {
-                (arena_target as u64).saturating_mul(8)
-            } else {
-                0
-            };
-            let during = old + new + arena_old + arena_new + 256;
-            match self.retain(during) {
-                Ok(()) => {}
-                // A set that holds rows stops growing when it no longer fits.
-                Err(Error::BudgetExceeded(b))
-                    if self.query.is_some()
-                        && size > 0
-                        && matches!(
-                            b.kind,
-                            crate::BudgetKind::Memory | crate::BudgetKind::ServerMemory
-                        ) =>
-                {
-                    self.frozen = true;
-                    return Ok(false);
-                }
-                Err(error) => return Err(error),
+        let grown = match self.seen.as_mut().expect("distinct state") {
+            Seen::One(ids) => ids.reserve(len),
+            Seen::Many(set) => set.reserve(len),
+        };
+        match grown {
+            Ok(()) => Ok(true),
+            // A set that holds rows stops growing when it no longer fits, and a refusal
+            // left its buffers as they were.
+            Err(error) if spills && memory_refusal(&error) => {
+                self.frozen = true;
+                Ok(false)
             }
-            let seen = self.seen.as_mut().expect("distinct state");
-            match seen {
-                Seen::One(ids) => ids.reserve(hash_target - ids.len()),
-                Seen::Many { table, rows } => {
-                    if hash_grows {
-                        table.reserve(hash_target - table.len(), |&r| {
-                            let r = r as usize;
-                            FxBuildHasher.hash_one(&rows[r * width..(r + 1) * width])
-                        });
-                    }
-                    if arena_grows {
-                        rows.reserve_exact(arena_target - rows.len());
-                    }
-                }
-            }
-            let (capacity, arena) = match seen {
-                Seen::One(ids) => (ids.capacity(), 0),
-                Seen::Many { table, rows } => (table.capacity(), rows.capacity()),
-            };
-            self.retain(table_bytes(capacity, entry) + arena as u64 * 8 + 256)?;
+            Err(error) => Err(error),
         }
-        Ok(!self.frozen)
     }
 
     /// Insert the rows `range` of `buffer` into the set, whose room [`Self::reserve`]
@@ -475,13 +411,13 @@ impl Distinct {
                         ctx.check()?;
                     }
                     let id = column[row];
-                    if ids.insert(id) {
+                    if ids.insert_reserved(id) {
                         column[output] = id;
                         output += 1;
                     }
                 }
             }
-            Seen::Many { table, rows } => {
+            Seen::Many(set) => {
                 let mut key = Vec::with_capacity(width);
                 for row in range {
                     if row.is_multiple_of(1024) {
@@ -489,22 +425,9 @@ impl Distinct {
                     }
                     key.clear();
                     key.extend(buffer.table.cols[..width].iter().map(|column| column[row]));
-                    let hash = FxBuildHasher.hash_one(key.as_slice());
-                    let found = table
-                        .find(hash, |&r| {
-                            let r = r as usize;
-                            rows[r * width..(r + 1) * width] == key[..]
-                        })
-                        .is_some();
-                    if found {
+                    if !set.insert_reserved(&key, Rows::hash(&key)) {
                         continue;
                     }
-                    let number = (rows.len() / width) as u32;
-                    rows.extend_from_slice(&key);
-                    table.insert_unique(hash, number, |&r| {
-                        let r = r as usize;
-                        FxBuildHasher.hash_one(&rows[r * width..(r + 1) * width])
-                    });
                     for column in &mut buffer.table.cols {
                         column[output] = column[row];
                     }
@@ -516,31 +439,54 @@ impl Distinct {
     }
 
     /// A set that no longer grows: rows in it are dropped and the others go to the
-    /// partitions of later passes, so none is emitted now.
+    /// partitions of later passes, so none is emitted now. The batch goes in ranges whose
+    /// scratch fits, halving a range whose scratch is refused before any of its rows are
+    /// written, so the rows of each partition keep their order. A refusal of the scratch
+    /// of one row is the query's.
     fn apply_frozen(&mut self, ctx: &Ctx, buffer: &mut Buffer) -> Result<()> {
         let len = buffer.table.len;
+        let (mut start, mut step) = (0, len.max(1));
+        while start < len {
+            let end = start + step.min(len - start);
+            match self.freeze_range(ctx, buffer, start..end) {
+                Ok(()) => start = end,
+                Err(error) if end - start > 1 && memory_refusal(&error) => {
+                    step = (end - start) / 2;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        for column in &mut buffer.table.cols {
+            column.clear();
+        }
+        buffer.table.len = 0;
+        buffer.reconcile()
+    }
+
+    /// Pass on the rows `range` of `buffer` that the set does not hold. Its scratch is
+    /// charged before any row is written, so a refusal of it writes nothing.
+    fn freeze_range(
+        &mut self,
+        ctx: &Ctx,
+        buffer: &Buffer,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
         let width = buffer.table.width() - usize::from(self.numbered);
-        let _rows = ctx.charge(len as u64 * 8 + 64)?;
-        let mut passed = Vec::new();
+        let _rows = ctx.charge(range.len() as u64 * 8 + 64)?;
+        let mut passed = Vec::with_capacity(range.len());
         {
             let seen = self.seen.as_ref().expect("distinct state");
             let mut key = Vec::with_capacity(width);
-            for row in 0..len {
+            for row in range {
                 if row.is_multiple_of(1024) {
                     ctx.check()?;
                 }
                 let found = match seen {
                     Seen::One(ids) => ids.contains(&buffer.table.cols[0][row]),
-                    Seen::Many { table, rows } => {
+                    Seen::Many(set) => {
                         key.clear();
                         key.extend(buffer.table.cols[..width].iter().map(|column| column[row]));
-                        let hash = FxBuildHasher.hash_one(key.as_slice());
-                        table
-                            .find(hash, |&r| {
-                                let r = r as usize;
-                                rows[r * width..(r + 1) * width] == key[..]
-                            })
-                            .is_some()
+                        set.contains(&key, Rows::hash(&key))
                     }
                 };
                 if !found {
@@ -548,14 +494,11 @@ impl Distinct {
                 }
             }
         }
-        if !passed.is_empty() {
-            self.pass_on(ctx, buffer, &passed)?;
+        if passed.is_empty() {
+            return Ok(());
         }
-        for column in &mut buffer.table.cols {
-            column.clear();
-        }
-        buffer.table.len = 0;
-        buffer.reconcile()
+        let _gather = ctx.charge(Self::gather_bytes(passed.len(), buffer.table.cols.len()))?;
+        self.pass_on(buffer, &passed)
     }
 
     /// Ordered input: a row passes when it differs from the row before it, which for the
@@ -589,81 +532,48 @@ mod tests {
     use super::*;
     use crate::store::{Store, StoreOptions};
 
-    fn numbered_growth(limit: u64, fits: bool) -> u64 {
-        let store = Store::in_memory(StoreOptions::default());
-        let mut ctx = Ctx::new(store.snapshot());
-        ctx.var("value");
-        ctx.var("number");
-        ctx.mem_limit = limit;
-        ctx.enable_cursor_accounting().unwrap();
-        let ctx = Arc::new(ctx);
-        ctx.attach_owner();
-        let baseline = ctx.live_bytes();
-        let mut distinct = Distinct::new(&ctx, &[0, 1], &[], false, true).unwrap();
-        let batch = |first: i64, len: usize| {
-            let mut buffer = Buffer::new(&ctx, &[0, 1], len).unwrap();
-            for i in first..first + len as i64 {
-                let id = Id::from_i64(i).unwrap();
-                buffer.table.cols[0].push(id);
-                buffer.table.cols[1].push(id);
-            }
-            buffer.table.len = len;
-            buffer.reconcile().unwrap();
-            buffer
-        };
-        let mut first = batch(0, 32);
-        distinct.apply(&ctx, &mut first).unwrap();
-        drop(first);
-        let (old_table, old_arena, target) = match distinct.seen.as_ref().unwrap() {
-            Seen::Many { table, rows } => (
-                table_bytes(table.capacity(), 4),
-                rows.capacity() as u64 * 8,
-                (table.len() + 64).max(table.capacity() * 2),
+    /// The bytes and capacities of the set's table and row arena.
+    fn sizes(distinct: &Distinct) -> (u64, u64, usize, usize) {
+        match distinct.seen.as_ref().expect("distinct state") {
+            Seen::Many(set) => (
+                set.table_bytes(),
+                set.arena_bytes(),
+                set.capacity(),
+                set.arena_capacity(),
             ),
-            Seen::One(_) => panic!("numbered input must retain row numbers separately"),
-        };
-        let neighbor = ctx.retained_charge(4096).unwrap();
-        let mut next = batch(32, 64);
-        let other = ctx.live_bytes() - distinct.bytes;
-        let overlapping =
-            other + old_table + table_bytes(target, 4) + old_arena + target as u64 * 8 + 256;
-        if fits {
-            distinct.apply(&ctx, &mut next).unwrap();
-            assert!(
-                ctx.mem_peak() >= overlapping,
-                "peak {} missed overlapping arenas requiring {overlapping}",
-                ctx.mem_peak()
-            );
-        } else {
-            assert!(matches!(
-                distinct.apply(&ctx, &mut next),
-                Err(Error::BudgetExceeded(_))
-            ));
-            match distinct.seen.as_ref().unwrap() {
-                Seen::Many { table, rows } => {
-                    assert_eq!(table_bytes(table.capacity(), 4), old_table);
-                    assert_eq!(rows.capacity() as u64 * 8, old_arena);
-                    assert_eq!(table.len(), 32);
-                }
-                Seen::One(_) => unreachable!(),
-            }
+            Seen::One(_) => panic!("these cases keep a row arena"),
         }
-        drop(next);
-        drop(neighbor);
-        drop(distinct);
-        assert_eq!(ctx.live_bytes(), baseline);
-        overlapping
     }
 
-    #[test]
-    fn numbered_one_column_growth_reserves_both_row_arenas() {
-        let overlap = numbered_growth(1 << 20, true);
-        numbered_growth(overlap - 1, false);
+    fn lens(distinct: &Distinct) -> (usize, usize) {
+        match distinct.seen.as_ref().expect("distinct state") {
+            Seen::Many(set) => (set.len(), set.arena_len()),
+            Seen::One(_) => unreachable!(),
+        }
     }
 
-    // Hashbrown rounds 32 entries to capacity 56, while the row arena has only
-    // 32 rows. The overlapping batches add eight keys without growing the hash.
-    fn arena_growth(limit: u64, numbered: bool, spill_on: bool, freeze: bool, fits: bool) -> u64 {
+    /// What the second batch of [`growth`] should do.
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Expect {
+        /// The table doubles and the arena grows to the table's room.
+        Grows,
+        /// The arena's growth to the table's room does not fit, and it grows to what
+        /// it needs.
+        Exact,
+        /// Not even that fits.
+        Refused,
+        /// The set of a spilling query stops growing.
+        Freezes,
+    }
+
+    /// A DISTINCT over 32 rows and then 40 more, of which eight repeat earlier rows, under
+    /// `limit`. Hashbrown rounds 32 entries to room for 56 and the arena takes the 32 rows
+    /// the batch needs, so the second batch grows both, the arena to the table's room of
+    /// 112. They grow one after the other on one charge, which
+    /// admits the larger of the two growths before either, and not both.
+    /// Returns the room the batch needs with the arena at the table's room and with the
+    /// arena at what it needs, read from the buffers' sizes.
+    fn growth(limit: u64, numbered: bool, spill_on: bool, expect: Expect) -> (u64, u64) {
         let tmp = tempfile::tempdir().unwrap();
         let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
             dir: tmp.path().to_path_buf(),
@@ -714,68 +624,78 @@ mod tests {
         let mut output = collect(&first);
         drop(first);
         let width = if numbered { 1 } else { 2 };
-        let (hash, arena) = match distinct.seen.as_ref().unwrap() {
-            Seen::Many { table, rows } => (table.capacity(), rows.capacity()),
-            Seen::One(_) => panic!("both cases require a row arena"),
-        };
-        assert!(48 <= hash && 48 * width > arena);
+        let (old_table, old_arena, hash, arena) = sizes(&distinct);
+        assert_eq!(
+            (hash, arena),
+            (56, 32 * width),
+            "a first growth sizes the arena to the batch, not the table's rounded room"
+        );
+        let rest = ctx.live_bytes() - old_table - old_arena;
         let neighbor = ctx
-            .retained_charge(if freeze { 800 << 10 } else { 4096 })
+            .retained_charge(if expect == Expect::Freezes {
+                800 << 10
+            } else {
+                4096
+            })
             .unwrap();
-        let mut next = batch(24, 16);
-        let other = ctx.live_bytes() - distinct.bytes;
-        let arena_target = (48 * width).max(arena * 2);
-        let overlap = other + table_bytes(hash, 4) + (arena + arena_target) as u64 * 8 + 256;
-        if fits {
-            distinct.apply(&ctx, &mut next).unwrap();
-            if freeze {
-                assert!(distinct.frozen, "arena growth must be a freeze point");
+        let mut next = batch(24, 40);
+        let other = ctx.live_bytes() - old_table - old_arena;
+        let result = distinct.apply(&ctx, &mut next);
+        let (table, arena_bytes, hash_now, arena_now) = sizes(&distinct);
+        match expect {
+            Expect::Refused => {
+                assert!(matches!(result, Err(Error::BudgetExceeded(_))));
+                // The pair is refused before either buffer allocates, so the table, the
+                // arena and the rows are as they were.
+                assert_eq!((table, hash_now), (old_table, hash));
+                assert_eq!((arena_bytes, arena_now), (old_arena, arena));
+                assert_eq!(lens(&distinct), (32, 32 * width));
+            }
+            Expect::Freezes => {
+                result.unwrap();
+                assert!(distinct.frozen, "a growth must be a freeze point");
+                assert_eq!((hash_now, arena_now), (hash, arena));
                 assert_eq!(next.table.len, 0);
                 assert!(distinct.has_more());
-            } else {
-                let required = match distinct.seen.as_ref().unwrap() {
-                    Seen::Many { table, rows } => {
-                        assert_eq!(table.capacity(), hash);
-                        assert!(rows.capacity() > arena);
-                        table_bytes(table.capacity(), 4) + rows.capacity() as u64 * 8 + 256
-                    }
-                    Seen::One(_) => unreachable!(),
-                };
-                assert_eq!(
-                    distinct.bytes, required,
-                    "retained charge must cover the live arena"
-                );
+            }
+            Expect::Grows | Expect::Exact => {
+                result.unwrap();
+                assert_eq!(hash_now, 112);
+                // the exact need is room for every row of the batch
+                let grown = if expect == Expect::Grows { 112 } else { 72 };
+                assert_eq!(arena_now, grown * width);
+                assert_eq!(lens(&distinct), (64, 64 * width));
+                let needed =
+                    other + (old_table + table + old_arena).max(table + old_arena + arena_bytes);
                 assert!(
-                    ctx.mem_peak() >= overlap,
-                    "both arena allocations must be admitted"
+                    ctx.mem_peak() >= needed,
+                    "peak {} missed the growths, which need {needed}",
+                    ctx.mem_peak()
                 );
             }
+        }
+        let (table, arena_bytes, _, _) = sizes(&distinct);
+        let first_growth = old_table + table + old_arena;
+        let full = other + first_growth.max(table + old_arena + (112 * width) as u64 * 8);
+        let exact = other + first_growth.max(table + old_arena + (72 * width) as u64 * 8);
+        if expect != Expect::Refused {
             output.extend(collect(&next));
-        } else {
-            assert!(matches!(
-                distinct.apply(&ctx, &mut next),
-                Err(Error::BudgetExceeded(_))
-            ));
-            match distinct.seen.as_ref().unwrap() {
-                Seen::Many { table, rows } => {
-                    assert_eq!(table.capacity(), hash);
-                    assert_eq!(rows.capacity(), arena);
-                    assert_eq!(table.len(), 32);
-                    assert_eq!(rows.len(), 32 * width);
-                }
-                Seen::One(_) => unreachable!(),
-            }
         }
         drop(next);
         drop(neighbor);
-        if fits {
+        assert_eq!(
+            ctx.live_bytes() - table - arena_bytes,
+            rest,
+            "the set charges what it holds"
+        );
+        if expect != Expect::Refused {
             while let Some(buffer) = distinct.drain(&ctx, &[0, 1]).unwrap() {
                 output.extend(collect(&buffer));
             }
             // Both spill modes must match the eager first-occurrence result,
             // including the row numbers carried by numbered DISTINCT.
             output.sort_unstable();
-            let expected: Vec<_> = (0..40)
+            let expected: Vec<_> = (0..64)
                 .map(|i| {
                     (
                         Id::from_i64(i).unwrap(),
@@ -793,22 +713,209 @@ mod tests {
         drop(distinct);
         assert_eq!(ctx.live_bytes(), baseline);
         assert_eq!(spill.reserved_bytes(), 0);
-        overlap
+        (full, exact)
     }
 
     #[test]
-    fn row_arena_growth_without_hash_growth_is_charged_and_denied_before_allocation() {
+    fn set_growth_is_charged_and_denied_before_allocation() {
         for numbered in [false, true] {
-            let overlap = arena_growth(1 << 20, numbered, false, false, true);
-            arena_growth(overlap - 1, numbered, false, false, false);
-            arena_growth(1 << 20, numbered, true, false, true);
+            let (full, exact) = growth(1 << 20, numbered, false, Expect::Grows);
+            assert!(exact < full);
+            growth(full - 1, numbered, false, Expect::Exact);
+            growth(exact - 1, numbered, false, Expect::Refused);
+            growth(1 << 20, numbered, true, Expect::Grows);
         }
     }
 
     #[test]
-    fn row_arena_growth_without_hash_growth_can_freeze_and_drain() {
+    fn set_growth_can_freeze_and_drain() {
         for numbered in [false, true] {
-            arena_growth(1 << 20, numbered, true, true, true);
+            growth(1 << 20, numbered, true, Expect::Freezes);
         }
+    }
+
+    /// A one-column set of a query that may spill stops growing once the table it would
+    /// grow to reaches the pass's threshold, which is predicted from the table's own
+    /// bound and not from row bytes the set does not keep. The rows it passes on come
+    /// back from later passes, each once.
+    #[test]
+    fn a_one_column_set_freezes_at_its_predicted_table() {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.var("value");
+        ctx.mem_limit = 1 << 20;
+        ctx.spill = Some(Arc::new(spill.query(None)));
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let baseline = ctx.live_bytes();
+        let mut distinct = Distinct::new(&ctx, &[0], &[], false, false).unwrap();
+        let (rows, batch) = (100_000i64, 1000i64);
+        let mut output = Vec::new();
+        let mut largest = 0;
+        for first in (0..rows).step_by(batch as usize) {
+            let mut buffer = Buffer::new(&ctx, &[0], batch as usize).unwrap();
+            // every value twice, half the input apart
+            for i in first..first + batch {
+                buffer.table.cols[0].push(Id::from_i64(i % (rows / 2)).unwrap());
+            }
+            buffer.table.len = batch as usize;
+            buffer.reconcile().unwrap();
+            distinct.apply(&ctx, &mut buffer).unwrap();
+            output.extend(buffer.table.cols[0].iter().copied());
+            if let Some(Seen::One(ids)) = &distinct.seen {
+                largest = largest.max(ids.bytes());
+                assert_eq!(ids.bytes(), ids.allocation_size() as u64);
+            }
+        }
+        assert!(distinct.frozen, "the set must stop growing");
+        // the threshold is half the room the query had, at least 256 KiB
+        assert!(
+            largest < distinct.threshold,
+            "{largest} {}",
+            distinct.threshold
+        );
+        while let Some(buffer) = distinct.drain(&ctx, &[0]).unwrap() {
+            output.extend(buffer.table.cols[0].iter().copied());
+        }
+        assert!(distinct.passes > 0 && distinct.spilled > 0);
+        output.sort_unstable();
+        let expected: Vec<Id> = (0..rows / 2).map(|i| Id::from_i64(i).unwrap()).collect();
+        assert_eq!(output, expected);
+        drop(distinct);
+        assert_eq!(ctx.live_bytes(), baseline);
+        assert_eq!(spill.reserved_bytes(), 0);
+    }
+
+    /// `count` batches of `rows` new rows each, of `width` columns, under a budget that
+    /// sets the pass's threshold at its least and leaves `room` bytes when the second
+    /// batch arrives. Every row comes out once, and every charge returns. Returns
+    /// whether the set stopped growing at the second batch, whether its buffers kept
+    /// the sizes they had before it, and those sizes.
+    fn batches(width: usize, rows: usize, room: u64, count: usize) -> (bool, bool, (u64, u64)) {
+        let tmp = tempfile::tempdir().unwrap();
+        let spill = crate::spill::Spill::open(&crate::spill::SpillOptions {
+            dir: tmp.path().to_path_buf(),
+            max_bytes: 1 << 30,
+            query_bytes: 1 << 30,
+            min_free_bytes: 0,
+            encrypted: false,
+        })
+        .unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.var("value");
+        ctx.var("second");
+        // the room at the first growth is below twice the least pass, so the threshold
+        // is the least pass
+        ctx.mem_limit = 512 << 10;
+        ctx.spill = Some(Arc::new(spill.query(None)));
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let baseline = ctx.live_bytes();
+        let vars: Vec<VarId> = (0..width as VarId).collect();
+        let mut distinct = Distinct::new(&ctx, &vars, &[], false, false).unwrap();
+        let value = |i: usize, c: usize| Id::from_i64((i * (c + 1)) as i64).unwrap();
+        let collect = |buffer: &Buffer, output: &mut Vec<Vec<Id>>| {
+            for row in 0..buffer.table.len {
+                output.push(buffer.table.cols.iter().map(|c| c[row]).collect());
+            }
+        };
+        let mut output = Vec::new();
+        let mut neighbor = None;
+        let mut froze = false;
+        let (mut before, mut after) = ((0, 0), (0, 0));
+        let sizes = |distinct: &Distinct| match distinct.seen.as_ref().expect("distinct state") {
+            Seen::One(ids) => (ids.bytes(), 0),
+            Seen::Many(set) => (set.table_bytes(), set.arena_bytes()),
+        };
+        for b in 0..count {
+            let mut buffer = Buffer::new(&ctx, &vars, rows).unwrap();
+            for (c, column) in buffer.table.cols.iter_mut().enumerate() {
+                column.extend((b * rows..(b + 1) * rows).map(|i| value(i, c)));
+            }
+            buffer.table.len = rows;
+            buffer.reconcile().unwrap();
+            if b == 1 {
+                let free = ctx.memory_room();
+                assert!(free > room, "{free} bytes of room");
+                neighbor = ctx.retained_charge(free - room).unwrap();
+                assert_eq!(ctx.memory_room(), room);
+                before = sizes(&distinct);
+            }
+            distinct
+                .apply(&ctx, &mut buffer)
+                .unwrap_or_else(|e| panic!("batch {b} with {room} bytes of room: {e}"));
+            if b == 1 {
+                froze = distinct.frozen;
+                after = sizes(&distinct);
+            }
+            collect(&buffer, &mut output);
+        }
+        while let Some(buffer) = distinct.drain(&ctx, &vars).unwrap() {
+            collect(&buffer, &mut output);
+        }
+        output.sort_unstable();
+        let expected: Vec<Vec<Id>> = (0..count * rows)
+            .map(|i| (0..width).map(|c| value(i, c)).collect())
+            .collect();
+        assert_eq!(output.len(), expected.len(), "every row once");
+        assert_eq!(output, expected);
+        drop(neighbor);
+        drop(distinct);
+        assert_eq!(ctx.live_bytes(), baseline);
+        assert_eq!(spill.reserved_bytes(), 0);
+        assert!(before.0 > 0, "the set holds the first batch");
+        (froze, after == before, after)
+    }
+
+    /// The table and the arena of a two-column set grow one after the other, and their
+    /// pair is admitted before either allocates. Here the table's growth fits and the
+    /// pair's does not, so neither grows and the frozen batch has the room for its
+    /// scratch that a table grown alone would have taken. The room is also below the
+    /// growth's new allocations, so the set stops growing before the pair is admitted,
+    /// and a table grown on its own charge passes this test. The non-spilling
+    /// `set_growth_is_charged_and_denied_before_allocation` reaches the pair's admission
+    /// and fails such a table.
+    #[test]
+    fn a_pair_growth_that_does_not_fit_leaves_both_buffers() {
+        let (froze, kept, after) = batches(2, 3584, 132_000, 2);
+        assert!(froze, "the set must stop growing");
+        assert!(kept, "neither buffer grows, and they hold {after:?}");
+    }
+
+    /// The pair's growth at the second batch admits 135,184 bytes, and its new table
+    /// and arena take 155,680 bytes whole, with the 16-byte control groups of SSE2.
+    /// With room between the two the set stops growing, as it did before its buffers
+    /// were charged, and leaves that room to the operators above it. With 8-byte groups
+    /// the new table is 8 bytes smaller, and the same rooms give the same results.
+    #[test]
+    fn a_growth_leaves_the_room_of_its_new_allocations() {
+        let (froze, kept, after) = batches(2, 3584, 145_000, 2);
+        assert!(froze, "the set must stop growing");
+        assert!(kept, "neither buffer grows, and they hold {after:?}");
+        let (froze, _, _) = batches(2, 3584, 155_680, 2);
+        assert!(!froze, "the new allocations fit");
+    }
+
+    /// A set that grows where a formula of its final size would have frozen it holds
+    /// more when it stops growing later, and its frozen batch passes rows on in
+    /// smaller ranges where its scratch does not fit at once.
+    #[test]
+    fn a_later_freeze_passes_rows_on_in_ranges_that_fit() {
+        let (froze, _, _) = batches(2, 3584, 160_000, 3);
+        assert!(!froze, "the pair fits at the second batch");
+        let (froze, _, _) = batches(1, 7168, 180_000, 3);
+        assert!(!froze, "the table fits at the second batch");
     }
 }

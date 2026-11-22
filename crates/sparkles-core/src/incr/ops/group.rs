@@ -115,7 +115,11 @@ pub struct AggSpec {
 #[derive(Clone, Debug, Default)]
 struct SumState {
     rows: i64,
+    /// the arguments that were errors or not numbers, which make the sum unbound
     errs: i64,
+    /// the arguments that were errors, apart from values that are not numbers, for the
+    /// reading in which AVG over only errors is zero
+    undef: i64,
     /// the integer sum, in wrapping arithmetic so that removals stay exact
     int: i128,
     /// the decimal values as counts by their 128-bit encoding
@@ -200,8 +204,8 @@ impl SumState {
 #[derive(Clone, Debug, Default)]
 struct Multiset {
     vals: Vec<(Id, i64)>,
-    /// the count of arguments whose evaluation failed, which make a `GROUP_CONCAT`
-    /// unbound
+    /// the count of arguments that were errors, unbound variables among them, which make
+    /// a `GROUP_CONCAT` unbound, and a `MIN` or `MAX` under some readings of errors
     errs: i64,
     /// `SAMPLE`: the value reported, kept while the group holds it
     sample: Option<Id>,
@@ -527,15 +531,29 @@ impl Group {
                     _ => {
                         let mut s = sum.clone();
                         s.errs += errs;
+                        s.undef = *errs;
                         s.rows = vals.len() as i64 + errs;
                         self.sum_value(p, spec.kind, &s)
                     }
                 },
                 AState::Sum(s) => self.sum_value(p, spec.kind, s),
                 AState::Multi(m) => match spec.kind {
+                    AggKind::Min | AggKind::Max
+                        if m.errs != 0
+                            && p.aggregate_errors.best_errs(spec.kind == AggKind::Min) =>
+                    {
+                        Id::UNDEF
+                    }
                     AggKind::Min => m.min().unwrap_or(Id::UNDEF),
                     AggKind::Max => m.max(p).unwrap_or(Id::UNDEF),
                     AggKind::Sample => m.sample.unwrap_or(Id::UNDEF),
+                    // Jena's GROUP_CONCAT(DISTINCT …) over no rows
+                    _ if spec.distinct
+                        && g.rows == 0
+                        && p.aggregate_errors.distinct_concat_of_nothing_unbound() =>
+                    {
+                        Id::UNDEF
+                    }
                     _ => Self::concat(p, spec, m),
                 },
             };
@@ -552,6 +570,8 @@ impl Group {
         if m.errs != 0 {
             return Id::UNDEF;
         }
+        // CONCAT takes only strings
+        let strings = p.aggregate_errors.concat_strings_only();
         let sep = spec.separator.as_deref().unwrap_or(" ");
         let mut out = String::new();
         let mut first = true;
@@ -559,7 +579,11 @@ impl Group {
             if *n <= 0 {
                 continue;
             }
-            let Some(s) = p.value(*v).and_then(|v| v.lexical().ok()) else {
+            let Some(s) = p
+                .value(*v)
+                .filter(|v| !strings || v.is_string())
+                .and_then(|v| v.lexical().ok())
+            else {
                 return Id::UNDEF;
             };
             let reps = if spec.distinct { 1 } else { *n };
@@ -575,6 +599,14 @@ impl Group {
     }
 
     fn sum_value(&self, p: &mut Pass, kind: AggKind, s: &SumState) -> Id {
+        // AVG is Sum over Count, and Count leaves the errors out
+        if kind == AggKind::Avg
+            && s.rows > 0
+            && s.undef == s.rows
+            && p.aggregate_errors.avg_of_errors_zero()
+        {
+            return p.value_id(&Value::Integer(0.into()));
+        }
         let Some(sum) = s.sum() else {
             return Id::UNDEF;
         };
@@ -664,19 +696,18 @@ impl Group {
                             }
                         }
                     },
-                    AState::Sum(s) => s.add(vals[ai].as_ref(), w),
+                    AState::Sum(s) => {
+                        s.add(vals[ai].as_ref(), w);
+                        if arg.is_none() {
+                            s.undef += w;
+                        }
+                    }
                     AState::Multi(m) => match arg {
                         Some(v) => m.add(p, v, w),
-                        // a failed expression is an error, and so is an unbound variable
-                        // under GROUP_CONCAT, where a one-off evaluation answers an
-                        // error; MIN, MAX and SAMPLE leave an unbound variable out, as a
-                        // one-off evaluation does
-                        None if self.aggs[ai].column.is_none()
-                            || self.aggs[ai].kind == AggKind::Concat =>
-                        {
-                            m.errs += w
-                        }
-                        None => {}
+                        // a failed expression and an unbound variable are errors, which
+                        // SAMPLE passes over, GROUP_CONCAT answers with and MIN and MAX
+                        // treat as the reading of errors says
+                        None => m.errs += w,
                     },
                 }
             }
@@ -771,6 +802,7 @@ impl Group {
         fn sum(w: &mut Writer, s: &SumState) {
             w.i64(s.rows);
             w.i64(s.errs);
+            w.i64(s.undef);
             w.i128(s.int);
             w.u64(s.decs.len() as u64);
             for (k, n) in &s.decs {
@@ -848,6 +880,7 @@ impl Group {
             let mut s = SumState {
                 rows: r.i64()?,
                 errs: r.i64()?,
+                undef: r.i64()?,
                 int: r.i128()?,
                 ..Default::default()
             };

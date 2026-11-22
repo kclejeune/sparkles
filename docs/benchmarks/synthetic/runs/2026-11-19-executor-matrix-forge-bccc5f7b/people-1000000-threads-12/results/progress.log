@@ -1,0 +1,13 @@
+00:42:12 unpacking
+00:42:16 data: 10527323 triples
+00:42:21 A loaded in 4.84 s
+00:42:21 queries: class-predicate-list class-predicates contains count-all distinct-join distinct-obj employee-docs exists-join export-500k expr-agg-arg expr-bind-group expr-order-key group-avg knows-reach lang-filter minus not-exists optional-chain optional-count order-by-full path-plus predicate-counts predicate-subjects range-topk regex-iri star-join star-lookup subquery-agg two-hop-count types-grouped values-star
+00:52:17 round 1 epoch 1 (A) done
+01:02:14 round 1 epoch 2 (B) done
+01:10:12 round 1 epoch 3 (B) done
+01:18:08 round 1 epoch 4 (A) done
+01:26:04 round 2 epoch 5 (A) done
+01:34:01 round 2 epoch 6 (B) done
+01:41:59 round 2 epoch 7 (B) done
+01:49:54 round 2 epoch 8 (A) done
+01:49:54 finished

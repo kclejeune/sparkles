@@ -353,6 +353,8 @@ fn monotone(program: &AnalysisProgram) -> Result<bool> {
                 "noValue" | "now" | "listNotContains" | "listLength" | "listEntry" | "listForAll"
             ),
             Clause::Rule(rule) => safe(rule),
+            // a negated atom is not monotone
+            Clause::Not(_) => false,
             _ => true,
         }) && rule.head.iter().all(|clause| match clause {
             Clause::Builtin(_) => false,

@@ -284,8 +284,9 @@ on CPU 11 and the server on CPUs 0–9, with the result cache off.
 Cold mode restarts the server and evicts its files from the OS page cache before each
 query, three times per query, and reports the median request time without process
 startup. Eviction does not guarantee that the device itself is cold. A Sparkles server is
-ready 0.09 s after a restart at both scales. Sparkles is fastest on 21 of 28 cold queries
-at 1.05M and on 24 of 28 at 10.5M. The cold losses are these:
+ready 0.09 s after a restart at both scales. Against Fluree at 1.05M,
+[Cold against Fluree at 1.05M](#cold-against-fluree-at-105m) gives the current figures.
+Against the other engines, the run of all 28 queries found these cold losses:
 
 Jena also completes `knows-reach` with the larger stack after three process restarts
 and file-cache evictions at each scale. Its median request times are 1,417.885 ms and
@@ -296,17 +297,72 @@ result.
 
 | Query, cold | Faster engine | 1.05M | 10.5M |
 |---|---|---|---|
-| `count-all` | Fluree at 1.05M | 1.55× (3.4 against 2.2 ms) | — |
-| `two-hop-count` | Fluree at 1.05M | 1.05× (18.6 against 17.7 ms) | — |
-| `contains` | Fluree at 1.05M | 1.17× (14.2 against 12.1 ms) | — |
 | `path-plus` | Oxigraph | 2.95× (6.5 against 2.2 ms) | 2.94× (4.7 against 1.6 ms) |
-| `distinct-obj` | Fluree at 1.05M | 3.0× (4.8 against 1.6 ms) | — |
 | `star-lookup` | Oxigraph at 10.5M | — | 1.31× (20.1 against 15.4 ms) |
 | `values-star` | Oxigraph | 1.51× (8.0 against 5.3 ms) | 1.50× (8.1 against 5.4 ms) |
-| `employee-docs` | Fluree at 1.05M, Oxigraph at 10.5M | 1.38× (11.7 against 8.5 ms) | 1.07× (14.7 against 13.7 ms) |
+| `employee-docs` | Oxigraph at 10.5M | — | 1.07× (14.7 against 13.7 ms) |
 
 *Sparkles was measured on forge on 2026-10-23 at commit 6699f27d, and the other engines on
 2026-10-19. Medians of three restarts are noisy at these sizes.*
+
+#### Cold against Fluree at 1.05M
+
+Sparkles at commit b47b582b and Fluree 4.2.2 from the repository's pinned package were
+measured in one run on forge, each loaded fresh from the same data. The cold mode of
+`bench.sh` ran 7 restarts per engine and query in each of three rounds, with the engines in
+the orders Sparkles then Fluree, Fluree then Sparkles, and Sparkles then Fluree. Both
+engines give the same answers to all eight queries. Each cell is the median of 21 samples,
+followed by the fastest and the slowest.
+
+| Cold, ms | Sparkles | Fluree |
+|---|---:|---:|
+| `count-all` | **2.1** (1.5 to 2.5) | 19.2 (1.5 to 27.4) |
+| `two-hop-count` | **13.0** (11.5 to 15.5) | 36.4 (21.8 to 49.5) |
+| `contains` | **11.9** (10.6 to 13.2) | 29.0 (25.2 to 33.7) |
+| `distinct-obj` | **1.8** (1.1 to 2.6) | 19.3 (2.0 to 27.2) |
+| `employee-docs` | **7.4** (5.7 to 8.3) | 29.5 (14.2 to 36.5) |
+| `star-lookup` | **10.1** (6.6 to 11.0) | 44.8 (35.7 to 54.4) |
+| `values-star` | **5.2** (3.4 to 6.0) | 36.5 (27.0 to 44.4) |
+| `path-plus` | **2.5** (1.5 to 3.2) | 29.1 (22.9 to 36.7) |
+
+Fluree answers its readiness check 0.02 s after most restarts, against 0.09 s for
+Sparkles, and its first request then takes 14 to 55 ms. On 28 of the 168 restarts its check
+answered only on the harness's second poll, 0.05 s or more after the start, and the first
+request was faster, with medians of 1.8 ms on `count-all`, 2.1 ms on `distinct-obj` and
+15.1 ms on `employee-docs`. A Fluree store of the same data loaded earlier behaves the same
+way.
+
+The harness sends the timed request as soon as the server answers its readiness check. A
+second run of the same rounds waited 1 s between the readiness check and the request, in a
+copy of the harness with that one change.
+
+| Cold after a 1 s pause, ms | Sparkles | Fluree |
+|---|---:|---:|
+| `count-all` | 10.1 (9.2 to 11.4) | **2.8** (1.1 to 3.3) |
+| `two-hop-count` | **22.9** (14.7 to 25.1) | 43.7 (34.1 to 52.8) |
+| `contains` | **22.3** (20.2 to 25.0) | 34.3 (26.6 to 37.6) |
+| `distinct-obj` | **9.9** (8.7 to 10.9) | 10.8 (2.3 to 12.6) |
+| `employee-docs` | **17.7** (16.4 to 19.4) | 29.3 (16.6 to 36.1) |
+| `star-lookup` | **20.7** (19.0 to 23.5) | 54.2 (45.0 to 73.7) |
+| `values-star` | **14.7** (7.5 to 16.5) | 45.9 (36.7 to 58.9) |
+| `path-plus` | **11.0** (9.2 to 12.1) | 36.4 (32.4 to 41.5) |
+
+After the pause Fluree leads `count-all` 3.6 times, and `distinct-obj` is within 10%.
+Every Sparkles query takes 8 to 11 ms longer than without the pause. In the server's own
+`profile=io` timings, `count-all` reads no index block and one vocabulary page, for the
+`rdf:type` lookup of the planner's characteristic sets. That lookup takes 0.2 ms right
+after the readiness check and 7.5 to 8.4 ms after a 1 s pause, while parsing, execution
+and serialization do not change. Pauses of 0.2, 0.5 and 3 s cost the request as much.
+Single direct 4 KiB reads on forge's NVMe drive take 0.1 to 0.5 ms within 50 ms of the
+previous read, while after 0.2 to 1 s without reads some of them take about 8 ms. That is
+consistent with the drive leaving a low-power state, which was not measured directly. The
+harness's cold rows on this page were taken right after a restart, when the drive had just
+been read.
+
+Cold `contains` spends 3.9 to 6.4 ms of its 11 to 14 ms in the server on planning, where
+the selectivity sample of its filter decodes four PSO columns. The
+[run record](runs/2026-11-21-cold-fluree-forge-b47b582b/README.md) holds every sample, the
+harness patch, the server timings and the drive probe.
 
 Sparse point lookups and several small scans lose because warm execution hides their
 first-use reads and block decoding. Sparkles memory-maps its index and vocabulary, and
@@ -522,6 +578,59 @@ faster in both builds. The
 holds the revisions, binary hashes, settings, per-round ratios and compressed request
 samples. These are internal comparisons and make no cross-engine claim.
 
+## Pinned checks of the screen flags of batches 19 to 29
+
+Namespace screens of batches 19 to 29 flagged `path-plus`, `star-lookup`, `minus` and
+`distinct-obj` on short queries, and item 856 measured a fixed cost on the four queries
+under 0.01 ms. A pinned check on forge ran each flag's pre-flag base against 8baa5686, the
+main branch at batch 30, for 24 interleaved rounds of A, B, B and A with 200 timed
+requests per query and server process. Both builds of a pair loaded the same 1,052,807
+generated triples. The server ran on CPU 2 with one Rayon thread and the client on CPU 4,
+with spinners on both, the host's benchmark locks held and zero steal time. Execution was
+the server's default. All builds came from `scripts/nsc-build.sh` on the laptop with the
+same compilers, and every answer matched across each pair.
+
+A query under 0.3 ms passes when the upper end of the 95% interval of its ratio is at most
+1.02 or its median added server time is at most 0.5 µs, the rule of the
+[X14 acceptance gates](../../specs/X14-unified-executor/SPEC.md#acceptance-gates). The
+interval is the t interval of the mean log round ratio over the 24 rounds. Each query is
+judged on the pair of its own flag.
+
+| query | base | base ms | 8baa5686 ms | ratio | 95% interval | added µs | slower rounds | result |
+|---|---|--:|--:|--:|---|--:|--:|---|
+| `path-plus` | 06ca04ef | 0.00982 | 0.01028 | 1.046 | 1.028 to 1.058 | 0.46 | 23 of 24 | pass |
+| `star-lookup` | c2b5d7cf | 0.06188 | 0.06125 | 0.990 | 0.951 to 1.006 | −0.64 | 7 of 24 | pass |
+| `distinct-obj` | f854145b | 0.00363 | 0.00413 | 1.137 | 1.121 to 1.160 | 0.50 | 24 of 24 | pass |
+| `count-all` | 321508fe | 0.00431 | 0.00458 | 1.064 | 1.049 to 1.085 | 0.28 | 22 of 24 | pass |
+| `distinct-obj` | 321508fe | 0.00376 | 0.00402 | 1.069 | 1.054 to 1.085 | 0.26 | 23 of 24 | pass |
+| `predicate-counts` | 321508fe | 0.00430 | 0.00466 | 1.082 | 1.069 to 1.094 | 0.35 | 24 of 24 | pass |
+| `predicate-subjects` | 321508fe | 0.00625 | 0.00652 | 1.043 | 1.034 to 1.052 | 0.27 | 24 of 24 | pass |
+
+The `path-plus` and `distinct-obj` flags pass on added time alone, and `distinct-obj`
+passes at 0.499 µs, at the limit of the rule. Its cost against f854145b is real, since all
+24 rounds are slower, and it is of the same kind as item 856's. Against 321508fe, the main
+branch before item 825, the four queries of item 856 are 0.26 to 0.35 µs slower with
+nearly every round agreeing, which confirms the item's measurement at the batch 30 build.
+Cross-checks in the same runs put `path-plus` 0.80 µs and `star-lookup` 2.5 µs slower
+than 321508fe, 1.085 and 1.043 of its time.
+
+`minus` takes one of two speeds for the life of each server process, about 0.25 ms or about
+0.40 ms, in both builds of every pair. The two speeds match its cursor and eager execution
+times in the [forge matrix](#forge-record-at-batch-30-against-cc94ac7f), so this is the
+history of quick texts settling on one mode per process, as
+[the execution mode of quick texts](#execution-mode-of-quick-texts-in-fresh-servers)
+describes, and the pooled median depends on how many processes settle eagerly. Within each
+mode, 8baa5686 runs `minus` at 0.2537 ms against 0.2530 ms for adbe757c and at 0.4022 ms
+against 0.4048 ms, so the flags of batches 21 and 22 are not costs. On 321508fe the slow
+mode takes 0.302 ms and on 06ca04ef, the merge of item 825, 0.402 ms, each in its own pair
+against 8baa5686. The query-path changes between those two commits are item 825's, and the
+rest are reasoner changes, so the eager mode of `minus` most likely became about 0.10 ms
+slower with item 825. The matrix measures that cost in every cell.
+
+The [run record](runs/2026-11-18-post-push-pinned-forge-8baa5686/validation.json) holds
+the binary hashes, the settings, the per-mode medians of `minus`, the analysis script and
+compressed request samples. These are internal comparisons and make no cross-engine claim.
+
 ## Eager-against-cursor matrix
 
 `mise run bench:executors` is the rewrite gate of the executor paths and the oracle of
@@ -588,8 +697,10 @@ about the execution modes. Streaming is also slower end to end on the large answ
 of the time goes to writing the rows. It is faster on the grouped aggregates
 `expr-agg-arg` and `group-avg` in every cell, on `expr-bind-group` in every cell with 12
 threads and at 10.5M triples on `minus` and `not-exists`. Item 534 covers the
-streamed response's fixed cost and its losses on large answers, which the merged executor
-must not inherit.
+streamed response's fixed cost, which the merged executor must not inherit. With item
+240's buffered writers, separate atlas measurements at 1.05M triples with 12 threads show
+streamed responses faster than eager ones on these four queries, as the
+[engine results](../engine/RESULTS.md) record.
 
 ### Forge record after stages 1 and 3
 
@@ -695,10 +806,448 @@ Eager `expr-bind-group` read 0.839 of the base, 0.50 ms against 0.60 ms, `expr-a
 and EXPLAIN marks it `[incremental]`. `group-avg` and `expr-bind-group` kept running state
 in the base as well. Streamed, the same queries read 0.975, 1.004 and 0.980. `types-grouped`,
 `predicate-counts` and `subquery-agg` keep their count plans and read 0.955 to 1.021 in
-both modes, within the spread of the base. Eager `types-grouped` read 1.003, a median of
-0.02 µs more in this one order of the A/B, under the 0.5 µs bound of the Intel rule. The
+both modes, within the spread of the base. Eager `subquery-agg` read 1.009 and streamed
+`predicate-counts` read 1.021. Eager `types-grouped` read 1.003, a median of 0.02 µs more
+in this order of the A/B, under the 0.5 µs bound of the Intel rule. The
 12-thread cells of these queries come from the forge matrix. Roadmap item 1067 follows
 these small deltas.
+
+An eager aggregate whose argument compares a variable with a constant IRI or holds an
+EXISTS decoded that variable's column before it ran, and item 1098 removed that decode.
+Its fix, 59d29b40, was compared on forge with main, bccc5f7b, and with 92371f0f, the main
+before the grouping operator, at 10.5M triples with one thread. Each pair ran three
+rounds of A,B,B,A with 42 timed requests per arm and mode, from builds made on forge with
+the same compilers. The [run record](runs/ce40bfef42a7a7384020a8f4a5b3a4c9b194efe0db6878493e2f3de9ffabe4ec/README.md)
+keeps the samples, answers, queries and scripts, and every query returned the same answer
+in every server.
+
+| Query | Main | Fix | Fix/main | Before 826 | Fix/before |
+|---|--:|--:|--:|--:|--:|
+| Eager `SUM(IF(?p = ex:nobody, 1, 0))` | 60.06 ms | 15.05 ms | 0.251 | 16.10 ms | 0.942 |
+| Eager BIND of the same `IF` and `SUM` | 60.94 ms | 15.21 ms | 0.250 | 59.97 ms | 0.253 |
+| Eager `SUM(IF(EXISTS { ?p ex:authorOf ?d }, 1, 0))` | 917.92 ms | 866.92 ms | 0.944 | 870.70 ms | 0.998 |
+
+The fix column comes from the pair with main. The ratios against the build before item
+826 divide the other pair's fix medians, 15.16, 15.20 and 868.90 ms. Every round read
+within 0.02 of these ratios except those of the first query against the
+build before item 826, which read 0.988, 0.701 and 0.981. The fix leaves the queries that
+read values within 0.99 to 1.01 of main, such as `SUM(STRLEN(?n))`, `SUM(?s * 2)` and
+`expr-agg-arg`, and every streamed query above 0.3 ms within 0.98 to 1.01 of main. Streamed `sum-if` and the streamed
+BIND form take about 13.5 ms in most server processes and 17 to 22 ms in some, in all
+three builds, so the second pair's streamed ratios of 1.35 and 1.32 are noise that a round
+below 1.0 shows. Against the build before item 826, eager `SUM(STRLEN(?n))` grouped by
+employer reads 0.784, and eager `SUM(?s * 2)` reads 1.163, 57.9 ms against 49.7 ms, which
+roadmap item 1099 follows. With one thread at 10.5M triples, the same pair reads 1.039 for
+streamed `SUM(STRLEN(STR(?o)))`, 1.074 for streamed `expr-agg-arg`, 1.013 for streamed
+`SUM(?s * 2)` and 1.008 for streamed `SUM(STRLEN(?n))`. The fix is slower in all three
+rounds for each query. Item 1067 holds these costs and the 12-thread `group-avg` follow-up
+from the [pinned forge comparison](#pinned-checks-and-drift-at-batch-37).
+
+### Leaf cursors
+
+The first part of item 829 was compared with its base on forge alone, under the host's
+heavy lock. A is main at bccc5f7b and B is 9df856f3, the part-1 engine before a cursor
+returned the count on two variables to the eager kernel, both release builds made on
+stanley with the same compilers. The
+[run record](runs/2026-11-18-leaf-cursors-ab-forge-9df856f3/README.md) keeps the samples,
+answers, queries and scripts of every run. A first pass ran the 31-query matrix at 1.05M
+triples with one thread in eight rounds of A,B,B,A in each mode, and the text, geo and
+vector scripts in one A,B,B,A round per mode with 12 threads and with one. A confirmation
+then ran the synthetic queries under 0.3 ms, the ones over it that the first pass flagged
+and the vector queries in twelve rounds of A,B,B,A in both orders, with 200 timed
+requests per query and server for the synthetic queries and 50 for the vector queries,
+and `scripts/x08-gates/combine.py` removed the position bias. Every server returned the
+same answers in every run.
+
+`mise run bench:request-insn` counted the instructions per request of the same two
+binaries on stanley, in eight rounds of A,B,B,A with 50 requests per query and server.
+Streamed `distinct-join`, `employee-docs`, `expr-bind-group`, `values-star` and
+`star-lookup` run 0.6% to 1.9% more instructions, and every other counted query runs
+the same count within the host's noise floor. Eager execution runs the same count as the
+base on every counted query.
+
+The confirmation's real costs in server time are these, where the item column names the
+roadmap item that holds each one. Costs under 0.3 ms within the cap of item 1074, with both modes of a
+query counted together, are its lines, each a kept-path cost without a profile. Instructions are the stanley ratio, and
+the vector store was not counted.
+
+| Query | Mode | Base | Tip/base | 95% interval | Added | Instructions | Item |
+|---|---|--:|--:|---|--:|--:|---|
+| `distinct-join` | streaming | 3.75 ms | 1.035 | 1.035–1.036 | 131 µs | 1.011 | 1160 |
+| `distinct-join` | eager | 3.57 ms | 1.022 | 1.021–1.023 | 78 µs | 1.000 | 1161 |
+| `lang-filter` | streaming | 1.79 ms | 1.028 | 1.027–1.029 | 50 µs | 1.000 | 1161 |
+| `lang-filter` | eager | 1.79 ms | 1.027 | 1.026–1.028 | 48 µs | 1.000 | 1161 |
+| `star-join` | eager | 1.39 ms | 1.019 | 1.016–1.022 | 27 µs | 1.000 | 1161 |
+| `star-join` | streaming | 1.41 ms | 1.013 | 1.010–1.016 | 18 µs | 1.001 | 1160 |
+| `regex-iri` | eager | 3.72 ms | 1.011 | 1.009–1.011 | 39 µs | 1.000 | 1161 |
+| `regex-iri` | streaming | 3.72 ms | 1.010 | 1.008–1.010 | 36 µs | 1.000 | 1161 |
+| `contains` | eager | 2.53 ms | 1.006 | 1.006–1.007 | 16 µs | 1.000 | 1161 |
+| `contains` | streaming | 2.53 ms | 1.006 | 1.006–1.007 | 16 µs | 1.000 | 1161 |
+| `minus` | eager | 0.36 ms | 1.008 | 1.003–1.010 | 2.7 µs | 1.000 | 1161 |
+| `expr-bind-group` | streaming | 0.36 ms | 1.013 | 1.009–1.015 | 4.7 µs | 1.013 | 1160 |
+| `employee-docs` | streaming | 0.041 ms | 1.039 | 1.030–1.053 | 1.6 µs | 1.019 | 1160 |
+| `star-lookup` | streaming | 0.063 ms | 1.032 | 1.027–1.037 | 2.0 µs | 1.006 | 1160 |
+| `star-lookup` | eager | 0.059 ms | 1.018 | 1.012–1.026 | 1.0 µs | 1.000 | 1161 |
+| `values-star` | streaming | 0.020 ms | 1.052 | 1.041–1.063 | 1.0 µs | 1.010 | 1160 |
+| `q-ef-256` | streaming | 0.57 ms | 1.006 | 1.001–1.009 | 3.2 µs | | 1162 |
+| `q-exact-true` | eager | 10.8 ms | 1.001 | 1.000–1.002 | 13 µs | | 1162 |
+| `q-ef-128` | eager | 0.22 ms | 1.006 | 1.003–1.010 | 1.3 µs | | 1074, 1162 |
+| `q-ef-128` | streaming | 0.23 ms | 1.007 | 1.002–1.012 | 1.6 µs | | 1074, 1162 |
+| `q-ef-64` | eager | 0.11 ms | 1.012 | 1.007–1.018 | 1.3 µs | | 1162 |
+| `q-ef-64` | streaming | 0.11 ms | 1.011 | 1.004–1.016 | 1.3 µs | | 1162 |
+| `q-ef-32` | eager | 0.071 ms | 1.009 | 1.006–1.020 | 0.65 µs | | 1162 |
+| `q-ef-32` | streaming | 0.075 ms | 1.013 | 1.008–1.022 | 0.99 µs | | 1162 |
+| `q-ef-16` | eager | 0.053 ms | 1.012 | 1.003–1.017 | 0.61 µs | | 1162 |
+| `q-ef-16` | streaming | 0.056 ms | 1.016 | 1.010–1.030 | 0.91 µs | | 1162 |
+
+The other confirmed queries read as noise by the Intel rule, with an interval that
+reaches 1.0 or a median added time of at most 0.5 µs, and `subquery-agg` reads 0.988
+eager and 0.996 streamed. The confirmation's wall times are curl's transfer times, which split between
+about 1 and 2 ms for many of the short queries, so their medians can move by a whole
+step between servers. Over that column, every vector query reads within 1.0006 of the
+base, and five synthetic queries read as real costs, which item 1161 holds beside their
+server time.
+
+| Query | Mode | Base wall | Tip/base | 95% interval | Added | Item |
+|---|---|--:|--:|---|--:|---|
+| `predicate-counts` | streaming | 1.78 ms | 1.160 | 1.028–1.359 | 285 µs | 1161 |
+| `distinct-join` | eager | 5.23 ms | 1.018 | 1.014–1.023 | 92 µs | 1161 |
+| `regex-iri` | streaming | 4.91 ms | 1.009 | 1.001–1.012 | 43 µs | 1161 |
+| `contains` | streaming | 3.75 ms | 1.007 | 1.0001–1.0121 | 26 µs | 1161 |
+| `contains` | eager | 3.70 ms | 1.005 | 1.004–1.013 | 20 µs | 1161 |
+
+Streamed `predicate-counts` reads as noise in server time and runs the same instructions
+as the base, and between 35% and 72% of the requests to each of its servers took the
+upper step, so its wall-time cost waits for a rerun that separates the step from the
+build.
+
+The [script rerun](runs/2026-11-20-leaf-cursors-scripts-rerun-forge-9df856f3/README.md)
+ran the text, geo and vector scripts again on forge with the same two binaries, in three
+rounds of A,B,B,A, B,A,A,B and A,B,B,A over one store per script, which gives six pairs
+per query. The ratios are of client wall time, which includes the start of a curl process
+per request, and a configuration is slower when every pair is above 1. Of the 88
+configurations, 80 read as noise, 5 as faster and 3 as slower, and every server returned
+the same answers. Two of the slower ones are real costs that item 1162 holds.
+
+| Script | Query | Mode | Threads | Base | Tip/base | Pairs | Same-binary spread | Item |
+|---|---|---|--:|--:|--:|---|--:|---|
+| geo | `q6-touching-counties` | eager | 1 | 1,937 ms | 1.012 | 1.000 to 1.019 | 0.8% | 1162 |
+| vector | `q-ef-64` | eager | 1 | 9.85 ms | 1.080 | 1.013 to 1.737 | 78% | 1162 |
+
+The wall times of eager `q-ef-64` with one thread are bimodal within a server, so its
+ratio is unsteady, and the confirmation above measured 1.2% more server time for it. The
+third slower configuration is streamed geo `q9-star` with 12 threads, which read 1.144
+pooled, with pairs from 1.002 to 1.504 and a same-binary spread of 13.9%.
+
+A [q9-star rerun](runs/2026-11-20-leaf-cursors-q9-star-forge-cde29b37/README.md) then
+timed that query alone on forge at 12 threads for three builds, which are the base
+bccc5f7b, main at 5f3f69c2 and the tip of item 829's first part at cde29b37 on that main.
+It ran six rounds in which the builds rotate through the positions, with 25 timed requests
+for each of 12 server processes per build and mode. Its ratios have a 95% bootstrap
+interval over server processes. The tip against main, item 829's own cost, reads 0.966
+streamed, with an interval of 0.944 to 0.991, and 1.006 eager, with an interval of 0.975 to
+1.044, so the item adds no cost to the query. The server without the spatial rewrites
+runs the same plan and reads 0.971 and 0.982.
+
+Main against the base reads 1.078 streamed, with an interval of 1.011 to 1.134 that
+excludes 1.0, so main's changes since bccc5f7b slow the streamed query, and item 1235
+investigates it. The requests of every build split between a fast mode under 22 ms and
+a slow mode of 26 to 30 ms. Streamed, 70 of the base's 300 requests take the fast mode
+against 22 of main's, and the base's servers differ from each other by up to 40.7%.
+Within the slow mode alone main reads 1.031 of the base, with an interval of 0.993 to
+1.080, so most of the difference is how often main's servers reach the fast mode. The
+run's CPU samples show no correlation between a server's median and its share of P
+cores, though with one indexed streamed server whose median is under 22 ms they cannot
+rule out placement of single requests, so the cause of the fast mode is open. The tip against the base reads 1.042
+streamed, with pairs from 0.834 to 1.376, and 0.997 eager.
+
+The same confirmation compared the tip's eager and streamed `CountJoin` in both orders.
+The streamed count of `{ ?a foaf:knows ?b . ?b foaf:knows ?a }`, a merge join on two
+variables, took 1.813 of the eager time, 9.58 ms against 5.28 ms, with an interval of
+1.807 to 1.815, and it runs 2.26 times the instructions of the base, which counted it
+eagerly in both modes. Item 1129 follows it, and until it lands a cursor runs the eager
+kernel for a count over a merge join on two or more variables, so streamed execution no
+longer takes the path measured here. The streamed count of
+`?a foaf:knows ?b FILTER(?a != ?b) ?b ex:worksFor ?o` took 0.151 of the eager time, 8.4 ms
+against 55.3 ms, and `two-hop-count`, which counts from key runs in both modes, read
+0.991. Automatic execution keeps both counts eager, item 1221 decides when it should
+stream the filtered one, and the record keeps the plans of both queries in each mode.
+
+### Per-query floor cache
+
+The floor cache of item 1069, 3a8b7adb, whose workers share one table, was compared on
+forge with its base, c0948014, with a probe build of the direct comparison of two string
+keys on that base, and with 174de1f8, an earlier build of the item that gave each worker
+a map of its own. The cells were interleaved A/Bs of release builds that forge made with
+the same compilers, at 1.05M triples in five A,B,B,A rounds of ten timed requests per
+query and server. The run record keeps the samples, answers and summary of each of the six cells, in the
+table's order [one](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g1-streaming/summary.md), [two](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g2-vs-direct/summary.md),
+[three](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g3-t12-streaming/summary.md), [four](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g4-t12-eager/summary.md),
+[five](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g5-vs-maps-streaming/summary.md) and [six](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/g6-vs-maps-eager/summary.md),
+with their [commands](runs/2026-11-19-floor-table-ab-forge-3a8b7adb/run.sh.txt). Every cell returned the same
+answers from both builds, and steal was zero. The table gives server execution time as a
+ratio of 3a8b7adb to the other build.
+
+| Cell | `str-pair-lt` | `str-pair-names` | `str-pair-colleague` |
+|---|--:|--:|--:|
+| Streaming against the base, one thread | 0.815 | 0.517 | 1.042 |
+| Eager against the direct comparison, one thread | 0.778 | 0.512 | 0.991 |
+| Streaming against the base, 12 threads | 0.935 | 0.777 | 1.065 |
+| Eager against the base, 12 threads | 0.843 | 0.636 | 0.802 |
+| Streaming against the per-worker maps, one thread | 0.907 | 1.053 | 0.952 |
+| Eager against the per-worker maps, one thread | 0.908 | 1.097 | 0.931 |
+
+In every cell, each round of these three queries agreed in direction with its median. Streaming `str-pair-names`
+took 29.8 ms against the base's 57.7 ms with one thread and 24.5 ms against 31.6 ms with
+12 threads. `str-filter-two`, which the floors do not reach, read 1.000 in streaming and
+0.999 in eager execution with one thread, and 1.014 in streaming execution with 12 threads
+in all five rounds. `bind-two` and `order-lcase` at 12 threads read 0.992 to 1.037 with
+rounds on both sides of 1 and spreads of 8% to 94%.
+
+The 37-query screens compared 174de1f8 with c0948014 and have not been run on 3a8b7adb,
+and item 678's pair compared
+75a70587 with 7e272f4d. The earlier run record keeps the
+[streaming](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f5-screen-streaming/summary.md) and
+[automatic](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f6-screen-auto/summary.md) screens and the pair's
+[automatic](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f7-layout-auto/summary.md) and
+[streaming](runs/2026-11-18-floor-cache-ab-forge-174de1f8/f8-layout-streaming/summary.md) cells with their
+[commands](runs/2026-11-18-floor-cache-ab-forge-174de1f8/run.sh.txt).
+The screens against the base ran three rounds and read a geometric mean of 0.980 in
+streaming and 0.970 in automatic execution, with no query 10% slower, and automatic
+`str-pair-colleague` read 0.777. Roadmap item 1088 follows the streaming cost of
+`str-pair-colleague`, whose names rarely repeat, item 1140 the cost of the table's growth
+on `str-pair-names` against the per-worker maps, and item 1089 the 12-thread cost of
+`str-filter-two` and the costs of 0.2% to 2.8% that the screens found in queries the
+floors do not reach, together with item 678's costs
+on `lang-filter`, `str-filter-two` and `distinct-join` of 1.8% to 2.9%. Automatic
+`str-filter-two` spread by 22% to 23% between server processes of one build, which item
+1087 follows.
+
+### Forge record at batch 30 against cc94ac7f
+
+The matrix ran on forge alone for cc94ac7f, the main branch before item 825 and the fixed
+baseline that the [X14 acceptance gates](../../specs/X14-unified-executor/SPEC.md#acceptance-gates)
+compare every later main branch with, and then for 8baa5686, the main branch at batch 30.
+Both runs used the scripts of 8baa5686, the same data and release builds with the same
+compilers and build configuration, GCC 15.3.0, clang 23.1.0git and rustc 1.99.1, made on
+the laptop and copied to forge. The run records of
+[cc94ac7f](runs/2026-11-18-executor-matrix-forge-cc94ac7f/summary.md) and
+[8baa5686](runs/2026-11-18-executor-matrix-forge-8baa5686/summary.md) hold the records,
+summaries and commands. Both modes returned the same answers in every cell of both runs,
+and no answer fingerprint changed.
+
+Against cc94ac7f, `bench-gate.py compare` flagged 67 of 248 execution times
+([execution times](runs/2026-11-18-executor-matrix-forge-8baa5686/compare-cc94ac7f-exec.md),
+[wall times](runs/2026-11-18-executor-matrix-forge-8baa5686/compare-cc94ac7f-wall.md)).
+Forty-three of them are queries under 0.3 ms, which the matrix's ten timed requests per
+server cannot resolve. The flags above 0.3 ms are the drift of batches 17 to 30 from the
+baseline.
+
+| query | mode | cells | ratio to cc94ac7f | cc94ac7f ms | 8baa5686 ms |
+|---|---|---|--:|--:|--:|
+| `minus` | eager | all four | 1.30 to 1.42 | 0.31 to 3.30 | 0.41 to 4.30 |
+| `lang-filter` | both | one thread | 1.12 to 1.13 | 1.64 and 16.0 | 1.83 and 18.0 |
+| `lang-filter` | either | 12 threads | 1.07 to 1.11 | 0.73 and 2.91 | 0.81 and 3.12 |
+| `regex-iri` | both | one thread | 1.09 to 1.11 | 3.48 and 34.5 | 3.80 and 38.2 |
+| `optional-chain` | streaming | three of four | 1.06 to 1.12 | 1.95 to 22.5 | 2.06 to 25.3 |
+| `optional-count` | streaming | three of four | 1.05 to 1.06 | 0.52 to 5.18 | 0.54 to 5.45 |
+| `distinct-join` | both | 1.05M, 12 threads | 1.05 and 1.07 | 3.58 and 3.77 | 3.76 and 4.02 |
+
+Every server process of a cell agrees on `minus`, and with one thread on `regex-iri`,
+`lang-filter` and streamed `optional-chain`. With 12 threads the process medians of the two
+builds overlap for `lang-filter` and streamed `optional-chain`. Eager `minus` took 0.31 ms in each process
+of cc94ac7f at 1.05M triples with one thread and 0.41 ms in each process of 8baa5686, and
+the pinned checks place this cost between 321508fe and
+06ca04ef, the range of item 825. The same cells are faster at 10.5M triples
+with 12 threads, where `order-by-full` takes 0.56 to 0.58 of its time in both modes and
+eager `optional-chain` 0.56, and four of the eight cells and modes of `export-500k` are 7% to 15% faster in execution.
+Eager `optional-chain` at that size varied from 38.6 to 47.6 ms between the processes of
+cc94ac7f. The e52937ca record took 28.5 ms there, but its compilers differ, so that ratio is
+not a measurement of the code. In wall time, streamed `export-500k` is 5% to 6% slower in all four cells and
+`lang-filter` and `regex-iri` 10% to 12% slower at 10.5M triples with one thread.
+
+### Forge record at batch 33 against cc94ac7f
+
+The matrix ran on forge alone for bccc5f7b, the main branch after batches 32 and 33, and
+then for eda22fce, the main branch before batch 32. Both runs used the scripts and data of
+the batch-30 runs and release builds made on the laptop whose build configuration and
+compiler notes equal those of the cc94ac7f build. The engine of eda22fce differs from that
+of 8baa5686 only in the OWL classifier, which no synthetic query runs, so the ratios of
+eda22fce to 8baa5686 show how far two forge runs of the same query code differ on
+different days. The run records of
+[bccc5f7b](runs/2026-11-19-executor-matrix-forge-bccc5f7b/summary.md) and
+[eda22fce](runs/2026-11-19-executor-matrix-forge-eda22fce/summary.md) hold the records,
+summaries, commands and compare outputs. Both modes returned the same answers in every
+cell of both runs, and every answer fingerprint equals that of cc94ac7f. These are
+separate runs, not interleaved pairs, so their ratios locate candidates and do not measure
+costs.
+
+Between the two runs of the same query code, every one-thread execution time above 0.3 ms
+read 0.98 to 1.02, apart from eager `export-500k`, whose 2 ms of execution inside a 230 ms
+request read 0.94 and 1.10. With 12 threads, eight of the 85 cell times above 0.3 ms read
+1.05 or more, up to 1.17 for streamed `order-by-full` at 10.5M triples. The streamed wall
+times of `export-500k`, `optional-chain` and `order-by-full` in the eda22fce run were 2% to
+6% lower than in the 8baa5686 run in every cell.
+
+Against eda22fce, bccc5f7b ran several eager grouping queries faster with one thread.
+Eager `expr-bind-group` read 0.84 and 0.85, eager `optional-count` 0.86, `group-avg` 0.89
+and 0.93, `expr-agg-arg` 0.89 and 0.90 and eager `minus` 0.89. The table lists every time
+above 0.3 ms that bccc5f7b ran at least 2% slower than both runs of the earlier code, with
+each of its four server processes slower than every process of those two runs.
+
+| query | mode | cell | 8baa5686 | eda22fce | bccc5f7b | ratio to eda22fce |
+|---|---|---|--:|--:|--:|--:|
+| `order-by-full` | eager | 10.5M, 12 threads | 108.7 ms | 121.7 ms | 146.4 ms | 1.203 |
+| `order-by-full` | eager | 1.05M, 12 threads | 8.77 ms | 8.75 ms | 9.42 ms | 1.076 |
+| `class-predicates` | streaming | 1.05M, 12 threads | 1.020 ms | 1.006 ms | 1.052 ms | 1.046 |
+| `group-avg` | streaming | 10.5M, 12 threads | 37.72 ms | 37.88 ms | 39.08 ms | 1.032 |
+| `group-avg` | streaming | 10.5M, one thread | 37.23 ms | 36.93 ms | 37.98 ms | 1.029 |
+| `export-500k` | streaming | 10.5M, one thread | 0.400 ms | 0.404 ms | 0.418 ms | 1.035 |
+| `export-500k` | streaming | 1.05M, one thread | 0.395 ms | 0.393 ms | 0.403 ms | 1.024 |
+| `not-exists` | streaming | 1.05M, 12 threads | 0.793 ms | 0.797 ms | 0.813 ms | 1.021 |
+| `expr-order-key` | streaming | 10.5M, 12 threads | 10.96 ms | 11.04 ms | 11.27 ms | 1.021 |
+
+In wall time the same test selects streamed `order-by-full` at 10.5M triples with 12
+threads, 1.151 of eda22fce, eager `order-by-full` there, 1.063, streamed `group-avg` there,
+1.035, and streamed `optional-chain` there, 1.072. Streamed `export-500k` read 1.049 to
+1.085 of eda22fce in wall time in all four cells and 1.017 to 1.021 of 8baa5686, and in
+three of the four cells every server process of bccc5f7b was slower than every process of
+both runs. Row 1063 puts the cost
+of item 1039, which batch 32 merged, at about 3% of streamed `export-500k` execution time
+with wall time unchanged, and row 1067 holds small streamed grouping costs. An interleaved
+forge A/B of eda22fce and bccc5f7b decides which of these differences are costs of the
+code.
+
+Against cc94ac7f, `bench-gate.py compare` flagged 75 of 248 execution times
+([execution times](runs/2026-11-19-executor-matrix-forge-bccc5f7b/compare-cc94ac7f-exec.md),
+[wall times](runs/2026-11-19-executor-matrix-forge-bccc5f7b/compare-cc94ac7f-wall.md)), 51
+of them under 0.3 ms. The table lists all 24 flags above 0.3 ms.
+
+| query | mode | cells | ratio to cc94ac7f | cc94ac7f ms | bccc5f7b ms |
+|---|---|---|--:|--:|--:|
+| `minus` | eager | all four | 1.16 to 1.28 | 0.31 to 3.30 | 0.37 to 3.91 |
+| `lang-filter` | both | one thread | 1.09 to 1.10 | 1.64 and 16.0 | 1.79 and 17.6 |
+| `lang-filter` | streaming | 1.05M, 12 threads | 1.12 | 0.73 | 0.82 |
+| `regex-iri` | both | one thread | 1.08 to 1.10 | 3.48 and 34.5 | 3.75 and 37.8 |
+| `regex-iri` | streaming | 1.05M, 12 threads | 1.07 | 0.96 | 1.03 |
+| `optional-chain` | streaming | three of four | 1.06 to 1.12 | 1.95 to 25.5 | 2.06 to 27.6 |
+| `optional-count` | streaming | three of four | 1.06 to 1.08 | 0.56 to 5.18 | 0.60 to 5.52 |
+| `class-predicates` | streaming | 1.05M, 12 threads | 1.07 | 0.99 | 1.05 |
+| `class-predicate-list` | streaming | 1.05M, 12 threads | 1.05 | 0.98 | 1.03 |
+| `order-by-full` | eager | 1.05M, 12 threads | 1.06 | 8.92 | 9.42 |
+| `export-500k` | eager | 10.5M, one thread | 1.08 | 2.21 | 2.39 |
+
+Eager `minus` read 1.30 to 1.42 of cc94ac7f in the batch-30 record and 1.16 to 1.28 here.
+With one thread, every server process of a cell agrees on `lang-filter`, `regex-iri` and
+streamed `optional-chain`, and their ratios to cc94ac7f are within 0.04 of those in the
+[batch-30 record](#forge-record-at-batch-30-against-cc94ac7f). At batch 33, item 1072
+recorded `lang-filter` at about 2.5% slower after item 678. Costs on `regex-iri` and
+streamed `optional-chain` and `optional-count` had no rows. The drift of the four queries
+from cc94ac7f exceeded the costs that [row 1074](../../ROADMAP.md) counted and prompted
+the [pinned interleaved run](#pinned-checks-and-drift-at-batch-37). In
+wall time, streamed `export-500k` is 7% to 9% slower than cc94ac7f in all four cells, and
+`lang-filter` and `regex-iri` 9% slower at 10.5M triples with one thread.
+
+### Pinned checks and drift at batch 37
+
+Forge ran eleven interleaved pairs alone under its benchmark and build locks, in rounds of
+A,B,B,A, with release builds of the matrix recipe that the laptop made with the compilers
+and build configuration of the cc94ac7f build. The
+[run record](runs/2026-11-19-post-push-pinned-forge-stage3/README.md) holds the
+scripts, samples, answer checksums, binary hashes and verdicts. For every pair, the sorted
+TSV answers of both builds have the same checksums, and the timed responses were not
+compared. A query whose arm medians are both under 0.3 ms is judged by the D4 rule of the
+pinned checks above. Otherwise a ratio of 1.05 or more fails, and a lower ratio that is
+slower in every round is a confirmed cost that needs a roadmap row. The record's
+`verdict.txt` applies this rule to the output of `analyze.py`, whose own verdict field
+tests only the ratio above 0.3 ms.
+
+The screen flags of batches 33 and 35 pass. Against eda22fce, the main before batch 32,
+bccc5f7b runs `types-grouped` at 0.984 eager and 0.969 streamed. Under automatic execution
+it reads 1.030 with an interval that reaches 1.037, and it passes because the added time
+is 0.22 µs. Against ffb18866, the main before batch 35, `subquery-agg` reads 0.997 under
+automatic execution and 1.001 streamed, with intervals that reach 1.0.
+
+The pairs of eda22fce and bccc5f7b rerun the candidates above 0.3 ms that the
+[batch-33 record](#forge-record-at-batch-33-against-cc94ac7f) listed, apart from streamed
+`group-avg` and `export-500k` at 10.5M triples with one thread, which have no pair. Every
+ratio is below 1.05, and two are confirmed costs.
+
+| query | mode | cell | ratio | rounds slower |
+|---|---|---|--:|--:|
+| `export-500k` | streaming | 1.05M, one thread | 1.032 | 12 of 12 |
+| `group-avg` | streaming | 10.5M, 12 threads | 1.022 | 8 of 8 |
+| `expr-order-key` | streaming | 10.5M, 12 threads | 1.022 | 7 of 8 |
+| `order-by-full` | streaming | 10.5M, 12 threads | 1.009 | 7 of 8 |
+| `order-by-full` | eager | 10.5M, 12 threads | 1.001 | 4 of 8 |
+| `order-by-full` | eager | 1.05M, 12 threads | 1.003 | 6 of 12 |
+| `class-predicates` | streaming | 1.05M, 12 threads | 1.006 | 9 of 12 |
+
+Row 1063 holds the `export-500k` cost and row 1067 the `group-avg` cost. The pairs
+span batches 32 and 33. Batch 32 merged items 826, 678 and 1039, which are
+starting points for investigating `group-avg`. Streamed
+`expr-order-key` has an interval from 1.010 to 1.031 but is faster in one of eight rounds,
+which the rule above counts as noise. Eager `order-by-full` at 10.5M triples, which the
+separate matrix runs read at 1.20, reads 1.001 here with an interval from 0.994 to 1.007.
+
+The pair of cc94ac7f and 71c277b0, the main at batch 37, measures the drift of streamed
+queries since the fixed baseline with one thread at 1.05M triples.
+
+| query | cc94ac7f ms | 71c277b0 ms | ratio | 95% interval | rounds slower | row |
+|---|--:|--:|--:|---|--:|---|
+| `optional-chain` | 1.940 | 2.096 | 1.081 | 1.076 to 1.085 | 12 of 12 | 1202 |
+| `optional-count` | 0.517 | 0.545 | 1.056 | 1.052 to 1.059 | 12 of 12 | 1203 |
+| `regex-iri` | 3.476 | 3.593 | 1.034 | 1.031 to 1.038 | 12 of 12 | 1204 |
+| `lang-filter` | 1.632 | 1.679 | 1.029 | 1.027 to 1.031 | 12 of 12 | 1204 |
+| `export-500k` | 0.417 | 0.398 | 0.956 | 0.952 to 0.959 | 0 of 12 | none |
+
+Each ratio is the whole drift since cc94ac7f. The
+[separate timing of item 678](../../specs/X14-unified-executor/SPEC.md#charged-query-state-and-chunked-live-reservations)
+compares `lang-filter` against that item's own base. Roadmap item 1089 tracks that cost.
+The share of the 1.029 endpoint ratio attributable to item 678 remains unresolved. The
+separate matrix runs of 8baa5686 and bccc5f7b read
+`lang-filter` and `regex-iri` at 1.08 to 1.12 of the cc94ac7f run in the same cells, against
+1.03 here. Their instruction counts are nearly flat from 8baa5686 to 71c277b0, so the gap
+between the two methods is not explained. The 10.5M and 12-thread cells of these four
+queries have no interleaved pair. In wall time this pair reads 0.650 for `optional-chain`
+and 0.543 for `export-500k`, over every change from cc94ac7f to 71c277b0. The atlas
+comparison of 8baa5686 and a016b7bd in the
+[streamed response section](../../specs/X14-unified-executor/SPEC.md#the-streamed-response-cost)
+measures item 240's buffered cursor writer on its own and does not divide this difference.
+Server execution time covers the cursor's batches and leaves out the writer and its term
+cache.
+
+The [attribution files](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/README.md)
+count instructions per request on the laptop, streamed with one Rayon thread at 1.05M
+triples. They compare consecutive matrix builds from cc94ac7f to 71c277b0 and, between
+cc94ac7f and 8baa5686, cached screen builds of another toolchain. Counts locate a change in
+the code, and only the forge pair sizes a cost.
+
+- On `optional-count`, the screen builds 321508fe and 06ca04ef differ by 4.4%, and no
+  other adjacent step in the screen ladder adds more than 0.3%. The range holds item 825 and the Horn classifier
+  with individuals, which no synthetic query runs.
+- On `optional-chain`, the same range adds 0.5% while `export-500k` stays flat. The matrix
+  step from ffb18866 to 1cbc23cd adds another 0.55% to `optional-chain` and 0.47% to
+  `export-500k`, and from cc94ac7f to 8baa5686 the whole request runs 0.16% fewer
+  instructions. Most of this request is the writer, so these totals do not show where the
+  query's own instructions changed.
+- On `lang-filter` and `regex-iri`, adbe757c to 65c570db, which is batch 21, adds 1.8% and
+  1.6%, and no other adjacent step in the screen ladder adds more than 0.06%. Item 948 changed the checked vocabulary
+  decode in that batch and is a candidate that its own comparison would confirm.
+
+[Flat profiles](runs/2026-11-19-post-push-pinned-forge-stage3/attribution/perf/) of
+cc94ac7f and 71c277b0 on the laptop's performance cores, sampled on user-space instructions,
+name the code without isolating the execution window. In cc94ac7f the cursor joined
+`optional-chain` through its own hash index in `cursor::binary`. In 71c277b0 it joins
+through the `join::hash` kernels that item 825 added, which build a partitioned index. The
+join symbols, counting the merge bounds and zipper on both sides, take an estimated 8.9
+million instructions per request against 6.9 million. The count of `optional-count` moved
+from the cursor's grouping count over `zipper::lower_bounds` to `join::merge::count` and
+`join::merge::bounds`, and those symbols with the zipper take an estimated 4.1 million
+instructions per request against 3.8 million. The merge keeps both kernel families, so
+both costs are on the kept path. The filter profiles do not locate the added instructions,
+so row 1204 is on the kept path by default. The laptop carried other work, so the cycle
+profiles are not measurements.
 
 ### Execution mode of quick texts in fresh servers
 

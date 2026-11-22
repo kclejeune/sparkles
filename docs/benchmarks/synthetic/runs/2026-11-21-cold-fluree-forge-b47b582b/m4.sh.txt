@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# m4: which startup effect makes a cold query 1 s after ready plan ~7.5 ms slower.
+set -uo pipefail
+L=$HOME/lanes/cold-scan
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+W=$L/work
+rm -rf $L/m4 && mkdir -p $L/m4 && cp -r $W/sparkles.db $L/m4/db
+run() { # tag delay env... -- serve args
+  local tag=$1 d=$2; shift 2
+  local envs=() args=()
+  while [ $# -gt 0 ] && [ "$1" != -- ]; do envs+=("$1"); shift; done
+  [ $# -gt 0 ] && shift
+  for x in "$@"; do args+=("--serve-arg=$x"); done
+  env COLD_DELAY=$d "${envs[@]}" python3 $L/srcd/scripts/br-delay.py --binary $L/bin/sparkles --db $L/m4/db --queries $W/queries \
+    --names count-all contains --out $L/m4/$tag.json --runs 7 --cold --format application/x-sparkles+json --port 4373 "${args[@]}" > $L/m4/$tag.log 2>&1
+  echo "$tag $(python3 -c "import json;d=json.load(open('$L/m4/$tag.json'));print({q:round(v['median'],2) for q,v in d.items()})")"
+}
+run base0 0
+run base1 1
+run nopf0 0 -- --no-code-prefault
+run nopf1 1 -- --no-code-prefault
+run purge1 1 MIMALLOC_PURGE_DELAY=-1
+run d02 0.2
+run d05 0.5
+run d3 3
+echo M4-DONE

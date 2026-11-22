@@ -20,6 +20,7 @@ fn rules() -> Vec<Rule> {
             head: vec![triple(true)],
             direction: Direction::Forward,
             line: i + 1,
+            include: None,
         })
         .collect()
 }
@@ -30,6 +31,7 @@ fn nested() -> Vec<Rule> {
         head: vec![triple(true)],
         direction: Direction::Forward,
         line: 1,
+        include: None,
     };
     for depth in 0..8 {
         rule = Rule {
@@ -38,6 +40,7 @@ fn nested() -> Vec<Rule> {
             head: vec![Clause::Rule(Box::new(rule))],
             direction: Direction::Forward,
             line: depth + 2,
+            include: None,
         };
     }
     vec![rule]
@@ -214,6 +217,7 @@ fn compilation_charges_no_unmade_error_messages() {
         })],
         direction: Direction::Forward,
         line: 1,
+        include: None,
     };
     let terms = terms();
     let budget = terms.budget();
@@ -246,6 +250,7 @@ fn a_skipped_rule_charges_its_message() {
         head: vec![triple(true)],
         direction: Direction::Forward,
         line: 1,
+        include: None,
     };
     let terms = terms();
     let budget = terms.budget();

@@ -1,0 +1,5 @@
+parse 0.36 ms · plan 0.64 ms · exec 34.66 ms · total 35.66 ms
+Project ?p ?o  [300191 rows (est 300191), 33.70 ms]
+  OptionalJoin filter !(?o = <http://example.org/x>) [merge on ?p]  [300191 rows (est 300191), 33.17 ms]
+    IndexScan POS ?p rdf:type <http://example.org/Student> [decodes SG]  [300191 rows (est 300191), 3.39 ms]
+    IndexScan PSO ?p <http://example.org/advisor> ?o [decodes SOG]  [300191 rows (est 300191), 4.98 ms]
