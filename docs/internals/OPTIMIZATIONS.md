@@ -435,7 +435,11 @@ implementation and always apply. EXPLAIN shows which ones ran.
   pairs. That bound does not cover what evaluating the condition charges. One test with
   the switch on can hold more pairs than a test with it off, so a condition whose
   charge grows with the pairs in one call, such as one that decodes long strings, can
-  need more than the bound adds.
+  need more than the bound adds. A deciding merge ends its batches at other rows than
+  the second path. Every call that a condition makes observable is the same in both
+  settings, with the same arguments in the same order, but batch boundaries are not part
+  of that contract. A consumer, and a callback, `work` hook or cancellation check that
+  shares state with it, can see different batch lengths in the two settings. Item 1199 records that limit.
 * **Probed OPTIONAL** (`probed_optional`). An OPTIONAL whose right side is a triple
   pattern, with its FILTERs, sorted on a variable that every row of the evaluated left
   side binds reads the pattern only for the left side's distinct values. It uses the

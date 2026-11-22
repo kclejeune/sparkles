@@ -5855,7 +5855,11 @@ other error aborts the query. Such a failure also keeps a write transaction that
 query belongs to from committing, even if the application catches the query error. A
 callback cannot run nested queries or writes on the same dataset or its branches.
 Callbacks are trusted application code and must check for cancellation during their
-own long-running work.
+own long-running work. A callback sees the rows of its own calls, and the engine
+promises nothing about how the query divides its other work into batches. A callback
+that reads state another part of the query also touches, such as a SERVICE target in
+the same process, its `work` hook or its cancellation checks, can see batch lengths
+change between releases and optimizer settings.
 
 The default volatility is `Volatile`. Queries that call registered functions skip the
 result cache. The batch interface receives one row of arguments per call. Registered
