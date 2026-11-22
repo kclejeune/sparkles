@@ -1455,27 +1455,15 @@ impl Found {
     /// fold charges each union it keeps, but not the slots of its `seen` table beyond the
     /// union itself, nor its step list's spare capacity, each with the buffer it grew from.
     /// The bound takes each step to make one union per choice, the product of the lengths
-    /// of the lists so far, which can far exceed the unions a step keeps.
+    /// of the lists so far, which can far exceed the unions a step keeps. Any overflow of
+    /// a nonempty product's choice count or table model saturates cleanly to `usize::MAX`.
     pub(super) fn fold_slack(&self) -> usize {
+        const SIDE: u128 = std::mem::size_of::<Side>() as u128;
+        const MAX: u128 = usize::MAX as u128;
         self.prods
             .iter()
             .filter(|p| !p.2)
-            .map(|p| {
-                let last = p.0.len().saturating_sub(1);
-                let mut choices = 1usize;
-                let mut most = 0usize;
-                for (i, l) in p.0.iter().enumerate() {
-                    choices = choices.saturating_mul(l.len());
-                    // a last step past FOLD_PRUNE unions derives them as it makes them
-                    let listed = if i < last {
-                        choices
-                    } else {
-                        choices.min(FOLD_PRUNE + 1)
-                    };
-                    most = most.max(step_slack(choices, listed));
-                }
-                most
-            })
+            .map(|p| fold_slack_lens(p.0.iter().map(Vec::len), SIDE, MAX) as usize)
             .max()
             .unwrap_or(0)
     }
@@ -1586,39 +1574,80 @@ pub(super) const RECORD_SLACK: usize = 64 * 1024;
 /// the sides kept before it.
 const FOLD_PRUNE: usize = 4096;
 
+/// The [`step_slack`] model in `u128` for a `Side` of `side` bytes, clamped once at the
+/// end to `max`. Computing in `u128` avoids subtracting saturated `usize` values when
+/// `unions * side` and the table size both exceed `max`.
+fn step_slack_model(unions: u128, listed: u128, side: u128, max: u128) -> u128 {
+    debug_assert!(unions <= u64::MAX as u128 && listed <= u64::MAX as u128);
+    let table = |n: u128| -> u128 {
+        let buckets = match n {
+            0 => 0,
+            1..4 => 4,
+            4..8 => 8,
+            _ => (n * 8 / 7).next_power_of_two(),
+        };
+        buckets * (side + 1) + 16
+    };
+    let grown = table(unions)
+        + if unions >= 4 {
+            table(unions / 2 + 1)
+        } else {
+            0
+        };
+    let cap = if listed == 0 {
+        0
+    } else {
+        listed.next_power_of_two()
+    };
+    let list = (cap + cap / 2) * side;
+    let slack = (grown - unions * side) + (list - listed * side);
+    slack.min(max)
+}
+
+/// The [`Found::fold_slack`] bound for one product's list lengths, returning `max` when
+/// a nonempty product's choice count overflows `max`.
+fn fold_slack_lens(
+    lens: impl ExactSizeIterator<Item = usize> + Clone,
+    side: u128,
+    max: u128,
+) -> u128 {
+    if lens.clone().any(|n| n == 0) {
+        return 0;
+    }
+    let last = lens.len().saturating_sub(1);
+    let mut choices = 1u128;
+    let mut most = 0u128;
+    for (i, len) in lens.enumerate() {
+        let Some(next) = choices.checked_mul(len as u128).filter(|&c| c <= max) else {
+            return max;
+        };
+        choices = next;
+        // a last step past FOLD_PRUNE unions derives them as it makes them
+        let listed = if i < last {
+            choices
+        } else {
+            choices.min((FOLD_PRUNE + 1) as u128)
+        };
+        most = most.max(step_slack_model(choices, listed, side, max));
+    }
+    most
+}
+
 /// The bytes of one step of [`fold`] that its charge leaves out, for `unions` unions of
 /// which `listed` stay in the step's list: the `seen` table's slots and control bytes
 /// beyond the size of a union, which fold charges for each, together with the table of
 /// half the buckets it grew from, and the list's capacity beyond its length, together with
 /// the buffer of half that capacity it grew from. The buckets follow the hash table's
-/// growth, a power of two at least 8/7 of the entries.
+/// growth, a power of two at least 8/7 of the entries. All arithmetic runs in `u128` and
+/// clamps once to `usize::MAX` at the end.
+#[cfg(test)]
 fn step_slack(unions: usize, listed: usize) -> usize {
-    const SIDE: usize = std::mem::size_of::<Side>();
-    let table = |n: usize| -> usize {
-        let buckets = match n {
-            0 => 0,
-            1..4 => 4,
-            4..8 => 8,
-            _ => (n.saturating_mul(8) / 7)
-                .checked_next_power_of_two()
-                .unwrap_or(usize::MAX),
-        };
-        buckets.saturating_mul(SIDE + 1).saturating_add(16)
-    };
-    let grown = table(unions).saturating_add(if unions >= 4 {
-        table(unions / 2 + 1)
-    } else {
-        0
-    });
-    let cap = if listed == 0 {
-        0
-    } else {
-        listed.checked_next_power_of_two().unwrap_or(usize::MAX)
-    };
-    let list = cap.saturating_add(cap / 2).saturating_mul(SIDE);
-    grown
-        .saturating_sub(unions.saturating_mul(SIDE))
-        .saturating_add(list.saturating_sub(listed.saturating_mul(SIDE)))
+    step_slack_model(
+        unions as u128,
+        listed as u128,
+        std::mem::size_of::<Side>() as u128,
+        usize::MAX as u128,
+    ) as usize
 }
 
 /// Derives the conclusions of a product that is not ground (item 969): the union of one
@@ -1716,8 +1745,13 @@ fn fold<S: Sink>(
                 if x.choices as usize >= PRODUCT_POLL {
                     x.choices = 0;
                     let go = if pending > 0 {
-                        charged += pending;
-                        out.reserve_data(std::mem::take(&mut pending))
+                        let add = std::mem::take(&mut pending);
+                        if out.reserve_data(add) {
+                            charged += add;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         out.go_on()
                     };
@@ -1743,8 +1777,10 @@ fn fold<S: Sink>(
         charged -= back;
         out.release_data(back);
         if pending >= RECORD_SLACK {
-            charged += pending;
-            if !out.reserve_data(std::mem::take(&mut pending)) {
+            let add = std::mem::take(&mut pending);
+            if out.reserve_data(add) {
+                charged += add;
+            } else {
                 return stop(st, out, charged);
             }
         }
@@ -1908,8 +1944,13 @@ pub(super) fn drain_with<S: Sink>(
             if x.choices as usize >= PRODUCT_POLL {
                 x.choices = 0;
                 let go = if pending > 0 {
-                    charged += pending;
-                    out.reserve_data(std::mem::take(&mut pending))
+                    let add = std::mem::take(&mut pending);
+                    if out.reserve_data(add) {
+                        charged += add;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     out.go_on()
                 };
@@ -1939,8 +1980,10 @@ pub(super) fn drain_with<S: Sink>(
         // and a small tail is left uncharged rather than add a check of the bounds to
         // every product, which bounds what one product holds unseen by RECORD_SLACK
         if pending >= RECORD_SLACK {
-            charged += pending;
-            if !out.reserve_data(std::mem::take(&mut pending)) {
+            let add = std::mem::take(&mut pending);
+            if out.reserve_data(add) {
+                charged += add;
+            } else {
                 ds(st).store.interrupted = true;
                 out.release_data(charged);
                 return;
@@ -3849,11 +3892,14 @@ mod tests {
         fn me(&mut self, _: Concl) {}
         // a reservation checks the bounds too, as the saturation's does
         fn reserve_data(&mut self, bytes: usize) -> bool {
-            self.reserved += bytes;
-            self.go_on()
+            let ok = self.go_on()
                 && self
                     .budget
-                    .is_none_or(|b| self.reserved - self.released <= b)
+                    .is_none_or(|b| self.reserved - self.released + bytes <= b);
+            if ok {
+                self.reserved += bytes;
+            }
+            ok
         }
         fn release_data(&mut self, bytes: usize) {
             self.released += bytes;
@@ -4164,5 +4210,110 @@ mod tests {
         let mut run = run;
         run.begin_run();
         assert!(!run.too_wide(&lists));
+    }
+
+    #[test]
+    fn step_slack_saturates_cleanly_and_matches_the_u128_model() {
+        let side_bytes = std::mem::size_of::<Side>() as u128;
+        let expected = |unions: usize, listed: usize| -> usize {
+            let u = unions as u128;
+            let l = listed as u128;
+            let table = |n: u128| -> u128 {
+                let buckets = match n {
+                    0 => 0,
+                    1..4 => 4,
+                    4..8 => 8,
+                    _ => (n * 8 / 7).next_power_of_two(),
+                };
+                buckets * (side_bytes + 1) + 16
+            };
+            let grown = table(u) + if u >= 4 { table(u / 2 + 1) } else { 0 };
+            let cap = if l == 0 { 0 } else { l.next_power_of_two() };
+            let list = (cap + cap / 2) * side_bytes;
+            ((grown - u * side_bytes) + (list - l * side_bytes)).min(usize::MAX as u128) as usize
+        };
+        for (u, l) in [
+            (0, 0),
+            (1, 1),
+            (3, 3),
+            (4, 4),
+            (7, 7),
+            (8, 8),
+            (16, 16),
+            (100, 100),
+            (FOLD_PRUNE, FOLD_PRUNE),
+            (FOLD_PRUNE + 1, FOLD_PRUNE + 1),
+            (50_000, 50_000),
+            (200_000_000, FOLD_PRUNE + 1),
+            (usize::MAX / std::mem::size_of::<Side>() + 1, FOLD_PRUNE + 1),
+            (usize::MAX, FOLD_PRUNE + 1),
+            (usize::MAX, usize::MAX),
+        ] {
+            assert_eq!(step_slack(u, l), expected(u, l), "u={u}, l={l}");
+        }
+        assert_eq!(step_slack(usize::MAX, usize::MAX), usize::MAX);
+        assert_eq!(step_slack(usize::MAX, FOLD_PRUNE + 1), usize::MAX);
+    }
+
+    #[test]
+    fn fold_slack_saturates_on_choice_overflow_and_handles_empty_and_ground() {
+        assert_eq!(Found::default().fold_slack(), 0);
+        // Ground products are ignored by fold_slack.
+        let mut ground = Found::default();
+        ground.ground_products(
+            vec![vec![side(&[1]), side(&[2])], vec![side(&[3]), side(&[4])]],
+            side(&[]),
+        );
+        assert_eq!(ground.fold_slack(), 0);
+        // Empty-list products produce no choices.
+        let mut empty = Found::default();
+        empty.products(vec![vec![side(&[1])], Vec::new()], side(&[]));
+        assert_eq!(empty.fold_slack(), 0);
+        // Choice multiplication overflowing usize must return usize::MAX.
+        let mut overflow = Found::default();
+        let lists: Vec<Vec<Side>> = (0..usize::BITS)
+            .map(|i| vec![side(&[2 * i + 2]), side(&[2 * i + 3])])
+            .collect();
+        overflow.products(lists, side(&[]));
+        assert_eq!(overflow.fold_slack(), usize::MAX);
+        // Multiple sequential products take the maximum, not the sum.
+        let mut multi = Found::default();
+        multi.products(
+            vec![
+                vec![side(&[1]), side(&[2]), side(&[3]), side(&[4])],
+                vec![side(&[5]), side(&[6]), side(&[7]), side(&[8])],
+            ],
+            side(&[]),
+        );
+        let one = multi.fold_slack();
+        assert_eq!(one, step_slack(4, 4).max(step_slack(16, 16)));
+        multi.products(
+            vec![
+                vec![side(&[11]), side(&[12]), side(&[13]), side(&[14])],
+                vec![side(&[15]), side(&[16]), side(&[17]), side(&[18])],
+            ],
+            side(&[]),
+        );
+        assert_eq!(multi.fold_slack(), one);
+        // 32-bit 50,000 x 4,000 example (Side = 24 B, max = u32::MAX): step 0 is 2,416,928 B
+        // and step 1 (200,000,000 choices, FOLD_PRUNE + 1 listed) must saturate to u32::MAX
+        // instead of collapsing to 196,584 B and letting fold_slack return 2,416,928 B.
+        assert_eq!(
+            step_slack_model(50_000, 50_000, 24, u32::MAX as u128),
+            2_416_928
+        );
+        assert_eq!(
+            step_slack_model(200_000_000, (FOLD_PRUNE + 1) as u128, 24, u32::MAX as u128),
+            u32::MAX as u128
+        );
+        assert_eq!(
+            fold_slack_lens([50_000, 4_000].into_iter(), 24, u32::MAX as u128),
+            u32::MAX as u128
+        );
+        // Empty list after an overflowing prefix still represents an empty product (0).
+        assert_eq!(
+            fold_slack_lens([usize::MAX, 2, 0].into_iter(), 48, usize::MAX as u128),
+            0
+        );
     }
 }

@@ -1545,15 +1545,16 @@ fn m_note<S: Sink>(
 /// M-return's late premise `prem`, whose maximal literal is `l`: the clauses the root
 /// returned with l in their bodies are resolved with it in batches, each drained before the
 /// next is made, so that the many returns of a literal are never prepared whole. A batch
-/// closes after [`M_POLL`] returns or once its products hold [`RECORD_SLACK`] bytes, and its
-/// bytes are admitted to the run's memory before it drains and released after, so what one
-/// batch holds uncharged is at most the slack and one return's lists. The admission checks
-/// the run's bounds, and a batch with nothing to admit polls them instead. A refusal, or a
-/// drain that stopped, ends the replay with the store interrupted, as [`drain`] leaves it,
-/// and the function is false. The conclusions are charged as `drain` charges them.
-/// The premise lists of a batch's returns are read without a count of the reads, as the
-/// premise lists of the other rules are, so up to [`M_POLL`] returns' preparation runs between
-/// two checks (roadmap item 1280).
+/// closes after [`M_POLL`] returns or once its products hold [`RECORD_SLACK`] bytes. Before
+/// draining, [`m_flush`] reserves the checked sum of the batch's held bytes and
+/// [`Found::fold_slack`] (the largest product's table bound, since products drain
+/// sequentially) and releases it after, so what one batch holds uncharged is at most the
+/// slack and one return's lists. The admission checks the run's bounds, and an empty batch
+/// polls them instead. A sum overflow, refusal, or drain that stopped ends the replay with
+/// the store interrupted, as [`drain`] leaves it, and the function is false. The
+/// conclusions are charged as `drain` charges them. The premise lists of a batch's returns
+/// are read without a count of the reads, as the premise lists of the other rules are, so
+/// up to [`M_POLL`] returns' preparation runs between two checks (roadmap item 1280).
 fn m_late<S: Sink>(ix: &Index, st: &mut State, l: Lit, prem: &Side, out: &mut S) -> bool {
     let mut batch = Found::default();
     let mut since = 0;
@@ -1582,23 +1583,34 @@ fn m_late<S: Sink>(ix: &Index, st: &mut State, l: Lit, prem: &Side, out: &mut S)
     since == 0 || m_flush(ix, st, &mut batch, out)
 }
 
-/// Admits and drains one batch of [`m_late`], false when the run stopped.
+/// Admits a batch's held bytes plus [`Found::fold_slack`] and drains it, false when the
+/// run stopped or the reservation overflowed.
 fn m_flush<S: Sink>(ix: &Index, st: &mut State, batch: &mut Found, out: &mut S) -> bool {
     let b = std::mem::take(batch);
     let held = b.held_bytes();
-    let go = if held > 0 {
-        out.reserve_data(held)
+    let slack = b.fold_slack();
+    let Some(need) = held
+        .checked_add(slack)
+        .filter(|&n| n <= isize::MAX as usize)
+    else {
+        out.data_overflow();
+        ds(st).store.interrupted = true;
+        return false;
+    };
+    let go = if need > 0 {
+        out.reserve_data(need)
     } else {
         out.go_on()
     };
     if !go {
-        out.release_data(held);
         ds(st).store.interrupted = true;
         return false;
     }
     let was = ds(st).store.interrupted;
     drain(ix, st, b, out);
-    out.release_data(held);
+    if need > 0 {
+        out.release_data(need);
+    }
     was || !ds(st).store.interrupted
 }
 
@@ -1713,8 +1725,8 @@ impl Scan {
 }
 
 /// Admits `bytes` of a handler's scratch before the handler builds it, false when the run
-/// refused them, which marks the store `x` interrupted. The caller releases the bytes
-/// either way.
+/// refused them, which marks the store `x` interrupted. The caller releases `bytes` only
+/// when `m_admit` returns `true` ([`Sink::reserve_data`]).
 fn m_admit<S: Sink>(x: &mut DlSt, bytes: usize, out: &mut S) -> bool {
     if out.reserve_data(bytes) {
         return true;
@@ -1833,7 +1845,6 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         let n: usize = us.iter().map(|u| r.edges.get(u).map_or(0, Vec::len)).sum();
         let bytes = n * std::mem::size_of::<Ex>();
         if !m_admit(x, bytes, out) {
-            out.release_data(bytes);
             return true;
         }
         // the registrations are read as a scan, charged and polled, and the destinations
@@ -1886,7 +1897,6 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         .map_or(0, Vec::len);
     let bytes = g * 4;
     if !m_admit(x, bytes, out) {
-        out.release_data(bytes);
         return true;
     }
     let r = x.root.as_deref().expect("made above");
@@ -1962,7 +1972,6 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     let bytes = n * std::mem::size_of::<(u32, u32)>();
     if !m_admit(x, bytes, out) {
         scan.end(out);
-        out.release_data(bytes);
         return;
     }
     let r = x.root.as_deref().expect("read above");
@@ -2053,7 +2062,6 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
     let cap = len(&first);
     let bytes = cap * std::mem::size_of::<Ex>();
     if !m_admit(x, bytes, out) {
-        out.release_data(bytes);
         return;
     }
     let r = x.root.as_deref().expect("made above");
@@ -2101,7 +2109,8 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
 /// maximal, resolved with the returned clause on those literals, keeping the premises'
 /// bodies and residual heads. The clause is kept under its body literals for the premises
 /// that come later. The drain's products first reserve [`Found::fold_slack`], the bytes of
-/// fold's tables that its own charge leaves out, which a wide return makes large.
+/// fold's tables that its own charge leaves out, which a wide return makes large. An
+/// unrepresentable bound stops the run via [`Sink::data_overflow`] before enumeration.
 pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool {
     if st.bottom || m_stopped(st, out) {
         return false;
@@ -2121,16 +2130,23 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
     let mut found = Found::default();
     ret_products(st, &c, None, cf_of(ix, out), &mut found);
     // fold's tables on M-return's wide products grow past its charge, so their bound is
-    // reserved before the drain and released after it, all of it transient. A refusal
-    // stops the run as a refused charge inside fold does.
-    let slack = found.fold_slack().min(isize::MAX as usize);
+    // reserved before the drain and released after it, all of it transient. An
+    // unrepresentable bound stops cleanly through data_overflow without clamping, and any
+    // refusal marks the store interrupted before enumeration.
+    let slack = found.fold_slack();
+    if slack > isize::MAX as usize {
+        out.data_overflow();
+        ds(st).store.interrupted = true;
+        return true;
+    }
     if slack > 0 && !out.reserve_data(slack) {
-        out.release_data(slack);
         ds(st).store.interrupted = true;
         return true;
     }
     drain(ix, st, found, out);
-    out.release_data(slack);
+    if slack > 0 {
+        out.release_data(slack);
+    }
     true
 }
 
@@ -2925,7 +2941,7 @@ pub(super) fn marker_deficits(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::super::dl_norm::DlAx;
     use super::super::dl_rules::DlRun;
     use super::super::index::{Axioms, Interner, RoleName};
@@ -2958,6 +2974,9 @@ mod tests {
             self.polls.set(self.polls.get() + 1);
             self.held += bytes;
             self.peak = self.peak.max(self.held);
+            if !self.go {
+                self.held -= bytes;
+            }
             self.go
         }
         fn release_data(&mut self, bytes: usize) {
@@ -3129,6 +3148,8 @@ mod tests {
         stop: std::cell::Cell<bool>,
         refuse: bool,
         after: usize,
+        budget: Option<usize>,
+        overflow: bool,
         sent: Vec<(Ex, Concl)>,
         asked: usize,
         held: usize,
@@ -3143,6 +3164,8 @@ mod tests {
                 stop: Default::default(),
                 refuse: false,
                 after: 0,
+                budget: None,
+                overflow: false,
                 sent: Vec::new(),
                 asked: 0,
                 held: 0,
@@ -3169,11 +3192,22 @@ mod tests {
         fn stopped(&self) -> bool {
             self.stop.get()
         }
+        fn data_overflow(&mut self) {
+            self.overflow = true;
+            self.stop.set(true);
+        }
         fn reserve_data(&mut self, n: usize) -> bool {
             self.asked += n;
             self.held += n;
             self.peak = self.peak.max(self.held);
-            self.go_on()
+            if self.budget.is_some_and(|b| self.held > b) {
+                self.stop.set(true);
+            }
+            let ok = self.go_on();
+            if !ok {
+                self.held -= n;
+            }
+            ok
         }
         fn release_data(&mut self, n: usize) {
             self.held -= n;
@@ -3313,6 +3347,236 @@ mod tests {
             assert_eq!(
                 out.held, 0,
                 "mode {mode}: the refused reservation is released"
+            );
+        }
+    }
+
+    /// A context holding `counts[i]` distinct non-ground singleton premises for body
+    /// literal `i` of a returned clause `A0(u) ∧ ... ∧ A_{n-1}(u) → H(u)`.
+    pub(in crate::classify) fn multi_list_return(
+        mode: u8,
+        counts: &[usize],
+    ) -> (Index, DlRun, State, u32, Vec<Lit>, Lit) {
+        let mut sig = Sig::new();
+        let h = sig.class("H");
+        let atoms: Vec<Ex> = (0..counts.len())
+            .map(|i| sig.class(&format!("A{i}")))
+            .collect();
+        let total: usize = counts.iter().sum();
+        let ks: Vec<Ex> = (0..total).map(|i| sig.class(&format!("K{i}"))).collect();
+        let u = sig.ind("u");
+        let (ix, _) = probe_ix(sig);
+        let mut run = DlRun::new(false, Default::default());
+        run.mrepair = mode;
+        let lits: Vec<Lit> = atoms.iter().map(|&a| glit(&run, &ix, a, u)).collect();
+        let gh = glit(&run, &ix, h, u);
+        let mut st = State::default();
+        let mut ki = 0usize;
+        for (&l, &cnt) in lits.iter().zip(counts) {
+            for _ in 0..cnt {
+                let k = ks[ki];
+                ki += 1;
+                let id = ds(&mut st).store.clauses.len() as u32;
+                assert!(
+                    ds(&mut st)
+                        .store
+                        .add(Clause::new(vec![Lit::x(k)], vec![l]))
+                        .is_some()
+                );
+                ds(&mut st).store.by_xl.entry(l).or_default().push(id);
+            }
+        }
+        let cid = run.table.push(Clause::new(lits.clone(), vec![gh]));
+        (ix, run, st, cid, lits, gh)
+    }
+
+    #[test]
+    fn m_return_unrepresentable_bound_stops_before_enumeration() {
+        // Six lists of 512 premises followed by 8 gives 2^57 choices and a fold_slack
+        // past isize::MAX from only 3,080 distinct non-ground premises. rret must signal
+        // data_overflow and stop before enumeration without clamping into reserve_data.
+        for mode in MODES {
+            let (ix, run, mut st, cid, _, _) =
+                multi_list_return(mode, &[512, 512, 512, 512, 512, 512, 8]);
+            let stored = dl(&st).unwrap().store.clauses.len();
+            let mut out = Stops::new(&run);
+            // Guard against entering drain if the old code clamps and calls reserve_data.
+            out.budget = Some(1 << 30);
+            assert!(rret(&ix, &mut st, cid, &mut out), "mode {mode}");
+            assert!(out.overflow, "mode {mode}: must report data_overflow");
+            assert_eq!(
+                out.asked, 0,
+                "mode {mode}: must not clamp an unrepresentable bound into reserve_data"
+            );
+            assert_eq!(out.held, 0, "mode {mode}");
+            assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
+            assert_eq!(
+                dl(&st).unwrap().store.clauses.len(),
+                stored,
+                "mode {mode}: nothing derived"
+            );
+        }
+    }
+
+    #[test]
+    fn m_return_s_late_replay_reserves_fold_slack_and_refuses_over_budget() {
+        for mode in MODES {
+            // 1. 3-literal returned clause A(u) ∧ B(u) ∧ C(u) → H(u) with 4 premises each
+            // for B and C; late premise K(x) → A(u) yields a 1 × 4 × 4 product below fold's
+            // internal charging thresholds.
+            let setup = |counts: &[usize], extra_ret: bool| {
+                let mut sig = Sig::new();
+                let h = sig.class("H");
+                let h2 = sig.class("H2");
+                let late_k = sig.class("LateK");
+                let atoms: Vec<Ex> = (0..counts.len())
+                    .map(|i| sig.class(&format!("A{i}")))
+                    .collect();
+                let total: usize = counts.iter().sum();
+                let ks: Vec<Ex> = (0..total).map(|i| sig.class(&format!("K{i}"))).collect();
+                let u = sig.ind("u");
+                let (ix, _) = probe_ix(sig);
+                let mut run = DlRun::new(false, Default::default());
+                run.mrepair = mode;
+                let lits: Vec<Lit> = atoms.iter().map(|&a| glit(&run, &ix, a, u)).collect();
+                let gh = glit(&run, &ix, h, u);
+                let gh2 = glit(&run, &ix, h2, u);
+                let mut st = State::default();
+                let mut ki = 0usize;
+                for (&l, &cnt) in lits.iter().zip(counts) {
+                    for _ in 0..cnt {
+                        let k = ks[ki];
+                        ki += 1;
+                        let id = ds(&mut st).store.clauses.len() as u32;
+                        assert!(
+                            ds(&mut st)
+                                .store
+                                .add(Clause::new(vec![Lit::x(k)], vec![l]))
+                                .is_some()
+                        );
+                        ds(&mut st).store.by_xl.entry(l).or_default().push(id);
+                    }
+                }
+                let mut ids = vec![run.table.push(Clause::new(lits.clone(), vec![gh]))];
+                if extra_ret {
+                    ids.push(run.table.push(Clause::new(lits.clone(), vec![gh2])));
+                }
+                {
+                    let out = Stops::new(&run);
+                    let r = rst(&mut st, &out);
+                    mrep_new(r, &out);
+                    r.mw().rets.insert(lits[0], ids);
+                }
+                let premise = Clause::new(vec![Lit::x(late_k)], vec![lits[0]]);
+                let prem = side(&premise, lits[0]);
+                (ix, run, st, lits[0], prem)
+            };
+
+            // Measure exact held_bytes and fold_slack for one 1 × 4 × 4 late product.
+            let (ix, run, mut st, la, prem) = setup(&[0, 4, 4], false);
+            let mut probe = Found::default();
+            let c0 = run
+                .table
+                .get(rst(&mut st, &Stops::new(&run)).mr().rets[&la][0])
+                .clone();
+            ret_products(
+                &st,
+                &c0,
+                Some((la, &prem)),
+                cf_of(&ix, &Stops::new(&run)),
+                &mut probe,
+            );
+            let held_one = probe.held_bytes();
+            let slack_one = probe.fold_slack();
+            assert!(held_one > 0 && slack_one > 0, "mode {mode}");
+
+            // Granted late replay reserves held + slack, derives 16 clauses, and releases all.
+            let stored = dl(&st).unwrap().store.clauses.len();
+            let mut out = Stops::new(&run);
+            assert!(m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert_eq!(
+                dl(&st).unwrap().store.clauses.len() - stored,
+                16,
+                "mode {mode}"
+            );
+            assert!(!dl(&st).unwrap().store.interrupted, "mode {mode}");
+            assert_eq!(out.held, 0, "mode {mode}");
+            assert_eq!(
+                out.peak,
+                held_one + slack_one,
+                "mode {mode}: late replay must reserve held ({held_one}) + slack ({slack_one})"
+            );
+
+            // 2. Budget admitting held_bytes alone but rejecting held_bytes + fold_slack
+            // must refuse before drain, derive nothing, interrupt the store, and hold 0.
+            let (ix, run, mut st, la, prem) = setup(&[0, 4, 4], false);
+            let stored = dl(&st).unwrap().store.clauses.len();
+            let mut out = Stops::new(&run);
+            out.budget = Some(held_one + slack_one - 1);
+            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert_eq!(
+                dl(&st).unwrap().store.clauses.len(),
+                stored,
+                "mode {mode}: nothing derived on slack refusal"
+            );
+            assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
+            assert_eq!(out.held, 0, "mode {mode}");
+
+            // 3. Multiple products in one batch reserve held_both + max(slack), not sum of slacks.
+            let (ix, run, mut st, la, prem) = setup(&[0, 4, 4], true);
+            let mut probe2 = Found::default();
+            for &cid in &rst(&mut st, &Stops::new(&run)).mr().rets[&la].clone() {
+                let c = run.table.get(cid).clone();
+                ret_products(
+                    &st,
+                    &c,
+                    Some((la, &prem)),
+                    cf_of(&ix, &Stops::new(&run)),
+                    &mut probe2,
+                );
+            }
+            let held_two = probe2.held_bytes();
+            assert_eq!(probe2.fold_slack(), slack_one, "mode {mode}");
+            let mut out = Stops::new(&run);
+            assert!(m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert_eq!(out.peak, held_two + slack_one, "mode {mode}");
+            assert_eq!(out.held, 0, "mode {mode}");
+
+            // 4. Empty replay (missing partner list): polls go_on without calling reserve_data.
+            let (ix, run, mut st, la, prem) = setup(&[0, 4, 0], false);
+            let mut out = Stops::new(&run);
+            assert!(m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert_eq!(out.asked, 0, "mode {mode}");
+            assert_eq!(out.polls.get(), 1, "mode {mode}");
+            let mut out = Stops::new(&run);
+            out.refuse = true;
+            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert_eq!(out.asked, 0, "mode {mode}");
+            assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
+
+            // 5. Sum overflow in m_flush (1 × 512^6 × 8 -> fold_slack > isize::MAX):
+            // signals data_overflow without calling reserve_data or deriving anything.
+            let (ix, run, mut st, la, prem) = setup(&[0, 512, 512, 512, 512, 512, 512, 8], false);
+            let stored = dl(&st).unwrap().store.clauses.len();
+            let mut out = Stops::new(&run);
+            out.budget = Some(1 << 30);
+            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(out.overflow, "mode {mode}");
+            assert_eq!(out.asked, 0, "mode {mode}");
+            assert_eq!(out.held, 0, "mode {mode}");
+            assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
+            assert_eq!(dl(&st).unwrap().store.clauses.len(), stored, "mode {mode}");
+
+            // 6. Interruption during drain releases the granted batch reservation.
+            let (ix, run, mut st, la, prem) = setup(&[0, 16, 17], false);
+            let mut out = Stops::new(&run);
+            out.refuse = true;
+            out.after = 1; // grant m_flush's reservation, refuse the first poll inside fold
+            assert!(!m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
+            assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
+            assert_eq!(
+                out.held, 0,
+                "mode {mode}: interrupted drain must release batch"
             );
         }
     }

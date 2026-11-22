@@ -267,26 +267,31 @@ number of reads nor the allocated bytes by the memory budget, which is an estima
 measures the heap 6 to 31% above the charged estimate on the three files named below, with the
 repair on or off, and item 1291 follows that difference.
 
-A returned clause reserves memory before its products run. The product of a clause that
+A returned clause reserves memory before its products run, both on initial arrival and when a
+late premise replays saved returns. The product of a clause that
 is not ground charges each union that it keeps, as every rule does, but not the table that
 records its unions nor the spare capacity of each step's list. These grow with the number of
 unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
 million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
-and 51 MB, and the heap reached 286 MB. A return therefore reserves a bound on those
-tables before its products and releases it after them, and a refused reservation stops
-the run as a refused charge does. The bound takes one union per choice of the product,
+and 51 MB, and the heap reached 286 MB. Initial arrivals therefore reserve a bound on those
+tables before draining their products and release it after them, and each late-replay batch
+reserves the checked sum of its held products and the largest product's table bound before
+draining. The table model runs in 128-bit arithmetic and saturates once at the end, and an
+unrepresentable bound or estimate overflow stops the run cleanly with a memory stop before
+enumeration rather than clamping the reservation or promising a hard allocation ceiling. A
+refused reservation rolls back any debit it added and stops the run as a refused charge does.
+The bound takes one union per choice of the product,
 which can exceed the unions a step keeps by more than a thousand times. That overcount is
 what makes it a bound. Its model of a step's tables, taken at the unions that the step
 actually keeps, is smaller than the growth of the heap past the estimate in the heaviest
 returns without the reservation, 18.7 MB against 23.3 MB under the budget of 256 MiB and
-24.6 MB against 173.6 MB under the default budget. On that file the
-return then stops the run earlier, at a heap of 179 MB. On part022 p01, g1-051_p0121 and
-g1-051_p0012 at 4 million conclusions, and on g1-051_p0012 with
-`SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, no reservation is refused and the runs
-end as before. Without the reservation, the same run
-under the default budget of 1 GiB reaches a heap of 1.29 GB. With the reservation that run
-stops at a refused reservation with a heap of 256 MB, so it does not finish under its own
-budget either way, and item 1291 follows it. The rules of the default
+24.6 MB against 173.6 MB under the default budget. In the initial-arrival measurements on
+those files, the return reservation stopped g1-051_p0012 earlier at a heap of 179 MB under
+256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
+conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
+stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
+reservation, so that run does not finish under its own budget either way and item 1291
+follows it. The rules of the default
 path leave the same tables uncharged. With the repair off these tables stay at or below
 6.3 KB on these files and at 50 KB on ore_ont_14817 until its Tier D attempt passes its
 bound, and item 1291 covers them.

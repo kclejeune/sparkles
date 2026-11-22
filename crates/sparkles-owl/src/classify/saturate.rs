@@ -1074,7 +1074,7 @@ impl Drop for Out<'_, '_> {
     fn drop(&mut self) {
         if self.kept > 0 {
             let kept = std::mem::take(&mut self.kept);
-            let _ = self.reserve_data(kept);
+            self.charge_kept(kept);
         }
     }
 }
@@ -1230,7 +1230,12 @@ impl Outbox {
 
 /// Where the rules of a context send their conclusions.
 pub trait Sink {
-    /// Pre-admit functional-data allocation, with retained growth reconciled afterwards.
+    /// Pre-admits temporary data against the run's memory budget and checks the run's
+    /// bounds. Returns `true` when the reservation is granted and active, in which case
+    /// the caller releases `bytes` with [`Sink::release_data`] when done. Returns `false`
+    /// when a bound, pool, stop or arithmetic overflow refuses the reservation; in every
+    /// refusal case no net debit remains active on the run's memory count, so the caller
+    /// must not call [`Sink::release_data`] for it.
     fn reserve_data(&mut self, _bytes: usize) -> bool {
         true
     }
@@ -1240,7 +1245,13 @@ pub trait Sink {
     fn keep_data(&mut self, bytes: usize) {
         let _ = self.reserve_data(bytes);
     }
+    /// Releases bytes previously granted by [`Sink::reserve_data`] or charged by
+    /// [`Sink::keep_data`]. Callers must not call this for a reservation that
+    /// [`Sink::reserve_data`] refused.
     fn release_data(&mut self, _bytes: usize) {}
+    /// Records an unrepresentable memory reservation or total, raising peak memory to
+    /// `usize::MAX` and stopping the run with a memory stop without changing the shared
+    /// memory count.
     fn data_overflow(&mut self) {}
 
     /// sends a conclusion to a context, which may be the one the rules run in
@@ -1303,23 +1314,49 @@ pub trait Sink {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static BEFORE_DEBIT: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_debit() {
+    let barrier = BEFORE_DEBIT.with(|slot| slot.borrow().clone());
+    if let Some(b) = barrier {
+        b.wait();
+    }
+}
+
+impl Out<'_, '_> {
+    /// Charges retained bytes from [`Sink::keep_data`] into the run's memory count without
+    /// rolling them back on a bound refusal, since the caller keeps the data.
+    fn charge_kept(&mut self, bytes: usize) {
+        if bytes > isize::MAX as usize {
+            self.data_overflow();
+            return;
+        }
+        let _ = self.run.check_debit(0, bytes, 0);
+    }
+}
+
 impl Sink for Out<'_, '_> {
     fn reserve_data(&mut self, bytes: usize) -> bool {
-        if bytes > isize::MAX as usize
-            || self
-                .run
-                .memory
-                .load(Ordering::Relaxed)
-                .checked_add(bytes)
-                .is_none()
-        {
+        if bytes > isize::MAX as usize {
             self.data_overflow();
             return false;
         }
         // An inference of a run in steps that reserves as it goes ends as one that does
         // not: once the activation alone has derived more than the run's bound
-        // ([`Sink::go_on`]). The caller releases what it reserved.
-        self.run.check(0, bytes, 0) && !(self.run.steps && self.dl().past(self.work))
+        // ([`Sink::go_on`]). Any debit added before a refusal is rolled back here directly
+        // on `run.memory` (leaving `self.kept` intact), so callers release only granted
+        // reservations.
+        let (debited, ok) = self.run.check_debit(0, bytes, 0);
+        let granted = ok && !(self.run.steps && self.dl().past(self.work));
+        if !granted && debited {
+            self.run.credit(bytes);
+        }
+        granted
     }
     fn data_overflow(&mut self) {
         self.run.peak.fetch_max(usize::MAX, Ordering::Relaxed);
@@ -1329,10 +1366,14 @@ impl Sink for Out<'_, '_> {
     /// the rules that keep a little at a time do not each update the run's shared counts,
     /// which four threads contend for.
     fn keep_data(&mut self, bytes: usize) {
-        self.kept += bytes;
-        if self.kept >= KEEP_BATCH {
-            let kept = std::mem::take(&mut self.kept);
-            let _ = self.reserve_data(kept);
+        if let Some(next) = self.kept.checked_add(bytes) {
+            self.kept = next;
+            if self.kept >= KEEP_BATCH {
+                let kept = std::mem::take(&mut self.kept);
+                self.charge_kept(kept);
+            }
+        } else {
+            self.data_overflow();
         }
     }
     fn release_data(&mut self, bytes: usize) {
@@ -1340,17 +1381,7 @@ impl Sink for Out<'_, '_> {
         let waiting = bytes.min(self.kept);
         self.kept -= waiting;
         let bytes = bytes - waiting;
-        if bytes == 0 {
-            return;
-        }
-        // a caller releases what it reserved, and a reservation the overflow check refused
-        // before it added anything is released as well, so the count stops at zero
-        let _ = self
-            .run
-            .memory
-            .try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
-                Some(m.saturating_sub(bytes))
-            });
+        self.run.credit(bytes);
     }
 
     #[inline]
@@ -2354,19 +2385,69 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Checks the bounds, and stops the run when one is reached. `bytes` is the growth
-    /// of the stored conclusions and `queued` the change in waiting messages since the
-    /// worker's last check.
-    fn check(&self, applied: usize, bytes: usize, queued: isize) -> bool {
-        self.applied.fetch_add(applied, Ordering::Relaxed);
-        let held = self.memory.fetch_add(bytes, Ordering::Relaxed) + bytes;
-        let waiting = self.queued.fetch_add(queued, Ordering::Relaxed) + queued;
-        let dynamic =
-            self.dynamic.map_or(0, |d| d.bytes()) + self.bounds.dl.map_or(0, |d| d.bytes());
-        let used = held + dynamic + waiting.max(0) as usize * std::mem::size_of::<Concl>();
+    /// Atomically adds `bytes` to `self.memory`, returning the new total or `None` when
+    /// the addition would overflow `usize`.
+    fn try_debit(&self, bytes: usize) -> Option<usize> {
+        #[cfg(test)]
+        before_debit();
+        if bytes == 0 {
+            return Some(self.memory.load(Ordering::Relaxed));
+        }
+        self.memory
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                m.checked_add(bytes)
+            })
+            .ok()
+            .map(|prev| prev + bytes)
+    }
+
+    /// Subtracts `bytes` previously debited from `self.memory`.
+    fn credit(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self
+            .memory
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                Some(m.saturating_sub(bytes))
+            });
+    }
+
+    /// Checks the bounds and stops the run when one is reached, returning `(debited, ok)`.
+    /// `debited` is `true` when `bytes` was added to `self.memory` (or `bytes == 0`) and
+    /// `false` when arithmetic overflow prevented the debit.
+    fn check_debit(&self, applied: usize, bytes: usize, queued: isize) -> (bool, bool) {
+        if applied != 0 {
+            self.applied.fetch_add(applied, Ordering::Relaxed);
+        }
+        let waiting = if queued == 0 {
+            self.queued.load(Ordering::Relaxed)
+        } else {
+            self.queued
+                .fetch_add(queued, Ordering::Relaxed)
+                .saturating_add(queued)
+        };
+        let Some(held) = self.try_debit(bytes) else {
+            self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
+            self.halt(STOP_MEMORY);
+            return (false, false);
+        };
+        let dynamic = self
+            .dynamic
+            .map_or(0, |d| d.bytes())
+            .checked_add(self.bounds.dl.map_or(0, |d| d.bytes()));
+        let queue_bytes = (waiting.max(0) as usize).checked_mul(std::mem::size_of::<Concl>());
+        let Some(used) = dynamic
+            .and_then(|d| held.checked_add(d))
+            .and_then(|t| queue_bytes.and_then(|q| t.checked_add(q)))
+        else {
+            self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
+            self.halt(STOP_MEMORY);
+            return (true, false);
+        };
         let before = self.peak.fetch_max(used, Ordering::Relaxed);
         if self.stopped() {
-            return false;
+            return (true, false);
         }
         if !self.batch.load(Ordering::Relaxed) {
             self.batch_if_congested();
@@ -2377,29 +2458,48 @@ impl<'a> Run<'a> {
             || b.charge.is_some_and(|f| grown > 0 && !f(grown))
         {
             self.halt(STOP_MEMORY);
-            return false;
+            return (true, false);
         }
         // the work bound is its own reason, so that the first stop published decides
         // whether the run falls back or answers in part; a run in steps compares it
         // between steps only
         if !self.steps && b.dl.is_some_and(|d| d.over_work()) {
             self.halt(STOP_WORK);
-            return false;
+            return (true, false);
         }
         if b.deadline.is_some_and(|d| Instant::now() >= d) {
             self.halt(STOP_TIMEOUT);
-            return false;
+            return (true, false);
         }
         if b.cancelled.is_some_and(|f| f()) {
             self.halt(STOP_CANCEL);
-            return false;
+            return (true, false);
         }
-        true
+        (true, true)
+    }
+
+    /// Checks the bounds, and stops the run when one is reached. `bytes` is the growth
+    /// of the stored conclusions and `queued` the change in waiting messages since the
+    /// worker's last check.
+    fn check(&self, applied: usize, bytes: usize, queued: isize) -> bool {
+        self.check_debit(applied, bytes, queued).1
     }
 
     /// Adds a worker's counts to the totals and checks the bounds.
     fn flush(&self, t: &mut Tally) -> bool {
-        let ok = self.check(t.applied, t.stored * CONCLUSION_BYTES, t.queued);
+        let Some(bytes) = t.stored.checked_mul(CONCLUSION_BYTES) else {
+            if t.applied != 0 {
+                self.applied.fetch_add(t.applied, Ordering::Relaxed);
+            }
+            if t.queued != 0 {
+                self.queued.fetch_add(t.queued, Ordering::Relaxed);
+            }
+            self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
+            self.halt(STOP_MEMORY);
+            *t = Tally::default();
+            return false;
+        };
+        let ok = self.check(t.applied, bytes, t.queued);
         *t = Tally::default();
         ok
     }
@@ -3717,6 +3817,450 @@ mod horn_accounting_tests {
             out.keep_data(24);
         }
         assert_eq!(held(&run), 72);
+    }
+
+    #[test]
+    fn data_reservation_concurrent_overflow_is_atomic_and_preserves_winner() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let base = 4096usize;
+        let bounds = Bounds {
+            threads: 2,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            base_memory: base,
+            peak_memory: base,
+            dynamic: None,
+            dl: None,
+            partial: false,
+            steps: false,
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        // Individually representable (< isize::MAX), but base + 2 * bytes overflows usize.
+        let bytes = isize::MAX as usize - 1024;
+        assert!(base.checked_add(bytes).is_some());
+        assert!(
+            base.checked_add(bytes)
+                .unwrap()
+                .checked_add(bytes)
+                .is_none()
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results: Vec<bool> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let run = &run;
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let root = f.root;
+                    s.spawn(move || {
+                        BEFORE_DEBIT.with(|slot| *slot.borrow_mut() = Some(barrier));
+                        let mut marks = Marks::default();
+                        let (mut local, mut woke, mut outbox) =
+                            (Vec::new(), VecDeque::new(), Outbox::default());
+                        let mut out = Out {
+                            run,
+                            me: root,
+                            local: &mut local,
+                            woke: &mut woke,
+                            outbox: &mut outbox,
+                            marks: &mut marks,
+                            pending: false,
+                            sent: 0,
+                            work: 0,
+                            kept: 0,
+                        };
+                        let ok = out.reserve_data(bytes);
+                        BEFORE_DEBIT.with(|slot| *slot.borrow_mut() = None);
+                        // Leave the winner's debit held until the loser finishes checking.
+                        ok
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            results.iter().filter(|&&ok| ok).count(),
+            1,
+            "exactly one concurrent debit may succeed: {results:?}"
+        );
+        assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+        assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
+        assert_eq!(
+            run.memory.load(Ordering::Relaxed),
+            base + bytes,
+            "the winning debit must remain intact after the overflowing peer fails"
+        );
+        // Releasing the winner's single granted reservation restores base.
+        let mut marks = Marks::default();
+        let (mut local, mut woke, mut outbox) = (Vec::new(), VecDeque::new(), Outbox::default());
+        let mut out = Out {
+            run: &run,
+            me: f.root,
+            local: &mut local,
+            woke: &mut woke,
+            outbox: &mut outbox,
+            marks: &mut marks,
+            pending: false,
+            sent: 0,
+            work: 0,
+            kept: 0,
+        };
+        out.release_data(bytes);
+        assert_eq!(run.memory.load(Ordering::Relaxed), base);
+    }
+
+    #[test]
+    fn data_reservation_rejected_before_debit_preserves_other_debit_and_kept() {
+        // 32 x 32 premises gives a representable fold_slack (~197 KB) larger than the
+        // initial DlRun table (~66 KB) plus headroom, so base + first + dl_bytes fits in
+        // usize while base + first + fold_slack overflows run.memory before debit.
+        let (ix, dl, mut st, cid, _, _) =
+            super::dl_root::tests::multi_list_return(super::dl_rules::MREPAIR_ON, &[32, 32]);
+        let ctx: Contexts = (0..16).map(|_| OnceLock::new()).collect();
+        let dl_bytes = dl.bytes();
+        let room = dl_bytes + 4096;
+        assert!(room < 150_000, "unexpected initial dl_bytes={dl_bytes}");
+        let base = isize::MAX as usize;
+        let first = usize::MAX - base - room;
+        assert!(first <= isize::MAX as usize);
+        let bounds = Bounds {
+            threads: 2,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            base_memory: base,
+            peak_memory: base,
+            dynamic: None,
+            dl: Some(&dl),
+            partial: false,
+            steps: false,
+        };
+        let run = run(&ix, &ctx, &bounds);
+        run.queued.store(0, Ordering::Relaxed);
+        let mut m1 = Marks::default();
+        let (mut l1, mut w1, mut o1) = (Vec::new(), VecDeque::new(), Outbox::default());
+        let mut out1 = Out {
+            run: &run,
+            me: TOP,
+            local: &mut l1,
+            woke: &mut w1,
+            outbox: &mut o1,
+            marks: &mut m1,
+            pending: false,
+            sent: 0,
+            work: 0,
+            kept: 0,
+        };
+        assert!(out1.reserve_data(first));
+        assert_eq!(run.memory.load(Ordering::Relaxed), base + first);
+
+        {
+            let mut m2 = Marks::default();
+            let (mut l2, mut w2, mut o2) = (Vec::new(), VecDeque::new(), Outbox::default());
+            let mut out2 = Out {
+                run: &run,
+                me: TOP,
+                local: &mut l2,
+                woke: &mut w2,
+                outbox: &mut o2,
+                marks: &mut m2,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            out2.keep_data(500);
+            assert_eq!(out2.kept, 500);
+            // rret requests a representable fold_slack (2,000 B) that overflows base + first
+            // before debit; its cleanup must leave out1's debit and out2's kept untouched.
+            assert!(super::dl_root::rret(&ix, &mut st, cid, &mut out2));
+            assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+            assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
+            assert_eq!(
+                run.memory.load(Ordering::Relaxed),
+                base + first,
+                "overflow refusal in rret must not subtract from worker 1's debit"
+            );
+            assert_eq!(
+                out2.kept, 500,
+                "overflow refusal in rret must not consume worker 2's pending kept bytes"
+            );
+            // Also verify direct unrepresentable request leaves both untouched.
+            assert!(!out2.reserve_data(isize::MAX as usize + 1));
+            assert_eq!(run.memory.load(Ordering::Relaxed), base + first);
+            assert_eq!(out2.kept, 500);
+        }
+        // Dropping out2 flushes its 500 kept bytes cleanly onto base + first.
+        assert_eq!(run.memory.load(Ordering::Relaxed), base + first + 500);
+        out1.release_data(first);
+        assert_eq!(run.memory.load(Ordering::Relaxed), base + 500);
+    }
+
+    #[test]
+    fn data_reservation_used_sum_and_flush_overflow_stop_cleanly() {
+        let f = fixture();
+        // Case 1: held fits in usize, held + queue_bytes overflows usize.
+        {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let base = usize::MAX - 1024;
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: None,
+                base_memory: base,
+                peak_memory: 0,
+                dynamic: None,
+                dl: None,
+                partial: false,
+                steps: false,
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            run.queued.store(200, Ordering::Relaxed);
+            let mut marks = Marks::default();
+            let (mut local, mut woke, mut outbox) =
+                (Vec::new(), VecDeque::new(), Outbox::default());
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut local,
+                woke: &mut woke,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            out.keep_data(120);
+            assert!(!out.reserve_data(512));
+            assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+            assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
+            assert_eq!(
+                run.memory.load(Ordering::Relaxed),
+                base,
+                "debit must be rolled back when used overflows"
+            );
+            assert_eq!(out.kept, 120);
+            out.kept = 0;
+        }
+        // Case 2: held fits in usize, held + dl.bytes() overflows usize.
+        {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let dl = super::dl_rules::DlRun::default();
+            dl.grow(4096);
+            let base = usize::MAX - 1024;
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: None,
+                base_memory: base,
+                peak_memory: 0,
+                dynamic: None,
+                dl: Some(&dl),
+                partial: false,
+                steps: false,
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            let mut marks = Marks::default();
+            let (mut local, mut woke, mut outbox) =
+                (Vec::new(), VecDeque::new(), Outbox::default());
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut local,
+                woke: &mut woke,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            assert!(!out.reserve_data(512));
+            assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+            assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
+            assert_eq!(run.memory.load(Ordering::Relaxed), base);
+        }
+        // Case 3: ordinary Run::flush (Run::check) overflowing memory stops cleanly.
+        {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let base = usize::MAX - 4;
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: None,
+                base_memory: base,
+                peak_memory: 0,
+                dynamic: None,
+                dl: None,
+                partial: false,
+                steps: false,
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            let mut tally = Tally {
+                applied: 1,
+                stored: 1,
+                queued: 0,
+            };
+            assert!(!run.flush(&mut tally));
+            assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+            assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
+            assert_eq!(run.memory.load(Ordering::Relaxed), base);
+        }
+    }
+
+    #[test]
+    fn data_reservation_finite_refusal_reports_peak_charges_pool_and_rolls_back() {
+        let f = fixture();
+        let base = 4096usize;
+        // Budget refusal: reports attempted peak, halts, rolls back debit, preserves kept.
+        {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: Some(base + 1000),
+                cancelled: None,
+                charge: None,
+                base_memory: base,
+                peak_memory: base,
+                dynamic: None,
+                dl: None,
+                partial: false,
+                steps: false,
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            run.queued.store(0, Ordering::Relaxed);
+            let mut marks = Marks::default();
+            let (mut local, mut woke, mut outbox) =
+                (Vec::new(), VecDeque::new(), Outbox::default());
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut local,
+                woke: &mut woke,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            out.keep_data(200);
+            assert!(!out.reserve_data(5000));
+            assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+            assert_eq!(run.peak.load(Ordering::Relaxed), base + 5000);
+            assert_eq!(run.memory.load(Ordering::Relaxed), base);
+            assert_eq!(out.kept, 200);
+            // Already-stopped reservation also rolls back without consuming kept.
+            assert!(!out.reserve_data(300));
+            assert_eq!(run.memory.load(Ordering::Relaxed), base);
+            assert_eq!(out.kept, 200);
+        }
+        // Pool refusal: bills high water, halts, rolls back debit, preserves kept.
+        {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let billed = AtomicUsize::new(0);
+            let charge = |grown| {
+                billed.fetch_add(grown, Ordering::Relaxed);
+                false
+            };
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: None,
+                cancelled: None,
+                charge: Some(&charge),
+                base_memory: base,
+                peak_memory: base,
+                dynamic: None,
+                dl: None,
+                partial: false,
+                steps: false,
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            run.queued.store(0, Ordering::Relaxed);
+            let mut marks = Marks::default();
+            let (mut local, mut woke, mut outbox) =
+                (Vec::new(), VecDeque::new(), Outbox::default());
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut local,
+                woke: &mut woke,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            out.keep_data(200);
+            assert!(!out.reserve_data(5000));
+            assert_eq!(billed.load(Ordering::Relaxed), 5000);
+            assert_eq!(run.peak.load(Ordering::Relaxed), base + 5000);
+            assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+            assert_eq!(run.memory.load(Ordering::Relaxed), base);
+            assert_eq!(out.kept, 200);
+        }
+        // Granted reservation bills pool high water, and valid release nets against kept.
+        {
+            let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+            let billed = AtomicUsize::new(0);
+            let charge = |grown| {
+                billed.fetch_add(grown, Ordering::Relaxed);
+                true
+            };
+            let bounds = Bounds {
+                threads: 1,
+                deadline: None,
+                max_memory: Some(base + 10_000),
+                cancelled: None,
+                charge: Some(&charge),
+                base_memory: base,
+                peak_memory: base,
+                dynamic: None,
+                dl: None,
+                partial: false,
+                steps: false,
+            };
+            let run = run(&f.ix, &ctx, &bounds);
+            run.queued.store(0, Ordering::Relaxed);
+            let mut marks = Marks::default();
+            let (mut local, mut woke, mut outbox) =
+                (Vec::new(), VecDeque::new(), Outbox::default());
+            {
+                let mut out = Out {
+                    run: &run,
+                    me: f.root,
+                    local: &mut local,
+                    woke: &mut woke,
+                    outbox: &mut outbox,
+                    marks: &mut marks,
+                    pending: false,
+                    sent: 0,
+                    work: 0,
+                    kept: 0,
+                };
+                out.keep_data(200);
+                assert!(out.reserve_data(5000));
+                assert_eq!(billed.load(Ordering::Relaxed), 5000);
+                assert_eq!(run.memory.load(Ordering::Relaxed), base + 5000);
+                out.release_data(5000);
+                assert_eq!(out.kept, 0);
+                assert_eq!(run.memory.load(Ordering::Relaxed), base + 200);
+            }
+            assert_eq!(run.memory.load(Ordering::Relaxed), base + 200);
+        }
     }
 
     /// A flush of a context's link products pairs what is new since the marks with

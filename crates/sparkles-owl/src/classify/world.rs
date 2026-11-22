@@ -755,15 +755,21 @@ impl WorldSink<'_> {
 
 impl Sink for WorldSink<'_> {
     fn reserve_data(&mut self, bytes: usize) -> bool {
-        if bytes > isize::MAX as usize {
-            self.halted.set(true);
-            self.overflow.set(true);
+        let Ok(add) = isize::try_from(bytes) else {
+            self.data_overflow();
             return false;
+        };
+        let Some(next) = self.data_growth.get().checked_add(add) else {
+            self.data_overflow();
+            return false;
+        };
+        self.data_growth.set(next);
+        let ok = (self.bound)(add);
+        if !ok {
+            self.data_growth.set(next - add);
+            (self.bound)(-add);
+            self.halted.set(true);
         }
-        self.data_growth
-            .set(self.data_growth.get() + bytes as isize);
-        let ok = (self.bound)(bytes as isize);
-        self.halted.set(self.halted.get() || !ok);
         ok
     }
     fn data_overflow(&mut self) {
