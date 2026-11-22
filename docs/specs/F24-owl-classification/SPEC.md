@@ -113,15 +113,23 @@ the run finds unsatisfiable, or in a world whose class has no instance, is not r
 data unions or enumerations, which the Horn tier now decides. A cover over the values of
 a property that gives different classes, a key over a checker property and a universal
 or maximum data restriction on the left are reported as used in part, and item 768 takes
-them in Tier D and the rooted run. On 21 of the wiring tests' ontologies HermiT 1.4.5
-gives 32 of the 33 answers that the tests pin, and it derives the subsumption whose cover
+them in Tier D and the rooted run. On 26 of the wiring tests' ontologies HermiT 1.4.5
+gives 37 of the 38 answers that the tests pin, and it derives the subsumption whose cover
 a world reports as used in part. The other answer is a
 `NegativeDataPropertyAssertion` of `"3"^^xsd:integer` beside the assertion of
 `"3"^^xsd:int`, which HermiT finds consistent, while it finds the same negation written as
 a class assertion of a complement inconsistent, as the shared numeric value space of
-OWL 2 requires. Item 1303 records that one axiom needing case analysis sends an ontology
-whose data properties occur only outside OWL 2 EL to Tier D, which leaves out every data
-axiom.
+OWL 2 requires. Across the 222 non-held-out census files whose default run previously left
+out data axioms, phase 2 keeps every file on the same tier, leaves more axioms out on none
+and takes 43,014 more axioms across 195 files. Twenty of those files now leave no axiom
+out and report nothing as used in part, one file reports a cover over three axioms as used
+in part, and nine files move from consistent to inconsistent, all nine confirmed
+inconsistent by HermiT 1.4.5. On the thirteen Kepler16b OML probes, the functional
+`xsd:double` probe and the `xsd:boolean` range probe move from consistent to inconsistent
+as in HermiT, so the classifier now agrees with HermiT on eleven of the thirteen probes
+and misses only the SWRL rule and enumeration probes. Item 1303 records that one axiom
+needing case analysis sends an ontology whose data properties occur only outside OWL 2 EL
+to Tier D, which leaves out every data axiom.
 
 Item 1256 changes the invalidation of a run kept by the EL rules. It recomputed what
 every kept context takes from the index and read every subsumer of every context with
@@ -4203,9 +4211,10 @@ W3C OWL 2 test cases that involve datatypes, among them `Datatype-Float-Discrete
 `+0`. A differential test compares the checker's answers on random small sets of atoms
 with a brute-force model finder over small finite stand-ins for the value spaces, and a
 second one does the same for the theory rule's clauses. Phase 2 is item 972 with the
-Horn tier's data atoms, checked against HermiT on the OML probes and the census files.
-Phase 3 is item 768, data atoms in Tier D and the rooted run, with the census tool run
-on the 61 files before and after.
+Horn tier's data atoms, checked against HermiT on the thirteen OML probes and on the 222
+non-held-out census files whose default run left out data axioms, as the Outcome above
+records. Phase 3 is item 768, data atoms in Tier D and the rooted run, with the census
+tool run on the 61 files before and after.
 
 ### Nominals in the disjunctive rules
 
@@ -4925,19 +4934,20 @@ With the requests that `owl-load`, `owl-query` and `owl-shacl` send, made with `
 stores the ontologies and HermiT's entailment graphs, answers the five queries as the
 reference does over them and answers the SHACL request.
 
-Thirteen probes each added one violation to the sample. The classifier agrees with
-HermiT on the eight that need disjointness from the closure, keys, asymmetry, universal
-restrictions, the closure's differences, functional properties and a functional string
-property. It misses a reflexive fact that a SWRL rule derives, an individual of an
-enumeration that differs from its members, two values of a functional `xsd:double`
-property and a string in an `xsd:boolean` range, and it has no closed-world cardinality
-check. The rooted run creates no contexts on the sample, because it refuses keys and
-functional data properties, and the sample's base vocabulary and the metrology library
-declare both. Item 768 takes the keys and functional data properties, and items 970 to
-977 record the other gaps, the SWRL reader, the
-lenient read that drops an `AllDisjointClasses` axiom with an undeclared member, the
-`all-disjoint-classes` check that passes its row limit on the sample, owl-reason's
-entailment outputs and an OML importer.
+Thirteen probes each added one violation to the sample. After item 972's datatype checker
+in the Horn tier, the classifier agrees with HermiT on eleven of the thirteen probes,
+covering disjointness from the closure, keys, asymmetry, universal restrictions, the
+closure's differences, functional object properties, a functional string property, two
+values of a functional `xsd:double` property and a string in an `xsd:boolean` range, as
+well as the two closed-world probes that HermiT finds consistent. It misses a reflexive
+fact that a SWRL rule derives and an individual of an enumeration that differs from its
+members, and it has no closed-world cardinality check. The rooted run creates no contexts
+on the sample, because it refuses keys and functional data properties, and the sample's
+base vocabulary and the metrology library declare both. Item 768 takes the keys and
+functional data properties, and items 970, 971 and 973 to 977 record the other gaps, the
+SWRL reader, the lenient read that drops an `AllDisjointClasses` axiom with an undeclared
+member, the `all-disjoint-classes` check that passes its row limit on the sample,
+owl-reason's entailment outputs and an OML importer.
 
 A later run checked these stand-ins against openCAESAR's own pipeline. The sample's
 Gradle build ran with oml2owl 2.13.1, owl-reason 2.15.0 with Openllet 2.6.5 and
@@ -4964,10 +4974,11 @@ On the adapter's closure Sparkles gives the survey's results. The classifier's t
 equals Openllet's with or without counting and the rooted option. `ontology reason`
 gives Openllet's 307 types and the 21 `swrl:Variable` types, OWL RL materialization
 gives the same types and misses the same 34 object property values, and the five queries
-give the same answers. On the probes the classifier again finds the seven
-inconsistencies that need no rule, enumeration or OWL 2 DL datatype. It agrees with
-HermiT, and with Openllet's consistency check alone, that the two closed-world probes
-are consistent, and it misses the same four. The `all-disjoint-classes` check still
+give the same answers. On the probes the classifier finds the nine inconsistencies that
+need no rule or enumeration, including the two OWL 2 DL datatype probes after item 972.
+It agrees with HermiT, and with Openllet's consistency check alone, that the two
+closed-world probes are consistent, and it misses only the rule and enumeration probes.
+The `all-disjoint-classes` check still
 passes its row limit. The rules file that the adapter writes with `generateRules` holds
 the adapter's four default rules and the six bundle rules of the survey's file, but it
 gives its prefixes as `@prefix oml: http://opencaesar.io/oml#` without angle brackets

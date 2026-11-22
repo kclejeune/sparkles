@@ -977,9 +977,9 @@ the normal selection of asserted data.
   between those graphs. On the OWL that openCAESAR's build writes for its Kepler16b
   sample, the classifier's taxonomy equals the one that `owl-reason` gets from Openllet.
   Its named types of individuals equal Openllet's apart from types it gives the SWRL
-  rules' variables, and the classifier finds the
-  inconsistencies that the bundle's disjointness, keys, functional properties, universal
-  restrictions and property characteristics raise
+  rules' variables, and the classifier finds the inconsistencies that the bundle's
+  disjointness, keys, functional properties, universal restrictions, property
+  characteristics and OWL 2 DL datatypes raise
   ([F24](../specs/F24-owl-classification/SPEC.md#oml-and-opencaesar-models)).
 * `sparkles serve --fuseki-config` starts from an openCAESAR project's `.fuseki.ttl`,
   with its in-memory dataset, union default graph, query timeout and SHACL endpoint. It
@@ -994,9 +994,9 @@ the normal selection of asserted data.
   Jena's rule engine derives from the file.
 * The SWRL rules are not read, so a reified relation's forward property and the facts of
   an OML rule are not derived, and the OWL RL materialization answers a query that needs
-  them with fewer rows. Rule-derived inconsistencies, enumerations beside keys, OWL 2 DL
-  datatypes such as `xsd:double` and `xsd:boolean`, and openCAESAR's closed-world
-  cardinality check are not covered. The known gaps below name the roadmap items.
+  them with fewer rows. Rule-derived inconsistencies, enumerations beside keys and
+  openCAESAR's closed-world cardinality check are not covered. The known gaps below name
+  the roadmap items.
 
 ## Known gaps
 
