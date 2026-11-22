@@ -97,12 +97,18 @@ impl Comps {
         if n == 0 {
             return Ok(Comps::default());
         }
-        let out_est = n.saturating_mul(std::mem::size_of::<(DataProperty, u32)>() + 24);
+        let out_buckets = super::range::map_buckets_for(n);
+        let out_est = out_buckets
+            .saturating_mul(std::mem::size_of::<(DataProperty, u32)>() + 1)
+            .saturating_add(out_buckets.saturating_mul(std::mem::size_of::<(usize, u32)>() + 1))
+            .saturating_add(n.saturating_mul(std::mem::size_of::<u32>() + 1))
+            .saturating_add(96);
         if !admit(out_est) {
             return Err(CompFail::Memory);
         }
-        let mut root_comp: FxHashMap<usize, u32> = FxHashMap::default();
-        let mut checker = Vec::new();
+        let mut root_comp: FxHashMap<usize, u32> =
+            FxHashMap::with_capacity_and_hasher(n, Default::default());
+        let mut checker = Vec::with_capacity(n);
         let mut of_id = vec![0u32; n];
         for (i, slot) in of_id.iter_mut().enumerate() {
             let r = w.find(i);
@@ -118,7 +124,10 @@ impl Comps {
                 checker[of_id[i] as usize] = true;
             }
         }
-        let comp = w.ids.into_iter().map(|(d, i)| (d, of_id[i])).collect();
+        let mut comp = FxHashMap::with_capacity_and_hasher(n, Default::default());
+        for (d, i) in w.ids {
+            comp.insert(d, of_id[i]);
+        }
         Ok(Comps { comp, checker })
     }
 
@@ -147,8 +156,9 @@ impl Comps {
     }
 
     pub fn bytes(&self) -> usize {
-        self.comp.capacity() * (std::mem::size_of::<(DataProperty, u32)>() + 1)
-            + self.checker.capacity()
+        super::range::map_backing_bytes(&self.comp)
+            .saturating_add(self.comp.keys().map(|d| d.as_str().len()).sum::<usize>())
+            .saturating_add(self.checker.capacity())
     }
 }
 

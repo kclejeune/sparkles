@@ -429,13 +429,20 @@ pub fn check_bounded(
         .map(|q| q.ranges.len())
         .sum::<usize>()
         .saturating_add(p.atoms.len());
-    let init_est =
-        np.saturating_mul(std::mem::size_of::<u64>())
-            .saturating_add(total_range_refs.saturating_mul(
-                std::mem::size_of::<Rid>() + std::mem::size_of::<(Rid, usize)>() + 16,
-            ))
-            .saturating_add(std::mem::size_of::<(Rid, Vec<bool>)>())
-            .saturating_add(64);
+    let map_buckets = super::range::map_buckets_for(total_range_refs);
+    let index_backing = if map_buckets == 0 {
+        0
+    } else {
+        map_buckets
+            .saturating_mul(std::mem::size_of::<(Rid, usize)>() + 1)
+            .saturating_add(16)
+    };
+    let init_est = np
+        .saturating_mul(std::mem::size_of::<u64>())
+        .saturating_add(total_range_refs.saturating_mul(std::mem::size_of::<Rid>()))
+        .saturating_add(index_backing)
+        .saturating_add(std::mem::size_of::<(Rid, Vec<bool>)>())
+        .saturating_add(64);
     if !scope.take(init_est) {
         return Answer::Unknown(Why::Stopped);
     }
@@ -457,9 +464,10 @@ pub fn check_bounded(
             break;
         }
     }
-    // the distinct ranges involved, by index
-    let mut ranges: Vec<Rid> = Vec::new();
-    let mut index: FxHashMap<Rid, usize> = FxHashMap::default();
+    // the distinct ranges involved, by index; preallocated to the admitted capacities
+    let mut ranges: Vec<Rid> = Vec::with_capacity(total_range_refs);
+    let mut index: FxHashMap<Rid, usize> =
+        FxHashMap::with_capacity_and_hasher(total_range_refs, Default::default());
     let atom_ranges = p.atoms.iter().map(|a| {
         let (Atom::AtLeast(_, _, x) | Atom::AtMost(_, _, x)) = *a;
         x

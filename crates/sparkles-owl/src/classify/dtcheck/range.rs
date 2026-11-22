@@ -1070,9 +1070,13 @@ fn facet_nf(fam: Fam, facet: &str, value: &Literal) -> Result<Nf, Unsupported> {
         }
         "pattern" => Err(Unsupported::Pattern),
         _ if facet == vocab::RDF_LANG_RANGE && fam == Fam::Plain => {
-            let r = match value::of_literal(value)? {
-                DVal::Str(s) => s.to_ascii_lowercase(),
-                _ => return Err(Unsupported::Facet(facet.to_string())),
+            let r = if value.language().is_none() && value.datatype() == vocab::XSD_STRING {
+                value.value().to_ascii_lowercase()
+            } else {
+                match value::of_literal(value)? {
+                    DVal::Str(s) => s.to_ascii_lowercase(),
+                    _ => return Err(Unsupported::Facet(facet.to_string())),
+                }
             };
             n.cells = std::array::from_fn(|_| Disc::empty());
             n.tiny &= !Tiny::PLAIN;
@@ -1115,14 +1119,35 @@ fn time_facet(dt: &str, facet: &str, value: &Literal) -> Result<(), Unsupported>
 /// An interned range.
 pub type Rid = u32;
 
-/// The interned ranges of one run, with the meets, joins and complements already
-/// computed.
-fn map_growth<K, V>(m: &FxHashMap<K, V>) -> usize {
-    if m.len() == m.capacity() {
-        m.capacity()
-            .max(8)
-            .saturating_add(8)
+/// Exact upper bound on the power-of-two bucket count hashbrown allocates for `cap`.
+pub(super) fn map_buckets_for(cap: usize) -> usize {
+    if cap == 0 {
+        0
+    } else {
+        cap.saturating_mul(8).div_ceil(7).next_power_of_two().max(8)
+    }
+}
+
+/// Backing bucket + control byte allocation of a hashbrown `FxHashMap` (preserved by `clone`).
+pub(super) fn map_backing_bytes<K, V>(m: &FxHashMap<K, V>) -> usize {
+    let buckets = map_buckets_for(m.capacity());
+    if buckets == 0 {
+        0
+    } else {
+        buckets
             .saturating_mul(std::mem::size_of::<(K, V)>() + 1)
+            .saturating_add(16)
+    }
+}
+
+/// Worst-case allocation when inserting into `m` at its capacity boundary (covers the
+/// doubled destination table during rehash).
+pub(super) fn map_growth<K, V>(m: &FxHashMap<K, V>) -> usize {
+    if m.len() == m.capacity() {
+        let next_buckets = map_buckets_for(m.capacity()).saturating_mul(2).max(8);
+        next_buckets
+            .saturating_mul(std::mem::size_of::<(K, V)>() + 1)
+            .saturating_add(16)
     } else {
         0
     }
@@ -1204,9 +1229,24 @@ impl Ranges {
     pub fn nf(&self, id: Rid) -> &Nf {
         &self.nfs[id as usize]
     }
-    /// The bytes the table retains, for the run's memory budget.
+    /// The bytes the table retains, including allocated vector and hash-table bucket
+    /// capacities preserved by [`Clone`], for the run's memory budget.
     pub fn bytes(&self) -> usize {
-        self.bytes + 48 * (self.meets.len() + self.joins.len() + self.nots.len() + self.sizes.len())
+        let nf_size = std::mem::size_of::<Nf>();
+        let spare_nfs = self
+            .nfs
+            .capacity()
+            .saturating_sub(self.nfs.len())
+            .saturating_mul(nf_size);
+        let ids_backing =
+            map_backing_bytes(&self.ids).saturating_sub(self.ids.len().saturating_mul(nf_size));
+        self.bytes
+            .saturating_add(spare_nfs)
+            .saturating_add(ids_backing)
+            .saturating_add(map_backing_bytes(&self.meets))
+            .saturating_add(map_backing_bytes(&self.joins))
+            .saturating_add(map_backing_bytes(&self.nots))
+            .saturating_add(map_backing_bytes(&self.sizes))
     }
     pub fn meet(&mut self, a: Rid, b: Rid) -> Rid {
         let k = (a.min(b), a.max(b));
@@ -1291,11 +1331,12 @@ impl Ranges {
             return Ok(*r);
         }
         let nots_growth = if self.nots.len().saturating_add(2) > self.nots.capacity() {
-            self.nots
-                .capacity()
-                .max(8)
-                .saturating_add(8)
+            let next_buckets = map_buckets_for(self.nots.capacity())
+                .saturating_mul(2)
+                .max(8);
+            next_buckets
                 .saturating_mul(std::mem::size_of::<(Rid, Rid)>() + 1)
+                .saturating_add(16)
         } else {
             0
         };
@@ -1528,10 +1569,11 @@ impl Ranges {
                         .value
                         .value()
                         .len()
-                        .saturating_add(f.value.language().map_or(0, str::len))
-                        .saturating_add(n.bytes())
-                        .saturating_add(std::mem::size_of::<Nf>())
-                        .saturating_add(128);
+                        .saturating_mul(3)
+                        .saturating_add(f.value.language().map_or(0, str::len).saturating_mul(3))
+                        .saturating_add(n.bytes().saturating_mul(2))
+                        .saturating_add(std::mem::size_of::<Nf>().saturating_mul(2))
+                        .saturating_add(256);
                     if !admit(facet_est) {
                         return Err(Fail::Memory);
                     }
@@ -1583,26 +1625,24 @@ impl Defs {
         Defs::new(self.map.clone())
     }
 
-    /// Estimated bytes of a shallow [`Defs::unconverted`] clone (keys and `Arc` pointers,
-    /// without duplicating the shared `DataRange` ASTs).
+    /// Estimated bytes of a shallow [`Defs::unconverted`] clone (full hash-table bucket
+    /// allocation and cloned datatype IRI strings, sharing the immutable `DataRange` ASTs).
     pub fn shallow_bytes(&self) -> usize {
-        self.map
-            .len()
-            .saturating_mul(std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>() + 16)
-            + self.map.keys().map(|d| d.as_str().len()).sum::<usize>()
+        map_backing_bytes(&self.map)
+            .saturating_add(self.map.keys().map(|d| d.as_str().len()).sum::<usize>())
     }
 
-    /// The bytes the definitions (including shared `DataRange` ASTs) and converted ranges
-    /// take.
+    /// The bytes the definitions (including full bucket capacities and shared `DataRange`
+    /// ASTs) and converted ranges take.
     pub fn bytes(&self) -> usize {
-        self.map.capacity() * (std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>() + 1)
-            + self
-                .map
-                .iter()
-                .map(|(d, r)| d.as_str().len() + data_range_bytes(r) + 16)
-                .sum::<usize>()
-            + self.memo.capacity()
-                * (std::mem::size_of::<(Datatype, Option<Result<Rid, Unsupported>>)>() + 1)
+        map_backing_bytes(&self.map)
+            .saturating_add(
+                self.map
+                    .iter()
+                    .map(|(d, r)| d.as_str().len() + data_range_bytes(r) + 16)
+                    .sum::<usize>(),
+            )
+            .saturating_add(map_backing_bytes(&self.memo))
     }
 }
 

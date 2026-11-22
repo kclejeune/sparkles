@@ -76,24 +76,18 @@ impl DtTable {
         } else {
             0
         };
-        let map_add = if self.ids.len() == self.ids.capacity() {
-            self.ids
-                .capacity()
-                .max(8)
-                .saturating_add(8)
-                .saturating_mul(key + 4 + 1)
-        } else {
-            0
-        };
+        let map_add = super::range::map_growth(&self.ids);
         vec_add.saturating_add(map_add)
     }
 
     /// The bytes the atoms and the ranges retain.
     pub fn bytes(&self) -> usize {
         let key = std::mem::size_of::<DtKey>();
-        self.atoms.capacity() * key
-            + self.ids.capacity() * (key + 4 + 1)
-            + self.ranges.as_ref().map_or(0, Ranges::bytes)
+        self.atoms
+            .capacity()
+            .saturating_mul(key)
+            .saturating_add(super::range::map_backing_bytes(&self.ids))
+            .saturating_add(self.ranges.as_ref().map_or(0, Ranges::bytes))
     }
 }
 

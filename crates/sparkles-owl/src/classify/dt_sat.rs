@@ -301,13 +301,14 @@ fn evaluate<S: Sink>(ix: &Index, dt: &DtIx, st: &mut State, at: usize, out: &mut
     };
     let s = &x.dt[at];
     let comp = s.comp;
+    let body_cap = dt.body[comp as usize].len();
     let key_est = s
         .held
         .len()
         .saturating_mul(std::mem::size_of::<Ex>())
         .saturating_add(
-            dt.body[comp as usize]
-                .len()
+            body_cap
+                .saturating_mul(2)
                 .saturating_mul(std::mem::size_of::<(Ex, Group)>()),
         )
         .saturating_add(32);
@@ -319,11 +320,13 @@ fn evaluate<S: Sink>(ix: &Index, dt: &DtIx, st: &mut State, at: usize, out: &mut
         return;
     }
     let held: Box<[Ex]> = s.held.as_slice().into();
-    let body: Box<[(Ex, Group)]> = dt.body[comp as usize]
-        .iter()
-        .filter(|b| !st.subs.contains(&b.e))
-        .map(|b| (b.e, group(st, b)))
-        .collect();
+    let mut body_vec = Vec::with_capacity(body_cap);
+    for b in &dt.body[comp as usize] {
+        if !st.subs.contains(&b.e) {
+            body_vec.push((b.e, group(st, b)));
+        }
+    }
+    let body: Box<[(Ex, Group)]> = body_vec.into_boxed_slice();
     let key: Key = (comp, held, body);
     let cached = dt.cache.lock().get(&key).cloned();
     let answer = match cached {
@@ -1010,5 +1013,145 @@ mod tests {
         assert!(handoff_saw_live_body.get());
         assert!(out_bytes_charged.get() >= got.entailed.capacity() * std::mem::size_of::<usize>());
         assert_eq!(live_mem.get(), 0);
+
+        // 4. Non-power-of-two evaluation key (513 body atoms) admits both Vec backing and
+        // boxed-slice conversion without un-admitted 1024-slot doubling.
+        let body513: Vec<Body> = (10..523u32).map(|e| Body { e, told: None }).collect();
+        let dt513 = DtIx::new(
+            Vec::new(),
+            FxHashMap::default(),
+            vec![body513],
+            Vec::new(),
+            Ranges::new(),
+            Comps::default(),
+            FxHashMap::default(),
+        );
+        let key513: Key = (
+            0,
+            vec![1u32].into_boxed_slice(),
+            (10..523u32)
+                .map(|e| (e, Group::Other))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        dt513
+            .cache
+            .lock()
+            .insert(key513, Arc::new(Ok(Units::default())));
+        let ix513 = Index::default();
+        let mut st513 = State::default();
+        st513.extra().dt.push(DtSt {
+            comp: 0,
+            held: vec![1],
+            last: FINE,
+        });
+        struct RecordSink {
+            cap: usize,
+            held: isize,
+            peak: usize,
+        }
+        impl Sink for RecordSink {
+            fn reserve_data(&mut self, bytes: usize) -> bool {
+                self.held += bytes as isize;
+                let ok = self.held as usize <= self.cap;
+                if ok {
+                    self.peak = self.peak.max(self.held as usize);
+                }
+                ok
+            }
+            fn release_data(&mut self, bytes: usize) {
+                self.held -= bytes as isize;
+            }
+            fn send(&mut self, _to: Ex, _c: Concl) {}
+            fn me(&mut self, _c: Concl) {}
+        }
+        // Old single-copy estimate (513 * size_of + 4 + 32) is refused now because
+        // `key_est` covers both `Vec::with_capacity(513)` and `into_boxed_slice`.
+        let old_key_est = 4 + 513 * std::mem::size_of::<(Ex, Group)>() + 32;
+        let mut sink513 = RecordSink {
+            cap: old_key_est + 64,
+            held: 0,
+            peak: 0,
+        };
+        evaluate(&ix513, &dt513, &mut st513, 0, &mut sink513);
+        assert_eq!(st513.extra.as_ref().unwrap().dt[0].last, STOPPED);
+        assert_eq!(sink513.held, 0);
+
+        // 5. Initial solver workspace with 897 distinct ranges (hashbrown 2048-bucket
+        // boundary): refuses old 32,396-byte underestimate and accepts exact planned cap.
+        let mut r897 = Ranges::new();
+        let mut atoms897 = Vec::with_capacity(897);
+        for i in 0..897i64 {
+            let rid = r897
+                .of(&crate::model::DataRange::OneOf(
+                    [crate::model::Literal::typed(
+                        format!("{i}"),
+                        crate::vocab::XSD_INTEGER,
+                    )]
+                    .into_iter()
+                    .collect(),
+                ))
+                .unwrap();
+            atoms897.push(Atom::AtLeast(0, 1, rid));
+        }
+        let p897 = Problem {
+            props: vec![Prop {
+                supers: Vec::new(),
+                ranges: Vec::new(),
+            }],
+            disjoint: Vec::new(),
+            atoms: atoms897,
+        };
+        let old_init_underest = 33_000usize;
+        let held897 = std::cell::Cell::new(0isize);
+        let peak897 = std::cell::Cell::new(0usize);
+        let ans897 = super::super::dtcheck::solve::check_bounded(
+            &mut r897,
+            &p897,
+            &Bounds::default(),
+            &|| false,
+            &|_| true,
+            &|d| {
+                if d > 0 {
+                    let next = held897.get() + d;
+                    if next as usize > old_init_underest {
+                        return false;
+                    }
+                    held897.set(next);
+                    peak897.set(peak897.get().max(next as usize));
+                    true
+                } else {
+                    held897.set(held897.get() + d);
+                    true
+                }
+            },
+        );
+        assert_eq!(
+            ans897,
+            super::super::dtcheck::solve::Answer::Unknown(Why::Stopped)
+        );
+        assert_eq!(held897.get(), 0);
+        // Verify exact planned initial reservation covers the 2048-bucket map + 897 Vec.
+        let first_admit = std::cell::Cell::new(0usize);
+        let _ = super::super::dtcheck::solve::check_bounded(
+            &mut r897,
+            &p897,
+            &Bounds::default(),
+            &|| false,
+            &|_| true,
+            &|d| {
+                if d > 0 && first_admit.get() == 0 {
+                    first_admit.set(d as usize);
+                }
+                false
+            },
+        );
+        let actual_backing =
+            8 + 897 * std::mem::size_of::<Rid>() + 2048 * (std::mem::size_of::<(Rid, usize)>() + 1);
+        assert!(
+            first_admit.get() >= actual_backing,
+            "first_admit {} must cover actual backing >= {actual_backing}",
+            first_admit.get()
+        );
     }
 }

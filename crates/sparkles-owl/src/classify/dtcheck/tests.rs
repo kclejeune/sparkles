@@ -1806,4 +1806,104 @@ mod units_rule {
         // The immutable AST Arc must have no stray cloned references after the call.
         assert_eq!(Arc::strong_count(&big), 2);
     }
+
+    #[test]
+    fn large_lang_range_facet_rejects_cap_below_simultaneous_copies() {
+        let mut r = Ranges::new();
+        let mut defs = super::super::range::Defs::default();
+        // ~70 KiB valid basic language range.
+        let long_tag = std::iter::repeat_n("abcdef", 10_000)
+            .collect::<Vec<_>>()
+            .join("-");
+        let len = long_tag.len();
+        let range = plain_restr(&[(vocab::RDF_LANG_RANGE, Literal::simple(&long_tag))]);
+        // Cap admits the old `1 * len + base + Nf + 128` estimate, but denies simultaneous
+        // facet + Tags::map2 meet copies (~2x len).
+        let cap = len + 4096;
+        let admitted = std::cell::Cell::new(0usize);
+        let got = r.of_defined_bounded(&range, &mut defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert_eq!(got, Err(Fail::Memory));
+        assert!(admitted.get() <= cap);
+        assert_eq!(r.bytes(), Ranges::new().bytes());
+    }
+
+    #[test]
+    fn ranges_bytes_and_defs_shallow_bytes_include_cloned_hash_buckets() {
+        use super::super::comp::{CompFail, Comps};
+        use super::super::range::{Defs, Nf, Rid};
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty};
+        use rustc_hash::FxHashMap;
+        use std::sync::Arc;
+
+        // 897 distinct compact integer point ranges push hashbrown to 2048 buckets.
+        let mut r = Ranges::new();
+        for i in 0..895i64 {
+            let _ = r.of(&DataRange::OneOf(
+                [Literal::typed(format!("{i}"), vocab::XSD_INTEGER)]
+                    .into_iter()
+                    .collect(),
+            ));
+        }
+        // `r` now has 897 entries (EMPTY, FULL + 895 points) -> 2048 hashbrown buckets.
+        let min_cloned_backing =
+            1024 * std::mem::size_of::<Nf>() + 2048 * (std::mem::size_of::<(Nf, Rid)>() + 1);
+        assert!(
+            r.bytes() >= min_cloned_backing,
+            "Ranges::bytes() {} must cover cloned bucket backing >= {min_cloned_backing}",
+            r.bytes()
+        );
+
+        // 897 distinct datatype definitions -> 2048 hashbrown buckets in `Defs.map`.
+        let int_arc = Arc::new(DataRange::Datatype(Datatype::new(format!(
+            "{}int",
+            vocab::XSD
+        ))));
+        let mut map = FxHashMap::default();
+        let mut key_str_bytes = 0usize;
+        for i in 0..897usize {
+            let d = Datatype::new(format!("urn:dt:d{i}"));
+            key_str_bytes += d.as_str().len();
+            map.insert(d, Arc::clone(&int_arc));
+        }
+        let defs = Defs::new(map);
+        let min_defs_buckets =
+            2048 * (std::mem::size_of::<(Datatype, Arc<DataRange>)>() + 1) + key_str_bytes;
+        assert!(
+            defs.shallow_bytes() >= min_defs_buckets,
+            "Defs::shallow_bytes() {} must cover cloned buckets >= {min_defs_buckets}",
+            defs.shallow_bytes()
+        );
+        // A cap that would have admitted the old `len * (size_of + 16)` underestimate
+        // (plus scratch init) must refuse `ensure_scratch` before cloning `defs.map`.
+        let old_underest =
+            897 * (std::mem::size_of::<(Datatype, Arc<DataRange>)>() + 16) + key_str_bytes + 4096;
+        assert!(old_underest < min_defs_buckets);
+        let ax = [AxiomKind::SubClassOf(
+            ClassExpression::Class(Class::new("urn:dt:A")),
+            ClassExpression::DataSomeValuesFrom(
+                vec![DataProperty::new("urn:dt:p")],
+                DataRange::Datatype(Datatype::new("urn:dt:d0")),
+            ),
+        )];
+        let refs: Vec<&AxiomKind> = ax.iter().collect();
+        let admitted = std::cell::Cell::new(0usize);
+        let res = Comps::of_bounded(&refs, &defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > old_underest {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert!(matches!(res, Err(CompFail::Memory)));
+    }
 }
