@@ -228,11 +228,13 @@ path meets the [acceptance gates](SPEC.md#acceptance-gates), measured as the
 
 ### Hierarchical budget, item 675
 
-The phase is landing. The maintainer decided that a graph result keeps the query's
-admitted high point charged to the pool until the result is dropped, as the design says
-for eager contexts until stage 6 leases every table. The seams it leaves open, native MCP
-frames, snapshot and mask escapes, deallocation proofs and the later milestones, stay
-recorded in its report and do not block stage 5.
+The foundation has landed, and item 675 is narrowed to giving the reasoner's budgets and
+incremental views parents in the query pool without blocking the merge. The maintainer
+decided that a graph result keeps the query's admitted high point charged to the pool
+until the result is dropped, as the design says for eager contexts until the merge leases
+every table. The remaining seams are tracked separately and do not block stage 5 or the
+merge: MCP native frames in item 1305, binding result buffers in item 1306, snapshot and
+access escapes in item 1307 and strict decoding across all callers in item 1308.
 
 ### Decoding twins, item 678
 
