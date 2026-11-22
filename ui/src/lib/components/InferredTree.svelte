@@ -138,13 +138,15 @@
           {model.reply.outcome.incompleteCount === 1 ? 'class remains' : 'classes remain'} incomplete.
         {:else if model.reply.outcome?.complete}
           Complete for its supported source.
-        {:else if model.reply.outcome && model.reply.outcome.excludedCount > 0}
-          Classification completed with {model.reply.outcome.excludedCount} omitted or partly used axioms.
-        {:else if model.reply.outcome && model.reply.outcome.unmappedCount > 0}
-          Classification is incomplete. {model.reply.outcome.unmappedCount}
-          {model.reply.outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom.
         {:else}
           Classification is incomplete.
+          {#if model.reply.outcome && model.reply.outcome.excludedCount > 0}
+            {model.reply.outcome.excludedCount} omitted or partly used axioms.
+          {/if}
+          {#if model.reply.outcome && model.reply.outcome.unmappedCount > 0}
+            {model.reply.outcome.unmappedCount}
+            {model.reply.outcome.unmappedCount === 1 ? 'triple' : 'triples'} of the input map to no axiom.
+          {/if}
         {/if}
         {#if model.reply.outcome?.consistency === 'unknown'}Consistency is unknown.{/if}
         {model.reply.outcome?.consistency === 'inconsistent'

@@ -14,6 +14,7 @@ import {
   WELL_KNOWN,
   type PrefixMap,
 } from './rdf';
+import { fmtCount } from './format';
 import { lexicalCompare, preferredLabel } from './rendering';
 import type { WritePreview } from './validation-overlay';
 
@@ -195,7 +196,12 @@ export type Classification = {
   /** The explicit tree's browser read cap, distinct from reasoning completeness. */
   nodesTruncated?: boolean;
   consistent: boolean;
+  /** `unknown` when the run left out part of the input that could make it inconsistent */
+  consistency?: 'consistent' | 'inconsistent' | 'unknown';
   complete: boolean;
+  /** complete for the axioms the run took, as a profile reasoner reports */
+  completeForTaken?: boolean;
+  incompleteCount?: number;
   classes: number;
   nodeCount: number;
   unsatisfiableCount: number;
@@ -203,8 +209,26 @@ export type Classification = {
   excludedCount: number;
   excluded: (AxiomItem & { rule?: string; message?: string; partial?: string })[];
   nodes: TaxonomyNode[];
-  stats: { incremental: boolean; saturationMs: number };
+  /** the first triples of the input that map to no axiom, as N-Triples terms */
+  unmappedTriples?: { subject: string; predicate: string; object: string }[];
+  unmappedTruncated?: boolean;
+  stats: { incremental: boolean; saturationMs: number; unmapped?: number };
 };
+
+/**
+ * The Workbench heading's note on a classification: its tier when it is complete, and
+ * otherwise what it left out, the excluded axioms and the triples of the input that map
+ * to no axiom, either of which can make it incomplete.
+ */
+export function classificationNote(c: Classification): string {
+  if (c.complete) return `${c.tier?.toUpperCase() ?? 'Classification'} · commit ${c.commit}`;
+  const parts: string[] = [];
+  if (c.excludedCount > 0) parts.push(fmtCount(c.excludedCount, 'omitted or partly used axiom'));
+  const unmapped = c.stats?.unmapped ?? 0;
+  if (unmapped > 0) parts.push(`${fmtCount(unmapped, 'triple')} mapping to no axiom`);
+  if (parts.length === 0) parts.push('incomplete');
+  return `${parts.join(' · ')} · commit ${c.commit}`;
+}
 
 // --- requests ------------------------------------------------------------------------
 

@@ -75,6 +75,20 @@ describe('the actual inferred-tree outcome region', () => {
     expect(body).toContain('triples of the input map to no axiom');
     expect(body).not.toContain('omitted or partly used axioms');
   });
+  it('names both the excluded axioms and the unmapped triples when there are both', () => {
+    fixture.outcome = {
+      complete: false,
+      partial: false,
+      consistency: 'unknown',
+      excludedCount: 1,
+      incompleteCount: 4,
+      unmappedCount: 1,
+    };
+    const body = html();
+    expect(body).toContain('Classification is incomplete.');
+    expect(body).toContain('omitted or partly used axioms');
+    expect(body).toContain('triple of the input map to no axiom');
+  });
   it('retains the complete supported-source notice', () => {
     expect(html()).toContain('Complete for its supported source.');
   });

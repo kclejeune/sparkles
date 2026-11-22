@@ -57,6 +57,7 @@
     ontologyAxioms,
     ontologyEntities,
     ontologyKindLabels,
+    classificationNote,
     ontologyLabelsFor,
     ontologyEntity,
     ontologySummary,
@@ -1797,10 +1798,8 @@
                   {#if kindTab === 'Class'}
                     <h2 class="col-title">
                       Inferred
-                      {#if classification}<span class="faint">
-                          {classification.complete
-                            ? `${classification.tier?.toUpperCase() ?? 'Classification'} · commit ${classification.commit}`
-                            : `${fmtInt(classification.excludedCount)} omitted or partly used axioms · commit ${classification.commit}`}</span
+                      {#if classification}<span class="faint"
+                          >{classificationNote(classification)}</span
                         >{/if}
                     </h2>
                     <button
@@ -1821,6 +1820,11 @@
                         {#if classification && !classification.consistent}
                           <p class="error-box" role="alert">
                             The ontology is inconsistent, so every class is unsatisfiable.
+                          </p>
+                        {:else if classification?.consistency === 'unknown'}
+                          <p class="note">
+                            Consistency is unknown, since the classification left out part of the
+                            input.
                           </p>
                         {/if}
                         <OntoTree
