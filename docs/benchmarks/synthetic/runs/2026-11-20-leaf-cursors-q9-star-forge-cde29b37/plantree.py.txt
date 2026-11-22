@@ -1,0 +1,9 @@
+import json, sys
+def walk(p, ind=0):
+    op = p['operator'] if isinstance(p.get('operator'), dict) else p
+    print(' ' * ind + f"{op.get('operator')} | {str(op.get('description', ''))[:90]} | rows {op.get('actualRows', op.get('rows'))}")
+    for c in p.get('children', []):
+        walk(c, ind + 2)
+for f in sys.argv[1:]:
+    print('==', f)
+    walk(json.load(open(f))['meta']['plan'])

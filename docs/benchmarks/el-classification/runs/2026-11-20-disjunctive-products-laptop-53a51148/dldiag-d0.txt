@@ -1,0 +1,73 @@
+ore_ont_10140 DLDIAG end work=17564 ms=2314 derive=17564 foldChoice=18432 foldNew=17287 addOk=6505 addSub=9759 processed=5631 predProd=12498 pruneIn=13003 foldEmit=6181
+ore_ont_10140 DLDIAG endstats contexts=257 stored=6505
+ore_ont_11460 DLDIAG end work=14560 ms=2482 derive=14560 foldChoice=14483 foldNew=13499 addOk=6147 addSub=7304 processed=5371 predProd=9838 pruneIn=10384 foldEmit=4965
+ore_ont_11460 DLDIAG endstats contexts=270 stored=6147
+ore_ont_12141 DLDIAG at work=65536 ms=71 derive=65536 foldChoice=10771 foldNew=10714 addOk=43266 addSub=6162 processed=37887 predProd=9766 pruneIn=10391 foldEmit=9311
+ore_ont_12141 DLDIAG at work=131072 ms=136 derive=131072 foldChoice=43677 foldNew=42046 addOk=73106 addSub=27429 processed=62769 predProd=36987 pruneIn=37519 foldEmit=29278
+ore_ont_12141 DLDIAG end work=136117 ms=151 derive=136117 foldChoice=47413 foldNew=45776 addOk=75182 addSub=30101 processed=65602 predProd=39544 pruneIn=40448 foldEmit=30558
+ore_ont_12141 DLDIAG endstats contexts=323 stored=75182
+ore_ont_13103 DLDIAG at work=65536 ms=148 derive=65536 foldChoice=9152 foldNew=8502 addOk=39370 addSub=20683 processed=36160 predProd=5945 pruneIn=7376 foldEmit=3868
+ore_ont_13103 DLDIAG at work=131072 ms=251 derive=131072 foldChoice=31234 foldNew=29175 addOk=70890 addSub=49207 processed=64327 predProd=20756 pruneIn=23292 foldEmit=10884
+ore_ont_13103 DLDIAG at work=262144 ms=487 derive=262144 foldChoice=109337 foldNew=104933 addOk=121543 addSub=126707 processed=112917 predProd=71052 pruneIn=82771 foldEmit=35785
+ore_ont_13103 DLDIAG at work=524288 ms=1308 derive=524288 foldChoice=204024 foldNew=193889 addOk=238403 addSub=245121 processed=217200 predProd=134952 pruneIn=150757 foldEmit=64392
+ore_ont_13103 DLDIAG at work=1048576 ms=3110 derive=1048576 foldChoice=750541 foldNew=738014 addOk=327045 addSub=661844 processed=299375 predProd=496057 pruneIn=532260 foldEmit=160155
+ore_ont_13103 DLDIAG at work=2097152 ms=7533 derive=2097152 foldChoice=1826549 foldNew=1791189 addOk=645194 addSub=1281082 processed=549315 predProd=1214915 pruneIn=1269308 foldEmit=305740
+ore_ont_13103 DLDIAG end work=2763619 ms=11521 derive=2763619 foldChoice=2953740 foldNew=2917226 addOk=754875 addSub=1807980 processed=664766 predProd=1960642 pruneIn=2049818 foldEmit=453719
+ore_ont_13103 DLDIAG endstats contexts=3742 stored=754875
+ore_ont_14817 DLDIAG at work=65536 ms=395 derive=65536 foldChoice=18580 foldNew=17615 addOk=50553 addSub=12792 processed=45398 predProd=11585 pruneIn=15450 foldEmit=7469
+ore_ont_14817 DLDIAG at work=131072 ms=735 derive=131072 foldChoice=51994 foldNew=49152 addOk=94612 addSub=32970 processed=82439 predProd=32852 pruneIn=42864 foldEmit=19344
+ore_ont_14817 DLDIAG at work=262144 ms=1438 derive=262144 foldChoice=176584 foldNew=166628 addOk=170440 addSub=84578 processed=144989 predProd=248404 pruneIn=138137 foldEmit=53421
+ore_ont_14817 DLDIAG at work=524288 ms=4175 derive=524288 foldChoice=1744385 foldNew=1441051 addOk=282781 addSub=232366 processed=248177 predProd=1017616056 pruneIn=843883 foldEmit=160600
+ore_ont_14817 DLDIAG at work=1048576 ms=8777 derive=1048576 foldChoice=3481718 foldNew=2882334 addOk=626034 addSub=401733 processed=542347 predProd=1355071355 pruneIn=1753273 foldEmit=283825
+ore_ont_14817 DLDIAG at work=2097152 ms=14402 derive=2097152 foldChoice=5167997 foldNew=4358615 addOk=1242236 addSub=802913 processed=993869 predProd=1360901200 pruneIn=2733237 foldEmit=628774
+ore_ont_14817 DLDIAG at work=4194304 ms=23507 derive=4194304 foldChoice=9495369 foldNew=8269463 addOk=2213180 addSub=1868481 processed=1570014 predProd=1377828324 pruneIn=5239170 foldEmit=1499077
+ore_ont_14817 DLDIAG at work=8388608 ms=41659 derive=8388608 foldChoice=22413396 foldNew=19550341 addOk=3905248 addSub=4210048 processed=2411673 predProd=1530317584 pruneIn=11796160 foldEmit=3279327
+ore_ont_14817 DLDIAG at work=16777216 ms=112716 derive=16676863 foldChoice=102104937 foldNew=84320335 addOk=6413986 addSub=9779290 processed=3682508 predProd=5820682604 pruneIn=40192878 foldEmit=7153926
+ore_ont_14817 DLDIAG over work=22412180 ms=183799 derive=21992863 foldChoice=211916797 foldNew=169775745 addOk=7675593 addSub=13553686 processed=4252744 predProd=33307042684 pruneIn=69852634 foldEmit=9880160
+ore_ont_15491 DLDIAG end work=10580 ms=67 derive=10580 foldChoice=2804 foldNew=2742 addOk=6362 addSub=3322 processed=6112 predProd=1842 pruneIn=2616 foldEmit=1613
+ore_ont_15491 DLDIAG endstats contexts=858 stored=6362
+ore_ont_16680 DLDIAG at work=65536 ms=210 derive=65536 foldChoice=6304 foldNew=6284 addOk=48706 addSub=15860 processed=48018 predProd=3430 pruneIn=6226 foldEmit=3232
+ore_ont_16680 DLDIAG at work=131072 ms=446 derive=131072 foldChoice=16042 foldNew=15727 addOk=89054 addSub=35098 processed=86719 predProd=9237 pruneIn=14951 foldEmit=7813
+ore_ont_16680 DLDIAG at work=262144 ms=684 derive=262144 foldChoice=45068 foldNew=43701 addOk=156924 addSub=84206 processed=143806 predProd=27836 pruneIn=38022 foldEmit=18433
+ore_ont_16680 DLDIAG at work=524288 ms=1185 derive=524288 foldChoice=175848 foldNew=171913 addOk=264134 addSub=226768 processed=245822 predProd=112496 pruneIn=136405 foldEmit=59664
+ore_ont_16680 DLDIAG at work=1048576 ms=2155 derive=1048576 foldChoice=391963 foldNew=381360 addOk=490349 addSub=477025 processed=448487 predProd=255251 pruneIn=293784 foldEmit=118361
+ore_ont_16680 DLDIAG at work=2097152 ms=3974 derive=2097152 foldChoice=1312543 foldNew=1299610 addOk=709282 addSub=1247932 processed=651044 predProd=862972 pruneIn=939074 foldEmit=310410
+ore_ont_16680 DLDIAG at work=4194304 ms=9991 derive=4194304 foldChoice=4917137 foldNew=4884226 addOk=1127169 addSub=2792838 processed=950916 predProd=3265466 pruneIn=3366120 foldEmit=590312
+ore_ont_16680 DLDIAG end work=6945320 ms=15329 derive=6945320 foldChoice=7972062 foldNew=7915307 addOk=1792126 addSub=4652270 processed=1570551 predProd=5285543 pruneIn=5501461 foldEmit=1095559
+ore_ont_16680 DLDIAG endstats contexts=6460 stored=1792126
+ore_ont_3215 DLDIAG at work=65536 ms=605 derive=65536 foldChoice=14759 foldNew=14759 addOk=37478 addSub=15371 processed=36251 predProd=14759 pruneIn=14759 foldEmit=14759
+ore_ont_3215 DLDIAG at work=131072 ms=772 derive=131072 foldChoice=38204 foldNew=38204 addOk=78513 addSub=29499 processed=70211 predProd=32292 pruneIn=36522 foldEmit=29038
+ore_ont_3215 DLDIAG at work=262144 ms=1036 derive=262144 foldChoice=83526 foldNew=83526 addOk=168956 addSub=59211 processed=141224 predProd=61053 pruneIn=78050 foldEmit=49725
+ore_ont_3215 DLDIAG at work=524288 ms=1430 derive=524288 foldChoice=362094 foldNew=319925 addOk=320038 addSub=138262 processed=258471 predProd=274521 pruneIn=246663 foldEmit=132328
+ore_ont_3215 DLDIAG at work=1048576 ms=2292 derive=1048576 foldChoice=1595189 foldNew=1388600 addOk=501529 addSub=322965 processed=372824 predProd=1206066 pruneIn=961262 foldEmit=471915
+ore_ont_3215 DLDIAG at work=2097152 ms=3789 derive=2097152 foldChoice=3946028 foldNew=3587622 addOk=749072 addSub=661684 processed=560234 predProd=2825035 pruneIn=2548087 foldEmit=1234269
+ore_ont_3215 DLDIAG at work=4194304 ms=7016 derive=4194304 foldChoice=9242879 foldNew=8482437 addOk=1093933 addSub=1445655 processed=835067 predProd=6470431 pruneIn=6036417 foldEmit=2916060
+ore_ont_3215 DLDIAG at work=8388608 ms=18175 derive=8388608 foldChoice=21138433 foldNew=19958838 addOk=1353330 addSub=2820989 processed=1035519 predProd=14501152 pruneIn=14093872 foldEmit=6789612
+ore_ont_3215 DLDIAG at work=16777216 ms=33393 derive=16777216 foldChoice=45094613 foldNew=43787242 addOk=1587986 addSub=5267335 processed=1223195 predProd=30396084 pruneIn=30716709 foldEmit=14863070
+ore_ont_3215 DLDIAG over work=21110025 ms=41997 derive=21110025 foldChoice=57626371 foldNew=56272676 addOk=1668075 addSub=6734135 processed=1295234 predProd=38714822 pruneIn=39347353 foldEmit=19078237
+ore_ont_4897 DLDIAG end work=895 ms=2 derive=895 foldChoice=395 foldNew=395 addOk=194 addSub=230 processed=170 predProd=395 pruneIn=395 foldEmit=395
+ore_ont_4897 DLDIAG endstats contexts=158 stored=194
+ore_ont_5438 DLDIAG at work=65536 ms=343 derive=65536 foldChoice=24259 foldNew=22783 addOk=39048 addSub=21999 processed=36485 predProd=16469 pruneIn=17876 foldEmit=7811
+ore_ont_5438 DLDIAG at work=131072 ms=554 derive=131072 foldChoice=64988 foldNew=63198 addOk=71753 addSub=51245 processed=67303 predProd=43446 pruneIn=46366 foldEmit=13495
+ore_ont_5438 DLDIAG at work=262144 ms=981 derive=262144 foldChoice=142398 foldNew=135922 addOk=124253 addSub=128056 processed=113456 predProd=95642 pruneIn=99507 foldEmit=33207
+ore_ont_5438 DLDIAG at work=524288 ms=2682 derive=524288 foldChoice=661947 foldNew=650842 addOk=180032 addSub=328294 processed=163558 predProd=441383 pruneIn=452363 foldEmit=76664
+ore_ont_5438 DLDIAG end work=783093 ms=3866 derive=783093 foldChoice=982606 foldNew=961316 addOk=263873 addSub=495670 processed=238144 predProd=657403 pruneIn=669100 foldEmit=125651
+ore_ont_5438 DLDIAG endstats contexts=3115 stored=263873
+ore_ont_5940 DLDIAG end work=12 ms=0 derive=12 foldChoice=8 foldNew=8 addOk=4 addSub=0 processed=4 predProd=8 pruneIn=8 foldEmit=8
+ore_ont_5940 DLDIAG endstats contexts=8 stored=4
+ore_ont_6423 DLDIAG end work=361 ms=17 derive=361 foldChoice=67 foldNew=67 addOk=211 addSub=9 processed=193 predProd=67 pruneIn=67 foldEmit=67
+ore_ont_6423 DLDIAG endstats contexts=76 stored=211
+ore_ont_6485 DLDIAG end work=18054 ms=21 derive=18054 foldChoice=6537 foldNew=6484 addOk=10292 addSub=5874 processed=9555 predProd=5343 pruneIn=5818 foldEmit=4524
+ore_ont_6485 DLDIAG endstats contexts=154 stored=10292
+ore_ont_6952 DLDIAG end work=13699 ms=3969 derive=13699 foldChoice=14545 foldNew=13572 addOk=5674 addSub=7190 processed=5177 predProd=9897 pruneIn=10337 foldEmit=4960
+ore_ont_6952 DLDIAG endstats contexts=257 stored=5674
+ore_ont_9663 DLDIAG at work=65536 ms=519 derive=65536 foldChoice=2821 foldNew=2690 addOk=50062 addSub=954 processed=48254 predProd=2277 pruneIn=2469 foldEmit=1862
+ore_ont_9663 DLDIAG at work=131072 ms=757 derive=131072 foldChoice=12394 foldNew=11913 addOk=97736 addSub=3580 processed=89610 predProd=9456 pruneIn=11072 foldEmit=7691
+ore_ont_9663 DLDIAG at work=262144 ms=1149 derive=262144 foldChoice=38779 foldNew=37178 addOk=188762 addSub=14471 processed=168956 predProd=28586 pruneIn=33768 foldEmit=22234
+ore_ont_9663 DLDIAG at work=524288 ms=1746 derive=524288 foldChoice=119352 foldNew=113392 addOk=353014 addSub=53483 processed=309692 predProd=86616 pruneIn=100279 foldEmit=62721
+ore_ont_9663 DLDIAG at work=1048576 ms=2788 derive=1048576 foldChoice=338447 foldNew=322540 addOk=674003 addSub=176910 processed=588804 predProd=240981 pruneIn=280549 foldEmit=164262
+ore_ont_9663 DLDIAG at work=2097152 ms=4710 derive=2097152 foldChoice=1020420 foldNew=987194 addOk=1256282 addSub=549258 processed=1102333 predProd=733054 pruneIn=843876 foldEmit=417731
+ore_ont_9663 DLDIAG at work=4194304 ms=11190 derive=4194304 foldChoice=4388682 foldNew=3935565 addOk=2306592 addSub=1537905 processed=1857014 predProd=34158475 pruneIn=3103316 foldEmit=917964
+ore_ont_9663 DLDIAG at work=8388608 ms=34980 derive=8388608 foldChoice=35124607 foldNew=26326978 addOk=3806437 addSub=4208360 processed=2851503 predProd=1514657486 pruneIn=13443900 foldEmit=2535106
+ore_ont_9663 DLDIAG at work=16777216 ms=135948 derive=15972031 foldChoice=215543022 foldNew=139473219 addOk=5525391 addSub=10063754 processed=3953509 predProd=54649131883 pruneIn=50312613 foldEmit=6848689
+ore_ont_9663 DLDIAG over work=22346259 ms=207345 derive=18418092 foldChoice=354552398 foldNew=219982316 addOk=5890653 addSub=12144051 processed=4197375 predProd=173984165007 pruneIn=68126249 foldEmit=8454400

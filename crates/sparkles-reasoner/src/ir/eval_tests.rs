@@ -35,6 +35,7 @@ fn limits() -> Limits {
         max_inferred: 10_000_000,
         budget: Budget::unlimited(),
         closures: false,
+        magic: None,
         sampled_planning: false,
         cancel: None,
         deadline: None,

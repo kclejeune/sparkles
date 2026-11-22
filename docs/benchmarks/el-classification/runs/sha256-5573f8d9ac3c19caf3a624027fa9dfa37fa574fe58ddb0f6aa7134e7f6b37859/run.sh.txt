@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Run this job under sparkles-heavy-run on Stanley or in an equivalent admitted scope.
+set -euo pipefail
+here=$(cd -- "$(dirname -- "$0")" && pwd)
+scratch=$(cd -- "${1:?pass the clean c1619c37 scratch checkout}" && pwd)
+result=$here/${2:-result}
+mkdir -- "$result"
+exec > >(tee "$result/driver.log") 2>&1
+patch=$here/diagnostic.patch
+applied=0
+
+finish() {
+    status=$?
+    if ((applied)); then
+        if ! git -C "$scratch" apply --reverse "$patch"; then
+            echo "ERROR: scratch patch could not be reversed: $scratch"
+            status=1
+        elif [[ -n $(git -C "$scratch" status --porcelain) ]]; then
+            echo "ERROR: scratch checkout is no longer clean: $scratch"
+            status=1
+        fi
+    fi
+    printf 'JOB-EXIT %s %s\n' "$status" "$(date -Is)" | tee "$result/exit.txt"
+    exit "$status"
+}
+trap finish EXIT
+
+head=$(git -C "$scratch" rev-parse HEAD)
+test "$head" = c1619c3726f12c64acf9c05a6554de4fe3ff1a55
+test -z "$(git -C "$scratch" status --porcelain)"
+echo "START $(date -Is)"
+git -C "$scratch" apply --check "$patch"
+git -C "$scratch" apply "$patch"
+applied=1
+git -C "$scratch" diff --check
+git -C "$scratch" diff | cmp - "$patch"
+(
+    cd -- "$scratch"
+    hostname
+    printf 'source=%s\n' "$head"
+    sha256sum "$patch"
+    rustc --version
+    mbx --version
+) | tee "$result/source.txt"
+(
+    cd -- "$scratch"
+    mbx sparkles-task -- bash -ec '
+        mbx build -j 6 --release -p sparkles-owl --example el_classify
+        cp target/release/examples/el_classify "$1"
+    ' horn-witness-snapshot "$result/el-classify"
+) > "$result/build.log" 2>&1
+sha256sum "$result/el-classify" | tee "$result/binary.sha256"
+echo "BUILD-DONE $(date -Is)"
+python3 -u "$here/compare.py" "$result/el-classify" "$here/.." "$result"

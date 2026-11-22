@@ -1,0 +1,122 @@
+"""Compare actual witness-world class IRIs from one saturated state."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+
+MARK = "HORN_SNAPSHOT_"
+
+
+def result_from(stderr):
+    markers = [line.split("\t") for line in stderr.splitlines() if line.startswith(MARK)]
+    if markers == [[MARK + "BEGIN", "false"]]:
+        return {"entangled": False, "witness_counts": [0, 0], "with": [], "without": []}
+    if len(markers) < 3 or markers[0] != [MARK + "BEGIN", "true"]:
+        raise ValueError("missing or repeated snapshot start")
+    if len(markers[1]) != 3 or markers[1][0] != MARK + "WITNESSES":
+        raise ValueError("missing witness counts")
+    if len(markers[-1]) != 3 or markers[-1][0] != MARK + "END":
+        raise ValueError("incomplete class sets")
+    with_ids, without_ids = [], []
+    for marker in markers[2:-1]:
+        if len(marker) != 2:
+            raise ValueError(f"malformed class marker: {marker!r}")
+        if marker[0] == MARK + "WITH":
+            with_ids.append(marker[1])
+        elif marker[0] == MARK + "WITHOUT":
+            without_ids.append(marker[1])
+        else:
+            raise ValueError(f"unexpected class marker: {marker[0]}")
+    counts = list(map(int, markers[-1][1:]))
+    witnesses = list(map(int, markers[1][1:]))
+    if counts != [len(with_ids), len(without_ids)]:
+        raise ValueError("recorded class counts do not match the IRI sets")
+    if with_ids != sorted(set(with_ids)) or without_ids != sorted(set(without_ids)):
+        raise ValueError("class IRIs are not sorted and unique")
+    if witnesses[0] > witnesses[1] or not set(with_ids).issubset(without_ids):
+        raise ValueError("with-clause result must be a subset of the without-clause result")
+    return {"entangled": True, "witness_counts": witnesses,
+            "with": with_ids, "without": without_ids}
+
+
+def observe(binary, path, threads, env):
+    try:
+        proc = subprocess.run(
+            [binary, "--threads", str(threads), str(path)],
+            text=True, capture_output=True, timeout=30, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"status": 124, "error": "classifier timed out after 30 seconds"}
+    if proc.returncode:
+        return {"status": proc.returncode, "error": proc.stderr, "stdout": proc.stdout}
+    try:
+        classifier = json.loads(proc.stdout)
+        if classifier["threads"] != threads:
+            raise ValueError("classifier used a different thread count")
+        data = result_from(proc.stderr)
+    except (ValueError, KeyError) as error:
+        return {"status": 0, "error": str(error), "stderr": proc.stderr, "stdout": proc.stdout}
+    diff = sorted(set(data["without"]) - set(data["with"]))
+    return {"status": 0, "tier": classifier["tier"], "different_iris": diff, **data}
+
+
+def run_phase(binary, inputs, output, phase):
+    env = dict(os.environ, SPARKLES_HORN_RULES="2")
+    summaries = {
+        str(threads): {"completed": 0, "failed": 0, "entangled": 0,
+                       "witness_set_changed": 0, "world_set_changed": 0,
+                       "nonempty_world_set": 0}
+        for threads in (1, 8)
+    }
+    print(f"PHASE-START {phase} files={len(inputs)}")
+    with (output / f"{phase}.jsonl").open("x", buffering=1) as log:
+        for path in inputs:
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            for threads in (1, 8):
+                data = observe(binary, path, threads, env)
+                log.write(json.dumps({"name": path.name, "sha256": digest,
+                                      "threads": threads, **data}) + "\n")
+                summary = summaries[str(threads)]
+                if "error" in data:
+                    summary["failed"] += 1
+                    print(f"ERROR {phase} t{threads} {path.name}: {data['error']}")
+                    continue
+                summary["completed"] += 1
+                summary["entangled"] += data["entangled"]
+                summary["witness_set_changed"] += (data["witness_counts"][0] !=
+                                                   data["witness_counts"][1])
+                summary["world_set_changed"] += bool(data["different_iris"])
+                summary["nonempty_world_set"] += bool(data["with"])
+                if data["different_iris"]:
+                    print(f"WORLD-DIFFERENCE {phase} t{threads} {path.name} "
+                          f"{json.dumps(data['different_iris'])}")
+    (output / f"{phase}-summary.json").write_text(json.dumps(summaries, indent=2) + "\n")
+    print(f"PHASE-DONE {phase} {json.dumps(summaries)}")
+    return all(s["completed"] == len(inputs) and s["witness_set_changed"] > 0
+               and s["nonempty_world_set"] > 0 for s in summaries.values())
+
+
+def main():
+    binary, corpus, output = (Path(arg).resolve() for arg in sys.argv[1:])
+    hand = sorted((corpus / "hand").glob("*.ofn"))
+    selected = sorted((corpus / "cov/files").glob("*.ofn"))
+    all_generated = sorted((corpus / "cov/all").glob("*.ofn"))
+    if (len(hand), len(selected), len(all_generated)) != (21, 348, 968):
+        raise ValueError("unexpected corpus size")
+    if not {p.name for p in selected}.issubset({p.name for p in all_generated}):
+        raise ValueError("selected inputs are absent from the full generated corpus")
+    if not run_phase(binary, hand + selected, output, "hermit-checked"):
+        print("GATE-FAILED: incomplete runs or covered-witness/world-path coverage")
+        return 1
+    if not run_phase(binary, all_generated, output, "generated"):
+        print("GATE-FAILED: incomplete runs or covered-witness/world-path coverage")
+        return 1
+    print("GATE-DONE")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

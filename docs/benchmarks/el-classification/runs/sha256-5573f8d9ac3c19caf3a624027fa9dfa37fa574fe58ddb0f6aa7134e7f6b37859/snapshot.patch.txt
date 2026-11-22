@@ -1,0 +1,73 @@
+diff --git a/crates/sparkles-owl/src/classify/mod.rs b/crates/sparkles-owl/src/classify/mod.rs
+index 1710691b..169ff1a1 100644
+--- a/crates/sparkles-owl/src/classify/mod.rs
++++ b/crates/sparkles-owl/src/classify/mod.rs
+@@ -2565,10 +2565,42 @@ impl Saturation {
+         // the classes whose instances reach an individual through a context that is not
+         // real, each in a world of its own
+         let mut world_bytes = 0usize;
++        eprintln!("HORN_SNAPSHOT_BEGIN\t{entangled}");
+         if entangled {
+-            let witnesses = world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal);
++            let witnesses = world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal, true);
++            let without = world::witnesses(&ix, &self.ctx, dynamic.as_ref(), &universal, false);
++            let classes = world::reaching(&ix, &self.ctx, dynamic.as_ref(), &witnesses);
++            let without_classes = world::reaching(&ix, &self.ctx, dynamic.as_ref(), &without);
++            let class_iris = |classes: &[Ex]| {
++                classes
++                    .iter()
++                    .map(|&class| match ix.head(class).node {
++                        Node::Class(id) => self.interner.classes[id as usize].as_str(),
++                        _ => unreachable!("worlds are run for named classes"),
++                    })
++                    .collect::<std::collections::BTreeSet<_>>()
++            };
++            let with_iris = class_iris(&classes);
++            let without_iris = class_iris(&without_classes);
++            eprintln!(
++                "HORN_SNAPSHOT_WITNESSES\t{}\t{}",
++                witnesses.len(),
++                without.len()
++            );
++            for iri in &with_iris {
++                eprintln!("HORN_SNAPSHOT_WITH\t{iri}");
++            }
++            for iri in &without_iris {
++                eprintln!("HORN_SNAPSHOT_WITHOUT\t{iri}");
++            }
++            eprintln!(
++                "HORN_SNAPSHOT_END\t{}\t{}",
++                with_iris.len(),
++                without_iris.len()
++            );
++            assert!(witnesses.iter().all(|e| without.binary_search(e).is_ok()));
++            assert!(with_iris.is_subset(&without_iris));
+             if !witnesses.is_empty() {
+-                let classes = world::reaching(&ix, &self.ctx, dynamic.as_ref(), &witnesses);
+                 let mut real: Vec<Ex> = (0..self.ctx.len() as Ex)
+                     .filter(|&e| self.ctx[e as usize].get().is_some_and(|c| c.st.lock().real))
+                     .collect();
+diff --git a/crates/sparkles-owl/src/classify/world.rs b/crates/sparkles-owl/src/classify/world.rs
+index c2d3ad5f..2a3f1f01 100644
+--- a/crates/sparkles-owl/src/classify/world.rs
++++ b/crates/sparkles-owl/src/classify/world.rs
+@@ -560,6 +560,7 @@ pub fn witnesses(
+     ctx: &Contexts,
+     dynamic: Option<&Dynamic>,
+     universal: &[Ex],
++    cover_successors: bool,
+ ) -> Vec<Ex> {
+     let view = GlobalAll { ctx, dynamic };
+     let horn = ix.horn.is_some();
+@@ -621,7 +622,10 @@ pub fn witnesses(
+                                 || succ.iter().any(|s| {
+                                     !st.extra.as_ref().is_some_and(|x| {
+                                         x.horn.succ.contains(s)
+-                                            || super::horn_rules::covered(ix, &x.horn, s.0, s.1)
++                                            || (cover_successors
++                                                && super::horn_rules::covered(
++                                                    ix, &x.horn, s.0, s.1,
++                                                ))
+                                     })
+                                 }));
+                     });

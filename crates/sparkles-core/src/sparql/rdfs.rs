@@ -30,6 +30,13 @@
 //! pattern. The rewrite is graph-agnostic, so it applies in every graph the pattern is
 //! matched in, and each graph is closed on its own, as in Jena, where every graph of the
 //! dataset is wrapped with the schema.
+//!
+//! A property registered as a property function (see [`super::extensions`]) is a call,
+//! not stored data. The rewrite leaves a triple pattern that names one as the query
+//! wrote it and never adds one as a branch, as a subproperty, as the property of a
+//! domain or range, or as the predicate of a superproperty pair. A schema that mentions
+//! a registered property therefore changes no answer through it and calls nothing the
+//! query does not call.
 
 mod explain;
 pub use explain::{AssertedResolver, SchemaLeaves};
@@ -375,13 +382,23 @@ fn schema_of_graph_controlled(
 /// The query pattern with RDFS on read applied, when the context has a schema.
 pub(crate) fn apply<'a>(ctx: &Ctx, gp: &'a GraphPattern) -> Cow<'a, GraphPattern> {
     match ctx.rdfs.as_deref() {
-        Some(s) if !s.is_empty() => Cow::Owned(rewrite(gp, s)),
+        Some(s) if !s.is_empty() => Cow::Owned(rewrite_calls(gp, s, ctx.extensions.as_deref())),
         _ => Cow::Borrowed(gp),
     }
 }
 
 /// `gp` over stored triples, answering as RDFS on read with `schema` answers.
 pub fn rewrite(gp: &GraphPattern, schema: &RdfsSchema) -> GraphPattern {
+    rewrite_calls(gp, schema, None)
+}
+
+/// [`rewrite`], leaving the properties that `calls` registers out of every pattern the
+/// rewrite adds and their own patterns as written.
+fn rewrite_calls(
+    gp: &GraphPattern,
+    schema: &RdfsSchema,
+    calls: Option<&super::extensions::ExtensionRegistry>,
+) -> GraphPattern {
     let mut g = gp.clone();
     if schema.is_empty() {
         return g;
@@ -389,6 +406,7 @@ pub fn rewrite(gp: &GraphPattern, schema: &RdfsSchema) -> GraphPattern {
     let rw = Rewriter {
         s: schema,
         n: Cell::new(0),
+        calls: calls.filter(|r| !r.is_empty()),
     };
     // Blank nodes of the patterns become variables, so that the parts a pattern is split
     // into still share them. Labels are scoped to one basic graph pattern, and the
@@ -407,6 +425,8 @@ const MAX_UNION: usize = 16;
 struct Rewriter<'a> {
     s: &'a RdfsSchema,
     n: Cell<u32>,
+    /// the registered property functions, which the rewrite never adds
+    calls: Option<&'a super::extensions::ExtensionRegistry>,
 }
 
 /// A table of schema terms joined with a pattern.
@@ -419,6 +439,24 @@ enum Table {
 }
 
 impl Rewriter<'_> {
+    /// Whether `p` is a registered property function, a call rather than stored data.
+    fn call(&self, p: &NamedNode) -> bool {
+        self.calls.is_some_and(|r| r.property(p.as_str()).is_some())
+    }
+
+    /// Whether `p` has a subproperty that is not a registered property.
+    fn has_subproperties(&self, p: &NamedNode) -> bool {
+        RdfsSchema::get(&self.s.sub_prop, p.as_ref())
+            .is_some_and(|subs| subs.iter().any(|q| !self.call(q)))
+    }
+
+    /// The pairs of a property and a superproperty, without registered properties.
+    fn property_pairs(&self) -> Vec<[NamedNode; 2]> {
+        let mut pairs = self.s.property_pairs();
+        pairs.retain(|[a, b]| !self.call(a) && !self.call(b));
+        pairs
+    }
+
     fn fresh(&self) -> Variable {
         let n = self.n.get();
         self.n.set(n + 1);
@@ -559,9 +597,15 @@ impl Rewriter<'_> {
     /// A basic graph pattern with its changed patterns replaced, or `None` when none
     /// changes.
     fn bgp(&self, patterns: &[TriplePattern]) -> Option<GraphPattern> {
+        let group = call_group(self.calls, patterns);
         let mut kept = Vec::new();
         let mut parts = Vec::new();
-        for t in patterns {
+        let mut called = Vec::new();
+        for (t, in_group) in patterns.iter().zip(group) {
+            if in_group {
+                called.push(t.clone());
+                continue;
+            }
             match self.triple(&t.subject, &t.predicate, &t.object) {
                 Some(p) => parts.push(p),
                 None => kept.push(t.clone()),
@@ -571,7 +615,10 @@ impl Rewriter<'_> {
             return None;
         }
         let mut out = (!kept.is_empty()).then_some(GraphPattern::Bgp { patterns: kept });
-        for p in parts {
+        // the calls and their list cells, as written, after the patterns that bind
+        // their inputs
+        let called = (!called.is_empty()).then_some(GraphPattern::Bgp { patterns: called });
+        for p in parts.into_iter().chain(called) {
             out = Some(match out {
                 None => p,
                 Some(l) => join(l, p),
@@ -588,15 +635,15 @@ impl Rewriter<'_> {
         o: &TermPattern,
     ) -> Option<GraphPattern> {
         let changes = match p {
+            // a call is answered by its function, as the query wrote it
+            NamedNodePattern::NamedNode(p) if self.call(p) => false,
             NamedNodePattern::NamedNode(p) if p.as_ref() == TYPE => !self.s.only_properties(),
             NamedNodePattern::NamedNode(p)
                 if p.as_ref() == rdfs::SUB_CLASS_OF || p.as_ref() == rdfs::SUB_PROPERTY_OF =>
             {
                 false
             }
-            NamedNodePattern::NamedNode(p) => {
-                RdfsSchema::get(&self.s.sub_prop, p.as_ref()).is_some()
-            }
+            NamedNodePattern::NamedNode(p) => self.has_subproperties(p),
             NamedNodePattern::Variable(_) => true,
         };
         if !changes {
@@ -645,6 +692,7 @@ impl Rewriter<'_> {
                 for q in RdfsSchema::get(&self.s.sub_prop, pn.as_ref())
                     .into_iter()
                     .flatten()
+                    .filter(|q| !self.call(q))
                 {
                     b.push(tp(&s, q, &o));
                 }
@@ -732,7 +780,7 @@ impl Rewriter<'_> {
             _ => {}
         }
         // domains: s p ?y
-        for (p, classes) in &self.s.domain {
+        for (p, classes) in self.s.domain.iter().filter(|(p, _)| !self.call(p)) {
             let y = TermPattern::Variable(self.fresh());
             let k = self.s.closed(classes);
             if let Some(g) = with_table(tp(s, p, &y), &[o], k.into_iter().map(|c| vec![c])) {
@@ -742,7 +790,7 @@ impl Rewriter<'_> {
         // ranges: ?y p s
         let literal_s = matches!(s, TermPattern::Literal(_));
         if literal_range || !literal_s {
-            for (p, classes) in &self.s.range {
+            for (p, classes) in self.s.range.iter().filter(|(p, _)| !self.call(p)) {
                 let y = TermPattern::Variable(self.fresh());
                 let k = self.s.closed(classes);
                 let mut pat = tp(&y, p, s);
@@ -762,7 +810,7 @@ impl Rewriter<'_> {
         }
         if subproperties && self.s.has_classes() {
             for (q, sups) in &self.s.sup_prop {
-                if sups.contains(&ty) {
+                if sups.contains(&ty) && !self.call(q) {
                     b.push(tp(s, q, o));
                 }
             }
@@ -793,7 +841,7 @@ impl Rewriter<'_> {
                     object: o.clone(),
                 }],
             };
-            let rows = self.s.property_pairs();
+            let rows = self.property_pairs();
             if let Some(g) = with_table(
                 pat,
                 &[&TermPattern::Variable(q), &p],
@@ -811,13 +859,19 @@ impl Rewriter<'_> {
         } else {
             (true, false)
         };
-        let types = self.types(s, o, false, literal_range, subproperties);
+        // a registered `rdf:type` is a call, which no type branch may add
+        let types = if self.call(&TYPE.into_owned()) {
+            Vec::new()
+        } else {
+            self.types(s, o, false, literal_range, subproperties)
+        };
         let mut preds = vec![TYPE.into_owned()];
         if !subject_bound {
             preds.extend(
                 RdfsSchema::get(&self.s.sup_prop, TYPE)
                     .into_iter()
                     .flatten()
+                    .filter(|q| !self.call(q))
                     .cloned(),
             );
         }
@@ -845,12 +899,15 @@ impl Rewriter<'_> {
         use PropertyPathExpression as P;
         match path {
             P::NamedNode(p) => {
-                if p.as_ref() == rdfs::SUB_CLASS_OF || p.as_ref() == rdfs::SUB_PROPERTY_OF {
+                if self.call(p)
+                    || p.as_ref() == rdfs::SUB_CLASS_OF
+                    || p.as_ref() == rdfs::SUB_PROPERTY_OF
+                {
                     false
                 } else if p.as_ref() == TYPE {
                     top && !self.s.only_properties()
                 } else {
-                    RdfsSchema::get(&self.s.sub_prop, p.as_ref()).is_some()
+                    self.has_subproperties(p)
                 }
             }
             P::NegatedPropertySet(_) => top,
@@ -882,6 +939,13 @@ impl Rewriter<'_> {
     ) -> GraphPattern {
         use PropertyPathExpression as P;
         match path {
+            // a path link reads stored triples, also of a registered property, which
+            // as a triple pattern would be a call
+            P::NamedNode(p) if self.call(p) => GraphPattern::Path {
+                subject: s.clone(),
+                path: path.clone(),
+                object: o.clone(),
+            },
             P::NamedNode(p) => {
                 let pred = NamedNodePattern::NamedNode(p.clone());
                 self.triple(s, &pred, o).unwrap_or_else(|| tp(s, p, o))
@@ -994,10 +1058,12 @@ impl Rewriter<'_> {
                 if p.as_ref() != TYPE
                     && p.as_ref() != rdfs::SUB_CLASS_OF
                     && p.as_ref() != rdfs::SUB_PROPERTY_OF
+                    && !self.call(p)
                 {
                     for q in RdfsSchema::get(&self.s.sub_prop, p.as_ref())
                         .into_iter()
                         .flatten()
+                        .filter(|q| !self.call(q))
                     {
                         out = P::Alternative(Box::new(out), Box::new(P::NamedNode(q.clone())));
                     }
@@ -1166,7 +1232,7 @@ fn blank_to_var(gp: &mut GraphPattern) {
         match t {
             TermPattern::BlankNode(b) => {
                 *t = TermPattern::Variable(Variable::new_unchecked(format!(
-                    "__rdfsb_{}",
+                    "{BLANK_PREFIX}{}",
                     b.as_str()
                 )));
             }
@@ -1267,6 +1333,80 @@ fn blank_to_var(gp: &mut GraphPattern) {
         | G::OrderBy { inner, .. }
         | G::Group { inner, .. } => blank_to_var(inner),
         G::Service { .. } | G::Values { .. } => {}
+    }
+}
+
+/// The prefix of the variables that stand for the query's blank nodes after the rewrite.
+/// SPARQL variable names cannot contain `-`, so no query can write one.
+const BLANK_PREFIX: &str = "__rdfs-b_";
+
+/// The label of a blank node of the query, written or renamed by the rewrite, so that a
+/// registered call's list argument is still read as the list the query wrote.
+pub(crate) fn list_node(t: &TermPattern) -> Option<&str> {
+    match t {
+        TermPattern::BlankNode(b) => Some(b.as_str()),
+        TermPattern::Variable(v) => v.as_str().strip_prefix(BLANK_PREFIX),
+        _ => None,
+    }
+}
+
+/// Which patterns of a basic graph pattern are registered calls or the cells of their
+/// list arguments: the `rdf:first` and `rdf:rest` patterns of the blank nodes reached
+/// from a list-shaped argument through `rdf:rest`.
+fn call_group(
+    calls: Option<&super::extensions::ExtensionRegistry>,
+    patterns: &[TriplePattern],
+) -> Vec<bool> {
+    use super::extensions::ArgumentShape;
+    let mut group = vec![false; patterns.len()];
+    let Some(r) = calls else {
+        return group;
+    };
+    let mut heads: Vec<&str> = Vec::new();
+    for (t, g) in patterns.iter().zip(group.iter_mut()) {
+        let NamedNodePattern::NamedNode(p) = &t.predicate else {
+            continue;
+        };
+        let Some(d) = r.property(p.as_str()) else {
+            continue;
+        };
+        *g = true;
+        for (x, shape) in [(&t.subject, &d.subject), (&t.object, &d.object)] {
+            if matches!(shape, ArgumentShape::List(_))
+                && let Some(head) = list_node(x)
+            {
+                heads.push(head);
+            }
+        }
+    }
+    if heads.is_empty() {
+        return group;
+    }
+    // A cell may itself be a call when `rdf:first` or `rdf:rest` is registered, so the
+    // walk tracks the cells it has visited apart from the group.
+    let mut visited = vec![false; patterns.len()];
+    loop {
+        let mut grew = false;
+        for (i, t) in patterns.iter().enumerate() {
+            let NamedNodePattern::NamedNode(p) = &t.predicate else {
+                continue;
+            };
+            let (first, rest) = (p.as_ref() == rdf::FIRST, p.as_ref() == rdf::REST);
+            if visited[i] || !(first || rest) {
+                continue;
+            }
+            if list_node(&t.subject).is_some_and(|b| heads.contains(&b)) {
+                visited[i] = true;
+                group[i] = true;
+                grew = true;
+                if rest && let Some(next) = list_node(&t.object) {
+                    heads.push(next);
+                }
+            }
+        }
+        if !grew {
+            return group;
+        }
     }
 }
 

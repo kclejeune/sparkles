@@ -1,0 +1,30 @@
+"""analyze.py OUT: per file and thread count, the median over rounds of each arm's process
+median classification time, index time, peak RSS and peak estimate, and each arm's ratio to
+base with the range of the per-round ratios. Fails when a process exited non-zero or the
+taxonomies of one file differ between arms."""
+import json, statistics, sys
+from collections import defaultdict
+rows = [json.loads(l) for l in open(f"{sys.argv[1]}/timing/log.txt") if l.startswith("{")]
+bad = [r for r in rows if r["exit"] != 0]
+tax = defaultdict(set)
+for r in rows:
+    tax[(r["file"], r["threads"])].add(r["tax"])
+diff = {k: v for k, v in tax.items() if len(v) != 1}
+by = defaultdict(dict)
+for r in rows:
+    by[(r["file"], r["threads"], r["arm"])][r["round"]] = r
+med = lambda xs: statistics.median(xs)
+print("| File | Threads | Arm | ms | index ms | arm/base | range | index arm/base | RSS MiB | estimate MiB |")
+print("|---|---:|---|---:|---:|---:|---|---:|---:|---:|")
+for (f, t) in sorted(tax):
+    base = by[(f, t, "base")]
+    for arm in ("base", "e21", "tip"):
+        a = by[(f, t, arm)]
+        rs = sorted(set(a) & set(base))
+        ratios = [a[k]["ms"] / base[k]["ms"] for k in rs]
+        iratio = med([a[k]["index"] for k in rs]) / med([base[k]["index"] for k in rs])
+        print(f"| {f} | {t} | {arm} | {med([a[k]['ms'] for k in rs]):.1f} | {med([a[k]['index'] for k in rs]):.1f} | "
+              f"{med(ratios):.3f} | {min(ratios):.3f} to {max(ratios):.3f} | {iratio:.3f} | "
+              f"{med([a[k]['rss'] for k in rs]) / 1024:.0f} | {med([a[k]['est'] for k in rs]) / 2**20:.0f} |")
+print(f"\nprocesses {len(rows)}, failed {len(bad)}, files with differing taxonomies {len(diff)}")
+sys.exit(1 if bad or diff else 0)

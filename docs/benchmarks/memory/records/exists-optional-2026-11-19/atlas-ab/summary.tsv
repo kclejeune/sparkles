@@ -1,0 +1,17 @@
+query	mode	a_ms	b_ms	b/a	n	answers
+class-exists	eager	36.24	38.53	1.063	42/42	same
+class-exists	streaming	36.66	32.46	0.885	42/42	same
+class-fail	eager	82.37	83.00	1.008	42/42	same
+class-fail	streaming	78.06	77.73	0.996	42/42	same
+exists-optional	eager	19.38	21.65	1.117	42/42	same
+exists-optional	streaming	49.06	19.70	0.402	42/42	same
+knows-exists	eager	132.09	132.88	1.006	42/42	same
+knows-exists	streaming	319.49	180.92	0.566	42/42	same
+knows-fail	eager	148.17	150.05	1.013	42/42	same
+knows-fail	streaming	303.50	197.90	0.652	42/42	same
+knows-mixed	eager	548.75	547.46	0.998	42/42	same
+knows-mixed	streaming	829.33	646.90	0.780	42/42	same
+optional-cond	eager	20.53	18.59	0.905	42/42	same
+optional-cond	streaming	70.10	19.39	0.277	42/42	same
+optional-filter	eager	27.88	27.22	0.976	42/42	same
+optional-filter	streaming	46.59	19.25	0.413	42/42	same

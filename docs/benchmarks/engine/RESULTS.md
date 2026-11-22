@@ -206,6 +206,33 @@ Every query passes. Repeated runs of the same comparison differed by up to 4% on
 under 15 µs, and `path-plus` reads faster with the pool on, so ratios of these queries
 below 1.05 are within the run-to-run spread.
 
+### The cost of a root scan that shares its block
+
+A cursor whose root is a scan hands out an index block's rows without copying them, and
+the scan reads the block through the handle that those batches share. Two builds were
+compared on atlas with 100,000 people and one Rayon worker, in 12 rounds of A,B,B,A in both
+arm orders, combined to cancel the bias of the second position. The base is `9acd6d74`,
+the build before the scan stopped charging its block between reads, and the current build
+is `4e9185f1`.
+
+| Query | Mode | Base | Current against base | 95% interval | Added time |
+|---|---|--:|--:|---|--:|
+| `root-limit` | streaming | 3.6 µs | 1.039 | 1.004 to 1.075 | 0.14 µs |
+| `root-limit` | automatic | 11.5 µs | 1.040 | 1.011 to 1.088 | 0.46 µs |
+| `root-scan` | streaming | 82.4 µs | 1.024 | 1.021 to 1.027 | 1.98 µs |
+| `root-scan` | automatic | 83.9 µs | 1.011 | 1.007 to 1.014 | 0.89 µs |
+| `export-500k` | streaming | 391.3 µs | 1.005 | 1.003 to 1.008 | 1.95 µs |
+| `export-500k` | automatic | 409.0 µs | 1.003 | 0.999 to 1.006 | 1.07 µs |
+
+*Measured on atlas.*
+
+`root-scan` under streaming takes 2 µs longer than the base and fails the Intel rule. It
+and the smaller costs of automatic `root-scan` and streaming `export-500k`, whose intervals
+lie above 1.0, are the remainder that roadmap item 1063 holds. The current build is
+1.6% to 3.5% faster than the build before item 1063 on each of these cells. The
+[run record](runs/2026-11-19-shared-scan-atlas/README.md) has the method, the controls and
+a cycle profile of the scan.
+
 ### Planning large basic graph patterns
 
 The ignored test `large_bgp_planning_time` in `crates/sparkles/tests/nesting.rs` runs
@@ -507,23 +534,26 @@ A change that a gate covers compares its own gate record with them using
 ### W3C suites under streaming execution
 
 `mise run test:w3c:streaming` ran the query evaluation suites with `execution=streaming`
-at commit fcff390a, whose engine code is that of 04d49b57. The suites came from the
-Apache Jena checkout that the tests read by default. Every suite passed with no new
-failures, and the debug test binary took 23 seconds on a busy development laptop.
+at commit 9df856f3, with `SPARKLES_W3C_FALLBACKS=1` so that the log names the operator of
+each fallback. The suites came from the Apache Jena checkout that `SPARKLES_W3C_DIR`
+named. Every suite passed with no new failures, and the debug test binary took 26 seconds
+on the development laptop.
 
 | Suite | Passed | Failed | Skipped | Queries with eager fallback |
 |---|--:|--:|--:|--:|
 | SPARQL 1.0 and 1.1 query | 508 | 0 | 103 | 0 |
 | SPARQL 1.2 | 63 | 0 | 206 | 0 |
-| Jena's CDT, FOLD and UNFOLD tests | 655 | 0 | 0 | 30 |
+| Jena's CDT, FOLD and UNFOLD tests | 655 | 0 | 0 | 0 |
 | ARQ property functions | 48 | 0 | 0 | 24 |
 
 The skipped tests are syntax and update tests, which do not depend on the execution mode
 and run in the default pass. The fallback counts are the queries whose plans hold an
 operator that the cursors do not stream, which then runs eagerly on first demand. These
-counts are the measure that the executor merge drives to zero. The
-[run record](runs/2026-11-01-w3c-streaming-stanley/record.json) and its
-[log](runs/2026-11-01-w3c-streaming-stanley/output.log) hold the counts. `mise run test`
+counts are the measure that the executor merge drives to zero. The 24 fallbacks of the
+property-function suite are calls over constant arguments, which the strict policy
+refuses until they get a reader of their own. The
+[run record](runs/2026-11-18-w3c-streaming-stanley/record.json) and its
+[log](runs/2026-11-18-w3c-streaming-stanley/output.log) hold the counts. `mise run test`
 runs the same tests in CI with Oxigraph's GeoSPARQL tests added. A separate run with the
 `geo` feature gave 37 passes and the 7 listed failures of those tests in both modes, with
 no eager fallback. The streaming tests

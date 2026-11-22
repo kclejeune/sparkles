@@ -1,0 +1,8 @@
+parse 0.20 ms · plan 0.25 ms · exec 191.50 ms · total 191.95 ms
+Project ?c ?w  [1 rows (est 1), 191.47 ms]
+  Bind ?w := ?ea957b9de9545efc18eaf553e6d4d62c  [1 rows (est 1), 191.46 ms]
+    Bind ?c := ?ee04ae535797c20378c7c624a0788d84  [1 rows (est 1), 191.46 ms]
+      GroupBy by  aggs ?ee04ae535797c20378c7c624a0788d84=Count ?ea957b9de9545efc18eaf553e6d4d62c=Count [incremental]  [1 rows (est 1), 191.44 ms]
+        OptionalJoin filter (?f = <http://example.org/nobody>) [merge on ?p]  [1020000 rows (est 1748334), 183.96 ms]
+          IndexScan PSO ?p <http://xmlns.com/foaf/0.1/name> ?n [decodes SOG]  [1020000 rows (est 1020000), 15.82 ms]
+          IndexScan PSO ?p <http://xmlns.com/foaf/0.1/knows> ?f [decodes SOG]  [2497620 rows (est 2497620), 24.09 ms]

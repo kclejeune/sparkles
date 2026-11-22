@@ -1,0 +1,36 @@
+go base el insn=6423831696
+<not counted> tax=97e1d85e8ae3254b {"sat":409.055885,"idx":43.656676999999995,"concl":2800914,"conj":0,"over":false,"dlWork":0}
+go base horn insn=6777730628
+<not counted> tax=e8828808260eb2a4 {"sat":473.291114,"idx":45.876447,"concl":2947343,"conj":2609,"over":false,"dlWork":0}
+go base el3 insn=16408204440 tax=97e1d85e8ae3254b {"sat":309.187008,"idx":36.781287000000006,"concl":2800914,"conj":0,"over":false,"dlWork":0}
+go base horn3 insn=17466052570 tax=e8828808260eb2a4 {"sat":360.79657799999995,"idx":42.483528,"concl":2947343,"conj":2609,"over":false,"dlWork":0}
+ore_ont_14817 base el1 insn=6984525430 tax=668ff19dc1444b0c {"sat":1015.1864239999999,"idx":64.644178,"concl":16469022,"conj":0,"over":false,"dlWork":0}
+ore_ont_14817 base el2 insn=11600328731 tax=668ff19dc1444b0c {"sat":497.621492,"idx":63.747703,"concl":16469022,"conj":0,"over":false,"dlWork":0}
+ore_ont_14817 base horn1 insn=21834473368 tax=c4cce8afad0915e1 {"sat":3981.26135,"idx":69.66946899999999,"concl":22090247,"conj":70689,"over":true,"dlWork":0}
+ore_ont_14817 base horn2 insn=41304203931 tax=c4cce8afad0915e1 {"sat":4290.005415,"idx":75.984544,"concl":22090247,"conj":70689,"over":true,"dlWork":0}
+ore_ont_14817 base def1 insn=727649919288 tax=c4cce8afad0915e1 {"sat":4508.270394,"idx":85.516132,"concl":22090247,"conj":70689,"over":true,"dlWork":0}
+ore_ont_9663 base el1 insn=8379654696 tax=6f3507767e5b0edf {"sat":739.65176,"idx":88.009404,"concl":10813172,"conj":0,"over":false,"dlWork":0}
+ore_ont_9663 base el2 insn=14657855213 tax=6f3507767e5b0edf {"sat":774.367619,"idx":85.739309,"concl":10813172,"conj":0,"over":false,"dlWork":0}
+ore_ont_9663 base horn1 insn=27838046343 tax=0ca0ab55ef6cbf4a {"sat":8941.654994,"idx":94.266374,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_9663 base horn2 insn=53571931731 tax=0ca0ab55ef6cbf4a {"sat":5925.698065,"idx":90.359412,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_9663 base def1 insn=857330916406 tax=0ca0ab55ef6cbf4a {"sat":4721.3551769999995,"idx":66.283473,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+M2-DONE
+ore_ont_16680 base def insn=66370670799 tax=4343d2c027a79982 {"sat":10262.462588,"idx":68.41190900000001,"concl":4514818,"conj":0,"over":false,"dlWork":6945320}
+ore_ont_16680 w2 w0 insn=57405527868 tax=4343d2c027a79982 {"sat":7315.5754990000005,"idx":62.260645000000004,"concl":4514818,"conj":0,"over":false,"dlWork":6945320}
+ore_ont_16680 w2 def insn=57409172467 tax=4343d2c027a79982 {"sat":8474.935803999999,"idx":58.764773,"concl":4514818,"conj":0,"over":false,"dlWork":6945320}
+ore_ont_13103 base def insn=22144419087 tax=1448b2df5a7bed25 {"sat":2901.307253,"idx":31.702441999999998,"concl":1827445,"conj":0,"over":false,"dlWork":2763619}
+ore_ont_13103 w2 w0 insn=19993123740 tax=1448b2df5a7bed25 {"sat":2794.8493160000003,"idx":32.605504,"concl":1827445,"conj":0,"over":false,"dlWork":2763619}
+ore_ont_13103 w2 def insn=19996486399 tax=1448b2df5a7bed25 {"sat":2707.9790949999997,"idx":34.337638,"concl":1827445,"conj":0,"over":false,"dlWork":2763619}
+ore_ont_5438 base def insn=7177668868 tax=a3d6a2d27eda8c99 {"sat":954.4893880000001,"idx":21.629858,"concl":708972,"conj":0,"over":false,"dlWork":783093}
+ore_ont_5438 w2 w0 insn=6525220643 tax=a3d6a2d27eda8c99 {"sat":854.120582,"idx":20.458181999999997,"concl":708972,"conj":0,"over":false,"dlWork":783093}
+ore_ont_5438 w2 def insn=6526170980 tax=a3d6a2d27eda8c99 {"sat":865.228077,"idx":21.753483,"concl":708972,"conj":0,"over":false,"dlWork":783093}
+ore_ont_14817 base def insn=727649039672 tax=c4cce8afad0915e1 {"sat":2165.044435,"idx":84.992955,"concl":22090247,"conj":70689,"over":true,"dlWork":0}
+ore_ont_14817 w2 w0 insn=583606360110 tax=c4cce8afad0915e1 {"sat":2371.349146,"idx":170.123771,"concl":22090247,"conj":70689,"over":true,"dlWork":0}
+ore_ont_14817 w2 def insn=25550951198 tax=c4cce8afad0915e1 {"sat":2339.072265,"idx":79.755758,"concl":22090247,"conj":70689,"over":true,"dlWork":0}
+ore_ont_9663 base def insn=857269425028 tax=0ca0ab55ef6cbf4a {"sat":3337.94582,"idx":65.674779,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_9663 w2 w0 insn=700386126299 tax=0ca0ab55ef6cbf4a {"sat":5243.115695,"idx":105.867005,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_9663 w2 def insn=51128919259 tax=0ca0ab55ef6cbf4a {"sat":3387.154748,"idx":68.466176,"concl":35611566,"conj":97224,"over":true,"dlWork":0}
+ore_ont_3215 base def insn=183070688763 tax=b55d92d645f4054c {"sat":925.6122340000001,"idx":170.350528,"concl":37046160,"conj":0,"over":true,"dlWork":0}
+ore_ont_3215 w2 w0 insn=158785850467 tax=b55d92d645f4054c {"sat":1182.261955,"idx":281.741756,"concl":37046160,"conj":0,"over":true,"dlWork":0}
+ore_ont_3215 w2 def insn=158857976216 tax=b55d92d645f4054c {"sat":1249.439737,"idx":216.362271,"concl":37046160,"conj":0,"over":true,"dlWork":0}
+M6-DONE

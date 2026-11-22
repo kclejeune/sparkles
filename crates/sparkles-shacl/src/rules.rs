@@ -119,13 +119,13 @@ fn number(t: &Term, what: &str) -> Result<f64> {
 impl Parser<'_> {
     /// Read every `sh:rule` of the shapes graph into [`Shapes::rules`].
     pub(crate) fn parse_rules(&mut self) -> Result<()> {
-        let mut pairs: Vec<(Term, Term)> = self
-            .g
-            .g
-            .triples_for_predicate(sh::RULE)
-            .map(|t| (Term::from(t.subject.into_owned()), t.object.into_owned()))
-            .collect();
+        let mut pairs = Vec::new();
+        for t in self.g.g.triples_for_predicate(sh::RULE) {
+            self.check_deadline()?;
+            pairs.push((Term::from(t.subject.into_owned()), t.object.into_owned()));
+        }
         pairs.sort_by_cached_key(|(s, r)| (s.to_string(), r.to_string()));
+        self.check_deadline()?;
         for (s, r) in pairs {
             let shape = self
                 .shape(&s)
@@ -199,7 +199,7 @@ impl Parser<'_> {
                     [] => bail!("a SPARQL rule needs sh:construct"),
                     _ => bail!("sh:construct has more than one value"),
                 };
-                let prefixes = crate::sparql::prefixes(&self.g, r);
+                let prefixes = crate::sparql::prefixes(&self.g, r, self.deadline)?;
                 let query = crate::sparql::parse(&text, &prefixes, &["this".to_string()])?;
                 if !matches!(query, Query::Construct { .. }) {
                     bail!("sh:construct is not a CONSTRUCT query");

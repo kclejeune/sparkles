@@ -557,6 +557,17 @@ pub fn validate(
     engine::validate(snap, schema, map, opts)
 }
 
+/// Validate with an additional byte allowance for retained results and explanations.
+pub fn validate_controlled(
+    snap: &Arc<Snapshot>,
+    schema: &CompiledSchema,
+    map: &ShapeMap,
+    opts: &ValidateOptions,
+    max_report_bytes: Option<u64>,
+) -> anyhow::Result<ResultMap> {
+    engine::validate_controlled(snap, schema, map, opts, max_report_bytes)
+}
+
 /// Validate one node against one shape.
 pub fn validate_node(
     snap: &Arc<Snapshot>,

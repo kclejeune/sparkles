@@ -635,7 +635,7 @@ pub(super) fn path_search_leaf(
             vars.push(v);
         }
     }
-    let Some((graph, graph_var)) = p.graph_filter(g) else {
+    let Some((graph, graph_var)) = p.graph_filter(g)? else {
         return Ok(Node::empty(vars));
     };
     if graph_var.is_some() {

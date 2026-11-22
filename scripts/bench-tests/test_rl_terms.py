@@ -3,6 +3,7 @@ the OWL 2 RL reference: the datatypes it gives each literal (the rule dt-type2),
 round trip of encoded terms, the split of an N-Quads dump, and the differ's verdicts, which
 must match those of a comparison of two in-memory sets."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import contextlib
 import gc
 import importlib.util

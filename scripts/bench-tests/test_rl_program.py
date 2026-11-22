@@ -4,6 +4,7 @@ owl:sameAs. Check rdfs.rls on generalized intermediates and container membership
 properties. NMO names the nmo executable, and without it or nmo on PATH the tests are
 skipped."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import os
 import shutil

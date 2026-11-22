@@ -343,6 +343,94 @@ lock, so jobs from several lanes queue rather than compete. `--no-wait` starts a
 returns, and `--status` and `--fetch` follow it later. The
 [remote CI section](REMOTE-EXECUTORS.md#remote-ci) describes the bounds on a Boat worker.
 
+`mise run check:remote --host <host> '<command>'` runs one targeted step the same way, such
+as `mbx check`, `mbx clippy --all-targets -- -D warnings` or `mbx nextest run -p <crate>
+--test <name>`, and prints the command's log and exits with its code. It checks the
+working tree as it is, with its uncommitted and untracked files, unless `--commit` asks for
+`HEAD`. The tree travels as a temporary commit object whose parent is `HEAD`, which a
+private index writes, so the branch, the index and the stash are left alone. The host
+checks out the whole commit, `rust-toolchain.toml` and `mise.toml` included, exports
+`RUSTUP_TOOLCHAIN` from `rust-toolchain.toml` and runs the command under `mise exec`, so the
+pinned compiler and the pinned mbx apply. The log starts with the `rustc --version` and
+`mbx --version` the command used. The step is a job of `scripts/remote-ci.sh --cmd`, so it
+waits for the host's heavy lock and needs the host's disk floor, as lane CI does.
+
+A job of `scripts/remote-ci.sh` exits with the code of its check, and with codes of its own
+when the check did not finish. Exit 2 means the job could not be set up and exit 3 that too
+little time was left before its end. Exit 4 means the host refused the job at admission,
+most often because its disk was below its floor, and exit 5 that the disk fell under
+`REMOTE_CI_RUN_FLOOR_GIB` during the run. A refusal for the disk writes `disk-below-floor`
+to the job's `outcome` file, and `remote-ci.sh` then says that the result says nothing about
+the commit. Any other refusal names its reason in the job's `progress.log`. Exit 6 means the check was stopped and its
+processes could not be shown gone, so the worktree stays on the host for a later cleanup. A
+command that itself exits with one of these codes is told apart by the `outcome` file and
+the job's `progress.log`. The [remote CI section](REMOTE-EXECUTORS.md#remote-ci) gives the
+details.
+
+### Script tests
+
+The Python tests of the CI, gate and benchmark scripts live in `scripts/bench-tests`, and
+`mise run test:bench-scripts` runs them with `scripts/unittest-parallel.py`, eight processes
+at a time. `python3 -m unittest discover -s scripts/bench-tests` runs the same tests
+serially, and the runner reaches the same verdict under the condition given below. It
+discovers the suite once in a child process and then starts one process per module or
+package that discovery loads. Each process discovers the whole suite again, checks that it
+found the same tests in the same order, and runs its own part exactly as discovered. Import
+errors, import-time skips and class and module fixtures therefore behave as they do
+serially. The whole suite runs in one process, as discovery returned it, and the runner says
+why, when any module or package has a `load_tests` hook, when the suite holds anything other
+than default suites and `TestCase` tests, including a suite given its own `run`, when a test
+module changes unittest's suite classes or rebinds their names, or when test classes of one
+module run under more than one module, as when one test module imports another's class. Such
+a suite or test can depend on what ran before it, and the runner does not try to tell
+whether it does. A default suite that replaces both its own `run` and `countTestCases` and
+hides its tests, for instance by setting `_tests` to `None`, is outside what the runner
+supports, and the runner fails the run with exit 1 instead of passing it. Tests that share
+state in another way, such as a helper module's globals, are not detected. The runner
+therefore reaches the serial verdict only when no test depends on state that a test in
+another process left behind, and passing alone does not show this, since such a test can
+skip instead of fail. The same holds for the tests of a split module.
+The runner also assumes that a test's own `run` method reads only its own test's result, and
+that test code does not react to being inspected or imported more than once, since each
+process imports every module and asks each test for its id and attributes again. The
+[nightly gate](#nightly-gate) runs the suite both ways and fails when the two verdicts or
+test counts differ.
+The three long tests of `test_x08_latency` run one per process. A module named with
+`--split` is split this way only when it has no fixtures, imported classes or repeated
+tests, and otherwise runs whole with a note that says why.
+
+Each process writes a result record, and the runner takes its verdict from those records
+and from unittest's own results, never from the printed output. A process that ends without
+a complete record fails, and a run in which no test ran and none was skipped exits 5, as
+unittest does. The process-leak check in `test_zz_process_leaks.py` runs once, after every
+other process, on the unwaited subprocesses that each process reports after its tests and
+teardown. Discovery has a 300 s deadline and each process a 900 s deadline, which
+`--discover-timeout` and `--unit-timeout` change. The one process that runs the whole suite,
+when it does, has a 2400 s deadline, which `--suite-timeout` changes. At a deadline, or on SIGINT, SIGTERM or
+SIGHUP, the runner starts no more processes, stops every active one with its group and the
+descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
+the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
+stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
+host it says so and hands the run to a serial `unittest discover`, which then exits as it
+would on its own. It hands the run over in the same way when the discovery directory, or any
+directory under it, has an entry named as one of the few modules that its processes load
+before discovery and serial discovery does not, such as `json.py`, since a test importing
+`json` would get that file serially and the runner's module in its processes. Serial
+discovery puts the working directory first on the path before it loads `argparse` and
+`unittest`, so an entry there named as any module loaded after interpreter startup, such as
+`locale.py`, also hands the run over. A test that puts a directory outside the discovery
+directory on the path is not checked, and the nightly comparison of the two runs catches a
+module that it shadows. `--keep DIR` keeps the discovery, the plan, each process's output
+and the result records. Discovery and every process get the interpreter's `-W`
+options, so `python3 -Werror scripts/unittest-parallel.py` fails on a warning as serial
+`python3 -Werror -m unittest discover` does.
+
+Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
+`test_git_isolation.py` fails when one does not. The import removes the host's `GIT_*`
+variables and global Git configuration, such as hooks, signing and templates, so a fixture
+repository and any script a test runs see only their own settings. A new test module needs
+the same first import, even when it runs Git only through another script.
+
 ### Remote executors
 
 Prefer available local resources before renting another worker. A 16 GiB Boat worker is
@@ -379,8 +467,9 @@ commands accept an explicit admitted `boat:bx_ID` worker. Build hosts, partition
 shares and gate hosts accept the same selector. The [remote executor commands](REMOTE-EXECUTORS.md)
 describe the tracked qualification/environment/finish commands, explicit private
 profile and admission inputs, warm reuse, artifact transport and cleanup. The batch query
-screen runs through `bench:remote` on a Boat worker, and the retired `bench:nsc` tasks are
-unsupported. Changing placement preserves the tests, benchmark comparability and acceptance criteria.
+screen runs on a quiet Intel host, as [benchmarking](BENCHMARKING.md) describes, and a
+`bench:remote` run on a Boat worker gives only an approximate check. The retired
+`bench:nsc` tasks are unsupported. Changing placement preserves the tests, benchmark comparability and acceptance criteria.
 
 ### Known flaky tests
 
@@ -550,10 +639,18 @@ another port. The task is not part of `mise run ci`.
 
 ### Browser integration tests
 
-`mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
-port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
-configuration with one user and one API token. It then runs the Playwright tests in
-`ui/tests/e2e` in headless Chromium and stops the server.
+`mise run ui:e2e` builds the formatter's WebAssembly module, the UI with the module and a
+debug server. It starts two `sparkles serve` processes on free ports of 127.0.0.1, each
+with a temporary data directory. The first has a small dataset and an auth configuration
+with users and API tokens. The second runs without auth and allows private outbound
+addresses. The task then runs the Playwright tests in `ui/tests/e2e` in headless Chromium
+and stops the servers. The Pattern pane, the plan's pattern and **Apply to query** in the
+facets of a query have no server fallback, so their tests need the module. Before the
+servers start, the setup looks for the module in the directory that `SPARKLES_UI_DIR`
+names. Without that setting it looks in `ui/build` when the binary is the default debug
+build, and it skips the check for another binary, whose UI it cannot see. It stops with a
+message when the module is missing. `SPARKLES_E2E_NO_WASM=1` skips the check, and the
+tests that need the module still fail without it.
 
 To test another binary, set `SPARKLES_BIN=path/to/sparkles`. Extra arguments go to
 `playwright test`, as in `mise run ui:e2e -- -g Similar`. The flake's dev shell provides
@@ -943,7 +1040,7 @@ keeps its recorded intent for reconciliation.
 | `gate.sh --no-wait <rev>` | Pushes and starts the gate, then returns, for agents with bounded waits. |
 | `gate.sh --status <rev>` | Prints each half's progress, steps and last memory sample. The last line is `active` while either half runs. |
 | `gate.sh --fetch <rev>` | Copies and merges the results into `.artifacts/gates/main-gate-<name>-<host>/` of the main checkout. |
-| `gate.sh --hosts` | Prints each host's lock state, number of gate units and free disk. |
+| `gate.sh --hosts` | Prints each host's lock state, number of gate units and free GiB, and whether that meets the disk floor of a whole gate or of a conformance half. |
 | `gate.sh --host wally <rev>` | Runs ci on wally, with the conformance half on a free configured helper. |
 | `gate.sh --host wally --helper none <rev>` | Runs the whole gate on one host. |
 | `gate.sh --base origin/main~3 <rev>` | Selects the checks from the changes since the merge base of `origin/main~3` and the commit. The default base is `GATE_BASE` or `origin/main`. |
@@ -980,17 +1077,33 @@ under `~/gate/bin/v-<hash>/`, named by the hash of their contents. A new version
 never rewrites a script that a queued or running gate is reading. The host also needs
 `~/gate/suites` with the conformance suites, `~/gate/conformance.env` and the pytest venv
 `~/gate/py-venv`. `scripts/gate/setup-host.sh <host>` creates them, copies the suites from
-wally through the laptop and checks linger, mbx and free disk. A ci half needs about
-30 GiB of free disk for its target and a conformance half about 15 GiB.
+wally through the laptop and checks linger, mbx and free disk.
 
-The driver checks the free disk under the home directory of each chosen host before it
-starts anything there. A whole gate needs what a ci half needs. When a host has less, the
-driver runs `mbx gc` on it, which collects idle managed targets and evicts cache objects to
-the cache's budgets, and checks again. A host that is still short makes the driver stop
-with a message that names the host, the free space and the space needed. The check runs
-before the start because a running build holds its target's lease, so the cache cannot
-give back that space until the gate ends. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change
-the two amounts, in the environment or in `~/.config/sparkles/gate.env`.
+A gate has a disk floor on every host, 110 GiB by default for a ci half, a whole gate, the
+link check and a conformance half alike. That is the floor of a Boat gate, which a cold
+workspace build needs. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change the floors of the
+ci and conformance parts, in the environment or in `~/.config/sparkles/gate.env`, and
+`GATE_BOAT_MIN_FREE_GIB` sets a Boat worker's. The driver reads the free disk under the
+home directory of each chosen host before it starts anything there and warns when a host
+is short. It collects nothing, since another job or a timing run may hold the host. The
+gate checks the floor under the host's heavy lock, before it builds, because a running
+build holds its target's lease and the cache cannot give back that space until the gate
+ends. An ssh host that is short runs `mbx gc` with `gc.min_free_size` raised to the floor,
+which collects idle managed targets and evicts cache objects until that much is free, and
+a Boat worker runs its disk cleanup. A gate still short ends with exit 4 and
+`disk-below-floor` in its `outcome` file, and the driver says that the host's disk was
+below its floor. A split gate keeps each half's own record, the ci half's as `outcome` and
+the conformance half's as `outcome-conf`. When every failed half exited 4 with its own
+disk record, the merge exits 4, writes `gate-outcome` and names the refusing halves in
+`outcome-host`. Any other failure makes the merge exit 1. An ssh gate still creates its
+worktree before it takes the heavy lock, which roadmap item 1169 tracks. `--auto` and the default helper choice read the disk without collecting, and a host's cache
+keeps it near its own `gc.min_free_size`, so they count a host as having the disk for a
+whole gate at `GATE_MIN_FREE_GB` free, 40 by default, and for a conformance half at
+`GATE_MIN_FREE_HALF_GB`, 20 by default. `gate.sh --hosts` marks a host that meets a floor
+as `room-for-whole` or `room-for-half`, and one that needs a collection before the floor as
+`whole-after-gc` or `half-after-gc`. Each ssh gate start on
+such a host evicts cache down to the floor, so a host whose cache budget and other data
+leave less than the floor free rebuilds more of the cache on each gate.
 
 Each run sets `CARGO_BUILD_JOBS` from its host's gate memory cap, the cap in GiB less one,
 halved, between 2 and 8. That gives 5 jobs at a Boat worker's 12 GiB cap, 6 jobs on a host
@@ -1156,6 +1269,15 @@ and catches up after the laptop wakes. `--uninstall` removes the timer and
 `--dry-run` prints the commit and the hosts. The timer's service needs the ssh agent that
 the ssh configuration names, so an agent socket at a fixed path, as with an
 `IdentityAgent` setting, works where a per-login agent does not.
+
+A full gate, and so the nightly gate, also runs `mise run test:bench-scripts:compare` after
+its ci step. It runs the script tests serially with `python3 -m unittest discover` and then
+with the parallel runner, one after the other, and fails when their exit statuses or their
+counts of tests run and skipped differ. The parallel runner reaches the serial verdict only
+under assumptions about the tests that it does not check, which
+[Script tests](#script-tests) lists, and this comparison catches a test that breaks one.
+The comparison adds about 13 minutes to a full gate, and it runs only on full and nightly
+gates, not on a batch gate that selects its checks.
 
 Each run writes a log to `.artifacts/gates/nightly/` in the main checkout, and the gate's
 results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. The server artifact link

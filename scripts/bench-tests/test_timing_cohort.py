@@ -1,4 +1,5 @@
 """Exercise the host-timing test group: its definition, the gate's exclusion and the checks of its runs."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import json
 import os

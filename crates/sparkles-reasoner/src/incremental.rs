@@ -1146,6 +1146,7 @@ impl<'a> Program for TierProgram<'a> {
                         progress: limits.progress.clone(),
                         budget: limits.budget.clone(),
                         closures: limits.closures,
+                        magic: None,
                         sampled_planning: limits.sampled_planning,
                     };
                     &narrowed
@@ -2476,6 +2477,7 @@ pub(crate) mod tests {
             max_inferred: 10_000_000,
             budget: Budget::unlimited(),
             closures: false,
+            magic: None,
             sampled_planning: false,
             cancel: None,
             deadline: None,

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Runs the staged confirmation runs one after another on forge, each under the heavy lock
+# in a 13G scope. <run>/exit.txt holds each exit status and ALL-DONE marks the end.
+set -u
+cd ~/lanes/leaf-cursors-829/confirm
+for n in "$@"; do
+  flock ~/lanes/.heavy.lock bash -c "uptime > $n/uptime-before.txt; systemd-run --user --scope -q -p MemoryMax=13G -p MemorySwapMax=2G -p OOMPolicy=continue bash -c 'cd $n && bash nsc-bench-remote.sh'" > "$n.log" 2>&1
+  echo "exit=$?" > "$n/exit.txt"
+  rm -rf "$n/A" "$n/B" "$n/stores" "$n/data.nt"
+  echo "$(date -Is) $n $(cat "$n/exit.txt")" >> driver.log
+done
+date -Is > ALL-DONE

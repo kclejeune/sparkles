@@ -7,6 +7,7 @@ through nixbin, nixexe, nixpkg, flake_build, `nixpkgs#<name>` or `$ROOT#<name>` 
 this test until the package is added to one of the two files.
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 from pathlib import Path
 import re
 import unittest

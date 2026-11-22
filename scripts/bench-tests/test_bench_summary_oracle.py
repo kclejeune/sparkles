@@ -1,4 +1,5 @@
 """A summary must rank accepted oracle answers and refuse stale verification receipts."""
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 from pathlib import Path
 import subprocess

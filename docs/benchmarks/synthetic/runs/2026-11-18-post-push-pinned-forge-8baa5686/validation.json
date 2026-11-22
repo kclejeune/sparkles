@@ -1,0 +1,158 @@
+{
+  "format_version": 1,
+  "kind": "pinned_internal_regression_check",
+  "items": [
+    1047,
+    1050,
+    752,
+    856
+  ],
+  "host": "forge",
+  "cpu": "Intel Core i5-13500",
+  "kernel": "7.2.9",
+  "candidate": {
+    "commit": "8baa5686",
+    "role": "origin/main at batch 30, the post-push check of the screen flags of batches 19 to 29"
+  },
+  "pairs": {
+    "path-plus": {
+      "A": "06ca04ef",
+      "B": "8baa5686",
+      "designated_queries": "path-plus",
+      "flag": "batch 19 screen flag"
+    },
+    "star-lookup": {
+      "A": "c2b5d7cf",
+      "B": "8baa5686",
+      "designated_queries": "star-lookup",
+      "flag": "batch 20 screen flag and item 1050 (batch 29)"
+    },
+    "minus": {
+      "A": "adbe757c",
+      "B": "8baa5686",
+      "designated_queries": "minus",
+      "flag": "batches 21 and 22 screen flags and item 752"
+    },
+    "distinct-obj-1047": {
+      "A": "f854145b",
+      "B": "8baa5686",
+      "designated_queries": "distinct-obj",
+      "flag": "item 1047 (batch 28)"
+    },
+    "small-856": {
+      "A": "321508fe",
+      "B": "8baa5686",
+      "designated_queries": "count-all, distinct-obj, predicate-counts, predicate-subjects",
+      "flag": "item 856, base before item 825"
+    }
+  },
+  "binary_sha256": {
+    "06ca04ef": "703d6a8f5cd28911cfa8aa26283a233bc294b3ce9bd836ed216e0317a017b9f9",
+    "c2b5d7cf": "bc9413dd6461152f96b82c4332040f95c0499be8286c00ee92569d762c10962b",
+    "adbe757c": "5db11d6fd432a8bb83e78fb8279bff1bbd77a020f3aac9195fd163fbe14c1827",
+    "f854145b": "a4d7cbbf4c5b7b1274225db3d116c00884329a8053bbe000e12452cbe8b34dc1",
+    "321508fe": "ce4a8d83229633771b122972a5b3233480e009f7d4e30e32f5ed5ec37c6ae2f5",
+    "8baa5686": "e5897e601d191814c7bb5a65bab135e2d38b49e2d608a6c75ddfefea40905dc9"
+  },
+  "compiler_provenance": "The bases are the cached screen builds of scripts/nsc-build.sh on stanley and 8baa5686 is a fresh build by the same script on stanley, all with rustc 1.99.1, clang 21.1.8 and GCC 16.2.0. The binaries were copied to forge, which built nothing.",
+  "settings": {
+    "people": 100000,
+    "triples": 1052807,
+    "rounds_ABBA": 24,
+    "reps": 200,
+    "warmup": 5,
+    "rayon_threads": 1,
+    "server_cpu": 2,
+    "client_cpu": 4,
+    "idle_spinners": true,
+    "execution": "default (automatic)",
+    "queries": [
+      "path-plus",
+      "star-lookup",
+      "minus",
+      "distinct-obj",
+      "count-all",
+      "predicate-counts",
+      "predicate-subjects"
+    ]
+  },
+  "lock": "forge-backlog-stage1.service held ~/lanes/.bench.lock and ~/lanes/.heavy.lock for all five pairs and refused to start while rustc, cargo, sparkles or another engine ran. Steal time was 0.00%.",
+  "verdict_rule": "X14 SPEC D4. A query under 0.3 ms passes when the upper end of the 95% t interval of the mean log round ratio over 24 rounds is at most 1.02, or its median added server time is at most 0.5 us. A query above 0.3 ms passes when its ratio is below 1.05. Each query is judged on its designated pair.",
+  "statistics": "ratio is the median of all B exec samples over the median of all A exec samples, computed by analyze.py, whose output is pinned-summary.json and pinned-summary.txt.",
+  "minus_modes": {
+    "note": "Per server process, minus runs in one of two modes, about 0.25 ms and about 0.40 ms (0.30 ms on 321508fe), in both builds of every pair, so its pooled median depends on how many processes land in each mode. The two modes match the streaming and eager exec times of minus in the matrices. Processes are split at 0.275 ms.",
+    "pairs": {
+      "path-plus": {
+        "A": {
+          "fast_processes": 21,
+          "fast_median_ms": 0.25307,
+          "slow_processes": 27,
+          "slow_median_ms": 0.40213
+        },
+        "B": {
+          "fast_processes": 10,
+          "fast_median_ms": 0.25405,
+          "slow_processes": 38,
+          "slow_median_ms": 0.40191
+        }
+      },
+      "star-lookup": {
+        "A": {
+          "fast_processes": 21,
+          "fast_median_ms": 0.25373,
+          "slow_processes": 27,
+          "slow_median_ms": 0.40585
+        },
+        "B": {
+          "fast_processes": 18,
+          "fast_median_ms": 0.25455,
+          "slow_processes": 30,
+          "slow_median_ms": 0.40363
+        }
+      },
+      "minus": {
+        "A": {
+          "fast_processes": 25,
+          "fast_median_ms": 0.25298,
+          "slow_processes": 23,
+          "slow_median_ms": 0.40477
+        },
+        "B": {
+          "fast_processes": 22,
+          "fast_median_ms": 0.25371,
+          "slow_processes": 26,
+          "slow_median_ms": 0.40223
+        }
+      },
+      "distinct-obj-1047": {
+        "A": {
+          "fast_processes": 16,
+          "fast_median_ms": 0.25433,
+          "slow_processes": 32,
+          "slow_median_ms": 0.40195
+        },
+        "B": {
+          "fast_processes": 20,
+          "fast_median_ms": 0.25406,
+          "slow_processes": 28,
+          "slow_median_ms": 0.40339
+        }
+      },
+      "small-856": {
+        "A": {
+          "fast_processes": 6,
+          "fast_median_ms": 0.25111,
+          "slow_processes": 42,
+          "slow_median_ms": 0.30172
+        },
+        "B": {
+          "fast_processes": 13,
+          "fast_median_ms": 0.25428,
+          "slow_processes": 35,
+          "slow_median_ms": 0.40152
+        }
+      }
+    }
+  },
+  "answer_equality": true
+}

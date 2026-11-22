@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Writes small Horn ontologies for the gate of roadmap item 1025's covered link: the
+horn-roles family of item 692's differential run with chains and transitivity added, and
+before the random axioms one or two patterns that give a context a link beside a link to the
+same individual by a subrole (an asserted inverse or subrole of the inverse of a functional
+property, assertions by a role and its superrole, successors that a functional property
+merges).
+
+Usage: gen-covered.py DIR [COUNT] [SEED]
+"""
+import random
+import sys
+
+sys.path.insert(0, sys.argv[4] if len(sys.argv) > 4 else "crates/sparkles-owl/tests/fixtures/dl603")
+import generate as g  # noqa: E402
+
+g.FAMILIES["horn-covered"] = (
+    ["forall", "max1", "nominal", "self"],
+    ["horn", "horn", "role_sub", "role_inverse_sub", "inverses", "functional",
+     "inverse_functional", "asymmetric", "role_disjoint", "domain", "range",
+     "class_assertion", "role_assertion", "role_assertion", "different", "chain", "chain",
+     "transitive"],
+    True,
+)
+
+
+def patterns(r):
+    a, b, c = r.sample(g.INDS, 3)
+    p, q = r.sample(g.SIMPLE, 2)
+    up = r.choice(g.COMPLEX)
+    fun = r.choice([f"FunctionalObjectProperty({p})", f"InverseFunctionalObjectProperty({q})",
+                    f"SubClassOf(owl:Thing ObjectMaxCardinality(1 {p} owl:Thing))"])
+    inv = r.choice([f"SubObjectPropertyOf({q} ObjectInverseOf({p}))",
+                    f"InverseObjectProperties({p} {q})",
+                    f"SubObjectPropertyOf(ObjectInverseOf({q}) {p})"])
+    return [
+        # R6: b is a's successor by the functional p and its predecessor by q under p's inverse
+        [inv, fun, f"ObjectPropertyAssertion({p} {a} {b})", f"ObjectPropertyAssertion({q} {b} {a})"],
+        # the same with a class between the individuals
+        [inv, fun, f"ClassAssertion(ObjectSomeValuesFrom({p} ObjectOneOf({b})) {a})",
+         f"ObjectPropertyAssertion({q} {b} {a})"],
+        # assertions by a role and a role above it to one individual
+        [f"SubObjectPropertyOf({p} {up})", f"ObjectPropertyAssertion({p} {a} {b})",
+         f"ObjectPropertyAssertion({up} {a} {b})"],
+        # successors that a functional property merges, one of them by a subrole as well
+        [f"SubObjectPropertyOf({q} {p})", f"FunctionalObjectProperty({p})",
+         f"ObjectPropertyAssertion({p} {a} {b})", f"ObjectPropertyAssertion({q} {a} {c})"],
+        # a predecessor that an inverse functional property merges
+        [inv, f"InverseFunctionalObjectProperty({q})", f"ObjectPropertyAssertion({q} {b} {a})",
+         f"ObjectPropertyAssertion({q} {c} {a})", f"ObjectPropertyAssertion({p} {a} {b})"],
+    ]
+
+
+d = sys.argv[1]
+count = int(sys.argv[2]) if len(sys.argv) > 2 else 600
+seed = int(sys.argv[3]) if len(sys.argv) > 3 else 1025
+r = random.Random(f"{seed}:horn-covered")
+ops, axioms, inverse = g.FAMILIES["horn-covered"]
+for n in range(count):
+    gen = g.Gen(r, set(ops), axioms, inverse)
+    out = g.header(f"horn-covered-{n:03}", g.CLASSES, g.SIMPLE + g.COMPLEX, g.DATA, g.INDS)
+    ps = patterns(r)
+    body = set()
+    for pat in r.sample(ps, r.randint(1, 2)):
+        body.update(pat)
+    body.update(gen.axiom() for _ in range(r.randint(6, 16)))
+    out += sorted(body)
+    out.append(")")
+    with open(f"{d}/horn-covered-{n:03}.ofn", "w") as f:
+        f.write("\n".join(out) + "\n")

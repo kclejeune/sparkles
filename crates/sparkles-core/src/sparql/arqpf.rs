@@ -506,7 +506,7 @@ pub(super) fn leaf(
             .collect::<Vec<_>>()
             .join(" ")
     );
-    let Some((graph, _)) = p.graph_filter(g) else {
+    let Some((graph, _)) = p.graph_filter(g)? else {
         return Ok(Node::empty(vars));
     };
     let est = match c.kind {

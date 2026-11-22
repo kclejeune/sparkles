@@ -1,0 +1,111 @@
+# reasoning-latency gate: candidate against baseline
+
+- baseline: host forge, commit 5ef06e3f94f5fc420817f930ff368139ba68b176, started 2026-11-20T21:41:09Z
+- candidate: host forge, commit 5ef06e3f94f5fc420817f930ff368139ba68b176, started 2026-11-20T21:33:03Z
+- threshold: 10.0% slower
+- compared although different: setting demand_closures: '0' against '1'
+
+| metric | baseline | candidate | ratio | flag |
+|---|--:|--:|--:|---|
+| rdfs/materialize | 2258.69 | 2122.76 | 0.940 |  |
+| owl-rl/materialize | 1667.66 | 1652.34 | 0.991 |  |
+| rdfs/materialized/q1 | 0.044759 | 0.05233 | 1.169 | slower |
+| rdfs/demand/q1 | 0.931992 | 0.953844 | 1.023 |  |
+| rdfs/demand-cached/q1 | 0.287679 | 0.268684 | 0.934 |  |
+| rdfs/on-read/q1 | 0.391159 | 0.382743 | 0.978 |  |
+| rdfs/materialized/q2 | 0.582607 | 0.58896 | 1.011 |  |
+| rdfs/demand/q2 | 4.71154 | 4.55023 | 0.966 |  |
+| rdfs/demand-cached/q2 | 2.67284 | 2.67772 | 1.002 |  |
+| rdfs/on-read/q2 | 15.346 | 15.1162 | 0.985 |  |
+| rdfs/materialized/q3 | 0.042975 | 0.043145 | 1.004 |  |
+| rdfs/demand/q3 | 0.946445 | 0.957834 | 1.012 |  |
+| rdfs/demand-cached/q3 | 0.268047 | 0.266088 | 0.993 |  |
+| rdfs/on-read/q3 | 2.26247 | 2.28187 | 1.009 |  |
+| rdfs/materialized/q4 | 0.138418 | 0.142344 | 1.028 |  |
+| rdfs/demand/q4 | 1.90109 | 1.91425 | 1.007 |  |
+| rdfs/demand-cached/q4 | 1.01082 | 1.0222 | 1.011 |  |
+| rdfs/on-read/q4 | 0.586549 | 0.595654 | 1.016 |  |
+| rdfs/materialized/q5 | 0.126816 | 0.126181 | 0.995 |  |
+| rdfs/demand/q5 | 4.0152 | 3.98357 | 0.992 |  |
+| rdfs/demand-cached/q5 | 1.32393 | 1.3202 | 0.997 |  |
+| rdfs/on-read/q5 | 7.77877 | 8.02572 | 1.032 |  |
+| rdfs/materialized/q6 | 1.255 | 1.26471 | 1.008 |  |
+| rdfs/demand/q6 | 58.8488 | 58.8316 | 1.000 |  |
+| rdfs/demand-cached/q6 | 49.1281 | 49.0175 | 0.998 |  |
+| rdfs/on-read/q6 | 1.59538 | 1.58259 | 0.992 |  |
+| rdfs/materialized/q7 | 0.094728 | 0.112483 | 1.187 | slower |
+| rdfs/demand/q7 | 1.63278 | 1.7485 | 1.071 |  |
+| rdfs/demand-cached/q7 | 0.604907 | 0.609153 | 1.007 |  |
+| rdfs/on-read/q7 | 2.639 | 2.65218 | 1.005 |  |
+| rdfs/materialized/q8 | 3.48011 | 3.46633 | 0.996 |  |
+| rdfs/demand/q8 | 76.6646 | 76.1884 | 0.994 |  |
+| rdfs/demand-cached/q8 | 63.1465 | 63.1836 | 1.001 |  |
+| rdfs/on-read/q8 | 13.4341 | 13.3324 | 0.992 |  |
+| rdfs/materialized/q9 | 9.83496 | 9.45392 | 0.961 |  |
+| rdfs/demand/q9 | 51.0834 | 50.2992 | 0.985 |  |
+| rdfs/demand-cached/q9 | 48.5994 | 48.5864 | 1.000 |  |
+| rdfs/on-read/q9 | 7.77356 | 7.73703 | 0.995 |  |
+| rdfs/materialized/q10 | 0.04692 | 0.05363 | 1.143 | slower |
+| rdfs/demand/q10 | 0.872317 | 0.855692 | 0.981 |  |
+| rdfs/demand-cached/q10 | 0.276211 | 0.280685 | 1.016 |  |
+| rdfs/on-read/q10 | 1.79409 | 1.73747 | 0.968 |  |
+| rdfs/materialized/q11 | 0.047697 | 0.048119 | 1.009 |  |
+| rdfs/demand/q11 | 0.778806 | 0.785989 | 1.009 |  |
+| rdfs/demand-cached/q11 | 0.264897 | 0.275071 | 1.038 |  |
+| rdfs/on-read/q11 | 0.102679 | 0.103987 | 1.013 |  |
+| rdfs/materialized/q12 | 0.045125 | 0.044888 | 0.995 |  |
+| rdfs/demand/q12 | 1.47922 | 1.66808 | 1.128 | slower |
+| rdfs/demand-cached/q12 | 0.54477 | 0.557949 | 1.024 |  |
+| rdfs/on-read/q12 | 0.120668 | 0.135098 | 1.120 | slower |
+| rdfs/materialized/q13 | 0.02797 | 0.027477 | 0.982 |  |
+| rdfs/demand/q13 | 0.827541 | 0.910365 | 1.100 | slower |
+| rdfs/demand-cached/q13 | 0.215363 | 0.21955 | 1.019 |  |
+| rdfs/on-read/q13 | 0.112689 | 0.113467 | 1.007 |  |
+| rdfs/materialized/q14 | 1.25573 | 1.2495 | 0.995 |  |
+| rdfs/demand/q14 | 1.29638 | 1.23185 | 0.950 |  |
+| rdfs/demand-cached/q14 | 0.50279 | 0.498842 | 0.992 |  |
+| rdfs/on-read/q14 | 1.30479 | 1.28814 | 0.987 |  |
+| owl-rl/materialized/q1 | 0.055387 | 0.043303 | 0.782 |  |
+| owl-rl/demand/q1 | 1.9667 | 1.99663 | 1.015 |  |
+| owl-rl/demand-cached/q1 | 0.555756 | 0.573008 | 1.031 |  |
+| owl-rl/materialized/q2 | 1.22433 | 1.18439 | 0.967 |  |
+| owl-rl/demand/q2 | 8.89368 | 9.23336 | 1.038 |  |
+| owl-rl/demand-cached/q2 | 4.02577 | 4.04209 | 1.004 |  |
+| owl-rl/materialized/q3 | 0.047127 | 0.048015 | 1.019 |  |
+| owl-rl/demand/q3 | 2.14044 | 2.15423 | 1.006 |  |
+| owl-rl/demand-cached/q3 | 0.541325 | 0.551802 | 1.019 |  |
+| owl-rl/materialized/q4 | 0.1381 | 0.147396 | 1.067 |  |
+| owl-rl/demand/q4 | 9.12169 | 9.38245 | 1.029 |  |
+| owl-rl/demand-cached/q4 | 2.5429 | 2.56023 | 1.007 |  |
+| owl-rl/materialized/q5 | 0.133103 | 0.130772 | 0.982 |  |
+| owl-rl/demand/q5 | 36.4349 | 36.8401 | 1.011 |  |
+| owl-rl/demand-cached/q5 | 3.96185 | 3.95694 | 0.999 |  |
+| owl-rl/materialized/q6 | 1.6212 | 1.62078 | 1.000 |  |
+| owl-rl/demand/q6 | 1715.89 | 1681.08 | 0.980 |  |
+| owl-rl/demand-cached/q6 | 687.424 | 659.026 | 0.959 |  |
+| owl-rl/materialized/q7 | 0.101082 | 0.104886 | 1.038 |  |
+| owl-rl/demand/q7 | 7.36618 | 7.29718 | 0.991 |  |
+| owl-rl/demand-cached/q7 | 1.14308 | 1.13126 | 0.990 |  |
+| owl-rl/materialized/q8 | 4.59469 | 4.63147 | 1.008 |  |
+| owl-rl/demand/q8 | 1789.34 | 1750.48 | 0.978 |  |
+| owl-rl/demand-cached/q8 | 786.569 | 708.876 | 0.901 |  |
+| owl-rl/materialized/q9 | 9.28331 | 9.3009 | 1.002 |  |
+| owl-rl/demand/q9 | 1697.61 | 1690.83 | 0.996 |  |
+| owl-rl/demand-cached/q9 | 1616.67 | 1592.61 | 0.985 |  |
+| owl-rl/materialized/q10 | 0.04894 | 0.056895 | 1.163 | slower |
+| owl-rl/demand/q10 | 4.45231 | 4.60108 | 1.033 |  |
+| owl-rl/demand-cached/q10 | 0.581239 | 0.594419 | 1.023 |  |
+| owl-rl/materialized/q11 | 0.109531 | 0.113657 | 1.038 |  |
+| owl-rl/demand/q11 | 2.90484 | 2.87555 | 0.990 |  |
+| owl-rl/demand-cached/q11 | 0.742116 | 0.752626 | 1.014 |  |
+| owl-rl/materialized/q12 | 0.146972 | 0.152641 | 1.039 |  |
+| owl-rl/demand/q12 | 57.2888 | 57.2607 | 1.000 |  |
+| owl-rl/demand-cached/q12 | 15.8602 | 15.8511 | 0.999 |  |
+| owl-rl/materialized/q13 | 0.081229 | 0.092066 | 1.133 | slower |
+| owl-rl/demand/q13 | 21.3647 | 21.1209 | 0.989 |  |
+| owl-rl/demand-cached/q13 | 6.5865 | 6.56984 | 0.997 |  |
+| owl-rl/materialized/q14 | 1.2391 | 1.23374 | 0.996 |  |
+| owl-rl/demand/q14 | 2.30836 | 2.26119 | 0.980 |  |
+| owl-rl/demand-cached/q14 | 0.684835 | 0.68533 | 1.001 |  |
+
+100 metrics compared, 8 flagged, 0 failed checks, 0 missing checks, 0 changed fingerprints.

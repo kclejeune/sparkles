@@ -6,6 +6,7 @@ directory under hosts/, so the "remote" processes outlive an interrupted ssh as 
 on a real host. A fake systemd-run makes each scope its own process group, which the fake
 systemctl stop kills."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import json
 import ctypes
 import hashlib
@@ -190,15 +191,33 @@ class BuildHost(unittest.TestCase):
         self.assertEqual(self.fixture_libc.prctl(37,ctypes.byref(self.fixture_previous),0,0,0),0)
         self.assertEqual(self.fixture_libc.prctl(36,1,0,0,0),0)
         self.reaper_stop=threading.Event()
+        # A test that waits on a scope's leader itself names the scope here, so that the reaper
+        # does not take the leader's exit status first, which subprocess then reports as 0.
+        self.reaper_skip=set()
         def reap_owned_mock_scopes():
             while not self.reaper_stop.wait(0.01):
                 for path in (self.hosts/'units').glob('*.scope'):
+                    if path.name in self.reaper_skip:continue
+                    # The fake scope writes its file after creating it, so the reaper can read
+                    # it empty, and that pass must skip it rather than end the thread.
                     try:
                         group=int(path.read_text().split()[0])
                         while os.waitpid(-group,os.WNOHANG)[0]>0:pass
-                    except (ChildProcessError,FileNotFoundError,ProcessLookupError,ValueError):pass
+                    except (ChildProcessError,FileNotFoundError,IndexError,ProcessLookupError,ValueError):pass
         self.fixture_reaper=threading.Thread(target=reap_owned_mock_scopes,daemon=True)
         self.fixture_reaper.start()
+
+    def assert_group_ends(self, group, seconds=10):
+        """The process group ends, which the reaper thread finishes; a loaded host can take
+        longer than a fixed pause to schedule the kill and the reap."""
+        end = time.monotonic() + seconds
+        while True:
+            try:
+                os.killpg(group, 0)
+            except ProcessLookupError:
+                return
+            self.assertLess(time.monotonic(), end, f"process group {group} is still there")
+            time.sleep(0.05)
 
     def tearDown(self):
         for holder in self.holders:
@@ -242,7 +261,7 @@ class BuildHost(unittest.TestCase):
         out = self.root / f"out-{self.runs}"
         result = subprocess.run(["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out),
                                  *args, self.sha, self.sha], env=env or self.env,
-                                capture_output=True, text=True, timeout=60)
+                                capture_output=True, text=True, timeout=300)
         self.assertNotEqual(result.returncode, 0)
         if ok_stop:
             # Both binaries are staged and the run stops at the compiler check.
@@ -592,9 +611,7 @@ class BuildHost(unittest.TestCase):
         self.assertTrue(any(line.endswith("stop u-fence.scope") for line in calls), calls)
         self.assertTrue((self.hosts / "u-fence.scope.stopped").exists())
         scope = int((self.hosts / "units" / "u-fence.scope").read_text().split()[0])
-        time.sleep(0.2)
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(scope, 0)
+        self.assert_group_ends(scope)
         self.assertEqual(self.remote("--status", str(d), "u-fence", "0").stdout.splitlines()[0], "gone")
         # A start whose earlier attempt was lost is refused once the build is cancelled.
         (d / "launched").unlink()
@@ -674,6 +691,7 @@ class BuildHost(unittest.TestCase):
         d = self.remote_dir()
         script = str(d / "bin" / "nsc-build-remote.sh")
         env = dict(self.env, HOME=str(self.hosts / "h1"), FAKE_BUILD_DELAY="60")
+        self.reaper_skip.update({"u-past.scope", "u-exp.scope"})
         # A scope that begins after the expiry builds nothing.
         late = subprocess.run(["systemd-run", "--user", "--scope", "--unit", "u-past", "--", "bash", script, "--run",
                                str(d), "u-past", self.expiry(20)], env=env, capture_output=True, text=True, timeout=30)
@@ -889,21 +907,45 @@ class BuildHost(unittest.TestCase):
             ["bash", str(self.repo / "scripts/nsc-bench.sh"), "--out", str(out), "--build-host", "h1",
              self.sha, self.sha], env=dict(self.env, FAKE_BUILD_DELAY="60"),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-        deadline = time.monotonic() + 20
+        # A failed wait or assertion below still ends and reaps the run and its scope, so no
+        # process outlives the test. The cleanup runs after tearDown, so it cancels the run as
+        # an interrupt does, which stops its scope, and then ends the test's own scope if it
+        # is still there, whether or not the run had already exited.
+        owned = {}
+        def reap():
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGINT)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.communicate(timeout=120)
+                except subprocess.TimeoutExpired:
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+            process.communicate()
+            if "scope" in owned:
+                try:
+                    os.killpg(owned["scope"], signal.SIGKILL)
+                except OSError:
+                    pass
+        self.addCleanup(reap)
+        deadline = time.monotonic() + 120
         while not (self.hosts / "build-started").exists():
             self.assertLess(time.monotonic(), deadline, "the build did not start")
             time.sleep(0.05)
         [unit] = list((self.hosts / "units").iterdir())
         scope = int(unit.read_text().split()[0])
+        owned["scope"] = scope
         os.killpg(process.pid, signal.SIGINT)
-        process.communicate(timeout=20)
+        process.communicate(timeout=120)
         self.assertEqual(process.returncode, 130)
         self.assertEqual(self.scratch("h1"), [])
         self.assertTrue(unit.name.endswith(".scope"))
         self.assertIn(f"stop {unit.name}", (self.hosts / "systemctl.log").read_text())
-        time.sleep(0.2)
-        with self.assertRaises(ProcessLookupError):
-            os.killpg(scope, 0)
+        self.assert_group_ends(scope)
         self.assertFalse((self.entry() / "build.txt").exists())
 
     def test_writes_local_build_uses_managed_mbx_source_and_exact_feature_cache(self):

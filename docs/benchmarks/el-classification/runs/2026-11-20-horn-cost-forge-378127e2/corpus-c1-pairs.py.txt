@@ -1,0 +1,16 @@
+# corpus-c1-pairs.py: pairs the tip and c1 lines of out/corpus-c1.txt by order (each file and thread
+# count runs tip then c1) and compares everything but the time
+import re, sys
+ls = [l.rstrip('\n') for l in open(sys.argv[1]) if not l.startswith('CORPUS-DONE')]
+strip = lambda l: re.sub(r',[0-9.]+\]$', ']', l).split(' ', 2)[2]
+pairs = diffs = both = bad = 0
+for a, b in zip(ls[0::2], ls[1::2]):
+    fa, fb = a.split(), b.split()
+    if fa[1] != 'tip' or fb[1] != 'c1' or fa[0] != fb[0] or fa[2] != fb[2]:
+        bad += 1; continue
+    pairs += 1
+    if strip(a) != strip(b):
+        diffs += 1; print('DIFF', a, '|', b)
+    elif fa[3] == '0':
+        both += 1
+print('lines', len(ls), 'pairs', pairs, 'misordered', bad, 'diffs', diffs, 'classified by both', both)

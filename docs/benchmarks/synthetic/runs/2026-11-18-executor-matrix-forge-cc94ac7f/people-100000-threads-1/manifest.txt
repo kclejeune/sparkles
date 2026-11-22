@@ -1,0 +1,15 @@
+binary: /home/kclejeune/lanes/forge-backlog/bin/sparkles-cc94ac7f-matrix
+binary sha256: 9efa1cd4655ff0d75af758bf0bb0f54ff5950f152b61b3e0afb765ff63e0fcba
+binary commit: cc94ac7f
+version: sparkles 0.1.0
+compilers: GCC: (GNU) 15.3.0; Linker: LLD 23.1.1 (/checkout/src/llvm-project/llvm 1b9c0d5ff9bbe7634aead059efe6b11a7eeba145); clang version 23.1.0git; rustc version 1.99.1 (58cf8f9c3 2026-10-13)
+build config: {"Cargo.toml":{"release":{"codegen-units":4,"debug":1,"lto":"thin","package":{"sparkles-core":{"codegen-units":1},"sparkles-owl":{"codegen-units":1}}}},"cargo":"build --release -p sparkles-server --bin sparkles","env":{"CARGO_INCREMENTAL":"0"},"mbx_policy":"779a99e845a5ac3f1c4d64a3c95bcc74b33f47418e829bf008542ec2dbbcd151","profile":"release"}
+runtime env: clean
+scripts commit: unknown
+scripts dirty: 0
+host: forge
+started: 2026-11-18T07:04:20Z
+settings: 31 queries, 2 rounds of A,B,B,A, 3 warm-up and 10 timed requests per query and server process, RAYON_NUM_THREADS=1, server CPU 2, client CPU 4, spinners on, execution eager,streaming
+A: /home/kclejeune/lanes/forge-backlog/bin/sparkles-cc94ac7f-matrix
+B: /home/kclejeune/lanes/forge-backlog/bin/sparkles-cc94ac7f-matrix
+data sha256: c2d387f07a0717fdcd1d001081507b5ac09608961f562f0102d971c36e36edd8

@@ -150,10 +150,24 @@ fn split(key: &[u8]) -> Key<'_> {
     }
 }
 
+/// `s` as a string when it is UTF-8. ASCII, the common case, is checked here with a
+/// word-at-a-time scan before the general validator runs. Every site of the filter calls
+/// this one function, and it stays out of line so that the scan does not grow
+/// [`KeyFilter::test_with`].
+#[inline(never)]
+fn utf8(s: &[u8]) -> Option<&str> {
+    if s.is_ascii() {
+        // SAFETY: every sequence of ASCII bytes is UTF-8.
+        Some(unsafe { std::str::from_utf8_unchecked(s) })
+    } else {
+        std::str::from_utf8(s).ok()
+    }
+}
+
 impl Key<'_> {
     /// Whether the parts the tests read are UTF-8 (a key that is not is no string).
     fn valid(&self) -> bool {
-        let ok = |b: &[u8]| std::str::from_utf8(b).is_ok();
+        let ok = |b: &[u8]| utf8(b).is_some();
         match self {
             Key::Iri(i) => ok(i),
             Key::Literal { lex, lang, .. } => ok(lex) && lang.is_none_or(ok),
@@ -219,6 +233,65 @@ impl KeyFilter {
     /// without compiling its regular expressions, for the planner's estimates.
     pub(super) fn plan_prefixes(exprs: &[Expr], v: VarId) -> Option<Vec<Vec<u8>>> {
         Self::compile(Programs::None, exprs, v)?.key_prefixes()
+    }
+
+    /// The most that [`KeyFilter::plan_prefixes`] allocates for the conjunct `e` of its
+    /// list over `v`: the slots of its tests in a list that grows by doubling, each
+    /// substring test's boxed finder with its copy of the needle, each regular
+    /// expression's anchored prefix as it grows and as shared text, each language range,
+    /// and the at most two prefixes the filter gives. Conjuncts that are no key test
+    /// add nothing.
+    pub(super) fn plan_prefixes_bytes(e: &Expr, v: VarId) -> usize {
+        fn walk(e: &Expr, v: VarId, tests: &mut usize, heap: &mut usize, longest: &mut usize) {
+            if length_test(e, v).is_some() {
+                *tests += 1;
+                return;
+            }
+            if let Expr::And(a, b) = e {
+                walk(a, v, tests, heap, longest);
+                walk(b, v, tests, heap, longest);
+                return;
+            }
+            let Expr::Call(Func::Builtin(f), args) = e else {
+                return;
+            };
+            let (text, bytes) = match (f, args.as_slice()) {
+                (Function::Contains | Function::StrStarts | Function::StrEnds, [_, n]) => {
+                    let s = match n {
+                        Expr::Lit(_, Value::Str(s)) => s.len(),
+                        Expr::Lit(_, Value::Lang(s, _) | Value::LangDir(s, _, _)) => s.len(),
+                        _ => return,
+                    };
+                    (
+                        s,
+                        size_of::<memchr::memmem::Finder<'static>>().saturating_add(s),
+                    )
+                }
+                (Function::Regex, [_, p, ..]) => {
+                    let Some(p) = const_str(p) else { return };
+                    (p.len(), p.len().saturating_mul(3).saturating_add(32))
+                }
+                (Function::LangMatches, [_, r]) => {
+                    let Some(r) = const_str(r) else { return };
+                    (0, r.len().saturating_add(16))
+                }
+                _ => return,
+            };
+            *tests += 1;
+            *heap = heap.saturating_add(bytes);
+            *longest = (*longest).max(text);
+        }
+        let (mut tests, mut heap, mut longest) = (0, 0, 0);
+        walk(e, v, &mut tests, &mut heap, &mut longest);
+        if tests == 0 {
+            return 0;
+        }
+        tests
+            .max(4)
+            .saturating_mul(2 * size_of::<Test>())
+            .saturating_add(heap)
+            .saturating_add(longest.saturating_add(1).saturating_mul(2))
+            .saturating_add(3 * size_of::<Vec<u8>>())
     }
 
     /// Reserve cursor metadata before compiling key tests. Regex programs and
@@ -412,10 +485,8 @@ impl KeyFilter {
         // UTF-8 is self-synchronizing: a byte match of a UTF-8 needle in a UTF-8 string
         // is a match of the strings
         self.0.iter().all(|t| match t {
-            Test::Length { arg, op, bound } => arg
-                .read(&key)
-                .and_then(|(s, _)| std::str::from_utf8(s).ok())
-                .is_some_and(|s| {
+            Test::Length { arg, op, bound } => {
+                arg.read(&key).and_then(|(s, _)| utf8(s)).is_some_and(|s| {
                     let n = s.chars().count() as u64;
                     if *bound < 0 {
                         return matches!(op, CmpOp::Gt | CmpOp::Ge);
@@ -427,7 +498,8 @@ impl KeyFilter {
                         CmpOp::Gt => n > bound,
                         CmpOp::Ge => n >= bound,
                     }
-                }),
+                })
+            }
             Test::Str {
                 f,
                 arg,
@@ -446,7 +518,7 @@ impl KeyFilter {
                 let i = regexes;
                 regexes += 1;
                 arg.read(&key)
-                    .and_then(|(s, _)| std::str::from_utf8(s).ok())
+                    .and_then(|(s, _)| utf8(s))
                     .is_some_and(|s| regex(i, re, s))
             }
             Test::LangMatches(range) => match &key {
@@ -848,6 +920,96 @@ mod tests {
         let f = KeyFilter::new(&[lang("en")], v).unwrap();
         for tag in [b"de".as_slice(), b"english", b"enx--rtl"] {
             assert!(!f.test(&raw(b"Ada", tag)));
+        }
+    }
+
+    #[test]
+    fn utf8_agrees_with_the_standard_validator() {
+        let bad: [&[u8]; 9] = [
+            b"\x80",
+            b"\xc3",
+            b"\xc3(",
+            b"\xc0\x80",
+            b"\xe0\x80\x80",
+            b"\xed\xa0\x80",
+            b"\xf4\x90\x80\x80",
+            b"\xf0\x9f\x99",
+            b"\xff",
+        ];
+        let good: [&[u8]; 4] = [b"a", "é".as_bytes(), "日".as_bytes(), "🙂".as_bytes()];
+        let mut inputs: Vec<Vec<u8>> = vec![Vec::new()];
+        for len in [1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+            let ascii = vec![b'x'; len];
+            inputs.push(ascii.clone());
+            for piece in bad.iter().chain(&good) {
+                inputs.push([*piece, &ascii].concat());
+                inputs.push([&ascii, *piece].concat());
+                let (a, b) = ascii.split_at(len / 2);
+                inputs.push([a, *piece, b].concat());
+            }
+        }
+        for s in &inputs {
+            assert_eq!(utf8(s), std::str::from_utf8(s).ok(), "{s:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_utf8_fails_every_string_test() {
+        let v = 0;
+        let lex = |lex: &[u8]| [b"\"".as_slice(), lex].concat();
+        let lang = |lex: &[u8], tag: &[u8]| [b"\"".as_slice(), lex, &[KEY_SEP], b"@", tag].concat();
+        let iri = |i: &[u8]| [b"<".as_slice(), i].concat();
+        let strlen = |arg: Expr, op: CmpOp, n: i64| {
+            Expr::Cmp(
+                Box::new(call(Function::StrLen, vec![arg])),
+                Box::new(Expr::Lit(crate::id::Id::UNDEF, Value::Integer(n.into()))),
+                op,
+            )
+        };
+        let str_v = call(Function::Str, vec![Expr::Var(v)]);
+        let cases: Vec<(Expr, Vec<u8>, Vec<u8>)> = vec![
+            // STRLEN counts characters, so `a日` of four bytes has a length of at most 2
+            (
+                strlen(Expr::Var(v), CmpOp::Le, 2),
+                lex("a日".as_bytes()),
+                lex(b"a\xe6\x97"),
+            ),
+            (
+                strlen(str_v.clone(), CmpOp::Le, 5),
+                iri("urn:日".as_bytes()),
+                iri(b"urn:\xe6\x97"),
+            ),
+            (
+                strlen(Expr::Var(v), CmpOp::Ge, 1),
+                lang("日".as_bytes(), b"ja"),
+                lang(b"a", b"j\xc3"),
+            ),
+            (
+                call(Function::Regex, vec![Expr::Var(v), lit("^a.$")]),
+                lex("a日".as_bytes()),
+                lex(b"a\xe6"),
+            ),
+            (
+                call(Function::Regex, vec![str_v.clone(), lit("person/1")]),
+                iri("http://ex/é/person/1".as_bytes()),
+                iri(b"http://ex/\xc3/person/1"),
+            ),
+            (
+                call(Function::Contains, vec![Expr::Var(v), lit("Ada")]),
+                lex("Ada é".as_bytes()),
+                lex(b"Ada \xc3"),
+            ),
+            (
+                call(Function::Contains, vec![str_v, lit("person/1")]),
+                iri("http://ex/é/person/1".as_bytes()),
+                iri(b"http://ex/\xed\xa0\x80/person/1"),
+            ),
+        ];
+        for (i, (expr, good, bad)) in cases.into_iter().enumerate() {
+            let f = KeyFilter::new(std::slice::from_ref(&expr), v).unwrap();
+            let bound = f.bind();
+            assert!(f.test(&good) && bound.test(&good), "case {i} on {good:?}");
+            assert!(!f.test(&bad) && !bound.test(&bad), "case {i} on {bad:?}");
         }
     }
 }

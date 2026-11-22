@@ -98,6 +98,16 @@ async fn grant_released(s: &Server, limit: Duration) -> bool {
     .is_ok()
 }
 
+async fn abort_fired(abort: &super::StreamAbort, limit: Duration) -> bool {
+    tokio::time::timeout(limit, async {
+        while !abort.is_aborted() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
 async fn second_status(s: &Server) -> StatusCode {
     s.app
         .clone()
@@ -342,12 +352,25 @@ async fn cleanup_waits_for_the_real_producer_not_only_its_released_pool_grant() 
     tokio::time::timeout(Duration::from_secs(5), after_write.entered.notified())
         .await
         .unwrap();
+    // The gate only shows that the writer returned. The timer latches the abort under
+    // the body state lock and closes the channel before it fires the request-side abort
+    // handle, so the writer can reach the gate first and the handle needs a bounded wait.
     assert!(
-        abort.is_aborted(),
+        abort_fired(&abort, Duration::from_secs(2)).await,
         "the real unread-body idle timer must have fired"
     );
     assert_eq!(s.state.catalog.pool().unwrap().granted(), 0);
     assert!(!completion.finished(), "the real producer is still gated");
+    // Consume and drop the failed body first, so that its own admission lease is gone and
+    // only the gated producer's share can refuse the next query.
+    assert!(matches!(
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            axum::body::to_bytes(held.response.take().unwrap().into_body(), usize::MAX)
+        )
+        .await,
+        Ok(Err(_))
+    ));
     let busy = s
         .app
         .clone()
@@ -376,14 +399,6 @@ async fn cleanup_waits_for_the_real_producer_not_only_its_released_pool_grant() 
         s.state.catalog.pool().unwrap().granted(),
         completion.finished()
     );
-    assert!(matches!(
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            axum::body::to_bytes(held.response.take().unwrap().into_body(), usize::MAX)
-        )
-        .await,
-        Ok(Err(_))
-    ));
     let premature_cleanup = {
         let mut cleanup = Box::pin(transfer_cleanup(&s, &completion));
         match futures_util::poll!(cleanup.as_mut()) {

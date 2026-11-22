@@ -1,0 +1,8 @@
+parse 0.18 ms · plan 0.22 ms · exec 96.86 ms · total 97.26 ms
+Project ?n ?w  [1 rows (est 1), 96.84 ms]
+  Bind ?w := ?b208025f0a987d18651c93d7e79e74b0  [1 rows (est 1), 96.83 ms]
+    Bind ?n := ?cfb0d91fd01974adc887894d44320ef5  [1 rows (est 1), 96.83 ms]
+      GroupBy by  aggs ?cfb0d91fd01974adc887894d44320ef5=Count ?b208025f0a987d18651c93d7e79e74b0=Count [incremental]  [1 rows (est 1), 96.82 ms]
+        OptionalJoin filter (?x = <http://example.org/nobody>) [flat hash table: 11 keys in 256 parts]  [12 rows (est 1064012), 96.80 ms]
+          IndexScan PSO ?c rdfs:label ?l [decodes SOG]  [12 rows (est 12), 0.05 ms]
+          IndexScan PSO ?x rdf:type ?c [decodes SOG]  [1520017 rows (est 1520017), 12.30 ms]

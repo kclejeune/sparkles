@@ -3,10 +3,15 @@
     python3 -m unittest discover -s scripts/bench-tests -p test_request_insn.py
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
+import process_checks
 import json
 import os
+import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -117,7 +122,10 @@ class Counters(unittest.TestCase):
         try:
             c = ri.Counters(p.pid, False)
         except OSError as e:
+            # A runner without counters skips here, and a process left unwaited would warn
+            # when a later test collects it.
             p.kill()
+            p.wait()
             os.close(w)
             self.skipTest(f"no counters here: {e}")
         c0 = c.read()
@@ -155,6 +163,48 @@ class Counters(unittest.TestCase):
             p.wait()
             p.stdout.close()
         self.assertFalse(d["covered"])
+
+
+@unittest.skipUnless(os.path.exists("/proc/self/stat") and shutil.which("taskset") and shutil.which("chrt"),
+                     "needs Linux, taskset and chrt")
+class Spinners(unittest.TestCase):
+    def test_a_run_killed_outright_leaves_no_busy_loop(self):
+        # A run whose own cleanup cannot run, as after SIGKILL, still takes its loops with it.
+        with tempfile.TemporaryDirectory() as d:
+            pids = os.path.join(d, "pids")
+            code = (
+                "import importlib.util, os, sys, time\n"
+                "spec = importlib.util.spec_from_file_location('ri', sys.argv[1])\n"
+                "ri = importlib.util.module_from_spec(spec); spec.loader.exec_module(ri)\n"
+                "out = []; cpu = min(os.sched_getaffinity(0))\n"
+                "ri.spinners([cpu, cpu], out)\n"
+                "open(sys.argv[2] + '.tmp', 'w').write(' '.join(str(p.pid) for p in out))\n"
+                "os.rename(sys.argv[2] + '.tmp', sys.argv[2])\n"
+                "time.sleep(60)\n"
+            )
+            run = subprocess.Popen([sys.executable, "-c", code, os.path.join(SCRIPTS, "request-insn.py"), pids])
+            loops = []
+            try:
+                deadline = time.monotonic() + 30
+                while not os.path.exists(pids):
+                    self.assertIsNone(run.poll(), "the run ended before it started its loops")
+                    self.assertLess(time.monotonic(), deadline, "the loops did not start")
+                    time.sleep(0.02)
+                loops = [int(x) for x in open(pids).read().split()]
+                self.assertEqual(len(loops), 2)
+                run.send_signal(signal.SIGKILL)
+                run.wait(timeout=10)
+                for pid in loops:
+                    self.assertTrue(process_checks.ended(pid), f"busy loop {pid} outlived its run")
+            finally:
+                if run.poll() is None:
+                    run.kill()
+                    run.wait()
+                for pid in loops:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
 
 if __name__ == "__main__":

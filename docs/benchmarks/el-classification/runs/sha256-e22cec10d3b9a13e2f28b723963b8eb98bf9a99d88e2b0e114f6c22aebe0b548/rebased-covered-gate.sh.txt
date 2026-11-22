@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# regate.sh: run.sh of the gate again with bin/fixr (the rebased tip c1619c37), the four arms
+# without the diagnostic arm, into gate/out-c1619c37. Run under sparkles-heavy-run.
+set -u
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2
+G=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/gate
+R692=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/gen
+FIX=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/bin/fixr; DIAG=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/bin/fixdiag
+cd $W
+for set in hand:$G/hand:$G/hand-hermit s692:$R692/files:$R692/hermit cov:$G/cov/files:$G/cov/hermit; do
+  IFS=: read name files refs <<< "$set"
+  for f in $files/*.ofn; do
+    n=$(basename "$f" .ofn)
+    for arm in 2:1 2:8 0:1 1:1; do
+      l=${arm%:*}; t=${arm#*:}
+      o=$G/out-c1619c37/$name/l$l-t$t; mkdir -p "$o"
+      SPARKLES_HORN_RULES=$l timeout 120 $FIX --threads $t --taxonomy "$o/$n.tax" "$f" > "$o/$n.json" 2> "$o/$n.err"
+      status=$?
+      python3 -I scripts/elk-compare/ours-compare.py --status $status --name "$n" --hermit "$refs/$n.txt" --konclude "" --report "$o/$n.json" --stderr "$o/$n.err" --taxonomy "$o/$n.tax" >> "$o/judge.jsonl" 2>> "$o/judge.err"
+    done
+  done
+done
+echo GATE-DONE >> $G/out-c1619c37/log.txt

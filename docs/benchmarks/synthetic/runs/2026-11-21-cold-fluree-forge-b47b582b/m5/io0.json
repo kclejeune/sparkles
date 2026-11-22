@@ -1,0 +1,829 @@
+{
+  "count-all": {
+    "ms": [
+      2.613507676869631,
+      2.051775809377432,
+      2.174961846321821,
+      2.4138279259204865,
+      2.952482085675001
+    ],
+    "median": 2.4138279259204865,
+    "mean": 2.4413110688328743,
+    "stdev": 0.35860229716023234,
+    "hashes": [
+      "fa75ad9effda1c462d268d85b54d422d15fad0ae0b4b98860371f5dc61b97e43"
+    ],
+    "rows": [
+      0
+    ],
+    "ready_ms": [
+      65.49130193889141,
+      53.109823260456324,
+      52.6225408539176,
+      52.7212917804718,
+      107.04286396503448
+    ],
+    "meta": [
+      {
+        "totalRows": 1,
+        "sentRows": 1,
+        "timing": {
+          "parseMs": 0.08238599999999999,
+          "planMs": 0.161631,
+          "execMs": 0.027468,
+          "serializeMs": 0.012139,
+          "totalMs": 0.283624
+        },
+        "plan": {
+          "id": "0",
+          "operator": "Project",
+          "description": "?c",
+          "columns": [
+            "c"
+          ],
+          "sortedOn": [],
+          "estimatedRows": 1.0,
+          "estimatedCost": 2.0,
+          "actualRows": 1,
+          "timeMs": 0.023785,
+          "cached": false,
+          "children": [
+            {
+              "id": "0.0",
+              "operator": "Bind",
+              "description": "?c := ?df275f5bfc581c8a2be544c7f69a764e",
+              "columns": [
+                "df275f5bfc581c8a2be544c7f69a764e",
+                "c"
+              ],
+              "sortedOn": [],
+              "estimatedRows": 1.0,
+              "estimatedCost": 2.0,
+              "actualRows": 1,
+              "timeMs": 0.020166999999999997,
+              "cached": false,
+              "children": [
+                {
+                  "id": "0.0.0",
+                  "operator": "CountFromIndex",
+                  "description": "SPO ?s ?p ?o",
+                  "columns": [
+                    "df275f5bfc581c8a2be544c7f69a764e"
+                  ],
+                  "sortedOn": [],
+                  "estimatedRows": 1.0,
+                  "estimatedCost": 1.0,
+                  "actualRows": 1,
+                  "timeMs": 0.010468,
+                  "cached": false,
+                  "patterns": [
+                    {
+                      "s": "?s",
+                      "p": "?p",
+                      "o": "?o",
+                      "occurrence": 0
+                    }
+                  ],
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        "memory": {
+          "peakBytes": 661,
+          "grantedBytes": 16777216
+        },
+        "rowsProduced": 3,
+        "commit": 1,
+        "datasetId": "140c3ae7-53eb-4fa8-a207-b0db0c867cac",
+        "io": {
+          "index": {},
+          "readahead": {
+            "vocab.dat": {
+              "requests": 1,
+              "bytes": 3165
+            },
+            "vocab.off": {
+              "requests": 1,
+              "bytes": 304
+            }
+          },
+          "vocab": {
+            "finds": 1,
+            "groupsHinted": 1,
+            "blocksScanned": 1
+          },
+          "numericPagesRequested": 0,
+          "timeMs": {
+            "vocabLookup": 0.049164,
+            "vocabRead": 0.0,
+            "indexDecode": 0.0,
+            "indexWait": 0.0
+          },
+          "majorFaults": 0,
+          "minorFaults": 2,
+          "pages": {
+            "vocab.dat": {
+              "touched": 1,
+              "residentBefore": 1,
+              "residentAfter": 1,
+              "broughtIn": 0
+            },
+            "vocab.off": {
+              "touched": 1,
+              "residentBefore": 1,
+              "residentAfter": 1,
+              "broughtIn": 0
+            }
+          },
+          "pagesTruncated": false,
+          "events": [
+            {
+              "atUs": 261,
+              "file": "-",
+              "what": "plan",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 310,
+              "file": "vocab.off",
+              "what": "willneed",
+              "bytes": 304,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 333,
+              "file": "vocab.dat",
+              "what": "willneed",
+              "bytes": 3165,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 394,
+              "file": "-",
+              "what": "planned",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 395,
+              "file": "-",
+              "what": "scans prefetched",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 431,
+              "file": "-",
+              "what": "executed",
+              "bytes": 0,
+              "columnsDecoded": 0
+            }
+          ]
+        }
+      },
+      {
+        "totalRows": 1,
+        "sentRows": 1,
+        "timing": {
+          "parseMs": 0.07606800000000001,
+          "planMs": 0.296165,
+          "execMs": 0.021302,
+          "serializeMs": 0.008136,
+          "totalMs": 0.401671
+        },
+        "plan": {
+          "id": "0",
+          "operator": "Project",
+          "description": "?c",
+          "columns": [
+            "c"
+          ],
+          "sortedOn": [],
+          "estimatedRows": 1.0,
+          "estimatedCost": 2.0,
+          "actualRows": 1,
+          "timeMs": 0.018556,
+          "cached": false,
+          "children": [
+            {
+              "id": "0.0",
+              "operator": "Bind",
+              "description": "?c := ?f0c9db70b9c14a07ac2e09e41aad88e6",
+              "columns": [
+                "f0c9db70b9c14a07ac2e09e41aad88e6",
+                "c"
+              ],
+              "sortedOn": [],
+              "estimatedRows": 1.0,
+              "estimatedCost": 2.0,
+              "actualRows": 1,
+              "timeMs": 0.015866,
+              "cached": false,
+              "children": [
+                {
+                  "id": "0.0.0",
+                  "operator": "CountFromIndex",
+                  "description": "SPO ?s ?p ?o",
+                  "columns": [
+                    "f0c9db70b9c14a07ac2e09e41aad88e6"
+                  ],
+                  "sortedOn": [],
+                  "estimatedRows": 1.0,
+                  "estimatedCost": 1.0,
+                  "actualRows": 1,
+                  "timeMs": 0.008475,
+                  "cached": false,
+                  "patterns": [
+                    {
+                      "s": "?s",
+                      "p": "?p",
+                      "o": "?o",
+                      "occurrence": 0
+                    }
+                  ],
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        "memory": {
+          "peakBytes": 661,
+          "grantedBytes": 16777216
+        },
+        "rowsProduced": 3,
+        "commit": 1,
+        "datasetId": "140c3ae7-53eb-4fa8-a207-b0db0c867cac",
+        "io": {
+          "index": {},
+          "readahead": {
+            "vocab.dat": {
+              "requests": 1,
+              "bytes": 3165
+            },
+            "vocab.off": {
+              "requests": 1,
+              "bytes": 304
+            }
+          },
+          "vocab": {
+            "finds": 1,
+            "groupsHinted": 1,
+            "blocksScanned": 1
+          },
+          "numericPagesRequested": 0,
+          "timeMs": {
+            "vocabLookup": 0.208734,
+            "vocabRead": 0.0,
+            "indexDecode": 0.0,
+            "indexWait": 0.0
+          },
+          "majorFaults": 0,
+          "minorFaults": 4,
+          "pages": {
+            "vocab.dat": {
+              "touched": 1,
+              "residentBefore": 0,
+              "residentAfter": 1,
+              "broughtIn": 1
+            },
+            "vocab.off": {
+              "touched": 1,
+              "residentBefore": 1,
+              "residentAfter": 1,
+              "broughtIn": 0
+            }
+          },
+          "pagesTruncated": false,
+          "events": [
+            {
+              "atUs": 174,
+              "file": "-",
+              "what": "plan",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 212,
+              "file": "vocab.off",
+              "what": "willneed",
+              "bytes": 304,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 225,
+              "file": "vocab.dat",
+              "what": "willneed",
+              "bytes": 3165,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 450,
+              "file": "-",
+              "what": "planned",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 451,
+              "file": "-",
+              "what": "scans prefetched",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 478,
+              "file": "-",
+              "what": "executed",
+              "bytes": 0,
+              "columnsDecoded": 0
+            }
+          ]
+        }
+      },
+      {
+        "totalRows": 1,
+        "sentRows": 1,
+        "timing": {
+          "parseMs": 0.07086300000000001,
+          "planMs": 0.281374,
+          "execMs": 0.022787,
+          "serializeMs": 0.012686,
+          "totalMs": 0.38771
+        },
+        "plan": {
+          "id": "0",
+          "operator": "Project",
+          "description": "?c",
+          "columns": [
+            "c"
+          ],
+          "sortedOn": [],
+          "estimatedRows": 1.0,
+          "estimatedCost": 2.0,
+          "actualRows": 1,
+          "timeMs": 0.019795,
+          "cached": false,
+          "children": [
+            {
+              "id": "0.0",
+              "operator": "Bind",
+              "description": "?c := ?87059a037d5b19dbd90efc9256af462b",
+              "columns": [
+                "87059a037d5b19dbd90efc9256af462b",
+                "c"
+              ],
+              "sortedOn": [],
+              "estimatedRows": 1.0,
+              "estimatedCost": 2.0,
+              "actualRows": 1,
+              "timeMs": 0.016462,
+              "cached": false,
+              "children": [
+                {
+                  "id": "0.0.0",
+                  "operator": "CountFromIndex",
+                  "description": "SPO ?s ?p ?o",
+                  "columns": [
+                    "87059a037d5b19dbd90efc9256af462b"
+                  ],
+                  "sortedOn": [],
+                  "estimatedRows": 1.0,
+                  "estimatedCost": 1.0,
+                  "actualRows": 1,
+                  "timeMs": 0.008739,
+                  "cached": false,
+                  "patterns": [
+                    {
+                      "s": "?s",
+                      "p": "?p",
+                      "o": "?o",
+                      "occurrence": 0
+                    }
+                  ],
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        "memory": {
+          "peakBytes": 661,
+          "grantedBytes": 16777216
+        },
+        "rowsProduced": 3,
+        "commit": 1,
+        "datasetId": "140c3ae7-53eb-4fa8-a207-b0db0c867cac",
+        "io": {
+          "index": {},
+          "readahead": {
+            "vocab.dat": {
+              "requests": 1,
+              "bytes": 3165
+            },
+            "vocab.off": {
+              "requests": 1,
+              "bytes": 304
+            }
+          },
+          "vocab": {
+            "finds": 1,
+            "groupsHinted": 1,
+            "blocksScanned": 1
+          },
+          "numericPagesRequested": 0,
+          "timeMs": {
+            "vocabLookup": 0.185155,
+            "vocabRead": 0.0,
+            "indexDecode": 0.0,
+            "indexWait": 0.0
+          },
+          "majorFaults": 0,
+          "minorFaults": 2,
+          "pages": {
+            "vocab.dat": {
+              "touched": 1,
+              "residentBefore": 0,
+              "residentAfter": 1,
+              "broughtIn": 1
+            },
+            "vocab.off": {
+              "touched": 1,
+              "residentBefore": 1,
+              "residentAfter": 1,
+              "broughtIn": 0
+            }
+          },
+          "pagesTruncated": false,
+          "events": [
+            {
+              "atUs": 166,
+              "file": "-",
+              "what": "plan",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 207,
+              "file": "vocab.off",
+              "what": "willneed",
+              "bytes": 304,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 224,
+              "file": "vocab.dat",
+              "what": "willneed",
+              "bytes": 3165,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 426,
+              "file": "-",
+              "what": "planned",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 427,
+              "file": "-",
+              "what": "scans prefetched",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 457,
+              "file": "-",
+              "what": "executed",
+              "bytes": 0,
+              "columnsDecoded": 0
+            }
+          ]
+        }
+      },
+      {
+        "totalRows": 1,
+        "sentRows": 1,
+        "timing": {
+          "parseMs": 0.091785,
+          "planMs": 0.292554,
+          "execMs": 0.025309,
+          "serializeMs": 0.009464,
+          "totalMs": 0.41911200000000004
+        },
+        "plan": {
+          "id": "0",
+          "operator": "Project",
+          "description": "?c",
+          "columns": [
+            "c"
+          ],
+          "sortedOn": [],
+          "estimatedRows": 1.0,
+          "estimatedCost": 2.0,
+          "actualRows": 1,
+          "timeMs": 0.022062,
+          "cached": false,
+          "children": [
+            {
+              "id": "0.0",
+              "operator": "Bind",
+              "description": "?c := ?d8f63c6cc9ea4177807a6b16f804201",
+              "columns": [
+                "d8f63c6cc9ea4177807a6b16f804201",
+                "c"
+              ],
+              "sortedOn": [],
+              "estimatedRows": 1.0,
+              "estimatedCost": 2.0,
+              "actualRows": 1,
+              "timeMs": 0.018792,
+              "cached": false,
+              "children": [
+                {
+                  "id": "0.0.0",
+                  "operator": "CountFromIndex",
+                  "description": "SPO ?s ?p ?o",
+                  "columns": [
+                    "d8f63c6cc9ea4177807a6b16f804201"
+                  ],
+                  "sortedOn": [],
+                  "estimatedRows": 1.0,
+                  "estimatedCost": 1.0,
+                  "actualRows": 1,
+                  "timeMs": 0.010074,
+                  "cached": false,
+                  "patterns": [
+                    {
+                      "s": "?s",
+                      "p": "?p",
+                      "o": "?o",
+                      "occurrence": 0
+                    }
+                  ],
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        "memory": {
+          "peakBytes": 661,
+          "grantedBytes": 16777216
+        },
+        "rowsProduced": 3,
+        "commit": 1,
+        "datasetId": "140c3ae7-53eb-4fa8-a207-b0db0c867cac",
+        "io": {
+          "index": {},
+          "readahead": {
+            "vocab.dat": {
+              "requests": 1,
+              "bytes": 3165
+            },
+            "vocab.off": {
+              "requests": 1,
+              "bytes": 304
+            }
+          },
+          "vocab": {
+            "finds": 1,
+            "groupsHinted": 1,
+            "blocksScanned": 1
+          },
+          "numericPagesRequested": 0,
+          "timeMs": {
+            "vocabLookup": 0.179228,
+            "vocabRead": 0.0,
+            "indexDecode": 0.0,
+            "indexWait": 0.0
+          },
+          "majorFaults": 0,
+          "minorFaults": 1,
+          "pages": {
+            "vocab.dat": {
+              "touched": 1,
+              "residentBefore": 0,
+              "residentAfter": 1,
+              "broughtIn": 1
+            },
+            "vocab.off": {
+              "touched": 1,
+              "residentBefore": 1,
+              "residentAfter": 1,
+              "broughtIn": 0
+            }
+          },
+          "pagesTruncated": false,
+          "events": [
+            {
+              "atUs": 195,
+              "file": "-",
+              "what": "plan",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 237,
+              "file": "vocab.off",
+              "what": "willneed",
+              "bytes": 304,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 255,
+              "file": "vocab.dat",
+              "what": "willneed",
+              "bytes": 3165,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 462,
+              "file": "-",
+              "what": "planned",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 463,
+              "file": "-",
+              "what": "scans prefetched",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 498,
+              "file": "-",
+              "what": "executed",
+              "bytes": 0,
+              "columnsDecoded": 0
+            }
+          ]
+        }
+      },
+      {
+        "totalRows": 1,
+        "sentRows": 1,
+        "timing": {
+          "parseMs": 0.09568099999999999,
+          "planMs": 0.50174,
+          "execMs": 0.031501999999999995,
+          "serializeMs": 0.012954,
+          "totalMs": 0.641877
+        },
+        "plan": {
+          "id": "0",
+          "operator": "Project",
+          "description": "?c",
+          "columns": [
+            "c"
+          ],
+          "sortedOn": [],
+          "estimatedRows": 1.0,
+          "estimatedCost": 2.0,
+          "actualRows": 1,
+          "timeMs": 0.027337,
+          "cached": false,
+          "children": [
+            {
+              "id": "0.0",
+              "operator": "Bind",
+              "description": "?c := ?c31e9e0df7371d57538ee4fbeda34046",
+              "columns": [
+                "c31e9e0df7371d57538ee4fbeda34046",
+                "c"
+              ],
+              "sortedOn": [],
+              "estimatedRows": 1.0,
+              "estimatedCost": 2.0,
+              "actualRows": 1,
+              "timeMs": 0.023663,
+              "cached": false,
+              "children": [
+                {
+                  "id": "0.0.0",
+                  "operator": "CountFromIndex",
+                  "description": "SPO ?s ?p ?o",
+                  "columns": [
+                    "c31e9e0df7371d57538ee4fbeda34046"
+                  ],
+                  "sortedOn": [],
+                  "estimatedRows": 1.0,
+                  "estimatedCost": 1.0,
+                  "actualRows": 1,
+                  "timeMs": 0.012104,
+                  "cached": false,
+                  "patterns": [
+                    {
+                      "s": "?s",
+                      "p": "?p",
+                      "o": "?o",
+                      "occurrence": 0
+                    }
+                  ],
+                  "children": []
+                }
+              ]
+            }
+          ]
+        },
+        "memory": {
+          "peakBytes": 661,
+          "grantedBytes": 16777216
+        },
+        "rowsProduced": 3,
+        "commit": 1,
+        "datasetId": "140c3ae7-53eb-4fa8-a207-b0db0c867cac",
+        "io": {
+          "index": {},
+          "readahead": {
+            "vocab.dat": {
+              "requests": 1,
+              "bytes": 3165
+            },
+            "vocab.off": {
+              "requests": 1,
+              "bytes": 304
+            }
+          },
+          "vocab": {
+            "finds": 1,
+            "groupsHinted": 1,
+            "blocksScanned": 1
+          },
+          "numericPagesRequested": 0,
+          "timeMs": {
+            "vocabLookup": 0.366385,
+            "vocabRead": 0.0,
+            "indexDecode": 0.0,
+            "indexWait": 0.0
+          },
+          "majorFaults": 0,
+          "minorFaults": 5,
+          "pages": {
+            "vocab.dat": {
+              "touched": 1,
+              "residentBefore": 0,
+              "residentAfter": 1,
+              "broughtIn": 1
+            },
+            "vocab.off": {
+              "touched": 1,
+              "residentBefore": 1,
+              "residentAfter": 1,
+              "broughtIn": 0
+            }
+          },
+          "pagesTruncated": false,
+          "events": [
+            {
+              "atUs": 300,
+              "file": "-",
+              "what": "plan",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 354,
+              "file": "vocab.off",
+              "what": "willneed",
+              "bytes": 304,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 380,
+              "file": "vocab.dat",
+              "what": "willneed",
+              "bytes": 3165,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 767,
+              "file": "-",
+              "what": "planned",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 769,
+              "file": "-",
+              "what": "scans prefetched",
+              "bytes": 0,
+              "columnsDecoded": 0
+            },
+            {
+              "atUs": 812,
+              "file": "-",
+              "what": "executed",
+              "bytes": 0,
+              "columnsDecoded": 0
+            }
+          ]
+        }
+      }
+    ]
+  }
+}

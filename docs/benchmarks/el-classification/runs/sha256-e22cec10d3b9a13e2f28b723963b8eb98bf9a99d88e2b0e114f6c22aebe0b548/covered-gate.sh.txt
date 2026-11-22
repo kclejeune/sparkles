@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# run.sh: the gate of level 2 of SPARKLES_HORN_RULES (roadmap item 1025) against HermiT. For the
+# 300 generated files of item 692's differential run (its references, read only), the 600 files
+# of gate/cov and the six hand cases: bin/fix (the committed tip) at level 2 on one and eight
+# threads and at levels 0 and 1 on one thread, each judged by ours-compare.py, and bin/fixdiag
+# (the tip with gate/diag-passed.patch) at level 2 on one thread, whose standard error has one
+# HORNPASSED line for each link passed over and one HORNSELF line for each core R6 left out.
+set -u
+W=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2
+G=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/gate
+R692=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-individuals-692/.artifacts/lanes/horn-individuals-692/data/gen
+FIX=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/bin/fix; DIAG=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-uberon-2/.artifacts/lanes/horn-uberon-2/g2/bin/fixdiag
+cd $W
+for set in hand:$G/hand:$G/hand-hermit s692:$R692/files:$R692/hermit cov:$G/cov/files:$G/cov/hermit; do
+  IFS=: read name files refs <<< "$set"
+  for f in $files/*.ofn; do
+    n=$(basename "$f" .ofn)
+    for arm in 2:1 2:8 0:1 1:1; do
+      l=${arm%:*}; t=${arm#*:}
+      o=$G/out/$name/l$l-t$t; mkdir -p "$o"
+      SPARKLES_HORN_RULES=$l timeout 120 $FIX --threads $t --taxonomy "$o/$n.tax" "$f" > "$o/$n.json" 2> "$o/$n.err"
+      status=$?
+      python3 -I scripts/elk-compare/ours-compare.py --status $status --name "$n" --hermit "$refs/$n.txt" --konclude "" --report "$o/$n.json" --stderr "$o/$n.err" --taxonomy "$o/$n.tax" >> "$o/judge.jsonl" 2>> "$o/judge.err"
+    done
+    o=$G/out/$name/diag; mkdir -p "$o"
+    SPARKLES_HORN_RULES=2 timeout 120 $DIAG --threads 1 "$f" > /dev/null 2> "$o/$n.err"
+    echo "$n $? $(grep -c '^HORNPASSED' "$o/$n.err") $(grep -c '^HORNSELF' "$o/$n.err")" >> $G/out/$name/passed.txt
+    rm -f "$o/$n.err"
+  done
+done
+echo GATE-DONE >> $G/out/log.txt

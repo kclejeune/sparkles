@@ -840,6 +840,27 @@ impl Snapshot {
         self.scan_between(perm, pad(prefix, 0), pad(prefix, u64::MAX), f)
     }
 
+    /// Like [`scan`](Self::scan), with a fallible control before index reads and
+    /// during the delta merge, including rows removed by deletions. A consumer
+    /// that iterates a visible block slice can invoke the same control within
+    /// its own row loop.
+    pub fn scan_checked(
+        &self,
+        perm: Perm,
+        prefix: &[u64],
+        check: impl Fn() -> Result<()>,
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between_cols_checked(
+            perm,
+            pad(prefix, 0),
+            pad(prefix, u64::MAX),
+            crate::index::ALL_COLS,
+            check,
+            f,
+        )
+    }
+
     /// Visit all quads whose permuted key lies in `[lo, hi]`, in key order, merging the
     /// base index with the delta (see [`scan`](Self::scan)).
     pub fn scan_between(
@@ -862,8 +883,21 @@ impl Snapshot {
         lo: Key,
         hi: Key,
         mask: crate::index::ColMask,
+        f: impl FnMut(Chunk<'_>) -> Result<bool>,
+    ) -> Result<()> {
+        self.scan_between_cols_checked(perm, lo, hi, mask, || Ok(()), f)
+    }
+
+    fn scan_between_cols_checked(
+        &self,
+        perm: Perm,
+        lo: Key,
+        hi: Key,
+        mask: crate::index::ColMask,
+        check: impl Fn() -> Result<()>,
         mut f: impl FnMut(Chunk<'_>) -> Result<bool>,
     ) -> Result<()> {
+        check()?;
         let pi = perm.index();
         let (ins_set, del_set) = (&self.delta.ins[pi], &self.delta.del[pi]);
         let mut ins = Delta::key_range(ins_set, lo, hi).peekable();
@@ -888,67 +922,77 @@ impl Snapshot {
         };
         let mut stop = false;
         if base.rows > 0 {
-            let r = base.for_each_key_range_masked(&self.cache, &lo, &hi, mask_of, |blk, s, e| {
-                if stop {
-                    return Ok(!stop);
-                }
-                // with undecoded columns read as 0 this is at most the true last key, and
-                // such a block has no delta key at or before its last row left to merge
-                let last = blk.key(e - 1);
-                let ins_hit = ins.peek().is_some_and(|k| **k <= last);
-                let del_hit = del.peek().is_some_and(|k| **k <= last);
-                if !ins_hit && !del_hit {
-                    if !f(Chunk::Block(blk, s, e))? {
-                        stop = true;
-                    }
-                    return Ok(!stop);
-                }
-                // merge: the rows before the next delta key go out as one slice, found by
-                // binary search, then the inserted key or the deleted row
-                let mut i = s;
-                loop {
-                    let next_ins = ins.peek().filter(|k| ***k <= last).map(|k| **k);
-                    let next_del = del.peek().filter(|k| ***k <= last).map(|k| **k);
-                    let (k, inserted) = match (next_ins, next_del) {
-                        (None, None) => break,
-                        (Some(a), Some(d)) if d < a => (d, false),
-                        (Some(a), _) => (a, true),
-                        (None, Some(d)) => (d, false),
-                    };
-                    let j = first_row_from(blk, i, e, &k);
-                    if i < j && !f(Chunk::Block(blk, i, j))? {
-                        stop = true;
+            let r = base.for_each_key_range_masked_checked(
+                &self.cache,
+                &lo,
+                &hi,
+                mask_of,
+                &check,
+                |blk, s, e| {
+                    if stop {
                         return Ok(!stop);
                     }
-                    i = j;
-                    if inserted {
-                        // an inserted key is not in the base, so row `j` comes after it
-                        if !f(Chunk::Row(k))? {
+                    // with undecoded columns read as 0 this is at most the true last key, and
+                    // such a block has no delta key at or before its last row left to merge
+                    let last = blk.key(e - 1);
+                    let ins_hit = ins.peek().is_some_and(|k| **k <= last);
+                    let del_hit = del.peek().is_some_and(|k| **k <= last);
+                    if !ins_hit && !del_hit {
+                        if !f(Chunk::Block(blk, s, e))? {
+                            stop = true;
+                        }
+                        return Ok(!stop);
+                    }
+                    // merge: the rows before the next delta key go out as one slice, found by
+                    // binary search, then the inserted key or the deleted row
+                    let mut i = s;
+                    loop {
+                        let next_ins = ins.peek().filter(|k| ***k <= last).map(|k| **k);
+                        let next_del = del.peek().filter(|k| ***k <= last).map(|k| **k);
+                        let (k, inserted) = match (next_ins, next_del) {
+                            (None, None) => break,
+                            (Some(a), Some(d)) if d < a => (d, false),
+                            (Some(a), _) => (a, true),
+                            (None, Some(d)) => (d, false),
+                        };
+                        check()?;
+                        let j = first_row_from(blk, i, e, &k);
+                        if i < j && !f(Chunk::Block(blk, i, j))? {
                             stop = true;
                             return Ok(!stop);
                         }
-                        ins.next();
-                    } else {
-                        // a deleted key is in the base (one that is not is skipped)
-                        if i < e && blk.key(i) == k {
-                            i += 1;
+                        i = j;
+                        if inserted {
+                            // an inserted key is not in the base, so row `j` comes after it
+                            if !f(Chunk::Row(k))? {
+                                stop = true;
+                                return Ok(!stop);
+                            }
+                            ins.next();
+                        } else {
+                            // a deleted key is in the base (one that is not is skipped)
+                            if i < e && blk.key(i) == k {
+                                i += 1;
+                            }
+                            del.next();
                         }
-                        del.next();
                     }
-                }
-                if i < e && !f(Chunk::Block(blk, i, e))? {
-                    stop = true;
-                }
-                Ok(!stop)
-            });
+                    if i < e && !f(Chunk::Block(blk, i, e))? {
+                        stop = true;
+                    }
+                    Ok(!stop)
+                },
+            );
             r?;
         }
         if !stop {
             for k in ins {
+                check()?;
                 if !f(Chunk::Row(*k))? {
-                    break;
+                    return Ok(());
                 }
             }
+            check()?;
         }
         Ok(())
     }
@@ -1243,7 +1287,7 @@ impl Snapshot {
     fn distinct_first_checked(
         &self,
         perm: Perm,
-        mut check: impl FnMut() -> Result<()>,
+        check: impl Fn() -> Result<()>,
         mut each: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
         let mut cur: Option<u64> = None;
@@ -1260,6 +1304,7 @@ impl Snapshot {
             let b = base.blocks.partition_point(|m| m.last[0] < from);
             if b < base.blocks.len() {
                 let blk = self.cache.get(base, b)?;
+                check()?;
                 let i = blk.cols[0].partition_point(|&v| v < from);
                 if i < blk.len() {
                     next = Some(blk.cols[0][i]);
@@ -1278,8 +1323,7 @@ impl Snapshot {
             // whether any quad remains under `v`: the first one found answers it, where
             // a count would walk every inserted and deleted key of the delta under `v`
             let mut any = false;
-            self.scan(perm, &[v], |c| {
-                check()?;
+            self.scan_checked(perm, &[v], &check, |c| {
                 any = match c {
                     Chunk::Block(_, start, end) => start < end,
                     Chunk::Row(_) => true,
@@ -1312,7 +1356,7 @@ impl Snapshot {
     /// The query adapter supplies its control check; callback errors propagate directly.
     pub(crate) fn for_each_graph_id_checked(
         &self,
-        check: impl FnMut() -> Result<()>,
+        check: impl Fn() -> Result<()>,
         mut each: impl FnMut(Id) -> Result<()>,
     ) -> Result<()> {
         self.distinct_first_checked(Perm::Gspo, check, |value| {
@@ -4062,6 +4106,7 @@ impl Store {
     }
 
     /// Replace the wall clock used for commit timestamps (tests).
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn set_clock(&self, clock: Arc<dyn Fn() -> i64 + Send + Sync>) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
@@ -4425,7 +4470,7 @@ impl Store {
     }
 
     /// Test hook: make the next full-text update fail.
-    #[cfg(feature = "text")]
+    #[cfg(all(feature = "text", any(test, feature = "failpoints")))]
     #[doc(hidden)]
     pub fn fail_next_text_commit(&self) {
         if let Some(ti) = self.text.load_full() {
@@ -4435,7 +4480,7 @@ impl Store {
 
     /// Test hook: checkpoint the full-text index now, as its background tick does about
     /// once a second, so that a short run writes checkpoints that name its commits.
-    #[cfg(feature = "text")]
+    #[cfg(all(feature = "text", any(test, feature = "failpoints")))]
     #[doc(hidden)]
     pub fn checkpoint_text(&self) -> Result<()> {
         match self.text.load_full() {
@@ -4486,7 +4531,7 @@ impl Store {
 
     /// Test hook: pause (or resume) the full-text index's background tick, so staged
     /// documents stay uncommitted until a search, compaction or close.
-    #[cfg(feature = "text")]
+    #[cfg(all(feature = "text", any(test, feature = "failpoints")))]
     #[doc(hidden)]
     pub fn set_text_ticks(&self, on: bool) {
         crate::sparql::extensions::assert_family(self.owner_dataset_id());
@@ -6320,6 +6365,7 @@ impl Store {
 
     /// Whether the writer has the current log's write-through handle open, so that
     /// small commits into preallocated space use direct writes (for tests).
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn wal_direct_active(&self) -> bool {
         matches!(self.writer.lock().tail.lock().direct, wal::Direct::Open(_))
@@ -6327,6 +6373,7 @@ impl Store {
 
     /// Whether the current generation's delta vocabulary has its write-through handle
     /// open, so that the terms of small commits use direct writes (for tests).
+    #[cfg(any(test, feature = "failpoints"))]
     #[doc(hidden)]
     pub fn vocab_direct_active(&self) -> bool {
         self.snapshot().generation.dvocab.direct_active()
@@ -6554,7 +6601,6 @@ impl Drop for OrdinarySyncObservation<'_> {
     fn drop(&mut self) {
         if let Some((path, took)) = self.sample.take() {
             self.store.commit_stats.synced(path, took);
-            #[cfg(test)]
             ordinary_sync_probe::published(self.store, path);
         }
     }
@@ -7368,39 +7414,19 @@ impl WriteTxn<'_> {
                     && let Some(direct) = io.direct.handle(path.as_deref(), wal.get_ref())
                 {
                     let t = std::time::Instant::now();
-                    let direct_written = {
-                        #[cfg(not(test))]
-                        {
-                            commit_direct(
-                                direct,
-                                w.wal_len,
-                                &data,
-                                &gen_.dvocab,
-                                &mut w.vocab_sync,
-                                u64::MAX,
-                            )?
-                        }
-                        #[cfg(test)]
-                        {
-                            // Branch-selection control, not a physical EINVAL fault:
-                            // refuse before this helper performs any mutation.
-                            if ordinary_sync_probe::skip_direct(self.store) {
-                                false
-                            } else {
-                                commit_direct(
-                                    direct,
-                                    w.wal_len,
-                                    &data,
-                                    &gen_.dvocab,
-                                    &mut w.vocab_sync,
-                                    u64::MAX,
-                                )?
-                            }
-                        }
-                    };
+                    // A test's branch-selection control, not a physical EINVAL fault,
+                    // refuses before this helper performs any mutation.
+                    let direct_written = !ordinary_sync_probe::skip_direct(self.store)
+                        && commit_direct(
+                            direct,
+                            w.wal_len,
+                            &data,
+                            &gen_.dvocab,
+                            &mut w.vocab_sync,
+                            u64::MAX,
+                        )?;
                     if direct_written {
                         *sync = Some((SyncPath::Direct, t.elapsed()));
-                        #[cfg(test)]
                         ordinary_sync_probe::captured(self.store);
                         return Ok(());
                     }
@@ -7419,7 +7445,6 @@ impl WriteTxn<'_> {
                 let synced =
                     sync_commit_reused(wal.get_ref(), &gen_.dvocab, &mut w.vocab_sync, u64::MAX);
                 *sync = Some((SyncPath::Buffered, t.elapsed()));
-                #[cfg(test)]
                 ordinary_sync_probe::captured(self.store);
                 synced
             });
@@ -9748,6 +9773,187 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
     }
 
     #[test]
+    fn checked_graph_ids_poll_deleted_base_rows() {
+        use std::fmt::Write as _;
+        let store = Store::in_memory(StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        });
+        let mut data = String::new();
+        for i in 0..4096 {
+            writeln!(data, "<urn:s:{i}> <urn:p> <urn:o> <urn:g> .").unwrap();
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let before = store.snapshot();
+        let graph = before.lookup_iri("urn:g").unwrap();
+        assert_eq!(before.graph_ids().unwrap(), vec![graph]);
+        assert_eq!(before.delta.inserts(), 0);
+        let mut write = store.write();
+        for key in before.scan_keys(Perm::Gspo, &[graph.0]).unwrap() {
+            assert!(write.delete(Perm::Gspo.to_quad(&key)).unwrap());
+        }
+        write.commit().unwrap();
+        let tombstones = store.snapshot();
+        assert_eq!(tombstones.delta.deletes(), 4096);
+        assert!(tombstones.graph_ids().unwrap().is_empty());
+        let checks = std::cell::Cell::new(0);
+        let mut delivered = 0;
+        let result = tombstones.for_each_graph_id_checked(
+            || {
+                checks.set(checks.get() + 1);
+                if checks.get() > 8 {
+                    Err(Error::Timeout)
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                delivered += 1;
+                Ok(())
+            },
+        );
+        assert_eq!(delivered, 0);
+        assert!(
+            matches!(result, Err(Error::Timeout)),
+            "checked graph discovery completed after only {} control checkpoints: {result:?}",
+            checks.get()
+        );
+    }
+
+    #[test]
+    fn prepared_graph_ids_seek_past_live_prefixes_and_poll_deleted_prefixes() {
+        use crate::access::Preparation;
+        use crate::task::{Cancel, Control, Progress};
+        use std::fmt::Write as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let store = Store::in_memory(StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        });
+        let mut data = String::from("<urn:s> <urn:p> <urn:o> .\n");
+        for graph in ["urn:alive", "urn:removed"] {
+            for i in 0..(crate::index::SEG_ROWS * 4) {
+                writeln!(data, "<urn:s:{i}> <urn:p> <urn:o> <{graph}> .").unwrap();
+            }
+        }
+        data.push_str("<urn:s> <urn:p> <urn:o> _:graph .\n");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let before = store.snapshot();
+        assert_eq!(before.delta.inserts(), 0);
+        let (alive, removed) = (
+            before.lookup_iri("urn:alive").unwrap(),
+            before.lookup_iri("urn:removed").unwrap(),
+        );
+        let progress = Arc::new(AtomicUsize::new(0));
+        let scans = progress.clone();
+        let cancel = Cancel::new();
+        let stop = cancel.clone();
+        let preparation = Preparation::new(
+            Control {
+                cancel,
+                progress: Progress::new(move |_, phase| {
+                    if phase == "scanning permission rows" {
+                        scans.fetch_add(1, Ordering::Relaxed);
+                        stop.cancel();
+                    }
+                }),
+                deadline: None,
+            },
+            2 << 20,
+        )
+        .unwrap();
+        let mut ids = Vec::new();
+        before
+            .scan_graph_ids_prepared(&preparation, |id| {
+                ids.push(id);
+                Ok(())
+            })
+            .unwrap();
+        let expected = |snap: &Snapshot| {
+            let mut ids = snap.graph_ids().unwrap();
+            ids.push(Id::DEFAULT_GRAPH);
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(ids, expected(&before));
+        assert!(before.graph_exists_prepared(alive, &preparation).unwrap());
+        assert_eq!(progress.load(Ordering::Relaxed), 0);
+
+        let mut write = store.write();
+        for key in before.scan_keys(Perm::Gspo, &[removed.0]).unwrap() {
+            write.delete(Perm::Gspo.to_quad(&key)).unwrap();
+        }
+        for graph in ["urn:alive", "urn:new"] {
+            let ids = write
+                .encode_quad(
+                    &Quad::new(
+                        named("urn:inserted"),
+                        named("urn:p"),
+                        named("urn:o"),
+                        named(graph),
+                    ),
+                    &mut Default::default(),
+                )
+                .unwrap();
+            assert!(write.insert(ids).unwrap());
+        }
+        write.commit().unwrap();
+        let after = store.snapshot();
+        assert_eq!(after.delta.deletes(), crate::index::SEG_ROWS * 4);
+        ids.clear();
+        let result = after.scan_graph_ids_prepared(&preparation, |id| {
+            ids.push(id);
+            Ok(())
+        });
+        assert!(matches!(result, Err(Error::Cancelled)));
+        assert_eq!(progress.load(Ordering::Relaxed), 1);
+        assert!(ids.contains(&alive));
+        assert!(!ids.contains(&removed));
+        let cancelled = Cancel::new();
+        let during_scan = cancelled.clone();
+        let prep = Preparation::new(
+            Control {
+                cancel: cancelled,
+                progress: Progress::new(move |_, phase| {
+                    if phase == "scanning permission rows" {
+                        during_scan.cancel();
+                    }
+                }),
+                deadline: None,
+            },
+            2 << 20,
+        )
+        .unwrap();
+        assert!(matches!(
+            after.graph_exists_prepared(removed, &prep),
+            Err(Error::Cancelled)
+        ));
+        ids.clear();
+        let preparation = Preparation::new(Control::none(), 2 << 20).unwrap();
+        assert!(!after.graph_exists_prepared(removed, &preparation).unwrap());
+        after
+            .scan_graph_ids_prepared(&preparation, |id| {
+                ids.push(id);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(ids, expected(&after));
+    }
+
+    #[test]
     fn mem_store_and_graphs() {
         let store = Store::in_memory(StoreOptions::default());
         let trig = r#"@prefix ex: <http://ex.org/> .
@@ -9838,7 +10044,24 @@ ex:a ex:p 1, 2, 3 . ex:b ex:p 2 . ex:c ex:q "hello"@en .
 }
 
 // Private diagnostic probes are scoped to one Store and one calling thread. No timed
-// release build contains the observer, fault selection, or post-capture panic point.
+// release build contains the observer, fault selection, or post-capture panic point:
+// outside tests the three points of `publish_log` call the empty functions below.
+#[cfg(not(test))]
+mod ordinary_sync_probe {
+    use super::{Store, SyncPath};
+
+    #[inline(always)]
+    pub(super) fn published(_: &Store, _: SyncPath) {}
+
+    #[inline(always)]
+    pub(super) fn captured(_: &Store) {}
+
+    #[inline(always)]
+    pub(super) fn skip_direct(_: &Store) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod ordinary_sync_probe {
     use super::*;

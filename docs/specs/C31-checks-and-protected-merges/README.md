@@ -1,7 +1,7 @@
 # Checks and protected merges
 
-This spec covers gate suites of SHACL, ShEx, lint, reasoning and quality checks defined in RDF, required checks on protected branches, breaking-change analysis, change-request workflows and comments. It is planned, and
-[roadmap item 459](../../ROADMAP.md) holds the work. The storage format of comments is
+This spec covers gate suites of SHACL, ShEx, lint, reasoning and quality checks defined in RDF, required checks on protected branches, breaking-change analysis, change-request workflows and comments. Its gate-suite and required-check phases are in progress under
+[roadmap item 1136](../../ROADMAP.md), and [item 459](../../ROADMAP.md) holds the other phases. The storage format of comments is
 chosen, and the ontology editor's discussions of item 618 use it, as the
 [Outcome](SPEC.md#outcome) describes.
 

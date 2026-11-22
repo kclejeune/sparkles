@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# m3: cold native-JSON server timings with a pause of 0 or 1 s after ready (a copy of
+# bench-regressions.py with one added sleep), count-all and contains. M3-DONE at the end.
+set -uo pipefail
+L=$HOME/lanes/cold-scan
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+W=$L/work
+cp $L/src/scripts/bench-regressions.py $L/srcd/scripts/br-delay.py
+python3 - $L/srcd/scripts/br-delay.py <<'PY'
+import sys; p=sys.argv[1]; s=open(p).read()
+s=s.replace("            before = time.perf_counter()\n", "            time.sleep(float(os.environ.get('COLD_DELAY','0')))\n            before = time.perf_counter()\n",1)
+open(p,'w').write(s)
+PY
+grep -n "COLD_DELAY" $L/srcd/scripts/br-delay.py
+rm -rf $L/m3 && mkdir -p $L/m3 && cp -r $W/sparkles.db $L/m3/db
+for d in 0 1 0 1; do
+  COLD_DELAY=$d python3 $L/srcd/scripts/br-delay.py --binary $L/bin/sparkles --db $L/m3/db --queries $W/queries \
+    --names count-all contains --out $L/m3/d$d-$RANDOM.json --runs 7 --cold --format application/x-sparkles+json --port 4372 >> $L/m3/d$d.log 2>&1
+done
+echo M3-DONE

@@ -9,6 +9,7 @@ use oxrdf::{BlankNode, NamedNode, Term, Triple};
 use rustc_hash::FxHashSet;
 use sparkles_core::id::Id;
 use std::fmt;
+use std::time::Instant;
 
 /// A SHACL property path.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -24,11 +25,21 @@ pub enum PropertyPath {
 
 impl PropertyPath {
     /// Parse the path rooted at `node` of a shapes graph.
-    pub(crate) fn from_graph(g: &G<'_>, node: &Term) -> Result<PropertyPath> {
-        Self::parse(g, node, 0)
+    pub(crate) fn from_graph(
+        g: &G<'_>,
+        node: &Term,
+        deadline: Option<Instant>,
+    ) -> Result<PropertyPath> {
+        Self::parse(g, node, 0, deadline)
     }
 
-    fn parse(g: &G<'_>, node: &Term, depth: usize) -> Result<PropertyPath> {
+    fn parse(
+        g: &G<'_>,
+        node: &Term,
+        depth: usize,
+        deadline: Option<Instant>,
+    ) -> Result<PropertyPath> {
+        crate::data::check_deadline(deadline)?;
         if depth > 64 {
             bail!("property path nested too deeply at {node}");
         }
@@ -39,20 +50,20 @@ impl PropertyPath {
             Term::BlankNode(_) => {}
         }
         if g.has(node, rdf::FIRST) {
-            let items = g.list(node)?;
+            let items = g.list(node, deadline)?;
             if items.len() < 2 {
                 bail!("a sequence path needs at least two members: {node}");
             }
             return Ok(PropertyPath::Sequence(
                 items
                     .iter()
-                    .map(|i| Self::parse(g, i, depth + 1))
+                    .map(|i| Self::parse(g, i, depth + 1, deadline))
                     .collect::<Result<_>>()?,
             ));
         }
         let one = |p| -> Result<Option<Box<PropertyPath>>> {
             match g.object(node, p) {
-                Some(t) => Ok(Some(Box::new(Self::parse(g, &t, depth + 1)?))),
+                Some(t) => Ok(Some(Box::new(Self::parse(g, &t, depth + 1, deadline)?))),
                 None => Ok(None),
             }
         };
@@ -60,14 +71,14 @@ impl PropertyPath {
             return Ok(PropertyPath::Inverse(p));
         }
         if let Some(l) = g.object(node, sh::ALTERNATIVE_PATH) {
-            let items = g.list(&l)?;
+            let items = g.list(&l, deadline)?;
             if items.len() < 2 {
                 bail!("an alternative path needs at least two members: {node}");
             }
             return Ok(PropertyPath::Alternative(
                 items
                     .iter()
-                    .map(|i| Self::parse(g, i, depth + 1))
+                    .map(|i| Self::parse(g, i, depth + 1, deadline))
                     .collect::<Result<_>>()?,
             ));
         }
@@ -93,21 +104,69 @@ impl PropertyPath {
 
     /// SPARQL 1.1 property path syntax (used for `$PATH` substitution).
     pub fn to_sparql(&self) -> String {
-        fn wrap(p: &PropertyPath) -> String {
-            match p {
-                PropertyPath::Predicate(_) => p.to_sparql(),
-                _ => format!("({})", p.to_sparql()),
-            }
+        self.to_sparql_checked(|| Ok(()))
+            .expect("uncontrolled rendering")
+    }
+
+    pub(crate) fn to_sparql_checked(
+        &self,
+        check: impl Fn() -> sparkles_core::Result<()>,
+    ) -> sparkles_core::Result<String> {
+        let mut out = String::new();
+        self.write_sparql(&mut out, false, &check)?;
+        Ok(out)
+    }
+
+    fn write_sparql(
+        &self,
+        out: &mut String,
+        wrap: bool,
+        check: &impl Fn() -> sparkles_core::Result<()>,
+    ) -> sparkles_core::Result<()> {
+        use PropertyPath::*;
+        check()?;
+        let wrap = wrap && !matches!(self, Predicate(_));
+        if wrap {
+            out.push('(');
         }
         match self {
-            PropertyPath::Predicate(p) => p.to_string(),
-            PropertyPath::Inverse(p) => format!("^{}", wrap(p)),
-            PropertyPath::Sequence(ps) => ps.iter().map(wrap).collect::<Vec<_>>().join("/"),
-            PropertyPath::Alternative(ps) => ps.iter().map(wrap).collect::<Vec<_>>().join("|"),
-            PropertyPath::ZeroOrMore(p) => format!("{}*", wrap(p)),
-            PropertyPath::OneOrMore(p) => format!("{}+", wrap(p)),
-            PropertyPath::ZeroOrOne(p) => format!("{}?", wrap(p)),
+            Predicate(predicate) => {
+                #[cfg(test)]
+                ObservePathRender::predicate();
+                out.push('<');
+                append_checked(out, predicate.as_str(), check)?;
+                out.push('>');
+            }
+            Inverse(path) => {
+                out.push('^');
+                path.write_sparql(out, true, check)?;
+            }
+            Sequence(paths) | Alternative(paths) => {
+                let separator = if matches!(self, Sequence(_)) {
+                    '/'
+                } else {
+                    '|'
+                };
+                for (i, path) in paths.iter().enumerate() {
+                    if i != 0 {
+                        out.push(separator);
+                    }
+                    path.write_sparql(out, true, check)?;
+                }
+            }
+            ZeroOrMore(path) | OneOrMore(path) | ZeroOrOne(path) => {
+                path.write_sparql(out, true, check)?;
+                out.push(match self {
+                    ZeroOrMore(_) => '*',
+                    OneOrMore(_) => '+',
+                    _ => '?',
+                });
+            }
         }
+        if wrap {
+            out.push(')');
+        }
+        Ok(())
     }
 
     /// Serialize as SHACL path RDF (fresh blank nodes); returns the path node.
@@ -147,7 +206,7 @@ impl PropertyPath {
 
     /// Parse a path from an arbitrary graph node (e.g. `sh:resultPath` of a report).
     pub fn from_rdf(graph: &oxrdf::Graph, node: &Term) -> Result<PropertyPath> {
-        Self::parse(&G { g: graph }, node, 0)
+        Self::from_graph(&G { g: graph }, node, None)
     }
 }
 
@@ -173,27 +232,54 @@ pub(crate) enum CPath {
 
 impl CPath {
     pub fn compile(p: &PropertyPath, resolve: &mut impl FnMut(&NamedNode) -> Id) -> CPath {
-        let mut c = |x: &PropertyPath| Box::new(CPath::compile(x, resolve));
-        match p {
-            PropertyPath::Predicate(n) => CPath::Pred(resolve(n)),
-            PropertyPath::Inverse(x) => CPath::Inverse(c(x)),
-            PropertyPath::ZeroOrMore(x) => CPath::ZeroOrMore(c(x)),
-            PropertyPath::OneOrMore(x) => CPath::OneOrMore(c(x)),
-            PropertyPath::ZeroOrOne(x) => CPath::ZeroOrOne(c(x)),
-            PropertyPath::Sequence(xs) => {
-                CPath::Seq(xs.iter().map(|x| CPath::compile(x, resolve)).collect())
+        Self::compile_checked(p, resolve, &|| Ok(()))
+            .expect("an uncontrolled path translation cannot time out")
+    }
+
+    pub fn compile_checked(
+        p: &PropertyPath,
+        resolve: &mut impl FnMut(&NamedNode) -> Id,
+        check: &impl Fn() -> sparkles_core::Result<()>,
+    ) -> sparkles_core::Result<CPath> {
+        check()?;
+        let mut child = |x: &PropertyPath| Self::compile_checked(x, resolve, check).map(Box::new);
+        Ok(match p {
+            PropertyPath::Predicate(n) => {
+                #[cfg(test)]
+                ObservePathCompile::predicate();
+                CPath::Pred(resolve(n))
             }
-            PropertyPath::Alternative(xs) => {
-                CPath::Alt(xs.iter().map(|x| CPath::compile(x, resolve)).collect())
-            }
-        }
+            PropertyPath::Inverse(x) => CPath::Inverse(child(x)?),
+            PropertyPath::ZeroOrMore(x) => CPath::ZeroOrMore(child(x)?),
+            PropertyPath::OneOrMore(x) => CPath::OneOrMore(child(x)?),
+            PropertyPath::ZeroOrOne(x) => CPath::ZeroOrOne(child(x)?),
+            PropertyPath::Sequence(xs) => CPath::Seq(
+                xs.iter()
+                    .map(|x| Self::compile_checked(x, resolve, check))
+                    .collect::<sparkles_core::Result<_>>()?,
+            ),
+            PropertyPath::Alternative(xs) => CPath::Alt(
+                xs.iter()
+                    .map(|x| Self::compile_checked(x, resolve, check))
+                    .collect::<sparkles_core::Result<_>>()?,
+            ),
+        })
     }
 
     /// Value nodes reachable from `node` (distinct, in discovery order).
     pub fn eval(&self, data: &DataGraph, node: Id) -> anyhow::Result<Vec<Id>> {
+        self.eval_checked(data, node, || Ok(()))
+    }
+
+    pub fn eval_checked(
+        &self,
+        data: &DataGraph,
+        node: Id,
+        check: impl Fn() -> sparkles_core::Result<()>,
+    ) -> anyhow::Result<Vec<Id>> {
         let mut out = Vec::new();
         let mut seen = FxHashSet::default();
-        self.eval_into(data, node, false, &mut |v| {
+        self.eval_into(data, node, false, &check, &mut |v| {
             if seen.insert(v) {
                 out.push(v);
             }
@@ -206,21 +292,26 @@ impl CPath {
         data: &DataGraph,
         node: Id,
         inverse: bool,
+        check: &impl Fn() -> sparkles_core::Result<()>,
         emit: &mut dyn FnMut(Id),
     ) -> anyhow::Result<()> {
+        check()?;
         match self {
             CPath::Pred(p) => {
                 let vs = if inverse {
-                    data.subjects(*p, node)?
+                    data.subjects_checked(*p, node, check)?
                 } else {
-                    data.objects(node, *p)?
+                    data.objects_checked(node, *p, check)?
                 };
-                vs.into_iter().for_each(emit);
+                for value in vs {
+                    check()?;
+                    emit(value);
+                }
             }
-            CPath::Inverse(x) => x.eval_into(data, node, !inverse, emit)?,
+            CPath::Inverse(x) => x.eval_into(data, node, !inverse, check, emit)?,
             CPath::Alt(xs) => {
                 for x in xs {
-                    x.eval_into(data, node, inverse, emit)?;
+                    x.eval_into(data, node, inverse, check, emit)?;
                 }
             }
             CPath::Seq(xs) => {
@@ -231,10 +322,11 @@ impl CPath {
                     Box::new(xs.iter())
                 };
                 for x in order {
+                    check()?;
                     let mut next = Vec::new();
                     let mut seen = FxHashSet::default();
                     for n in cur {
-                        x.eval_into(data, n, inverse, &mut |v| {
+                        x.eval_into(data, n, inverse, check, &mut |v| {
                             if seen.insert(v) {
                                 next.push(v);
                             }
@@ -242,11 +334,14 @@ impl CPath {
                     }
                     cur = next;
                 }
-                cur.into_iter().for_each(emit);
+                for value in cur {
+                    check()?;
+                    emit(value);
+                }
             }
             CPath::ZeroOrOne(x) => {
                 emit(node);
-                x.eval_into(data, node, inverse, emit)?;
+                x.eval_into(data, node, inverse, check, emit)?;
             }
             CPath::ZeroOrMore(x) | CPath::OneOrMore(x) => {
                 let zero = matches!(self, CPath::ZeroOrMore(_));
@@ -258,8 +353,9 @@ impl CPath {
                 let mut frontier = vec![node];
                 while let Some(n) = frontier.pop() {
                     let mut step = Vec::new();
-                    x.eval_into(data, n, inverse, &mut |v| step.push(v))?;
+                    x.eval_into(data, n, inverse, check, &mut |v| step.push(v))?;
                     for v in step {
+                        check()?;
                         if seen.insert(v) {
                             emit(v);
                             frontier.push(v);
@@ -269,5 +365,122 @@ impl CPath {
             }
         }
         Ok(())
+    }
+}
+
+/// Append UTF-8 text while checking between bounded copies.
+pub(crate) fn append_checked(
+    out: &mut String,
+    mut text: &str,
+    check: &impl Fn() -> sparkles_core::Result<()>,
+) -> sparkles_core::Result<()> {
+    while !text.is_empty() {
+        check()?;
+        let mut end = text.len().min(4096);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&text[..end]);
+        text = &text[end..];
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static PATH_PREDICATES: std::cell::RefCell<Option<PathCompilationProbe>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct PathCompilationProbe {
+    visited: usize,
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+#[cfg(test)]
+pub(crate) struct ObservePathCompile;
+
+#[cfg(test)]
+impl ObservePathCompile {
+    pub(crate) fn start() -> Self {
+        Self::observe(None)
+    }
+
+    pub(crate) fn cancel_during_compile(
+        flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self::observe(Some(flag))
+    }
+
+    fn observe(cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>) -> Self {
+        PATH_PREDICATES
+            .with(|probe| probe.replace(Some(PathCompilationProbe { visited: 0, cancel })));
+        Self
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        PATH_PREDICATES.with(|probe| probe.borrow().as_ref().unwrap().visited)
+    }
+
+    fn predicate() {
+        PATH_PREDICATES.with(|probe| {
+            if let Some(probe) = probe.borrow_mut().as_mut() {
+                probe.visited += 1;
+                if probe.visited == 5 {
+                    if let Some(flag) = &probe.cancel {
+                        flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        crate::data::set_deadline_checks_left(Some(0));
+                    }
+                }
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObservePathCompile {
+    fn drop(&mut self) {
+        PATH_PREDICATES.with(|probe| probe.replace(None));
+        crate::data::set_deadline_checks_left(None);
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static RENDERED_PATH_PREDICATES: std::cell::Cell<Option<(usize, bool)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) struct ObservePathRender;
+
+#[cfg(test)]
+impl ObservePathRender {
+    pub(crate) fn start(expire: bool) -> Self {
+        RENDERED_PATH_PREDICATES.set(Some((0, expire)));
+        Self
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        RENDERED_PATH_PREDICATES.get().unwrap().0
+    }
+
+    fn predicate() {
+        if let Some((visited, expire)) = RENDERED_PATH_PREDICATES.get() {
+            RENDERED_PATH_PREDICATES.set(Some((visited + 1, expire)));
+            if expire && visited == 4 {
+                crate::data::set_deadline_checks_left(Some(0));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ObservePathRender {
+    fn drop(&mut self) {
+        RENDERED_PATH_PREDICATES.set(None);
+        crate::data::set_deadline_checks_left(None);
     }
 }

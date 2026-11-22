@@ -135,7 +135,8 @@ The columnar derived tier, the first phase of the core, is built under item 835.
 SHACL-AF and SPIN frontend of Phase 5 is built under item 838, with its maintenance in
 item 958 and SPIN's RDF syntax in item 959. The rule IR of the n-ary core is built under
 item 839, with its evaluation by strata, maintenance, explanations, witnesses, demand and
-the rule frontend, and its restricted chase and planner over relations remain. The other core and
+the rule frontend, and its restricted chase and planner over relations remain. Phase 2,
+closure operators in demand programs, is built as the first half of item 521. The other core and
 convergence phases remain under [item 456](../../ROADMAP.md).
 
 ### Columnar derived tier
@@ -478,8 +479,8 @@ relation with Tarjan's algorithm, computes each component's reachable set once i
 reverse topological order, and releases a set once every component that reads it is
 done. An equivalence closes its classes with union-find. With few new edges the operator
 reads only the nodes that reach them, through the indexes. The rules stay in the
-program, so explanations, incremental maintenance and query-time reasoning, which
-evaluate them as joins, still name them.
+program, so explanations and incremental maintenance, which evaluate them as joins,
+still name them.
 
 The result equals the join evaluation. `tests/closure.rs` compares both on 300 random
 ontologies under three profiles, on late edges, on literals with equal values in
@@ -502,6 +503,56 @@ takes 5.0 to 5.3 s against 53 s. OWL2Bench with 10 universities exceeded the 14 
 operators, and with them a 28 GiB limit on a development host. Where that memory goes
 has not been profiled, and roadmap item 522 covers it.
 [The reasoning results](../../benchmarks/reasoning/RESULTS.md#owl2bench) give every run.
+
+Query-time reasoning uses the operators too (Phase 2). In a demand session's staged runs,
+`Closures::detect` takes a stage's magic predicates and finds the adorned copies of
+transitive rules, of `prp-trp` specialized to one predicate, whose guard becomes a constant
+atom checked each step, and of `prp-trp` under keys whose predicate a magic fact holds or
+leaves free. A copy whose magic atom binds the subject has, at its fixpoint, the pairs from
+each value its magic facts hold to every value that value reaches, because each such pair
+follows from a shorter one from the same value and one edge. The operator walks forward
+from those values through the indexes and emits that fixpoint. A copy that binds the object
+walks backward over reversed edges, and one that binds neither closes the relation once its
+magic fact holds. The operator keeps a mark per predicate for its edges and one for its
+magic facts, so a later step or a later demand of the session walks from every value only
+when the relation gained edges, and otherwise from the new values alone. The run also records
+the rows of the pairs that transitive operators merged, which change what no value reaches
+and so call for no walk, and the row before which a copy that binds neither end closed the
+whole relation. Until an edge that is not such a pair follows that row, no transitive
+operator over the predicate walks it, except that a closure filtered by `notEqual` lacks
+the pairs from a value to itself, so an operator without the filter still walks it. A later run of the session scans a closed
+relation once more, which roadmap item 1226 covers. Each operator emits
+exactly its copy's fixpoint, so the session derives the facts the joins derive, and
+`src/query_closure_tests.rs` checks that with the derived-table cache off on every kind of
+copy, on sessions of several demands and on random property graphs. The source rules are
+checked for the order of derivation once, since a stage's copies can have list heads that
+the source rules lack. A guarded operator whose guard admits `rdf:first` or `rdf:rest`
+gives its rule back. A run that derives list cells its rules read kills its own rows and
+runs again without operators, and the session's later runs use joins. Explanation sessions,
+the compact strategy and lowered programs that read lists again keep the joins, and
+`SPARKLES_DEMAND_CLOSURES=0` turns the operators off. The operators emit the pairs of every
+value the copy's magic rules ask for, as the joins do, and not only the pairs of the query's
+own values, which roadmap item 1222 covers.
+
+On forge, the benchmark host, at `365cffcf` against `5f3f69c2`, the OWL2Bench(1) queries
+q2, q7, q12 and q19 under `owl-rl` demand on the unmaterialized store took 8.3 to 8.5 s
+against 113 to 117 s, the medians of three alternating rounds, at 1.2 GiB of peak RSS
+against 2.3 GiB, and returned the same rows.
+[The reasoning results](../../benchmarks/reasoning/RESULTS.md#query-time-closure-operators-on-owl2bench)
+give the record. An earlier approximate run on stanley, a laptop with other work beside it, at
+`c97471c3` against `5f3f69c2`, is in
+[its own directory](../../benchmarks/reasoning/runs/2026-11-20-item-521-stanley/env.txt).
+
+A demand session sorts each chunk of derived facts it exports in predicate, object and
+subject order, the order in which joins mostly derive them, because a query that reads a cached table
+inserts its facts into the query's overlay and the operators' own order made that slower.
+A session decides at its first run whether its rules admit operators, so a session whose
+tables all come from the cache does not check, and `Closures::detect` passes over adorned
+copies whose body does not read the head's predicate twice before taking them apart. On
+forge at `5ef06e3f` against `5f3f69c2`, the reasoning latency gate found no metric slower
+in every round, with the same answer fingerprints. [The reasoning
+results](../../benchmarks/reasoning/RESULTS.md#query-time-closure-operators-on-owl2bench)
+describe that run.
 
 ### Bounded incremental deletion
 

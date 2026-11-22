@@ -1,0 +1,9 @@
+query	mode	a_ms	b_ms	b/a	round_min	round_max	a_spread	b_spread	added_us	n	answers
+class-predicate-list	streaming	0.935	0.903	0.965	0.962	0.969	0.020	0.018	-32.5	320/320	same
+class-predicates	streaming	0.944	0.915	0.970	0.964	0.975	0.014	0.018	-28.7	320/320	same
+distinct-join	streaming	3.790	3.798	1.002	0.996	1.006	0.011	0.007	8.3	320/320	same
+distinct-obj	streaming	0.005	0.005	1.002	0.959	1.045	0.140	0.175	0.0	320/320	same
+distinct-one	streaming	2.919	2.846	0.975	0.971	0.985	0.020	0.011	-73.0	320/320	same
+distinct-two	streaming	6.542	6.593	1.008	1.004	1.010	0.009	0.005	50.5	320/320	same
+distinct-two-wide	streaming	32.316	33.390	1.033	1.002	1.058	0.079	0.046	1073.8	320/320	same
+predicate-subjects	streaming	0.009	0.009	1.010	0.976	1.082	0.082	0.138	0.1	320/320	same

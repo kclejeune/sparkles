@@ -9172,6 +9172,19 @@ as in Jena. Schema terms that are blank nodes cannot be constants of the rewritt
 so they are left out and counted in `skipped`. Everyone who may query the dataset sees
 the consequences of the schema, whatever graphs they may read.
 
+A property that the application registered as a property function
+([USAGE.md](USAGE.md#registered-property-functions)) is a call, so the rewrite never
+calls it where the query does not. A triple pattern that names it keeps its call and its
+list arguments as written, and its subproperties do not join it. The call follows the
+rewritten patterns of its group, so it still reads the inputs they bind. The rewrite
+does not add the property as a subproperty of a queried property, as the property of a
+domain or range, or as the predicate of a superproperty pair. When `rdf:type` is
+registered, a pattern with a variable predicate gets no type branches. A path link of a
+registered property that the rewrite expands reads stored triples, while a simple
+inverse or sequence that the parser has already turned into triple patterns remains a
+call. The schema therefore derives nothing through a registered property, and the
+closure of the schema keeps the entailments that pass through it to other properties.
+
 **Cost.** `cargo run --release -p sparkles-reasoner --example rdfs_on_read -- 1000000`
 compares stored answers, RDFS on read and materialized `rdfs-simple` inferences on the
 generated benchmark data, whose schema has 1,365 classes in a tree of depth 5 and 40
@@ -9215,7 +9228,12 @@ sparkles query --loc db --reasoning demand --rules family.rules --explain 'SELEC
 
 Each triple pattern that rules can give facts for becomes a demand, with the pattern's
 constants bound. A pattern whose subject or object an earlier pattern of its group binds
-is seeded with that pattern's values, up to 10,000 of them. The demand (magic sets)
+is seeded with that pattern's values, up to 10,000 of them. Seeds are not read through a
+registered property function, which runs only in the query itself, so a pattern whose
+seeds would need one is derived with its constants alone. The plan of the executed query
+names this fallback as `constants (a registered call binds the seeds)`. The OWL 2 QL
+rewrite does not tell registered properties apart from ontology properties, which
+roadmap item 1205 covers. The demand (magic sets)
 transformation rewrites the rules for each demand, so that only the facts that can reach
 its answers are derived. LUBM query 1 at 100 universities under OWL 2 RL derives no facts
 beyond the schema, where a materialization derives 10.9 million.

@@ -1,0 +1,184 @@
+diff --git a/crates/sparkles-owl/src/classify/dl_clause.rs b/crates/sparkles-owl/src/classify/dl_clause.rs
+index 2756dc1b..0f8b51c4 100644
+--- a/crates/sparkles-owl/src/classify/dl_clause.rs
++++ b/crates/sparkles-owl/src/classify/dl_clause.rs
+@@ -940,8 +940,10 @@ impl Store {
+     pub fn add(&mut self, c: Clause) -> Option<usize> {
+         let sig = c.sig();
+         if self.subsumed(&c, sig) {
++            super::dl_rules::diag::add(4, 1);
+             return None;
+         }
++        super::dl_rules::diag::add(3, 1);
+         // the clauses it subsumes have every literal of its head
+         let every: Vec<u32>;
+         let weaker: &[u32] = match c.head().first() {
+diff --git a/crates/sparkles-owl/src/classify/dl_rules.rs b/crates/sparkles-owl/src/classify/dl_rules.rs
+index 8e6a18d5..ac65ae43 100644
+--- a/crates/sparkles-owl/src/classify/dl_rules.rs
++++ b/crates/sparkles-owl/src/classify/dl_rules.rs
+@@ -513,6 +513,65 @@ impl DlIx {
+     }
+ }
+ 
++
++/// Diagnostics of the lane horn-cost, never committed: counters of the work of Tier D
++/// that `SPARKLES_DL_DIAG` prints at every doubling of the derived conclusions and when
++/// the run ends.
++pub mod diag {
++    use std::sync::OnceLock;
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    pub const NAMES: [&str; 9] = [
++        "derive", "foldChoice", "foldNew", "addOk", "addSub", "processed", "predProd", "pruneIn", "foldEmit",
++    ];
++    pub static C: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
++    static NEXT: AtomicU64 = AtomicU64::new(1 << 16);
++    fn start() -> &'static std::time::Instant {
++        static T: OnceLock<std::time::Instant> = OnceLock::new();
++        T.get_or_init(std::time::Instant::now)
++    }
++    #[inline]
++    pub fn on() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_DIAG").is_some())
++    }
++    #[inline]
++    pub fn add(i: usize, n: u64) {
++        if on() {
++            C[i].fetch_add(n, Relaxed);
++        }
++    }
++    pub fn line(tag: &str, work: usize) {
++        let mut s = format!("DLDIAG {tag} work={work} ms={}", start().elapsed().as_millis());
++        for (i, n) in NAMES.iter().enumerate() {
++            s.push_str(&format!(" {n}={}", C[i].load(Relaxed)));
++        }
++        eprintln!("{s}");
++    }
++    #[inline]
++    pub fn at(work: usize) {
++        if !on() {
++            return;
++        }
++        let _ = start();
++        let next = NEXT.load(Relaxed);
++        if work as u64 >= next
++            && NEXT
++                .compare_exchange(next, next * 2, Relaxed, Relaxed)
++                .is_ok()
++        {
++            line("at", work);
++        }
++    }
++    pub fn reset() {
++        if on() {
++            for c in &C {
++                c.store(0, Relaxed);
++            }
++            NEXT.store(1 << 16, Relaxed);
++        }
++    }
++}
++
+ /// What a saturation with Tier D shares: the table of the clauses that contexts send one
+ /// another and the bytes of the clause stores.
+ #[derive(Default)]
+@@ -562,6 +621,7 @@ impl DlRun {
+     /// derives its redundant conclusions in another order and can derive more, so a kept
+     /// run can answer in full where a run that starts again falls back.
+     pub fn begin_run(&mut self) {
++        diag::reset();
+         *self.stores.get_mut() = 0;
+         self.carried = self.carried.saturating_add(*self.work.get_mut());
+         *self.work.get_mut() = 0;
+@@ -582,7 +642,8 @@ impl DlRun {
+     }
+     /// Counts `n` derived conclusions.
+     pub(super) fn count(&self, n: usize) {
+-        self.work.fetch_add(n, Ordering::Relaxed);
++        let w = self.work.fetch_add(n, Ordering::Relaxed);
++        diag::at(w + n);
+     }
+     /// Whether `n` conclusions alone, with those of the runs whose contexts this one
+     /// keeps, are more than the run's bound, and marks the run past its bound when they
+@@ -1248,8 +1309,13 @@ impl Found {
+             return;
+         }
+         for l in &mut lists {
++            diag::add(7, l.len() as u64);
+             prune(l);
+         }
++        if diag::on() {
++            let p = lists.iter().fold(1u64, |a, l| a.saturating_mul(l.len() as u64));
++            diag::add(6, p);
++        }
+         self.prods.push((lists, base, ground, self.rule));
+     }
+ }
+@@ -1357,11 +1423,13 @@ fn fold<S: Sink>(
+                 if out.stopped() {
+                     return stop(st, out, charged);
+                 }
++                diag::add(1, 1);
+                 let mut s = a.clone();
+                 s.0.extend_from_slice(&t.0);
+                 s.1.extend_from_slice(&t.1);
+                 norm(&mut s);
+                 if !seen.contains(&s) {
++                    diag::add(2, 1);
+                     // the step's record and its list hold the union
+                     pending += 2 * bytes(&s);
+                     seen.insert(s.clone());
+@@ -1433,6 +1501,7 @@ fn fold<S: Sink>(
+             }
+         }
+     }
++    diag::add(8, acc.len() as u64);
+     for s in acc {
+         emit(ix, st, s, rule, root, trace, out, derive);
+         let x = ds(st);
+@@ -1697,6 +1766,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out:
+     if st.bottom {
+         return;
+     }
++    diag::add(0, 1);
+     out.worked(1);
+     let dx = dix(ix);
+     // a test context's denied class leaves the head
+@@ -3034,6 +3104,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
+             s.sel = selected(&out.dl().lits, inv, &s.c);
+         }
+         n += 1;
++        diag::add(5, 1);
+         let c = x.store.clauses[id as usize].c.clone();
+         process(ix, me, st, id, &c, &max, out);
+         // the units go to the EL rules first, and a stopped run leaves the rest queued,
+diff --git a/crates/sparkles-owl/src/classify/mod.rs b/crates/sparkles-owl/src/classify/mod.rs
+index 1710691b..c8cfc856 100644
+--- a/crates/sparkles-owl/src/classify/mod.rs
++++ b/crates/sparkles-owl/src/classify/mod.rs
+@@ -2664,6 +2664,10 @@ impl Saturation {
+                 }
+             }
+             stats.dl_work = d.work();
++            if dl_rules::diag::on() {
++                dl_rules::diag::line("end", d.work());
++                eprintln!("DLDIAG endstats contexts={} stored={}", stats.dl_contexts, stats.dl_stored);
++            }
+             if open.is_some() {
+                 // A partial answer has taken its record, and the next run starts again,
+                 // so the clause stores and the clause table go before its taxonomy.
+diff --git a/crates/sparkles-owl/src/classify/saturate.rs b/crates/sparkles-owl/src/classify/saturate.rs
+index c8dc6220..36c155ea 100644
+--- a/crates/sparkles-owl/src/classify/saturate.rs
++++ b/crates/sparkles-owl/src/classify/saturate.rs
+@@ -2365,6 +2365,9 @@ impl<'a> Run<'a> {
+         // whether the run falls back or answers in part; a run in steps compares it
+         // between steps only
+         if !self.steps && b.dl.is_some_and(|d| d.over_work()) {
++            if super::dl_rules::diag::on() {
++                super::dl_rules::diag::line("over", b.dl.map_or(0, |d| d.work()));
++            }
+             self.halt(STOP_WORK);
+             return false;
+         }
