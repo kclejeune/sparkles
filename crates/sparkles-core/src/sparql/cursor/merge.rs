@@ -2433,6 +2433,70 @@ mod tests {
         conditional_on(&context_with(limit, spill, pairs), node, cap)
     }
 
+    /// The memory bound of `merge_pair_conditions` at batch size `cap`: an output batch
+    /// with its marker column, as [`Merge::merged`] admits it, and the scratch that
+    /// [`Merge::interior`] charges to decide it. A conditional merge OPTIONAL that fits a
+    /// budget with the switch off fits it, or a budget at most this much larger, with the
+    /// switch on.
+    fn pair_bound(node: &Node, cap: usize) -> u64 {
+        let ctx = context(u64::MAX);
+        let (vars, rows) = (node.vars.len() as u64 + 1, cap.max(2) as u64);
+        let width = node.vars.len();
+        crate::sparql::ctx::table_bytes(rows as usize, vars as usize)
+            + vars * 40
+            + 128
+            + rows * decide_row(width)
+            + decide_fixed(&ctx, width)
+    }
+
+    /// The rows of a streamed merge over `node` in output order, pulled at the caps of
+    /// `caps` in turn under `limit` bytes, with the condition tested on the pairs when
+    /// `pairs` is set, and the length of each batch, or the error the merge failed with.
+    /// With `hold` the caller keeps each batch until the next pull returns, so the batch
+    /// stays charged while the merge builds the next one.
+    fn pulled(
+        snap: &Arc<crate::store::Snapshot>,
+        node: &Node,
+        caps: &[usize],
+        limit: u64,
+        pairs: bool,
+        hold: bool,
+    ) -> Result<(Vec<Vec<Id>>, Vec<usize>)> {
+        let mut ctx = Ctx::new(Arc::clone(snap));
+        ctx.opt.merge_pair_conditions = pairs;
+        for name in ["key", "shared", "left", "right"] {
+            ctx.var(name);
+        }
+        ctx.mem_limit = limit;
+        ctx.extension_failure = Some(Default::default());
+        ctx.enable_cursor_accounting().unwrap();
+        let ctx = Arc::new(ctx);
+        ctx.attach_owner();
+        let mut op = Operator::build(&ctx, node.clone(), FallbackPolicy::RejectMaterialization)?;
+        assert!(matches!(op.state, super::super::State::Merge(_)));
+        let (mut out, mut sizes, mut previous) = (Vec::new(), Vec::new(), None);
+        for pull in 0.. {
+            let cap = caps[pull % caps.len()];
+            let options = CursorOptions {
+                batch_rows: cap,
+                ..Default::default()
+            };
+            let Some(batch) = op.next(&ctx, &options, cap)? else {
+                break;
+            };
+            assert!(batch.table.len <= cap && batch.table.len > 0);
+            sizes.push(batch.table.len);
+            let table = &batch.table;
+            out.extend((0..table.len).map(|i| table.cols.iter().map(|c| c[i]).collect()));
+            if hold {
+                // The batch before this one is released only now, after this pull.
+                previous = Some(batch);
+            }
+        }
+        drop(previous);
+        Ok((out, sizes))
+    }
+
     /// [`conditional_batches`] on a context.
     fn conditional_on(
         ctx: &Arc<Ctx>,
@@ -2764,18 +2828,7 @@ mod tests {
             let mut expected = conditional(&node, 4096, u64::MAX, false, None).unwrap().0;
             expected.sort();
             for cap in [1, 2, 4, 64] {
-                // An output batch with its marker column, as [`Merge::merged`] admits
-                // it, and the scratch that [`Merge::interior`] charges to decide it.
-                let bound = {
-                    let ctx = context(u64::MAX);
-                    let (vars, rows) = (node.vars.len() as u64 + 1, cap.max(2) as u64);
-                    let width = node.vars.len();
-                    crate::sparql::ctx::table_bytes(rows as usize, vars as usize)
-                        + vars * 40
-                        + 128
-                        + rows * decide_row(width)
-                        + decide_fixed(&ctx, width)
-                };
+                let bound = pair_bound(&node, cap);
                 let (mut fits, mut fails) = (0, 0);
                 for limit in (1024..40_000u64).step_by(16) {
                     let budget = |e: &Error| matches!(e, Error::BudgetExceeded(_));
@@ -2826,6 +2879,209 @@ mod tests {
         // The long last run needs more with pair conditions at some budgets, so the
         // sweep exercises the bound and not only equal budgets.
         assert!(worst > 0);
+    }
+
+    /// Small conditional merge OPTIONALs whose runs cross batches, pulled at small and
+    /// changing caps, each with the caps to pull it at. The shapes are those that found
+    /// over-budget output buffers and run copies in the streamed merge's batch ends: one
+    /// pair, a right side of keys only, caps that change between pulls, a copy at a batch
+    /// boundary, runs of one to six, a long stretch without a match, and a left run of
+    /// one row more than a power of two beside a short right run. Each has a condition
+    /// that some pairs pass and some fail.
+    fn pair_condition_fixtures() -> Vec<(String, Node, Vec<usize>)> {
+        let (left, right) = (2, 3);
+        // Values that mix passing and failing pairs under `?right > ?left`.
+        let keyed = |keys: &[i64], step: i64| -> Vec<Vec<i64>> {
+            keys.iter()
+                .enumerate()
+                .map(|(i, &k)| vec![k, i as i64 * step % 100])
+                .collect()
+        };
+        let repeat = |runs: &[(i64, usize)]| -> Vec<i64> {
+            runs.iter()
+                .flat_map(|&(k, n)| std::iter::repeat_n(k, n))
+                .collect()
+        };
+        let above = |a: VarId, b: VarId| {
+            Expr::Cmp(
+                Box::new(Expr::Var(a)),
+                Box::new(Expr::Var(b)),
+                crate::sparql::expr::CmpOp::Gt,
+            )
+        };
+        let optional = |l: Node, r: Node, condition: Expr| {
+            let mut node = join(l, r);
+            node.kind = Kind::LeftJoin {
+                expr: Some(condition),
+            };
+            node
+        };
+        let mut cases = Vec::new();
+        let mut add = |name: &str, node: Node, caps: &[usize]| {
+            for &cap in caps {
+                cases.push((format!("{name} cap {cap}"), node.clone(), vec![cap]));
+            }
+            if caps.len() > 1 {
+                cases.push((format!("{name} caps {caps:?}"), node, caps.to_vec()));
+            }
+        };
+        let two = |l: &[i64], r: &[i64]| {
+            optional(
+                values(vec![0, left], &keyed(l, 37)),
+                values(vec![0, right], &keyed(r, 53)),
+                above(right, left),
+            )
+        };
+        add("one pair", two(&[0], &[0, 0]), &[2]);
+        // The right side has the key only, so the condition reads the left value.
+        let rows: Vec<Vec<i64>> = repeat(&[(0, 2), (1, 8), (2, 5), (3, 1)])
+            .into_iter()
+            .map(|k| vec![k])
+            .collect();
+        let node = optional(
+            values(vec![0, left], &keyed(&repeat(&[(0, 3), (2, 5)]), 37)),
+            values(vec![0], &rows),
+            above(left, 0),
+        );
+        add("key-only right", node, &[5]);
+        add(
+            "changing caps",
+            two(
+                &repeat(&[(0, 1), (1, 1), (3, 4)]),
+                &repeat(&[(0, 5), (1, 1), (2, 6), (3, 1), (4, 42)]),
+            ),
+            &[6, 43],
+        );
+        add("boundary copy", two(&[2, 2, 5], &[2, 2, 2, 5, 6]), &[4]);
+        let l: Vec<i64> = (0..40)
+            .flat_map(|k| std::iter::repeat_n(k, 1 + (k % 3) as usize))
+            .collect();
+        let r: Vec<i64> = (0..40)
+            .filter(|k| k % 5 != 2)
+            .flat_map(|k| std::iter::repeat_n(k, 1 + (k * 7 % 6) as usize))
+            .collect();
+        add("runs of one to six", two(&l, &r), &[1, 2, 3, 5, 7]);
+        let l: Vec<i64> = (0..300).chain((300..310).flat_map(|k| [k, k])).collect();
+        let r: Vec<i64> = (300..310).flat_map(|k| [k, k, k]).collect();
+        add("unmatched stretch", two(&l, &r), &[1, 3]);
+        // A left run of 2^k + 1 rows, whose copy grows its buffer to twice the rows it
+        // holds, beside a right run of two. With one column a side the condition reads
+        // the key alone and every pair passes.
+        let one = |keys: &[i64]| -> Node {
+            let rows: Vec<Vec<i64>> = keys.iter().map(|&k| vec![k]).collect();
+            values(vec![0], &rows)
+        };
+        let any = Expr::Cmp(
+            Box::new(Expr::Var(0)),
+            Box::new(Expr::Const(Id::from_i64(-1).unwrap())),
+            crate::sparql::expr::CmpOp::Gt,
+        );
+        for n in [128, 129, 130, 257] {
+            let l: Vec<i64> = [0].into_iter().chain(std::iter::repeat_n(3, n)).collect();
+            let r = [0, 1, 2, 3, 3];
+            for caps in [&[3, 1][..], &[1, 3], &[3, 3, 1], &[64, 1]] {
+                cases.push((
+                    format!("left run {n}, one column, caps {caps:?}"),
+                    optional(one(&l), one(&r), any.clone()),
+                    caps.to_vec(),
+                ));
+                cases.push((
+                    format!("left run {n}, two columns, caps {caps:?}"),
+                    two(&l, &r),
+                    caps.to_vec(),
+                ));
+            }
+        }
+        cases
+    }
+
+    /// The fixtures of [`pair_condition_fixtures`] under a pointwise budget sweep. At
+    /// every budget that a merge fits with the condition tested after the batch, it fits
+    /// with `merge_pair_conditions` at that budget or within [`pair_bound`] above it, at
+    /// the largest of its caps, and gives the same bag with the left order. The fit is
+    /// not monotone in the budget, so no limit is bisected: every limit from 2 KiB below
+    /// the smallest that the switch-off merge was found to fit at, to 4 KiB or twice the
+    /// bound above it, is tried in steps of 8 bytes, for a caller that releases each
+    /// batch before the next pull and for one that holds it across the pull.
+    #[test]
+    fn pair_conditions_stay_within_the_bound_on_the_full_batch_fixtures() {
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let budget = |e: &Error| matches!(e, Error::BudgetExceeded(_));
+        let (mut failed, mut differ, mut worst) = (Vec::new(), 0, (0u64, String::new()));
+        let cases = pair_condition_fixtures();
+        for (name, node, caps) in &cases {
+            let bound = pair_bound(node, caps.iter().copied().max().unwrap());
+            let (mut expected, off_sizes) =
+                pulled(&snap, node, caps, u64::MAX, false, false).unwrap();
+            let keys: Vec<Id> = expected.iter().map(|row| row[0]).collect();
+            assert!(keys.is_sorted(), "{name}");
+            expected.sort();
+            let (_, on_sizes) = pulled(&snap, node, caps, u64::MAX, true, false).unwrap();
+            differ += usize::from(on_sizes != off_sizes);
+            for hold in [false, true] {
+                let fits =
+                    |limit: u64, pairs: bool| match pulled(&snap, node, caps, limit, pairs, hold) {
+                        Ok((mut bag, _)) => {
+                            let keys: Vec<Id> = bag.iter().map(|row| row[0]).collect();
+                            assert!(keys.is_sorted(), "{name} at {limit} bytes, pairs {pairs}");
+                            bag.sort();
+                            assert_eq!(bag, expected, "{name} at {limit} bytes, pairs {pairs}");
+                            true
+                        }
+                        Err(e) => {
+                            assert!(budget(&e), "{name} at {limit} bytes, pairs {pairs}: {e}");
+                            false
+                        }
+                    };
+                // A first smallest fit with the switch off, by bisection, as the centre
+                // of the pointwise range only.
+                let (mut lo, mut hi) = (0u64, 1u64 << 20);
+                assert!(fits(hi, false), "{name}");
+                while hi - lo > 8 {
+                    let mid = lo + (hi - lo) / 2;
+                    if fits(mid, false) {
+                        hi = mid;
+                    } else {
+                        lo = mid;
+                    }
+                }
+                let (mut tried, mut more) = (0, 0);
+                for limit in (hi.saturating_sub(2048)..hi + 4096.max(2 * bound)).step_by(8) {
+                    if !fits(limit, false) {
+                        continue;
+                    }
+                    tried += 1;
+                    if fits(limit, true) {
+                        continue;
+                    }
+                    let Some(extra) = (8..=bound).step_by(8).find(|m| fits(limit + m, true)) else {
+                        failed.push(format!(
+                            "{name}, hold {hold}: fits {limit} bytes with the staged test, and \
+                             with pair conditions not within {bound} bytes more"
+                        ));
+                        break;
+                    };
+                    more = more.max(extra);
+                }
+                assert!(tried > 0, "{name}, hold {hold}");
+                if more > worst.0 {
+                    worst = (
+                        more,
+                        format!("{name}, hold {hold}: {more} of {bound} bytes"),
+                    );
+                }
+            }
+        }
+        println!("PAIRBOUND worst {}", worst.1);
+        println!(
+            "PAIRBOUND {differ} of {} cases end batches elsewhere",
+            cases.len()
+        );
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+        // The switch changes where batches end on most fixtures, so the sweep compares
+        // two different paths and not one path with itself.
+        assert!(differ * 2 > cases.len(), "{differ} of {}", cases.len());
     }
 
     /// With the switch off, the test after the batch reserves its scratch, which holds
