@@ -10,8 +10,10 @@ could become one and the axiom was dropped. A rooted run of `DisjointClasses(∃
 ≥1 top.A)` with `K ⊑ A` answered A and K satisfiable where HermiT finds them empty, and
 `DisjointClasses(owl:Thing, ≥0 top.X)` came out consistent, with each run reporting itself
 complete. The rewriting now makes an image of more than one member empty and keeps the
-disjointness of the distinct images, as roadmap item 1304. Runs without `Limits::rooted`
-were not affected.
+disjointness of the distinct images, as roadmap item 1304. The report of the axioms
+left out names every original axiom that a left-out rewritten axiom stands for, where it
+named only the first, and no longer drops an axiom that the ontology states unchanged.
+Runs without `Limits::rooted` were not affected.
 
 ### Cold small scans at 1.05M measured again against Fluree
 

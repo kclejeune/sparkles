@@ -148,7 +148,10 @@ reported itself complete. The members are equivalent, so their disjointness make
 image empty. The rewriting now adds `D ⊑ ⊥` for each image `D` of more than one member,
 keeps the disjointness of the distinct images when two or more remain, and keeps the union
 of a `DisjointUnion` over the set of images. Intersections, unions and equivalences keep
-the set of images, since a repeated member does not change their meaning.
+the set of images, since a repeated member does not change their meaning. A rewritten
+axiom can equal an axiom that the ontology states unchanged or the rewriting of another
+axiom, so the report of the axioms left out now names every original axiom that a left-out
+rewritten axiom stands for, and names each original once for each kind of gap.
 
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
