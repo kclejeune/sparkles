@@ -705,7 +705,8 @@ where
                 serialize_ms,
                 error: result.err(),
                 disconnected,
-                rows: sw.ledger.delivered(),
+                // a handoff that failed committed nothing, so no row reached a client
+                rows: committed.then(|| sw.ledger.delivered()).flatten(),
                 committed,
             });
             drop(span);
@@ -1801,6 +1802,54 @@ mod timed_tests {
                 .to_string()
                 .contains("producer stopped unexpectedly")
         );
+    }
+    /// A handler that went away before the switch to streaming leaves the timed handoff
+    /// failed and the body uncommitted, so its report gives no rows, though the writer
+    /// recorded its rows in the ledger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_handoff_reports_no_rows() {
+        use sparkles::sparql::results as res;
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let r = sparkles::sparql::query(
+            store.snapshot(),
+            "SELECT ?x WHERE { VALUES ?x { 1 2 3 } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let (gate_tx, gate) = std::sync::mpsc::channel::<()>();
+        let release = Release(Some(gate_tx));
+        let (send, end) = oneshot::channel();
+        let mut serialized = Box::pin(serialize_inner_timed(
+            1,
+            false,
+            None,
+            None,
+            Some(timeouts()),
+            move |w: &mut LimitedWriter<SwitchWriter>| {
+                let _ = gate.recv();
+                let rows = res::RowCount::with_ledger(w.get_ref().ledger());
+                res::write(
+                    res::Source::Result(&r),
+                    res::WriteOptions::new(
+                        res::Format::Solutions(res::SolutionsFormat::Tsv),
+                        &rows,
+                    ),
+                    w,
+                )
+                .map(|_| ())
+            },
+            move |e| {
+                let _ = send.send(e);
+            },
+        ));
+        // the producer starts and waits at the gate, and the handler goes away
+        assert!(futures_util::poll!(serialized.as_mut()).is_pending());
+        drop(serialized);
+        drop(release);
+        let report = ended(end).await;
+        assert!(report.error.is_some());
+        assert!(!report.committed);
+        assert_eq!(report.rows, None);
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_body_cancels_and_joins_producer_timer() {

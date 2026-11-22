@@ -343,16 +343,30 @@ impl<'a> RowOut<'a> {
         self.grow_marks()
     }
 
+    /// Double the marks, with as many slots of the ledger's queue, under their charge.
+    ///
+    /// The marks and then the ledger's queue grow by moving reallocations, each of which
+    /// holds its old slots beside the new ones until it has copied them. The growth is
+    /// admitted with the larger of those old allocations too, since the two happen one
+    /// after the other, and the charge falls back to the new capacity after them.
     #[cold]
     #[inline(never)]
     fn grow_marks(&mut self) -> std::io::Result<()> {
-        let marks = (self.marks.capacity() * 2).max(FIRST_MARKS);
+        let old = self.marks.capacity();
+        let marks = (old * 2).max(FIRST_MARKS);
         let buf = self.buf.capacity() + self.spill.capacity();
-        if let Err(e) = self.cover(self.held(buf, marks)) {
+        let held = self.held(buf, marks);
+        let overlap = old as u64 * MARK_BYTES.max(LEDGER_MARK_BYTES);
+        if let Err(e) = self.cover(held + overlap) {
             return Err(self.refuse(e));
         }
         self.marks.reserve_exact(marks - self.marks.len());
         self.reserve_pending(marks);
+        if let Some(charge) = &self.charge
+            && let Err(e) = charge.resize(held)
+        {
+            return Err(self.refuse(e));
+        }
         Ok(())
     }
 
@@ -555,6 +569,11 @@ impl<'a> RowOut<'a> {
         // before the bytes go anywhere
         if self.buf.capacity() == 0 {
             self.start()?;
+            // a row of no bytes may have ended before the buffer existed, and its mark at
+            // offset 0 is settled now, before this piece can go on whole past it
+            if !self.marks.is_empty() {
+                self.drain_to(0)?;
+            }
             // a piece open before the buffer existed counts as moved, so that one of
             // exactly the buffer's size goes on at its end
             self.moved = self.open != CLOSED;

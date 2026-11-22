@@ -309,7 +309,11 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   callback can reach the adapter through the wrapper. Row counts describe what
   the supplied writer accepted, including rows it still holds in its buffer.
   The completion check itself performs no I/O. An error during serialization
-  or writing skips the callback.
+  or writing skips the callback. Some writers flush the supplied writer as part of
+  serialization. SPARQL Results Thrift, RDF/JSON, TriX and the other Jena graph formats
+  flush it at their end, and every format flushes after the first batch of a cursor, so
+  an adapter's check can fail inside serialization and skip the callback, and a buffered
+  wrapper may have passed its bytes on by the time the callback runs.
 * Native SELECT output and standard JSON, XML, CSV and TSV solution responses of at
   most 65,536 rows check a complete decoded row before writing its cells. Row storage
   and decoded terms retain query memory credit while they are written. A required

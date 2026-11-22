@@ -551,3 +551,90 @@ fn the_ledger_queue_is_freed_on_unwind() {
     assert_eq!(pending_capacity(&ledger), 0);
     assert_eq!(room(&ctx), before);
 }
+
+/// The marks double from 512 to 1,024 slots at the 513th row of 10 bytes, and the
+/// moving reallocation holds the old 512 slots beside the new ones, as the ledger's queue
+/// does after it. A budget that fits the new capacity alone but not that overlap refuses
+/// the growth, in both modes, with and without a ledger, and the rows before it are
+/// written on and counted. With the overlap's room the growth is admitted, and the charge
+/// falls back to the new capacity.
+#[test]
+fn the_growth_of_the_marks_is_charged_with_the_old_slots() {
+    for explicit in [false, true] {
+        for with_ledger in [false, true] {
+            let slot = if with_ledger {
+                MARK_BYTES + LEDGER_MARK_BYTES
+            } else {
+                MARK_BYTES
+            };
+            let held = OUTPUT_BUFFER as u64 + 1024 * slot;
+            let overlap = 512 * MARK_BYTES.max(LEDGER_MARK_BYTES);
+            for (left, refused) in [(held, true), (held + overlap, false)] {
+                let r = small_answer();
+                let _held = leave(&r, left);
+                let ledger = RowLedger::new();
+                let count = if with_ledger {
+                    RowCount::with_ledger(ledger.clone())
+                } else {
+                    RowCount::new()
+                };
+                let mut t = Transport::new(&ledger, 64 << 10, usize::MAX);
+                let mut write = rows(600, 10, 3, explicit);
+                let result = write_buffered(
+                    &mut t,
+                    &count,
+                    Some(r.test_context().clone()),
+                    &mut |w, staged| {
+                        write(w, staged)?;
+                        assert_eq!(w.marks.capacity(), 1024);
+                        assert_eq!(w.charge.as_ref().map(|c| c.bytes()), Some(held));
+                        Ok(())
+                    },
+                );
+                let case = format!("{explicit} {with_ledger} {refused}");
+                if refused {
+                    memory_refusal(result);
+                    // the growth comes at the 513th row's mark in either mode
+                    assert!((512..=513).contains(&count.get()), "{case} {}", count.get());
+                } else {
+                    result.unwrap();
+                    assert_eq!(count.get(), 600, "{case}");
+                }
+                t.finish().unwrap();
+                let lines = t.copied / 10;
+                assert_eq!(lines, count.get(), "{case}");
+            }
+        }
+    }
+}
+
+/// A row of no bytes that ends before the buffer exists leaves its mark at offset 0. The
+/// next row of exactly the buffer's size, in pieces smaller than it, goes on whole at its
+/// end, and the earlier row is counted at offset 0, whether the caller's writer takes the
+/// big row or refuses it.
+#[test]
+fn a_row_of_no_bytes_before_the_buffer_is_counted() {
+    let big = |w: &mut RowOut<'_>, _: &Cell<u64>| -> Result<()> {
+        for _ in 0..2 {
+            w.begin_row()?;
+            w.end_row(1).map_err(Error::Io)?;
+        }
+        w.begin_row()?;
+        w.write_all(&[b'x'; OUTPUT_BUFFER / 2]).map_err(Error::Io)?;
+        w.write_all(&[b'x'; OUTPUT_BUFFER / 2]).map_err(Error::Io)?;
+        w.end_row(1).map_err(Error::Io)?;
+        Ok(())
+    };
+    let ledger = RowLedger::new();
+    let count = RowCount::with_ledger(ledger.clone());
+    let mut t = Transport::new(&ledger, 1, usize::MAX);
+    write_buffered(&mut t, &count, None, &mut { big }).unwrap();
+    assert_eq!(count.get(), 3);
+    t.finish().unwrap();
+    assert_eq!(ledger.delivered(), Some(3));
+    // a writer that refuses the big row takes the rows of no bytes before it
+    let count = RowCount::new();
+    let mut out = crate::sparql::results::LimitedWriter::new(Vec::new(), Some(4096), None);
+    assert!(write_buffered(&mut out, &count, None, &mut { big }).is_err());
+    assert_eq!(count.get(), 2);
+}

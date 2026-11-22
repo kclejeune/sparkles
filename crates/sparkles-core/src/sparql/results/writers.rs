@@ -93,7 +93,14 @@ pub fn write(
 /// This adds no write or flush of its own. A callback can inspect a known writer
 /// layout, for example by invoking
 /// [`LimitedWriter::check_completion`](super::LimitedWriter::check_completion)
-/// directly or via a surrounding `BufWriter`'s `get_mut()`.
+/// directly or via a surrounding `BufWriter`'s `get_mut()`. The flushes that
+/// serialization makes itself remain, such as the one after a cursor's first batch and
+/// the one at the end of SPARQL Results Thrift and the Jena graph formats, so an
+/// adapter's check can fail there first and skip the callback.
+///
+/// The dispatch and the drivers above the encoders are generic over the writer and the
+/// callback, so each distinct callback type instantiates them once. The encoders take
+/// the engine's own buffer and are compiled once in this crate.
 pub fn write_with_completion<W: Write>(
     source: Source<'_>,
     options: WriteOptions<'_>,
