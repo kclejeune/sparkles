@@ -1,7 +1,7 @@
 //! The window's construction, refill and refresh under the pass's work, memory and
 //! control (spec F13 §4.4, review of item 419).
 
-use super::{CANCEL_AFTER, CMPS, RECONCILED, Window};
+use super::{CANCEL_AFTER, CANCEL_PLACING, CMPS, HeapEntry, RECONCILED, Window};
 use crate::error::{BudgetKind, Error};
 use crate::incr::circuit::{Circuit, DeltaSet};
 use crate::incr::compile::compile;
@@ -190,6 +190,17 @@ fn with_pass<T>(
     f: impl FnOnce(&mut Window, &mut Pass) -> T,
 ) -> T {
     let snap = c.snap.clone().expect("built");
+    with_pass_on(c, snap, control, budget, f)
+}
+
+/// [`with_pass`] over the snapshot `snap`.
+fn with_pass_on<T>(
+    c: &mut Circuit,
+    snap: Arc<crate::store::Snapshot>,
+    control: &Control,
+    budget: Option<u64>,
+    f: impl FnOnce(&mut Window, &mut Pass) -> T,
+) -> T {
     let vis = Vis::new(None, &snap);
     let Circuit {
         terms, root, vars, ..
@@ -450,4 +461,258 @@ fn a_window_that_holds_a_row_twice_does_not_load() {
     let mut r = Reader::new(&data, &snap, &mut terms).expect("reader");
     let r = window(&mut c).load(&mut r);
     assert!(matches!(r, Err(Error::Corrupt(_))), "{r:?}");
+}
+
+/// A control whose flag the window raises once it has installed `n` rows on this
+/// thread.
+fn cancel_placing_after(n: u64) -> Control {
+    let flag = Arc::new(AtomicBool::new(false));
+    CANCEL_PLACING.with(|c| *c.borrow_mut() = Some((n, flag.clone())));
+    Control::with_cancel(flag)
+}
+
+/// A refill over rows whose keys all tie merges the rows it keeps with the new ones in
+/// one pass: no new row is searched for among the kept rows it ties with.
+#[test]
+fn a_refill_over_ties_does_linear_work() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 2000, |_| 1)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 2000");
+    let before: Vec<u64> = window(&mut c).kept.iter().map(|e| e.serial).collect();
+    assert_eq!(before.len(), 2000);
+    upd(
+        &s,
+        &format!("INSERT DATA {{ {} }}", ints(2000, 3000, |_| 1)),
+    );
+    let n = with_pass_on(&mut c, s.snapshot(), &Control::none(), None, |w, p| {
+        let rows = w.inner_init(p).expect("input");
+        assert_eq!(rows.len(), 3000);
+        CMPS.with(|n| n.set(0));
+        w.fill(p, rows, true).expect("refill");
+        CMPS.with(|n| n.get())
+    });
+    assert!(n <= 30_000, "{n} comparisons for 3000 rows");
+    let w = window(&mut c);
+    assert_eq!(w.kept.len(), 3000);
+    let kept: Vec<u64> = w.kept.iter().map(|e| e.serial).collect();
+    assert_eq!(
+        &kept[..2000],
+        &before[..],
+        "the kept rows stay first, in order"
+    );
+    assert!(
+        kept[2000..].iter().all(|s| !before.contains(s)),
+        "the new rows have new serials"
+    );
+}
+
+/// A build from fewer rows than any periodic check would wait for charges its fixed
+/// entries, whose keys have no strings, and installs nothing when they pass the budget.
+#[test]
+fn a_short_build_charges_its_fixed_entries() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        &format!("INSERT DATA {{ {} }}", ints(0, 1000, i64::from)),
+    );
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 2000");
+    with_pass(&mut c, &Control::none(), None, |w, p| {
+        let rows = w.inner_init(p).expect("input");
+        assert_eq!(rows.len(), 1000);
+        w.kept = Vec::new();
+        w.held = 0;
+        p.max_memory_bytes = Some(16 << 10);
+        let r = w.fill(p, rows, false);
+        assert!(over_memory(r), "the build passed its budget");
+        assert!(
+            w.kept.is_empty() && w.held == 0,
+            "a failed build installed rows"
+        );
+    });
+}
+
+/// A build from an empty input charges nothing, so a budget of zero bytes holds it.
+#[test]
+fn an_empty_build_charges_nothing() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 10, i64::from)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 20");
+    with_pass(&mut c, &Control::none(), Some(0), |w, p| {
+        w.kept = Vec::new();
+        w.held = 0;
+        w.fill(p, Vec::new(), false).expect("an empty build");
+        assert!(w.kept.is_empty());
+        assert_eq!(w.total, 0);
+    });
+}
+
+/// A cancellation that arrives while a build places its rows fails the build, though
+/// too few rows follow for a periodic check, and leaves the window empty with the
+/// input's total.
+#[test]
+fn placing_notices_a_cancellation_during_the_phase() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 10, i64::from)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 20");
+    let control = cancel_placing_after(3);
+    let r = with_pass(&mut c, &control, None, |w, p| {
+        let rows = w.inner_init(p).expect("input");
+        w.fill(p, rows, false)
+    });
+    CANCEL_PLACING.with(|c| *c.borrow_mut() = None);
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    let w = window(&mut c);
+    assert!(w.kept.is_empty() && w.held == 0, "a failed build kept rows");
+    assert_eq!(w.total, 10);
+}
+
+/// The same while a refill merges its rows into the kept ones.
+#[test]
+fn reconciling_notices_a_cancellation_during_the_phase() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 10, i64::from)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 20");
+    assert_eq!(window(&mut c).kept.len(), 10);
+    let control = cancel_placing_after(3);
+    let r = with_pass(&mut c, &control, None, |w, p| {
+        let rows = w.inner_init(p).expect("input");
+        w.fill(p, rows, true)
+    });
+    CANCEL_PLACING.with(|c| *c.borrow_mut() = None);
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    let w = window(&mut c);
+    assert!(
+        w.kept.is_empty() && w.held == 0,
+        "a failed refill kept rows"
+    );
+    assert_eq!(w.total, 10);
+}
+
+/// The heap's rows of the window's input in order, each with its index among the kept
+/// rows, and the kept rows' copies in the input.
+fn sorted_input(c: &mut Circuit) -> (Vec<HeapEntry>, Vec<i64>) {
+    use crate::sparql::sortkey::TopK;
+    with_pass(c, &Control::none(), None, |w, p| {
+        let rows = w.inner_init(p).expect("input");
+        let mut counts = vec![0i64; w.kept.len()];
+        let mut top = TopK::new(usize::try_from(w.cap()).unwrap(), w.asc.clone());
+        for (r, n) in rows {
+            let at = w.kept.iter().position(|e| e.row == r);
+            if let Some(i) = at {
+                counts[i] += n;
+            }
+            top.offer(w.key_of(p, &r), (r, n, at));
+        }
+        (top.into_sorted(), counts)
+    })
+}
+
+/// Placing and merging rows obey a deadline that has passed, however few rows there are.
+#[test]
+fn placing_and_reconciling_obey_an_expired_deadline() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, &format!("INSERT DATA {{ {} }}", ints(0, 10, i64::from)));
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 20");
+    let before = window(&mut c).rows();
+    let (sorted, _) = sorted_input(&mut c);
+    let r = with_pass(&mut c, &expired(), None, |w, p| w.place(p, sorted));
+    assert!(matches!(r, Err(Error::Timeout)), "{r:?}");
+    assert_eq!(
+        window(&mut c).rows(),
+        before,
+        "a failed placement installed rows"
+    );
+    let (sorted, counts) = sorted_input(&mut c);
+    assert_eq!(counts, vec![1; 10]);
+    let r = with_pass(&mut c, &expired(), None, |w, p| {
+        w.reconcile(p, sorted, &counts)
+    });
+    assert!(matches!(r, Err(Error::Timeout)), "{r:?}");
+}
+
+/// Keys without a total order are installed in the heap's order, which a search of the
+/// rows placed before cannot reproduce. Y and X are instants with timezones, Y the
+/// earlier, and Z a time without one, which orders by its lexical form against them, so
+/// that Y < X < Z < Y, and Y2 is another row with Y's key.
+#[test]
+fn keys_without_a_total_order_install_in_the_heaps_order() {
+    const DT: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+    let s = Store::in_memory(StoreOptions::default());
+    let y = "2026-01-01T12:00:00+05:00";
+    let x = "2026-01-01T09:00:00Z";
+    let z = "2026-01-01T10:00:00";
+    upd(
+        &s,
+        &format!(
+            "INSERT DATA {{ :y :v \"{y}\"^^<{DT}> . :x :v \"{x}\"^^<{DT}> . :z :v \"{z}\"^^<{DT}> . :y2 :v \"{y}\"^^<{DT}> }}"
+        ),
+    );
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 10");
+    let (got, want) = with_pass(&mut c, &Control::none(), None, |w, p| {
+        use std::cmp::Ordering::{Equal, Less};
+        let e = w.kept.clone();
+        assert_eq!(e.len(), 4);
+        // Y and Y2 are the two rows with one key, X follows Y and Z precedes it
+        let (i, j) = (0..4)
+            .flat_map(|i| (i + 1..4).map(move |j| (i, j)))
+            .find(|&(i, j)| w.cmp(&e[i].keys, &e[j].keys) == Equal)
+            .expect("two rows with Y's key");
+        let (ye, y2) = (e[i].clone(), e[j].clone());
+        let others: Vec<_> = (0..4).filter(|&k| k != i && k != j).collect();
+        let (xe, ze) = if w.cmp(&ye.keys, &e[others[0]].keys) == Less {
+            (e[others[0]].clone(), e[others[1]].clone())
+        } else {
+            (e[others[1]].clone(), e[others[0]].clone())
+        };
+        assert_eq!(w.cmp(&ze.keys, &ye.keys), Less);
+        // the premise: the three keys order in a cycle
+        assert_eq!(w.cmp(&xe.keys, &ze.keys), Less);
+        let seq = [ye, xe, ze, y2];
+        let want: Vec<_> = seq.iter().map(|e| e.row.clone()).collect();
+        let sorted: Vec<HeapEntry> = seq
+            .into_iter()
+            .enumerate()
+            .map(|(i, e)| crate::sparql::sortkey::Entry {
+                keys: e.keys,
+                seq: i as u64,
+                payload: (e.row, 1, None),
+            })
+            .collect();
+        w.kept = Vec::new();
+        w.held = 0;
+        w.place(p, sorted).expect("place");
+        let got: Vec<_> = w.kept.iter().map(|e| e.row.clone()).collect();
+        (got, want)
+    });
+    assert_eq!(got, want);
+}
+
+/// A window saved in a checkpoint and loaded again computes its numeric keys within a
+/// budget of exactly its loaded size, since the size counts their slots already.
+#[test]
+fn a_loaded_window_refreshes_within_its_own_size() {
+    use crate::incr::persist::{Reader, Writer};
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        &format!("INSERT DATA {{ {} }}", ints(0, 300, i64::from)),
+    );
+    let mut c = circuit(&s, "SELECT ?s WHERE { ?s :v ?v } ORDER BY ?v LIMIT 300");
+    let snap = c.snap.clone().expect("built");
+    let before = window(&mut c).rows();
+    let saved = window(&mut c).clone();
+    let mut out = Writer::new(&snap, &c.terms);
+    saved.save(&mut out).expect("save");
+    let data = out.finish();
+    let mut terms = c.terms.clone();
+    let mut r = Reader::new(&data, &snap, &mut terms).expect("reader");
+    window(&mut c).load(&mut r).expect("load");
+    let w = window(&mut c);
+    assert!(w.stale());
+    let budget = w.bytes();
+    with_pass(&mut c, &Control::none(), Some(budget), |w, p| w.refresh(p))
+        .expect("the keys fit the loaded size");
+    let w = window(&mut c);
+    assert!(!w.stale());
+    assert_eq!(w.rows(), before);
 }

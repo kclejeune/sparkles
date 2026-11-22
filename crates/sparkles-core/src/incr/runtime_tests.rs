@@ -2274,3 +2274,105 @@ fn an_ordered_live_query_streams_positions() {
         other => panic!("{other:?}"),
     }
 }
+
+/// The events a live query holds now.
+fn drain(l: &super::live::LiveQuery) -> Vec<LiveEvent> {
+    std::iter::from_fn(|| l.try_next()).collect()
+}
+
+/// A live query whose ordered window fails a pass publishes nothing of that pass: the
+/// subscriber receives only the error, and a new evaluation gives the query's rows.
+fn a_failed_window_pass_publishes_nothing(
+    setup: &str,
+    change: &str,
+    budget: Option<u64>,
+    arm: impl FnOnce(),
+    code: &str,
+) {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, setup);
+    let rt = runtime(&s, None);
+    let query = "SELECT ?s ?v WHERE { ?s :v ?v } ORDER BY ?v LIMIT 2";
+    let l = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                max_memory_bytes: budget,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let first = l.try_next().expect("the first rows");
+    let (_, rows) = live_rows(&first);
+    assert_eq!(rows.len(), 2);
+    upd(&s, change);
+    arm();
+    rt.round(&s);
+    super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = None);
+    super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = None);
+    let events = drain(&l);
+    assert!(
+        matches!(&events[..], [LiveEvent::Error { code: c, .. }] if c == code),
+        "{events:?}"
+    );
+    let again = rt
+        .live(&s, &q(query), None, &LiveOptions::default())
+        .unwrap();
+    let e = again.try_next().expect("the rows again");
+    assert_eq!(e.commit(), Some(s.snapshot().commit));
+    let mut want = oracle(&s, query, None);
+    let mut got = live_rows(&e).1;
+    want.sort();
+    got.sort();
+    assert_eq!(got, want);
+}
+
+/// A commit whose changes' keys pass a live window's budget ends the query with
+/// `over-budget`, although the window that would follow fits it.
+#[test]
+fn a_window_over_budget_publishes_nothing() {
+    let setup = format!(
+        "INSERT DATA {{ {} }}",
+        (0..10)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    let change = format!(
+        "INSERT DATA {{ {} }}",
+        (0..3000)
+            .map(|i| format!(":n{i} :v {}", -1 - i))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    a_failed_window_pass_publishes_nothing(&setup, &change, Some(64 << 10), || {}, "over-budget");
+}
+
+/// A pass cancelled while a live window refills its reserve ends the query with
+/// `pass-timeout`, though too few rows follow for a periodic check.
+#[test]
+fn a_window_cancelled_while_refilling_publishes_nothing() {
+    let setup = format!(
+        "INSERT DATA {{ {} }}",
+        (0..200)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    // the first 101 rows leave, so the reserve of 100 runs out and the window refills
+    let change = format!(
+        "DELETE DATA {{ {} }}",
+        (0..101)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    let arm = || {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = Some(flag.clone()));
+        super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = Some((3, flag)));
+    };
+    a_failed_window_pass_publishes_nothing(&setup, &change, None, arm, "pass-timeout");
+}

@@ -3,6 +3,14 @@
 
 use super::*;
 
+#[cfg(test)]
+thread_local! {
+    /// a cancellation flag that the passes of rounds on this thread obey, for tests of a
+    /// pass that fails midway
+    pub(crate) static PASS_CANCEL: std::cell::RefCell<Option<Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(super) fn failure(e: &Error) -> (String, String) {
     let code = match e {
         Error::Timeout | Error::Cancelled => "pass-timeout",
@@ -69,8 +77,16 @@ impl Runtime {
     }
 
     pub(super) fn control(&self) -> Control {
+        let deadline = Some(Instant::now() + self.opts.read().pass_timeout);
+        #[cfg(test)]
+        if let Some(flag) = PASS_CANCEL.with(|c| c.borrow().clone()) {
+            return Control {
+                deadline,
+                ..Control::with_cancel(flag)
+            };
+        }
         Control {
-            deadline: Some(Instant::now() + self.opts.read().pass_timeout),
+            deadline,
             ..Control::none()
         }
     }

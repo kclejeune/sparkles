@@ -33,6 +33,10 @@ use std::cmp::Ordering;
 /// The least reserve of a window, in rows.
 pub const MIN_RESERVE: usize = 100;
 
+/// A test hook: a count of steps and the flag it raises when the count reaches zero.
+#[cfg(test)]
+type Hook = std::cell::RefCell<Option<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>>;
+
 #[cfg(test)]
 thread_local! {
     /// the comparisons of [`Window::cmp`] on this thread, for tests of the work
@@ -42,8 +46,24 @@ thread_local! {
     static RECONCILED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// a flag that [`Window::key_of`] raises once it has computed this many keys, for
     /// tests of a cancellation that arrives during a phase
-    pub(crate) static CANCEL_AFTER: std::cell::RefCell<Option<(u64, std::sync::Arc<std::sync::atomic::AtomicBool>)>> =
+    pub(crate) static CANCEL_AFTER: Hook =
         const { std::cell::RefCell::new(None) };
+    /// the same for the rows that [`Window::place`] and [`Window::reconcile`] install
+    pub(crate) static CANCEL_PLACING: Hook =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Count one step of a test hook down and raise its flag at zero.
+#[cfg(test)]
+fn count_down(hook: &'static std::thread::LocalKey<Hook>) {
+    hook.with(|c| {
+        if let Some((n, flag)) = c.borrow_mut().as_mut() {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    });
 }
 
 /// Rows of the window that entered or left it in a pass, each with the position of its
@@ -138,14 +158,7 @@ impl Window {
 
     fn key_of(&self, p: &Pass, r: &[crate::id::Id]) -> Vec<SortKey> {
         #[cfg(test)]
-        CANCEL_AFTER.with(|c| {
-            if let Some((n, flag)) = c.borrow_mut().as_mut() {
-                *n = n.saturating_sub(1);
-                if *n == 0 {
-                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        });
+        count_down(&CANCEL_AFTER);
         self.keys
             .iter()
             .map(|&(c, _)| SortKey::new(p.value(r[c])))
@@ -434,6 +447,8 @@ impl Window {
         let mut held = 0i64;
         for e in sorted {
             p.tick()?;
+            #[cfg(test)]
+            count_down(&CANCEL_PLACING);
             let (row, w, _) = e.payload;
             held = held.saturating_add(w);
             kept.push(Entry {
@@ -479,6 +494,8 @@ impl Window {
             }
             while let Some(f) = fresh.next_if(|f| self.cmp(&f.2, &e.keys) == Ordering::Less) {
                 p.tick()?;
+                #[cfg(test)]
+                count_down(&CANCEL_PLACING);
                 held = held.saturating_add(f.1);
                 kept.push(Entry {
                     row: f.0,
@@ -488,12 +505,16 @@ impl Window {
                 });
             }
             p.tick()?;
+            #[cfg(test)]
+            count_down(&CANCEL_PLACING);
             e.w = w;
             held = held.saturating_add(w);
             kept.push(e);
         }
         for f in fresh {
             p.tick()?;
+            #[cfg(test)]
+            count_down(&CANCEL_PLACING);
             held = held.saturating_add(f.1);
             kept.push(Entry {
                 row: f.0,
