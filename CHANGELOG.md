@@ -2,6 +2,448 @@
 
 ## Unreleased
 
+### Cold small scans at 1.05M measured again against Fluree
+
+Sparkles at b47b582b and Fluree 4.2.2 were measured cold in one run on forge at 1.05M
+triples, as roadmap item 1270. Sparkles leads all eight measured cold queries, including
+the five that the October run counted as losses to Fluree, with `count-all` at 2.1 against
+19.2 ms and `distinct-obj` at 1.8 against 19.3 ms. With a 1 s pause between readiness and
+the request, Fluree leads `count-all` at 2.8 against 10.1 ms. After the pause Sparkles' one
+vocabulary read takes about 8 ms, which is consistent with forge's NVMe drive waking from a
+low-power state, and item 572 now records it beside the 10.5M case. Fluree's first
+request is fast on the restarts where its readiness check answers 0.05 s or more after the
+start, as nearly every restart of the October run did, which is consistent with its October
+`count-all` and `distinct-obj` medians of 2.2 and 1.6 ms. Its October `contains` and
+`employee-docs` medians of 12.1 and 8.5 ms were not reproduced.
+### The EL index stage checks the profile without allocating
+
+Roadmap item 1269 removes allocations from the index stage of OWL 2 EL classification.
+The profile check of each axiom walks it without allocating and falls back to the full
+check, which copied each class and property IRI into a signature, only for an axiom the
+walk cannot accept, such as one that may break a rule or one with data restrictions or
+keys, which still allocate in that check, so the axioms left out keep their rules and messages. Normalization
+looks up an object property's role by its IRI in a table of role ids. On forge
+`ore_ont_13482` classifies on one thread in a median of 898 ms against 999 ms, and its paired rounds give a
+median ratio of 0.871 of the base's time, with its index stage at 0.625, and ChEBI lite takes 0.964 on one and 0.956 on four
+threads. GO's index stage is faster too, but its saturation moved with the code's layout
+and the whole classification takes 1.0% longer on one thread, which item 1288 holds.
+### The reasoner's random closure sessions run as three tests
+
+`random_sessions_derive_what_the_joins_derive` in sparkles-reasoner derived its six random
+sessions in one test, which took 340 s to 480 s on GitHub's four-CPU runners and passed
+nextest's limit of 600 s on 0779d666, beside other slow tests in its shard. The code was
+not slower, since on `wally` the test took 140 s at both 0779d666 and b47b582b. The six
+cases now run as three tests of two seeds each, `..._part_1_of_3` to `..._part_3_of_3`,
+with the same seeds, checks and `SPARKLES_CLOSURE_CASES` setting, as roadmap item 1275.
+
+### A kept EL classification over its memory budget starts again in full
+
+A kept OWL 2 EL run counts the contexts it keeps and its own new state against
+`max_memory` and the pool's grants, which a fresh run does not hold. Such a run that
+passed its budget returned a memory error where a fresh run under the same limit
+succeeded, and a repeated call failed the same way. It now starts again in full under the
+same limits, as kept runs with the Horn rules or Tier D do, and charges the pool first
+against what the kept attempt was granted, as roadmap item 1263. A run that a fresh run
+could not finish either still fails with the memory error.
+
+### A range that only a loop reaches is classified in full
+
+A context with a role loop, from a self restriction or the Horn rules, takes the role's
+range. The OWL 2 EL classifier registered a range as a positive
+occurrence only through a positive existential on the role, so the existentials of such a
+range had no successor contexts and its data restrictions no told subsumers. A full run
+could miss a subsumption or an unsatisfiable class while reporting itself complete, and a
+kept run could differ from a fresh one after an unrelated edit. The index now registers
+every range, as roadmap item 1262. The taxonomies of `ore_ont_13482` and `ore_ont_9499`
+are unchanged.
+
+### Kept EL runs keep what their contexts take from the index
+
+After an edit of class axioms, a classification kept by the EL rules no longer recomputes
+the negative existential restrictions and disjointness members of every kept context,
+which took about half of the invalidation's 105 ms on `ore_ont_13482` on `wally` for a
+few dozen cleared contexts. A kept context renumbers its disjointness sets only when the
+run's sets differ from the last run's, the invalidation's two reads of every context use
+bit sets, and its scratch counts against the memory budget, as roadmap item 1256 records.
+On `wally` with four threads an edit of `ore_ont_13482` takes 408.1 ms against 485.9 ms
+before, and an edit of `ore_ont_9499` 138.6 ms against 146.6 ms.
+`incremental_classify` also prints the resident bytes of the first edit's run. The
+reasoning guide states the higher peak of a kept run, whose contexts stay live beside the
+second build of the index, and roadmap item 1254 covers incremental normalization and
+indexing, which items 590 and 664 now wait for.
+
+### Incremental EL classification runs again after a change to a self restriction
+
+An incremental OWL 2 EL classification could miss entailments after an axiom with
+`ObjectHasSelf` was added, as roadmap item 1258 found. A negative self restriction gives
+its class to every context with a loop by the role or a subrole, and a kept context can
+have that loop from a self restriction on a subrole, a reflexive role or a chain without
+holding the restriction that the invalidation looks for. With `r ⊑ s` and
+`owl:Thing ⊑ ObjectHasSelf(r)` fixed, adding `ObjectHasSelf(s) ⊑ C` cleared no context and
+left out `owl:Thing ⊑ C`, and a reflexive `r` with an added `ObjectHasSelf(r) ⊑ C` did the
+same. A change to an axiom with a self restriction now saturates everything again, as a
+change to an axiom with an individual does. Kept runs with the Horn or disjunctive rules
+already started again after such a change, through the check of the tier when axioms
+outside OWL 2 EL are in play and the comparison of the two indexes' tables. A new
+differential sweep, `tests/incremental_sweep.rs`, compares kept runs with fresh ones on
+edits of class axioms beside fixed self restrictions, reflexive roles, chains, ranges,
+individuals and the top and bottom properties.
+
+### FILTER NOT EXISTS builds its mask in one pass again
+
+When the key set of a FILTER NOT EXISTS or FILTER EXISTS answers every row, the filter
+maps the probe's answers to its mask in one branch-free pass, as roadmap item 1249's
+repair. The probe and the mask were split in item 7's first phase, whose second loop
+took a branch per row and made `not-exists` 15 to 21% slower in execution on forge
+between bccc5f7b and 23626cdc. On `atlas`, a9a237b7 against 6dbf2a08, `not-exists`
+executes in 0.87 to 0.90 times the base's time in every cell, by default and streamed, and
+streamed `exists-join` in 0.95 to 0.99 times. Item 1252 bisects the eager `minus` and
+streamed `optional-chain` readings against cc94ac7f, and item 1253 holds the small
+costs that the counts and the timing found.
+
+### Index columns and builder runs share one delta coder, and test hooks need `failpoints`
+
+Storage consolidation Phase 5, roadmap item 832, gives the index's column frames and the
+builder's run blocks one zig-zag delta varint coder. The run reader decodes each column in place
+into the keys, which made the run decode about 4% faster on `atlas`. The on-disk bytes did not
+change. The store's test hooks, such as `Store::set_clock`, `Spill::inject_fault` and the
+vector and full-text pause hooks, now build only for tests or with the `failpoints` feature of
+`sparkles-core` and `sparkles`. `parse_source` and `parse_source_into` share their first rungs
+and one whole-slice parser. Before batch 46 two one-thread query cells read slower on `atlas`, while
+on batch 46 the instruction counts of every benchmark query stay within their noise floor, so
+roadmap item 1246 confirms the two cells on the matrix after the push.
+
+### Late existential restrictions take the clauses their successor already sent
+
+In a run that counts and in a rooted run, an existential restriction that reaches a
+successor after the successor sent its clauses over the predecessor, as a unit derived
+later or under eager expansion as a later edge into a shared successor, now takes Pred
+with those clauses, as roadmap item 1229's repair. Such a run could report itself complete
+and miss an entailed subsumption, and a rooted run that counted classified again without
+counting where it detected the case. The repair is adopted on a measured gate of
+generated and fixture ontologies without a proof, so item 1229 stays open, and the
+cautious and eager strategies give the same taxonomy on that gate wherever both answer in
+full. On the runs that answer in full with and without it, and where the run
+without it agrees with HermiT, the repair adds 0.29% to the
+derived conclusions of rooted runs that count, 0.47% to rooted runs without counting and
+0.90% to runs that count without the root, and three generated ontologies now exceed the
+bound on derived conclusions, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` keeps
+the earlier containment, which now also covers rooted runs without counting, and `=0`
+turns both off, for measurement.
+
+### Rooted runs withdraw answers that a ground fact under a class may leave incomplete
+
+With `Limits::rooted`, a run could report a complete answer that missed an entailment when
+a fact that holds only under the queried class concerns an individual reached from
+another individual. After its saturation a rooted run now looks for such a fact whose
+condition cannot reach a context registered for one of its individuals. When it finds
+one, it classifies again without the rooted rules, gives the default answer, which leaves
+the axioms outside OWL 2 EL out, and sets `Stats::dl_rooted_declined` and
+`Stats::dl_over_budget`. The `el_classify` report has `dlRootedDeclined`. The check
+exempts the predecessors of the context that holds the fact, the individual's own
+context, contexts that the root does not reach and the root's direct successors, and
+those exemptions are not proved, so this is partial containment and roadmap item 1231 stays open for the
+repair. On generated ontologies built around the loss, every miss is withdrawn. The check
+also withdraws answers that were complete, between 2 and 38 per generated corpus of several
+hundred to several thousand ontologies. `Limits::rooted_decline` set to false keeps the
+rooted answer, and `SPARKLES_ROOTED_MARKER_DECLINE` chooses the check's tier or `off` for
+measurements.
+
+### The selection of rooted runs is on again with selected partners
+
+With `Limits::rooted`, Hyper over `x` and Pred from a successor over a successor term of a
+constant take selected clauses as partners, and the selection of ground body literals is
+on again beside the Join exemption, as roadmap item 1220's repair. Generated ontologies
+built around the two losses find none with the repair in runs without counting, and
+every file that the run without the selection finished still finishes. With counting, one
+generated ontology loses subsumptions with or without the repair, which is item 1229. The repair is adopted on that measured
+gate without a proof of completeness, so item 1220 stays open. 48 of the 50 `shoi`
+fixtures are exact again. The generated ontology s2-g2-011 and a version of shoi-022 with
+its individuals merged, on four threads, pass the work bound where the run before item
+1220 finished, and they are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0` and
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0` turn the selection and the selected partners off for
+measurement.
+
+### The selection of rooted runs is off and Join is partly exempt from the ground restriction
+
+With `Limits::rooted`, the selection of ground body literals and the restriction of Join
+on ground inferences, two of the departures F24 records, could make a run that reported
+itself complete miss an entailed subsumption or an unsatisfiable class. Rooted runs now
+select no ground body literals, and a Join whose premise on the side of the head has no
+ground body literal is exempt from the restriction, until roadmap item 1220 repairs the
+selection. The completeness of the rooted run is
+still not proved. shoi-005 and shoi-027 now pass the work bound and give the default
+answer, with the axioms it leaves out and the fallback in its statistics, so 46 of the 50
+`shoi` fixtures finish against 48.
+
+### UTF-8 checks of key filters
+
+The key filters that answer CONTAINS, STRSTARTS, STRENDS, STRLEN, REGEX and LANGMATCHES
+on stored keys now check each key's UTF-8 through one helper. The helper accepts an ASCII
+key with a word-at-a-time scan and passes other keys to the standard validator, so an ASCII
+key no longer calls the standard library's validator, whose placement in the binary moved
+`lang-filter` by up to 10% between builds. Malformed keys are rejected as before. On
+stanley at 1.05M triples, `lang-filter` counts 0.75 of the instructions per request,
+`regex-iri` 0.86, `contains` 0.98 and `advisor-sparse` 0.98, and the other screen queries
+are unchanged. A key that is not ASCII pays one extra scan of its bytes before validation.
+When every name and title of the same data ends in a non-ASCII character, which is the worst
+case, `lang-filter` counts 1.026 of the instructions and `contains` 1.000.
+
+### Cheaper disjunctive attempts, and a width limit on one thread
+
+The pruning of the disjunctive rules' product lists compares sides by a signature and a
+sorted merge, and the Pred rule no longer copies its lists for a fixed premise. The attempts
+derive the same conclusions, and six of the largest classifications of the ORE 2015 DL
+development set take 0.80 to 0.91 times the instructions. On one thread an attempt also ends at a product
+of more than `Limits::dl_attempt_width` choices, 1,048,576 by default, so that
+`ore_ont_14817` and `ore_ont_9663` fall back to the Horn rules after 0.5 and 4 million
+conclusions instead of 22.4 million, in 25.6 and 51.1 G instructions against 584 and 700 G,
+with the same taxonomies (roadmap items 990 and 1011). `el_classify --dl-attempt-width N`
+sets the limit, and roadmap item 1225 follows why one thread makes such wide products.
+On one thread on forge the two files classify in 2.3 and 4.9 s against 57.4 and 74.3 s, and
+the other four in 0.86 to 0.91 times the base's time.
+
+The rule of the Horn rules for a new universal no longer searches the context's universals
+for a repeat, which a context never derives. On one thread on forge `ore_ont_14817` and
+`ore_ont_9663` classify 2.1% and 2.4% faster, and GO 0.6 ms slower in 303 ms, which roadmap
+item 1234 follows (item 693).
+
+### Cursor operators for searches, calls and counts
+
+The first part of roadmap item 829 runs text, hybrid, history, spatial and vector searches
+over their input, remote LATERAL loops, whole-input searches and algorithm calls, bounded
+leaves and `CountJoin` as cursor operators under explicit streaming, where they fell back
+to eager subtrees before. Automatic execution keeps its earlier choices for these kinds
+until a same-host A/B admits each one. A streamed count over a join that eager execution
+counts from its pairs holds one batch where eager holds every pair, and a count over a
+merge join on two or more variables still runs the eager kernel. The strict policy refuses
+the forms that remain without a resumable reader, which the second part of the item
+covers. On forge, the text, geo and vector scripts read within noise of the base except
+eager `q6-touching-counties` and `q-ef-64` with one thread, which item 1162 holds, and
+streamed `q9-star` with 12 threads, which a rerun against the tip's merge base put at
+0.966.
+
+### Closure operators in query-time reasoning
+
+Demand sessions now close the adorned copies of transitive rules and of `prp-trp` with
+closure operators seeded by their magic facts, the first half of roadmap item 521 and
+Phase 2 of spec F23. A copy whose demand binds the subject walks forward from the values it
+is asked for, one that binds the object walks backward, and one that binds neither closes
+the relation, each emitting the facts its joins would derive. On forge the OWL2Bench(1)
+queries q2, q7, q12 and q19 under `owl-rl` demand took 8.3 to 8.5 s instead of 113 to
+117 s, with the same rows and about half the peak RSS. A run that derives list cells its
+rules read starts again without the operators. `SPARKLES_DEMAND_CLOSURES=0` turns them off.
+Roadmap item 1222 covers pairs derived for values the query did not ask for.
+
+Within a run, an operator no longer walks a relation again for pairs other operators
+merged, or once a copy that binds neither end closed the whole relation and no other edge
+has arrived since, unless that closure left out the pairs from a value to itself and the
+operator does not. At OWL2Bench(1) q12, the walks that merged nothing read 1.3 million edges
+instead of 21 million, with the same rows. Roadmap item 1226 covers the scan of the closed
+relation that a later run of a session still makes.
+
+A demand session now sorts each chunk of derived facts it exports in predicate, object and
+subject order, the order in which joins mostly derive them, because a query that reads a
+cached table inserts its facts into the query's overlay and the operators' own order made
+that slower. A session checks its rules for operators at its first run, so a session served
+from the cache skips the check, and `Closures::detect` passes over adorned copies that
+cannot be transitive before taking them apart. On forge the reasoning latency gate then
+found no metric slower than before the operators in every round, where the first gate had
+found `owl-rl` demand-cached `q11` slower in every round.
+
+### Targeted checks on a remote host
+
+`mise run check:remote --host <host> '<command>'` runs one command, such as `mbx check` or
+`mbx nextest run -p <crate> --test <name>`, on an ssh build host or a Boat worker in a full
+copy of the working tree, with the pinned compiler and mbx, and prints its log and exits
+with its code. It is `scripts/remote-ci.sh --cmd`, so it waits for the host's heavy lock and
+keeps the host's disk floor.
+
+### A free-disk floor on ssh build hosts
+
+`scripts/remote-ci.sh` and the batch gate now refuse an ssh host whose disk is below the
+floor, as they refused a Boat worker, which completes roadmap item 1130. Under the host's
+heavy lock a lane CI job needs 85 GiB free and a gate part 110 GiB, and an ssh host that is
+short first runs `mbx gc` with `gc.min_free_size` raised to the floor. On an ssh host a lane
+CI job also watches the free space while its build and tests run and stops with exit 5
+when less than 4 GiB is left, so the server's tests no longer fail against their 1 GiB
+reserve when another job fills the disk, and its temporary files live beside its worktree. The
+gate driver's own check only reads and warns. The gate's
+default disk needs rise from 30 GiB for a ci half and 15 GiB for a conformance half to the
+110 GiB floor of a cold build, and `gate.sh --hosts` shows each host against the floors.
+
+### Browser tests on a local debug build
+
+`mise run ui:e2e` now builds the formatter's WebAssembly module before the UI, as
+`ui:e2e:mock` does. The tests of the Pattern pane, the plan's pattern and **Apply to
+query** in the facets of a query need the module, and they now pass against a local debug
+server. Before the servers start, the setup looks for the module in the directory that
+`SPARKLES_UI_DIR` names, or else in `ui/build` for the default debug binary, and stops with
+a message when it is missing. `SPARKLES_E2E_NO_WASM=1` skips that check. The lens tests now look for unlabelled nodes under the full IRIs that the rendering
+preferences draw. The outbound-policy test of ontology imports asks for a link-local
+address, which the test server's policy refuses before it connects, although it allows
+private addresses. This completes roadmap item 1131.
+
+### Registered property functions under RDFS on read and reasoning
+
+A query could abort the server process when RDFS on read was on and the schema declared
+a registered property function a subproperty of a predicate the query named. The
+rewrite added a call that the query had not been prepared for, the call panicked, and
+the stream's destructor panicked again while unwinding. A schema that gave the function
+a domain or range, or put a subproperty below it, could also add or change a call, and
+the seed queries of query-time reasoning ran a written call in the same unprepared way.
+The RDFS rewrite now derives nothing through a registered property. It keeps the
+query's own call and its list arguments as written, after the patterns that bind its
+inputs, and adds none, and a reasoning seed set that would need a call is derived from
+constants instead. RDFS on read had also refused a written call with a list argument,
+or one whose input came from a rewritten pattern, and both now run. A callback reached from an unprepared
+query now fails that query with an error, and the stream and accumulator destructors no
+longer panic. This completes roadmap item 1198.
+
+### DISTINCT on charged buffers
+
+A cursor DISTINCT keeps its set in `Charged` buffers, which take their memory charge from
+their own allocations at one growth site, so the set is admitted to the query's budget
+before it grows, which completes roadmap item 1183. A shared heap audit compares every
+cursor operator's heap with its ledger, and the operators it finds above their ledger
+have roadmap items of their own. Seven DISTINCT sweeps over a range of budgets fit every
+budget they fitted before the move with the same answers, and three of them now fit from
+smaller budgets, such as 40,960 bytes in place of 57,344 for a one-column spilled set. On
+forge at 1.05M quads, streamed DISTINCT of two columns of a join takes 1.008 times as long
+as before and a wider one 1.033 times, which roadmap item 1237 recovers, and the other
+DISTINCT queries take the same time or up to 3.5% less.
+
+### Streamed answers through the engine buffer
+
+The cursor writers of streamed SELECT, native JSON, RDF and Jena graph answers write
+through the engine's 8 KiB buffer, as eager answers do, which completes roadmap item 240.
+A streamed request on the large answers of the synthetic benchmark at 1.05M triples runs
+0.46 to 0.69 times the instructions it ran before, and on atlas with 12 threads it takes 0.42 to 0.77 times its former wall time, which puts it ahead of the eager request on those answers. The access log and the metrics report
+the rows whose bytes the response writer accepted for a streamed body that stopped
+partway, as they do for an eager one. A streamed body
+that the result-size budget stops after its first bytes now sends what it had buffered
+before it aborts the transfer, as an eager body did, so a client receives up to one more
+chunk of complete rows before the abort.
+
+### The UI's result table under automatic execution
+
+The query page's result table now runs a query in the server's default execution mode
+instead of asking for eager execution, so plans that are faster as cursors, such as plain
+scans of a thousand rows or more and large groupings, stream there too. When a streamed answer reaches the row limit, the Table tab
+reads the count with a plus sign, such as `1,000+`, and a notice says that there may be
+more rows and that the total is unknown. A streamed graph answer, whose statements arrive
+as quads, draws as an eager one does. A comparison on the history slider still reads both
+states eagerly. A streamed answer skips the full-result cache, so rerunning it is not
+served from the cache. This is part of roadmap item 7.
+
+### Instruction counts per request before timing
+
+`mise run bench:request-insn` counts the user-space instructions, cycles and CPU time per
+request of two server builds, query by query, in rounds of A,B,B,A on one pinned core,
+and reports each query's ratio with a 95% interval and the spread over processes. Lanes
+now count before they book an Intel host. An A-against-A run on `stanley` set the noise
+floor at 1% for queries under 2 million instructions per request and 0.25% above. Back
+tests showed that the counts flag item 678's slower string floors, at +13% and +29%
+against +25% and +33% in time, and miss item 1039's per-block charge, which added
+execution time without adding instructions. Counts measure the whole request,
+so they cannot resolve the 0.5 µs bound of the Intel rule on queries under 0.3 ms, which
+are still timed, as are changes to charging, allocation, atomics, locks, thread
+hand-offs, system calls, the response path, layout and concurrency. Instructions do not
+bound cycles either, so a change cleared by its counts leaves any cost in cycles alone to
+the batch screen and the forge checks after the push.
+
+### Materialized inferences under the clause keywords of entity frames
+
+The read-only materialized region of a property or individual frame in Browse and the
+ontology editor groups its rows under the frame's clause keywords, such as Types, Facts and
+SubPropertyOf, in Manchester syntax with an Inferred badge on each row, in place of a list
+of functional-style axioms. The rows stay in their own region below the asserted frame. Names link to their pages in Browse and select the entity in
+the editor, and their labels come from the same pinned read as the rows. Entailments that
+every entity of the profile has, such as a property's subproperty relation to itself or a
+type of `owl:Thing` or `rdfs:Resource`, are counted instead of listed. This is part of
+roadmap item 622. Classifier-backed inferred axioms beyond named-class parents and
+equivalents, and explanation links from F24's justifications, remain open.
+
+### Aggregate errors follow Jena by default
+
+MIN and MAX are now unbound when one of their arguments is an error, such as a value
+that OPTIONAL leaves unbound, as in Apache Jena, and `GROUP_CONCAT(DISTINCT …)` over no
+rows is unbound as Jena makes it. Earlier releases let MIN and MAX pass over such
+arguments, so queries that relied on that answer differently. The setting
+`aggregate-errors` chooses among three readings, `jena` (the default), `sparkles` (the
+earlier answers) and `spec` (the text of SPARQL 1.1 and 1.2, in which MIN is unbound, MAX
+passes over errors, AVG over only errors is `0` and GROUP_CONCAT takes only strings),
+which completes roadmap item 1064. A query sets it with the `aggregate-errors` request
+parameter, the library's `QueryOptions::aggregate_errors`, the Python, Node.js and JVM
+query options, the MCP argument `aggregateErrors` or `--aggregate-errors`. A dataset keeps
+its own at `/$/aggregate-errors/{ds}` in `aggregate-errors.json`, and `sparkles serve
+--aggregate-errors` and the NixOS option `aggregateErrors` set the server's default.
+Materialized views and live queries follow the dataset's reading and evaluate again when
+it changes, and a query under another reading evaluates a view's query from the data.
+The incremental group state now keeps error counts, so view checkpoints of earlier
+releases are refused and rebuilt from the data on the first start, and a deployment with
+views should expect that rebuild. The memory tools, GraphRAG's fact reader and the UI's
+agent and nearby lists ask for the `sparkles` reading, since they want the values
+present. Backups now hold `aggregate-errors.json` and `describe.json`, which earlier
+backups left out, so a restore kept the data but lost a dataset's DESCRIBE setting.
+
+### Eager aggregates over IRI comparisons and EXISTS
+
+An eager aggregate whose argument compares a variable with a constant IRI or holds an
+EXISTS, such as `SUM(IF(?p = ex:nobody, 1, 0))`, no longer decodes that variable's terms
+before it runs. The grouping operator of item 826 evaluates such arguments as BIND does,
+and that path decoded every vocabulary column an expression named once the table passed
+16,384 rows, although these columns are answered from term ids. The decode now covers
+only the columns whose values the expression reads, which also spares eager BIND and
+ORDER BY keys of the same shape. On forge with one thread over 1,000,000 people, the query
+takes 15.1 ms against 60.1 ms on the previous main and 16.1 ms before item 826, and its BIND
+form 15.2 ms against 60.9 ms. Its EXISTS form takes 867 ms against 918 ms, since the EXISTS
+evaluation itself sets most of its time. Arguments that read values, such as
+`STRLEN(?name)`, still decode their columns first, since that was faster on one thread
+than reading them row by row. This is roadmap item 1098.
+
+### Rule programs with relations and negation
+
+A reasoner rule text can declare relations with `.decl name(col, …)`, write relation atoms
+in rule bodies and heads, negate a triple pattern or a relation atom with `not`, and write
+forward rules as `head :- body.` clauses, the rule-file subset of the Datalog syntax of
+spec C24 §6.2. Such a text is one stratified program, which materialization, incremental
+maintenance, witnesses, explanations, query-time reasoning and why-not answers all read,
+and relation facts never reach the dataset. A program with `not` runs in full on every
+update, and one with an existential head or an include of the OWL rule sets is refused. A text without the new syntax is
+parsed and evaluated as before. `Clause` gains the `Relation` and `Not` variants and
+`Rule` the `include` field, `parser::rules_text` writes a parsed program back as text, and
+the web UI shows a relation fact in an explanation as `name(args)` and leaves it out of
+**Show on graph**. The `owl-rl` profile keeps its property chain and key rules per length
+until roadmap item 1102 lets a query-time demand bind a later column of a relation.
+
+### One load plan
+
+`LoadPlan::choose` in `store/load_plan.rs` now picks the bulk path or a transaction for
+`Store::load_with`, `Store::replace_with`, `WriteTxn::insert_bulk` and RDF Patch, which
+each had a rule of their own, and a table test records the plan of each entry point at
+the boundaries. The threshold test is strict everywhere, so a batch or a patch of exactly
+the bulk threshold now commits in a transaction. A load into an empty store still takes
+the bulk path unless all its inputs are streams that end within 8 MiB, and a graph
+replacement still takes a transaction unless its estimate or its streams are above the
+threshold, whatever the store holds. A stream load into a store that holds data reads its
+stream ahead up to 80 bytes per threshold quad, as a replacement did, and takes the bulk
+path past that bound. A bulk replacement returns the quads it parsed, duplicates
+included, as the transactional path and the documentation already did, where it used to
+return the quads the store held afterwards. Every stream of a load or a replacement now
+checks the write's deadline and cancellation beneath its decoder whichever plan runs,
+which a load into a store with data and a write limited to some graphs did not do before.
+A write limited to some graphs still parses its sources in a transaction, and a bulk
+insert or a patch under such a limit, whose graphs are checked as it is staged, may still
+take the bulk path. A dry run of a load or a replacement through a transaction is no
+longer refused by an in-memory dataset's memory limit while its sources are parsed. It
+returns a preview that reports the refusal the write itself gets, as a dry run on the
+bulk path does, with the sizes of the check that refused it. The refusal comes before a
+rejection by the guard, and for a replacement before a failed precondition too, since the
+write meets them in that order. This corrects the dry run of a large first PUT into an empty in-memory
+dataset and of a large POST into one with data. Durability, the write-ahead log and the
+on-disk formats are unchanged.
+
 ### Dependency security updates
 
 The Office converter reads ZIP containers with zip 9.6.1 instead of 7.4.0, which fixes
@@ -25,6 +467,19 @@ with vite 8.3.3, vitest 5.0.3, adapter-static 3.0.11 and SvelteKit 2.70.4, which
 their advisories. The SvelteKit advisories that only 3.x fixes concern features the
 static UI does not use, and roadmap item 1049 covers the migration.
 
+### String comparisons through a per-query floor cache
+
+`FILTER(?x < ?y)` and the other order comparisons of two columns of stored strings read
+the strings' order from their vocabulary ids and floors in streaming execution as well as
+in eager execution, which completes roadmap items 678 and 1069. The floors live in a cache
+that lasts the query, charged to its memory budget inside the spill threshold and capped
+at 64 MiB or a sixteenth of the budget, so a cursor's batches share them. On forge at 1.05M
+triples with one thread, streaming `str-pair-names` takes 0.517 of its earlier time and
+`str-pair-lt` 0.815, while `str-pair-colleague`, whose names rarely repeat, takes 1.042,
+and 1.065 with 12 threads, which item 1088 follows. Every worker of a comparison reads and
+writes the slots of one table of floors without a lock, which replaced an earlier map per worker that
+computed a repeated string's floor once per worker.
+
 ### Fewer rooted classification runs past their bound
 
 With `Limits::rooted`, an existential restriction into a singleton, or into a class below
@@ -43,6 +498,16 @@ and roadmap item 1075 follows the disjunctive equalities of constants in shoi-04
 822 is complete. The taxonomy no longer panics when an incomplete run derives two classes
 equivalent and only one of them equivalent to `owl:Thing` or unsatisfiable, and places
 both where the equivalence puts them.
+
+### Root scans read a shared block in place
+
+A cursor scan that shares its block with the batches it hands out keeps no weak handle on
+the block and reads it in place, and it takes the block back from the shared batch only
+when it switches to owned rows inside the block or a batch declines the shared path. This removes most of the cost that the
+uncharged scan of item 1039 added. On 100,000 people on atlas with one thread, `root-scan`,
+`export-500k` and `root-limit` are 1.6% to 3.5% faster in server time. Against the build
+before item 1039, `root-scan` still takes 2.4% longer under streaming and 1.1% under
+automatic execution, about 2 and 1 µs, and roadmap item 1063 stays open for that remainder.
 
 ### Keys and the universal property in rooted classification runs
 
@@ -73,6 +538,50 @@ execution answers some queries under small budgets that it refused before. The d
 of a large term beside a shared batch can still be refused under a budget at which a
 copy would answer, which roadmap item 1051 holds. A cursor that reads a snapshot without filling the block cache, as an
 export does, decodes its current block again for each batch of copied rows.
+
+### Reference evaluator for the differential tests
+
+A test-only evaluator in `crates/sparkles-core/tests/support/reference` follows the
+SPARQL 1.1 and 1.2 algebra literally and shares only the parser with the engine, which
+completes roadmap item 512. It answers all 508 SPARQL 1.0 and 1.1 and all 63 SPARQL 1.2
+query evaluation tests under an exact comparison. It is the oracle of the seeded cursor
+differential in place of the eager executor, and the optimizer, index-join and
+string-filter tests compare the engine with it as well as with `Optimizations::NONE`. It
+notes the values and rows that the specification leaves open and the sort key of each
+row, and one comparison in `check.rs` passes no answer that the specification forbids
+and reports a partial, unordered or skipped comparison where it cannot decide. Where Jena's reading differs from the specification's
+text and the engine follows Jena, as for the default graph of several FROM clauses, the
+evaluator follows Jena, and the W3C suites run under the text. It found four groups of
+engine disagreements. MIN and MAX pass over errors, AVG over errors only is an error and
+GROUP_CONCAT reads IRIs and numbers, roadmap item 1064, integers and decimals beyond the
+engine's decimal range are not numbers, roadmap item 1065, the string functions ignore the
+base direction of their arguments, roadmap item 1071, and three XSD and XPath readings
+differ, roadmap item 1077.
+
+### EXISTS inside larger expressions
+
+Both executors answer an EXISTS inside a larger expression, such as IF, OR, an aggregate
+argument or an ORDER BY key, from the key set of its pattern, as they answer a FILTER
+EXISTS, and automatic execution streams such plans. On an Intel host at 10.5M quads with
+one Rayon thread, a SUM over IF(EXISTS …) went from 885 to 16 ms eagerly and from 913 to
+15 ms streamed. Every row is probed, also one on which the expression does not reach the
+EXISTS, so an IF branch that is never taken still builds the key set, which roadmap item
+1080 covers. An EXISTS pattern evaluated per key now streams too, and the plans that stay
+eager are an EXISTS over a SERVICE, an EXISTS nested more than four levels deep, which item
+1081 covers, and an OPTIONAL whose condition holds an EXISTS, which item 570 covers.
+
+### Conditional merge OPTIONAL in the cursor
+
+The cursor merges an OPTIONAL with a condition over two inputs sorted on their shared
+variable, as eager execution does, and tests the condition on each batch's pairs. Both
+plans name the merge, and `merge_left_join` selects it in both modes. On an Intel host
+at 10.5M quads with one Rayon thread, the streamed `optional-filter` went from 46.6 to
+19.3 ms and `optional-cond` from 70.1 to 19.4 ms. At about 2.5 pairs per left row the cursor still takes 1.18 to 1.36 times
+the eager time, so an OPTIONAL whose condition holds an EXISTS stays eager under
+automatic execution, which item 570 keeps open. Item 1105 gives a future admission the
+build's merge order, and items 1106, 1137, 1143, 1144 and 1145 follow the EXISTS
+counters of the cursor's plan, the charge of the merge's variable map, a 0.9% cost of a
+hashed control, the reservation of a spooled frame and the eager memory retry.
 
 ### MCP tool profiles and semantic search
 
@@ -233,6 +742,13 @@ backup feature `control/1`. `sparkles check` has a `control` check of the two lo
 ordering.
 
 ### OWL classification
+
+The Horn classifier skips R7 predecessor searches when the trigger cannot
+contribute a pair and checks the run's bounds during growing scans. It also
+omits a link covered by a retained subrole link to the same successor and a
+repeated core at the successor itself. Four assertion-heavy ORE 2015 DL files
+classify 9 to 12% faster on one thread and 18 to 23% faster on four by the
+median of paired Atlas rounds, with unchanged taxonomies.
 
 A property assertion `r(a, b)` over a property with a range links `a` to `b`'s own
 context, and the index tells `b` the range. Before, the index made a context of `b` with
@@ -428,6 +944,18 @@ ChEBI lite classifies 8 to 14% faster and GO 1 to 3% faster, and the taxonomies 
 298 ORE 2015 EL files, GO, ChEBI lite and `ore_ont_8737` are unchanged. An
 open-addressing table for large sets measured no faster and was reverted. The filter's
 remaining cost is item 956.
+
+A transitive role whose equivalent roles compose alike, and whose left partners compose
+again with a further link by it, now composes its chains left-linearly. A link of such a
+role that a chain composes from two links by its equivalents keeps no forward link at its
+source, so a middle context no longer derives the role's closure again, and the
+saturation stores the same backward links (roadmap item 956). On forge the saturation of
+`ore_ont_8737` takes 0.94 s on four threads instead of 8.22 s, 2.99 s on one instead of
+25.41 s and 0.70 s on twelve instead of 7.05 s, with a peak resident set of 2.3 instead
+of 6.3 GiB on four threads, and ChEBI lite classifies in 0.48 to 0.81 times the time.
+The taxonomies are unchanged. `ore_ont_13482` classifies 2.5% slower on four threads and
+`ore_ont_9855` 1.0% slower on one, which item 1224 follows. `SPARKLES_LINEAR_CHAINS=0`
+turns the composition off for measurements.
 
 ### Ask latency
 

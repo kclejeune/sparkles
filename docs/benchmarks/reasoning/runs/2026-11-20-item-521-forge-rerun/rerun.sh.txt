@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# rerun.sh: staged rerun of the reasoning latency gate for lane reasoner-456-next on forge
+# (item 521, F23 Phase 2). It checks that the recovery commit settles the two metrics that
+# bench-gate flagged in both pairs of runs/20261120T142503Z: owl-rl/demand-cached/q11
+# (+71-74 us, slower in all 10 rounds) and rdfs/materialized/q1 (0.041 ms, 8 of 10 rounds).
+# Arms: base 5f3f69c2, tip 5ef06e3f (the q11 recovery: exported chunks sorted in predicate,
+# object and subject order, the operators' rule check made at a session's first run, and
+# detect passing over adorned copies that cannot be transitive),
+# and "off", the tip binary with SPARKLES_DEMAND_CLOSURES=0, a same-binary control.
+# The first pass ran tip 365cffcf, whose q11 cost came from the cached table's fact order.
+# The binaries were rebuilt inside nix develop with MBX_LEARNED_INCREMENTAL=false
+# (rbin/, SHA256SUMS, *.build-config.json). 10 universities, 15 rounds x 3 reps, 12 threads,
+# order base tip off off tip base. Expect about 50-60 min.
+# Takes ~/lanes/.bench.lock then ~/lanes/.heavy.lock and refuses when anything heavy runs.
+# Last lines: RERUN-DONE ok|flagged, then a line DONE. Launch (check
+# `systemctl --user list-units 'reasoner-456*'` first):
+#   systemd-run --user --unit=reasoner-456-next-rerun --collect -p MemoryMax=12G -p MemorySwapMax=2G \
+#     bash -c 'bash $HOME/lanes/reasoner-456-next/rerun.sh > $HOME/lanes/reasoner-456-next/rerun.log 2>&1'
+set -uo pipefail
+W=$HOME/lanes/reasoner-456-next
+trap 'echo DONE' EXIT
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+echo "RERUN locks held $(date -u +%FT%TZ) load $(cat /proc/loadavg)"
+if pgrep -x rustc >/dev/null || pgrep -x cargo >/dev/null || pgrep -x sparkles >/dev/null || pgrep -f 'qlever-server|fuseki-server|oxigraph serve|reasoning_latency' >/dev/null; then
+  echo "busy:"; ps -eo pid,args --sort=-pcpu | head -8 | cut -c1-150
+  echo "RERUN-FAILED refused: something else is running"; exit 1
+fi
+cd $W/rbin && sha256sum -c SHA256SUMS || { echo "RERUN-FAILED binaries do not match SHA256SUMS"; exit 1; }
+R=$W/reruns/$(date -u +%Y%m%dT%H%M%SZ); mkdir -p $R
+S=$W/scripts
+fail=""
+n=0
+for arm in base tip off off tip base; do
+  n=$((n + 1)); o=$R/latency/$n-$arm; mkdir -p $o
+  bin=$arm; closures=1; [ $arm = off ] && { bin=tip; closures=0; }
+  started=$(date -u +%FT%TZ)
+  SPARKLES_DEMAND_CLOSURES=$closures RAYON_NUM_THREADS=12 $W/rbin/reasoning_latency-$bin 10 15 3 $o/metrics.jsonl > $o/output.md 2> $o/err.log || { fail="$fail latency-$n-$arm"; continue; }
+  python3 $S/bench-gate.py metrics $o/metrics.jsonl --gate reasoning-latency --suite lubm-style \
+    --scale "10 universities" --threshold 0.10 --out $o/record.json --binary $W/rbin/reasoning_latency-$bin \
+    --manifest commit="$(cat $W/rbin/$bin.commit)" --manifest started="$started" --manifest ended="$(date -u +%FT%TZ)" \
+    --manifest build_config="$(cat $W/rbin/reasoning_latency-$bin.build-config.json)" \
+    --setting universities=10 --setting rounds=15 --setting reps=3 --setting threads=12 \
+    --setting demand_closures=$closures \
+    --setting harness="crates/sparkles-reasoner/examples/reasoning_latency.rs" || fail="$fail record-$n-$arm"
+  echo "LATENCY-RUN $n $arm $(date -u +%FT%TZ)"
+done
+flagged=""
+for pair in "1-base 2-tip" "6-base 5-tip" "3-off 2-tip" "4-off 5-tip"; do
+  set -- $pair
+  # the off arm differs from the tip in its demand_closures setting, on purpose
+  allow=""; case $1 in *off) allow="--allow-different" ;; esac
+  python3 $S/bench-gate.py compare $R/latency/$1/record.json $R/latency/$2/record.json --threshold 0.10 $allow \
+    > $R/latency/compare-$1-$2.txt 2>&1; rc=$?
+  echo "compare $1 $2 exit $rc" | tee -a $R/latency-summary.txt
+  case $rc in 0) ;; 1) flagged="$flagged $1-$2" ;; *) fail="$fail refused-$1-$2" ;; esac
+  tail -2 $R/latency/compare-$1-$2.txt | tee -a $R/latency-summary.txt
+done
+echo "run dir $R"
+if [ -n "$fail" ]; then echo "RERUN-FAILED$fail"; exit 1; fi
+if [ -n "$flagged" ]; then echo "RERUN-DONE flagged$flagged"; else echo "RERUN-DONE ok"; fi

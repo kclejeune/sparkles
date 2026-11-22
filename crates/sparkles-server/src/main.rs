@@ -148,6 +148,13 @@ struct Cli {
     /// Treat the default graph as the union of all named graphs
     #[arg(long, global = true)]
     union_default_graph: bool,
+    /// How aggregates treat errors and values that are not strings: jena (MIN and MAX
+    /// over an error are unbound, the default), sparkles (MIN and MAX pass over errors)
+    /// or spec (the literal SPARQL reading). `serve` uses it for the datasets without a
+    /// setting of their own, and `query` and `update` for their one request
+    #[arg(long, global = true, value_name = "READING",
+        value_parser = ["jena", "sparkles", "spec"])]
+    aggregate_errors: Option<String>,
     /// Memory for materialized past states (point-in-time reads), for the whole server,
     /// in MiB (default 512, `small`: 128)
     #[arg(long, global = true)]
@@ -2287,6 +2294,11 @@ fn store_opts(cli: &Cli) -> StoreOptions {
         result_cache_bytes: sizes.results,
         service_cache_bytes: sizes.service,
         union_default_graph: cli.union_default_graph,
+        aggregate_errors: cli
+            .aggregate_errors
+            .as_deref()
+            .map(|m| m.parse().expect("clap admits only the readings"))
+            .unwrap_or_default(),
         history_cache_bytes: sizes.history,
         history_max_generations: cli.history_max_generations,
         max_snapshots: cli.max_snapshots,
@@ -2984,6 +2996,12 @@ fn run() -> Result<()> {
             let mut opts = opts;
             if fuseki.as_ref().is_some_and(|f| f.union_default_graph) {
                 opts.union_default_graph = true;
+            }
+            // the configuration's reading of errors in aggregates, unless the flag names one
+            if cli.aggregate_errors.is_none()
+                && let Some(m) = fuseki.as_ref().and_then(|f| f.aggregate_errors)
+            {
+                opts.aggregate_errors = m;
             }
             opts.min_free_disk_bytes = (min_free_disk_mb > 0).then_some(min_free_disk_mb << 20);
             opts.max_memory_bytes = (max_mem_dataset_mb > 0).then_some(max_mem_dataset_mb << 20);
@@ -3856,6 +3874,7 @@ fn run() -> Result<()> {
             describe_max_depth,
             outbound,
         } => {
+            let query_aggregate_errors = cli.aggregate_errors.clone();
             let q = match (query, text) {
                 (Some(f), _) => std::fs::read_to_string(f)?,
                 (None, Some(t)) => t,
@@ -3889,6 +3908,9 @@ fn run() -> Result<()> {
                 }
                 if let Some(n) = describe_max_triples {
                     params.push(("describe-max-triples", n.to_string()));
+                }
+                if let Some(m) = &query_aggregate_errors {
+                    params.push(("aggregate-errors", m.clone()));
                 }
                 if let Some(n) = describe_max_depth {
                     params.push(("describe-max-depth", n.to_string()));
@@ -3955,6 +3977,10 @@ fn run() -> Result<()> {
                     d.labels |= describe_labels;
                     d.reifiers |= describe_reifiers;
                     d.lowered(describe_max_triples, describe_max_depth)
+                },
+                aggregate_errors: match &query_aggregate_errors {
+                    Some(m) => Some(m.parse()?),
+                    None => defaults.aggregate_errors,
                 },
                 ..defaults
             };
@@ -4191,6 +4217,7 @@ fn run() -> Result<()> {
                     &ds,
                     &u,
                     message.as_deref(),
+                    cli.aggregate_errors.as_deref(),
                 );
                 #[cfg(not(feature = "auth"))]
                 return no_remote(&ds, insecure_http);
@@ -4205,6 +4232,11 @@ fn run() -> Result<()> {
                     message,
                     ..Default::default()
                 },
+                // the flag comes before the dataset's own setting, as for `query`
+                aggregate_errors: cli
+                    .aggregate_errors
+                    .as_deref()
+                    .map(|m| m.parse().expect("clap admits only the readings")),
                 ..Default::default()
             };
             let s = sparkles::sparql::update::update(&store, &u, &qopts)?;

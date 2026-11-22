@@ -18,7 +18,7 @@ NAME=$1 TIP=$2 BASE=$3 CONTEXT=$4
 ROOT=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
 OUT=${AUDIT_DIR:-$ROOT/.artifacts/audits}/$NAME
 SCRATCH=$ROOT/../sparkles-audit-$NAME
-MODEL=(-m "${CODEX_REVIEW_MODEL:-gpt-6.1-sol}" -c "model_reasoning_effort=\"${CODEX_REVIEW_REASONING_EFFORT:-high}\"")
+MODEL=(-m "${CODEX_REVIEW_MODEL:-gpt-6.2-sol}" -c "model_reasoning_effort=\"${CODEX_REVIEW_REASONING_EFFORT:-high}\"")
 mkdir -p "$OUT"
 
 git -C "$ROOT" worktree add --detach "$SCRATCH" "$TIP" > /dev/null 2>&1 ||

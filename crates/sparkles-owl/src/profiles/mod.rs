@@ -123,6 +123,17 @@ pub(crate) fn el_axiom(ax: &AxiomKind) -> Vec<Broken> {
     el::axiom_kind(ax)
 }
 
+/// The first rule of [`el_axiom`] that one axiom breaks, which allocates only for an
+/// axiom that the allocation-free check cannot pass, so that a classification checks
+/// its axioms without copying their names.
+pub(crate) fn el_first(ax: &AxiomKind) -> Option<Broken> {
+    if el::certainly_el(ax) {
+        None
+    } else {
+        el_axiom(ax).into_iter().next()
+    }
+}
+
 /// Checks axioms one at a time against several profiles. The ontology given to
 /// [`new`](Checker::new) supplies the typing, the property hierarchy and the datatype
 /// definitions that the global restrictions need; the axioms passed to
@@ -436,4 +447,163 @@ pub(crate) fn datatypes(ax: &AxiomKind) -> Vec<String> {
         out.clear();
     }
     out
+}
+
+#[cfg(test)]
+mod el_first_tests {
+    use super::*;
+    use proptest::prelude::*;
+    use std::collections::BTreeSet;
+
+    const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+
+    fn ind() -> impl Strategy<Value = Individual> {
+        prop_oneof![
+            4 => (0..3u8).prop_map(|i| Individual::Named(NamedIndividual::new(format!("urn:i{i}")))),
+            1 => (0..2u8).prop_map(|i| Individual::anonymous(format!("b{i}"))),
+        ]
+    }
+
+    fn ope() -> impl Strategy<Value = ObjectPropertyExpression> {
+        prop_oneof![
+            4 => (0..3u8).prop_map(|p| ObjectPropertyExpression::Property(ObjectProperty::new(format!("urn:p{p}")))),
+            1 => (0..2u8).prop_map(|p| ObjectPropertyExpression::InverseOf(ObjectProperty::new(format!("urn:p{p}")))),
+        ]
+    }
+
+    fn datatype() -> impl Strategy<Value = Datatype> {
+        prop::sample::select(vec!["integer", "double", "string", "float", "dateTime"])
+            .prop_map(|d| Datatype::new(format!("{XSD}{d}")))
+    }
+
+    fn literal() -> impl Strategy<Value = Literal> {
+        prop_oneof![
+            Just(Literal::simple("a")),
+            Just(Literal::lang("a", "en").unwrap()),
+            prop::sample::select(vec!["integer", "double", "string", "float"])
+                .prop_map(|d| Literal::typed("1", &format!("{XSD}{d}"))),
+        ]
+    }
+
+    fn data_range() -> impl Strategy<Value = DataRange> {
+        let leaf = prop_oneof![
+            datatype().prop_map(DataRange::Datatype),
+            prop::collection::btree_set(literal(), 1..3).prop_map(DataRange::OneOf),
+        ];
+        leaf.prop_recursive(2, 6, 2, |inner| {
+            prop_oneof![
+                prop::collection::btree_set(inner.clone(), 1..3)
+                    .prop_map(DataRange::IntersectionOf),
+                prop::collection::btree_set(inner.clone(), 1..3).prop_map(DataRange::UnionOf),
+                inner.prop_map(|r| DataRange::ComplementOf(Box::new(r))),
+            ]
+        })
+    }
+
+    fn dp() -> impl Strategy<Value = DataProperty> {
+        (0..2u8).prop_map(|p| DataProperty::new(format!("urn:d{p}")))
+    }
+
+    fn class_expression() -> impl Strategy<Value = ClassExpression> {
+        use ClassExpression as C;
+        let leaf = prop_oneof![
+            4 => (0..4u8).prop_map(|c| C::Class(Class::new(format!("urn:c{c}")))),
+            1 => ope().prop_map(C::ObjectHasSelf),
+            1 => (ope(), ind()).prop_map(|(p, i)| C::ObjectHasValue(p, i)),
+            1 => prop::collection::btree_set(ind(), 1..3).prop_map(C::ObjectOneOf),
+            1 => (dp(), literal()).prop_map(|(p, l)| C::DataHasValue(p, l)),
+            1 => (dp(), data_range()).prop_map(|(p, r)| C::DataSomeValuesFrom(vec![p], r)),
+            1 => (0..3u32, dp(), prop::option::of(data_range()))
+                .prop_map(|(n, p, r)| C::DataMinCardinality(n, p, r)),
+        ];
+        leaf.prop_recursive(3, 16, 3, |inner| {
+            prop_oneof![
+                3 => prop::collection::btree_set(inner.clone(), 1..4).prop_map(C::ObjectIntersectionOf),
+                3 => (ope(), inner.clone()).prop_map(|(p, c)| C::ObjectSomeValuesFrom(p, Box::new(c))),
+                1 => prop::collection::btree_set(inner.clone(), 1..3).prop_map(C::ObjectUnionOf),
+                1 => inner.clone().prop_map(|c| C::ObjectComplementOf(Box::new(c))),
+                1 => (ope(), inner.clone()).prop_map(|(p, c)| C::ObjectAllValuesFrom(p, Box::new(c))),
+                1 => (0..3u32, ope(), prop::option::of(inner))
+                    .prop_map(|(n, p, c)| C::ObjectMinCardinality(n, p, c.map(Box::new))),
+            ]
+        })
+    }
+
+    fn axiom() -> impl Strategy<Value = AxiomKind> {
+        use AxiomKind as K;
+        let ces = || prop::collection::btree_set(class_expression(), 1..3);
+        let inds = || prop::collection::btree_set(ind(), 1..3);
+        prop_oneof![
+            4 => (class_expression(), class_expression()).prop_map(|(a, b)| K::SubClassOf(a, b)),
+            2 => ces().prop_map(K::EquivalentClasses),
+            1 => ces().prop_map(K::DisjointClasses),
+            2 => (class_expression(), ind()).prop_map(|(c, i)| K::ClassAssertion(c, i)),
+            1 => (ope(), ind(), ind()).prop_map(|(p, a, b)| K::ObjectPropertyAssertion(p, a, b)),
+            1 => (ope(), ind(), ind()).prop_map(|(p, a, b)| K::NegativeObjectPropertyAssertion(p, a, b)),
+            1 => (ope(), ope()).prop_map(|(a, b)| K::SubObjectPropertyOf(SubObjectPropertyExpression::Expression(a), b)),
+            1 => (prop::collection::vec(ope(), 1..3), ope())
+                .prop_map(|(ps, b)| K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), b)),
+            1 => prop::collection::btree_set(ope(), 1..3).prop_map(K::EquivalentObjectProperties),
+            1 => prop::collection::btree_set(ope(), 1..3).prop_map(K::DisjointObjectProperties),
+            1 => (ope(), class_expression()).prop_map(|(p, c)| K::ObjectPropertyDomain(p, c)),
+            1 => (ope(), class_expression()).prop_map(|(p, c)| K::ObjectPropertyRange(p, c)),
+            1 => ope().prop_map(K::TransitiveObjectProperty),
+            1 => ope().prop_map(K::ReflexiveObjectProperty),
+            1 => ope().prop_map(K::FunctionalObjectProperty),
+            1 => ope().prop_map(K::SymmetricObjectProperty),
+            1 => inds().prop_map(K::SameIndividual),
+            1 => inds().prop_map(K::DifferentIndividuals),
+            1 => datatype().prop_map(|d| K::Declaration(Entity::Datatype(d))),
+            1 => (0..2u8).prop_map(|c| K::Declaration(Entity::Class(Class::new(format!("urn:c{c}"))))),
+            1 => (dp(), data_range()).prop_map(|(p, r)| K::DataPropertyRange(p, r)),
+            1 => (dp(), class_expression()).prop_map(|(p, c)| K::DataPropertyDomain(p, c)),
+            1 => (dp(), ind(), literal()).prop_map(|(p, a, l)| K::DataPropertyAssertion(p, a, l)),
+            1 => (class_expression(), prop::collection::btree_set(ope(), 0..2))
+                .prop_map(|(c, ops)| K::HasKey(c, ops, BTreeSet::new())),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+        /// The allocation-free check passes only axioms that break no rule, and the first
+        /// rule broken is the full check's first, with its message.
+        #[test]
+        fn el_first_matches_el_axiom(k in axiom()) {
+            let all = el_axiom(&k);
+            if el::certainly_el(&k) {
+                prop_assert!(all.is_empty(), "{k:?} passed but breaks {:?}", all[0].message);
+            }
+            let first = el_first(&k);
+            prop_assert_eq!(
+                first.map(|b| (b.rule, b.message)),
+                all.into_iter().next().map(|b| (b.rule, b.message))
+            );
+        }
+    }
+
+    /// The axioms of an ontology in OWL 2 EL pass the allocation-free check, so that a
+    /// classification does not fall back to the full one for them.
+    #[test]
+    fn el_axioms_pass_without_allocating() {
+        use ClassExpression as C;
+        let c = |n: &str| C::Class(Class::new(format!("urn:{n}")));
+        let p = ObjectPropertyExpression::Property(ObjectProperty::new("urn:p"));
+        let a = Individual::Named(NamedIndividual::new("urn:a"));
+        let ks = [
+            AxiomKind::SubClassOf(
+                c("a"),
+                C::ObjectIntersectionOf(BTreeSet::from([
+                    c("b"),
+                    C::ObjectSomeValuesFrom(p.clone(), Box::new(c("c"))),
+                ])),
+            ),
+            AxiomKind::ClassAssertion(c("a"), a.clone()),
+            AxiomKind::ObjectPropertyAssertion(p.clone(), a.clone(), a),
+            AxiomKind::Declaration(Entity::Class(Class::new("urn:a"))),
+            AxiomKind::TransitiveObjectProperty(p),
+        ];
+        for k in &ks {
+            assert!(el::certainly_el(k), "{k:?}");
+        }
+    }
 }

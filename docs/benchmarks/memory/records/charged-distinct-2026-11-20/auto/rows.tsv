@@ -1,0 +1,9 @@
+query	mode	a_ms	b_ms	b/a	round_min	round_max	a_spread	b_spread	added_us	n	answers
+class-predicate-list	auto	0.938	0.906	0.965	0.959	0.969	0.021	0.014	-32.5	320/320	same
+class-predicates	auto	0.946	0.914	0.966	0.964	0.970	0.019	0.019	-32.1	320/320	same
+distinct-join	auto	3.628	3.627	1.000	0.989	1.016	0.016	0.032	-1.2	320/320	same
+distinct-obj	auto	0.004	0.004	0.999	0.949	1.070	0.125	0.131	-0.0	320/320	same
+distinct-one	auto	2.977	2.977	1.000	0.992	1.006	0.028	0.023	-0.1	320/320	same
+distinct-two	auto	7.661	7.693	1.004	0.998	1.011	0.027	0.024	31.5	320/320	same
+distinct-two-wide	auto	41.639	41.690	1.001	0.984	1.013	0.059	0.039	51.5	320/320	same
+predicate-subjects	auto	0.007	0.007	0.943	0.913	0.982	0.082	0.097	-0.4	320/320	same

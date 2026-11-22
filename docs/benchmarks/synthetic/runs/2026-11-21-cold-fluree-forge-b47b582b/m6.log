@@ -1,0 +1,81 @@
+dataset: 1052807 triples
+[06:48:37] cold fluree count-all run 1: ready 0.020 s, query 0.017487 s
+[06:48:37] cold fluree count-all run 2: ready 0.016 s, query 0.019111 s
+[06:48:37] cold fluree count-all run 3: ready 0.083 s, query 0.000991 s
+[06:48:38] cold fluree count-all run 4: ready 0.020 s, query 0.015979 s
+[06:48:38] cold fluree count-all run 5: ready 0.077 s, query 0.001953 s
+[06:48:38] cold fluree count-all run 6: ready 0.018 s, query 0.026734 s
+[06:48:38] cold fluree count-all run 7: ready 0.017 s, query 0.015125 s
+[06:48:39] cold fluree two-hop-count run 1: ready 0.076 s, query 0.027651 s
+[06:48:39] cold fluree two-hop-count run 2: ready 0.073 s, query 0.025238 s
+[06:48:39] cold fluree two-hop-count run 3: ready 0.081 s, query 0.028819 s
+[06:48:39] cold fluree two-hop-count run 4: ready 0.022 s, query 0.033934 s
+[06:48:40] cold fluree two-hop-count run 5: ready 0.014 s, query 0.036999 s
+[06:48:40] cold fluree two-hop-count run 6: ready 0.012 s, query 0.037267 s
+[06:48:40] cold fluree two-hop-count run 7: ready 0.077 s, query 0.030389 s
+[06:48:40] cold fluree contains run 1: ready 0.018 s, query 0.027154 s
+[06:48:40] cold fluree contains run 2: ready 0.017 s, query 0.027606 s
+[06:48:41] cold fluree contains run 3: ready 0.021 s, query 0.025832 s
+[06:48:41] cold fluree contains run 4: ready 0.011 s, query 0.030354 s
+[06:48:41] cold fluree contains run 5: ready 0.015 s, query 0.033185 s
+[06:48:41] cold fluree contains run 6: ready 0.019 s, query 0.029305 s
+[06:48:42] cold fluree contains run 7: ready 0.084 s, query 0.020699 s
+[06:48:42] cold fluree distinct-obj run 1: ready 0.018 s, query 0.018335 s
+[06:48:42] cold fluree distinct-obj run 2: ready 0.018 s, query 0.017435 s
+[06:48:42] cold fluree distinct-obj run 3: ready 0.011 s, query 0.019582 s
+[06:48:42] cold fluree distinct-obj run 4: ready 0.023 s, query 0.019380 s
+[06:48:42] cold fluree distinct-obj run 5: ready 0.024 s, query 0.017760 s
+[06:48:43] cold fluree distinct-obj run 6: ready 0.023 s, query 0.017247 s
+[06:48:43] cold fluree distinct-obj run 7: ready 0.013 s, query 0.017233 s
+[06:48:43] cold fluree employee-docs run 1: ready 0.017 s, query 0.029001 s
+[06:48:43] cold fluree employee-docs run 2: ready 0.017 s, query 0.034473 s
+[06:48:43] cold fluree employee-docs run 3: ready 0.015 s, query 0.037552 s
+[06:48:44] cold fluree employee-docs run 4: ready 0.019 s, query 0.032146 s
+[06:48:44] cold fluree employee-docs run 5: ready 0.013 s, query 0.037845 s
+[06:48:44] cold fluree employee-docs run 6: ready 0.016 s, query 0.026555 s
+[06:48:44] cold fluree employee-docs run 7: ready 0.021 s, query 0.031048 s
+| query | fluree (ms) |
+|---|---:|
+| count-all | — |
+| types-grouped | — |
+| star-join | — |
+| two-hop-count | — |
+| range-topk | — |
+| optional-count | — |
+| contains | — |
+| group-avg | — |
+| path-plus | — |
+| distinct-obj | — |
+| export-500k | — |
+| predicate-counts | — |
+| predicate-subjects | — |
+| class-predicates | — |
+| class-predicate-list | — |
+| order-by-full | — |
+| optional-chain | — |
+| minus | — |
+| not-exists | — |
+| exists-join | — |
+| subquery-agg | — |
+| regex-iri | — |
+| knows-reach | — |
+| distinct-join | — |
+| lang-filter | — |
+| star-lookup | — |
+| values-star | — |
+| employee-docs | — |
+| expr-bind-group | — |
+| expr-order-key | — |
+| expr-agg-arg | — |
+
+Cold runs: the median of 7 runs of each query after a server restart with the engine's files evicted from the page cache.
+
+| query (cold) | fluree (ms) |
+|---|---:|
+| count-all | **16.0** |
+| two-hop-count | **30.4** |
+| contains | **27.6** |
+| distinct-obj | **17.8** |
+| employee-docs | **32.1** |
+| **time to ready** after the restart (median, s) | 0.02 |
+M6-DONE

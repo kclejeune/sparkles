@@ -1,0 +1,10 @@
+09:27:30 matrix of 31 queries into /home/kclejeune/lanes/forge-backlog/matrix-8baa5686
+09:27:31 people-100000-threads-12: start, load 2.94 3.08 2.99
+09:48:20 people-100000-threads-12: done
+09:48:21 people-100000-threads-1: start, load 1.72 1.58 1.82
+10:01:34 people-100000-threads-1: done
+10:01:35 people-1000000-threads-12: start, load 3.14 3.31 2.78
+11:09:07 people-1000000-threads-12: done
+11:09:07 people-1000000-threads-1: start, load 1.01 1.01 1.05
+11:51:28 people-1000000-threads-1: done
+11:51:28 finished: /home/kclejeune/lanes/forge-backlog/matrix-8baa5686/summary.md and /home/kclejeune/lanes/forge-backlog/matrix-8baa5686/record.json

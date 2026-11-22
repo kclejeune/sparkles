@@ -26,6 +26,7 @@ impl Runtime {
         let mut circuit = Circuit::new(compiled, access);
         circuit.max_memory_bytes = max_memory_bytes;
         circuit.inference = inference;
+        circuit.aggregate_errors = Some(reg.aggregate_errors);
         let info = Info {
             status: Status::Building,
             applied: 0,
@@ -183,23 +184,26 @@ impl Runtime {
         }
     }
 
-    /// Compile every circuit for the host's inference when it has changed. Each circuit
-    /// then evaluates its query again in the new mode on the next round, and the
-    /// difference reaches its live queries as a diff or a `reset`, so views stay
-    /// attached and live queries keep running.
+    /// Compile every circuit for the host's inference and reading of errors in
+    /// aggregates when either has changed. Each circuit then evaluates its query again
+    /// in the new mode on the next round, and the difference reaches its live queries as
+    /// a diff or a `reset`, so views stay attached and live queries keep running.
     pub(super) fn sync_inference(&self, reg: &mut Registry, host: &dyn Host) {
         let now = host.inference();
-        if Inference::same(reg.inference.as_deref(), now.as_ref()) {
+        let errors = host.aggregate_errors();
+        if Inference::same(reg.inference.as_deref(), now.as_ref()) && errors == reg.aggregate_errors
+        {
             return;
         }
         let now = now.map(Arc::new);
         tracing::info!(
             target: "sparkles::incr::runtime",
-            "the dataset's inference changed ({}): {} circuits evaluate again",
+            "the dataset's inference ({}) or aggregate errors ({errors}) changed: {} circuits evaluate again",
             now.as_ref().map_or("none", |i| i.reason()),
             reg.cells.len()
         );
         reg.inference = now.clone();
+        reg.aggregate_errors = errors;
         // every event of the old mode carries a commit at most `seen`, or at most the
         // commit of a circuit whose pass was in flight, which the state lock waits for
         let mut boundary = self.seen.load(Ordering::Acquire);
@@ -210,7 +214,10 @@ impl Runtime {
             self.switched.fetch_max(boundary, Ordering::AcqRel);
             let fresh = st.fresh(now.clone());
             let mut c = match fresh {
-                Ok(c) => c,
+                Ok(mut c) => {
+                    c.aggregate_errors = Some(errors);
+                    c
+                }
                 Err(e) => {
                     self.fail(cell, &mut st, &e);
                     continue;
@@ -291,5 +298,133 @@ mod switch_tests {
         let mut reg = rt.reg.lock();
         rt.sync_inference(&mut reg, host.as_ref());
         assert_eq!(rt.switched.load(Ordering::Acquire), 7);
+    }
+
+    /// Planning asks for a view's reading without waiting for another view's pass: a
+    /// change of the dataset's reading is not applied to the circuits there, and a
+    /// registry held past the query's deadline gives no answer.
+    #[test]
+    fn the_planning_reading_waits_for_no_pass() {
+        use crate::sparql::AggregateErrors;
+        use std::time::{Duration, Instant};
+        struct Reading(Mutex<AggregateErrors>);
+        impl Host for Reading {
+            fn access(&self, _: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+                Ok(None)
+            }
+            fn stored_query(&self, _: &str) -> Result<String> {
+                Err(Error::NotFound("none".into()))
+            }
+            fn aggregate_errors(&self) -> AggregateErrors {
+                *self.0.lock()
+            }
+        }
+        let s = Store::in_memory(StoreOptions::default());
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        let host = Arc::new(Reading(Mutex::new(AggregateErrors::Jena)));
+        rt.set_host(host.clone());
+        for (name, q) in [
+            ("a", "SELECT (MIN(?o) AS ?m) WHERE { ?s ?p ?o }"),
+            ("b", "SELECT ?s WHERE { ?s ?p ?o }"),
+        ] {
+            rt.put(&s, name, crate::incr::views::ViewDef::table(q))
+                .unwrap();
+        }
+        rt.round(&s);
+        assert_eq!(rt.view_reading("a", None), Some(AggregateErrors::Jena));
+        // a pass of b holds its state while the dataset's reading changes
+        let b = rt.reg.lock().views.get("b").unwrap().cell.clone().unwrap();
+        let pass = b.state.lock();
+        *host.0.lock() = AggregateErrors::Sparkles;
+        let ask = |deadline: Duration| {
+            let rt = rt.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                tx.send(rt.view_reading("a", Some(Instant::now() + deadline)))
+                    .unwrap();
+            });
+            rx.recv_timeout(Duration::from_secs(2))
+                .expect("the planning reading waited past its deadline")
+        };
+        assert_eq!(
+            ask(Duration::from_millis(10)),
+            Some(AggregateErrors::Sparkles)
+        );
+        assert_eq!(rt.view_reading("missing", None), None);
+        // a registry held past the deadline gives no answer by the deadline
+        let reg = rt.reg.lock();
+        assert_eq!(ask(Duration::from_millis(10)), None);
+        drop(reg);
+        drop(pass);
+    }
+
+    /// A read compares its reading with the circuit whose rows it returns. A switch of
+    /// the dataset's reading can rebuild a view between the read's copy of the
+    /// registry's reading and its lock of the view's state, which leaves the registry's
+    /// copy naming the old reading while the circuit holds rows of the new one. A read
+    /// that asks for the old reading then evaluates the view's query under it.
+    #[test]
+    fn a_read_compares_its_reading_with_the_circuit() {
+        use crate::sparql::AggregateErrors;
+        use crate::sparql::viewsvc::ViewRead;
+        let s = Store::in_memory(StoreOptions::default());
+        crate::sparql::update::update(
+            &s,
+            "INSERT DATA { <urn:a> <urn:g> \"x\" ; <urn:v> 1 . <urn:b> <urn:g> \"x\" }",
+            &crate::sparql::QueryOptions::default(),
+        )
+        .unwrap();
+        let rt = Runtime::open(None, s.dataset_id(), RuntimeOptions::default());
+        rt.set_host(Arc::new(OpenHost));
+        rt.put(
+            &s,
+            "m",
+            crate::incr::views::ViewDef::table(
+                "SELECT (MIN(?v) AS ?m) WHERE { ?s <urn:g> ?g OPTIONAL { ?s <urn:v> ?v } }",
+            ),
+        )
+        .unwrap();
+        rt.round(&s);
+        let snap = s.snapshot();
+        let read = |m: Option<AggregateErrors>| {
+            let r = rt
+                .read(&ViewRead {
+                    name: "m",
+                    at: snap.commit,
+                    snap: Some(&snap),
+                    allow_stale: false,
+                    caller: None,
+                    deadline: None,
+                    aggregate_errors: m,
+                })
+                .unwrap();
+            let cells: Vec<String> = r
+                .rows
+                .iter()
+                .map(|(row, _)| row[0].as_ref().map_or("UNDEF".into(), |t| t.to_string()))
+                .collect();
+            (cells, r.evaluated_under)
+        };
+        assert_eq!(
+            read(Some(AggregateErrors::Jena)),
+            (vec!["UNDEF".into()], None)
+        );
+        // the circuit as a switch to sparkles rebuilt it, while the registry still
+        // names jena
+        let cell = rt.reg.lock().cells.values().next().unwrap().clone();
+        {
+            let mut st = cell.state.lock();
+            let mut c = st.fresh(None).unwrap();
+            c.aggregate_errors = Some(AggregateErrors::Sparkles);
+            c.build(snap.clone(), &Control::none()).unwrap();
+            st.circuit = c;
+        }
+        assert_eq!(rt.reg.lock().aggregate_errors, AggregateErrors::Jena);
+        let one = "\"1\"^^<http://www.w3.org/2001/XMLSchema#integer>".to_string();
+        assert_eq!(read(None), (vec![one], None));
+        assert_eq!(
+            read(Some(AggregateErrors::Jena)),
+            (vec!["UNDEF".into()], Some(AggregateErrors::Jena))
+        );
     }
 }

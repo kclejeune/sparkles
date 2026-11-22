@@ -1,0 +1,13 @@
+query	mode	a_ms	b_ms	b/a	n	answers
+exists-agg	eager	884.84	16.03	0.018	42/42	same
+exists-agg	streaming	912.77	14.72	0.016	42/42	same
+exists-bind	eager	14.46	12.49	0.864	42/42	same
+exists-bind	streaming	15.11	12.19	0.806	42/42	same
+exists-bind-join	eager	15.96	10.67	0.669	42/42	same
+exists-bind-join	streaming	14.94	10.42	0.697	42/42	same
+exists-union	eager	2133.88	2125.27	0.996	42/42	same
+exists-union	streaming	2173.35	2173.97	1.000	42/42	same
+exists-union-bind	eager	1549.41	1537.56	0.992	42/42	same
+exists-union-bind	streaming	1521.38	1544.67	1.015	42/42	same
+not-exists	eager	17.01	17.07	1.004	42/42	same
+not-exists	streaming	17.50	17.18	0.981	42/42	same

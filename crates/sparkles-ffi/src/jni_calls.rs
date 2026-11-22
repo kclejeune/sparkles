@@ -495,6 +495,7 @@ mod tests {
             binding_names: vec![],
             binding_values: vec![],
             no_cache: false,
+            aggregate_errors: None,
         }
     }
 
@@ -513,6 +514,7 @@ mod tests {
             binding_names: vec!["x".into()],
             binding_values: vec![1, 2, 3],
             no_cache: true,
+            aggregate_errors: None,
         };
         let mut buf = Vec::new();
         <QueryOpts as Lower<UniFfiTag>>::write(opts, &mut buf);

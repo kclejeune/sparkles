@@ -70,7 +70,7 @@ spill format.
 
 **One join-order planner.** Keep `joinorder.rs` only, lift its 128-join-variable fallback with the existing Bits set or route it to its own greedy, and delete `Planner::dp`, `apply_dp_filters`, `Planner::greedy` and the `pruned_join_order` toggle. `Planner::dp` and `Planner::greedy` survive in `plan.rs` as a narrow fallback and toggle-off path. Item 84 should land on the unified planner. Roadmap item 475 holds this phase.
 
-**Delete the off paths of replacement-style optimization toggles.** Remove the superseded implementations behind about 15 replacement toggles and the toggles themselves, and keep the algorithm toggles for diagnosis. Optimizations has 44 boolean fields, and every kernel change must keep each off path correct. Roadmap item 476 holds this phase, and item 512 holds the test-only evaluator that follows the SPARQL algebra literally, after which the off paths that only tests reach can go.
+**Delete the off paths of replacement-style optimization toggles.** Remove the superseded implementations behind about 15 replacement toggles and the toggles themselves, and keep the algorithm toggles for diagnosis. Optimizations has 44 boolean fields, and every kernel change must keep each off path correct. Roadmap item 476 holds this phase. Item 512's test-only evaluator, which follows the SPARQL algebra literally, is the oracle of the differential tests, so the off paths that only tests reach can go.
 
 **Shared format registry and small helpers.** Add one syntax registry for format names, extensions and media types, one INFERRED_GRAPH constant, one `parse_duration` and one durable atomic-write helper, and fix the Turtle string escaping that differs between `mapping/rdf.rs` and `mapping/draft.rs`. About ten format tables, nine INFERRED_GRAPH constants and ten atomic-write helpers exist. The unescaped draft writer could produce invalid Turtle. Roadmap item 477 holds this phase.
 
@@ -118,11 +118,11 @@ The maintainer settled these questions for stage 4.
 
 **One query-scoped expression memo.** Replace exprcache, cursor BIND reuse and the EXISTS memo with one charged memo keyed by expression and input value with one admission policy fed by observed repetition. Three memos each have their own admission and charging. It depends on item 293.
 
-**One columnar writer per format over batch sources.** Write each result format once over a batch source, with an eager QueryResult as a one-batch source, vectorized term decoding, per-column writes into prebuilt buffers, and the Thrift writer moved into core. Two serializer stacks exist, Thrift forces eager execution, cursor writers write a few bytes at a time (item 240), and large answers such as SP2Bench q4 at 1.96 GB need a raised limit. It depends on items 91, 240, 243 and 534.
+**One columnar writer per format over batch sources.** Write each result format once over a batch source, with an eager QueryResult as a one-batch source, vectorized term decoding, per-column writes into prebuilt buffers, and the Thrift writer moved into core. Two serializer stacks exist, Thrift forces eager execution, and large answers such as SP2Bench q4 at 1.96 GB need a raised limit. It depends on items 91, 243 and 534, and item 240 has shipped.
 
 ### Stage 6: the executor merge
 
-**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 240, 243, 293, 534 and 512. Item 93 has shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator becomes their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
+**Single morsel-driven executor with eager as a consumption policy.** Replace the eager columnar executor and the pull-cursor executor with one morsel-driven pull engine in which every operator serves demand over column batches, `collect()` requests unbounded demand with whole-input morsels and Rayon across them, and exchange operators, partitioned hash builds and parallel merge joins give pipeline parallelism. The remaining fallback kinds get native leaf cursors, so the 840-line admission layer, `State::Fallback` and the eager memory retry go. Two complete executors exist (about 8,800 and 11,650 non-test lines) with 17 entry-point rules. Eager's remaining wins at 12 threads come from whole-table parallelism inside operators. It depends on items 7, 243, 293 and 534. Items 93, 240 and 512 have shipped. Once the eager executor is gone the differential tests have no second executor, so item 512's reference evaluator remains their oracle, with the answer fingerprints of the forge matrix and the W3C suites.
 
 **Eager LIMIT and ASK through pull demand.** Route every ASK and unordered LIMIT through the cursor's pull demand, move UNION branch ordering for ASK into the planner's cost model, and delete `run_limited`'s geometric prefix replay and the unionpush first-work estimator. Eager LIMIT replays growing prefixes and unionpush keeps a duplicate cost model. `ask_streaming` exists, so this can land before the executor merge. It depends on item 7.
 
@@ -156,9 +156,9 @@ The maintainer settled these questions for stage 4.
 * Items 7 and 93 land before the executor merge, because they settle the spill default and
   the remaining eager fallbacks that the merge must absorb. Item 93 has shipped.
 * Items 240, 243, 293 and 534 settle the cursor writers, row accounting, BIND reuse and
-  the streamed response cost that stage 6 relies on.
-* Item 512's test-only reference evaluator is the oracle of the differential tests before
-  the eager executor is deleted.
+  the streamed response cost that stage 6 relies on. Item 240 has shipped.
+* Item 512's test-only reference evaluator is the oracle of the differential tests, as it
+  must be before the eager executor is deleted.
 * The join-algorithm work of [X15](../X15-join-algorithms-and-estimation/README.md),
   [item 454](../../ROADMAP.md), follows the merge so that new algorithms land in one executor.
 
@@ -183,7 +183,7 @@ The maintainer settled these questions for stage 4.
   views share, `mise run bench:reasoning-latency` guards changes to value decoding and
   the query path that query-time reasoning runs through, and `mise run bench:insn` guards
   changes to vocabulary readers and WAL replay.
-* The guards are `scripts/bench.sh` and `mise run bench:nsc` for queries, with forge runs
+* The guards are `scripts/bench.sh` and the Boat query screen (`mise run bench:remote --executor boat:bx_ID`) for queries, with forge runs
   of BSBM Explore and BI, SP²Bench `q4`, `q6` and `q12b`, WatDiv, LUBM and DBpedia at 50M,
   the memory benchmarks in `docs/benchmarks/memory`, `query_cursor.rs`,
   `plan_fidelity_tests.rs` and the W3C suites. Bindings use `bench:bindings`.
@@ -226,37 +226,191 @@ This design derives from Sparkles' existing specs and code. Its phases also draw
 ## Outcome
 
 Stages 1 and 3 have shipped, apart from item 484 of stage 3, which X16 holds with item
-479 of stage 2. Stage 4's accounting model and mode-neutral kernels have shipped. The
-hierarchical budget of item 675 remains, and so does the cursor exclusion of the string
-floors, which item 1069 removes. Stage 5's
+479 of stage 2. Stage 4's accounting model, mode-neutral kernels and decoding twins have
+shipped, and the hierarchical budget of item 675 remains. Stage 5's
 join-kernel library has shipped, and its other phases follow the
 [plan](PLAN.md#order-of-work). [Item 453](../../ROADMAP.md) tracks the rest of the work.
 
-Item 678 has shipped in part. The string floors of `string_order_mask` read their keys
+Items 678 and 1069 have shipped. The string floors of `string_order_mask` read their keys
 and search for a string's first extension inside the decoding envelope, and a refused
-read fails the comparison with its refusal. Cursor batches still compare two string
-columns key by key and do not use the floors. On atlas with 1.05M triples and one
-thread, comparing through floors cached per batch made streaming `str-pair-lt` 24.8%
-slower and `str-pair-names` 33.4% slower than the direct comparison, in every round. The
-names of `str-pair-names` repeat across batches, with 83,226 and 91,694 distinct values in
-its two columns over 249,868 rows, so each batch computes again floors that an earlier batch had. Every name of
-`str-pair-lt` is distinct, 70,023 in 70,023 rows, and the cause of its loss is not
-established. Item 1069 takes up a floor cache that lasts the query and the exclusion.
-The row-aligned
-pre-decode of `decode_for` decodes its columns through the same sorted pre-decode as the
-dictionary values of top k and the numeric FILTER, which admits each value's storage
-before it builds it, and moves or clones the distinct values to their rows. Indexing the
-rows through the distinct values' slots was considered and not built, because the row
-evaluator reads the decoded column on its hot path and that change would need its own
-Intel measurement. The bounded-reads test counts every read of the mode, eight in all.
+read fails the comparison with its refusal. The row-aligned pre-decode of `decode_for`
+decodes its columns through the same sorted pre-decode as the dictionary values of top k
+and the numeric FILTER, which admits each value's storage before it builds it, and moves
+or clones the distinct values to their rows. Indexing the rows through the distinct
+values' slots was considered and not built, because the row evaluator reads the decoded
+column on its hot path and that change would need its own Intel measurement. Forge
+measured item 678 against the build before it on 36 queries at 1.05M triples with one
+thread, in three A,B,B,A rounds of ten requests, with the same answers and geometric means
+of 1.002 in streaming and 0.993 in automatic execution.
 
-Forge measured the item against the build before it on 36 queries at 1.05M triples with
-one thread, in three A,B,B,A rounds of ten requests, and every answer was the same. The
-geometric mean was 1.002 in streaming execution and 0.993 in automatic execution. A few
-filters that decode values became slower in every round. `str-filter-two` took 2.4% longer
-in streaming and 4.4% longer in automatic execution, `lang-filter` 2.4% and 2.6% longer,
-and streaming `str-pair-lt` 2.1% longer. With 12 threads `str-pair-lt` and `str-pair-names`
-were 2% faster.
+The query's context keeps the floors in a cache that lasts the query, so cursor batches
+compare two string columns through the floors as eager tables do. A floor cache that
+each batch built again had measured 24.8% slower on streaming `str-pair-lt` and 33.4% on
+`str-pair-names` on atlas, since names that repeat across batches had their floors
+computed in every batch. Every worker of a mask reads and writes one direct-mapped table
+of atomic words without a lock, since maps of their own made each worker compute a
+recurring string's floor again. A word holds the id's slot tag, the distance down to its
+floor and a bit set when the floor is read again. The first table has up to 2^16 slots,
+fewer when the vocabulary's strings or the cap need fewer. Before a mask or a part of a
+large eager table it grows up to eightfold, within the same limits, once its estimate of
+the floors it evicted that had been read again reaches a thirty-second of its slots, so
+inputs whose strings rarely repeat keep it. Each table is charged to the query before it is allocated, inside
+the spill threshold, and the cache holds at most 64 MiB or a sixteenth of the query's
+memory budget. This memory buys the speed below, and a table that the budget refuses
+leaves the floors the cache lacks to be computed each time. A cursor reads a key and the key before it in one walk of their block when
+that walk admits at most 4 KiB and the envelope grants it, and otherwise reads the key
+alone. A cursor batch spreads its floor comparison over the pool as the generic filter
+does. The bounded-reads test counts every read of the mode, seven in all.
+
+Forge measured 3a8b7adb, the build with the shared table, against c0948014, the build
+before item 1069, with 1.05M triples in five A,B,B,A rounds of ten requests per cell, and
+every answer was the same. With one thread in streaming execution, `str-pair-names` took
+0.517 of the base's time, 29.8 against 57.7 ms, `str-pair-lt` 0.815 and
+`str-pair-colleague` 1.042. Against the direct comparison of the two keys in eager
+execution, a probe build on the same base that the run record names, they read 0.512,
+0.778 and 0.991. With 12 threads, streaming `str-pair-lt` read 0.935, `str-pair-names`
+0.777 and `str-pair-colleague` 1.065, and eager execution read 0.843, 0.636 and 0.802.
+Every round of these cells agreed in direction with its median.
+
+An earlier build of the item, 174de1f8, gave each worker a map of its own, so a repeated
+name's floor was computed once for each worker that met it, and with 12 threads its
+streaming `str-pair-names` read 1.000 of the base and `str-pair-colleague` 1.118. Against
+that build with one thread, the shared table reads 0.952 on `str-pair-colleague` and
+0.907 on `str-pair-lt` in streaming execution and 0.931 and 0.908 in eager execution,
+while `str-pair-names` takes 5.3% longer in streaming and 9.7% longer in eager execution.
+The names query's table grows from its first 2^16 slots during the query. On wally, a
+first table as large as the vocabulary's clamp closed that gap but made `str-pair-lt`,
+whose table never grows, 1.5% slower in streaming and 2.2% in eager execution, and item 1140 follows the cost of the growth.
+
+`str-pair-colleague` holds 30,077 and 25,967 distinct names in its 30,077 rows, so its
+floors are nearly all computed once, and in streaming execution they cost more than
+comparing the two keys. A switch that turns the floors off
+when a prefix of the rows repeats few values was considered and not built, because in a
+shuffled order the first 4,096 rows of `str-pair-names` repeat as few values as
+`str-pair-colleague` while the whole query repeats many, so the switch would lose the
+names query's 2x. A profile of the per-worker maps put most of the floors' time in
+`Ctx::with_vocab_key_prev` and `Vocab::get_with_prev_checked`, which read the key and its
+predecessor. The shared table has not been profiled, so that read is the suspected cause
+of its cost, and item 1088 recovers the streaming cost. Its first candidate admits and allocates
+the checked walk's key buffer before the walk instead of growing it from empty and reads the
+predecessor without the copy that `PrevKey::keep` makes, keeping the checked envelope and
+its fallback.
+
+Queries that the floors do not reach also became slower in every round, and item 1089
+holds these costs. The 37-query screens compared 174de1f8, before the shared table, with
+c0948014, and these lines have not been measured on 3a8b7adb. Over three rounds the screens
+had geometric means of 0.980 in streaming and 0.970 in automatic execution, and no query
+was 10% slower. With one thread, 174de1f8 made streaming `str-filter-two` 2.8% slower over
+five rounds, which 3a8b7adb reads at 1.000 with rounds on both sides, and with 12 threads
+3a8b7adb makes streaming `str-filter-two` 1.4% slower in all five rounds. The screens
+found streaming `distinct-join` 2.5% slower, `star-join` 1.7% in streaming and 2.0% in
+automatic execution, automatic `employee-docs` 2.8% at 0.036 ms and automatic
+`star-lookup` 2.5% at 0.062 ms. `range-topk`, `order-lcase`, automatic `two-hop-count`
+and automatic `minus` read 0.8% to 1.3% slower, and streaming `lang-filter`, streaming
+`optional-count` and automatic `order-by-full` 0.2% to 0.4%. With both builds made on
+forge, item 678, 75a70587 against 7e272f4d, made `lang-filter` 2.9% slower in automatic
+and 2.7% in streaming execution, `str-filter-two` 2.1% and 1.8%, and streaming
+`distinct-join` 1.9%, in all five rounds, while `employee-docs` showed no cost. Profiles
+of item 678's costs on the laptop found no function the item changed above 0.14% of the
+samples and the same instruction counts for `lang-filter`. Automatic `str-filter-two`
+changes mode between server processes, which item 1087 holds.
+
+The test-only reference evaluator of item 512 has shipped in
+`crates/sparkles-core/tests/support/reference`. It reads a list of quads and a parsed
+query and evaluates every operator as a nested loop over solution mappings, as the
+SPARQL 1.1 algebra of section 18 and the SPARQL 1.2 drafts define them, with no part of
+the engine but the parser. Indexes on the predicate, subject and object narrow the
+triples a pattern tries, a join tries only the solutions that agree on the variables
+every solution of both sides binds, and a closure path with a fixed end is walked from
+that end, none of which changes an answer. It answers all 508 query evaluation tests of SPARQL 1.0 and 1.1
+and all 63 of SPARQL 1.2 under a comparison that holds literals to their exact form,
+numbers to their value and ORDER BY results to their order. It reports the queries it
+does not evaluate, such as SERVICE, DESCRIBE and extension functions, rather than
+answer them approximately. It follows SPARQL 1.2 where the two versions differ, so the
+effective boolean value of an ill-formed literal is an error. It reads XPath regular
+expressions in their own syntax, checks where each quantifier stands and reports as
+unsupported the constructs whose XPath meaning it does not establish, which are a
+back-reference, a class with a `-` other than a simple range, the `i` flag with a category,
+a negation or text that is not ASCII, and the `m` flag with an anchor on text that ends in
+a newline, where XPath's anchors differ from the regex crate's. Where Jena's reading
+differs from the specification's text and the engine follows Jena, the evaluator follows
+Jena too, and a switch selects the text, which the W3C suites take. Under Jena's reading
+the default graph of several FROM clauses is the union of their graphs, as in TDB, a
+negated property set gives a pair once for each triple that joins it, and `\b` in REGEX,
+which Java reads as a word boundary and XPath rejects, is unsupported. ORDER BY orders two
+different terms with equal values, such as `1` and `1.0`, by the terms themselves, where
+the text ties them and orders them by the next condition, so the comparison leaves their
+order open. Where the
+specification allows several answers, it says which. A value that it leaves open, such as
+a SAMPLE, a MIN or MAX among unordered values, a GROUP_CONCAT order, a RAND, a UUID, NOW
+or a new blank node, makes its column open, and an open value that decides which rows
+there are, in a FILTER, a join, a group key or DISTINCT, makes the rows open. For an
+ordered or sliced answer it reports each row's sort key, including keys the query does
+not project. The seeded queries of `tests/query_cursor.rs` compare the eager answer and
+the cursor answers at batch sizes 1, 2, 3 and 4,096 with it over a compacted base, a
+pending delta, several index blocks and a masked view, and the optimizer, index-join and
+string-filter tests compare `Optimizations::ALL` with it as well as with
+`Optimizations::NONE`. Both go through one comparison, which passes no answer that the specification
+forbids and, where it cannot decide, reports a partial or unordered comparison instead.
+An open column is compared only by its place in the rows, which makes the comparison
+partial. A column that only computed values bind compares numbers by datatype and value,
+and a column that only copied terms bind compares them exactly. Arithmetic, the numeric
+functions, a cast to a number and the COUNT, SUM and AVG aggregates compute values. A
+variable, a constant, IF, COALESCE, STRDT, STRLANG, STRLANGDIR and the MIN, MAX and SAMPLE
+aggregates pass on the terms or lexical forms they are given, and any other operator
+counts as both. A string or constructor that shows the lexical form of a computed number,
+such as `STR(1.0 + 1.0)` or `STRDT(STR(1.0 + 1.0), xsd:decimal)`, still compares exactly,
+so an engine that writes that number in another allowed form would fail the comparison. A column bound by both,
+such as a COALESCE over a variable and a constant, compares exactly, and a number that
+differs there only in its lexical form makes the comparison partial. An ordered or sliced
+answer must be a slice, at the query's offset, of an order that ORDER BY allows, and an
+answer with open rows is left uncompared. A sort key stops before the first condition
+that reads an open value. The conditions after it can still order the rows that tie
+before it, so the key only finds an answer that the earlier conditions forbid, and
+otherwise the order is unchecked and a slice of it is left uncompared. A slice that passes
+the checks against each other row is compared when the reference's other rows, placed
+around it in their own order, complete it to an order that ORDER BY allows. When that
+completion breaks a constraint between two rows, or the order of a slice is otherwise not
+established, the slice is left uncompared. Where DISTINCT keeps a row whose copies have different sort
+keys, the order is unchecked and a slice of it is open. The order check tests the strict
+order between every two blocks of equal keys that it meets, gives up past 50 million key
+comparisons, and where equal rows with different keys make its matching ambiguous it
+reports the order unchecked rather than fail. Whether an open value is bound is open too,
+so BOUND, EXISTS, a join, DISTINCT, a LATERAL join and a GRAPH pattern whose name is a
+variable that its inner pattern binds make the rows open when that variable holds open
+values. Numbers sort by their exact values, which keeps the sort
+transitive where promotion makes values of different datatypes equal. These rules decline to
+judge some answers that the evaluator once compared. Of the 5,000 answers of the seeded
+queries, 20 with open columns are compared in part, 15 others with open columns are
+compared without their order because an ORDER BY condition reads an open value, no slice fails its completion, and 105
+have open rows, 20 more than before because whether an open value is
+bound is open. In the optimizer, index-join and string-filter tests, 3 answers with open columns
+are compared in part, and 12 string filters whose regular expression takes the `i` flag
+over text that is not ASCII are unsupported. No answer of either set has a column bound
+by both copied terms and computed values that differs only in a number's lexical form. The parser writes the middle of a path sequence as a blank node, which
+the algebra treats as a variable, so a `COUNT(DISTINCT *)` over such a middle is an open
+value. A query whose nested loops pass the evaluator's work limit of 20 million
+intermediate solutions is left uncompared, and so is one that reads a number of more than
+16 digits. The comparison found disagreements, which items 1064, 1065, 1071 and 1077 hold. The
+engine passes over an error in MIN and MAX, where the specification's order makes MIN an
+error and Jena makes both an error, and it follows Jena in making AVG over errors only an
+error and in letting GROUP_CONCAT read IRIs and numbers. It does not read an
+`xsd:integer` or `xsd:decimal` beyond the range of its decimal type as a number, which
+XSD permits and Jena does not do. Its string functions take a directional string and a
+language-tagged string of the same language as compatible arguments, which SPARQL 1.2
+and Jena do not. The evaluator evaluates the aggregates of item 1064 under the
+specification's, Jena's or the engine's reading, answers the W3C suites under the
+specification's, and compares the engine under the engine's current reading until the
+setting of item 1064 lands with Jena's as its default. The evaluator notes where a query
+meets item 1064 or 1071, and the tests compare such a query exactly under the engine's
+reading. Item 1077 holds three
+XSD and XPath readings in which the engine differs from both the specification and
+Jena, `isNumeric("inf"^^xsd:double)`, the canonical form of a double cast to a string and
+`.` in REGEX, which matches a carriage return. The
+evaluator takes two well-formed values of different supported types, such as a string
+and an integer, as unequal, which the note to section 17.4.1.7 allows and Jena does by
+default, where Jena's strict mode and the section's main text make the comparison an
+error.
 
 The mode-independent plans of item 827 have shipped. `PatternScan` has a resumable cursor
 over the predicate patterns, which the eager scan shares, so `spk:hasPredicate` plans its
@@ -433,9 +587,10 @@ that shipped with their measurements in the current release, `probed_optional` a
 `gallop_index_join` chooses between the galloping reader and the clustered reader, which
 are different read paths.
 
-The generic operators of `Optimizations::NONE` remain the oracle of the differential
-tests. The test-only evaluator that follows the SPARQL algebra literally, after which
-the remaining off paths that only tests reach can go, is item 512.
+Item 512's test-only reference evaluator is the oracle of the differential tests. The
+optimizer tests still compare `Optimizations::ALL` with `Optimizations::NONE` and both
+with the reference where it evaluates the query, so the remaining off paths that only
+tests reach can go once their tests rest on the reference alone.
 
 ### Shared format registry and small helpers
 
@@ -774,22 +929,20 @@ row of the table before it starts, which is more than the 12 bytes and one value
 decoded row that the separate large-input pre-decode admitted. Under a budget with little room left,
 a large column can therefore fall back to its rows where it was decoded before, which
 costs time but no correctness. The comparison of two string columns through cached
-lexicographic floors serves eager tables of at least 4,096 rows. A floor reads its
+lexicographic floors serves eager tables and cursor batches of at least 4,096 rows. A floor reads its
 string's key, the key before it and, for a string that other strings extend, the search
 for the first of them inside the decoding envelope, and a refused read fails the
-comparison with the refusal it recorded. Cursor batches compare the two keys directly
-instead, because the floors with a cache that lasts one batch measured slower than that
-comparison. Item 1069 takes up a cache that lasts the query.
+comparison with the refusal it recorded. The floors last the query in a charged cache,
+which the batches of a cursor share.
 
 A unit test, `the_accounting_mode_is_read_in_a_bounded_number_of_places`, counts the
 reads of the accounting mode outside tests and fails above its bound. A read is a call of
 `streams()` or `accounting()`, a use of either `Accounting` variant or a direct read of
-the `streams` field outside its accessors. The bound is 8. The first read is the routing
+the `streams` field outside its accessors. The bound is 7. The first read is the routing
 of `query_execution_with_plan` in `cursor.rs`. The second accumulates an EXISTS key set
 across a cursor's batches, which an eager table builds in one batch. The third lets a
 cursor's decoding envelope refuse on the ledger, because eager callers of `term` and
-`value` cannot report a refusal and decode without the envelope instead. The fourth
-keeps cursor batches from the string floors until item 1069. The other four read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
+`value` cannot report a refusal and decode without the envelope instead. The other four read the field in `ctx.rs` to decide whether a cursor owner exists, whether a context
 without an owner may keep retained state uncharged, whether an empty release trims the
 ledger and whether a finished query's pool contribution shrinks. `CursorMemory` is gone, and a context in cursor accounting differs
 from an eager one only by its `streams` flag, its ledger retention and its deadline. The
@@ -811,7 +964,7 @@ alive, and it decodes the block again at its row when the cache has dropped it. 
 batches that the cursor root hands out without copying share the block and one charge of
 its decoded columns through one handle. The root scan keeps that handle while it reads
 the block, so a writer that drops each batch before it pulls the next, as the result
-writers do with one Rayon worker, does not charge the block again for every batch. The
+writers do with one Rayon worker, does not charge the block again for every batch. While the root shares a block, the scan keeps no weak handle on it and reads it through the shared handle in place, and it takes the block back from that handle when it switches to owned rows inside the block or a batch declines the shared path, so a scan stopped inside a block always has a way back to it. The
 charge ends when the scan leaves the block, reads it as owned rows or ends, and when the
 last batch handed out from it drops, so a cursor stopped inside a block keeps it charged
 until the cursor closes. The root shares a
@@ -827,6 +980,21 @@ of a term larger than the room the block leaves, under a budget at which a copy 
 answer, and roadmap item 1051 holds that. A cursor over a read-through snapshot, which keeps no blocks,
 decodes its current block again for each batch of copied rows, and no cursor query reads such a
 snapshot.
+
+Roadmap item 1063 removed most of the cost that item 1039 left on root scans. The shared
+path no longer makes and drops a weak handle on the block for each batch, and it reads the
+block in place instead of taking it back at each read. On 100,000 people on atlas with one
+thread, `root-scan`, `export-500k` and `root-limit` became 1.6% to 3.5% faster in server
+time under streaming and automatic execution, and in a cycle profile on stanley the range
+of the scan's cost over four passes overlaps its range before item 1039. Against that
+build, `root-scan` still takes 2.4% longer under streaming, 1.98 µs, and 1.1% under
+automatic execution, 0.89 µs, and streaming `export-500k` 0.5% longer, 1.95 µs. The
+remainder is about the same on both queries although the export reads more blocks, and the
+profile does not show it. Item 1063 stays open for that remainder. `distinct-obj` and `predicate-counts` read 0.3 µs
+slower under streaming and faster under automatic execution, and their plans do not reach
+the changed code. The
+[run record](../../benchmarks/engine/runs/2026-11-19-shared-scan-atlas/README.md) has the
+method and the numbers.
 
 ### One join-kernel library
 
@@ -866,8 +1034,9 @@ hash form, the kernel's scratch for one chunk of candidates, which together are 
 what decoding the 20,000 terms charges. The `merge_left_join` switch selects the
 merge OPTIONAL without a condition in both modes, and EXPLAIN names the algorithm that
 ran, `[merge on ?k]` or `[hash join]`, in both. An OPTIONAL with a condition over two
-sorted inputs still merges only in eager execution, where its condition is tested over
-all of the matched pairs at once, and hashes in the cursor, which item 854 follows. An
+sorted inputs merged only in eager execution, where its condition is tested over all of
+the matched pairs at once, and hashed in the cursor until item 570 gave the cursor its
+own conditional merge. Item 854 follows one conditional merge for both modes. An
 eager hash join, OPTIONAL, semi join, anti join or MINUS whose hash table does not fit
 the memory budget of a query that may spill runs again as the cursor's partitioned hash
 join over its two input tables, whose Grace partitioning wraps the same kernel, and its
@@ -884,8 +1053,10 @@ builds on its right side as the cursor does rather than on the smaller side. An 
 MINUS, semi join or anti join on one bound key now builds the kernel's table with its
 grouped rows, about twice the memory of the id set it used, which item 852 follows. The
 measurement of item 570's conditional OPTIONAL in both modes on the benchmark worker,
-which the plan asks of this phase, is outstanding, and item 570 records it when it is
-taken.
+which the plan asks of this phase, was taken after the cursor gained a conditional
+merge, and the
+[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
+records it.
 
 ### One grouping operator
 
@@ -1019,6 +1190,15 @@ streamed count meets, and the merge removes that difference. A count can refuse 
 limit equal to the work that its own run reported, in both modes, and
 [item 1103](../../ROADMAP.md) makes the two counts agree.
 
+A count over a merge join on two or more shared variables runs the eager kernel under a
+cursor instead, as a whole-input operator under either policy, because the streamed join
+writes every pair into its batches and took 1.81 times the eager count on forge. The
+operator reads both inputs under the memory budget and counts once, so it holds both
+inputs and the pair indices where the streamed join held one batch of pairs, and an eager
+run of such a count that exceeds the memory budget with spill on retries into the same
+kernel. [Item 1129](../../ROADMAP.md) counts that join in the cursor without writing its
+pairs and then streams it again.
+
 The ignored test `measure_whole_input_and_leaf_forms` in `query_cursor.rs` measured the
 peak memory and the best of five times of each form on 200,000 subjects in a release
 build on the development laptop, which is not a benchmark host. A path search under a
@@ -1027,10 +1207,76 @@ MiB eager and took the same time within 1 ms. An algorithm call over its group,
 over an edge pattern or over constants peaked within 1 MiB of eager and took within 1 ms of
 it. A streamed count over a join that eager counts from its pairs peaked at 0.3 MiB
 against 6.1 to 7.6 MiB eager. Over a filtered scan it took 6.0 ms against 6.3 ms, and on
-two shared variables it took 9.8 ms against 8.6 ms. Streaming trades that time for the
+two shared variables it took 9.8 ms against 8.6 ms, through the streamed join that a
+cursor no longer runs for that shape. Streaming trades that time for the
 memory, and automatic execution keeps such counts eager until the A/B of the item's
 plan admits them. A count of two scans on one variable from their key runs took 12.0 ms
 streamed against 6.1 ms eager.
+
+On forge at 1.05M triples with one thread, 9df856f3, the part-1 tip before a cursor
+returned the count on two variables to the eager kernel, was compared with
+its base, bccc5f7b, in twelve rounds of A,B,B,A in both orders, and the tip's eager and
+streamed counts with each other in the same way. The streamed count on two shared
+variables took 1.81 times the eager count, 9.58 ms against 5.28 ms, and runs 2.26 times
+the instructions per request on stanley, since the cursor writes the merge join's pairs
+into batches that the eager count holds as indices, and item 1129 removes that cost.
+Explicit streaming has since run the eager kernel for that shape, as the paragraph above
+says. The
+streamed count over a filtered scan took 0.15 of the eager time, 8.4 ms against 55.3 ms,
+and automatic execution keeps both counts eager. Against the base, streamed queries that
+run 0.6% to 1.9% more instructions are 1.3% to 5.2% slower, which item 1160 holds, and
+queries that run the same instructions in either mode are 0.6% to 2.8% slower, which item
+1161 holds as likely code layout. Item 1074 holds the costs under 0.3 ms within its cap.
+
+The text, geo and vector scripts ran on forge in three rounds of the two binaries, with six
+pairs per query, as the phase's comparison of wall time. Of 88 configurations, 80 read as
+noise and 5 as faster. Eager `q6-touching-counties` with one thread reads 1.2% slower and
+eager `q-ef-64` with one thread 8.0% slower, which is over the plan's 5% threshold on wall
+time. Its wall times are bimodal, its servers differ from each other by up to 78% and its
+server time is 1.2% longer, and item 1162 holds both costs. Streamed `q9-star` with 12 threads read 1.144, and a rerun of that query
+alone, with 12 server processes per build and mode, put the tip at cde29b37 at 0.966 of
+its merge base with main, 5f3f69c2, streamed and 1.006 eager, so no query is 5% or more
+slower at 12 threads, which is the stage's acceptance gate. The
+[synthetic results](../../benchmarks/synthetic/RESULTS.md#leaf-cursors) list each query.
+
+### Readings of errors in aggregates
+
+Item 1064 makes the treatment of errors in MIN, MAX, AVG and GROUP_CONCAT a setting,
+`aggregate-errors`, with the readings `jena`, `sparkles` and `spec`. `jena` is the
+default on every surface. The readings differ only when the aggregates finish, so the
+running accumulators, the per-group kernel and the incremental group operator keep a
+count of the arguments that were errors and decide at `finish`. A count rather than a
+flag keeps retraction exact, since a group that loses its last error answers again as
+if it never had one, and it keeps item 1066's merges of partial states exact. A query's
+reading comes from `QueryOptions::aggregate_errors`, else the dataset's setting in
+`aggregate-errors.json`, else the store's option, which is the server's default.
+
+The `jena` reading was fixed by running ARQ 6.2.0 on every aggregate, with and without
+DISTINCT and over a variable and an expression, for groups with unbound values, type
+errors, only errors and no rows. The fixture `tests/fixtures/aggregate-errors/` keeps
+that output, and the `jena` reading gives every answer in it apart from SAMPLE's choice
+and the digits beyond 18 of a decimal AVG, which item 1084 holds. Jena's rule turned out
+wider than the three cases of the item only where the engine already agreed, so an error
+makes SUM, AVG, MIN, MAX and GROUP_CONCAT unbound and COUNT and SAMPLE pass over it. The
+one further difference was `GROUP_CONCAT(DISTINCT …)` over no rows, which ARQ makes
+unbound and the `jena` reading follows. The planner's shortcuts were audited, and only
+the COUNT plans assume anything about errors, which every reading shares.
+
+Materialized and incrementally maintained state follows the dataset's reading, else the
+server's. Views and live queries run under it, switch when it changes as they switch on
+a change of inference, and fingerprint their checkpoints with it. A query whose own
+reading differs never reads or writes the maintained state. It evaluates the view's
+query from the data at its snapshot, and its plan notes the fallback. A Group node names
+a reading other than `jena`, which also keys the result cache. The group state's new
+error counts changed the incremental compiler's version, so a checkpoint of an earlier
+release is refused and the view is rebuilt from the data, and no file format changed.
+
+The W3C SPARQL suites pass under all three readings, which
+`mise run test:w3c:aggregate-errors` checks for the two readings that are not the default.
+None of their tests tells the readings apart. `agg-err-01` averages a group that holds a
+string, which leaves AVG unbound under every reading, and their MIN and MAX tests read
+groups in which no value is an error, so the fixture of ARQ's answers in
+`sparkles-core/tests/aggregate_errors.rs` is what separates the readings.
 
 ### Measurements of stage 1
 
@@ -1235,3 +1481,100 @@ second's final form, 0acba641, ran 1.3% more instructions than 6fba19d6 on
 c2b5d7cf over the two runs, longer in every round. The checked writer also had 44% more
 branch misses than 6fba19d6 on `optional-chain`, and none of the builds changed that
 count, so item 763 looks there next.
+
+### The streamed response cost
+
+Roadmap item 534 measured where a streamed response spends the time that an eager one
+does not, at 1.05M triples in native JSON. On the laptop, an Intel Core Ultra X7 358H
+with the server on four performance cores, `perf stat` counted 472 thousand user-space
+instructions per request of a streamed `count-all` against 311 thousand eager, 1.78
+million against 1.19 million on `star-lookup`, and 263 thousand more on
+`predicate-counts`. The user-space cycles of `count-all` were nearly equal, 410 thousand
+streamed against 396 thousand eager per request, so the gap of the short queries is not
+work in the server's code. On the large answers the streamed requests ran 6.13 billion
+instructions against 3.54 billion on `export-500k`, 315 million against 183 million on
+`optional-chain`, 68 million against 39 million on `star-join` and 1.41 billion against
+976 million on `order-by-full`. LBR call stacks showed that the cursor writers' chain of
+calls through the server's size-limited switch writer, which serde's escaping wrote
+through a few bytes at a time and which was not inlined, cost more than the whole
+difference on `export-500k` and about 90 thousand of the 160 thousand instructions on
+`count-all`, while the streamed decoding was cheaper than the eager one.
+
+On forge, with the server on CPUs 0 to 11 with 12 Rayon threads and curl on CPU 12, a
+streamed answer took 0.13 to 0.23 ms more wall time than an eager one on the nine
+queries under 1 ms, 1.29 to 1.47 times as long. The large answers took 7.53 ms against
+5.00 ms on `star-join`, 22.4 against 20.1 ms on `optional-chain`, 49.4 against 40.2 ms
+on `order-by-full` and 284 against 213 ms on `export-500k`. A phase trace of
+the nine short queries in a diagnostic build placed their gap in the hand-off between
+threads, with each phase measured per request. An eager request ran in place on the
+worker that received it, and `count-all` had serialized its answer a median of 65 µs
+after the handler started. A streamed request woke a blocking-pool thread to open its
+cursor, woke the handler to receive the cursor and woke a second pool thread to write
+the body. Each pool wake took either about 10 µs or about 80 µs, and their means across
+the nine queries were 35 to 80 µs for the open's wake and 32 to 73 µs for the
+producer's, with medians of 8 to 10 µs for the return to the handler. The end of the body, from the
+last write to the producer's finish, took 49 to 85 µs on average. On `count-all` the
+cursor's open took a median of 59 µs against the eager run's 45 µs, and the first batch
+with its write 42 µs against the eager serialization's 8 µs. The same build answered a streamed request whole, without the
+early commit at the first batch, which removes the channel, the end-of-body handshake and
+the early commit together, and it was no faster. Its streamed `count-all` took 0.729 ms
+against 0.546 ms with the early commit, and the other short queries took 0.58 to 0.89 ms
+against 0.53 to 0.82 ms. The Python client bounded the large answers' wall times in the
+laptop's runs, so their wall times come from curl.
+
+Roadmap item 240 then gave the cursor writers of SELECT, native JSON, RDF and Jena graph
+answers the 8 KiB `Buffered` writer of the eager writers through `write_buffered`, which
+is compiled in `sparkles-core`, so a streamed answer reaches the server's writer in
+pieces of that size. Each writer counts the rows whose bytes reached the server's writer,
+and the access log and the metrics report that count for a streamed body that stopped
+partway, as they do for an eager one. A streamed body that the result-size budget stops
+after its first bytes now sends what it had buffered before it aborts, as an eager body
+already did, so the rows reported are the rows a client that keeps reading receives.
+That last send waits under the body's idle limit like any other, and when it fails the
+bytes reported leave out the unsent chunk while the row count still includes its rows,
+so the count is exact when the client keeps reading and otherwise within one chunk.
+
+Matched release builds of 8baa5686 and a016b7bd, both from wally, were counted on the
+laptop with the server on four performance cores, over two passes of 200 requests for
+the short queries and 10 for the large ones, at 1.05M triples. The eager requests ran
+the same instructions within 0.5% in native JSON and in SPARQL JSON. In native JSON the
+streamed requests ran 0.46 times the base's instructions on `export-500k`, 2.82 billion
+against 6.13 billion, and below the eager requests' 3.54 billion. They ran 0.50 times on
+`optional-chain`, 158 million against 315 million with 182 million eager, 0.60 times on
+`star-join`, 40.4 million against 67.6 million with 39.6 million eager, and 0.69 times
+on `order-by-full`, 970 million against 1.41 billion with 976 million eager. The short
+queries kept part of their gap, as the hand-off is outside the writer. A streamed
+`count-all` ran 391 thousand instructions against 453 thousand with 307 thousand eager,
+`predicate-counts` 510 thousand against 670 thousand with 422 thousand eager, and
+`star-lookup` 1.33 million against 1.76 million with 1.19 million eager. In SPARQL JSON
+the streamed requests ran 0.44 to 0.50 times the base's instructions on `export-500k`,
+`optional-chain` and `star-join`, 7.64 billion against 7.69 billion eager on
+`export-500k` and 78.8 million against 73.3 million eager on `star-join`. The laptop ran
+other builds at the time, so only the instruction counts are reported here.
+
+The wall times of the same two builds come from atlas, an Intel host with forge's
+hardware. The server ran on CPUs 0 to 11 and the client on CPU 12, at 1.05M triples in
+native JSON, in rounds of A,B,B,A with 10 requests per variant in each position, and each
+cell ran once with the base first and once with the base second. The ratios below are
+the geometric means of the two orders, over the 31 queries of the matrix with eight
+rounds in each order, from runs that had the host to themselves. With 12 Rayon threads a
+streamed request took 0.42 times the base's wall time on `export-500k`, 0.56 times on
+`optional-chain`, 0.63 times on `order-by-full` and 0.77 times on `star-join`. In the run
+with the base second, these streamed requests took 121 ms against 289 ms, 10.4 against
+18.4 ms, 31.7 against 50.6 ms and 4.55 against 5.88 ms, and they finished before the
+eager requests of the same build, which took 220, 14.1, 42.7 and 4.89 ms. With one thread
+the four queries took 0.53, 0.65, 0.78 and 0.73 times the base's wall time, and the
+streamed `star-join` and `order-by-full` took about as long as the eager ones. The
+geometric mean of the streamed ratios over the 31 queries was 0.935 with 12 threads. The
+eager requests of the two builds took 0.984 to 1.023 times each other's wall time with 12
+threads, in the order with the base second, since the other order's eager run may have
+overlapped a build, and 0.983 to 1.018 with one thread over both orders.
+
+The seven queries under 1 ms ran again on atlas with 12 rounds in each order and 12
+threads, as a pinned check of the streamed `count-all` and `distinct-obj`, which one
+order of the matrix had shown about 7% slower. The streamed wall-time ratios of the two
+builds were 0.96 to 1.02 on all seven queries, and the 95% interval of every ratio
+included 1.0, as did the eager control's. A streamed answer still took 0.21 to 0.29 ms
+more wall time than an eager one on those queries, against 0.23 to 0.31 ms in the base,
+because the hand-off between threads that the phase trace measured lies outside the
+writer.

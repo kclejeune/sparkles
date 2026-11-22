@@ -158,6 +158,7 @@ impl sparkles_core::sparql::viewsvc::ViewSource for Integers {
                 .map(|i| (vec![Some(Term::Literal(oxrdf::Literal::from(i)))], 1))
                 .collect(),
             commit: 0,
+            evaluated_under: None,
         })
     }
 }

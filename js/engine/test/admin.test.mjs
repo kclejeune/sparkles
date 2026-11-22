@@ -198,6 +198,23 @@ test('history, snapshots, settings, branches, guards and validation handles', as
     assert.equal(changes.commits[0].changes[0].quad.subject.value, 'urn:t');
     await ds.settings.describe.set({ mode: 'cbd' });
     assert.equal((await ds.settings.describe.get()).mode, 'cbd');
+    const min = async (options) =>
+      (
+        await (await ds.select('SELECT (MIN(?v) AS ?m) {VALUES ?v {1 UNDEF}}', options)).toArray()
+      )[0].get('m')?.value;
+    assert.deepEqual(await ds.settings.aggregateErrors.get(), {
+      mode: 'jena',
+      source: 'default',
+      modes: ['jena', 'sparkles', 'spec'],
+    });
+    assert.equal(await min(), undefined);
+    assert.equal(await min({ aggregateErrors: 'sparkles' }), '1');
+    assert.equal((await ds.settings.aggregateErrors.set({ mode: 'sparkles' })).source, 'dataset');
+    assert.equal(await min(), '1');
+    assert.equal(await min({ aggregateErrors: 'jena' }), undefined);
+    await assert.rejects(ds.settings.aggregateErrors.set({ mode: 'arq' }), InvalidInputError);
+    await assert.rejects(min({ aggregateErrors: 'arq' }), InvalidInputError);
+    assert.equal((await ds.settings.aggregateErrors.reset()).mode, 'jena');
     await ds.branches.create('draft');
     const draft = t.resource(await ds.branch('draft'));
     await draft.update('INSERT DATA {<urn:b> <urn:p> 3}');

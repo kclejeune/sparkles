@@ -1,0 +1,119 @@
+{
+ "suite": "el-classification",
+ "kind": "correctness-evidence",
+ "scope": "Same-snapshot Horn witness and named-class world-selection comparison",
+ "scale": "21 hand cases and 968 generated cases. The HermiT-checked phase includes 348 of the generated cases.",
+ "host": {
+  "name": "stanley"
+ },
+ "manifest": {
+  "commit": "c1619c3726f12c64acf9c05a6554de4fe3ff1a55",
+  "diagnostic_patch_sha256": "68485372d20d1c45a6d8bb8cc48ed881ad8ced154586d8e56c4c4d17a3ee6e74",
+  "diagnostic_binary_sha256": "bf55846b4c87ecce1a67125e4e7f8f869b533361c29ce366487fe5891d19d338",
+  "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+  "mbx": "1.29.1",
+  "build": "mbx build -j 6 --release -p sparkles-owl --example el_classify inside mbx sparkles-task",
+  "atlas_timing_record": "runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json",
+  "fixture_input_sha256": "8d6458e9b9299ffbb7db391df435dcc304d73dff313a785c787943b6d004557c",
+  "fixture_hermit_taxonomy_sha256": "18b901cacf57dbf26f2d70d2c52c073e79d77348db6f982c9e4214378620c332",
+  "raw_jsonl_sha256": {
+   "hermit-checked.jsonl": "13802724bbadcb20ad19468eefed02abb345ecc90ae5875a01a13ec7ae3238c6",
+   "generated.jsonl": "b359c1631b30fa4183bec846977fc26b0c405435f50d0e886f159f56f5401edc"
+  }
+ },
+ "settings": {
+  "threads": [
+   1,
+   8
+  ],
+  "horn_rules_level": 2,
+  "phase_sizes": {
+   "hermit-checked": 369,
+   "generated": 968
+  }
+ },
+ "method": "Evaluate the production witness predicate twice on the same post-saturation state, toggling only recognition of a covered successor. Call the ordinary world-reachability routine on both witness sets and record sorted class IRIs before any world runs. The classifier then continues using the enabled result.",
+ "phases": {
+  "hermit-checked": {
+   "1": {
+    "completed": 369,
+    "failed": 0,
+    "entangled": 369,
+    "witness_set_changed": 39,
+    "world_set_changed": 0,
+    "nonempty_world_set": 339
+   },
+   "8": {
+    "completed": 369,
+    "failed": 0,
+    "entangled": 369,
+    "witness_set_changed": 36,
+    "world_set_changed": 0,
+    "nonempty_world_set": 339
+   }
+  },
+  "generated": {
+   "1": {
+    "completed": 968,
+    "failed": 0,
+    "entangled": 968,
+    "witness_set_changed": 18,
+    "world_set_changed": 0,
+    "nonempty_world_set": 953
+   },
+   "8": {
+    "completed": 968,
+    "failed": 0,
+    "entangled": 968,
+    "witness_set_changed": 16,
+    "world_set_changed": 0,
+    "nonempty_world_set": 953
+   }
+  }
+ },
+ "proved_fixture": {
+  "file": "crates/sparkles-owl/tests/fixtures/horn_individuals/covered_successor_witness.ofn",
+  "source_name": "s7-horn-witness-07846-reduced.ofn",
+  "thread_results": [
+   {
+    "name": "s7-horn-witness-07846-reduced.ofn",
+    "sha256": "8d6458e9b9299ffbb7db391df435dcc304d73dff313a785c787943b6d004557c",
+    "threads": 1,
+    "status": 0,
+    "tier": "horn",
+    "different_iris": [],
+    "entangled": true,
+    "witness_counts": [
+     1,
+     2
+    ],
+    "with": [
+     "http://example.org/d#C3"
+    ],
+    "without": [
+     "http://example.org/d#C3"
+    ]
+   },
+   {
+    "name": "s7-horn-witness-07846-reduced.ofn",
+    "sha256": "8d6458e9b9299ffbb7db391df435dcc304d73dff313a785c787943b6d004557c",
+    "threads": 8,
+    "status": 0,
+    "tier": "horn",
+    "different_iris": [],
+    "entangled": true,
+    "witness_counts": [
+     1,
+     2
+    ],
+    "with": [
+     "http://example.org/d#C3"
+    ],
+    "without": [
+     "http://example.org/d#C3"
+    ]
+   }
+  ]
+ },
+ "exit": "JOB-EXIT 0 2026-11-19T14:04:09-05:00"
+}

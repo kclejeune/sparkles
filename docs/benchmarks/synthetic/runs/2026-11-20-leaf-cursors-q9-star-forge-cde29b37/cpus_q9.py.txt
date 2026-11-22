@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""Thread placement of the q9-star servers, from q9.sh's cpus-geo-<tag>.txt samples.
+
+    cpus_q9.py OUT_DIR P_CPUS [MODE] > placement.md     (P_CPUS e.g. 0-11 on forge and atlas)
+
+For each arm, the servers are numbered by the order their pids appear: 1 the indexed server
+("sparkles"), 2 the scan server, 3 the rewrites-off server ("sparkles-plain"). Between two
+samples a thread's CPU time (utime ticks) is attributed to the CPU it was on at the later
+sample. The table gives, for servers 1 and 3, the share of the query-* pool's ticks on
+P_CPUS and the arm's median request time, to test whether the fast mode is P-core placement.
+"""
+
+import json
+import statistics as st
+import sys
+from collections import defaultdict
+from pathlib import Path
+
+
+def cpuset(spec):
+    out = set()
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        out.update(range(int(a), int(b or a) + 1))
+    return out
+
+
+def main():
+    out, pc = Path(sys.argv[1]), cpuset(sys.argv[2])
+    modes = sys.argv[3:] or ["streaming", "eager"]
+    print("| round | arm | mode | server | P share of query ticks | ticks | median ms |")
+    print("|---|---|---|---|--:|--:|--:|")
+    for r in sorted((p for p in out.glob("r*") if p.is_dir()), key=lambda p: int(p.name[1:])):
+        for f in sorted(r.glob("cpus-geo-*.txt")):
+            tag = f.name[len("cpus-geo-"):-4]
+            arm, mode = tag.split("-")[0], tag.split("-")[1]
+            if mode not in modes:
+                continue
+            pids, last = [], {}
+            ticks = defaultdict(lambda: [0, 0])
+            for line in f.read_text().splitlines():
+                parts = line.split()
+                if len(parts) != 5:
+                    continue
+                _, pid, comm, cpu, ut = parts
+                if pid not in pids:
+                    pids.append(pid)
+                if not comm.startswith("query-"):
+                    continue
+                k = (pid, comm)
+                d = int(ut) - last.get(k, int(ut))
+                last[k] = int(ut)
+                ticks[pid][0 if int(cpu) in pc else 1] += max(d, 0)
+            res = json.loads((r / "results" / f"geo-{tag}" / "geo-q9-star.json").read_text())["results"]
+            med = {x["command"]: st.median(x["times"]) * 1e3 for x in res}
+            for i, eng in ((0, "sparkles"), (2, "sparkles-plain")):
+                if i < len(pids):
+                    p, e = ticks[pids[i]]
+                    share = p / (p + e) if p + e else float("nan")
+                    print(f"| {r.name} | {arm} | {mode} | {eng} | {share:.2f} | {p + e} | {med.get(eng, float('nan')):.1f} |")
+
+
+main()

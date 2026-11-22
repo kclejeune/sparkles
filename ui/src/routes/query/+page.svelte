@@ -1662,12 +1662,16 @@
             ? api.runStoredQuery(target, stored.name, stored.values, o)
             : api.query(target, text, o);
         // the left side is an earlier commit, or the head of another branch
+        // The table takes the server's default, which streams the plans that are faster
+        // as cursors, so a streamed answer cut at the row limit has no total. A
+        // comparison runs both reads eagerly, since it compares whole results or counts.
+        const execution: api.QueryOptions['execution'] = compareOn ? 'eager' : 'server';
         const [result, base] = await Promise.all([
-          read(opts),
+          read({ ...opts, execution }),
           compareOn
             ? against
-              ? read({ ...opts, at: undefined }, onBranch(dsName, against))
-              : read({ ...opts, at: fromAt })
+              ? read({ ...opts, execution, at: undefined }, onBranch(dsName, against))
+              : read({ ...opts, execution, at: fromAt })
             : Promise.resolve(undefined),
         ]);
         const elapsed = performance.now() - started;
@@ -2085,6 +2089,8 @@
 
   /** Whether the results are compared: the slider is open with two handles and both reads arrived. */
   const comparing = $derived(timeOpen && compare && !!outcome?.base);
+  /** A compared side's row count, which a streamed read that stopped does not know. */
+  const rowCount = (n: number | null) => (n == null ? 'an unknown number of' : fmtInt(n));
   /** The two results as bags, or that they are too many to compare in the browser. */
   const diffView = $derived.by(() => {
     const o = outcome;
@@ -3536,9 +3542,13 @@
                 onclick={() => setView('table')}
               >
                 <Icon name="table" size={14} /> Table
-                {#if outcome.result?.meta}<span class="count"
-                    >{fmtInt(outcome.result.meta.totalRows)}</span
-                  >{/if}
+                {#if outcome.result?.meta}{@const m =
+                    outcome.result.meta}{#if api.totalUnknown(m)}<span
+                      class="count"
+                      title="The server streamed this answer and stopped after {fmtInt(
+                        m.sentRows,
+                      )} rows, so the total is unknown">{fmtInt(m.sentRows)}+</span
+                    >{:else}<span class="count">{fmtInt(m.totalRows)}</span>{/if}{/if}
               </button>
               {#if outcome.result?.queryType !== 'ASK'}
                 <button
@@ -3686,13 +3696,22 @@
           onvarpick={() => (useVarPicked = true)}
         />
       {/if}
-      {#if outcome.result && outcome.result.meta.sentRows < outcome.result.meta.totalRows && outcome.view !== 'explain'}
-        <div class="notice">
-          <Icon name="info" size={14} />
-          Showing the first {fmtInt(outcome.result.meta.sentRows)} of {fmtInt(
-            outcome.result.meta.totalRows,
-          )} results. Raise the row limit or download the full result from Raw.
-        </div>
+      {#if outcome.result && outcome.view !== 'explain'}
+        {@const m = outcome.result.meta}
+        {#if api.totalUnknown(m)}
+          <div class="notice">
+            <Icon name="info" size={14} />
+            Showing the first {fmtInt(m.sentRows)} results. The server streamed the answer and stopped
+            at the row limit, so there may be more and the total is unknown. Raise the row limit or download
+            the full result from Raw.
+          </div>
+        {:else if m.totalRows != null && m.sentRows < m.totalRows}
+          <div class="notice">
+            <Icon name="info" size={14} />
+            Showing the first {fmtInt(m.sentRows)} of {fmtInt(m.totalRows)} results. Raise the row limit
+            or download the full result from Raw.
+          </div>
+        {/if}
       {/if}
 
       {#if outcome.result?.inferences && outcome.view !== 'explain'}
@@ -3714,7 +3733,7 @@
             <Icon name="info" size={14} />
             {#if diffView.cut}
               <span
-                >The results were truncated ({fmtInt(diffView.left)} rows before, {fmtInt(
+                >The results were truncated ({rowCount(diffView.left)} rows before, {rowCount(
                   diffView.right,
                 )} after), so only the counts are compared and the later state is shown.</span
               >

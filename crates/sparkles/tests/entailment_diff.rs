@@ -479,3 +479,34 @@ fn pinned_branch_selectors_follow_inherited_history_by_owner_identity() {
     let diff = dataset.reasoning().diff(&request).unwrap();
     assert_eq!((diff.added, diff.removed), (1, 0));
 }
+
+/// A rule program with a backward rule is rewritten to forward rules for the analysis,
+/// and it still refuses an include of the OWL rule sets (item 839).
+#[test]
+fn an_analysis_program_refuses_the_owl_include() {
+    let (_dir, dataset) = open();
+    update(&dataset, "INSERT DATA { ex:a ex:p ex:b }");
+    let from = dataset.store().snapshot().commit;
+    update(&dataset, "INSERT DATA { ex:c ex:p ex:d }");
+    let to = dataset.store().snapshot().commit;
+    let mut req = DiffRequest::new(from.to_string(), to.to_string());
+    req.analysis.program = Some(AnalysisProgram {
+        profile: Profile::Rules(
+            "@prefix ex: <http://ex.org/> .
+@include <owl-rl> .
+.decl r(x)
+r(?x) :- (?x ex:p ?y).
+[b: (?x ex:q ex:yes) <- r(?x)]
+"
+            .into(),
+        ),
+        extras: Extras::default(),
+        inputs: Inputs::default(),
+    });
+    let e = dataset.reasoning().diff(&req).expect_err("refused");
+    assert!(
+        e.to_string()
+            .contains("a rule program, with relation atoms or 'not', cannot include <owl-rl>"),
+        "{e}"
+    );
+}

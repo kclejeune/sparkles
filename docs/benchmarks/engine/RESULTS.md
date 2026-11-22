@@ -118,6 +118,49 @@ whose bytes the response writer took. That accounting costs 7% of the instructio
 a buffer that counts rows only when it is written out, and on forge `optional-chain` took
 150.8 ms of client time against 132.0 ms without it. Roadmap item 243 follows this up.
 
+Streamed answers write through the same buffer, with the same count of the rows the
+response writer accepted. The table gives `instructions:u` per request of a native JSON request with
+`execution=streaming` at 1.05M triples, over two passes of 200 requests for the short
+queries and 10 for the large ones, for a build whose cursor writers wrote to the response
+writer a few bytes at a time and for the current one, with the eager request's count
+beside them. The eager counts of the two builds agree within 0.5%.
+
+| Query | Writing to the response writer | Writing to the buffer | Eager |
+|---|--:|--:|--:|
+| `count-all` | 453.2 thousand | 390.9 thousand | 306.8 thousand |
+| `predicate-counts` | 670.3 thousand | 509.7 thousand | 422.3 thousand |
+| `star-lookup` | 1,760.0 thousand | 1,327.1 thousand | 1,188.7 thousand |
+| `star-join` | 67.6 million | 40.4 million | 39.6 million |
+| `optional-chain` | 315.1 million | 157.6 million | 182.4 million |
+| `order-by-full` | 1,407.3 million | 970.5 million | 975.8 million |
+| `export-500k` | 6,132.2 million | 2,816.6 million | 3,537.1 million |
+
+*Instructions were counted on an Intel Core Ultra X7 358H laptop with the server on four
+performance cores, for release builds of 8baa5686 and a016b7bd made on the same host. The
+laptop ran other builds at the time, so cycles and wall times are not reported.*
+
+The wall times of the same two builds come from atlas, which has forge's hardware. The
+table gives the median wall time of a native JSON request at 1.05M triples with 12 Rayon
+threads, the server on CPUs 0 to 11 and the client on CPU 12, over eight rounds of A,B,B,A
+with 10 requests per variant in each position, from a run with the earlier build second
+that had the host to itself.
+
+| Query | Streamed, writing to the response writer | Streamed, writing to the buffer | Eager |
+|---|--:|--:|--:|
+| `star-join` | 5.88 ms | 4.55 ms | 4.89 ms |
+| `optional-chain` | 18.4 ms | 10.4 ms | 14.1 ms |
+| `order-by-full` | 50.6 ms | 31.7 ms | 42.7 ms |
+| `export-500k` | 289 ms | 121 ms | 220 ms |
+
+*Wall times were measured on atlas for release builds of 8baa5686 and a016b7bd made on
+wally. They are not comparable with forge's figures.*
+
+Over both orders, a streamed request with 12 threads took 0.42 to 0.77 times the earlier
+build's wall time on these four queries, and with one thread 0.53 to 0.78 times. On the
+seven queries under 1 ms, a pinned atlas check with 12 rounds in each order found the two builds' streamed wall times within 4% of each other, with every
+95% interval including 1.0. A streamed answer there still takes 0.21 to 0.29 ms more wall
+time than an eager one, which roadmap item 534 follows up.
+
 A pinned forge comparison of the combined feature changes, with 16 A,B,B,A rounds and
 100 requests per server process, found `count-all` server time 12.5% higher at 6.0 µs
 against 5.3 µs and `distinct-obj` 14.5% higher at 4.2 µs against 3.6 µs. Every round was slower for both
@@ -162,6 +205,33 @@ plain query can hold up to 64 KiB of the pool beyond its estimate.
 Every query passes. Repeated runs of the same comparison differed by up to 4% on queries
 under 15 µs, and `path-plus` reads faster with the pool on, so ratios of these queries
 below 1.05 are within the run-to-run spread.
+
+### The cost of a root scan that shares its block
+
+A cursor whose root is a scan hands out an index block's rows without copying them, and
+the scan reads the block through the handle that those batches share. Two builds were
+compared on atlas with 100,000 people and one Rayon worker, in 12 rounds of A,B,B,A in both
+arm orders, combined to cancel the bias of the second position. The base is `9acd6d74`,
+the build before the scan stopped charging its block between reads, and the current build
+is `4e9185f1`.
+
+| Query | Mode | Base | Current against base | 95% interval | Added time |
+|---|---|--:|--:|---|--:|
+| `root-limit` | streaming | 3.6 µs | 1.039 | 1.004 to 1.075 | 0.14 µs |
+| `root-limit` | automatic | 11.5 µs | 1.040 | 1.011 to 1.088 | 0.46 µs |
+| `root-scan` | streaming | 82.4 µs | 1.024 | 1.021 to 1.027 | 1.98 µs |
+| `root-scan` | automatic | 83.9 µs | 1.011 | 1.007 to 1.014 | 0.89 µs |
+| `export-500k` | streaming | 391.3 µs | 1.005 | 1.003 to 1.008 | 1.95 µs |
+| `export-500k` | automatic | 409.0 µs | 1.003 | 0.999 to 1.006 | 1.07 µs |
+
+*Measured on atlas.*
+
+`root-scan` under streaming takes 2 µs longer than the base and fails the Intel rule. It
+and the smaller costs of automatic `root-scan` and streaming `export-500k`, whose intervals
+lie above 1.0, are the remainder that roadmap item 1063 holds. The current build is
+1.6% to 3.5% faster than the build before item 1063 on each of these cells. The
+[run record](runs/2026-11-19-shared-scan-atlas/README.md) has the method, the controls and
+a cycle profile of the scan.
 
 ### Planning large basic graph patterns
 
@@ -489,6 +559,63 @@ runs the same tests in CI with Oxigraph's GeoSPARQL tests added. A separate run 
 no eager fallback. The streaming tests
 replace the cursor pass at 4,096 rows that `sparql_query_cursors` used to run, so CI
 runs about 10 seconds more of these tests than before.
+
+### Per-request instruction counts
+
+`mise run bench:request-insn` counted user-space instructions per request on `stanley`
+in the five runs of the [run record](runs/2026-11-18-request-insn-stanley/README.md),
+each of 38 queries under streaming and automatic execution, eight rounds of A,B,B,A and up
+to 50 counted requests per query and process. The two A-against-A runs set the noise
+floor. The widest 95% interval of a query's ratio deviated from 1 by these amounts, with
+the queries of automatic execution whose processes split left out.
+
+| Instructions per request | One binary | One source built on two hosts |
+|---|--:|--:|
+| Under 2 million, 20 cells | 0.47% | 1.07% |
+| 2 million or more, 56 cells | 0.17% | 0.12% |
+
+The small queries' counts spread by 0.1% to 4.1% over processes, and the larger queries'
+by at most 0.43%. Under automatic execution some queries ran on a different executor in
+some processes. `str-filter-two` ran 225 or 272 million instructions per request, and
+`minus`, `optional-count`, `root-limit`, `group-avg` and a few small queries spread by more
+than 5%. No query split under streaming.
+
+The back tests compared builds whose timing on `atlas` was known.
+
+| Change | Query | Instructions | Interval | Time on `atlas` |
+|---|---|--:|---|--:|
+| Item 678's string floors, a97afd76 against 7e272f4d | `str-pair-lt`, streaming | +13.3% | 1.1320-1.1331 | +24.8% |
+| | `str-pair-names`, streaming | +28.9% | 1.2886-1.2891 | +33.4% |
+| Item 1039's charged scan, 60eeac80 against 9acd6d74 | `root-scan`, streaming | -0.04% | 0.9994-0.9999 | +9.8% execution |
+| | `export-500k`, streaming | 0.00% | 0.9999-1.0001 | +8.8% execution |
+| Row 1063, 9e3d7954 against 9acd6d74 | `root-limit`, streaming | 0.00% | 0.9999-1.0001 | +20% execution |
+
+Under streaming the counts flagged item 678 on its two queries and on nothing else, and
+they missed item 1039 on every query. Under automatic execution every run, the
+A-against-A runs included, flagged `str-filter-two` and marked a few other queries as
+split, which is why a flag of an automatic query is rerun under explicit modes. Apart from
+those, `bt-678` flagged the two string queries under automatic execution as well, and
+`bt-1039` flagged only `optional-count`, whose processes split between 5.75 and 7.30
+million instructions per request in three rounds. The execution times that the runs
+record on the busy `stanley` do not resolve these costs, since their per-round ratios in
+the A-against-A runs scatter by up to 50% on these queries. Both builds of row 1063 made the same system calls per request, 6 futex
+calls and 2.4 `writev` calls among them. Three call-graph profiles of `root-limit`
+under streaming, of 100,000 and twice 300,000 requests, sampled cycles in one server
+process of each build. The totals under `Operator::next_shared`, the call that execution
+time covers, moved between profiles by more than the change, as other functions' cycles
+shift between processes. The functions that only the new build runs there were stable,
+however. Per request, the shared batch's construction in `Scan::next_shared` added 650
+to 690 cycles, `Block::downgrade` 200 to 270, `Scan::reads_base` 200, `BaseScan::unpark`
+160 and the allocation and the drop of the weak block handle about 100 each, against
+about 300 cycles of `Block::clone`, `Ctx::nvars` and `scan_mask` that the old build ran.
+That nets about 1,300 cycles, or 0.3 µs on `stanley`, for the one block that `root-limit`
+enters, and it
+retires only a few hundred instructions, a hundredth of the noise floor of a request of
+9.4 million.
+
+The resolution of the counts is the floor times the request's CPU time. It is 1.4 to
+5.4 µs for every query under 0.3 ms, 135 µs for `root-scan` and 1 ms for `export-500k`,
+and within 2% of execution time for 49 of the 76 cells.
 
 ### Instruction counts of vocabulary scans and WAL replay
 

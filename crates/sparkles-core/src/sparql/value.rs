@@ -239,6 +239,12 @@ impl Value {
         }
     }
     /// Lexical form (STR()).
+    /// Whether the value is a string literal as SPARQL's string functions take one: a
+    /// simple literal, an `xsd:string` or a language-tagged string.
+    pub fn is_string(&self) -> bool {
+        matches!(self, Value::Str(_) | Value::Lang(..) | Value::LangDir(..))
+    }
+
     pub fn lexical(&self) -> EvalResult<Arc<str>> {
         Ok(match self {
             Value::Iri(i) => i.clone(),

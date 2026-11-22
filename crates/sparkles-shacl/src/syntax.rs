@@ -7,7 +7,9 @@ use oxrdf::{Graph, Triple};
 use sparkles_core::codec::Codec;
 use sparkles_core::io::{RdfFormat, Source};
 use std::fmt;
+use std::io::{self, Read};
 use std::path::Path;
+use std::time::Instant;
 
 /// The syntax of a shapes document.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,13 +103,28 @@ pub fn read_document(
     syntax: ShapesSyntax,
     base: Option<&str>,
 ) -> Result<ShapesDocument> {
+    read_document_until(text, syntax, base, None)
+}
+
+pub(crate) fn read_document_until(
+    text: &str,
+    syntax: ShapesSyntax,
+    base: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<ShapesDocument> {
+    crate::data::check_deadline(deadline)?;
     match syntax {
         ShapesSyntax::Compact => {
-            let doc = compact::parse(text, base)?;
+            let doc = compact::parse(text, base);
+            crate::data::check_deadline(deadline)?;
+            let doc = doc?;
             Ok(ShapesDocument {
                 graph: doc.graph,
                 prefixes: doc.prefixes,
             })
+        }
+        ShapesSyntax::Rdf(RdfFormat::Turtle) if deadline.is_some() => {
+            read_turtle_until(text.as_bytes(), base, deadline)
         }
         ShapesSyntax::Rdf(format) => {
             let mut src = Source::from_bytes(text.as_bytes().to_vec(), format, None);
@@ -115,8 +132,12 @@ pub fn read_document(
             src.name = "<shapes>".into();
             let (quads, prefixes) =
                 sparkles_core::io::parse_to_vec(&src).context("parsing shapes graph")?;
+            crate::data::check_deadline(deadline)?;
             let mut graph = Graph::new();
-            for q in quads {
+            for (i, q) in quads.into_iter().enumerate() {
+                if i % 256 == 0 {
+                    crate::data::check_deadline(deadline)?;
+                }
                 graph.insert(&Triple::new(q.subject, q.predicate, q.object));
             }
             Ok(ShapesDocument {
@@ -125,6 +146,116 @@ pub fn read_document(
             })
         }
     }
+}
+
+fn read_turtle_until(
+    input: impl Read,
+    base: Option<&str>,
+    deadline: Option<Instant>,
+) -> Result<ShapesDocument> {
+    struct CheckedRead<R> {
+        input: R,
+        deadline: Option<Instant>,
+    }
+    impl<R: Read> Read for CheckedRead<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            // Limit each read so that a long comment or token polls before a
+            // quad reaches the parser's sink.
+            let cap = buf.len().min(16 * 1024);
+            crate::data::check_deadline(self.deadline).map_err(io::Error::other)?;
+            let n = self.input.read(&mut buf[..cap])?;
+            crate::data::check_deadline(self.deadline).map_err(io::Error::other)?;
+            Ok(n)
+        }
+    }
+
+    let mut graph = Graph::new();
+    let prefixes = sparkles_core::io::parse_rdf_reader(
+        CheckedRead { input, deadline },
+        RdfFormat::Turtle,
+        base,
+        "<shapes>",
+        |q| {
+            crate::data::check_deadline(deadline)?;
+            graph.insert(&Triple::new(q.subject, q.predicate, q.object));
+            Ok(())
+        },
+    )
+    .context("parsing shapes graph")?;
+    crate::data::check_deadline(deadline)?;
+    Ok(ShapesDocument {
+        graph,
+        prefixes: prefixes.into_iter().collect(),
+    })
+}
+
+#[cfg(test)]
+#[test]
+fn gate_turtle_polls_before_the_first_quad() {
+    use sparkles_core::Error;
+    // One line and no quad. Three setup/reader checks can pass before expiry.
+    let text = format!("#{}\n<invalid", "x".repeat(1 << 20));
+    crate::data::set_deadline_checks_left(Some(3));
+    let result = read_document_until(
+        &text,
+        ShapesSyntax::default(),
+        None,
+        Some(Instant::now() + std::time::Duration::from_secs(30)),
+    );
+    crate::data::set_deadline_checks_left(None);
+    assert!(matches!(
+        result.err().and_then(|e| e.downcast::<Error>().ok()),
+        Some(Error::Timeout)
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn gate_turtle_preserves_a_read_error_at_expiry() {
+    let input = |_: &mut [u8]| -> io::Result<usize> {
+        crate::data::set_deadline_checks_left(Some(0));
+        Err(io::Error::other("read failed"))
+    };
+    struct Reader<F>(F);
+    impl<F: FnMut(&mut [u8]) -> io::Result<usize>> Read for Reader<F> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            (self.0)(buf)
+        }
+    }
+    let result = read_turtle_until(Reader(input), None, None);
+    crate::data::set_deadline_checks_left(None);
+    assert!(matches!(
+        result.err().and_then(|e| e.downcast::<sparkles_core::Error>().ok()),
+        Some(sparkles_core::Error::Io(e)) if e.to_string() == "read failed"
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn gate_turtle_preserves_base_prefixes_and_blank_node_scope() {
+    let text = b"@prefix ex: <urn:examples:> . _:shape ex:p <focus> . _:shape ex:q <target> .";
+    let doc = read_turtle_until(text.as_slice(), Some("https://example.com/"), None).unwrap();
+    assert_eq!(
+        doc.prefixes,
+        vec![("ex".to_owned(), "urn:examples:".to_owned())]
+    );
+    let mut rows = doc.graph.iter();
+    let first = rows.next().unwrap();
+    let second = rows.next().unwrap();
+    assert_eq!(first.subject, second.subject);
+    assert!(matches!(
+        first.subject,
+        oxrdf::NamedOrBlankNodeRef::BlankNode(_)
+    ));
+    let mut targets = [first.object.to_string(), second.object.to_string()];
+    targets.sort();
+    assert_eq!(
+        targets,
+        [
+            "<https://example.com/focus>",
+            "<https://example.com/target>"
+        ]
+    );
 }
 
 /// Write a shapes graph in Turtle with these prefixes (those it uses).

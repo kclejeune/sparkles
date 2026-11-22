@@ -215,6 +215,25 @@ pub type Mapped = (Vec<Ex>, Vec<Role>);
 /// The names and expressions a merge of chunks takes between two calls of its poll.
 pub const POLL_MERGE: usize = if cfg!(test) { 64 } else { 65_536 };
 
+/// The hash of a role's name that [`Interner`] keys by, which [`object_hash`] gives an
+/// object property from its IRI alone.
+fn role_hash(r: &RoleName) -> u64 {
+    use std::hash::BuildHasher;
+    let fx = rustc_hash::FxBuildHasher;
+    match r {
+        RoleName::Object(p) => object_hash(p.as_str()),
+        RoleName::Data(p) => fx.hash_one((1u8, p.as_str())),
+        RoleName::Fresh(n) => fx.hash_one((2u8, *n)),
+        RoleName::Inverse(p) => fx.hash_one((3u8, p.as_str())),
+    }
+}
+
+#[inline]
+fn object_hash(iri: &str) -> u64 {
+    use std::hash::BuildHasher;
+    rustc_hash::FxBuildHasher.hash_one((0u8, iri))
+}
+
 /// The name of a role.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RoleName {
@@ -250,7 +269,9 @@ pub struct Interner {
     /// the opaque data atoms and the datatype definitions of the run
     pub ranges: Ranges,
     pub roles: Vec<RoleName>,
-    role_ids: FxHashMap<RoleName, Role>,
+    /// the id of each name in [`Interner::roles`], by [`role_hash`], so that an object
+    /// property is looked up without a copy of its IRI
+    role_ids: hashbrown::HashTable<Role>,
     fresh: u32,
     /// the fresh classes of the Horn normalization
     fresh_classes: u32,
@@ -532,7 +553,9 @@ impl Interner {
 
     /// The role of a name, if the interner has it.
     pub fn role_id(&self, name: &RoleName) -> Option<Role> {
-        self.role_ids.get(name).copied()
+        self.role_ids
+            .find(role_hash(name), |&id| self.roles[id as usize] == *name)
+            .copied()
     }
 
     pub fn len(&self) -> usize {
@@ -770,13 +793,28 @@ impl Interner {
     }
 
     pub fn role(&mut self, r: RoleName) -> Role {
-        if let Some(&id) = self.role_ids.get(&r) {
+        if let Some(id) = self.role_id(&r) {
             return id;
         }
         let id = self.roles.len() as Role;
-        self.roles.push(r.clone());
-        self.role_ids.insert(r, id);
+        let h = role_hash(&r);
+        self.roles.push(r);
+        let roles = &self.roles;
+        self.role_ids
+            .insert_unique(h, id, |&i| role_hash(&roles[i as usize]));
         id
+    }
+
+    /// The role of an object property, which copies its IRI only when it is new.
+    pub fn object_role(&mut self, p: &ObjectProperty) -> Role {
+        let found = self.role_ids.find(
+            object_hash(p.as_str()),
+            |&id| matches!(&self.roles[id as usize], RoleName::Object(q) if q == p),
+        );
+        match found {
+            Some(&id) => id,
+            None => self.role(RoleName::Object(p.clone())),
+        }
     }
 
     pub fn fresh_role(&mut self) -> Role {
@@ -931,7 +969,18 @@ pub struct Roles {
     /// first and a role under the second between the same pair is a clash, which
     /// disjoint and asymmetric roles give
     pub clash: Vec<(Role, Role)>,
+    /// for each role, whether its chains compose left-linearly
+    /// ([`Roles::finish_chains`], roadmap item 956)
+    pub linear: Vec<bool>,
+    /// for each pair of [`Roles::comp`], what the source of the composed links takes:
+    /// the roles of those it keeps as forward links, and [`NO_ROLE`] for each that is
+    /// empty, in the order of the composition table
+    pub comp_fwd: FxHashMap<(Role, Role), Vec<Role>>,
 }
+
+/// The variable that turns the left-linear composition of [`Roles::finish_chains`] off
+/// when it is `0`, for measurements (roadmap item 956).
+pub const LINEAR_CHAINS_ENV: &str = "SPARKLES_LINEAR_CHAINS";
 
 /// No role, in [`Roles::inv`].
 pub const NO_ROLE: Role = Role::MAX;
@@ -959,6 +1008,12 @@ impl Roles {
                 .map(|v| 24 + v.capacity() * 4)
                 .sum::<usize>()
             + self.empty.len()
+            + self.linear.len()
+            + self
+                .comp_fwd
+                .values()
+                .map(|v| 40 + v.capacity() * 4)
+                .sum::<usize>()
     }
 
     /// The functional superroles of a data role, itself included.
@@ -994,6 +1049,157 @@ impl Roles {
     #[inline]
     pub fn keeps_forward(&self, r: Role) -> bool {
         self.right.get(r as usize).copied().unwrap_or(false)
+    }
+
+    /// What the source of the links that [`Roles::comp`] composes takes, one message
+    /// each: a forward link by each role that keeps them, less the left-linear
+    /// compositions of [`Roles::finish_chains`], and the bottom, as [`NO_ROLE`], for each
+    /// empty role.
+    #[inline]
+    pub fn comp_fwd(&self, r1: Role, r2: Role) -> &[Role] {
+        if !self.left.get(r1 as usize).copied().unwrap_or(false) {
+            return &[];
+        }
+        self.comp_fwd.get(&(r1, r2)).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Composes every chain as before roadmap item 956, with every composed link kept as
+    /// a forward link where its role keeps them, for tests that compare the two.
+    #[cfg(test)]
+    pub fn without_linear(&mut self) {
+        self.linear.iter_mut().for_each(|l| *l = false);
+        let (right, empty) = (&self.right, &self.empty);
+        self.comp_fwd = self
+            .comp
+            .iter()
+            .map(|(&k, v)| {
+                let kept = v
+                    .iter()
+                    .flat_map(|&t| {
+                        let fwd = right.get(t as usize).copied().unwrap_or(false).then_some(t);
+                        let bottom = empty
+                            .get(t as usize)
+                            .copied()
+                            .unwrap_or(false)
+                            .then_some(NO_ROLE);
+                        fwd.into_iter().chain(bottom)
+                    })
+                    .collect();
+                (k, kept)
+            })
+            .collect();
+    }
+
+    /// Whether `r` and `s` are equivalent roles.
+    fn equivalent(&self, r: Role, s: Role) -> bool {
+        self.sub(r, s) && self.sub(s, r)
+    }
+
+    /// Decides which roles compose left-linearly and fills [`Roles::comp_fwd`], once the
+    /// composition table is final (roadmap item 956).
+    ///
+    /// A role `t` is linear when every pair of roles equivalent to `t` composes into the
+    /// roles that `t` with itself does, and every role `s` that composes with a link by
+    /// `t` on its right composes alike with the roles equivalent to `t`, into roles `V`
+    /// each of which some role of `V` composed with `t` gives again. A link by `t` that
+    /// a chain composes from two links by roles equivalent to `t` then needs no forward
+    /// link at its source. A link `(w, s, x)` that would meet such a link `(x, t, z)`,
+    /// composed from `(x, a, y)` and `(y, b, z)`, gives `(w, u, y)` for every `u` of `V`
+    /// with `(x, a, y)`, directly or by induction on the composition when that link is one
+    /// of them too, and these with `(y, b, z)` give every role of `V` again. So the
+    /// saturation stores the same backward links, a middle context pairs its backward
+    /// links only with the forward links that are not such compositions, and the
+    /// transitive closure of a role is derived once for each link that ends in a link
+    /// the axioms give, rather than once for each intermediate context.
+    /// `grow` takes the bytes of the tables it adds before it adds them.
+    pub fn finish_chains<E>(
+        &mut self,
+        mut grow: impl FnMut(usize) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let n = self.sup.len();
+        let mut linear = vec![false; n];
+        // a switch for measurements, which composes every pair as before
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let off =
+            *OFF.get_or_init(|| std::env::var_os(LINEAR_CHAINS_ENV).is_some_and(|v| v == "0"));
+        // the roles that two of their own links compose into, and the pairs with a link
+        // by each of them on the right, which one pass over the table finds
+        let mut right_of: FxHashMap<Role, Vec<Role>> = FxHashMap::default();
+        if !off {
+            for t in 0..n as Role {
+                if self.keeps_forward(t) && self.comp(t, t).contains(&t) {
+                    right_of.insert(t, Vec::new());
+                }
+            }
+        }
+        if !right_of.is_empty() {
+            for (&(s, b), v) in &self.comp {
+                if let Some(l) = right_of.get_mut(&b)
+                    && !v.is_empty()
+                    && self.left[s as usize]
+                {
+                    l.push(s);
+                }
+            }
+        }
+        for (&t, lefts) in &right_of {
+            let class: Vec<Role> = self.sup[t as usize]
+                .iter()
+                .copied()
+                .filter(|&s| self.sub(s, t))
+                .collect();
+            let sorted = |v: &[Role]| {
+                let mut v = v.to_vec();
+                v.sort_unstable();
+                v
+            };
+            let tt = sorted(self.comp(t, t));
+            // every pair of roles equivalent to t composes as t with itself
+            let uniform = class
+                .iter()
+                .all(|&a| class.iter().all(|&b| sorted(self.comp(a, b)) == tt));
+            // a role that composes with a link by t on its right does so alike with the
+            // roles equivalent to t, and each role it composes into comes again from one
+            // of them composed with a further link by t
+            let covered = lefts.iter().all(|&s| {
+                let st = sorted(self.comp(s, t));
+                class.iter().all(|&a| sorted(self.comp(s, a)) == st)
+                    && st
+                        .iter()
+                        .all(|w| st.iter().any(|&u| self.comp(u, t).contains(w)))
+            });
+            linear[t as usize] = uniform && covered;
+        }
+        self.linear = linear;
+        grow(n)?;
+        // a pair whose source takes nothing has no entry, and each entry is charged
+        // before it is made
+        let mut comp_fwd: FxHashMap<(Role, Role), Vec<Role>> = FxHashMap::default();
+        for (&(r1, r2), v) in &self.comp {
+            let products = |t: Role| {
+                let fwd = self.keeps_composed(r1, r2, t).then_some(t);
+                let bottom = self.is_empty_role(t).then_some(NO_ROLE);
+                fwd.into_iter().chain(bottom)
+            };
+            let len = v.iter().map(|&t| products(t).count()).sum::<usize>();
+            if len == 0 {
+                continue;
+            }
+            grow(40 + len * 4)?;
+            comp_fwd.insert((r1, r2), v.iter().flat_map(|&t| products(t)).collect());
+        }
+        self.comp_fwd = comp_fwd;
+        Ok(())
+    }
+
+    /// Whether the source of a link by `t` that a chain composes from links by `r1` and
+    /// `r2` keeps it as a forward link ([`Roles::comp_fwd`]).
+    #[inline]
+    pub fn keeps_composed(&self, r1: Role, r2: Role, t: Role) -> bool {
+        self.keeps_forward(t)
+            && !(self.linear.get(t as usize).copied().unwrap_or(false)
+                && self.equivalent(r1, t)
+                && self.equivalent(r2, t))
     }
 
     /// The inverse of a role, when the run has one.
@@ -1509,7 +1715,7 @@ pub const OPAQUE: &str = "literals and datatypes without values the classifier c
 
 fn object_role(p: &ObjectPropertyExpression, it: &mut Interner) -> Option<Role> {
     match p {
-        ObjectPropertyExpression::Property(p) => Some(it.role(RoleName::Object(p.clone()))),
+        ObjectPropertyExpression::Property(p) => Some(it.object_role(p)),
         ObjectPropertyExpression::InverseOf(_) => None,
     }
 }
@@ -1566,7 +1772,7 @@ pub fn class_expression(
                     (BOTTOM, partial)
                 }
                 ObjectPropertyExpression::Property(p) => {
-                    let r = it.role(RoleName::Object(p.clone()));
+                    let r = it.object_role(p);
                     if f == BOTTOM {
                         return Ok((BOTTOM, partial));
                     }
@@ -1582,7 +1788,7 @@ pub fn class_expression(
             };
             match p {
                 ObjectPropertyExpression::Property(p) => {
-                    let r = it.role(RoleName::Object(p.clone()));
+                    let r = it.object_role(p);
                     (it.node(Node::Exist(r, f)), None)
                 }
                 ObjectPropertyExpression::InverseOf(_) => return Err("inverse properties"),
@@ -1593,7 +1799,7 @@ pub fn class_expression(
             _ => return Err("anonymous individuals"),
         },
         C::ObjectHasSelf(ObjectPropertyExpression::Property(p)) => {
-            let r = it.role(RoleName::Object(p.clone()));
+            let r = it.object_role(p);
             (it.node(Node::SelfLoop(r)), None)
         }
         C::DataSomeValuesFrom(ps, r) if ps.len() == 1 => {
@@ -1795,6 +2001,8 @@ impl Index {
             any_empty: a_any_empty,
             inv: a_inv,
             clash: a_clash,
+            linear: a_linear,
+            comp_fwd: a_comp_fwd,
         } = a_roles;
         let Roles {
             sup: b_sup,
@@ -1809,6 +2017,8 @@ impl Index {
             any_empty: b_any_empty,
             inv: b_inv,
             clash: b_clash,
+            linear: b_linear,
+            comp_fwd: b_comp_fwd,
         } = b_roles;
         assert_eq!(
             (
@@ -1840,6 +2050,11 @@ impl Index {
                 b_clash
             ),
             "fixture role content"
+        );
+        assert_eq!(
+            (a_linear, a_comp_fwd),
+            (b_linear, b_comp_fwd),
+            "fixture linear chains"
         );
         assert_eq!(a_vals, b_vals, "fixture values");
         assert_eq!(a_neg_data, b_neg_data, "fixture negative data");
@@ -1917,9 +2132,6 @@ impl Index {
     #[inline]
     pub fn disjoint_of(&self, h: &Head) -> &[u32] {
         h.disj.of(&self.disjoint)
-    }
-    pub fn exist(&self, e: Ex) -> &[(Role, Ex)] {
-        self.exist_of(self.head(e))
     }
     pub fn disjoint(&self, e: Ex) -> &[u32] {
         self.disjoint_of(self.head(e))
@@ -2002,6 +2214,7 @@ impl Index {
             && a.functional.iter().all(|f| f.is_empty())
             && b.functional.iter().all(|f| f.is_empty())
             && prefix(&a.empty, &b.empty)
+            && prefix(&a.linear, &b.linear)
             && b.inv.len() >= a.inv.len()
             && b.inv[..a.inv.len()] == a.inv[..]
             && a.clash == b.clash
@@ -2234,6 +2447,19 @@ impl Index {
                     b.positive(e, it, &mut ix);
                 }
             }
+        }
+        // A loop by a role is a link from a context to itself, so the context takes the
+        // role's range (saturate.rs, `Concl::Loop`). Loops come from self restrictions,
+        // from chains that compose loops, from individuals linked to themselves and from
+        // the Horn rules, by roles that need not occur in any positive existential, so
+        // every range occurs positively (roadmap item 1262). A range that no context
+        // takes still costs its index entries, such as the intersections of the fillers
+        // of its existentials with their roles' ranges, their heads and successor
+        // entries and the told subsumers of its data restrictions, but no context is
+        // saturated for it.
+        let ranges: Vec<Ex> = ix.roles.range.iter().flatten().copied().collect();
+        for c in ranges {
+            b.positive(c, it, &mut ix);
         }
         // a reflexive role links every individual to itself, and a universal role every
         // individual to every one, so their ranges hold everywhere
@@ -2672,6 +2898,9 @@ fn horn_index(
         ix.roles.comp = sel.comp;
         ix.roles.left = sel.left;
         ix.roles.right = sel.right;
+        // the selection keeps some of the chains, so its table is no larger than the
+        // one the role table's build charged
+        let _ = ix.roles.finish_chains(|_| Ok::<(), ()>(()));
     }
     dead.sort_unstable();
     dead.dedup();
@@ -3091,14 +3320,14 @@ fn roles(
     }
     // every object property is a subproperty of the top object property, and every
     // data property of the top data property
-    if let Some(&top) = it.role_ids.get(&RoleName::Object(ObjectProperty::top())) {
+    if let Some(top) = it.role_id(&RoleName::Object(ObjectProperty::top())) {
         for (r, name) in it.roles.iter().enumerate() {
             if matches!(name, RoleName::Object(_)) && r as Role != top {
                 direct[r].push(top);
             }
         }
     }
-    if let Some(&top) = it.role_ids.get(&RoleName::Data(DataProperty::top())) {
+    if let Some(top) = it.role_id(&RoleName::Data(DataProperty::top())) {
         for (r, name) in it.roles.iter().enumerate() {
             if matches!(name, RoleName::Data(_)) && r as Role != top {
                 direct[r].push(top);
@@ -3215,7 +3444,7 @@ fn roles(
         RoleName::Object(ObjectProperty::bottom()),
         RoleName::Data(DataProperty::bottom()),
     ] {
-        if let Some(&b) = it.role_ids.get(&bottom) {
+        if let Some(b) = it.role_id(&bottom) {
             for (r, ss) in sup.iter().enumerate() {
                 if ss.binary_search(&b).is_ok() {
                     empty[r] = true;
@@ -3252,6 +3481,8 @@ fn roles(
         empty,
         inv,
         clash,
+        linear: Vec::new(),
+        comp_fwd: FxHashMap::default(),
     };
     if !roles.clash.is_empty() {
         for r in 0..n as Role {
@@ -3261,6 +3492,8 @@ fn roles(
         }
     }
     roles.any_empty = roles.empty.contains(&true);
+    // the products of the chains read the empty roles
+    roles.finish_chains(grow)?;
     Ok(roles)
 }
 

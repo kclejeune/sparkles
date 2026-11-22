@@ -95,20 +95,85 @@ impl Default for ValidateOptions {
     }
 }
 
+pub(crate) struct ValidationControls {
+    pub deadline: Option<Instant>,
+    pub cancel: Option<Arc<AtomicBool>>,
+    pub cancellation: Option<sparkles_core::task::Cancellation>,
+}
+
+impl ValidationControls {
+    fn new(opts: &ValidateOptions) -> Self {
+        let relative = opts
+            .timeout
+            .and_then(|timeout| Instant::now().checked_add(timeout));
+        Self {
+            deadline: opts.deadline.into_iter().chain(relative).min(),
+            cancel: opts.cancel.clone(),
+            cancellation: opts.cancellation.clone(),
+        }
+    }
+
+    fn active(&self) -> bool {
+        self.deadline.is_some() || self.cancel.is_some() || self.cancellation.is_some()
+    }
+
+    fn check(&self) -> sparkles_core::Result<()> {
+        if self
+            .cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(AtomicOrdering::Relaxed))
+        {
+            return Err(sparkles_core::Error::Cancelled);
+        }
+        if let Some(cancellation) = &self.cancellation {
+            cancellation.check()?;
+        }
+        crate::data::check_deadline(self.deadline)
+    }
+}
+
 /// Validate the data graph of a snapshot against a shapes graph.
 pub fn validate(
     snap: &Arc<Snapshot>,
     shapes: &Shapes,
     opts: &ValidateOptions,
 ) -> Result<ValidationReport> {
-    let (data, ids) = DataGraph::new(
+    validate_impl(snap, shapes, opts, None, None)
+}
+
+/// Validate with bounds on embedded SPARQL and estimated retained report memory.
+/// From `query`, use the intermediate rows, bytes, produced rows and shared work
+/// counter. The validation deadline and data selection are supplied by `opts`.
+pub fn validate_controlled(
+    snap: &Arc<Snapshot>,
+    shapes: &Shapes,
+    opts: &ValidateOptions,
+    query: &sparkles_core::sparql::QueryOptions,
+    max_report_bytes: Option<u64>,
+) -> Result<ValidationReport> {
+    validate_impl(snap, shapes, opts, Some(query), max_report_bytes)
+}
+
+fn validate_impl(
+    snap: &Arc<Snapshot>,
+    shapes: &Shapes,
+    opts: &ValidateOptions,
+    query: Option<&sparkles_core::sparql::QueryOptions>,
+    max_report_bytes: Option<u64>,
+) -> Result<ValidationReport> {
+    let controls = ValidationControls::new(opts);
+    let (data, ids) = DataGraph::new_checked(
         snap.clone(),
         opts.data_graph.as_deref(),
         &opts.extra_graphs,
         &opts.exclude_graphs,
         shapes,
+        || controls.check(),
     )?;
-    let engine = Engine::new(shapes, &data, ids, opts)?;
+    let mut engine = Engine::new_checked(shapes, &data, ids, opts, controls)?;
+    engine.query_limits = query.cloned();
+    engine.report_bytes = max_report_bytes.map(sparkles_core::validation::ReportBytes::new);
+    engine.check_limits()?;
     engine.run(None)
 }
 
@@ -349,14 +414,14 @@ pub(crate) struct Engine<'a> {
     pub expr_paths: Vec<Option<CPath>>,
     parallel: bool,
     pool: Option<Arc<rayon::ThreadPool>>,
-    pub deadline: Option<Instant>,
-    pub cancel: Option<Arc<AtomicBool>>,
-    pub cancellation: Option<sparkles_core::task::Cancellation>,
+    pub controls: ValidationControls,
     max_results: Option<usize>,
     /// the most nodes one node expression evaluation may work through
     pub max_expr_nodes: u64,
     /// the memory budget of each query ([`ValidateOptions::query_memory`])
     pub query_memory: Option<u64>,
+    pub query_limits: Option<sparkles_core::sparql::QueryOptions>,
+    report_bytes: Option<sparkles_core::validation::ReportBytes>,
     /// results collected so far (checked against `max_results`)
     collected: AtomicUsize,
     /// the queries node expressions have run, which keep the new blank nodes of each
@@ -388,34 +453,56 @@ impl<'a> Engine<'a> {
         ids: Vec<Id>,
         opts: &ValidateOptions,
     ) -> Result<Engine<'a>> {
-        let lookup = |n: &NamedNode| {
+        Self::new_checked(shapes, data, ids, opts, ValidationControls::new(opts))
+    }
+
+    fn new_checked(
+        shapes: &'a Shapes,
+        data: &'a DataGraph,
+        ids: Vec<Id>,
+        opts: &ValidateOptions,
+        controls: ValidationControls,
+    ) -> Result<Engine<'a>> {
+        let mut lookup = |n: &NamedNode| {
             data.snap
                 .lookup_iri(n.as_str())
                 .unwrap_or(Id::local(u64::MAX >> 8))
         };
+        let check = || controls.check();
+        check()?;
+        let mut compile = |path: &PropertyPath| {
+            if controls.active() {
+                CPath::compile_checked(path, &mut lookup, &check)
+            } else {
+                Ok(CPath::compile(path, &mut lookup))
+            }
+        };
         let expr_paths = shapes
             .exprs
             .iter()
-            .map(|e| match e {
-                crate::nodeexpr::Expr::PathValues { path, .. } => {
-                    Some(CPath::compile(path, &mut |n| lookup(n)))
+            .enumerate()
+            .map(|(i, e)| {
+                if i % 256 == 0 {
+                    check()?;
                 }
-                _ => None,
+                Ok(match e {
+                    crate::nodeexpr::Expr::PathValues { path, .. } => Some(compile(path)?),
+                    _ => None,
+                })
             })
-            .collect();
+            .collect::<sparkles_core::Result<Vec<_>>>()?;
         let paths = shapes
             .shapes
             .iter()
-            .map(|s| {
-                s.path.as_ref().map(|p| {
-                    CPath::compile(p, &mut |n| {
-                        data.snap
-                            .lookup_iri(n.as_str())
-                            .unwrap_or(Id::local(u64::MAX >> 8))
-                    })
-                })
+            .enumerate()
+            .map(|(i, s)| {
+                if i % 256 == 0 {
+                    check()?;
+                }
+                s.path.as_ref().map(&mut compile).transpose()
             })
-            .collect();
+            .collect::<sparkles_core::Result<Vec<_>>>()?;
+        check()?;
         Ok(Engine {
             shapes,
             data,
@@ -424,46 +511,38 @@ impl<'a> Engine<'a> {
             expr_paths,
             parallel: opts.parallel,
             pool: opts.pool.clone(),
-            deadline: opts
-                .deadline
-                .into_iter()
-                .chain(opts.timeout.map(|t| Instant::now() + t))
-                .min(),
-            cancel: opts.cancel.clone(),
-            cancellation: opts.cancellation.clone(),
+            controls,
             max_results: opts.max_results,
             max_expr_nodes: opts.max_expr_nodes,
             query_memory: opts.query_memory,
+            query_limits: None,
+            report_bytes: None,
             collected: AtomicUsize::new(0),
             query_calls: Default::default(),
         })
     }
 
     pub(crate) fn check_limits(&self) -> Result<()> {
-        if let Some(c) = &self.cancel
-            && c.load(AtomicOrdering::Relaxed)
-        {
-            bail!("validation cancelled");
-        }
-        if let Some(cancellation) = &self.cancellation {
-            cancellation.check()?;
-        }
-        if let Some(d) = self.deadline
-            && Instant::now() >= d
-        {
-            bail!("validation timed out");
-        }
-        Ok(())
+        self.check_data_scan().map_err(Into::into)
     }
 
-    /// Count `n` more results against `max_results`.
-    fn count_results(&self, n: usize) -> Result<()> {
+    pub(crate) fn check_data_scan(&self) -> sparkles_core::Result<()> {
+        self.controls.check()
+    }
+
+    /// Admit a report entry or a nested detail before retaining it.
+    fn admit_result(&self, result: &ValidationResult) -> Result<()> {
+        if let Some(bytes) = &self.report_bytes {
+            bytes.admit(result.retained_bytes())?;
+        }
         let Some(limit) = self.max_results else {
             return Ok(());
         };
-        if n > 0 && self.collected.fetch_add(n, AtomicOrdering::Relaxed) + n > limit {
-            return Err(TooManyResults { limit }.into());
-        }
+        self.collected
+            .try_update(AtomicOrdering::Relaxed, AtomicOrdering::Relaxed, |n| {
+                (n < limit).then(|| n + 1)
+            })
+            .map_err(|_| TooManyResults { limit })?;
         Ok(())
     }
 
@@ -540,9 +619,7 @@ impl<'a> Engine<'a> {
                     if i % 256 == 0 {
                         self.check_limits()?;
                     }
-                    let before = out.results.len();
                     self.validate_focus(si, f, &mut out, &mut cx)?;
-                    self.count_results(out.results.len() - before)?;
                 }
                 Ok(out.results)
             };
@@ -569,7 +646,9 @@ impl<'a> Engine<'a> {
     pub(crate) fn focus_nodes(&self, si: ShapeId) -> Result<Vec<Id>> {
         let mut out = Vec::new();
         let mut seen = FxHashSet::default();
+        let check = || self.check_data_scan();
         for t in &self.shapes.shapes[si].targets {
+            self.check_limits()?;
             let nodes = match *t {
                 Target::Node(t) => vec![self.id(t)],
                 Target::Expr(e) => {
@@ -579,9 +658,9 @@ impl<'a> Engine<'a> {
                     let mut cx = Cx::default();
                     self.eval(e, focus, &Scope::default(), &mut cx)?
                 }
-                Target::Class(c) => self.data.instances(self.id(c))?,
-                Target::SubjectsOf(p) => self.data.subjects_of(self.id(p))?,
-                Target::ObjectsOf(p) => self.data.objects_of(self.id(p))?,
+                Target::Class(c) => self.data.instances_checked(self.id(c), check)?,
+                Target::SubjectsOf(p) => self.data.subjects_of_checked(self.id(p), check)?,
+                Target::ObjectsOf(p) => self.data.objects_of_checked(self.id(p), check)?,
                 Target::Where(w) => {
                     let mut cx = Cx::default();
                     let mut out = Vec::new();
@@ -597,6 +676,7 @@ impl<'a> Engine<'a> {
                 }
             };
             for n in nodes {
+                self.check_limits()?;
                 if seen.insert(n) {
                     out.push(n);
                 }
@@ -606,7 +686,9 @@ impl<'a> Engine<'a> {
     }
 
     pub(crate) fn is_target(&self, si: ShapeId, f: Id) -> Result<bool> {
+        let check = || self.check_data_scan();
         for t in &self.shapes.shapes[si].targets {
+            self.check_limits()?;
             let hit = match *t {
                 Target::Node(t) => self.id(t) == f,
                 Target::Expr(e) => {
@@ -615,9 +697,13 @@ impl<'a> Engine<'a> {
                     self.eval(e, focus, &Scope::default(), &mut Cx::default())?
                         .contains(&f)
                 }
-                Target::Class(c) => self.data.is_instance(f, self.id(c))?,
-                Target::SubjectsOf(p) => !self.data.objects(f, self.id(p))?.is_empty(),
-                Target::ObjectsOf(p) => !self.data.subjects(self.id(p), f)?.is_empty(),
+                Target::Class(c) => self.data.is_instance_checked(f, self.id(c), check)?,
+                Target::SubjectsOf(p) => {
+                    !self.data.objects_checked(f, self.id(p), check)?.is_empty()
+                }
+                Target::ObjectsOf(p) => {
+                    !self.data.subjects_checked(self.id(p), f, check)?.is_empty()
+                }
                 // a node that conforms is one of the candidates; those of a narrowed
                 // set are nodes of the data graph
                 Target::Where(w) => {
@@ -637,6 +723,7 @@ impl<'a> Engine<'a> {
 
     /// The nodes that may conform to shape `si` (see [`Shapes::candidates`]).
     pub(crate) fn candidates(&self, si: ShapeId) -> Result<Vec<Id>> {
+        let check = || self.check_data_scan();
         let pred = |p: &NamedNode| {
             self.data
                 .snap
@@ -644,11 +731,12 @@ impl<'a> Engine<'a> {
                 .unwrap_or(Id::local(u64::MAX >> 8))
         };
         Ok(match self.shapes.candidates(si) {
-            Candidates::All => self.data.nodes()?,
-            Candidates::Instances(c) => self.data.instances(self.id(c))?,
+            Candidates::All => self.data.nodes_checked(check)?,
+            Candidates::Instances(c) => self.data.instances_checked(self.id(c), check)?,
             Candidates::Terms(ts) => {
                 let mut out = Vec::new();
                 for t in ts {
+                    self.check_limits()?;
                     let id = self.id(t);
                     if self.is_node(id)? && !out.contains(&id) {
                         out.push(id);
@@ -656,36 +744,29 @@ impl<'a> Engine<'a> {
                 }
                 out
             }
-            Candidates::SubjectsOf(p) => self.data.subjects_of(pred(&p))?,
-            Candidates::ObjectsOf(p) => self.data.objects_of(pred(&p))?,
+            Candidates::SubjectsOf(p) => self.data.subjects_of_checked(pred(&p), check)?,
+            Candidates::ObjectsOf(p) => self.data.objects_of_checked(pred(&p), check)?,
         })
     }
 
     /// Whether `n` is a node of the data graph (the subject or object of a triple).
     fn is_node(&self, n: Id) -> Result<bool> {
-        if matches!(
-            n.tag(),
-            sparkles_core::id::Tag::Local | sparkles_core::id::Tag::Undef
-        ) {
-            return Ok(false);
-        }
-        let mut found = false;
-        self.data.scan_out_edges(n, |_, _| {
-            found = true;
-            false
-        })?;
-        if !found {
-            found = self.data.has_in_edge(n)?;
-        }
-        Ok(found)
+        Ok(self.data.has_node_checked(n, || self.check_data_scan())?)
     }
 
     /// Value nodes of a shape for a focus node.
     pub fn value_nodes(&self, si: ShapeId, focus: Id) -> Result<Vec<Id>> {
         match &self.paths[si] {
-            Some(p) => p.eval(self.data, focus),
+            Some(path) => self.eval_path(path, focus),
             None => Ok(vec![focus]),
         }
+    }
+
+    pub(crate) fn eval_path(&self, path: &CPath, node: Id) -> Result<Vec<Id>> {
+        if !self.controls.active() {
+            return path.eval(self.data, node);
+        }
+        path.eval_checked(self.data, node, || self.check_data_scan())
     }
 
     pub(crate) fn validate_focus(
@@ -712,8 +793,18 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
+    fn objects(&self, subject: Id, predicate: Id) -> sparkles_core::Result<Vec<Id>> {
+        if self.controls.active() {
+            self.data
+                .objects_checked(subject, predicate, || self.check_data_scan())
+        } else {
+            self.data.objects(subject, predicate)
+        }
+    }
+
     /// Does `v` conform to shape `si`?
     pub(crate) fn conforms(&self, si: ShapeId, v: Id, cx: &mut Cx) -> Result<bool> {
+        self.check_limits()?;
         if cx.stack.contains(&(si, v)) || self.deactivated_at(si, v, cx)? {
             return Ok(true);
         }
@@ -725,9 +816,12 @@ impl<'a> Engine<'a> {
         }
         cx.stack.push((si, v));
         let mut out = Out::probe();
+        #[cfg(test)]
+        control_tests::observe_conformance_probe();
         let r = self.validate_focus(si, v, &mut out, cx);
         cx.stack.pop();
         r?;
+        self.check_limits()?;
         Ok(!out.failed)
     }
 
@@ -806,7 +900,7 @@ impl<'a> Engine<'a> {
             let d = default();
             if d.is_empty() { Vec::new() } else { msg(d) }
         };
-        out.results.push(ValidationResult {
+        let result = ValidationResult {
             focus_node: focus,
             result_path,
             value,
@@ -816,7 +910,9 @@ impl<'a> Engine<'a> {
             severity: shape.severity.clone(),
             messages,
             details: Vec::new(),
-        });
+        };
+        self.admit_result(&result)?;
+        out.results.push(result);
         Ok(())
     }
 
@@ -848,8 +944,8 @@ impl<'a> Engine<'a> {
             if members.len() % 4096 == 4095 {
                 self.check_limits()?;
             }
-            let firsts = self.data.objects(n, first)?;
-            let rests = self.data.objects(n, rest)?;
+            let firsts = self.objects(n, first)?;
+            let rests = self.objects(n, rest)?;
             if n == nil {
                 return Ok((firsts.is_empty() && rests.is_empty()).then_some(members));
             }
@@ -934,7 +1030,12 @@ impl<'a> Engine<'a> {
                 let cid = self.id(*cls);
                 each_value!(
                     v,
-                    self.data.is_instance(v, cid)?,
+                    if self.controls.active() {
+                        self.data
+                            .is_instance_checked(v, cid, || self.check_data_scan())?
+                    } else {
+                        self.data.is_instance(v, cid)?
+                    },
                     format!(
                         "ClassConstraint[{}]: Expected class {} for {}",
                         self.shapes.term(*cls),
@@ -1088,7 +1189,7 @@ impl<'a> Engine<'a> {
                 }
             }
             Constraint::Equals(p) => {
-                let others = self.data.objects(focus, self.id(*p))?;
+                let others = self.objects(focus, self.id(*p))?;
                 let pt = self.shapes.term(*p);
                 for &v in values {
                     if !others.contains(&v) {
@@ -1112,7 +1213,7 @@ impl<'a> Engine<'a> {
                 }
             }
             Constraint::Disjoint(p) => {
-                let others = self.data.objects(focus, self.id(*p))?;
+                let others = self.objects(focus, self.id(*p))?;
                 let pt = self.shapes.term(*p);
                 each_value!(
                     v,
@@ -1122,7 +1223,7 @@ impl<'a> Engine<'a> {
             }
             Constraint::LessThan(p) | Constraint::LessThanOrEquals(p) => {
                 let or_eq = matches!(c, Constraint::LessThanOrEquals(_));
-                let others = self.data.objects(focus, self.id(*p))?;
+                let others = self.objects(focus, self.id(*p))?;
                 let pt = self.shapes.term(*p);
                 for &v in values {
                     let vv = self.data.value(v);
@@ -1265,7 +1366,12 @@ impl<'a> Engine<'a> {
             Constraint::Closed { allowed, .. } => {
                 let allowed: Vec<Id> = allowed.iter().map(|t| self.id(*t)).collect();
                 for &v in values {
-                    for (p, o) in self.data.out_edges(v)? {
+                    let edges = if self.controls.active() {
+                        self.data.out_edges_checked(v, || self.check_data_scan())?
+                    } else {
+                        self.data.out_edges(v)?
+                    };
+                    for (p, o) in edges {
                         if !allowed.contains(&p) {
                             self.report(
                                 out,
@@ -1561,6 +1667,748 @@ mod control_tests {
     use sparkles_core::io::{RdfFormat, Source};
     use sparkles_core::store::{Store, StoreOptions};
 
+    thread_local! {
+        static EXPIRE_IN_CONFORMANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub(super) fn observe_conformance_probe() {
+        if EXPIRE_IN_CONFORMANCE.replace(false) {
+            crate::data::set_deadline_checks_left(Some(16));
+        }
+    }
+
+    #[test]
+    fn conformance_target_probes_poll_excluded_and_deleted_adjacency() {
+        use crate::vocab::{SH_NS, SHNEX_NS};
+        use sparkles_core::index::Perm;
+        use std::fmt::Write;
+
+        let store = Store::in_memory(StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        });
+        let mut input = String::from("<urn:x> <urn:keep> <urn:o> .\n<urn:x> <urn:bad> <urn:o> .\n");
+        for i in 0..4096 {
+            writeln!(input, "<urn:x> <urn:hidden> <urn:o:{i}> <urn:excluded> .").unwrap();
+        }
+        store
+            .load(&[Source::from_bytes(
+                input.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let before = store.snapshot();
+        let excluded = before.lookup_iri("urn:excluded").unwrap();
+        let mut tx = store.write();
+        for key in before.scan_keys(Perm::Gspo, &[excluded.0]).unwrap() {
+            assert!(tx.delete(Perm::Gspo.to_quad(&key)).unwrap());
+        }
+        tx.commit().unwrap();
+        let after = store.snapshot();
+        assert_eq!(after.delta.deletes(), 4096);
+        let opts = ValidateOptions {
+            data_graph: Some(sparkles_core::sparql::ctx::UNION_GRAPH_IRI.into()),
+            exclude_graphs: vec!["urn:excluded".into()],
+            deadline: Instant::now().checked_add(Duration::from_secs(60)),
+            parallel: false,
+            ..Default::default()
+        };
+        let mut misses = Vec::new();
+        for (target, expected_len) in [
+            ("sh:targetWhere <urn:probe>", 0),
+            ("sh:targetNode [ shnex:nodesMatching <urn:probe> ]", 0),
+            (
+                "sh:targetNode [ shnex:conformsToShape ( <urn:x> <urn:probe> ) ]",
+                1,
+            ),
+        ] {
+            let shapes = Shapes::parse_for_gate(
+                &format!(
+                    "@prefix sh: <{SH_NS}> . @prefix shnex: <{SHNEX_NS}> .
+                     <urn:S> {target} .
+                     <urn:probe> sh:hasValue <urn:x> ; sh:closed true ;
+                         sh:ignoredProperties ( <urn:keep> ) ."
+                ),
+                RdfFormat::Turtle,
+                None,
+                None,
+            )
+            .unwrap();
+            let si = shapes.by_node[&Term::from(NamedNode::new_unchecked("urn:S"))];
+            for snap in [&before, &after] {
+                let (data, ids) = DataGraph::new(
+                    snap.clone(),
+                    opts.data_graph.as_deref(),
+                    &opts.extra_graphs,
+                    &opts.exclude_graphs,
+                    &shapes,
+                )
+                .unwrap();
+                let engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
+                assert_eq!(engine.focus_nodes(si).unwrap().len(), expected_len);
+                let _clock = crate::data::ScopedDeadlineChecks::expire_after(100);
+                EXPIRE_IN_CONFORMANCE.set(true);
+                let result = engine.focus_nodes(si);
+                assert!(
+                    !EXPIRE_IN_CONFORMANCE.replace(false),
+                    "{target} never entered conforms"
+                );
+                if !matches!(
+                    result.as_ref().err().and_then(|e| e.downcast_ref()),
+                    Some(sparkles_core::Error::Timeout)
+                ) {
+                    misses.push(format!(
+                        "{target} with {} tombstones missed timeout: {result:?}",
+                        snap.delta.deletes()
+                    ));
+                }
+            }
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    #[test]
+    fn controlled_target_probes_check_class_comparison_and_list_reads() {
+        use crate::vocab::{SH_NS, SHNEX_NS, rdf};
+        use std::fmt::Write;
+
+        for (constraint, predicate) in [
+            ("sh:class <urn:MissingClass>", rdf::TYPE.as_str()),
+            ("sh:equals <urn:compared>", "urn:compared"),
+            ("sh:minListLength 1", rdf::FIRST.as_str()),
+        ] {
+            let store = Store::in_memory(StoreOptions {
+                bulk_threshold: 1,
+                ..Default::default()
+            });
+            let mut input = String::from("<urn:x> <urn:keep> <urn:o> .\n");
+            for i in 0..4096 {
+                writeln!(input, "<urn:x> <{predicate}> <urn:o:{i}> <urn:hidden> .").unwrap();
+            }
+            store
+                .load(&[Source::from_bytes(
+                    input.into_bytes(),
+                    RdfFormat::NQuads,
+                    None,
+                )])
+                .unwrap();
+            let snap = store.snapshot();
+            let shapes = Shapes::parse_for_gate(
+                &format!(
+                    "@prefix sh: <{SH_NS}> . @prefix shnex: <{SHNEX_NS}> .
+                     <urn:S> sh:targetNode [
+                         shnex:conformsToShape ( <urn:x> <urn:probe> )
+                     ] .
+                     <urn:probe> {constraint} ."
+                ),
+                RdfFormat::Turtle,
+                None,
+                None,
+            )
+            .unwrap();
+            let si = shapes.by_node[&Term::from(NamedNode::new_unchecked("urn:S"))];
+            let opts = ValidateOptions {
+                data_graph: Some(sparkles_core::sparql::ctx::UNION_GRAPH_IRI.into()),
+                exclude_graphs: vec!["urn:hidden".into()],
+                deadline: Instant::now().checked_add(Duration::from_secs(60)),
+                ..Default::default()
+            };
+            let (data, ids) = DataGraph::new(
+                snap,
+                opts.data_graph.as_deref(),
+                &[],
+                &opts.exclude_graphs,
+                &shapes,
+            )
+            .unwrap();
+            let engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
+            let false_node = engine.lit_id(&Literal::from(false).into());
+            assert_eq!(
+                engine.focus_nodes(si).unwrap(),
+                [false_node],
+                "{constraint}"
+            );
+            let _clock = crate::data::ScopedDeadlineChecks::expire_after(100);
+            EXPIRE_IN_CONFORMANCE.set(true);
+            let result = engine.focus_nodes(si);
+            assert!(!EXPIRE_IN_CONFORMANCE.replace(false), "{constraint}");
+            assert!(
+                matches!(
+                    result.as_ref().err().and_then(|e| e.downcast_ref()),
+                    Some(sparkles_core::Error::Timeout)
+                ),
+                "{constraint}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn checked_graph_plans_keep_public_shacl_graph_answers() {
+        use sparkles_core::sparql::QueryOptions;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:x> <urn:p> 1 .
+              <urn:x> { <urn:x> <urn:p> 2 . }
+              <urn:excluded> { <urn:x> <urn:p> 3 . }
+              _:named { <urn:x> <urn:q> 4 . }"
+                    .to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let opts = ValidateOptions {
+            exclude_graphs: vec!["urn:excluded".into()],
+            parallel: false,
+            ..Default::default()
+        };
+        for (query, expected) in [
+            ("SELECT $this ?value { GRAPH ?value {} }", 3),
+            (
+                "SELECT $this ?value { GRAPH ?value { OPTIONAL { $this <urn:p> ?o } FILTER (!BOUND(?value)) } }",
+                3,
+            ),
+            (
+                "SELECT $this ?value { GRAPH $this { $this <urn:p> ?value } }",
+                1,
+            ),
+            (
+                "SELECT $this ?value { GRAPH <urn:excluded> { $this <urn:p> ?value } }",
+                1,
+            ),
+            (
+                "SELECT $this ?value { GRAPH <urn:x-arq:DefaultGraph> { $this <urn:p> ?value } }",
+                1,
+            ),
+            (
+                "SELECT $this ?value { GRAPH <urn:x-arq:UnionGraph> { $this <urn:p> ?value } }",
+                2,
+            ),
+        ] {
+            let shape = format!(
+                "@prefix sh: <http://www.w3.org/ns/shacl#> .
+                 <urn:S> sh:targetNode <urn:x> ; sh:sparql [ sh:select '{query}' ] ."
+            );
+            let shapes = Shapes::parse(&shape, RdfFormat::Turtle, None).unwrap();
+            let ordinary = validate(&snap, &shapes, &opts).unwrap();
+            assert_eq!(ordinary.results.len(), expected, "{query}");
+            let checked =
+                validate_controlled(&snap, &shapes, &opts, &QueryOptions::default(), None).unwrap();
+            assert_eq!(checked, ordinary, "{query}");
+            assert!(
+                Shapes::parse_for_gate(&shape, RdfFormat::Turtle, None, None).is_err(),
+                "{query}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_setup_uses_the_earlier_deadline_and_preserves_absolute_on_overflow() {
+        let now = Instant::now();
+        let absolute = now + Duration::from_secs(120);
+        let mut opts = ValidateOptions {
+            deadline: Some(absolute),
+            timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        };
+        let deadline = ValidationControls::new(&opts).deadline.unwrap();
+        assert!(deadline >= now + Duration::from_secs(60) && deadline < absolute);
+        opts.deadline = Some(now);
+        assert_eq!(ValidationControls::new(&opts).deadline, Some(now));
+        opts.timeout = Some(Duration::MAX);
+        assert_eq!(ValidationControls::new(&opts).deadline, Some(now));
+    }
+
+    #[test]
+    fn controlled_public_named_graph_planning_obeys_memory_cap() {
+        use sparkles_core::error::{Budget, BudgetKind};
+        use sparkles_core::sparql::{QueryOptions, ctx::DEFAULT_GRAPH_IRI};
+        use std::fmt::Write;
+        use std::sync::atomic::AtomicU64;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let mut data = String::from("<urn:focus> <urn:p> <urn:o> .\n");
+        for i in 0..4096 {
+            writeln!(data, "<urn:focus> <urn:p> <urn:o> <urn:g:{i}> .").unwrap();
+        }
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let opts = ValidateOptions {
+            data_graph: Some(DEFAULT_GRAPH_IRI.into()),
+            parallel: false,
+            ..Default::default()
+        };
+        let max_memory_bytes = Some(24 * 1024);
+        let baseline = Shapes::parse(
+            "@prefix sh: <http://www.w3.org/ns/shacl#> .
+             <urn:S> sh:targetNode <urn:focus> ;
+                 sh:sparql [ sh:select 'SELECT $this WHERE {} LIMIT 1' ] .",
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let baseline_query = QueryOptions {
+            max_memory_bytes,
+            ..Default::default()
+        };
+        let control = validate_controlled(&snap, &baseline, &opts, &baseline_query, None).unwrap();
+        assert_eq!(
+            control.results.len(),
+            1,
+            "the tight cap must admit checked setup"
+        );
+        let mut misses = Vec::new();
+        for group in ["", "OPTIONAL { <urn:focus> <urn:p> ?o }"] {
+            let shapes = Shapes::parse(
+                &format!(
+                    "@prefix sh: <http://www.w3.org/ns/shacl#> .
+                     <urn:S> sh:targetNode <urn:focus> ;
+                         sh:sparql [ sh:select 'SELECT $this WHERE {{ GRAPH ?g {{ {group} }} }} LIMIT 1' ] ."
+                ),
+                RdfFormat::Turtle,
+                None,
+            )
+            .unwrap();
+            let generous = QueryOptions {
+                max_memory_bytes: Some(64 << 20),
+                ..Default::default()
+            };
+            let result = validate_controlled(&snap, &shapes, &opts, &generous, None).unwrap();
+            assert_eq!(result.results.len(), 1, "{group}");
+            let work = Arc::new(AtomicU64::new(0));
+            let tight = QueryOptions {
+                max_memory_bytes,
+                max_rows_produced: Some(1 << 20),
+                work: Some(work.clone()),
+                ..Default::default()
+            };
+            crate::sparql::take_embedded_plans();
+            let result = validate_controlled(&snap, &shapes, &opts, &tight, None);
+            let planned = crate::sparql::take_embedded_plans();
+            let produced = work.load(AtomicOrdering::Relaxed);
+            if !matches!(
+                result.as_ref().err().and_then(|e| e.downcast_ref()),
+                Some(sparkles_core::Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::Memory,
+                    ..
+                }))
+            ) || produced != 0
+                || planned != 0
+            {
+                misses.push(format!(
+                    "GRAPH {{ {group} }} did not refuse during preparation: {result:?}, produced {produced}, completed plans {planned}"
+                ));
+            }
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    #[test]
+    fn controlled_public_graph_r12_refuses_wide_exists_during_preparation() {
+        use sparkles_core::error::{Budget, BudgetKind};
+        use sparkles_core::sparql::QueryOptions;
+        use std::sync::atomic::AtomicU64;
+
+        let store = Store::in_memory(StoreOptions::default());
+        store
+            .load(&[Source::from_bytes(
+                b"<urn:focus> <urn:p> <urn:o> .
+                  <urn:g:0> { <urn:focus> <urn:p> <urn:o> . }
+                  <urn:g:1> { <urn:focus> <urn:p> <urn:o> . }"
+                    .to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let expr = format!(
+            "<urn:missing> <urn:p> \"{}\" . <urn:missing> <urn:q> \"{}\" .",
+            "L".repeat(65_521),
+            "M".repeat(65_519),
+        );
+        let shape = format!(
+            "@prefix sh: <http://www.w3.org/ns/shacl#> .
+             <urn:S> sh:targetNode <urn:focus> ;
+             sh:sparql [ sh:select '''SELECT $this WHERE {{
+               GRAPH ?g {{ BIND(EXISTS {{ {expr} }} AS ?hit) }}
+             }} LIMIT 1''' ] ."
+        );
+        let snap = store.snapshot();
+        let shapes = Shapes::parse(&shape, RdfFormat::Turtle, None).unwrap();
+        let opts = ValidateOptions {
+            parallel: false,
+            ..Default::default()
+        };
+        let ordinary = validate(&snap, &shapes, &opts).unwrap();
+        assert_eq!(ordinary.results.len(), 1);
+        let generous = QueryOptions {
+            max_memory_bytes: Some(8 << 20),
+            ..Default::default()
+        };
+        let checked = validate_controlled(&snap, &shapes, &opts, &generous, None).unwrap();
+        assert_eq!(checked, ordinary);
+        let rows = Arc::new(AtomicU64::new(0));
+        let tight = QueryOptions {
+            max_memory_bytes: Some(24 * 1024),
+            max_rows_produced: Some(1 << 20),
+            work: Some(rows.clone()),
+            ..Default::default()
+        };
+        crate::sparql::take_embedded_plans();
+        let result = validate_controlled(&snap, &shapes, &opts, &tight, None);
+        let planned = crate::sparql::take_embedded_plans();
+        let produced = rows.load(AtomicOrdering::Relaxed);
+        assert!(
+            matches!(
+                result.as_ref().err().and_then(|error| error.downcast_ref()),
+                Some(sparkles_core::Error::BudgetExceeded(Budget {
+                    kind: BudgetKind::Memory,
+                    ..
+                }))
+            ) && planned == 0
+                && produced == 0,
+            "wide GRAPH syntax reached execution: {result:?}, completed plans {planned}, produced {produced}"
+        );
+    }
+
+    #[test]
+    fn controlled_public_setup_observes_cancellation_and_relative_timeout() {
+        use sparkles_core::sparql::QueryOptions;
+        use std::fmt::Write;
+
+        let store = Store::in_memory(StoreOptions::default());
+        let snap = store.snapshot();
+        let mut input = String::from("@prefix sh: <http://www.w3.org/ns/shacl#> .\n");
+        for i in 0..1024 {
+            writeln!(input, "<urn:S> sh:targetNode <urn:target:{i}> .").unwrap();
+        }
+        let shapes = Shapes::parse(&input, RdfFormat::Turtle, None).unwrap();
+        assert!(shapes.terms.len() >= 1024);
+        let mut misses = Vec::new();
+        for source in ["legacy", "linked", "relative"] {
+            let flag = Arc::new(AtomicBool::new(source == "legacy"));
+            let opts = ValidateOptions {
+                cancel: (source == "legacy").then(|| flag.clone()),
+                cancellation: (source == "linked")
+                    .then(|| sparkles_core::task::Cancellation::from_flags([flag.clone()])),
+                timeout: (source == "relative").then_some(Duration::ZERO),
+                parallel: false,
+                ..Default::default()
+            };
+            crate::data::observe_mapping_with((source == "linked").then(|| flag.clone()));
+            let result = validate_controlled(&snap, &shapes, &opts, &QueryOptions::default(), None);
+            let visited = crate::data::mapped_terms();
+            crate::data::observe_mapping_with(None);
+            let typed = result.as_ref().err().and_then(|e| e.downcast_ref());
+            let passed = match source {
+                "relative" => matches!(typed, Some(sparkles_core::Error::Timeout)) && visited == 0,
+                "legacy" => matches!(typed, Some(sparkles_core::Error::Cancelled)) && visited == 0,
+                _ => {
+                    matches!(typed, Some(sparkles_core::Error::Cancelled))
+                        && (5..=256).contains(&visited)
+                }
+            };
+            if !passed {
+                misses.push(format!("{source} mapped {visited} terms: {result:?}"));
+            }
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    #[test]
+    fn embedded_queries_keep_physical_default_and_named_graph_access() {
+        use sparkles_core::sparql::ctx::DEFAULT_GRAPH_IRI;
+        let store = Store::in_memory(StoreOptions {
+            union_default_graph: true,
+            ..Default::default()
+        });
+        store
+            .load(&[Source::from_bytes(
+                br#"@prefix sh: <http://www.w3.org/ns/shacl#> .
+                    <urn:x> <urn:p> "default" .
+                    _:g { <urn:x> <urn:p> "blank", "default" . }
+                    <urn:extra> { <urn:x> <urn:p> "extra" . }
+                    <urn:shapes> {
+                        <urn:x> <urn:p> "shapes" .
+                        <urn:S> sh:targetNode <urn:x> ;
+                            sh:sparql [
+                                sh:select '''SELECT $this ?value {
+                                    $this <urn:p> ?value .
+                                    GRAPH $shapesGraph { $this <urn:p> "shapes" }
+                                }'''
+                            ] .
+                    }"#
+                .to_vec(),
+                RdfFormat::TriG,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let shapes = Shapes::from_store(&snap, Some("urn:shapes")).unwrap();
+        let queries = sparkles_core::sparql::QueryOptions {
+            max_memory_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        for (selection, extra, exclude, expected) in [
+            (
+                None,
+                vec![],
+                vec!["urn:shapes"],
+                vec!["blank", "default", "extra"],
+            ),
+            (Some("urn:extra"), vec![], vec![], vec!["extra"]),
+            (
+                Some(DEFAULT_GRAPH_IRI),
+                vec!["urn:extra"],
+                vec![],
+                vec!["default", "extra"],
+            ),
+            (
+                Some(DEFAULT_GRAPH_IRI),
+                vec![],
+                vec![DEFAULT_GRAPH_IRI],
+                vec![],
+            ),
+        ] {
+            let opts = ValidateOptions {
+                data_graph: selection.map(str::to_owned),
+                extra_graphs: extra.into_iter().map(str::to_owned).collect(),
+                exclude_graphs: exclude.into_iter().map(str::to_owned).collect(),
+                ..Default::default()
+            };
+            let mut values = validate_controlled(&snap, &shapes, &opts, &queries, None)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|r| match r.value.unwrap() {
+                    Term::Literal(literal) => literal.value().to_owned(),
+                    term => panic!("expected a literal result, got {term}"),
+                })
+                .collect::<Vec<_>>();
+            values.sort();
+            assert_eq!(values, expected, "{selection:?}");
+        }
+    }
+
+    #[test]
+    fn target_scan_expires_inside_excluded_or_deleted_rows() {
+        let (_store, before, after, _) = crate::data::scan_fixture();
+        for target in ["targetSubjectsOf", "targetObjectsOf"] {
+            let shapes = Shapes::parse(
+                &format!("<urn:S> <http://www.w3.org/ns/shacl#{target}> <urn:p> ."),
+                RdfFormat::Turtle,
+                None,
+            )
+            .unwrap();
+            for snap in [&before, &after] {
+                let deadline = Instant::now().checked_add(Duration::from_secs(60));
+                let opts = ValidateOptions {
+                    data_graph: Some(sparkles_core::sparql::ctx::UNION_GRAPH_IRI.into()),
+                    exclude_graphs: vec!["urn:shapes".into()],
+                    deadline,
+                    parallel: false,
+                    ..Default::default()
+                };
+                let (data, ids) = DataGraph::new(
+                    snap.clone(),
+                    opts.data_graph.as_deref(),
+                    &opts.extra_graphs,
+                    &opts.exclude_graphs,
+                    &shapes,
+                )
+                .unwrap();
+                let engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
+                assert!(engine.focus_nodes(0).unwrap().is_empty());
+                let _clock = crate::data::ScopedDeadlineChecks::expire_after(8);
+                let result = engine.focus_nodes(0);
+                assert!(
+                    matches!(
+                        result.as_ref().err().and_then(|e| e.downcast_ref()),
+                        Some(sparkles_core::Error::Timeout)
+                    ),
+                    "{target} finished without a raw-scan timeout: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn target_expression_expires_inside_excluded_and_deleted_rows() {
+        use crate::vocab::{SH_NS, SHNEX_NS, rdf};
+        use sparkles_core::index::Perm;
+        use std::fmt::Write;
+
+        let store = Store::in_memory(StoreOptions {
+            bulk_threshold: 1,
+            ..Default::default()
+        });
+        let mut input = String::new();
+        for i in 0..4096 {
+            writeln!(
+                input,
+                "<urn:fixed> <urn:p> <urn:o:{i}> <urn:excluded> .
+                 <urn:s:{i}> {} <urn:Class> <urn:excluded> .",
+                rdf::TYPE
+            )
+            .unwrap();
+        }
+        store
+            .load(&[Source::from_bytes(
+                input.into_bytes(),
+                RdfFormat::NQuads,
+                None,
+            )])
+            .unwrap();
+        let before = store.snapshot();
+        assert_eq!(before.delta.inserts(), 0);
+        let graph = before.lookup_iri("urn:excluded").unwrap();
+        let mut tx = store.write();
+        for key in before.scan_keys(Perm::Gspo, &[graph.0]).unwrap() {
+            assert!(tx.delete(Perm::Gspo.to_quad(&key)).unwrap());
+        }
+        tx.commit().unwrap();
+        let after = store.snapshot();
+        assert_eq!(after.delta.deletes(), 8192);
+        let mut misses = Vec::new();
+        for expression in [
+            "shnex:pathValues <urn:p> ; shnex:focusNode <urn:fixed>",
+            "shnex:instancesOf <urn:Class>",
+        ] {
+            let shapes = Shapes::parse_for_gate(
+                &format!(
+                    "@prefix sh: <{SH_NS}> .
+                     @prefix shnex: <{SHNEX_NS}> .
+                     <urn:S> sh:targetNode [ {expression} ] ."
+                ),
+                RdfFormat::Turtle,
+                None,
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                shapes.shapes[0].targets.as_slice(),
+                [Target::Expr(_)]
+            ));
+            let opts = ValidateOptions {
+                data_graph: Some(sparkles_core::sparql::ctx::UNION_GRAPH_IRI.into()),
+                exclude_graphs: vec!["urn:excluded".into()],
+                deadline: Instant::now().checked_add(Duration::from_secs(60)),
+                parallel: false,
+                ..Default::default()
+            };
+            for snap in [&before, &after] {
+                let (data, ids) = DataGraph::new(
+                    snap.clone(),
+                    opts.data_graph.as_deref(),
+                    &opts.extra_graphs,
+                    &opts.exclude_graphs,
+                    &shapes,
+                )
+                .unwrap();
+                let engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
+                assert!(engine.focus_nodes(0).unwrap().is_empty());
+                let _clock = crate::data::ScopedDeadlineChecks::expire_after(16);
+                let result = engine.focus_nodes(0);
+                if !matches!(
+                    result.as_ref().err().and_then(|e| e.downcast_ref()),
+                    Some(sparkles_core::Error::Timeout)
+                ) {
+                    misses.push(format!(
+                        "{expression} with {} tombstones finished without a raw-scan timeout: {result:?}",
+                        snap.delta.deletes()
+                    ));
+                }
+            }
+        }
+        assert!(misses.is_empty(), "{}", misses.join("\n"));
+    }
+
+    #[test]
+    fn engine_setup_checks_inside_wide_path_translation() {
+        use crate::vocab::SH_NS;
+        let list = vec!["<urn:p>"; 1024].join(" ");
+        let shapes = Shapes::parse_for_gate(
+            &format!(
+                "@prefix sh: <{SH_NS}> .
+                 <urn:S> sh:targetNode <urn:x> ; sh:path ({list}) ."
+            ),
+            RdfFormat::Turtle,
+            None,
+            None,
+        )
+        .unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let (data, ids) = DataGraph::new(store.snapshot(), None, &[], &[], &shapes).unwrap();
+        let deadline = Instant::now().checked_add(Duration::from_secs(60));
+        let opts = ValidateOptions {
+            deadline,
+            ..Default::default()
+        };
+        let engine = Engine::new(&shapes, &data, ids.clone(), &opts).unwrap();
+        assert!(matches!(engine.paths[0].as_ref(), Some(CPath::Seq(paths)) if paths.len() == 1024));
+        let observed = crate::path::ObservePathCompile::start();
+        let result = Engine::new(&shapes, &data, ids, &opts);
+        let visited = observed.count();
+        assert!(
+            matches!(
+                result.as_ref().err().and_then(|e| e.downcast_ref()),
+                Some(sparkles_core::Error::Timeout)
+            ),
+            "wide path setup finished after translating {visited} predicates"
+        );
+        assert!(
+            (5..=6).contains(&visited),
+            "translated {visited} predicates"
+        );
+    }
+
+    #[test]
+    fn controlled_setup_cancels_during_physical_path_translation() {
+        use crate::path::ObservePathCompile;
+        use crate::vocab::SH_NS;
+        use sparkles_core::sparql::QueryOptions;
+
+        let list = vec!["<urn:p>"; 1024].join(" ");
+        let shapes = Shapes::parse(
+            &format!(
+                "@prefix sh: <{SH_NS}> .
+                 <urn:S> sh:targetNode <urn:x> ; sh:path ({list}) ."
+            ),
+            RdfFormat::Turtle,
+            None,
+        )
+        .unwrap();
+        let store = Store::in_memory(StoreOptions::default());
+        let flag = Arc::new(AtomicBool::new(false));
+        let opts = ValidateOptions {
+            cancellation: Some(sparkles_core::task::Cancellation::from_flags(
+                [flag.clone()],
+            )),
+            ..Default::default()
+        };
+        let observed = ObservePathCompile::cancel_during_compile(flag);
+        let result = validate_controlled(
+            &store.snapshot(),
+            &shapes,
+            &opts,
+            &QueryOptions::default(),
+            None,
+        );
+        assert!(matches!(
+            result.as_ref().err().and_then(|e| e.downcast_ref()),
+            Some(sparkles_core::Error::Cancelled)
+        ));
+        assert_eq!(observed.count(), 5);
+    }
+
     #[test]
     fn operation_controls_reach_engine_and_sparql_context() {
         let store = Store::in_memory(StoreOptions::default());
@@ -1586,37 +2434,47 @@ mod control_tests {
                 _ => None,
             })
             .unwrap();
-        for source in 0..4 {
-            let flag = Arc::new(AtomicBool::new(false));
-            let primary = Arc::new(AtomicBool::new(source == 1));
-            let opts = ValidateOptions {
-                cancel: Some(primary),
-                cancellation: Some(sparkles_core::task::Cancellation::from_flags(
-                    [flag.clone()],
-                )),
-                deadline: (source == 2).then(Instant::now),
-                timeout: (source == 3).then_some(Duration::ZERO),
-                ..Default::default()
-            };
-            let (mut data, ids) = DataGraph::new(snap.clone(), None, &[], &[], &shapes).unwrap();
-            let focus = data.resolve(
-                &Term::NamedNode(NamedNode::new_unchecked("urn:focus")),
-                false,
-            );
-            let engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
-            if source == 0 {
+        for controlled in [false, true] {
+            for source in 0..3 {
+                let flag = Arc::new(AtomicBool::new(false));
+                let primary = Arc::new(AtomicBool::new(false));
+                let opts = ValidateOptions {
+                    cancel: Some(primary.clone()),
+                    cancellation: Some(sparkles_core::task::Cancellation::from_flags([
+                        flag.clone()
+                    ])),
+                    ..Default::default()
+                };
+                let (mut data, ids) =
+                    DataGraph::new(snap.clone(), None, &[], &[], &shapes).unwrap();
+                let focus = data.resolve(
+                    &Term::NamedNode(NamedNode::new_unchecked("urn:focus")),
+                    false,
+                );
+                let mut engine = Engine::new(&shapes, &data, ids, &opts).unwrap();
+                engine.query_limits = controlled.then(sparkles_core::sparql::QueryOptions::default);
                 assert!(engine.check_limits().is_ok());
-                flag.store(true, AtomicOrdering::Relaxed);
+                match source {
+                    0 => flag.store(true, AtomicOrdering::Relaxed),
+                    1 => primary.store(true, AtomicOrdering::Relaxed),
+                    _ => engine.controls.deadline = Some(Instant::now()),
+                }
+                let native = engine.check_limits().unwrap_err();
+                let query = engine
+                    .check_sparql(si, constraint, focus, &mut Out::collect())
+                    .unwrap_err();
+                for error in [native, query] {
+                    let typed = error.downcast_ref::<sparkles_core::Error>();
+                    assert!(
+                        if source < 2 {
+                            matches!(typed, Some(sparkles_core::Error::Cancelled))
+                        } else {
+                            matches!(typed, Some(sparkles_core::Error::Timeout))
+                        },
+                        "{error}"
+                    );
+                }
             }
-            let native = engine.check_limits().unwrap_err();
-            // check_sparql directly enters its query context, bypassing Engine's
-            // outer limit check, so this proves propagation to actual Ctx checks.
-            let query = engine
-                .check_sparql(si, constraint, focus, &mut Out::collect())
-                .unwrap_err();
-            let expected = if source < 2 { "cancel" } else { "timed out" };
-            assert!(native.to_string().contains(expected), "{native}");
-            assert!(query.to_string().contains(expected), "{query}");
         }
     }
 }

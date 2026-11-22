@@ -1,0 +1,306 @@
+diff --git a/crates/sparkles-owl/src/classify/dl_clause.rs b/crates/sparkles-owl/src/classify/dl_clause.rs
+index 2756dc1b..2fafe454 100644
+--- a/crates/sparkles-owl/src/classify/dl_clause.rs
++++ b/crates/sparkles-owl/src/classify/dl_clause.rs
+@@ -82,6 +82,12 @@ pub enum Made {
+ }
+ 
+ impl Lit {
++    /// The literal's bit of a signature, a union of such bits that a subset's union is
++    /// within.
++    #[inline]
++    pub(super) fn sig_bit(self) -> u64 {
++        1 << (self.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
++    }
+     #[inline]
+     pub fn y(a: Ex) -> Lit {
+         Lit((Y << KIND_SHIFT) | a as u64)
+@@ -408,9 +414,7 @@ impl Clause {
+     /// A signature of the literals: one bit for each, by a hash, so that a clause whose
+     /// signature has a bit that another's lacks does not subsume it.
+     pub fn sig(&self) -> u64 {
+-        self.lits.iter().fold(0, |s, l| {
+-            s | 1 << (l.0.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58)
+-        })
++        self.lits.iter().fold(0, |s, l| s | l.sig_bit())
+     }
+     /// Whether this clause subsumes `other`: its body and its head are subsets of
+     /// `other`'s.
+@@ -727,7 +731,9 @@ impl Rooted<'_> {
+ }
+ 
+ /// Whether sorted `a` is a subset of sorted `b`.
+-fn subset(a: &[Lit], b: &[Lit]) -> bool {
++/// Whether the sorted literals `a` without repeats are among the sorted literals `b`
++/// without repeats.
++pub(super) fn subset(a: &[Lit], b: &[Lit]) -> bool {
+     if a.len() > b.len() {
+         return false;
+     }
+@@ -940,8 +946,10 @@ impl Store {
+     pub fn add(&mut self, c: Clause) -> Option<usize> {
+         let sig = c.sig();
+         if self.subsumed(&c, sig) {
++            super::dl_rules::diag::add(4, 1);
+             return None;
+         }
++        super::dl_rules::diag::add(3, 1);
+         // the clauses it subsumes have every literal of its head
+         let every: Vec<u32>;
+         let weaker: &[u32] = match c.head().first() {
+diff --git a/crates/sparkles-owl/src/classify/dl_rules.rs b/crates/sparkles-owl/src/classify/dl_rules.rs
+index 8e6a18d5..c5b67ce0 100644
+--- a/crates/sparkles-owl/src/classify/dl_rules.rs
++++ b/crates/sparkles-owl/src/classify/dl_rules.rs
+@@ -513,6 +513,65 @@ impl DlIx {
+     }
+ }
+ 
++
++/// Diagnostics of the lane horn-cost, never committed: counters of the work of Tier D
++/// that `SPARKLES_DL_DIAG` prints at every doubling of the derived conclusions and when
++/// the run ends.
++pub mod diag {
++    use std::sync::OnceLock;
++    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++    pub const NAMES: [&str; 10] = [
++        "derive", "foldChoice", "foldNew", "addOk", "addSub", "processed", "predProd", "pruneIn", "foldEmit", "maxProd",
++    ];
++    pub static C: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
++    static NEXT: AtomicU64 = AtomicU64::new(1 << 16);
++    fn start() -> &'static std::time::Instant {
++        static T: OnceLock<std::time::Instant> = OnceLock::new();
++        T.get_or_init(std::time::Instant::now)
++    }
++    #[inline]
++    pub fn on() -> bool {
++        static ON: OnceLock<bool> = OnceLock::new();
++        *ON.get_or_init(|| std::env::var_os("SPARKLES_DL_DIAG").is_some())
++    }
++    #[inline]
++    pub fn add(i: usize, n: u64) {
++        if on() {
++            C[i].fetch_add(n, Relaxed);
++        }
++    }
++    pub fn line(tag: &str, work: usize) {
++        let mut s = format!("DLDIAG {tag} work={work} ms={}", start().elapsed().as_millis());
++        for (i, n) in NAMES.iter().enumerate() {
++            s.push_str(&format!(" {n}={}", C[i].load(Relaxed)));
++        }
++        eprintln!("{s}");
++    }
++    #[inline]
++    pub fn at(work: usize) {
++        if !on() {
++            return;
++        }
++        let _ = start();
++        let next = NEXT.load(Relaxed);
++        if work as u64 >= next
++            && NEXT
++                .compare_exchange(next, next * 2, Relaxed, Relaxed)
++                .is_ok()
++        {
++            line("at", work);
++        }
++    }
++    pub fn reset() {
++        if on() {
++            for c in &C {
++                c.store(0, Relaxed);
++            }
++            NEXT.store(1 << 16, Relaxed);
++        }
++    }
++}
++
+ /// What a saturation with Tier D shares: the table of the clauses that contexts send one
+ /// another and the bytes of the clause stores.
+ #[derive(Default)]
+@@ -562,6 +621,7 @@ impl DlRun {
+     /// derives its redundant conclusions in another order and can derive more, so a kept
+     /// run can answer in full where a run that starts again falls back.
+     pub fn begin_run(&mut self) {
++        diag::reset();
+         *self.stores.get_mut() = 0;
+         self.carried = self.carried.saturating_add(*self.work.get_mut());
+         *self.work.get_mut() = 0;
+@@ -582,7 +642,8 @@ impl DlRun {
+     }
+     /// Counts `n` derived conclusions.
+     pub(super) fn count(&self, n: usize) {
+-        self.work.fetch_add(n, Ordering::Relaxed);
++        let w = self.work.fetch_add(n, Ordering::Relaxed);
++        diag::at(w + n);
+     }
+     /// Whether `n` conclusions alone, with those of the runs whose contexts this one
+     /// keeps, are more than the run's bound, and marks the run past its bound when they
+@@ -1248,8 +1309,14 @@ impl Found {
+             return;
+         }
+         for l in &mut lists {
++            diag::add(7, l.len() as u64);
+             prune(l);
+         }
++        if diag::on() {
++            let p = lists.iter().fold(1u64, |a, l| a.saturating_mul(l.len() as u64));
++            diag::add(6, p);
++            diag::C[9].fetch_max(p, std::sync::atomic::Ordering::Relaxed);
++        }
+         self.prods.push((lists, base, ground, self.rule));
+     }
+ }
+@@ -1275,22 +1342,39 @@ pub(super) fn tr_ctx(st: &State, root: bool) -> String {
+ }
+ 
+ /// Drops from a product's list each premise whose side has every literal of another's: a
+-/// choice of it gives a conclusion that the other's choice subsumes.
++/// choice of it gives a conclusion that the other's choice subsumes. The sides are taken
++/// shortest first, in their order among sides of one length, and each is compared with
++/// the sides kept before it, first by a signature of its literals, then by a merge when
++/// both sides are sorted without repeats, as the sides of [`fold`] and of stored clauses
++/// are, and by a search of each literal otherwise.
+ fn prune(l: &mut Vec<Side>) {
+     if l.len() < 2 {
+         return;
+     }
+-    let within = |a: &Side, b: &Side| {
+-        a.0.iter().all(|x| b.0.contains(x)) && a.1.iter().all(|x| b.1.contains(x))
++    let sig = |x: &[Lit]| x.iter().fold(0u64, |s, l| s | l.sig_bit());
++    let strict = |x: &[Lit]| x.windows(2).all(|w| w[0] < w[1]);
++    let within = |a: &(Side, u64, u64, bool), b: &(Side, u64, u64, bool)| {
++        if a.1 & !b.1 != 0 || a.2 & !b.2 != 0 {
++            return false;
++        }
++        let ((a0, a1), (b0, b1)) = (&a.0, &b.0);
++        if a.3 && b.3 {
++            super::dl_clause::subset(a0, b0) && super::dl_clause::subset(a1, b1)
++        } else {
++            a0.iter().all(|x| b0.contains(x)) && a1.iter().all(|x| b1.contains(x))
++        }
+     };
+     l.sort_by_key(|s| s.0.len() + s.1.len());
+-    let mut keep: Vec<Side> = Vec::with_capacity(l.len());
++    let mut keep: Vec<(Side, u64, u64, bool)> = Vec::with_capacity(l.len());
+     for s in l.drain(..) {
++        let (s0, s1) = (sig(&s.0), sig(&s.1));
++        let sorted = strict(&s.0) && strict(&s.1);
++        let s = (s, s0, s1, sorted);
+         if !keep.iter().any(|k| within(k, &s)) {
+             keep.push(s);
+         }
+     }
+-    *l = keep;
++    l.extend(keep.into_iter().map(|k| k.0));
+ }
+ 
+ /// The choices of a product between two checks of the run's bounds.
+@@ -1357,11 +1441,13 @@ fn fold<S: Sink>(
+                 if out.stopped() {
+                     return stop(st, out, charged);
+                 }
++                diag::add(1, 1);
+                 let mut s = a.clone();
+                 s.0.extend_from_slice(&t.0);
+                 s.1.extend_from_slice(&t.1);
+                 norm(&mut s);
+                 if !seen.contains(&s) {
++                    diag::add(2, 1);
+                     // the step's record and its list hold the union
+                     pending += 2 * bytes(&s);
+                     seen.insert(s.clone());
+@@ -1433,6 +1519,7 @@ fn fold<S: Sink>(
+             }
+         }
+     }
++    diag::add(8, acc.len() as u64);
+     for s in acc {
+         emit(ix, st, s, rule, root, trace, out, derive);
+         let x = ds(st);
+@@ -1697,6 +1784,7 @@ fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out:
+     if st.bottom {
+         return;
+     }
++    diag::add(0, 1);
+     out.worked(1);
+     let dx = dix(ix);
+     // a test context's denied class leaves the head
+@@ -2957,17 +3045,30 @@ fn pred(
+     match fixed {
+         None => found.products(lists_free, base),
+         Some((p, side)) => {
+-            for (k, &n) in need.iter().enumerate() {
+-                if !fits(n, p) {
+-                    continue;
+-                }
+-                let mut lists = lists_free.clone();
++            // without counting the premise fits one place
++            let places: Vec<usize> = need
++                .iter()
++                .enumerate()
++                .filter(|&(_, &n)| fits(n, p))
++                .map(|(k, _)| k)
++                .take(if dx.counting { usize::MAX } else { 1 })
++                .collect();
++            // the last place takes the lists and the base themselves
++            let (mut lists_free, mut base) = (Some(lists_free), Some(base));
++            for (i, &k) in places.iter().enumerate() {
++                let (mut lists, b) = if i + 1 == places.len() {
++                    (
++                        lists_free.take().expect("the lists"),
++                        base.take().expect("the base"),
++                    )
++                } else {
++                    (
++                        lists_free.clone().expect("the lists"),
++                        base.clone().expect("the base"),
++                    )
++                };
+                 lists[k] = vec![side.clone()];
+-                found.products(lists, base.clone());
+-                // without counting the premise fits one place
+-                if !dx.counting {
+-                    break;
+-                }
++                found.products(lists, b);
+             }
+         }
+     }
+@@ -3034,6 +3135,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
+             s.sel = selected(&out.dl().lits, inv, &s.c);
+         }
+         n += 1;
++        diag::add(5, 1);
+         let c = x.store.clauses[id as usize].c.clone();
+         process(ix, me, st, id, &c, &max, out);
+         // the units go to the EL rules first, and a stopped run leaves the rest queued,
+diff --git a/crates/sparkles-owl/src/classify/mod.rs b/crates/sparkles-owl/src/classify/mod.rs
+index 1710691b..c8cfc856 100644
+--- a/crates/sparkles-owl/src/classify/mod.rs
++++ b/crates/sparkles-owl/src/classify/mod.rs
+@@ -2664,6 +2664,10 @@ impl Saturation {
+                 }
+             }
+             stats.dl_work = d.work();
++            if dl_rules::diag::on() {
++                dl_rules::diag::line("end", d.work());
++                eprintln!("DLDIAG endstats contexts={} stored={}", stats.dl_contexts, stats.dl_stored);
++            }
+             if open.is_some() {
+                 // A partial answer has taken its record, and the next run starts again,
+                 // so the clause stores and the clause table go before its taxonomy.
+diff --git a/crates/sparkles-owl/src/classify/saturate.rs b/crates/sparkles-owl/src/classify/saturate.rs
+index c8dc6220..36c155ea 100644
+--- a/crates/sparkles-owl/src/classify/saturate.rs
++++ b/crates/sparkles-owl/src/classify/saturate.rs
+@@ -2365,6 +2365,9 @@ impl<'a> Run<'a> {
+         // whether the run falls back or answers in part; a run in steps compares it
+         // between steps only
+         if !self.steps && b.dl.is_some_and(|d| d.over_work()) {
++            if super::dl_rules::diag::on() {
++                super::dl_rules::diag::line("over", b.dl.map_or(0, |d| d.work()));
++            }
+             self.halt(STOP_WORK);
+             return false;
+         }

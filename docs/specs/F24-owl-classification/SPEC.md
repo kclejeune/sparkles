@@ -96,6 +96,23 @@ rules on ontologies with individuals, functional data properties and top propert
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.
 
+Item 1256 changes the invalidation of a run kept by the EL rules. It recomputed what
+every kept context takes from the index and read every subsumer of every context with
+hash sets, which on `ore_ont_13482` on `wally` took about 105 ms of a 433 ms index stage
+to clear 3 to 39 of its 659,580 contexts. Kept contexts now keep their propagations,
+renumber their disjointness sets only when the run's sets differ from the last run's,
+and the two remaining reads of every context use bit sets. The invalidation admits its
+bit sets and the normalized premises of the changed axioms before it starts, and its lists
+of parts, of the walk and of the cleared contexts before each grows. It also admits the
+larger disjointness maps that kept contexts need when they number their sets again,
+before any context changes, and an unsatisfiable context keeps no map. On `wally` with four
+threads, in alternating runs of 7885a660 against 3afa8c52 that each passed the check against
+a fresh run, the kept index stage of `ore_ont_13482` fell from 423.5 to 347.6 ms and its edit
+from 485.9 to 408.1 ms, 0.68 of a run that starts again, and the edit of `ore_ont_9499` fell
+from 146.6 to 138.6 ms. Items 590 and 664 wait for item 1254, since on `ore_ont_13482`
+the index build and the checks before it are 0.47 of a run
+that starts again.
+
 Item 804 delivers the sixth phase's rooted run as the option `Limits::rooted`, off by
 default, as [nominals in the disjunctive rules](#nominals-in-the-disjunctive-rules) and
 [item 804's departures](#item-804s-departures-from-the-journals-rules) describe. With it,
@@ -139,6 +156,68 @@ default paths. All agree with
 HermiT but g2-150, whose answer holds one subsumption that HermiT 1.4.5 does not report,
 since HermiT does not apply a key over the universal property. HermiT derives that subsumption once the key's property is a named one with the
 same values. The gap of `owl:Thing` that item 805 found is closed.
+
+Item 1220 first turned off the selection of ground body literals in rooted runs and
+narrowed the restriction on ground inferences in Join, since each could make a run that
+reported itself complete miss an entailed subsumption or an unsatisfiable class. A Join
+whose premise on the side of the head has no ground literal in its body is exempt from the
+restriction, whatever its residual head. Generated ontologies found both losses, and with
+the two changes no generated or fixture run that finished within the bound, reported itself
+complete and left no axiom out differed from HermiT, apart from g2-150, whose difference
+is HermiT's. That is evidence and not a proof, and a complete rooted answer is not a
+certificate of completeness while item 823 is open. shoi-005 and shoi-027 then passed the bound and gave their default answer, so 46 of the
+50 `shoi` fixtures were exact against HermiT, and 14 more of the 393 generated ontologies
+with keys or the universal property passed the bound.
+
+Item 1220's repair then turned the selection back on. Hyper over `x` takes selected
+clauses as partners of an atom over `x`, and Pred from a successor over a successor term
+`f_e(u)` of a constant takes them as partners of an atom over `f_e(u)`, so two selected
+clauses of one context meet in both inferences. The Join exemption stays. Generated
+ontologies built around both losses, with bodies of two to four literals, delayed and
+disjunctive support, residues on edges, successor-term hypotheses, missing premises and
+renamed twins, find the losses in many runs with the selection and without the repair and,
+without counting, in none with the repair, apart from g2-150. With counting, one generated
+ontology loses subsumptions with the repair, with the selection off and with both
+restrictions off, so that loss is not the selection's, and it is item 1229. Every fixture and generated run that the
+run without the selection finishes within the bound still finishes, with counting on and
+off. The repair is adopted on that measured gate, and its completeness is not proved, so
+item 1220 stays open for the proof. Against the run before item 1220, 48 of the 50 `shoi`
+fixtures are exact again, and two runs pass the bound that finished before, s2-g2-011 on
+one thread and on four and a version of shoi-022 with its individuals merged on four
+threads, which are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0`,
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` turn each part off
+for measurement.
+
+Item 1229 records a loss of runs that count and of rooted runs. Pred takes each clause
+that a successor sends with the restrictions that reach the successor when it arrives, and
+drops the clause when the successor sends it again over a later link. A unit existential
+restriction that the context derived later took no Pred with the clauses its successor
+had already sent. Under the eager strategy two restrictions can share a successor, and the
+second restriction's edge can come after the successor's clauses did, when the context
+replayed Pred only with the literal that made the edge, so a clause whose body lacks that
+literal missed the new restriction in the same way. With counting Pred's conclusion can
+name the restriction's own successor term in a role atom, and in a rooted run in an
+equality with a constant, so such a run could report itself complete and miss an entailed
+subsumption. Without counting or the root, a conclusion names the successor term only
+through premises whose own arrival replays Pred, and runs that force the replay on in that
+case change no taxonomy. A run that counts or is rooted now replays every clause that the
+successor already sent with the late restriction, for a new unit, for a unit whose earlier
+edge went to another successor, and for a new edge, whose replay of the literal that made
+it is then left out for that successor as already included. The repair is adopted on a measured gate and
+item 1229 stays open for the proof that it covers every order of arrival. On generated and
+fixture ontologies built around the loss and on the selection's sets, on one and four
+threads with both strategies, every run that answers in full, with nothing left out
+and no fallback, agrees with HermiT wherever HermiT gives a taxonomy, and the cautious and
+eager runs that both answer in full give the same taxonomy.
+On the runs that answer in full with and without it, and where the run without it agrees
+with HermiT, the replay adds 0.29% to the derived
+conclusions of rooted runs that count, 0.47% to rooted runs without counting and 0.90% to
+runs that count without the root, because it charges its products before the redundancy check. Three
+generated ontologies that finished close to the bound now exceed it and give the answer
+without counting or without the rooted rules, with the same taxonomy as before at a raised
+bound, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` gives the earlier containment, in
+which a rooted run classifies again without counting or without the rooted rules when such
+a restriction or edge arrives, and `=0` turns both off, for measurement.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
@@ -307,6 +386,61 @@ kept run counts the conclusions of the runs before it, as
 and item 1010 follows the edits after which a kept and a fresh run fall on two sides of the
 bound. Item 1011 follows the bound's form on other ontologies.
 
+Item 1011 found what the attempts spend beyond their counted conclusions. On one thread
+on the laptop the attempt took about 706 of the 728 G instructions of ore_ont_14817's
+classification and 829 of 857 G on ore_ont_9663, and its cost per conclusion grew as its
+clause stores grew. On the loaded laptop ore_ont_14817 took 5.1, 6.2, 7.9, 19.3 and 47.6 s
+with bounds of 1, 2, 4, 8 and 16 million conclusions and 89 s with the default bound of
+22.4 million. Half of the attempt's time went into the products of the rules, whose
+choices below 4,096 unions a step count nothing toward the bound, and a fifth into pruning
+their lists. The pruning of a product's lists now compares two sides by a signature of
+their literals and then by a merge of the sorted literals, where it searched each literal,
+and keeps the same sides in the same order. The Pred rule with a fixed premise moves its
+lists into the last product instead of copying them. The 96 disjunctive files of the
+development set derive the same conclusions with the same estimated bytes and taxonomies,
+and the 15 that attempt the rules make the same products and clauses at every doubling
+of the work. The classifications take 0.80 to 0.91 times the base's
+instructions on the six files counted, with the limit below off. The times on the loaded
+laptop are not measurements, but they show the classification of ore_ont_14817 taking 97
+against 192 s on one thread in the sweeps with diagnostic counters. The
+[laptop record](../../benchmarks/el-classification/runs/2026-11-20-disjunctive-products-laptop-53a51148/record.json)
+holds the counts, the sweeps and the scripts.
+
+On one thread an attempt also ends when one product of its rules has more choices than
+`Limits::dl_attempt_width`, 1,048,576 by default. The 12 attempts of the development set
+that finish make products of at most 256 choices on one thread, and the 2,166 generated
+ontologies of item 969 with a union of at most 3,645. ore_ont_14817 makes a product of
+120 million choices after 0.5 million conclusions, and ore_ont_9663 one of 4.2 million
+after 4 million, where the bound is 22.4 million. Their classifications on one thread on
+the laptop take 25.6 and 51.1 G instructions against 584 and 700 G without the limit, with the same
+taxonomies, and every other file of the two sweeps keeps its answer and its statistics.
+The width of a product depends on the order in which contexts receive their premises. On
+four and eight threads the finishing attempts make products of up to 22,500 choices, and
+in three runs on four threads ore_ont_9663 made products of at most 22,707 to 923,521
+choices and ore_ont_14817 of 1.3 to 5.1 million, so the width does not tell an attempt
+that finishes from one that cannot, and a run on more threads has no limit on it. Unlike
+the bound on conclusions, the limit therefore depends on the number of threads. A run on
+one thread may fall back to the Horn rules' answer, as any attempt that does not finish
+does, on an ontology where a run on four threads answers in full with the disjunctive
+rules, and the classifier accepts this. No file of the development set and none of the
+generated ontologies does so, since their widest products on one thread stay 4,096 and
+288 times under the limit. On one thread the order is fixed, and the
+widest product of ore_ont_9663 falls from 999 million choices on one thread to 1.3 million
+on two and 22,707 in one run on four, with 355, 71 and 24 million choices made by the products'
+steps, which item 1225 follows. A kept run whose product passes the limit starts again in
+full, as past the bound on conclusions. A run that leaves out an inference too wide to make,
+for this limit or for an at-most restriction with too many candidates, now falls back even when it has
+no bound on its conclusions, where it answered as complete without the inference before.
+
+On one thread on forge the six files of the laptop counts classify in 0.79 to 0.91 times
+the base's time with the pruning alone, and with the width limit ore_ont_14817 and
+ore_ont_9663 take 2.3 and 4.9 s against 57.4 and 74.3 s for the base. GO, which has no
+disjunctive attempt, takes 0.99 times the base's time. On four threads the rounds of one
+binary spread by up to 24% on those two files, so the forge run decides nothing there,
+and the four other files take 0.88 to 0.96 times the base's time. The
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#the-disjunctive-attempt-and-the-universals-on-the-benchmark-host)
+gives every file.
+
 Item 869 found where the Horn rules with individuals spend their time on four files of
 the ORE 2015 DL development set with 7,856 to 114,957 property assertions,
 `ore_ont_4510`, `ore_ont_12901`, `ore_ont_14375` and `ore_ont_10951`. A diagnostic build
@@ -357,10 +491,8 @@ million conclusions against 1.15 million for the EL rules alone on one thread. A
 diagnostic build on the laptop counted the difference as five subsumers that every
 context takes from `owl:Thing`, 300 thousand conclusions, the two conclusions that tell a
 successor it is real, 548 thousand, the states of the automata, 103 thousand, 218
-thousand further repeats of existential restrictions and 40 thousand successors. Item
-1025 keeps that remainder and the conjunctions of a class that is equivalent to an
-individual. A prototype in which a successor learns that it is real from one conclusion
-in place of two took 1.4 to 1.9% off the four files on one thread and was not kept, as
+thousand further repeats of existential restrictions and 40 thousand successors. A
+prototype in which a successor learns that it is real from one conclusion in place of two took 1.4 to 1.9% off the four files on one thread and was not kept, as
 [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#reasoning) records.
 
 Item 1026 bounds what R5 gives a context before the activation applies it. A flush merges
@@ -381,6 +513,26 @@ median of 8.75 against 8.17 s and is slower in 12 rounds, and on one thread 76.3
 75.8 s with the same conclusions in each of four rounds. Almost all of the difference is
 outside the Horn rules' final saturation, in time that holds the attempt of the
 disjunctive rules, which item 869 does not change. Item 1027 follows it.
+
+Item 1025's guarded R7 search and covered link rules reduce classification time
+on the four assertion-heavy ORE files. In six rounds on `atlas`, commit
+`8b311a59` against `48344bca` takes 0.88 to 0.91 times the time on one thread
+and 0.77 to 0.82 times on four by the median paired ratio. The Horn rules
+take 1.63 to 1.68 times the EL-only time on one thread and 1.52 to 1.54 times
+on four. On one thread `ore_ont_4510` takes 207.5 against 235.3 ms and
+derives 2.21 against 2.36 million conclusions. Its 116 conjunction contexts
+hold only 2,228 of 758,645 subsumers, so their duplication accounts for little
+of the remaining work. On the rebased classifier the generated and hand-written
+cases, including contexts whose witness verdict the covered successor changes,
+agree with HermiT. The two paths with and without the witness clause select
+identical sets of named classes for worlds when evaluated against the same
+saturated state. This holds across 369 HermiT-checked cases and a set of 968
+generated cases on one and eight threads. The clause changes a context's
+witness verdict in 39 and 36 of the HermiT-checked cases, respectively.
+Item 1028 follows the
+one-thread costs on GO and EL-only `ore_ont_10951`. The
+[benchmark report](../../benchmarks/el-classification/RESULTS.md#guarded-horn-rules-with-individuals)
+gives the stages, controls and evidence.
 
 Item 693 reduces the automata by which a run with the Horn rules unfolds its universal
 and negative existential restrictions, as [the Horn rules](#the-horn-rules) describe. It
@@ -411,6 +563,16 @@ rules and not kept, as [the experiments page](../../PERFORMANCE-EXPERIMENTS.md#r
 records. Item 693 keeps the remaining cost of the Horn rules on the two files, which
 still derive 22.1 and 35.6 million conclusions against 16.5 and 10.8 million for the EL
 rules alone.
+
+The rule for a new universal no longer searches the context's universals for the same
+role and filler. A context derives each universal once, since a role and a filler have
+one node, and a repeat would only repeat work, because the successor rule deduplicates
+the fillers it collects. A debug assertion keeps the premise, and it held in the test
+suite and in debug classifications of GO, ore_ont_14817 and ore_ont_9663 on one and four
+threads. A corpus sweep of the release builds with and without the search gave the same
+results on the 1,010 pairs that both classified. On
+one thread on forge ore_ont_14817 and ore_ont_9663 classify 2.1% and 2.4% faster, and GO
+0.2% to 0.7% slower in each round, a median of 0.6 ms, which item 1234 follows.
 
 Item 868 asked for a cheaper criterion for the witnesses of a run of the Horn rules with
 individuals, whose worlds can find nothing. A diagnostic build counted the witnesses and
@@ -456,7 +618,10 @@ chain of a property with itself. A range is pushed into the filler of each exist
 restriction on the property, which is complete under the range restriction of OWL 2 EL
 (Profiles §2.2.6). A restriction to an individual that an assertion tells is the
 exception, which the paragraph on individuals below describes. A chain that breaks the
-range restriction is left out. The taxonomy groups
+range restriction is left out. A context with a role loop takes the role's range, and the
+index registers every range as a positive occurrence, so the existentials and data
+restrictions of a range that only a loop reaches have their successors and told
+subsumers (item 1262). The taxonomy groups
 the classes by mutual subsumption and computes direct superclasses by transitive
 reduction, by greedy minimization or, for a class with more than 32 direct superclasses,
 by marking the classes above each candidate. The subsumers, the equivalence classes and
@@ -586,15 +751,26 @@ too.
 additions and removals clears the contexts that derived the left side of a changed
 subsumption or part of it, the contexts whose links a changed existential restriction
 can use, and every context that links to a cleared one, and saturates those again. The
-other contexts drop their links from cleared contexts and recompute what they take from
-the index, which is rebuilt from the axioms on every run. A change to the property
+other contexts drop their links from cleared contexts and keep what they take from the
+index, which is rebuilt from the axioms on every run. A negative existential restriction
+that an edit adds or removes has its filler among the changed parts, so every context
+that takes it from the index is cleared, and a kept context renumbers the disjointness
+sets it meets only when the run's sets differ from the last run's (item 1256). A change to the property
 hierarchy, chains, reflexivity or ranges saturates everything again, and so does a
-change to an axiom with an individual, a data property, a datatype or a key. So does any
-change after a run that marked the real contexts, which merges, worlds, keys and the
-facts of universal roles tie together in ways the invalidation does not follow, and a
+change to an axiom with an individual, a data property, a datatype, a key or a self
+restriction. So does any change after a run that marked the real contexts, which
+merges, worlds, keys and the facts of universal roles tie together in ways the
+invalidation does not follow, and a
 run after a run that stopped before its saturation ended. A run that stops later keeps
 its saturated contexts. Property tests check that an incremental run after random
 additions and removals gives the taxonomy of a full run.
+
+A self restriction starts the run again because a context can have a loop by a role
+without holding the self restriction whose subsumer the loop gives. A loop also comes
+from a self restriction on a subrole, a reflexive role or a chain, so the invalidation
+cannot find the contexts that a changed self restriction reaches by the expressions they
+hold. Until item 1258, an added `ObjectHasSelf(s) ⊑ C` beside `r ⊑ s` and
+`owl:Thing ⊑ ObjectHasSelf(r)` cleared no context and left out `owl:Thing ⊑ C`.
 
 This reuse applies to eligible EL edits. Normalization with Horn or disjunctive axioms
 currently clears the contexts and marks the run entangled, so a later edited source
@@ -826,7 +1002,9 @@ report](../../benchmarks/el-classification/RESULTS.md) has the numbers and the r
 each construct, the reports of excluded axioms, the bounds, incremental runs, a
 comparison with an independent naive completion procedure for EL++ on random ontologies
 of up to twenty axioms, incremental against full runs on random changes for both
-`Classifier` and `Saturation`, the same taxonomy on one, two and eight threads for an
+`Classifier` and `Saturation`, and in `tests/incremental_sweep.rs` incremental against
+full runs on edits of class axioms beside fixed self restrictions, reflexive roles,
+chains, ranges, individuals and the top and bottom properties, the same taxonomy on one, two and eight threads for an
 ontology of 3,000 classes, and an estimate that bounds a run with its taxonomy. Unit
 tests of the taxonomy check that the estimate counts every link of a wide hierarchy,
 that an inconsistent ontology's taxonomy asks the budget and that every stage polls the
@@ -1324,6 +1502,52 @@ not kept. In a profile on the laptop the filter's probes take 45% of a four-thre
 cycles and the rules' inserts 13%, since the run still sends three billion messages for 32
 million conclusions, and item 956 follows them.
 
+Item 956 takes up the repeated links. A transitive role's closure was derived once for
+each intermediate context, since a middle context composed its backward links with every
+forward link it held, those that chains had composed included. A role is now linear when
+every pair of roles equivalent to it composes into the roles it composes into with
+itself, and every role that composes with one of its links on the right does so alike
+with its equivalents, into roles that compose again with a further link by it into the
+same roles. A link of a linear role that a chain composes from two links by its
+equivalents then keeps no forward link at its source, and a middle context pairs its
+backward links only with the forward links that the axioms and the other chains give.
+Every backward link that the saturation stored before it still stores, by induction on
+the composition of the links that keep no forward link, so the taxonomies do not change.
+`SPARKLES_LINEAR_CHAINS=0` composes every pair as before, for measurements. On the
+laptop a four-thread run of `ore_ont_8737` with an early build of the composition sends
+296 million messages instead of the 2.98 billion it sends with the switch off, and stores
+15.8 instead of 20.9 million conclusions. On forge, against the build
+before the item, the file's saturation with the Horn rules takes 0.94 s on four threads
+against 8.22 s, 2.99 s on one against 25.41 s and 0.70 s on twelve against 7.05 s, its
+classification 1.39 s against 9.07 s on four threads, and its peak resident set 2.3
+instead of 6.3 GiB on four threads and 2.1 instead of 3.8 GiB on one. ChEBI lite
+classifies in 0.81 times the time on one thread, 0.69 on four and 0.48 on twelve, and
+GO and `ore_ont_3836` within the noise. `ore_ont_13482` classifies 2.5% slower on four
+threads and `ore_ont_9855` 1.0% slower on one, with the same conclusions in those
+cells, which item 1224 follows. The six timed files give the same taxonomies on
+both builds. On the laptop so do the 298 ORE 2015 EL files, GO and ChEBI lite on one and
+four threads with commit 3f20f7db, and 205 of the 207 files of the ORE 2015 DL
+development set on four with commit 05838a64, which has the item's engine code, where
+both builds refuse one file at the reader and stop one at its memory budget. The
+[EL classification results](../../benchmarks/el-classification/RESULTS.md#left-linear-chains-of-transitive-roles)
+give the rounds.
+
+Item 1269 removes allocations from the index stage. The profile check of each axiom ran
+the profile checker, whose datatype pass copies each class and property IRI into a
+signature. It now walks the axiom without allocating and falls back to the full check
+only for an axiom that may break a rule, so the axioms left out keep their rules,
+messages and order. Normalization looks up an object property's role by its IRI in a
+table of role ids. On forge `ore_ont_13482` classifies on one thread in 898 ms against
+999 ms, with an index stage of 216 against 345 ms, and in 0.918 of the time on four
+threads. ChEBI lite classifies in 0.964 and 0.956 of the time. GO's index stage is
+faster, but its saturation moved with the code's layout, and its classification takes
+1.0% longer on one thread, which item 1288 holds. On GO, ChEBI lite, the 298 ORE 2015 EL
+files and the 207 DL development files on one and four threads, the 1,010 pairs that both
+builds classify give the base's taxonomies and the base's axioms left out, with their
+rules and messages, and both builds fail on the same two DL files. The
+[EL classification results](../../benchmarks/el-classification/RESULTS.md#allocations-of-the-index-stage)
+give the rounds.
+
 The references disagree on two files of the set. On ore_ont_15516, Konclude's parsers all
 failed at the first SWRL rule and it classified an empty ontology. HermiT found the
 ontology inconsistent, which its rules cannot cause, since the properties in their heads
@@ -1550,6 +1774,31 @@ went three ways. The index links the restriction of an assertion to `b`'s own co
 and tells `b` the range, as [the EL classifier](#the-owl-2-el-classifier) argues for
 individuals, so the run makes none of these contexts (item 1025).
 
+**Guarded Horn rules.** When a new predecessor triggers R7, the rule looks for
+pairs only if the predecessor is real and the current restriction counts it.
+The rule visits the same predecessor pairs in the same order when the run
+continues. It checks the run's bounds periodically during the scans and after
+a restriction that makes a pair or sends a message. The scan of the roles that
+clash is charged before the lookup. Successor counting and singular propagation
+read the existing at-most restrictions one at a time.
+
+A Horn link to a successor is covered when the context already holds a link
+by a different subrole to that same successor. When the new role has an inverse,
+the covering inverse must exist and be a subrole of that inverse. This preserves
+what R6, R7 and R8 can read at the target. The retained link matches the
+superroles needed by the forward rules, the two operands of a composition,
+and clashes inherited under subroles. The link retains the same source and
+target for filler and realness propagation. The rule applies the coverage
+check to Horn links in runs with individuals while the source already holds
+at most sixteen successors. If the broader link arrives first, it stays.
+R6 also omits a repeated core at a predecessor that is itself the successor,
+whose core was scheduled when that context was initialized.
+
+`SPARKLES_HORN_RULES` selects the comparison level. Level 0 uses the earlier
+rule bodies. Level 1 adds guarded R7 and reads restrictions without copying
+the list. Level 2 also uses covered links and omits the repeated core. Level
+2 is the default.
+
 **Witnesses and worlds.** The reachability condition of the EL rules of individuals stays
 the mechanism that makes a conclusion that depends on a class having an instance hold
 only where it does. The rules that read whether a context is real are the exchange from
@@ -1559,9 +1808,12 @@ in a world. A world for a class makes the class and what it reaches real, so a c
 whose global subsumers are incomplete reaches a context that one of these rules would
 read as real. Each such context is a witness. A context that is not real, derives an
 individual and has a subsumer, a Horn successor or a loop that the individual lacks is
-one, which extends today's witness by the Horn successors and the loops. A context that
-is not real and that an at-most restriction of a singular context counts as a
-predecessor is one, since R7 identifies it with another predecessor only where it has an
+one, which extends the EL witness by the Horn successors and loops. At level 2
+the individual already has a Horn successor when its own retained link covers
+it by the rule above. The witness check applies this criterion at any successor
+count. The individual may have obtained its subrole link without ever receiving
+the broader link. A context that is not real and that an at-most restriction of a
+singular context counts as a predecessor is one, since R7 identifies it with another predecessor only where it has an
 instance. A context that is not real and holds a fact's restriction on a universal role
 is one, as today. The keys read the links of a real context to named individuals and its
 data values, which come from its subsumers and its Horn successors, so a context that
@@ -1764,8 +2016,9 @@ strategy, and the JSON operation, `POST /$/ontology/{ds}/classify`, the Python, 
 and JVM bindings and `sparkles ontology classify --partial --expansion` take them. Every
 answer gives `tier` and `consistency`, and a partial one has `partial` true, `complete`
 false and the open classes under `incomplete` with `incompleteCount`. The `complete` of
-the JSON and of `Classified::complete` stays true only for an answer that left nothing out
-and finished. The dataset keeps no partial answer. A request that writes its taxonomy,
+the JSON and of `Classified::complete` stays true only for a run that finished and reported
+no axiom left out. A rooted run can miss entailments with the flag true, which item 1231
+records, and a run that counts rests on item 1229's repair, which is not proved. The dataset keeps no partial answer. A request that writes its taxonomy,
 asks for the functional-style answer or runs a ROBOT-compatible command refuses or ignores
 the flag, since none of them can say that a taxonomy is partial. The command line takes
 `--timeout`, notes a partial answer on stderr and exits with status 2 for one that is
@@ -1784,7 +2037,8 @@ Horn rules, leaves the axioms that need case analysis out and reports them, and 
 `Stats::dl_over_budget`. A run that neither counts nor is rooted also has a bound on the
 conclusions it derives, `Limits::dl_attempt_work`, of 384 for each class of the signature
 and at least 2,097,152, past which it falls back in the same way and sets
-`Stats::dl_attempt_over` too (item 990). ore_ont_3215 of the ORE 2015 DL sample, with
+`Stats::dl_attempt_over` too (item 990). On one thread such a run also falls back when one
+product of its rules has more than `Limits::dl_attempt_width` choices (item 1011). ore_ont_3215 of the ORE 2015 DL sample, with
 18,323 unions over a transitive property, needs this, item 713.
 
 Counting is part of the same rules and is off by default. `Limits::counting` turns it on,
@@ -3872,6 +4126,10 @@ the successor's own element from the hypothesis, through Hyper with a body atom 
 conclusions mention `x` or `y`. The ground consequences of a hypothesis alone are left to
 the context that holds the marked literal in an actual clause.
 
+The argument does not hold for Join against facts that only the context's core gives, which
+no ancestor holds, so a Join whose premise on the side of the head has no ground body
+literal is exempt from the restriction, as the Outcome records for item 1220.
+
 The argument for completeness is the one for ordered resolution. A root clause `A_1 ∧ … ∧
 A_n → Δ` that r-Pred would hand to a context `v`, where `v` holds each `A_iσ` as a
 maximal literal in `Γ_i → Δ_i ∨ A_iσ`, is derived in the root by Hyper at constants, Eq,
@@ -3937,30 +4195,33 @@ departures in place.
 
 **Equalities with `x` in query contexts.** The rewriting equality `x ≈ u` rewrites `x` to
 `u` only in a unit clause whose atom is a core atom of a query context, which is the
-context of a named class or, since item 1070, of `owl:Thing`, and rewrites `u` to `x` only in a named-class atom over `u` and
-only in a query context. Elsewhere Eq does not rewrite with `x ≈ u`. Every other rule
-stays. Factor takes `x ≈ u` and `x ≈ v` in one head as Table 2 says, and an equality of
-constants `u ≈ v` rewrites the constant in `x ≈ u` to give `x ≈ v`, since it is the
-rewriting equality and `x ≈ u` only the rewritten literal, and `f(x) ≈ u` rewrites as
-usual. The journal's Section 7.2.3 reports that its completeness proof needs `x ≈ u` as
-the rewriting equality only in query contexts and only on query atoms, and its Lemmas 21
-and 22 use exactly the two forms kept. Lemma 21 rewrites a unit `Γ_0 → A(x)` with `A(x)`
-in the query body, which for classification is the context's core atom, so that the
-constant's facts include `A(u)` and the consequences at `u` follow from the ontology's
-clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and then needs a clause with
-`x ≈ u` maximal beside named atoms, which the second form rewrites back to `x`. A
-successor context has no query and needs neither form. Its element's equality to a
-constant reaches the predecessor as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual
-and the predecessor reasons at `u`. Sequoia blocks the same inferences. The journal's
-observation is about its own calculus, and that it carries over to the run without the
-root's markers is part of the open obligation above. Without the blocking the run
-rewrites every clause over `x` of a context that holds `x ≈ u`, and in the earlier
-experiments the blocking was on in every configuration that finished.
+context of a named class or, since item 1070, of `owl:Thing`, and rewrites `u` to `x` only
+in a named-class atom over `u` and only in a query context. Elsewhere Eq does not rewrite
+with `x ≈ u`. Every other rule stays. Factor takes `x ≈ u` and `x ≈ v` in one head as
+Table 2 says, and an equality of constants `u ≈ v` rewrites the constant in `x ≈ u` to
+give `x ≈ v`, since it is the rewriting equality and `x ≈ u` only the rewritten literal,
+and `f(x) ≈ u` rewrites as usual. The journal's Section 7.2.3 reports that its
+completeness proof needs `x ≈ u` as the rewriting equality only in query contexts and only
+on query atoms, and its Lemmas 21 and 22 use exactly the two forms kept. Lemma 21 rewrites
+a unit `Γ_0 → A(x)` with `A(x)` in the query body, which for classification is the
+context's core atom, so that the constant's facts include `A(u)` and the consequences at
+`u` follow from the ontology's clauses there, and Lemma 22 rewrites `x ≈ u` by `u ≈ v` and
+then needs a clause with `x ≈ u` maximal beside named atoms, which the second form
+rewrites back to `x`. A successor context that is not the context of a named class has no
+query and needs neither form. Its element's equality to a constant reaches the predecessor
+as `f(x) ≈ u`, where Eq rewrites `f(x)` to `u` as usual and the predecessor reasons at
+`u`. A successor that reuses the context of a named class has that class's query, and
+there Eq and Factor in the form of a query leave out a selected premise. That no
+entailment is lost there is the open case of item 1220. Sequoia blocks the same
+inferences. The journal's observation is about its own calculus, and that it carries over
+to the run without the root's markers is part of the open obligation above. Without the
+blocking the run rewrites every clause over `x` of a context that holds `x ≈ u`, and in
+the earlier experiments the blocking was on in every configuration that finished.
 
-**Selection of the ground literals in bodies.** In a context other than the root, a
-clause whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) →
-A(u)` included. A selected clause is a premise only of an inference local to the context,
-of Join on its ground body literal as the side with the body, of Pred and of Succ, and it
+**Selection of the ground literals in bodies.** In a context other than the root, a clause
+whose body holds a literal with neither `x` nor `y` is selected, a marker `A(u) → A(u)`
+included. A selected clause is a premise only of an inference local to the context, of
+Join on its ground body literal as the side with the body, of Pred and of Succ, and it
 still sends the hypotheses and markers of its maximal literals. An inference is local when
 it is on a literal that holds a successor term of the context or on a role atom between
 `x` or `y` and a constant or a successor term of a constant, since no predecessor sees
@@ -3970,23 +4231,28 @@ the predecessor, which receives the clause by Pred, discharges the ground body b
 against its actual clauses and sends the hypotheses and markers that let the context go
 on. One exception stays in the context. A selected clause whose head holds an atom over
 `x` cannot go to the predecessor, since Pred carries no such head, so it takes the Hyper
-over `x` itself, with the unselected clauses as its partners. Partner lookups leave out
-selected clauses the same way, so an inference between two clauses fires or not whatever
-their order of processing. The rationale is the measured cause of the remaining work
-after the first three departures. In shoi-005's dominant context 13,731 of 17,384 distinct
-clauses held a ground literal in the body and 9,731 two or more, which is the root's
-marker explosion moved into one context, since the context combined the markers of all
-its predecessors in bodies. A restriction of inferences is sound. The argument for
-completeness is that of ordered resolution with selection, where a clause with a selected
-literal resolves only on it, and the predecessor that holds the marked literal in an
-actual clause makes the inference the context leaves out. What the argument leaves open is
-the return path. The predecessor's clause after Join holds the context's literals over
-`f(x)` and sends them as hypotheses, and whether every inference the context leaves out
-comes back this way across a shared successor or a chain of successors is not shown. A
-consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑ ∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`,
-`A ⊑ ⊥` as a case where the exception is needed, and it is a regression test, which
-passes. The selection is measured with it on and off, and the run keeps it only if the
-gate needs it.
+over `x` itself. Hyper over `x`, and Pred from a successor over a successor term of a
+constant, take selected clauses as partners, and the other partner lookups leave out
+selected clauses the same way that the rules leave out a selected premise, so an inference
+between two clauses fires or not whatever their order of processing. The rationale is the
+measured cause of the remaining work after the first three departures. In shoi-005's
+dominant context 13,731 of 17,384 distinct clauses held a ground literal in the body and
+9,731 two or more, which is the root's marker explosion moved into one context, since the
+context combined the markers of all its predecessors in bodies. A restriction of
+inferences is sound. The argument for completeness is that of ordered resolution with
+selection, where a clause with a selected literal resolves only on it, and the predecessor
+that holds the marked literal in an actual clause makes the inference the context leaves
+out. What the argument leaves open is the return path. The predecessor's clause after Join
+holds the context's literals over `f(x)` and sends them as hypotheses, and whether every
+inference the context leaves out comes back this way across a shared successor or a chain
+of successors is not shown. A consult proposed the ontology `Q ⊑ ∃s.D`, `Q ⊑ ∃t.{a}`, `Q ⊑
+∀t.∀r.A`, `D ⊑ ∃r⁻.{a}`, `A ⊑ ⊥` as a case where the exception is needed, and it is a
+regression test, which passes. The selection is measured with it on and off, and the run
+keeps it only if the gate needs it.
+
+The argument does not hold when both premises of an inference over `x` are selected, since
+no predecessor then holds either premise. That is why those two lookups take selected
+partners, as the Outcome records for item 1220, whose completeness is not proved.
 
 **The facts of a hypothetical successor go to the root.** A hypothetical successor has the
 empty core and no denied class, and its hypotheses and markers are in the bodies of its
@@ -4394,7 +4660,9 @@ the options that select rules do. The tables that no expression keys differ. The
 keeps more than twice the expressions, the conjunctions or tests, or the clauses of the
 table that the last full run had, plus 4,096. A kept run that stops on its memory budget
 also starts again in full before a lower tier takes over, since the last index and the
-contexts that nothing reaches count against the budget of a kept run alone. Before the
+contexts that nothing reaches count against the budget of a kept run alone. A run kept
+by the OWL 2 EL rules does the same, with or without `Limits::el_only`, and the run in
+full draws first on what the pool granted the kept attempt (item 1263). Before the
 comparison the run admits both indexes, the kept contexts, the clause table and the
 marks and queue of the invalidation against that budget. A run that
 its deadline or a cancellation stops leaves a classifier whose next run starts again.

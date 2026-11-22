@@ -35,6 +35,7 @@ from sparkles._errors import (
 from sparkles._sparkles import (
     FEATURES,
     INFERRED_GRAPH,
+    AggregateErrorsSetting,
     Algorithms,
     BlankNode,
     Branches,
@@ -112,6 +113,7 @@ from sparkles._sparkles import (
 __all__ = [
     "FEATURES",
     "INFERRED_GRAPH",
+    "AggregateErrorsSetting",
     "Algorithms",
     "BackupError",
     "BlankNode",

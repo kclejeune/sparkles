@@ -1,0 +1,5 @@
+NOTBOTH ore_ont_7192 t1 137 137
+NOTBOTH ore_ont_7192 t4 137 137
+NOTBOTH ore_ont_9881 t1 101 101
+NOTBOTH ore_ont_9881 t4 101 101
+pairs 1014 both-classified 1010 diffs 0

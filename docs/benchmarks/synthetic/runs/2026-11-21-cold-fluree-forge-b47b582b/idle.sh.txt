@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# idle probe: warm server, count-all after various idle gaps
+set -uo pipefail
+L=$HOME/lanes/cold-scan
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+W=$L/work; P=4391
+rm -rf $L/idle && mkdir -p $L/idle
+$L/bin/sparkles --result-cache-mb 0 serve --data $L/idle/server --loc bench=$W/sparkles.db --port $P --read-only > $L/idle/server.log 2>&1 &
+pid=$!
+until curl -sf localhost:$P/\$/ready > /dev/null; do sleep 0.05; done
+q() { curl -s -o /dev/null -w '%{time_total}\n' -H 'Accept: text/tab-separated-values' --data-urlencode "query@$W/queries/$1.rq" localhost:$P/bench/sparql; }
+for n in count-all contains; do for i in 1 2 3; do q $n > /dev/null; done; done
+for gap in 0 0.01 0.05 0.1 0.2 0.5 1 2; do
+  for n in count-all contains; do
+    s=""; for i in 1 2 3 4 5; do sleep $gap; s="$s $(q $n)"; done
+    echo "gap $gap $n $s"
+  done
+done
+kill $pid; wait $pid
+echo IDLE-DONE

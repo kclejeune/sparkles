@@ -1,0 +1,29 @@
+total 2318126
+region other: 2300948
+region next_batch_at_most: 17178
+== leaves of next_batch_at_most
+   2203 sparkles_core::sparql::exec::block_passes
+   1625 mi_free
+   1330 <sparkles_core::index::Block>::key_range
+   1240 mi_malloc
+   1123 <sparkles_core::index::PermIndex>::key_block_range
+   1057 <sparkles_core::sparql::cursor::Operator>::next_shared
+    952 __vdso_clock_gettime
+    854 <sparkles_core::sparql::cursor::Scan>::next_shared::{closure#2}
+    623 <quick_cache::sync::Cache<(u64, u32, u32), sparkles_core::index::Col, sparkles_core::index::BlockWeighter>>::get::<(u64, u32, u32)>
+    600 <sparkles_core::index::BlockCache>::get_cols_cached
+    525 <sparkles_core::sparql::cursor::QueryCursor>::next_batch_at_most
+    382 <quick_cache::shard::CacheShard<(u64, u32, u32), sparkles_core::index::Col, sparkles_core::index::BlockWeighter, quick_cache::DefaultHashBuilder, quic
+    308 <sparkles_core::sparql::ctx::OwnedCharge>::new
+    281 <sparkles_core::sparql::query_memory::QueryMemoryLedger>::new_owner
+    278 <sparkles_core::sparql::cursor::QueryCursor>::terminate::stopped
+    236 core::ptr::drop_glue::<sparkles_core::sparql::cursor::State>
+    220 <sparkles_core::sparql::cursor::Scan>::reads_base
+    214 core::ptr::drop_glue::<sparkles_core::sparql::exec::PlanInfo>
+    209 core::ptr::drop_glue::<core::option::Option<sparkles_core::index::WeakBlock>>
+    198 <sparkles_core::index::Block>::downgrade
+    182 core::ptr::drop_glue::<sparkles_core::sparql::cursor::Operator>
+    180 <sparkles_core::sparql::ctx::Ctx>::check
+    177 <sparkles_core::sparql::cursor::BaseScan>::unpark
+    164 core::ptr::drop_glue::<sparkles_core::sparql::plan::Kind>
+    155 <sparkles_core::sparql::cursor::Operator>::update_plan

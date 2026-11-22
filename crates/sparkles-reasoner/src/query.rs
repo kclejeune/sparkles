@@ -63,7 +63,23 @@ struct Shared {
     /// the most branches of one basic graph pattern's OWL 2 QL rewriting
     max_union: usize,
     warnings: Vec<String>,
+    /// a rule program of the IR (item 839) that the sessions evaluate in place of
+    /// `rules`, made over each session's terms (see [`QueryReasoner::with_program`])
+    program: Option<ProgramSource>,
+    /// `program` was given directly (by a test) and not made from the rule text, so the
+    /// table cache's keys do not name it
+    direct_program: bool,
+    /// whether the sessions close the adorned copies of transitive rules with closure
+    /// operators (spec F23 Phase 2); `SPARKLES_DEMAND_CLOSURES=0` turns them off
+    closures: bool,
 }
+
+/// A rule program of the IR over a session's terms.
+pub(crate) type ProgramSource = Arc<
+    dyn Fn(&Terms, &mut WorkingWarnings) -> anyhow::Result<crate::engine::frontend::ProgramInfo>
+        + Send
+        + Sync,
+>;
 
 /// A reasoner that derives facts for queries on demand, with the rules of a profile.
 #[derive(Clone)]
@@ -84,6 +100,16 @@ impl QueryReasoner {
                     .to_string(),
             );
         }
+        // a rule text with relations or `not` is a rule program, compiled by the frontend
+        // over each session's terms (item 839's plan, §22.4)
+        crate::parser::check_program_includes(&rules)?;
+        let program: Option<ProgramSource> = crate::parser::uses_program(&rules).then(|| {
+            let parsed = Arc::new(rules.clone());
+            let source: ProgramSource = Arc::new(move |t: &Terms, w: &mut WorkingWarnings| {
+                crate::engine::frontend::compile(&parsed, t, w, true)
+            });
+            source
+        });
         Ok(QueryReasoner {
             shared: Arc::new(Shared {
                 digest: crate::rules_digest(&profile, extras),
@@ -99,6 +125,9 @@ impl QueryReasoner {
                 max_iterations: usize::MAX,
                 max_union: crate::qlrewrite::DEFAULT_MAX_UNION,
                 warnings,
+                program,
+                direct_program: false,
+                closures: std::env::var("SPARKLES_DEMAND_CLOSURES").map_or(true, |v| v != "0"),
             }),
         })
     }
@@ -120,6 +149,9 @@ impl QueryReasoner {
                 max_iterations: s.max_iterations,
                 max_union: s.max_union,
                 warnings: s.warnings.clone(),
+                program: s.program.clone(),
+                direct_program: s.direct_program,
+                closures: s.closures,
             }),
         }
     }
@@ -141,7 +173,63 @@ impl QueryReasoner {
                 max_iterations: s.max_iterations,
                 max_union: n.max(1),
                 warnings: s.warnings.clone(),
+                program: s.program.clone(),
+                direct_program: s.direct_program,
+                closures: s.closures,
             }),
+        }
+    }
+
+    /// The same reasoner over the rule program that `source` makes over each session's
+    /// terms, in place of its profile's rules (item 839's plan, §20.2), for tests that
+    /// build IR rules directly. Its sessions neither read nor fill the table cache, whose
+    /// keys name the profile's rule text and not `source`.
+    #[cfg(test)]
+    pub(crate) fn with_program(self, source: ProgramSource) -> QueryReasoner {
+        let s = &self.shared;
+        QueryReasoner {
+            shared: Arc::new(Shared {
+                profile: s.profile.clone(),
+                extras: s.extras.clone(),
+                rules: s.rules.clone(),
+                sources: vec!["rules".to_string()],
+                geo_default: s.geo_default,
+                inputs: s.inputs.clone(),
+                digest: s.digest,
+                max_derived: s.max_derived,
+                max_iterations: s.max_iterations,
+                max_union: s.max_union,
+                warnings: s.warnings.clone(),
+                program: Some(source),
+                direct_program: true,
+                closures: s.closures,
+            }),
+        }
+    }
+
+    /// The same reasoner with the closure operators of its demand programs on or off,
+    /// for the tests that compare the two.
+    #[cfg(test)]
+    pub(crate) fn with_closures(self, on: bool) -> QueryReasoner {
+        let mut shared = Arc::try_unwrap(self.shared).unwrap_or_else(|s| Shared {
+            profile: s.profile.clone(),
+            extras: s.extras.clone(),
+            rules: s.rules.clone(),
+            sources: s.sources.clone(),
+            geo_default: s.geo_default,
+            inputs: s.inputs.clone(),
+            digest: s.digest,
+            max_derived: s.max_derived,
+            max_iterations: s.max_iterations,
+            max_union: s.max_union,
+            warnings: s.warnings.clone(),
+            program: s.program.clone(),
+            direct_program: s.direct_program,
+            closures: s.closures,
+        });
+        shared.closures = on;
+        QueryReasoner {
+            shared: Arc::new(shared),
         }
     }
 
@@ -231,6 +319,12 @@ impl QueryReasoner {
                     (!B::from_name(&b.name).is_some_and(pure)).then(|| format!("calls {}", b.name))
                 }
                 Clause::Rule(r) => find(&r.body, false).or_else(|| find(&r.head, true)),
+                // a relation atom reads or gives facts as a triple does, so a head atom
+                // that holds a blank node or a functor makes terms, and `not` reads the
+                // facts as `noValue` does
+                Clause::Relation(a) => (head && a.args.iter().any(makes_terms))
+                    .then(|| "makes a blank node or functor in its head".to_string()),
+                Clause::Not(_) => Some("negates an atom".to_string()),
                 Clause::Triple(t) => (head
                     && [&t.subject, &t.predicate, &t.object]
                         .into_iter()
@@ -313,10 +407,19 @@ impl QueryReasoner {
     /// `cached` set it reads and fills the schema's table, whose facts join the graph, and
     /// without it not even that, since facts added to the session (a why-not hypothesis)
     /// change the schema.
+    /// A query's session, with linear recursion rewritten or not, for tests.
+    #[cfg(test)]
+    pub(crate) fn test_session(&self, req: SessionRequest, linear: bool) -> Result<Session> {
+        let mut s = Session::new(self.shared.clone(), req)?;
+        s.rewrite_linear = linear;
+        Ok(s)
+    }
+
     pub(crate) fn explain_session(&self, mut req: SessionRequest, cached: bool) -> Result<Session> {
         req.no_cache = true;
         let mut s = Session::new(self.shared.clone(), req)?;
         s.rewrite_linear = false;
+        s.closures = Some(false);
         s.view = None;
         if !cached {
             s.schema_view = None;
@@ -443,13 +546,93 @@ pub(crate) struct Parts<'a> {
     pub snap: &'a Arc<Snapshot>,
     pub budget: &'a Arc<Budget>,
     pub compact_rounds: &'a [u32],
+    /// the relations of the session's rule program (item 839)
+    pub relations: Option<&'a crate::ir::Relations>,
+}
+
+/// The rules a session evaluates: its profile's, compiled, or a rule program's, lowered
+/// with the infos of its IR rules and its relations (item 839).
+enum Compiled {
+    Profile(engine::CompiledInfo),
+    Program {
+        rules: Vec<CRule>,
+        infos: Vec<engine::RuleInfo>,
+        /// the program, which charges its relation catalog, kept for the catalog
+        program: Box<crate::engine::frontend::ProgramInfo>,
+        /// the program runs as `engine::run_program` runs it: it has an IR feature, so
+        /// its lists are read again when their cells arrive, in every stage
+        replay: bool,
+        /// the charges of the rules, their infos and the lowering's buffers
+        _held: (crate::budget::Held, crate::ir::lower::Lowered),
+    },
+}
+
+/// The lowered rules of the program that `source` makes over `terms`, in stratum order.
+/// Demand stages every negation in a stage of its own below its rule (see
+/// [`demand::transform`]), so the strata's boundaries are not kept.
+fn program_rules(
+    source: &ProgramSource,
+    terms: &Terms,
+    budget: &Arc<Budget>,
+    warnings: &mut WorkingWarnings,
+) -> Result<Compiled> {
+    let failed = |e: anyhow::Error| match BudgetFailure::from_anyhow(&e) {
+        Some(m) => memory_error(m, "the rule program"),
+        None => component(RULES_CODE, format!("{e:#}")),
+    };
+    let program = Box::new(source(terms, warnings).map_err(failed)?);
+    let mut lowered = program.program.lower(budget).map_err(|e| match e {
+        crate::ir::lower::LowerError::Memory(m) => memory_error(m, "the rule program"),
+        e => component(RULES_CODE, e.to_string()),
+    })?;
+    let replay = lowered.shape != crate::ir::lower::Shape::Jena;
+    let mut held = crate::budget::Held::new(budget);
+    let (rules, infos) =
+        crate::explain::flat_rules(&program.program, &mut lowered, &mut held, &program.lines)
+            .map_err(|e| memory_error(e, "the rule program"))?;
+    Ok(Compiled::Program {
+        rules,
+        infos,
+        program,
+        replay,
+        _held: (held, lowered),
+    })
+}
+
+impl Compiled {
+    fn rules(&self) -> &[CRule] {
+        match self {
+            Compiled::Profile(c) => c.rules(),
+            Compiled::Program { rules, .. } => rules,
+        }
+    }
+
+    fn infos(&self) -> &[engine::RuleInfo] {
+        match self {
+            Compiled::Profile(c) => c.infos(),
+            Compiled::Program { infos, .. } => infos,
+        }
+    }
+
+    /// Whether the rules run as `engine::run_program` runs a program with an IR feature,
+    /// reading lists again when their cells arrive (item 839's plan, §21).
+    fn replays_lists(&self) -> bool {
+        matches!(self, Compiled::Program { replay: true, .. })
+    }
+
+    fn relations(&self) -> Option<&crate::ir::Relations> {
+        match self {
+            Compiled::Profile(_) => None,
+            Compiled::Program { program, .. } => Some(&program.program.relations),
+        }
+    }
 }
 
 pub(crate) struct Session {
     shared: Arc<Shared>,
     snap: Arc<Snapshot>,
     terms: Terms,
-    compiled: engine::CompiledInfo,
+    compiled: Compiled,
     /// whether the demand program rewrites linear recursion (see [`demand::transform`])
     rewrite_linear: bool,
     graphs: Vec<Id>,
@@ -472,6 +655,9 @@ pub(crate) struct Session {
     publish_limit: Option<u64>,
     warnings: WorkingWarnings,
     demands: Vec<Demand>,
+    /// the demands were given by id ([`Session::derive_ids`]), and their terms name
+    /// them only in part, so no table is kept for them
+    by_id: bool,
     keys: Vec<Key>,
     /// the constants of each demand (0 where none), and its seeded position
     consts: Vec<[u64; 3]>,
@@ -528,6 +714,22 @@ pub(crate) struct Session {
     cached: Vec<Arc<Table>>,
     reports: Vec<DemandReport>,
     seeds: Vec<FxHashSet<u64>>,
+    /// whether the session's demand programs may use closure operators (spec F23 Phase
+    /// 2): the reasoner allows them, the session is not an explanation's, and the source
+    /// rules admit them. `None` until the first run decides it, so that a session whose
+    /// tables all come from the cache does not check the rules.
+    closures: Option<bool>,
+    /// a run derived list structure that its rules read, so the session's runs go on
+    /// without operators (see [`closure::Restart`])
+    closures_off: bool,
+    /// the magic predicates of the session's programs for the operators, made again when
+    /// the set grows
+    magic: Option<Arc<FxHashSet<u64>>>,
+    /// the facts that are not magic facts among the rows a restarted run killed, which
+    /// the session's limit of derived facts does not count again
+    killed: usize,
+    /// what the closure operators of the session's runs did
+    closure_stats: crate::closure::Stats,
 }
 
 impl Session {
@@ -541,8 +743,14 @@ impl Session {
             .map_err(|e| memory_error(e, "the rules"))?;
         let mut warnings = WorkingWarnings::try_clone_from(&shared.warnings, &budget)
             .map_err(|e| memory_error(e, "the rule warnings"))?;
-        let compiled = engine::compile_info(&shared.rules, &terms, &mut warnings, true)
-            .map_err(|e| memory_error(e, "the compiled rules"))?;
+        let compiled = match &shared.program {
+            None => Compiled::Profile(
+                engine::compile_info(&shared.rules, &terms, &mut warnings, true)
+                    .map_err(|e| memory_error(e, "the compiled rules"))?,
+            ),
+            Some(source) => program_rules(source, &terms, &budget, &mut warnings)?,
+        };
+        let closures = (!shared.closures).then_some(false);
         // imports are followed only through the graphs the caller reads (spec F17 §4.5)
         let resolved = match &req.readable {
             Some(readable) => inputs::resolve_readable(&snap, &shared.inputs, &|g| readable(g)),
@@ -584,6 +792,14 @@ impl Session {
             }
             None => (None, None),
         };
+        // the tables of a program that a test gives directly are not kept, since the
+        // cache's keys name the profile's rule text; a program from the rule text is
+        // named by the digest of that text (item 839's plan, §22.5)
+        let (anchor_key, schema_view, publish_limit) = if shared.direct_program {
+            (None, None, None)
+        } else {
+            (anchor_key, schema_view, publish_limit)
+        };
         let view = schema_view.clone().filter(|_| !req.no_cache);
         Ok(Session {
             shared,
@@ -602,6 +818,7 @@ impl Session {
             publish_limit,
             warnings,
             demands: Vec::new(),
+            by_id: false,
             keys: Vec::new(),
             consts: Vec::new(),
             seeded: Vec::new(),
@@ -632,6 +849,11 @@ impl Session {
             cached: Vec::new(),
             reports: Vec::new(),
             seeds: Vec::new(),
+            closures,
+            closures_off: false,
+            magic: None,
+            killed: 0,
+            closure_stats: Default::default(),
         })
     }
 
@@ -643,6 +865,9 @@ impl Session {
 
     /// The table cache's key of demand `d` with `seeds` (sorted), when it may be cached.
     fn table_key(&self, d: usize, seeds: &[u64]) -> Option<tables::Key> {
+        if self.by_id {
+            return None;
+        }
         let view = self.view.as_ref()?;
         // the demand names its constants by term, but seeds by the session's ids
         if seeds.iter().any(|&s| Id(s).tag() == Tag::Local) {
@@ -675,9 +900,40 @@ impl Session {
         } else {
             &program.stages[stage].rules
         };
+        // a lowered program's rules read a list again when its cells arrive, as its full
+        // run reads them (item 839's plan, §20.1)
+        // in every stage, since a lower stage may hold none of the IR's features
+        let lists = (!compact && self.compiled.replays_lists())
+            .then_some((self.terms.rdf_first, self.terms.rdf_rest));
+        // the adorned copies of transitive rules are closed by operators, but not in a
+        // compact run, which reads the source rules, nor in a lowered program's
+        let closures = !self.closures_off && !compact && lists.is_none() && {
+            match self.closures {
+                Some(c) => c,
+                None => {
+                    let c = crate::closure::Closures::admits(self.compiled.rules(), &self.terms)
+                        .map_err(|e| memory_error(e, "the rules"))?;
+                    self.closures = Some(c);
+                    c
+                }
+            }
+        };
+        let magic = if closures {
+            match &self.magic {
+                Some(m) if m.len() == self.hidden.len() => Some(m.clone()),
+                _ => {
+                    let m = Arc::new(self.hidden.clone());
+                    self.magic = Some(m.clone());
+                    Some(m)
+                }
+            }
+        } else {
+            None
+        };
         let g = self.graph.as_mut().expect("graph made");
-        // magic facts are charged to the memory budget, not to the limit of facts
-        let derived = g.inferred_since(g.offset());
+        // magic facts are charged to the memory budget, not to the limit of facts, and
+        // the rows a restarted run killed are not counted again
+        let derived = g.inferred_since(g.offset()).saturating_sub(self.killed);
         let max = self.shared.max_derived;
         if derived > max {
             return Err(component(
@@ -688,14 +944,15 @@ impl Session {
             ));
         }
         let flag = Arc::new(AtomicBool::new(false));
-        let limits = engine::Limits {
+        let mut limits = engine::Limits {
             max_iterations: self.shared.max_iterations,
             max_inferred: max - derived,
             cancel: Some(flag.clone()),
             deadline: None,
             progress: None,
             budget: self.budget.clone(),
-            closures: false,
+            closures,
+            magic,
             sampled_planning: false,
         };
         let terms = &self.terms;
@@ -718,13 +975,59 @@ impl Session {
             ends[*count] = end;
             *count += 1;
         };
-        let (r, stopped) = watched(&self.stop, &flag, || {
-            if compact {
-                engine::run_observed(g, rules, terms, &limits, None, Some(&mut note))
-            } else {
-                engine::run(g, rules, terms, &limits, Some(start))
+        // the rows from here on are this run's: a run with operators that derived list
+        // structure its rules read starts again from here without them
+        let entry = g.len();
+        let mut killed = 0usize;
+        let mut restarted = false;
+        let (r, stopped) = loop {
+            let (r, stopped) = watched(&self.stop, &flag, || {
+                if compact {
+                    engine::run_observed(g, rules, terms, &limits, None, Some(&mut note))
+                } else if lists.is_some() {
+                    let origin = engine::Origin {
+                        lists,
+                        ..engine::Origin::default()
+                    };
+                    engine::run_from(g, rules, terms, &limits, Some(start), None, origin)
+                } else {
+                    engine::run(g, rules, terms, &limits, Some(start))
+                }
+            });
+            match &r {
+                Err(e)
+                    if stopped.is_none()
+                        && limits.closures
+                        && e.is::<crate::closure::Restart>() =>
+                {
+                    tracing::debug!(target: "sparkles_reasoner::demand", "{e}");
+                    // one row at a time, so that nothing beside the dead bits is held,
+                    // polling the query's stop meanwhile
+                    for i in entry..g.len() {
+                        if i % 4096 == 0 {
+                            (self.stop)()?;
+                        }
+                        if !g.alive(i) {
+                            continue;
+                        }
+                        let t = g.triple(i);
+                        g.kill(&t).map_err(|e| memory_error(e, what))?;
+                        killed += !self.hidden.contains(&t[1]) as usize;
+                    }
+                    limits.closures = false;
+                    limits.magic = None;
+                    restarted = true;
+                }
+                _ => break (r, stopped),
             }
-        });
+        };
+        self.killed += killed;
+        if restarted {
+            self.closures_off = true;
+        }
+        if let Ok(o) = &r {
+            self.closure_stats.add(&o.closure);
+        }
         if tracing::enabled!(target: "sparkles_reasoner::demand", tracing::Level::DEBUG) {
             self.trace_facts(pre);
         }
@@ -772,6 +1075,10 @@ impl Session {
         let mut g = Graph::with_base(Arc::new(base));
         g.set_budget(&self.budget)
             .map_err(|e| memory_error(e, "the input graphs"))?;
+        // relation facts are hidden from every atom with a variable predicate
+        if self.compiled.relations().is_some_and(|r| !r.is_empty()) {
+            g.set_relations();
+        }
         self.graph = Some(g);
         Ok(())
     }
@@ -904,9 +1211,37 @@ impl Session {
 
     /// The equality table of the session's derived facts, with the charge for building
     /// it, or `None` when it is not kept (see [`Session::cache_equality`]).
+    /// The facts of [`equality_table`](Self::equality_table), for tests.
+    #[cfg(test)]
+    pub(crate) fn equality_facts_for_tests(&self) -> Option<Vec<[u64; 3]>> {
+        self.equality_table()
+            .map(|(t, _)| t.facts().copied().collect())
+    }
+
+    /// The bytes charged to `budget` while the rules of `source` over `terms` live, for
+    /// tests.
+    #[cfg(test)]
+    pub(crate) fn program_rules_for_tests(
+        source: &ProgramSource,
+        terms: &Terms,
+        budget: &Arc<Budget>,
+    ) -> Result<usize> {
+        // the bytes the session's rules hold charged while they live
+        let mut w = WorkingWarnings::new(budget);
+        program_rules(source, terms, budget, &mut w).map(|_compiled| budget.used())
+    }
+
     fn equality_table(&self) -> Option<(Table, Held)> {
         let g = self.graph.as_ref().expect("graph made");
-        let kept = || g.facts().filter(|t| !self.hidden.contains(&t[1]));
+        // a relation fact is left out: the handle of its tail is a local term whose
+        // columns a replay cannot map, and the stages above the equality stages, where
+        // only owl:sameAs is complete, derive the relation facts they ask for again
+        let kept = || {
+            g.facts().enumerate().filter_map(|(i, t)| {
+                (!self.hidden.contains(&t[1]) && !crate::ir::lower::is_key(t[1]) && live(g, i))
+                    .then_some(t)
+            })
+        };
         let local = |x: &u64| Id(*x).tag() == Tag::Local;
         // the facts and their local ids are counted first, and each list is made at the
         // size its charge admits, so that none of them grows
@@ -968,12 +1303,23 @@ impl Session {
     fn transform(&self, rules: &[CRule], roots: &[Key], pass: Pass<'_>) -> Result<Program> {
         let g = self.graph.as_ref().expect("graph made");
         let est = |a: &Atom, bound: &[bool]| estimate(g, a, bound);
-        demand::transform(rules, &self.terms, roots, &est, pass, self.rewrite_linear).map_err(|e| {
-            match e {
-                TransformError::Memory(m) => memory_error(m, "the demand program"),
-                TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
-                TransformError::NotStratified => component(RULES_CODE, e.to_string()),
-            }
+        // whether the program reads lists again when their cells arrive is the source
+        // program's, since the schema pass and specialization may leave out the rules
+        // that hold its IR features (item 839)
+        let replay = self.compiled.replays_lists();
+        demand::transform(
+            rules,
+            &self.terms,
+            roots,
+            &est,
+            pass,
+            self.rewrite_linear,
+            replay,
+        )
+        .map_err(|e| match e {
+            TransformError::Memory(m) => memory_error(m, "the demand program"),
+            TransformError::TooLarge(_) => component(BUDGET_CODE, e.to_string()),
+            TransformError::NotStratified => component(RULES_CODE, e.to_string()),
         })
     }
 
@@ -1471,6 +1817,7 @@ impl Session {
             } else {
                 &[]
             },
+            relations: self.compiled.relations(),
         })
     }
 
@@ -1499,6 +1846,33 @@ impl Session {
         let seeds = (0..demands.len()).map(|d| (d, Vec::new())).collect();
         self.derive(seeds)?;
         Ok(())
+    }
+
+    /// [`derive_all`](Self::derive_all) for patterns of ids, `None` where a position is
+    /// free, which may name a relation's key (item 839's plan, §20.2). A pattern names its
+    /// terms in the reports where they have one.
+    pub(crate) fn derive_ids(&mut self, pats: &[[Option<u64>; 3]]) -> Result<()> {
+        let term = |x: Option<u64>| match x.and_then(|id| self.terms.term(id)) {
+            Some(t) => DemandTerm::Const(t),
+            None => DemandTerm::Var,
+        };
+        let demands: Vec<Demand> = pats
+            .iter()
+            .map(|p| Demand {
+                s: term(p[0]),
+                p: term(p[1]),
+                o: term(p[2]),
+            })
+            .collect();
+        self.prepare_ids(&demands, Some(pats), false)?;
+        let seeds = (0..pats.len()).map(|d| (d, Vec::new())).collect();
+        self.derive(seeds)?;
+        Ok(())
+    }
+
+    /// The relations of the session's rule program, when it has one.
+    pub(crate) fn relations(&self) -> Option<&crate::ir::Relations> {
+        self.compiled.relations()
     }
 
     /// The session's graph, made when no demand derived yet.
@@ -1578,7 +1952,7 @@ impl Session {
         let mut seen: FxHashSet<u64> = FxHashSet::default();
         for (i, t) in g.facts_from(from).enumerate() {
             let t = &t;
-            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+            if self.hidden.contains(&t[1]) || !self.terms.valid(t) || !live(g, from + i) {
                 continue;
             }
             let schema = || {
@@ -1652,9 +2026,9 @@ impl Session {
     fn export_rows(&mut self, lo: usize, hi: usize, which: Rows, out: &mut Derived) {
         let g = self.graph.as_ref().expect("graph made");
         let mut chunk: Vec<[u64; 3]> = Vec::new();
-        for t in g.facts_range(lo, hi) {
+        for (i, t) in g.facts_range(lo, hi).enumerate() {
             let t = &t;
-            if self.hidden.contains(&t[1]) || !self.terms.valid(t) {
+            if self.hidden.contains(&t[1]) || !self.terms.valid(t) || !live(g, lo + i) {
                 continue;
             }
             match which {
@@ -1680,6 +2054,11 @@ impl Session {
             }
             chunk.push(*t);
         }
+        // in predicate, object and subject order, the order joins mostly derive them in,
+        // which the query's overlay inserts fastest: a closure operator derives its pairs
+        // in another order, and the overlay of a cached table, made again for every
+        // query, took 10% longer for it. Subject order cost some queries 2% against this.
+        chunk.sort_unstable_by_key(|t| (t[1], t[2], t[0]));
         out.facts.extend_from_slice(&chunk);
         if !chunk.is_empty() {
             self.chunks.push(Arc::new(chunk));
@@ -1881,30 +2260,38 @@ fn estimate(g: &Graph, a: &Atom, bound: &[bool]) -> (f64, f64) {
     (stored, unknown)
 }
 
-impl ReasoningSession for Session {
-    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> Result<bool> {
-        let slot = |t: Option<&Term>, v: usize| match t {
-            Some(t) => self.id_of(t).map(Slot::Const),
-            None => Ok(Slot::Var(v)),
-        };
-        Ok(demand::intensional(
-            self.compiled.rules(),
-            (slot(s, 0)?, slot(p, 1)?, slot(o, 2)?),
-        ))
-    }
-
-    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
+impl Session {
+    /// [`ReasoningSession::prepare`], with the constants of each demand given by id in
+    /// `ids` when it is set, where `demands` names them only for the reports: a relation's
+    /// key has no term (item 839's plan, §20.2).
+    fn prepare_ids(
+        &mut self,
+        demands: &[Demand],
+        ids: Option<&[[Option<u64>; 3]]>,
+        estimates: bool,
+    ) -> Result<Vec<DemandInfo>> {
         self.demands = demands.to_vec();
+        self.by_id = ids.is_some();
         self.keys.clear();
         self.consts.clear();
         self.seeded.clear();
-        for d in demands {
+        // which positions of each demand are constants
+        let mut constant: Vec<[bool; 3]> = Vec::with_capacity(demands.len());
+        for (di, d) in demands.iter().enumerate() {
             let mut c = [0u64; 3];
+            let mut fixed = [false; 3];
+            let given = ids.map(|x| x[di]);
             let mut val = |t: &DemandTerm, i: usize| -> Result<bool> {
+                if let Some(g) = given {
+                    fixed[i] = g[i].is_some();
+                    c[i] = g[i].unwrap_or(0);
+                    return Ok(fixed[i]);
+                }
                 Ok(match t {
                     DemandTerm::Const(t) => {
                         let id = self.id_of(t)?;
                         c[i] = id;
+                        fixed[i] = true;
                         true
                     }
                     DemandTerm::Seeded => true,
@@ -1917,11 +2304,11 @@ impl ReasoningSession for Session {
             let kp = if p { KeyP::Const(c[1]) } else { KeyP::Free };
             let k = Key::new(s, kp, o);
             let rdf_type = self.id_of(&Term::NamedNode(oxrdf::vocab::rdf::TYPE.into_owned()))?;
-            self.keys.push(match (&d.p, &d.o) {
-                (DemandTerm::Const(_), DemandTerm::Const(_)) if c[1] == rdf_type => {
-                    k.with_class(c[2])
-                }
-                _ => k,
+            constant.push(fixed);
+            self.keys.push(if fixed[1] && fixed[2] && c[1] == rdf_type {
+                k.with_class(c[2])
+            } else {
+                k
             });
             self.consts.push(c);
             self.seeded.push(match (&d.s, &d.o) {
@@ -1942,11 +2329,15 @@ impl ReasoningSession for Session {
                     DemandTerm::Const(t) => short(t),
                     _ => "?p".to_string(),
                 };
-                let slot = |t: &DemandTerm, i: usize| match t {
-                    DemandTerm::Const(_) => Slot::Const(c[i]),
-                    _ => Slot::Var(i),
+                let fixed = constant[i];
+                let slot = |j: usize| {
+                    if fixed[j] {
+                        Slot::Const(c[j])
+                    } else {
+                        Slot::Var(j)
+                    }
                 };
-                let pattern = (slot(&d.s, 0), slot(&d.p, 1), slot(&d.o, 2));
+                let pattern = (slot(0), slot(1), slot(2));
                 let cone = demand::cone_indices(self.compiled.rules(), &self.terms, pattern);
                 // the materializer skips top-level backward rules (spec F17 §5.1), so a
                 // materialization lacks the facts of a cone that holds one
@@ -1990,6 +2381,23 @@ impl ReasoningSession for Session {
         self.program = None;
         self.specialized = false;
         Ok(infos)
+    }
+}
+
+impl ReasoningSession for Session {
+    fn intensional(&self, s: Option<&Term>, p: Option<&Term>, o: Option<&Term>) -> Result<bool> {
+        let slot = |t: Option<&Term>, v: usize| match t {
+            Some(t) => self.id_of(t).map(Slot::Const),
+            None => Ok(Slot::Var(v)),
+        };
+        Ok(demand::intensional(
+            self.compiled.rules(),
+            (slot(s, 0)?, slot(p, 1)?, slot(o, 2)?),
+        ))
+    }
+
+    fn prepare(&mut self, demands: &[Demand], estimates: bool) -> Result<Vec<DemandInfo>> {
+        self.prepare_ids(demands, None, estimates)
     }
 
     fn derive(&mut self, seeds: Vec<(usize, Vec<u64>)>) -> Result<Derived> {
@@ -2123,6 +2531,13 @@ impl ReasoningSession for Session {
             warnings: self.warnings.as_slice().to_vec(),
         }
     }
+}
+
+/// Whether the `i`-th fact of `g`'s derived tier is live: a run that started again
+/// without closure operators killed the rows it had derived with them.
+#[inline]
+fn live(g: &Graph, i: usize) -> bool {
+    g.dead_rows() == 0 || g.alive(g.offset() + i as u32)
 }
 
 /// `f` run while a thread polls `stop`, the query's deadline and cancellation, and sets
@@ -2339,13 +2754,15 @@ mod compact_tests {
         // Keep this structural strategy control on valid compiler-owned fixtures.
         let mut warnings = WorkingWarnings::new(&session.budget);
         let many = crate::parse_rules(&"[(?s ?p ?o) -> (?o ?p ?s)]\n".repeat(257)).unwrap();
-        session.compiled =
-            engine::compile_info(&many, &session.terms, &mut warnings, true).unwrap();
+        session.compiled = Compiled::Profile(
+            engine::compile_info(&many, &session.terms, &mut warnings, true).unwrap(),
+        );
         assert!(!session.prefer_compact(50_000).unwrap());
         let wide =
             crate::parse_rules(&format!("[{} -> (?s ?p ?o)]", "(?s ?p ?o) ".repeat(65))).unwrap();
-        session.compiled =
-            engine::compile_info(&wide, &session.terms, &mut warnings, true).unwrap();
+        session.compiled = Compiled::Profile(
+            engine::compile_info(&wide, &session.terms, &mut warnings, true).unwrap(),
+        );
         assert!(!session.prefer_compact(8192).unwrap());
     }
 
@@ -2843,3 +3260,88 @@ mod proof_cache_tests {
         assert!(get(&key, &other).is_none());
     }
 }
+
+#[cfg(test)]
+mod program_identity_tests {
+    use super::*;
+    use sparkles_core::io::{RdfFormat, Source};
+    use sparkles_core::store::{Store, StoreOptions};
+
+    /// The demand programs of `rdfs` and `owl-rl` for LUBM-style patterns, printed rule by
+    /// rule, to compare two builds (item 839's plan, §20.6). Run with `--ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn print_profile_demand_programs() {
+        const UB: &str = "http://swat.cse.lehigh.edu/onto/univ-bench.owl#";
+        let ttl = format!(
+            "@prefix ub: <{UB}> . @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+             @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+             ub:GraduateStudent rdfs:subClassOf ub:Student . ub:takesCourse rdfs:domain ub:Student . \
+             ub:memberOf owl:inverseOf ub:member . ub:subOrganizationOf a owl:TransitiveProperty . \
+             ub:worksFor rdfs:subPropertyOf ub:memberOf . <http://ex.org/s> ub:takesCourse <http://ex.org/c> ."
+        );
+        for profile in [Profile::Rdfs, Profile::OwlRl] {
+            let store = Store::in_memory(StoreOptions::default());
+            store
+                .load(&[Source::from_bytes(
+                    ttl.clone().into_bytes(),
+                    RdfFormat::Turtle,
+                    None,
+                )])
+                .unwrap();
+            let name = profile.name().to_string();
+            let reasoner =
+                QueryReasoner::new(profile, &crate::Extras::default(), crate::Inputs::default())
+                    .unwrap();
+            let mut session = Session::new(
+                reasoner.shared.clone(),
+                SessionRequest {
+                    snap: store.snapshot(),
+                    readable: None,
+                    stop: Arc::new(|| Ok(())),
+                    max_memory: None,
+                    no_cache: true,
+                },
+            )
+            .unwrap();
+            session.make_graph().unwrap();
+            let id = |iri: &str| {
+                session
+                    .terms
+                    .id_for(&Term::NamedNode(oxrdf::NamedNode::new_unchecked(iri)))
+                    .unwrap()
+            };
+            let ty = id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+            let keys = [
+                Key::new(false, KeyP::Const(ty), true).with_class(id(&format!("{UB}Student"))),
+                Key::new(true, KeyP::Const(id(&format!("{UB}memberOf"))), false),
+                Key::new(
+                    false,
+                    KeyP::Const(id(&format!("{UB}subOrganizationOf"))),
+                    true,
+                ),
+                Key::new(true, KeyP::Free, false),
+                Key::new(false, KeyP::Free, false),
+            ];
+            for (ki, k) in keys.iter().enumerate() {
+                let rules: Vec<CRule> = session
+                    .compiled
+                    .rules()
+                    .iter()
+                    .map(CRule::clone_shallow)
+                    .collect();
+                let program = session.transform(&rules, &[*k], Pass::Plain).unwrap();
+                for (si, st) in program.stages.iter().enumerate() {
+                    for r in &st.rules {
+                        eprintln!("ident {name} key{ki} stage{si} {r:?}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "query_closure_tests.rs"]
+mod closure_tests;

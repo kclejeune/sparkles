@@ -550,13 +550,55 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
     let st = Arc::new(AppState::new(dir.path(), opts, Duration::from_secs(30)).unwrap());
     st.create("disk", DbType::Persistent).unwrap();
     st.create("mem", DbType::Mem).unwrap();
+    st.create("fresh-put", DbType::Mem).unwrap();
+    st.create("fresh-post", DbType::Mem).unwrap();
     let app = router(st.clone());
     let small = "<http://example.org/a> <http://example.org/p> \"1\" .";
+    // an in-memory dataset below its limit takes writes
+    let r = send(
+        &app,
+        put("/mem/data?default", "application/n-triples", small),
+    )
+    .await;
+    assert!(r.status.is_success(), "{}", r.text());
     let mut large = String::new();
     for i in 0..5000 {
         large.push_str(&format!(
             "<http://example.org/s{i}> <http://example.org/p> \"{i}\" .\n"
         ));
+    }
+    // A transaction admits each quad by its memory estimate, for a first PUT into an empty
+    // dataset and a POST into one with data. A dry run writes nothing, so the limit does
+    // not refuse it outright, and its preview reports the refusal the write gets.
+    for (method, uri) in [
+        ("PUT", "/fresh-put/data?default"),
+        ("POST", "/mem/data?default"),
+    ] {
+        let req = |uri: &str| {
+            let f = if method == "PUT" { put } else { post };
+            f(uri, "application/n-triples", &large)
+        };
+        let r = send(&app, req(&format!("{uri}&dryRun=true"))).await;
+        assert_eq!(
+            r.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{method} {uri}: {}",
+            r.text()
+        );
+        let j = r.json();
+        assert_eq!(j["dryRun"], true, "{method} {uri}: {j}");
+        assert_eq!(j["outcome"], "storage-refused", "{method} {uri}: {j}");
+        assert_eq!(j["storage"]["status"], "refused", "{method} {uri}: {j}");
+        assert_eq!(j["commit"]["inserted"], 5000, "{method} {uri}: {j}");
+        let real = send(&app, req(uri)).await;
+        assert_eq!(
+            real.status,
+            StatusCode::INSUFFICIENT_STORAGE,
+            "{}",
+            real.text()
+        );
+        assert_eq!(real.json()["code"], "storage-full");
+        assert_eq!(real.json()["error"], j["error"], "{method} {uri}");
     }
     let writes = [
         post(
@@ -580,12 +622,15 @@ async fn commits_that_would_fill_the_disk_or_memory_get_507() {
         assert_eq!(r.json()["code"], "storage-full", "{what}");
     }
     assert_eq!(st.get("disk").unwrap().store.head_commit().seq, 0);
-    assert!(st.get("mem").unwrap().store.snapshot().is_empty());
-    // an in-memory dataset below its limit takes writes
+    assert_eq!(st.get("mem").unwrap().store.snapshot().len(), 1);
+    assert!(st.get("fresh-put").unwrap().store.snapshot().is_empty());
+    // A POST into an empty dataset takes the bulk plan, which admits the generation it
+    // builds by its size, and that of these quads fits in the limit.
     let r = send(
         &app,
-        put("/mem/data?default", "application/n-triples", small),
+        post("/fresh-post/data?default", "application/n-triples", &large),
     )
     .await;
     assert!(r.status.is_success(), "{}", r.text());
+    assert_eq!(st.get("fresh-post").unwrap().store.snapshot().len(), 5000);
 }

@@ -394,6 +394,45 @@ function marked pure runs natively with the same answer as its ARQ fallback; `fn
 with a variable IRI that names a registered function calls it and the query is not
 cached.
 
+### Calls added by query rewrites
+
+This section records roadmap item 1198. A query decided whether it calls registered
+extensions from its pattern as written, before RDFS on read rewrote it. A schema that declared a registered
+property function a subproperty of a queried predicate made the rewrite add the call to
+a query that had no callback state. `CallbackGuard::enter` panicked, the property
+stream's destructor entered the guard again while unwinding, and the process aborted. A
+plain join on the parent predicate was refused with a planning error instead, and the
+seed queries of query-time reasoning planned a written call without the callback state
+in the same way.
+
+The RDFS rewrite now treats a registered property as a call through which the schema
+derives nothing. It leaves a triple pattern that names one as written, with the list
+cells of its list-shaped arguments, and joins it after the rewritten patterns of its group so that
+it still reads their bindings. It adds none as a subproperty branch, a domain or range
+branch or a superproperty pair, gives a variable predicate no type branches when
+`rdf:type` is registered, and keeps a path link of one as a stored read. The rewrite
+still renames the query's blank nodes to variables whose prefix no SPARQL variable name
+can have, so that one blank node keeps one binding across the algebra nodes of a group,
+and list extraction reads such a variable as the blank node it replaced. A review found
+that the OWL 2 QL rewrite reads the ontology without the registry in the same way, and
+roadmap item 1205 covers it. A reasoning seed set that would read through a call falls back to
+the pattern's demand with constants. The configuration is still decided on the pattern
+as written, which the rewrite no longer extends, so the order of the two steps did not
+change. An error replaces the panic in `CallbackGuard::enter`, the planner refuses a
+call that its context was not configured for, and the destructors of property streams
+and aggregate accumulators drop their value without a guard when none can be entered and
+leak the payload of a panic from it, whose own destructor could otherwise unwind.
+When an evaluated `EXISTS` or a registered scalar call encounters this refusal, query
+execution preserves the original error even if an expression such as `COALESCE`
+handles the evaluation error. Patterns containing registered callbacks use per-row
+`EXISTS` evaluation. Row-budget checks preserve a recorded unconfigured-call refusal.
+`tests/rdfs_extension_calls.rs` covers eager and streamed shapes, an update's `WHERE`
+clause, inputs from rewritten patterns, list arguments, a registered `rdf:type` and the
+reasoning seeds. Unit tests cover the guard, the planner, eager execution and cursor
+execution on unconfigured contexts. The eager query fails and a strict cursor fails
+on its first pull without publishing a row. An untaken `IF` arm and ordinary
+expression fallback still succeed in both modes.
+
 ### Callback context during thread destruction
 
 Callback and writer bookkeeping remains available through thread destruction. The

@@ -33,7 +33,8 @@ use super::indexjoin::{self, ProbeSide};
 use super::keyprobe::Side;
 use super::plan::{self, JoinModel, Node, Planner};
 use super::table::VarId;
-use crate::error::Result;
+use crate::access::{PreparationText, Reservation};
+use crate::error::{Error, Result};
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -278,15 +279,140 @@ fn filtered(cost: f64, est: f64, sel: f64, unsorted: bool) -> (f64, f64) {
     (cost, (est * sel).max(if est > 0.0 { 1.0 } else { 0.0 }))
 }
 
-/// Join `a` and `b` the given way (the same nodes as the planner's join candidates).
-fn build_join(a: Node, b: Node, how: How, ctx: &Ctx) -> Node {
-    let keys: Vec<VarId> = a
-        .vars
-        .iter()
-        .filter(|v| b.vars.contains(v))
-        .copied()
-        .collect();
+/// The variables of `a` that `b` also has, in `a`'s order.
+fn shared_vars<'a>(a: &'a Node, b: &'a Node) -> impl Iterator<Item = VarId> + 'a {
+    a.vars.iter().filter(|v| b.vars.contains(v)).copied()
+}
+
+/// The most that [`build_join`] of `a` and `b` the given way allocates at once, counting
+/// what the join keeps and the hash join made instead of an index join no longer offered.
+fn join_build_bound(
+    layout: &mut super::checked_layout::Layout<'_>,
+    a: &Node,
+    b: &Node,
+    how: How,
+    ctx: &Ctx,
+) -> Result<()> {
+    let keys = shared_vars(a, b).count();
+    layout.slots::<VarId>(keys)?;
     match how {
+        How::Merge(v) => plan::merge_join_bound(layout, a, b, v, keys, ctx),
+        How::Hash => plan::hash_join_bound(layout, a, b, shared_vars(a, b), ctx),
+        How::ProbeRight | How::ProbeLeft => {
+            let (drive, probe) = match how {
+                How::ProbeRight => (a, b),
+                _ => (b, a),
+            };
+            indexjoin::index_join_bound(layout, drive, probe, ctx)?;
+            plan::hash_join_bound(layout, a, b, shared_vars(a, b), ctx)
+        }
+    }
+}
+
+/// Keep, of `held`'s credit, what `n` and the sorts that made it (`sorts`, per child)
+/// keep, and add it to the branch's plan storage.
+fn keep_built(pl: &Planner, mut held: Reservation, n: &Node, sorts: [bool; 2]) -> Result<()> {
+    let kept = {
+        let mut layout = super::checked_layout::Layout::retained(held.preparation());
+        layout.shallow(n)?;
+        for (child, sorted) in n.children.iter().zip(sorts) {
+            if sorted {
+                layout.shallow(child)?;
+            }
+        }
+        layout.bytes()
+    };
+    debug_assert!(
+        kept <= held.bytes(),
+        "the plan keeps {kept} bytes of the {} admitted",
+        held.bytes()
+    );
+    if kept <= held.bytes() {
+        held.release_to(kept);
+    } else {
+        held.grow_by(kept - held.bytes())?;
+    }
+    #[cfg(test)]
+    crate::test_alloc::observe_release();
+    pl.retain_planning(held);
+    Ok(())
+}
+
+/// The filter credit that [`place_masked`] hands back for a filtered input copy in
+/// [`Dp::run`], dropped after the copy. Unit tests settle its drop with the observer.
+#[cfg(test)]
+fn leaf_kept(held: Option<Reservation>) -> crate::test_alloc::Settled {
+    crate::test_alloc::Settled::new(crate::test_alloc::Origin::handed_up(), held)
+}
+#[cfg(not(test))]
+fn leaf_kept(held: Option<Reservation>) -> Option<Reservation> {
+    held
+}
+
+/// Join plans `a` and `b` as [`plan::join`] does: as a cross product when they share no
+/// variable, or one of them when the other is the one empty solution. On the checked
+/// route the join is admitted as [`build_join`] admits one.
+pub(super) fn join_admitted(a: Node, b: Node, pl: &Planner) -> Result<Node> {
+    #[cfg(test)]
+    let _stage = crate::test_alloc::Stage::enter(7);
+    let ctx = pl.ctx;
+    let mut keys = 0;
+    let held = refused(pl.planning_stage(JOIN_BUILD_PHASE).and_then(|()| {
+        pl.planning_scratch(|layout| {
+            keys = shared_vars(&a, &b).count();
+            plan::join_bound(layout, &a, &b)?;
+            if keys > 0 {
+                // the planner's join candidates, each made from copies of both plans
+                for _ in 0..keys + 3 {
+                    layout.node(&a)?;
+                    layout.node(&b)?;
+                }
+                for v in shared_vars(&a, &b) {
+                    plan::merge_join_bound(layout, &a, &b, v, keys, ctx)?;
+                }
+                plan::hash_join_bound(layout, &a, &b, shared_vars(&a, &b), ctx)?;
+                indexjoin::index_join_bound(layout, &a, &b, ctx)?;
+                indexjoin::index_join_bound(layout, &b, &a, ctx)?;
+            }
+            Ok(())
+        })
+    }))?;
+    let keeps_input = held.is_some() && plan::join_keeps_input(&a, &b);
+    let n = plan::join(a, b, ctx);
+    if let Some(held) = held {
+        if keeps_input {
+            drop(held);
+        } else {
+            keep_built(pl, held, &n, [keys > 0; 2])?;
+        }
+    }
+    Ok(n)
+}
+
+/// Join `a` and `b` the given way (the same nodes as the planner's join candidates). On
+/// the checked route the most the join allocates is admitted before it is made, and what
+/// the plan keeps of it stays with the branch's plan storage.
+fn build_join(a: Node, b: Node, how: How, pl: &Planner) -> Result<Node> {
+    #[cfg(test)]
+    let _stage = crate::test_alloc::Stage::enter(7);
+    let ctx = pl.ctx;
+    let held =
+        refused(pl.planning_stage(JOIN_BUILD_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| join_build_bound(layout, &a, &b, how, ctx))
+        }))?;
+    let keys: Vec<VarId> = match &held {
+        Some(_) => {
+            let mut keys = Vec::with_capacity(shared_vars(&a, &b).count());
+            keys.extend(shared_vars(&a, &b));
+            keys
+        }
+        None => shared_vars(&a, &b).collect(),
+    };
+    let sorts = match how {
+        How::Merge(v) => [a.sorted.first() != Some(&v), b.sorted.first() != Some(&v)],
+        _ => [false; 2],
+    };
+    let n = match how {
         How::Merge(v) => plan::merge_join(a, b, v, &keys, ctx),
         How::Hash => plan::hash_join(a, b, keys, ctx),
         How::ProbeRight => match indexjoin::index_join(a, &b, ctx) {
@@ -303,7 +429,11 @@ fn build_join(a: Node, b: Node, how: How, ctx: &Ctx) -> Node {
                 plan::hash_join(a, *b, keys, ctx)
             }
         },
+    };
+    if let Some(held) = held {
+        keep_built(pl, held, &n, sorts)?;
     }
+    Ok(n)
 }
 
 /// What the ordering needs to know about a FILTER conjunct.
@@ -336,6 +466,8 @@ struct Group {
     filters: Vec<FilterInfo>,
     /// how the joins are estimated when not from distinct values
     models: Models,
+    /// the checked route's credit for the above, dropped after them
+    _held: Option<Reservation>,
 }
 
 /// What the inputs of a group hold that estimates a join other than from distinct values.
@@ -374,6 +506,26 @@ impl Held {
 }
 
 impl Models {
+    /// Measure the storage of a copy of these models.
+    fn measure(&self, layout: &mut super::checked_layout::Layout<'_>) -> Result<()> {
+        layout.slice(&self.stars)?;
+        for stars in &self.stars {
+            layout.slice(stars)?;
+        }
+        layout.slice(&self.sides)?;
+        for sides in &self.sides {
+            layout.slice(sides)?;
+        }
+        layout.slice(&self.inputs)?;
+        for inputs in &self.inputs {
+            layout.slice(inputs)?;
+            for vars in inputs {
+                layout.slice(vars)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Whether one input of the inputs `ins` binds every key of `shared`, as
     /// [`plan::one_input_binds`] finds in the plan of them.
     fn one_binds<I: Iterator<Item = usize>>(&self, mut ins: I, shared: &[Shared]) -> bool {
@@ -418,6 +570,25 @@ impl Models {
         js.into_iter()
             .map(|j| (j, self.held(j, std::iter::once(i))))
             .collect()
+    }
+
+    /// The most join variables that [`Models::held_by`] lists for input `i`.
+    fn held_by_bound(&self, i: usize) -> usize {
+        self.stars.get(i).map_or(0, Vec::len) + self.sides.get(i).map_or(0, Vec::len)
+    }
+
+    /// [`Models::held_by`] in storage of [`Models::held_by_bound`] variables.
+    fn held_by_within(&self, i: usize) -> Vec<(u32, Held)> {
+        let stars = self.stars.get(i).map_or(&[][..], Vec::as_slice);
+        let sides = self.sides.get(i).map_or(&[][..], Vec::as_slice);
+        let mut js: Vec<u32> = Vec::with_capacity(stars.len() + sides.len());
+        js.extend(stars.iter().map(|x| x.0));
+        js.extend(sides.iter().map(|x| x.0));
+        js.sort_unstable();
+        js.dedup();
+        let mut out = Vec::with_capacity(js.len());
+        out.extend(js.iter().map(|&j| (j, self.held(j, std::iter::once(i)))));
+        out
     }
 
     /// How a join on join variable `j` (variable `v`) of the inputs `a` and `b` is
@@ -520,10 +691,44 @@ fn merge_held(a: &[(u32, Held)], b: &[(u32, Held)]) -> Vec<(u32, Held)> {
 }
 
 impl Group {
-    fn new(items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Result<Group> {
-        let mut idx: FxHashMap<VarId, u32> = FxHashMap::default();
-        let mut vars = Vec::new();
-        let mut count: Vec<u32> = Vec::new();
+    /// The group of `items` and `filters`. On the checked route the storage is sized
+    /// from the inputs and the filters before any of it is allocated, and admitted in
+    /// two steps, the variables and filters first and the join models once the join
+    /// variables are known. The group holds the credit until it drops.
+    fn new(items: &[Vec<Node>], filters: &[Expr], pl: &Planner) -> Result<Group> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(0);
+        let ctx = pl.ctx;
+        let total: usize = items.iter().map(|it| it[0].vars.len()).sum();
+        first_storage(|| total * std::mem::size_of::<VarId>());
+        let mut held = refused(pl.planning_stage(GROUP_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<VarId>(total)?;
+                layout.map::<VarId, u32>(total)?;
+                // count, join and jvars
+                layout.slots::<u32>(3 * total)?;
+                layout.slots::<Vec<u32>>(items.len())?;
+                for it in items {
+                    layout.slots::<u32>(it[0].vars.len())?;
+                }
+                layout.slots::<FilterInfo>(filters.len())?;
+                let mut most = 0;
+                for f in filters {
+                    let c = var_count(f);
+                    layout.slots::<u32>(c)?;
+                    most = most.max(c);
+                }
+                // one filter's variable set and local indices at a time
+                layout.slots::<VarId>(most)?;
+                layout.slots::<Option<u32>>(most)
+            })
+        }))?;
+        let checked = held.is_some();
+        let cap = if checked { total } else { 0 };
+        let mut vars = Vec::with_capacity(cap);
+        let mut idx: FxHashMap<VarId, u32> =
+            FxHashMap::with_capacity_and_hasher(cap, Default::default());
+        let mut count: Vec<u32> = Vec::with_capacity(cap);
         let mut item_vars = Vec::with_capacity(items.len());
         for it in items {
             let mut iv = Vec::with_capacity(it[0].vars.len());
@@ -541,57 +746,167 @@ impl Group {
             item_vars.push(iv);
         }
         let mut join = vec![u32::MAX; vars.len()];
-        let mut jvars = Vec::new();
+        let mut jvars = Vec::with_capacity(cap);
         for (l, &c) in count.iter().enumerate() {
             if c >= 2 {
                 join[l] = jvars.len() as u32;
                 jvars.push(l as u32);
             }
         }
-        let filters = filters
-            .iter()
-            .map(|f| {
-                let vs = f.var_set();
-                let local: Vec<Option<u32>> = vs.iter().map(|v| idx.get(v).copied()).collect();
-                let placeable =
-                    !f.has_exists() && !vs.is_empty() && local.iter().all(Option::is_some);
-                let cached = super::exprcache::eligible(&[f])
-                    .ok()
-                    .flatten()
-                    .and_then(|v| idx.get(&v).copied());
-                FilterInfo {
-                    placeable,
-                    vars: local.into_iter().flatten().collect(),
-                    cached,
-                    sel: ctx.sampled(&f.display(ctx)).map(|s| s.sel),
+        // a conjunct is looked up by its text only when some selectivity was sampled
+        let sampling = ctx.has_sampled();
+        let mut infos = Vec::with_capacity(filters.len());
+        for f in filters {
+            let vs = if checked {
+                // the same variables as `var_set`, in storage of the counted size
+                let mut vs = Vec::with_capacity(var_count(f));
+                f.vars(&mut vs);
+                vs.sort_unstable();
+                vs.dedup();
+                vs
+            } else {
+                f.var_set()
+            };
+            let local: Vec<Option<u32>> = vs.iter().map(|v| idx.get(v).copied()).collect();
+            let placeable = !f.has_exists() && !vs.is_empty() && local.iter().all(Option::is_some);
+            let cached = super::exprcache::eligible(&[f])
+                .ok()
+                .flatten()
+                .and_then(|v| idx.get(&v).copied());
+            let sel = match (&held, sampling) {
+                (_, false) => None,
+                (Some(credit), true) => {
+                    let mut text = PreparationText::new(credit.preparation())?;
+                    let written = f.write_description(ctx, &mut text);
+                    let (text, credit) = text.finish()?;
+                    if written.is_err() {
+                        return Err(Error::invalid("could not write a filter description"));
+                    }
+                    let sel = ctx.sampled(&text).map(|s| s.sel);
+                    // the text goes before its credit
+                    drop(text);
+                    drop(credit);
+                    sel
                 }
-            })
-            .collect();
-        let mut models = Models::default();
+                (None, true) => ctx.sampled(&f.display(ctx)).map(|s| s.sel),
+            };
+            let vars = if checked {
+                let mut out = Vec::with_capacity(local.iter().flatten().count());
+                out.extend(local.iter().flatten().copied());
+                out
+            } else {
+                local.into_iter().flatten().collect()
+            };
+            infos.push(FilterInfo {
+                placeable,
+                vars,
+                cached,
+                sel,
+            });
+        }
+        let filters = infos;
+        // the inputs that bind several keys, needed only when two inputs could each bind
+        // several keys of one join
+        let several =
+            |iv: &Vec<u32>| iv.iter().filter(|&&l| join[l as usize] != u32::MAX).count() > 1;
+        let backoff = ctx.opt.key_backoff && item_vars.iter().filter(|iv| several(iv)).count() > 1;
+        // The models' credit, with the scratch of one input at a time, which is released
+        // once they are built.
+        let mut scratch = 0;
+        if let Some(credit) = held.as_mut() {
+            first_storage(|| items.len() * std::mem::size_of::<Vec<(u32, u64)>>());
+            let models = refused(pl.planning_stage(MODELS_PHASE).and_then(|()| {
+                pl.planning_scratch(|layout| {
+                    let mut most = super::checked_layout::Layout::new(credit.preparation());
+                    layout.slots::<Vec<(u32, u64)>>(items.len())?;
+                    layout.slots::<Vec<(u32, Side)>>(items.len())?;
+                    for (i, it) in items.iter().enumerate() {
+                        let mut one = super::checked_layout::Layout::new(credit.preparation());
+                        if ctx.opt.characteristic_sets {
+                            let bound = super::charsets::of_node_bound(ctx, &it[0]);
+                            layout.slots::<(u32, u64)>(bound)?;
+                            one.slots::<(VarId, u64)>(bound)?;
+                            one.map::<VarId, usize>(bound)?;
+                        }
+                        if ctx.opt.probed_keys {
+                            let own = own_keys(&item_vars[i], &join).count();
+                            layout.slots::<(u32, Side)>(own)?;
+                            one.slots::<u32>(own)?;
+                        }
+                        if one.bytes() > most.bytes() {
+                            most = one;
+                        }
+                    }
+                    if backoff {
+                        layout.slots::<Vec<Vec<u32>>>(items.len())?;
+                        for it in items {
+                            let (mut inputs, mut keys) = (0usize, 0usize);
+                            plan::input_vars(&it[0], &mut |vs| {
+                                let k = keys_in(vs, &idx, &join).count();
+                                if k > 1 {
+                                    inputs += 1;
+                                    keys += k;
+                                }
+                            });
+                            layout.slots::<Vec<u32>>(inputs)?;
+                            layout.slots::<u32>(keys)?;
+                        }
+                    }
+                    scratch = most.bytes();
+                    layout.add(
+                        usize::try_from(scratch).map_err(|_| credit.preparation().exhausted())?,
+                    )
+                })
+            }))?;
+            if let Some(models) = models {
+                credit.merge(models);
+            }
+        }
+        let checked_cap = |n: usize| if checked { n } else { 0 };
+        let mut models = Models {
+            stars: Vec::with_capacity(checked_cap(items.len())),
+            sides: Vec::with_capacity(checked_cap(items.len())),
+            ..Models::default()
+        };
         for (i, it) in items.iter().enumerate() {
             ctx.check()?;
             let mut masks = Vec::new();
             if ctx.opt.characteristic_sets {
-                super::charsets::of_node(ctx, &it[0], &mut masks);
+                if checked {
+                    let bound = super::charsets::of_node_bound(ctx, &it[0]);
+                    super::charsets::of_node_within(ctx, &it[0], &mut masks, bound);
+                } else {
+                    super::charsets::of_node(ctx, &it[0], &mut masks);
+                }
             }
-            models.stars.push(
-                masks
-                    .into_iter()
-                    .filter_map(|(v, m)| {
-                        let j = join[*idx.get(&v)? as usize];
-                        (j != u32::MAX).then_some((j, m))
-                    })
-                    .collect(),
-            );
-            let mut sides = Vec::new();
+            let star = |(v, m): (VarId, u64)| {
+                let j = join[*idx.get(&v)? as usize];
+                (j != u32::MAX).then_some((j, m))
+            };
+            models.stars.push(if checked {
+                let kept = masks.iter().copied().filter_map(star).count();
+                let mut stars = Vec::with_capacity(kept);
+                stars.extend(masks.iter().copied().filter_map(star));
+                drop(masks);
+                stars
+            } else {
+                masks.into_iter().filter_map(star).collect()
+            });
+            let mut sides = if checked && ctx.opt.probed_keys {
+                Vec::with_capacity(own_keys(&item_vars[i], &join).count())
+            } else {
+                Vec::new()
+            };
             if ctx.opt.probed_keys {
                 // an input without the variable holds no leaf on it, and its side merges
                 // as nothing
-                let mut own: Vec<u32> = item_vars[i]
-                    .iter()
-                    .map(|&l| join[l as usize])
-                    .filter(|&j| j != u32::MAX)
-                    .collect();
+                let mut own: Vec<u32> = if checked {
+                    let mut own = Vec::with_capacity(own_keys(&item_vars[i], &join).count());
+                    own.extend(own_keys(&item_vars[i], &join));
+                    own
+                } else {
+                    own_keys(&item_vars[i], &join).collect()
+                };
                 own.sort_unstable();
                 for j in own {
                     let v = vars[jvars[j as usize] as usize];
@@ -602,19 +917,25 @@ impl Group {
             }
             models.sides.push(sides);
         }
-        // the inputs that bind several keys, needed only when two inputs could each bind
-        // several keys of one join
-        let several =
-            |iv: &Vec<u32>| iv.iter().filter(|&&l| join[l as usize] != u32::MAX).count() > 1;
-        if ctx.opt.key_backoff && item_vars.iter().filter(|iv| several(iv)).count() > 1 {
+        if backoff {
+            models.inputs.reserve_exact(checked_cap(items.len()));
             for it in items {
                 let mut inputs = Vec::new();
+                if checked {
+                    let mut count = 0;
+                    plan::input_vars(&it[0], &mut |vs| {
+                        count += usize::from(keys_in(vs, &idx, &join).count() > 1);
+                    });
+                    inputs.reserve_exact(count);
+                }
                 plan::input_vars(&it[0], &mut |vs| {
-                    let mut x: Vec<u32> = vs
-                        .iter()
-                        .filter_map(|v| idx.get(v).map(|&l| join[l as usize]))
-                        .filter(|&j| j != u32::MAX)
-                        .collect();
+                    let mut x: Vec<u32> = if checked {
+                        let mut x = Vec::with_capacity(keys_in(vs, &idx, &join).count());
+                        x.extend(keys_in(vs, &idx, &join));
+                        x
+                    } else {
+                        keys_in(vs, &idx, &join).collect()
+                    };
                     if x.len() > 1 {
                         x.sort_unstable();
                         x.dedup();
@@ -626,6 +947,9 @@ impl Group {
         }
         models.starred = models.stars.iter().any(|s| !s.is_empty());
         models.probed = models.sides.iter().any(|s| !s.is_empty());
+        if let Some(credit) = held.as_mut() {
+            credit.release_to(credit.bytes() - scratch);
+        }
         Ok(Group {
             vars,
             idx,
@@ -634,8 +958,53 @@ impl Group {
             item_vars,
             filters,
             models,
+            _held: held,
         })
     }
+}
+
+/// The join variable indexes of the variables `vs`, unsorted.
+fn keys_in<'a>(
+    vs: &'a [VarId],
+    idx: &'a FxHashMap<VarId, u32>,
+    join: &'a [u32],
+) -> impl Iterator<Item = u32> + 'a {
+    vs.iter()
+        .filter_map(|v| idx.get(v).map(|&l| join[l as usize]))
+        .filter(|&j| j != u32::MAX)
+}
+
+/// The join variable indexes of the local variables `iv`.
+fn own_keys<'a>(iv: &'a [u32], join: &'a [u32]) -> impl Iterator<Item = u32> + 'a {
+    iv.iter()
+        .map(|&l| join[l as usize])
+        .filter(|&j| j != u32::MAX)
+}
+
+/// The occurrences of variables in `f`, which bound its variable set.
+fn var_count(f: &Expr) -> usize {
+    let mut n = 0usize;
+    let Ok(()) = f.visit_vars(&mut |_| {
+        n += 1;
+        Ok::<_, std::convert::Infallible>(())
+    });
+    n
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Refusals and cancellations of the program's admissions on this thread, for the
+    /// tests of their admission.
+    pub(super) static DP_REFUSALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The bytes of the first storage that the program's latest admission covers: the
+    /// table it last asked to grow to, or the first buffer of another admission.
+    pub(super) static DP_GROWTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The rounds the program planned on this thread.
+    pub(super) static DP_ROUNDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The scratch credit the last checked greedy ordering released when it finished,
+    /// the credit it kept, and the storage it keeps (see `Greedy::storage`).
+    pub(super) static GREEDY_RELEASED: std::cell::Cell<(usize, usize, usize)> =
+        const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 /// The set bits of `m`.
@@ -658,9 +1027,9 @@ pub(super) fn order(
     mut items: Vec<Vec<Node>>,
     filters: &mut Vec<Expr>,
 ) -> Result<Node> {
-    let g = Group::new(&items, filters, pl.ctx)?;
-    let dp = Dp::prepare(&g, &items);
-    let greedy = Greedy::run(&g, &items, filters, pl.ctx)?;
+    let g = Group::new(&items, filters, pl)?;
+    let dp = Dp::prepare(&g, &items, pl)?;
+    let greedy = Greedy::run(&g, &items, filters, pl)?;
     if let Some(mut dp) = dp {
         let bound = greedy.cost();
         if let Some(best) = dp.run(&items, filters, bound, pl)? {
@@ -686,29 +1055,42 @@ pub(super) fn order(
 /// mark and whose variables `n` binds, and return `n` with `applied` and those filters
 /// marked. `fvars` holds each filter's variables, with an impossible variable for one
 /// that holds an EXISTS, which is never placed here.
+/// On the checked route the FILTER is admitted before the filters are copied, and the
+/// credit returned holds what the plan keeps of it.
 pub(super) fn place_masked(
     pl: &Planner,
     n: Node,
     applied: u64,
     filters: &[Expr],
     fvars: &[Vec<VarId>],
-) -> (Node, u64) {
-    let mut now = Vec::new();
+) -> Result<(Node, u64, Option<Reservation>)> {
+    #[cfg(test)]
+    let _stage = crate::test_alloc::Stage::within(6);
     let mut mask = applied;
-    for (i, f) in filters.iter().enumerate().take(64) {
-        if mask & (1 << i) == 0
-            && !fvars[i].is_empty()
-            && fvars[i].iter().all(|v| n.vars.contains(v))
-        {
-            now.push(f.clone());
+    let mut count = 0;
+    for (i, fv) in fvars.iter().enumerate().take(filters.len().min(64)) {
+        if mask & (1 << i) == 0 && !fv.is_empty() && fv.iter().all(|v| n.vars.contains(v)) {
             mask |= 1 << i;
+            count += 1;
         }
     }
-    if now.is_empty() {
-        (n, mask)
-    } else {
-        (plan::filter(n, now, pl.ctx), mask)
+    if count == 0 {
+        return Ok((n, mask, None));
     }
+    let placed = mask & !applied;
+    let now = || {
+        filters
+            .iter()
+            .take(64)
+            .enumerate()
+            .filter(move |&(i, _)| placed & (1 << i) != 0)
+            .map(|(_, f)| f)
+    };
+    let scratch = refused(pl.filter_scratch(&n, now(), true))?;
+    let mut copies = Vec::with_capacity(count);
+    copies.extend(now().cloned());
+    let (n, kept) = pl.filter_held(scratch, n, copies, 0)?;
+    Ok((n, mask, kept))
 }
 
 // ------------------------------------------------------------------------------
@@ -845,15 +1227,61 @@ struct Greedy {
     alive: Vec<usize>,
     /// filters placed, by index
     placed: Vec<bool>,
+    /// the checked route's credit for the copies of inputs that filters are placed on,
+    /// which the plan keeps when it is built from this ordering
+    leaf_held: Option<Reservation>,
+    /// the checked route's credit for the above, dropped after them
+    held: Option<Reservation>,
+}
+
+/// The storage of a set of `n` indices.
+fn bits_bytes(n: usize) -> usize {
+    n.div_ceil(64) * std::mem::size_of::<u64>()
 }
 
 impl Greedy {
-    fn run(g: &Group, items: &[Vec<Node>], filters: &[Expr], ctx: &Ctx) -> Result<Greedy> {
-        let nv = g.vars.len();
+    /// The greedy ordering of `items`. On the checked route the tables, whose sizes
+    /// follow from the group, are admitted before they are allocated, and each plan's
+    /// storage, and the heap's growth, as the ordering makes them.
+    fn run(g: &Group, items: &[Vec<Node>], filters: &[Expr], pl: &Planner) -> Result<Greedy> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(1);
+        let ctx = pl.ctx;
+        let (n, nv, jv) = (items.len(), g.vars.len(), g.jvars.len());
+        let held_vars: usize = g.item_vars.iter().map(Vec::len).sum();
+        first_storage(|| 2 * n * std::mem::size_of::<Unit>());
+        let mut held = refused(pl.planning_stage(GREEDY_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<bool>(filters.len())?;
+                layout.slots::<Unit>(2 * n)?;
+                // the inputs, variables and certain variables of each input's plan
+                layout.add(n * (2 * bits_bytes(nv) + bits_bytes(n)))?;
+                layout.slots::<(usize, Option<Node>)>(n)?;
+                // alive and the plans paired with each new one
+                layout.slots::<usize>(2 * n)?;
+                // seen and dead
+                layout.slots::<usize>(2 * n)?;
+                layout.slots::<bool>(2 * n)?;
+                // the holders of each variable, with their counts while they are sized
+                layout.slots::<Vec<usize>>(nv)?;
+                layout.slots::<usize>(held_vars)?;
+                layout.slots::<u32>(nv)?;
+                layout.slots::<Shared>(jv)?;
+                layout.slots::<Cand>(jv + 3)
+            })
+        }))?;
+        let checked = held.is_some();
+        let cap = |k: usize| if checked { k } else { 0 };
+        let mut leaf_held = match &held {
+            Some(credit) => Some(credit.preparation().reserve(0)?),
+            None => None,
+        };
         let batched = plan::Costing::of(ctx);
         let mut placed = vec![false; filters.len()];
-        let mut units: Vec<Unit> = Vec::with_capacity(2 * items.len());
-        let mut leaves = Vec::with_capacity(items.len());
+        let mut units: Vec<Unit> = Vec::with_capacity(2 * n);
+        let mut leaves = Vec::with_capacity(n);
+        // the credit of the leaves' transient lists, released when the ordering ends
+        let mut listed = 0;
         for (i, opts) in items.iter().enumerate() {
             ctx.check()?;
             let mut at = 0;
@@ -867,29 +1295,88 @@ impl Greedy {
             for &l in &g.item_vars[i] {
                 has.set(l);
             }
-            let now: Vec<usize> = (0..filters.len())
-                .filter(|&f| {
-                    !placed[f]
-                        && g.filters[f].placeable
-                        && g.filters[f].vars.iter().all(|&l| has.get(l))
-                })
-                .collect();
+            let binds = |f: usize| {
+                !placed[f]
+                    && g.filters[f].placeable
+                    && g.filters[f].vars.iter().all(|&l| has.get(l))
+            };
+            let placing = if checked {
+                (0..filters.len()).filter(|&f| binds(f)).count()
+            } else {
+                0
+            };
+            // filters keep the variables of their input
+            let keys = if checked {
+                best.vars
+                    .iter()
+                    .filter(|v| g.join[g.idx[*v] as usize] != u32::MAX)
+                    .count()
+            } else {
+                0
+            };
+            let starred = g.models.starred || g.models.probed;
+            if let Some(credit) = held.as_mut() {
+                // the plan's variables, estimates, domains and what it holds, with the
+                // filters it places while they are listed
+                let mut bytes = best.vars.len() * std::mem::size_of::<u32>();
+                bytes += 2 * keys * std::mem::size_of::<(u32, f64)>();
+                bytes += placing * std::mem::size_of::<usize>();
+                if starred {
+                    bytes += g.models.held_by_bound(i)
+                        * (std::mem::size_of::<u32>() + std::mem::size_of::<(u32, Held)>());
+                }
+                first_storage(|| bytes);
+                let preparation = credit.preparation().clone();
+                refused(preparation.stage(GREEDY_UNIT_PHASE))?;
+                refused(credit.grow_by(bytes as u64))?;
+                // the filter list and the variables `held_by_within` lists them from
+                listed += placing * std::mem::size_of::<usize>();
+                if starred {
+                    listed += g.models.held_by_bound(i) * std::mem::size_of::<u32>();
+                }
+            }
+            if let Some(credit) = leaf_held.as_mut()
+                && placing > 0
+            {
+                // the copy of the input, under the filters placed on it, whose copies the
+                // FILTER admits
+                let preparation = credit.preparation().clone();
+                refused(preparation.stage(GREEDY_LEAF_PHASE))?;
+                let mut layout = super::checked_layout::Layout::new(&preparation);
+                layout.node(best)?;
+                first_storage(|| layout.bytes() as usize);
+                refused(credit.grow_by(layout.bytes()))?;
+            }
+            let mut now = Vec::with_capacity(placing);
+            now.extend((0..filters.len()).filter(|&f| binds(f)));
             let filtered = if now.is_empty() {
                 None
             } else {
                 for &f in &now {
                     placed[f] = true;
                 }
-                Some(plan::filter(
-                    best.clone(),
-                    now.iter().map(|&f| filters[f].clone()).collect(),
-                    ctx,
-                ))
+                let copy = best.clone();
+                #[cfg(test)]
+                let _stage = crate::test_alloc::Stage::within(6);
+                // the copy of the input is admitted with the leaf, and the FILTER with the
+                // copies of its filters now, before they are made
+                let scratch =
+                    refused(pl.filter_scratch(&copy, now.iter().map(|&f| &filters[f]), true))?;
+                let conjuncts: Vec<Expr> = now.iter().map(|&f| filters[f].clone()).collect();
+                let (node, kept) = pl.filter_held(scratch, copy, conjuncts, 0)?;
+                match (leaf_held.as_mut(), kept) {
+                    (Some(credit), Some(kept)) => credit.merge(kept),
+                    (None, Some(kept)) => pl.retain_planning(kept),
+                    _ => {}
+                }
+                Some(node)
             };
+            drop(now);
             let node = filtered.as_ref().unwrap_or(best);
+            debug_assert_eq!(node.vars.len(), best.vars.len());
             let mut certain = Bits::new(nv);
-            let mut d = Vec::new();
-            let mut dom = Vec::new();
+            let mut d = Vec::with_capacity(cap(keys));
+            let mut dom = Vec::with_capacity(cap(keys));
             let vars: Vec<u32> = node.vars.iter().map(|v| g.idx[v]).collect();
             for (&l, &v) in vars.iter().zip(&node.vars) {
                 if node.certain.contains(&v) {
@@ -903,7 +1390,7 @@ impl Greedy {
             }
             d.sort_unstable_by_key(|x| x.0);
             dom.sort_unstable_by_key(|x| x.0);
-            let mut inputs = Bits::new(items.len());
+            let mut inputs = Bits::new(n);
             inputs.set(i as u32);
             units.push(Unit {
                 sum: Sum::of(node),
@@ -920,10 +1407,10 @@ impl Greedy {
                 },
                 from: From::Leaf,
                 filters: Vec::new(),
-                held: if g.models.starred || g.models.probed {
-                    g.models.held_by(i)
-                } else {
-                    Vec::new()
+                held: match (starred, checked) {
+                    (false, _) => Vec::new(),
+                    (true, false) => g.models.held_by(i),
+                    (true, true) => g.models.held_by_within(i),
                 },
             });
             leaves.push((at, filtered));
@@ -931,15 +1418,34 @@ impl Greedy {
         let mut gr = Greedy {
             units,
             leaves,
-            alive: (0..items.len()).collect(),
+            alive: (0..n).collect(),
             placed,
+            leaf_held,
+            held,
         };
         let mut heap = BinaryHeap::new();
-        let mut cands = Vec::new();
-        let mut shared = Vec::new();
+        let mut cands = Vec::with_capacity(cap(jv + 3));
+        let mut shared = Vec::with_capacity(cap(jv));
         // the plans left that bind each variable, so that only plans sharing a variable
-        // are paired: testing every pair costs the square of the inputs at each step
-        let mut holders: Vec<Vec<usize>> = vec![Vec::new(); nv];
+        // are paired: testing every pair costs the square of the inputs at each step. A
+        // join replaces one or two holders of each of its variables with itself, so the
+        // checked route sizes each list once from the inputs.
+        let mut holders: Vec<Vec<usize>> = if checked {
+            let mut count = vec![0u32; nv];
+            for iv in &g.item_vars {
+                for &l in iv {
+                    count[l as usize] += 1;
+                }
+            }
+            let holders = count
+                .iter()
+                .map(|&c| Vec::with_capacity(c as usize))
+                .collect();
+            drop(count);
+            holders
+        } else {
+            vec![Vec::new(); nv]
+        };
         for (u, unit) in gr.units.iter().enumerate() {
             for l in unit.has.ones() {
                 holders[l].push(u);
@@ -947,9 +1453,10 @@ impl Greedy {
         }
         // when each plan was last paired with the plan being paired
         let mut seen = vec![usize::MAX; 2 * gr.units.len()];
+        let mut with = Vec::with_capacity(cap(n));
         for b in 0..gr.units.len() {
             ctx.check()?;
-            let mut with = Vec::new();
+            with.clear();
             for l in gr.units[b].has.ones() {
                 for &a in &holders[l] {
                     if a < b && seen[a] != b {
@@ -958,11 +1465,13 @@ impl Greedy {
                     }
                 }
             }
-            for a in with {
+            gr.heap_room(&mut heap, with.len())?;
+            for &a in &with {
                 gr.push_pair(g, a, b, batched, ctx, &mut heap, &mut cands, &mut shared);
             }
         }
-        let mut dead = vec![false; gr.units.len()];
+        let mut dead = Vec::with_capacity(cap(2 * n));
+        dead.resize(gr.units.len(), false);
         while gr.alive.len() > 1 {
             ctx.check()?;
             let Some(p) = std::iter::from_fn(|| heap.pop())
@@ -970,7 +1479,7 @@ impl Greedy {
             else {
                 break;
             };
-            let w = gr.join(g, &p, filters);
+            let w = gr.join(g, &p, filters)?;
             dead[p.a as usize] = true;
             dead[p.b as usize] = true;
             dead.push(false);
@@ -978,7 +1487,7 @@ impl Greedy {
             if seen.len() <= w {
                 seen.resize(w + 1, usize::MAX);
             }
-            let mut with = Vec::new();
+            with.clear();
             for l in gr.units[w].has.ones() {
                 let h = &mut holders[l];
                 h.retain(|&u| u != p.a as usize && u != p.b as usize);
@@ -990,12 +1499,60 @@ impl Greedy {
                 }
                 h.push(w);
             }
-            for u in with {
+            gr.heap_room(&mut heap, with.len())?;
+            for &u in &with {
                 gr.push_pair(g, u, w, batched, ctx, &mut heap, &mut cands, &mut shared);
             }
             gr.alive.push(w);
         }
+        // The ordering keeps the plans, the leaves, the plans left and the placed
+        // filters. The heap and the working lists are dropped here, and with them
+        // their credit, sized as above.
+        let heap_bytes = heap.capacity() * std::mem::size_of::<Pair>();
+        drop((heap, cands, shared, holders, seen, with, dead));
+        if let Some(credit) = gr.held.as_mut() {
+            let scratch = heap_bytes
+                + listed
+                + n * std::mem::size_of::<usize>()
+                + 2 * n * (std::mem::size_of::<usize>() + std::mem::size_of::<bool>())
+                + nv * (std::mem::size_of::<Vec<usize>>() + std::mem::size_of::<u32>())
+                + held_vars * std::mem::size_of::<usize>()
+                + jv * std::mem::size_of::<Shared>()
+                + (jv + 3) * std::mem::size_of::<Cand>();
+            credit.release_to(credit.bytes() - scratch as u64);
+            #[cfg(test)]
+            {
+                let (kept, storage) = (credit.bytes() as usize, gr.storage());
+                GREEDY_RELEASED.with(|r| r.set((scratch, kept, storage)));
+            }
+        }
         Ok(gr)
+    }
+
+    /// The storage the ordering keeps, besides the copies of its leaves, measured from
+    /// its vectors.
+    #[cfg(test)]
+    fn storage(&self) -> usize {
+        use std::mem::size_of;
+        let bits = |b: &Bits| b.0.capacity() * size_of::<u64>();
+        let units: usize = self
+            .units
+            .iter()
+            .map(|u| {
+                bits(&u.inputs)
+                    + bits(&u.has)
+                    + bits(&u.certain)
+                    + u.vars.capacity() * size_of::<u32>()
+                    + (u.d.capacity() + u.dom.capacity()) * size_of::<(u32, f64)>()
+                    + u.filters.capacity() * size_of::<usize>()
+                    + u.held.capacity() * size_of::<(u32, Held)>()
+            })
+            .sum();
+        units
+            + self.units.capacity() * size_of::<Unit>()
+            + self.leaves.capacity() * size_of::<(usize, Option<Node>)>()
+            + self.alive.capacity() * size_of::<usize>()
+            + self.placed.capacity() * size_of::<bool>()
     }
 
     /// Cost the joins of plans `a` and `b` (`a` made first) and queue the best.
@@ -1033,6 +1590,8 @@ impl Greedy {
         }
         let model = match shared.as_slice() {
             [s] => {
+                #[cfg(test)]
+                let _stage = crate::test_alloc::Stage::enter(8);
                 let j = g.join[g.idx[&s.v] as usize];
                 g.models
                     .of_held(ctx, s.v, ua.held_on(j), ub.held_on(j))
@@ -1081,15 +1640,63 @@ impl Greedy {
         });
     }
 
-    /// Make the plan joining `p.a` and `p.b`, with the filters it binds on top.
-    fn join(&mut self, g: &Group, p: &Pair, filters: &[Expr]) -> usize {
+    /// Make room in `heap` for `need` more joins. On the checked route the larger
+    /// storage is admitted before it is allocated.
+    fn heap_room(&mut self, heap: &mut BinaryHeap<Pair>, need: usize) -> Result<()> {
+        match self.held.as_mut() {
+            Some(credit) if heap.capacity() - heap.len() < need => {
+                grow_admitted_in(credit, heap, need, GREEDY_GROW_PHASE)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Make the plan joining `p.a` and `p.b`, with the filters it binds on top. On the
+    /// checked route its storage is admitted before it is allocated.
+    fn join(&mut self, g: &Group, p: &Pair, filters: &[Expr]) -> Result<usize> {
         let (a, b) = (&self.units[p.a as usize], &self.units[p.b as usize]);
         let (drive, other) = if p.how == How::ProbeLeft {
             (b, a)
         } else {
             (a, b)
         };
-        let mut vars = drive.vars.clone();
+        let binds = |f: usize| {
+            !self.placed[f]
+                && g.filters[f].placeable
+                && g.filters[f]
+                    .vars
+                    .iter()
+                    .all(|&l| a.has.get(l) || b.has.get(l))
+        };
+        let checked = self.held.is_some();
+        let (width, placing) = if checked {
+            let rest = other.vars.iter().filter(|&&l| !drive.has.get(l)).count();
+            (
+                drive.vars.len() + rest,
+                (0..filters.len()).filter(|&f| binds(f)).count(),
+            )
+        } else {
+            (0, 0)
+        };
+        if let Some(credit) = self.held.as_mut() {
+            let mut bytes = width * std::mem::size_of::<u32>();
+            bytes += (2 * a.has.0.len() + a.inputs.0.len()) * std::mem::size_of::<u64>();
+            bytes += (a.d.len() + b.d.len() + a.dom.len() + b.dom.len())
+                * std::mem::size_of::<(u32, f64)>();
+            bytes += placing * std::mem::size_of::<usize>();
+            bytes += (a.held.len() + b.held.len()) * std::mem::size_of::<(u32, Held)>();
+            first_storage(|| bytes);
+            let preparation = credit.preparation().clone();
+            refused(preparation.stage(GREEDY_UNIT_PHASE))?;
+            refused(credit.grow_by(bytes as u64))?;
+        }
+        let mut vars = if checked {
+            let mut vars = Vec::with_capacity(width);
+            vars.extend_from_slice(&drive.vars);
+            vars
+        } else {
+            drive.vars.clone()
+        };
         vars.extend(other.vars.iter().filter(|&&l| !drive.has.get(l)));
         let has = a.has.or(&b.has);
         let certain = match p.how {
@@ -1131,13 +1738,19 @@ impl Greedy {
             chain: p.chain,
             ..Sum::new(p.cost, p.est, p.sorted)
         };
-        let now: Vec<usize> = (0..filters.len())
-            .filter(|&f| {
-                !self.placed[f]
-                    && g.filters[f].placeable
-                    && g.filters[f].vars.iter().all(|&l| has.get(l))
-            })
-            .collect();
+        let now: Vec<usize> = if checked {
+            let mut now = Vec::with_capacity(placing);
+            now.extend((0..filters.len()).filter(|&f| binds(f)));
+            now
+        } else {
+            (0..filters.len())
+                .filter(|&f| {
+                    !self.placed[f]
+                        && g.filters[f].placeable
+                        && g.filters[f].vars.iter().all(|&l| has.get(l))
+                })
+                .collect()
+        };
         if !now.is_empty() {
             let unsorted = now.iter().any(|&f| {
                 g.filters[f]
@@ -1170,7 +1783,7 @@ impl Greedy {
             filters: now,
             held: merge_held(&a.held, &b.held),
         });
-        self.units.len() - 1
+        Ok(self.units.len() - 1)
     }
 
     /// The cost of the plan, when the inputs became one plan.
@@ -1183,7 +1796,20 @@ impl Greedy {
 
     /// Build the plan tree from the inputs, removing the placed filters from `filters`.
     fn build(self, items: Vec<Vec<Node>>, filters: &mut Vec<Expr>, pl: &Planner) -> Result<Node> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(5);
         let ctx = pl.ctx;
+        first_storage(|| self.units.len() * std::mem::size_of::<Option<Node>>());
+        let _nodes_held = match &self.held {
+            Some(_) => refused(pl.planning_stage(GREEDY_BUILD_PHASE).and_then(|()| {
+                pl.planning_scratch(|layout| layout.slots::<Option<Node>>(self.units.len()))
+            }))?,
+            None => None,
+        };
+        // the plan keeps the copies of the inputs that filters are placed on
+        if let Some(leaf_held) = self.leaf_held {
+            pl.retain_planning(leaf_held);
+        }
         let mut nodes: Vec<Option<Node>> = Vec::with_capacity(self.units.len());
         let mut leaves = self.leaves.into_iter().zip(items);
         for u in &self.units {
@@ -1195,15 +1821,24 @@ impl Greedy {
                 },
                 From::Join(a, b, how) => {
                     let (na, nb) = (nodes[a].take().unwrap(), nodes[b].take().unwrap());
-                    let n = build_join(na, nb, how, ctx);
+                    let n = build_join(na, nb, how, pl)?;
                     if u.filters.is_empty() {
                         n
                     } else {
-                        plan::filter(
-                            n,
-                            u.filters.iter().map(|&f| filters[f].clone()).collect(),
-                            ctx,
-                        )
+                        #[cfg(test)]
+                        let _stage = crate::test_alloc::Stage::within(6);
+                        let scratch = refused(pl.filter_scratch(
+                            &n,
+                            u.filters.iter().map(|&f| &filters[f]),
+                            true,
+                        ))?;
+                        let mut copies = Vec::with_capacity(u.filters.len());
+                        copies.extend(u.filters.iter().map(|&f| filters[f].clone()));
+                        let (n, kept) = pl.filter_held(scratch, n, copies, 0)?;
+                        if let Some(kept) = kept {
+                            pl.retain_planning(kept);
+                        }
+                        n
                     }
                 }
             };
@@ -1226,7 +1861,12 @@ impl Greedy {
         let mut acc = nodes[it.next().unwrap()].take().unwrap();
         for u in it {
             let n = nodes[u].take().unwrap();
-            acc = pl.place_filters(plan::join(acc, n, ctx), filters);
+            debug_assert_eq!(
+                shared_vars(&acc, &n).count(),
+                0,
+                "the plans left by the greedy order share no variable"
+            );
+            acc = pl.place_filters(join_admitted(acc, n, pl)?, filters)?;
         }
         Ok(acc)
     }
@@ -1305,6 +1945,9 @@ struct Dp {
     /// beside `dval`, each entry's domain of each join variable it binds (see
     /// [`plan::domain`]), the larger of its inputs'
     ddom: Vec<f64>,
+    /// the checked route's credit for the tables over the subsets and the storage of
+    /// `ents`, `dval` and `ddom`, dropped after them
+    held: Option<Reservation>,
 }
 
 /// One round's tables, per subset of the parts.
@@ -1321,6 +1964,9 @@ struct Round {
     minc: Vec<f64>,
     /// splits per subset size
     splits: Vec<u64>,
+    /// the checked route's credit for the round's tables and the storage of `list`,
+    /// dropped after them
+    held: Option<Reservation>,
 }
 
 #[inline]
@@ -1344,13 +1990,32 @@ fn connected(m: u32, nb: &[u32]) -> bool {
 impl Dp {
     /// The tables over the inputs' subsets, or `None` when the program cannot track
     /// the group (too many inputs or join variables).
-    fn prepare(g: &Group, items: &[Vec<Node>]) -> Option<Dp> {
+    fn prepare(g: &Group, items: &[Vec<Node>], pl: &Planner) -> Result<Option<Dp>> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(2);
         let n = items.len();
         if n > DP_MAX_ITEMS || g.jvars.len() > DP_MAX_JOIN_VARS {
-            return None;
+            return Ok(None);
         }
         let full: u32 = (1u32 << n) - 1;
         let size = 1usize << n;
+        let fcount = g.filters.len().min(64);
+        // The tables below are sized from the group before any is allocated.
+        let held = pl.planning_stage(PREPARE_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<VarId>(g.jvars.len())?;
+                layout.slots::<u32>(g.vars.len())?;
+                layout.slots::<u128>(2 * n)?;
+                layout.slots::<&FilterInfo>(fcount)?;
+                layout.slots::<u128>(2 * size)?;
+                layout.slots::<u64>(size)?;
+                layout.slots::<Option<(VarId, u32)>>(fcount)?;
+                layout.map::<VarId, u32>(g.jvars.len())?;
+                layout.slots::<Option<f64>>(fcount)?;
+                g.models.measure(layout)
+            })
+        });
+        let held = refused(held)?;
         let jvar: Vec<VarId> = g.jvars.iter().map(|&l| g.vars[l as usize]).collect();
         let mut var_items = vec![0u32; g.vars.len()];
         let mut jb = vec![0u128; n];
@@ -1398,7 +2063,7 @@ impl Dp {
             .map(|(j, &v)| (v, j as u32))
             .collect();
         let fsel = fl.iter().map(|fi| fi.sel).collect();
-        Some(Dp {
+        Ok(Some(Dp {
             n,
             jm,
             cm,
@@ -1411,7 +2076,8 @@ impl Dp {
             ents: Vec::new(),
             dval: Vec::new(),
             ddom: Vec::new(),
-        })
+            held,
+        }))
     }
 
     /// The join variables of the inputs `m` that inputs outside them share.
@@ -1421,9 +2087,24 @@ impl Dp {
     }
 
     /// The tables of a round over `parts`.
-    fn round(&self, parts: Vec<Part>) -> Round {
+    fn round(&self, parts: Vec<Part>, pl: &Planner) -> Result<Round> {
+        #[cfg(test)]
+        DP_ROUNDS.with(|n| n.set(n.get() + 1));
         let k = parts.len();
         let size = 1usize << k;
+        let listed: usize = parts.iter().map(|p| p.ents.len()).sum();
+        first_storage(|| 4 * size);
+        // The tables below are sized from the parts before any is allocated. `list`
+        // starts with the parts' entries and grows as the round plans subsets.
+        let mut held = refused(pl.planning_stage(ROUND_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<u32>(2 * size + k + listed)?;
+                layout.slots::<bool>(2 * size)?;
+                layout.slots::<u64>(k + 1)?;
+                layout.slots::<(u32, u32)>(size)?;
+                layout.slots::<f64>(size)
+            })
+        }))?;
         let mut inputs = vec![0u32; size];
         let mut nb = vec![0u32; size];
         let mut conn = vec![false; size];
@@ -1449,7 +2130,13 @@ impl Dp {
                 splits[c as usize] += (1u64 << (c - 1)) - 1;
             }
         }
-        let mut list = Vec::new();
+        // The neighbours serve only to find the connected subsets, so their storage
+        // and its credit go before the round is planned.
+        drop((nb, adj));
+        if let Some(held) = held.as_mut() {
+            held.release_to(held.bytes() - (4 * (size + k)) as u64);
+        }
+        let mut list = Vec::with_capacity(listed);
         let mut slot = vec![(0u32, 0u32); size];
         let mut minc = vec![f64::INFINITY; size];
         for (i, p) in parts.iter().enumerate() {
@@ -1461,7 +2148,7 @@ impl Dp {
                 minc[m] = minc[m].min(self.ents[e as usize].sum.cost);
             }
         }
-        Round {
+        Ok(Round {
             parts,
             inputs,
             conn,
@@ -1470,7 +2157,8 @@ impl Dp {
             list,
             minc,
             splits,
-        }
+            held,
+        })
     }
 
     /// The entry among `ents` of least cost (the first of equal ones).
@@ -1495,9 +2183,39 @@ impl Dp {
         pl: &Planner,
     ) -> Result<Option<u32>> {
         let ctx = pl.ctx;
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(3);
         let ub = bound.unwrap_or(f64::INFINITY);
         let batched = plan::Costing::of(ctx);
-        let fvars = dp_filter_vars(filters);
+        let fvars = dp_filter_vars(filters, pl)?;
+        let fvars = &fvars.vars[..];
+        let leaves: usize = items.iter().map(Vec::len).sum();
+        // On the checked route, the parts' storage is admitted before it is allocated,
+        // and the credit is dropped after the parts.
+        first_storage(|| items.len() * std::mem::size_of::<Part>());
+        let mut parts_held = refused(pl.planning_stage(PARTS_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<Part>(items.len())?;
+                layout.slots::<u32>(leaves)?;
+                layout.slots::<bool>(items.iter().map(Vec::len).max().unwrap_or(0))
+            })
+        }))?;
+        if self.held.is_some() {
+            let vals: usize = (0..items.len())
+                .map(|i| items[i].len() * self.bnd(1 << i).count_ones() as usize)
+                .sum();
+            make_room(self.held.as_mut(), &mut self.ents, leaves)?;
+            make_room(self.held.as_mut(), &mut self.dval, vals)?;
+            make_room(self.held.as_mut(), &mut self.ddom, vals)?;
+        }
+        // Every plan's first sort variable is a join variable or a leaf's (see
+        // [`joins`]), which bounds the plans kept per subset.
+        let keys = 1 + self.jvar.len() + leaves;
+        let mut keep = Vec::with_capacity(if parts_held.is_some() {
+            items.iter().map(Vec::len).max().unwrap_or(0)
+        } else {
+            0
+        });
         // the inputs: every access path with the filters it binds
         let mut parts = Vec::with_capacity(items.len());
         for (i, opts) in items.iter().enumerate() {
@@ -1505,14 +2223,28 @@ impl Dp {
             let bnd = self.bnd(m);
             let mut ents = Vec::with_capacity(opts.len());
             for (k, o) in opts.iter().enumerate() {
-                // copied only to place filters on, since an input can be a whole subtree
+                // copied only to place filters on, since an input can be a whole subtree.
+                // On the checked route the copy is admitted before it is made, and the
+                // credit is dropped after it.
+                let _copy;
+                let _kept;
                 let filtered;
                 let o = if fvars
                     .iter()
                     .take(64)
                     .any(|fv| !fv.is_empty() && fv.iter().all(|v| o.vars.contains(v)))
                 {
-                    filtered = place_masked(pl, o.clone(), 0, filters, &fvars).0;
+                    _copy = if parts_held.is_some() {
+                        refused(
+                            pl.planning_stage(LEAF_PHASE)
+                                .and_then(|()| pl.planning_scratch(|layout| layout.node(o))),
+                        )?
+                    } else {
+                        None
+                    };
+                    let placed = place_masked(pl, o.clone(), 0, filters, fvars)?;
+                    _kept = leaf_kept(placed.2);
+                    filtered = placed.0;
                     &filtered
                 } else {
                     o
@@ -1540,19 +2272,27 @@ impl Dp {
                     },
                 });
             }
-            self.drop_dominated(m, &mut ents);
+            self.drop_dominated(m, &mut ents, &mut keep);
             parts.push(Part { inputs: m, ents });
         }
+        debug_assert!(self.ents.len() <= leaves);
+        drop(keep);
         let mut rounds = false;
         loop {
-            let mut r = self.round(parts);
+            let mut r = self.round(parts, pl)?;
             let k = r.parts.len();
             let total: u64 = r.splits.iter().sum();
             if !rounds && total > DP_MAX_SPLITS {
                 // planned in rounds from here on, where the parts keep only the plans
                 // that can matter later
                 rounds = true;
-                parts = r.parts.into_iter().map(|p| self.useful(p)).collect();
+                if let Some(held) = parts_held.as_mut() {
+                    first_storage(|| part_bytes(k) as usize);
+                    refused(pl.planning_stage(PARTS_PHASE))?;
+                    refused(held.grow_by(part_bytes(k)))?;
+                }
+                parts = Vec::with_capacity(k);
+                parts.extend(r.parts.into_iter().map(|p| self.useful(p)));
                 continue;
             }
             let budget = if rounds { ROUND_SPLITS } else { DP_MAX_SPLITS };
@@ -1569,7 +2309,7 @@ impl Dp {
                     size = s;
                 }
             }
-            self.plan_round(&mut r, size, ub, batched, ctx)?;
+            self.plan_round(&mut r, size, keys, ub, batched, ctx)?;
             if size == k {
                 let (s, l) = r.slot[(1usize << k) - 1];
                 return Ok(self.cheapest(&r.list[s as usize..(s + l) as usize]));
@@ -1593,58 +2333,86 @@ impl Dp {
                 return Ok(None);
             };
             let (s, l) = r.slot[m as usize];
+            let rest = k - size + 1;
+            if let Some(held) = parts_held.as_mut() {
+                // the merged part's entries are copied first
+                first_storage(|| 4 * l as usize);
+                refused(pl.planning_stage(PARTS_PHASE))?;
+                refused(held.grow_by(part_bytes(rest) + 4 * l as u64))?;
+            }
             let merged = self.useful(Part {
                 inputs: r.inputs[m as usize],
                 ents: r.list[s as usize..(s + l) as usize].to_vec(),
             });
-            parts = r
-                .parts
-                .into_iter()
-                .enumerate()
-                .filter(|(i, _)| m & (1 << i) == 0)
-                .map(|(_, p)| p)
-                .collect();
+            parts = Vec::with_capacity(rest);
+            parts.extend(
+                r.parts
+                    .into_iter()
+                    .enumerate()
+                    .filter(|(i, _)| m & (1 << i) == 0)
+                    .map(|(_, p)| p),
+            );
             parts.push(merged);
         }
     }
 
     /// The part with its cheapest plan and those sorted on a variable that later joins
     /// read.
-    fn useful(&self, p: Part) -> Part {
+    /// The entries are kept in place, in their order.
+    fn useful(&self, mut p: Part) -> Part {
         let cheapest = self.cheapest(&p.ents);
         let bnd = self.bnd(p.inputs);
-        let ents = p
-            .ents
-            .iter()
-            .copied()
-            .filter(|&e| {
-                Some(e) == cheapest
-                    || self.ents[e as usize].sum.sorted.is_some_and(|v| {
-                        self.jvar
-                            .iter()
-                            .position(|&x| x == v)
-                            .is_some_and(|j| bnd >> j & 1 == 1)
-                    })
-            })
-            .collect();
-        Part {
-            inputs: p.inputs,
-            ents,
-        }
+        p.ents.retain(|&e| {
+            Some(e) == cheapest
+                || self.ents[e as usize].sum.sorted.is_some_and(|v| {
+                    self.jvar
+                        .iter()
+                        .position(|&x| x == v)
+                        .is_some_and(|j| bnd >> j & 1 == 1)
+                })
+        });
+        p
     }
 
     /// Plan every connected subset of the round's parts of at most `size` parts.
+    /// `keys` bounds the plans kept per subset.
     fn plan_round(
         &mut self,
         r: &mut Round,
         size: usize,
+        keys: usize,
         ub: f64,
         batched: plan::Costing,
         ctx: &Ctx,
     ) -> Result<()> {
         let k = r.parts.len();
-        let mut cur: Vec<Best> = Vec::new();
-        let mut scratch = Scratch::default();
+        // On the checked route, the buffers reused across the round's subsets are
+        // admitted at their bounds before they are allocated, and the credit is dropped
+        // after them.
+        let jv = self.jvar.len();
+        let held = match self.held.as_ref() {
+            Some(held) => {
+                let preparation = held.preparation();
+                first_storage(|| keys * std::mem::size_of::<Best>());
+                let reserve = || {
+                    preparation.stage(SCRATCH_PHASE)?;
+                    let mut layout = super::checked_layout::Layout::new(preparation);
+                    layout.slots::<Best>(keys)?;
+                    Scratch::measure(&mut layout, jv, self.cached.len(), keys)?;
+                    preparation.reserve(layout.bytes())
+                };
+                Some(refused(reserve())?)
+            }
+            None => None,
+        };
+        let (mut cur, mut scratch) = if held.is_some() {
+            (
+                Vec::with_capacity(keys),
+                Scratch::with_capacity(jv, self.cached.len(), keys),
+            )
+        } else {
+            (Vec::new(), Scratch::default())
+        };
         for m in 1..(1u32 << k) {
             let c = m.count_ones() as usize;
             if c < 2 || c > size || !r.conn[m as usize] {
@@ -1660,8 +2428,10 @@ impl Dp {
                 self.split(r, m, sub, m ^ sub, ub, batched, ctx, &mut cur, &mut scratch);
                 sub = (sub - 1) & low;
             }
-            self.finish(r, m, &mut cur);
+            debug_assert!(held.is_none() || cur.capacity() == keys);
+            self.finish(r, m, &mut cur, &mut scratch)?;
         }
+        debug_assert!(held.is_none() || scratch.within(jv, self.cached.len(), keys));
         Ok(())
     }
 
@@ -1700,6 +2470,8 @@ impl Dp {
         // a join on one variable: from probed values or characteristic sets
         let model = if sh.count_ones() == 1 {
             let j = sh.trailing_zeros();
+            #[cfg(test)]
+            let _stage = crate::test_alloc::Stage::enter(8);
             self.models
                 .of(ctx, self.jvar[j as usize], j, bits_of(ia), bits_of(ib))
                 .map(|m| (j, m))
@@ -1756,6 +2528,7 @@ impl Dp {
             pos,
             cached,
             cands,
+            ..
         } = sc;
         for &ea in &r.list[sa as usize..(sa + la) as usize] {
             let a = &self.ents[ea as usize];
@@ -1840,10 +2613,16 @@ impl Dp {
     }
 
     /// Store the best plans of subset `m`, in order of their sort variable.
-    fn finish(&mut self, r: &mut Round, m: u32, cur: &mut [Best]) {
+    fn finish(&mut self, r: &mut Round, m: u32, cur: &mut [Best], sc: &mut Scratch) -> Result<()> {
         cur.sort_unstable_by_key(|b| b.sorted);
         let start = r.list.len() as u32;
         let bnd = self.bnd(r.inputs[m as usize]);
+        // On the checked route, the tables grow only by admitted steps.
+        let vals = cur.len() * bnd.count_ones() as usize;
+        make_room(self.held.as_mut(), &mut self.ents, cur.len())?;
+        make_room(self.held.as_mut(), &mut self.dval, vals)?;
+        make_room(self.held.as_mut(), &mut self.ddom, vals)?;
+        make_room(r.held.as_mut(), &mut r.list, cur.len())?;
         for b in cur.iter() {
             let (ea, eb) = (self.ents[b.a as usize], self.ents[b.b as usize]);
             let (ja, jbm) = (self.jm[ea.mask as usize], self.jm[eb.mask as usize]);
@@ -1886,20 +2665,24 @@ impl Dp {
             });
         }
         let first = self.ents.len() as u32 - cur.len() as u32;
-        let mut ids: Vec<u32> = (first..self.ents.len() as u32).collect();
-        self.drop_dominated(r.inputs[m as usize], &mut ids);
-        for &e in &ids {
+        let Scratch { ids, keep, .. } = sc;
+        ids.clear();
+        ids.extend(first..self.ents.len() as u32);
+        self.drop_dominated(r.inputs[m as usize], ids, keep);
+        for &e in ids.iter() {
             r.minc[m as usize] = r.minc[m as usize].min(self.ents[e as usize].sum.cost);
         }
-        r.list.extend(&ids);
+        r.list.extend(ids.iter());
         r.slot[m as usize] = (start, ids.len() as u32);
+        Ok(())
     }
 
     /// Drop from `ids`, plans of the inputs `inputs`, those whose sort variable no later
     /// join or filter reads and that another plan matches in rows and distinct-value
     /// estimates at no more cost. Every plan made from a dropped one has a counterpart
     /// made from the other that costs no more, with the same estimates.
-    fn drop_dominated(&self, inputs: u32, ids: &mut Vec<u32>) {
+    /// `keep` is a buffer reused across calls.
+    fn drop_dominated(&self, inputs: u32, ids: &mut Vec<u32>, keep: &mut Vec<bool>) {
         if ids.len() < 2 {
             return;
         }
@@ -1926,7 +2709,8 @@ impl Dp {
                         == self.dval[(y.d + i) as usize].to_bits()
                 })
         };
-        let mut keep = vec![true; ids.len()];
+        keep.clear();
+        keep.resize(ids.len(), true);
         for i in 0..ids.len() {
             let x = &self.ents[ids[i] as usize];
             if !dead(x.sum.sorted) {
@@ -1958,10 +2742,24 @@ impl Dp {
         filters: &[Expr],
         pl: &Planner,
     ) -> Result<(Node, u64)> {
+        #[cfg(test)]
+        let _stage = crate::test_alloc::Stage::enter(4);
         let ctx = pl.ctx;
-        let fvars = dp_filter_vars(filters);
+        let fvars = dp_filter_vars(filters, pl)?;
+        let fvars = &fvars.vars[..];
+        // The plan joins each of the n inputs once, so it has 2n - 1 entries, and at
+        // most n built plans wait for their parent. On the checked route that storage is
+        // admitted before it is allocated, and the credit is dropped after it.
+        first_storage(|| (2 * self.n - 1) * std::mem::size_of::<u32>());
+        let held = refused(pl.planning_stage(BUILD_PHASE).and_then(|()| {
+            pl.planning_scratch(|layout| {
+                layout.slots::<u32>(2 * self.n - 1)?;
+                layout.map::<u32, (Node, u64)>(self.n)
+            })
+        }))?;
         // the entries of the plan, children before parents
-        let mut need = vec![root];
+        let mut need = Vec::with_capacity(if held.is_some() { 2 * self.n - 1 } else { 1 });
+        need.push(root);
         let mut i = 0;
         while i < need.len() {
             let e = self.ents[need[i] as usize];
@@ -1971,19 +2769,29 @@ impl Dp {
             }
             i += 1;
         }
+        debug_assert!(need.len() < 2 * self.n);
         need.sort_unstable();
-        let mut built: FxHashMap<u32, (Node, u64)> = FxHashMap::default();
+        let mut built: FxHashMap<u32, (Node, u64)> = if held.is_some() {
+            FxHashMap::with_capacity_and_hasher(self.n, Default::default())
+        } else {
+            FxHashMap::default()
+        };
+        #[cfg(debug_assertions)]
+        let capacity = built.capacity();
         for &x in &need {
             ctx.check()?;
             let e = self.ents[x as usize];
-            let (n, f) = if e.mask.is_power_of_two() {
+            let (n, f, kept) = if e.mask.is_power_of_two() {
                 let leaf = std::mem::replace(&mut items[e.a as usize][e.b as usize], Node::unit());
-                place_masked(pl, leaf, 0, filters, &fvars)
+                place_masked(pl, leaf, 0, filters, fvars)?
             } else {
                 let (na, fa) = built.remove(&e.a).unwrap();
                 let (nb, fb) = built.remove(&e.b).unwrap();
-                place_masked(pl, build_join(na, nb, e.how, ctx), fa | fb, filters, &fvars)
+                place_masked(pl, build_join(na, nb, e.how, pl)?, fa | fb, filters, fvars)?
             };
+            if let Some(kept) = kept {
+                pl.retain_planning(kept);
+            }
             debug_assert!(
                 n.cost.to_bits() == e.sum.cost.to_bits() && n.est.to_bits() == e.sum.est.to_bits(),
                 "summary {:?} differs from its plan ({}, {})",
@@ -1993,6 +2801,8 @@ impl Dp {
             );
             built.insert(x, (n, f));
         }
+        #[cfg(debug_assertions)]
+        debug_assert!(held.is_none() || built.capacity() == capacity);
         Ok(built.remove(&root).unwrap())
     }
 }
@@ -2006,19 +2816,244 @@ struct Scratch {
     /// the variables of the filters placed on a join that an expression cache reads
     cached: Vec<VarId>,
     cands: Vec<Cand>,
+    /// a subset's new entries, and which of them [`Dp::drop_dominated`] keeps
+    ids: Vec<u32>,
+    keep: Vec<bool>,
+}
+
+impl Scratch {
+    /// The buffers' storage at their bounds: `jv` join variables, `cached` filters an
+    /// expression cache reads, and `keys` plans per subset. A join offers at most a
+    /// merge join per shared variable, a hash join and two index joins (see [`joins`]).
+    fn measure(
+        layout: &mut super::checked_layout::Layout<'_>,
+        jv: usize,
+        cached: usize,
+        keys: usize,
+    ) -> Result<()> {
+        layout.slots::<Shared>(jv)?;
+        layout.slots::<(u32, u32)>(jv)?;
+        layout.slots::<VarId>(cached)?;
+        layout.slots::<Cand>(jv + 3)?;
+        layout.slots::<u32>(keys)?;
+        layout.slots::<bool>(keys)
+    }
+
+    fn with_capacity(jv: usize, cached: usize, keys: usize) -> Scratch {
+        Scratch {
+            shared: Vec::with_capacity(jv),
+            pos: Vec::with_capacity(jv),
+            cached: Vec::with_capacity(cached),
+            cands: Vec::with_capacity(jv + 3),
+            ids: Vec::with_capacity(keys),
+            keep: Vec::with_capacity(keys),
+        }
+    }
+
+    /// Whether no buffer grew past the bounds it was made with.
+    fn within(&self, jv: usize, cached: usize, keys: usize) -> bool {
+        self.shared.capacity() == jv
+            && self.pos.capacity() == jv
+            && self.cached.capacity() == cached
+            && self.cands.capacity() == jv + 3
+            && self.ids.capacity() == keys
+            && self.keep.capacity() == keys
+    }
+}
+
+/// The phases a checked plan reports before it admits the program's tables, a round's
+/// tables, and the growth of either.
+pub(super) const PREPARE_PHASE: &str = "reserving join order tables";
+/// The phases a checked plan reports before it admits the group's variables and
+/// filters, and then its join models.
+pub(super) const GROUP_PHASE: &str = "reserving join order group";
+pub(super) const MODELS_PHASE: &str = "reserving join order models";
+pub(super) const ROUND_PHASE: &str = "reserving join order round";
+pub(super) const GROW_PHASE: &str = "growing join order table";
+/// The phases a checked plan reports before it admits the filters' variables, the
+/// parts, a round's reused buffers, the rebuilt plan's lists, and the copy of an input
+/// that filters are placed on to cost it.
+pub(super) const FILTER_VARS_PHASE: &str = "reserving join order filter variables";
+pub(super) const PARTS_PHASE: &str = "reserving join order parts";
+pub(super) const SCRATCH_PHASE: &str = "reserving join order round scratch";
+pub(super) const BUILD_PHASE: &str = "reserving join order rebuild";
+pub(super) const LEAF_PHASE: &str = "copying join order input";
+/// The phases a checked plan reports before it admits the greedy ordering's tables,
+/// each of its plans, the copy of an input that filters are placed on, the growth of
+/// its heap of joins, and the list of plans it rebuilds.
+pub(super) const GREEDY_PHASE: &str = "reserving greedy join order";
+pub(super) const GREEDY_UNIT_PHASE: &str = "reserving greedy join order plan";
+pub(super) const GREEDY_LEAF_PHASE: &str = "copying greedy join order input";
+pub(super) const GREEDY_GROW_PHASE: &str = "growing greedy join order heap";
+pub(super) const GREEDY_BUILD_PHASE: &str = "reserving greedy join order rebuild";
+/// The phase a checked plan reports before it admits a join of its rebuilt plan.
+pub(super) const JOIN_BUILD_PHASE: &str = "reserving join order join";
+
+/// Record, for the tests of the program's admission, the bytes of the first storage
+/// that the next admission covers.
+#[inline]
+fn first_storage(_bytes: impl FnOnce() -> usize) {
+    #[cfg(test)]
+    DP_GROWTH.with(|n| n.set(_bytes()));
+}
+
+/// The storage of `count` parts.
+fn part_bytes(count: usize) -> u64 {
+    (count * std::mem::size_of::<Part>()) as u64
+}
+
+/// `held`, counted on this thread when refused, for the tests of the program's
+/// admission.
+fn refused<T>(held: Result<T>) -> Result<T> {
+    #[cfg(test)]
+    if held.is_err() {
+        DP_REFUSALS.with(|n| n.set(n.get() + 1));
+    }
+    held
+}
+
+/// Make room in `v` for `need` more values. On the checked route `credit`, which holds
+/// `v`'s storage among others, admits the larger storage before it is allocated.
+#[inline]
+fn make_room<T>(credit: Option<&mut Reservation>, v: &mut Vec<T>, need: usize) -> Result<()> {
+    match credit {
+        Some(credit) if v.capacity() - v.len() < need => grow_admitted(credit, v, need),
+        _ => Ok(()),
+    }
+}
+
+/// Grow `v` to at least twice its storage, holding credit for the old storage and the
+/// new while the values move, and then for the new storage only.
+#[cold]
+fn grow_admitted<T>(credit: &mut Reservation, v: &mut Vec<T>, need: usize) -> Result<()> {
+    grow_admitted_in(credit, v, need, GROW_PHASE)
+}
+
+/// Storage that [`grow_admitted_in`] grows.
+trait Room {
+    type Item;
+    fn len(&self) -> usize;
+    fn capacity(&self) -> usize;
+    fn try_reserve_exact(
+        &mut self,
+        more: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError>;
+}
+
+impl<T> Room for Vec<T> {
+    type Item = T;
+    fn len(&self) -> usize {
+        Vec::len(self)
+    }
+    fn capacity(&self) -> usize {
+        Vec::capacity(self)
+    }
+    fn try_reserve_exact(
+        &mut self,
+        more: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError> {
+        Vec::try_reserve_exact(self, more)
+    }
+}
+
+impl<T: Ord> Room for BinaryHeap<T> {
+    type Item = T;
+    fn len(&self) -> usize {
+        BinaryHeap::len(self)
+    }
+    fn capacity(&self) -> usize {
+        BinaryHeap::capacity(self)
+    }
+    fn try_reserve_exact(
+        &mut self,
+        more: usize,
+    ) -> std::result::Result<(), std::collections::TryReserveError> {
+        BinaryHeap::try_reserve_exact(self, more)
+    }
+}
+
+/// [`grow_admitted`] for any storage, reporting `phase` before it admits the growth.
+#[cold]
+fn grow_admitted_in<S: Room>(
+    credit: &mut Reservation,
+    v: &mut S,
+    need: usize,
+    phase: &str,
+) -> Result<()> {
+    let preparation = credit.preparation().clone();
+    let size = std::mem::size_of::<S::Item>();
+    let bytes = |n: usize| {
+        n.checked_mul(size)
+            .and_then(|b| u64::try_from(b).ok())
+            .ok_or_else(|| preparation.exhausted())
+    };
+    let want = v
+        .len()
+        .checked_add(need)
+        .ok_or_else(|| preparation.exhausted())?;
+    let capacity = want.max(v.capacity().saturating_mul(2)).max(4);
+    let (old, new) = (bytes(v.capacity())?, bytes(capacity)?);
+    #[cfg(test)]
+    DP_GROWTH.with(|n| n.set(new as usize));
+    refused(preparation.stage(phase))?;
+    refused(credit.grow_by(new))?;
+    v.try_reserve_exact(capacity - v.len())
+        .map_err(|_| preparation.exhausted())?;
+    if size != 0 && v.capacity() != capacity {
+        return Err(preparation.exhausted());
+    }
+    credit.release_to(credit.bytes() - old);
+    Ok(())
 }
 
 /// The variables of each filter as the exhaustive program reads them (EXISTS never
-/// placed).
-fn dp_filter_vars(filters: &[Expr]) -> Vec<Vec<VarId>> {
-    filters
-        .iter()
-        .map(|f| {
-            if f.has_exists() {
+/// placed), with the checked route's credit for them, dropped after them.
+struct FilterVars {
+    vars: Vec<Vec<VarId>>,
+    _held: Option<Reservation>,
+}
+
+/// The variables of each filter (see [`FilterVars`]). On the checked route their
+/// storage is sized by a walk over the filters that allocates nothing, and admitted
+/// before it is allocated.
+fn dp_filter_vars(filters: &[Expr], pl: &Planner) -> Result<FilterVars> {
+    let count = var_count;
+    first_storage(|| filters.len() * std::mem::size_of::<Vec<VarId>>());
+    let held = refused(pl.planning_stage(FILTER_VARS_PHASE).and_then(|()| {
+        pl.planning_scratch(|layout| {
+            layout.slots::<Vec<VarId>>(filters.len())?;
+            for f in filters {
+                layout.slots::<VarId>(if f.has_exists() { 1 } else { count(f) })?;
+            }
+            Ok(())
+        })
+    }))?;
+    let vars = if held.is_some() {
+        let mut vars = Vec::with_capacity(filters.len());
+        for f in filters {
+            vars.push(if f.has_exists() {
                 vec![VarId::MAX]
             } else {
-                f.var_set()
-            }
-        })
-        .collect()
+                // the same variables as `var_set`, in storage of the counted size
+                let mut v = Vec::with_capacity(count(f));
+                f.vars(&mut v);
+                v.sort_unstable();
+                v.dedup();
+                v
+            });
+        }
+        vars
+    } else {
+        filters
+            .iter()
+            .map(|f| {
+                if f.has_exists() {
+                    vec![VarId::MAX]
+                } else {
+                    f.var_set()
+                }
+            })
+            .collect()
+    };
+    Ok(FilterVars { vars, _held: held })
 }

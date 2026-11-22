@@ -131,6 +131,56 @@ pub(super) fn axiom_kind(kind: &AxiomKind) -> Vec<Broken> {
     out
 }
 
+/// Whether an axiom certainly breaks no rule of [`axiom_kind`], decided without
+/// allocating. It answers `false` for every axiom that breaks a rule and for some that
+/// break none, such as those with data ranges or literals, whose datatypes only
+/// [`axiom_kind`] checks, so a caller that needs the rules falls back to it then.
+pub(super) fn certainly_el(kind: &AxiomKind) -> bool {
+    use AxiomKind as K;
+    fn named(i: &Individual) -> bool {
+        matches!(i, Individual::Named(_))
+    }
+    fn plain(p: &ObjectPropertyExpression) -> bool {
+        matches!(p, ObjectPropertyExpression::Property(_))
+    }
+    fn ce(c: &ClassExpression) -> bool {
+        use ClassExpression as C;
+        match c {
+            C::Class(_) => true,
+            C::ObjectIntersectionOf(cs) => cs.iter().all(ce),
+            C::ObjectOneOf(is) => is.len() == 1 && is.iter().all(named),
+            C::ObjectSomeValuesFrom(p, c) => plain(p) && ce(c),
+            C::ObjectHasValue(p, i) => plain(p) && named(i),
+            C::ObjectHasSelf(p) => plain(p),
+            // the data restrictions name datatypes, and the rest are outside OWL 2 EL
+            _ => false,
+        }
+    }
+    match kind {
+        // a declaration names a datatype without using it
+        K::Declaration(_) => true,
+        K::SubClassOf(a, b) => ce(a) && ce(b),
+        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().all(ce),
+        K::SubObjectPropertyOf(sub, sup) => {
+            plain(sup)
+                && match sub {
+                    SubObjectPropertyExpression::Expression(p) => plain(p),
+                    SubObjectPropertyExpression::Chain(ps) => ps.iter().all(plain),
+                }
+        }
+        K::EquivalentObjectProperties(ps) => ps.iter().all(plain),
+        K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => plain(p) && ce(c),
+        K::ReflexiveObjectProperty(p) | K::TransitiveObjectProperty(p) => plain(p),
+        K::ClassAssertion(c, i) => ce(c) && named(i),
+        K::ObjectPropertyAssertion(p, a, b) | K::NegativeObjectPropertyAssertion(p, a, b) => {
+            plain(p) && named(a) && named(b)
+        }
+        K::SameIndividual(is) | K::DifferentIndividuals(is) => is.iter().all(named),
+        // the remaining types are left to the full check
+        _ => false,
+    }
+}
+
 /// The global restriction of §2.2.6 on the ranges of property chains.
 pub(super) struct El {
     /// the ranges each object property has, through its superproperties

@@ -538,6 +538,9 @@ pub struct DlRun {
     /// set once an inference was too wide to make, which passes the bound whatever the
     /// count is
     exhausted: std::sync::atomic::AtomicBool,
+    /// the most choices of one product that the run makes before it passes its bound on
+    /// derived conclusions, zero for no limit (roadmap item 1011)
+    width_limit: AtomicUsize,
 }
 
 impl DlRun {
@@ -566,6 +569,7 @@ impl DlRun {
         self.carried = self.carried.saturating_add(*self.work.get_mut());
         *self.work.get_mut() = 0;
         *self.work_limit.get_mut() = 0;
+        *self.width_limit.get_mut() = 0;
         *self.exhausted.get_mut() = false;
     }
     pub(super) fn grow(&self, bytes: usize) {
@@ -575,6 +579,20 @@ impl DlRun {
     /// conclusions keep its memory flat.
     pub fn set_work_limit(&self, n: usize) {
         self.work_limit.store(n, Ordering::Relaxed);
+    }
+    /// Limits the choices of one product of the run, past which it passes its bound on
+    /// derived conclusions (roadmap item 1011).
+    pub fn set_width_limit(&self, n: usize) {
+        self.width_limit.store(n, Ordering::Relaxed);
+    }
+    /// Whether a product of these lists has more choices than the run's limit.
+    pub(super) fn too_wide(&self, lists: &[Vec<Side>]) -> bool {
+        let l = self.width_limit.load(Ordering::Relaxed);
+        l != 0
+            && lists
+                .iter()
+                .try_fold(1usize, |n, x| n.checked_mul(x.len()).filter(|&n| n <= l))
+                .is_none()
     }
     /// Whether the run has a bound on the conclusions it derives.
     pub fn bounded(&self) -> bool {
@@ -607,15 +625,16 @@ impl DlRun {
         self.exhausted.store(true, Ordering::Relaxed);
     }
     /// Whether the run derived more conclusions than its bound, with those of the runs
-    /// whose contexts it keeps.
+    /// whose contexts it keeps, or left out an inference too wide to make, which passes
+    /// the bound even when the run has none, since the run is incomplete without it.
     pub fn over_work(&self) -> bool {
         let l = self.work_limit.load(Ordering::Relaxed);
-        let over = l != 0
-            && (self.exhausted.load(Ordering::Relaxed)
-                || self
+        let over = self.exhausted.load(Ordering::Relaxed)
+            || l != 0
+                && self
                     .carried
                     .saturating_add(self.work.load(Ordering::Relaxed))
-                    > l);
+                    > l;
         if over {
             self.worked.store(true, Ordering::Relaxed);
         }
@@ -905,7 +924,7 @@ fn partners_x(st: &State, a: Ex) -> Vec<Side> {
     };
     d.store
         .with_x(a)
-        .filter(|&i| !d.store.clauses[i as usize].sel)
+        .filter(|&i| sel_partners_x() || !d.store.clauses[i as usize].sel)
         .map(|i| side(&d.store.clauses[i as usize].c, Lit::x(a)))
         .collect()
 }
@@ -1078,7 +1097,7 @@ pub(super) fn into_nominal(ix: &Index, d: Ex) -> Option<(Role, u32)> {
 /// its classes in arrays on the stack and allocates nothing. A search whose classes to
 /// visit outgrow [`SINGLETON_OPEN`] starts again in [`singleton_of_on_heap`], which gives
 /// the same answer with vectors.
-fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
+pub(super) fn singleton_of(ix: &Index, a: Ex) -> Option<u32> {
     let mut todo = [a; SINGLETON_OPEN];
     let mut open = 1;
     let mut seen = [a; SINGLETON_SEEN];
@@ -1149,8 +1168,6 @@ pub fn promote() -> bool {
     *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_PROMOTE").is_none_or(|v| v != "0"))
 }
 
-/// Whether a context other than the root selects the ground literals in its bodies, item
-/// 804's selection (F24). `SPARKLES_ROOTED_SELECT_GROUND=0` turns it off, for measurement.
 /// Whether the at-least conjunctions of item 728's clauses rank below every class, which
 /// `SPARKLES_DL_LOW_H=1` turns on. It is off until its measurement, since with it
 /// `sriq-010` of the counting fixtures passes a bound of 8 million conclusions on one
@@ -1180,9 +1197,148 @@ fn blocked(dx: &DlIx, st: &State, d: Ex) -> bool {
         .is_some_and(|hs| hs.iter().any(|h| st.subs.contains(h)))
 }
 
+/// What a run that counts or has the root does when an existential restriction reaches a
+/// successor after the successor sent clauses over the predecessor, item 1229 (F24). Pred
+/// takes each such clause once, with the restrictions that reach the successor when it
+/// comes, and drops it when the successor sends it again over a later link. A restriction
+/// reaches a successor late as a unit derived later, as a unit that had an edge to another
+/// successor before, or under the eager strategy as a second edge into a shared successor,
+/// whose replay takes only the literal that made the edge. In these runs Pred's conclusion
+/// can name the restriction's own successor term, in a role atom over it with counting or
+/// in an equality with a constant in a rooted run, so the late restriction could miss what
+/// the clause gives it. By default the context replays every clause the successor sent
+/// with the late restriction in Pred, item 1229's repair, which is adopted on a measured
+/// gate and not proved. `SPARKLES_COUNTING_LATE_UNIT=1` gives the containment instead,
+/// in which a rooted run passes its bound on derived conclusions and classifies again
+/// without counting or without the rooted rules, and `=0` turns both off, for
+/// measurement.
+pub fn late_unit_mode() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SPARKLES_COUNTING_LATE_UNIT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Whether a run takes the rule of [`late_unit_mode`]: one that counts or has the root,
+/// in which Pred's conclusion can name the restriction's successor term.
+fn late_rules(dx: &DlIx) -> bool {
+    dx.counting || dx.root.is_some()
+}
+
+/// The rule of [`late_unit_mode`] on a restriction `e` of the context `me` that newly
+/// reaches the successor `v`, as a new unit whose EL successor is v, as a unit that had an
+/// edge to v before, or as a new edge to v. Under the eager strategy two restrictions can
+/// share a successor, so the second one's edge can come after the clauses did, and the
+/// context replays on the edge only Pred with the literal that made it. The answer is
+/// whether the rule replayed the clauses, which then include the products with that
+/// literal.
+#[allow(clippy::too_many_arguments)]
+fn late<S: Sink>(
+    ix: &Index,
+    me: Ex,
+    st: &State,
+    e: Ex,
+    v: Ex,
+    kind: &str,
+    found: &mut Found,
+    out: &mut S,
+) -> bool {
+    let dx = dix(ix);
+    // the root takes no Pred over the successor terms of x, and a restriction into a
+    // singleton has no successor term, as in pred_c
+    if dx.is_root(me) || into_nominal(ix, e).is_some() {
+        return false;
+    }
+    let Some(cids) = dl(st).and_then(|x| x.pred_in.get(&v)) else {
+        return false;
+    };
+    if cids.is_empty() {
+        return false;
+    }
+    match late_unit_mode() {
+        0 => false,
+        // the containment holds only for a rooted run, which classifies again without
+        // the rooted rules or counting
+        1 if dx.root.is_none() => false,
+        1 => {
+            if tracing() {
+                eprintln!("TR LATE {kind} {} e={e} succ={v}", tr_ctx(st, false));
+            }
+            found.over = true;
+            false
+        }
+        _ => {
+            for &cid in cids {
+                let c = out.dl().table.get(cid).clone();
+                pred(ix, st, e, &c, None, found, &out.dl().lits);
+            }
+            true
+        }
+    }
+}
+
+/// Whether a context other than the root selects the ground literals in its bodies, item
+/// 804's selection (F24). It is on, with item 1220's repair [`sel_partners_x`], since
+/// without that repair two selected clauses of one context never meet in Hyper over x, so
+/// that a run could report itself complete and miss an entailed subsumption. The repair is
+/// adopted on a measured gate and its completeness is not proved.
+/// `SPARKLES_ROOTED_SELECT_GROUND=0` turns the selection off, for measurement.
 pub fn select_ground() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| !std::env::var_os("SPARKLES_ROOTED_SELECT_GROUND").is_some_and(|v| v == "0"))
+}
+
+/// Whether Hyper over x takes selected clauses as partners, item 1220's repair R1 of the
+/// selection: the partners of an atom over x, and in Pred from a successor over `f_e(u)`
+/// the partners of an atom over `f_e(u)` ([`super::dl_root::root_pred`]). Without it two
+/// selected clauses of one context never meet in such an inference. It matters only while
+/// [`select_ground`] is on. It is on by default, and `SPARKLES_ROOTED_SEL_PARTNERS_X=0`
+/// turns it off, for measurement.
+pub fn sel_partners_x() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        !std::env::var_os("SPARKLES_ROOTED_SEL_PARTNERS_X").is_some_and(|v| v == "0")
+    })
+}
+
+/// Which Joins the restriction on ground inferences exempts, part of item 1220's repair.
+/// When the partners are facts that hold only under the context's core, no ancestor holds
+/// them, and one Join, which resolves a single literal, leaves a ground clause with a body
+/// that the restriction would drop before the next Join could discharge it. A Join whose
+/// premise on the side of the head has no ground literal in its body is exempt, whatever
+/// the residual head. `SPARKLES_ROOTED_JOIN_EXEMPT=0` restricts
+/// every Join and `=1` exempts every Join, for measurement.
+pub fn join_exempt() -> u8 {
+    static ON: OnceLock<u8> = OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("SPARKLES_ROOTED_JOIN_EXEMPT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(2)
+    })
+}
+
+/// Whether the restriction leaves out the conclusion `c` of a Join whose premise on the
+/// side of the head has the body `hb`.
+pub(super) fn join_restricted(
+    lits: &Lits,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    hb: &[Lit],
+    c: &Side,
+) -> bool {
+    match join_exempt() {
+        1 => false,
+        2 if !hb
+            .iter()
+            .any(|&l| l.kind() == XL && no_xy(lits.view(l, inv))) =>
+        {
+            false
+        }
+        _ => restricted(lits, inv, c),
+    }
 }
 
 /// Whether a clause of a context other than the root is selected: its body holds a literal
@@ -1193,10 +1349,18 @@ pub fn select_ground() -> bool {
 /// that let the context go on, so that the context never combines the markers of its
 /// predecessors in one body.
 pub(super) fn selected(lits: &Lits, inv: impl Fn(Role) -> Option<Role> + Copy, c: &Clause) -> bool {
-    select_ground()
-        && c.body()
-            .iter()
-            .any(|&l| l.kind() == XL && no_xy(lits.view(l, inv)))
+    select_ground() && selected_always(lits, inv, c)
+}
+
+/// [`selected`] whatever [`select_ground`] says.
+pub(super) fn selected_always(
+    lits: &Lits,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    c: &Clause,
+) -> bool {
+    c.body()
+        .iter()
+        .any(|&l| l.kind() == XL && no_xy(lits.view(l, inv)))
 }
 
 /// Whether an inference on the literal `v` is local to its context, so that a selected
@@ -1229,6 +1393,14 @@ pub(super) struct Found {
     pub(super) rule: &'static str,
     /// whether the conclusions are the root's, for the derivation trace
     pub(super) root: bool,
+}
+
+#[cfg(test)]
+impl Found {
+    /// The number of products, for tests.
+    pub(super) fn products_len(&self) -> usize {
+        self.prods.len()
+    }
 }
 
 impl Found {
@@ -1275,22 +1447,39 @@ pub(super) fn tr_ctx(st: &State, root: bool) -> String {
 }
 
 /// Drops from a product's list each premise whose side has every literal of another's: a
-/// choice of it gives a conclusion that the other's choice subsumes.
+/// choice of it gives a conclusion that the other's choice subsumes. The sides are taken
+/// shortest first, in their order among sides of one length, and each is compared with
+/// the sides kept before it, first by a signature of its literals, then by a merge when
+/// both sides are sorted without repeats, as the sides of [`fold`] and of stored clauses
+/// are, and by a search of each literal otherwise.
 fn prune(l: &mut Vec<Side>) {
     if l.len() < 2 {
         return;
     }
-    let within = |a: &Side, b: &Side| {
-        a.0.iter().all(|x| b.0.contains(x)) && a.1.iter().all(|x| b.1.contains(x))
+    let sig = |x: &[Lit]| x.iter().fold(0u64, |s, l| s | l.sig_bit());
+    let strict = |x: &[Lit]| x.windows(2).all(|w| w[0] < w[1]);
+    let within = |a: &(Side, u64, u64, bool), b: &(Side, u64, u64, bool)| {
+        if a.1 & !b.1 != 0 || a.2 & !b.2 != 0 {
+            return false;
+        }
+        let ((a0, a1), (b0, b1)) = (&a.0, &b.0);
+        if a.3 && b.3 {
+            super::dl_clause::subset(a0, b0) && super::dl_clause::subset(a1, b1)
+        } else {
+            a0.iter().all(|x| b0.contains(x)) && a1.iter().all(|x| b1.contains(x))
+        }
     };
     l.sort_by_key(|s| s.0.len() + s.1.len());
-    let mut keep: Vec<Side> = Vec::with_capacity(l.len());
+    let mut keep: Vec<(Side, u64, u64, bool)> = Vec::with_capacity(l.len());
     for s in l.drain(..) {
+        let (s0, s1) = (sig(&s.0), sig(&s.1));
+        let sorted = strict(&s.0) && strict(&s.1);
+        let s = (s, s0, s1, sorted);
         if !keep.iter().any(|k| within(k, &s)) {
             keep.push(s);
         }
     }
-    *l = keep;
+    l.extend(keep.into_iter().map(|k| k.0));
 }
 
 /// The choices of a product between two checks of the run's bounds.
@@ -1522,6 +1711,13 @@ pub(super) fn drain_with<S: Sink>(
     let dx = ix.dl.as_deref();
     let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
     for (lists, base, ground, rule) in found.prods {
+        // a product past the run's limit on choices ends the run as its bound does, before
+        // the product spends its work (roadmap item 1011)
+        if out.dl().too_wide(&lists) {
+            out.dl().exhaust();
+            ds(st).store.interrupted = true;
+            return;
+        }
         if !ground {
             if !fold(ix, st, &lists, base, rule, found.root, trace, out, &derive) {
                 return;
@@ -2432,6 +2628,15 @@ pub fn sub<S: Sink>(ix: &Index, me: Ex, st: &mut State, d: Ex, out: &mut S) {
         && into_nominal(ix, d).is_none()
     {
         on_rl(ix, st, d, r, &unit, &mut found);
+        if late_rules(dx) {
+            late(ix, me, st, d, h.succ, "unit", &mut found, out);
+            // a restriction that had an edge before it became a unit reaches that
+            // successor too, now with the unit's premises
+            let w = dl(st).and_then(|x| x.edges.iter().find(|&&(f, _)| f == d).map(|&(_, w)| w));
+            if let Some(w) = w.filter(|&w| w != h.succ) {
+                late(ix, me, st, d, w, "unit-edge", &mut found, out);
+            }
+        }
         if dx.counting && dx.root.is_none() {
             let mut us = Vec::new();
             unit_lits(ix, dx, st, d, &mut us);
@@ -2957,17 +3162,30 @@ fn pred(
     match fixed {
         None => found.products(lists_free, base),
         Some((p, side)) => {
-            for (k, &n) in need.iter().enumerate() {
-                if !fits(n, p) {
-                    continue;
-                }
-                let mut lists = lists_free.clone();
+            // without counting the premise fits one place
+            let places: Vec<usize> = need
+                .iter()
+                .enumerate()
+                .filter(|&(_, &n)| fits(n, p))
+                .map(|(k, _)| k)
+                .take(if dx.counting { usize::MAX } else { 1 })
+                .collect();
+            // the last place takes the lists and the base themselves
+            let (mut lists_free, mut base) = (Some(lists_free), Some(base));
+            for (i, &k) in places.iter().enumerate() {
+                let (mut lists, b) = if i + 1 == places.len() {
+                    (
+                        lists_free.take().expect("the lists"),
+                        base.take().expect("the base"),
+                    )
+                } else {
+                    (
+                        lists_free.clone().expect("the lists"),
+                        base.clone().expect("the base"),
+                    )
+                };
                 lists[k] = vec![side.clone()];
-                found.products(lists, base.clone());
-                // without counting the premise fits one place
-                if !dx.counting {
-                    break;
-                }
+                found.products(lists, b);
             }
         }
     }
@@ -3111,7 +3329,8 @@ fn process<S: Sink>(
     }
     // a selected clause takes only the local inferences, Join, Pred and Succ, except that
     // one Pred cannot carry, whose head holds an atom over x, takes the Hyper over x too,
-    // since no predecessor sees it (its partners are still the unselected clauses)
+    // since no predecessor sees it (with sel_partners_x its partners include selected
+    // clauses, as do those of Pred from a successor over `f_e(u)`)
     let sel = rooted && dl(st).is_some_and(|x| x.store.clauses[id as usize].sel);
     let sel_x = sel && ready;
     let mut ps: Vec<(Role, Ex)> = Vec::new();
@@ -3223,8 +3442,16 @@ fn process<S: Sink>(
             }
             F | RL | EQ | NE => {
                 let e = l.fun();
+                let had = dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e));
                 // Succ: the successor takes the marker
                 let v = target(ix, me, st, e, out);
+                let edge_v = v;
+                // the late rule's replay takes the clauses with every partner, this
+                // premise included, so the replay below skips v
+                let replayed = late_rules(dx)
+                    && !had
+                    && dl(st).is_some_and(|x| x.edges.iter().any(|&(f, _)| f == e))
+                    && late(ix, me, st, e, v, "edge", &mut found, out);
                 match l.kind() {
                     F => send_hyp(ix, st, v, l.atom(), out),
                     RL => on_rl(ix, st, e, l.atom(), &prem, &mut found),
@@ -3259,6 +3486,9 @@ fn process<S: Sink>(
                 }
                 let table = &out.dl().table;
                 for &v in &es {
+                    if replayed && v == edge_v {
+                        continue;
+                    }
                     let cids = dl(st)
                         .and_then(|x| x.pred_in.get(&v))
                         .map_or(&[][..], |v| v.as_slice());
@@ -3732,5 +3962,80 @@ mod tests {
         }
         assert!(run.over_work());
         assert_eq!(run.work(), 100);
+    }
+
+    /// The pruning before item 1011, which searched each literal.
+    fn prune_by_search(l: &mut Vec<Side>) {
+        if l.len() < 2 {
+            return;
+        }
+        let within = |a: &Side, b: &Side| {
+            a.0.iter().all(|x| b.0.contains(x)) && a.1.iter().all(|x| b.1.contains(x))
+        };
+        l.sort_by_key(|s| s.0.len() + s.1.len());
+        let mut keep: Vec<Side> = Vec::with_capacity(l.len());
+        for s in l.drain(..) {
+            if !keep.iter().any(|k| within(k, &s)) {
+                keep.push(s);
+            }
+        }
+        *l = keep;
+    }
+
+    #[test]
+    fn pruning_keeps_the_sides_that_a_search_of_each_literal_keeps() {
+        // sides over few literals, so that many contain others, sorted or not, with
+        // repeats and empty halves, and more literals than a signature has bits
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..2000 {
+            let atoms = if round % 2 == 0 { 6 } else { 90 };
+            let lits = |next: &mut dyn FnMut(u64) -> u64| -> Vec<Lit> {
+                let n = next(5) as usize;
+                let mut v: Vec<Lit> = (0..n).map(|_| Lit::x(next(atoms) as Ex + 2)).collect();
+                match next(3) {
+                    0 => {
+                        v.sort_unstable();
+                        v.dedup();
+                    }
+                    1 => v.sort_unstable(),
+                    _ => {}
+                }
+                v
+            };
+            let len = next(12) as usize;
+            let list: Vec<Side> = (0..len)
+                .map(|_| (lits(&mut next), lits(&mut next)))
+                .collect();
+            let (mut a, mut b) = (list.clone(), list);
+            prune(&mut a);
+            prune_by_search(&mut b);
+            assert_eq!(a, b, "round {round}");
+        }
+    }
+
+    #[test]
+    fn a_product_wider_than_the_limit_is_too_wide() {
+        let run = DlRun::default();
+        let list = |n: usize| vec![unit(); n];
+        let lists = vec![list(3), list(4)];
+        assert!(!run.too_wide(&lists), "no limit");
+        run.set_width_limit(12);
+        assert!(!run.too_wide(&lists));
+        run.set_width_limit(11);
+        assert!(run.too_wide(&lists));
+        // a product whose count passes the range of the count is too wide
+        let wide = vec![list(1 << 12); 6];
+        run.set_width_limit(usize::MAX);
+        assert!(run.too_wide(&wide));
+        // a run that starts again has no limit until it is given one
+        let mut run = run;
+        run.begin_run();
+        assert!(!run.too_wide(&lists));
     }
 }

@@ -16,6 +16,7 @@ pub(crate) struct Shared<'a> {
     pub cache: &'a Arc<BlockCache>,
     pub results: &'a Arc<crate::sparql::cache::ResultCache>,
     pub union_default_graph: bool,
+    pub aggregate_errors: crate::sparql::AggregateErrors,
     pub geo_op_vertices: u64,
     pub change_log: Option<Arc<ChangeLog>>,
 }
@@ -47,6 +48,7 @@ impl SnapshotBuilder {
             text: None,
             geo: None,
             union_default_graph: shared.union_default_graph,
+            aggregate_errors: shared.aggregate_errors,
             geo_op_vertices: shared.geo_op_vertices,
             historical: false,
             counts: Default::default(),
@@ -74,6 +76,7 @@ impl SnapshotBuilder {
             text: base.text.clone(),
             geo: base.geo.clone(),
             union_default_graph: base.union_default_graph,
+            aggregate_errors: base.aggregate_errors,
             geo_op_vertices: base.geo_op_vertices,
             historical: false,
             counts: Default::default(),
@@ -157,6 +160,7 @@ impl Store {
             cache: &self.cache,
             results: &self.results,
             union_default_graph: self.opts.union_default_graph,
+            aggregate_errors: self.opts.aggregate_errors,
             geo_op_vertices: self.opts.geo_op_vertices,
             change_log: self.changelog.clone(),
         }

@@ -67,6 +67,7 @@ impl OutputBudget {
             Some(source),
             policy.as_ref(),
             None,
+            None,
         )?);
         ctx.attach_owner();
         ctx.check()?;
@@ -497,6 +498,7 @@ impl OutputReservation {
 pub struct SnapshotOutputRoot {
     source: crate::store::BoundReadSource,
     budget: OutputBudget,
+    snapshot: std::sync::Weak<crate::store::Snapshot>,
 }
 impl SnapshotOutputRoot {
     pub fn new(snapshot: Arc<crate::store::Snapshot>, opts: &super::QueryOptions) -> Result<Self> {
@@ -518,7 +520,11 @@ impl SnapshotOutputRoot {
         let prepared = access.masked_controlled(&snapshot, &preparation)?;
         let source = prepared.read_source();
         let budget = OutputBudget::receiving_prepared(source.clone(), opts, true)?;
-        Ok(Self { source, budget })
+        Ok(Self {
+            source,
+            budget,
+            snapshot: Arc::downgrade(&snapshot),
+        })
     }
     pub fn budget(&self) -> &OutputBudget {
         &self.budget
@@ -537,7 +543,57 @@ impl SnapshotOutputRoot {
         opts: &super::QueryOptions,
     ) -> Result<super::QueryResult> {
         self.budget.check()?;
-        super::execute_retained_source(self.source.clone(), query, opts, 0.0)
+        super::execute_retained_source(self.source.clone(), query, opts, 0.0, None)
+    }
+
+    /// Stream a FOCUS selector over this validation's physical data graph.
+    /// Scanning and decoded output use this root's original controls and memory.
+    pub fn scan_focus<E: From<Error>>(
+        &self,
+        data: &crate::validation::DataGraph,
+        predicate: Id,
+        fixed: Option<Id>,
+        focus_is_subject: bool,
+        each: impl FnMut(Id) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), E> {
+        self.budget.check()?;
+        self.check_snapshot(data)?;
+        data.scan_focus(
+            self.source.query_input().2,
+            predicate,
+            fixed,
+            focus_is_subject,
+            each,
+        )
+    }
+
+    fn check_snapshot(&self, data: &crate::validation::DataGraph) -> Result<()> {
+        if !std::ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(&data.snap)) {
+            return Err(Error::invalid(
+                "the selector data graph belongs to a different snapshot",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Execute a SELECT over a validation data graph from the exact Snapshot used
+    /// to construct this root. The selection replaces both dataset clauses and
+    /// protocol graph options. The query has no named graphs and remains subject
+    /// to this root's access policy and controls.
+    pub fn execute_selector(
+        &self,
+        query: &spargebra::Query,
+        opts: &super::QueryOptions,
+        data: &crate::validation::DataGraph,
+    ) -> Result<super::QueryResult> {
+        self.budget.check()?;
+        self.check_snapshot(data)?;
+        if !matches!(query, spargebra::Query::Select { .. }) {
+            return Err(Error::invalid(
+                "a validation selector requires a SELECT query",
+            ));
+        }
+        super::execute_retained_source(self.source.clone(), query, opts, 0.0, Some(&data.sel))
     }
 }
 
@@ -852,9 +908,9 @@ pub(super) fn term_depth(mut term: &Term) -> usize {
     nesting
 }
 
-// Conservative owned string/box payload envelope. The outer Term slots are paid
-// by build; no allocation occurs while calculating this admission.
-pub(super) fn term_bytes(mut term: &Term) -> Option<u64> {
+/// A conservative estimate of a term's owned string and box payloads, including
+/// nested triple terms. The enclosing term slot is charged separately.
+pub fn term_bytes(mut term: &Term) -> Option<u64> {
     let mut bytes = 0u64;
     loop {
         let text = match term {

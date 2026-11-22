@@ -245,6 +245,15 @@ mod tests {
             update(&s, &u, &QueryOptions::default()).unwrap();
         }
         s.set_prefix("ex", "http://example.org/").unwrap();
+        // the dataset's own settings, which an in-memory store keeps only in memory
+        s.set_aggregate_errors_setting(Some(sparkles_core::sparql::AggregateErrors::Sparkles))
+            .unwrap();
+        let describe = sparkles_core::sparql::describe::DescribeOptions {
+            labels: true,
+            max_triples: Some(9),
+            ..Default::default()
+        };
+        s.set_describe_settings(Some(describe.clone())).unwrap();
         let mut want = Vec::new();
         s.dump_nquads(&mut want).unwrap();
         let head = s.head_commit();
@@ -323,6 +332,23 @@ mod tests {
                 restored.prefixes().get("ex").map(String::as_str),
                 Some("http://example.org/")
             );
+            assert_eq!(
+                restored.aggregate_errors_setting(),
+                Some(sparkles_core::sparql::AggregateErrors::Sparkles)
+            );
+            assert_eq!(restored.describe_settings(), describe);
+            // the restored setting is the reading the library passes to its queries
+            let r = sparkles_core::sparql::query(
+                restored.snapshot(),
+                "SELECT (MIN(?v) AS ?m) WHERE { VALUES ?v { 1 UNDEF } }",
+                &QueryOptions {
+                    aggregate_errors: Some(restored.aggregate_errors()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let rows = r.rows().unwrap();
+            assert!(rows.iter().next().unwrap().values()[0].is_some());
         });
     }
 

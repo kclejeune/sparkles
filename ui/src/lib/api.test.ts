@@ -110,13 +110,19 @@ describe('query', () => {
       reasoning: false,
       nocache: true,
     });
-    // the table shows exact totals, so it asks for eager execution explicitly
+    // most callers need exact totals, so it asks for eager execution unless told otherwise
     expect(calls[0].url).toBe(
       '/my%20ds/sparql?nocache=true&send=10&execution=eager&reasoning=false',
     );
     expect((calls[0].init.headers as Record<string, string>).Accept).toBe(api.SPARKLES_JSON);
     expect(r.vars).toEqual(['s', 'o']);
     expect(r.meta.totalRows).toBe(0);
+  });
+
+  it('passes the reading of errors in aggregates', async () => {
+    const calls = stubFetch(() => jsonResponse({ queryType: 'SELECT', vars: [], rows: [] }));
+    await api.query('ds', 'SELECT * {}', { aggregateErrors: 'sparkles' });
+    expect(calls[0].url).toContain('aggregate-errors=sparkles');
   });
 
   it('sends a query-time mode with its profile and reads what it derived', async () => {
@@ -144,6 +150,73 @@ describe('query', () => {
     });
     expect(api.parseReasoningHeader('materialized')).toBeUndefined();
     expect(api.parseReasoningHeader(null)).toBeUndefined();
+  });
+
+  it('leaves the mode to the server when asked, and names any other mode', async () => {
+    const calls = stubFetch(() => jsonResponse({ queryType: 'SELECT', vars: [], rows: [] }));
+    await api.query('ds', 'SELECT * {}', { send: 5, execution: 'server' });
+    expect(calls[0].url).toBe('/ds/sparql?send=5');
+    await api.query('ds', 'SELECT * {}', { execution: 'auto' });
+    expect(calls[1].url).toBe('/ds/sparql?execution=auto');
+    await api.runStoredQuery('ds', 'q', {}, { execution: 'server' });
+    expect(calls[2].url).toBe('/ds/queries/q');
+    await api.runStoredQuery('ds', 'q', {});
+    expect(calls[3].url).toBe('/ds/queries/q?execution=eager');
+  });
+
+  it('reads a streamed answer that stopped at the row limit as one with no total', async () => {
+    // the shape `write_cursor_native_json` writes when `send` cut a streamed answer
+    stubFetch(() =>
+      jsonResponse({
+        queryType: 'SELECT',
+        vars: ['s'],
+        rows: [[{ type: 'uri', value: 'urn:a' }]],
+        meta: {
+          totalRows: null,
+          sentRows: 1,
+          status: 'stopped',
+          timing: { parseMs: 0, planMs: 0, execMs: 0, serializeMs: 0, totalMs: 0 },
+          plan: {
+            operator: { operator: 'Scan', description: '', columns: ['s'], children: [] },
+            materializes: false,
+            fullInputBeforeOutput: false,
+            growingState: false,
+            complete: true,
+            reason: null,
+            children: [],
+          },
+        },
+      }),
+    );
+    const r = await api.query('ds', 'SELECT ?s {}', { send: 1, execution: 'server' });
+    expect(r.meta.totalRows).toBeNull();
+    expect(api.totalUnknown(r.meta)).toBe(true);
+    expect(api.totalUnknown({ totalRows: 4, status: 'complete' })).toBe(false);
+    expect(api.totalUnknown({ totalRows: 4 })).toBe(false);
+    // a stopped stream has no total even if a server sent one
+    expect(api.totalUnknown({ totalRows: 1, status: 'stopped' })).toBe(true);
+  });
+
+  it('reads a streamed graph answer, whose statements come as quads, like an eager one', () => {
+    const t = (v: string): api.Term => ({ type: 'uri', value: v });
+    const named = [t('s2'), t('p'), t('o'), t('g')] as [api.Term, api.Term, api.Term, api.Term];
+    const r = api.normalizeResult({
+      queryType: 'CONSTRUCT',
+      triples: [],
+      quads: [[t('s1'), t('p'), t('o'), null], named],
+      meta: { totalRows: null, sentRows: 2, status: 'stopped' } as never,
+    });
+    expect(r.triples).toEqual([[t('s1'), t('p'), t('o')]]);
+    expect(r.quads).toEqual([named]);
+    // an eager answer's triples and named-graph quads stay as they are
+    const e = api.normalizeResult({
+      queryType: 'CONSTRUCT',
+      triples: [[t('a'), t('p'), t('o')]],
+      quads: [named],
+      meta: { totalRows: 2, sentRows: 2 } as never,
+    });
+    expect(e.triples).toEqual([[t('a'), t('p'), t('o')]]);
+    expect(e.quads).toEqual([named]);
   });
 
   it('downloads leave the execution mode to the server', async () => {

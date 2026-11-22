@@ -42,6 +42,9 @@ pub struct ServerPlan {
     pub metrics_fuseki_names: bool,
     /// `fuseki:realm`
     pub realm: Option<String>,
+    /// the server's reading of errors in aggregates, from the `aggregateErrors` context
+    /// symbol (`--aggregate-errors`)
+    pub aggregate_errors: Option<sparkles::sparql::AggregateErrors>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +96,9 @@ pub struct DatasetPlan {
     pub reasoning: Option<Reasoning>,
     /// the dataset's own union-default-graph setting
     pub union: Option<bool>,
+    /// the dataset's own reading of errors in aggregates, from the `aggregateErrors`
+    /// context symbol of the dataset or one of its endpoints
+    pub aggregate_errors: Option<sparkles::sparql::AggregateErrors>,
 }
 
 impl DatasetPlan {
@@ -124,8 +130,12 @@ pub(super) struct Converter<'a> {
     pub(super) server_query_timeout: Option<f64>,
     pub(super) server_update_timeout: Option<f64>,
     pub(super) server_union: Option<bool>,
+    pub(super) server_aggregate_errors: Option<sparkles::sparql::AggregateErrors>,
     /// union-default-graph settings found in the contexts read since the last drain
     pub(super) local_union: Vec<(String, bool)>,
+    /// readings of errors in aggregates found in the contexts of datasets and endpoints
+    /// read since the last drain
+    pub(super) local_aggregate_errors: Vec<(String, sparkles::sparql::AggregateErrors)>,
 }
 
 pub fn convert(inputs: &Inputs, mode: Mode) -> Result<Plan> {
@@ -140,7 +150,9 @@ pub fn convert(inputs: &Inputs, mode: Mode) -> Result<Plan> {
         server_query_timeout: None,
         server_update_timeout: None,
         server_union: None,
+        server_aggregate_errors: None,
         local_union: Vec::new(),
+        local_aggregate_errors: Vec::new(),
     };
     c.run()
 }
@@ -253,6 +265,8 @@ impl Converter<'_> {
 
         self.settle_timeouts(&mut plan_server);
         self.settle_union(&mut plan_server, &mut datasets);
+        plan_server.aggregate_errors = self.server_aggregate_errors;
+        self.settle_aggregate_errors(&datasets);
 
         let auth = access::plan(
             &AccessInput {
@@ -480,6 +494,27 @@ impl Converter<'_> {
                             // recorded by the caller through `local_union`
                             self.local_union.push((place.to_string(), on));
                         }
+                    }
+                }
+                // the JVM binding's `Sparkles.AGGREGATE_ERRORS` symbol (roadmap item 1064)
+                "aggregateErrors" => {
+                    match value.trim().parse::<sparkles::sparql::AggregateErrors>() {
+                        Ok(m) => match scope {
+                            Scope::Server => {
+                                self.server_aggregate_errors = Some(m);
+                                self.report.converted(
+                                    place,
+                                    format!("{name} {m} (--aggregate-errors {m})"),
+                                );
+                            }
+                            Scope::Local => {
+                                self.local_aggregate_errors.push((place.to_string(), m))
+                            }
+                        },
+                        Err(_) => self.report.unsupported(
+                            place,
+                            format!("{name} \"{value}\" is not jena, sparkles or spec"),
+                        ),
                     }
                 }
                 _ => self.report.ignored(

@@ -551,6 +551,12 @@ pub(super) fn write_view_key(ctx: &Ctx, mut s: impl std::fmt::Write) -> std::fmt
 fn raw_key(n: &Node, ctx: &Ctx) -> Option<String> {
     let mut s = view_key(ctx);
     s.reserve(256);
+    // Another reading of errors changes the answers of aggregates, including those of
+    // subqueries planned while the query runs, such as a correlated LATERAL's right
+    // side, whose Group is not a child of the node the key describes.
+    if ctx.aggregate_errors != super::AggregateErrors::default() {
+        let _ = write!(s, "a{}|", ctx.aggregate_errors);
+    }
     write_node(n, ctx, &mut s).then_some(s)
 }
 
@@ -571,7 +577,11 @@ fn write_node(n: &Node, ctx: &Ctx, s: &mut String) -> bool {
     };
     let _ = write!(s, "({} [{}] {{{}}}", n.operator(), n.desc, names(&n.vars));
     let ok = match &n.kind {
-        Kind::Service { .. } | Kind::VectorSearch(_) | Kind::HybridSearch(_) => false,
+        Kind::Service { .. }
+        | Kind::VectorSearch(_)
+        | Kind::HybridSearch(_)
+        | Kind::GraphNames(_)
+        | Kind::GraphBranches(_) => false,
         Kind::Values(t) => {
             // include the actual rows (local ids make it uncacheable)
             if t.cols.iter().flatten().any(|id| id.tag() == Tag::Local) {

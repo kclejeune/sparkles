@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Item 829 q9-star rerun: geo q9-star at 12 threads over three builds.
+
+    analyze_q9.py OUT_DIR [ENGINE] > summary.md   (OUT_DIR holds r1 .. rN from q9.sh)
+
+Builds: base bccc5f7b (the lane's base), main 5f3f69c2 (the tip's merge base with main)
+and tip cde29b37. Each round runs six arms, each its own server process, in an order that
+rotates the builds through the positions (q9.sh), so every
+comparison Y/X gives two pairs per round, Y/X and Y2/X2. A pair's ratio is the median of
+the Y requests over the median of the X requests (client wall time, hyperfine). The
+pooled ratio is the median of all Y requests over the median of all X requests, with a
+95% bootstrap interval that resamples server processes within each build. Same-binary
+ratios X2/X give the spread. The fast mode is a request under FAST_MS (22 ms, from the
+forge first pass and rerun). ENGINE is the hyperfine command name, "sparkles" (the
+indexed server, default) or "sparkles-plain" (the rewrites-off server, a second
+process per arm). Answer fingerprints must agree across every arm of every round.
+
+Comparisons: tip/main is the lane's cost on current main, main/base is main's drift
+since the lane's base, and tip/base is the comparison the coordinator named.
+"""
+
+import json
+import random
+import statistics as st
+import sys
+from pathlib import Path
+
+BUILDS = {"base": "bccc5f7b", "main": "5f3f69c2", "tip": "cde29b37"}
+COMPARISONS = (("tip", "main"), ("main", "base"), ("tip", "base"))
+FAST_MS = 22.0
+
+
+def times(d, engine):
+    j = json.loads((d / "geo-q9-star.json").read_text())
+    return [r for r in j["results"] if r["command"] == engine][0]["times"]
+
+
+def flat(arms):
+    return [t for a in arms for t in a]
+
+
+def main():
+    out = Path(sys.argv[1])
+    engine = sys.argv[2] if len(sys.argv) > 2 else "sparkles"
+    rounds = sorted((p for p in out.glob("r*") if p.is_dir()), key=lambda p: int(p.name[1:]))
+    ref, bad = None, []
+    for r in rounds:
+        for d in sorted((r / "results").iterdir()):
+            fp = json.dumps(json.loads((d / "geo-answers.json").read_text()), sort_keys=True)
+            ref = ref or fp
+            if fp != ref:
+                bad.append(f"{r.name}/{d.name}")
+    print(f"# q9-star rerun at 12 threads, {len(rounds)} rounds, engine {engine}\n")
+    print("Builds: " + ", ".join(f"{k} {v}" for k, v in BUILDS.items()) + "\n")
+    print(f"Answer fingerprints differing from the first arm: {bad or 'none'}\n")
+    res = {}
+    modes = [m for m in ("streaming", "eager") if (rounds[0] / "results" / f"geo-base-{m}-t12").is_dir()]
+    for mode in modes:
+        arms = {b: [] for b in BUILDS}
+        per_round = []
+        for r in rounds:
+            x = {f"{b}{s}": times(r / "results" / f"geo-{b}{s}-{mode}-t12", engine)
+                 for b in BUILDS for s in ("", "2")}
+            per_round.append(x)
+            for b in BUILDS:
+                arms[b] += [x[b], x[b + "2"]]
+        print(f"## {mode} t12\n")
+        for b in BUILDS:
+            a = arms[b]
+            nfast = sum(t * 1e3 < FAST_MS for t in flat(a))
+            farms = sum(st.median(v) * 1e3 < FAST_MS for v in a)
+            sbs = [st.median(x[b + "2"]) / st.median(x[b]) for x in per_round]
+            print(f"- {b} {BUILDS[b]}: median {st.median(flat(a)) * 1e3:.2f} ms; arm medians "
+                  f"{' '.join(f'{st.median(v) * 1e3:.1f}' for v in a)}; fast requests {nfast}/{len(flat(a))}, "
+                  f"fast arms {farms}/{len(a)}; same-binary max spread "
+                  f"{(max(max(s, 1 / s) for s in sbs) - 1) * 100:.1f}%")
+        print()
+        rng = random.Random(829)
+        for y, x0 in COMPARISONS:
+            pairs = []
+            for x in per_round:
+                pairs += [st.median(x[y]) / st.median(x[x0]), st.median(x[y + "2"]) / st.median(x[x0 + "2"])]
+            pooled = st.median(flat(arms[y])) / st.median(flat(arms[x0]))
+            boot = sorted(
+                st.median(flat(rng.choices(arms[y], k=len(arms[y]))))
+                / st.median(flat(rng.choices(arms[x0], k=len(arms[x0]))))
+                for _ in range(4000)
+            )
+            lo, hi = boot[100], boot[3899]
+            above = all(p > 1 for p in pairs)
+            below = all(p < 1 for p in pairs)
+            res[f"{mode}/{y}/{x0}"] = dict(pooled=pooled, ci95=[lo, hi], pairs=pairs,
+                                           above_1_every_pair=above, below_1_every_pair=below)
+            print(f"- {y}/{x0}: pooled {pooled:.3f} (95% over processes {lo:.3f} to {hi:.3f}); "
+                  f"pairs {' '.join(f'{p:.3f}' for p in pairs)}; min {min(pairs):.3f}, max {max(pairs):.3f}; "
+                  f"above 1 in every pair: {above}; below 1 in every pair: {below}")
+        print()
+        res[f"{mode}/arms_ms"] = {b: [st.median(v) * 1e3 for v in arms[b]] for b in BUILDS}
+    (out.parent / f"q9-analysis-{engine}.json").write_text(
+        json.dumps(dict(answers_differ=bad, q9=res), indent=1))
+
+
+main()

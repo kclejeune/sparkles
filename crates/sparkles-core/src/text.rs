@@ -2834,6 +2834,7 @@ mod imp {
         }
 
         /// Test hook: make the next update fail.
+        #[cfg(any(test, feature = "failpoints"))]
         #[doc(hidden)]
         pub fn fail_next_commit(&self) {
             self.inner.fail_next_commit.store(true, Ordering::SeqCst);
@@ -2841,6 +2842,7 @@ mod imp {
 
         /// Test hook: pause (or resume) the tick, so staged documents stay uncommitted
         /// until a search, compaction or close.
+        #[cfg(any(test, feature = "failpoints"))]
         #[doc(hidden)]
         pub fn set_ticks(&self, on: bool) {
             self.inner.ticks.store(on, Ordering::SeqCst);

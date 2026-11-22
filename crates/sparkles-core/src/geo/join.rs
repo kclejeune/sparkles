@@ -702,6 +702,7 @@ pub fn spatial_join(
                     i,
                     map: &map,
                     dec: None,
+                    exists: None,
                 };
                 spec.filter
                     .iter()

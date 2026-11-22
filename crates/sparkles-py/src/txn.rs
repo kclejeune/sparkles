@@ -387,7 +387,7 @@ impl PyTransaction {
 
     /// Run a SPARQL query that sees this transaction's changes: `QuerySolutions` for
     /// SELECT, `bool` for ASK, `QueryTriples` for CONSTRUCT and DESCRIBE.
-    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, describe = None))]
+    #[pyo3(signature = (query, *, base_iri = None, prefixes = None, bindings = None, default_graph = None, named_graphs = None, include_inferred = false, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, describe = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn query<'py>(
         &self,
@@ -405,6 +405,7 @@ impl PyTransaction {
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'py, PyAny>>,
         describe: Option<Bound<'py, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let args = query_args(
             base_iri,
@@ -420,6 +421,7 @@ impl PyTransaction {
             cancel,
             None,
             describe,
+            aggregate_errors,
         );
         self.run_query(py, query, args, None)
     }
@@ -427,7 +429,7 @@ impl PyTransaction {
     /// Run a SPARQL Update request in this transaction. Its changes commit or roll back
     /// with the transaction. An update that fails after it began to change data leaves
     /// the transaction to be rolled back.
-    #[pyo3(signature = (update, *, base_iri = None, prefixes = None, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None))]
+    #[pyo3(signature = (update, *, base_iri = None, prefixes = None, timeout = None, max_rows = None, max_memory_bytes = None, max_rows_produced = None, cancel = None, aggregate_errors = None))]
     #[allow(clippy::too_many_arguments)]
     fn update(
         &self,
@@ -440,6 +442,7 @@ impl PyTransaction {
         max_memory_bytes: Option<u64>,
         max_rows_produced: Option<u64>,
         cancel: Option<Bound<'_, PyAny>>,
+        aggregate_errors: Option<String>,
     ) -> PyResult<PyUpdateStats> {
         let args = QueryArgs {
             base_iri,
@@ -449,6 +452,7 @@ impl PyTransaction {
             max_memory_bytes,
             max_rows_produced,
             cancel,
+            aggregate_errors,
             ..Default::default()
         };
         let (opts, _) = query_options(&args)?;

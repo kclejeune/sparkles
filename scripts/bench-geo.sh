@@ -67,12 +67,15 @@ if [ -z "${SKIP_LOAD:-}" ]; then
     --command-name build "$SPARKLES geo-index --loc $DB" --export-json results/geo-build.new.json
   merge results/geo-build.new.json results/geo-build.json
 fi
-"$SPARKLES" geo-index --loc "$DB" > /dev/null 2>&1
+"$SPARKLES" geo-index --loc "$DB" > /dev/null
 "$SPARKLES" geo-index --loc "$DB" --status > results/geo-status.json
 
 SPID=
+# The server holds the store until its process exits, which can be after its port closes,
+# and `geo-index` refuses a store in use, so stop() waits for the server it started.
 stop() {
   [ -n "$SPID" ] && { kill "$SPID" 2> /dev/null || true; }
+  [ -n "$SPID" ] && { wait "$SPID" 2> /dev/null || true; }
   pid=$(ss -ltnp 2> /dev/null | grep ":$PORT " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1 || true)
   [ -n "$pid" ] && { kill "$pid" 2> /dev/null || true; }
   for _ in $(seq 1 100); do
@@ -122,11 +125,11 @@ serve sparkles --geo bench
 run sparkles
 stop
 # without it (the spatial index disabled, then enabled again for the next run)
-"$SPARKLES" geo-index --loc "$DB" --disable > /dev/null 2>&1
+"$SPARKLES" geo-index --loc "$DB" --disable > /dev/null
 serve sparkles-scan
 run sparkles-scan
 stop
-"$SPARKLES" geo-index --loc "$DB" > /dev/null 2>&1
+"$SPARKLES" geo-index --loc "$DB" > /dev/null
 # with the index, the spatial join and nearest-neighbour rewrites off
 if [ -n "$PLAIN_QUERIES" ]; then
   QUERIES_ALL=${QUERIES:-}

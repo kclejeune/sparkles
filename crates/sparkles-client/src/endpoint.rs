@@ -46,6 +46,7 @@ pub struct QueryOptions {
     pub(crate) execution: Option<Execution>,
     pub(crate) server_timeout: Option<Duration>,
     pub(crate) reasoning: Option<bool>,
+    pub(crate) aggregate_errors: Option<AggregateErrors>,
     pub(crate) default_graphs: Vec<String>,
     pub(crate) named_graphs: Vec<String>,
     pub(crate) method: QueryMethod,
@@ -75,6 +76,12 @@ impl QueryOptions {
     /// Include (`true`) or exclude materialized inferences (Sparkles only).
     pub fn reasoning(mut self, on: bool) -> Self {
         self.reasoning = Some(on);
+        self
+    }
+    /// How the query's MIN, MAX, AVG and GROUP_CONCAT treat errors, over the dataset's
+    /// setting (Sparkles only, the `aggregate-errors` parameter).
+    pub fn aggregate_errors(mut self, reading: AggregateErrors) -> Self {
+        self.aggregate_errors = Some(reading);
         self
     }
     /// The protocol's `default-graph-uri` (repeatable).
@@ -107,6 +114,29 @@ pub enum Execution {
     Auto,
 }
 
+/// How a Sparkles query's aggregates treat errors, such as an unbound value. `Jena` is
+/// the server's default unless it was started otherwise. API.md describes the readings
+/// under "Aggregate errors".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AggregateErrors {
+    /// MIN and MAX over an error are unbound, as in Apache Jena.
+    Jena,
+    /// MIN and MAX pass over errors.
+    Sparkles,
+    /// The text of SPARQL 1.1 and 1.2.
+    Spec,
+}
+
+impl AggregateErrors {
+    fn as_str(self) -> &'static str {
+        match self {
+            AggregateErrors::Jena => "jena",
+            AggregateErrors::Sparkles => "sparkles",
+            AggregateErrors::Spec => "spec",
+        }
+    }
+}
+
 impl Execution {
     fn as_str(self) -> &'static str {
         match self {
@@ -122,6 +152,7 @@ impl Execution {
 pub struct UpdateOptions {
     pub(crate) using_graphs: Vec<String>,
     pub(crate) using_named_graphs: Vec<String>,
+    pub(crate) aggregate_errors: Option<AggregateErrors>,
     pub(crate) write: WriteCommon,
     pub(crate) call: CallOptions,
 }
@@ -147,6 +178,12 @@ impl UpdateOptions {
     /// The protocol's `using-named-graph-uri` (repeatable).
     pub fn using_named_graph(mut self, iri: impl Into<String>) -> Self {
         self.using_named_graphs.push(iri.into());
+        self
+    }
+    /// How the aggregates of the update's WHERE clauses treat errors, over the dataset's
+    /// setting (Sparkles only, the `aggregate-errors` parameter).
+    pub fn aggregate_errors(mut self, reading: AggregateErrors) -> Self {
+        self.aggregate_errors = Some(reading);
         self
     }
     /// The commit message (Sparkles only).
@@ -394,6 +431,10 @@ impl Endpoint {
             self.sparkles_only("execution")?;
             extra.push(("execution", mode.as_str().to_string()));
         }
+        if let Some(m) = opts.aggregate_errors {
+            self.sparkles_only("aggregate-errors")?;
+            extra.push(("aggregate-errors", m.as_str().to_string()));
+        }
         if let Some(t) = opts.server_timeout {
             extra.push(("timeout", secs(t)));
         }
@@ -454,6 +495,10 @@ impl Endpoint {
         }
         for g in &opts.using_named_graphs {
             r.param("using-named-graph-uri", g.clone());
+        }
+        if let Some(m) = opts.aggregate_errors {
+            self.sparkles_only("aggregate-errors")?;
+            r.param("aggregate-errors", m.as_str());
         }
         self.write_params(&mut r, &opts.write)?;
         r.body(ReqBody::text("application/sparql-update", update));

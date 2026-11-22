@@ -88,6 +88,9 @@ pub fn update_in(txn: &mut WriteTxn<'_>, u: &str, opts: &QueryOptions) -> Result
             budget: RequestBudget::new(&opts.outbound),
             produced: Default::default(),
             grant: opts.query_grant(),
+            aggregate_errors: opts
+                .aggregate_errors
+                .unwrap_or_else(|| txn.aggregate_errors()),
         };
         for op in &parsed.operations {
             req.check()?;
@@ -226,6 +229,9 @@ fn run_update(
             .unwrap_or_else(|| RequestBudget::new(&opts.outbound)),
         produced: Default::default(),
         grant: opts.query_grant(),
+        aggregate_errors: opts
+            .aggregate_errors
+            .unwrap_or_else(|| store.aggregate_errors()),
     };
     // the request's cancellation and deadline also end the wait for the writer lock
     // and the write guard
@@ -294,6 +300,9 @@ struct Request<'a> {
     produced: Arc<std::sync::atomic::AtomicU64>,
     /// the pool reservation the operations share, one at a time
     grant: Option<Arc<super::pool::PoolGrant>>,
+    /// the reading of errors in aggregates of every WHERE clause: the request's, else
+    /// the dataset's (roadmap item 1064)
+    aggregate_errors: super::AggregateErrors,
 }
 
 impl Request<'_> {
@@ -355,6 +364,7 @@ impl Request<'_> {
         }
         ctx.base_iri = self.base.clone();
         ctx.extensions = self.opts.extensions.clone();
+        ctx.aggregate_errors = self.aggregate_errors;
         ctx
     }
 }

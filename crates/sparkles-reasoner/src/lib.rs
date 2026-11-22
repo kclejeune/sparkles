@@ -60,7 +60,8 @@ pub use maintain::{
     Cache, DEFAULT_CACHE_TRIPLES, FactWitnesses, literal_typings, literal_typings_controlled,
 };
 pub use parser::{
-    BuiltinCall, Clause, Direction, Node, Rule, RuleParseError, TriplePattern, parse_rules,
+    BuiltinCall, Clause, Direction, Node, RelationAtom, Rule, RuleParseError, TriplePattern,
+    parse_rules, rules_text, uses_program,
 };
 
 use anyhow::Context as _;
@@ -522,6 +523,39 @@ fn derive_here(
         defaults = Some(d);
     }
     let mut warnings = WorkingWarnings::new(&budget);
+    if parser::uses_program(&rules) {
+        // a rule program (item 839): its strata run in order, and it reads lists again
+        // when their cells arrive, so it needs neither the closure operators nor a restart
+        let info = engine::frontend::compile(&rules, &terms, &mut warnings, false)?;
+        if let Some(context) = &opts.analysis {
+            context.check()?;
+        }
+        let limits = engine::Limits {
+            max_iterations: opts.max_iterations,
+            max_inferred: opts.max_inferred,
+            cancel: opts.cancel.clone(),
+            deadline: None,
+            progress: opts.progress.clone(),
+            budget: budget.clone(),
+            closures: false,
+            magic: None,
+            sampled_planning: opts.sampled_planning,
+        };
+        progress(opts, 0.1, "reasoning");
+        let out = engine::run_program(&mut g, &info.program, &terms, &limits, &mut warnings)?;
+        budget.check_peak()?;
+        return Ok(Derivation {
+            graph: g,
+            terms,
+            rules: info.program.rules.len(),
+            iterations: out.iterations,
+            warnings,
+            budget,
+            defaults,
+            base_scans: base.scans(),
+            threads: rayon::current_num_threads(),
+        });
+    }
     let compiled = engine::compile(&rules, &terms, &mut warnings)?;
     if let Some(context) = &opts.analysis {
         context.check()?;
@@ -534,6 +568,7 @@ fn derive_here(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: opts.closure_operators && opts.analysis.is_none(),
+        magic: None,
         sampled_planning: opts.sampled_planning,
     };
     progress(opts, 0.1, "reasoning");
@@ -943,6 +978,86 @@ pub(crate) fn profile_rules(profile: &Profile, extras: &Extras) -> anyhow::Resul
     Ok(rules)
 }
 
+/// The rules that an incremental run or a witness pass evaluates: Jena rules as
+/// [`engine::compile`] gives them, or the lowered rules of a rule program (item 839) of
+/// every stratum, with its relation part, which an update rebuilds when the closure
+/// lacks its relation facts.
+enum RunRules {
+    Jena(engine::CompiledRules),
+    Program {
+        rules: Vec<engine::CRule>,
+        part: Option<Box<ir::Program>>,
+        /// a stratum after the first: the program negates, and is not maintained
+        strata: usize,
+        _held: Box<(Held, ir::lower::Lowered, engine::frontend::ProgramInfo)>,
+    },
+}
+
+impl std::ops::Deref for RunRules {
+    type Target = [engine::CRule];
+    fn deref(&self) -> &[engine::CRule] {
+        match self {
+            RunRules::Jena(c) => c,
+            RunRules::Program { rules, .. } => rules,
+        }
+    }
+}
+
+impl RunRules {
+    /// Compile `rules` over `terms`, through the frontend when they are a rule program.
+    fn new(
+        rules: &[Rule],
+        terms: &Terms,
+        warnings: &mut WorkingWarnings,
+    ) -> anyhow::Result<RunRules> {
+        if !parser::uses_program(rules) {
+            return Ok(RunRules::Jena(engine::compile(rules, terms, warnings)?));
+        }
+        let budget = terms.budget();
+        let info = engine::frontend::compile(rules, terms, warnings, false)?;
+        let mut lowered = info.program.lower(&budget)?;
+        let strata = lowered.strata.len();
+        let part = info
+            .program
+            .relation_part(&ir::Vocab::of(terms), &budget)
+            .map_err(|e| match e {
+                ir::ProgramError::Memory(m) => anyhow::Error::from(m),
+                e => anyhow::anyhow!("{e}"),
+            })?;
+        let mut held = Held::new(&budget);
+        let (flat, _infos) =
+            explain::flat_rules(&info.program, &mut lowered, &mut held, &info.lines)?;
+        Ok(RunRules::Program {
+            rules: flat,
+            part: part.map(Box::new),
+            strata,
+            _held: Box::new((held, lowered, info)),
+        })
+    }
+
+    /// The relation part of a rule program.
+    fn part(&self) -> Option<&ir::Program> {
+        match self {
+            RunRules::Jena(_) => None,
+            RunRules::Program { part, .. } => part.as_deref(),
+        }
+    }
+
+    /// Why the closure of these rules is not maintained incrementally, if it is not.
+    fn blocker(&self, terms: &Terms) -> Option<String> {
+        if let RunRules::Program { strata, .. } = self
+            && *strata > 1
+        {
+            return Some(
+                "the rule program negates an atom, so it runs by strata and in full on every update"
+                    .to_string(),
+            );
+        }
+        self.iter()
+            .find_map(|r| engine::incremental_blocker(r, terms))
+    }
+}
+
 /// The most rule sets that [`incremental_rules`] keeps.
 const KEPT_RULE_SETS: usize = 8;
 
@@ -1019,6 +1134,8 @@ fn rules_bytes(rules: &[Rule]) -> usize {
                 Clause::Triple(t) => node(&t.subject) + node(&t.predicate) + node(&t.object),
                 Clause::Builtin(b) => b.name.len() + b.args.iter().map(node).sum::<usize>(),
                 Clause::Rule(r) => rule(r),
+                Clause::Relation(a) => a.name.len() + a.args.iter().map(node).sum::<usize>(),
+                Clause::Not(c) => clause(c),
             }
     }
     fn rule(r: &Rule) -> usize {
@@ -1053,9 +1170,13 @@ fn incremental_rules(
     let rules = Arc::new(profile_rules(profile, extras)?);
     let terms = Terms::new(snap.clone());
     let mut w = WorkingWarnings::new(&terms.budget());
-    let blocker = engine::compile(&rules, &terms, &mut w)?
-        .iter()
-        .find_map(|r| engine::incremental_blocker(r, &terms));
+    // a rule program that cannot be lowered, such as one with an existential head, has
+    // its error reported by the full run
+    let blocker = match RunRules::new(&rules, &terms, &mut w) {
+        Ok(compiled) => compiled.blocker(&terms),
+        Err(e) if parser::uses_program(&rules) => Some(format!("{e:#}")),
+        Err(e) => return Err(e),
+    };
     let set = KeptRules {
         digest,
         bytes: rules_bytes(&rules),
@@ -1439,6 +1560,7 @@ fn witness_limits(budget: &Arc<Budget>, opts: &ReasonOptions) -> engine::Limits 
         progress: None,
         budget: budget.clone(),
         closures: false,
+        magic: None,
         sampled_planning: false,
     }
 }
@@ -1454,7 +1576,7 @@ fn build_witnesses(
 ) -> anyhow::Result<witness::Witnesses> {
     let rules = profile_rules(profile, extras)?;
     let mut warnings = WorkingWarnings::new(budget);
-    let compiled = engine::compile(&rules, &c.terms, &mut warnings)?;
+    let compiled = RunRules::new(&rules, &c.terms, &mut warnings)?;
     witness::Witnesses::build(c, &compiled, max, &witness_limits(budget, opts))
 }
 
@@ -1837,7 +1959,10 @@ fn update_closure(
         Vec::new()
     };
     let mut warnings = WorkingWarnings::new(&budget);
-    let compiled = engine::compile(&rules, &closure.terms, &mut warnings)?;
+    let compiled = RunRules::new(&rules, &closure.terms, &mut warnings)?;
+    // a closure read back from the dataset has no relation facts, which the update
+    // rebuilds first (item 839's plan, §12.2)
+    let rebuild = (prev.source != "memory").then(|| compiled.part()).flatten();
     let limits = engine::Limits {
         max_iterations: opts.max_iterations,
         max_inferred: opts.max_inferred,
@@ -1846,6 +1971,7 @@ fn update_closure(
         progress: opts.progress.clone(),
         budget: budget.clone(),
         closures: false,
+        magic: None,
         sampled_planning: opts.sampled_planning,
     };
     let ch = &ch;
@@ -1870,13 +1996,14 @@ fn update_closure(
             Ok(())
         };
         let hook: Option<incremental::BeforeDelete<'_>> = if has { Some(&mut hook) } else { None };
-        let up = incremental::update(
+        let up = incremental::update_with(
             &mut closure,
             &compiled,
             &limits,
             &ch.base_added,
             &ch.base_removed,
             hook,
+            rebuild,
         );
         (up, rayon::current_num_threads())
     });
@@ -1899,7 +2026,11 @@ fn update_closure(
     )?;
     let added: Vec<[u64; 3]> = up.added(&closure).collect();
     for t in &added {
-        if !closure.explicit_held(t) && !closure.terms.valid(t) && generalized.insert(*t) {
+        if !closure.explicit_held(t)
+            && !closure.terms.valid(t)
+            && !ir::lower::is_key(t[1])
+            && generalized.insert(*t)
+        {
             gen_changes.added.push(*t);
         }
     }
@@ -2223,11 +2354,11 @@ pub fn dred_overdeletion(
         )
     })?;
     let mut warnings = WorkingWarnings::new(&d.budget);
-    let rules = engine::compile(
-        &profile_rules(profile, &Extras::default())?,
-        &d.terms,
-        &mut warnings,
-    )?;
+    let parsed = profile_rules(profile, &Extras::default())?;
+    if parser::uses_program(&parsed) {
+        anyhow::bail!("the over-deletion measurement takes Jena rules, not a rule program");
+    }
+    let rules = engine::compile(&parsed, &d.terms, &mut warnings)?;
     let removed: Vec<[u64; 3]> = removed
         .iter()
         .map(|t| {
@@ -2246,6 +2377,7 @@ pub fn dred_overdeletion(
         progress: None,
         budget: Budget::unlimited(),
         closures: false,
+        magic: None,
         sampled_planning: false,
     };
     let mut c = d.into_closure()?;

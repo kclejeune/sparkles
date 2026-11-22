@@ -225,8 +225,15 @@ fn random_histories_match_full_runs() {
 /// A chain of six properties through `chain/4` and a key of four values through
 /// `keyed/3`, after `owl2rl.rls`: `chain-end` derives `(x p2 y)` and `key-end` `(x p3 y)`.
 fn chain_and_key(v: &TV) -> Program {
+    let (rels, rules) = chain_and_key_rules(v);
+    checked(v, rels, rules)
+}
+
+/// The relations and rules of [`chain_and_key`].
+pub(super) fn chain_and_key_rules(v: &TV) -> (Relations, Vec<Rule>) {
     let mut rels = Relations::default();
-    // chain(list, i, x, y): the chain's first i properties lead from x to y
+    // chain(x, list, i, y): the chain's first i properties lead from x to y, with the
+    // subject first so that demand with a bound subject binds the first column (Q10)
     let chain = rels.declare("chain", 4, false).unwrap();
     // keyed(x, i, k): x has the key's first i values k (one value per property here)
     let keyed = rels.declare("keyed", 3, false).unwrap();
@@ -235,24 +242,24 @@ fn chain_and_key(v: &TV) -> Program {
     let mut rules = vec![rule(
         "chain-0",
         vec![pos(tri(V(0), p(0), V(1)))],
-        vec![head(rel(chain, &[C(ind(7)), C(n(1)), V(0), V(1)]))],
+        vec![head(rel(chain, &[V(0), C(ind(7)), C(n(1)), V(1)]))],
     )];
     for i in 1..6 {
         rules.push(rule(
             &format!("chain-{i}"),
             vec![
-                pos(rel(chain, &[C(ind(7)), C(n(i as i64)), V(0), V(1)])),
+                pos(rel(chain, &[V(0), C(ind(7)), C(n(i as i64)), V(1)])),
                 pos(tri(V(1), p(i), V(2))),
             ],
             vec![head(rel(
                 chain,
-                &[C(ind(7)), C(n(i as i64 + 1)), V(0), V(2)],
+                &[V(0), C(ind(7)), C(n(i as i64 + 1)), V(2)],
             ))],
         ));
     }
     rules.push(rule(
         "chain-end",
-        vec![pos(rel(chain, &[C(ind(7)), C(n(6)), V(0), V(1)]))],
+        vec![pos(rel(chain, &[V(0), C(ind(7)), C(n(6)), V(1)]))],
         vec![head(tri(V(0), v.props[2], V(1)))],
     ));
     // keys over p0 four times by position, standing for four properties
@@ -279,7 +286,7 @@ fn chain_and_key(v: &TV) -> Program {
         ],
         vec![head(tri(V(0), v.props[3], V(1)))],
     ));
-    checked(v, rels, rules)
+    (rels, rules)
 }
 
 /// Chains and keys written as relations, after `owl2rl.rls`: a chain of six properties

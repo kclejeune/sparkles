@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inert retention checks; fake tools never invoke Cargo or MBX builds."""
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import importlib.util
 import json
 import os

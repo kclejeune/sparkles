@@ -34,8 +34,8 @@ adds to this file and does not override it.
 - Prefer available local implementation and build hosts. Use Boat sandboxes for overflow,
   isolation or additional parallel capacity, after checking the worker's tools, memory,
   disk and competing work. Reuse a warm worker for ordinary fix and test iterations.
-  Namespace remains a fallback for a measured resource need or a workflow without a
-  qualified Boat replacement. Provider-neutral commands accept an admitted `boat:bx_ID`
+  Namespace is not used. A workflow that only Namespace supported waits for a Boat or
+  local equivalent, which gets a roadmap item. Provider-neutral commands accept an admitted `boat:bx_ID`
   worker and never create or stop it. The tracked `boat:qualify`, `boat:job-env` and
   `boat:finish` commands preserve explicit profile/release and verified closure. See [remote executors](docs/REMOTE-EXECUTORS.md).
 - The benchmark host, which `SPARKLES_BENCH_HOST` names, runs no builds or gates. Keep
@@ -79,9 +79,18 @@ adds to this file and does not override it.
 - Features inspired by Fluree are built clean-room. Work from the W3C standards and
   Fluree's public documentation only, and never read Fluree's source code.
 - Performance claims need measurements. `mise run bench:remote --executor boat:bx_ID A B`
-  gives a quick A/B on a Boat worker, and `mise run bench:nsc A B` on Namespace. Effects under about 5%, queries under 0.3 ms and codegen-sensitive changes
-  need an Intel host, and published numbers come from the benchmark host. See
+  gives a quick A/B on a Boat worker. Effects under about 5%, queries under 0.3 ms and
+  codegen-sensitive changes need an Intel host, and published numbers come from the benchmark host. See
   [docs/BENCHMARKING.md](docs/BENCHMARKING.md).
+- Count instructions per request with `mise run bench:request-insn BASE_BIN TIP_BIN` before
+  booking an Intel host. A count flag books the timing run, and counts never size an
+  effect. Counts are enough only when the change adds or removes computation on data the
+  query already reads, reaches no query under 0.3 ms, stays within the host's noise floor
+  on every query it can reach, and each such query resolves within 2% of its execution
+  time. Changes to memory charging, allocation, atomics, locks, thread hand-offs, system
+  calls, the response path, memory layout or concurrency are timed whatever the counts
+  show. [Instruction counts before timing](docs/BENCHMARKING.md#instruction-counts-before-timing)
+  gives the floors and the resolution test.
 - Run both arms of an A/B comparison on one host with the same compiler and build
   configuration and no competing heavy work. Never pool or compare timings across hosts,
   even hosts with the same hardware, and qualify a second host's results separately.
@@ -188,7 +197,7 @@ results separately from conversation events.
 | Implementation requiring substantial engineering judgment | GPT-6.1 Sol or Claude Opus 5.5 |
 | Second-look lanes and consults at critical decisions | Use Claude Fable 5.2 or GPT-6 Astra. Prefer the family that the stalled lane or the consulting session does not use. When neither is available, use the strongest available model in a separate session. |
 | Easy, nearly trivial tasks and the execution of a plan that fixes every step | GPT-6.1 Terra or Claude Sonnet 5.5 |
-| Code review and finding validation | Prefer GPT-6.1 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
+| Code review and finding validation | Prefer GPT-6.2 Sol. GPT-6.1 Terra may review a nearly trivial change. Claude Opus 5.5 may review when an independent perspective helps. |
 | Mechanical tasks with an exact rule | A plain script. |
 | Easy tasks that need a lot of context, such as exploration, broad file scans, searches across many files and log triage | Claude Haiku 5.5 or GPT-6 Luna. |
 
@@ -271,7 +280,7 @@ No lane lands without review, and each step picks its model from the table above
 1. **An independent agent reviews.** `scripts/codex-review.sh NAME TIP BASE "CONTEXT"`
    runs `codex exec review` on `BASE..TIP` in a scratch worktree and writes `review.md`
    under `$AUDIT_DIR/NAME` (default `.artifacts/audits`). CONTEXT names the roadmap item,
-   the specs and what the work was meant to do. The script defaults to Sol at high effort,
+   the specs and what the work was meant to do. The script defaults to GPT-6.2 Sol at high effort,
    and `CODEX_REVIEW_MODEL` and `CODEX_REVIEW_REASONING_EFFORT` select another choice.
 2. **A capable agent validates and plans.** The validating agent checks every finding
    independently and reproduces it where it can. It marks each one confirmed, refuted or
@@ -312,17 +321,18 @@ affect and falls back to the whole workspace when a shared root changes. Lanes d
 full gates of their own.
 
 Finished lanes merge into local `main` as they land, and several lanes may share one
-batch. One gate runs on the batch, with a query screen on an admitted
-Boat worker (`mise run bench:remote --executor boat:bx_ID --build-host boat:bx_ID
-origin/main HEAD`). The Namespace screen (`mise run bench:nsc origin/main HEAD`) remains
-the fallback when no Boat worker can take the screen, with the same acceptance criteria. `scripts/gate/gate.sh <rev>` runs the gate on the
-configured gate hosts and selects its checks from the batch's diff against `origin/main`.
+batch. One gate runs on the batch, with a query screen on a quiet Intel benchmark
+worker, which is the screen of record. Both arms and the reruns of flagged queries run on
+that one host with nothing beside them, and timings from different hosts are never
+compared. A Boat screen (`mise run bench:remote --executor boat:bx_ID A B`) is approximate
+and decides nothing.
+`scripts/gate/gate.sh <rev>` runs the gate on the configured gate hosts and selects its checks from the batch's diff against `origin/main`.
 It runs the `scripts/ci.sh` tasks, conformance suites and spill matrices that the changed
 files call for, with Clippy and the Rust tests for the packages they can affect, as the
 [batch gate section](docs/DEVELOPMENT.md#batch-gate) describes. Build configuration, the CI
 scripts and files that no rule covers run everything. Push when the tests pass and the
 screen shows no query 10% or more slower after the rerun of the flagged queries with more
-rounds, which the screen runs on the same worker or instance and reports beside the first pass.
+rounds, which the screen runs on the same host and reports beside the first pass.
 The screen is skipped when `gate.sh` prints `skip screen (reason)`, which it does only
 when every changed file is one that cannot reach the server's query path or the screen,
 such as documentation, the CI scripts, tests or the OWL and validation crates. Any change

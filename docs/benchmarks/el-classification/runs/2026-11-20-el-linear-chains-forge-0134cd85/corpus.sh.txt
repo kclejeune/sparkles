@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# corpus.sh TAG BIN THREADS LIST...: classifies every file of the lists with BIN and writes
+# taxonomies, reports and stats under out/corpus/TAG-tTHREADS
+set -u
+TAG=$1 BIN=$2 T=$3; shift 3
+L=~/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/el-956/.artifacts/lanes/el-956
+OUT=$L/out/corpus/$TAG-t$T
+mkdir -p $OUT
+for f in "$@"; do
+  n=$(basename "$f"); n=${n%.*}
+  [ -s $OUT/$n.json ] && continue
+  SPARKLES_SATURATION_STATS=1 timeout 900 systemd-run --user --scope -q -p MemoryMax=10G -p MemorySwapMax=1G -p OOMPolicy=continue \
+    "$BIN" --threads $T --taxonomy $OUT/$n.tax "$f" > $OUT/$n.json 2> $OUT/$n.err
+  echo "$n status=$?" >> $OUT/log.txt
+done
+echo CORPUS-DONE >> $OUT/log.txt

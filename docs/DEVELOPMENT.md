@@ -119,7 +119,7 @@ no compiler produces, such as logs, downloaded suites, test binaries built with 
 that runs a built binary after the build command has exited either runs inside
 `mbx sparkles-task` or copies the binary out of the target first. The benchmark and probe
 scripts do the second through `stage_binary` in `scripts/bench-tools.sh`, which copies a
-binary that lies in the managed target to the run's work directory, as the Namespace
+binary that lies in the managed target to the run's work directory, as the query
 screens stage theirs. A collection can also leave `target` as a link to a directory that
 no longer exists, and a command that writes there then fails with "File exists" or "Not a
 directory". Any `mbx` build places a fresh target, and so does `mbx sparkles-task -- true`.
@@ -190,7 +190,7 @@ mise run bench:text   # full-text search: Sparkles vs Fuseki with jena-text vs Q
 mise run bench:watdiv # the same engines on WatDiv's 20 query templates, 11M triples
 mise run bench:shacl 100000; mise run bench:reasoner 100000 owl-rl
 mise run bench:shacl-write 100000   # 1-triple INSERT DATA latency with validation off / warn / reject
-mise run bench:nsc main HEAD        # interleaved A/B of two revisions on a Namespace instance (needs nsc)
+mise run bench:remote --executor boat:bx_ID main HEAD   # interleaved A/B of two revisions on an admitted Boat worker
 mise run licenses     # regenerate the third-party notices after a Cargo.lock or UI dependency change (licenses:check)
 ```
 
@@ -343,6 +343,94 @@ lock, so jobs from several lanes queue rather than compete. `--no-wait` starts a
 returns, and `--status` and `--fetch` follow it later. The
 [remote CI section](REMOTE-EXECUTORS.md#remote-ci) describes the bounds on a Boat worker.
 
+`mise run check:remote --host <host> '<command>'` runs one targeted step the same way, such
+as `mbx check`, `mbx clippy --all-targets -- -D warnings` or `mbx nextest run -p <crate>
+--test <name>`, and prints the command's log and exits with its code. It checks the
+working tree as it is, with its uncommitted and untracked files, unless `--commit` asks for
+`HEAD`. The tree travels as a temporary commit object whose parent is `HEAD`, which a
+private index writes, so the branch, the index and the stash are left alone. The host
+checks out the whole commit, `rust-toolchain.toml` and `mise.toml` included, exports
+`RUSTUP_TOOLCHAIN` from `rust-toolchain.toml` and runs the command under `mise exec`, so the
+pinned compiler and the pinned mbx apply. The log starts with the `rustc --version` and
+`mbx --version` the command used. The step is a job of `scripts/remote-ci.sh --cmd`, so it
+waits for the host's heavy lock and needs the host's disk floor, as lane CI does.
+
+A job of `scripts/remote-ci.sh` exits with the code of its check, and with codes of its own
+when the check did not finish. Exit 2 means the job could not be set up and exit 3 that too
+little time was left before its end. Exit 4 means the host refused the job at admission,
+most often because its disk was below its floor, and exit 5 that the disk fell under
+`REMOTE_CI_RUN_FLOOR_GIB` during the run. A refusal for the disk writes `disk-below-floor`
+to the job's `outcome` file, and `remote-ci.sh` then says that the result says nothing about
+the commit. Any other refusal names its reason in the job's `progress.log`. Exit 6 means the check was stopped and its
+processes could not be shown gone, so the worktree stays on the host for a later cleanup. A
+command that itself exits with one of these codes is told apart by the `outcome` file and
+the job's `progress.log`. The [remote CI section](REMOTE-EXECUTORS.md#remote-ci) gives the
+details.
+
+### Script tests
+
+The Python tests of the CI, gate and benchmark scripts live in `scripts/bench-tests`, and
+`mise run test:bench-scripts` runs them with `scripts/unittest-parallel.py`, eight processes
+at a time. `python3 -m unittest discover -s scripts/bench-tests` runs the same tests
+serially, and the runner reaches the same verdict under the condition given below. It
+discovers the suite once in a child process and then starts one process per module or
+package that discovery loads. Each process discovers the whole suite again, checks that it
+found the same tests in the same order, and runs its own part exactly as discovered. Import
+errors, import-time skips and class and module fixtures therefore behave as they do
+serially. The whole suite runs in one process, as discovery returned it, and the runner says
+why, when any module or package has a `load_tests` hook, when the suite holds anything other
+than default suites and `TestCase` tests, including a suite given its own `run`, when a test
+module changes unittest's suite classes or rebinds their names, or when test classes of one
+module run under more than one module, as when one test module imports another's class. Such
+a suite or test can depend on what ran before it, and the runner does not try to tell
+whether it does. A default suite that replaces both its own `run` and `countTestCases` and
+hides its tests, for instance by setting `_tests` to `None`, is outside what the runner
+supports, and the runner fails the run with exit 1 instead of passing it. Tests that share
+state in another way, such as a helper module's globals, are not detected. The runner
+therefore reaches the serial verdict only when no test depends on state that a test in
+another process left behind, and passing alone does not show this, since such a test can
+skip instead of fail. The same holds for the tests of a split module.
+The runner also assumes that a test's own `run` method reads only its own test's result, and
+that test code does not react to being inspected or imported more than once, since each
+process imports every module and asks each test for its id and attributes again. The
+[nightly gate](#nightly-gate) runs the suite both ways and fails when the two verdicts or
+test counts differ.
+The three long tests of `test_x08_latency` run one per process. A module named with
+`--split` is split this way only when it has no fixtures, imported classes or repeated
+tests, and otherwise runs whole with a note that says why.
+
+Each process writes a result record, and the runner takes its verdict from those records
+and from unittest's own results, never from the printed output. A process that ends without
+a complete record fails, and a run in which no test ran and none was skipped exits 5, as
+unittest does. The process-leak check in `test_zz_process_leaks.py` runs once, after every
+other process, on the unwaited subprocesses that each process reports after its tests and
+teardown. Discovery has a 300 s deadline and each process a 900 s deadline, which
+`--discover-timeout` and `--unit-timeout` change. The one process that runs the whole suite,
+when it does, has a 2400 s deadline, which `--suite-timeout` changes. At a deadline, or on SIGINT, SIGTERM or
+SIGHUP, the runner starts no more processes, stops every active one with its group and the
+descendants it can find, with SIGKILL after a grace period that `--grace` sets, and fails
+the run. When the runner itself is killed, its processes get SIGTERM from the kernel and
+stop their own descendants. The runner needs Linux's `/proc` and `prctl`, and on another
+host it says so and hands the run to a serial `unittest discover`, which then exits as it
+would on its own. It hands the run over in the same way when the discovery directory, or any
+directory under it, has an entry named as one of the few modules that its processes load
+before discovery and serial discovery does not, such as `json.py`, since a test importing
+`json` would get that file serially and the runner's module in its processes. Serial
+discovery puts the working directory first on the path before it loads `argparse` and
+`unittest`, so an entry there named as any module loaded after interpreter startup, such as
+`locale.py`, also hands the run over. A test that puts a directory outside the discovery
+directory on the path is not checked, and the nightly comparison of the two runs catches a
+module that it shadows. `--keep DIR` keeps the discovery, the plan, each process's output
+and the result records. Discovery and every process get the interpreter's `-W`
+options, so `python3 -Werror scripts/unittest-parallel.py` fails on a warning as serial
+`python3 -Werror -m unittest discover` does.
+
+Every test module in `scripts/bench-tests` imports `git_isolation` as its first import, and
+`test_git_isolation.py` fails when one does not. The import removes the host's `GIT_*`
+variables and global Git configuration, such as hooks, signing and templates, so a fixture
+repository and any script a test runs see only their own settings. A new test module needs
+the same first import, even when it runs Git only through another script.
+
 ### Remote executors
 
 Prefer available local resources before renting another worker. A 16 GiB Boat worker is
@@ -350,8 +438,8 @@ the normal starting point for overflow builds and tests. Check aggregate memory,
 disk and competing work before admitting a heavy job, and cap it where systemd is
 available. Boxington schedules builds but does not isolate other memory consumers.
 Start with one heavy job per worker, and use measurements to justify more concurrency or
-a larger machine. Namespace remains available for demonstrated resource needs and
-workflows without a qualified Boat replacement.
+a larger machine. Namespace is not used, and a workflow that only Namespace supported
+waits for a Boat or local equivalent.
 
 Keep ordinary implementation and test iterations on a warm worker within its assigned
 lifetime. Record its explicit sandbox ID, environment version, source and branch,
@@ -378,9 +466,10 @@ The provider-neutral `bench:remote`, `bench:remote-writes` and `bench:jena-remot
 commands accept an explicit admitted `boat:bx_ID` worker. Build hosts, partitioned test
 shares and gate hosts accept the same selector. The [remote executor commands](REMOTE-EXECUTORS.md)
 describe the tracked qualification/environment/finish commands, explicit private
-profile and admission inputs, warm reuse, artifact transport and cleanup. These adapters require
-real workload qualification before they replace the mandatory `bench:nsc` screen.
-Changing placement preserves the tests, benchmark comparability and acceptance criteria.
+profile and admission inputs, warm reuse, artifact transport and cleanup. The batch query
+screen runs on a quiet Intel host, as [benchmarking](BENCHMARKING.md) describes, and a
+`bench:remote` run on a Boat worker gives only an approximate check. The retired
+`bench:nsc` tasks are unsupported. Changing placement preserves the tests, benchmark comparability and acceptance criteria.
 
 ### Known flaky tests
 
@@ -399,9 +488,9 @@ retries no other test.
 runs one share of the tests on this machine and sends the archive to the other machines,
 where nextest runs the other shares with `--partition slice:K/N`. The machines come from
 `--hosts`, `TEST_PARTITION_HOSTS` or a `TEST_PARTITION_HOSTS=` line in
-`~/.config/sparkles/test-partition.env`. An entry is an ssh host, or `nsc` or
-`nsc:MACHINE` for an ephemeral Namespace instance that the run creates and destroys,
-or `boat:bx_ID` for an admitted warm worker. An ssh host that is busy is left out, which means that another process holds its
+`~/.config/sparkles/test-partition.env`. An entry is an ssh host or `boat:bx_ID` for an
+admitted warm worker. The `nsc` and `nsc:MACHINE` selectors are retired and unsupported.
+An ssh host that is busy is left out, which means that another process holds its
 `~/lanes/.heavy.lock`, a gate unit runs there, its load exceeds half its processors or it
 has less than `TEST_PARTITION_MIN_FREE_GB` (default 40) GiB free. `--transport hc` starts
 each ssh host's share as a named terminal of the maintainer's terminal service, and the
@@ -410,8 +499,7 @@ connection.
 
 A Boat share checks its admission and remaining lifetime, uses the qualified installed
 tools and retains the existing archive and coverage checks. It never installs or
-refreshes toolchain pins during a job. The Namespace selector remains an explicit
-fallback while real Boat workload acceptance is outstanding under item 762.
+refreshes toolchain pins during a job. Item 762 tracks real Boat workload acceptance.
 
 The test binaries hold the absolute paths of the checkout that built them, from
 `CARGO_MANIFEST_DIR`, `CARGO_BIN_EXE_*` and `CARGO_TARGET_TMPDIR`. Each share therefore
@@ -419,9 +507,7 @@ runs at the same absolute path as the building checkout. The run creates that di
 on each machine, marks it as a share directory and refuses a machine where the path exists
 without the mark. It copies the tracked files, `ui/build` and the conformance suite
 directories the local tests read, and it extracts the archive there as it arrives. A
-Namespace instance also gets a C compiler, Python, Node.js, patchelf and the pinned
-rustfmt, and its share runs as an unprivileged user, since tests of permission checks
-fail as root. A binary whose loader the machine lacks, such as one built against a Nix
+binary whose loader the machine lacks, such as one built against a Nix
 store, gets the machine's own loader.
 Each share's JUnit report, log and exit code land in
 `.artifacts/test-partitioned/<time>/share-K/`, and the run fails unless every share passed
@@ -451,6 +537,27 @@ All of these suites pass: 482/482, 328/328, 157/157 and 269/269 for SPARQL, and 
 and 20/20 for SHACL. The eight SHACL 1.2 list tests pass, and all 32 test pairs of the
 SHACLC suite read to the expected graph and write back to it.
 `crates/sparkles-core/tests/w3c-known-failures.txt` lists known failures and is empty.
+
+The `reference_` tests of `w3c.rs` answer the query evaluation tests with the test-only
+reference evaluator in `crates/sparkles-core/tests/support/reference`, which follows the
+SPARQL algebra literally and shares only the parser with the engine. They compare
+literals by their exact form, numbers by value and ORDER BY results in order, and
+`crates/sparkles-core/tests/w3c-reference-known.txt` lists the tests it answers
+otherwise, which is none. The seeded queries of `tests/query_cursor.rs` take the
+evaluator as their oracle, and the optimizer, index-join and string-filter tests of
+`src/sparql` compare the engine with it as well as with `Optimizations::NONE`. Both go
+through `check.rs` beside the evaluator, which passes no answer that the specification
+forbids and reports a partial, unordered or skipped comparison where it cannot decide. A column of open values,
+such as a SAMPLE or a RAND, is compared only by its place in the rows. A number in a column
+that only computed values bind is compared by datatype and value, and every other term
+exactly. An ordered or sliced answer must be a slice of an order that ORDER BY allows,
+with the sort keys that the evaluator reports. An answer whose rows an open value decides
+is not compared. The evaluator follows Jena where Jena's reading differs from the
+specification's text and the engine follows Jena, and `with_spec_readings(true)` selects
+the text, which the W3C suites take. `SPARKLES_REFERENCE_KEEP_GOING=1` makes the seeded
+queries report every disagreement before they fail, and `SPARKLES_REFERENCE_SKIPS=1` makes
+the seeded queries count their partial, unordered and skipped answers by reason and the
+other tests print each query they do not compare with the evaluator.
 
 The shexTest suite comes from the same Jena checkout (`jena-shex`). Set
 `SPARKLES_SHEX_TESTS` to use an upstream shexTest checkout instead.
@@ -532,10 +639,18 @@ another port. The task is not part of `mise run ci`.
 
 ### Browser integration tests
 
-`mise run ui:e2e` builds the UI and a debug server. It starts `sparkles serve` on a free
-port of 127.0.0.1 with a temporary data directory, a small dataset, and an auth
-configuration with one user and one API token. It then runs the Playwright tests in
-`ui/tests/e2e` in headless Chromium and stops the server.
+`mise run ui:e2e` builds the formatter's WebAssembly module, the UI with the module and a
+debug server. It starts two `sparkles serve` processes on free ports of 127.0.0.1, each
+with a temporary data directory. The first has a small dataset and an auth configuration
+with users and API tokens. The second runs without auth and allows private outbound
+addresses. The task then runs the Playwright tests in `ui/tests/e2e` in headless Chromium
+and stops the servers. The Pattern pane, the plan's pattern and **Apply to query** in the
+facets of a query have no server fallback, so their tests need the module. Before the
+servers start, the setup looks for the module in the directory that `SPARKLES_UI_DIR`
+names. Without that setting it looks in `ui/build` when the binary is the default debug
+build, and it skips the check for another binary, whose UI it cannot see. It stops with a
+message when the module is missing. `SPARKLES_E2E_NO_WASM=1` skips the check, and the
+tests that need the module still fail without it.
 
 To test another binary, set `SPARKLES_BIN=path/to/sparkles`. Extra arguments go to
 `playwright test`, as in `mise run ui:e2e -- -g Similar`. The flake's dev shell provides
@@ -726,10 +841,10 @@ reasoner, small SPARQL queries, parameterized queries, small updates and Model w
 bulk load and queries through Fuseki. Every arm runs in fresh JVMs in A/B/B/A order, the
 answers are checked first, and the results go to `.artifacts/bench-jena/results` as
 `summary.md` and `raw.json`. An arm is an engine with JVM options, so a system property
-that turns a feature off gives a before arm. `scripts/nsc-jena.sh` (`mise run
-bench:jena-nsc`) runs the same comparison on an ephemeral Namespace instance. It builds
-the bindings here, ships them with a Temurin JDK and a standalone CPython, and downloads
-the results to `.artifacts/nsc-jena/<time>`.
+that turns a feature off gives a before arm. `mise run bench:jena-remote --executor
+boat:bx_ID` runs the same comparison on an admitted Boat worker. It builds the bindings
+here, ships them with a Temurin JDK and a standalone CPython, and downloads the results
+to `.artifacts/nsc-jena/<time>`.
 
 `./gradlew :sparkles-jena:perfCheck -Pdata=DATA.nt -Pqueries=QUERIES.tsv`, run in `jvm/`,
 times queries through Jena on Sparkles, through the native library alone and on an
@@ -925,7 +1040,7 @@ keeps its recorded intent for reconciliation.
 | `gate.sh --no-wait <rev>` | Pushes and starts the gate, then returns, for agents with bounded waits. |
 | `gate.sh --status <rev>` | Prints each half's progress, steps and last memory sample. The last line is `active` while either half runs. |
 | `gate.sh --fetch <rev>` | Copies and merges the results into `.artifacts/gates/main-gate-<name>-<host>/` of the main checkout. |
-| `gate.sh --hosts` | Prints each host's lock state, number of gate units and free disk. |
+| `gate.sh --hosts` | Prints each host's lock state, number of gate units and free GiB, and whether that meets the disk floor of a whole gate or of a conformance half. |
 | `gate.sh --host wally <rev>` | Runs ci on wally, with the conformance half on a free configured helper. |
 | `gate.sh --host wally --helper none <rev>` | Runs the whole gate on one host. |
 | `gate.sh --base origin/main~3 <rev>` | Selects the checks from the changes since the merge base of `origin/main~3` and the commit. The default base is `GATE_BASE` or `origin/main`. |
@@ -962,17 +1077,33 @@ under `~/gate/bin/v-<hash>/`, named by the hash of their contents. A new version
 never rewrites a script that a queued or running gate is reading. The host also needs
 `~/gate/suites` with the conformance suites, `~/gate/conformance.env` and the pytest venv
 `~/gate/py-venv`. `scripts/gate/setup-host.sh <host>` creates them, copies the suites from
-wally through the laptop and checks linger, mbx and free disk. A ci half needs about
-30 GiB of free disk for its target and a conformance half about 15 GiB.
+wally through the laptop and checks linger, mbx and free disk.
 
-The driver checks the free disk under the home directory of each chosen host before it
-starts anything there. A whole gate needs what a ci half needs. When a host has less, the
-driver runs `mbx gc` on it, which collects idle managed targets and evicts cache objects to
-the cache's budgets, and checks again. A host that is still short makes the driver stop
-with a message that names the host, the free space and the space needed. The check runs
-before the start because a running build holds its target's lease, so the cache cannot
-give back that space until the gate ends. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change
-the two amounts, in the environment or in `~/.config/sparkles/gate.env`.
+A gate has a disk floor on every host, 110 GiB by default for a ci half, a whole gate, the
+link check and a conformance half alike. That is the floor of a Boat gate, which a cold
+workspace build needs. `GATE_NEED_CI_GB` and `GATE_NEED_CONF_GB` change the floors of the
+ci and conformance parts, in the environment or in `~/.config/sparkles/gate.env`, and
+`GATE_BOAT_MIN_FREE_GIB` sets a Boat worker's. The driver reads the free disk under the
+home directory of each chosen host before it starts anything there and warns when a host
+is short. It collects nothing, since another job or a timing run may hold the host. The
+gate checks the floor under the host's heavy lock, before it builds, because a running
+build holds its target's lease and the cache cannot give back that space until the gate
+ends. An ssh host that is short runs `mbx gc` with `gc.min_free_size` raised to the floor,
+which collects idle managed targets and evicts cache objects until that much is free, and
+a Boat worker runs its disk cleanup. A gate still short ends with exit 4 and
+`disk-below-floor` in its `outcome` file, and the driver says that the host's disk was
+below its floor. A split gate keeps each half's own record, the ci half's as `outcome` and
+the conformance half's as `outcome-conf`. When every failed half exited 4 with its own
+disk record, the merge exits 4, writes `gate-outcome` and names the refusing halves in
+`outcome-host`. Any other failure makes the merge exit 1. An ssh gate still creates its
+worktree before it takes the heavy lock, which roadmap item 1169 tracks. `--auto` and the default helper choice read the disk without collecting, and a host's cache
+keeps it near its own `gc.min_free_size`, so they count a host as having the disk for a
+whole gate at `GATE_MIN_FREE_GB` free, 40 by default, and for a conformance half at
+`GATE_MIN_FREE_HALF_GB`, 20 by default. `gate.sh --hosts` marks a host that meets a floor
+as `room-for-whole` or `room-for-half`, and one that needs a collection before the floor as
+`whole-after-gc` or `half-after-gc`. Each ssh gate start on
+such a host evicts cache down to the floor, so a host whose cache budget and other data
+leave less than the floor free rebuilds more of the cache on each gate.
 
 Each run sets `CARGO_BUILD_JOBS` from its host's gate memory cap, the cap in GiB less one,
 halved, between 2 and 8. That gives 5 jobs at a Boat worker's 12 GiB cap, 6 jobs on a host
@@ -1139,6 +1270,15 @@ and catches up after the laptop wakes. `--uninstall` removes the timer and
 the ssh configuration names, so an agent socket at a fixed path, as with an
 `IdentityAgent` setting, works where a per-login agent does not.
 
+A full gate, and so the nightly gate, also runs `mise run test:bench-scripts:compare` after
+its ci step. It runs the script tests serially with `python3 -m unittest discover` and then
+with the parallel runner, one after the other, and fails when their exit statuses or their
+counts of tests run and skipped differ. The parallel runner reaches the serial verdict only
+under assumptions about the tests that it does not check, which
+[Script tests](#script-tests) lists, and this comparison catches a test that breaks one.
+The comparison adds about 13 minutes to a full gate, and it runs only on full and nightly
+gates, not on a batch gate that selects its checks.
+
 Each run writes a log to `.artifacts/gates/nightly/` in the main checkout, and the gate's
 results go to `.artifacts/gates/main-gate-<short>-nightly-<host>/`. The server artifact link
 check, described below, writes its own log beside it and its results to
@@ -1303,9 +1443,9 @@ container keeps its process limit and drops its 4 CPU and 14 GB limits, and Carg
 compiler job for each CPU instead of two in total.
 
 No workflow uses a remote build cache, so a build job needs no OIDC token. Every job keeps
-its caches in GitHub Actions, which serves self-hosted runners as it serves its own. Both
-providers below bill per second of runner time, while GitHub's standard runners are free for
-this public repository.
+its caches in GitHub Actions, which serves self-hosted runners as it serves its own. Boat
+bills per second of runner time, while GitHub's standard runners are free for this public
+repository.
 
 Boat runs each job in a fresh Ubuntu 24.04 virtual machine with Docker, passwordless
 `sudo` and 4 GB of swap. Its machines are in Germany, Finland and France, so a job may wait longer for
@@ -1324,20 +1464,7 @@ day limit fails. To set it up, the owner of the repository runs these steps.
    `SPARKLES_RUNNER` at `boat-large`, `SPARKLES_TEST_SLICES` at 2 gives about the same
    shard times as four 4-vCPU shards with two fewer jobs.
 
-Namespace registers its runners through a GitHub app and selects them by profile, with the
-label `namespace-profile-<name>`. A profile can attach a cache volume, mounted at `/cache`,
-and configure swap, which its runners lack by default and which a swap file on their
-overlay file system cannot replace. The workflows do not use cache volumes. To set it up,
-the owner runs these steps.
-
-1. Install the Namespace GitHub app on the account from the dashboard's GitHub runners
-   page and grant it this repository.
-2. Create a Linux AMD64 profile named `sparkles-large` with the 16x32 shape and 8 GB of
-   swap, and optionally a profile named `sparkles` with the 8x16 shape.
-3. Set `SPARKLES_RUNNER_LARGE` to `namespace-profile-sparkles-large`, and optionally
-   `SPARKLES_RUNNER` to `namespace-profile-sparkles`.
-
-Fork pull requests never reach either provider, because every label expression falls back
+Fork pull requests never reach Boat, because every label expression falls back
 to `ubuntu-24.04` unless the pull request's head repository is this one.
 
 ### Caches

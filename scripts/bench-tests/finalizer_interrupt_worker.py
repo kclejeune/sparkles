@@ -90,12 +90,24 @@ def finish(*args, **kwargs):
 owned_group.finish = finish
 os.killpg = killpg
 ready = work / 'ready'
+fixture = f"""\
+import os
+from pathlib import Path
+import signal
+import time
+
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+ready = Path({str(ready)!r})
+pending = ready.with_suffix('.tmp')
+pending.write_text(str(os.getpid()))
+pending.replace(ready)
+time.sleep(5)
+"""
 if leader == 'timeout':
-    argv = [sys.executable, '-c', "import os,signal,time,pathlib;signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path(" + repr(str(ready)) + ").write_text(str(os.getpid()));time.sleep(5)"]
+    argv = [sys.executable, '-c', fixture]
     seconds = 0.3
 else:
-    child = "import os,signal,time,pathlib;signal.signal(signal.SIGTERM,signal.SIG_IGN);pathlib.Path(" + repr(str(ready)) + ").write_text(str(os.getpid()));time.sleep(5)"
-    argv = [sys.executable, '-c', "import sys,subprocess,pathlib,time;p=subprocess.Popen([sys.executable,'-c'," + repr(child) + "],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);end=time.monotonic()+2\nwhile not pathlib.Path(" + repr(str(ready)) + ").exists():\n if time.monotonic()>end:raise SystemExit(19)\n time.sleep(.005)\nprint('{}');raise SystemExit(" + leader + ")"]
+    argv = [sys.executable, '-c', "import sys,subprocess,pathlib,time;p=subprocess.Popen([sys.executable,'-c'," + repr(fixture) + "],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);end=time.monotonic()+2\nwhile not pathlib.Path(" + repr(str(ready)) + ").exists():\n if time.monotonic()>end:raise SystemExit(19)\n time.sleep(.005)\nprint('{}');raise SystemExit(" + leader + ")"]
     seconds = 3
 outcome = {}
 try:

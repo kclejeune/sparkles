@@ -172,6 +172,19 @@ describe('compareResults', () => {
     expect(cutRight && isTooLarge(cutRight) && cutRight.cut).toBe(true);
   });
 
+  it('compares counts only when a streamed read stopped with no total', () => {
+    const stopped = (sent: number) =>
+      ({ sentRows: sent, totalRows: null, status: 'stopped' }) as never;
+    const left = compareResults({ rows: [a], meta: stopped(1) }, { rows: [a], meta: meta(1) });
+    expect(left).toEqual({ tooLarge: true, cut: true, left: null, right: 1 });
+    const right = compareResults({ rows: [a], meta: meta(1) }, { rows: [a], meta: stopped(1) });
+    expect(right).toEqual({ tooLarge: true, cut: true, left: 1, right: null });
+    // a streamed read that the row limit did not reach is complete and compares as a bag
+    const whole = { sentRows: 2, totalRows: 2, status: 'complete' } as never;
+    const d = compareResults({ rows: [a], meta: meta(1) }, { rows: [a, c], meta: whole });
+    expect(d && !isTooLarge(d) && d.added).toBe(1);
+  });
+
   it('says nothing about a table against a graph', () => {
     expect(compareResults({ rows: [a], meta: meta(1) }, { triples: [], meta: meta(0) })).toBeNull();
   });

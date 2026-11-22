@@ -54,7 +54,7 @@ global_env = [
   "RUSTFLAGS", "CARGO_FEATURES", "CARGO_INCREMENTAL", "RUSTC_WRAPPER", "RUSTC_WORKSPACE_WRAPPER",
   "MBX_INCREMENTAL", "MBX_LEARNED_INCREMENTAL", "MBX_EAGER_INCREMENTAL", "MBX_LINKER",
   "MBX_SEED_INCREMENTAL", "MBX_VERIFY", "MBX_VERIFY_SAMPLE_RATE",
-  "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS",
+  "SPARKLES_W3C_DIR", "SPARKLES_W3C_SPILL", "SPARKLES_W3C_AGGREGATE_ERRORS", "SPARKLES_SHACL_TESTS", "SPARKLES_SHEX_TESTS",
   "SPARKLES_CHANGED_PACKAGES", "SPARKLES_TEST_EXCLUDE_GROUP",
 ]
 
@@ -230,10 +230,15 @@ cache = { enabled = false }
 description = "Rebuild the browser formatter if it was built before (`mise run ui:wasm`) and the formatter changed since"
 hide = true
 run = "if [ -e ui/src/lib/wasm/sparkles_fmt_wasm_bg.wasm ]; then mise run ui:wasm; fi"
+# after ui:wasm when one task graph, such as ui:e2e's, runs both, so that the graph builds the
+# module once (separate mise runs in one checkout are not serialized)
+wait_for = ["ui:wasm"]
 
 [tasks."ui:build"]
 description = "Build the SvelteKit UI (embedded into the server binary)"
 depends = ["ui:install", "ui:wasm:refresh"]
+# in a task graph that also runs ui:wasm, this build has the module
+wait_for = ["ui:wasm"]
 dir = "ui"
 run = "pnpm build"
 sources = ["src/**/*", "static/**/*", "scripts/**/*", "svelte.config.js", "vite.config.ts", "package.json", "pnpm-lock.yaml"]
@@ -287,7 +292,9 @@ pnpm exec playwright install chromium
 
 [tasks."ui:e2e"]
 description = "UI end-to-end tests (Playwright) against a real `sparkles serve` (debug build; SPARKLES_BIN=… for another); extra args go to `playwright test`"
-depends = ["ui:build", "ui:e2e:browsers"]
+# ui:wasm: the Pattern pane and the facets of a query have no server fallback, and the
+# flake's ui-e2e check runs against a UI built with the module
+depends = ["ui:wasm", "ui:build", "ui:e2e:browsers"]
 dir = "ui"
 # The server is built inside the lease that the tests run in, so collection cannot remove
 # the binary before they start it.
@@ -521,6 +528,13 @@ description = "W3C SPARQL 1.0/1.1/1.2 conformance with per-suite summaries"
 # in parallel. Each summary is one line, so their output stays readable.
 run = "mbx test -p sparkles-core --test w3c -- --nocapture"
 
+[tasks."test:w3c:aggregate-errors"]
+description = "The W3C SPARQL suites under the sparkles and spec readings of errors in aggregates (test:w3c runs the default, jena)"
+run = [
+  "SPARKLES_W3C_AGGREGATE_ERRORS=sparkles mbx test -p sparkles-core --test w3c -- --nocapture",
+  "SPARKLES_W3C_AGGREGATE_ERRORS=spec mbx test -p sparkles-core --test w3c -- --nocapture",
+]
+
 [tasks."test:shacl"]
 description = "W3C SHACL Core + SHACL-SPARQL conformance, the SHACL 1.2 list and node expression tests and the SHACLC test pairs"
 run = "mbx test -p sparkles-shacl --test w3c_shacl -- --nocapture"
@@ -540,11 +554,21 @@ run = "mbx test -p sparkles-core --test csvw_conformance -- --nocapture"
 [tasks."test:bench-scripts"]
 description = "Unit tests of the benchmark record builder and the record comparison (scripts/bench-record.py, bench-regressions.py compare), and the crash harness's own tests (scripts/crash-harness.rs)"
 run = [
-  "python3 -m unittest discover -s scripts/bench-tests",
+  # One process per test module, up to eight at a time, since the tests mostly wait on
+  # subprocesses and sleeps. Each process discovers the whole suite and runs its module as
+  # discovered, and the verdict comes from each process's result record. The three long x08
+  # latency tests run one per process, and the process-leak check runs last on every
+  # process's report. `python3 -m unittest discover -s scripts/bench-tests` runs the same
+  # tests serially with the same verdict. docs/DEVELOPMENT.md "Script tests" has the details.
+  "python3 scripts/unittest-parallel.py --split test_x08_latency scripts/bench-tests",
   # The test binary is scratch output outside the managed target, which Boxington can
   # collect between commands and leave as a dangling link.
   'out="{{config_root}}/.artifacts/crash-harness/crash-harness-test" && mkdir -p "$(dirname "$out")" && rustc --edition 2024 --test -o "$out" scripts/crash-harness.rs && "$out"',
 ]
+
+[tasks."test:bench-scripts:compare"]
+description = "The script tests serially with unittest discover and then with scripts/unittest-parallel.py, failing when their verdicts or counts differ (scripts/unittest-compare.py; the nightly gate runs it)"
+run = "python3 scripts/unittest-compare.py --split test_x08_latency scripts/bench-tests"
 
 [tasks."test:jena-clients"]
 description = "Apache Jena's own HTTP clients (RDFConnectionRemote, RDFConnectionFuseki, GSP, DSP, QueryExecHTTP, UpdateExecHTTP) and Fuseki admin calls against a debug server on a temporary directory; Jena and a JDK come from nixpkgs unless JENA_HOME and JAVA are set (not part of ci; also the flake's jena-clients check)"
@@ -565,6 +589,16 @@ run = 'scripts/ci.sh --jobs "$usage_jobs" ${usage_exhaustive_features:+--exhaust
 [tasks."ci:fast"]
 description = "The quick CI subset for iterating: formatting, cited doc paths, Clippy on the workspace and the Rust tests"
 run = "scripts/ci.sh --fast"
+
+[tasks."check:remote"]
+description = "Run one targeted command, such as `mbx check` or `mbx nextest run -p X --test Y`, on a remote host in a full copy of this working tree, and print its log and exit with its code (scripts/remote-ci.sh --cmd)"
+usage = '''
+flag "--host <host>" help="an ssh host such as wally, atlas or forge, or boat:bx_ID (default SPARKLES_REMOTE_CI_HOST)"
+flag "--commit" help="check HEAD as committed instead of the working tree"
+flag "--no-wait" help="start the job and return; scripts/remote-ci.sh --status and --fetch follow it"
+arg "<command>" help="the command, run with bash -c in the checkout"
+'''
+run = 'scripts/remote-ci.sh ${usage_host:+--host "$usage_host"} $([ "${usage_commit:-false}" = true ] || echo --worktree) ${usage_no_wait:+--no-wait} --cmd "$usage_command"'
 
 # ------------------------------------------------------------------- Python bindings ----
 # crates/sparkles-py is its own cargo workspace (see its Cargo.toml). These tasks build it
@@ -1449,7 +1483,7 @@ python3 scripts/bench-gate.py w3c "$out/output.log" --out "$out/record.json" \
 '''
 
 [tasks."bench:executors"]
-description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; writes a gate record"
+description = "The eager-against-cursor matrix (item 469): the 31 synthetic queries with execution=eager and streaming at 1.05M and 10.5M triples, with 12 threads and one, on this host; with --base, a four-arm A/B of a base and a tip binary; writes a gate record"
 usage = '''
 arg "[binary]" help="a built sparkles binary (default: build this checkout's release binary)"
 flag "--out <dir>" help="results directory (default .artifacts/bench-executors/<UTC time>)"
@@ -1460,6 +1494,11 @@ flag "--reps <n>" default="10" help="timed requests per query and server process
 flag "--queries <list>" help="only these queries (default: all 31)"
 flag "--commit <rev>" help="the commit the binary was built from, for the record"
 flag "--build-config <json>" help="a prebuilt binary's build configuration, from scripts/bench-gate.py build-config --cargo '<its cargo arguments>' in its build environment; compare refuses a record without one"
+flag "--modes <list>" help="the binary's execution modes, or the tip's with --base (default 'eager streaming', or 'default streaming' with --base, where default sends no execution field)"
+flag "--base <binary>" help="a prebuilt base binary: the run interleaves its --base-modes with the tip's --modes, and needs an even --rounds"
+flag "--base-modes <list>" help="the base binary's execution modes (default 'eager streaming')"
+flag "--base-commit <rev>" help="the commit the base binary was built from, for the record"
+flag "--base-build-config <json>" help="the base binary's build configuration, as --build-config gives the tip's"
 '''
 run = '''
 mbx sparkles-task -- bash -euo pipefail <<'SPARKLES_TASK'
@@ -1475,7 +1514,10 @@ if [ -z "$bin" ]; then
 fi
 scripts/bench-executors.sh --scales "$usage_scales" --threads "$usage_threads" \
   --rounds "$usage_rounds" --reps "$usage_reps" ${usage_queries:+--queries "$usage_queries"} \
-  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} ${config:+--build-config "$config"} "$bin"
+  ${usage_out:+--out "$usage_out"} ${commit:+--commit "$commit"} ${config:+--build-config "$config"} \
+  ${usage_modes:+--modes "$usage_modes"} ${usage_base:+--base "$usage_base"} \
+  ${usage_base_modes:+--base-modes "$usage_base_modes"} ${usage_base_commit:+--base-commit "$usage_base_commit"} \
+  ${usage_base_build_config:+--base-build-config "$usage_base_build_config"} "$bin"
 SPARKLES_TASK
 '''
 
@@ -1554,6 +1596,49 @@ python3 scripts/bench-gate.py metrics "${files[@]}" --gate insn-screen --suite i
 SPARKLES_TASK
 '''
 
+[tasks."bench:request-insn"]
+description = "Per-request instruction counts of two server builds (scripts/request-insn.py, Linux): user-space instructions, cycles and CPU time per request per query in rounds of A,B,B,A on one pinned CPU, with per-query ratios, intervals and spread"
+usage = '''
+arg "<a>" help="base server binary"
+arg "<b>" help="tip server binary, or the base again for an A-against-A run"
+flag "--store <dir>" help="an existing store both builds serve"
+flag "--data <file>" help="N-Triples that A loads (default: the 1.05M triples of scripts/gen-data.py 100000)"
+flag "--queries <dir>" help="directory of NAME.rq files (default: the queries of scripts/bench.sh)"
+flag "--execution <modes>" default="streaming,auto" help="comma-separated execution modes"
+flag "--rounds <n>" default="8" help="rounds of A,B,B,A"
+flag "--reps <n>" default="50" help="counted requests per query and process"
+flag "--threshold <pct>" default="1.0" help="flag threshold in percent below 2M instructions per request (0.25% above), from A-against-A runs on the host"
+flag "--server-cpu <n>" default="2"
+flag "--client-cpu <n>" default="3"
+flag "--out <dir>" help="results directory (default .artifacts/bench-request-insn/<UTC time>)"
+'''
+run = '''
+#!/usr/bin/env bash
+set -euo pipefail
+out=$(realpath -m "${usage_out:-.artifacts/bench-request-insn/$(date -u +%Y%m%dT%H%M%SZ)}")
+mkdir -p "$out"
+q=${usage_queries:-}
+if [ -z "$q" ]; then
+  q=$out/queries
+  mkdir -p "$q"
+  P=$(sed -n "s/^P='\(.*\)'$/\1/p" scripts/bench.sh)
+  while IFS=$'\t' read -r n body; do printf '%s%s' "$P" "$body" > "$q/$n.rq"; done \
+    < <(sed -n "s/^add \([a-z0-9-]*\) '\(.*\)'$/\1\t\2/p" scripts/bench.sh)
+fi
+src=()
+if [ -n "${usage_store:-}" ]; then src=(--store "$usage_store")
+elif [ -n "${usage_data:-}" ]; then src=(--data "$usage_data")
+else
+  mkdir -p .artifacts/bench-request-insn
+  d=.artifacts/bench-request-insn/people-100000.nt.zst
+  [ -f "$d" ] || python3 scripts/gen-data.py 100000 | zstd -q -T0 -10 -o "$d"
+  src=(--data "$d")
+fi
+exec python3 scripts/request-insn.py run --a "$usage_a" --b "$usage_b" "${src[@]}" --queries "$q" \
+  --execution "$usage_execution" --rounds "$usage_rounds" --reps "$usage_reps" --threshold "$usage_threshold" \
+  --server-cpu "$usage_server_cpu" --client-cpu "$usage_client_cpu" --out "$out"
+'''
+
 [tasks."bench:reasoning-latency"]
 description = "Derivation on demand and RDFS on read against materialized inferences (item 472): the 14 LUBM queries on LUBM-style data, interleaved rounds, into a gate record"
 usage = '''
@@ -1591,9 +1676,9 @@ SPARKLES_TASK
 '''
 
 [tasks."bench:remote"]
-description = "Interleaved query A/B on an explicit Namespace or admitted warm Boat worker; the mandatory full screen remains Namespace until Boat qualification"
+description = "Interleaved query A/B on an admitted warm Boat worker; this is the batch screen"
 usage = '''
-flag "--executor <selector>" default="nsc" help="nsc or boat:bx_ID with SPARKLES_BOAT_ADMISSION"
+flag "--executor <selector>" required=#true help="boat:bx_ID with SPARKLES_BOAT_ADMISSION; the Namespace executor is retired"
 arg "<a>" help="the baseline: a git revision (built here or on a build host, and cached) or a sparkles binary"
 arg "<b>" help="the candidate: a git revision or a sparkles binary"
 flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
@@ -1628,9 +1713,9 @@ SPARKLES_TASK
 '''
 
 [tasks."bench:remote-writes"]
-description = "Interleaved durable-write comparisons on an explicit Namespace or admitted warm Boat worker"
+description = "Interleaved durable-write comparisons on an admitted warm Boat worker"
 usage = '''
-flag "--executor <selector>" default="nsc" help="nsc or boat:bx_ID with SPARKLES_BOAT_ADMISSION"
+flag "--executor <selector>" required=#true help="boat:bx_ID with SPARKLES_BOAT_ADMISSION; the Namespace executor is retired"
 arg "<variants>" var=#true help="NAME=REF[:FLAGS]: a revision or sparkles binary, and optional global flags to run it with"
 flag "--people <n>" default="100000" help="dataset size in people (~10.5 triples each)"
 flag "--scenarios <list>" default="serial-literal writers mixed" help="from serial-literal serial-iri serial-delete writers writers16 mixed serial-message writers-message writers16-message"
@@ -1658,7 +1743,7 @@ SPARKLES_TASK
 '''
 
 [tasks."bench:jena-remote"]
-description = "Jena comparison on an explicit executor; pass --executor nsc or boat:bx_ID and jena.py options after --"
+description = "Jena comparison on an explicit executor; pass --executor boat:bx_ID (the nsc fallback is retired) and jena.py options after --"
 run = "mbx sparkles-task -- scripts/jena-remote.sh"
 
 [tasks."boat:qualify"]

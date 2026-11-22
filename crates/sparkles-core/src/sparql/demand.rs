@@ -231,6 +231,7 @@ fn upper_rows(ctx: &Ctx, node: &Node, left: &mut usize, bytes: &mut u64) -> Opti
             scan_rows(ctx, spec)?
         }
         Kind::Values(table) => table.len() as u64,
+        Kind::GraphNames(names) => names.table.len() as u64,
         Kind::Empty => 0,
         Kind::Project(_) | Kind::Distinct | Kind::Sort(_) => upper_rows(ctx, only()?, left, bytes)?,
         Kind::Slice { offset, limit, .. } => upper_rows(ctx, only()?, left, bytes)?
@@ -349,6 +350,7 @@ fn plain(node: &Node, left: &mut usize) -> bool {
         Kind::Scan(_)
         | Kind::RangeScan(..)
         | Kind::Values(_)
+        | Kind::GraphNames(_)
         | Kind::Empty
         | Kind::PatternScan(_)
         | Kind::Join { .. }
@@ -426,9 +428,11 @@ fn first_cost(node: &Node, want: f64, left: &mut usize) -> f64 {
     // the input rows that give `want` output rows, at the node's estimated ratio
     let input_want = |input: &Node| want * (input.est.max(1.0) / node.est.max(1.0)).max(1.0);
     let cost = match &node.kind {
-        Kind::Scan(_) | Kind::RangeScan(..) | Kind::PatternScan(_) | Kind::Values(_) => {
-            whole * share(want, node.est)
-        }
+        Kind::Scan(_)
+        | Kind::RangeScan(..)
+        | Kind::PatternScan(_)
+        | Kind::Values(_)
+        | Kind::GraphNames(_) => whole * share(want, node.est),
         Kind::Empty => 0.0,
         Kind::Project(_) | Kind::Extend(..) | Kind::Filter(_) | Kind::IndexJoin(_)
             if node.children.len() == 1 =>

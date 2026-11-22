@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# cold-scan m1: Fluree 4.2.2 against Sparkles b47b582b, cold, 1.05M, on forge.
+# Loads both engines, checks answers, then two cold rounds (engine order reversed) of
+# COLD_RUNS restarts per query, then a profile=io cold run of Sparkles.
+# Last line of m1.log: M1-DONE or M1-FAILED <reason>.
+set -uo pipefail
+L=$HOME/lanes/cold-scan
+exec 8> "$HOME/lanes/.bench.lock"; flock 8
+exec 9> "$HOME/lanes/.heavy.lock"; flock 9
+echo "locks held $(date -u +%FT%TZ) load $(cat /proc/loadavg)"
+for p in rustc cargo mbx java qlever-server oxigraph sparkles fluree; do
+  if pgrep -x $p > /dev/null; then ps -eo pid,args --sort=-pcpu | head -8 | cut -c1-150; echo "M1-FAILED busy $p"; exit 1; fi
+done
+export SPARKLES=$L/bin/sparkles FLUREE=$L/gcroots/fluree/bin/fluree
+export HYPERFINE=$HOME/.local/share/mise/installs/hyperfine/2.0.0/hyperfine-v2.0.0-x86_64-unknown-linux-gnu/hyperfine
+export PORT_BASE=4331
+W=$L/work
+Q="count-all two-hop-count contains distinct-obj employee-docs star-lookup values-star path-plus"
+B="bash $L/src/scripts/bench.sh 100000 $W"
+# load and answer check
+ENGINES="sparkles fluree" QUERIES="$Q" ANSWERS_ONLY=1 SKIP_PROBE=1 $B > "$L/load.log" 2>&1 || { echo "M1-FAILED load"; exit 1; }
+cp -r "$W/results" "$L/answers"
+r=0
+for order in "sparkles fluree" "fluree sparkles" "sparkles fluree"; do
+  r=$((r + 1))
+  echo "round $r ($order) $(date -u +%FT%TZ)"
+  rm -f "$W/results/cold.json" "$W/results/cold-runs.json"
+  MODE=cold COLD_RUNS=${COLD_RUNS:-7} ENGINES="$order" QUERIES="$Q" $B > "$L/cold-$r.log" 2>&1 || { echo "M1-FAILED cold round $r"; exit 1; }
+  mkdir -p "$L/cold-$r" && cp "$W/results/cold.json" "$W/results/cold-runs.json" "$L/cold-$r/"
+done
+echo "io $(date -u +%FT%TZ)"
+rm -rf "$L/io" && mkdir -p "$L/io" && cp -r "$W/sparkles.db" "$L/io/db"
+python3 "$L/src/scripts/bench-regressions.py" --binary "$SPARKLES" --db "$L/io/db" --queries "$W/queries" \
+  --names count-all distinct-obj contains employee-docs --out "$L/io/io.json" --runs 11 --cold --io --port 4371 \
+  > "$L/io/io.log" 2>&1 || { echo "M1-FAILED io"; exit 1; }
+echo "M1-DONE $(date -u +%FT%TZ)"

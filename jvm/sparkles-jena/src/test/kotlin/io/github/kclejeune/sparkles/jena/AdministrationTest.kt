@@ -94,6 +94,28 @@ class AdministrationTest {
     }
 
     @Test
+    fun aggregate_errors_follow_the_query_and_the_dataset_setting() {
+        SparklesDatasets.memory().use { ds ->
+            fun min(context: Context = Context()): String? =
+                QueryExec.dataset(ds).query("SELECT (MIN(?v) AS ?m) { VALUES ?v { 1 UNDEF } }")
+                    .context(context.set(Sparkles.FALLBACK, SparklesFallback.NEVER)).select().next().get("m")?.literalLexicalForm
+            assertEquals(AggregateErrors.JENA, ds.settings().aggregateErrors().get())
+            assertFalse(ds.settings().aggregateErrors().isSet())
+            assertNull(min())
+            assertEquals("1", min(Context().set(Sparkles.AGGREGATE_ERRORS, AggregateErrors.SPARKLES)))
+            assertEquals("1", min(Context().set(Sparkles.AGGREGATE_ERRORS, "sparkles")))
+            ds.settings().aggregateErrors().set(AggregateErrors.SPARKLES)
+            assertTrue(ds.settings().aggregateErrors().isSet())
+            assertEquals("1", min())
+            assertNull(min(Context().set(Sparkles.AGGREGATE_ERRORS, AggregateErrors.SPEC)))
+            assertThrows(IllegalArgumentException::class.java) { min(Context().set(Sparkles.AGGREGATE_ERRORS, "arq")) }
+            ds.settings().aggregateErrors().reset()
+            assertEquals(AggregateErrors.JENA, ds.settings().aggregateErrors().get())
+            assertNull(min())
+        }
+    }
+
+    @Test
     fun describe_uses_the_configured_engine_strategy_and_other_datasets_keep_jena_handlers() {
         SparklesDatasets.memory().use { ds ->
             ds.load(ByteArrayInputStream("<urn:s> <urn:p> _:b . _:b <urn:q> 2 .".toByteArray()), Lang.TURTLE)

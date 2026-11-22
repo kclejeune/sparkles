@@ -159,7 +159,7 @@ pub(crate) struct IBuiltin {
 }
 
 impl IBuiltin {
-    fn of(b: &CBuiltin) -> IBuiltin {
+    pub(crate) fn of(b: &CBuiltin) -> IBuiltin {
         IBuiltin {
             kind: b.kind,
             args: SmallVec::from_slice(&b.args),
@@ -618,6 +618,9 @@ pub(crate) struct Program {
     pub relations: Relations,
     pub rules: Vec<Rule>,
     pub strata: strata::Strata,
+    /// the built-in rule set an `@include` brought each rule from, by rule, when the
+    /// frontend knows it (empty otherwise)
+    pub includes: Vec<Option<Box<str>>>,
     _held: Held,
 }
 
@@ -686,8 +689,23 @@ impl Program {
             relations,
             rules,
             strata,
+            includes: Vec::new(),
             _held: held,
         })
+    }
+
+    /// Record the included rule set of each rule, charged to the program's budget.
+    pub fn set_includes(&mut self, includes: Vec<Option<Box<str>>>) -> Result<(), BudgetFailure> {
+        let bytes = includes.capacity() * size_of::<Option<Box<str>>>()
+            + includes.iter().flatten().map(|s| s.len()).sum::<usize>();
+        self._held.try_grow(bytes)?;
+        self.includes = includes;
+        Ok(())
+    }
+
+    /// The included rule set of rule `ri`, if it came from one.
+    pub fn include(&self, ri: usize) -> Option<&str> {
+        self.includes.get(ri).and_then(|s| s.as_deref())
     }
 
     pub fn uses_ir(&self) -> bool {

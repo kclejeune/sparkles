@@ -95,6 +95,9 @@ parquet = { version = "59.3", default-features = false, features = ["snap", "fla
 libc = "0.2"
 
 [dev-dependencies]
+# The engine's own integration tests use the test hooks of the `failpoints` feature, such
+# as `Store::set_clock`, whichever packages a test run selects.
+sparkles-core = { workspace = true, features = ["failpoints"] }
 # the server's allocator, for the examples that measure memory
 sparkles-alloc.workspace = true
 oxrdfio.workspace = true

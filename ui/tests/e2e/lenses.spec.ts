@@ -56,7 +56,10 @@ for (const [name, title] of [
   open(`${title} draws the inferred type dashed and the asserted edge solid`, async ({ page }) => {
     await page.addInitScript((d) => localStorage.setItem('sparkles.dataset', d), name);
     await page.goto(`/ui/explore?ds=${name}&iri=${encodeURIComponent(`${EX}alice`)}`);
-    await expect.poll(async () => (await drawn(page)).nodes.map(([l]) => l)).toContain('Employee');
+    // no dataset prefix covers ex:, so the unlabelled class is drawn under its full IRI
+    await expect
+      .poll(async () => (await drawn(page)).nodes.map(([l]) => l))
+      .toContain(`${EX}Employee`);
     await expect
       .poll(async () => (await drawn(page)).edges.some(([, , i]) => i === 'inferred'), {
         timeout: 15_000,

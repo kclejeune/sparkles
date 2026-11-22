@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+"""Writes small Horn ontologies for the third site of level 2 of roadmap item 1025, the
+search for witnesses: the horn-covered family of gate/gen-covered.py with one pattern before
+the random axioms that puts a class with no asserted instance before an individual that holds
+a link beside a subrole's link (file 279 of the gate's run, reduced, with its parts varied).
+
+Usage: gen-witness.py DIR [COUNT] [SEED] [FIXTURES]
+"""
+import random
+import sys
+
+sys.path.insert(0, sys.argv[4] if len(sys.argv) > 4 else "crates/sparkles-owl/tests/fixtures/dl603")
+import generate as g  # noqa: E402
+
+FAMILY = (
+    ["forall", "max1", "nominal", "self"],
+    ["horn", "horn", "role_sub", "role_inverse_sub", "inverses", "functional",
+     "inverse_functional", "domain", "range", "class_assertion", "role_assertion",
+     "role_assertion", "chain", "transitive"],
+    True,
+)
+
+
+def pattern(r):
+    a, b = r.sample(g.INDS, 2)
+    p, q = r.sample(g.SIMPLE, 2)
+    c, f = r.sample(g.CLASSES, 2)
+    fun = r.choice([
+        f"FunctionalObjectProperty({p})",
+        f"ClassAssertion(ObjectMaxCardinality(1 {p} owl:Thing) {a})",
+        f"ClassAssertion(ObjectMaxCardinality(1 {p} owl:Thing) {b})",
+        f"ClassAssertion(ObjectMaxCardinality(1 {p} {f}) {b})",
+        f"SubClassOf({f} ObjectMaxCardinality(1 {p} owl:Thing))",
+        f"InverseFunctionalObjectProperty({q})",
+    ])
+    inv = r.choice([f"InverseObjectProperties({p} {q})",
+                    f"SubObjectPropertyOf({q} ObjectInverseOf({p}))",
+                    f"SubObjectPropertyOf(ObjectInverseOf({q}) {p})"])
+    sub = r.choice([[f"SubObjectPropertyOf({q} {p})"], [f"SubObjectPropertyOf({p} {q})"], []])
+    link = r.choice([f"ObjectPropertyAssertion({q} {a} {b})", f"ObjectPropertyAssertion({p} {a} {b})",
+                     f"ObjectPropertyAssertion({q} {b} {a})"])
+    univ = r.choice([f"ObjectPropertyRange({p} ObjectHasSelf({p}))",
+                     f"ObjectPropertyRange({p} {f})",
+                     f"SubClassOf({c} ObjectAllValuesFrom({p} {f}))",
+                     f"ObjectPropertyDomain({q} {f})"])
+    before = r.choice([f"SubClassOf({c} ObjectHasValue({p} {b}))",
+                       f"SubClassOf({c} ObjectHasValue({q} {a}))",
+                       f"SubClassOf({c} ObjectSomeValuesFrom({p} ObjectOneOf({b})))"])
+    more = r.choice([[f"ClassAssertion({f} {b})"], [f"ClassAssertion({f} {a})"], []])
+    return [fun, inv, link, univ, before] + sub + more
+
+
+d = sys.argv[1]
+count = int(sys.argv[2]) if len(sys.argv) > 2 else 600
+seed = int(sys.argv[3]) if len(sys.argv) > 3 else 1025
+r = random.Random(f"{seed}:horn-witness")
+ops, axioms, inverse = FAMILY
+for n in range(count):
+    gen = g.Gen(r, set(ops), axioms, inverse)
+    out = g.header(f"horn-witness-{n:05}", g.CLASSES, g.SIMPLE + g.COMPLEX, g.DATA, g.INDS)
+    body = set(pattern(r))
+    body.update(gen.axiom() for _ in range(r.randint(0, 8)))
+    out += sorted(body)
+    out.append(")")
+    with open(f"{d}/horn-witness-{n:05}.ofn", "w") as f:
+        f.write("\n".join(out) + "\n")

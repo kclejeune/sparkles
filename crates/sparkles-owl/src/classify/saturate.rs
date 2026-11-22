@@ -26,7 +26,7 @@ use super::dl_root;
 use super::dl_rules;
 use super::horn::HornIx;
 use super::horn_rules;
-use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
+use super::index::{BOTTOM, Ex, Index, NO_ROLE, Node, Role, TOP};
 use parking_lot::{Condvar, Mutex, RwLock};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
@@ -250,6 +250,16 @@ impl Subs {
         self.len() == 0
     }
 
+    /// Whether a member is one of `few`, or one that `marked` answers true for, which
+    /// are the same expressions: a set probes for each of a few, and a list, or a set
+    /// that is small beside them, is read once.
+    pub fn meets(&self, few: &[Ex], marked: impl Fn(Ex) -> bool) -> bool {
+        match self {
+            Subs::Set(set) if few.len() * 4 <= set.len() => few.iter().any(|e| set.contains(e)),
+            _ => self.iter().any(|&e| marked(e)),
+        }
+    }
+
     pub fn iter(&self) -> SubsIter<'_> {
         match self {
             Subs::Set(set) => SubsIter::Set(set.iter()),
@@ -464,12 +474,21 @@ impl State {
 
     /// Removes the backward links whose source is in `gone`.
     pub fn drop_links_from(&mut self, gone: &FxHashSet<Ex>) {
+        self.drop_links_where(|e| gone.contains(&e));
+    }
+
+    /// Removes the backward links whose source `gone` answers true for.
+    pub fn drop_links_where(&mut self, gone: impl Fn(Ex) -> bool) {
+        let mut emptied = false;
         for (_, srcs) in &mut self.back {
-            if srcs.list.iter().any(|e| gone.contains(e)) {
-                srcs.retain(|e| !gone.contains(e));
+            if srcs.list.iter().any(|&e| gone(e)) {
+                srcs.retain(|&e| !gone(e));
+                emptied |= srcs.list.is_empty();
             }
         }
-        self.back.retain(|(_, v)| !v.list.is_empty());
+        if emptied {
+            self.back.retain(|(_, v)| !v.list.is_empty());
+        }
     }
 
     /// Removes what the state keeps of the contexts in `gone` as its predecessors,
@@ -542,13 +561,46 @@ impl State {
     }
 
     /// Recomputes the members of the disjointness sets among the subsumers, whose
-    /// numbers the index of each run gives anew.
+    /// numbers the index of each run gives anew. An unsatisfiable context reads no
+    /// membership again, so it keeps none: its subsumers hold `owl:Nothing` and the
+    /// subsumer that gave it, whose memberships the saturation never recorded. The map
+    /// grows only past [`State::disjoint_growth`], which the caller admits first.
     pub fn reindex_disjoint(&mut self, ix: &Index) {
         self.disj.clear();
+        if self.bottom {
+            return;
+        }
+        let n = self.disjoint_members(ix);
+        if n > self.disj.capacity() {
+            // drop the old table before the new one is allocated
+            self.disj = FxHashMap::default();
+            self.disj.reserve(n);
+        }
         for &d in &self.subs {
             for &s in ix.disjoint(d) {
                 self.disj.entry(s).or_insert(d);
             }
+        }
+    }
+
+    /// The memberships of the subsumers in the index's disjointness sets, a bound on the
+    /// entries of the map that [`State::reindex_disjoint`] builds.
+    fn disjoint_members(&self, ix: &Index) -> usize {
+        self.subs.iter().map(|&d| ix.disjoint(d).len()).sum()
+    }
+
+    /// The bytes of the table that [`State::reindex_disjoint`] allocates over `ix`, none
+    /// when the map it has holds the memberships. A table reserved for `n` entries has
+    /// at most `2n + 8` of capacity.
+    pub fn disjoint_growth(&self, ix: &Index) -> usize {
+        if self.bottom {
+            return 0;
+        }
+        let n = self.disjoint_members(ix);
+        if n <= self.disj.capacity() {
+            0
+        } else {
+            table_bytes(2 * n + 8, 8)
         }
     }
 
@@ -563,19 +615,6 @@ impl State {
             }
         };
         &mut self.back[at].1
-    }
-
-    /// Recomputes what depends on the index rather than on the derivations: the
-    /// propagations and the disjointness members of the subsumers.
-    pub fn reindex(&mut self, ix: &Index) {
-        self.props.clear();
-        self.disj.clear();
-        for &d in &self.subs {
-            self.props.extend_from_slice(ix.exist(d));
-            for &s in ix.disjoint(d) {
-                self.disj.entry(s).or_insert(d);
-            }
-        }
     }
 }
 
@@ -1784,11 +1823,14 @@ impl<'a> Run<'a> {
                     .iter()
                     .filter(|&&(s, _)| !st.bottom && roles.sub(r1, s))
                     .map(|&(_, x)| Concl::Sub(x));
+                // a left-linear composition keeps no forward link (roadmap item 956)
                 let links = fwds.iter().flat_map(|&(r2, f)| {
-                    roles.comp(r1, r2).iter().flat_map(move |&t| {
-                        let fwd = roles.keeps_forward(t).then_some(Concl::Fwd(t, f));
-                        let bottom = roles.is_empty_role(t).then_some(Concl::Sub(BOTTOM));
-                        fwd.into_iter().chain(bottom)
+                    roles.comp_fwd(r1, r2).iter().map(move |&t| {
+                        if t == NO_ROLE {
+                            Concl::Sub(BOTTOM)
+                        } else {
+                            Concl::Fwd(t, f)
+                        }
                     })
                 });
                 let mut products = subs.chain(links);
@@ -2874,7 +2916,7 @@ fn apply_rules<S: Sink, R: Rules>(
                 }
                 for &(r2, f) in &st.fwd.list {
                     for &t in roles.comp(r, r2) {
-                        compose(roles, e, t, f, out);
+                        compose(roles, e, t, f, roles.keeps_composed(r, r2, t), out);
                     }
                 }
             }
@@ -2906,8 +2948,9 @@ fn apply_rules<S: Sink, R: Rules>(
             if !out.defer() {
                 for (r1, srcs) in &st.back {
                     for &t in roles.comp(*r1, r2) {
+                        let fwd = roles.keeps_composed(*r1, r2, t);
                         for &e in &srcs.list {
-                            compose(roles, e, t, f, out);
+                            compose(roles, e, t, f, fwd, out);
                         }
                     }
                 }
@@ -3106,11 +3149,12 @@ fn link_to<S: Sink>(ix: &Index, me: Ex, st: &State, e: Ex, r: Role, out: &mut S)
     individuals(ix, me, st, |n| out.send(e, Concl::LinkTo(r, n)));
 }
 
-/// The link of a chain: an instance of `e` has an instance of `f` as a `t`-successor.
+/// The link of a chain: an instance of `e` has an instance of `f` as a `t`-successor,
+/// which `e` keeps as a forward link when `fwd` says so ([`super::index::Roles::comp_fwd`]).
 #[inline]
-fn compose<S: Sink>(roles: &super::index::Roles, e: Ex, t: Role, f: Ex, out: &mut S) {
+fn compose<S: Sink>(roles: &super::index::Roles, e: Ex, t: Role, f: Ex, fwd: bool, out: &mut S) {
     out.send(f, Concl::Back(e, t));
-    if roles.keeps_forward(t) {
+    if fwd {
         out.send(e, Concl::Fwd(t, f));
     }
     if roles.is_empty_role(t) {
@@ -4529,6 +4573,340 @@ mod horn_delivery_tests {
                 1,
                 "{name}: R6 gives the conjunction"
             );
+        }
+    }
+}
+
+/// Left-linear composition of transitive roles (roadmap item 956).
+#[cfg(test)]
+mod linear_chain_tests {
+    use super::*;
+    use crate::classify::index::{Axioms, Interner, RoleName};
+    use crate::model::{Class, ObjectProperty};
+
+    /// The roles of a case: which are transitive, which are under which, and the other
+    /// chains, by index.
+    struct Case {
+        roles: usize,
+        transitive: &'static [usize],
+        subs: &'static [(usize, usize)],
+        chains: &'static [(usize, usize, usize)],
+        /// the roles that should compose left-linearly
+        linear: &'static [usize],
+    }
+
+    const CASES: &[Case] = &[
+        // one transitive role
+        Case {
+            roles: 1,
+            transitive: &[0],
+            subs: &[],
+            chains: &[],
+            linear: &[0],
+        },
+        // a strict subrole of a transitive role composes with its links into the role
+        Case {
+            roles: 2,
+            transitive: &[0],
+            subs: &[(1, 0)],
+            chains: &[],
+            linear: &[0],
+        },
+        // equivalent roles, of which the first stays the least result
+        Case {
+            roles: 2,
+            transitive: &[0],
+            subs: &[(1, 0), (0, 1)],
+            chains: &[],
+            linear: &[0],
+        },
+        // a chain into the transitive role from other roles keeps it linear
+        Case {
+            roles: 3,
+            transitive: &[0],
+            subs: &[],
+            chains: &[(1, 2, 0)],
+            linear: &[0],
+        },
+        // a chain with the transitive role on its right into the role keeps it linear
+        Case {
+            roles: 2,
+            transitive: &[0],
+            subs: &[],
+            chains: &[(1, 0, 0)],
+            linear: &[0],
+        },
+        // and into the left role, as regulates ∘ part_of ⊑ regulates
+        Case {
+            roles: 2,
+            transitive: &[0],
+            subs: &[],
+            chains: &[(1, 0, 1)],
+            linear: &[0],
+        },
+        // but not into a third role that no chain composes again with the role
+        Case {
+            roles: 3,
+            transitive: &[0],
+            subs: &[],
+            chains: &[(1, 0, 2)],
+            linear: &[],
+        },
+        // a chain with the transitive role on its left keeps it linear, and two
+        // transitive roles under a third
+        Case {
+            roles: 4,
+            transitive: &[0, 2],
+            subs: &[(0, 3), (2, 3)],
+            chains: &[(0, 1, 1)],
+            linear: &[0, 2],
+        },
+    ];
+
+    struct Built {
+        ix: Index,
+        size: usize,
+        classes: Vec<Ex>,
+        roles: Vec<Role>,
+    }
+
+    /// The case's roles over `n` classes with pseudo-random existential restrictions,
+    /// two thirds of them on the first role, and a negative existential over each role
+    /// so that the links propagate a subsumer.
+    fn build(case: &Case, n: usize, seed: u64) -> Built {
+        let mut it = Interner::new();
+        let classes: Vec<Ex> = (0..n)
+            .map(|i| it.class(&Class::new(format!("urn:linear:C{i}"))))
+            .collect();
+        let roles: Vec<Role> = (0..case.roles)
+            .map(|i| {
+                it.role(RoleName::Object(ObjectProperty::new(format!(
+                    "urn:linear:r{i}"
+                ))))
+            })
+            .collect();
+        let mut x = seed | 1;
+        let mut next = move |m: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x % m as u64) as usize
+        };
+        let mut subs = Vec::new();
+        for _ in 0..3 * n {
+            let (a, b) = (classes[next(n)], classes[next(n)]);
+            let r = if next(3) < 2 {
+                roles[0]
+            } else {
+                roles[next(case.roles)]
+            };
+            let e = it.node(Node::Exist(r, b));
+            subs.push((a, e));
+        }
+        for (i, &r) in roles.iter().enumerate() {
+            let goal = it.class(&Class::new(format!("urn:linear:G{i}")));
+            let e = it.node(Node::Exist(r, classes[next(n)]));
+            subs.push((e, goal));
+        }
+        let mut chains: Vec<(Vec<Role>, Role)> = case
+            .transitive
+            .iter()
+            .map(|&t| (vec![roles[t], roles[t]], roles[t]))
+            .collect();
+        chains.extend(
+            case.chains
+                .iter()
+                .map(|&(a, b, t)| (vec![roles[a], roles[b]], roles[t])),
+        );
+        let ax = Axioms {
+            subs,
+            role_subs: case
+                .subs
+                .iter()
+                .map(|&(a, b)| (roles[a], roles[b]))
+                .collect(),
+            chains,
+            ..Axioms::default()
+        };
+        let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+        Built {
+            ix,
+            size: it.len(),
+            classes,
+            roles,
+        }
+    }
+
+    /// What a saturation of every class leaves: each context's subsumers and backward
+    /// links, sorted, and the forward links stored in all.
+    /// A context's subsumers and backward links.
+    type Held = (Vec<Ex>, Vec<(Role, Ex)>);
+
+    fn saturated(b: &Built, threads: usize) -> (Vec<Held>, usize) {
+        let ctx: Contexts = (0..b.size).map(|_| OnceLock::new()).collect();
+        let bounds = Bounds {
+            threads,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            base_memory: 0,
+            peak_memory: 0,
+            dynamic: None,
+            dl: None,
+            partial: false,
+            steps: false,
+        };
+        saturate(&b.ix, &ctx, &b.classes, &[], &[], &bounds).unwrap();
+        let mut fwd = 0;
+        let states = ctx
+            .iter()
+            .map(|c| {
+                let Some(c) = c.get() else {
+                    return (Vec::new(), Vec::new());
+                };
+                let st = c.st.lock();
+                fwd += st.fwd.list.len();
+                let mut subs: Vec<Ex> = st.subs.iter().copied().collect();
+                subs.sort_unstable();
+                let mut back: Vec<(Role, Ex)> = st
+                    .back
+                    .iter()
+                    .flat_map(|(r, v)| v.list.iter().map(move |&e| (*r, e)))
+                    .collect();
+                back.sort_unstable();
+                (subs, back)
+            })
+            .collect();
+        (states, fwd)
+    }
+
+    #[test]
+    fn transitive_roles_without_other_chains_on_their_right_are_linear() {
+        for (i, case) in CASES.iter().enumerate() {
+            let b = build(case, 4, 7);
+            let want: Vec<bool> = (0..case.roles).map(|r| case.linear.contains(&r)).collect();
+            let got: Vec<bool> = b
+                .roles
+                .iter()
+                .map(|&r| b.ix.roles.linear[r as usize])
+                .collect();
+            assert_eq!(got, want, "case {i}");
+        }
+    }
+
+    /// The rules applied one conclusion at a time with a sink that does not defer the
+    /// products of links, as a world's does, to a fixpoint on one thread.
+    fn immediate(b: &Built) -> Vec<Held> {
+        struct Queue {
+            me: Ex,
+            out: Vec<(Ex, Concl)>,
+        }
+        impl Sink for Queue {
+            fn send(&mut self, to: Ex, c: Concl) {
+                self.out.push((to, c));
+            }
+            fn me(&mut self, c: Concl) {
+                self.out.push((self.me, c));
+            }
+        }
+        let mut states = vec![State::default(); b.size];
+        let mut q = Queue {
+            me: 0,
+            out: Vec::new(),
+        };
+        let mut todo: VecDeque<(Ex, Concl)> = VecDeque::new();
+        for &c in &b.classes {
+            q.me = c;
+            init(&b.ix, c, &mut states[c as usize], &[], &mut q);
+            todo.extend(q.out.drain(..));
+        }
+        while let Some((e, c)) = todo.pop_front() {
+            q.me = e;
+            let st = &mut states[e as usize];
+            if !st.init {
+                init(&b.ix, e, st, &[], &mut q);
+            }
+            apply(&b.ix, e, st, c, &mut q);
+            todo.extend(q.out.drain(..));
+        }
+        states
+            .iter()
+            .map(|st| {
+                if !st.init {
+                    return (Vec::new(), Vec::new());
+                }
+                let mut subs: Vec<Ex> = st.subs.iter().copied().collect();
+                subs.sort_unstable();
+                let mut back: Vec<(Role, Ex)> = st
+                    .back
+                    .iter()
+                    .flat_map(|(r, v)| v.list.iter().map(move |&e| (*r, e)))
+                    .collect();
+                back.sort_unstable();
+                (subs, back)
+            })
+            .collect()
+    }
+
+    /// The rules without the deferred flush give the same subsumers and backward links
+    /// with left-linear composition as without it, and as the concurrent saturation.
+    #[test]
+    fn immediate_composition_stores_the_same_backward_links() {
+        for (i, case) in CASES.iter().enumerate() {
+            for seed in [3, 17] {
+                let lin = build(case, 32, seed);
+                let mut all = build(case, 32, seed);
+                all.ix.roles.without_linear();
+                let a = immediate(&lin);
+                assert!(a == immediate(&all), "case {i} seed {seed}");
+                assert!(
+                    a == saturated(&lin, 1).0,
+                    "case {i} seed {seed} against a run"
+                );
+            }
+        }
+    }
+
+    /// A run that keeps the contexts of another compares the linear roles of the two
+    /// indexes, since a kept context of a linear role lacks the forward links that a run
+    /// without it composes with.
+    #[test]
+    fn indexes_with_other_linear_roles_do_not_share_their_contexts() {
+        let a = build(&CASES[0], 8, 5);
+        let mut b = build(&CASES[0], 8, 5);
+        assert!(a.ix.same_tables(&b.ix) && b.ix.same_tables(&a.ix));
+        b.ix.roles.without_linear();
+        assert!(!a.ix.same_tables(&b.ix));
+        assert!(!b.ix.same_tables(&a.ix));
+    }
+
+    /// The saturation with left-linear composition stores the subsumers and backward
+    /// links of the one that composes every pair, on one thread and on several, with
+    /// and without congested deliveries, and stores fewer forward links where a role is
+    /// linear.
+    #[test]
+    fn left_linear_composition_stores_the_same_backward_links() {
+        for (i, case) in CASES.iter().enumerate() {
+            for seed in [3, 11, 29] {
+                let lin = build(case, 48, seed);
+                let mut all = build(case, 48, seed);
+                all.ix.roles.without_linear();
+                for threads in [1, 3] {
+                    for congested in [false, true] {
+                        ALWAYS_CONGESTED.set(congested);
+                        let (a, fa) = saturated(&lin, threads);
+                        let (b, fb) = saturated(&all, threads);
+                        ALWAYS_CONGESTED.set(false);
+                        let label = format!("case {i} seed {seed} {threads} threads {congested}");
+                        assert!(a == b, "{label}");
+                        assert!(fa <= fb, "{label}");
+                        if !case.linear.is_empty() {
+                            assert!(fa < fb, "{label}: {fa} against {fb}");
+                        }
+                    }
+                }
+            }
         }
     }
 }

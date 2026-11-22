@@ -1,0 +1,58 @@
+# make-record.py LANE DEST: builds the benchmark record of lane horn-cost's forge A/B (items 990,
+# 1011 and 693's C1) from the files copied back from forge:~/lanes/horn-cost-ab
+import json, sys, os, glob, shutil
+lane, dest = sys.argv[1], sys.argv[2]
+src = os.path.join(lane, 'forge-result')
+keep = ['classifyMs', 'classifyMedianMs', 'indexMs', 'saturationMs', 'taxonomyMs', 'tier', 'hornOverBudget', 'dlOverBudget',
+        'dlAttemptOver', 'outside', 'outsideTaken', 'conclusions', 'contexts', 'conjunctions', 'clauses', 'rules', 'dlWork',
+        'estimatedBytes', 'peakEstimatedBytes', 'peakRssKib', 'threads', 'consistency', 'unsatisfiable']
+def text(p):
+    return open(p).read() if os.path.exists(p) else None
+t = os.path.join(src, 'out', 'timing')
+runs = []
+for p in sorted(glob.glob(os.path.join(t, '*.json'))):
+    d = json.load(open(p))
+    err = text(p[:-5] + '.err')
+    runs.append({'path': os.path.relpath(p, t), 'report': {k: d.get(k) for k in keep}, 'stderr': err or ''})
+sums = {l.split()[1]: l.split()[0] for l in text(os.path.join(src, 'SHA256SUMS')).splitlines()}
+heads = {n: text(os.path.join(lane, 'bin', n + '.head')).split()[0] for n in ['base', 'tip', 'c1']}
+rec = {
+  'suite': 'el-classification', 'kind': 'measurement',
+  'scale': 'ORE 2015 DL development files ore_ont_14817, ore_ont_9663, ore_ont_3215, ore_ont_16680, ore_ont_13103 and ore_ont_5438, and GO 2026-07-26',
+  'host': {'name': 'forge', 'cpu': '13th Gen Intel(R) Core(TM) i5-13500', 'cpus': 20, 'ram_mib': 15620},
+  'manifest': {
+    'sides': {'base': '09f6ed15, the lane base',
+              'tip0': '378127e2 with --dl-attempt-width 0, the pruning of items 990 and 1011 without the one-thread width limit',
+              'tip': '378127e2 as it runs by default, with the pruning and the one-thread width limit of 2^20 choices',
+              'c1': '378127e2 with c1.patch.txt, which replaces the linear check for a repeated universal in horn_rules::forall by a debug assertion (item 693)'},
+    'build': 'build.sh: ~/.local/bin/sparkles-heavy-run 8 mbx build --release -p sparkles-owl --example el_classify on stanley, the laptop, with mbx 1.29.1 and rustc 1.99.1 (58cf8f9c3 2026-10-13), copied to forge. The code of 378127e2 equals that of the lane tip in crates/.',
+    'commits': heads, 'binaries_sha256': {k.split('/')[-1]: v for k, v in sums.items() if k.startswith('bin/')},
+    'data_sha256': {k.split('/')[-1]: v for k, v in sums.items() if k.startswith('files/')},
+    'scripts': ['run.sh.txt', 'timing.sh.txt', 'analyze.py.txt', 'make-record.py.txt', 'corpus-c1.sh.txt', 'corpus-c1-pairs.py.txt', 'step0.sh.txt'],
+    'patches': ['c1.patch.txt']},
+  'settings': {'threads': 'one and four',
+               'pinning': 'taskset on P-cores of separate physical cores, cpu 2 on one thread and cpus 2, 4, 6 and 8 on four',
+               'scope': 'one process per run in a 12 GiB systemd scope without swap, with a 900 s timeout',
+               'lock': 'the rounds ran under ~/lanes/.bench.lock and ~/lanes/.heavy.lock as the systemd user unit horn-cost-ab, alone on the host'},
+  'method': 'timing.sh ran five rounds of the four sides in an order that rotates with the round and thread count, one process per side, file and thread count, with --repeat 5 on GO and ore_ont_5438, 3 on ore_ont_13103 and 1 on the rest. analyze.py takes the median over the five processes of each process median classification, the ratio of each side to the base and the range of the five rounds ratios. Each line of the log gives the round, the side, the file, the thread count, the exit status, the first 16 hex digits of the SHA-256 of the sorted taxonomy and the report fields. tip0 and tip are one binary, and above one thread they do the same work, so their ratio is the spread of one binary.',
+  'timing': runs,
+  'timing_log': text(os.path.join(t, 'log.txt')),
+  'timing_summary': text(os.path.join(src, 'out', 'summary.md')),
+  'correctness_on_the_laptop': {
+    'host': 'stanley, the laptop, with other lanes running beside it, so its times are not measurements',
+    'corpus_sweep': 'corpus-c1.sh ran tip and c1 once per file on one and four threads on GO, ChEBI lite, the 298 ORE 2015 EL files and the 207 DL development files. corpus-c1-pairs.py pairs its lines by order and compares the exit status, the taxonomy hash, the tier, the flags, the classes outside the rules, the count of unsatisfiable classes and the consistency',
+    'corpus_pairs': text(os.path.join(lane, 'out', 'corpus-c1-pairs.txt')),
+    'debug_build': 'step0.sh ran a dev-profile build of c1, with debug assertions, on GO, ore_ont_14817 and ore_ont_9663 on one and four threads. panic=0 means that the assertion never fired',
+    'debug_runs': text(os.path.join(lane, 'out', 'step0.txt'))},
+  'hosts': {'before.txt': text(os.path.join(src, 'out', 'before.txt')), 'after.txt': text(os.path.join(src, 'out', 'after.txt')),
+            'sha-check.txt': text(os.path.join(src, 'out', 'sha-check.txt')), 'queue.log': text(os.path.join(src, 'queue.log')),
+            'DONE': text(os.path.join(src, 'DONE'))},
+}
+os.makedirs(dest, exist_ok=True)
+for s, name in [('run.sh', 'run.sh'), ('timing.sh', 'timing.sh'), ('analyze.py', 'analyze.py'), ('c1.patch.txt', 'c1.patch')]:
+    shutil.copyfile(os.path.join(src, s), os.path.join(dest, name + '.txt'))
+shutil.copyfile(os.path.join(lane, 'make-record.py'), os.path.join(dest, 'make-record.py.txt'))
+for s_, name in [('corpus-c1.sh', 'corpus-c1.sh.txt'), ('corpus-c1-pairs.py', 'corpus-c1-pairs.py.txt'), ('step0.sh', 'step0.sh.txt'), ('out/corpus-c1.txt', 'corpus-c1.txt')]:
+    shutil.copyfile(os.path.join(lane, s_), os.path.join(dest, name))
+json.dump(rec, open(os.path.join(dest, 'record.json'), 'w'), indent=1)
+print('timing', len(rec['timing']), heads)

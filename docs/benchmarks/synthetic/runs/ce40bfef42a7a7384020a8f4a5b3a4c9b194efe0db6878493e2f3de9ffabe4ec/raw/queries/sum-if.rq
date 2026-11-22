@@ -1,0 +1,1 @@
+PREFIX ex: <http://example.org/> SELECT (SUM(IF(?p = ex:nobody, 1, 0)) AS ?c) WHERE { ?p a ex:Researcher }

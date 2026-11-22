@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# insn.sh BIN TAG FILE [args]: user instructions of one one-thread classification, in out/insn.txt.
+L=/home/kclejeune/repositories/github.com/kclejeune/sparkles/.artifacts/worktrees/horn-cost/.artifacts/lanes/horn-cost
+P=/nix/store/ciwqn0d1ybrvzw9sdlklfhg58njv3inc-perf-linux-7.3.3/bin/perf
+bin=$1; tag=$2; f=$3; shift 3
+n=$(basename $f); n=${n%.*}; o=$L/out/insn.$bin.$tag.$n
+taskset -c ${CPUS:-9} $P stat -x, -e instructions:u -o $o.perf $L/bin/$bin --threads 1 --taxonomy $o.tax "$@" $f > $o.json 2>/dev/null
+sha=$(LC_ALL=C sort $o.tax | sha256sum | cut -c1-16); rm -f $o.tax
+ins=$(grep instructions $o.perf | grep -v "not counted" | cut -d, -f1 | head -1)
+echo "$n $bin $tag insn=$ins tax=$sha $(jq -c '{sat:.saturationMs,idx:.indexMs,concl:.conclusions,conj:.conjunctions,over:.dlAttemptOver,dlWork}' $o.json)" | tee -a $L/out/insn.txt

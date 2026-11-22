@@ -344,6 +344,9 @@ impl Runtime {
         let compiled = compile(&q, whole.as_deref())?;
         let mut circuit = Circuit::new(compiled, graphs.clone());
         circuit.max_memory_bytes = Some(spec.max_memory_bytes);
+        // the dataset's reading of errors in aggregates when the circuit attaches
+        let errors = self.host_or_open().aggregate_errors();
+        circuit.aggregate_errors = Some(errors);
         circuit.set_provenance(spec.provenance)?;
         // an accumulator counts the changes and keeps no rows
         circuit.keep_result = matches!(spec.sink, Sink::Rows);
@@ -382,6 +385,9 @@ impl Runtime {
             // whether the default graph is the union of the named graphs changes what
             // the query reads, so a state of the other setting is not loaded
             h.update([u8::from(store.snapshot().union_default_graph)]);
+            h.update([0]);
+            // and so does the reading of errors in aggregates
+            h.update(errors.as_str().as_bytes());
             h.update([0]);
             if !spec.provenance.is_none() {
                 h.update(b"provenance\0");

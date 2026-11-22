@@ -11,6 +11,7 @@ v2*.json from hyperfine 2.0.0, each pair from the same invocation:
     v-single.json  --shell=sh --runs 1 --command-name load "sleep 0.01"
 """
 
+import git_isolation  # noqa: F401, first, so no fixture sees the host Git settings
 import copy
 import importlib.util
 import json

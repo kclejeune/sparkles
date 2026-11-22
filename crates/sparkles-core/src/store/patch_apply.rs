@@ -373,7 +373,8 @@ impl Store {
         }
         // the prefix map the patch leaves must fit, before anything is written
         self.fold_prefixes(&prefixes, true)?;
-        let bulk = !deleting && adds.len() as u64 >= self.opts.bulk_threshold;
+        let bulk = txn.bulk_plan(super::load_plan::Entry::Patch, adds.len(), deleting)
+            == super::load_plan::LoadPlan::Bulk;
         if bulk {
             txn.insert_bulk(std::mem::take(&mut adds))?;
         } else {

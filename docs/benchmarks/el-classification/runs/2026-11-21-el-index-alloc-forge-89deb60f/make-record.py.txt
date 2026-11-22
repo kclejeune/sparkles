@@ -1,0 +1,112 @@
+"""make-record.py RUNDIR: writes the record of lane el-index-alloc (roadmap item 1269) into
+RUNDIR/record.json from the forge and atlas outputs, the laptop's instruction counts, the stage
+probe and the corpus sweep, and copies the scripts beside it as .txt files."""
+import glob, json, os, re, shutil, sys
+L = os.path.dirname(os.path.abspath(__file__))
+out = sys.argv[1]
+os.makedirs(out, exist_ok=True)
+
+def lines(p):
+    return [json.loads(l) for l in open(p) if l.startswith("{")]
+
+def processes(d):
+    rows = []
+    for p in sorted(glob.glob(f"{d}/timing/*.json")):
+        rep = [json.loads(l) for l in open(p) if l.startswith("{")]
+        err = open(p[:-5] + ".err").read() if os.path.exists(p[:-5] + ".err") else ""
+        keep = ("classifyMs", "classifyMedianMs", "indexMs", "saturationMs", "taxonomyMs", "readMs",
+                "tier", "outside", "conclusions", "contexts", "estimatedBytes", "peakEstimatedBytes",
+                "peakRssKib", "peakRssKibAfterRead", "threads", "consistency", "unsatisfiable")
+        rows.append({"path": os.path.basename(p),
+                     "report": {k: rep[0].get(k) for k in keep} if rep else None, "stderr": err})
+    return rows
+
+def sums(p):
+    return {l.split()[1]: l.split()[0] for l in open(p) if l.strip()}
+
+def insn(prefix):
+    res = {}
+    for arm in ("base", "e21", "e22"):
+        per = []
+        for rnd in (1, 2):
+            v = {}
+            for rep in (1, 3):
+                f = f"{L}/insn/{prefix}{arm}.r{rep}.{rnd}.csv"
+                v[rep] = int([x for x in open(f) if "cpu_core" in x][0].split(",")[0])
+            per.append({"repeat1": v[1], "repeat3": v[3], "per_classification": (v[3] - v[1]) // 2})
+        res[{"e22": "tip"}.get(arm, arm)] = per
+    return res
+
+def probe(p):
+    runs = []
+    cur = {}
+    for l in open(p):
+        for k, v in re.findall(r"(\w+_us)=(\d+)", l):
+            cur[k] = int(v)
+        if "index_us" in l:
+            runs.append(cur); cur = {}
+    return runs
+
+forge = f"{L}/forge-out"; atlas = f"{L}/atlas-out"; atlas2 = f"{L}/atlas-ab2-out"
+fs = sums(f"{L}/atlas-ab/SHA256SUMS")
+record = {
+    "suite": "el-classification",
+    "kind": "measurement",
+    "scale": "ore_ont_13482 of the ORE 2015 EL sample, GO 2026-07-26 and ChEBI lite 256 on forge, with separate atlas rounds and the laptop's counts and corpus sweep",
+    "host": {"name": "forge", "cpu": "13th Gen Intel(R) Core(TM) i5-13500", "cpus": 20, "ram_mib": 15620},
+    "manifest": {
+        "sides": {
+            "base": "b47b582b, origin/main, the lane base",
+            "e21": "15a9f9b2, the allocation-free profile check (el_first)",
+            "tip": "89deb60f, e21 and the role table looked up by IRI (Interner::object_role)",
+            "clone": "89deb60f with a dropped copy of the IRI at each role found, a layout probe run on atlas only, uncommitted",
+        },
+        "build": "~/.local/bin/sparkles-heavy-run 8 mbx build --release -p sparkles-owl --example el_classify on stanley, the laptop, mbx 1.29.1, rustc 1.99.1, copied to forge and atlas",
+        "commits": {"base": "b47b582b", "e21": "15a9f9b2", "tip": "89deb60f"},
+        "binaries_sha256": {k.split("/")[-1]: v for k, v in fs.items() if k.startswith("bin/")},
+        "data_sha256": {k.split("/")[-1]: v for k, v in fs.items() if k.startswith("files/")},
+    },
+    "settings": {
+        "threads": "one and four",
+        "pinning": "taskset on P-cores of separate physical cores, cpu 2 on one thread and cpus 2, 4, 6 and 8 on four",
+        "scope": "one process per run in a 12 GiB systemd scope without swap, with a 900 s timeout",
+        "lock": "the rounds ran under ~/lanes/.bench.lock and ~/lanes/.heavy.lock as the systemd user unit el-index-alloc-ab, alone on the host",
+    },
+    "method": "timing.sh ran nine rounds on forge of the three sides in an order that rotates with the round and thread count, one process per side, file and thread count, with --repeat 5 on ore_ont_13482 and GO and 3 on ChEBI lite. analyze.py takes the median over the rounds of each process's median classification and of its last classification's index time, the ratio of each side to the base and the range of the rounds' ratios. Each line of the log gives the round, the side, the file, the thread count, the exit status, the first 16 hex digits of the SHA-256 of the sorted taxonomy and report fields.",
+    "timing": processes(forge),
+    "timing_log": open(f"{forge}/timing/log.txt").read(),
+    "timing_summary": open(f"{forge}/summary.md").read(),
+    "host_state": {"before": open(f"{forge}/before.txt").read(), "after": open(f"{forge}/after.txt").read(),
+                   "sha_check": open(f"{forge}/sha-check.txt").read(), "queue": open(f"{forge}/queue.log").read()},
+    "atlas": {
+        "note": "Atlas results are qualified separately and never pooled with forge's. The first run, five rounds of the same three sides and files, had a same-process spread of 30 to 50% on ore_ont_13482 while kcompactd0 was in D state and swap was in use, so its ore_ont_13482 totals decide nothing. Its GO and ChEBI lite cells were stable. The second run, seven rounds of e21, tip and clone on one thread, is the layout probe.",
+        "first": {"log": open(f"{atlas}/timing/log.txt").read(), "summary": open(f"{atlas}/summary.md").read(),
+                  "before": open(f"{atlas}/before.txt").read(), "after": open(f"{atlas}/after.txt").read()},
+        "layout_probe": {"log": open(f"{atlas2}/timing/log.txt").read(), "summary": open(f"{atlas2}/summary.md").read(),
+                         "before": open(f"{atlas2}/before.txt").read(), "after": open(f"{atlas2}/after.txt").read(),
+                         "clone_patch": "In Interner::object_role, the Some(&id) arm runs drop(std::hint::black_box(p.clone())) before returning id."},
+    },
+    "laptop": {
+        "instructions": {
+            "method": "perf stat -e instructions:u with taskset -c 2, el_classify --threads 1 --repeat 1 and --repeat 3 in two rounds, the per-classification count is half the difference",
+            "ore_ont_13482": insn(""),
+            "go": insn("go."),
+        },
+        "stage_probe": {
+            "method": "probe.patch.txt, eprintln timers around the profile check, the normalization, the negative occurrences, the told sort and Index::build, el_classify --threads 1 --repeat 5 on ore_ont_13482 on the loaded laptop",
+            "base": probe(f"{L}/perf/probe.err"),
+            "e21": probe(f"{L}/perf/e21probe.err"),
+        },
+        "corpus": {
+            "method": "corpus.sh.txt: base and tip on GO, ChEBI lite, the 298 ORE 2015 EL files and the 207 DL development files on one and four threads, with EL_CLASSIFY_EXCLUDED=1. Each line gives the file, side, threads, exit status, the taxonomy hash, the hash of the excluded-axiom lines with their rules and messages, their count and report fields.",
+            "lines": open(f"{L}/out/corpus.txt").read(),
+        },
+    },
+}
+json.dump(record, open(f"{out}/record.json", "w"), indent=1)
+for src, name in [("atlas-ab/timing.sh", "timing.sh.txt"), ("atlas-ab/run.sh", "run.sh.txt"),
+                  ("atlas-ab/analyze.py", "analyze.py.txt"), ("forge-ab2/timing.sh", "timing-layout-probe.sh.txt"),
+                  ("corpus.sh", "corpus.sh.txt"), ("probe.patch", "probe.patch.txt"),
+                  ("make-record.py", "make-record.py.txt")]:
+    shutil.copy(f"{L}/{src}", f"{out}/{name}")
+print("wrote", out)

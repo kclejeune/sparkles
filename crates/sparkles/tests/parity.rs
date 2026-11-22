@@ -179,6 +179,27 @@ fn entries() -> Vec<(&'static str, Entry)> {
         op!("deleteDescribe", "settings.describe.reset", |ds| {
             ds.settings().describe().reset();
         }),
+        op!(
+            "getAggregateErrors",
+            "settings.aggregate_errors.get",
+            |ds| {
+                ds.settings().aggregate_errors().get();
+            }
+        ),
+        op!(
+            "setAggregateErrors",
+            "settings.aggregate_errors.set",
+            |ds| {
+                ds.settings().aggregate_errors().set(Default::default());
+            }
+        ),
+        op!(
+            "deleteAggregateErrors",
+            "settings.aggregate_errors.reset",
+            |ds| {
+                ds.settings().aggregate_errors().reset();
+            }
+        ),
         op!("runStoredQuery", "queries.run", |ds| {
             ds.queries().run("q", &BTreeMap::new(), &Default::default());
         }),

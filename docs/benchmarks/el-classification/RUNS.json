@@ -160,7 +160,7 @@
      },
      "ended": "2026-11-02T20:50:54Z",
      "lock_note": "Each process took the bench lock and the heavy lock for itself. env.txt gives the time and load average when each took them. Another lane's benchmark jobs ran between the processes and never beside them.",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224\u2026, pins.tsv sha256 4d470f93\u2026), Temurin 17.0.20+8",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20, the harness of commit 3d8fd876 (ElkClassify.java sha256 036a7224…, pins.tsv sha256 4d470f93…), Temurin 17.0.20+8",
      "started": "2026-11-02T17:11:55Z"
     },
     "settings": {
@@ -262,7 +262,7 @@
      "binary": "crates/sparkles-owl/examples/el_classify.rs",
      "binary_sha256": "21ea154f772d48d70c60026e67bd5c8db20845f73d3cb3ee9472634efc7c7c06",
      "build": "MBX_LEARNED_INCREMENTAL=false mbx build --release -p sparkles-owl --example el_classify on wally, copied to the benchmark host",
-     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d\u2026, pins.tsv sha256 4d470f93\u2026), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
+     "reference": "ELK 0.6.0 with OWL API 5.1.20 through scripts/elk-compare/elk.sh (ElkClassify.java sha256 8bc9178d…, pins.tsv sha256 4d470f93…), openjdk version \"17.0.20\" 2026-07-21 OpenJDK Runtime Environment Temurin-17.0.20+8 (build 17.0.20+8) OpenJDK 64-Bit Server VM Temurin-17.0.20+8 (build 17.0.20+8, mixed mode, sharing)",
      "data": {
       "chebi_lite": {
        "sha256": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4"
@@ -1374,6 +1374,233 @@
     }
    },
    "metadata_note": "Manual record of roadmap item 889 on atlas: three rounds of ore_ont_8737 of every side on one, four and twelve threads, the rounds of GO, ChEBI lite, ore_ont_3836 and ore_ont_13482, the profiles on atlas, and the profiles, rounds and taxonomy sweeps taken on the laptop."
+  },
+  {
+   "run_id": "sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548",
+   "path": "runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json",
+   "sha256": "e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "15 ORE 2015 DL development ontologies, Gene Ontology and ChEBI lite",
+    "manifest": {
+     "commits": {
+      "base": "48344bca4066b70552b8305b9caa6248e77e2d82",
+      "candidate": "8b311a59255af60a20689a3cd6df5987ebed541b",
+      "hermit_comparison": "c1619c3726f12c64acf9c05a6554de4fe3ff1a55"
+     },
+     "build_host": "stanley",
+     "build_command": "mbx build -j 8 --release -p sparkles-owl --example el_classify",
+     "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+     "binaries_sha256": {
+      "base2": "cf23ad585b136964a838f6ece8cf8ddb7d6e4455084052716d49b35be6459633",
+      "fix": "b7b96085ba6a8ae34ad4e27d097ddafccf20827ea21bdd5018345944722d2227",
+      "fixr": "df98475d34a55bd79b1d87e4d0e2ce34c2b82e43d77fc93fde25b6aa11c10e07",
+      "fixdiagw": "56419c7ff2d765ab6b4805b89e79113cc838f78a50180d3757263d491eb63540"
+     },
+     "data_sha256": {
+      "chebi_lite.ofn": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+      "go.ofn": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+      "ore_ont_10073.owl": "ad0146f453b0f4f75c4a0e91730fe136cda8387b1563b6f8596c882707d6d1b6",
+      "ore_ont_10754.owl": "acd5d5f758e629b0322846bdbecef876350e812966336a20662f260115a1de6d",
+      "ore_ont_10951.owl": "cb814e4020b7c45892ff45a781c1530014721f2f293a4f7f0049fbb4461597ae",
+      "ore_ont_12901.owl": "6b68cf4ade1e3e27961d609ab1e46b456b34617606b9edc2ebad665056895c2d",
+      "ore_ont_1370.owl": "984580a8e09cbad8a44b0413a28dae22c0e49cff296e8bd00ac71af1077af75e",
+      "ore_ont_14375.owl": "021b73ea8a49c9ecce3323c98ac3ce83353e797d5906338d3f2229ffda886660",
+      "ore_ont_14817.owl": "c9ef59caad989ff6ab355038030256b9ac6409c1dd11265fa28e8266b63c100f",
+      "ore_ont_16744.owl": "14e1d911dddd8863c088733a4c27ed66a9323e6ea4e12af7b9c3ac3bf816a4fc",
+      "ore_ont_4510.owl": "9d6246688fe292693f91ced5d096d3c732ccfa1bcf5fb57bad1f25ae2aa8766a",
+      "ore_ont_4572.owl": "b08b653cca5f336c9b278bc8af0111ffba9be0900264f5a7d664ac345e611077",
+      "ore_ont_6132.owl": "8a4bd9612f1aaab4e24e5c0a7c2236867473587d6f1616c165a205f7cbca4077",
+      "ore_ont_8737.owl": "2f5e2478a6a21f304d5c49fa65aa6fc447cf5fe907b3a68ec375da05320f1cc6",
+      "ore_ont_9654.owl": "9b80e89d2d93b66d438ba597a125905f576fd0871502a000ac3676db87eb2513",
+      "ore_ont_9663.owl": "13497cacd9c6fc1035450e50255c8f2d605a7aa85829958aa4c5d9fedfc7c86b",
+      "ore_ont_9855.owl": "73e70d6d8af1c80ae7ce10d8e95cc2bb20e7ff8c6bc600d3f0e445bb59dbd9d4"
+     }
+    },
+    "settings": {
+     "rounds": 6,
+     "threads": [
+      1,
+      4
+     ],
+     "scope": "One process per file, arm and thread count, with a 13 GiB systemd scope without swap",
+     "lock": "horn-1025b-ab held ~/lanes/.heavy.lock",
+     "arms": {
+      "base": "old binary",
+      "l0": "new binary with the old rule bodies",
+      "l1": "new binary with guarded R7 and reduced copying",
+      "l2": "new binary with default Horn rules",
+      "base-el": "old binary with --el-only on the four main files",
+      "el": "new binary with --el-only on the four main files",
+      "-horn": "--dl-attempt-work 1 on the two Uberon files"
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "atlas",
+      "role": "Intel benchmark worker"
+     },
+     "method": "Within each round, compute the ratio of the two process medians. Report the median of the six ratios, their range, and the two-sided percentile interval over all 46656 six-pair resamples with replacement. Median added time is the median of paired differences. Odd and even rounds used reverse arm orders.",
+     "kind": "measurement",
+     "scope": "Atlas classification timing and separately traced HermiT correctness checks"
+    }
+   }
+  },
+  {
+   "run_id": "sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859",
+   "path": "runs/sha256-5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859/record.json",
+   "sha256": "5573f8d9ac3c19caf3a624027fa9dfa37fa574fe58ddb0f6aa7134e7f6b37859",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "21 hand cases and 968 generated cases. The HermiT-checked phase includes 348 of the generated cases.",
+    "manifest": {
+     "commit": "c1619c3726f12c64acf9c05a6554de4fe3ff1a55",
+     "diagnostic_patch_sha256": "68485372d20d1c45a6d8bb8cc48ed881ad8ced154586d8e56c4c4d17a3ee6e74",
+     "diagnostic_binary_sha256": "bf55846b4c87ecce1a67125e4e7f8f869b533361c29ce366487fe5891d19d338",
+     "rustc": "1.99.1 (58cf8f9c3 2026-10-13)",
+     "mbx": "1.29.1",
+     "build": "mbx build -j 6 --release -p sparkles-owl --example el_classify inside mbx sparkles-task",
+     "atlas_timing_record": "runs/sha256-e22cec10d3b9a13e2f28b723963b8eb98bf9a99d88e2b0e114f6c22aebe0b548/record.json",
+     "fixture_input_sha256": "8d6458e9b9299ffbb7db391df435dcc304d73dff313a785c787943b6d004557c",
+     "fixture_hermit_taxonomy_sha256": "18b901cacf57dbf26f2d70d2c52c073e79d77348db6f982c9e4214378620c332"
+    },
+    "settings": {
+     "threads": [
+      1,
+      8
+     ],
+     "horn_rules_level": 2,
+     "phase_sizes": {
+      "hermit-checked": 369,
+      "generated": 968
+     }
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "stanley"
+     },
+     "method": "Evaluate the production witness predicate twice on the same post-saturation state, toggling only recognition of a covered successor. Call the ordinary world-reachability routine on both witness sets and record sorted class IRIs before any world runs. The classifier then continues using the enabled result.",
+     "kind": "correctness-evidence",
+     "scope": "Same-snapshot Horn witness and named-class world-selection comparison"
+    }
+   }
+  },
+  {
+   "run_id": "sha256-bd270f0721daa1055ea67a1a7a82a4c4a1ed96732fc09277a3299c1ec8489851",
+   "path": "runs/2026-11-20-el-linear-chains-forge-0134cd85/record.json",
+   "sha256": "bd270f0721daa1055ea67a1a7a82a4c4a1ed96732fc09277a3299c1ec8489851",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "ore_ont_8737 and ore_ont_9855 of the ORE 2015 DL development set, GO 2026-07-26, ChEBI lite 256, ore_ont_3836 and ore_ont_13482 of the ORE 2015 EL sample on forge",
+    "manifest": {
+     "sides": {
+      "base": "5f3f69c2, the lane base, origin/main of batch 40",
+      "tip": "0134cd85, the left-linear composition of transitive roles of item 956, whose engine code is that of 05838a64"
+     },
+     "build": "mbx build --release -p sparkles-owl --example el_classify on wally through scripts/remote-ci.sh --cmd, rustc 1.99.1, mbx 1.29.1, both sides from clean checkouts, copied to forge",
+     "commits": {
+      "base": "5f3f69c2",
+      "tip": "0134cd85"
+     },
+     "binaries_sha256": {
+      "base": "618b940ec1e7f2a5c2092eac3aa0937483307dd760a5f28cf4242f4e2be869ee",
+      "tip": "2d3c9e1a725dd63c123a66eb4eec364eddf7cce95cb896792e5e8ff14c572a98"
+     },
+     "data_sha256": {
+      "go.ofn": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+      "chebi_lite.ofn": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+      "ore_ont_8737.owl": "2f5e2478a6a21f304d5c49fa65aa6fc447cf5fe907b3a68ec375da05320f1cc6",
+      "ore_ont_9855.owl": "73e70d6d8af1c80ae7ce10d8e95cc2bb20e7ff8c6bc600d3f0e445bb59dbd9d4",
+      "ore_ont_3836.owl": "fc559045f566b2837188505b707480dc3416b3e699c5188632fa5be3d4cf2473",
+      "ore_ont_13482.owl": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+     },
+     "scripts": [
+      "timing.py.txt",
+      "analyze.py.txt",
+      "run.sh.txt",
+      "RULES.md.txt",
+      "make-record.py.txt",
+      "run8737.sh.txt",
+      "insn.sh.txt",
+      "corpus.sh.txt",
+      "stats.patch.txt"
+     ]
+    },
+    "settings": {
+     "threads": "one, four and twelve in the warm rounds, one in the cold rounds",
+     "scope": "one process per run in a 12 GiB systemd scope with at most 1 GiB of swap on forge, no pinning",
+     "lock": "the rounds ran under ~/lanes/.bench.lock and ~/lanes/.heavy.lock as the systemd user unit el-956-timing"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620
+     },
+     "method": "RULES.md fixed the rules before the run. timing.py ran warm cells of el_classify --threads T --repeat 5, three rounds of ore_ont_8737 and six of GO, ChEBI lite, ore_ont_3836, ore_ont_13482 and ore_ont_9855, and cold cells of --threads 1 --repeat 1 of ore_ont_3836 and ore_ont_13482 in twenty rounds, the base first in odd rounds and the tip first in even ones, then one untimed run per file and side on four threads that wrote the taxonomy. analyze.py takes each side's median over the rounds, the ratio of the medians and a 95% bootstrap interval over whole rounds, and applies the Intel rule of AGENTS.md.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "Manual record of roadmap item 956 on forge: the rounds of ore_ont_8737, GO, ChEBI lite, ore_ont_3836, ore_ont_13482 and ore_ont_9855 on one, four and twelve threads, the cold rounds of ore_ont_3836 and ore_ont_13482, the taxonomy hashes, and the instruction counts, message counts and taxonomy sweeps taken on the laptop."
+  },
+  {
+   "run_id": "sha256-780481bb0fe38e430cadf00685be81d3a396eda3539cee5dfd1ce778a21ff0ff",
+   "path": "runs/2026-11-21-el-index-alloc-forge-89deb60f/record.json",
+   "sha256": "780481bb0fe38e430cadf00685be81d3a396eda3539cee5dfd1ce778a21ff0ff",
+   "format": "legacy-assessment",
+   "context": {
+    "suite": "el-classification",
+    "scale": "ore_ont_13482 of the ORE 2015 EL sample, GO 2026-07-26 and ChEBI lite 256 on forge, with separate atlas rounds and the laptop's counts and corpus sweep",
+    "manifest": {
+     "sides": {
+      "base": "b47b582b, origin/main, the lane base",
+      "e21": "15a9f9b2, the allocation-free profile check (el_first)",
+      "tip": "89deb60f, e21 and the role table looked up by IRI (Interner::object_role)",
+      "clone": "89deb60f with a dropped copy of the IRI at each role found, a layout probe run on atlas only, uncommitted"
+     },
+     "build": "~/.local/bin/sparkles-heavy-run 8 mbx build --release -p sparkles-owl --example el_classify on stanley, the laptop, mbx 1.29.1, rustc 1.99.1, copied to forge and atlas",
+     "commits": {
+      "base": "b47b582b",
+      "e21": "15a9f9b2",
+      "tip": "89deb60f"
+     },
+     "binaries_sha256": {
+      "base": "c2551d058fc649ef0e4b1d525b794a12ba6a8c6674f8114f10b285d24ee091d2",
+      "e21": "4bd50e05d3e805e3fe3b3a26ca916e6cfe4fb0aec850b06414795c1177490cc7",
+      "tip": "378c970b9f21cb213df4e999233cc9ec6e97aad1573c6847a47aa2bade3c0d42"
+     },
+     "data_sha256": {
+      "chebi_lite.ofn": "be39711a4cfe44c245f5a5406445ad7f8284d7df1cb80d0c67a4450057a7c3f4",
+      "go.ofn": "fd3f1a9962e4693bd3d62c8e2a4c8f0fadbdae0d8fd4be583ee813e77c68a375",
+      "ore_ont_13482.owl": "f732cc7d4ebdb45099e421d062e05d64837b22e60b53d6848a723aa8f0e8d971"
+     }
+    },
+    "settings": {
+     "threads": "one and four",
+     "pinning": "taskset on P-cores of separate physical cores, cpu 2 on one thread and cpus 2, 4, 6 and 8 on four",
+     "scope": "one process per run in a 12 GiB systemd scope without swap, with a 900 s timeout",
+     "lock": "the rounds ran under ~/lanes/.bench.lock and ~/lanes/.heavy.lock as the systemd user unit el-index-alloc-ab, alone on the host"
+    },
+    "durability_classes": [],
+    "legacy_metadata": {
+     "host": {
+      "name": "forge",
+      "cpu": "13th Gen Intel(R) Core(TM) i5-13500",
+      "cpus": 20,
+      "ram_mib": 15620
+     },
+     "method": "timing.sh ran nine rounds on forge of the three sides in an order that rotates with the round and thread count, one process per side, file and thread count, with --repeat 5 on ore_ont_13482 and GO and 3 on ChEBI lite. analyze.py takes the median over the rounds of each process's median classification and of its last classification's index time, the ratio of each side to the base and the range of the rounds' ratios. Each line of the log gives the round, the side, the file, the thread count, the exit status, the first 16 hex digits of the SHA-256 of the sorted taxonomy and report fields.",
+     "kind": "measurement"
+    }
+   },
+   "metadata_note": "Manual record of roadmap item 1269 on forge: nine rounds of the base, the allocation-free profile check and the tip on ore_ont_13482, GO and ChEBI lite on one and four threads, the separate atlas rounds with the layout probe, the laptop's instruction counts and stage probe, and the taxonomy and exclusion sweep."
   }
  ]
 }

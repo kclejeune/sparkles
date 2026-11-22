@@ -14,9 +14,9 @@ answers, and the schedule below follows them.
 
 Stages 1 and 3 have shipped, apart from the storage items 479 and 484 that
 [X16](../X16-storage-consolidation/README.md) holds. Stage 4's accounting model and
-mode-neutral kernels have shipped as items 671 to 674. Item 678 has shipped in part,
-and item 1069's per-query floor cache completes it by letting cursor batches compare
-strings through the floors. Item 675's hierarchical budget is landing. The rest of the design is
+mode-neutral kernels have shipped as items 671 to 674, and its decoding twins as items
+678 and 1069, whose per-query floor cache lets cursor batches compare strings through
+the floors. Item 675's hierarchical budget is landing. The rest of the design is
 stages 5 and 6, together with the phases that are scheduled with their area and the
 execution additions, which this plan does not schedule.
 
@@ -84,9 +84,11 @@ eighth of the budget. The decorrelated EXISTS key sets of `exists.rs` are shared
 
 The result writers exist twice, and the design's two gaps have narrowed. The eager
 writers of `sparql/results.rs` write a whole `QueryResult` through `Buffered`, which marks
-row ends and counts the rows the client received. The cursor writers write through the
-`Shared` adapter without that count, and SELECT, graph, Jena graph and native JSON each
-have a cursor writer of their own. An ASK that a streaming request runs is pulled through
+row ends and counts the rows the client received. The cursor writers run on the same
+`Buffered` writer through `write_buffered`, compiled in `sparkles-core`, and count the
+rows the client received the same way, but SELECT, graph, Jena graph and native JSON each
+still have a cursor writer of their own, whose serializer reaches the buffer through the
+`Shared` adapter. An ASK that a streaming request runs is pulled through
 the cursor by `finish_ask`, and its boolean is then written by the eager writers, since
 one value needs no streamed writer. The SPARQL Results Thrift encoder `ThriftResults` is
 already in `sparkles-core`'s `jena_formats.rs`, and only its writer
@@ -115,9 +117,11 @@ path search, history changes, view reads, algorithm calls, the predicate-table
 unsupported shape, remote LATERAL, a registered property function whose registration does
 not declare `prefix_output`, and any node one of whose EXISTS patterns cannot itself be
 built without materialization, which `exists_streams` decides by building each pattern
-under the strict policy. The depth cap of four and the refusal of a LeftJoin condition
-with EXISTS belong to `streams_natively`, the admission predicate of automatic execution,
-and not to the fallback. Several of these kinds have two forms. The `needs_input` methods
+under the strict policy. The depth cap of four, the refusal of an EXISTS pattern that
+calls a SERVICE and the refusal of a LeftJoin condition with EXISTS belong to
+`streams_natively`, the admission predicate of automatic execution, and not to the
+fallback. An EXISTS inside a larger expression, such as IF, OR, an aggregate argument or
+an ORDER BY key, is admitted, with or without a key set. Several of these kinds have two forms. The `needs_input` methods
 of `TextSpec`, `VectorSpec`, `HybridSpec`, `HistorySpec`, `AlgoSpec`, `SpatialPfSpec` and
 `PathSearchSpec` say whether a node reads variables its input binds, and the planner
 places a node that does above its input.
@@ -168,13 +172,13 @@ phases name are carried here as they stand at the base of this plan.
 | Grouping operator, item 826 | Item 93. | Item 7's grouping over key runs has shipped. Item 418 is outstanding, and the [schedule](#order-of-work) says how item 826 proceeds with and without it. |
 | Frontier kernel | Item 417. | Items 8 and 51. |
 | Expression memo | None. | Item 293. |
-| Columnar writers, item 828 | None. | Items 91, 240, 243 and 534. Item 828 follows items 534 and 240 and carries items 243 and 91 as its own gates. |
+| Columnar writers, item 828 | Item 240. | Items 91, 243 and 534. Item 828 carries items 243 and 91 as its own gates and the in-place route of item 534's hand-off plan. |
 | Mode-independent plans and pull-demand LIMIT and ASK, item 827 | None. | Item 7, for the EXISTS shapes that stay eager, which item 827 leaves to item 829. |
 | Native leaf cursors, item 829 | None. | Item 827 for the admission code, and item 825 for the operators that build over their input. |
-| The merge | Items 93, 469 to 473. | Items 7, 240, 243, 293, 534 and 512, and items 825 to 829. |
+| The merge | Items 93, 240, 469 to 473. | Items 7, 243, 293, 534 and 512, and items 825 to 829. |
 | Demand seeding and one visitor | None. | Item 190. |
 
-Items 7, 240, 243, 293 and 534 are on the merge's critical path because the design puts
+Items 7, 243, 293 and 534 are on the merge's critical path because the design puts
 them there, and this plan does not shorten that path. Item 243 lands inside item 828's
 work on the writers, and item 293 settles the memo's admission before the merge deletes
 the eager memo.
@@ -191,9 +195,9 @@ ownership boundaries given below, and the rows are serial.
 | Step | Phases | Why they wait |
 |---|---|---|
 | Now | Item 675 lands. Items 678, 512 and 534 start. Item 825 starts. Item 827 starts. | Each owns its own functions, as the boundaries below say. Item 534 is measurement work that items 240 and 828 build on. |
-| After 825 | Item 826 starts. Item 240 starts once item 534 says where the streamed time goes. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
+| After 825 | Item 826 starts. Item 240 has shipped on item 534's measurement. | Item 826 shares `Operator::build_for` and the eager dispatch with item 825. |
 | After 827 and 825 | Item 829 starts. | Its leaf cursors land in the admission code that item 827 changes, and its operators that build over their input take item 825's hash kernel. |
-| After 240 | Item 828 starts. | The writers take the buffer that item 240 gives the cursor writers. |
+| After 240 | Item 828 can start, and item 534 opens the cursor in the producer's task. | The writers take the buffer that item 240 gave the cursor writers. |
 | After 293 | The expression memo phase is numbered and starts. | Its admission policy is item 293's open question. |
 | After 825 to 829, 512, 243, 293, 534 and the remaining work of item 7 | The merge phase is numbered and starts. | The merge deletes the eager executor, so every kernel it keeps must already be one, and the reference evaluator must already be the oracle. |
 | After the merge | The frontier kernel and the demand seeding phases are numbered and start, and so does [X15](../X15-join-algorithms-and-estimation/README.md). | Neither blocks the merge, and new algorithms land in one executor. |
@@ -244,14 +248,13 @@ of this section listed. Before the change the test counts eight sites, the mode 
 `query_execution_with_plan`, the EXISTS key set accumulated across batches in
 `exists::prepare`, `envelope_refuses`, `string_order_mask` and the four direct reads.
 
-The floors now decode inside the envelope, and `decode_for` decodes through the one
-sorted pre-decode. Cursor batches still skip the floors. On atlas, comparing through
-floors cached per batch made `str-pair-lt` 24.8% slower and `str-pair-names` 33.4% slower
-in streaming mode. The names of `str-pair-names` repeat across batches, so each batch
-computes floors again, while every name of `str-pair-lt` is distinct and the cause of its
-loss is not established. The exclusion in `string_order_mask` therefore stays, and the
-bound stays at eight. Item 1069 takes up a charged per-query floor cache that serves both
-modes, the removal of the exclusion and the bound of seven.
+The floors decode inside the envelope, and `decode_for` decodes through the one sorted
+pre-decode. Floors cached per batch measured 24.8% and 33.4% slower than the direct
+comparison on streaming `str-pair-lt` and `str-pair-names` on atlas, so item 1069 gave
+the context a charged floor cache that lasts the query and serves both modes. Cursor
+batches now compare through the floors, the exclusion in `string_order_mask` is gone and
+the bound is seven. The [Outcome](SPEC.md#outcome) records the forge measurements, and
+items 1088, 1089 and 1140 hold the costs that remain.
 
 ## Stage 5: shared kernels
 
@@ -287,13 +290,12 @@ modes and EXPLAIN names the algorithm the switch selected in both. An OPTIONAL c
 is evaluated once over the gathered candidates of a chunk in both modes, as
 `Binary::condition` already does for the cursor and `left_join` for the eager table, and
 the phase measures the conditional OPTIONAL of item 570's record,
-`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. Item
-570 closes when that measurement puts the streamed query within the gate of the eager
-one and the admission of an OPTIONAL whose condition is an EXISTS with a key set, whose
-earlier admission and revert
-[PERFORMANCE-EXPERIMENTS.md](../../PERFORMANCE-EXPERIMENTS.md#query-execution) records,
-passes the same measurement. Until then item 570 stays open with the measurement
-recorded. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
+`OPTIONAL { ?p ex:advisor ?o FILTER(?o != ex:x) }` at 10.5M quads, in both modes. The
+[X05 outcome](../X05-streaming-query-execution.md#the-cursors-conditional-merge-optional-2026-11-19)
+records that measurement, in which the cursor merges the query and streams it within
+the gate. Item 570 states the remaining acceptance rule, which adds OPTIONALs with
+several pairs per left row and the admission of an OPTIONAL whose condition holds an
+EXISTS. The UNDEF-compatible nested loop of `join_pairs` stays as the kernel's fallback
 for keys the hash cannot take.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
@@ -361,17 +363,19 @@ phase records their change.
 
 ### Item 828: one columnar writer per format over batch sources
 
-The phase follows item 240, which follows the measurement of item 534. Once the design is
-written down it is routine work, apart from item 534's profiling.
+The phase follows item 240, which followed the measurement of item 534. Once the design
+is written down it is routine work.
 
-Item 534 first finds where a streamed response spends about 0.27 ms more than an eager
-one on queries under 1 ms, between `QueryCursor::next_batch` and the response writer. It
-counts user-space instructions per request with `perf stat` on atlas and profiles with
-LBR call stacks, as stage 4's per-query costs were traced, since the instruction harness
-of `bench:insn` covers vocabulary scans and WAL replay and not response writing. Item 240
-then gives the cursor writers the `Buffered` writer of the eager path, so that every
-writer counts the rows the client received the same way, and item 243 finds a row-end
-record that costs nothing per write, measured on `optional-chain`.
+Item 534 counted user-space instructions per request with `perf stat` and profiled with
+LBR call stacks, as the [Outcome](SPEC.md#the-streamed-response-cost) records. The cursor
+writers wrote a few bytes at a time through the server's size-limited switch writer, and
+that chain of calls was more than the whole difference in instructions on `export-500k`
+and about half of it on `count-all`. Item 240 gave the cursor writers the `Buffered`
+writer of the eager path, so that every writer counts the rows the client received the
+same way. Item 243 then finds a row-end record that costs nothing per write, measured on
+`optional-chain`. The wall-time gap of the short queries lies mostly outside the writer,
+in the hand-off between threads that the
+[next section](#the-hand-off-of-a-streamed-response-item-534) plans.
 
 Item 828 then defines a batch source trait in `sparql/results` with `next_batch` and the
 variables, implemented by `QueryCursor`, by `GraphCursor` and by an eager `QueryResult`
@@ -387,11 +391,9 @@ source's decode buffer. The `_counted` eager writers and the `Shared` adapter ar
 deleted.
 
 The regression tests that fail before the change are a server test that a streaming
-request for a SELECT in Thrift streams rather than being refused, a test in
-`results/output_boundary_tests.rs` that a streamed answer cut by the byte budget reports
-the rows the client received as the eager one does, and a differential test that every
-format's bytes for a result are equal whether written from the eager result or from a
-cursor at a batch size of one. The edge cases are an answer of zero rows in each format,
+request for a SELECT in Thrift streams rather than being refused and a differential test
+that every format's bytes for a result are equal whether written from the eager result or
+from a cursor at a batch size of one. The edge cases are an answer of zero rows in each format,
 a literal larger than the buffer, a graph answer whose last batch holds only labels, a
 decode refusal in the middle of a batch, which keeps its original error and the earlier
 complete rows as stage 4 decided, and a client that disconnects between batches.
@@ -403,6 +405,72 @@ slower today and the merge needs it within the gate, and SP²Bench `q4` through
 `scripts/bench-sp2b.sh` on atlas for item 91, with its forge record after the push. The
 bindings run `bench:bindings`, since the Node, Python and FFI bindings serialize through
 these writers.
+
+### The hand-off of a streamed response, item 534
+
+A phase trace of the nine short queries on forge put the rest of their gap in the
+hand-off between threads. An eager request for a text whose last run was quick runs on
+the worker that received it, without waking another thread, and `count-all` had
+serialized its answer a median of 65 µs after the handler started. A streamed request
+woke a blocking-pool thread to open its cursor, woke the handler to receive the cursor
+and woke a second pool thread to write the body. Each pool wake took either about 10 µs
+or about 80 µs per request, so their means are the useful measure, 35 to 80 µs for the
+open's wake and 32 to 73 µs for the producer's across the nine queries, with medians of 8 to 10 µs
+for the return to the handler. The plan therefore predicts savings in wakes removed and
+judges them by per-request deltas. Three changes follow, and they differ in what they change for a
+client.
+
+The first opens the cursor in the producer's task. `cursor::run` opens the cursor on the
+pool, hands it back to the handler and then starts the producer on the pool, and the
+automatic route that opens a cursor through `blocking(run)` and reaches `cursor::serve`
+through `Ran::Cursor` takes the same two wakes. Opening the cursor in the task that then
+writes its body removes both on both routes and changes no response. The refusal of a
+streamed SELECT in Thrift is decided from the parsed query's kind before the task starts.
+The task builds `StreamControl` from the opened cursor, and the commit, the resolved
+state, the content type and the `Sparkles-Reasoning` header come back with the
+producer's first outcome. An error of the open is the response error with the status
+`with_timeout` gives it today and never reaches the report of a stream's end, which the
+outcome of a body with a control otherwise calls. The permit is held from the open on,
+and the report's split between execution and serialization time stays as it is.
+Characterization tests that pass before and after the change cover a parse error, an
+unknown `at`, a budget refused at the open and a timeout at the open. The change is kept
+when atlas's interleaved rounds under the [Intel rule](#the-intel-rule) show a saving
+per request on the queries under 1 ms and no query slower, and it stays under item 534.
+
+The second gives the writing of a cursor's body the in-place route. A cursor opens in
+place on a text's first run and on a text whose quick history keeps automatic execution,
+as a quick cursor, a text that is settling its mode and a quick ASK do, and its body
+then still moves to the pool to be written. Every other quick history sends the text to
+the eager executor, and the route must cover both kinds of cursor. The merge
+keeps the in-place runner's choice between the receiving worker and the blocking pool
+for a collected cursor, so cursors need the route before the merge can hold a quick
+text to the eager time. A cursor run in place pulls batches and writes them until the
+cursor ends or the body passes the switch threshold, and it answers whole when the
+cursor ends first, as an eager answer does. Otherwise it hands the cursor and the bytes
+written so far to the producer on the pool. The hand-off needs a writer whose state can
+move to another thread between batches, which item 828's writers over a batch source
+give, so the route lands with item 828 and is measured there. A cursor knows it has
+ended only when a pull returns no batch, so the loop pulls once more after the last
+batch, which costs a check of a finished cursor's state.
+
+The third would have let a request with `execution=streaming` take the in-place route
+too, and it is not taken. Such a request opens on the pool, so its work stops when its
+client disconnects, as [X05](../X05-streaming-query-execution.md) specifies for
+streaming bodies, and it commits after its first batch or 64 KiB. Work in place cannot
+stop when its client goes away, and only the query's timeout bounds it. An explicit
+`execution=streaming` therefore keeps the pool route and its cancellation on a client's
+disconnect, and only the automatic execution of a quick text takes the in-place route.
+The merge keeps that difference beside the commit point. The saving given up is the
+open's wake, 35 to 80 µs on average, beside what the first change saves.
+
+Two candidates were measured and are not planned. A diagnostic build that answered a
+streamed request whole, without the early commit, removed the channel, the end-of-body
+handshake and the first-batch commit together and was no faster on forge, as the
+[Outcome](SPEC.md#the-streamed-response-cost) records. The cursor's open, a median of 59 µs
+against the eager run's 45 µs on `count-all`, and its first batch with its write, 42 µs
+against the eager serialization's 8 µs, are executor costs that no change of route removes. Item
+828's decoding of a batch column at a time takes the write, and the merge owns the open,
+since it opens a cursor for every query.
 
 ### The frontier-expansion kernel
 
@@ -444,11 +512,10 @@ and sampled filters planning choices that do not depend on the mode. The result 
 serves a cursor's subtree when the subtree is materialized anyway, and sampled filters
 prepare their samples once per plan. EXPLAIN then prints one plan for a query whatever
 the mode, which `plan_fidelity_tests.rs` checks, with a spill-configured DISTINCT over
-ORDER BY among its cases. After item 827 the mode is read in eight places, the mode
+ORDER BY among its cases. After item 1069 the mode is read in seven places, the mode
 branch of `query_execution_with_plan`, the EXISTS key set of `exists::prepare`,
-`envelope_refuses`, the cursor exclusion of `string_order_mask` and the four direct reads
-in `ctx.rs`, and the bounded-reads test's bound is eight. Item 1069 removes the exclusion
-of `string_order_mask`, and the merge removes the rest.
+`envelope_refuses` and the four direct reads in `ctx.rs`, and the bounded-reads test's
+bound is seven. The merge removes the rest.
 
 The phase then routes every ASK and unordered LIMIT through pull demand. A streaming
 request already pulls its ASK through the cursor, so the change is that automatic and
@@ -541,9 +608,11 @@ without a bound, as a maintained limitation that the streaming record names, and
 merge removes it with the eager executor. In both cases
 `mise run test:w3c:streaming` records no eager fallback for the W3C query suites, which
 hold no such shape. The EXISTS shapes that automatic execution keeps eager through
-`streams_natively`, an EXISTS deeper than four levels, a LeftJoin condition with EXISTS
-and an EXISTS inside a larger expression, are item 7's remaining work and an admission
-choice rather than a fallback, and the merge removes the admission with the mode.
+`streams_natively` are an admission choice rather than a fallback, and the merge removes
+the admission with the mode. A LeftJoin condition with EXISTS is item 570's work, since
+the cursor merges it but is slower than eager execution at higher fan-out, an
+EXISTS deeper than four levels is item 1081 and an EXISTS pattern that calls a SERVICE
+stays eager because a cursor cannot repeat its effects.
 
 The regression tests that fail before the change are a test in `tests/query_cursor.rs`
 that a streaming request over each former fallback form returns a cursor plan without a
@@ -581,6 +650,11 @@ SPARQL 1.1 algebra, and its semantics are validated on the W3C suites by the pla
 runs in parallel with stage 5 and must land before the merge phase starts. Its gate is
 that it agrees with the engine on every W3C query test and on the seeded queries of
 `tests/query_cursor.rs` at both modes.
+
+The evaluator has landed and passed this gate, apart from the disagreements that items
+1064, 1065 and 1071 hold. While those items are open, the tests compare the aggregates
+over errors and non-strings and the string functions over directional strings under the
+engine's reading, and leave out the queries that read longer numbers. The [spec's Outcome](SPEC.md#outcome) describes it.
 
 ### The merge
 
@@ -690,6 +764,21 @@ which the stage 4 record lists, and the phase names the ones its change can reac
 difference that survives is profiled with `perf stat` and LBR call stacks on atlas before
 the phase reports, as stage 4's per-query costs were.
 
+A phase counts instructions per request with `mise run bench:request-insn` on a build host
+before it books `atlas`, as [Instruction counts before
+timing](../../BENCHMARKING.md#instruction-counts-before-timing) describes, and a count
+flag books the timing run at once. The counts do not replace the timing of this rule.
+They cover the whole request, so on the matrix their resolution is 1.4 to 5.4 µs for
+every query under 0.3 ms, wider than the 0.5 µs bound, and they did not see item 1039's
+cost, which added execution time without adding instructions. A phase
+whose change can reach a query under 0.3 ms therefore still runs the A/B above, and a
+phase that charges memory, allocates, takes locks or atomic reference counts, hands work
+between threads or changes the response path runs it whatever the counts show. Counts are
+enough for a phase only when its change adds or removes computation and reaches no query
+under 0.3 ms, and every query it can reach stays within the floor and resolves within 2%
+of its execution time. Instructions do not bound cycles, so such a phase's cost in cycles
+alone is left to the batch screen and the forge matrix after the push.
+
 ### Correctness and conformance
 
 The differential tests of `tests/query_cursor.rs` run their seeded queries at batch sizes
@@ -726,12 +815,12 @@ they change planner and executor cost decisions, and their validating planner im
 them. Item 678, item 512, the expanding operators of item 829 for forms whose eager
 kernel already runs per batch, and the visitor half of the demand phase are routine work
 with this plan and the design as their specification, with the planner validating item
-512's semantics. Item 828 is routine once items 534 and 240 have written down where the
+512's semantics. Item 828 is routine now that items 534 and 240 have written down where the
 time goes, and item 534 itself is performance work for a capable implementer on atlas.
 
 Items 678, 512, 534 and 825 run at the same time with item 827 within the ownership
 boundaries above. Items 826 and 829 follow their predecessors in the order of work. No two
-phases run the Namespace screen of one commit at once.
+phases run the query screen of one commit at once.
 
 ## Decisions
 
@@ -763,4 +852,4 @@ The maintainer took these answers, and the phases above follow them.
    before it lands. The merge also runs the full matrix on atlas before it lands, since
    it deletes the eager executor and atlas has forge's hardware.
 9. The bounded-reads test counts direct reads of the mode flag as well as `streams()`
-   calls, so its bound is eight after item 827 and seven after item 1069.
+   calls, so its bound is seven after item 1069.
