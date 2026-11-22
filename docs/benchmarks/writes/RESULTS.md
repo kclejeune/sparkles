@@ -1020,8 +1020,11 @@ numbers are a development-host measurement for the design, not a published resul
 
 A pass costs 13 to 17 µs at the median against 0.8 to 2.1 ms for the query. The largest
 pass of `oldest` and `oldest-page-5` is a refill, which evaluates the window's input
-again, here a scan of the 200,000 ages, at about 55 ms. The 200 deletions at the front run
-the reserve of 100 rows out twice, so two of the 400 commits pay it. The engine answers
+again, here a scan of the 200,000 ages, at about 55 ms. A full window keeps its 100 rows
+of reserve, so the first 100 deletions at the front promote reserve rows and the 101st
+refills it. By the benchmark's schedule of commits that is the 201st commit, and the 99
+deletions after it fit the new reserve, so one of the 400 commits should refill. The run
+recorded the slowest pass and not a count of refills. The engine answers
 the query itself from a bounded top-k in about 2 ms, and a refill that read the engine's
 answer instead would cost that, which roadmap item 1294 takes up for inputs whose
 evaluation gives the same ids as the circuit.

@@ -603,7 +603,11 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
   memory limit, and its `memoryBytes` budget is checked against its state only after a
   pass, so a large build allocates its whole state before the view is suspended. A live
   query that starts its own circuit gives that circuit its budget, which ordered windows
-  and `recompute` nodes charge as they build. A view or live query that joins an existing
+  and `recompute` nodes charge as they build. An ordered window also charges the keys it
+  computes for a pass's changes and for rows loaded from a checkpoint, so a live query with
+  a budget can end with `over-budget` while it prepares those keys or computes them again
+  after a restart, even when the window that would follow fits the budget. A view or live
+  query that joins an existing
   circuit keeps that circuit's limit, so the limit depends on which of them created the
   shared circuit. Roadmap item 1298.
 * A view maintains a property path with `+` or `*` only when its step is made of IRIs,

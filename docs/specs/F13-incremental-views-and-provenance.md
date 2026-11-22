@@ -1659,8 +1659,9 @@ compiler's fallbacks and a window in a subquery against the engine.
 On wally with 200,000 people, a maintained pass of the three windows of
 `window_against_recompute` costs 13 to 17 µs at the median, against 0.8 to 2.1 ms for
 the query evaluated again, which is what each commit cost before. A refill evaluates the
-window's input again and costs about 55 ms on the ages, and 400 commits with 200
-deletions at the front pay it twice. The
+window's input again and costs about 55 ms on the ages. A full reserve takes 100
+deletions at the front, so of the 400 commits with 200 such deletions only the one with
+the 101st deletion should refill. The
 [writes benchmark](../benchmarks/writes/RESULTS.md#ordered-windows-in-views) gives the
 table and its run record.
 
