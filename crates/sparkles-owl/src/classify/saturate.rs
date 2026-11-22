@@ -3820,7 +3820,72 @@ mod horn_accounting_tests {
     }
 
     #[test]
-    fn data_reservation_concurrent_overflow_is_atomic_and_preserves_winner() {
+    fn data_reservation_try_debit_concurrent_overflow_is_atomic() {
+        let f = fixture();
+        let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
+        let base = 4096usize;
+        let bounds = Bounds {
+            threads: 2,
+            deadline: None,
+            max_memory: None,
+            cancelled: None,
+            charge: None,
+            base_memory: base,
+            peak_memory: base,
+            dynamic: None,
+            dl: None,
+            partial: false,
+            steps: false,
+        };
+        let run = run(&f.ix, &ctx, &bounds);
+        // Individually representable (< isize::MAX), but base + 2 * bytes overflows usize.
+        let bytes = isize::MAX as usize - 1024;
+        assert!(base.checked_add(bytes).is_some());
+        assert!(
+            base.checked_add(bytes)
+                .unwrap()
+                .checked_add(bytes)
+                .is_none()
+        );
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let results: Vec<Option<usize>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let run = &run;
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    s.spawn(move || {
+                        BEFORE_DEBIT.with(|slot| *slot.borrow_mut() = Some(barrier));
+                        let res = run.try_debit(bytes);
+                        BEFORE_DEBIT.with(|slot| *slot.borrow_mut() = None);
+                        // Leave the successful debit active until both attempts finish.
+                        res
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            results.iter().filter(|r| r.is_some()).count(),
+            1,
+            "exactly one concurrent try_debit must succeed: {results:?}"
+        );
+        assert_eq!(
+            results.iter().filter(|r| r.is_none()).count(),
+            1,
+            "the overflowing concurrent try_debit must return None: {results:?}"
+        );
+        assert_eq!(
+            results.iter().flatten().copied().collect::<Vec<_>>(),
+            vec![base + bytes]
+        );
+        assert_eq!(run.stop.load(Ordering::Relaxed), STOP_NONE);
+        assert_eq!(run.memory.load(Ordering::Relaxed), base + bytes);
+        run.credit(bytes);
+        assert_eq!(run.memory.load(Ordering::Relaxed), base);
+    }
+
+    #[test]
+    fn data_reservation_concurrent_overflow_stops_and_preserves_accounting() {
         let f = fixture();
         let ctx: Contexts = (0..f.size).map(|_| OnceLock::new()).collect();
         let base = 4096usize;
@@ -3873,49 +3938,53 @@ mod horn_accounting_tests {
                         };
                         let ok = out.reserve_data(bytes);
                         BEFORE_DEBIT.with(|slot| *slot.borrow_mut() = None);
-                        // Leave the winner's debit held until the loser finishes checking.
+                        // Leave any granted debit held until both attempts finish.
                         ok
                     })
                 })
                 .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        assert_eq!(
-            results.iter().filter(|&&ok| ok).count(),
-            1,
-            "exactly one concurrent debit may succeed: {results:?}"
+        // Either the atomic winner finishes check_debit before the overflowing peer halts
+        // (1 grant) or observes STOP_MEMORY first and credits its own debit back (0 grants).
+        let granted = results.iter().filter(|&&ok| ok).count();
+        assert!(
+            granted <= 1,
+            "at most one concurrent reservation may be granted: {results:?}"
         );
         assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
         assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
         assert_eq!(
             run.memory.load(Ordering::Relaxed),
-            base + bytes,
-            "the winning debit must remain intact after the overflowing peer fails"
+            base + granted * bytes,
+            "debited memory must match the granted reservation count ({granted})"
         );
-        // Releasing the winner's single granted reservation restores base.
-        let mut marks = Marks::default();
-        let (mut local, mut woke, mut outbox) = (Vec::new(), VecDeque::new(), Outbox::default());
-        let mut out = Out {
-            run: &run,
-            me: f.root,
-            local: &mut local,
-            woke: &mut woke,
-            outbox: &mut outbox,
-            marks: &mut marks,
-            pending: false,
-            sent: 0,
-            work: 0,
-            kept: 0,
-        };
-        out.release_data(bytes);
+        if granted == 1 {
+            let mut marks = Marks::default();
+            let (mut local, mut woke, mut outbox) =
+                (Vec::new(), VecDeque::new(), Outbox::default());
+            let mut out = Out {
+                run: &run,
+                me: f.root,
+                local: &mut local,
+                woke: &mut woke,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            out.release_data(bytes);
+        }
         assert_eq!(run.memory.load(Ordering::Relaxed), base);
     }
 
     #[test]
     fn data_reservation_rejected_before_debit_preserves_other_debit_and_kept() {
-        // 32 x 32 premises gives a representable fold_slack (~197 KB) larger than the
-        // initial DlRun table (~66 KB) plus headroom, so base + first + dl_bytes fits in
-        // usize while base + first + fold_slack overflows run.memory before debit.
+        // 32 x 32 premises gives a representable fold_slack larger than the remaining
+        // headroom (`room = dl.bytes() + 4096`), so `base + first + dl.bytes()` fits in
+        // `usize` while `base + first + fold_slack` overflows `run.memory` before debit.
         let (ix, dl, mut st, cid, _, _) =
             super::dl_root::tests::multi_list_return(super::dl_rules::MREPAIR_ON, &[32, 32]);
         let ctx: Contexts = (0..16).map(|_| OnceLock::new()).collect();
@@ -3974,8 +4043,9 @@ mod horn_accounting_tests {
             };
             out2.keep_data(500);
             assert_eq!(out2.kept, 500);
-            // rret requests a representable fold_slack (2,000 B) that overflows base + first
-            // before debit; its cleanup must leave out1's debit and out2's kept untouched.
+            // rret requests a representable fold_slack larger than the remaining headroom
+            // (`room`), so `base + first + fold_slack` overflows `run.memory` before debit;
+            // its cleanup must leave out1's debit and out2's kept untouched.
             assert!(super::dl_root::rret(&ix, &mut st, cid, &mut out2));
             assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
             assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
