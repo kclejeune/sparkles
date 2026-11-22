@@ -765,8 +765,8 @@ impl Classification {
     /// [`Excluded`] can name them.
     pub fn leave_out_unmapped(&mut self, u: Unmapped) {
         if u.count > 0 {
-            self.stats.unmapped += u.count;
-            self.unmapped = u;
+            self.unmapped = std::mem::take(&mut self.unmapped).merge(&u);
+            self.stats.unmapped = self.unmapped.count;
             self.not_all_read();
         }
     }
@@ -4443,6 +4443,44 @@ mod tests {
             }
             true
         }
+    }
+
+    /// Unmapped triples left out in two calls add up: the count and the list keep the
+    /// first call's triples, and an empty call changes nothing.
+    #[test]
+    fn a_second_set_of_unmapped_triples_adds_to_the_first() {
+        let t = ofn("Declaration(Class(:A)) Declaration(Class(:B)) SubClassOf(:A :B)");
+        let kinds: Vec<&AxiomKind> = t.iter().map(|a| &a.kind).collect();
+        let mut out = Saturation::new()
+            .classify(&kinds, None, &Limits::default())
+            .unwrap();
+        assert!(out.complete);
+        let triple = |s: &str| {
+            oxrdf::Triple::new(
+                oxrdf::NamedNode::new_unchecked(format!("http://ex.org/{s}")),
+                oxrdf::NamedNode::new_unchecked(crate::vocab::RDFS_DOMAIN),
+                oxrdf::NamedNode::new_unchecked("http://ex.org/A"),
+            )
+        };
+        let one = |s: &str| Unmapped::default().extend([&triple(s)]);
+        out.leave_out_unmapped(one("p"));
+        out.leave_out_unmapped(Unmapped::default());
+        out.leave_out_unmapped(one("q"));
+        assert_eq!(out.stats.unmapped, 2);
+        assert_eq!(out.unmapped.count, 2);
+        assert_eq!(out.unmapped.triples, vec![triple("p"), triple("q")]);
+        assert!(!out.unmapped.truncated && !out.complete);
+        assert_eq!(out.consistency, Consistency::Unknown);
+        // past the cap the count goes on and the list is truncated
+        let many: Vec<oxrdf::Triple> = (0..UNMAPPED_LISTED)
+            .map(|i| triple(&format!("r{i}")))
+            .collect();
+        out.leave_out_unmapped(Unmapped::default().extend(&many));
+        assert_eq!(out.stats.unmapped, UNMAPPED_LISTED + 2);
+        assert_eq!(out.unmapped.count, UNMAPPED_LISTED + 2);
+        assert_eq!(out.unmapped.triples.len(), UNMAPPED_LISTED);
+        assert_eq!(out.unmapped.triples[..2], [triple("p"), triple("q")]);
+        assert!(out.unmapped.truncated);
     }
 
     /// Any dropped axiom with logical content leaves the answer incomplete, every class of

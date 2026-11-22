@@ -76,6 +76,9 @@ pub struct OntologyFile {
     pub warnings: Vec<String>,
     /// the triples outside the terminology, in the order a store scans them
     assertions: Vec<Triple>,
+    /// the triples that map to no axiom of the input a chained command read before the
+    /// document this file holds, which its classifications count as left out
+    carried: Unmapped,
     /// an empty database with the file's prefixes, for the dataset defaults and the
     /// renderer a load of the file gives
     ds: Dataset,
@@ -210,6 +213,7 @@ impl OntologyFile {
             imports,
             warnings,
             assertions,
+            carried: Unmapped::default(),
             ds,
         })
     }
@@ -219,11 +223,14 @@ impl OntologyFile {
     /// functional-style document splits them: an assertion that a store would stream
     /// becomes its triples, which `assertions` options then include or leave out, and
     /// every other axiom is in the terminology as it is. The imports of the header do not
-    /// resolve, as a file's do not.
+    /// resolve, as a file's do not. `unmapped` are the triples of the input the document
+    /// was read from that map to no axiom, which the document has lost and which the
+    /// file's classifications count as left out, as a classification of that input does.
     pub fn from_document(
         name: String,
         doc: sparkles_owl::transform::Document,
         prefixes: BTreeMap<String, String>,
+        unmapped: Unmapped,
     ) -> Result<OntologyFile> {
         let imports: Vec<String> = doc
             .header
@@ -261,7 +268,7 @@ impl OntologyFile {
         });
         assertions.dedup();
         let ontology = read::Ontology::from_axioms(doc.header, terminology, Mode::Lenient);
-        OntologyFile::new(
+        let mut file = OntologyFile::new(
             name,
             RdfSyntax::OwlFunctional,
             ontology,
@@ -269,7 +276,9 @@ impl OntologyFile {
             prefixes,
             (imports, Vec::new()),
             &OntologyRequest::default(),
-        )
+        )?;
+        file.carried = unmapped;
+        Ok(file)
     }
 
     /// The header and every axiom of the file, the terminology and the assertions that
@@ -296,7 +305,8 @@ impl OntologyFile {
             Ok(true)
         })?;
         let unmapped =
-            super::classify::unmapped_of(&self.ontology, &unread, &std::cell::RefCell::new(None));
+            super::classify::unmapped_of(&self.ontology, &unread, &std::cell::RefCell::new(None))
+                .merge(&self.carried);
         let (header, terminology): (_, Vec<Axiom>) = match Arc::try_unwrap(self.ontology) {
             Ok(o) => (o.header, o.axioms.into_keys().collect()),
             Err(o) => (o.header.clone(), o.axioms.keys().cloned().collect()),
@@ -418,7 +428,8 @@ impl OntologyFile {
             .is_ok()
         };
         let dropped = (!c.assertions).then_some(&mut dropped as &mut Dropped<'_>);
-        let unmapped = || super::classify::unmapped_of(&self.ontology, &unread, &seen);
+        let unmapped =
+            || super::classify::unmapped_of(&self.ontology, &unread, &seen).merge(&self.carried);
         let (classification, excluded) = classify_once(&axioms, c, &opts, dropped, &unmapped)?;
         if c.strict && !classification.complete {
             return Err(super::classify::refuse_strict(
@@ -619,8 +630,10 @@ fn from_triples(
             }
         }
     }
-    // the assertions: every other triple, but not a class assertion of a structural type
-    // or a class expression, which the terminology reads or leaves out
+    // the assertions: every other triple, but not a class assertion of a structural type,
+    // which the terminology reads or leaves out. A class assertion of a blank node is
+    // taken above when the blank node is a class expression the terminology reads, and
+    // otherwise stays an assertion, which maps to no axiom.
     let rest: Vec<bool> = triples
         .iter()
         .enumerate()
@@ -628,6 +641,7 @@ fn from_triples(
             !taken[i]
                 && !main[i]
                 && !(t.predicate.as_str() == vocab::RDF_TYPE
+                    && matches!(&t.object, Term::NamedNode(_))
                     && read::is_terminological(t, &|_| false))
         })
         .collect();

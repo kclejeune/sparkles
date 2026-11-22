@@ -217,6 +217,9 @@ struct Inner {
     /// the main triples of reified axioms whose predicate is not terminological, read
     /// eagerly with their `owl:Axiom` node and left out of the assertion stream
     mains: FxHashSet<[Id; 4]>,
+    /// the blank nodes whose class assertions `x rdf:type _:c` were read eagerly, as
+    /// the class expressions of the terminology
+    class_nodes: FxHashSet<Id>,
 }
 
 /// One kept ontology.
@@ -802,15 +805,23 @@ struct Stream<'a> {
 impl Stream<'_> {
     /// The triple of a stored quad when it is an assertion the read left in the store:
     /// not terminological, not the main triple of an annotated axiom the read holds, and
-    /// not a class assertion of a structural type or a class expression.
+    /// not a class assertion of a structural type or of a class expression the read
+    /// collected. A class assertion whose blank-node class the read did not collect
+    /// stays in the stream, where it maps to no axiom.
     fn assertion(o: &Opened, rdf_type: Option<Id>, q: &[Id; 4]) -> Option<Triple> {
         let inner = &o.inner;
         if inner.terminological.contains(&q[1]) || inner.mains.contains(q) {
             return None;
         }
         let t = triple_of(&o.snapshot, q)?;
-        // class assertions with a structural type or a class expression were read
-        if Some(q[1]) == rdf_type && read::is_terminological(&t, &|_| false) {
+        // class assertions with a structural type or a collected class expression were
+        // read
+        if Some(q[1]) == rdf_type
+            && match &t.object {
+                Term::BlankNode(_) => inner.class_nodes.contains(&q[2]),
+                _ => read::is_terminological(&t, &|_| false),
+            }
+        {
             return None;
         }
         Some(t)
@@ -1910,6 +1921,7 @@ fn read_store(
         opts,
     };
     let mut terminological: FxHashSet<Id> = FxHashSet::default();
+    let mut class_nodes: FxHashSet<Id> = FxHashSet::default();
     let predicates = vocab::STRUCTURAL_PREDICATES
         .iter()
         .chain(vocab::FACETS.iter())
@@ -1954,6 +1966,7 @@ fn read_store(
         for b in bnodes {
             check(opts)?;
             c.prefix(&[rdf_type.0, b.0])?;
+            class_nodes.insert(b);
         }
     }
     // the main triples of reified axioms whose predicate was not read: an annotated
@@ -2001,7 +2014,7 @@ fn read_store(
         graph_ids.len(),
         requested,
         mode,
-        (terminological, mains),
+        (terminological, mains, class_nodes),
     )
 }
 
@@ -2049,7 +2062,7 @@ fn finish(
     graphs: usize,
     requested: usize,
     mode: Mode,
-    (terminological, mains): (FxHashSet<Id>, FxHashSet<[Id; 4]>),
+    (terminological, mains, class_nodes): (FxHashSet<Id>, FxHashSet<[Id; 4]>, FxHashSet<Id>),
 ) -> Result<(read::Ontology, Inner)> {
     let mut triples = Vec::with_capacity(quads.len());
     let mut graph_of = Vec::with_capacity(quads.len());
@@ -2086,6 +2099,7 @@ fn finish(
             graph_ids,
             terminological,
             mains,
+            class_nodes,
         },
     ))
 }

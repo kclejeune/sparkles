@@ -691,6 +691,9 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   `unmapped` statistic and leaves the answer incomplete in the same way, with or without
   `assertions`. The answer lists the first 100 such triples in `unmappedTriples`, with
   `unmappedTruncated` when there are more, as the OWL API reports its unparsed triples.
+  A class assertion of a blank node that no triple describes is such a triple too, and a
+  classification later in a ROBOT chain counts the unmapped triples of the chain's input.
+  A `check` later in a chain checks the mapped document and does not report them.
   A typing as `rdf:Property` alone, as RDFS vocabularies type their properties, carries
   no logical content and is not counted.
   The kept classification's outcome reports the count as `unmappedCount`, and the

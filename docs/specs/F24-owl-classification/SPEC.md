@@ -4652,7 +4652,13 @@ has logical content or maps to no axiom, so it counts and lists at most one unma
 assertion triple. A file in functional-style syntax
 whose entities are all declared reads without the store and has no unmapped triples. One
 with an undeclared entity takes the store's reading, in which a domain or range of an
-undeclared property is such a triple. A typing as `rdf:Property` alone, as RDFS
+undeclared property is such a triple. A class assertion whose class is a blank node that
+no triple of the terminology describes, such as `:x a _:c` alone, is one too. A
+classification later in a ROBOT chain, such as `relax` followed by `classify`, counts the
+unmapped triples of the input that the chain read, while a `check` there checks the
+mapped document, which has lost them, as roadmap item 1311 records. A classification with
+unmapped triples still runs the modules' pass for its left-out axioms, whose answer the
+unmapped triples then override, and roadmap item 1309 records skipping it. A typing as `rdf:Property` alone, as RDFS
 vocabularies type their properties, carries no logical content, so a classification does
 not count it, while the read and the profile checks still report it as unmapped. The GO and ChEBI lite releases in RDF/XML, and stores of
 OWL2Bench and of LUBM with their assertions, count no unmapped triple. The triples of a SWRL rule are not unmapped, since

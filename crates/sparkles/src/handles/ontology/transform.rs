@@ -113,9 +113,15 @@ impl WorkingOntology {
         })
     }
 
-    /// The ontology as a file that `classify` and `check` read.
+    /// The ontology as a file that `classify` and `check` read, whose classifications
+    /// count the input's triples that map to no axiom as left out.
     pub fn to_file(&self) -> Result<OntologyFile> {
-        OntologyFile::from_document(self.name.clone(), self.doc.clone(), self.prefixes.clone())
+        OntologyFile::from_document(
+            self.name.clone(),
+            self.doc.clone(),
+            self.prefixes.clone(),
+            self.unmapped.clone(),
+        )
     }
 
     /// A renderer with the input's prefixes.
@@ -452,5 +458,62 @@ EquivalentClasses(:D ObjectIntersectionOf(:C ObjectSomeValuesFrom(:p :B)))
             .reason(&ReasonOptions::default(), &strict, &QueryOptions::default())
             .unwrap_err();
         assert!(format!("{err:?}").contains("map to no axiom"), "{err:?}");
+    }
+
+    /// A file of the working ontology, as a chained command classifies it, counts the
+    /// input's triples that map to no axiom, which the document has lost: here an
+    /// undeclared property's domain and a class assertion of a blank node that no triple
+    /// describes. Its classification answers incomplete after a reason that is not
+    /// strict, and a strict one refuses.
+    #[test]
+    fn a_file_of_the_working_ontology_counts_the_unmapped_triples() {
+        let d = tempfile::tempdir().unwrap();
+        let input = d.path().join("o.ttl");
+        std::fs::write(
+            &input,
+            "@prefix : <http://ex.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             :A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A .
+             :p rdfs:domain :A . :x a _:missing .",
+        )
+        .unwrap();
+        let mut w = read(&input);
+        assert_eq!(w.unmapped.count, 2, "{:?}", w.unmapped);
+        assert!(
+            w.unmapped
+                .triples
+                .iter()
+                .any(|t| t.predicate.as_str() == sparkles_owl::vocab::RDF_TYPE
+                    && matches!(t.object, oxrdf::Term::BlankNode(_))),
+            "{:?}",
+            w.unmapped
+        );
+        w.reason(
+            &ReasonOptions::default(),
+            &ClassifyRequest::default(),
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let file = w.to_file().unwrap();
+        for assertions in [false, true] {
+            let c = ClassifyRequest {
+                assertions,
+                ..Default::default()
+            };
+            let out = file.classify(&c, &QueryOptions::default()).unwrap();
+            let k = &out.classification;
+            assert!(!k.complete, "assertions {assertions}");
+            assert_eq!(k.unmapped, w.unmapped, "assertions {assertions}");
+            let strict = ClassifyRequest { strict: true, ..c };
+            let Err(err) = file.classify(&strict, &QueryOptions::default()) else {
+                panic!("assertions {assertions}: a strict run answered");
+            };
+            assert!(err.to_string().contains("map to no axiom"), "{err}");
+        }
+        // the document a file of the working ontology hands on keeps them too
+        let (_, unmapped) = file
+            .into_counted_document(&QueryOptions::default())
+            .unwrap();
+        assert_eq!(unmapped, w.unmapped);
     }
 }

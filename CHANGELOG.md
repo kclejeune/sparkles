@@ -18,8 +18,9 @@ left out under the rule `assertion-not-read`, so an ontology with individuals an
 incomplete, with every class incomplete and the consistency `unknown`, until it is
 classified with them. A class that only such an assertion names shows only through
 `complete` and that entry. A triple that maps to no axiom, such as the domain of an
-undeclared property, is counted in the new `unmapped` statistic and
-leaves the answer incomplete in the same way (roadmap item 1276). The
+undeclared property or a class assertion of a blank node that no triple describes, is
+counted in the new `unmapped` statistic and leaves the answer incomplete in the same way,
+also in a classification later in a ROBOT chain (roadmap item 1276). The
 new `strict` option, `--strict` on `sparkles ontology classify` and `--strict true` on
 ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the error
 `classification-incomplete`, HTTP 422. ROBOT's commands are strict by default with

@@ -483,3 +483,99 @@ fn what_the_triples_could_read_otherwise_is_left_to_the_store() {
         compare_or_refuse(&format!("case{i}.ttl"), c, true);
     }
 }
+
+/// A class assertion whose class is a blank node that no triple of the terminology
+/// describes maps to no axiom on both paths: it is neither read nor dropped, so every
+/// classification counts it and answers incomplete, and a strict one refuses.
+#[test]
+fn a_class_assertion_of_an_undescribed_blank_node_maps_to_no_axiom() {
+    let text = "@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:A a owl:Class . :B a owl:Class . :Nucleus a owl:Class . :A rdfs:subClassOf :B .
+:p a owl:ObjectProperty .
+:x a _:missing .
+:y a [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] .
+";
+    compare("missing.ttl", text);
+    let d = tempfile::tempdir().unwrap();
+    let path = d.path().join("missing.ttl");
+    std::fs::write(&path, text).unwrap();
+    let req = OntologyRequest::default();
+    let file = OntologyFile::read(&path, &req, 4).unwrap().unwrap();
+    let ds = Dataset::memory();
+    let src = sparkles::io::Source::from_path(&path, None).unwrap();
+    ds.store().load(&[src]).unwrap();
+    for assertions in [false, true] {
+        let c = ClassifyRequest {
+            assertions,
+            ..Default::default()
+        };
+        let f = file
+            .classify(&c, &Default::default())
+            .unwrap()
+            .classification;
+        let s = ds
+            .ontology()
+            .classify(&req, &c, &Default::default())
+            .unwrap()
+            .classification;
+        for (path, k) in [("file", &f), ("store", &s)] {
+            assert!(!k.complete, "{path} assertions {assertions}");
+            assert_eq!(k.unmapped.count, 1, "{path} assertions {assertions}");
+            let t = &k.unmapped.triples[0];
+            assert!(
+                t.subject.to_string() == "<http://ex.org/x>"
+                    && t.predicate.as_str() == sparkles::owl::vocab::RDF_TYPE
+                    && matches!(t.object, oxrdf::Term::BlankNode(_)),
+                "{path} {t}"
+            );
+        }
+        let strict = ClassifyRequest { strict: true, ..c };
+        assert!(file.classify(&strict, &Default::default()).is_err());
+        assert!(
+            ds.ontology()
+                .classify(&req, &strict, &Default::default())
+                .is_err()
+        );
+    }
+    // a check of the assertions reports the triple as one that maps to no axiom
+    let check = CheckRequest {
+        profiles: vec![Profile::Dl],
+        ..Default::default()
+    };
+    for (path, reports) in [
+        ("file", file.check(&check, &Default::default()).unwrap()),
+        (
+            "store",
+            ds.ontology()
+                .check(&req, &check, &Default::default())
+                .unwrap(),
+        ),
+    ] {
+        let dl = &reports[0];
+        assert!(!dl.conforms, "{path}: {dl:?}");
+        assert!(
+            dl.violations
+                .iter()
+                .any(|v| v.message.contains("maps to no axiom") && v.message.contains("_:")),
+            "{path}: {:?}",
+            dl.violations
+        );
+    }
+    // a strict read counts it too
+    let strict_read = OntologyRequest {
+        mode: Mode::Strict,
+        ..Default::default()
+    };
+    let k = ds
+        .ontology()
+        .classify(
+            &strict_read,
+            &ClassifyRequest::default(),
+            &Default::default(),
+        )
+        .unwrap()
+        .classification;
+    assert!(!k.complete && k.unmapped.count >= 1, "{:?}", k.unmapped);
+}

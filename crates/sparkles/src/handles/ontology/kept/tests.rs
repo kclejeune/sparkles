@@ -1053,6 +1053,16 @@ fn fingerprints_compare_actual_content_and_policies_without_run_ids_or_timing() 
         content_fingerprint(&timing, &a.excluded, &opts()).unwrap(),
         a.publication.content_fingerprint
     );
+    // the count of unmapped triples is part of the outcome, so two answers that differ
+    // only in it differ
+    let mut unmapped = timing.clone();
+    unmapped.stats.unmapped = 1;
+    let one = content_fingerprint(&unmapped, &a.excluded, &opts()).unwrap();
+    unmapped.stats.unmapped = 2;
+    assert_ne!(
+        content_fingerprint(&unmapped, &a.excluded, &opts()).unwrap(),
+        one
+    );
     let other = self::ds(":A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A .");
     let mut taxonomy = a.classification.as_ref().clone();
     taxonomy.taxonomy = classify(&other).classification.taxonomy.clone();

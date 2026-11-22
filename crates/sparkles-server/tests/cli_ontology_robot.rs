@@ -449,6 +449,42 @@ fn reason_names_the_triples_that_map_to_no_axiom() {
     );
     assert_ne!(o.status.code(), Some(0), "{}", err(&o));
     assert!(err(&o).contains("<http://ex.org/p>"), "{}", err(&o));
+    // a classification later in a chain counts the input's unmapped triple as a direct
+    // one does, so it answers incomplete and a strict one refuses
+    let direct = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "u.ttl",
+            "--assertions",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(direct.status.code(), Some(0), "{}", err(&direct));
+    let direct: serde_json::Value = serde_json::from_str(&out(&direct)).unwrap();
+    for chain in [&["relax"][..], &["reason"][..], &["reduce"][..]] {
+        let mut args = vec!["ontology", chain[0], "-i", "u.ttl"];
+        args.extend(&chain[1..]);
+        args.extend(["classify", "--assertions", "--format", "json"]);
+        let o = sparkles(dir, &args);
+        assert_eq!(o.status.code(), Some(0), "{chain:?}: {}", err(&o));
+        let j: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
+        assert_eq!(j["complete"], false, "{chain:?}: {j}");
+        assert_eq!(j["complete"], direct["complete"], "{chain:?}");
+        assert_eq!(j["stats"]["unmapped"], 1, "{chain:?}: {j}");
+        assert_eq!(j["unmappedTriples"], direct["unmappedTriples"], "{chain:?}");
+        assert_ne!(j["consistency"], "consistent", "{chain:?}: {j}");
+        args.push("--strict");
+        let o = sparkles(dir, &args);
+        assert_ne!(o.status.code(), Some(0), "{chain:?}: {}", out(&o));
+        assert!(
+            err(&o).contains("map to no axiom"),
+            "{chain:?}: {}",
+            err(&o)
+        );
+    }
 }
 
 #[test]

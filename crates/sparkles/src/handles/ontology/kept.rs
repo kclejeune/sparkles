@@ -233,6 +233,7 @@ pub(super) fn content_fingerprint(
             cl.complete,
             cl.complete_for_taken,
             ClassNames(&cl.incomplete),
+            cl.stats.unmapped,
         ),
     )?;
     for (i, n) in cl.taxonomy.nodes().iter().enumerate() {
