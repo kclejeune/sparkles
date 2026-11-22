@@ -215,7 +215,7 @@ WORKFLOWS = [
         ".github/workflows/node-packages.yml",
     ]),
 ]
-WORKFLOW_UNMAPPED = {"ci.yml", "server-artifacts.yml", "nix.yml"}
+WORKFLOW_UNMAPPED = {"ci.yml", "server-artifacts.yml", "nix.yml", "codeql.yml"}
 
 
 def workflow_glob(pattern):
