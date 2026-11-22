@@ -194,7 +194,28 @@ impl Walk<'_> {
         if let Some(&i) = self.ids.get(d) {
             return Some(i);
         }
-        let est = std::mem::size_of::<(DataProperty, usize)>() + d.as_str().len() + 32;
+        let map_growth = if self.ids.len() == self.ids.capacity() {
+            self.ids
+                .capacity()
+                .max(8)
+                .saturating_add(8)
+                .saturating_mul(std::mem::size_of::<(DataProperty, usize)>() + 1)
+        } else {
+            0
+        };
+        let vec_growth = if self.parent.len() == self.parent.capacity() {
+            self.parent
+                .capacity()
+                .max(4)
+                .saturating_mul(std::mem::size_of::<usize>() + 1)
+        } else {
+            0
+        };
+        let est = map_growth
+            .saturating_add(vec_growth)
+            .saturating_add(std::mem::size_of::<(DataProperty, usize)>())
+            .saturating_add(d.as_str().len())
+            .saturating_add(32);
         if !self.admit_bytes(est) {
             return None;
         }
@@ -360,7 +381,7 @@ impl Walk<'_> {
             self.scratch = Some(Ranges::new());
         }
         if self.conv_defs.is_none() {
-            let defs_est = self.raw_defs.bytes();
+            let defs_est = self.raw_defs.shallow_bytes();
             if !self.admit_bytes(defs_est) {
                 return false;
             }
@@ -438,16 +459,27 @@ impl Walk<'_> {
                 if iri == vocab::RDFS_LITERAL || Kind::of(iri).is_some() {
                     return true;
                 }
-                let Some(x) = self.raw_defs.map().get(d).cloned() else {
-                    return false;
-                };
                 match self.el_defs.get(d) {
                     Some(Some(b)) => *b,
                     // a definition that names itself
                     Some(None) => false,
                     None => {
-                        let est =
-                            std::mem::size_of::<(Datatype, Option<bool>)>() + d.as_str().len() + 16;
+                        let Some(x) = self.raw_defs.map().get(d).map(std::sync::Arc::clone) else {
+                            return false;
+                        };
+                        let growth = if self.el_defs.len() == self.el_defs.capacity() {
+                            self.el_defs
+                                .capacity()
+                                .max(8)
+                                .saturating_add(8)
+                                .saturating_mul(std::mem::size_of::<(Datatype, Option<bool>)>() + 1)
+                        } else {
+                            0
+                        };
+                        let est = growth
+                            .saturating_add(std::mem::size_of::<(Datatype, Option<bool>)>())
+                            .saturating_add(d.as_str().len())
+                            .saturating_add(16);
                         if !self.admit_bytes(est) {
                             return false;
                         }
@@ -614,7 +646,7 @@ mod tests {
         let mut defs = FxHashMap::default();
         for k in &ax {
             if let AxiomKind::DatatypeDefinition(d, r) = k {
-                defs.insert(d.clone(), r.clone());
+                defs.insert(d.clone(), std::sync::Arc::new(r.clone()));
             }
         }
         Comps::of(&ax, &Defs::new(defs), &|| false).unwrap()

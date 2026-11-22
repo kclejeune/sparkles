@@ -1200,13 +1200,11 @@ fn prepass_and_saturation_admit_memory_before_growing() {
     let tight = full.stats.peak_memory / 2;
     let (granted3, limits3) = make_pool(tight);
     let mut sat3 = Saturation::new();
-    let out3 = sat3
-        .saturate(&fan_refs, None, &limits3)
-        .expect("superrole fan-out over Horn budget falls back to EL");
+    let res3 = sat3.saturate(&fan_refs, None, &limits3);
     assert!(
-        out3.stats.horn_over_budget,
-        "expected horn_over_budget under tight cap {tight}, got {:?}",
-        out3.stats
+        matches!(res3, Err(Error::Memory { .. }))
+            || matches!(res3, Ok(ref o) if o.stats.horn_over_budget),
+        "expected Error::Memory or horn_over_budget under tight cap {tight}, got {res3:?}"
     );
     assert!(granted3.load(Ordering::Relaxed) <= tight);
     assert!(sat3.interner.dt.is_unallocated());
@@ -1305,4 +1303,305 @@ fn tier_d_with_excluded_data_keeps_incremental_reuse() {
         )
         .unwrap();
     assert!(out.stats.incremental, "Tier D run should stay incremental");
+}
+
+#[test]
+fn shrinking_incremental_edit_into_checker_retries_fresh_and_honors_pool_cap() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let make_pool = |cap: usize| {
+        let granted = Arc::new(AtomicUsize::new(0));
+        let g = granted.clone();
+        let limits = Limits {
+            threads: 1,
+            max_memory: Some(cap),
+            charge: Some(Arc::new(move |bytes| {
+                let prev = g.fetch_add(bytes, Ordering::Relaxed);
+                if prev.saturating_add(bytes) > cap {
+                    g.fetch_sub(bytes, Ordering::Relaxed);
+                    false
+                } else {
+                    true
+                }
+            })),
+            ..Limits::default()
+        };
+        (granted, limits)
+    };
+
+    // 1. Large kept EL ontology shrinks via Changes into a small checker ontology under a
+    // budget that fits a fresh run of the small ontology but is smaller than the kept state.
+    let mut big_body = String::new();
+    for i in 0..1500 {
+        big_body.push_str(&format!("SubClassOf(:K{i} :K{})\n", i + 1));
+    }
+    let big_ax = axioms(&big_body);
+    let big_refs: Vec<&AxiomKind> = big_ax.iter().collect();
+    let small_ax = axioms(
+        "SubClassOf(:A DataHasValue(:d \"1\"^^xsd:int))\n\
+         SubClassOf(:A DataAllValuesFrom(:d xsd:string))",
+    );
+    let small_refs: Vec<&AxiomKind> = small_ax.iter().collect();
+
+    let mut fresh = Saturation::new();
+    let fresh_out = fresh
+        .saturate(
+            &small_refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(!fresh.describe(&Class::new("urn:dt:A")).unwrap().satisfiable);
+
+    // Test both same RuleKey (`el_only: false -> false`) and RuleKey change (`true -> false`).
+    for initial_el_only in [false, true] {
+        let mut sat = Saturation::new();
+        let base_out = sat
+            .saturate(
+                &big_refs,
+                None,
+                &Limits {
+                    threads: 1,
+                    el_only: initial_el_only,
+                    ..Limits::default()
+                },
+            )
+            .unwrap();
+        assert!(
+            base_out.stats.memory > fresh_out.stats.peak_memory * 2,
+            "base memory {} must exceed fresh peak {}",
+            base_out.stats.memory,
+            fresh_out.stats.peak_memory
+        );
+        let tight_cap = fresh_out.stats.peak_memory + 32 * 1024;
+        assert!(tight_cap < base_out.stats.memory);
+        let (granted, limits) = make_pool(tight_cap);
+        let inc_out = sat
+            .saturate(
+                &small_refs,
+                Some(Changes {
+                    added: &small_refs,
+                    removed: &big_refs,
+                }),
+                &limits,
+            )
+            .expect("shrinking edit must drop dead kept state and succeed fresh");
+        assert!(!sat.describe(&Class::new("urn:dt:A")).unwrap().satisfiable);
+        assert!(granted.load(Ordering::Relaxed) <= tight_cap);
+        assert!(
+            granted.load(Ordering::Relaxed) >= inc_out.stats.peak_memory,
+            "pool grant {} must cover peak_memory {}",
+            granted.load(Ordering::Relaxed),
+            inc_out.stats.peak_memory
+        );
+    }
+
+    // 2. Pool-cap saturation check: shrinking a large kept EL ontology into a checker
+    // ontology whose saturation grows well past its build peak must NOT bypass the pool cap.
+    let mut sat_heavy = String::from(
+        "TransitiveObjectProperty(:part_of)\n\
+         InverseObjectProperties(:part_of :has_part)\n\
+         SubClassOf(:FilopodiumMembrane :Membrane)\n\
+         SubClassOf(:FilopodiumMembrane ObjectSomeValuesFrom(:part_of :Filopodium))\n\
+         SubClassOf(:Filopodium ObjectSomeValuesFrom(:part_of :Cytoskeleton))\n\
+         SubClassOf(:Cytoskeleton :Organelle)\n\
+         EquivalentClasses(:MembraneBounded ObjectIntersectionOf(:Organelle ObjectSomeValuesFrom(:has_part :Membrane)))\n\
+         EquivalentClasses(:OrganelleMembrane ObjectIntersectionOf(:Membrane ObjectSomeValuesFrom(:part_of :MembraneBounded)))\n",
+    );
+    // 10 distinct small ranges combined across 45 classes produce many distinct dt_sat
+    // cache keys and range meets during saturation while keeping build small.
+    for i in 0..10 {
+        sat_heavy.push_str(&format!(
+            "SubClassOf(DataSomeValuesFrom(:d DatatypeRestriction(xsd:int xsd:minInclusive \"{i}\"^^xsd:int)) :G{i})\n"
+        ));
+    }
+    for i in 0..10 {
+        for j in (i + 1)..10 {
+            sat_heavy.push_str(&format!(
+                "SubClassOf(:P{i}_{j} DataSomeValuesFrom(:d DatatypeRestriction(xsd:int xsd:minInclusive \"{i}\"^^xsd:int)))\n\
+                 SubClassOf(:P{i}_{j} DataAllValuesFrom(:d DatatypeRestriction(xsd:int xsd:maxInclusive \"{j}\"^^xsd:int)))\n"
+            ));
+        }
+    }
+    let fan_ax = axioms(&sat_heavy);
+    let fan_refs: Vec<&AxiomKind> = fan_ax.iter().collect();
+    let mut uncap_fan = Saturation::new();
+    let full_fan = uncap_fan
+        .saturate(
+            &fan_refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    let mut el_fan = Saturation::new();
+    let el_fan_out = el_fan
+        .saturate(
+            &fan_refs,
+            None,
+            &Limits {
+                threads: 1,
+                el_only: true,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    assert!(
+        full_fan.stats.peak_memory > el_fan_out.stats.peak_memory * 2,
+        "full peak {} vs el peak {}",
+        full_fan.stats.peak_memory,
+        el_fan_out.stats.peak_memory
+    );
+    let pool_cap = full_fan.stats.peak_memory - 1;
+    let mut sat_pool = Saturation::new();
+    sat_pool
+        .saturate(
+            &big_refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    let granted_pool = Arc::new(AtomicUsize::new(0));
+    let gp = granted_pool.clone();
+    let pool_only_limits = Limits {
+        threads: 1,
+        max_memory: None,
+        charge: Some(Arc::new(move |bytes| {
+            let prev = gp.fetch_add(bytes, Ordering::Relaxed);
+            if prev.saturating_add(bytes) > pool_cap {
+                gp.fetch_sub(bytes, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        })),
+        ..Limits::default()
+    };
+    let out_pool = sat_pool
+        .saturate(
+            &fan_refs,
+            Some(Changes {
+                added: &fan_refs,
+                removed: &big_refs,
+            }),
+            &pool_only_limits,
+        )
+        .expect("Horn saturation over pool cap falls back to EL");
+    assert!(out_pool.stats.horn_over_budget);
+    assert!(granted_pool.load(Ordering::Relaxed) <= pool_cap);
+
+    // 3. Kept EL ontology with a large exact integer literal: adding a refused data axiom
+    // does not double-count the numeric ledger.
+    let big_digits = "9".repeat(4000);
+    let num_base = axioms(&format!(
+        "SubClassOf(:A DataHasValue(:n \"{big_digits}\"^^xsd:integer))"
+    ));
+    let num_add = axioms(
+        "SubClassOf(:X DataAllValuesFrom(:d DatatypeRestriction(xsd:string xsd:pattern \"a*\")))",
+    );
+    let mut num_all = num_base.clone();
+    num_all.extend(num_add.clone());
+    let num_base_refs: Vec<&AxiomKind> = num_base.iter().collect();
+    let num_all_refs: Vec<&AxiomKind> = num_all.iter().collect();
+    let num_add_refs: Vec<&AxiomKind> = num_add.iter().collect();
+
+    let mut fresh_num = Saturation::new();
+    let fresh_num_out = fresh_num
+        .saturate(
+            &num_all_refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    let mut inc_num = Saturation::new();
+    inc_num
+        .saturate(
+            &num_base_refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    let (granted_num, limits_num) = make_pool(fresh_num_out.stats.peak_memory + 16 * 1024);
+    let inc_num_out = inc_num
+        .saturate(
+            &num_all_refs,
+            Some(Changes {
+                added: &num_add_refs,
+                removed: &[],
+            }),
+            &limits_num,
+        )
+        .expect("numeric ledger must not be counted twice");
+    assert!(inc_num_out.consistent);
+    assert!(granted_num.load(Ordering::Relaxed) <= fresh_num_out.stats.peak_memory + 16 * 1024);
+}
+
+#[test]
+fn dt_index_copy_admits_memory_before_cloning() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // Build an ontology with many distinct checker ranges so `it.dt.ranges()` is large.
+    let mut body = String::new();
+    for i in 0..80 {
+        body.push_str(&format!(
+            "SubClassOf(:A{i} DataSomeValuesFrom(:d DataOneOf(\"{i:0>120}\"^^xsd:string \"x{i:0>120}\"^^xsd:string)))\n"
+        ));
+    }
+    let ax = axioms(&body);
+    let refs: Vec<&AxiomKind> = ax.iter().collect();
+    let mut uncap = Saturation::new();
+    let full = uncap
+        .saturate(
+            &refs,
+            None,
+            &Limits {
+                threads: 1,
+                ..Limits::default()
+            },
+        )
+        .unwrap();
+    let ix_dt_bytes = uncap.index.as_ref().unwrap().dt.as_ref().unwrap().bytes();
+    assert!(ix_dt_bytes > 20_000);
+    // Cap well below `full.stats.peak_memory` so `dt_index` refuses before copying.
+    let cap = full.stats.peak_memory.saturating_sub(ix_dt_bytes / 2);
+    let granted = Arc::new(AtomicUsize::new(0));
+    let g = granted.clone();
+    let limits = Limits {
+        threads: 1,
+        max_memory: Some(cap),
+        charge: Some(Arc::new(move |bytes| {
+            let prev = g.fetch_add(bytes, Ordering::Relaxed);
+            if prev.saturating_add(bytes) > cap {
+                g.fetch_sub(bytes, Ordering::Relaxed);
+                false
+            } else {
+                true
+            }
+        })),
+        ..Limits::default()
+    };
+    let mut sat = Saturation::new();
+    let res = sat.saturate(&refs, None, &limits);
+    assert!(
+        matches!(res, Err(Error::Memory { .. }))
+            || matches!(res, Ok(ref o) if o.stats.horn_over_budget),
+        "expected memory refusal or Horn fallback under cap {cap}, got {res:?}"
+    );
+    assert!(granted.load(Ordering::Relaxed) <= cap);
 }

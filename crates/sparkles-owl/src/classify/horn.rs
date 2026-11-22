@@ -1408,11 +1408,9 @@ impl Norm<'_> {
             // the atoms do not read, and one of a reserved name stay out.
             K::DatatypeDefinition(d, r)
                 if !vocab::is_reserved(d.as_str())
-                    && self
-                        .it
-                        .dt_run
-                        .as_ref()
-                        .is_some_and(|run| run.defs.map().get(d) == Some(r)) =>
+                    && self.it.dt_run.as_ref().is_some_and(|run| {
+                        run.defs.map().get(d).map(std::sync::Arc::as_ref) == Some(r)
+                    }) =>
             {
                 self.it.dt_range(&DataRange::Datatype(d.clone()))?;
                 Ok(())

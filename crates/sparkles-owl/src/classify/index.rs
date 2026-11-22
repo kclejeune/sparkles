@@ -1712,7 +1712,7 @@ fn normalize_axiom(
             if it
                 .dt_run
                 .as_ref()
-                .is_some_and(|run| run.defs.map().get(d) != Some(range))
+                .is_some_and(|run| run.defs.map().get(d).map(std::sync::Arc::as_ref) != Some(range))
             {
                 partial = Some("another definition of the same datatype supersedes this one");
             }
@@ -2799,7 +2799,7 @@ impl Index {
         if ax.dl.is_none()
             && let Some(run) = it.dt_run.as_deref()
         {
-            ix.dt = Some(Box::new(dt_index(ax, it, run, &ix, &b, refire)));
+            ix.dt = Some(Box::new(dt_index(ax, it, run, &ix, &b, refire)?));
         }
         Ok(ix)
     }
@@ -2815,8 +2815,54 @@ fn dt_index(
     ix: &Index,
     b: &Builder,
     refire: FxHashMap<Ex, Vec<u32>>,
-) -> super::dt_sat::DtIx {
+) -> Result<super::dt_sat::DtIx, Halt> {
     use super::dt_sat::{Body, DtIx, RoleIx};
+    let supers_bytes: usize = ix.roles.sup.iter().map(|v| v.len().saturating_mul(4)).sum();
+    let roles_est = it
+        .roles
+        .len()
+        .saturating_mul(2)
+        .saturating_mul(std::mem::size_of::<(Role, RoleIx)>() + 64)
+        .saturating_add(supers_bytes.saturating_mul(2))
+        .saturating_add(ax.dt_ranges.len().saturating_mul(8));
+    let told_bytes: usize = b
+        .dt_body
+        .iter()
+        .map(|&e| ix.told_of(ix.head(e)).len().saturating_mul(4))
+        .sum();
+    let body_est = run
+        .comps
+        .len()
+        .saturating_mul(std::mem::size_of::<Vec<Body>>())
+        .saturating_add(
+            b.dt_body
+                .len()
+                .saturating_mul(2)
+                .saturating_mul(std::mem::size_of::<Body>() + 32),
+        )
+        .saturating_add(told_bytes);
+    let disjoint_est = ax.dt_disjoint.len().saturating_mul(16);
+    let clone_est = it
+        .dt
+        .atoms
+        .len()
+        .saturating_mul(std::mem::size_of::<DtKey>())
+        .saturating_add(it.dt.ranges().map_or(0, |r| r.bytes()))
+        .saturating_add(run.comps.bytes());
+    let refire_est: usize = refire.values().map(|v| 16 + v.capacity() * 4).sum();
+    let total_est = roles_est
+        .saturating_add(body_est)
+        .saturating_add(disjoint_est)
+        .saturating_add(clone_est)
+        .saturating_add(refire_est)
+        .saturating_add(256);
+    let mut guard = it.ranges.budget.as_ref().map(|b| b.scratch_guard());
+    if let Some(g) = guard.as_mut() {
+        g.grow(total_est).map_err(|e| match e {
+            super::Error::Memory { used, .. } => Halt::Memory(used),
+            _ => Halt::Stopped,
+        })?;
+    }
     let mut roles: FxHashMap<Role, RoleIx> = FxHashMap::default();
     for (r, name) in it.roles.iter().enumerate() {
         if let RoleName::Data(d) = name
@@ -2905,7 +2951,7 @@ fn dt_index(
         .collect();
     disjoint.sort_unstable();
     disjoint.dedup();
-    DtIx::new(
+    let dt_ix = DtIx::new(
         it.dt.atoms.clone(),
         roles,
         body,
@@ -2913,7 +2959,14 @@ fn dt_index(
         it.dt.ranges().cloned().unwrap_or_default(),
         run.comps.clone(),
         refire,
-    )
+    );
+    if let Some(g) = guard {
+        g.commit_retained(dt_ix.bytes()).map_err(|e| match e {
+            super::Error::Memory { used, .. } => Halt::Memory(used),
+            _ => Halt::Stopped,
+        })?;
+    }
+    Ok(dt_ix)
 }
 
 /// The component of a checker atom, by its role, when the run's axioms reach it.

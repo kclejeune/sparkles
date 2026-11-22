@@ -1117,6 +1117,25 @@ pub type Rid = u32;
 
 /// The interned ranges of one run, with the meets, joins and complements already
 /// computed.
+fn map_growth<K, V>(m: &FxHashMap<K, V>) -> usize {
+    if m.len() == m.capacity() {
+        m.capacity()
+            .max(8)
+            .saturating_add(8)
+            .saturating_mul(std::mem::size_of::<(K, V)>() + 1)
+    } else {
+        0
+    }
+}
+
+fn vec_growth<T>(v: &Vec<T>) -> usize {
+    if v.len() == v.capacity() {
+        v.capacity().max(4).saturating_mul(std::mem::size_of::<T>())
+    } else {
+        0
+    }
+}
+
 #[derive(Clone)]
 pub struct Ranges {
     nfs: Vec<Nf>,
@@ -1160,7 +1179,10 @@ impl Ranges {
         if let Some(id) = self.ids.get(&nf) {
             return Ok(*id);
         }
-        let add = 2 * nf.bytes() + 64;
+        let add = (2 * nf.bytes())
+            .saturating_add(vec_growth(&self.nfs))
+            .saturating_add(map_growth(&self.ids))
+            .saturating_add(64);
         if !admit(add) {
             return Err(Fail::Memory);
         }
@@ -1210,6 +1232,7 @@ impl Ranges {
             .nf(a)
             .bytes()
             .saturating_add(self.nf(b).bytes())
+            .saturating_add(map_growth(&self.meets))
             .saturating_add(48);
         if !admit(est) {
             return Err(Fail::Memory);
@@ -1243,6 +1266,7 @@ impl Ranges {
             .nf(a)
             .bytes()
             .saturating_add(self.nf(b).bytes())
+            .saturating_add(map_growth(&self.joins))
             .saturating_add(48);
         if !admit(est) {
             return Err(Fail::Memory);
@@ -1266,7 +1290,20 @@ impl Ranges {
         if let Some(r) = self.nots.get(&a) {
             return Ok(*r);
         }
-        let est = self.nf(a).bytes().saturating_add(96);
+        let nots_growth = if self.nots.len().saturating_add(2) > self.nots.capacity() {
+            self.nots
+                .capacity()
+                .max(8)
+                .saturating_add(8)
+                .saturating_mul(std::mem::size_of::<(Rid, Rid)>() + 1)
+        } else {
+            0
+        };
+        let est = self
+            .nf(a)
+            .bytes()
+            .saturating_add(nots_growth)
+            .saturating_add(96);
         if !admit(est) {
             return Err(Fail::Memory);
         }
@@ -1284,6 +1321,18 @@ impl Ranges {
         self.sizes.insert(a, s);
         s
     }
+    pub fn size_bounded(&mut self, a: Rid, admit: &dyn Fn(usize) -> bool) -> Result<Size, Fail> {
+        if let Some(s) = self.sizes.get(&a) {
+            return Ok(*s);
+        }
+        let est = map_growth(&self.sizes).saturating_add(48);
+        if !admit(est) {
+            return Err(Fail::Memory);
+        }
+        let s = self.nf(a).size();
+        self.sizes.insert(a, s);
+        Ok(s)
+    }
     /// Whether the range is empty, or `None` when its size is not known well enough.
     pub fn is_empty(&mut self, a: Rid) -> Option<bool> {
         let s = self.size(a);
@@ -1294,6 +1343,21 @@ impl Ranges {
         } else {
             None
         }
+    }
+    /// [`Ranges::is_empty`], admitting size-cache growth through `admit` first.
+    pub fn is_empty_bounded(
+        &mut self,
+        a: Rid,
+        admit: &dyn Fn(usize) -> bool,
+    ) -> Result<Option<bool>, Fail> {
+        let s = self.size_bounded(a, admit)?;
+        Ok(if s.lo > 0 {
+            Some(false)
+        } else if s.hi == Some(0) {
+            Some(true)
+        } else {
+            None
+        })
     }
     /// Whether every value of `a` is a value of `b`, or `None` when not known.
     pub fn within(&mut self, a: Rid, b: Rid) -> Option<bool> {
@@ -1385,13 +1449,19 @@ impl Ranges {
                             d.0.as_str().to_string(),
                         )));
                     }
-                    let memo_est =
-                        std::mem::size_of::<(Datatype, Option<Result<Rid, Unsupported>>)>() + 16;
+                    let memo_est = map_growth(&defs.memo)
+                        .saturating_add(d.as_str().len())
+                        .saturating_add(std::mem::size_of::<(
+                            Datatype,
+                            Option<Result<Rid, Unsupported>>,
+                        )>())
+                        .saturating_add(16);
                     if !admit(memo_est) {
                         return Err(Fail::Memory);
                     }
                     defs.memo.insert(d.clone(), None);
-                    let x = defs.map[d].clone();
+                    // Only bumps the Arc refcount; never deep-clones the DataRange AST.
+                    let x = std::sync::Arc::clone(&defs.map[d]);
                     match self.of_in(&x, Some(&mut *defs), depth + 1, stop, admit) {
                         Ok(id) => {
                             defs.memo.insert(d.clone(), Some(Ok(id)));
@@ -1454,6 +1524,17 @@ impl Ranges {
                     if stop() {
                         return Err(Fail::Stopped);
                     }
+                    let facet_est = f
+                        .value
+                        .value()
+                        .len()
+                        .saturating_add(f.value.language().map_or(0, str::len))
+                        .saturating_add(n.bytes())
+                        .saturating_add(std::mem::size_of::<Nf>())
+                        .saturating_add(128);
+                    if !admit(facet_est) {
+                        return Err(Fail::Memory);
+                    }
                     let facet = f.facet.as_str();
                     if fam == Fam::Time {
                         // checked here, since `datatypes::facet_problem` reads date-times
@@ -1471,10 +1552,10 @@ impl Ranges {
 }
 
 /// The datatype definitions of a run, with the range of each defined datatype in one
-/// [`Ranges`] table once [`Ranges::of_defined`] has converted it.
+/// [`Ranges`] table once [`Ranges::of_defined_bounded`] has converted it.
 #[derive(Clone, Debug, Default)]
 pub struct Defs {
-    map: FxHashMap<Datatype, DataRange>,
+    map: FxHashMap<Datatype, std::sync::Arc<DataRange>>,
     /// `None` while the definition is being converted
     memo: FxHashMap<Datatype, Option<Result<Rid, Unsupported>>>,
 }
@@ -1483,7 +1564,7 @@ impl Defs {
     /// The deepest nesting of definitions a conversion follows.
     pub const MAX_DEPTH: usize = 64;
 
-    pub fn new(mut map: FxHashMap<Datatype, DataRange>) -> Defs {
+    pub fn new(mut map: FxHashMap<Datatype, std::sync::Arc<DataRange>>) -> Defs {
         // OWL 2 forbids redefining reserved datatype IRIs; never let an illegal
         // definition shadow a built-in datatype.
         map.retain(|d, _| !vocab::is_reserved(d.as_str()));
@@ -1493,23 +1574,32 @@ impl Defs {
         }
     }
 
-    pub fn map(&self) -> &FxHashMap<Datatype, DataRange> {
+    pub fn map(&self) -> &FxHashMap<Datatype, std::sync::Arc<DataRange>> {
         &self.map
     }
 
-    /// The definitions without the ranges converted so far, for another table.
+    /// The definitions without the ranges converted so far, sharing the immutable ASTs.
     pub fn unconverted(&self) -> Defs {
         Defs::new(self.map.clone())
     }
 
-    /// The bytes the definitions (including cloned `DataRange` ASTs) and converted ranges
+    /// Estimated bytes of a shallow [`Defs::unconverted`] clone (keys and `Arc` pointers,
+    /// without duplicating the shared `DataRange` ASTs).
+    pub fn shallow_bytes(&self) -> usize {
+        self.map
+            .len()
+            .saturating_mul(std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>() + 16)
+            + self.map.keys().map(|d| d.as_str().len()).sum::<usize>()
+    }
+
+    /// The bytes the definitions (including shared `DataRange` ASTs) and converted ranges
     /// take.
     pub fn bytes(&self) -> usize {
-        self.map.capacity() * (std::mem::size_of::<(Datatype, DataRange)>() + 1)
+        self.map.capacity() * (std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>() + 1)
             + self
                 .map
                 .iter()
-                .map(|(d, r)| d.as_str().len() + data_range_bytes(r))
+                .map(|(d, r)| d.as_str().len() + data_range_bytes(r) + 16)
                 .sum::<usize>()
             + self.memo.capacity()
                 * (std::mem::size_of::<(Datatype, Option<Result<Rid, Unsupported>>)>() + 1)

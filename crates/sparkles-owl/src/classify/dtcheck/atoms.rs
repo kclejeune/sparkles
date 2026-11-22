@@ -68,6 +68,26 @@ impl DtTable {
         self.ranges.get_or_insert_with(Ranges::new)
     }
 
+    /// Worst-case capacity growth in bytes if one new [`DtKey`] is inserted.
+    pub fn next_growth_bytes(&self) -> usize {
+        let key = std::mem::size_of::<DtKey>();
+        let vec_add = if self.atoms.len() == self.atoms.capacity() {
+            self.atoms.capacity().max(4).saturating_mul(key)
+        } else {
+            0
+        };
+        let map_add = if self.ids.len() == self.ids.capacity() {
+            self.ids
+                .capacity()
+                .max(8)
+                .saturating_add(8)
+                .saturating_mul(key + 4 + 1)
+        } else {
+            0
+        };
+        vec_add.saturating_add(map_add)
+    }
+
     /// The bytes the atoms and the ranges retain.
     pub fn bytes(&self) -> usize {
         let key = std::mem::size_of::<DtKey>();
@@ -209,7 +229,7 @@ impl DtRun {
             return Some(id);
         }
         let before = table.bytes();
-        let est = std::mem::size_of::<DtKey>() * 2 + 24;
+        let est = table.next_growth_bytes();
         let mut guard = self.budget.as_ref().map(Budget::scratch_guard);
         if let Some(g) = guard.as_mut()
             && let Err(Error::Memory { used, .. }) = g.grow(est)
@@ -219,6 +239,7 @@ impl DtRun {
         }
         let id = table.id(k);
         let retained = table.bytes().saturating_sub(before);
+        debug_assert!(retained <= est, "retained {retained} > est {est}");
         if let Some(g) = guard
             && let Err(Error::Memory { used, .. }) = g.commit_retained(retained)
         {

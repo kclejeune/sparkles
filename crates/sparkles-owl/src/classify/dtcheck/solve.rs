@@ -423,6 +423,22 @@ pub fn check_bounded(
         return Answer::Unknown(Why::Uncounted);
     }
     let mut scope = MemScope::new(mem);
+    let total_range_refs: usize = p
+        .props
+        .iter()
+        .map(|q| q.ranges.len())
+        .sum::<usize>()
+        .saturating_add(p.atoms.len());
+    let init_est =
+        np.saturating_mul(std::mem::size_of::<u64>())
+            .saturating_add(total_range_refs.saturating_mul(
+                std::mem::size_of::<Rid>() + std::mem::size_of::<(Rid, usize)>() + 16,
+            ))
+            .saturating_add(std::mem::size_of::<(Rid, Vec<bool>)>())
+            .saturating_add(64);
+    if !scope.take(init_est) {
+        return Answer::Unknown(Why::Stopped);
+    }
     // upward closure of the hierarchy
     let mut up: Vec<u64> = (0..np).map(|i| 1u64 << i).collect();
     loop {
@@ -487,7 +503,10 @@ pub fn check_bounded(
                 return Answer::Unknown(Why::Stopped);
             };
             for (part, inside) in [(p_in, true), (p_out, false)] {
-                if r.is_empty(part) != Some(true) {
+                let Ok(empty) = r.is_empty_bounded(part, admit_ranges) else {
+                    return Answer::Unknown(Why::Stopped);
+                };
+                if empty != Some(true) {
                     let mut s = sides.clone();
                     s.push(inside);
                     next.push((part, s));
@@ -571,7 +590,13 @@ pub fn check_bounded(
     }
     let cells: Vec<Rid> = cells.into_iter().map(|(c, _)| c).collect();
     drop(cells_scope);
-    let sizes: Vec<_> = cells.iter().map(|&c| r.size(c)).collect();
+    let mut sizes = Vec::with_capacity(cells.len());
+    for &c in &cells {
+        let Ok(s) = r.size_bounded(c, admit_ranges) else {
+            return Answer::Unknown(Why::Stopped);
+        };
+        sizes.push(s);
+    }
     let exact = sizes.iter().all(|s| s.is_exact());
     let cons_clone_bytes: usize = cons
         .iter()

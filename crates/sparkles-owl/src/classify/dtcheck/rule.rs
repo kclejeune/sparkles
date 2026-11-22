@@ -92,12 +92,14 @@ pub fn units(
     b: &Bounds,
     stop: &dyn Fn() -> bool,
 ) -> Result<Units, Why> {
-    units_bounded(r, base, body, b, stop, &|_| true, &|_| true)
+    units_bounded(r, base, body, b, stop, &|_| true, &|_| true, &|_| true)
 }
 
-/// [`units`], admitting shared [`Ranges`] growth via `admit_ranges` and scoped temporary
-/// solver allocations via `mem` (`+n` reserves, `-n` releases), returning [`Why::Stopped`]
-/// on refusal.
+/// [`units`], admitting shared [`Ranges`] growth via `admit_ranges`, scoped temporary
+/// solver allocations via `mem` (`+n` reserves, `-n` releases), and owned [`Units`]
+/// payload vectors via `admit_out` before releasing `mem`, returning [`Why::Stopped`] on
+/// refusal.
+#[expect(clippy::too_many_arguments)]
 pub fn units_bounded(
     r: &mut Ranges,
     base: &Problem,
@@ -106,6 +108,7 @@ pub fn units_bounded(
     stop: &dyn Fn() -> bool,
     admit_ranges: &dyn Fn(usize) -> bool,
     mem: &dyn Fn(isize) -> bool,
+    admit_out: &dyn Fn(usize) -> bool,
 ) -> Result<Units, Why> {
     let mut out = Units::default();
     if refutes(r, base, &[], b, stop, admit_ranges, mem)? {
@@ -119,6 +122,21 @@ pub fn units_bounded(
     if !body_scope.take(body_est) {
         return Err(Why::Stopped);
     }
+    let finish = |out: Units| -> Result<Units, Why> {
+        let out_bytes = out
+            .entailed
+            .capacity()
+            .saturating_mul(std::mem::size_of::<usize>())
+            .saturating_add(
+                out.classes
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            );
+        if out_bytes > 0 && !admit_out(out_bytes) {
+            return Err(Why::Stopped);
+        }
+        Ok(out)
+    };
     let mut left: Vec<(Atom, Group)> = Vec::new();
     for (i, &(q, g)) in body.iter().enumerate() {
         if refutes(r, base, &[q], b, stop, admit_ranges, mem)? {
@@ -128,7 +146,7 @@ pub fn units_bounded(
         }
     }
     if left.len() < 2 {
-        return Ok(out);
+        return finish(out);
     }
     let mut classes: Vec<u32> = left
         .iter()
@@ -154,5 +172,5 @@ pub fn units_bounded(
         let w: Vec<Atom> = left.iter().map(|&(q, _)| q).collect();
         out.cover = refutes(r, base, &w, b, stop, admit_ranges, mem)?;
     }
-    Ok(out)
+    finish(out)
 }

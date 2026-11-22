@@ -301,6 +301,23 @@ fn evaluate<S: Sink>(ix: &Index, dt: &DtIx, st: &mut State, at: usize, out: &mut
     };
     let s = &x.dt[at];
     let comp = s.comp;
+    let key_est = s
+        .held
+        .len()
+        .saturating_mul(std::mem::size_of::<Ex>())
+        .saturating_add(
+            dt.body[comp as usize]
+                .len()
+                .saturating_mul(std::mem::size_of::<(Ex, Group)>()),
+        )
+        .saturating_add(32);
+    if !out.admit_data(key_est) {
+        out.release_data(key_est);
+        if let Some(x) = st.extra.as_mut() {
+            x.dt[at].last = STOPPED;
+        }
+        return;
+    }
     let held: Box<[Ex]> = s.held.as_slice().into();
     let body: Box<[(Ex, Group)]> = dt.body[comp as usize]
         .iter()
@@ -312,8 +329,10 @@ fn evaluate<S: Sink>(ix: &Index, dt: &DtIx, st: &mut State, at: usize, out: &mut
     let answer = match cached {
         Some(a) => a,
         None => {
-            let a = solve(ix, dt, &key, out);
-            publish(dt, &key, a, out)
+            let (a, ans_reserved) = solve(ix, dt, &key, out);
+            let published = publish(dt, &key, a, out);
+            out.release_data(ans_reserved);
+            published
         }
     };
     let last = match answer.as_ref() {
@@ -334,6 +353,9 @@ fn evaluate<S: Sink>(ix: &Index, dt: &DtIx, st: &mut State, at: usize, out: &mut
         // the run's check that answered the stop has published it
         Err(Why::Stopped) => STOPPED,
     };
+    drop(answer);
+    drop(key);
+    out.release_data(key_est);
     if let Some(x) = st.extra.as_mut() {
         x.dt[at].last = last;
     }
@@ -357,7 +379,9 @@ fn group(st: &State, b: &Body) -> Group {
 
 /// The rule's answer for a key, with the problem restricted to the roles of its atoms
 /// and the roles above them, since the bound on properties counts every role it holds.
-fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> Result<Units, Why> {
+/// Also returns the bytes reserved for the returned `Units` vectors, held until `publish`
+/// transfers or drops the answer.
+fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> (Result<Units, Why>, usize) {
     let (_, held, body) = key;
     let reserve = |out: &mut S, n: usize| -> bool {
         if n == 0 {
@@ -380,7 +404,7 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> Result<Units
             let step_est = (1 + supers_len).saturating_mul(std::mem::size_of::<Role>() + 4);
             if !reserve(out, step_est) {
                 out.release_data(setup_reserved);
-                return Err(Why::Stopped);
+                return (Err(Why::Stopped), 0);
             }
             setup_reserved = setup_reserved.saturating_add(step_est);
             roles.push(k.role);
@@ -420,7 +444,7 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> Result<Units
         .saturating_add(128);
     if !reserve(out, build_est) {
         out.release_data(setup_reserved);
-        return Err(Why::Stopped);
+        return (Err(Why::Stopped), 0);
     }
     setup_reserved = setup_reserved.saturating_add(build_est);
     roles.sort_unstable();
@@ -492,6 +516,20 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> Result<Units
             true
         }
     };
+    let ans_reserved = std::cell::Cell::new(0usize);
+    let admit_out = |bytes: usize| {
+        if bytes == 0 {
+            return true;
+        }
+        let mut s = out.borrow_mut();
+        if s.admit_data(bytes) {
+            ans_reserved.set(ans_reserved.get().saturating_add(bytes));
+            true
+        } else {
+            s.release_data(bytes);
+            false
+        }
+    };
     let a = rule::units_bounded(
         &mut ranges,
         &p,
@@ -500,6 +538,7 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> Result<Units
         &stop,
         &admit_ranges,
         &temp_mem,
+        &admit_out,
     );
     let out = out.into_inner();
     let grown = ranges.bytes().saturating_sub(before);
@@ -519,7 +558,7 @@ fn solve<S: Sink>(ix: &Index, dt: &DtIx, key: &Key, out: &mut S) -> Result<Units
         out.keep_shared(grown - rr);
     }
     out.release_data(setup_reserved);
-    a
+    (a, ans_reserved.get())
 }
 
 fn key_of(ix: &Index, dt: &DtIx, e: Ex) -> Option<DtKey> {
@@ -764,6 +803,7 @@ mod tests {
             &stop,
             &admit_ranges,
             &temp_mem,
+            &|_| true,
         );
         let sink = sink_cell.into_inner();
         sink.release_data(ranges_reserved.get());
@@ -772,5 +812,203 @@ mod tests {
         assert_eq!(sink.held, 0);
         // Ranges did not grow past the cap because admission refused before interning.
         assert_eq!(ranges.bytes(), before_bytes);
+    }
+
+    #[test]
+    fn evaluate_admits_key_before_allocation_including_cache_hit() {
+        struct CapSink {
+            cap: usize,
+            held: isize,
+            peak: usize,
+        }
+        impl Sink for CapSink {
+            fn reserve_data(&mut self, bytes: usize) -> bool {
+                self.held += bytes as isize;
+                let ok = self.held as usize <= self.cap;
+                if ok {
+                    self.peak = self.peak.max(self.held as usize);
+                }
+                ok
+            }
+            fn release_data(&mut self, bytes: usize) {
+                self.held -= bytes as isize;
+            }
+            fn send(&mut self, _to: Ex, _c: Concl) {}
+            fn me(&mut self, _c: Concl) {}
+        }
+
+        let body: Vec<Body> = (10..266u32).map(|e| Body { e, told: None }).collect();
+        let dt = DtIx::new(
+            Vec::new(),
+            FxHashMap::default(),
+            vec![body],
+            Vec::new(),
+            Ranges::new(),
+            Comps::default(),
+            FxHashMap::default(),
+        );
+        // Pre-populate cache with the exact key that `evaluate` would build.
+        let key: Key = (
+            0,
+            vec![1u32].into_boxed_slice(),
+            (10..266u32)
+                .map(|e| (e, Group::Other))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        );
+        dt.cache.lock().insert(key, Arc::new(Ok(Units::default())));
+
+        let ix = Index::default();
+        let mut st = State::default();
+        st.extra().dt.push(DtSt {
+            comp: 0,
+            held: vec![1],
+            last: FINE,
+        });
+        // Cap is far smaller than the 256-entry body key (~2048 B).
+        let mut sink = CapSink {
+            cap: 256,
+            held: 0,
+            peak: 0,
+        };
+        evaluate(&ix, &dt, &mut st, 0, &mut sink);
+        assert_eq!(st.extra.as_ref().unwrap().dt[0].last, STOPPED);
+        assert!(sink.peak <= sink.cap);
+        assert_eq!(sink.held, 0);
+    }
+
+    #[test]
+    fn check_bounded_admits_initial_workspace_and_size_cache_and_units_handoff() {
+        // 1. Initial range-index workspace refused before allocation under a tiny mem cap.
+        let mut r = Ranges::new();
+        let mut atoms = Vec::new();
+        for i in 0..32 {
+            let rid = r
+                .of(&crate::model::DataRange::OneOf(
+                    [crate::model::Literal::typed(
+                        format!("{i}"),
+                        crate::vocab::XSD_INTEGER,
+                    )]
+                    .into_iter()
+                    .collect(),
+                ))
+                .unwrap();
+            atoms.push(Atom::AtLeast(0, 1, rid));
+        }
+        let p = Problem {
+            props: vec![Prop {
+                supers: Vec::new(),
+                ranges: Vec::new(),
+            }],
+            disjoint: Vec::new(),
+            atoms,
+        };
+        let mem_held = std::cell::Cell::new(0isize);
+        let mem_peak = std::cell::Cell::new(0usize);
+        let tiny_mem = |delta: isize| {
+            if delta > 0 {
+                let next = mem_held.get() + delta;
+                if next as usize > 128 {
+                    return false;
+                }
+                mem_held.set(next);
+                mem_peak.set(mem_peak.get().max(next as usize));
+                true
+            } else {
+                mem_held.set(mem_held.get() + delta);
+                true
+            }
+        };
+        let ans = super::super::dtcheck::solve::check_bounded(
+            &mut r,
+            &p,
+            &Bounds::default(),
+            &|| false,
+            &|_| true,
+            &tiny_mem,
+        );
+        assert_eq!(
+            ans,
+            super::super::dtcheck::solve::Answer::Unknown(Why::Stopped)
+        );
+        assert!(mem_peak.get() <= 128);
+        assert_eq!(mem_held.get(), 0);
+
+        // 2. Pre-populated meet/not caches still admit size-cache growth via size_bounded.
+        let mut r2 = Ranges::new();
+        let xsd_int = format!("{}int", crate::vocab::XSD);
+        let x = r2
+            .of(&crate::model::DataRange::Datatype(
+                crate::model::Datatype::new(&xsd_int),
+            ))
+            .unwrap();
+        let nx = r2.not(x);
+        let _ = r2.meet(Ranges::FULL, x);
+        let _ = r2.meet(Ranges::FULL, nx);
+        let bytes_before_size = r2.bytes();
+        let p2 = Problem {
+            props: vec![Prop {
+                supers: Vec::new(),
+                ranges: Vec::new(),
+            }],
+            disjoint: Vec::new(),
+            atoms: vec![Atom::AtLeast(0, 1, x)],
+        };
+        let ans2 = super::super::dtcheck::solve::check_bounded(
+            &mut r2,
+            &p2,
+            &Bounds::default(),
+            &|| false,
+            &|_| false, // deny even size-cache insertion
+            &|_| true,
+        );
+        assert_eq!(
+            ans2,
+            super::super::dtcheck::solve::Answer::Unknown(Why::Stopped)
+        );
+        assert_eq!(r2.bytes(), bytes_before_size);
+
+        // 3. `units_bounded` transfers output-vector reservation BEFORE `body_scope` drops.
+        let mut r3 = Ranges::new();
+        let int_r = r3
+            .of(&crate::model::DataRange::Datatype(
+                crate::model::Datatype::new(&xsd_int),
+            ))
+            .unwrap();
+        let p3 = Problem {
+            props: vec![Prop {
+                supers: Vec::new(),
+                ranges: Vec::new(),
+            }],
+            disjoint: Vec::new(),
+            atoms: vec![Atom::AtLeast(0, 2, int_r)],
+        };
+        let body3 = vec![(Atom::AtLeast(0, 1, int_r), Group::Free)];
+        let live_mem = std::cell::Cell::new(0isize);
+        let handoff_saw_live_body = std::cell::Cell::new(false);
+        let out_bytes_charged = std::cell::Cell::new(0usize);
+        let got = rule::units_bounded(
+            &mut r3,
+            &p3,
+            &body3,
+            &Bounds::default(),
+            &|| false,
+            &|_| true,
+            &|d| {
+                live_mem.set(live_mem.get() + d);
+                true
+            },
+            &|n| {
+                // `body_scope` must still be live when `admit_out` transfers the Vectors.
+                handoff_saw_live_body.set(live_mem.get() > 0);
+                out_bytes_charged.set(out_bytes_charged.get() + n);
+                true
+            },
+        )
+        .unwrap();
+        assert_eq!(got.entailed, vec![0]);
+        assert!(handoff_saw_live_body.get());
+        assert!(out_bytes_charged.get() >= got.entailed.capacity() * std::mem::size_of::<usize>());
+        assert_eq!(live_mem.get(), 0);
     }
 }

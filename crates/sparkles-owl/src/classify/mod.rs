@@ -2194,72 +2194,12 @@ impl Saturation {
                     })
             });
         // A run with checker components starts again, since what the premises below
-        // intern for a checker property would be the lattice's, and so does a change
-        // that makes a component the checker's.
-        let mut probe_peak = 0usize;
-        let probe_admitted = std::sync::Arc::new(AtomicUsize::new(0));
-        let checker = if self.index.as_ref().is_some_and(|ix| ix.dt.is_some()) {
-            true
-        } else if !limits.el_only
-            && let Some(c) = changes
-        {
-            let changed: Vec<&AxiomKind> = c.added.iter().chain(c.removed).copied().collect();
-            let may = match dtcheck::comp::Comps::may_trigger(&changed, &|| poll(limits).is_err()) {
-                Ok(v) => v,
-                Err(dtcheck::comp::CompFail::Stopped) => {
-                    poll(limits)?;
-                    return Err(Error::Cancelled);
-                }
-                Err(dtcheck::comp::CompFail::Memory) => {
-                    unreachable!("may_trigger allocates nothing")
-                }
-            };
-            if may {
-                let live_base = held_bytes
-                    + self
-                        .index
-                        .as_ref()
-                        .map_or(self.interner.bytes(), |ix| self.index_bytes(ix))
-                    + self.context_bytes()
-                    + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
-                    + self.dl_run.as_ref().map_or(0, |d| d.table.bytes());
-                let tracked = probe_admitted.clone();
-                let probe_limits = Limits {
-                    charge: limits.charge.clone().map(|f| {
-                        let f: std::sync::Arc<dyn Fn(usize) -> bool + Send + Sync> =
-                            std::sync::Arc::new(move |bytes: usize| {
-                                let ok = f(bytes);
-                                if ok {
-                                    tracked.fetch_add(bytes, Ordering::Relaxed);
-                                }
-                                ok
-                            });
-                        f
-                    }),
-                    ..limits.clone()
-                };
-                let probe_budget = numeric::Budget::new(
-                    &probe_limits,
-                    live_base,
-                    self.interner.ranges.ledger.clone(),
-                );
-                let (cs, _, _guard) = dt_comps(&changed, axioms, &probe_budget, &probe_limits)?;
-                probe_peak = probe_budget.peak();
-                cs.any()
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        let probe_credit = probe_admitted.load(Ordering::Relaxed);
-        let run_limits_owned = (probe_credit > 0).then(|| Limits {
-            charge: limits.charge.clone().map(|f| drawing_on(probe_credit, f)),
-            ..limits.clone()
-        });
-        let limits = run_limits_owned.as_ref().unwrap_or(limits);
+        // intern for a checker property would be the lattice's. Every edit that names a
+        // data property or datatype already satisfies `needs_full_run` inside
+        // `must_restart`, so `!full` guarantees no changed axiom can trigger a checker
+        // component.
         let full = self.entangled
-            || checker
+            || self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
             || match (&kept, changes) {
                 (Some(k), Some(c)) => {
                     self.must_restart(k, c)
@@ -2304,6 +2244,12 @@ impl Saturation {
         // the new axioms is built
         let premises = match changes {
             Some(c) if !full && old_ix.is_none() => {
+                debug_assert!(
+                    !c.added.iter().chain(c.removed).any(|k| {
+                        dtcheck::comp::Comps::may_trigger(&[*k], &|| false).unwrap_or(false)
+                    }),
+                    "must_restart already forces a full run for any edit naming a data property or datatype"
+                );
                 let mut scratch = Axioms::default();
                 for &k in c.added.iter().chain(c.removed) {
                     index::normalize(k, &mut self.interner, &mut scratch);
@@ -2336,7 +2282,6 @@ impl Saturation {
             kept_bytes,
             limits,
         )?;
-        normalized_peak = normalized_peak.max(probe_peak);
         drop(outside);
         // the disjointness sets by their numbers in this index, beside those of the
         // last run's, by which the contexts it leaves number the sets they meet; the run
@@ -3898,17 +3843,25 @@ fn dt_comps(
     Error,
 > {
     let mut guard = budget.scratch_guard();
-    let mut dt_defs: FxHashMap<Datatype, DataRange> = FxHashMap::default();
+    let mut dt_defs: FxHashMap<Datatype, std::sync::Arc<DataRange>> = FxHashMap::default();
     for &k in all_axioms {
         if let AxiomKind::DatatypeDefinition(d, r) = k
             && !crate::vocab::is_reserved(d.as_str())
         {
-            let est = std::mem::size_of::<(Datatype, DataRange)>()
-                + d.as_str().len()
-                + dtcheck::range::data_range_bytes(r)
-                + 32;
+            let map_growth = if dt_defs.len() == dt_defs.capacity() {
+                dt_defs.capacity().max(8).saturating_add(8).saturating_mul(
+                    std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>() + 1,
+                )
+            } else {
+                0
+            };
+            let est = map_growth
+                .saturating_add(std::mem::size_of::<(Datatype, std::sync::Arc<DataRange>)>())
+                .saturating_add(d.as_str().len())
+                .saturating_add(dtcheck::range::data_range_bytes(r))
+                .saturating_add(48);
             guard.grow(est)?;
-            dt_defs.insert(d.clone(), r.clone());
+            dt_defs.insert(d.clone(), std::sync::Arc::new(r.clone()));
         }
     }
     let dt_defs = dtcheck::range::Defs::new(dt_defs);

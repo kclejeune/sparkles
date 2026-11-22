@@ -1672,4 +1672,138 @@ mod units_rule {
         // Refusal precedes interning, so no partial OneOf prefix was retained in Ranges.
         assert_eq!(r.bytes(), Ranges::new().bytes());
     }
+
+    #[test]
+    fn large_lang_range_facet_stops_before_building_facet_nf() {
+        let mut r = Ranges::new();
+        let mut defs = super::super::range::Defs::default();
+        // A long valid BCP 47 language range (subtags of 1..=8 alnum separated by '-').
+        let long_tag = std::iter::repeat_n("abcdef", 1000)
+            .collect::<Vec<_>>()
+            .join("-");
+        let range = plain_restr(&[(vocab::RDF_LANG_RANGE, Literal::simple(&long_tag))]);
+        let admitted = std::cell::Cell::new(0usize);
+        let cap = 1024usize;
+        let got = r.of_defined_bounded(&range, &mut defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert_eq!(got, Err(Fail::Memory));
+        assert!(admitted.get() <= cap);
+        assert_eq!(r.bytes(), Ranges::new().bytes());
+    }
+
+    #[test]
+    fn atom_id_denies_capacity_growth_before_mutating_table() {
+        use super::super::atoms::{DtKey, DtRun, DtTable, Halted, Stop};
+        use super::super::comp::Comps;
+        use super::super::range::Defs;
+        use crate::classify::{Limits, numeric};
+
+        let mut table = DtTable::default();
+        // Fill until `atoms` is exactly at a large Vec capacity boundary (64).
+        for n in 0..64u64 {
+            table.id(DtKey {
+                role: 0,
+                at_least: true,
+                n,
+                range: Ranges::FULL,
+            });
+        }
+        assert_eq!(table.atoms.len(), 64);
+        assert_eq!(table.atoms.capacity(), 64);
+        let before_bytes = table.bytes();
+        let before_atoms_cap = table.atoms.capacity();
+        let growth = table.next_growth_bytes();
+        assert!(growth >= 64 * std::mem::size_of::<DtKey>());
+
+        // Set cap strictly above fixed entry size (64 B) but strictly below the planned
+        // Vec capacity doubling.
+        let cap = before_bytes + 64;
+        let limits = Limits {
+            max_memory: Some(cap),
+            ..Limits::default()
+        };
+        let budget = numeric::Budget::new(&limits, before_bytes, None);
+        let mut run = DtRun {
+            comps: Comps::default(),
+            defs: Defs::default(),
+            stop: Stop::default(),
+            budget: Some(budget),
+            stopped: None,
+        };
+        let next = DtKey {
+            role: 0,
+            at_least: true,
+            n: 64,
+            range: Ranges::FULL,
+        };
+        assert_eq!(run.atom_id(&mut table, next), None);
+        assert!(matches!(run.stopped, Some(Halted::Memory(_))));
+        assert_eq!(table.atoms.len(), 64);
+        assert_eq!(table.atoms.capacity(), before_atoms_cap);
+        assert_eq!(table.bytes(), before_bytes);
+    }
+
+    #[test]
+    fn shared_def_expansion_does_not_double_charge_ast_in_el_range_or_of_in() {
+        use super::super::comp::{CompFail, Comps};
+        use super::super::range::Defs;
+        use crate::model::{AxiomKind, Class, ClassExpression, DataProperty};
+        use rustc_hash::FxHashMap;
+        use std::sync::Arc;
+
+        let lits: std::collections::BTreeSet<Literal> = (0..250)
+            .map(|i| Literal::typed(format!("{i:0>200}"), vocab::XSD_STRING))
+            .collect();
+        let big = Arc::new(DataRange::OneOf(lits));
+        let dt_big = Datatype::new("urn:dt:big");
+        let mut map = FxHashMap::default();
+        map.insert(dt_big.clone(), Arc::clone(&big));
+        let defs = Defs::new(map);
+        let ast_bytes = super::super::range::data_range_bytes(&big);
+        assert!(ast_bytes > 40_000);
+
+        // Two uses of `:big` in EL-like positions. Under a tight scratch cap well below
+        // `ast_bytes`, `Walk::el_range` checks `el_defs` without cloning the AST, and
+        // `ensure_scratch` only pays shallow Arc-map bytes; conversion then stops cleanly
+        // inside `DataOneOf` literal admission without cloning the AST.
+        let ax = [
+            AxiomKind::SubClassOf(
+                ClassExpression::Class(Class::new("urn:dt:A")),
+                ClassExpression::DataSomeValuesFrom(
+                    vec![DataProperty::new("urn:dt:d")],
+                    DataRange::Datatype(dt_big.clone()),
+                ),
+            ),
+            AxiomKind::SubClassOf(
+                ClassExpression::Class(Class::new("urn:dt:B")),
+                ClassExpression::DataSomeValuesFrom(
+                    vec![DataProperty::new("urn:dt:d")],
+                    DataRange::Datatype(dt_big),
+                ),
+            ),
+        ];
+        let refs: Vec<&AxiomKind> = ax.iter().collect();
+        let admitted = std::cell::Cell::new(0usize);
+        let cap = 8192usize;
+        let res = Comps::of_bounded(&refs, &defs, &|| false, &|bytes| {
+            let next = admitted.get().saturating_add(bytes);
+            if next > cap {
+                false
+            } else {
+                admitted.set(next);
+                true
+            }
+        });
+        assert!(matches!(res, Err(CompFail::Memory)));
+        assert!(admitted.get() <= cap);
+        // The immutable AST Arc must have no stray cloned references after the call.
+        assert_eq!(Arc::strong_count(&big), 2);
+    }
 }
