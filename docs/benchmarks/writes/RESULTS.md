@@ -993,6 +993,42 @@ Namespace instance for the build before item 418 and the build with it. The medi
 0.85, 1.23 and 0.94 of the base's transactions per second, with every range overlapping,
 and item 907 pins them on the batch screen and forge.
 
+### Ordered windows in views
+
+The ignored test `window_against_recompute` of `crates/sparkles-core/tests/incr_bench.rs`
+measures the ordered windows of
+[F13 §4.4](../../specs/F13-incremental-views-and-provenance.md#ordered-windows) on the
+people data of the other view tests. Its 400 commits are small. Half of them remove the
+age of the oldest person, so the window loses its first row and the reserve runs out, a
+quarter change one person's age and a quarter add a member with an age. Before item 419
+each such view was a `recompute` node that evaluated the query at every commit that
+touched it, so the query time is what each commit cost then. `oldest` and
+`oldest-page-5` order the ages with the person as a tie-breaker, the second at offset 40,
+and `largest-teams` orders the team sizes of a grouped count.
+
+The run below used a release build of commit `1396fa6c` on wally, an Intel Core i7-12800H
+with 20 threads, under the host's heavy lock, with 200,000 people. Every view's
+maintained rows matched its query evaluated again at the end. The
+[run record](runs/2026-11-21-ordered-windows-wally/README.md) holds the raw output. The
+numbers are a development-host measurement for the design, not a published result.
+
+| View | Build ms | Query ms | Pass median ms | Pass p95 ms | Pass max ms | Query / pass | State MiB |
+|---|--:|--:|--:|--:|--:|--:|--:|
+| `oldest` | 68.7 | 2.0 | 0.015 | 0.038 | 54.980 | 132 | 0.0 |
+| `oldest-page-5` | 53.3 | 2.1 | 0.017 | 0.022 | 55.073 | 121 | 0.0 |
+| `largest-teams` | 31.4 | 0.8 | 0.013 | 0.034 | 0.075 | 64 | 0.2 |
+
+A pass costs 13 to 17 µs at the median against 0.8 to 2.1 ms for the query. The largest
+pass of `oldest` and `oldest-page-5` is a refill, which evaluates the window's input
+again, here a scan of the 200,000 ages, at about 55 ms. A full window keeps its 100 rows
+of reserve, so the first 100 deletions at the front promote reserve rows and the 101st
+refills it. By the benchmark's schedule of commits that is the 201st commit, and the 99
+deletions after it fit the new reserve, so one of the 400 commits should refill. The run
+recorded the slowest pass and not a count of refills. The engine answers
+the query itself from a bounded top-k in about 2 ms, and a refill that read the engine's
+answer instead would cost that, which roadmap item 1294 takes up for inputs whose
+evaluation gives the same ids as the circuit.
+
 ### Incremental view gate baseline
 
 `mise run bench:incr` is the rewrite gate of incremental view maintenance, as

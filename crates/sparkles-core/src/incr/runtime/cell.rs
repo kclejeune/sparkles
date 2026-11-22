@@ -98,13 +98,47 @@ impl Slot {
         u64::from_le_bytes(h.finalize()[..8].try_into().expect("8 bytes"))
     }
 
+    /// The rows of a snapshot. An ordered window's rows come in order with their
+    /// positions.
     pub(super) fn live_rows(&self, rows: Vec<(Vec<Option<Term>>, i64)>) -> Vec<LiveRow> {
+        let ordered = self.circuit.ordered();
+        let mut at = 0u64;
         rows.into_iter()
-            .map(|(terms, w)| LiveRow {
-                terms,
-                count: w.unsigned_abs(),
+            .map(|(terms, w)| {
+                let count = w.unsigned_abs();
+                let position = ordered.then_some(at);
+                at += count;
+                LiveRow {
+                    terms,
+                    count,
+                    position,
+                }
             })
             .collect()
+    }
+
+    /// The diff of an ordered window's latest pass, `None` when the pass left the
+    /// window alone.
+    pub(super) fn moves_event(&self, from: u64, to: u64) -> Option<LiveEvent> {
+        let (removed, added) = self.circuit.moves()?;
+        if removed.is_empty() && added.is_empty() {
+            return None;
+        }
+        let rows = |v: Vec<(u64, Vec<Option<Term>>, u64)>| -> Arc<[LiveRow]> {
+            v.into_iter()
+                .map(|(position, terms, count)| LiveRow {
+                    terms,
+                    count,
+                    position: Some(position),
+                })
+                .collect()
+        };
+        Some(LiveEvent::Diff {
+            commit: to,
+            from,
+            removed: rows(removed),
+            added: rows(added),
+        })
     }
 
     pub(super) fn event(&self, reset: bool) -> LiveEvent {
@@ -284,6 +318,7 @@ pub(super) fn diff_event(
         let r = LiveRow {
             terms,
             count: w.unsigned_abs(),
+            position: None,
         };
         if w < 0 {
             removed.push(r);

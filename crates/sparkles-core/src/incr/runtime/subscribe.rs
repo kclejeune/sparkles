@@ -159,6 +159,11 @@ impl Runtime {
         if switched > 0 && after <= switched {
             return Some(st.event(true));
         }
+        // an ordered window keeps no positions for past commits, and a circuit built
+        // again since the subscriber's event may order ties otherwise, even at its commit
+        if st.circuit.ordered() {
+            return Some(st.event(true));
+        }
         if after == applied {
             return None;
         }

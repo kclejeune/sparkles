@@ -607,6 +607,7 @@ impl Circuit {
 
     /// Evaluate the circuit from scratch at `snap`.
     pub fn build(&mut self, snap: Arc<Snapshot>, control: &Control) -> Result<()> {
+        self.clear_moves();
         self.terms = Terms::default();
         // the schema may have changed in changes no pass saw
         self.inferred = InferredFootprint::default();
@@ -719,6 +720,7 @@ impl Circuit {
 
     /// Apply the net changes `d` (whose `after` must be the circuit's commit).
     pub fn advance(&mut self, d: &DeltaSet, control: &Control) -> Result<Advance> {
+        self.clear_moves();
         let snap = d.snapshot.clone();
         if !d.complete {
             return Ok(Advance::Reset(self.reset(d, control)?));
@@ -828,9 +830,70 @@ impl Circuit {
             .collect()
     }
 
-    /// The whole result as terms.
+    /// The whole result as terms, in the window's order when the query orders it.
     pub fn rows(&self) -> Vec<(Vec<Option<Term>>, i64)> {
+        if let Some(rows) = self.ordered_rows() {
+            return rows;
+        }
         let rows: Vec<(Row, i64)> = self.result.iter().map(|(r, w)| (r.clone(), w)).collect();
         self.decode_rows(&rows)
+    }
+
+    /// Whether the result is an ordered window whose rows have positions (spec F13
+    /// §4.4).
+    pub fn ordered(&self) -> bool {
+        self.root.result_window().is_some_and(|(w, _)| w.positions)
+    }
+
+    fn window_row(cols: Option<&[Option<usize>]>, r: &Row) -> Row {
+        match cols {
+            None => r.clone(),
+            Some(cols) => cols.iter().map(|c| c.map_or(Id::UNDEF, |i| r[i])).collect(),
+        }
+    }
+
+    /// The rows of an ordered window in order, each with its copies.
+    pub fn ordered_rows(&self) -> Option<Vec<(Vec<Option<Term>>, i64)>> {
+        let (w, cols) = self.root.result_window()?;
+        if !w.positions {
+            return None;
+        }
+        let rows: Vec<(Row, i64)> = w
+            .rows()
+            .iter()
+            .map(|(r, n)| (Self::window_row(cols, r), *n))
+            .collect();
+        Some(self.decode_rows(&rows))
+    }
+
+    /// The rows that entered and left an ordered window in the latest pass, each with
+    /// its position and copies: `None` when the pass did not reach the window.
+    #[allow(clippy::type_complexity)]
+    pub fn moves(
+        &self,
+    ) -> Option<(
+        Vec<(u64, Vec<Option<Term>>, u64)>,
+        Vec<(u64, Vec<Option<Term>>, u64)>,
+    )> {
+        let (w, cols) = self.root.result_window()?;
+        let m = w.moves.as_ref()?;
+        let side = |v: &[(u64, Row, u64)]| {
+            let rows: Vec<(Row, i64)> = v
+                .iter()
+                .map(|(_, r, n)| (Self::window_row(cols, r), *n as i64))
+                .collect();
+            self.decode_rows(&rows)
+                .into_iter()
+                .zip(v)
+                .map(|((t, _), (pos, _, n))| (*pos, t, *n))
+                .collect()
+        };
+        Some((side(&m.removed), side(&m.added)))
+    }
+
+    fn clear_moves(&mut self) {
+        if let Some(w) = self.root.result_window_mut() {
+            w.moves = None;
+        }
     }
 }

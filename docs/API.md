@@ -4079,6 +4079,17 @@ and `count` when the row was added or removed more than once. CONSTRUCT streams 
 `diff` of `{commit, from, value}` only when the value changes. Each event's id is the
 commit it reflects.
 
+A SELECT with `ORDER BY` and `LIMIT` streams its window. Each row then has a `position`,
+0 for the first row of the result, and a row with a `count` above 1 stands at that many
+consecutive positions from it. A snapshot lists the rows in order. A diff lists the rows
+that left the window with their positions before the commit and the rows that entered it
+with their positions after it. The rows that stay keep their order, so a client removes
+the removed rows and then inserts the added rows in ascending position. A row that moves
+inside the window, because its sort key changed while its projected values did not,
+appears in both lists. The positions add to the format of the other queries, which a
+client that ignores them reads as before. An ordered stream does not merge diffs under
+`coalesceMs`, and a resume with `Last-Event-ID` starts with a `reset`.
+
 `Last-Event-ID: N` or `after=commit:N` resumes after commit N. The first event is then
 the change from N, taken from the diffs the query's circuit keeps or by evaluating the
 query before the changes since N, and a `reset` when the change log and history cannot

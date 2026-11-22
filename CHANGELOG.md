@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Views keep ORDER BY with LIMIT as an ordered window
+
+A view or live query whose SELECT has `ORDER BY` with `LIMIT` and `OFFSET` no longer
+evaluates its whole query again at every commit that touches it. It keeps the best
+`k + m + max(k, 100)` rows in order, promotes the next row when one leaves the window and
+refills the reserve from its input when it runs out, as roadmap item 419. A live query's
+rows now carry a `position`, its diffs list the rows that leave with their old positions
+and the rows that enter with their new ones, and `view:read` returns the window in order.
+Ordered live queries no longer merge diffs under `coalesceMs` and resume with a `reset`.
+The view compiler's version changed, so every existing view is built again once after the
+upgrade. The inner nodes of a view's property paths now take hidden names that no query
+variable can spell, so a query variable named `?__incr1` keeps its own binding (item 549).
+
 ### The ontology editor's head no longer waits for the whole mapping
 
 `GET /$/ontology/{ds}?view=head` answers the summary's header, entity counts, graphs,

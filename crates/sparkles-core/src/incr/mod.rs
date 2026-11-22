@@ -40,6 +40,8 @@ mod prov_tests;
 mod runtime_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod window_tests;
 
 pub use circuit::{Circuit, DeltaSet};
 pub use compile::{Compiled, Kind, compile};

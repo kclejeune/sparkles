@@ -1012,6 +1012,39 @@ fn service_view_read_reads_rows() {
     assert!(sparql::query(s.snapshot(), &bad, &o).is_err());
 }
 
+/// `SERVICE view:read` returns an ordered window's rows in the window's order, and two
+/// rows with the same projected terms stay two rows at their own places.
+#[test]
+fn service_view_read_keeps_a_window_in_order() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { :p1 :name \"x\" ; :age 40 . :p2 :name \"y\" ; :age 30 . \
+         :p3 :name \"x\" ; :age 20 . :p4 :name \"z\" ; :age 10 }",
+    );
+    let rt = runtime(&s, None);
+    let def = "SELECT ?name WHERE { ?p :name ?name ; :age ?age } ORDER BY DESC(?age) LIMIT 3";
+    rt.put(&s, "oldest", ViewDef::table(q(def))).unwrap();
+    rt.round(&s);
+    let text = q("PREFIX view: <urn:x-sparkles:view#> SELECT ?name WHERE { \
+                  SERVICE view:read { [] view:name \"oldest\" ; view:bind ?name } }");
+    let o = QueryOptions {
+        views: Some(rt.clone()),
+        ..Default::default()
+    };
+    let read = |s: &Store| -> Vec<String> {
+        let r = sparql::query(s.snapshot(), &text, &o).unwrap();
+        r.test_application_rows()
+            .iter()
+            .map(|r| show(&r[0]))
+            .collect()
+    };
+    assert_eq!(read(&s), ["x", "y", "x"]);
+    upd(&s, "INSERT DATA { :p5 :name \"w\" ; :age 35 }");
+    rt.round(&s);
+    assert_eq!(read(&s), ["x", "w", "y"]);
+}
+
 struct Fixed(Vec<String>);
 
 impl crate::access::GuardDecision for Fixed {
@@ -2135,4 +2168,218 @@ fn views_recover_from_crashes() {
     ] {
         crash_and_recover(TEST, name);
     }
+}
+
+/// Item 419: a live query with ORDER BY and LIMIT streams its rows with positions, a
+/// client that applies them keeps the window in order, its diffs do not merge, and a
+/// resume starts with a reset.
+#[test]
+fn an_ordered_live_query_streams_positions() {
+    let s = Store::in_memory(StoreOptions::default());
+    load(&s);
+    let rt = runtime(&s, None);
+    let query = "SELECT ?p ?a WHERE { ?p :age ?a } ORDER BY DESC(?a) LIMIT 2";
+    let live = rt
+        .live(&s, &q(query), None, &LiveOptions::default())
+        .unwrap();
+    let one = |r: &super::live::LiveRow| r.terms.iter().map(show).collect::<Vec<_>>().join(" ");
+    let mut client: Vec<String> = Vec::new();
+    let apply = |client: &mut Vec<String>, e: &LiveEvent| match e {
+        LiveEvent::Snapshot { rows, .. } => {
+            *client = rows.iter().map(one).collect();
+            let at: Vec<Option<u64>> = rows.iter().map(|r| r.position).collect();
+            assert_eq!(at, (0..rows.len() as u64).map(Some).collect::<Vec<_>>());
+        }
+        LiveEvent::Diff { removed, added, .. } => {
+            let mut gone: Vec<u64> = removed
+                .iter()
+                .map(|r| r.position.expect("a position"))
+                .collect();
+            gone.sort_unstable_by(|a, b| b.cmp(a));
+            for p in gone {
+                client.remove(p as usize);
+            }
+            let mut came: Vec<(u64, String)> = added
+                .iter()
+                .map(|r| (r.position.expect("a position"), one(r)))
+                .collect();
+            came.sort();
+            for (p, r) in came {
+                client.insert(p as usize, r);
+            }
+        }
+        other => panic!("{other:?}"),
+    };
+    let first = live.try_next().unwrap();
+    apply(&mut client, &first);
+    assert_eq!(client, ["c 50", "b 40"]);
+    upd(&s, "INSERT DATA { :d :age 45 }");
+    rt.round(&s);
+    let e = live.try_next().expect("a row entered");
+    assert!(e.merge(&e).is_none(), "positioned diffs do not merge");
+    apply(&mut client, &e);
+    assert_eq!(client, ["c 50", "d 45"]);
+    // a row that moves inside the window and keeps its terms
+    upd(
+        &s,
+        "DELETE DATA { :d :age 45 } ; INSERT DATA { :d :age 55 }",
+    );
+    rt.round(&s);
+    apply(&mut client, &live.try_next().expect("a row moved"));
+    assert_eq!(client, ["d 55", "c 50"]);
+    upd(&s, "DELETE DATA { :c :age 50 }");
+    rt.round(&s);
+    apply(&mut client, &live.try_next().expect("a row left"));
+    assert_eq!(client, ["d 55", "b 40"]);
+    // a commit after the window sends nothing
+    upd(&s, "INSERT DATA { :e :age 1 }");
+    rt.round(&s);
+    assert!(live.try_next().is_none());
+    // a resume at the circuit's commit starts with a reset as well, since a circuit
+    // built again may order ties otherwise
+    let at = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                after: Some(s.snapshot().commit),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert!(matches!(
+        at.try_next(),
+        Some(LiveEvent::Snapshot { reset: true, .. })
+    ));
+    let before = s.snapshot().commit;
+    upd(&s, "INSERT DATA { :f :age 60 }");
+    rt.round(&s);
+    let resumed = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                after: Some(before),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    match resumed.try_next().unwrap() {
+        LiveEvent::Snapshot { reset, rows, .. } => {
+            assert!(reset);
+            assert_eq!(rows.iter().map(one).collect::<Vec<_>>(), ["f 60", "d 55"]);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The events a live query holds now.
+fn drain(l: &super::live::LiveQuery) -> Vec<LiveEvent> {
+    std::iter::from_fn(|| l.try_next()).collect()
+}
+
+/// A live query whose ordered window fails a pass publishes nothing of that pass: the
+/// subscriber receives only the error, and a new evaluation gives the query's rows.
+fn a_failed_window_pass_publishes_nothing(
+    setup: &str,
+    change: &str,
+    budget: Option<u64>,
+    arm: impl FnOnce(),
+    code: &str,
+) {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(&s, setup);
+    let rt = runtime(&s, None);
+    let query = "SELECT ?s ?v WHERE { ?s :v ?v } ORDER BY ?v LIMIT 2";
+    let l = rt
+        .live(
+            &s,
+            &q(query),
+            None,
+            &LiveOptions {
+                max_memory_bytes: budget,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let first = l.try_next().expect("the first rows");
+    let (_, rows) = live_rows(&first);
+    assert_eq!(rows.len(), 2);
+    upd(&s, change);
+    struct ClearHooks;
+    impl Drop for ClearHooks {
+        fn drop(&mut self) {
+            super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = None);
+            super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = None);
+        }
+    }
+    let clear = ClearHooks;
+    arm();
+    rt.round(&s);
+    drop(clear);
+    let events = drain(&l);
+    assert!(
+        matches!(&events[..], [LiveEvent::Error { code: c, .. }] if c == code),
+        "{events:?}"
+    );
+    let again = rt
+        .live(&s, &q(query), None, &LiveOptions::default())
+        .unwrap();
+    let e = again.try_next().expect("the rows again");
+    assert_eq!(e.commit(), Some(s.snapshot().commit));
+    let mut want = oracle(&s, query, None);
+    let mut got = live_rows(&e).1;
+    want.sort();
+    got.sort();
+    assert_eq!(got, want);
+}
+
+/// A commit whose changes' keys pass a live window's budget ends the query with
+/// `over-budget`, although the window that would follow fits it.
+#[test]
+fn a_window_over_budget_publishes_nothing() {
+    let setup = format!(
+        "INSERT DATA {{ {} }}",
+        (0..10)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    let change = format!(
+        "INSERT DATA {{ {} }}",
+        (0..3000)
+            .map(|i| format!(":n{i} :v {}", -1 - i))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    a_failed_window_pass_publishes_nothing(&setup, &change, Some(64 << 10), || {}, "over-budget");
+}
+
+/// A pass cancelled while a live window refills its reserve ends the query with
+/// `pass-timeout`, though too few rows follow for a periodic check.
+#[test]
+fn a_window_cancelled_while_refilling_publishes_nothing() {
+    let setup = format!(
+        "INSERT DATA {{ {} }}",
+        (0..200)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    // the first 101 rows leave, so the reserve of 100 runs out and the window refills
+    let change = format!(
+        "DELETE DATA {{ {} }}",
+        (0..101)
+            .map(|i| format!(":s{i} :v {i}"))
+            .collect::<Vec<_>>()
+            .join(" . ")
+    );
+    let arm = || {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        super::runtime::PASS_CANCEL.with(|c| *c.borrow_mut() = Some(flag.clone()));
+        super::ops::window::CANCEL_PLACING.with(|c| *c.borrow_mut() = Some((3, flag)));
+    };
+    a_failed_window_pass_publishes_nothing(&setup, &change, None, arm, "pass-timeout");
 }

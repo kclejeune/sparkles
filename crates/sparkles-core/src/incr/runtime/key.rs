@@ -5,7 +5,7 @@ use super::*;
 
 /// The version of the compiler, part of a checkpoint's fingerprint: a state written
 /// by another compiler is not loaded.
-pub(super) const COMPILER: &str = "f13-phase2-2";
+pub(super) const COMPILER: &str = "f13-phase2-3";
 
 /// Whether `access` has protections that depend on the data, with the reason the
 /// whole query is then evaluated again (spec F13 §6.2).
@@ -134,6 +134,8 @@ mod compiler_tests {
         // AVG apart from values that are not numbers, for the readings of errors in
         // aggregates (item 1064)
         ("f13-phase2-2", "9910b68bd4b7e026"),
+        // ORDER BY with LIMIT and OFFSET compiles to the window operator (item 419)
+        ("f13-phase2-3", "33695b11351c501e"),
     ];
 
     /// The variants of `ops::Op` as the source declares them, without comments or

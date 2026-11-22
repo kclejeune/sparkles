@@ -22,6 +22,13 @@ pub struct LiveRow {
     pub terms: Vec<Option<Term>>,
     /// how many times the row was added or removed
     pub count: u64,
+    /// The row's position in an ordered window's result, 0 for the first row (spec F13
+    /// §4.4), and `None` for a query without `ORDER BY` and `LIMIT`. The copies of a row
+    /// with a count above 1 stand at the consecutive positions from it. A removed row
+    /// has its position before the change and an added row its position after it, and
+    /// the rows that stay keep their relative order, so removing the removed rows and
+    /// then inserting the added ones in ascending position gives the new result.
+    pub position: Option<u64>,
 }
 
 /// An event of a live query.
@@ -62,6 +69,17 @@ impl LiveEvent {
         }
     }
 
+    /// Whether the event's rows carry positions, which an ordered window's do. Such
+    /// events do not [`merge`](Self::merge).
+    pub fn positioned(&self) -> bool {
+        let any = |rows: &[LiveRow]| rows.iter().any(|r| r.position.is_some());
+        match self {
+            LiveEvent::Snapshot { rows, .. } => any(rows),
+            LiveEvent::Diff { removed, added, .. } => any(removed) || any(added),
+            _ => false,
+        }
+    }
+
     /// The rows the event carries, for queue bounds.
     fn rows(&self) -> usize {
         match self {
@@ -75,6 +93,10 @@ impl LiveEvent {
     /// `coalesceMs`), or `None` when they do not merge (an error, or a change that does
     /// not follow on).
     pub fn merge(&self, next: &LiveEvent) -> Option<LiveEvent> {
+        // rows with positions are sent one change at a time
+        if self.positioned() || next.positioned() {
+            return None;
+        }
         match (self, next) {
             (
                 LiveEvent::Diff {
@@ -107,6 +129,7 @@ impl LiveEvent {
                     let row = LiveRow {
                         terms: terms.clone(),
                         count: n.unsigned_abs(),
+                        position: None,
                     };
                     match n.cmp(&0) {
                         std::cmp::Ordering::Less => rem.push(row),
