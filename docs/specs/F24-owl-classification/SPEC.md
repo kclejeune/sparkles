@@ -105,15 +105,16 @@ the theory rule, as [the EL and Horn tiers](#the-datatype-checker) paragraph des
 An ontology whose data stays within OWL 2 EL builds no atoms and runs the EL lattice as
 before. A value outside an `xsd:int` range, two values of a functional `xsd:double`
 property and a string in an `xsd:boolean` range now make an ontology inconsistent, as
-they do under HermiT. Three other answers change. A `DatatypeDefinition` outside OWL 2
-EL that the checker converts and a `DisjointDataProperties` axiom over checker
-properties are used and no longer reported as left out. A cover found in a context that
-the run finds unsatisfiable, or in a world whose class has no instance, is not reported.
-`Stats::tier` reads `Disjunctive` for a run whose only axioms outside the Horn rules are
-data unions or enumerations, which the Horn tier now decides. A cover over the values of
-a property that gives different classes, a key over a checker property and a universal
-or maximum data restriction on the left are reported as used in part, and item 768 takes
-them in Tier D and the rooted run. On 26 of the wiring tests' ontologies HermiT 1.4.5
+they do under HermiT. Three other answers change. In a run with a checker component, a
+`DatatypeDefinition` outside OWL 2 EL that the checker converts and a
+`DisjointDataProperties` axiom over checker properties are used and no longer reported as
+left out. A cover found in a context that the run finds unsatisfiable, or in a world whose
+class has no instance, is not reported. `Stats::tier` reads `Disjunctive` for a run whose
+only axioms outside the Horn rules are data unions, enumerations of several values,
+complements on the left or higher data cardinalities, which the Horn tier now decides. A
+cover over the values of a property that gives different classes and a key over a checker
+property are reported as used in part, while a universal or maximum data restriction on
+the left is reported as left out, and item 768 takes them in Tier D and the rooted run. On 26 of the wiring tests' ontologies HermiT 1.4.5
 gives 37 of the 38 answers that the tests pin, and it derives the subsumption whose cover
 a world reports as used in part. The other answer is a
 `NegativeDataPropertyAssertion` of `"3"^^xsd:integer` beside the assertion of
@@ -4135,12 +4136,14 @@ the contexts they change. A world reads the last evaluation of each copy once it
 its fixpoint, and it skips unsatisfiable copies and every copy when its class has no
 instance, so that what it reports does not depend on the order of its derivations. A
 `DisjointDataProperties` axiom over properties of a checker component is a pair of
-disjoint properties of the local problem. A `DatatypeDefinition` outside OWL 2 EL is
-taken when the checker converts its range, since every property its datatype is used on
-is then in a checker component and reads the definition through its atoms. `Stats::tier`
-still counts a data union or an enumeration of several values as disjunctive, so it reads
-`Disjunctive` for a run whose only such axioms are data restrictions, while Tier D, which
-refuses every data restriction, takes no axiom of the run and the Horn tier decides it.
+disjoint properties of the local problem. In a run with a checker component, a
+`DatatypeDefinition` outside OWL 2 EL is taken when the checker converts its range,
+since every property its datatype is used on is then in a checker component and reads the
+definition through its atoms. `Stats::tier` still counts a data union, an enumeration of
+several values, a complement on the left or a higher data cardinality as disjunctive, so
+it reads `Disjunctive` for a run whose only such axioms are data restrictions, while Tier
+D, which refuses every data restriction, takes no axiom of the run and the Horn tier
+decides it.
 
 **Tier D.** Tier D's eligibility drops its refusal of data roles and keeps its refusal of
 the top data property. Data atoms are atoms of the index like named classes, ordered

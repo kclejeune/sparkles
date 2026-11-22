@@ -11,13 +11,15 @@ profile, with data cardinalities, universal data restrictions, facets and
 values of a functional `xsd:double` property, a value outside an `xsd:int` range and a
 string in an `xsd:boolean` range make an ontology inconsistent, as roadmap item 972. An
 ontology whose data stays within OWL 2 EL runs as before. Three answers change beside
-the new decisions. A `DatatypeDefinition` outside OWL 2 EL that the checker converts and
-a `DisjointDataProperties` axiom over the checker's properties are used and no longer
-reported as left out. A case analysis over data values that a context needs is reported
-as used in part, but not when the context, or the world of the class it was found in,
-turns out to have no instance. `Stats::tier` reads `Disjunctive` for a run whose only
-axioms outside the Horn rules are data unions or enumerations, which the Horn rules now
-decide. Keys over the checker's properties are reported as used in part.
+the new decisions. In a run with a checker component, a `DatatypeDefinition` outside OWL
+2 EL that the checker converts and a `DisjointDataProperties` axiom over the checker's
+properties are used and no longer reported as left out. A case analysis over data values
+that a context needs is reported as used in part, but not when the context, or the world
+of the class it was found in, turns out to have no instance. `Stats::tier` reads
+`Disjunctive` for a run whose only axioms outside the Horn rules are data unions,
+enumerations of several values, complements on the left or higher data cardinalities,
+which the Horn rules now decide. Keys over the checker's properties are reported as used
+in part, and universal or maximum data restrictions on the left are left out.
 
 ### A kept EL classification over its memory budget starts again in full
 

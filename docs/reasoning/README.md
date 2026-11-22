@@ -459,10 +459,10 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   that share their properties. A datatype checker decides these together in each context,
   so two values of a functional `xsd:double` property and a string in an `xsd:boolean`
   range make the ontology inconsistent. A case analysis over data values, such as a
-  Boolean property whose two values give different classes, a key over such a property and
-  a universal or maximum data restriction on the left are used in part and reported. An
-  ontology whose data stays within OWL 2 EL keeps the profile's data handling and builds
-  nothing for the checker. In an ontology
+  Boolean property whose two values give different classes, and a key over such a property
+  are used in part and reported, while a universal or maximum data restriction on the left
+  is left out and reported. An ontology whose data stays within OWL 2 EL keeps the
+  profile's data handling and builds nothing for the checker. In an ontology
   without individuals, data properties, self restrictions, reflexive properties or top
   properties, axioms that need case analysis, such as unions, complements and universal
   restrictions on the left, take the disjunctive rules of the consequence-based calculus
@@ -1238,8 +1238,9 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * A rooted run refuses keys over data properties and functional data properties, which
   OML vocabularies declare for their identifiers, as the Kepler16b sample and its
   metrology library do. The disjunctive rules take no data properties, so a case
-  analysis over data values, a key over a data property that the datatype checker takes and
-  a universal or maximum data restriction on the left are used in part. Roadmap item 768.
+  analysis over data values and a key over a data property that the datatype checker takes
+  are used in part, while a universal or maximum data restriction on the left is left out.
+  Roadmap item 768.
   When an ontology's data properties occur only in axioms outside OWL 2 EL, one axiom that
   needs case analysis sends it to the disjunctive rules, which then leave out every data
   axiom that the Horn rules would decide through the datatype checker. Roadmap item 1303.
