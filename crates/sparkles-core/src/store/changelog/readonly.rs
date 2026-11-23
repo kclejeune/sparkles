@@ -748,6 +748,207 @@ mod tests {
         }
     }
 
+    fn timestamp_meta(seq: u64, timestamp_ms: i64) -> Arc<ChangeCommit> {
+        Arc::new(ChangeCommit {
+            seq,
+            timestamp_ms,
+            kind: CommitKind::Update,
+            bulk: false,
+            inserted: 2,
+            deleted: 0,
+            author: Some(Arc::from("test author")),
+            message: Some(Arc::from("é 🦀")),
+        })
+    }
+
+    fn timestamp_changes(seq: u64, timestamp_ms: i64, rows: usize) -> Vec<u8> {
+        let quad: QuadKey = [b"".as_slice(), b"<urn:s>", b"<urn:p>", b"\"value\""].map(Arc::from);
+        encode(&Record::Changes(
+            timestamp_meta(seq, timestamp_ms),
+            vec![(true, quad); rows],
+        ))
+    }
+
+    fn timestamp_segment(root: &Path, first: u64, records: &[&[u8]]) -> CapturedSegment {
+        let path = root.join(format!("{first}.log"));
+        let mut wire = seg_header(uuid::Uuid::nil()).to_vec();
+        for record in records {
+            wire.extend_from_slice(record);
+        }
+        std::fs::write(&path, &wire).unwrap();
+        CapturedSegment {
+            first,
+            extent: wire.len() as u64,
+            file: File::open(&path).unwrap(),
+        }
+    }
+
+    #[test]
+    fn timestamp_only_lookup_matches_owned_walk_without_building_term_owners() {
+        use std::{cell::Cell, rc::Rc};
+
+        let root = tempfile::tempdir().unwrap();
+        let gap = encode(&Record::Gap {
+            from: 3,
+            through: 4,
+        });
+        let first = timestamp_changes(5, i64::MIN, 1);
+        let tied = timestamp_changes(6, i64::MIN, 1);
+        let at_head = encode(&Record::Summary(timestamp_meta(7, i64::MAX)));
+        let after_head = timestamp_changes(8, i64::MAX, 1);
+        let log = ReadOnlyLog {
+            segments: vec![timestamp_segment(
+                root.path(),
+                3,
+                &[&gap, &first, &tied, &at_head, &after_head],
+            )],
+            through: 5,
+            head: 7,
+        };
+        let owned = Rc::new(Cell::new(0));
+        let witness = owned.clone();
+        let _observer = open_tests::Observe::new(move |event| {
+            if event == open_tests::Event::ReadOnlyTermOwned {
+                witness.set(witness.get() + 1);
+            }
+        });
+        for (ms, expected) in [(i64::MIN, 6), (i64::MAX - 1, 6), (i64::MAX, 7)] {
+            // Exercise the signed base's full-record walk. It even validates the
+            // first record past head before rejecting it by sequence.
+            let mut previous = None;
+            log.walk(log.head, &mut || Ok(()), &mut |_, _, record, _| {
+                if record.timestamp().is_some_and(|time| time <= ms) {
+                    previous = Some(record.last());
+                }
+                Ok(true)
+            })
+            .unwrap();
+            assert_eq!(owned.replace(0), 12);
+            assert_eq!(previous, Some(expected));
+            assert_eq!(log.commit_at_time(ms, &mut || Ok(())).unwrap(), previous);
+            assert_eq!(owned.get(), 0);
+        }
+    }
+
+    #[test]
+    fn timestamp_only_lookup_rejects_malformed_crc_valid_suffixes() {
+        use crate::task::Control;
+        use std::{cell::Cell, rc::Rc};
+
+        let root = tempfile::tempdir().unwrap();
+        let first = timestamp_changes(4, 40, 1);
+        let good = timestamp_changes(5, 50, 2);
+        let after = encode(&Record::Summary(timestamp_meta(6, 60)));
+        let next_segment = encode(&Record::Summary(timestamp_meta(7, 70)));
+        let log = |middle: &[u8]| ReadOnlyLog {
+            segments: vec![
+                timestamp_segment(root.path(), 4, &[&first, middle, &after]),
+                timestamp_segment(root.path(), 7, &[&next_segment]),
+            ],
+            through: 7,
+            head: 7,
+        };
+        assert_eq!(
+            log(&good).commit_at_time(60, &mut || Ok(())).unwrap(),
+            Some(6)
+        );
+
+        let mut meta = Cur {
+            b: &good[8..],
+            i: 9,
+        };
+        assert!(
+            meta_checked(&mut meta, 5, &mut || Ok(()))
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(meta.varint(), Some(4));
+        let term_length = meta.i;
+        let author = meta
+            .b
+            .windows(b"test author".len())
+            .position(|w| w == b"test author")
+            .unwrap();
+        for damage in [
+            "reference",
+            "truncated",
+            "trailing",
+            "metadata",
+            "term length",
+            "kind",
+            "sequence",
+        ] {
+            let mut body = good[8..].to_vec();
+            match damage {
+                "reference" => *body.last_mut().unwrap() = 127,
+                "truncated" => {
+                    body.pop().unwrap();
+                }
+                "trailing" => body.push(0),
+                "metadata" => body[author] = 0xff,
+                "term length" => body[term_length] = 127,
+                "kind" => body[0] = 0xff,
+                "sequence" => body[1..9].copy_from_slice(&6_u64.to_le_bytes()),
+                _ => unreachable!(),
+            }
+            let mut wire = (body.len() as u32).to_le_bytes().to_vec();
+            wire.extend_from_slice(&crc32(&body).to_le_bytes());
+            wire.extend_from_slice(&body);
+            assert_eq!(frame(&wire, 0).unwrap().0, body.as_slice(), "{damage}");
+            let log = log(&wire);
+            assert_eq!(
+                log.commit_at_time(39, &mut || Ok(())).unwrap(),
+                None,
+                "{damage}"
+            );
+            assert_eq!(
+                log.commit_at_time(60, &mut || Ok(())).unwrap(),
+                Some(4),
+                "{damage}"
+            );
+            assert_eq!(
+                log.commit_at_time(70, &mut || Ok(())).unwrap(),
+                Some(7),
+                "{damage}"
+            );
+
+            let mut rows = Vec::new();
+            log.scan(
+                4,
+                7,
+                &LogFilter {
+                    keys: [None, None, None, None],
+                },
+                false,
+                &mut || Ok(()),
+                &mut |meta, _, _| {
+                    rows.push(meta.seq);
+                    Ok(true)
+                },
+            )
+            .unwrap();
+            assert_eq!(rows, [4], "{damage} exposed rows from a rejected record");
+
+            if damage == "reference" {
+                let flag = Arc::new(AtomicBool::new(false));
+                let control = Control::with_cancel(flag.clone());
+                let refs = Rc::new(Cell::new(0));
+                let witness = refs.clone();
+                let _observer = open_tests::Observe::new(move |event| {
+                    if event == open_tests::Event::ReadOnlyReference(5) {
+                        witness.set(witness.get() + 1);
+                        flag.store(true, Ordering::Relaxed);
+                    }
+                });
+                assert!(matches!(
+                    log.commit_at_time(70, &mut || control.check()),
+                    Err(Error::Cancelled)
+                ));
+                assert_eq!(refs.get(), 1, "the bad reference followed the stop");
+            }
+        }
+    }
+
     #[test]
     fn checked_history_payload_copy_cancels_after_the_first_chunk() {
         let bytes = vec![b'x'; 4 << 20];
@@ -1041,10 +1242,10 @@ pub(super) fn meta_checked(
 
 /// A record's table is required for positional term references. Changes remain
 /// borrowed and are emitted one at a time instead of collecting all its quads.
-enum RecordView<'a> {
+enum RecordView<'a, Terms = Vec<Arc<[u8]>>> {
     Changes {
         meta: Arc<ChangeCommit>,
-        terms: Vec<Arc<[u8]>>,
+        terms: Terms,
         entries: &'a [u8],
         count: u64,
     },
@@ -1069,6 +1270,47 @@ fn decode_checked_with<'a>(
     check: &mut dyn FnMut() -> Result<()>,
     exact: bool,
 ) -> Result<Option<RecordView<'a>>> {
+    let allocation_refused =
+        || Error::HistoryUnsupported("history term-table allocation was refused".into());
+    decode_record(
+        body,
+        check,
+        |count| {
+            let mut terms = Vec::new();
+            if exact {
+                terms
+                    .try_reserve_exact(count)
+                    .map_err(|_| allocation_refused())?;
+            }
+            Ok(terms)
+        },
+        |terms, bytes, check| {
+            if terms.len() == terms.capacity() {
+                terms.try_reserve(1).map_err(|_| allocation_refused())?;
+            }
+            terms.push(arc_bytes_checked(bytes, check)?);
+            #[cfg(test)]
+            open_tests::observe(open_tests::Event::ReadOnlyTermOwned);
+            Ok(())
+        },
+    )
+}
+
+fn decode_timestamp<'a>(
+    body: &'a [u8],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Option<RecordView<'a, ()>>> {
+    // Opaque terms only need bounds checks. The frame reader already polls while
+    // reading and checksumming their bytes, and decoding still polls per term.
+    decode_record(body, check, |_| Ok(()), |_, _, _| Ok(()))
+}
+
+fn decode_record<'a, Terms>(
+    body: &'a [u8],
+    check: &mut dyn FnMut() -> Result<()>,
+    make_terms: impl FnOnce(usize) -> Result<Terms>,
+    mut keep_term: impl FnMut(&mut Terms, &[u8], &mut dyn FnMut() -> Result<()>) -> Result<()>,
+) -> Result<Option<RecordView<'a, Terms>>> {
     check()?;
     let mut c = Cur { b: body, i: 0 };
     let Some((ty, seq)) = c.u8().zip(c.u64()) else {
@@ -1097,12 +1339,7 @@ fn decode_checked_with<'a>(
             let Some(n) = c.varint().and_then(|n| usize::try_from(n).ok()) else {
                 return Ok(None);
             };
-            let mut terms = Vec::new();
-            if exact {
-                terms.try_reserve_exact(n).map_err(|_| {
-                    Error::HistoryUnsupported("history term-table allocation was refused".into())
-                })?;
-            }
+            let mut terms = make_terms(n)?;
             for _ in 0..n {
                 check()?;
                 let Some(length) = c.varint().and_then(|n| usize::try_from(n).ok()) else {
@@ -1111,14 +1348,7 @@ fn decode_checked_with<'a>(
                 let Some(bytes) = c.bytes(length) else {
                     return Ok(None);
                 };
-                if terms.len() == terms.capacity() {
-                    terms.try_reserve(1).map_err(|_| {
-                        Error::HistoryUnsupported(
-                            "history term-table allocation was refused".into(),
-                        )
-                    })?;
-                }
-                terms.push(arc_bytes_checked(bytes, check)?);
+                keep_term(&mut terms, bytes, check)?;
             }
             let Some(count) = c.varint() else {
                 return Ok(None);
@@ -1134,7 +1364,7 @@ fn decode_checked_with<'a>(
                     return Ok(None);
                 }
                 for _ in 0..4 {
-                    if c.varint().is_none_or(|n| n >= terms.len() as u64) {
+                    if c.varint().is_none_or(|reference| reference >= n as u64) {
                         return Ok(None);
                     }
                 }
@@ -1152,7 +1382,7 @@ fn decode_checked_with<'a>(
     Ok((c.i == body.len()).then_some(record))
 }
 
-impl RecordView<'_> {
+impl<Terms> RecordView<'_, Terms> {
     fn first(&self) -> u64 {
         match self {
             Self::Changes { meta, .. } | Self::Summary(meta) => meta.seq,
@@ -1171,6 +1401,9 @@ impl RecordView<'_> {
             Self::Gap { .. } => None,
         }
     }
+}
+
+impl RecordView<'_> {
     fn emit(
         &self,
         filter: &LogFilter,
@@ -1204,8 +1437,11 @@ impl RecordView<'_> {
     }
 }
 
-type WalkVisitor<'a> =
-    dyn FnMut(usize, u64, &RecordView<'_>, &mut dyn FnMut() -> Result<()>) -> Result<bool> + 'a;
+type WalkVisitor<'a, Terms = Vec<Arc<[u8]>>> = dyn FnMut(usize, u64, &RecordView<'_, Terms>, &mut dyn FnMut() -> Result<()>) -> Result<bool>
+    + 'a;
+
+type RecordDecoder<Terms> =
+    for<'a> fn(&'a [u8], &mut dyn FnMut() -> Result<()>) -> Result<Option<RecordView<'a, Terms>>>;
 
 impl ReadOnlyLog {
     /// Walk each segment's valid consecutive prefix without retaining the log or
@@ -1216,13 +1452,23 @@ impl ReadOnlyLog {
         check: &mut dyn FnMut() -> Result<()>,
         visit: &mut WalkVisitor<'_>,
     ) -> Result<()> {
+        self.walk_with(maximum, check, decode_checked, visit)
+    }
+
+    fn walk_with<Terms>(
+        &self,
+        maximum: u64,
+        check: &mut dyn FnMut() -> Result<()>,
+        decode: RecordDecoder<Terms>,
+        visit: &mut WalkVisitor<'_, Terms>,
+    ) -> Result<()> {
         check()?;
         for (index, segment) in self.segments.iter().enumerate() {
             check()?;
             let mut offset = SEG_HEADER as u64;
             let mut previous = None;
             while let Some(body) = segment.body_at(offset, check)? {
-                let Some(record) = decode_checked(&body, check)? else {
+                let Some(record) = decode(&body, check)? else {
                     break;
                 };
                 if previous.is_some_and(|last: u64| last.checked_add(1) != Some(record.first())) {
@@ -1252,16 +1498,21 @@ impl ReadOnlyLog {
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<Option<u64>> {
         #[cfg(test)]
-        open_tests::observe(open_tests::Event::ReadOnlyTimestamp);
+        open_tests::observe(open_tests::Event::ReadOnlyTimestamp(ms));
         let mut best = None;
-        self.walk(self.head, check, &mut |_, _, record, _| {
-            // Match the ordinary index's last recorded commit at or before time;
-            // gap records have no timestamp and cannot manufacture a time bound.
-            if record.timestamp().is_some_and(|timestamp| timestamp <= ms) {
-                best = Some(record.last());
-            }
-            Ok(true)
-        })?;
+        self.walk_with(
+            self.head,
+            check,
+            decode_timestamp,
+            &mut |_, _, record, _| {
+                // Match the ordinary index's last recorded commit at or before time;
+                // gap records have no timestamp and cannot manufacture a time bound.
+                if record.timestamp().is_some_and(|timestamp| timestamp <= ms) {
+                    best = Some(record.last());
+                }
+                Ok(true)
+            },
+        )?;
         Ok(best)
     }
 }

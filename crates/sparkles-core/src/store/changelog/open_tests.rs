@@ -29,8 +29,9 @@ pub(in crate::store) enum Event {
     IndexRecords,
     IndexRecord,
     IndexPosting,
-    ReadOnlyTimestamp,
+    ReadOnlyTimestamp(i64),
     ReadOnlyReference(u64),
+    ReadOnlyTermOwned,
 }
 
 type Observer = Box<dyn FnMut(Event)>;
@@ -47,10 +48,10 @@ pub(in crate::store) fn observe(event: Event) {
     });
 }
 
-struct Observe;
+pub(super) struct Observe;
 
 impl Observe {
-    fn new(observer: impl FnMut(Event) + 'static) -> Self {
+    pub(super) fn new(observer: impl FnMut(Event) + 'static) -> Self {
         OBSERVER.with_borrow_mut(|slot| {
             assert!(slot.is_none());
             *slot = Some(Box::new(observer));
@@ -543,7 +544,7 @@ struct ColdFamily {
     main: Store,
     dir: tempfile::TempDir,
     target: crate::commit::CommitInfo,
-    later: u64,
+    later: crate::commit::CommitInfo,
     origin_log: PathBuf,
     early: u64,
 }
@@ -565,7 +566,7 @@ impl ColdFamily {
         assert_eq!(target.timestamp_ms, time, "the two commits must tie");
         parent.set_clock(Arc::new(move || time + 1000));
         write(&parent, "<urn:later> <urn:p> 2 .");
-        let later = parent.head_commit().seq;
+        let later = parent.head_commit();
         main.create_branch(
             "child",
             &BranchOptions {
@@ -659,7 +660,7 @@ fn stop_in_read_only_bound(
     let observer = Observe::new(move |event| {
         let (mut pass, mut refs) = witness.get();
         match event {
-            Event::ReadOnlyTimestamp => pass += 1,
+            Event::ReadOnlyTimestamp(_) => pass += 1,
             Event::ReadOnlyReference(seq) if pass == lookup && seq == target => {
                 refs += 1;
                 if refs == 1 {
@@ -734,7 +735,7 @@ fn checked_open_honors_original_composed_cancellation_during_read_only_timestamp
     assert_read_only_timestamp_stop(2, true);
 }
 
-fn assert_absolute_timestamp_deadline(source_expires: bool) {
+fn assert_absolute_timestamp_deadline(source_expires: bool, lookup: usize) {
     let fixture = ColdFamily::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     let prep = Preparation::new(
@@ -757,11 +758,12 @@ fn assert_absolute_timestamp_deadline(source_expires: bool) {
         }),
         ..Default::default()
     };
-    let mut cursor = strict_source(&fixture.child, &view, &opts, &format!("; hist:to {LATE}"));
+    let bounds = format!("; hist:from {EARLY} ; hist:to {LATE}");
+    let mut cursor = strict_source(&fixture.child, &view, &opts, &bounds);
     cursor
         .deadline_pause()
         .store(CREDIT.as_nanos() as u64, Ordering::Relaxed);
-    let error = stop_in_read_only_bound(&mut cursor, 1, fixture.target.seq, move || {
+    let error = stop_in_read_only_bound(&mut cursor, lookup, fixture.target.seq, move || {
         assert!(
             Instant::now() < deadline,
             "the deadline expired before the witness"
@@ -776,12 +778,22 @@ fn assert_absolute_timestamp_deadline(source_expires: bool) {
 
 #[test]
 fn checked_open_keeps_absolute_source_deadline_during_timestamp_lookup() {
-    assert_absolute_timestamp_deadline(true);
+    assert_absolute_timestamp_deadline(true, 1);
 }
 
 #[test]
 fn checked_open_keeps_absolute_query_deadline_during_timestamp_lookup() {
-    assert_absolute_timestamp_deadline(false);
+    assert_absolute_timestamp_deadline(false, 1);
+}
+
+#[test]
+fn checked_open_keeps_absolute_source_deadline_during_second_timestamp_lookup() {
+    assert_absolute_timestamp_deadline(true, 2);
+}
+
+#[test]
+fn checked_open_keeps_absolute_query_deadline_during_second_timestamp_lookup() {
+    assert_absolute_timestamp_deadline(false, 2);
 }
 
 #[test]
@@ -820,6 +832,57 @@ fn rows(cursor: &mut QueryCursor) -> Vec<Vec<Option<oxrdf::Term>>> {
 }
 
 #[test]
+fn checked_cold_timestamp_rows_match_commit_bounds_before_and_after_clamping() {
+    let cold = ColdFamily::new();
+    let policy = Arc::new(GraphAccess::all());
+    let prep = Preparation::new(Control::none(), 128 << 20).unwrap();
+    let view = cold.view(policy.clone(), &prep);
+    let tied = cold.target.timestamp();
+    let opts = QueryOptions {
+        graphs: Some(policy),
+        ..Default::default()
+    };
+    for (time, commit, passes) in [
+        (
+            format!("; hist:to \"time:{}\"", cold.later.timestamp()),
+            format!("; hist:to \"commit:{}\"", cold.later.seq),
+            vec![cold.later.timestamp_ms],
+        ),
+        (
+            format!("; hist:from \"time:{tied}\" ; hist:to \"time:{tied}\""),
+            format!(
+                "; hist:from \"commit:{}\" ; hist:to \"commit:{}\"",
+                cold.early, cold.target.seq
+            ),
+            vec![cold.target.timestamp_ms - 1, cold.target.timestamp_ms],
+        ),
+    ] {
+        for order in ["", "; hist:order hist:descending"] {
+            let read_rows = |bounds: &str| {
+                rows(&mut strict_source(
+                    &cold.child,
+                    &view,
+                    &opts,
+                    &format!("{bounds} {order}"),
+                ))
+            };
+            let lookups = Rc::new(RefCell::new(Vec::new()));
+            let witness = lookups.clone();
+            let _observer = Observe::new(move |event| {
+                if let Event::ReadOnlyTimestamp(ms) = event {
+                    witness.borrow_mut().push(ms);
+                }
+            });
+            let expected = read_rows(&commit);
+            assert!(lookups.borrow().is_empty(), "{commit} {order}");
+            assert_eq!(expected.len(), 8001, "{commit} {order}");
+            assert_eq!(read_rows(&time), expected, "{time} {order}");
+            assert_eq!(*lookups.borrow(), passes, "{time} {order}");
+        }
+    }
+}
+
+#[test]
 fn checked_open_preserves_writable_and_cold_selector_rows_and_order() {
     let cold = ColdFamily::new();
     let writable = Store::in_memory(Default::default());
@@ -836,7 +899,7 @@ fn checked_open_preserves_writable_and_cold_selector_rows_and_order() {
     assert_eq!(
         log.commit_at_time_checked(i64::MAX, &mut || Ok(()))
             .unwrap(),
-        Some(cold.later),
+        Some(cold.later.seq),
         "the time lookup sees the captured head beyond the row ceiling"
     );
     let warm_view = writable.prepare_read(policy.clone(), &prep).unwrap();
@@ -862,7 +925,7 @@ fn checked_open_preserves_writable_and_cold_selector_rows_and_order() {
             &cold_view,
             cold.early,
             cold.target.seq,
-            cold.later,
+            cold.later.seq,
         ),
         (&writable, &warm_view, first, target, target + 1),
     ] {
