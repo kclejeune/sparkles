@@ -73,9 +73,9 @@ check them against the W3C suites and Jena's own answers.
   `VARIANCE`, `VAR_SAMP` and `VAR_POP` work with `DISTINCT`, as keywords, by their `agg:`
   and `afn:` IRIs and through `AGG <iri>(…)`. Their results, types, empty groups and errors
   match ARQ's.
-* Results come as JSON, XML, CSV, TSV and `x-sparkles+json`, which includes the executed
-  plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and as
-  Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
+* Results come as JSON, XML, CSV, TSV, SPARQL Results Thrift and `x-sparkles+json`, which
+  includes the executed plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and
+  RDF/XML, and as Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
 
 ### Aggregate errors
 
@@ -300,8 +300,14 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   FOLD, registered aggregates, `MEDIAN`, `MODE` and the other custom aggregates read the
   whole rows of each group.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
-  library pulls SELECT results. Result writers use bounded buffers with backpressure and
-  stop when the client disconnects.
+  library pulls SELECT results. Result writers share one columnar implementation per
+  format across eager and cursor sources, including streamed SPARQL Results Thrift, and
+  stop when the client disconnects. Each active streamed HTTP response uses a bounded
+  channel of 16 chunks of 64 KiB, up to 1 MiB of live buffer memory released when the
+  stream ends or aborts, trading that buffer memory per active stream so a pre-decoded
+  4,096-row cursor batch can enqueue without stalling the producer. The stream idle timer
+  wakes only when the idle deadline starts, moves earlier or enters a terminal or aborted
+  state rather than on every chunk.
 * Rust callers can use `sparql::results::write_with_completion` to check a writer
   after serialization finishes and the writer has accepted the final rows. With a
   `LimitedWriter`, the callback can call `check_completion` to observe a pending

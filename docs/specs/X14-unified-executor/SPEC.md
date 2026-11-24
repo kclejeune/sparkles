@@ -1588,3 +1588,56 @@ included 1.0, as did the eager control's. A streamed answer still took 0.21 to 0
 more wall time than an eager one on those queries, against 0.23 to 0.31 ms in the base,
 because the hand-off between threads that the phase trace measured lies outside the
 writer.
+
+### One writer per format and exact row accounting (items 828 and 243)
+
+Roadmap items 828 and 243 shipped one columnar writer per format over a shared `Source`
+trait for SELECT, ASK and graph answers, replacing the separate eager and cursor writers
+and removing the public `_counted` writer functions. The engine now writes SPARQL JSON,
+XML, CSV and TSV SELECT results with its own encoders in place of the sparesults writers,
+keeping the same bytes and delivering each row whole under the query's memory and
+result-size budgets. SPARQL Results Thrift moved from `sparkles-server` into
+`sparkles-core` so a streamed Thrift SELECT writes from a cursor in the same bytes as an
+eager answer and no longer returns `501`. The result buffer records row ends in a
+`RowLedger` rather than checking the row count on every write, and a streamed HTTP
+response credits a row once the transport has handed over the bytes up to its end, so a
+failed final send excludes the unsent chunk's rows. The in-place cursor hand-off remains
+under item 534, graph response shape unification remains under item 1111, and the
+per-row cost of whole-row output remains under item 1195.
+
+Initial quiet `atlas` timing of `fd47b7ae` against `726563ad` confirmed a 1.1919×
+regression (+43.73 ms, 16/16 slower) on 12-thread native streaming `optional-chain`
+entirely inside serialization. Commit `a6814599` resolved that backpressure cliff with
+three changes: `Shared::timer` in `http/stream/lifetime.rs` no longer wakes on every
+64 KiB chunk or `Err(Full)` and instead notifies only when `idle_at` starts, moves
+earlier or enters a terminal or aborted state; `SwitchWriter`'s bounded stream channel
+grew from 4 to 16 chunks of 64 KiB (`CHANNEL_CAP = 16`); and `CursorSolutions::drive`
+hoisted its `row_storage` `OwnedCharge` out of the per-batch decode callback to avoid
+per-batch `QueryMemoryLedger` lock contention with Rayon's decode-ahead term cache.
+Raising the channel capacity trades up to 768 KiB more live buffer memory per active
+streamed HTTP response, from 256 KiB to 1 MiB matching `STREAM_AFTER` and released when
+the stream ends or aborts, so a pre-decoded 4,096-row cursor batch can enqueue without
+stalling the blocking producer inside `rayon::in_place_scope`.
+
+Quiet `atlas` order-corrected ABBA measurements with matched `wally` release builds
+(8 rounds of 10 requests in both orders at 10.5M triples) confirmed the gains across
+both streaming and format encoders with identical answer fingerprints. In the 12-thread
+native streaming confirmation cell comparing `fd47b7ae` with `a6814599`, all four
+workload queries improved with 0/16 rounds slower: `export-500k` ran at 0.3710× (250.94
+against 676.68 ms), `optional-chain` at 0.9420× (211.72 against 224.86 ms),
+`order-by-full` at 0.7782× (794.14 against 1,018.84 ms) and `star-join` at 0.8508×
+(53.87 against 63.35 ms). Across the full 34-pair `atlas` matrix comparing `fd47b7ae`
+with `726563ad`, 1-thread `optional-chain` ran at 0.4381× streamed and 0.5658× eager in
+SPARQL JSON, 0.5691× streamed and 0.7154× eager in XML, 0.9078× streamed in TSV and
+0.8979× streamed in CSV; on the `literals` dataset, `long-literal` ran at 0.4234×
+streamed and 0.4447× eager in SPARQL JSON, 0.7580× eager and 0.8632× streamed in CSV
+and 0.8381× streamed in TSV. The streamed Thrift probe passed with matching HTTP
+chunked framing and identical body fingerprints across base eager, tip eager and tip
+streaming. Three confirmed small costs on quiet `atlas` (`fd47b7ae..726563ad`) that
+passed the gate are tracked in roadmap item 1195: `workload-native-eager-1t`
+`order-by-full` at 1.0029× (+2.43 ms, 13/16), `literal-tsv-eager-1t` `escape-straddle`
+at 1.0017× (+3.76 µs, 14/16) and `short-native-streaming-1t` `predicate-counts` at
+1.0010× (+2.00 µs, 23/24). Non-Intel gates passed on `726563ad`: `mise run
+test:w3c:streaming` passed 1,274 of 1,274 tests with zero regressions and 24 unchanged
+fallbacks, and `py:test`, `jvm:test`, `node:test` and `bench:bindings` across all five
+Sparkles engines passed with zero answer discrepancies.
