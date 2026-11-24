@@ -1168,11 +1168,16 @@ enum GraphState<W: Write + Send + 'static> {
         header_written: bool,
     },
     Rdf {
-        serializer: Option<oxrdfio::WriterQuadSerializer<GraphSink<W>>>,
+        serializer: Option<Box<oxrdfio::WriterQuadSerializer<GraphSink<W>>>>,
         sink: GraphSink<W>,
         _charge: OwnedCharge,
         format: oxrdfio::RdfFormat,
         datasets: bool,
+        prefixes: Vec<(String, String)>,
+        max_prefix_name_bytes: u64,
+        header_bytes: u64,
+        rdfxml_subject: Option<oxrdf::NamedOrBlankNode>,
+        rdfxml_close_tag_bytes: u64,
         slot: SinkSlot<W>,
         staged: Arc<AtomicU64>,
         rows_taken: Arc<AtomicU64>,
@@ -1268,15 +1273,70 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
                     refused.clone(),
                     self.ledger.clone(),
                 );
+                let valid_prefixes: Vec<(String, String)> = if matches!(
+                    format,
+                    oxrdfio::RdfFormat::Turtle
+                        | oxrdfio::RdfFormat::TriG
+                        | oxrdfio::RdfFormat::RdfXml
+                ) {
+                    prefixes
+                        .iter()
+                        .filter(|(_, ns)| oxiri::Iri::parse(ns.as_str()).is_ok())
+                        .cloned()
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                let max_prefix_name_bytes = valid_prefixes
+                    .iter()
+                    .map(|(name, _)| name.len() as u64)
+                    .max()
+                    .unwrap_or(0)
+                    .max(8);
+                let header_bytes = match format {
+                    oxrdfio::RdfFormat::RdfXml => 128u64.saturating_add(
+                        valid_prefixes
+                            .iter()
+                            .map(|(name, ns)| {
+                                (name.len() as u64)
+                                    .saturating_add(ns.len() as u64)
+                                    .saturating_mul(6)
+                                    .saturating_add(16)
+                            })
+                            .sum::<u64>(),
+                    ),
+                    oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG => valid_prefixes
+                        .iter()
+                        .map(|(name, ns)| {
+                            (name.len() as u64)
+                                .saturating_add(ns.len() as u64)
+                                .saturating_add(16)
+                        })
+                        .sum::<u64>(),
+                    _ => 0,
+                };
+                let turtle_prefixes = if matches!(
+                    format,
+                    oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG
+                ) {
+                    valid_prefixes
+                } else {
+                    Vec::new()
+                };
                 let serializer =
                     crate::io::with_prefixes(oxrdfio::RdfSerializer::from_format(format), prefixes)
                         .for_writer(sink.clone());
                 GraphState::Rdf {
-                    serializer: Some(serializer),
+                    serializer: Some(Box::new(serializer)),
                     sink,
                     _charge: charge,
                     format,
                     datasets: format.supports_datasets(),
+                    prefixes: turtle_prefixes,
+                    max_prefix_name_bytes,
+                    header_bytes,
+                    rdfxml_subject: None,
+                    rdfxml_close_tag_bytes: 0,
                     slot,
                     staged,
                     rows_taken,
@@ -1640,9 +1700,7 @@ impl<W: Write + Send + 'static> GraphWriter<W> {
             }
             match &mut self.state {
                 GraphState::Rdf { serializer, .. } => {
-                    let sink = serializer
-                        .take()
-                        .expect("active RDF serializer")
+                    let sink = (*serializer.take().expect("active RDF serializer"))
                         .finish()
                         .map_err(io)?;
                     sink.finish_drain()?;
@@ -1750,34 +1808,130 @@ fn quad_size_bounds(
 }
 
 fn escaped_str_fits(s: &str, kind: EscapeKind, remaining: &mut u64) -> bool {
-    for b in s.bytes() {
-        let n: u64 = match kind {
-            EscapeKind::Rdf => match b {
-                b'\\' | b'"' | b'\n' | b'\r' | b'\t' => 2,
-                0..0x20 | 0x7f => 6,
-                _ => 1,
-            },
-            EscapeKind::Xml => match b {
-                b'&' => 5,
-                b'<' | b'>' => 4,
-                b'"' | b'\'' => 6,
-                b'\r' | b'\n' | b'\t' => 5,
-                _ => 1,
-            },
-            EscapeKind::Json => json_escape_len(b) as u64,
-        };
-        let Some(next) = remaining.checked_sub(n) else {
+    match kind {
+        EscapeKind::Rdf => {
+            // Match `oxrdf::literal::print_quoted_str`, including `\uFFFE` and `\uFFFF`
+            // (3 UTF-8 bytes expanding to 6 ASCII escape bytes).
+            for c in s.chars() {
+                let n: u64 = match c {
+                    '\u{8}' | '\t' | '\n' | '\u{C}' | '\r' | '"' | '\\' => 2,
+                    '\0'..='\u{1F}' | '\u{7F}' | '\u{FFFE}' | '\u{FFFF}' => 6,
+                    _ => c.len_utf8() as u64,
+                };
+                let Some(next) = remaining.checked_sub(n) else {
+                    return false;
+                };
+                *remaining = next;
+            }
+            true
+        }
+        EscapeKind::Xml => {
+            for b in s.bytes() {
+                let n: u64 = match b {
+                    b'&' => 5,
+                    b'<' | b'>' => 4,
+                    b'"' | b'\'' => 6,
+                    b'\r' | b'\n' | b'\t' => 5,
+                    _ => 1,
+                };
+                let Some(next) = remaining.checked_sub(n) else {
+                    return false;
+                };
+                *remaining = next;
+            }
+            true
+        }
+        EscapeKind::Json => {
+            for b in s.bytes() {
+                let Some(next) = remaining.checked_sub(json_escape_len(b) as u64) else {
+                    return false;
+                };
+                *remaining = next;
+            }
+            true
+        }
+    }
+}
+
+#[inline]
+fn is_turtle_escaped_local_byte(b: u8) -> bool {
+    matches!(
+        b,
+        b'_' | b'~'
+            | b'.'
+            | b'-'
+            | b'!'
+            | b'$'
+            | b'&'
+            | b'\''
+            | b'('
+            | b')'
+            | b'*'
+            | b'+'
+            | b','
+            | b';'
+            | b'='
+            | b'/'
+            | b'?'
+            | b'#'
+            | b'@'
+            | b'%'
+    )
+}
+
+/// Bound an IRI written by `oxttl` (N-Triples, N-Quads, Turtle, TriG). When prefixes are
+/// configured, a matching prefix may emit `{prefix}:{escaped_local}` where PN_LOCAL_ESC
+/// characters double in length.
+fn rdf_iri_fits(iri: &str, prefixes: &[(String, String)], remaining: &mut u64) -> bool {
+    let raw = (iri.len() as u64).saturating_add(2);
+    if prefixes.is_empty() {
+        let Some(next) = remaining.checked_sub(raw) else {
             return false;
         };
         *remaining = next;
+        return true;
     }
+    let mut worst = raw;
+    for (prefix_name, prefix_iri) in prefixes {
+        if let Some(local) = iri.strip_prefix(prefix_iri.as_str()) {
+            let mut prefixed = (prefix_name.len() as u64).saturating_add(1);
+            for b in local.bytes() {
+                prefixed = prefixed.saturating_add(if is_turtle_escaped_local_byte(b) {
+                    2
+                } else {
+                    1
+                });
+                if prefixed > *remaining {
+                    return false;
+                }
+            }
+            worst = worst.max(prefixed);
+        }
+    }
+    let Some(next) = remaining.checked_sub(worst) else {
+        return false;
+    };
+    *remaining = next;
     true
+}
+
+fn rdfxml_next_close_tag_bytes(quad: &Quad, max_prefix_name_bytes: u64) -> u64 {
+    if quad.predicate.as_ref() == oxrdf::vocab::rdf::TYPE
+        && let oxrdf::Term::NamedNode(class) = &quad.object
+    {
+        (class.as_str().len() as u64)
+            .saturating_add(max_prefix_name_bytes)
+            .saturating_add(16)
+    } else {
+        18
+    }
 }
 
 fn term_escaped_fits(
     term: oxrdf::TermRef<'_>,
     kind: EscapeKind,
-    meta: LiteralMetaMode,
+    prefixes: &[(String, String)],
+    rdfxml_prefix_bytes: Option<u64>,
     depth: usize,
     remaining: &mut u64,
 ) -> bool {
@@ -1790,7 +1944,7 @@ fn term_escaped_fits(
     };
     match term {
         oxrdf::TermRef::NamedNode(n) => match kind {
-            EscapeKind::Rdf => take((n.as_str().len() as u64).saturating_add(2), remaining),
+            EscapeKind::Rdf => rdf_iri_fits(n.as_str(), prefixes, remaining),
             EscapeKind::Xml | EscapeKind::Json => {
                 take(32, remaining) && escaped_str_fits(n.as_str(), kind, remaining)
             }
@@ -1808,24 +1962,19 @@ fn term_escaped_fits(
             if let Some(lang) = l.language() {
                 let frame = match kind {
                     EscapeKind::Rdf => 12,
-                    EscapeKind::Xml | EscapeKind::Json => 64,
+                    EscapeKind::Xml => 160,
+                    EscapeKind::Json => 64,
                 };
                 take(frame, remaining) && escaped_str_fits(lang, kind, remaining)
             } else if l.datatype() != oxrdf::vocab::xsd::STRING {
-                if matches!(meta, LiteralMetaMode::NonTurtleShorthand)
-                    && is_turtle_shorthand_datatype(l.datatype())
-                {
-                    take(4, remaining)
-                } else {
-                    match kind {
-                        EscapeKind::Rdf => take(
-                            (l.datatype().as_str().len() as u64).saturating_add(6),
-                            remaining,
-                        ),
-                        EscapeKind::Xml | EscapeKind::Json => {
-                            take(64, remaining)
-                                && escaped_str_fits(l.datatype().as_str(), kind, remaining)
-                        }
+                match kind {
+                    EscapeKind::Rdf => {
+                        take(4, remaining)
+                            && rdf_iri_fits(l.datatype().as_str(), prefixes, remaining)
+                    }
+                    EscapeKind::Xml | EscapeKind::Json => {
+                        take(64, remaining)
+                            && escaped_str_fits(l.datatype().as_str(), kind, remaining)
                     }
                 }
             } else {
@@ -1840,19 +1989,45 @@ fn term_escaped_fits(
         oxrdf::TermRef::Triple(t) => {
             let frame = match kind {
                 EscapeKind::Rdf => 12,
-                EscapeKind::Xml => 96u64.saturating_add((depth as u64).saturating_mul(16)),
+                EscapeKind::Xml => 160u64.saturating_add((depth as u64).saturating_mul(16)),
                 EscapeKind::Json => 64,
             };
-            take(frame, remaining)
-                && term_escaped_fits(t.subject.as_ref().into(), kind, meta, depth + 1, remaining)
-                && term_escaped_fits(
-                    t.predicate.as_ref().into(),
+            if !take(frame, remaining)
+                || !term_escaped_fits(
+                    t.subject.as_ref().into(),
                     kind,
-                    meta,
+                    prefixes,
+                    rdfxml_prefix_bytes,
                     depth + 1,
                     remaining,
                 )
-                && term_escaped_fits(t.object.as_ref(), kind, meta, depth + 1, remaining)
+                || !term_escaped_fits(
+                    t.predicate.as_ref().into(),
+                    kind,
+                    prefixes,
+                    rdfxml_prefix_bytes,
+                    depth + 1,
+                    remaining,
+                )
+            {
+                return false;
+            }
+            // In RDF/XML, a nested triple's predicate QName can be emitted in both opening
+            // and closing tags when its object is a literal or nested triple.
+            if let Some(prefix_bytes) = rdfxml_prefix_bytes
+                && (!take(prefix_bytes.saturating_mul(2).saturating_add(32), remaining)
+                    || !escaped_str_fits(t.predicate.as_str(), kind, remaining))
+            {
+                return false;
+            }
+            term_escaped_fits(
+                t.object.as_ref(),
+                kind,
+                prefixes,
+                rdfxml_prefix_bytes,
+                depth + 1,
+                remaining,
+            )
         }
     }
 }
@@ -1860,37 +2035,79 @@ fn term_escaped_fits(
 fn quad_escaped_fits(
     quad: &Quad,
     kind: EscapeKind,
-    meta: LiteralMetaMode,
+    prefixes: &[(String, String)],
     include_graph: bool,
+    extra_frame: u64,
     available: u64,
 ) -> bool {
     let q = quad.as_ref();
-    let frame = match kind {
+    let frame: u64 = match kind {
         EscapeKind::Rdf => 16,
         EscapeKind::Xml => 256,
         EscapeKind::Json => 64,
     };
+    let frame = frame.saturating_add(extra_frame);
     let Some(mut remaining) = available.checked_sub(frame) else {
         return false;
     };
-    if !term_escaped_fits(q.subject.into(), kind, meta, 0, &mut remaining)
-        || !term_escaped_fits(q.predicate.into(), kind, meta, 0, &mut remaining)
-        || !term_escaped_fits(q.object, kind, meta, 0, &mut remaining)
+    if !term_escaped_fits(q.subject.into(), kind, prefixes, None, 0, &mut remaining)
+        || !term_escaped_fits(q.predicate.into(), kind, prefixes, None, 0, &mut remaining)
+        || !term_escaped_fits(q.object, kind, prefixes, None, 0, &mut remaining)
     {
         return false;
     }
     if include_graph {
         match q.graph_name {
             oxrdf::GraphNameRef::NamedNode(n) => {
-                return term_escaped_fits(n.into(), kind, meta, 0, &mut remaining);
+                return term_escaped_fits(n.into(), kind, prefixes, None, 0, &mut remaining);
             }
             oxrdf::GraphNameRef::BlankNode(b) => {
-                return term_escaped_fits(b.into(), kind, meta, 0, &mut remaining);
+                return term_escaped_fits(b.into(), kind, prefixes, None, 0, &mut remaining);
             }
             oxrdf::GraphNameRef::DefaultGraph => {}
         }
     }
     true
+}
+
+fn rdfxml_quad_escaped_fits(
+    quad: &Quad,
+    available: u64,
+    extra_frame: u64,
+    max_prefix_name_bytes: u64,
+) -> bool {
+    let q = quad.as_ref();
+    let frame = 256u64
+        .saturating_add(extra_frame)
+        .saturating_add(max_prefix_name_bytes.saturating_mul(2));
+    let Some(mut remaining) = available.checked_sub(frame) else {
+        return false;
+    };
+    // RDF/XML splits the predicate into namespace + local name and emits the QName in both
+    // the opening and closing tags for literal and triple objects.
+    term_escaped_fits(
+        q.subject.into(),
+        EscapeKind::Xml,
+        &[],
+        Some(max_prefix_name_bytes),
+        0,
+        &mut remaining,
+    ) && term_escaped_fits(
+        q.predicate.into(),
+        EscapeKind::Xml,
+        &[],
+        Some(max_prefix_name_bytes),
+        0,
+        &mut remaining,
+    ) && escaped_str_fits(q.predicate.as_str(), EscapeKind::Xml, &mut remaining)
+        && term_escaped_fits(
+            q.object,
+            EscapeKind::Xml,
+            &[],
+            Some(max_prefix_name_bytes),
+            0,
+            &mut remaining,
+        )
 }
 
 fn json_str_escaped_bytes(s: &str) -> u64 {
@@ -1951,23 +2168,82 @@ fn sink_quad_fits<W: Write + Send + 'static>(
         GraphState::Rdf {
             format,
             datasets,
+            prefixes,
+            max_prefix_name_bytes,
+            header_bytes,
+            rdfxml_subject,
+            rdfxml_close_tag_bytes,
             progress_bytes,
             ..
         } => {
             if !*datasets && !quad.graph_name.is_default_graph() {
                 return true;
             }
-            let available = limit_bytes.saturating_sub(progress_bytes.load(Ordering::Relaxed));
-            let (kind, meta, quad_frame) = match format {
+            let progress = progress_bytes.load(Ordering::Relaxed);
+            let available = limit_bytes.saturating_sub(progress);
+            if *format == oxrdfio::RdfFormat::RdfXml {
+                let header_extra = if rdfxml_subject.is_none() {
+                    *header_bytes
+                } else {
+                    0
+                };
+                let new_subject = rdfxml_subject.as_ref() != Some(&quad.subject);
+                let prev_close_extra = if new_subject {
+                    *rdfxml_close_tag_bytes
+                } else {
+                    0
+                };
+                let next_close_extra = if new_subject {
+                    rdfxml_next_close_tag_bytes(quad, *max_prefix_name_bytes)
+                } else {
+                    0
+                };
+                let extra = header_extra
+                    .saturating_add(prev_close_extra)
+                    .saturating_add(next_close_extra);
+                let pred_extra = (quad.predicate.as_str().len() as u64)
+                    .saturating_mul(6)
+                    .saturating_add(max_prefix_name_bytes.saturating_mul(2))
+                    .saturating_add(32);
+                let (min_bytes, max_bytes) = quad_size_bounds(
+                    quad,
+                    LiteralMetaMode::All,
+                    6,
+                    false,
+                    256u64.saturating_add(extra).saturating_add(pred_extra),
+                );
+                if min_bytes
+                    .saturating_add(header_extra)
+                    .saturating_add(prev_close_extra)
+                    > available
+                {
+                    return false;
+                }
+                if max_bytes <= available {
+                    return true;
+                }
+                return rdfxml_quad_escaped_fits(quad, available, extra, *max_prefix_name_bytes);
+            }
+            let (kind, meta, quad_frame, extra_frame) = match format {
                 oxrdfio::RdfFormat::Turtle | oxrdfio::RdfFormat::TriG => {
-                    (EscapeKind::Rdf, LiteralMetaMode::NonTurtleShorthand, 16)
+                    let first_header = if progress == 0 { *header_bytes } else { 0 };
+                    let prefix_frame = max_prefix_name_bytes.saturating_mul(4);
+                    (
+                        EscapeKind::Rdf,
+                        LiteralMetaMode::NonTurtleShorthand,
+                        16u64
+                            .saturating_add(first_header)
+                            .saturating_add(prefix_frame),
+                        first_header,
+                    )
                 }
                 oxrdfio::RdfFormat::NTriples | oxrdfio::RdfFormat::NQuads => {
-                    (EscapeKind::Rdf, LiteralMetaMode::All, 16)
+                    (EscapeKind::Rdf, LiteralMetaMode::All, 16, 0)
                 }
-                oxrdfio::RdfFormat::RdfXml => (EscapeKind::Xml, LiteralMetaMode::All, 256),
-                oxrdfio::RdfFormat::JsonLd { .. } => (EscapeKind::Json, LiteralMetaMode::All, 64),
-                _ => (EscapeKind::Rdf, LiteralMetaMode::All, 64),
+                oxrdfio::RdfFormat::JsonLd { .. } => {
+                    (EscapeKind::Json, LiteralMetaMode::All, 64, 0)
+                }
+                _ => (EscapeKind::Rdf, LiteralMetaMode::All, 64, 0),
             };
             let (min_bytes, max_bytes) = quad_size_bounds(quad, meta, 6, *datasets, quad_frame);
             if min_bytes > available {
@@ -1976,7 +2252,7 @@ fn sink_quad_fits<W: Write + Send + 'static>(
             if max_bytes <= available {
                 return true;
             }
-            quad_escaped_fits(quad, kind, meta, *datasets, available)
+            quad_escaped_fits(quad, kind, prefixes, *datasets, extra_frame, available)
         }
         GraphState::Jena {
             format,
@@ -2005,13 +2281,7 @@ fn sink_quad_fits<W: Write + Send + 'static>(
                 if max_bytes <= avail_out {
                     return true;
                 }
-                return quad_escaped_fits(
-                    quad,
-                    EscapeKind::Json,
-                    LiteralMetaMode::All,
-                    false,
-                    avail_out,
-                );
+                return quad_escaped_fits(quad, EscapeKind::Json, &[], false, 0, avail_out);
             }
             let available = limit_bytes.saturating_sub(progress_bytes.load(Ordering::Relaxed));
             match format {
@@ -2024,7 +2294,7 @@ fn sink_quad_fits<W: Write + Send + 'static>(
                     if max_bytes <= available {
                         return true;
                     }
-                    quad_escaped_fits(quad, EscapeKind::Xml, LiteralMetaMode::All, true, available)
+                    quad_escaped_fits(quad, EscapeKind::Xml, &[], true, 0, available)
                 }
                 JenaFormat::Thrift | JenaFormat::Protobuf => {
                     let (_, max_bytes) = quad_size_bounds(quad, LiteralMetaMode::All, 1, true, 64);
@@ -2039,8 +2309,21 @@ fn sink_quad_fits<W: Write + Send + 'static>(
 
 fn sink_footer_min_bytes<W: Write + Send + 'static>(state: &GraphState<W>) -> u64 {
     match state {
-        GraphState::Rdf { format, .. } => match format {
-            oxrdfio::RdfFormat::RdfXml => 10,
+        GraphState::Rdf {
+            format,
+            header_bytes,
+            rdfxml_subject,
+            rdfxml_close_tag_bytes,
+            ..
+        } => match format {
+            oxrdfio::RdfFormat::RdfXml => {
+                let extra = if rdfxml_subject.is_some() {
+                    *rdfxml_close_tag_bytes
+                } else {
+                    *header_bytes
+                };
+                10u64.saturating_add(extra)
+            }
             _ => 0,
         },
         GraphState::Jena { format, .. } => match format {
@@ -2080,12 +2363,16 @@ fn write_native_quad(out: &mut RowOut<'_>, quad: &Quad, section: u64) -> Result<
 fn write_sink_quad<W: Write + Send + 'static>(
     state: &mut GraphState<W>,
     quad: &Quad,
-    track_deferred: bool,
+    track_limited: bool,
 ) -> Result<()> {
     match state {
         GraphState::Rdf {
             serializer,
+            format,
             datasets,
+            max_prefix_name_bytes,
+            rdfxml_subject,
+            rdfxml_close_tag_bytes,
             staged,
             ..
         } => {
@@ -2095,6 +2382,17 @@ fn write_sink_quad<W: Write + Send + 'static>(
                     .expect("active RDF serializer")
                     .serialize_quad(quad)
                     .map_err(io)?;
+                if *format == oxrdfio::RdfFormat::RdfXml {
+                    if track_limited {
+                        if rdfxml_subject.as_ref() != Some(&quad.subject) {
+                            *rdfxml_close_tag_bytes =
+                                rdfxml_next_close_tag_bytes(quad, *max_prefix_name_bytes);
+                            *rdfxml_subject = Some(quad.subject.clone());
+                        }
+                    } else {
+                        *rdfxml_subject = None;
+                    }
+                }
                 staged.fetch_add(1, Ordering::Relaxed);
             }
             Ok(())
@@ -2112,7 +2410,7 @@ fn write_sink_quad<W: Write + Send + 'static>(
                 let kept = crate::sparql::graph_quad_bytes(quad);
                 charge.bytes += kept.saturating_mul(4) + 1024;
                 charge.charge.resize(charge.bytes)?;
-                if track_deferred {
+                if track_limited {
                     *deferred_output_bytes =
                         deferred_output_bytes.saturating_add(quad_json_escaped_bytes(quad));
                 }
@@ -2953,11 +3251,11 @@ mod tests {
     fn graph_escape_expansion_pauses_before_buffering_the_quad() {
         let store = Store::in_memory(Default::default());
         let ctrl_20k = "\\u0001".repeat(20 << 10);
-        let ctrl_14k = "\\u0001".repeat(14 << 10);
+        let fffe_15k = "\\uFFFE".repeat(15_000);
         let amp_20k = "&".repeat(20 << 10);
         let nt = format!(
             "<urn:ge:s1> <urn:ge:ctrl20> \"{ctrl_20k}\" .\n\
-             <urn:ge:s2> <urn:ge:ctrl14> \"{ctrl_14k}\" .\n\
+             <urn:ge:s2> <urn:ge:fffe15k> \"{fffe_15k}\" .\n\
              <urn:ge:s3> <urn:ge:amp20> \"{amp_20k}\" .\n"
         );
         store
@@ -2979,14 +3277,24 @@ mod tests {
                 "CONSTRUCT { <urn:ge:s1> <urn:ge:ctrl20> ?o } WHERE { <urn:ge:s1> <urn:ge:ctrl20> ?o }",
             ),
             (
+                Format::Rdf(RdfFormat::NTriples),
+                "CONSTRUCT { <urn:ge:s2> <urn:ge:fffe15k> ?o } WHERE { <urn:ge:s2> <urn:ge:fffe15k> ?o }",
+            ),
+            (
+                Format::Rdf(RdfFormat::NQuads),
+                "CONSTRUCT { <urn:ge:s2> <urn:ge:fffe15k> ?o } WHERE { <urn:ge:s2> <urn:ge:fffe15k> ?o }",
+            ),
+            (
+                Format::Rdf(RdfFormat::Turtle),
+                "CONSTRUCT { <urn:ge:s2> <urn:ge:fffe15k> ?o } WHERE { <urn:ge:s2> <urn:ge:fffe15k> ?o }",
+            ),
+            (
+                Format::Rdf(RdfFormat::TriG),
+                "CONSTRUCT { <urn:ge:s2> <urn:ge:fffe15k> ?o } WHERE { <urn:ge:s2> <urn:ge:fffe15k> ?o }",
+            ),
+            (
                 Format::Solutions(SolutionsFormat::Sparkles),
                 "CONSTRUCT { <urn:ge:s1> <urn:ge:ctrl20> ?o } WHERE { <urn:ge:s1> <urn:ge:ctrl20> ?o }",
-            ),
-            // 14 KiB raw: 4x memory charge (57 KiB) stays below 64 KiB, while 6x JSON escaping
-            // expands to ~84 KiB during RDF/JSON finish_counted.
-            (
-                Format::Jena(JenaFormat::RdfJson),
-                "CONSTRUCT { <urn:ge:s2> <urn:ge:ctrl14> ?o } WHERE { <urn:ge:s2> <urn:ge:ctrl14> ?o }",
             ),
             (
                 Format::Rdf(RdfFormat::RdfXml),
@@ -3059,6 +3367,263 @@ mod tests {
                 assert_eq!(output, expected, "graph {format:?} parity");
             }
         }
+    }
+
+    #[test]
+    fn rdf_xml_long_qname_and_retained_type_tag_pause_before_overflow() {
+        let store = Store::in_memory(Default::default());
+        let pred_50k = format!("http://example.test/{}", "p".repeat(50 << 10));
+        let class_30k = format!("http://example.test/{}", "c".repeat(30 << 10));
+        let val_20k = "v".repeat(20 << 10);
+        let nt = format!(
+            "<urn:rx:s1> <{pred_50k}> \"x\" .\n\
+             <urn:rx:s2> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <{class_30k}> .\n\
+             <urn:rx:s2> <urn:rx:body> \"{val_20k}\" .\n"
+        );
+        store
+            .load(&[LoadSource::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+
+        let threshold = 64u64 << 10;
+        let format = Format::Rdf(RdfFormat::RdfXml);
+        // 1. Long literal-property QName (~50 KiB raw -> written twice as opening & closing tags ~100 KiB).
+        // 2. Long rdf:type class QName (~30 KiB opening + ~20 KiB property <= 64 KiB, then ~30 KiB closing
+        //    tag emitted at finish() crosses 64 KiB).
+        let queries = [
+            (
+                "CONSTRUCT { <urn:rx:s1> ?p ?o } WHERE { <urn:rx:s1> ?p ?o }",
+                0usize,
+            ),
+            (
+                "CONSTRUCT { <urn:rx:s2> ?p ?o } WHERE { <urn:rx:s2> ?p ?o } ORDER BY ?p",
+                2usize,
+            ),
+        ];
+        for (query, expected_sent_before_pause) in queries {
+            let open_graph = || match query_execution(
+                store.snapshot(),
+                query,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                ExecutionMode::Streaming,
+            )
+            .unwrap()
+            {
+                QueryExecution::Graph(cursor) => *cursor,
+                _ => unreachable!(),
+            };
+            let mut expected = Vec::new();
+            write(
+                Source::Graph(&mut open_graph()),
+                WriteOptions::new(format, &RowCount::new()),
+                &mut expected,
+            )
+            .unwrap();
+            assert!(
+                expected.len() as u64 > threshold,
+                "rdfxml expected {} <= {threshold} for {query}",
+                expected.len()
+            );
+
+            let mut writer = CursorWriter::graph(
+                open_graph(),
+                CursorWriteOptions {
+                    format,
+                    send: None,
+                    prefixes: Vec::new(),
+                    metadata: None,
+                    ledger: None,
+                },
+            );
+            let mut slot = Some(Vec::new());
+            assert!(
+                matches!(
+                    writer.write_until(&mut slot, threshold).unwrap(),
+                    WriteStep::Paused
+                ),
+                "rdfxml must pause for {query}"
+            );
+            if let CursorWriter::Graph(g) = &writer {
+                assert_eq!(
+                    g.sent, expected_sent_before_pause,
+                    "unexpected in-place quad count before pause for {query}"
+                );
+            }
+            let prefix_len = slot.as_ref().unwrap().len();
+            assert!(
+                prefix_len <= threshold as usize,
+                "rdfxml buffered {prefix_len} bytes (> {threshold}) before hand-off for {query}"
+            );
+            let output = std::thread::spawn(move || {
+                writer.finish(&mut slot).unwrap();
+                slot.unwrap()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(output, expected, "rdfxml parity for {query}");
+        }
+    }
+
+    #[test]
+    fn turtle_and_trig_prefixed_iri_escaping_pauses_before_buffering() {
+        let store = Store::in_memory(Default::default());
+        let tilde_45k = "~".repeat(45 << 10);
+        let nt = format!("<urn:ttl:s> <urn:ttl:p> <http://example.test/{tilde_45k}> .\n");
+        store
+            .load(&[LoadSource::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+
+        let threshold = 64u64 << 10;
+        let prefixes = vec![("ex".to_string(), "http://example.test/".to_string())];
+        let query = "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }";
+        for format in [Format::Rdf(RdfFormat::Turtle), Format::Rdf(RdfFormat::TriG)] {
+            let open_graph = || match query_execution(
+                store.snapshot(),
+                query,
+                &QueryOptions::default(),
+                &CursorOptions::default(),
+                ExecutionMode::Streaming,
+            )
+            .unwrap()
+            {
+                QueryExecution::Graph(cursor) => *cursor,
+                _ => unreachable!(),
+            };
+            let mut expected = Vec::new();
+            write(
+                Source::Graph(&mut open_graph()),
+                WriteOptions {
+                    prefixes: &prefixes,
+                    ..WriteOptions::new(format, &RowCount::new())
+                },
+                &mut expected,
+            )
+            .unwrap();
+            assert!(
+                expected.len() as u64 > threshold,
+                "{format:?} expected {} <= {threshold}",
+                expected.len()
+            );
+
+            let mut writer = CursorWriter::graph(
+                open_graph(),
+                CursorWriteOptions {
+                    format,
+                    send: None,
+                    prefixes: prefixes.clone(),
+                    metadata: None,
+                    ledger: None,
+                },
+            );
+            let mut slot = Some(Vec::new());
+            assert!(
+                matches!(
+                    writer.write_until(&mut slot, threshold).unwrap(),
+                    WriteStep::Paused
+                ),
+                "{format:?} must pause"
+            );
+            let prefix_len = slot.as_ref().unwrap().len();
+            assert!(
+                prefix_len <= threshold as usize,
+                "{format:?} buffered {prefix_len} bytes (> {threshold}) before hand-off"
+            );
+            let output = std::thread::spawn(move || {
+                writer.finish(&mut slot).unwrap();
+                slot.unwrap()
+            })
+            .join()
+            .unwrap();
+            assert_eq!(output, expected, "{format:?} parity");
+        }
+    }
+
+    #[test]
+    fn rdf_json_deferred_output_accumulation_pauses_below_memory_charge() {
+        let store = Store::in_memory(Default::default());
+        let ctrl_100k = "\\u0001".repeat(100 << 10);
+        // Two distinct quads of 100 KiB U+0001 each:
+        // - Combined retained memory charge (~128 KiB + 2 * 412 KiB = ~952 KiB) stays below 1 MiB.
+        // - Each quad's escaped JSON (~614 KiB) fits 1 MiB on its own, so quad 1 is accepted.
+        // - Their combined escaped JSON (~1.23 MiB) exceeds 1 MiB, so deferred_output_bytes pauses
+        //   before buffering quad 2 or calling finish_counted in place.
+        let nt = format!(
+            "<urn:rj:s1> <urn:rj:p> \"{ctrl_100k}\" .\n\
+             <urn:rj:s2> <urn:rj:p> \"{ctrl_100k}\" .\n"
+        );
+        store
+            .load(&[LoadSource::from_bytes(
+                nt.into_bytes(),
+                RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+
+        let threshold = 1u64 << 20;
+        let format = Format::Jena(JenaFormat::RdfJson);
+        let query = "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o } ORDER BY ?s";
+        let open_graph = || match query_execution(
+            store.snapshot(),
+            query,
+            &QueryOptions::default(),
+            &CursorOptions::default(),
+            ExecutionMode::Streaming,
+        )
+        .unwrap()
+        {
+            QueryExecution::Graph(cursor) => *cursor,
+            _ => unreachable!(),
+        };
+        let mut expected = Vec::new();
+        write(
+            Source::Graph(&mut open_graph()),
+            WriteOptions::new(format, &RowCount::new()),
+            &mut expected,
+        )
+        .unwrap();
+        assert!(expected.len() as u64 > threshold);
+
+        let mut writer = CursorWriter::graph(
+            open_graph(),
+            CursorWriteOptions {
+                format,
+                send: None,
+                prefixes: Vec::new(),
+                metadata: None,
+                ledger: None,
+            },
+        );
+        let mut slot = Some(Vec::new());
+        assert!(matches!(
+            writer.write_until(&mut slot, threshold).unwrap(),
+            WriteStep::Paused
+        ));
+        if let CursorWriter::Graph(g) = &writer {
+            assert_eq!(
+                g.sent, 1,
+                "quad 1 must be accepted in place so quad 2 exercises deferred_output_bytes"
+            );
+        }
+        assert!(
+            slot.as_ref().unwrap().is_empty(),
+            "RDF/JSON must pause before finish_counted writes >1 MiB in place, buffered {} bytes",
+            slot.as_ref().unwrap().len()
+        );
+        let output = std::thread::spawn(move || {
+            writer.finish(&mut slot).unwrap();
+            slot.unwrap()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(output, expected);
     }
 
     #[test]
