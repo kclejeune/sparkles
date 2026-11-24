@@ -494,12 +494,39 @@ impl ExplainWorkspace {
     ) -> Result<Option<String>> {
         check()?;
         if graph == Id::DEFAULT_GRAPH {
+            self.check_total(
+                self.retained.get().saturating_add("default".len()),
+                "decoding an explanation graph name",
+            )?;
             return Ok(Some("default".to_string()));
         }
         Ok(match self.decode_term(snap, graph, check)? {
             Some(Term::NamedNode(name)) => Some(name.into_string()),
             _ => None,
         })
+    }
+
+    /// Build an asserted leaf derivation from a borrowed triple, decoding the graph name
+    /// first and admitting the output copy together with the graph name before cloning
+    /// `triple`.
+    pub fn asserted_leaf(
+        &self,
+        snap: &Snapshot,
+        graph: Id,
+        triple: &[Term; 3],
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<crate::explain::Derivation> {
+        let graph_name = self.graph_name(snap, graph, check)?;
+        let copy_bytes = triple
+            .iter()
+            .map(crate::explain::term_bytes)
+            .fold(0usize, usize::saturating_add)
+            .saturating_add(graph_name.as_ref().map_or(0, String::len));
+        let _copy_hold = self.hold(copy_bytes)?;
+        Ok(crate::explain::Derivation::asserted(
+            triple.clone(),
+            graph_name,
+        ))
     }
 
     /// Decode one stored term while accounting for coexisting old/new scratch buffers,

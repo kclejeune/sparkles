@@ -252,12 +252,9 @@ pub fn explain(ds: &Dataset, req: &ExplainRequest) -> Result<Explanation> {
                     Explained::NotFound => Ok(None),
                 }
             } else {
-                let graph =
-                    workspace.graph_name(&view, graph, &mut || check_controls(req, deadline))?;
-                Ok(Some(crate::explain::Derivation::asserted(
-                    triple.clone(),
-                    graph,
-                )))
+                workspace
+                    .asserted_leaf(&view, graph, triple, &mut || check_controls(req, deadline))
+                    .map(Some)
             }
         };
         let resolve = {

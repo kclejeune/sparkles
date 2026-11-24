@@ -55,6 +55,13 @@ fn triple_copy_bytes(s: &Term, p: &NamedNode, o: &Term) -> usize {
         .saturating_add(term_bytes(o))
 }
 
+fn triple_bytes(triple: &[Term; 3]) -> usize {
+    triple
+        .iter()
+        .map(term_bytes)
+        .fold(0usize, usize::saturating_add)
+}
+
 struct Cx<'a> {
     schema: Option<&'a RdfsSchema>,
     snap: &'a Snapshot,
@@ -167,10 +174,24 @@ impl Cx<'_> {
         self.check()?;
         match self.resolve {
             Some(resolve) => resolve(g, triple, &self.workspace),
-            None => Ok(Some(Derivation::asserted(
-                triple.clone(),
-                self.graph_name(g)?,
-            ))),
+            None => self
+                .workspace
+                .asserted_leaf(self.snap, g, triple, &mut || self.check())
+                .map(Some),
+        }
+    }
+
+    /// Build a leaf derivation by moving an already-owned, workspace-held candidate triple
+    /// directly into the proof after decoding its graph name (avoiding a second copy of
+    /// `triple` while the candidate is live).
+    fn leaf_owned(&self, g: Id, triple: [Term; 3]) -> Result<Option<Derivation>> {
+        self.check()?;
+        match self.resolve {
+            Some(resolve) => resolve(g, &triple, &self.workspace),
+            None => {
+                let graph = self.graph_name(g)?;
+                Ok(Some(Derivation::asserted(triple, graph)))
+            }
         }
     }
 
@@ -179,6 +200,13 @@ impl Cx<'_> {
             return Ok(None);
         }
         self.leaf(g, triple)
+    }
+
+    fn asserted_owned(&self, g: Id, triple: [Term; 3]) -> Result<Option<Derivation>> {
+        if !self.held(g, &triple)? {
+            return Ok(None);
+        }
+        self.leaf_owned(g, triple)
     }
 
     /// Whether graph `g` holds `s p o`.
@@ -203,7 +231,7 @@ impl Cx<'_> {
             if let Some(object) = self.decode_term(Id(key[3]))? {
                 let _hold = self.workspace.hold(triple_copy_bytes(s, p, &object))?;
                 let triple = [s.clone(), Term::NamedNode(p.clone()), object];
-                if let Some(proof) = self.leaf(g, &triple)? {
+                if let Some(proof) = self.leaf_owned(g, triple)? {
                     found = Some(proof);
                     return Ok(false);
                 }
@@ -228,7 +256,7 @@ impl Cx<'_> {
             {
                 let _hold = self.workspace.hold(triple_copy_bytes(&subject, p, o))?;
                 let triple = [subject, Term::NamedNode(p.clone()), o.clone()];
-                if let Some(proof) = self.leaf(g, &triple)? {
+                if let Some(proof) = self.leaf_owned(g, triple)? {
                     found = Some(proof);
                     return Ok(false);
                 }
@@ -270,7 +298,7 @@ impl Cx<'_> {
                         .saturating_add(named_node_bytes(d)),
                 )?;
                 let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
-                self.asserted(g, &typed)?
+                self.asserted_owned(g, typed)?
             };
             let premise = match premise {
                 Some(proof) => Some(proof),
@@ -282,10 +310,16 @@ impl Cx<'_> {
             let Some(premise) = premise else {
                 continue;
             };
-            let _premise_hold = self.workspace.hold(premise.heap_bytes())?;
+            let mut premise_hold = self.workspace.hold(premise.heap_bytes())?;
             let Some(sc) = self.chain(d, rdfs::SUB_CLASS_OF, c)? else {
                 continue;
             };
+            premise_hold.add(
+                sc.heap_bytes()
+                    .saturating_add(term_bytes(s))
+                    .saturating_add(rdf_type_bytes)
+                    .saturating_add(named_node_bytes(c)),
+            )?;
             let t = [s.clone(), nn(rdf::TYPE), Term::NamedNode(c.clone())];
             return Ok(Some(Derivation::derived(
                 t,
@@ -307,16 +341,25 @@ impl Cx<'_> {
         Ok(match self.leaves {
             // a document's leaves are the triples of its closure, so a fact outside it is
             // no leaf
-            SchemaLeaves::Document => self.schema().closes(a, pred, b).then(|| {
-                Derivation::asserted(
+            SchemaLeaves::Document => {
+                if !self.schema().closes(a, pred, b) {
+                    return Ok(None);
+                }
+                let _fact_hold = self.workspace.hold(
+                    named_node_bytes(a)
+                        .saturating_add(pred.as_str().len())
+                        .saturating_add(std::mem::size_of::<Term>())
+                        .saturating_add(named_node_bytes(b)),
+                )?;
+                Some(Derivation::asserted(
                     [
                         Term::NamedNode(a.clone()),
                         nn(pred),
                         Term::NamedNode(b.clone()),
                     ],
                     None,
-                )
-            }),
+                ))
+            }
             SchemaLeaves::Graph(g) => {
                 let _fact_hold = self.workspace.hold(
                     named_node_bytes(a)
@@ -329,7 +372,7 @@ impl Cx<'_> {
                     nn(pred),
                     Term::NamedNode(b.clone()),
                 ];
-                self.asserted(g, &t)?
+                self.asserted_owned(g, t)?
             }
             SchemaLeaves::Hidden => None,
         })
@@ -389,7 +432,7 @@ impl Cx<'_> {
                             Term::NamedNode(pred_owned.clone()),
                             Term::NamedNode(y.clone()),
                         ];
-                        self.leaf(g, &triple)?.is_some()
+                        self.leaf_owned(g, triple)?.is_some()
                     };
                     if !supported {
                         return Ok(true);
@@ -432,7 +475,7 @@ impl Cx<'_> {
                 Term::NamedNode(pred_owned.clone()),
                 Term::NamedNode(y.clone()),
             ];
-            self.leaf(g, &triple)?.ok_or_else(|| {
+            self.leaf_owned(g, triple)?.ok_or_else(|| {
                 crate::Error::invalid("the schema premise no longer has a supported derivation")
             })
         };
@@ -443,6 +486,10 @@ impl Cx<'_> {
         d_hold.resize(d.heap_bytes())?;
         for i in (0..n - 2).rev() {
             let step = leaf(&path[i], &path[i + 1])?;
+            let next_conclusion = named_node_bytes(&path[i])
+                .saturating_add(named_node_bytes(&pred_owned))
+                .saturating_add(named_node_bytes(&path[n - 1]));
+            d_hold.add(step.heap_bytes().saturating_add(next_conclusion))?;
             d = Derivation::derived(
                 [
                     Term::NamedNode(path[i].clone()),
@@ -486,10 +533,21 @@ impl Cx<'_> {
             let Some(data) = other else {
                 continue;
             };
-            let _data_hold = self.workspace.hold(data.heap_bytes())?;
+            let mut data_hold = self.workspace.hold(data.heap_bytes())?;
             let Some(fact) = self.schema_fact(p, pred, c)? else {
                 continue;
             };
+            data_hold.add(
+                fact.heap_bytes()
+                    .saturating_add(term_bytes(s))
+                    .saturating_add(
+                        rdf::TYPE
+                            .as_str()
+                            .len()
+                            .saturating_add(std::mem::size_of::<Term>()),
+                    )
+                    .saturating_add(named_node_bytes(c)),
+            )?;
             return Ok(Some(Derivation::derived(
                 [s.clone(), nn(rdf::TYPE), Term::NamedNode(c.clone())],
                 rule(name),
@@ -583,16 +641,34 @@ fn explain_inner<'a>(
     // the best tree of each top rule
     let mut tops: BTreeMap<String, Derivation> = BTreeMap::new();
     let mut tops_hold = cx.workspace.hold(0)?;
-    let mut keep = |d: Derivation| -> Result<()> {
+    fn keep_top<'w>(
+        tops: &mut BTreeMap<String, Derivation>,
+        tops_hold: &mut super::WorkspaceHold<'w>,
+        d: Derivation,
+        mut held: Option<super::WorkspaceHold<'w>>,
+    ) -> Result<()> {
         let name = d.rule.as_ref().map(|r| r.name.clone()).unwrap_or_default();
         match tops.get(&name) {
-            Some(have) if have.depth <= d.depth => Ok(()),
+            Some(have) if have.depth <= d.depth => {
+                drop(d);
+                drop(held);
+                Ok(())
+            }
             _ => {
+                let old = tops.remove(&name);
+                drop(old);
+                if let Some(h) = held.take() {
+                    tops_hold.absorb(h);
+                }
                 tops.insert(name, d);
-                tops_hold.resize(tops.values().map(Derivation::heap_bytes).sum())
+                tops_hold.resize(
+                    tops.values()
+                        .map(Derivation::heap_bytes)
+                        .fold(0usize, usize::saturating_add),
+                )
             }
         }
-    };
+    }
     let [s, p, o] = triple;
     let Term::NamedNode(p) = p else {
         return Ok(Explained::NotFound);
@@ -604,7 +680,7 @@ fn explain_inner<'a>(
         && a != b
         && let Some(d) = cx.chain(a, pr, b)?
     {
-        keep(d)?;
+        keep_top(&mut tops, &mut tops_hold, d, None)?;
     }
     if pr == rdf::TYPE
         && let Term::NamedNode(c) = o
@@ -617,7 +693,7 @@ fn explain_inner<'a>(
         for &g in graphs {
             for range in [false, true] {
                 if let Some(d) = cx.by_domain_range(g, s, c, range)? {
-                    keep(d)?;
+                    keep_top(&mut tops, &mut tops_hold, d, None)?;
                 }
             }
             for d in subs.into_iter().flatten().filter(|d| *d != c) {
@@ -628,7 +704,7 @@ fn explain_inner<'a>(
                             .saturating_add(named_node_bytes(d)),
                     )?;
                     let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
-                    cx.asserted(g, &typed)?
+                    cx.asserted_owned(g, typed)?
                 };
                 let premise = match premise {
                     Some(proof) => Some(proof),
@@ -640,16 +716,13 @@ fn explain_inner<'a>(
                 let Some(premise) = premise else {
                     continue;
                 };
-                let _premise_hold = cx.workspace.hold(premise.heap_bytes())?;
+                let mut premise_hold = cx.workspace.hold(premise.heap_bytes())?;
                 let Some(sc) = cx.chain(d, rdfs::SUB_CLASS_OF, c)? else {
                     continue;
                 };
-                drop(_premise_hold);
-                keep(Derivation::derived(
-                    triple.clone(),
-                    rule("rdfs9"),
-                    vec![premise, sc],
-                ))?;
+                premise_hold.add(sc.heap_bytes().saturating_add(triple_bytes(triple)))?;
+                let derived = Derivation::derived(triple.clone(), rule("rdfs9"), vec![premise, sc]);
+                keep_top(&mut tops, &mut tops_hold, derived, Some(premise_hold))?;
             }
         }
     }
@@ -660,7 +733,7 @@ fn explain_inner<'a>(
                 let asserted = {
                     let _stored_hold = cx.workspace.hold(triple_copy_bytes(s, q, o))?;
                     let stored = [s.clone(), Term::NamedNode(q.clone()), o.clone()];
-                    cx.asserted(g, &stored)?
+                    cx.asserted_owned(g, stored)?
                 };
                 let premise = if let Some(proof) = asserted {
                     proof
@@ -674,16 +747,13 @@ fn explain_inner<'a>(
                 } else {
                     continue;
                 };
-                let _premise_hold = cx.workspace.hold(premise.heap_bytes())?;
+                let mut premise_hold = cx.workspace.hold(premise.heap_bytes())?;
                 let Some(sp) = cx.chain(q, rdfs::SUB_PROPERTY_OF, p)? else {
                     continue;
                 };
-                drop(_premise_hold);
-                keep(Derivation::derived(
-                    triple.clone(),
-                    rule("rdfs7"),
-                    vec![premise, sp],
-                ))?;
+                premise_hold.add(sp.heap_bytes().saturating_add(triple_bytes(triple)))?;
+                let derived = Derivation::derived(triple.clone(), rule("rdfs7"), vec![premise, sp]);
+                keep_top(&mut tops, &mut tops_hold, derived, Some(premise_hold))?;
                 break 'graphs;
             }
         }

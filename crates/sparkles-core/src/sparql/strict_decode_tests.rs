@@ -2554,3 +2554,523 @@ fn rdfs_explain_holds_owned_copies_across_decodes_and_counts_nested_triples() {
         "owned candidate copies surviving into graph-name decode must exceed shared workspace, got {res:?}"
     );
 }
+
+#[test]
+fn remote_service_filtered_term_does_not_overlap_next_key_in_same_row() {
+    #[derive(Debug)]
+    struct ReachSendEndpoint;
+    impl LocalEndpoints for ReachSendEndpoint {
+        fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>> {
+            (iri == "http://example.org/remote-sparql")
+                .then(|| Err(Error::Service("sentinel: reached send".into())))
+        }
+    }
+
+    let store = store_with_turtle(
+        "<http://example.org/seed> <http://example.org/seedp> <http://example.org/seedo> .\n",
+        true,
+    );
+    let long_iri = format!("http://example.org/delta-iri/{}", "x".repeat(2048));
+    let long_lit = "t".repeat(2048);
+    let ttl = format!(
+        "<http://example.org/s> <http://example.org/t> <<( <http://example.org/a> <http://example.org/b> \"{long_lit}\" )>> .\n\
+         <http://example.org/s> <http://example.org/p> <{long_iri}> .\n"
+    );
+    store
+        .load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let snap = store.snapshot();
+    let triple_id = snap
+        .lookup_term(&Term::Triple(Box::new(oxrdf::Triple::new(
+            NamedNode::new_unchecked("http://example.org/a"),
+            NamedNode::new_unchecked("http://example.org/b"),
+            Term::Literal(Literal::new_simple_literal(&long_lit)),
+        ))))
+        .unwrap();
+    let iri_id = snap.lookup_iri(&long_iri).unwrap();
+    assert_eq!(triple_id.tag(), Tag::Delta);
+    assert_eq!(iri_id.tag(), Tag::Delta);
+    let iri_len = long_iri.len() as u64;
+
+    let pattern = GraphPattern::Bgp {
+        patterns: vec![
+            TriplePattern {
+                subject: TermPattern::Variable(Variable::new_unchecked("x")),
+                predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(
+                    "http://example.org/q",
+                )),
+                object: TermPattern::Variable(Variable::new_unchecked("z")),
+            },
+            TriplePattern {
+                subject: TermPattern::Variable(Variable::new_unchecked("z")),
+                predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(
+                    "http://example.org/r",
+                )),
+                object: TermPattern::Variable(Variable::new_unchecked("y")),
+            },
+        ],
+    };
+    let rl = super::enhancer::RemoteLoop {
+        endpoint: NamedNode::new_unchecked("http://example.org/remote-sparql"),
+        bulk: 10,
+        cache: super::enhancer::CacheMode::None,
+        silent: false,
+        values: true,
+        idx: "__idx".into(),
+    };
+
+    // 1. Direct RemoteRun::add on one multi-key row [delta_triple_2k, delta_iri_2k] with
+    //    20 KiB headroom: fits either checked decode (~17 KiB) and the retained input (~4.2 KiB),
+    //    but NOT both checked decodes overlapping (~34 KiB). Must succeed in eager and cursor modes.
+    for cursor in [false, true] {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        ctx.allow_service = true;
+        if cursor {
+            ctx.enable_cursor_accounting().unwrap();
+        }
+        let v_x = ctx.var("x");
+        let v_z = ctx.var("z");
+        let spec = LateralSpec {
+            pattern: pattern.clone(),
+            keys: vec![v_x, v_z],
+            outer: Vec::new(),
+            outer_scoped: Vec::new(),
+            graph: ActiveGraph::Default,
+            optional: None,
+            unscoped: false,
+            service: Some(Box::new(rl.clone())),
+        };
+        let mut run = super::enhancer::RemoteRun::new(&ctx, &spec, &rl).unwrap();
+        let mut left = Table::new(vec![v_x, v_z]);
+        left.push_row(&[triple_id, iri_id]);
+        let _held = hold_all_but(&ctx, 20 * 1024);
+        let before_add = ctx.live_bytes();
+        run.add(&ctx, &spec, &rl, &left)
+            .expect("filtered triple term must not hold decode charge across next key in same row");
+        let retained = ctx.live_bytes() - before_add;
+        assert!(
+            retained >= 2 * iri_len && retained < 4 * iri_len,
+            "retained charge should cover only the kept IRI + slots (cursor={cursor}, retained={retained})"
+        );
+        drop(run);
+        assert_eq!(ctx.live_bytes(), before_add);
+
+        // Control check (cancellation) is still preserved even when the key is an unsendable kind.
+        let mut cancel_ctx = Ctx::new(store.snapshot());
+        cancel_ctx.mem_limit = MIB;
+        cancel_ctx.allow_service = true;
+        cancel_ctx.cancel = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        if cursor {
+            cancel_ctx.enable_cursor_accounting().unwrap();
+        }
+        let cv_x = cancel_ctx.var("x");
+        let cv_z = cancel_ctx.var("z");
+        let cancel_spec = LateralSpec {
+            pattern: pattern.clone(),
+            keys: vec![cv_x, cv_z],
+            outer: Vec::new(),
+            outer_scoped: Vec::new(),
+            graph: ActiveGraph::Default,
+            optional: None,
+            unscoped: false,
+            service: Some(Box::new(rl.clone())),
+        };
+        let mut cancel_run =
+            super::enhancer::RemoteRun::new(&cancel_ctx, &cancel_spec, &rl).unwrap();
+        let mut cancel_left = Table::new(vec![cv_x, cv_z]);
+        cancel_left.push_row(&[triple_id, iri_id]);
+        let err = cancel_run
+            .add(&cancel_ctx, &cancel_spec, &rl, &cancel_left)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Cancelled),
+            "control check must still fire on unsendable key kinds (cursor={cursor}), got {err:?}"
+        );
+    }
+
+    // 2. Full eager and cursor execution over the same multi-key row with tight headroom
+    //    must reach remote send instead of refusing on overlapping decode charges.
+    let query = "SELECT ?x ?z ?y WHERE { \
+        <http://example.org/s> <http://example.org/t> ?x . \
+        <http://example.org/s> <http://example.org/p> ?z . \
+        SERVICE <loop:http://example.org/remote-sparql> { \
+            ?x <http://example.org/q> ?z . \
+            ?z <http://example.org/r> ?y \
+        } \
+    }";
+    let probe_opts = QueryOptions {
+        allow_service: true,
+        no_cache: true,
+        local_endpoints: Some(Arc::new(ReachSendEndpoint)),
+        max_memory_bytes: Some(MIB),
+        ..QueryOptions::default()
+    };
+    let cursor_opts = super::cursor::CursorOptions {
+        batch_rows: 16,
+        fallback: super::cursor::FallbackPolicy::RejectMaterialization,
+        ..super::cursor::CursorOptions::default()
+    };
+    let fixed_setup = {
+        let probe =
+            super::cursor::select_cursor(store.snapshot(), query, &probe_opts, &cursor_opts)
+                .expect("open probe cursor");
+        probe.memory_meter().live_bytes()
+    };
+    let tight_opts = QueryOptions {
+        allow_service: true,
+        no_cache: true,
+        local_endpoints: Some(Arc::new(ReachSendEndpoint)),
+        max_memory_bytes: Some(fixed_setup + 20 * 1024),
+        ..QueryOptions::default()
+    };
+    let mut cursor =
+        super::cursor::select_cursor(store.snapshot(), query, &tight_opts, &cursor_opts)
+            .expect("open tight cursor");
+    let Err(cursor_err) = cursor.next_batch() else {
+        panic!("cursor SERVICE should reach sentinel send");
+    };
+    assert!(
+        matches!(&cursor_err, Error::Service(msg) if msg.contains("sentinel: reached send")),
+        "cursor multi-key SERVICE must reach send under 20 KiB headroom, got {cursor_err:?}"
+    );
+
+    let eager_opts = QueryOptions {
+        allow_service: true,
+        no_cache: true,
+        local_endpoints: Some(Arc::new(ReachSendEndpoint)),
+        max_memory_bytes: Some(24 * 1024),
+        ..QueryOptions::default()
+    };
+    let Err(eager_err) = super::query(store.snapshot(), query, &eager_opts) else {
+        panic!("eager SERVICE should reach sentinel send");
+    };
+    assert!(
+        matches!(&eager_err, Error::Service(msg) if msg.contains("sentinel: reached send")),
+        "eager multi-key SERVICE must reach send under 24 KiB budget, got {eager_err:?}"
+    );
+}
+
+#[test]
+fn remote_service_cache_key_refuses_before_allocating_key_string() {
+    let store = store_with_turtle(
+        "<http://example.org/seed> <http://example.org/seedp> <http://example.org/seedo> .\n",
+        true,
+    );
+    let quoted_lit = "\"".repeat(2048);
+    let ttl = format!(
+        "<http://example.org/s> <http://example.org/q> \"{}\" .\n",
+        "\\\"".repeat(2048)
+    );
+    store
+        .load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let snap = store.snapshot();
+    assert!(
+        snap.results.service.enabled(),
+        "default store should enable service cache"
+    );
+    let lit_id = snap
+        .lookup_term(&Term::Literal(Literal::new_simple_literal(&quoted_lit)))
+        .unwrap();
+    assert_eq!(lit_id.tag(), Tag::Delta);
+
+    let pattern = GraphPattern::Bgp {
+        patterns: vec![TriplePattern {
+            subject: TermPattern::Variable(Variable::new_unchecked("x")),
+            predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(
+                "http://example.org/p",
+            )),
+            object: TermPattern::Variable(Variable::new_unchecked("y")),
+        }],
+    };
+    let rl = super::enhancer::RemoteLoop {
+        endpoint: NamedNode::new_unchecked("http://example.org/remote-sparql"),
+        bulk: 10,
+        cache: super::enhancer::CacheMode::Default,
+        silent: false,
+        values: true,
+        idx: "__idx".into(),
+    };
+
+    for cursor in [false, true] {
+        // 1. All-unbound input with a 1 MiB service_scope and 1 KiB headroom:
+        //    must refuse BEFORE allocating the > 1 MiB cache key String.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = 2 * MIB;
+            ctx.allow_service = true;
+            ctx.use_cache = true;
+            ctx.service_scope = "s".repeat(1 << 20).into();
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let v_x = ctx.var("x");
+            let spec = LateralSpec {
+                pattern: pattern.clone(),
+                keys: vec![v_x],
+                outer: Vec::new(),
+                outer_scoped: Vec::new(),
+                graph: ActiveGraph::Default,
+                optional: None,
+                unscoped: false,
+                service: Some(Box::new(rl.clone())),
+            };
+            let mut run = super::enhancer::RemoteRun::new(&ctx, &spec, &rl).unwrap();
+            let mut left = Table::new(vec![v_x]);
+            left.push_row(&[Id::UNDEF]);
+            let _held = hold_all_but(&ctx, 1024);
+
+            let largest = crate::test_alloc::record_largest(|| {
+                assert_memory_budget_error(
+                    run.add(&ctx, &spec, &rl, &left),
+                    "cache-enabled all-unbound SERVICE with 1 MiB scope",
+                );
+            });
+            assert!(
+                largest < 4096,
+                "SERVICE cache key must refuse before allocating 1 MiB key string (cursor={cursor}, largest_alloc={largest})"
+            );
+        }
+
+        // 2. Bound escaped literal + 16 KiB service_scope under 18 KiB headroom:
+        //    checked decode (~16.5 KiB) fits, but formatted cache key (> 20 KiB) does not;
+        //    must refuse BEFORE allocating or growing the > 20 KiB key String.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = MIB;
+            ctx.allow_service = true;
+            ctx.use_cache = true;
+            ctx.service_scope = "k".repeat(16 * 1024).into();
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let v_x = ctx.var("x");
+            let spec = LateralSpec {
+                pattern: pattern.clone(),
+                keys: vec![v_x],
+                outer: Vec::new(),
+                outer_scoped: Vec::new(),
+                graph: ActiveGraph::Default,
+                optional: None,
+                unscoped: false,
+                service: Some(Box::new(rl.clone())),
+            };
+            let mut run = super::enhancer::RemoteRun::new(&ctx, &spec, &rl).unwrap();
+            let mut left = Table::new(vec![v_x]);
+            left.push_row(&[lit_id]);
+            let _held = hold_all_but(&ctx, 18 * 1024);
+
+            let largest = crate::test_alloc::record_largest(|| {
+                assert_memory_budget_error(
+                    run.add(&ctx, &spec, &rl, &left),
+                    "cache-enabled SERVICE with escaped literal + 16 KiB scope",
+                );
+            });
+            assert!(
+                largest < 18 * 1024,
+                "SERVICE cache key must refuse before allocating >20 KiB key string (cursor={cursor}, largest_alloc={largest})"
+            );
+        }
+
+        // 3. Fitting cache-enabled input retains its cache key capacity in kept_lease and
+        //    releases everything cleanly when RemoteRun drops.
+        {
+            let mut ctx = Ctx::new(store.snapshot());
+            ctx.mem_limit = MIB;
+            ctx.allow_service = true;
+            ctx.use_cache = true;
+            ctx.service_scope = "c".repeat(4096).into();
+            if cursor {
+                ctx.enable_cursor_accounting().unwrap();
+            }
+            let v_x = ctx.var("x");
+            let spec = LateralSpec {
+                pattern: pattern.clone(),
+                keys: vec![v_x],
+                outer: Vec::new(),
+                outer_scoped: Vec::new(),
+                graph: ActiveGraph::Default,
+                optional: None,
+                unscoped: false,
+                service: Some(Box::new(rl.clone())),
+            };
+            let baseline = ctx.live_bytes();
+            let mut run = super::enhancer::RemoteRun::new(&ctx, &spec, &rl).unwrap();
+            let mut left = Table::new(vec![v_x]);
+            left.push_row(&[Id::UNDEF]);
+            run.add(&ctx, &spec, &rl, &left).unwrap();
+            assert!(
+                ctx.live_bytes() - baseline >= 4096,
+                "cache-enabled input must retain its cache key capacity (cursor={cursor})"
+            );
+            drop(run);
+            assert_eq!(ctx.live_bytes(), baseline);
+        }
+    }
+}
+
+#[test]
+fn rdfs_explain_leaf_does_not_clone_held_candidate_before_graph_name_decode() {
+    let ex =
+        |local: &str| Term::NamedNode(NamedNode::new_unchecked(format!("http://ex.org/{local}")));
+
+    // 1. Owned candidate in Cx::object: 12 KiB nested triple object in a 6 KiB delta graph,
+    //    max_memory = 8192 (workspace cap = 16,640), no resolver.
+    //    Must refuse graph-name decode without cloning the held 12 KiB candidate first,
+    //    keeping peak net live heap within the 16,640-byte workspace cap.
+    {
+        let store = store_with_turtle(
+            "<http://ex.org/seed> <http://ex.org/seedp> <http://ex.org/seedo> .\n",
+            true,
+        );
+        let g_6k = format!("http://ex.org/g6k/{}", "g".repeat(6144));
+        let lit_12k = "t".repeat(12_288);
+        let nq = format!(
+            "<http://ex.org/s> <http://ex.org/p> <<( <http://ex.org/a> <http://ex.org/b> \"{lit_12k}\" )>> <{g_6k}> .\n"
+        );
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let snap = store.snapshot();
+        let g_id = snap.lookup_iri(&g_6k).unwrap();
+        assert_eq!(g_id.tag(), Tag::Delta);
+        let schema = super::rdfs::RdfsSchema::from_triples(&[oxrdf::Triple::new(
+            NamedNode::new_unchecked("http://ex.org/p"),
+            rdfs::DOMAIN.into_owned(),
+            NamedNode::new_unchecked("http://ex.org/C"),
+        )]);
+        let target = [ex("s"), Term::NamedNode(rdf::TYPE.into_owned()), ex("C")];
+        let limits = crate::explain::ExplainLimits {
+            max_trees: 1,
+            max_depth: 8,
+            deadline: None,
+            cancel: None,
+            max_memory: Some(8192),
+        };
+        let mut res = None;
+        let peak_live = crate::test_alloc::record_peak_live(|| {
+            res = Some(
+                super::rdfs::RdfsOnRead::fixed(schema.clone()).explain_resolving(
+                    &snap,
+                    super::rdfs::SchemaLeaves::Document,
+                    &[g_id],
+                    &target,
+                    limits.clone(),
+                    None,
+                ),
+            );
+        });
+        let res = res.unwrap();
+        assert!(
+            matches!(&res, Err(Error::Component(c)) if c.code == "reasoning-budget"),
+            "12 KiB candidate + 6 KiB graph must fail with reasoning-budget, got {res:?}"
+        );
+        assert!(
+            peak_live <= 16_640,
+            "leaf construction must not clone 12 KiB candidate before graph-name decode (peak_live={peak_live} > 16640)"
+        );
+    }
+
+    // 2. Borrowed input triple in top-level Cx::asserted: 6 KiB literal object in an 11 KiB
+    //    delta graph, max_memory = 8192 (workspace cap = 16,640), no resolver.
+    //    Must decode the 11 KiB graph and refuse before cloning the 6 KiB triple (which would
+    //    coexist at > 17 KiB), keeping peak net live heap within the 16,640-byte workspace cap.
+    {
+        let store = store_with_turtle(
+            "<http://ex.org/seed> <http://ex.org/seedp> <http://ex.org/seedo> .\n",
+            true,
+        );
+        let g_11k = format!("http://ex.org/g11k/{}", "h".repeat(11_264));
+        let lit_6k = "v".repeat(6144);
+        let nq = format!("<http://ex.org/s> <http://ex.org/p> \"{lit_6k}\" <{g_11k}> .\n");
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let snap = store.snapshot();
+        let g_id = snap.lookup_iri(&g_11k).unwrap();
+        assert_eq!(g_id.tag(), Tag::Delta);
+        let schema = super::rdfs::RdfsSchema::default();
+        let target = [
+            ex("s"),
+            ex("p"),
+            Term::Literal(Literal::new_simple_literal(&lit_6k)),
+        ];
+        let limits = crate::explain::ExplainLimits {
+            max_trees: 1,
+            max_depth: 8,
+            deadline: None,
+            cancel: None,
+            max_memory: Some(8192),
+        };
+        let mut res = None;
+        let peak_live = crate::test_alloc::record_peak_live(|| {
+            res = Some(
+                super::rdfs::RdfsOnRead::fixed(schema.clone()).explain_resolving(
+                    &snap,
+                    super::rdfs::SchemaLeaves::Document,
+                    &[g_id],
+                    &target,
+                    limits.clone(),
+                    None,
+                ),
+            );
+        });
+        let res = res.unwrap();
+        assert!(
+            matches!(&res, Err(Error::Component(c)) if c.code == "reasoning-budget"),
+            "borrowed 6 KiB triple + 11 KiB graph must fail with reasoning-budget, got {res:?}"
+        );
+        assert!(
+            peak_live <= 16_640,
+            "borrowed leaf construction must not clone 6 KiB triple alongside 11 KiB graph (peak_live={peak_live} > 16640)"
+        );
+    }
+
+    // 3. Resolver path (`ExplainWorkspace::asserted_leaf` while a 12 KiB candidate is held):
+    //    a 1 KiB graph name fits alongside the 12 KiB candidate, but cloning the 12 KiB triple
+    //    would reach ~25 KiB > 16,640 and must refuse BEFORE cloning.
+    {
+        let store = store_with_turtle(
+            "<http://ex.org/seed> <http://ex.org/seedp> <http://ex.org/seedo> .\n",
+            true,
+        );
+        let g_1k = format!("http://ex.org/g1k/{}", "r".repeat(1024));
+        let lit_12k = "w".repeat(12_288);
+        let nq = format!("<http://ex.org/s> <http://ex.org/p> \"{lit_12k}\" <{g_1k}> .\n");
+        store
+            .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+            .unwrap();
+        let snap = store.snapshot();
+        let g_id = snap.lookup_iri(&g_1k).unwrap();
+        assert_eq!(g_id.tag(), Tag::Delta);
+        let ws = super::rdfs::ExplainWorkspace::for_answer_limit(Some(8192));
+        let candidate = [
+            ex("s"),
+            ex("p"),
+            Term::Literal(Literal::new_simple_literal(&lit_12k)),
+        ];
+        let _held = ws.hold(12_400).unwrap();
+        let mut res = None;
+        let peak_live = crate::test_alloc::record_peak_live(|| {
+            res = Some(ws.asserted_leaf(&snap, g_id, &candidate, &mut || Ok(())));
+        });
+        let res = res.unwrap();
+        assert!(
+            matches!(&res, Err(Error::Component(c)) if c.code == "reasoning-budget"),
+            "resolver asserted_leaf must refuse output clone while 12 KiB candidate is held, got {res:?}"
+        );
+        assert!(
+            peak_live < 4096,
+            "resolver asserted_leaf must refuse BEFORE cloning 12 KiB triple (peak_live={peak_live})"
+        );
+    }
+}

@@ -18,7 +18,7 @@
 //! The options are IRIs with a scheme that is neither `http` nor `https`, so no query
 //! that could reach an endpoint before means something else now.
 
-use super::ctx::{Charge, Ctx};
+use super::ctx::{Charge, Ctx, TermKind};
 use super::exec::{join_tables, left_join};
 use super::lateral::LateralSpec;
 use super::plan::{ActiveGraph, Kind, Node, Planner, collect_pattern_vars};
@@ -1205,15 +1205,12 @@ pub(super) struct RemoteRun {
     missing: Vec<usize>,
     /// the bytes of the answers the inputs hold, summed as they arrive
     held: u64,
-    /// the bytes of the keys and inputs the loop keeps, summed as they are added
-    kept: u64,
     pub stats: LoopStats,
     /// retained credit for decoded outer constants and substituted pattern, dropped after
     /// `outer` and `pattern`
     _outer_lease: Option<QueryMemoryLease>,
-    /// retained credit for `self.kept` (distinct keys, inputs and cache keys), reconciled
-    /// continuously from each row's decode charge and dropped after `inputs`, `by_values`
-    /// and `by_key`
+    /// retained credit for distinct keys, inputs and cache keys, reconciled continuously
+    /// from each row's decode charge and dropped after `inputs`, `by_values` and `by_key`
     kept_lease: Option<QueryMemoryLease>,
 }
 
@@ -1280,7 +1277,6 @@ impl RemoteRun {
             by_key: FxHashMap::default(),
             missing: Vec::new(),
             held: 0,
-            kept: 0,
             stats: LoopStats::default(),
             _outer_lease,
             kept_lease: None,
@@ -1311,14 +1307,30 @@ impl RemoteRun {
             if self.by_key.contains_key(&key) {
                 continue;
             }
+            ctx.check()?;
             let row_decode = ctx.charge(0)?;
             let mut values = Vec::with_capacity(key.len());
             for id in &key {
                 let term = if id.is_undef() {
                     None
                 } else {
-                    ctx.term_checked_into(*id, &row_decode)?
-                        .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_)))
+                    ctx.check()?;
+                    match ctx.kind(*id) {
+                        TermKind::Iri | TermKind::Literal => {
+                            let prev = row_decode.bytes();
+                            match ctx.term_checked_into(*id, &row_decode)? {
+                                Some(t) if matches!(t, Term::NamedNode(_) | Term::Literal(_)) => {
+                                    Some(t)
+                                }
+                                discarded => {
+                                    drop(discarded);
+                                    row_decode.resize(prev)?;
+                                    None
+                                }
+                            }
+                        }
+                        _ => None,
+                    }
                 };
                 values.push(term);
             }
@@ -1332,7 +1344,6 @@ impl RemoteRun {
                     Some(held) => held.merge(&mut lease)?,
                     None => self.kept_lease = lease,
                 }
-                self.kept = self.kept.saturating_add(key_cost);
                 self.by_key.insert(key, (existing, false));
                 continue;
             }
@@ -1341,6 +1352,7 @@ impl RemoteRun {
                 key: None,
                 rows: None,
             };
+            let base_kept = key_cost.saturating_add(input_bytes(&input));
             if self.caching {
                 let mut kv: Vec<(&str, &Term)> = self
                     .outer
@@ -1353,14 +1365,22 @@ impl RemoteRun {
                         kv.push((n.as_str(), t));
                     }
                 }
-                input.key = Some(svccache::key(
+                input.key = Some(svccache::try_key(
                     &ctx.service_scope,
                     rl.endpoint.as_str(),
                     &self.text,
                     &kv,
-                ));
+                    |cap| -> Result<()> {
+                        let needed = base_kept.saturating_add(cap as u64);
+                        if needed > row_decode.bytes() {
+                            row_decode.add(needed - row_decode.bytes())?;
+                        }
+                        Ok(())
+                    },
+                )?);
             }
-            let kept_cost = key_cost.saturating_add(input_bytes(&input));
+            let kept_cost =
+                base_kept.saturating_add(input.key.as_ref().map_or(0, |k| k.capacity() as u64));
             // Admit any growth above the transient decode charge before cloning `values`
             // into `by_values` or mutating state, then settle continuously into `kept_lease`.
             if kept_cost > row_decode.bytes() {
@@ -1389,7 +1409,6 @@ impl RemoteRun {
                 Some(held) => held.merge(&mut lease)?,
                 None => self.kept_lease = lease,
             }
-            self.kept = self.kept.saturating_add(kept_cost);
         }
         self.stats.inputs = self.inputs.len();
         Ok(())
