@@ -94,6 +94,24 @@ impl PackedTree {
         self.meta.data_buffer_length() as u64
     }
 
+    /// Upper-bound bytes required to pack `n` items (flatbush buffer plus Hilbert sort
+    /// scratch), used for pre-admission before calling [`Self::pack`].
+    pub fn estimate_bytes(n: usize) -> u64 {
+        if n == 0 {
+            return 0;
+        }
+        // Flatbush stores 4 f32s (16B) + up to 4B index per node across all levels
+        // (<= n * 17/16 + 16 nodes), plus 4B/item Hilbert key scratch during finish().
+        let n = n as u64;
+        let nodes = n
+            .saturating_add(n / u64::from(NODE_SIZE))
+            .saturating_add(32);
+        nodes
+            .saturating_mul(20)
+            .saturating_add(n.saturating_mul(4))
+            .saturating_add(128)
+    }
+
     /// Height of the tree.
     pub fn num_levels(&self) -> usize {
         self.meta.level_bounds().len()

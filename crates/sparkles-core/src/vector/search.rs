@@ -100,6 +100,24 @@ pub fn search(
     q: &Search<'_>,
     check: &(dyn Fn() -> Result<()> + Sync),
 ) -> Result<(Vec<Hit>, SearchInfo)> {
+    search_with_admit(snap, q, check, &mut |_| Ok(()))
+}
+
+/// [`search`] with pre-admission of query-owned scratch (`deleted`, pending `inserted`
+/// rows, and candidate buffers) through `admit` before allocation and growth.
+pub(crate) fn search_with_admit(
+    snap: &Snapshot,
+    q: &Search<'_>,
+    check: &(dyn Fn() -> Result<()> + Sync),
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<(Vec<Hit>, SearchInfo)> {
+    fn next_cap(len: usize, cap: usize, extra: usize) -> usize {
+        if len.saturating_add(extra) <= cap {
+            cap
+        } else {
+            cap.saturating_mul(2).max(len.saturating_add(extra)).max(8)
+        }
+    }
     let dim = q.query.len();
     let qnorm = norm(q.query);
     if q.metric == Metric::Cosine && qnorm == 0.0 {
@@ -131,10 +149,26 @@ pub fn search(
     let pi = Perm::Pso.index();
     let lo = [q.pred, 0, 0, 0];
     let hi = [q.pred, u64::MAX, u64::MAX, u64::MAX];
-    let deleted: FxHashSet<[u64; 3]> = snap.delta.del[pi]
-        .range(lo..=hi)
-        .map(|k| [k[1], k[2], k[3]])
-        .collect();
+    let del_count = snap.delta.del[pi].count_between(&lo, &hi);
+    let del_est_bytes = if del_count == 0 {
+        0u64
+    } else {
+        (del_count.next_power_of_two().max(8) as u64)
+            .saturating_mul((size_of::<[u64; 3]>() + 1) as u64)
+    };
+    admit(del_est_bytes)?;
+    let mut deleted: FxHashSet<[u64; 3]> = FxHashSet::default();
+    if del_count > 0 {
+        deleted.reserve(del_count);
+        for (i, k) in snap.delta.del[pi].range(lo..=hi).enumerate() {
+            if i.is_multiple_of(4096) {
+                check()?;
+            }
+            deleted.insert([k[1], k[2], k[3]]);
+        }
+    }
+    let del_bytes = deleted.capacity() as u64 * (size_of::<[u64; 3]>() + 1) as u64;
+    admit(del_bytes)?;
     info.deleted = deleted.len() as u64;
     let seg = base.segment(dim);
     // whether the graph answers, decided before the inserted rows are read: the rows its
@@ -148,7 +182,16 @@ pub fn search(
         _ => None,
     };
     let mut ins_dims: FxHashSet<usize> = FxHashSet::default();
-    let (mut inserted, covered) = inserted_rows(snap, q, qnorm, live.as_deref(), &mut ins_dims);
+    let (mut inserted, covered) = inserted_rows_charged(
+        snap,
+        q,
+        qnorm,
+        live.as_deref(),
+        &mut ins_dims,
+        check,
+        del_bytes,
+        admit,
+    )?;
     info.inserted = inserted.len() as u64 + covered;
     info.pending = inserted.len() as u64;
     if seg.is_none() && inserted.is_empty() {
@@ -167,6 +210,7 @@ pub fn search(
                     .join(", ")
             )));
         }
+        admit(0)?;
         return Ok((Vec::new(), info));
     }
     info.rows = seg.map_or(0, |s| s.rows() as u64);
@@ -194,7 +238,17 @@ pub fn search(
                         // inserted row
                         info.method = "exact";
                         info.reason = Some("the graph found fewer than k rows");
-                        inserted = inserted_rows(snap, q, qnorm, None, &mut ins_dims).0;
+                        inserted = inserted_rows_charged(
+                            snap,
+                            q,
+                            qnorm,
+                            None,
+                            &mut ins_dims,
+                            check,
+                            del_bytes,
+                            admit,
+                        )?
+                        .0;
                         info.pending = inserted.len() as u64;
                         ctx.exact(seg, &mut info, check)?
                     }
@@ -207,8 +261,26 @@ pub fn search(
             (None, _, _) => ctx.exact(seg, &mut info, check)?,
         },
     };
+    let ins_bytes = inserted.capacity() as u64 * size_of::<Hit>() as u64;
+    let total_cand = cand.len().saturating_add(inserted.len());
+    let cand_cap = next_cap(cand.len(), cand.capacity(), inserted.len());
+    let seen_est = if q.distinct_subject || q.dedup {
+        (total_cand.next_power_of_two().max(8) as u64)
+            .saturating_mul((size_of::<(u64, u64)>() + 1) as u64)
+    } else {
+        0
+    };
+    admit(
+        del_bytes
+            .saturating_add(ins_bytes)
+            .saturating_add(cand_cap as u64 * size_of::<Hit>() as u64)
+            .saturating_add(seen_est),
+    )?;
     cand.extend(inserted);
-    Ok((finish(q, cand), info))
+    let mut out = finish(q, cand);
+    out.shrink_to_fit();
+    admit(out.capacity() as u64 * size_of::<Hit>() as u64)?;
+    Ok((out, info))
 }
 
 /// The snapshot's inserted rows of the predicate in scope, scored exactly, and the
@@ -217,13 +289,17 @@ pub fn search(
 /// the same delta, it holds every row it can score, so the rows are counted without
 /// reading them, and the count is every inserted row of the predicate. `ins_dims`
 /// collects the dimensions of the rows read.
-fn inserted_rows(
+#[allow(clippy::too_many_arguments)]
+fn inserted_rows_charged(
     snap: &Snapshot,
     q: &Search<'_>,
     qnorm: f32,
     live: Option<&LiveState>,
     ins_dims: &mut FxHashSet<usize>,
-) -> (Vec<Hit>, u64) {
+    check: &(dyn Fn() -> Result<()> + Sync),
+    base_bytes: u64,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<(Vec<Hit>, u64)> {
     let gv = &snap.generation.vectors;
     let pi = Perm::Pso.index();
     let lo = [q.pred, 0, 0, 0];
@@ -231,12 +307,15 @@ fn inserted_rows(
     if let Some(l) = live {
         let rows = snap.delta.ins[pi].count_between(&lo, &hi) as u64;
         if l.is_caught_up(snap, rows) {
-            return (Vec::new(), rows);
+            return Ok((Vec::new(), rows));
         }
     }
     let mut out = Vec::new();
     let mut covered = 0;
-    for k in snap.delta.ins[pi].range(lo..=hi) {
+    for (idx, k) in snap.delta.ins[pi].range(lo..=hi).enumerate() {
+        if idx.is_multiple_of(4096) {
+            check()?;
+        }
         if q.subjects.is_some_and(|s| s.binary_search(&k[1]).is_err()) {
             continue;
         }
@@ -254,6 +333,10 @@ fn inserted_rows(
             continue;
         }
         if let Some(sc) = score(q.metric, q.query, qnorm, &v, norm(&v)) {
+            if out.len() == out.capacity() {
+                let next_cap = out.capacity().saturating_mul(2).max(8);
+                admit(base_bytes.saturating_add(next_cap as u64 * size_of::<Hit>() as u64))?;
+            }
             out.push(Hit {
                 s: k[1],
                 o: k[2],
@@ -262,7 +345,7 @@ fn inserted_rows(
             });
         }
     }
-    (out, covered)
+    Ok((out, covered))
 }
 
 /// Sort, deduplicate and cut the candidates.

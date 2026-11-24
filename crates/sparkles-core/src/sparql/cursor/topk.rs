@@ -285,10 +285,9 @@ impl IndexTopK {
             let Kind::OrderedTopK(spec) = &self.node.kind else {
                 unreachable!("an ordered top-k node")
             };
-            match exec::ordered_topk_morsels(ctx, spec, &self.node.vars)? {
-                Some((table, read)) => {
+            match exec::ordered_topk_morsels_charged(ctx, spec, &self.node.vars)? {
+                Some((table, charge, read)) => {
                     info.description = format!("{} [read {read} rows]", info.description);
-                    let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
                     self.loaded = Some(Buffer { table, charge });
                 }
                 None => {
@@ -379,25 +378,21 @@ impl VectorOrder {
             let Kind::VectorSearch(spec) = &self.node.kind else {
                 unreachable!("a vector order node")
             };
-            let searched = match exec::vector_search(ctx, spec, None, &self.node.vars) {
-                Ok((t, c)) if t.len() >= spec.k => Some((t, c)),
-                Ok(_) => None,
+            let searched = match exec::vector_search_order_charged(ctx, spec, &self.node.vars, vars)
+            {
+                Ok(Some((table, charge, counters))) => Some((table, charge, counters)),
+                Ok(None) => None,
                 Err(crate::error::Error::BudgetExceeded(_) | crate::error::Error::Invalid(_)) => {
                     None
                 }
                 Err(e) => return Err(e),
             };
             match searched {
-                Some((table, counters)) => {
+                Some((table, charge, counters)) => {
                     children[0].mark_skipped("the vector index answered");
                     self.counters = Some(counters);
                     if !table.is_empty() {
-                        let charge = OwnedCharge::new(ctx, super::capacity_bytes(&table))?;
-                        let mut buffer = Buffer { table, charge };
-                        if buffer.table.vars != vars {
-                            buffer.project(vars)?;
-                        }
-                        self.loaded = Some(buffer);
+                        self.loaded = Some(Buffer { table, charge });
                     }
                 }
                 None => {

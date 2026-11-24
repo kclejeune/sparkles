@@ -361,25 +361,28 @@ struct KnnState {
     empty_batches: u64,
     keyed: u64,
     matched: u64,
-    runs: Vec<crate::sparql::PlanInfo>,
+    runs: Vec<CursorPlan>,
     charge: crate::sparql::ctx::OwnedCharge,
 }
 
 #[cfg(feature = "geo")]
 impl KnnState {
-    fn retained_bytes(&self) -> u64 {
+    fn retained_bytes_without_nearest(&self) -> u64 {
         let errs = self.error_rows.capacity() as u64 * size_of::<[crate::id::Id; 3]>() as u64;
         let taken = self.taken.capacity() as u64 * (size_of::<crate::id::Id>() + 1) as u64;
         let cands = self.pending_cands.capacity() as u64 * size_of::<[crate::id::Id; 3]>() as u64;
         let best = self.best.capacity() as u64 * size_of::<DistKey>() as u64;
+        errs.saturating_add(taken)
+            .saturating_add(cands)
+            .saturating_add(best)
+    }
+
+    fn retained_bytes(&self) -> u64 {
         let near = self
             .nearest
             .as_ref()
             .map_or(0, crate::geo::search::NearestIter::retained_bytes);
-        errs.saturating_add(taken)
-            .saturating_add(cands)
-            .saturating_add(best)
-            .saturating_add(near)
+        self.retained_bytes_without_nearest().saturating_add(near)
     }
 
     fn update_charge(&mut self) -> Result<()> {
@@ -450,7 +453,7 @@ impl SpatialKnn {
     ) -> Result<Option<Buffer>> {
         use crate::error::Error;
         use crate::geo::exec::state;
-        use crate::geo::knn::rows_without_distance;
+        use crate::geo::knn::rows_without_distance_charged;
         use crate::geo::search::NearestIter;
         use crate::id::Id;
         use crate::sparql::ctx::OwnedCharge;
@@ -476,8 +479,9 @@ impl SpatialKnn {
                 Some(PathEnd::Const(s)) => Some(s),
                 _ => None,
             };
+            let mut charge = OwnedCharge::new(ctx, 0)?;
             let (error_rows, taken) = if spec.errors {
-                rows_without_distance(ctx, spec, subj)?
+                rows_without_distance_charged(ctx, spec, subj, &mut |b| charge.resize(b))?
             } else {
                 (Vec::new(), rustc_hash::FxHashSet::default())
             };
@@ -503,7 +507,7 @@ impl SpatialKnn {
                 keyed: 0,
                 matched: 0,
                 runs: Vec::new(),
-                charge: OwnedCharge::new(ctx, 0)?,
+                charge,
             });
             st.update_charge()?;
             self.state = Some(st);
@@ -546,6 +550,13 @@ impl SpatialKnn {
                             && need > 0
                         {
                             if st.best.len() < need {
+                                if st.best.len() == st.best.capacity() {
+                                    let next_best = st.best.capacity().saturating_mul(2).max(8);
+                                    let add = next_best.saturating_sub(st.best.capacity()) as u64
+                                        * size_of::<DistKey>() as u64;
+                                    let projected = st.retained_bytes().saturating_add(add);
+                                    st.charge.resize(projected)?;
+                                }
                                 st.best.push(DistKey(d));
                             } else if st.best.peek().is_some_and(|m| d < m.0) {
                                 st.best.pop();
@@ -553,6 +564,7 @@ impl SpatialKnn {
                             }
                         }
                     }
+                    st.update_charge()?;
                     if batch.table.vars != vars {
                         batch.project(vars)?;
                     }
@@ -569,7 +581,7 @@ impl SpatialKnn {
                 if st.runs.len() < RUNS_SHOWN {
                     let mut cp = done_op.describe(ctx);
                     done_op.update_plan(&mut cp);
-                    st.runs.push(cp.operator);
+                    st.runs.push(cp);
                 }
                 done_op.release_finished();
                 // Check early-stop condition after a nearest-phase batch.
@@ -650,26 +662,39 @@ impl SpatialKnn {
             st.pending_cands.clear();
             let mut bound = f64::INFINITY;
             while st.pending_cands.len() < batch_target {
+                let base_bytes = st.retained_bytes_without_nearest();
                 let Some(iter) = &mut st.nearest else {
                     break;
                 };
                 let mut chunk = Vec::new();
-                let base_bytes = st.taken.capacity() as u64 * (size_of::<Id>() + 1) as u64
-                    + st.pending_cands.capacity() as u64 * size_of::<[Id; 3]>() as u64;
                 let charge = &mut st.charge;
                 match iter.next_chunk(ctx, &mut chunk, &mut |b| {
                     charge.resize(base_bytes.saturating_add(b))
                 })? {
                     Some(b) => {
                         bound = b;
-                        st.pending_cands.extend(
-                            chunk
-                                .into_iter()
-                                .filter(|h| {
-                                    st.subj.is_none_or(|s| s == h.s) && !st.taken.contains(&h.o)
-                                })
-                                .map(|h| [h.s, h.o, h.g]),
-                        );
+                        let kept: Vec<[Id; 3]> = chunk
+                            .into_iter()
+                            .filter(|h| {
+                                st.subj.is_none_or(|s| s == h.s) && !st.taken.contains(&h.o)
+                            })
+                            .map(|h| [h.s, h.o, h.g])
+                            .collect();
+                        if st.pending_cands.len().saturating_add(kept.len())
+                            > st.pending_cands.capacity()
+                        {
+                            let next_cap = st
+                                .pending_cands
+                                .capacity()
+                                .saturating_mul(2)
+                                .max(st.pending_cands.len().saturating_add(kept.len()))
+                                .max(8);
+                            let add = next_cap.saturating_sub(st.pending_cands.capacity()) as u64
+                                * size_of::<[Id; 3]>() as u64;
+                            let projected = st.retained_bytes().saturating_add(add);
+                            st.charge.resize(projected)?;
+                        }
+                        st.pending_cands.extend(kept);
                         if !bound.is_finite() {
                             break;
                         }
@@ -734,26 +759,74 @@ impl SpatialKnn {
         counters: &mut Option<serde_json::Map<String, serde_json::Value>>,
         template_plan: &mut Option<Box<CursorPlan>>,
     ) {
+        fn plan_info_to_cursor(mut info: crate::sparql::PlanInfo) -> CursorPlan {
+            let children = std::mem::take(&mut info.children)
+                .into_iter()
+                .map(plan_info_to_cursor)
+                .collect();
+            CursorPlan {
+                operator: info,
+                materializes: false,
+                full_input_before_output: false,
+                growing_state: false,
+                complete: true,
+                reason: None,
+                children,
+            }
+        }
+        fn merge_cursor_run(a: CursorPlan, mut b: CursorPlan) -> CursorPlan {
+            b.operator = a.operator.merge_run(b.operator);
+            b.materializes |= a.materializes;
+            b.full_input_before_output |= a.full_input_before_output;
+            b.growing_state |= a.growing_state;
+            b.complete &= a.complete;
+            if b.reason.is_none() {
+                b.reason = a.reason;
+            }
+            if a.children.len() == b.children.len()
+                && a.children
+                    .iter()
+                    .zip(&b.children)
+                    .all(|(x, y)| x.operator.operator == y.operator.operator)
+            {
+                let b_children = std::mem::take(&mut b.children);
+                b.children = a
+                    .children
+                    .into_iter()
+                    .zip(b_children)
+                    .map(|(x, y)| {
+                        let xs = x
+                            .operator
+                            .fidelity
+                            .as_ref()
+                            .and_then(|f| f.skipped.as_ref());
+                        let ys = y
+                            .operator
+                            .fidelity
+                            .as_ref()
+                            .and_then(|f| f.skipped.as_ref());
+                        match (xs, ys) {
+                            (None, Some(_)) => x,
+                            (Some(_), _) => y,
+                            (None, None) => merge_cursor_run(x, y),
+                        }
+                    })
+                    .collect();
+            }
+            b
+        }
         Self::record_counters(st, counters);
         let merged = std::mem::take(&mut st.runs)
             .into_iter()
-            .reduce(crate::sparql::PlanInfo::merge_run)
+            .reduce(merge_cursor_run)
             .unwrap_or_else(|| {
                 let mut d = crate::sparql::exec::describe(ctx, template);
                 if ctx.graphs.is_some() {
                     d.redact();
                 }
-                d.skip("no candidate needed it")
+                plan_info_to_cursor(d.skip("no candidate needed it"))
             });
-        *template_plan = Some(Box::new(CursorPlan {
-            operator: merged,
-            materializes: false,
-            full_input_before_output: false,
-            growing_state: false,
-            complete: true,
-            reason: None,
-            children: Vec::new(),
-        }));
+        *template_plan = Some(Box::new(merged));
     }
 
     #[cfg(not(feature = "geo"))]

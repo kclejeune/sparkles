@@ -362,3 +362,283 @@ fn silent_service_respects_decision_q_svc1_and_error_suppression_parity() {
     }
     assert_eq!(bag(rows), expected);
 }
+
+/// Regression for S4 & S5:
+/// - Backward BFS in `path:all` pre-admits a high fan-in frontier before allocation.
+/// - Per-edge path longer than `batch_rows` maintains parity and charges `terms`/`current`
+///   across pulls.
+/// - DFS pruned-neighbour loop polls cancellation/timeout even when every neighbour is
+///   pruned by the backward distance map.
+#[test]
+fn path_search_pre_admission_batch_boundary_and_pruned_cancel() {
+    // 1. High fan-in backward BFS under tight memory budget fails with Memory budget.
+    let fanin = Store::in_memory(StoreOptions::default());
+    let mut data = String::new();
+    for i in 0..400 {
+        data.push_str(&format!("<urn:in:{i}> <urn:e> <urn:hub> .\n"));
+    }
+    data.push_str("<urn:start> <urn:e> <urn:in:0> .\n");
+    load(&fanin, &data, RdfFormat::Turtle);
+    let strict = CursorOptions {
+        batch_rows: 1,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let tight = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(2048),
+        ..Default::default()
+    };
+    let q_bfs = format!(
+        "{P}SELECT ?p {{ SERVICE path:search {{ [] path:source <urn:start> ; path:target <urn:hub> ; path:predicate <urn:e> ; path:algorithm path:all ; path:maxLength 2 ; path:pathIndex ?p }} }}"
+    );
+    let res = select_cursor(fanin.snapshot(), &q_bfs, &tight, &strict).and_then(|mut c| {
+        while c.next_batch()?.is_some() {}
+        Ok(())
+    });
+    assert!(
+        matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "BFS fan-in pre-admission: {res:?}"
+    );
+
+    // 2. Per-edge path longer than batch_rows=1 with edge triple terms (`path:edge ?e`).
+    let chain = Store::in_memory(StoreOptions::default());
+    let mut chain_data = String::new();
+    for i in 0..12 {
+        chain_data.push_str(&format!("<urn:c:{i}> <urn:next> <urn:c:{}> .\n", i + 1));
+    }
+    load(&chain, &chain_data, RdfFormat::Turtle);
+    assert_parity(
+        &chain.snapshot(),
+        "SELECT ?i ?e ?len { SERVICE path:search { [] path:source <urn:c:0> ; path:target <urn:c:12> ; path:predicate <urn:next> ; path:algorithm path:all ; path:maxLength 12 ; path:edgeIndex ?i ; path:edge ?e ; path:length ?len } }",
+        &QueryOptions::default(),
+        true,
+    );
+
+    // 3. DFS pruned-neighbour cancellation: <urn:src> has 3,000 dead-end neighbours that
+    //    cannot reach <urn:dst> (all pruned by backward distance map `d`), so `steps` never
+    //    advances; expired deadline triggered after open must still be caught promptly.
+    let dead = Store::in_memory(StoreOptions::default());
+    let mut dead_data = String::new();
+    for i in 0..3000 {
+        dead_data.push_str(&format!("<urn:src> <urn:p> <urn:dead:{i}> .\n"));
+    }
+    dead_data.push_str("<urn:other> <urn:p> <urn:dst> .\n");
+    load(&dead, &dead_data, RdfFormat::Turtle);
+    let q_pruned = format!(
+        "{P}SELECT ?p {{ SERVICE path:search {{ [] path:source <urn:src> ; path:target <urn:dst> ; path:predicate <urn:p> ; path:algorithm path:all ; path:maxLength 2 ; path:pathIndex ?p }} }}"
+    );
+    let cancel = Arc::new(AtomicBool::new(true));
+    let cancel_opts = QueryOptions {
+        no_cache: true,
+        cancel: Some(cancel),
+        ..Default::default()
+    };
+    let res = select_cursor(dead.snapshot(), &q_pruned, &cancel_opts, &strict)
+        .and_then(|mut c| c.next_batch().map(|_| ()));
+    assert!(
+        matches!(res, Err(Error::Cancelled)),
+        "pruned DFS cancel: {res:?}"
+    );
+}
+
+/// Regression for S6 & N4:
+/// - Extended path search forms (weighted, maxDegree, direction backward/both,
+///   excludePredicate, minLength 0 / maxLength 0 with path:all, kShortest budgets).
+/// - `VectorOrder` with small `k` and large pending delta (pre-admission & parity).
+/// - `IndexTopK` with `topk_heap = false` under cancel, timeout, and tight memory.
+#[test]
+fn path_search_extended_forms_and_native_topk_pre_admission() {
+    let store = Store::in_memory(StoreOptions::default());
+    let mut data = String::from("@prefix ex: <http://example.org/> .\n");
+    data.push_str(
+        r#"
+        <urn:a> <urn:p> <urn:b> .
+        <urn:b> <urn:p> <urn:c> .
+        <urn:a> <urn:p> <urn:c> .
+        <urn:c> <urn:q> <urn:d> .
+        <urn:b> <urn:skip> <urn:d> .
+        << <urn:a> <urn:p> <urn:b> >> <urn:w> 1.5 .
+        << <urn:b> <urn:p> <urn:c> >> <urn:w> 1.0 .
+        << <urn:a> <urn:p> <urn:c> >> <urn:w> 10.0 .
+        "#,
+    );
+    load(&store, &data, RdfFormat::Turtle);
+    let snap = store.snapshot();
+    let opts = QueryOptions::default();
+
+    // Weighted shortest / kShortest / all
+    assert_parity(
+        &snap,
+        "SELECT ?i ?es ?eo ?c { SERVICE path:search { [] path:source <urn:a> ; path:target <urn:c> ; path:predicate <urn:p> ; path:weight <urn:w> ; path:edgeIndex ?i ; path:edgeSubject ?es ; path:edgeObject ?eo ; path:cost ?c } }",
+        &opts,
+        true,
+    );
+    assert_parity(
+        &snap,
+        "SELECT ?p ?c { SERVICE path:search { [] path:source <urn:a> ; path:target <urn:c> ; path:predicate <urn:p> ; path:algorithm path:kShortest ; path:k 2 ; path:weight <urn:w> ; path:pathIndex ?p ; path:cost ?c } }",
+        &opts,
+        true,
+    );
+    assert_parity(
+        &snap,
+        "SELECT ?p ?c { SERVICE path:search { [] path:source <urn:a> ; path:target <urn:c> ; path:predicate <urn:p> ; path:algorithm path:all ; path:maxLength 3 ; path:weight <urn:w> ; path:pathIndex ?p ; path:cost ?c } }",
+        &opts,
+        true,
+    );
+    // Direction backward & both, maxDegree, excludePredicate, minLength 0 / maxLength 0
+    assert_parity(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source <urn:c> ; path:target ?t ; path:predicate <urn:p> ; path:algorithm path:all ; path:direction path:backward ; path:maxLength 2 ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    assert_parity(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source <urn:b> ; path:target ?t ; path:predicate <urn:p> ; path:algorithm path:all ; path:direction path:both ; path:maxLength 2 ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    assert_parity(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source <urn:a> ; path:target ?t ; path:predicate <urn:p> ; path:algorithm path:all ; path:maxLength 3 ; path:maxDegree 1 ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    assert_parity(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source <urn:a> ; path:target ?t ; path:algorithm path:all ; path:maxLength 3 ; path:excludePredicate <urn:skip> ; path:length ?len } }",
+        &opts,
+        true,
+    );
+    assert_parity(
+        &snap,
+        "SELECT ?t ?len { SERVICE path:search { [] path:source <urn:a> ; path:target ?t ; path:predicate <urn:p> ; path:algorithm path:all ; path:minLength 0 ; path:maxLength 0 ; path:length ?len } }",
+        &opts,
+        true,
+    );
+
+    // S6: VectorOrder with small k=2 and large pending delta (500 inserted vector triples).
+    let vstore = Store::in_memory(StoreOptions::default());
+    load(
+        &vstore,
+        r#"
+        @prefix ex: <http://example.org/> .
+        ex:base0 ex:emb "[1, 0, 0]"^^<urn:x-sparkles:vector> .
+        ex:base1 ex:emb "[0, 1, 0]"^^<urn:x-sparkles:vector> .
+        "#,
+        RdfFormat::Turtle,
+    );
+    // Insert 500 delta vectors into the live delta overlay.
+    let mut delta_ttl = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..500 {
+        let a = ((i % 100) as f64) / 100.0;
+        let b = (1.0 - a * a).max(0.0).sqrt();
+        delta_ttl.push_str(&format!(
+            "ex:d{i} ex:emb \"[{a:.3}, {b:.3}, 0]\"^^<urn:x-sparkles:vector> .\n"
+        ));
+    }
+    sparkles_core::sparql::update::update(
+        &vstore,
+        &format!(
+            "PREFIX ex: <http://example.org/> INSERT DATA {{ {} }}",
+            delta_ttl.trim_start_matches("@prefix ex: <http://example.org/> .\n")
+        ),
+        &QueryOptions::default(),
+    )
+    .unwrap();
+    let vsnap = vstore.snapshot();
+    assert_parity(
+        &vsnap,
+        "SELECT ?s { ?s ex:emb ?v } ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2",
+        &opts,
+        true,
+    );
+    let strict = CursorOptions {
+        batch_rows: 4,
+        fallback: FallbackPolicy::RejectMaterialization,
+        ..Default::default()
+    };
+    let tight = QueryOptions {
+        no_cache: true,
+        max_memory_bytes: Some(2048),
+        ..Default::default()
+    };
+    let vq = format!(
+        "{P}SELECT ?s {{ ?s ex:emb ?v }} ORDER BY DESC(spk:cosine(?v, \"[1,0,0]\"^^spk:vector)) LIMIT 2"
+    );
+    let res = select_cursor(vsnap, &vq, &tight, &strict).and_then(|mut c| {
+        while c.next_batch()?.is_some() {}
+        Ok(())
+    });
+    assert!(
+        matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+        "VectorOrder delta pre-admission: {res:?}"
+    );
+
+    // S6 + N4: IndexTopK (`topk_heap = false`) and `path:kShortest` cancel, timeout, memory.
+    let decimals = Store::in_memory(StoreOptions::default());
+    let dec_data: String = (0..10_000)
+        .map(|i| {
+            format!(
+                "<urn:s:{i}> <urn:v> \"{}.{:02}\"^^<http://www.w3.org/2001/XMLSchema#decimal> .\n",
+                (i * 7919) % 5000,
+                i % 100
+            )
+        })
+        .collect();
+    load(&decimals, &dec_data, RdfFormat::Turtle);
+    let mut no_heap = Optimizations::ALL;
+    no_heap.topk_heap = false;
+    let q_topk = "SELECT ?s ?v { ?s <urn:v> ?v } ORDER BY DESC(?v) LIMIT 5";
+    for (snap_i, q_i, opt_base) in [
+        (
+            decimals.snapshot(),
+            q_topk.to_string(),
+            QueryOptions {
+                no_cache: true,
+                optimizations: Some(no_heap),
+                ..Default::default()
+            },
+        ),
+        (
+            snap.clone(),
+            format!(
+                "{P}SELECT ?p ?c {{ SERVICE path:search {{ [] path:source <urn:a> ; path:target <urn:c> ; path:predicate <urn:p> ; path:algorithm path:kShortest ; path:k 2 ; path:weight <urn:w> ; path:pathIndex ?p ; path:cost ?c }} }}"
+            ),
+            QueryOptions {
+                no_cache: true,
+                ..Default::default()
+            },
+        ),
+    ] {
+        let cancel_opts = QueryOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..opt_base.clone()
+        };
+        let res = select_cursor(snap_i.clone(), &q_i, &cancel_opts, &strict)
+            .and_then(|mut c| c.next_batch().map(|_| ()));
+        assert!(matches!(res, Err(Error::Cancelled)), "`{q_i}`: {res:?}");
+
+        let timeout_opts = QueryOptions {
+            deadline: Some(Instant::now() - Duration::from_secs(1)),
+            ..opt_base.clone()
+        };
+        let res = select_cursor(snap_i.clone(), &q_i, &timeout_opts, &strict)
+            .and_then(|mut c| c.next_batch().map(|_| ()));
+        assert!(matches!(res, Err(Error::Timeout)), "`{q_i}`: {res:?}");
+
+        let mem_opts = QueryOptions {
+            max_memory_bytes: Some(128),
+            ..opt_base
+        };
+        let res = select_cursor(snap_i, &q_i, &mem_opts, &strict).and_then(|mut c| {
+            while c.next_batch()?.is_some() {}
+            Ok(())
+        });
+        assert!(
+            matches!(res, Err(Error::BudgetExceeded(b)) if b.kind == BudgetKind::Memory),
+            "`{q_i}`: {res:?}"
+        );
+    }
+}

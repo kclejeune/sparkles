@@ -46,6 +46,15 @@ const PREPARE_OVER: usize = 8;
 const WORLD: [f64; 4] = [-180.0, -90.0, 180.0, 90.0];
 const JOIN_WORLD: [f64; 4] = [-1e30, -1e30, 1e30, 1e30];
 
+#[inline]
+fn next_cap(len: usize, cap: usize, extra: usize) -> usize {
+    if len.saturating_add(extra) <= cap {
+        cap
+    } else {
+        cap.saturating_mul(2).max(len.saturating_add(extra)).max(8)
+    }
+}
+
 fn same_frame(a: &Geom, b: &Geom) -> bool {
     a.crs == b.crs
         || matches!(
@@ -185,7 +194,6 @@ impl SpatialScanReader {
     pub(crate) fn counters(&self) -> Counters {
         let mut st = self.st.clone();
         if let Some(iter) = &self.iter {
-            st.candidates = st.candidates.max(iter.st.candidates);
             st.nodes = iter.st.nodes;
             st.rechecked = iter.st.rechecked;
             st.fallback = iter.st.fallback;
@@ -211,19 +219,20 @@ impl SpatialScanReader {
         } else {
             Some(Table::new(self.vars.clone()))
         };
+        let bytes_for = |iter: &Option<WindowIter>, pending_cap: usize, seen_cap: usize| -> u64 {
+            let iter_bytes = iter.as_ref().map_or(0, WindowIter::retained_bytes);
+            let pending_bytes = pending_cap as u64 * size_of::<Hit>() as u64;
+            let seen_bytes = seen_cap as u64 * (size_of::<Id>() + 2) as u64;
+            iter_bytes
+                .saturating_add(pending_bytes)
+                .saturating_add(seen_bytes)
+        };
         let resize_charge = |iter: &Option<WindowIter>,
                              pending: &VecDeque<Hit>,
                              seen_lit: &FxHashMap<Id, bool>,
                              charge: &mut OwnedCharge|
          -> Result<()> {
-            let iter_bytes = iter.as_ref().map_or(0, WindowIter::retained_bytes);
-            let pending_bytes = pending.capacity() as u64 * size_of::<Hit>() as u64;
-            let seen_bytes = seen_lit.capacity() as u64 * (size_of::<Id>() + 2) as u64;
-            charge.resize(
-                iter_bytes
-                    .saturating_add(pending_bytes)
-                    .saturating_add(seen_bytes),
-            )
+            charge.resize(bytes_for(iter, pending.capacity(), seen_lit.capacity()))
         };
         loop {
             ctx.check()?;
@@ -239,13 +248,17 @@ impl SpatialScanReader {
                     charge.resize(b.saturating_add(seen_bytes))
                 })?;
                 if ended {
-                    self.st.candidates = self.st.candidates.max(iter.st.candidates);
                     self.st.nodes = iter.st.nodes;
                     self.st.rechecked = iter.st.rechecked;
                     self.st.fallback = iter.st.fallback;
                     self.iter = None;
                 }
-                self.pending.extend(buf);
+                if !buf.is_empty() {
+                    let next_p = next_cap(self.pending.len(), self.pending.capacity(), buf.len());
+                    self.charge
+                        .resize(bytes_for(&self.iter, next_p, self.seen_lit.capacity()))?;
+                    self.pending.extend(buf);
+                }
                 resize_charge(&self.iter, &self.pending, &self.seen_lit, &mut self.charge)?;
             }
             let want = cap.saturating_sub(out.len());
@@ -270,6 +283,14 @@ impl SpatialScanReader {
                     refined_since_check += 1;
                     if refined_since_check.is_multiple_of(CHECK_EVERY) {
                         ctx.check()?;
+                    }
+                    if self.seen_lit.len() == self.seen_lit.capacity() {
+                        let next_s = next_cap(self.seen_lit.len(), self.seen_lit.capacity(), 1);
+                        self.charge.resize(bytes_for(
+                            &self.iter,
+                            self.pending.capacity(),
+                            next_s,
+                        ))?;
                     }
                     let pass = noted(ctx, h.entry.geom(&ctx.snap))
                         .ok()
@@ -315,6 +336,14 @@ impl SpatialScanReader {
 
 // ------------------------------------------------------------------ SpatialPf --
 
+struct ActiveLinkScan {
+    geom_s: Id,
+    h_g: Id,
+    g_key: Id,
+    link_at: usize,
+    scan: Option<PrefixScan>,
+}
+
 /// Resumable streaming reader for unlimited `SpatialPf` without input (item 829, group 4 / 6a).
 pub(crate) struct SpatialPfReader {
     spec: SpatialPfSpec,
@@ -328,6 +357,7 @@ pub(crate) struct SpatialPfReader {
     iter: Option<WindowIter>,
     pending_hits: VecDeque<Hit>,
     pending_feats: VecDeque<(Id, Id)>,
+    active_links: Option<ActiveLinkScan>,
     seen_lit: FxHashMap<Id, bool>,
     seen_geom: FxHashSet<(Id, Id)>,
     seen_feat: FxHashSet<(Id, Id)>,
@@ -337,6 +367,7 @@ pub(crate) struct SpatialPfReader {
 
 impl SpatialPfReader {
     pub(crate) fn open(ctx: &Arc<Ctx>, spec: &SpatialPfSpec, vars: &[VarId]) -> Result<Self> {
+        ctx.check()?;
         let cfg = config(ctx);
         let st_str = state(ctx).to_string();
         let ids = |iris: &[String]| -> Vec<Id> {
@@ -373,14 +404,28 @@ impl SpatialPfReader {
             let mut tester = Tester::new(ctx, &check);
             let mut lit_memo: FxHashMap<Id, bool> = FxHashMap::default();
             let mut scope = Scope::new(&cfg);
+            let mut scanned = 0usize;
+            let open_bytes = |lit_cap: usize, seen_cap: usize, pend_cap: usize| -> u64 {
+                (lit_cap as u64 * (size_of::<Id>() + 2) as u64)
+                    .saturating_add(seen_cap as u64 * (size_of::<(Id, Id)>() + 1) as u64)
+                    .saturating_add(pend_cap as u64 * size_of::<(Id, Id)>() as u64)
+            };
             for l in &links {
                 scan_keys(ctx, Perm::Spo, &[f.0, l.0], |k| {
+                    scanned += 1;
+                    if scanned.is_multiple_of(CHECK_EVERY) {
+                        ctx.check()?;
+                    }
                     let (geom, g1) = (k[2], k[3]);
                     if !spec.graph.accepts(g1) {
                         return Ok(());
                     }
                     for p in &preds {
                         scan_keys(ctx, Perm::Spo, &[geom, p.0], |k2| {
+                            scanned += 1;
+                            if scanned.is_multiple_of(CHECK_EVERY) {
+                                ctx.check()?;
+                            }
                             let g = k2[3];
                             if !spec.graph.accepts(g) || !scope.contains(ctx, g) {
                                 return Ok(());
@@ -390,22 +435,36 @@ impl SpatialPfReader {
                             }
                             let o = Id(k2[2]);
                             st.candidates += 1;
-                            let ok = *lit_memo.entry(o).or_insert_with(|| {
+                            if st.candidates.is_multiple_of(CHECK_CANDIDATES) {
+                                ctx.check()?;
+                                ctx.check_rows(st.candidates as usize)?;
+                            }
+                            let ok = if let Some(&v) = lit_memo.get(&o) {
+                                v
+                            } else {
+                                if lit_memo.len() == lit_memo.capacity() {
+                                    charge.resize(open_bytes(
+                                        next_cap(lit_memo.len(), lit_memo.capacity(), 1),
+                                        seen_feat.capacity(),
+                                        pending_feats.capacity(),
+                                    ))?;
+                                }
                                 st.refined += 1;
-                                let Some(v) = ctx.value(o) else {
-                                    return false;
-                                };
-                                let max = max_vertices(ctx);
-                                let Some(parsed) =
-                                    ctx.geo.get_or_parse_charged(ctx, MemoKey::Id(o), || {
-                                        parse_value(&v, max)
-                                    })
-                                else {
-                                    return false;
-                                };
-                                note_crs(ctx, &parsed);
-                                tester.check(&parsed).is_some()
-                            });
+                                let v = (|| {
+                                    let v = ctx.value(o)?;
+                                    let max = max_vertices(ctx);
+                                    let parsed = ctx.geo.get_or_parse_charged(
+                                        ctx,
+                                        MemoKey::Id(o),
+                                        || parse_value(&v, max),
+                                    )?;
+                                    note_crs(ctx, &parsed);
+                                    Some(tester.check(&parsed).is_some())
+                                })()
+                                .unwrap_or(false);
+                                lit_memo.insert(o, v);
+                                v
+                            };
                             if ok {
                                 st.matched += 1;
                                 let g_key = if spec.graph_var.is_some() {
@@ -413,7 +472,21 @@ impl SpatialPfReader {
                                 } else {
                                     Id::UNDEF
                                 };
-                                if seen_feat.insert((*f, g_key)) {
+                                if !seen_feat.contains(&(*f, g_key)) {
+                                    if seen_feat.len() == seen_feat.capacity()
+                                        || pending_feats.len() == pending_feats.capacity()
+                                    {
+                                        charge.resize(open_bytes(
+                                            lit_memo.capacity(),
+                                            next_cap(seen_feat.len(), seen_feat.capacity(), 1),
+                                            next_cap(
+                                                pending_feats.len(),
+                                                pending_feats.capacity(),
+                                                1,
+                                            ),
+                                        ))?;
+                                    }
+                                    seen_feat.insert((*f, g_key));
                                     pending_feats.push_back((*f, g_key));
                                 }
                             }
@@ -426,6 +499,10 @@ impl SpatialPfReader {
             if let (Some(lat_p), Some((_, long_p))) = (lat, super::wgs84::predicates(&ctx.snap)) {
                 let mut scope = Scope::new(&cfg);
                 scan_keys(ctx, Perm::Spo, &[f.0, lat_p.0], |k| {
+                    scanned += 1;
+                    if scanned.is_multiple_of(CHECK_EVERY) {
+                        ctx.check()?;
+                    }
                     let (lat_o, g) = (k[2], k[3]);
                     if !spec.graph.accepts(g) || !scope.contains(ctx, g) {
                         return Ok(());
@@ -434,10 +511,18 @@ impl SpatialPfReader {
                         return Ok(());
                     };
                     for long_o in super::wgs84::objects(&ctx.snap, f.0, long_p.0, g)? {
+                        scanned += 1;
+                        if scanned.is_multiple_of(CHECK_EVERY) {
+                            ctx.check()?;
+                        }
                         let e = super::wgs84::number(&ctx.snap, Id(long_o))
                             .and_then(|x| super::wgs84::point(y, x));
                         if let Some(e) = e {
                             st.candidates += 1;
+                            if st.candidates.is_multiple_of(CHECK_CANDIDATES) {
+                                ctx.check()?;
+                                ctx.check_rows(st.candidates as usize)?;
+                            }
                             st.refined += 1;
                             if noted(ctx, e.geom(&ctx.snap))
                                 .ok()
@@ -450,7 +535,21 @@ impl SpatialPfReader {
                                 } else {
                                     Id::UNDEF
                                 };
-                                if seen_feat.insert((*f, g_key)) {
+                                if !seen_feat.contains(&(*f, g_key)) {
+                                    if seen_feat.len() == seen_feat.capacity()
+                                        || pending_feats.len() == pending_feats.capacity()
+                                    {
+                                        charge.resize(open_bytes(
+                                            lit_memo.capacity(),
+                                            next_cap(seen_feat.len(), seen_feat.capacity(), 1),
+                                            next_cap(
+                                                pending_feats.len(),
+                                                pending_feats.capacity(),
+                                                1,
+                                            ),
+                                        ))?;
+                                    }
+                                    seen_feat.insert((*f, g_key));
                                     pending_feats.push_back((*f, g_key));
                                 }
                             }
@@ -482,6 +581,7 @@ impl SpatialPfReader {
             iter,
             pending_hits: VecDeque::new(),
             pending_feats,
+            active_links: None,
             seen_lit: FxHashMap::default(),
             seen_geom: FxHashSet::default(),
             seen_feat,
@@ -512,7 +612,6 @@ impl SpatialPfReader {
     pub(crate) fn counters(&self) -> Counters {
         let mut st = self.st.clone();
         if let Some(iter) = &self.iter {
-            st.candidates = st.candidates.max(iter.st.candidates);
             st.nodes = iter.st.nodes;
             st.rechecked = iter.st.rechecked;
             st.fallback = iter.st.fallback;
@@ -545,6 +644,26 @@ impl SpatialPfReader {
             }
             out.push_row(row);
         };
+        let bytes_for = |iter: &Option<WindowIter>,
+                         hits_cap: usize,
+                         feats_cap: usize,
+                         lits_cap: usize,
+                         geoms_cap: usize,
+                         seen_cap: usize|
+         -> u64 {
+            let iter_bytes = iter.as_ref().map_or(0, WindowIter::retained_bytes);
+            let hits = hits_cap as u64 * size_of::<Hit>() as u64;
+            let feats = feats_cap as u64 * size_of::<(Id, Id)>() as u64;
+            let lits = lits_cap as u64 * (size_of::<Id>() + 2) as u64;
+            let geoms = geoms_cap as u64 * (size_of::<(Id, Id)>() + 1) as u64;
+            let seen = seen_cap as u64 * (size_of::<(Id, Id)>() + 1) as u64;
+            iter_bytes
+                .saturating_add(hits)
+                .saturating_add(feats)
+                .saturating_add(lits)
+                .saturating_add(geoms)
+                .saturating_add(seen)
+        };
         let resize_charge = |iter: &Option<WindowIter>,
                              pending_hits: &VecDeque<Hit>,
                              pending_feats: &VecDeque<(Id, Id)>,
@@ -553,20 +672,14 @@ impl SpatialPfReader {
                              seen_feat: &FxHashSet<(Id, Id)>,
                              charge: &mut OwnedCharge|
          -> Result<()> {
-            let iter_bytes = iter.as_ref().map_or(0, WindowIter::retained_bytes);
-            let hits = pending_hits.capacity() as u64 * size_of::<Hit>() as u64;
-            let feats = pending_feats.capacity() as u64 * size_of::<(Id, Id)>() as u64;
-            let lits = seen_lit.capacity() as u64 * (size_of::<Id>() + 2) as u64;
-            let geoms = seen_geom.capacity() as u64 * (size_of::<(Id, Id)>() + 1) as u64;
-            let seen = seen_feat.capacity() as u64 * (size_of::<(Id, Id)>() + 1) as u64;
-            charge.resize(
-                iter_bytes
-                    .saturating_add(hits)
-                    .saturating_add(feats)
-                    .saturating_add(lits)
-                    .saturating_add(geoms)
-                    .saturating_add(seen),
-            )
+            charge.resize(bytes_for(
+                iter,
+                pending_hits.capacity(),
+                pending_feats.capacity(),
+                seen_lit.capacity(),
+                seen_geom.capacity(),
+                seen_feat.capacity(),
+            ))
         };
         let mut refined_since_check = 0usize;
         loop {
@@ -589,6 +702,88 @@ impl SpatialPfReader {
                 )?;
                 return Ok(false);
             }
+            // Step any active reverse feature-link scan in bounded chunks.
+            if let Some(act) = &mut self.active_links {
+                if act.scan.is_none() {
+                    if act.link_at >= self.links.len() {
+                        self.active_links = None;
+                        continue;
+                    }
+                    let l = self.links[act.link_at];
+                    act.link_at += 1;
+                    act.scan = Some(PrefixScan::new(Perm::Pos, &[l.0, act.geom_s.0]));
+                }
+                let (h_g, g_key) = (act.h_g, act.g_key);
+                let mut raw = Vec::new();
+                let ended = act.scan.as_mut().expect("link scan").next_chunk(
+                    ctx,
+                    &mut raw,
+                    cap.clamp(64, 4096),
+                )?;
+                if ended {
+                    act.scan = None;
+                }
+                let mut link_steps = 0usize;
+                for k in raw {
+                    link_steps += 1;
+                    if link_steps.is_multiple_of(CHECK_EVERY) {
+                        ctx.check()?;
+                    }
+                    let (f, g1) = (Id(k[2]), k[3]);
+                    let same = match self.spec.graph_var {
+                        Some(_) => g1 == h_g.0,
+                        None => self.spec.graph.accepts(g1),
+                    };
+                    if !same || matches!(self.spec.subject, PathEnd::Const(c) if c != f) {
+                        continue;
+                    }
+                    if same_fg && f != g_key {
+                        continue;
+                    }
+                    if !self.seen_feat.contains(&(f, g_key)) {
+                        if self.seen_feat.len() == self.seen_feat.capacity()
+                            || (out.len() >= cap
+                                && self.pending_feats.len() == self.pending_feats.capacity())
+                        {
+                            self.charge.resize(bytes_for(
+                                &self.iter,
+                                self.pending_hits.capacity(),
+                                if out.len() >= cap {
+                                    next_cap(
+                                        self.pending_feats.len(),
+                                        self.pending_feats.capacity(),
+                                        1,
+                                    )
+                                } else {
+                                    self.pending_feats.capacity()
+                                },
+                                self.seen_lit.capacity(),
+                                self.seen_geom.capacity(),
+                                next_cap(self.seen_feat.len(), self.seen_feat.capacity(), 1),
+                            ))?;
+                        }
+                        self.seen_feat.insert((f, g_key));
+                        if out.len() < cap {
+                            emit_row(f, g_key, out, &mut row);
+                        } else {
+                            self.pending_feats.push_back((f, g_key));
+                        }
+                    }
+                }
+                resize_charge(
+                    &self.iter,
+                    &self.pending_hits,
+                    &self.pending_feats,
+                    &self.seen_lit,
+                    &self.seen_geom,
+                    &self.seen_feat,
+                    &mut self.charge,
+                )?;
+                if out.len() >= cap {
+                    return Ok(false);
+                }
+                continue;
+            }
             if self.pending_hits.is_empty() {
                 let Some(iter) = &mut self.iter else {
                     resize_charge(
@@ -604,21 +799,40 @@ impl SpatialPfReader {
                 };
                 let mut buf = Vec::new();
                 let chunk_want = cap.clamp(64, 4096);
-                let base_bytes = self.seen_lit.capacity() as u64 * (size_of::<Id>() + 2) as u64
-                    + self.seen_geom.capacity() as u64 * (size_of::<(Id, Id)>() + 1) as u64
-                    + self.seen_feat.capacity() as u64 * (size_of::<(Id, Id)>() + 1) as u64;
+                let base_bytes = bytes_for(
+                    &None,
+                    self.pending_hits.capacity(),
+                    self.pending_feats.capacity(),
+                    self.seen_lit.capacity(),
+                    self.seen_geom.capacity(),
+                    self.seen_feat.capacity(),
+                );
                 let charge = &mut self.charge;
                 let ended = iter.next_hits(ctx, &mut buf, chunk_want, &mut |b| {
                     charge.resize(b.saturating_add(base_bytes))
                 })?;
                 if ended {
-                    self.st.candidates = self.st.candidates.max(iter.st.candidates);
                     self.st.nodes = iter.st.nodes;
                     self.st.rechecked = iter.st.rechecked;
                     self.st.fallback = iter.st.fallback;
                     self.iter = None;
                 }
-                self.pending_hits.extend(buf);
+                if !buf.is_empty() {
+                    let next_h = next_cap(
+                        self.pending_hits.len(),
+                        self.pending_hits.capacity(),
+                        buf.len(),
+                    );
+                    self.charge.resize(bytes_for(
+                        &self.iter,
+                        next_h,
+                        self.pending_feats.capacity(),
+                        self.seen_lit.capacity(),
+                        self.seen_geom.capacity(),
+                        self.seen_feat.capacity(),
+                    ))?;
+                    self.pending_hits.extend(buf);
+                }
                 resize_charge(
                     &self.iter,
                     &self.pending_hits,
@@ -632,7 +846,7 @@ impl SpatialPfReader {
                     return Ok(true);
                 }
             }
-            while out.len() < cap {
+            while out.len() < cap && self.active_links.is_none() {
                 let Some(h) = self.pending_hits.pop_front() else {
                     break;
                 };
@@ -648,6 +862,16 @@ impl SpatialPfReader {
                     refined_since_check += 1;
                     if refined_since_check.is_multiple_of(CHECK_EVERY) {
                         ctx.check()?;
+                    }
+                    if self.seen_lit.len() == self.seen_lit.capacity() {
+                        self.charge.resize(bytes_for(
+                            &self.iter,
+                            self.pending_hits.capacity(),
+                            self.pending_feats.capacity(),
+                            next_cap(self.seen_lit.len(), self.seen_lit.capacity(), 1),
+                            self.seen_geom.capacity(),
+                            self.seen_feat.capacity(),
+                        ))?;
                     }
                     let pass = noted(ctx, h.entry.geom(&ctx.snap))
                         .ok()
@@ -672,36 +896,44 @@ impl SpatialPfReader {
                     if same_fg && h.s != g_key {
                         continue;
                     }
-                    if self.seen_feat.insert((h.s, g_key)) {
+                    if !self.seen_feat.contains(&(h.s, g_key)) {
+                        if self.seen_feat.len() == self.seen_feat.capacity() {
+                            self.charge.resize(bytes_for(
+                                &self.iter,
+                                self.pending_hits.capacity(),
+                                self.pending_feats.capacity(),
+                                self.seen_lit.capacity(),
+                                self.seen_geom.capacity(),
+                                next_cap(self.seen_feat.len(), self.seen_feat.capacity(), 1),
+                            ))?;
+                        }
+                        self.seen_feat.insert((h.s, g_key));
                         emit_row(h.s, g_key, out, &mut row);
                     }
                     continue;
                 }
-                if !self.seen_geom.insert((h.s, h.g)) {
+                if self.seen_geom.contains(&(h.s, h.g)) {
                     continue;
                 }
-                for &l in &self.links {
-                    scan_keys(ctx, Perm::Pos, &[l.0, h.s.0], |k| {
-                        let (f, g1) = (Id(k[2]), k[3]);
-                        let same = match self.spec.graph_var {
-                            Some(_) => g1 == h.g.0,
-                            None => self.spec.graph.accepts(g1),
-                        };
-                        if !same || matches!(self.spec.subject, PathEnd::Const(c) if c != f) {
-                            return Ok(());
-                        }
-                        if same_fg && f != g_key {
-                            return Ok(());
-                        }
-                        if self.seen_feat.insert((f, g_key)) {
-                            if out.len() < cap {
-                                emit_row(f, g_key, out, &mut row);
-                            } else {
-                                self.pending_feats.push_back((f, g_key));
-                            }
-                        }
-                        Ok(())
-                    })?;
+                if self.seen_geom.len() == self.seen_geom.capacity() {
+                    self.charge.resize(bytes_for(
+                        &self.iter,
+                        self.pending_hits.capacity(),
+                        self.pending_feats.capacity(),
+                        self.seen_lit.capacity(),
+                        next_cap(self.seen_geom.len(), self.seen_geom.capacity(), 1),
+                        self.seen_feat.capacity(),
+                    ))?;
+                }
+                self.seen_geom.insert((h.s, h.g));
+                if !self.links.is_empty() {
+                    self.active_links = Some(ActiveLinkScan {
+                        geom_s: h.s,
+                        h_g: h.g,
+                        g_key,
+                        link_at: 0,
+                        scan: None,
+                    });
                 }
             }
             resize_charge(
@@ -877,6 +1109,18 @@ enum OneConstCand {
     Done,
 }
 
+struct PairEmit {
+    a_lit: Id,
+    b_lit: Id,
+    ai: usize,
+    bi: usize,
+    oai: usize,
+    obi: usize,
+    oa_len: usize,
+    ob_len: usize,
+    matched_counted: bool,
+}
+
 enum RelateStage {
     Asserted {
         scan: PrefixScan,
@@ -888,27 +1132,44 @@ enum RelateStage {
         subject_const: bool,
         qs: Vec<Id>,
         by_lit: FxHashMap<Id, Vec<Option<Id>>>,
+        by_lit_elem_bytes: u64,
         q_at: usize,
         qg: Option<GeomRef>,
         cand: OneConstCand,
         pending_sers: VecDeque<Ser>,
+        active_ser: Option<(Ser, usize)>,
         lit_pass: FxHashMap<Id, bool>,
     },
     BothVar {
         items: Vec<RelateItem>,
         by_lit: FxHashMap<Id, Vec<Ser>>,
+        by_lit_elem_bytes: u64,
         boxed_idx: Vec<usize>,
         unboxed_idx: Vec<usize>,
         tree: Option<PackedTree>,
         phase: BothVarPhase,
+        pair_emit: Option<PairEmit>,
     },
     Done,
 }
 
 enum BothVarPhase {
-    Boxed { outer: usize },
-    Unboxed { idx: usize },
-    Disjoint { i: usize, j: usize },
+    Boxed {
+        outer: usize,
+        cur_i: Option<usize>,
+        stack: Vec<usize>,
+        ws_f32: [f32; 4],
+    },
+    Unboxed {
+        idx: usize,
+        j: usize,
+        rev_pending: bool,
+    },
+    Disjoint {
+        i: usize,
+        j: usize,
+        rev_pending: bool,
+    },
     Done,
 }
 
@@ -927,6 +1188,7 @@ pub(crate) struct SpatialRelateReader {
     scope: FxHashMap<u64, bool>,
     geoms: FxHashMap<Id, Option<GeomRef>>,
     features: FxHashMap<(Id, Id), Vec<Id>>,
+    features_elem_bytes: u64,
     emitted: FxHashSet<(Id, Id, Id)>,
     pending_out: VecDeque<(Id, Id, Id)>,
     asserted_count: u64,
@@ -985,6 +1247,7 @@ impl SpatialRelateReader {
             scope: FxHashMap::default(),
             geoms: FxHashMap::default(),
             features: FxHashMap::default(),
+            features_elem_bytes: 0,
             emitted: FxHashSet::default(),
             pending_out: VecDeque::new(),
             asserted_count: 0,
@@ -1009,8 +1272,8 @@ impl SpatialRelateReader {
         c
     }
 
-    fn retained_bytes(&self) -> u64 {
-        let mut bytes = (self.emitted.capacity() as u64 * (size_of::<(Id, Id, Id)>() + 1) as u64)
+    fn base_retained_bytes(&self) -> u64 {
+        (self.emitted.capacity() as u64 * (size_of::<(Id, Id, Id)>() + 1) as u64)
             .saturating_add(self.pending_out.capacity() as u64 * size_of::<(Id, Id, Id)>() as u64)
             .saturating_add(
                 self.geoms.capacity() as u64
@@ -1019,9 +1282,18 @@ impl SpatialRelateReader {
             .saturating_add(
                 self.features.capacity() as u64
                     * (size_of::<(Id, Id)>() + size_of::<Vec<Id>>() + 1) as u64,
-            );
+            )
+            .saturating_add(self.features_elem_bytes)
+            .saturating_add(self.scope.capacity() as u64 * (size_of::<u64>() + 2) as u64)
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        let mut bytes = self.base_retained_bytes();
         match &self.stage {
             RelateStage::OneConst {
+                qs,
+                by_lit,
+                by_lit_elem_bytes,
                 cand,
                 pending_sers,
                 lit_pass,
@@ -1031,27 +1303,43 @@ impl SpatialRelateReader {
                     bytes = bytes.saturating_add(it.retained_bytes());
                 }
                 bytes = bytes
+                    .saturating_add(qs.capacity() as u64 * size_of::<Id>() as u64)
+                    .saturating_add(
+                        by_lit.capacity() as u64
+                            * (size_of::<Id>() + size_of::<Vec<Option<Id>>>() + 1) as u64,
+                    )
+                    .saturating_add(*by_lit_elem_bytes)
                     .saturating_add(pending_sers.capacity() as u64 * size_of::<Ser>() as u64)
                     .saturating_add(lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64);
             }
             RelateStage::BothVar {
                 items,
                 by_lit,
+                by_lit_elem_bytes,
                 boxed_idx,
                 unboxed_idx,
                 tree,
+                phase,
                 ..
             } => {
+                let stack_bytes = match phase {
+                    BothVarPhase::Boxed { stack, .. } => {
+                        stack.capacity() as u64 * size_of::<usize>() as u64
+                    }
+                    _ => 0,
+                };
                 bytes = bytes
                     .saturating_add(items.capacity() as u64 * size_of::<RelateItem>() as u64)
                     .saturating_add(
                         by_lit.capacity() as u64
                             * (size_of::<Id>() + size_of::<Vec<Ser>>() + 1) as u64,
                     )
+                    .saturating_add(*by_lit_elem_bytes)
                     .saturating_add(
                         (boxed_idx.capacity() + unboxed_idx.capacity()) as u64
                             * size_of::<usize>() as u64,
                     )
+                    .saturating_add(stack_bytes)
                     .saturating_add(tree.as_ref().map_or(0, PackedTree::bytes));
             }
             _ => {}
@@ -1074,36 +1362,57 @@ impl SpatialRelateReader {
         self.spec.graph.accepts(g) && self.in_scope(ctx, g)
     }
 
-    fn geom(&mut self, ctx: &Ctx, lit: Id) -> Option<GeomRef> {
-        self.geoms
-            .entry(lit)
-            .or_insert_with(|| {
-                let v = ctx.value(lit)?;
-                let max = max_vertices(ctx);
-                let g = ctx
-                    .geo
-                    .get_or_parse_charged(ctx, MemoKey::Id(lit), || parse_value(&v, max))?;
-                note_crs(ctx, &g);
-                Some(g)
-            })
-            .clone()
+    fn geom_charged(&mut self, ctx: &Ctx, lit: Id, extra_bytes: u64) -> Result<Option<GeomRef>> {
+        if let Some(g) = self.geoms.get(&lit) {
+            return Ok(g.clone());
+        }
+        if self.geoms.len() == self.geoms.capacity() {
+            let add = (next_cap(self.geoms.len(), self.geoms.capacity(), 1) - self.geoms.capacity())
+                as u64
+                * (size_of::<Id>() + size_of::<Option<GeomRef>>() + 1) as u64;
+            self.charge.resize(
+                self.base_retained_bytes()
+                    .saturating_add(extra_bytes)
+                    .saturating_add(add),
+            )?;
+        }
+        let parsed = (|| {
+            let v = ctx.value(lit)?;
+            let max = max_vertices(ctx);
+            let g = ctx
+                .geo
+                .get_or_parse_charged(ctx, MemoKey::Id(lit), || parse_value(&v, max))?;
+            note_crs(ctx, &g);
+            Some(g)
+        })();
+        self.geoms.insert(lit, parsed.clone());
+        Ok(parsed)
     }
 
     fn sers_of(&mut self, ctx: &Ctx, s: Id) -> Result<Vec<Ser>> {
         let mut out = Vec::new();
         for p in self.preds.clone() {
-            let mut keys = Vec::new();
-            scan_keys(ctx, Perm::Spo, &[s.0, p.0], |k| {
-                keys.push(k);
-                Ok(())
-            })?;
-            for k in keys {
-                if self.ser_graph(ctx, k[3]) {
-                    out.push(Ser {
-                        s,
-                        o: Id(k[2]),
-                        g: Id(k[3]),
-                    });
+            let mut scan = PrefixScan::new(Perm::Spo, &[s.0, p.0]);
+            let mut raw = Vec::new();
+            loop {
+                let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
+                for &k in &raw {
+                    if self.ser_graph(ctx, k[3]) {
+                        if out.len() == out.capacity() {
+                            let add = next_cap(out.len(), out.capacity(), 1) as u64
+                                * size_of::<Ser>() as u64;
+                            self.charge
+                                .resize(self.retained_bytes().saturating_add(add))?;
+                        }
+                        out.push(Ser {
+                            s,
+                            o: Id(k[2]),
+                            g: Id(k[3]),
+                        });
+                    }
+                }
+                if ended {
+                    break;
                 }
             }
         }
@@ -1113,6 +1422,13 @@ impl SpatialRelateReader {
     fn const_lits(&mut self, ctx: &Ctx, e: &RelateEnd) -> Result<Vec<ConstLit>> {
         let id = match e {
             RelateEnd::Geometry(id, g) => {
+                if self.geoms.len() == self.geoms.capacity() && !self.geoms.contains_key(id) {
+                    let add = (next_cap(self.geoms.len(), self.geoms.capacity(), 1)
+                        - self.geoms.capacity()) as u64
+                        * (size_of::<Id>() + size_of::<Option<GeomRef>>() + 1) as u64;
+                    self.charge
+                        .resize(self.retained_bytes().saturating_add(add))?;
+                }
                 self.geoms.insert(*id, Some(g.clone()));
                 return Ok(vec![ConstLit { lit: *id, g: None }]);
             }
@@ -1129,15 +1445,28 @@ impl SpatialRelateReader {
             .collect();
         if let Some(link) = self.link {
             let mut geoms = Vec::new();
-            scan_keys(ctx, Perm::Spo, &[id.0, link.0], |k| {
-                if self.spec.graph.accepts(k[3]) {
-                    geoms.push((Id(k[2]), k[3]));
+            let mut scan = PrefixScan::new(Perm::Spo, &[id.0, link.0]);
+            let mut raw = Vec::new();
+            loop {
+                let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
+                for &k in &raw {
+                    if self.spec.graph.accepts(k[3]) {
+                        geoms.push((Id(k[2]), k[3]));
+                    }
                 }
-                Ok(())
-            })?;
+                if ended {
+                    break;
+                }
+            }
             for (geom, g1) in geoms {
                 for r in self.sers_of(ctx, geom)? {
                     if self.spec.graph_var.is_none() || r.g.0 == g1 {
+                        if out.len() == out.capacity() {
+                            let add = next_cap(out.len(), out.capacity(), 1) as u64
+                                * size_of::<ConstLit>() as u64;
+                            self.charge
+                                .resize(self.retained_bytes().saturating_add(add))?;
+                        }
                         out.push(ConstLit {
                             lit: r.o,
                             g: Some(r.g),
@@ -1151,43 +1480,109 @@ impl SpatialRelateReader {
         Ok(out)
     }
 
-    fn features_of(&mut self, ctx: &Ctx, s: Id, g: Id) -> Result<Vec<Id>> {
+    fn ensure_features(&mut self, ctx: &Ctx, s: Id, g: Id, extra_bytes: u64) -> Result<usize> {
         if let Some(f) = self.features.get(&(s, g)) {
-            return Ok(f.clone());
+            return Ok(f.len());
         }
-        let mut out = Vec::new();
+        let mut out: Vec<Id> = Vec::new();
         if let Some(link) = self.link {
             let same = self.spec.graph_var.is_some();
-            let graph = &self.spec.graph;
-            scan_keys(ctx, Perm::Pos, &[link.0, s.0], |k| {
-                let g1 = k[3];
-                if (same && g1 == g.0) || (!same && graph.accepts(g1)) {
-                    out.push(Id(k[2]));
+            let mut scan = PrefixScan::new(Perm::Pos, &[link.0, s.0]);
+            let mut raw = Vec::new();
+            loop {
+                let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
+                for &k in &raw {
+                    let g1 = k[3];
+                    if (same && g1 == g.0) || (!same && self.spec.graph.accepts(g1)) {
+                        if out.len() == out.capacity() {
+                            let next_out = next_cap(out.len(), out.capacity(), 1) as u64
+                                * size_of::<Id>() as u64;
+                            self.charge.resize(
+                                self.base_retained_bytes()
+                                    .saturating_add(extra_bytes)
+                                    .saturating_add(next_out),
+                            )?;
+                        }
+                        out.push(Id(k[2]));
+                    }
                 }
-                Ok(())
-            })?;
+                if ended {
+                    break;
+                }
+            }
             out.sort_unstable();
             out.dedup();
+            out.shrink_to_fit();
         }
-        self.features.insert((s, g), out.clone());
-        Ok(out)
+        let map_add = if self.features.len() == self.features.capacity() {
+            (next_cap(self.features.len(), self.features.capacity(), 1) - self.features.capacity())
+                as u64
+                * (size_of::<(Id, Id)>() + size_of::<Vec<Id>>() + 1) as u64
+        } else {
+            0
+        };
+        let elem_bytes = out.capacity() as u64 * size_of::<Id>() as u64;
+        self.charge.resize(
+            self.base_retained_bytes()
+                .saturating_add(extra_bytes)
+                .saturating_add(map_add)
+                .saturating_add(elem_bytes),
+        )?;
+        let len = out.len();
+        self.features_elem_bytes = self.features_elem_bytes.saturating_add(elem_bytes);
+        self.features.insert((s, g), out);
+        Ok(len)
     }
 
-    fn objects(&mut self, ctx: &Ctx, r: &Ser) -> Result<Vec<Id>> {
-        let mut v = vec![r.s];
-        v.extend(self.features_of(ctx, r.s, r.g)?);
-        Ok(v)
+    fn object_at(&self, r: &Ser, idx: usize) -> Option<Id> {
+        if idx == 0 {
+            Some(r.s)
+        } else {
+            self.features
+                .get(&(r.s, r.g))
+                .and_then(|v| v.get(idx - 1).copied())
+        }
     }
 
-    fn record_emit(&mut self, ctx: &Ctx, s: Id, o: Id, g: Id) -> Result<bool> {
+    fn record_emit_charged(
+        &mut self,
+        ctx: &Ctx,
+        s: Id,
+        o: Id,
+        g: Id,
+        extra_bytes: u64,
+    ) -> Result<bool> {
         let g = if self.spec.graph_var.is_some() {
             g
         } else {
             Id::UNDEF
         };
-        if !self.emitted.insert((s, o, g)) {
+        if self.emitted.contains(&(s, o, g)) {
             return Ok(false);
         }
+        let emit_add = if self.emitted.len() == self.emitted.capacity() {
+            (next_cap(self.emitted.len(), self.emitted.capacity(), 1) - self.emitted.capacity())
+                as u64
+                * (size_of::<(Id, Id, Id)>() + 1) as u64
+        } else {
+            0
+        };
+        let pend_add = if self.pending_out.len() == self.pending_out.capacity() {
+            (next_cap(self.pending_out.len(), self.pending_out.capacity(), 1)
+                - self.pending_out.capacity()) as u64
+                * size_of::<(Id, Id, Id)>() as u64
+        } else {
+            0
+        };
+        if emit_add > 0 || pend_add > 0 {
+            self.charge.resize(
+                self.base_retained_bytes()
+                    .saturating_add(extra_bytes)
+                    .saturating_add(emit_add)
+                    .saturating_add(pend_add),
+            )?;
+        }
+        self.emitted.insert((s, o, g));
         if self.emitted.len().is_multiple_of(4096) {
             ctx.check()?;
             ctx.check_rows(self.emitted.len())?;
@@ -1197,6 +1592,12 @@ impl SpatialRelateReader {
     }
 
     fn push_pending_to_table(&mut self, out: &mut Table, cap: usize) {
+        debug_assert!(
+            self.sv.is_none_or(|v| self.vars.contains(&v))
+                && self.ov.is_none_or(|v| self.vars.contains(&v))
+                && self.gv.is_none_or(|v| self.vars.contains(&v)),
+            "SpatialRelateReader assumes self.vars contains every variable in (sv, ov, gv)"
+        );
         let mut row = vec![Id::UNDEF; self.vars.len()];
         'items: while out.len() < cap {
             let Some((s, o, g)) = self.pending_out.pop_front() else {
@@ -1226,71 +1627,185 @@ impl SpatialRelateReader {
         let spec = self.spec.clone();
         match (&spec.subject, &spec.object) {
             (RelateEnd::Var(_), RelateEnd::Var(_)) => {
-                // Collect all serialization rows in scope and pack boxed geometries.
+                // Collect all serialization rows in scope and pack boxed geometries with
+                // pre-admission before every container growth.
                 if search::indexed(&ctx.snap, &self.preds).is_some() {
-                    let mut st = SearchStats::default();
-                    let mut known: Vec<(Id, GeomRef)> = Vec::new();
-                    search::window_with(
+                    let base = self.base_retained_bytes();
+                    let charge = &mut self.charge;
+                    let mut iter = WindowIter::open(
                         ctx,
-                        &self.preds,
-                        &[WORLD],
-                        &self.spec.graph,
+                        self.preds.clone(),
+                        vec![WORLD],
+                        self.spec.graph.clone(),
                         false,
-                        &mut st,
-                        &mut |hits| {
-                            for h in hits {
-                                if let Ok(g) = noted(ctx, h.entry.geom(&ctx.snap)) {
-                                    known.push((h.o, g));
-                                }
-                            }
-                            Ok(())
-                        },
+                        &mut |b| charge.resize(base.saturating_add(b)),
                     )?;
-                    self.st.nodes += st.nodes;
-                    self.st.rechecked += st.rechecked;
-                    for (o, g) in known {
-                        self.geoms.entry(o).or_insert(Some(g));
+                    let mut hits = Vec::new();
+                    loop {
+                        hits.clear();
+                        let cur_base = self.base_retained_bytes();
+                        let charge = &mut self.charge;
+                        let ended = iter.next_hits(ctx, &mut hits, 4096, &mut |b| {
+                            charge.resize(cur_base.saturating_add(b))
+                        })?;
+                        let iter_bytes = iter.retained_bytes();
+                        for h in &hits {
+                            if !self.geoms.contains_key(&h.o)
+                                && let Ok(g) = noted(ctx, h.entry.geom(&ctx.snap))
+                            {
+                                if self.geoms.len() == self.geoms.capacity() {
+                                    let add = (next_cap(self.geoms.len(), self.geoms.capacity(), 1)
+                                        - self.geoms.capacity())
+                                        as u64
+                                        * (size_of::<Id>() + size_of::<Option<GeomRef>>() + 1)
+                                            as u64;
+                                    self.charge.resize(
+                                        self.base_retained_bytes()
+                                            .saturating_add(iter_bytes)
+                                            .saturating_add(add),
+                                    )?;
+                                }
+                                self.geoms.insert(h.o, Some(g));
+                            }
+                        }
+                        if ended {
+                            break;
+                        }
                     }
+                    self.st.nodes += iter.st.nodes;
+                    self.st.rechecked += iter.st.rechecked;
                 } else {
                     self.st.fallback = true;
                 }
                 let mut rows: Vec<Ser> = Vec::new();
                 for p in self.preds.clone() {
-                    let mut keys = Vec::new();
-                    scan_keys(ctx, Perm::Pso, &[p.0], |k| {
-                        keys.push(k);
-                        if keys.len().is_multiple_of(4096) {
-                            ctx.check()?;
+                    let mut scan = PrefixScan::new(Perm::Pso, &[p.0]);
+                    let mut raw = Vec::new();
+                    loop {
+                        let ended = scan.next_chunk(ctx, &mut raw, 4096)?;
+                        let raw_bytes = raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
+                        for &k in &raw {
+                            if self.ser_graph(ctx, k[3]) {
+                                if rows.len() == rows.capacity() {
+                                    let next_rows = next_cap(rows.len(), rows.capacity(), 1) as u64
+                                        * size_of::<Ser>() as u64;
+                                    self.charge.resize(
+                                        self.base_retained_bytes()
+                                            .saturating_add(raw_bytes)
+                                            .saturating_add(next_rows),
+                                    )?;
+                                }
+                                rows.push(Ser {
+                                    s: Id(k[1]),
+                                    o: Id(k[2]),
+                                    g: Id(k[3]),
+                                });
+                            }
                         }
-                        Ok(())
-                    })?;
-                    for k in keys {
-                        if self.ser_graph(ctx, k[3]) {
-                            rows.push(Ser {
-                                s: Id(k[1]),
-                                o: Id(k[2]),
-                                g: Id(k[3]),
-                            });
+                        if ended {
+                            break;
                         }
                     }
                 }
                 rows.sort_unstable();
                 rows.dedup();
                 self.st.candidates = self.st.candidates.max(rows.len() as u64);
+                let rows_bytes = rows.capacity() as u64 * size_of::<Ser>() as u64;
                 let mut by_lit: FxHashMap<Id, Vec<Ser>> = FxHashMap::default();
-                for r in rows {
-                    by_lit.entry(r.o).or_default().push(r);
+                let mut by_lit_elem_bytes = 0u64;
+                for (idx, r) in rows.into_iter().enumerate() {
+                    if idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                    let map_growth = if by_lit.len() == by_lit.capacity()
+                        && !by_lit.contains_key(&r.o)
+                    {
+                        (next_cap(by_lit.len(), by_lit.capacity(), 1) - by_lit.capacity()) as u64
+                            * (size_of::<Id>() + size_of::<Vec<Ser>>() + 1) as u64
+                    } else {
+                        0
+                    };
+                    let vec_growth = match by_lit.get(&r.o) {
+                        Some(v) if v.len() == v.capacity() => {
+                            (next_cap(v.len(), v.capacity(), 1) - v.capacity()) as u64
+                                * size_of::<Ser>() as u64
+                        }
+                        None => 4 * size_of::<Ser>() as u64,
+                        _ => 0,
+                    };
+                    if map_growth > 0 || vec_growth > 0 {
+                        let map_bytes = by_lit.capacity() as u64
+                            * (size_of::<Id>() + size_of::<Vec<Ser>>() + 1) as u64;
+                        self.charge.resize(
+                            self.base_retained_bytes()
+                                .saturating_add(rows_bytes)
+                                .saturating_add(map_bytes)
+                                .saturating_add(by_lit_elem_bytes)
+                                .saturating_add(map_growth)
+                                .saturating_add(vec_growth),
+                        )?;
+                    }
+                    let v = by_lit.entry(r.o).or_default();
+                    let old_cap = v.capacity();
+                    v.push(r);
+                    let new_cap = v.capacity();
+                    if new_cap > old_cap {
+                        by_lit_elem_bytes = by_lit_elem_bytes
+                            .saturating_add((new_cap - old_cap) as u64 * size_of::<Ser>() as u64);
+                    }
                 }
+                let by_lit_bytes = (by_lit.capacity() as u64
+                    * (size_of::<Id>() + size_of::<Vec<Ser>>() + 1) as u64)
+                    .saturating_add(by_lit_elem_bytes);
+                let lits_bytes = by_lit.len() as u64 * size_of::<Id>() as u64;
+                self.charge.resize(
+                    self.base_retained_bytes()
+                        .saturating_add(by_lit_bytes)
+                        .saturating_add(lits_bytes),
+                )?;
                 let mut lits: Vec<Id> = by_lit.keys().copied().collect();
                 lits.sort_unstable();
                 let mut items = Vec::new();
-                for lit in lits {
-                    if let Some(geom) = self.geom(ctx, lit) {
+                for (idx, lit) in lits.into_iter().enumerate() {
+                    if idx.is_multiple_of(CHECK_EVERY) {
+                        ctx.check()?;
+                    }
+                    let items_bytes = items.capacity() as u64 * size_of::<RelateItem>() as u64;
+                    let extra = by_lit_bytes
+                        .saturating_add(lits_bytes)
+                        .saturating_add(items_bytes);
+                    if let Some(geom) = self.geom_charged(ctx, lit, extra)? {
                         let bbox = geom.bbox84();
+                        if items.len() == items.capacity() {
+                            let next_items = next_cap(items.len(), items.capacity(), 1) as u64
+                                * size_of::<RelateItem>() as u64;
+                            self.charge.resize(
+                                self.base_retained_bytes()
+                                    .saturating_add(by_lit_bytes)
+                                    .saturating_add(lits_bytes)
+                                    .saturating_add(next_items),
+                            )?;
+                        }
                         items.push(RelateItem { lit, geom, bbox });
                     }
                 }
+                let items_bytes = items.capacity() as u64 * size_of::<RelateItem>() as u64;
                 let (boxed_idx, unboxed_idx, tree, phase) = if self.spec.rel.index_usable() {
+                    let n_boxed = items.iter().filter(|it| it.bbox.is_some()).count();
+                    let n_unboxed = items
+                        .iter()
+                        .filter(|it| it.bbox.is_none() && !it.geom.empty)
+                        .count();
+                    let idx_est =
+                        (n_boxed.saturating_add(n_unboxed) as u64) * size_of::<usize>() as u64;
+                    let tree_est = PackedTree::estimate_bytes(n_boxed);
+                    self.charge.resize(
+                        self.base_retained_bytes()
+                            .saturating_add(by_lit_bytes)
+                            .saturating_add(items_bytes)
+                            .saturating_add(idx_est)
+                            .saturating_add(tree_est),
+                    )?;
                     let boxed_idx: Vec<usize> = (0..items.len())
                         .filter(|&i| items[i].bbox.is_some())
                         .collect();
@@ -1303,9 +1818,18 @@ impl SpatialRelateReader {
                             .map(|&i| round_out(items[i].bbox.expect("boxed item"))),
                     );
                     let phase = if tree.is_some() {
-                        BothVarPhase::Boxed { outer: 0 }
+                        BothVarPhase::Boxed {
+                            outer: 0,
+                            cur_i: None,
+                            stack: Vec::new(),
+                            ws_f32: [0.0; 4],
+                        }
                     } else if !unboxed_idx.is_empty() {
-                        BothVarPhase::Unboxed { idx: 0 }
+                        BothVarPhase::Unboxed {
+                            idx: 0,
+                            j: 0,
+                            rev_pending: false,
+                        }
                     } else {
                         BothVarPhase::Done
                     };
@@ -1314,17 +1838,23 @@ impl SpatialRelateReader {
                     let phase = if items.is_empty() {
                         BothVarPhase::Done
                     } else {
-                        BothVarPhase::Disjoint { i: 0, j: 0 }
+                        BothVarPhase::Disjoint {
+                            i: 0,
+                            j: 0,
+                            rev_pending: false,
+                        }
                     };
                     (Vec::new(), Vec::new(), None, phase)
                 };
                 self.stage = RelateStage::BothVar {
                     items,
                     by_lit,
+                    by_lit_elem_bytes,
                     boxed_idx,
                     unboxed_idx,
                     tree,
                     phase,
+                    pair_emit: None,
                 };
                 self.update_charge()?;
             }
@@ -1339,8 +1869,17 @@ impl SpatialRelateReader {
                 };
                 let lits = self.const_lits(ctx, c)?;
                 let mut by_lit: FxHashMap<Id, Vec<Option<Id>>> = FxHashMap::default();
+                let mut by_lit_elem_bytes = 0u64;
                 for l in lits {
-                    by_lit.entry(l.lit).or_default().push(l.g);
+                    let v = by_lit.entry(l.lit).or_default();
+                    let old_cap = v.capacity();
+                    v.push(l.g);
+                    let new_cap = v.capacity();
+                    if new_cap > old_cap {
+                        by_lit_elem_bytes = by_lit_elem_bytes.saturating_add(
+                            (new_cap - old_cap) as u64 * size_of::<Option<Id>>() as u64,
+                        );
+                    }
                 }
                 let mut qs: Vec<Id> = by_lit.keys().copied().collect();
                 qs.sort_unstable();
@@ -1349,10 +1888,12 @@ impl SpatialRelateReader {
                     subject_const,
                     qs,
                     by_lit,
+                    by_lit_elem_bytes,
                     q_at: 0,
                     qg: None,
                     cand: OneConstCand::Done,
                     pending_sers: VecDeque::new(),
+                    active_ser: None,
                     lit_pass: FxHashMap::default(),
                 };
                 self.update_charge()?;
@@ -1374,17 +1915,21 @@ impl SpatialRelateReader {
                 let mut graphs = Vec::new();
                 let mut any = false;
                 for x in &la {
-                    let Some(gx) = self.geom(ctx, x.lit) else {
+                    ctx.check()?;
+                    let Some(gx) = self.geom_charged(ctx, x.lit, 0)? else {
                         continue;
                     };
                     let mut tester = ConstTest::new(gx, self.spec.rel, true, self.op_vertices);
-                    for y in &lb {
+                    for (yi, y) in lb.iter().enumerate() {
+                        if yi.is_multiple_of(CHECK_EVERY) {
+                            ctx.check()?;
+                        }
                         let g = match (x.g, y.g) {
                             (Some(p), Some(q)) if graph_var && p != q => continue,
                             (Some(p), _) | (None, Some(p)) => Some(p),
                             (None, None) => None,
                         };
-                        let Some(gy) = self.geom(ctx, y.lit) else {
+                        let Some(gy) = self.geom_charged(ctx, y.lit, 0)? else {
                             continue;
                         };
                         self.st.refined += 1;
@@ -1408,7 +1953,7 @@ impl SpatialRelateReader {
                 graphs.sort_unstable();
                 graphs.dedup();
                 for g in graphs {
-                    self.record_emit(ctx, sid, oid, g)?;
+                    self.record_emit_charged(ctx, sid, oid, g, 0)?;
                 }
                 self.stage = RelateStage::Done;
                 self.update_charge()?;
@@ -1417,24 +1962,63 @@ impl SpatialRelateReader {
         Ok(())
     }
 
-    fn emit_pair_objects(&mut self, ctx: &Ctx, a_sers: &[Ser], b_sers: &[Ser]) -> Result<()> {
+    fn step_pair_emit(
+        &mut self,
+        ctx: &Ctx,
+        by_lit: &FxHashMap<Id, Vec<Ser>>,
+        pe: &mut PairEmit,
+        cap: usize,
+        stage_bytes: u64,
+    ) -> Result<bool> {
         let graph_var = self.spec.graph_var.is_some();
-        for ra in a_sers {
-            let oa = self.objects(ctx, ra)?;
-            for rb in b_sers {
+        let a_sers = &by_lit[&pe.a_lit];
+        let b_sers = &by_lit[&pe.b_lit];
+        let mut steps = 0usize;
+        while pe.ai < a_sers.len() {
+            let ra = a_sers[pe.ai];
+            if pe.bi == 0 && pe.oai == 0 && pe.obi == 0 && !pe.matched_counted {
+                pe.oa_len = 1 + self.ensure_features(ctx, ra.s, ra.g, stage_bytes)?;
+            }
+            while pe.bi < b_sers.len() {
+                let rb = b_sers[pe.bi];
                 if graph_var && ra.g != rb.g {
+                    pe.bi += 1;
                     continue;
                 }
-                self.st.matched += 1;
-                let ob = self.objects(ctx, rb)?;
-                for &sa in &oa {
-                    for &sb in &ob {
-                        self.record_emit(ctx, sa, sb, ra.g)?;
-                    }
+                if !pe.matched_counted {
+                    self.st.matched += 1;
+                    pe.ob_len = 1 + self.ensure_features(ctx, rb.s, rb.g, stage_bytes)?;
+                    pe.oai = 0;
+                    pe.obi = 0;
+                    pe.matched_counted = true;
                 }
+                while pe.oai < pe.oa_len {
+                    let sa = self.object_at(&ra, pe.oai).expect("cached a object");
+                    while pe.obi < pe.ob_len {
+                        steps += 1;
+                        if steps.is_multiple_of(CHECK_EVERY) {
+                            ctx.check()?;
+                        }
+                        if self.pending_out.len() >= cap {
+                            return Ok(false);
+                        }
+                        let sb = self.object_at(&rb, pe.obi).expect("cached b object");
+                        pe.obi += 1;
+                        self.record_emit_charged(ctx, sa, sb, ra.g, stage_bytes)?;
+                    }
+                    pe.oai += 1;
+                    pe.obi = 0;
+                }
+                pe.bi += 1;
+                pe.matched_counted = false;
             }
+            pe.ai += 1;
+            pe.bi = 0;
+            pe.oai = 0;
+            pe.obi = 0;
+            pe.matched_counted = false;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Fill `out` with up to `cap` rows. Returns `true` when exhausted.
@@ -1464,7 +2048,7 @@ impl SpatialRelateReader {
                         let q = perm.to_quad(&k);
                         if self.spec.graph.accepts(q[3].0)
                             && o_filter.is_none_or(|o| o == q[2])
-                            && self.record_emit(ctx, q[0], q[2], q[3])?
+                            && self.record_emit_charged(ctx, q[0], q[2], q[3], 0)?
                         {
                             self.asserted_count += 1;
                         }
@@ -1493,36 +2077,140 @@ impl SpatialRelateReader {
             subject_const,
             qs,
             by_lit,
+            by_lit_elem_bytes,
             mut q_at,
             mut qg,
             mut cand,
             mut pending_sers,
+            mut active_ser,
             mut lit_pass,
         } = stage
         else {
             unreachable!()
         };
         let graph_var = self.spec.graph_var.is_some();
-        let base_retained = self.retained_bytes();
+        let fixed_stage_bytes = (qs.capacity() as u64 * size_of::<Id>() as u64)
+            .saturating_add(
+                by_lit.capacity() as u64
+                    * (size_of::<Id>() + size_of::<Vec<Option<Id>>>() + 1) as u64,
+            )
+            .saturating_add(by_lit_elem_bytes);
+        let one_const_stage_bytes = |cand: &OneConstCand,
+                                     pending_sers: &VecDeque<Ser>,
+                                     lit_pass: &FxHashMap<Id, bool>|
+         -> u64 {
+            let iter_bytes = match cand {
+                OneConstCand::Indexed(it) => it.retained_bytes(),
+                _ => 0,
+            };
+            fixed_stage_bytes
+                .saturating_add(iter_bytes)
+                .saturating_add(pending_sers.capacity() as u64 * size_of::<Ser>() as u64)
+                .saturating_add(lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64)
+        };
         let res: Result<()> = (|| {
             loop {
                 ctx.check()?;
+                // 1. Drain any active matched serialization's objects up to `cap`.
+                if let Some((r, mut obj_idx)) = active_ser.take() {
+                    let stage_bytes = one_const_stage_bytes(&cand, &pending_sers, &lit_pass);
+                    let total_objs = 1 + self.ensure_features(ctx, r.s, r.g, stage_bytes)?;
+                    let mut steps = 0usize;
+                    while obj_idx < total_objs {
+                        steps += 1;
+                        if steps.is_multiple_of(CHECK_EVERY) {
+                            ctx.check()?;
+                        }
+                        if self.pending_out.len() >= cap {
+                            active_ser = Some((r, obj_idx));
+                            return Ok(());
+                        }
+                        let so = self.object_at(&r, obj_idx).expect("cached object");
+                        obj_idx += 1;
+                        if subject_const {
+                            self.record_emit_charged(ctx, cid, so, r.g, stage_bytes)?;
+                        } else {
+                            self.record_emit_charged(ctx, so, cid, r.g, stage_bytes)?;
+                        }
+                    }
+                    if self.pending_out.len() >= cap {
+                        return Ok(());
+                    }
+                }
                 if let Some(q_geom) = qg.as_ref() {
                     if pending_sers.is_empty() {
                         let mut cand_done = false;
                         match &mut cand {
                             OneConstCand::Indexed(iter) => {
                                 let mut hits = Vec::new();
+                                let non_iter_stage = fixed_stage_bytes
+                                    .saturating_add(
+                                        pending_sers.capacity() as u64 * size_of::<Ser>() as u64,
+                                    )
+                                    .saturating_add(
+                                        lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64,
+                                    );
+                                let base_now =
+                                    self.base_retained_bytes().saturating_add(non_iter_stage);
                                 let charge = &mut self.charge;
                                 let ended = iter.next_hits(
                                     ctx,
                                     &mut hits,
                                     cap.clamp(64, 4096),
-                                    &mut |b| charge.resize(base_retained.saturating_add(b)),
+                                    &mut |b| charge.resize(base_now.saturating_add(b)),
                                 )?;
+                                let iter_bytes = iter.retained_bytes();
                                 for h in hits {
-                                    if let Ok(g) = noted(ctx, h.entry.geom(&ctx.snap)) {
-                                        self.geoms.entry(h.o).or_insert(Some(g));
+                                    if !self.geoms.contains_key(&h.o)
+                                        && let Ok(g) = noted(ctx, h.entry.geom(&ctx.snap))
+                                    {
+                                        if self.geoms.len() == self.geoms.capacity() {
+                                            let add = (next_cap(
+                                                self.geoms.len(),
+                                                self.geoms.capacity(),
+                                                1,
+                                            ) - self.geoms.capacity())
+                                                as u64
+                                                * (size_of::<Id>()
+                                                    + size_of::<Option<GeomRef>>()
+                                                    + 1)
+                                                    as u64;
+                                            let cur_stage = fixed_stage_bytes
+                                                .saturating_add(iter_bytes)
+                                                .saturating_add(
+                                                    pending_sers.capacity() as u64
+                                                        * size_of::<Ser>() as u64,
+                                                )
+                                                .saturating_add(
+                                                    lit_pass.capacity() as u64
+                                                        * (size_of::<Id>() + 2) as u64,
+                                                );
+                                            self.charge.resize(
+                                                self.base_retained_bytes()
+                                                    .saturating_add(cur_stage)
+                                                    .saturating_add(add),
+                                            )?;
+                                        }
+                                        self.geoms.insert(h.o, Some(g));
+                                    }
+                                    if pending_sers.len() == pending_sers.capacity() {
+                                        let next_ps = next_cap(
+                                            pending_sers.len(),
+                                            pending_sers.capacity(),
+                                            1,
+                                        )
+                                            as u64
+                                            * size_of::<Ser>() as u64;
+                                        let cur_stage = fixed_stage_bytes
+                                            .saturating_add(iter_bytes)
+                                            .saturating_add(next_ps)
+                                            .saturating_add(
+                                                lit_pass.capacity() as u64
+                                                    * (size_of::<Id>() + 2) as u64,
+                                            );
+                                        self.charge.resize(
+                                            self.base_retained_bytes().saturating_add(cur_stage),
+                                        )?;
                                     }
                                     pending_sers.push_back(Ser {
                                         s: h.s,
@@ -1559,6 +2247,9 @@ impl SpatialRelateReader {
                                     if ended {
                                         *scan = None;
                                     }
+                                    let raw_bytes =
+                                        raw.capacity() as u64 * size_of::<[u64; 4]>() as u64;
+                                    let win = *window;
                                     for k in raw {
                                         if !self.ser_graph(ctx, k[3]) {
                                             continue;
@@ -1568,13 +2259,45 @@ impl SpatialRelateReader {
                                             o: Id(k[2]),
                                             g: Id(k[3]),
                                         };
-                                        if let Some(w) = *window
-                                            && let Some(g) = self.geom(ctx, ser.o)
+                                        let cur_stage = fixed_stage_bytes
+                                            .saturating_add(
+                                                pending_sers.capacity() as u64
+                                                    * size_of::<Ser>() as u64,
+                                            )
+                                            .saturating_add(
+                                                lit_pass.capacity() as u64
+                                                    * (size_of::<Id>() + 2) as u64,
+                                            );
+                                        if let Some(w) = win
+                                            && let Some(g) = self.geom_charged(
+                                                ctx,
+                                                ser.o,
+                                                cur_stage.saturating_add(raw_bytes),
+                                            )?
                                             && g.bbox84().is_some_and(|b| !meets(b, w))
                                         {
                                             continue;
                                         }
                                         self.st.candidates += 1;
+                                        if pending_sers.len() == pending_sers.capacity() {
+                                            let next_ps = next_cap(
+                                                pending_sers.len(),
+                                                pending_sers.capacity(),
+                                                1,
+                                            )
+                                                as u64
+                                                * size_of::<Ser>() as u64;
+                                            let projected = self
+                                                .base_retained_bytes()
+                                                .saturating_add(fixed_stage_bytes)
+                                                .saturating_add(raw_bytes)
+                                                .saturating_add(next_ps)
+                                                .saturating_add(
+                                                    lit_pass.capacity() as u64
+                                                        * (size_of::<Id>() + 2) as u64,
+                                                );
+                                            self.charge.resize(projected)?;
+                                        }
                                         pending_sers.push_back(ser);
                                     }
                                 }
@@ -1599,23 +2322,38 @@ impl SpatialRelateReader {
                             let Some(r) = pending_sers.pop_front() else {
                                 break;
                             };
+                            let stage_bytes =
+                                one_const_stage_bytes(&cand, &pending_sers, &lit_pass);
                             let pass = if let Some(&v) = lit_pass.get(&r.o) {
                                 v
-                            } else if let Some(w) = self.geom(ctx, r.o) {
-                                self.st.refined += 1;
-                                refined_since += 1;
-                                if refined_since.is_multiple_of(CHECK_EVERY) {
-                                    ctx.check()?;
-                                }
-                                let ok = tester.holds(&w);
-                                if ok {
-                                    self.pairs += 1;
-                                }
-                                lit_pass.insert(r.o, ok);
-                                ok
                             } else {
-                                lit_pass.insert(r.o, false);
-                                false
+                                if lit_pass.len() == lit_pass.capacity() {
+                                    let add = (next_cap(lit_pass.len(), lit_pass.capacity(), 1)
+                                        - lit_pass.capacity())
+                                        as u64
+                                        * (size_of::<Id>() + 2) as u64;
+                                    self.charge.resize(
+                                        self.base_retained_bytes()
+                                            .saturating_add(stage_bytes)
+                                            .saturating_add(add),
+                                    )?;
+                                }
+                                if let Some(w) = self.geom_charged(ctx, r.o, stage_bytes)? {
+                                    self.st.refined += 1;
+                                    refined_since += 1;
+                                    if refined_since.is_multiple_of(CHECK_EVERY) {
+                                        ctx.check()?;
+                                    }
+                                    let ok = tester.holds(&w);
+                                    if ok {
+                                        self.pairs += 1;
+                                    }
+                                    lit_pass.insert(r.o, ok);
+                                    ok
+                                } else {
+                                    lit_pass.insert(r.o, false);
+                                    false
+                                }
                             };
                             if !pass {
                                 continue;
@@ -1624,11 +2362,23 @@ impl SpatialRelateReader {
                                 continue;
                             }
                             self.st.matched += 1;
-                            for so in self.objects(ctx, &r)? {
+                            let stage_bytes =
+                                one_const_stage_bytes(&cand, &pending_sers, &lit_pass);
+                            let total_objs =
+                                1 + self.ensure_features(ctx, r.s, r.g, stage_bytes)?;
+                            for obj_idx in 0..total_objs {
+                                if obj_idx.is_multiple_of(CHECK_EVERY) {
+                                    ctx.check()?;
+                                }
+                                if self.pending_out.len() >= cap {
+                                    active_ser = Some((r, obj_idx));
+                                    return Ok(());
+                                }
+                                let so = self.object_at(&r, obj_idx).expect("cached object");
                                 if subject_const {
-                                    self.record_emit(ctx, cid, so, r.g)?;
+                                    self.record_emit_charged(ctx, cid, so, r.g, stage_bytes)?;
                                 } else {
-                                    self.record_emit(ctx, so, cid, r.g)?;
+                                    self.record_emit_charged(ctx, so, cid, r.g, stage_bytes)?;
                                 }
                             }
                         }
@@ -1640,6 +2390,10 @@ impl SpatialRelateReader {
                     if matches!(cand, OneConstCand::Done) {
                         qg = None;
                         lit_pass.clear();
+                    } else {
+                        // Candidate source is not yet exhausted (e.g., an empty filtered
+                        // scan chunk or predicate boundary); keep stepping it for this q.
+                        continue;
                     }
                 }
                 if q_at >= qs.len() {
@@ -1647,12 +2401,23 @@ impl SpatialRelateReader {
                 }
                 let q = qs[q_at];
                 q_at += 1;
-                let Some(q_geom) = self.geom(ctx, q) else {
+                lit_pass.clear();
+                let stage_bytes = one_const_stage_bytes(&cand, &pending_sers, &lit_pass);
+                let Some(q_geom) = self.geom_charged(ctx, q, stage_bytes)? else {
                     continue;
                 };
                 let window = q_geom.bbox84().filter(|_| self.spec.rel.index_usable());
                 cand = match window {
                     Some(w) if search::indexed(&ctx.snap, &self.preds).is_some() => {
+                        let base_now = self
+                            .base_retained_bytes()
+                            .saturating_add(fixed_stage_bytes)
+                            .saturating_add(
+                                pending_sers.capacity() as u64 * size_of::<Ser>() as u64,
+                            )
+                            .saturating_add(
+                                lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64,
+                            );
                         let charge = &mut self.charge;
                         OneConstCand::Indexed(Box::new(WindowIter::open(
                             ctx,
@@ -1660,7 +2425,7 @@ impl SpatialRelateReader {
                             vec![w],
                             self.spec.graph.clone(),
                             false,
-                            &mut |b| charge.resize(base_retained.saturating_add(b)),
+                            &mut |b| charge.resize(base_now.saturating_add(b)),
                         )?))
                     }
                     None if self.spec.rel.index_usable() && q_geom.empty => OneConstCand::Done,
@@ -1680,6 +2445,7 @@ impl SpatialRelateReader {
         })();
         stage = if q_at >= qs.len()
             && qg.is_none()
+            && active_ser.is_none()
             && pending_sers.is_empty()
             && matches!(cand, OneConstCand::Done)
         {
@@ -1690,10 +2456,12 @@ impl SpatialRelateReader {
                 subject_const,
                 qs,
                 by_lit,
+                by_lit_elem_bytes,
                 q_at,
                 qg,
                 cand,
                 pending_sers,
+                active_ser,
                 lit_pass,
             }
         };
@@ -1706,148 +2474,323 @@ impl SpatialRelateReader {
         let RelateStage::BothVar {
             items,
             by_lit,
+            by_lit_elem_bytes,
             boxed_idx,
             unboxed_idx,
             tree,
             mut phase,
+            mut pair_emit,
         } = stage
         else {
             unreachable!()
         };
         let rel = self.spec.rel;
         let opv = self.op_vertices;
+        let fixed_stage_bytes = (items.capacity() as u64 * size_of::<RelateItem>() as u64)
+            .saturating_add(
+                by_lit.capacity() as u64 * (size_of::<Id>() + size_of::<Vec<Ser>>() + 1) as u64,
+            )
+            .saturating_add(by_lit_elem_bytes)
+            .saturating_add(
+                (boxed_idx.capacity() + unboxed_idx.capacity()) as u64 * size_of::<usize>() as u64,
+            )
+            .saturating_add(tree.as_ref().map_or(0, PackedTree::bytes));
         let res: Result<()> = (|| {
+            let mut cached_prep: Option<(usize, Prepared)> = None;
+            let mut prep_hits = 0usize;
+            let mut prep_for_i: Option<usize> = None;
+            let mut scanned = 0usize;
             while self.pending_out.len() < cap {
                 ctx.check()?;
+                let stack_bytes = match &phase {
+                    BothVarPhase::Boxed { stack, .. } => {
+                        stack.capacity() as u64 * size_of::<usize>() as u64
+                    }
+                    _ => 0,
+                };
+                let stage_bytes = fixed_stage_bytes.saturating_add(stack_bytes);
+                if let Some(pe) = &mut pair_emit {
+                    if self.step_pair_emit(ctx, &by_lit, pe, cap, stage_bytes)? {
+                        pair_emit = None;
+                    } else {
+                        break;
+                    }
+                }
                 match &mut phase {
-                    BothVarPhase::Boxed { outer } => {
+                    BothVarPhase::Boxed {
+                        outer,
+                        cur_i,
+                        stack,
+                        ws_f32,
+                    } => {
                         let Some(t) = &tree else {
                             phase = if !unboxed_idx.is_empty() {
-                                BothVarPhase::Unboxed { idx: 0 }
+                                BothVarPhase::Unboxed {
+                                    idx: 0,
+                                    j: 0,
+                                    rev_pending: false,
+                                }
                             } else {
                                 BothVarPhase::Done
                             };
                             continue;
                         };
-                        if *outer >= boxed_idx.len() {
-                            phase = if !unboxed_idx.is_empty() {
-                                BothVarPhase::Unboxed { idx: 0 }
-                            } else {
-                                BothVarPhase::Done
-                            };
-                            continue;
+                        if cur_i.is_none() {
+                            if *outer >= boxed_idx.len() {
+                                phase = if !unboxed_idx.is_empty() {
+                                    BothVarPhase::Unboxed {
+                                        idx: 0,
+                                        j: 0,
+                                        rev_pending: false,
+                                    }
+                                } else {
+                                    BothVarPhase::Done
+                                };
+                                continue;
+                            }
+                            let i = boxed_idx[*outer];
+                            *outer += 1;
+                            let w = items[i].bbox.expect("boxed item");
+                            *ws_f32 = super::index::window_f32(&w);
+                            stack.clear();
+                            stack.push(t.tree().root());
+                            *cur_i = Some(i);
+                            cached_prep = None;
+                            prep_hits = 0;
+                            prep_for_i = Some(i);
                         }
-                        let i = boxed_idx[*outer];
-                        *outer += 1;
+                        let i = cur_i.expect("active outer boxed item");
+                        if prep_for_i != Some(i) {
+                            cached_prep = None;
+                            prep_hits = 0;
+                            prep_for_i = Some(i);
+                        }
                         let a = &items[i];
-                        let w = a.bbox.expect("boxed item");
-                        let found = t.search(&[w], &mut self.st.nodes);
-                        if found.is_empty() {
-                            continue;
-                        }
-                        self.st.candidates += found.len() as u64;
-                        ctx.check_rows(self.st.candidates as usize)?;
-                        let prep =
-                            (found.len() > PREPARE_OVER).then(|| Prepared::new(a.geom.clone()));
-                        let a_sers = by_lit[&a.lit].clone();
-                        for c in found {
-                            let j = boxed_idx[c as usize];
-                            let b = &items[j];
-                            self.st.refined += 1;
-                            if self.st.refined.is_multiple_of(CHECK_EVERY as u64) {
+                        let w = *ws_f32;
+                        let hits_f32 = |b: [f32; 4]| {
+                            b[0] <= w[2] && b[2] >= w[0] && b[1] <= w[3] && b[3] >= w[1]
+                        };
+                        let tr = t.tree();
+                        while let Some(n) = stack.pop() {
+                            scanned += 1;
+                            if scanned.is_multiple_of(CHECK_EVERY) {
                                 ctx.check()?;
                             }
-                            let ok = match &prep {
-                                Some(p)
-                                    if u64::from(a.geom.vertices) + u64::from(b.geom.vertices)
-                                        <= opv =>
-                                {
-                                    p.relation(&b.geom, rel).unwrap_or(false)
+                            if tr.is_item(n) {
+                                if !hits_f32(tr.bbox(n)) {
+                                    continue;
                                 }
-                                Some(_) => false,
-                                None => relate_relation(&a.geom, &b.geom, rel, opv),
-                            };
-                            if ok {
-                                self.pairs += 1;
-                                let b_sers = by_lit[&b.lit].clone();
-                                self.emit_pair_objects(ctx, &a_sers, &b_sers)?;
+                                let c = tr.item(n);
+                                self.st.candidates += 1;
+                                if self.st.candidates.is_multiple_of(CHECK_CANDIDATES) {
+                                    ctx.check_rows(self.st.candidates as usize)?;
+                                }
+                                let j = boxed_idx[c];
+                                let b = &items[j];
+                                self.st.refined += 1;
+                                prep_hits += 1;
+                                if prep_hits == PREPARE_OVER + 1 && cached_prep.is_none() {
+                                    cached_prep = Some((i, Prepared::new(a.geom.clone())));
+                                }
+                                let ok = match &cached_prep {
+                                    Some((pi, p))
+                                        if *pi == i
+                                            && u64::from(a.geom.vertices)
+                                                + u64::from(b.geom.vertices)
+                                                <= opv =>
+                                    {
+                                        p.relation(&b.geom, rel).unwrap_or(false)
+                                    }
+                                    Some((pi, _)) if *pi == i => false,
+                                    _ => relate_relation(&a.geom, &b.geom, rel, opv),
+                                };
+                                if ok {
+                                    self.pairs += 1;
+                                    pair_emit = Some(PairEmit {
+                                        a_lit: a.lit,
+                                        b_lit: b.lit,
+                                        ai: 0,
+                                        bi: 0,
+                                        oai: 0,
+                                        obi: 0,
+                                        oa_len: 0,
+                                        ob_len: 0,
+                                        matched_counted: false,
+                                    });
+                                    break;
+                                }
+                            } else {
+                                self.st.nodes += 1;
+                                for ch in tr.children(n) {
+                                    if hits_f32(tr.bbox(ch)) {
+                                        stack.push(ch);
+                                    }
+                                }
                             }
                         }
+                        if stack.is_empty() && pair_emit.is_none() {
+                            *cur_i = None;
+                        }
                     }
-                    BothVarPhase::Unboxed { idx } => {
+                    BothVarPhase::Unboxed {
+                        idx,
+                        j,
+                        rev_pending,
+                    } => {
                         if *idx >= unboxed_idx.len() {
                             phase = BothVarPhase::Done;
                             continue;
                         }
                         let i = unboxed_idx[*idx];
-                        *idx += 1;
                         let a = &items[i];
-                        let a_sers = by_lit[&a.lit].clone();
-                        for (j, b) in items.iter().enumerate() {
-                            if b.bbox.is_none() && (b.geom.empty || j < i) {
+                        if *rev_pending {
+                            *rev_pending = false;
+                            let cur_j = *j;
+                            *j += 1;
+                            let b = &items[cur_j];
+                            self.st.refined += 1;
+                            if relate_relation(&b.geom, &a.geom, rel, opv) {
+                                self.pairs += 1;
+                                pair_emit = Some(PairEmit {
+                                    a_lit: b.lit,
+                                    b_lit: a.lit,
+                                    ai: 0,
+                                    bi: 0,
+                                    oai: 0,
+                                    obi: 0,
+                                    oa_len: 0,
+                                    ob_len: 0,
+                                    matched_counted: false,
+                                });
+                            }
+                            continue;
+                        }
+                        if *j >= items.len() {
+                            *idx += 1;
+                            *j = 0;
+                            continue;
+                        }
+                        while *j < items.len() {
+                            scanned += 1;
+                            if scanned.is_multiple_of(CHECK_EVERY) {
+                                ctx.check()?;
+                            }
+                            let cur_j = *j;
+                            let b = &items[cur_j];
+                            if b.bbox.is_none() && (b.geom.empty || cur_j < i) {
+                                *j += 1;
                                 continue;
                             }
                             self.st.refined += 1;
-                            if relate_relation(&a.geom, &b.geom, rel, opv) {
-                                self.pairs += 1;
-                                let b_sers = by_lit[&b.lit].clone();
-                                self.emit_pair_objects(ctx, &a_sers, &b_sers)?;
+                            let fwd = relate_relation(&a.geom, &b.geom, rel, opv);
+                            if i != cur_j {
+                                *rev_pending = true;
+                            } else {
+                                *j += 1;
                             }
-                            if i != j {
-                                self.st.refined += 1;
-                                if relate_relation(&b.geom, &a.geom, rel, opv) {
-                                    self.pairs += 1;
-                                    let b_sers = by_lit[&b.lit].clone();
-                                    self.emit_pair_objects(ctx, &b_sers, &a_sers)?;
-                                }
+                            if fwd {
+                                self.pairs += 1;
+                                pair_emit = Some(PairEmit {
+                                    a_lit: a.lit,
+                                    b_lit: b.lit,
+                                    ai: 0,
+                                    bi: 0,
+                                    oai: 0,
+                                    obi: 0,
+                                    oa_len: 0,
+                                    ob_len: 0,
+                                    matched_counted: false,
+                                });
+                                break;
+                            }
+                            if *rev_pending {
+                                break;
                             }
                         }
                     }
-                    BothVarPhase::Disjoint { i, j } => {
+                    BothVarPhase::Disjoint { i, j, rev_pending } => {
                         if *i >= items.len() {
                             phase = BothVarPhase::Done;
                             continue;
                         }
                         let cur_i = *i;
                         let a = &items[cur_i];
-                        let a_sers = by_lit[&a.lit].clone();
-                        let prep = (items.len() - cur_i > PREPARE_OVER)
-                            .then(|| Prepared::new(a.geom.clone()));
-                        while *j < items.len() && self.pending_out.len() < cap {
+                        if *rev_pending {
+                            *rev_pending = false;
                             let cur_j = *j;
                             *j += 1;
                             let b = &items[cur_j];
                             self.st.refined += 1;
-                            if self.st.refined.is_multiple_of(CHECK_EVERY as u64) {
-                                ctx.check()?;
-                            }
-                            let fwd = match &prep {
-                                Some(p)
-                                    if u64::from(a.geom.vertices) + u64::from(b.geom.vertices)
-                                        <= opv =>
-                                {
-                                    p.relation(&b.geom, rel).unwrap_or(false)
-                                }
-                                Some(_) => false,
-                                None => relate_relation(&a.geom, &b.geom, rel, opv),
-                            };
-                            if fwd {
+                            if relate_relation(&b.geom, &a.geom, rel, opv) {
                                 self.pairs += 1;
-                                let b_sers = by_lit[&b.lit].clone();
-                                self.emit_pair_objects(ctx, &a_sers, &b_sers)?;
+                                pair_emit = Some(PairEmit {
+                                    a_lit: b.lit,
+                                    b_lit: a.lit,
+                                    ai: 0,
+                                    bi: 0,
+                                    oai: 0,
+                                    obi: 0,
+                                    oa_len: 0,
+                                    ob_len: 0,
+                                    matched_counted: false,
+                                });
                             }
-                            if cur_i != cur_j {
-                                self.st.refined += 1;
-                                if relate_relation(&b.geom, &a.geom, rel, opv) {
-                                    self.pairs += 1;
-                                    let b_sers = by_lit[&b.lit].clone();
-                                    self.emit_pair_objects(ctx, &b_sers, &a_sers)?;
-                                }
-                            }
+                            continue;
                         }
                         if *j >= items.len() {
                             *i += 1;
                             *j = *i;
+                            cached_prep = None;
+                            continue;
+                        }
+                        if items.len() - cur_i > PREPARE_OVER
+                            && !matches!(cached_prep, Some((pi, _)) if pi == cur_i)
+                        {
+                            cached_prep = Some((cur_i, Prepared::new(a.geom.clone())));
+                        }
+                        while *j < items.len() {
+                            scanned += 1;
+                            if scanned.is_multiple_of(CHECK_EVERY) {
+                                ctx.check()?;
+                            }
+                            let cur_j = *j;
+                            let b = &items[cur_j];
+                            self.st.refined += 1;
+                            let fwd = match &cached_prep {
+                                Some((pi, p))
+                                    if *pi == cur_i
+                                        && u64::from(a.geom.vertices)
+                                            + u64::from(b.geom.vertices)
+                                            <= opv =>
+                                {
+                                    p.relation(&b.geom, rel).unwrap_or(false)
+                                }
+                                Some((pi, _)) if *pi == cur_i => false,
+                                _ => relate_relation(&a.geom, &b.geom, rel, opv),
+                            };
+                            if cur_i != cur_j {
+                                *rev_pending = true;
+                            } else {
+                                *j += 1;
+                            }
+                            if fwd {
+                                self.pairs += 1;
+                                pair_emit = Some(PairEmit {
+                                    a_lit: a.lit,
+                                    b_lit: b.lit,
+                                    ai: 0,
+                                    bi: 0,
+                                    oai: 0,
+                                    obi: 0,
+                                    oa_len: 0,
+                                    ob_len: 0,
+                                    matched_counted: false,
+                                });
+                                break;
+                            }
+                            if *rev_pending {
+                                break;
+                            }
                         }
                     }
                     BothVarPhase::Done => break,
@@ -1855,16 +2798,18 @@ impl SpatialRelateReader {
             }
             Ok(())
         })();
-        stage = if matches!(phase, BothVarPhase::Done) {
+        stage = if matches!(phase, BothVarPhase::Done) && pair_emit.is_none() {
             RelateStage::Done
         } else {
             RelateStage::BothVar {
                 items,
                 by_lit,
+                by_lit_elem_bytes,
                 boxed_idx,
                 unboxed_idx,
                 tree,
                 phase,
+                pair_emit,
             }
         };
         self.stage = stage;
@@ -2052,7 +2997,13 @@ impl JoinSideData {
             .saturating_add(self.tree.as_ref().map_or(0, PackedTree::bytes))
     }
 
-    fn add_table_batch(&mut self, ctx: &Ctx, batch: &Table, geom_var: VarId) -> Result<()> {
+    fn add_table_batch_charged(
+        &mut self,
+        ctx: &Ctx,
+        batch: &Table,
+        geom_var: VarId,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let Some(c) = batch.col_of(geom_var) else {
             return Ok(());
         };
@@ -2071,8 +3022,37 @@ impl JoinSideData {
                 Some(&idx) => idx,
                 None => {
                     let g = super::memo::by_id(ctx, id, None).ok();
+                    let by_id_add = if self.by_id.len() == self.by_id.capacity() {
+                        (next_cap(self.by_id.len(), self.by_id.capacity(), 1)
+                            - self.by_id.capacity()) as u64
+                            * (size_of::<Id>() + 5) as u64
+                    } else {
+                        0
+                    };
                     let idx = match g.as_ref().and_then(|g| item_box(g)) {
                         Some(b) => {
+                            let items_add = if self.items.len() == self.items.capacity() {
+                                (next_cap(self.items.len(), self.items.capacity(), 1)
+                                    - self.items.capacity()) as u64
+                                    * size_of::<JoinItem>() as u64
+                            } else {
+                                0
+                            };
+                            let rows_add = if self.rows.len() == self.rows.capacity() {
+                                (next_cap(self.rows.len(), self.rows.capacity(), 1)
+                                    - self.rows.capacity()) as u64
+                                    * size_of::<Vec<u32>>() as u64
+                            } else {
+                                0
+                            };
+                            if by_id_add > 0 || items_add > 0 || rows_add > 0 {
+                                admit(
+                                    self.retained_bytes()
+                                        .saturating_add(by_id_add)
+                                        .saturating_add(items_add)
+                                        .saturating_add(rows_add),
+                                )?;
+                            }
                             let idx = self.items.len() as u32;
                             self.items.push(JoinItem {
                                 row: idx,
@@ -2083,13 +3063,44 @@ impl JoinSideData {
                             self.rows.push(Vec::new());
                             idx
                         }
-                        None => u32::MAX,
+                        None => {
+                            if by_id_add > 0 {
+                                admit(self.retained_bytes().saturating_add(by_id_add))?;
+                            }
+                            u32::MAX
+                        }
                     };
                     self.by_id.insert(id, idx);
                     idx
                 }
             };
             if item != u32::MAX {
+                let tbl_add: u64 = self
+                    .table
+                    .cols
+                    .iter()
+                    .map(|col| {
+                        if col.len() == col.capacity() {
+                            (next_cap(col.len(), col.capacity(), 1) - col.capacity()) as u64 * 8
+                        } else {
+                            0
+                        }
+                    })
+                    .sum();
+                let rvec = &self.rows[item as usize];
+                let rvec_add = if rvec.len() == rvec.capacity() {
+                    (next_cap(rvec.len(), rvec.capacity(), 1) - rvec.capacity()) as u64
+                        * size_of::<u32>() as u64
+                } else {
+                    0
+                };
+                if tbl_add > 0 || rvec_add > 0 {
+                    admit(
+                        self.retained_bytes()
+                            .saturating_add(tbl_add)
+                            .saturating_add(rvec_add),
+                    )?;
+                }
                 let row_idx = self.table.len() as u32;
                 for (dst, src) in row_buf.iter_mut().zip(&col_map) {
                     *dst = src.map_or(Id::UNDEF, |sc| batch.cols[sc][i]);
@@ -2101,15 +3112,50 @@ impl JoinSideData {
         Ok(())
     }
 
-    fn add_hit(&mut self, ctx: &Ctx, ix: &OwnedIndexSide, h: &Hit) {
+    fn add_hit_charged(
+        &mut self,
+        ctx: &Ctx,
+        ix: &OwnedIndexSide,
+        h: &Hit,
+        admit: &mut dyn FnMut(u64) -> Result<()>,
+    ) -> Result<()> {
         let item = match self.by_id.get(&h.o) {
             Some(&idx) => idx,
             None => {
+                let by_id_add = if self.by_id.len() == self.by_id.capacity() {
+                    (next_cap(self.by_id.len(), self.by_id.capacity(), 1) - self.by_id.capacity())
+                        as u64
+                        * (size_of::<Id>() + 5) as u64
+                } else {
+                    0
+                };
                 let idx = match noted(ctx, h.entry.geom(&ctx.snap))
                     .ok()
                     .and_then(|g| item_box(&g).map(|b| (g, b)))
                 {
                     Some((g, b)) => {
+                        let items_add = if self.items.len() == self.items.capacity() {
+                            (next_cap(self.items.len(), self.items.capacity(), 1)
+                                - self.items.capacity()) as u64
+                                * size_of::<JoinItem>() as u64
+                        } else {
+                            0
+                        };
+                        let rows_add = if self.rows.len() == self.rows.capacity() {
+                            (next_cap(self.rows.len(), self.rows.capacity(), 1)
+                                - self.rows.capacity()) as u64
+                                * size_of::<Vec<u32>>() as u64
+                        } else {
+                            0
+                        };
+                        if by_id_add > 0 || items_add > 0 || rows_add > 0 {
+                            admit(
+                                self.retained_bytes()
+                                    .saturating_add(by_id_add)
+                                    .saturating_add(items_add)
+                                    .saturating_add(rows_add),
+                            )?;
+                        }
                         let idx = self.items.len() as u32;
                         self.items.push(JoinItem {
                             row: idx,
@@ -2120,22 +3166,64 @@ impl JoinSideData {
                         self.rows.push(Vec::new());
                         idx
                     }
-                    None => u32::MAX,
+                    None => {
+                        if by_id_add > 0 {
+                            admit(self.retained_bytes().saturating_add(by_id_add))?;
+                        }
+                        u32::MAX
+                    }
                 };
                 self.by_id.insert(h.o, idx);
                 idx
             }
         };
         if item != u32::MAX {
+            let tbl_add: u64 = self
+                .table
+                .cols
+                .iter()
+                .map(|col| {
+                    if col.len() == col.capacity() {
+                        (next_cap(col.len(), col.capacity(), 1) - col.capacity()) as u64 * 8
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+            let rvec = &self.rows[item as usize];
+            let rvec_add = if rvec.len() == rvec.capacity() {
+                (next_cap(rvec.len(), rvec.capacity(), 1) - rvec.capacity()) as u64
+                    * size_of::<u32>() as u64
+            } else {
+                0
+            };
+            if tbl_add > 0 || rvec_add > 0 {
+                admit(
+                    self.retained_bytes()
+                        .saturating_add(tbl_add)
+                        .saturating_add(rvec_add),
+                )?;
+            }
             let row_idx = self.table.len() as u32;
             let mut row_buf = vec![Id::UNDEF; ix.cols.len()];
             ix.hit_row(h, &mut row_buf);
             self.table.push_row(&row_buf);
             self.rows[item as usize].push(row_idx);
         }
+        Ok(())
     }
 
-    fn pack(&mut self) {
+    fn pack_charged(&mut self, admit: &mut dyn FnMut(u64) -> Result<()>) -> Result<()> {
+        let n_boxed = self.items.iter().filter(|it| placed(&it.bbox84)).count();
+        let n_unplaced = self.items.len().saturating_sub(n_boxed);
+        let idx_bytes =
+            (n_boxed.saturating_add(n_unplaced) as u64).saturating_mul(size_of::<usize>() as u64);
+        let tree_est = PackedTree::estimate_bytes(n_boxed);
+        admit(
+            self.retained_bytes()
+                .saturating_add(idx_bytes)
+                .saturating_add(tree_est),
+        )?;
         self.boxed_idx = (0..self.items.len())
             .filter(|&i| placed(&self.items[i].bbox84))
             .collect();
@@ -2147,6 +3235,7 @@ impl JoinSideData {
                 .iter()
                 .map(|&i| round_out(self.items[i].bbox84)),
         );
+        admit(self.retained_bytes())
     }
 
     fn read_index(
@@ -2171,13 +3260,16 @@ impl JoinSideData {
             let ended = iter.next_hits(ctx, &mut buf, 4096, &mut |b| {
                 charge.resize(base.saturating_add(b))
             })?;
+            let iter_bytes = iter.retained_bytes();
             for h in &buf {
                 if ix.subj.is_none_or(|s| s == h.s) {
-                    side.add_hit(ctx, ix, h);
+                    side.add_hit_charged(ctx, ix, h, &mut |b| {
+                        charge.resize(b.saturating_add(iter_bytes))
+                    })?;
                 }
             }
             ctx.check_output(side.table.len(), side.table.width())?;
-            charge.resize(side.retained_bytes().saturating_add(iter.retained_bytes()))?;
+            charge.resize(side.retained_bytes().saturating_add(iter_bytes))?;
             if ended {
                 break;
             }
@@ -2185,8 +3277,8 @@ impl JoinSideData {
         st.nodes += iter.st.nodes;
         st.rechecked += iter.st.rechecked;
         st.fallback |= iter.st.fallback;
-        side.pack();
-        charge.resize(side.retained_bytes())?;
+        drop(iter);
+        side.pack_charged(&mut |b| charge.resize(b))?;
         Ok(side)
     }
 }
@@ -2226,6 +3318,77 @@ struct ActiveProbe {
     iter: WindowIter,
     hits: VecDeque<Hit>,
     lit_pass: FxHashMap<Id, bool>,
+    /// Currently matched inner hit row and next index into `outer.rows[item_idx]`.
+    pending_match: Option<(Vec<Id>, usize)>,
+}
+
+impl ActiveProbe {
+    fn retained_bytes(&self) -> u64 {
+        let pm = self
+            .pending_match
+            .as_ref()
+            .map_or(0, |(r, _)| r.capacity() as u64 * size_of::<Id>() as u64);
+        self.iter
+            .retained_bytes()
+            .saturating_add(self.hits.capacity() as u64 * size_of::<Hit>() as u64)
+            .saturating_add(self.lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64)
+            .saturating_add(pm)
+    }
+}
+
+/// Resumable probe cursor for one probe geometry against an in-memory `JoinSideData`.
+struct SideProbeState {
+    probe_geom: GeomRef,
+    probe_row: Vec<Id>,
+    probe_is_left: bool,
+    placed: bool,
+    ws_f32: Vec<[f32; 4]>,
+    tree_stack: Vec<usize>,
+    unplaced_at: usize,
+    /// Currently matched build item index and next index into `side.rows[bi]`.
+    active_match: Option<(usize, usize)>,
+}
+
+impl SideProbeState {
+    fn open(
+        side: &JoinSideData,
+        test: &JoinTest,
+        probe_geom: GeomRef,
+        probe_box: [f64; 4],
+        probe_row: Vec<Id>,
+        probe_is_left: bool,
+    ) -> Self {
+        let is_placed = placed(&probe_box);
+        let (ws_f32, tree_stack) = if is_placed {
+            if let Some(tree) = &side.tree {
+                let ws: Vec<[f32; 4]> = join_windows(test, probe_box)
+                    .iter()
+                    .map(super::index::window_f32)
+                    .collect();
+                (ws, vec![tree.tree().root()])
+            } else {
+                (Vec::new(), Vec::new())
+            }
+        } else {
+            (Vec::new(), Vec::new())
+        };
+        Self {
+            probe_geom,
+            probe_row,
+            probe_is_left,
+            placed: is_placed,
+            ws_f32,
+            tree_stack,
+            unplaced_at: 0,
+            active_match: None,
+        }
+    }
+
+    fn retained_bytes(&self) -> u64 {
+        (self.probe_row.capacity() as u64 * size_of::<Id>() as u64)
+            .saturating_add(self.ws_f32.capacity() as u64 * size_of::<[f32; 4]>() as u64)
+            .saturating_add(self.tree_stack.capacity() as u64 * size_of::<usize>() as u64)
+    }
 }
 
 /// Resumable spatial join state machine supporting:
@@ -2255,6 +3418,30 @@ struct ProbeSink<'a> {
     map: &'a OutputMap,
     vars_len: usize,
     pending_out: &'a mut VecDeque<Vec<Id>>,
+    charge: &'a mut OwnedCharge,
+    /// Live bytes held by the engine excluding `pending_out` and the active probe.
+    other_bytes: u64,
+}
+
+impl ProbeSink<'_> {
+    fn pending_out_bytes(&self) -> u64 {
+        self.pending_out.capacity() as u64
+            * (size_of::<Vec<Id>>() + self.vars_len * size_of::<Id>()) as u64
+    }
+
+    fn push_pending_row(&mut self, row: Vec<Id>, active_bytes: u64) -> Result<()> {
+        if self.pending_out.len() == self.pending_out.capacity() {
+            let next_p = next_cap(self.pending_out.len(), self.pending_out.capacity(), 1) as u64
+                * (size_of::<Vec<Id>>() + self.vars_len * size_of::<Id>()) as u64;
+            self.charge.resize(
+                self.other_bytes
+                    .saturating_add(active_bytes)
+                    .saturating_add(next_p),
+            )?;
+        }
+        self.pending_out.push_back(row);
+        Ok(())
+    }
 }
 
 enum JoinMode {
@@ -2278,6 +3465,7 @@ enum JoinMode {
         map: OutputMap,
         outer_iter: Option<Box<WindowIter>>,
         outer_hits: VecDeque<Hit>,
+        active_probe: Option<Box<SideProbeState>>,
     },
     /// One plan child streamed batch-by-batch, probing a usable spatial index.
     PlanIndexProbe {
@@ -2299,6 +3487,7 @@ enum JoinMode {
         inner: JoinSideData,
         map: OutputMap,
         batch: Option<(Table, usize)>,
+        active_probe: Option<Box<SideProbeState>>,
         child_done: bool,
     },
     /// Two plan children: build side read whole into `JoinSideData`, probe child streamed.
@@ -2309,6 +3498,7 @@ enum JoinMode {
         build: JoinSideData,
         map: OutputMap,
         batch: Option<(Table, usize)>,
+        active_probe: Option<Box<SideProbeState>>,
         probe_done: bool,
     },
     Done,
@@ -2375,6 +3565,7 @@ impl SpatialJoinEngine {
                     map,
                     outer_iter: Some(Box::new(outer_iter)),
                     outer_hits: VecDeque::new(),
+                    active_probe: None,
                 },
                 false,
             )
@@ -2443,6 +3634,7 @@ impl SpatialJoinEngine {
                     inner,
                     map,
                     batch: None,
+                    active_probe: None,
                     child_done: false,
                 },
                 false,
@@ -2495,11 +3687,10 @@ impl SpatialJoinEngine {
         let mut charge = OwnedCharge::new(ctx, 0)?;
         let mut build = JoinSideData::new(build_vars.to_vec());
         build_table_fn(build_child, &mut |batch| {
-            build.add_table_batch(ctx, batch, build_geom)?;
+            build.add_table_batch_charged(ctx, batch, build_geom, &mut |b| charge.resize(b))?;
             charge.resize(build.retained_bytes())
         })?;
-        build.pack();
-        charge.resize(build.retained_bytes())?;
+        build.pack_charged(&mut |b| charge.resize(b))?;
         let map = OutputMap::new(vars, left_vars, right_vars);
         Ok(Self {
             spec: spec.clone(),
@@ -2513,6 +3704,7 @@ impl SpatialJoinEngine {
                 build,
                 map,
                 batch: None,
+                active_probe: None,
                 probe_done: false,
             },
             pending_out: VecDeque::new(),
@@ -2537,9 +3729,13 @@ impl SpatialJoinEngine {
         c
     }
 
+    fn pending_bytes(&self) -> u64 {
+        self.pending_out.capacity() as u64
+            * (size_of::<Vec<Id>>() + self.vars.len() * size_of::<Id>()) as u64
+    }
+
     fn retained_bytes(&self) -> u64 {
-        let pending = self.pending_out.capacity() as u64
-            * (size_of::<Vec<Id>>() + self.vars.len() * size_of::<Id>()) as u64;
+        let pending = self.pending_bytes();
         let mode_bytes = match &self.mode {
             JoinMode::IndexIndexProbe {
                 outer_iter,
@@ -2550,36 +3746,52 @@ impl SpatialJoinEngine {
                 .as_deref()
                 .map_or(0, WindowIter::retained_bytes)
                 .saturating_add(wave.as_ref().map_or(0, JoinSideData::retained_bytes))
-                .saturating_add(active.as_deref().map_or(0, |a| {
-                    a.iter
-                        .retained_bytes()
-                        .saturating_add(a.hits.capacity() as u64 * size_of::<Hit>() as u64)
-                        .saturating_add(a.lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64)
-                })),
+                .saturating_add(active.as_deref().map_or(0, ActiveProbe::retained_bytes)),
             JoinMode::IndexIndexBuild {
                 inner,
                 outer_iter,
                 outer_hits,
+                active_probe,
                 ..
             } => inner
                 .retained_bytes()
                 .saturating_add(outer_iter.as_deref().map_or(0, WindowIter::retained_bytes))
-                .saturating_add(outer_hits.capacity() as u64 * size_of::<Hit>() as u64),
+                .saturating_add(outer_hits.capacity() as u64 * size_of::<Hit>() as u64)
+                .saturating_add(
+                    active_probe
+                        .as_deref()
+                        .map_or(0, SideProbeState::retained_bytes),
+                ),
             JoinMode::PlanIndexProbe { batch, active, .. } => batch
                 .as_ref()
                 .map_or(0, JoinSideData::retained_bytes)
-                .saturating_add(active.as_deref().map_or(0, |a| {
-                    a.iter
-                        .retained_bytes()
-                        .saturating_add(a.hits.capacity() as u64 * size_of::<Hit>() as u64)
-                        .saturating_add(a.lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64)
-                })),
-            JoinMode::PlanIndexBuild { inner, batch, .. } => inner
+                .saturating_add(active.as_deref().map_or(0, ActiveProbe::retained_bytes)),
+            JoinMode::PlanIndexBuild {
+                inner,
+                batch,
+                active_probe,
+                ..
+            } => inner
                 .retained_bytes()
-                .saturating_add(batch.as_ref().map_or(0, |(t, _)| table_capacity_bytes(t))),
-            JoinMode::PlanPlan { build, batch, .. } => build
+                .saturating_add(batch.as_ref().map_or(0, |(t, _)| table_capacity_bytes(t)))
+                .saturating_add(
+                    active_probe
+                        .as_deref()
+                        .map_or(0, SideProbeState::retained_bytes),
+                ),
+            JoinMode::PlanPlan {
+                build,
+                batch,
+                active_probe,
+                ..
+            } => build
                 .retained_bytes()
-                .saturating_add(batch.as_ref().map_or(0, |(t, _)| table_capacity_bytes(t))),
+                .saturating_add(batch.as_ref().map_or(0, |(t, _)| table_capacity_bytes(t)))
+                .saturating_add(
+                    active_probe
+                        .as_deref()
+                        .map_or(0, SideProbeState::retained_bytes),
+                ),
             JoinMode::Done => 0,
         };
         pending.saturating_add(mode_bytes)
@@ -2638,24 +3850,141 @@ impl SpatialJoinEngine {
         Ok(())
     }
 
-    fn probe_item_against_side(
+    /// Advance one resumable probe against an in-memory `JoinSideData`, yielding as soon
+    /// as `sink.pending_out.len() >= cap`. Returns `true` when the probe is exhausted.
+    fn step_side_probe(
         sink: &mut ProbeSink<'_>,
         side: &JoinSideData,
-        probe_geom: &GeomRef,
-        probe_box: [f64; 4],
-        probe_row: &[Id],
-        probe_is_left: bool,
-    ) -> Result<()> {
+        probe: &mut SideProbeState,
+        cap: usize,
+    ) -> Result<bool> {
         let mut build_row = vec![Id::UNDEF; side.table.width()];
         let mut out_row = vec![Id::UNDEF; sink.vars_len];
-        if placed(&probe_box) {
-            if let Some(tree) = &side.tree {
-                let found = tree.search(
-                    &join_windows(&sink.exact.test, probe_box),
-                    &mut sink.st.nodes,
-                );
-                if !found.is_empty() {
-                    sink.st.candidates = sink.st.candidates.saturating_add(found.len() as u64);
+        let mut prep: Option<Prepared> = None;
+        let mut tested = 0usize;
+        let mut ticks = 0usize;
+        loop {
+            // 1. Drain any currently matched build item's rows up to `cap`.
+            if let Some((bi, mut row_at)) = probe.active_match.take() {
+                let rows = &side.rows[bi];
+                while row_at < rows.len() {
+                    ticks += 1;
+                    if ticks.is_multiple_of(CHECK_EVERY) {
+                        sink.ctx.check()?;
+                    }
+                    if sink.pending_out.len() >= cap {
+                        probe.active_match = Some((bi, row_at));
+                        return Ok(false);
+                    }
+                    let br = rows[row_at];
+                    row_at += 1;
+                    for (col, dst) in build_row.iter_mut().enumerate() {
+                        *dst = side.table.cols[col][br as usize];
+                    }
+                    if probe.probe_is_left {
+                        sink.map
+                            .write_row(&probe.probe_row, &build_row, &mut out_row);
+                    } else {
+                        sink.map
+                            .write_row(&build_row, &probe.probe_row, &mut out_row);
+                    }
+                    let active_bytes = probe.retained_bytes();
+                    sink.push_pending_row(out_row.clone(), active_bytes)?;
+                }
+                if sink.pending_out.len() >= cap {
+                    return Ok(false);
+                }
+            }
+            // 2. Find the next matching build item.
+            if probe.placed {
+                let Some(tree) = &side.tree else {
+                    return Ok(true);
+                };
+                let tr = tree.tree();
+                let ws_f32 = &probe.ws_f32;
+                let hits_f32 = |b: [f32; 4]| {
+                    ws_f32
+                        .iter()
+                        .any(|w| b[0] <= w[2] && b[2] >= w[0] && b[1] <= w[3] && b[3] >= w[1])
+                };
+                let mut matched_bi = None;
+                while let Some(n) = probe.tree_stack.pop() {
+                    ticks += 1;
+                    if ticks.is_multiple_of(CHECK_EVERY) {
+                        sink.ctx.check()?;
+                    }
+                    if tr.is_item(n) {
+                        if !hits_f32(tr.bbox(n)) {
+                            continue;
+                        }
+                        sink.st.candidates = sink.st.candidates.saturating_add(1);
+                        if sink.st.candidates > sink.ctx.max_rows as u64 {
+                            return Err(Error::BudgetExceeded(Budget {
+                                kind: BudgetKind::Rows,
+                                limit: sink.ctx.max_rows as u64,
+                                requested: sink.st.candidates,
+                            }));
+                        }
+                        let bi = side.boxed_idx[tr.item(n)];
+                        let other = &side.items[bi];
+                        sink.st.refined += 1;
+                        tested += 1;
+                        if sink.exact.prepares() && tested == PREPARE_OVER + 1 && prep.is_none() {
+                            prep = Some(Prepared::new(probe.probe_geom.clone()));
+                        }
+                        let ok = match (&prep, probe.probe_is_left) {
+                            (Some(p), true) => sink.exact.holds_left(p, &other.geom),
+                            (Some(p), false) => sink.exact.holds_right(&other.geom, p),
+                            (None, true) => sink.exact.holds(&probe.probe_geom, &other.geom),
+                            (None, false) => sink.exact.holds(&other.geom, &probe.probe_geom),
+                        };
+                        if ok {
+                            *sink.npairs += 1;
+                            matched_bi = Some(bi);
+                            break;
+                        }
+                    } else {
+                        sink.st.nodes += 1;
+                        for c in tr.children(n) {
+                            if hits_f32(tr.bbox(c)) {
+                                if probe.tree_stack.len() == probe.tree_stack.capacity() {
+                                    let add = (next_cap(
+                                        probe.tree_stack.len(),
+                                        probe.tree_stack.capacity(),
+                                        1,
+                                    ) - probe.tree_stack.capacity())
+                                        as u64
+                                        * size_of::<usize>() as u64;
+                                    let projected = sink
+                                        .other_bytes
+                                        .saturating_add(sink.pending_out_bytes())
+                                        .saturating_add(probe.retained_bytes())
+                                        .saturating_add(add);
+                                    sink.charge.resize(projected)?;
+                                }
+                                probe.tree_stack.push(c);
+                            }
+                        }
+                    }
+                }
+                match matched_bi {
+                    Some(bi) => probe.active_match = Some((bi, 0)),
+                    None => return Ok(true),
+                }
+            } else {
+                let mut matched_bi = None;
+                while probe.unplaced_at < side.unplaced_idx.len() {
+                    ticks += 1;
+                    if ticks.is_multiple_of(CHECK_EVERY) {
+                        sink.ctx.check()?;
+                    }
+                    let bi = side.unplaced_idx[probe.unplaced_at];
+                    probe.unplaced_at += 1;
+                    let other = &side.items[bi];
+                    if probe.probe_geom.crs != other.geom.crs {
+                        continue;
+                    }
+                    sink.st.candidates = sink.st.candidates.saturating_add(1);
                     if sink.st.candidates > sink.ctx.max_rows as u64 {
                         return Err(Error::BudgetExceeded(Budget {
                             kind: BudgetKind::Rows,
@@ -2663,75 +3992,24 @@ impl SpatialJoinEngine {
                             requested: sink.st.candidates,
                         }));
                     }
-                    let prep = (sink.exact.prepares() && found.len() > PREPARE_OVER)
-                        .then(|| Prepared::new(probe_geom.clone()));
-                    for c in found {
-                        let bi = side.boxed_idx[c as usize];
-                        let other = &side.items[bi];
-                        sink.st.refined += 1;
-                        if sink.st.refined.is_multiple_of(CHECK_EVERY as u64) {
-                            sink.ctx.check()?;
-                        }
-                        let ok = match (&prep, probe_is_left) {
-                            (Some(p), true) => sink.exact.holds_left(p, &other.geom),
-                            (Some(p), false) => sink.exact.holds_right(&other.geom, p),
-                            (None, true) => sink.exact.holds(probe_geom, &other.geom),
-                            (None, false) => sink.exact.holds(&other.geom, probe_geom),
-                        };
-                        if ok {
-                            *sink.npairs += 1;
-                            for &br in &side.rows[bi] {
-                                for (col, dst) in build_row.iter_mut().enumerate() {
-                                    *dst = side.table.cols[col][br as usize];
-                                }
-                                if probe_is_left {
-                                    sink.map.write_row(probe_row, &build_row, &mut out_row);
-                                } else {
-                                    sink.map.write_row(&build_row, probe_row, &mut out_row);
-                                }
-                                sink.pending_out.push_back(out_row.clone());
-                            }
-                        }
+                    sink.st.refined += 1;
+                    let ok = if probe.probe_is_left {
+                        sink.exact.holds(&probe.probe_geom, &other.geom)
+                    } else {
+                        sink.exact.holds(&other.geom, &probe.probe_geom)
+                    };
+                    if ok {
+                        *sink.npairs += 1;
+                        matched_bi = Some(bi);
+                        break;
                     }
                 }
-            }
-        } else {
-            for &bi in &side.unplaced_idx {
-                let other = &side.items[bi];
-                if probe_geom.crs != other.geom.crs {
-                    continue;
-                }
-                sink.st.candidates += 1;
-                if sink.st.candidates > sink.ctx.max_rows as u64 {
-                    return Err(Error::BudgetExceeded(Budget {
-                        kind: BudgetKind::Rows,
-                        limit: sink.ctx.max_rows as u64,
-                        requested: sink.st.candidates,
-                    }));
-                }
-                sink.st.refined += 1;
-                let ok = if probe_is_left {
-                    sink.exact.holds(probe_geom, &other.geom)
-                } else {
-                    sink.exact.holds(&other.geom, probe_geom)
-                };
-                if ok {
-                    *sink.npairs += 1;
-                    for &br in &side.rows[bi] {
-                        for (col, dst) in build_row.iter_mut().enumerate() {
-                            *dst = side.table.cols[col][br as usize];
-                        }
-                        if probe_is_left {
-                            sink.map.write_row(probe_row, &build_row, &mut out_row);
-                        } else {
-                            sink.map.write_row(&build_row, probe_row, &mut out_row);
-                        }
-                        sink.pending_out.push_back(out_row.clone());
-                    }
+                match matched_bi {
+                    Some(bi) => probe.active_match = Some((bi, 0)),
+                    None => return Ok(true),
                 }
             }
         }
-        Ok(())
     }
 
     fn step_active_probe(
@@ -2750,16 +4028,74 @@ impl SpatialJoinEngine {
         let mut outer_row = vec![Id::UNDEF; outer.table.width()];
         let mut inner_row = vec![Id::UNDEF; ix.cols.len()];
         let mut out_row = vec![Id::UNDEF; sink.vars_len];
+        let mut ticks = 0usize;
         loop {
             sink.ctx.check()?;
+            // 1. Drain any active matched inner hit across outer rows up to `cap`.
+            if let Some((in_row, mut row_at)) = active.pending_match.take() {
+                let orows = &outer.rows[active.item_idx];
+                while row_at < orows.len() {
+                    ticks += 1;
+                    if ticks.is_multiple_of(CHECK_EVERY) {
+                        sink.ctx.check()?;
+                    }
+                    if sink.pending_out.len() >= cap {
+                        active.pending_match = Some((in_row, row_at));
+                        return Ok(false);
+                    }
+                    let orow = orows[row_at];
+                    row_at += 1;
+                    for (col, dst) in outer_row.iter_mut().enumerate() {
+                        *dst = outer.table.cols[col][orow as usize];
+                    }
+                    if outer_is_left {
+                        sink.map.write_row(&outer_row, &in_row, &mut out_row);
+                    } else {
+                        sink.map.write_row(&in_row, &outer_row, &mut out_row);
+                    }
+                    let active_bytes = active
+                        .retained_bytes()
+                        .saturating_add(in_row.capacity() as u64 * size_of::<Id>() as u64);
+                    sink.push_pending_row(out_row.clone(), active_bytes)?;
+                }
+                if sink.pending_out.len() >= cap {
+                    return Ok(false);
+                }
+            }
             if active.hits.is_empty() {
                 let mut buf = Vec::new();
+                let non_iter = sink
+                    .other_bytes
+                    .saturating_add(sink.pending_out_bytes())
+                    .saturating_add(active.hits.capacity() as u64 * size_of::<Hit>() as u64)
+                    .saturating_add(
+                        active.lit_pass.capacity() as u64 * (size_of::<Id>() + 2) as u64,
+                    );
+                let charge = &mut *sink.charge;
                 let ended =
                     active
                         .iter
-                        .next_hits(sink.ctx, &mut buf, cap.clamp(64, 4096), &mut |_| Ok(()))?;
+                        .next_hits(sink.ctx, &mut buf, cap.clamp(64, 4096), &mut |b| {
+                            charge.resize(non_iter.saturating_add(b))
+                        })?;
+                let iter_bytes = active.iter.retained_bytes();
                 for h in buf {
                     if ix.subj.is_none_or(|s| s == h.s) {
+                        if active.hits.len() == active.hits.capacity() {
+                            let next_h = next_cap(active.hits.len(), active.hits.capacity(), 1)
+                                as u64
+                                * size_of::<Hit>() as u64;
+                            let projected = sink
+                                .other_bytes
+                                .saturating_add(sink.pending_out_bytes())
+                                .saturating_add(iter_bytes)
+                                .saturating_add(next_h)
+                                .saturating_add(
+                                    active.lit_pass.capacity() as u64
+                                        * (size_of::<Id>() + 2) as u64,
+                                );
+                            sink.charge.resize(projected)?;
+                        }
                         active.hits.push_back(h);
                     }
                 }
@@ -2789,6 +4125,17 @@ impl SpatialJoinEngine {
                     if sink.st.refined.is_multiple_of(CHECK_EVERY as u64) {
                         sink.ctx.check()?;
                     }
+                    if active.lit_pass.len() == active.lit_pass.capacity() {
+                        let add = (next_cap(active.lit_pass.len(), active.lit_pass.capacity(), 1)
+                            - active.lit_pass.capacity()) as u64
+                            * (size_of::<Id>() + 2) as u64;
+                        let projected = sink
+                            .other_bytes
+                            .saturating_add(sink.pending_out_bytes())
+                            .saturating_add(active.retained_bytes())
+                            .saturating_add(add);
+                        sink.charge.resize(projected)?;
+                    }
                     let pass = match noted(sink.ctx, h.entry.geom(&sink.ctx.snap)) {
                         Ok(geom) => match (&prep, outer_is_left) {
                             (Some(p), true) => sink.exact.holds_left(p, &geom),
@@ -2806,7 +4153,16 @@ impl SpatialJoinEngine {
                 }
                 *sink.npairs += 1;
                 ix.hit_row(&h, &mut inner_row);
-                for &orow in &outer.rows[active.item_idx] {
+                let orows = &outer.rows[active.item_idx];
+                for (row_at, &orow) in orows.iter().enumerate() {
+                    ticks += 1;
+                    if ticks.is_multiple_of(CHECK_EVERY) {
+                        sink.ctx.check()?;
+                    }
+                    if sink.pending_out.len() >= cap {
+                        active.pending_match = Some((inner_row.clone(), row_at));
+                        return Ok(false);
+                    }
                     for (col, dst) in outer_row.iter_mut().enumerate() {
                         *dst = outer.table.cols[col][orow as usize];
                     }
@@ -2815,7 +4171,8 @@ impl SpatialJoinEngine {
                     } else {
                         sink.map.write_row(&inner_row, &outer_row, &mut out_row);
                     }
-                    sink.pending_out.push_back(out_row.clone());
+                    let active_bytes = active.retained_bytes();
+                    sink.push_pending_row(out_row.clone(), active_bytes)?;
                 }
             }
             if sink.pending_out.len() >= cap {
@@ -2843,6 +4200,7 @@ impl SpatialJoinEngine {
                 self.update_charge()?;
                 return Ok(false);
             }
+            let pending_bytes = self.pending_bytes();
             match &mut self.mode {
                 JoinMode::Done => {
                     self.st.matched += out.len() as u64;
@@ -2860,6 +4218,10 @@ impl SpatialJoinEngine {
                     next_item,
                 } => {
                     if let (Some(w), Some(act)) = (wave.as_ref(), active.as_deref_mut()) {
+                        let other_bytes = outer_iter
+                            .as_deref()
+                            .map_or(0, WindowIter::retained_bytes)
+                            .saturating_add(w.retained_bytes());
                         let mut sink = ProbeSink {
                             ctx,
                             exact: &self.exact,
@@ -2868,6 +4230,8 @@ impl SpatialJoinEngine {
                             map,
                             vars_len,
                             pending_out: &mut self.pending_out,
+                            charge: &mut self.charge,
+                            other_bytes,
                         };
                         let done = Self::step_active_probe(
                             &mut sink,
@@ -2885,6 +4249,11 @@ impl SpatialJoinEngine {
                     }
                     if let Some(w) = wave.as_ref() {
                         let mut opened = false;
+                        let base_open = pending_bytes
+                            .saturating_add(
+                                outer_iter.as_deref().map_or(0, WindowIter::retained_bytes),
+                            )
+                            .saturating_add(w.retained_bytes());
                         while *next_item < w.items.len() {
                             let idx = *next_item;
                             *next_item += 1;
@@ -2892,19 +4261,21 @@ impl SpatialJoinEngine {
                                 continue;
                             }
                             let ws = join_windows(&self.exact.test, w.items[idx].bbox84);
+                            let charge = &mut self.charge;
                             let iter = WindowIter::open(
                                 ctx,
                                 vec![inner_ix.pred],
                                 ws,
                                 inner_ix.graph.clone(),
                                 inner_ix.scan.dedup,
-                                &mut |_| Ok(()),
+                                &mut |b| charge.resize(base_open.saturating_add(b)),
                             )?;
                             *active = Some(Box::new(ActiveProbe {
                                 item_idx: idx,
                                 iter,
                                 hits: VecDeque::new(),
                                 lit_pass: FxHashMap::default(),
+                                pending_match: None,
                             }));
                             opened = true;
                             break;
@@ -2921,7 +4292,10 @@ impl SpatialJoinEngine {
                         continue;
                     };
                     let mut buf = Vec::new();
-                    let ended = iter.next_hits(ctx, &mut buf, 256, &mut |_| Ok(()))?;
+                    let charge = &mut self.charge;
+                    let ended = iter.next_hits(ctx, &mut buf, 256, &mut |b| {
+                        charge.resize(pending_bytes.saturating_add(b))
+                    })?;
                     if ended {
                         self.st.nodes += iter.st.nodes;
                         self.st.rechecked += iter.st.rechecked;
@@ -2929,10 +4303,16 @@ impl SpatialJoinEngine {
                         *outer_iter = None;
                     }
                     if !buf.is_empty() {
+                        let outer_bytes = pending_bytes.saturating_add(
+                            outer_iter.as_deref().map_or(0, WindowIter::retained_bytes),
+                        );
                         let mut w = JoinSideData::new(outer_ix.vars.clone());
+                        let charge = &mut self.charge;
                         for h in &buf {
                             if outer_ix.subj.is_none_or(|s| s == h.s) {
-                                w.add_hit(ctx, outer_ix, h);
+                                w.add_hit_charged(ctx, outer_ix, h, &mut |b| {
+                                    charge.resize(outer_bytes.saturating_add(b))
+                                })?;
                             }
                         }
                         if !w.items.is_empty() {
@@ -2949,29 +4329,67 @@ impl SpatialJoinEngine {
                     map,
                     outer_iter,
                     outer_hits,
+                    active_probe,
                 } => {
+                    if let Some(probe) = active_probe.as_deref_mut() {
+                        let other_bytes = inner
+                            .retained_bytes()
+                            .saturating_add(
+                                outer_iter.as_deref().map_or(0, WindowIter::retained_bytes),
+                            )
+                            .saturating_add(outer_hits.capacity() as u64 * size_of::<Hit>() as u64);
+                        let mut sink = ProbeSink {
+                            ctx,
+                            exact: &self.exact,
+                            st: &mut self.st,
+                            npairs: &mut self.npairs,
+                            map,
+                            vars_len,
+                            pending_out: &mut self.pending_out,
+                            charge: &mut self.charge,
+                            other_bytes,
+                        };
+                        if Self::step_side_probe(&mut sink, inner, probe, cap)? {
+                            *active_probe = None;
+                        }
+                        self.update_charge()?;
+                        continue;
+                    }
                     if outer_hits.is_empty() {
                         let Some(iter) = outer_iter.as_mut() else {
                             self.mode = JoinMode::Done;
                             continue;
                         };
                         let mut buf = Vec::new();
+                        let base_outer = pending_bytes.saturating_add(inner.retained_bytes());
+                        let charge = &mut self.charge;
                         let ended =
-                            iter.next_hits(ctx, &mut buf, cap.clamp(64, 4096), &mut |_| Ok(()))?;
+                            iter.next_hits(ctx, &mut buf, cap.clamp(64, 4096), &mut |b| {
+                                charge.resize(base_outer.saturating_add(b))
+                            })?;
                         if ended {
                             self.st.nodes += iter.st.nodes;
                             self.st.rechecked += iter.st.rechecked;
                             self.st.fallback |= iter.st.fallback;
                             *outer_iter = None;
                         }
-                        outer_hits.extend(buf);
+                        if !buf.is_empty() {
+                            let next_oh =
+                                next_cap(outer_hits.len(), outer_hits.capacity(), buf.len()) as u64
+                                    * size_of::<Hit>() as u64;
+                            let iter_b =
+                                outer_iter.as_deref().map_or(0, WindowIter::retained_bytes);
+                            self.charge.resize(
+                                base_outer.saturating_add(iter_b).saturating_add(next_oh),
+                            )?;
+                            outer_hits.extend(buf);
+                        }
                         if outer_hits.is_empty() && outer_iter.is_none() {
                             self.mode = JoinMode::Done;
                             continue;
                         }
                     }
-                    let mut outer_row = vec![Id::UNDEF; outer_ix.cols.len()];
-                    while self.pending_out.len() < cap {
+                    while self.pending_out.len() < cap && active_probe.is_none() {
                         let Some(h) = outer_hits.pop_front() else {
                             break;
                         };
@@ -2984,24 +4402,16 @@ impl SpatialJoinEngine {
                         let Some(b) = item_box(&g) else {
                             continue;
                         };
+                        let mut outer_row = vec![Id::UNDEF; outer_ix.cols.len()];
                         outer_ix.hit_row(&h, &mut outer_row);
-                        let mut sink = ProbeSink {
-                            ctx,
-                            exact: &self.exact,
-                            st: &mut self.st,
-                            npairs: &mut self.npairs,
-                            map,
-                            vars_len,
-                            pending_out: &mut self.pending_out,
-                        };
-                        Self::probe_item_against_side(
-                            &mut sink,
+                        *active_probe = Some(Box::new(SideProbeState::open(
                             inner,
-                            &g,
+                            &self.exact.test,
+                            g,
                             b,
-                            &outer_row,
+                            outer_row,
                             *outer_is_left,
-                        )?;
+                        )));
                     }
                     self.update_charge()?;
                 }
@@ -3017,6 +4427,7 @@ impl SpatialJoinEngine {
                     child_done,
                 } => {
                     if let (Some(b), Some(act)) = (batch.as_ref(), active.as_deref_mut()) {
+                        let other_bytes = b.retained_bytes();
                         let mut sink = ProbeSink {
                             ctx,
                             exact: &self.exact,
@@ -3025,6 +4436,8 @@ impl SpatialJoinEngine {
                             map,
                             vars_len,
                             pending_out: &mut self.pending_out,
+                            charge: &mut self.charge,
+                            other_bytes,
                         };
                         let done =
                             Self::step_active_probe(&mut sink, b, ix, *plan_is_left, act, cap)?;
@@ -3036,6 +4449,7 @@ impl SpatialJoinEngine {
                     }
                     if let Some(b) = batch.as_ref() {
                         let mut opened = false;
+                        let base_open = pending_bytes.saturating_add(b.retained_bytes());
                         while *next_item < b.items.len() {
                             let idx = *next_item;
                             *next_item += 1;
@@ -3043,19 +4457,21 @@ impl SpatialJoinEngine {
                                 continue;
                             }
                             let ws = join_windows(&self.exact.test, b.items[idx].bbox84);
+                            let charge = &mut self.charge;
                             let iter = WindowIter::open(
                                 ctx,
                                 vec![ix.pred],
                                 ws,
                                 ix.graph.clone(),
                                 ix.scan.dedup,
-                                &mut |_| Ok(()),
+                                &mut |bytes| charge.resize(base_open.saturating_add(bytes)),
                             )?;
                             *active = Some(Box::new(ActiveProbe {
                                 item_idx: idx,
                                 iter,
                                 hits: VecDeque::new(),
                                 lit_pass: FxHashMap::default(),
+                                pending_match: None,
                             }));
                             opened = true;
                             break;
@@ -3074,7 +4490,10 @@ impl SpatialJoinEngine {
                     match pull_child(*child_idx)? {
                         Some(t) => {
                             let mut side = JoinSideData::new(t.vars.clone());
-                            side.add_table_batch(ctx, &t, *geom_var)?;
+                            let charge = &mut self.charge;
+                            side.add_table_batch_charged(ctx, &t, *geom_var, &mut |b| {
+                                charge.resize(pending_bytes.saturating_add(b))
+                            })?;
                             if !side.items.is_empty() {
                                 *batch = Some(side);
                                 *next_item = 0;
@@ -3094,8 +4513,30 @@ impl SpatialJoinEngine {
                     inner,
                     map,
                     batch,
+                    active_probe,
                     child_done,
                 } => {
+                    if let Some(probe) = active_probe.as_deref_mut() {
+                        let other_bytes = inner.retained_bytes().saturating_add(
+                            batch.as_ref().map_or(0, |(t, _)| table_capacity_bytes(t)),
+                        );
+                        let mut sink = ProbeSink {
+                            ctx,
+                            exact: &self.exact,
+                            st: &mut self.st,
+                            npairs: &mut self.npairs,
+                            map,
+                            vars_len,
+                            pending_out: &mut self.pending_out,
+                            charge: &mut self.charge,
+                            other_bytes,
+                        };
+                        if Self::step_side_probe(&mut sink, inner, probe, cap)? {
+                            *active_probe = None;
+                        }
+                        self.update_charge()?;
+                        continue;
+                    }
                     if batch.is_none() {
                         if *child_done {
                             self.mode = JoinMode::Done;
@@ -3115,8 +4556,7 @@ impl SpatialJoinEngine {
                         *batch = None;
                         continue;
                     };
-                    let mut probe_row = vec![Id::UNDEF; t.width()];
-                    while *at < t.len() && self.pending_out.len() < cap {
+                    while *at < t.len() && self.pending_out.len() < cap && active_probe.is_none() {
                         let i = *at;
                         *at += 1;
                         let id = t.cols[gcol][i];
@@ -3129,28 +4569,20 @@ impl SpatialJoinEngine {
                         let Some(b) = item_box(&g) else {
                             continue;
                         };
+                        let mut probe_row = vec![Id::UNDEF; t.width()];
                         for (c, dst) in probe_row.iter_mut().enumerate() {
                             *dst = t.cols[c][i];
                         }
-                        let mut sink = ProbeSink {
-                            ctx,
-                            exact: &self.exact,
-                            st: &mut self.st,
-                            npairs: &mut self.npairs,
-                            map,
-                            vars_len,
-                            pending_out: &mut self.pending_out,
-                        };
-                        Self::probe_item_against_side(
-                            &mut sink,
+                        *active_probe = Some(Box::new(SideProbeState::open(
                             inner,
-                            &g,
+                            &self.exact.test,
+                            g,
                             b,
-                            &probe_row,
+                            probe_row,
                             *plan_is_left,
-                        )?;
+                        )));
                     }
-                    if *at >= t.len() {
+                    if *at >= t.len() && active_probe.is_none() {
                         *batch = None;
                     }
                     self.update_charge()?;
@@ -3162,12 +4594,33 @@ impl SpatialJoinEngine {
                     build,
                     map,
                     batch,
+                    active_probe,
                     probe_done,
-                    ..
                 } => {
                     if build.items.is_empty() {
                         // Drain/skip handled cleanly: no build geometries means no matches.
                         self.mode = JoinMode::Done;
+                        continue;
+                    }
+                    if let Some(probe) = active_probe.as_deref_mut() {
+                        let other_bytes = build.retained_bytes().saturating_add(
+                            batch.as_ref().map_or(0, |(t, _)| table_capacity_bytes(t)),
+                        );
+                        let mut sink = ProbeSink {
+                            ctx,
+                            exact: &self.exact,
+                            st: &mut self.st,
+                            npairs: &mut self.npairs,
+                            map,
+                            vars_len,
+                            pending_out: &mut self.pending_out,
+                            charge: &mut self.charge,
+                            other_bytes,
+                        };
+                        if Self::step_side_probe(&mut sink, build, probe, cap)? {
+                            *active_probe = None;
+                        }
+                        self.update_charge()?;
                         continue;
                     }
                     if batch.is_none() {
@@ -3189,8 +4642,7 @@ impl SpatialJoinEngine {
                         *batch = None;
                         continue;
                     };
-                    let mut probe_row = vec![Id::UNDEF; t.width()];
-                    while *at < t.len() && self.pending_out.len() < cap {
+                    while *at < t.len() && self.pending_out.len() < cap && active_probe.is_none() {
                         let i = *at;
                         *at += 1;
                         let id = t.cols[gcol][i];
@@ -3203,28 +4655,20 @@ impl SpatialJoinEngine {
                         let Some(b) = item_box(&g) else {
                             continue;
                         };
+                        let mut probe_row = vec![Id::UNDEF; t.width()];
                         for (c, dst) in probe_row.iter_mut().enumerate() {
                             *dst = t.cols[c][i];
                         }
-                        let mut sink = ProbeSink {
-                            ctx,
-                            exact: &self.exact,
-                            st: &mut self.st,
-                            npairs: &mut self.npairs,
-                            map,
-                            vars_len,
-                            pending_out: &mut self.pending_out,
-                        };
-                        Self::probe_item_against_side(
-                            &mut sink,
+                        *active_probe = Some(Box::new(SideProbeState::open(
                             build,
-                            &g,
+                            &self.exact.test,
+                            g,
                             b,
-                            &probe_row,
+                            probe_row,
                             !*build_is_left,
-                        )?;
+                        )));
                     }
-                    if *at >= t.len() {
+                    if *at >= t.len() && active_probe.is_none() {
                         *batch = None;
                     }
                     self.update_charge()?;

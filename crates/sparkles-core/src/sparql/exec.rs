@@ -3834,6 +3834,7 @@ fn topk_rest_morsels(
     // the one before the gap, so each morsel but a piece's last ends just before the next
     // one's first block, and a piece with no base block is one morsel.
     let mut morsels: Vec<Morsel> = Vec::new();
+    let mut morsel_list = ctx.retained_charge(0)?;
     for (piece, p) in pieces.iter().enumerate() {
         let (lo, hi) = (bound(p.lo, 0), bound(p.hi, u64::MAX));
         let (b0, b1) = perm.key_block_range(&lo, &hi);
@@ -3864,6 +3865,12 @@ fn topk_rest_morsels(
                 }
                 next.min(hi)
             };
+            if morsels.len() == morsels.capacity() {
+                let next_cap = morsels.capacity().saturating_mul(2).max(8);
+                if let Some(h) = &mut morsel_list {
+                    h.resize((next_cap * std::mem::size_of::<Morsel>()) as u64)?;
+                }
+            }
             morsels.push(Morsel {
                 first,
                 last,
@@ -3878,7 +3885,9 @@ fn topk_rest_morsels(
         }
     }
     ctx.check()?;
-    let _list = ctx.charge((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
+    if let Some(h) = &mut morsel_list {
+        h.resize((morsels.capacity() * std::mem::size_of::<Morsel>()) as u64)?;
+    }
     let mut heap: TopK<u32> = TopK::new(spec.k, vec![spec.asc]);
     let mut slots = RestSlots {
         width: vars.len(),
@@ -3949,7 +3958,14 @@ fn topk_rest_morsels(
     let width = slots.width;
     let entries = heap.into_sorted();
     ctx.check_output(entries.len(), width)?;
+    let out_bytes = (entries.len() as u64)
+        .saturating_mul(width as u64 * 8)
+        .saturating_add(vars.len() as u64 * 4);
+    let _rest_charge = ctx.charge(out_bytes)?;
     let mut rest = Table::new(vars.to_vec());
+    for col in &mut rest.cols {
+        col.reserve_exact(entries.len());
+    }
     for (j, col) in rest.cols.iter_mut().enumerate() {
         col.extend(
             entries
@@ -4029,13 +4045,14 @@ pub(super) fn ordered_topk(
 }
 
 /// [`ordered_topk`] using morsel-wise heap selection for non-monotone pieces regardless
-/// of `ctx.opt.topk_heap`, so a cursor never materializes those pieces whole.
-pub(super) fn ordered_topk_morsels(
-    ctx: &Ctx,
+/// of `ctx.opt.topk_heap`, transferring the projected result directly into a pre-admitted
+/// cursor [`OwnedCharge`](super::ctx::OwnedCharge) before releasing working charges.
+pub(super) fn ordered_topk_morsels_charged(
+    ctx: &std::sync::Arc<Ctx>,
     spec: &OrderedTopK,
     out: &[VarId],
-) -> Result<Option<(Table, usize)>> {
-    ordered_topk_inner(ctx, spec, out, true)
+) -> Result<Option<(Table, super::ctx::OwnedCharge, usize)>> {
+    ordered_topk_inner_charged(ctx, spec, out, true)
 }
 
 fn ordered_topk_inner(
@@ -4044,6 +4061,72 @@ fn ordered_topk_inner(
     out: &[VarId],
     morsels: bool,
 ) -> Result<Option<(Table, usize)>> {
+    let mut table_out = None;
+    let scanned = ordered_topk_run(ctx, spec, out, morsels, &mut |top| {
+        table_out = Some(top.project(out));
+        Ok(())
+    })?;
+    Ok(table_out.map(|t| (t, scanned)))
+}
+
+fn ordered_topk_inner_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &OrderedTopK,
+    out: &[VarId],
+    morsels: bool,
+) -> Result<Option<(Table, super::ctx::OwnedCharge, usize)>> {
+    let mut result: Option<(Table, super::ctx::OwnedCharge)> = None;
+    let scanned = ordered_topk_run(ctx, spec, out, morsels, &mut |top| {
+        let len = top.len();
+        let width = out.len();
+        let est = (len as u64)
+            .saturating_mul(width as u64 * 8)
+            .max(len as u64 * 8 * u64::from(width == 0))
+            .saturating_add(width as u64 * 4);
+        let mut charge = super::ctx::OwnedCharge::new(ctx, est)?;
+        let mut projected = Table::new(out.to_vec());
+        for col in &mut projected.cols {
+            col.reserve_exact(len);
+        }
+        let col_map: Vec<Option<usize>> = out.iter().map(|v| top.col_of(*v)).collect();
+        for (dst, src) in projected.cols.iter_mut().zip(&col_map) {
+            match src {
+                Some(c) => dst.extend_from_slice(&top.cols[*c]),
+                None => dst.resize(len, Id::UNDEF),
+            }
+        }
+        projected.len = len;
+        let actual: u64 = projected
+            .cols
+            .iter()
+            .map(|c| c.capacity() as u64 * 8)
+            .sum::<u64>()
+            .max(projected.len as u64 * 8 * u64::from(projected.width() == 0))
+            .saturating_add(projected.vars.capacity() as u64 * 4)
+            .saturating_add(projected.sorted.capacity() as u64 * 4);
+        charge.resize(actual)?;
+        result = Some((projected, charge));
+        Ok(())
+    })?;
+    Ok(result.map(|(t, c)| (t, c, scanned)))
+}
+
+fn ordered_topk_run(
+    ctx: &Ctx,
+    spec: &OrderedTopK,
+    _out: &[VarId],
+    morsels: bool,
+    finish: &mut dyn FnMut(Table) -> Result<()>,
+) -> Result<usize> {
+    let table_cap_bytes = |t: &Table| -> u64 {
+        t.cols
+            .iter()
+            .map(|c| c.capacity() as u64 * 8)
+            .sum::<u64>()
+            .max(t.len as u64 * 8 * u64::from(t.width() == 0))
+            .saturating_add(t.vars.capacity() as u64 * 4)
+            .saturating_add(t.sorted.capacity() as u64 * 4)
+    };
     let vars: Vec<VarId> = spec.scan.cols.iter().map(|c| c.1).collect();
     debug_assert_eq!(vars.first(), Some(&spec.var));
     let mut scanned = 0;
@@ -4073,10 +4156,10 @@ fn ordered_topk_inner(
         topk_rest(ctx, spec, &vars, &whole, &mut scanned)?
     };
     let Some(rest) = rest else {
-        return Ok(None);
+        return Ok(scanned);
     };
     let keys = [(Expr::Var(spec.var), spec.asc)];
-    let held = ctx.charge(rest.mem_bytes())?;
+    let mut held = ctx.retained_charge(table_cap_bytes(&rest))?;
     let better = if spec.asc {
         Ordering::Less
     } else {
@@ -4090,12 +4173,34 @@ fn ordered_topk_inner(
             }
             scanned += topk_step(ctx, spec, run, &vars)?;
         }
+        let retained_runs: u64 = table_cap_bytes(&rest).saturating_add(
+            runs.iter()
+                .map(|r| table_cap_bytes(&r.kept))
+                .fold(0u64, u64::saturating_add),
+        );
+        if let Some(h) = &mut held {
+            h.resize(retained_runs)?;
+        }
         // the candidates in the generic plan's row order, ranked by the generic ORDER BY
         let n = rest.len() + runs.iter().map(|r| r.kept.len()).sum::<usize>();
         ctx.check_output(n, vars.len())?;
-        let mut cand = rest.clone();
+        let cand_est = (n as u64)
+            .saturating_mul(vars.len() as u64 * 8)
+            .saturating_add(vars.len() as u64 * 4);
+        let _cand_charge = ctx.charge(cand_est)?;
+        let mut cand = Table::new(vars.clone());
+        for col in &mut cand.cols {
+            col.reserve_exact(n);
+        }
+        for (dst, src) in cand.cols.iter_mut().zip(&rest.cols) {
+            dst.extend_from_slice(src);
+        }
+        cand.len = rest.len();
         for run in &runs {
-            cand.append(run.kept.clone());
+            for (dst, src) in cand.cols.iter_mut().zip(&run.kept.cols) {
+                dst.extend_from_slice(src);
+            }
+            cand.len += run.kept.len();
         }
         cand.sorted.clear();
         cand.sort_by_vars(&spec.tie_order);
@@ -4118,7 +4223,7 @@ fn ordered_topk_inner(
                             }
                             run.hold = true;
                         }
-                        Lexical::Generic => return Ok(None),
+                        Lexical::Generic => return Ok(scanned),
                     }
                     continue;
                 }
@@ -4129,8 +4234,10 @@ fn ordered_topk_inner(
             }
         }
         if runs.iter().all(|r| r.done) {
+            finish(top)?;
+            drop(_cand_charge);
             drop(held);
-            return Ok(Some((top.project(out), scanned)));
+            return Ok(scanned);
         }
     }
 }
@@ -8991,7 +9098,13 @@ pub(super) fn vector_search(
             subjects: subjects.as_deref(),
             mode: spec.mode,
         };
-        let (hits, info) = vector::search(&ctx.snap, &q, &|| ctx.check())?;
+        let mut search_charge = ctx.retained_charge(0)?;
+        let (hits, info) = vector::search_with_admit(&ctx.snap, &q, &|| ctx.check(), &mut |b| {
+            if let Some(h) = &mut search_charge {
+                h.resize(b)?;
+            }
+            Ok(())
+        })?;
         searches += 1;
         match &mut info_all {
             None => info_all = Some(info),
@@ -9078,6 +9191,137 @@ pub(super) fn vector_search(
         counters.insert("searches".into(), searches.into());
     }
     Ok((t, counters))
+}
+
+pub(super) type ChargedVectorOrder = (Table, super::ctx::OwnedCharge, Counters);
+
+/// Cursor entry for [`Kind::VectorSearch`] with `order_fallback`: pre-admits search
+/// scratch and builds the projected output table directly under an [`OwnedCharge`]
+/// before returning so the caller never holds an uncharged table or marks the generic
+/// child skipped before admission succeeds.
+pub(super) fn vector_search_order_charged(
+    ctx: &std::sync::Arc<Ctx>,
+    spec: &super::plan::VectorSpec,
+    node_vars: &[VarId],
+    out_vars: &[VarId],
+) -> Result<Option<ChargedVectorOrder>> {
+    use super::plan::VectorQuery;
+    use crate::vector;
+    let mut counters = serde_json::Map::new();
+    let Some(pred) = spec.pred else {
+        return Ok(None);
+    };
+    let query = match &spec.query {
+        VectorQuery::Vector(v) => v.to_vec(),
+        VectorQuery::Text(s) => text_vector(ctx, pred, s)?.to_vec(),
+        VectorQuery::Entity(e) => match entity_vector(ctx, spec, pred, *e)? {
+            Some(v) => v,
+            None => return Ok(None),
+        },
+        VectorQuery::Var(_) => {
+            return Err(Error::invalid(
+                "spk:vectorSearch: the query variable is not bound by the rest of the group",
+            ));
+        }
+    };
+    let graph = |g: u64| spec.graph.accepts(g);
+    let q = vector::Search {
+        pred: pred.0,
+        query: &query,
+        k: spec.k,
+        metric: spec.metric,
+        graph: &graph,
+        dedup: spec.dedup,
+        distinct_subject: spec.distinct_subject,
+        subjects: None,
+        mode: spec.mode,
+    };
+    let mut scratch = super::ctx::OwnedCharge::new(ctx, 0)?;
+    let (hits, info) =
+        vector::search_with_admit(&ctx.snap, &q, &|| ctx.check(), &mut |b| scratch.resize(b))?;
+    let col = |v: Option<VarId>| v.and_then(|v| node_vars.iter().position(|x| *x == v));
+    let cs = match spec.subject {
+        PathEnd::Var(v) => col(Some(v)),
+        _ => None,
+    };
+    let (cscore, cvec, cg) = (col(spec.score), col(spec.vector), col(spec.graph_var));
+    let est = (hits.len() as u64)
+        .saturating_mul(node_vars.len() as u64 * 8)
+        .max(hits.len() as u64 * 8 * u64::from(node_vars.is_empty()))
+        .saturating_add(node_vars.len() as u64 * 4);
+    ctx.check_output(hits.len(), node_vars.len())?;
+    let mut out_charge = super::ctx::OwnedCharge::new(ctx, est)?;
+    let mut t = Table::new(node_vars.to_vec());
+    for col in &mut t.cols {
+        col.reserve_exact(hits.len());
+    }
+    let mut row = vec![Id::UNDEF; node_vars.len()];
+    let fill = |row: &mut Vec<Id>, h: &vector::Hit| -> bool {
+        let mut set = |c: Option<usize>, id: Id| -> bool {
+            match c {
+                Some(c) if row[c] != Id::UNDEF && row[c] != id => false,
+                Some(c) => {
+                    row[c] = id;
+                    true
+                }
+                None => true,
+            }
+        };
+        let score = Id::from_f64(h.score as f64)
+            .unwrap_or_else(|| ctx.intern_value(&Value::Double((h.score as f64).into())));
+        set(cs, Id(h.s)) && set(cscore, score) && set(cvec, Id(h.o)) && set(cg, Id(h.g))
+    };
+    for h in &hits {
+        if let PathEnd::Const(s) = spec.subject
+            && s.0 != h.s
+        {
+            continue;
+        }
+        row.fill(Id::UNDEF);
+        if fill(&mut row, h) {
+            t.push_row(&row);
+        }
+    }
+    drop(hits);
+    drop(scratch);
+    if t.len() < spec.k {
+        return Ok(None);
+    }
+    let t = if node_vars == out_vars {
+        t
+    } else {
+        let proj_est = (t.len() as u64)
+            .saturating_mul(out_vars.len() as u64 * 8)
+            .max(t.len() as u64 * 8 * u64::from(out_vars.is_empty()))
+            .saturating_add(out_vars.len() as u64 * 4);
+        out_charge.resize(est.saturating_add(proj_est))?;
+        t.project(out_vars)
+    };
+    let actual: u64 = t
+        .cols
+        .iter()
+        .map(|c| c.capacity() as u64 * 8)
+        .sum::<u64>()
+        .max(t.len as u64 * 8 * u64::from(t.width() == 0))
+        .saturating_add(t.vars.capacity() as u64 * 4)
+        .saturating_add(t.sorted.capacity() as u64 * 4);
+    out_charge.resize(actual)?;
+    counters.insert("method".into(), info.method.into());
+    if let Some(r) = info.reason {
+        counters.insert("exactBecause".into(), r.into());
+    }
+    if let Some(n) = info.index {
+        counters.insert("index".into(), n.into());
+    }
+    if info.ef > 0 {
+        counters.insert("ef".into(), info.ef.into());
+    }
+    counters.insert("rows".into(), info.rows.into());
+    counters.insert("scored".into(), info.scored.into());
+    counters.insert("overlayInserts".into(), info.inserted.into());
+    counters.insert("overlayPending".into(), info.pending.into());
+    counters.insert("overlayDeletes".into(), info.deleted.into());
+    Ok(Some((t, out_charge, counters)))
 }
 
 // ---------------------------------------------------------------- service ------

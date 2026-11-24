@@ -344,11 +344,6 @@ fn allowance(name: &str) -> Allowance {
             under: 52 * K,
             ..exact
         },
-        // item 1189: a path search under a cursor holds its search outside its ledger
-        "path search" => Allowance {
-            under: 360 * K,
-            ..exact
-        },
         // items 1190 and 1192: the streamed change-log reader stays within its ledger
         // except for small uncharged scratch, and overcharges per-change quad_bytes
         // that count term Arcs shared with the record (bounded per page)

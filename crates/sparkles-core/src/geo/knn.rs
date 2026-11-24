@@ -265,6 +265,30 @@ pub(crate) fn rows_without_distance(
     spec: &SpatialKnnSpec,
     subj: Option<Id>,
 ) -> Result<(Vec<[Id; 3]>, FxHashSet<Id>)> {
+    let mut held = ctx.retained_charge(0)?;
+    rows_without_distance_charged(ctx, spec, subj, &mut |bytes| {
+        if let Some(h) = &mut held {
+            h.resize(bytes)?;
+        }
+        Ok(())
+    })
+}
+
+/// [`rows_without_distance`] with pre-admission of `memo`, `rechecked`, output rows, and
+/// the returned exclusion set before capacity growth.
+pub(crate) fn rows_without_distance_charged(
+    ctx: &Ctx,
+    spec: &SpatialKnnSpec,
+    subj: Option<Id>,
+    admit: &mut dyn FnMut(u64) -> Result<()>,
+) -> Result<(Vec<[Id; 3]>, FxHashSet<Id>)> {
+    fn next_cap(len: usize, cap: usize, extra: usize) -> usize {
+        if len.saturating_add(extra) <= cap {
+            cap
+        } else {
+            cap.saturating_mul(2).max(len.saturating_add(extra)).max(8)
+        }
+    }
     let snap = &*ctx.snap;
     let base = snap.geo.as_deref().and_then(|v| v.base.clone());
     let cfg = config(ctx);
@@ -282,9 +306,16 @@ pub(crate) fn rows_without_distance(
     // literal → whether its distance is an error
     let mut memo: FxHashMap<u64, bool> = FxHashMap::default();
     let mut out = Vec::new();
+    let mut bad_lits = 0usize;
     let mut last: Option<[u64; 3]> = None;
     let mut n = 0usize;
     let mut err = None;
+    let bytes_for = |out_cap: usize, memo_cap: usize, re_bytes: u64, taken_cap: usize| -> u64 {
+        (out_cap as u64 * size_of::<[Id; 3]>() as u64)
+            .saturating_add(memo_cap as u64 * (size_of::<u64>() + size_of::<bool>() + 1) as u64)
+            .saturating_add(re_bytes)
+            .saturating_add(taken_cap as u64 * (size_of::<Id>() + 1) as u64)
+    };
     let mut row = |k: [u64; 4]| -> Result<()> {
         n += 1;
         if n.is_multiple_of(4096) {
@@ -310,25 +341,59 @@ pub(crate) fn rows_without_distance(
         if subj.is_some_and(|x| x != s) {
             return Ok(());
         }
-        let bad = *memo.entry(o.0).or_insert_with(|| {
-            if !matches!(o.tag(), Tag::Vocab | Tag::Delta) {
-                return true;
+        let bad = if let Some(&v) = memo.get(&o.0) {
+            v
+        } else {
+            if memo.len() == memo.capacity() {
+                admit(bytes_for(
+                    out.capacity(),
+                    next_cap(memo.len(), memo.capacity(), 1),
+                    rechecked.retained_bytes(),
+                    0,
+                ))?;
             }
-            let slot = base
-                .as_ref()
-                .and_then(|b| b.column.get(o.0))
-                .unwrap_or_else(|| match snap.key(o) {
-                    Some(key) => classify(&key, &cfg),
-                    None => Slot::Other,
-                });
-            let geom = match slot {
-                Slot::Geom(e) => e.geom(snap).ok(),
-                s if s.rechecked() => rechecked.entry(o.0).and_then(|e| e.geom(snap).ok()),
-                _ => None,
+            let v = if !matches!(o.tag(), Tag::Vocab | Tag::Delta) {
+                true
+            } else {
+                let slot = base
+                    .as_ref()
+                    .and_then(|b| b.column.get(o.0))
+                    .unwrap_or_else(|| match snap.key(o) {
+                        Some(key) => classify(&key, &cfg),
+                        None => Slot::Other,
+                    });
+                let geom = match slot {
+                    Slot::Geom(e) => e.geom(snap).ok(),
+                    s if s.rechecked() => {
+                        if rechecked.needs_growth(o.0) {
+                            admit(bytes_for(
+                                out.capacity(),
+                                memo.capacity(),
+                                rechecked.projected_bytes_after_insert(),
+                                0,
+                            ))?;
+                        }
+                        rechecked.entry(o.0).and_then(|e| e.geom(snap).ok())
+                    }
+                    _ => None,
+                };
+                geom.is_none_or(|g| !test.measurable(&g))
             };
-            geom.is_none_or(|g| !test.measurable(&g))
-        });
+            memo.insert(o.0, v);
+            if v {
+                bad_lits += 1;
+            }
+            v
+        };
         if bad {
+            if out.len() == out.capacity() {
+                admit(bytes_for(
+                    next_cap(out.len(), out.capacity(), 1),
+                    memo.capacity(),
+                    rechecked.retained_bytes(),
+                    0,
+                ))?;
+            }
             out.push([s, o, g.unwrap_or(Id::DEFAULT_GRAPH)]);
         }
         Ok(())
@@ -346,16 +411,30 @@ pub(crate) fn rows_without_distance(
             }
         }
     })?;
-    match err {
-        Some(e) => Err(e),
-        None => Ok((
-            out,
-            memo.into_iter()
-                .filter(|(_, bad)| *bad)
-                .map(|(o, _)| Id(o))
-                .collect(),
-        )),
+    if let Some(e) = err {
+        return Err(e);
     }
+    let taken_cap = if bad_lits == 0 {
+        0
+    } else {
+        bad_lits.next_power_of_two().max(8)
+    };
+    admit(bytes_for(
+        out.capacity(),
+        memo.capacity(),
+        rechecked.retained_bytes(),
+        taken_cap,
+    ))?;
+    let mut taken: FxHashSet<Id> = FxHashSet::default();
+    if bad_lits > 0 {
+        taken.reserve(bad_lits);
+        for (o, bad) in memo {
+            if bad {
+                taken.insert(Id(o));
+            }
+        }
+    }
+    Ok((out, taken))
 }
 
 /// Whether the distance between a geometry and the constant can be computed, as the

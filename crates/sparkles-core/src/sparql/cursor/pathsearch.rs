@@ -66,8 +66,34 @@ impl PathSearch {
             return Ok(None);
         };
         let want = cap.max(1);
+        let width = self.node.vars.len();
         let mut b = Buffer::new(ctx, &self.node.vars, want.min(64))?;
-        let ended = reader.next(ctx, &mut b.table, want)?;
+        let mut ended = false;
+        while b.table.len < want {
+            let target = if b.table.len == 0 {
+                want.min(64)
+            } else {
+                b.table.len.saturating_mul(2).min(want)
+            };
+            if target > b.table.cols.first().map_or(target, Vec::capacity) {
+                let new_bytes = (target as u64)
+                    .saturating_mul(width as u64 * 8)
+                    .max(target as u64 * 8 * u64::from(width == 0))
+                    .saturating_add(width as u64 * 4);
+                b.charge
+                    .resize(b.charge.bytes().saturating_add(new_bytes))?;
+                for col in &mut b.table.cols {
+                    if col.capacity() < target {
+                        col.reserve_exact(target - col.len());
+                    }
+                }
+                b.reconcile()?;
+            }
+            ended = reader.next(ctx, &mut b.table, target)?;
+            if ended {
+                break;
+            }
+        }
         self.counters = Some(reader.counters().clone());
         if ended {
             self.reader = None;

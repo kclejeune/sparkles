@@ -3630,7 +3630,29 @@ struct AllPathsState {
     skipped_hubs: u64,
     paths_found: u64,
     steps: u64,
+    poll_ticks: u64,
     done: bool,
+}
+
+#[inline]
+fn next_cap(len: usize, cap: usize, extra: usize) -> usize {
+    if len.saturating_add(extra) <= cap {
+        cap
+    } else {
+        cap.saturating_mul(2).max(len.saturating_add(extra)).max(8)
+    }
+}
+
+/// Physical bytes allocated by a hashbrown `FxHashMap`/`FxHashSet` at `cap`.
+#[inline]
+fn table_bytes(cap: usize, entry_size: usize) -> u64 {
+    if cap == 0 {
+        return 0;
+    }
+    let buckets = (cap.saturating_mul(8) / 7).next_power_of_two().max(4) as u64;
+    buckets
+        .saturating_mul(entry_size as u64 + 1)
+        .saturating_add(16)
 }
 
 impl AllPathsState {
@@ -3727,6 +3749,7 @@ impl AllPathsState {
             skipped_hubs: 0,
             paths_found: 0,
             steps: 0,
+            poll_ticks: 0,
             done: false,
         };
         if max_len == 0 {
@@ -3735,33 +3758,84 @@ impl AllPathsState {
         }
         if let Some(t) = target {
             let mut d: FxHashMap<u64, u32> = FxHashMap::default();
+            let d_entry_bytes = (size_of::<u64>() + size_of::<u32>() + 1) as u64;
+            let step_bytes = size_of::<(u64, Step)>() as u64;
+            charge.resize(
+                st.retained_bytes()
+                    .saturating_add(8 * d_entry_bytes)
+                    .saturating_add(8),
+            )?;
             d.insert(t, 0);
             let mut frontier = vec![t];
             st.set_roots(spec, &frontier);
             let mut level = 0;
             while !frontier.is_empty() && level < max_len {
+                let d_bytes = d.capacity() as u64 * d_entry_bytes;
+                let frontier_bytes = frontier.capacity() as u64 * size_of::<u64>() as u64;
+                let base_bfs = d_bytes.saturating_add(frontier_bytes);
                 let mut found = Vec::new();
-                st.expand(ctx, spec, &frontier, !forward, &mut found, charge)?;
+                st.expand(ctx, spec, &frontier, !forward, &mut found, charge, base_bfs)?;
                 level += 1;
+                let found_bytes = found.capacity() as u64 * step_bytes;
                 let mut next = Vec::new();
-                for (_, step) in found {
-                    if let std::collections::hash_map::Entry::Vacant(v) = d.entry(step.node) {
-                        v.insert(level);
+                let mut added_nodes = 0u64;
+                for (edge_idx, (_, step)) in found.into_iter().enumerate() {
+                    if edge_idx.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
+                    if !d.contains_key(&step.node) {
+                        let next_d_cap = if d.len() == d.capacity() {
+                            next_cap(d.len(), d.capacity(), 1)
+                        } else {
+                            d.capacity()
+                        };
+                        let next_vec_cap = if next.len() == next.capacity() {
+                            next_cap(next.len(), next.capacity(), 1)
+                        } else {
+                            next.capacity()
+                        };
+                        if next_d_cap != d.capacity() || next_vec_cap != next.capacity() {
+                            let projected = st
+                                .retained_bytes()
+                                .saturating_add(found_bytes)
+                                .saturating_add(frontier_bytes)
+                                .saturating_add(next_d_cap as u64 * d_entry_bytes)
+                                .saturating_add(next_vec_cap as u64 * size_of::<u64>() as u64);
+                            charge.resize(projected)?;
+                        }
+                        d.insert(step.node, level);
                         next.push(step.node);
+                        added_nodes += 1;
+                        if added_nodes.is_multiple_of(1024) {
+                            st.visit(spec, 1024)?;
+                        }
                     }
                 }
-                st.visit(spec, next.len() as u64)?;
+                let rem = added_nodes % 1024;
+                if rem > 0 {
+                    st.visit(spec, rem)?;
+                }
                 next.sort_unstable();
                 frontier = next;
-                let extra = d.capacity() as u64 * 16 + frontier.capacity() as u64 * 8;
+                let extra = d.capacity() as u64 * d_entry_bytes
+                    + frontier.capacity() as u64 * size_of::<u64>() as u64;
                 charge.resize(st.retained_bytes().saturating_add(extra))?;
             }
             st.dist = Some(d);
             charge.resize(st.retained_bytes())?;
         }
         st.set_roots(spec, &[root]);
+        let on_path_add = next_cap(st.on_path.len(), st.on_path.capacity(), 1) as u64
+            * (size_of::<u64>() + 1) as u64;
+        charge.resize(st.retained_bytes().saturating_add(on_path_add))?;
         st.on_path.insert(root);
-        let root_ns = st.neighbours(ctx, spec, root, forward, charge)?;
+        let root_ns = st.neighbours(ctx, spec, root, forward, charge, 0)?;
+        if st.stack.len() == st.stack.capacity() {
+            let add = (next_cap(st.stack.len(), st.stack.capacity(), 1) - st.stack.capacity())
+                as u64
+                * size_of::<(u64, std::sync::Arc<[Step]>, usize)>() as u64;
+            charge.resize(st.retained_bytes().saturating_add(add))?;
+        }
         st.stack.push((root, root_ns, 0));
         charge.resize(st.retained_bytes())?;
         Ok(st)
@@ -3769,19 +3843,21 @@ impl AllPathsState {
 
     fn retained_bytes(&self) -> u64 {
         let dist = self.dist.as_ref().map_or(0, |d| {
-            d.capacity() as u64 * (size_of::<u64>() + size_of::<u32>() + 1) as u64
+            table_bytes(d.capacity(), size_of::<u64>() + size_of::<u32>())
         });
-        let cache = self.cache_step_bytes.saturating_add(
-            self.cache.capacity() as u64
-                * (size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>() + 1) as u64,
-        );
+        let cache = self.cache_step_bytes.saturating_add(table_bytes(
+            self.cache.capacity(),
+            size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>(),
+        ));
         let stack =
             self.stack.capacity() as u64 * size_of::<(u64, std::sync::Arc<[Step]>, usize)>() as u64;
-        let on_path = self.on_path.capacity() as u64 * (size_of::<u64>() + 1) as u64;
+        let on_path = table_bytes(self.on_path.capacity(), size_of::<u64>());
         let edges = self.edges.capacity() as u64 * size_of::<Edge>() as u64;
-        let hubs = self.hubs.capacity() as u64 * (size_of::<u64>() + 2) as u64;
-        let weights = self.weights.capacity() as u64
-            * (size_of::<(u64, u64, u64)>() + size_of::<f64>() + 1) as u64;
+        let hubs = table_bytes(self.hubs.capacity(), size_of::<u64>() + size_of::<bool>());
+        let weights = table_bytes(
+            self.weights.capacity(),
+            size_of::<(u64, u64, u64)>() + size_of::<f64>(),
+        );
         dist.saturating_add(cache)
             .saturating_add(stack)
             .saturating_add(on_path)
@@ -3809,6 +3885,7 @@ impl AllPathsState {
         spec: &PathSearchSpec,
         x: u64,
         charge: &mut super::ctx::OwnedCharge,
+        extra_bytes: u64,
     ) -> Result<bool> {
         if spec.max_degree.is_none() || self.roots.contains(&x) {
             return Ok(false);
@@ -3820,8 +3897,18 @@ impl AllPathsState {
             return Ok(h);
         }
         let h = self.degree_above(ctx, spec, x, limit)?;
+        if self.hubs.len() == self.hubs.capacity() {
+            let add = (next_cap(self.hubs.len(), self.hubs.capacity(), 1) - self.hubs.capacity())
+                as u64
+                * (size_of::<u64>() + 2) as u64;
+            charge.resize(
+                extra_bytes
+                    .saturating_add(self.retained_bytes())
+                    .saturating_add(add),
+            )?;
+        }
         self.hubs.insert(x, h);
-        charge.resize(self.retained_bytes())?;
+        charge.resize(extra_bytes.saturating_add(self.retained_bytes()))?;
         Ok(h)
     }
 
@@ -3880,7 +3967,17 @@ impl AllPathsState {
         let mut out = Count(0);
         let sides = self.succ.clone();
         for s in &sides {
-            self.scan_lane(ctx, spec, &s.lane, &[x], s.rev, s.skip_self, &mut out, cap)?;
+            self.scan_lane(
+                ctx,
+                spec,
+                &s.lane,
+                &[x],
+                s.rev,
+                s.skip_self,
+                &mut out,
+                cap,
+                &mut |_| Ok(()),
+            )?;
             if out.0 >= cap {
                 return Ok(true);
             }
@@ -3901,6 +3998,7 @@ impl AllPathsState {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand(
         &mut self,
         ctx: &Ctx,
@@ -3909,15 +4007,19 @@ impl AllPathsState {
         succ: bool,
         out: &mut Vec<(u64, Step)>,
         charge: &mut super::ctx::OwnedCharge,
+        extra_bytes: u64,
     ) -> Result<()> {
         if spec.max_degree.is_none() && !self.sinks {
-            return self.expand_all(ctx, spec, frontier, succ, out);
+            return self.expand_all(ctx, spec, frontier, succ, out, charge, extra_bytes);
         }
         let mut kept: Option<Vec<u64>> = None;
         for (i, &x) in frontier.iter().enumerate() {
+            if i.is_multiple_of(4096) {
+                ctx.check()?;
+            }
             let skip = if self.sink(ctx, x, succ) {
                 true
-            } else if self.blocked(ctx, spec, x, charge)? {
+            } else if self.blocked(ctx, spec, x, charge, extra_bytes)? {
                 self.skipped_hubs += 1;
                 true
             } else {
@@ -3930,11 +4032,23 @@ impl AllPathsState {
             }
         }
         match kept {
-            None => self.expand_all(ctx, spec, frontier, succ, out),
-            Some(k) => self.expand_all(ctx, spec, &k, succ, out),
+            None => self.expand_all(ctx, spec, frontier, succ, out, charge, extra_bytes),
+            Some(k) => {
+                let k_bytes = k.capacity() as u64 * size_of::<u64>() as u64;
+                self.expand_all(
+                    ctx,
+                    spec,
+                    &k,
+                    succ,
+                    out,
+                    charge,
+                    extra_bytes.saturating_add(k_bytes),
+                )
+            }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expand_all(
         &mut self,
         ctx: &Ctx,
@@ -3942,6 +4056,8 @@ impl AllPathsState {
         frontier: &[u64],
         succ: bool,
         out: &mut Vec<(u64, Step)>,
+        charge: &mut super::ctx::OwnedCharge,
+        extra_bytes: u64,
     ) -> Result<()> {
         if frontier.is_empty() {
             return Ok(());
@@ -3951,8 +4067,10 @@ impl AllPathsState {
         } else {
             self.pred.clone()
         };
+        let base = extra_bytes.saturating_add(self.retained_bytes());
         for s in &sides {
             let start = out.len();
+            let mut cur_cap = out.capacity();
             self.scan_lane(
                 ctx,
                 spec,
@@ -3962,11 +4080,24 @@ impl AllPathsState {
                 s.skip_self,
                 out,
                 usize::MAX,
+                &mut |new_len| {
+                    if new_len > cur_cap {
+                        let next_c = next_cap(new_len.saturating_sub(1), cur_cap, 1);
+                        charge.resize(
+                            base.saturating_add(next_c as u64 * size_of::<(u64, Step)>() as u64),
+                        )?;
+                        cur_cap = next_c;
+                    }
+                    Ok(())
+                },
             )?;
             if !succ && s.lane.subject_side {
                 let snap = &ctx.snap;
                 let mut w = start;
                 for r in start..out.len() {
+                    if r.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                     if snap.term_kind(Id(out[r].1.node)) != crate::store::TermKind::Literal {
                         out[w] = out[r];
                         w += 1;
@@ -3989,6 +4120,7 @@ impl AllPathsState {
         skip_self: bool,
         out: &mut O,
         cap: usize,
+        admit_len: &mut dyn FnMut(usize) -> Result<()>,
     ) -> Result<()> {
         let snap = &ctx.snap;
         let (kc, nc, pc) = lane.cols();
@@ -4000,18 +4132,20 @@ impl AllPathsState {
         let fixed_p = lane.p.unwrap_or(0);
         let excl: &[u64] = if lane.p.is_none() { &spec.exclude } else { &[] };
         let mut last: Option<(u64, u64, u64)> = None;
-        let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut O| {
+        let mut emit = |x: u64, node: u64, p: u64, g: u64, out: &mut O| -> Result<()> {
             if !graph.accepts(g) || (skip_self && node == x) {
-                return;
+                return Ok(());
             }
             if !excl.is_empty() && excl.binary_search(&p).is_ok() {
-                return;
+                return Ok(());
             }
             if dedup && last == Some((x, node, p)) {
-                return;
+                return Ok(());
             }
             last = Some((x, node, p));
+            admit_len(out.len().saturating_add(1))?;
             out.put(x, Step { node, p, rev });
+            Ok(())
         };
         let rows = match lane.p {
             Some(p) => snap.estimate(lane.perm, &[p]),
@@ -4021,6 +4155,7 @@ impl AllPathsState {
             && frontier.len() >= 64
             && (frontier.len() as u64).saturating_mul(SWEEP_RATIO) >= rows;
         if !sweep {
+            let mut scanned = 0usize;
             for &x in frontier {
                 let mut key = prefix.clone();
                 key.push(x);
@@ -4028,11 +4163,24 @@ impl AllPathsState {
                     match c {
                         Chunk::Block(b, s, e) => {
                             for i in s..e {
+                                scanned += 1;
+                                if scanned.is_multiple_of(4096) {
+                                    ctx.check()?;
+                                }
                                 let p = pc.map_or(fixed_p, |c| b.cols[c][i]);
-                                emit(x, b.cols[nc][i], p, b.cols[gc][i], out);
+                                emit(x, b.cols[nc][i], p, b.cols[gc][i], out)?;
+                                if out.len() >= cap {
+                                    return Ok(false);
+                                }
                             }
                         }
-                        Chunk::Row(k) => emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out),
+                        Chunk::Row(k) => {
+                            scanned += 1;
+                            if scanned.is_multiple_of(4096) {
+                                ctx.check()?;
+                            }
+                            emit(x, k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
+                        }
                     }
                     if O::CHECKS {
                         ctx.check()?;
@@ -4048,12 +4196,18 @@ impl AllPathsState {
         lo.push(first);
         hi.push(last_node);
         let mut j = 0;
+        let mut scanned = 0usize;
         snap.scan_between_cols(lane.perm, pad(&lo, 0), pad(&hi, u64::MAX), mask, |c| {
+            ctx.check()?;
             match c {
                 Chunk::Block(b, s, e) => {
                     let keys = &b.cols[kc][s..e];
                     let mut i = 0;
                     while i < keys.len() && j < frontier.len() {
+                        scanned += 1;
+                        if scanned.is_multiple_of(4096) {
+                            ctx.check()?;
+                        }
                         let (k, f) = (keys[i], frontier[j]);
                         if k < f {
                             i += keys[i..].partition_point(|&x| x < f);
@@ -4063,16 +4217,20 @@ impl AllPathsState {
                             while i < keys.len() && keys[i] == f {
                                 let r = s + i;
                                 let p = pc.map_or(fixed_p, |c| b.cols[c][r]);
-                                emit(f, b.cols[nc][r], p, b.cols[gc][r], out);
+                                emit(f, b.cols[nc][r], p, b.cols[gc][r], out)?;
                                 i += 1;
                             }
                         }
                     }
                 }
                 Chunk::Row(k) => {
+                    scanned += 1;
+                    if scanned.is_multiple_of(4096) {
+                        ctx.check()?;
+                    }
                     j += frontier[j..].partition_point(|&x| x < k[kc]);
                     if j < frontier.len() && frontier[j] == k[kc] {
-                        emit(k[kc], k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out);
+                        emit(k[kc], k[nc], pc.map_or(fixed_p, |c| k[c]), k[gc], out)?;
                     }
                 }
             }
@@ -4088,11 +4246,12 @@ impl AllPathsState {
         x: u64,
         succ: bool,
         charge: &mut super::ctx::OwnedCharge,
+        extra_bytes: u64,
     ) -> Result<std::sync::Arc<[Step]>> {
         if self.sink(ctx, x, succ) {
             return Ok(std::sync::Arc::from(Vec::new()));
         }
-        if self.blocked(ctx, spec, x, charge)? {
+        if self.blocked(ctx, spec, x, charge, extra_bytes)? {
             self.skipped_hubs += 1;
             return Ok(std::sync::Arc::from(Vec::new()));
         }
@@ -4100,24 +4259,30 @@ impl AllPathsState {
             return Ok(n.clone());
         }
         let mut out = Vec::new();
-        self.expand_all(ctx, spec, &[x], succ, &mut out)?;
-        let steps: std::sync::Arc<[Step]> = out.into_iter().map(|(_, s)| s).collect();
-        let added = steps.len() as u64 * size_of::<Step>() as u64 + (2 * size_of::<usize>()) as u64;
+        self.expand_all(ctx, spec, &[x], succ, &mut out, charge, extra_bytes)?;
+        let out_bytes = out.capacity() as u64 * size_of::<(u64, Step)>() as u64;
+        let added = out.len() as u64 * size_of::<Step>() as u64 + (2 * size_of::<usize>()) as u64;
         let next_cache_bytes = self.cache_step_bytes.saturating_add(added);
+        // During HashMap rehash both old and new tables are simultaneously live.
         let growth = if self.cache.len() == self.cache.capacity() {
-            (self.cache.capacity().max(4) * 2) as u64
-                * (size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>() + 1) as u64
+            table_bytes(
+                next_cap(self.cache.len(), self.cache.capacity(), 1),
+                size_of::<(u64, bool)>() + size_of::<std::sync::Arc<[Step]>>(),
+            )
         } else {
             0
         };
         charge.resize(
-            self.retained_bytes()
+            extra_bytes
+                .saturating_add(self.retained_bytes())
+                .saturating_add(out_bytes)
                 .saturating_add(added)
                 .saturating_add(growth),
         )?;
+        let steps: std::sync::Arc<[Step]> = out.into_iter().map(|(_, s)| s).collect();
         self.cache_step_bytes = next_cache_bytes;
         self.cache.insert((x, succ), steps.clone());
-        charge.resize(self.retained_bytes())?;
+        charge.resize(extra_bytes.saturating_add(self.retained_bytes()))?;
         Ok(steps)
     }
 
@@ -4127,6 +4292,7 @@ impl AllPathsState {
         spec: &PathSearchSpec,
         edges: &[Edge],
         charge: &mut super::ctx::OwnedCharge,
+        extra_bytes: u64,
     ) -> Result<f64> {
         let Some(w) = spec.weight else {
             return Ok(edges.len() as f64);
@@ -4141,8 +4307,18 @@ impl AllPathsState {
                     x
                 } else {
                     let x = lookup_weight_standalone(ctx, spec, w, key)?;
+                    if self.weights.len() == self.weights.capacity() {
+                        let add = (next_cap(self.weights.len(), self.weights.capacity(), 1)
+                            - self.weights.capacity()) as u64
+                            * (size_of::<(u64, u64, u64)>() + size_of::<f64>() + 1) as u64;
+                        charge.resize(
+                            extra_bytes
+                                .saturating_add(self.retained_bytes())
+                                .saturating_add(add),
+                        )?;
+                    }
                     self.weights.insert(key, x);
-                    charge.resize(self.retained_bytes())?;
+                    charge.resize(extra_bytes.saturating_add(self.retained_bytes()))?;
                     x
                 }
             };
@@ -4156,6 +4332,7 @@ impl AllPathsState {
         ctx: &Ctx,
         spec: &PathSearchSpec,
         charge: &mut super::ctx::OwnedCharge,
+        extra_bytes: u64,
     ) -> Result<Option<Found>> {
         if self.done {
             return Ok(None);
@@ -4175,13 +4352,37 @@ impl AllPathsState {
             }));
         }
         if let Some(y) = self.pending_push.take() {
+            if self.on_path.len() == self.on_path.capacity() && !self.on_path.contains(&y) {
+                let add = table_bytes(
+                    next_cap(self.on_path.len(), self.on_path.capacity(), 1),
+                    size_of::<u64>(),
+                );
+                charge.resize(
+                    extra_bytes
+                        .saturating_add(self.retained_bytes())
+                        .saturating_add(add),
+                )?;
+            }
             self.on_path.insert(y);
-            let ns = self.neighbours(ctx, spec, y, self.forward, charge)?;
+            let ns = self.neighbours(ctx, spec, y, self.forward, charge, extra_bytes)?;
+            if self.stack.len() == self.stack.capacity() {
+                let add = next_cap(self.stack.len(), self.stack.capacity(), 1) as u64
+                    * size_of::<(u64, std::sync::Arc<[Step]>, usize)>() as u64;
+                charge.resize(
+                    extra_bytes
+                        .saturating_add(self.retained_bytes())
+                        .saturating_add(add),
+                )?;
+            }
             self.stack.push((y, ns, 0));
-            charge.resize(self.retained_bytes())?;
+            charge.resize(extra_bytes.saturating_add(self.retained_bytes()))?;
         }
         let need_edges = spec.per_edge() || spec.weighted();
         while let Some(top) = self.stack.last_mut() {
+            self.poll_ticks = self.poll_ticks.wrapping_add(1);
+            if self.poll_ticks.is_multiple_of(1024) {
+                ctx.check()?;
+            }
             let (x, ns, i) = (top.0, top.1.clone(), top.2);
             if i >= ns.len() {
                 self.stack.pop();
@@ -4223,22 +4424,49 @@ impl AllPathsState {
                     rev: st.rev,
                 }
             };
+            if self.edges.len() == self.edges.capacity() {
+                let add = next_cap(self.edges.len(), self.edges.capacity(), 1) as u64
+                    * size_of::<Edge>() as u64;
+                charge.resize(
+                    extra_bytes
+                        .saturating_add(self.retained_bytes())
+                        .saturating_add(add),
+                )?;
+            }
             self.edges.push(e);
+            charge.resize(extra_bytes.saturating_add(self.retained_bytes()))?;
             let matched = (closing || self.target.is_none_or(|t| t == y)) && len >= self.min_len;
             let stop_branch = closing || len >= self.max_len;
             if matched {
-                let ordered: Vec<Edge> = if self.forward {
-                    self.edges.clone()
+                let plen = self.edges.len();
+                let (ordered, cost) = if need_edges {
+                    let ordered_bytes = (plen as u64).saturating_mul(size_of::<Edge>() as u64);
+                    charge.resize(
+                        extra_bytes
+                            .saturating_add(self.retained_bytes())
+                            .saturating_add(ordered_bytes),
+                    )?;
+                    let ordered: Vec<Edge> = if self.forward {
+                        self.edges.clone()
+                    } else {
+                        self.edges.iter().rev().copied().collect()
+                    };
+                    let cost = self.path_cost(
+                        ctx,
+                        spec,
+                        &ordered,
+                        charge,
+                        extra_bytes.saturating_add(ordered_bytes),
+                    )?;
+                    (ordered, cost)
                 } else {
-                    self.edges.iter().rev().copied().collect()
+                    (Vec::new(), plen as f64)
                 };
                 if stop_branch {
                     self.edges.pop();
                 } else {
                     self.pending_push = Some(y);
                 }
-                let cost = self.path_cost(ctx, spec, &ordered, charge)?;
-                let plen = ordered.len();
                 let (start, end) = if self.forward {
                     (self.root, y)
                 } else {
@@ -4248,7 +4476,7 @@ impl AllPathsState {
                 return Ok(Some(Found {
                     start,
                     end,
-                    edges: if need_edges { ordered } else { Vec::new() },
+                    edges: ordered,
                     len: plen,
                     cost,
                 }));
@@ -4257,10 +4485,30 @@ impl AllPathsState {
                 self.edges.pop();
                 continue;
             }
+            if self.on_path.len() == self.on_path.capacity() && !self.on_path.contains(&y) {
+                let add = table_bytes(
+                    next_cap(self.on_path.len(), self.on_path.capacity(), 1),
+                    size_of::<u64>(),
+                );
+                charge.resize(
+                    extra_bytes
+                        .saturating_add(self.retained_bytes())
+                        .saturating_add(add),
+                )?;
+            }
             self.on_path.insert(y);
-            let child_ns = self.neighbours(ctx, spec, y, self.forward, charge)?;
+            let child_ns = self.neighbours(ctx, spec, y, self.forward, charge, extra_bytes)?;
+            if self.stack.len() == self.stack.capacity() {
+                let add = next_cap(self.stack.len(), self.stack.capacity(), 1) as u64
+                    * size_of::<(u64, std::sync::Arc<[Step]>, usize)>() as u64;
+                charge.resize(
+                    extra_bytes
+                        .saturating_add(self.retained_bytes())
+                        .saturating_add(add),
+                )?;
+            }
             self.stack.push((y, child_ns, 0));
-            charge.resize(self.retained_bytes())?;
+            charge.resize(extra_bytes.saturating_add(self.retained_bytes()))?;
         }
         self.done = true;
         Ok(None)
@@ -4342,6 +4590,7 @@ fn find_const_bounded(
     spec: &PathSearchSpec,
     s: u64,
     t: u64,
+    out_charge: &mut super::ctx::OwnedCharge,
 ) -> Result<(
     std::collections::VecDeque<Found>,
     serde_json::Map<String, serde_json::Value>,
@@ -4349,7 +4598,8 @@ fn find_const_bounded(
     let eng = Engine::new(ctx, spec, None)?;
     let weighted = spec.weighted();
     let need_edges = spec.per_edge() || weighted;
-    let mut found = std::collections::VecDeque::new();
+    let mut found: std::collections::VecDeque<Found> = std::collections::VecDeque::new();
+    let mut found_edge_bytes = 0u64;
     let mut push = |edges: Vec<Edge>, len: Option<usize>| -> Result<bool> {
         if !eng.take() {
             return Ok(false);
@@ -4357,7 +4607,14 @@ fn find_const_bounded(
         let cost = eng.path_cost(&edges)?;
         let plen = len.unwrap_or(edges.len());
         let edges = if need_edges { edges } else { Vec::new() };
-        eng.charge.add(edges.len() as u64 * 32 + 64)?;
+        let add_edge = edges.capacity() as u64 * size_of::<Edge>() as u64;
+        let q_cap = next_cap(found.len(), found.capacity(), 1) as u64 * size_of::<Found>() as u64;
+        out_charge.resize(
+            found_edge_bytes
+                .saturating_add(add_edge)
+                .saturating_add(q_cap),
+        )?;
+        found_edge_bytes = found_edge_bytes.saturating_add(add_edge);
         found.push_back(Found {
             start: s,
             end: t,
@@ -4492,11 +4749,14 @@ impl Reader {
                 let (PathEnd::Const(s), PathEnd::Const(t)) = (&spec.source, &spec.target) else {
                     unreachable!("stream_eligible requires constant source and target")
                 };
-                let (paths, counters) = find_const_bounded(ctx, spec, s.0, t.0)?;
+                let (paths, counters) = find_const_bounded(ctx, spec, s.0, t.0, &mut charge)?;
                 let bytes: u64 = paths
                     .iter()
-                    .map(|f| (f.edges.capacity() * size_of::<Edge>() + size_of::<Found>()) as u64)
-                    .sum();
+                    .map(|f| (f.edges.capacity() * size_of::<Edge>()) as u64)
+                    .fold(
+                        paths.capacity() as u64 * size_of::<Found>() as u64,
+                        u64::saturating_add,
+                    );
                 charge.resize(bytes)?;
                 (ReaderMode::Bounded(paths), counters)
             }
@@ -4524,24 +4784,35 @@ impl Reader {
         &self.counters
     }
 
-    fn update_charge(&mut self) -> Result<()> {
-        let terms_bytes = self.terms.capacity() as u64
-            * (size_of::<(u64, u64, u64)>() + size_of::<Id>() + 1) as u64;
-        let cur_bytes = self.current.as_ref().map_or(0, |(_, f, _)| {
+    fn terms_bytes(&self) -> u64 {
+        self.terms.capacity() as u64 * (size_of::<(u64, u64, u64)>() + size_of::<Id>() + 1) as u64
+    }
+
+    fn current_bytes(&self) -> u64 {
+        self.current.as_ref().map_or(0, |(_, f, _)| {
             (f.edges.capacity() * size_of::<Edge>() + size_of::<Found>()) as u64
-        });
-        let mode_bytes = match &self.mode {
+        })
+    }
+
+    fn mode_bytes(&self) -> u64 {
+        match &self.mode {
             ReaderMode::Bounded(q) => q
                 .iter()
-                .map(|f| (f.edges.capacity() * size_of::<Edge>() + size_of::<Found>()) as u64)
-                .sum(),
+                .map(|f| (f.edges.capacity() * size_of::<Edge>()) as u64)
+                .fold(
+                    q.capacity() as u64 * size_of::<Found>() as u64,
+                    u64::saturating_add,
+                ),
             ReaderMode::All(st) => st.retained_bytes(),
-        };
-        self.charge.resize(
-            mode_bytes
-                .saturating_add(cur_bytes)
-                .saturating_add(terms_bytes),
-        )
+        }
+    }
+
+    fn update_charge(&mut self) -> Result<()> {
+        let total = self
+            .mode_bytes()
+            .saturating_add(self.current_bytes())
+            .saturating_add(self.terms_bytes());
+        self.charge.resize(total)
     }
 
     /// Fill `out` with up to `cap` rows. Returns `true` when the search is exhausted.
@@ -4560,10 +4831,11 @@ impl Reader {
         while out.len() < cap {
             ctx.check()?;
             if self.current.is_none() {
+                let extra_bytes = self.terms_bytes();
                 let next = match &mut self.mode {
                     ReaderMode::Bounded(q) => q.pop_front(),
                     ReaderMode::All(st) => {
-                        let p = st.next_path(ctx, &self.spec, &mut self.charge)?;
+                        let p = st.next_path(ctx, &self.spec, &mut self.charge, extra_bytes)?;
                         self.counters = st.counters(&self.spec);
                         p
                     }
@@ -4575,7 +4847,9 @@ impl Reader {
                 let pid = self.next_path_id;
                 self.next_path_id = self.next_path_id.saturating_add(1);
                 self.current = Some((pid, found, 0));
+                self.update_charge()?;
             }
+            let mode_bytes = self.mode_bytes();
             let (pid, found, edge_at) = self.current.as_mut().expect("current path");
             let cost_id = if weighted {
                 Id::from_f64(found.cost)
@@ -4595,6 +4869,9 @@ impl Reader {
             } else {
                 1
             };
+            let mode_and_cur_bytes = mode_bytes.saturating_add(
+                (found.edges.capacity() * size_of::<Edge>() + size_of::<Found>()) as u64,
+            );
             while *edge_at < n_rows && out.len() < cap {
                 let k = *edge_at;
                 *edge_at += 1;
@@ -4606,18 +4883,44 @@ impl Reader {
                     set(self.cols.ep_c, Id(p), &mut r);
                     set(self.cols.eo_c, Id(o), &mut r);
                     if self.cols.edge_c.is_some() {
-                        let tid = *self.terms.entry((s, p, o)).or_insert_with(|| {
-                            let parts = (ctx.term(Id(s)), ctx.term(Id(p)), ctx.term(Id(o)));
-                            let (Some(s), Some(Term::NamedNode(p)), Some(o)) = parts else {
-                                return Id::UNDEF;
+                        let tid = if let Some(&existing) = self.terms.get(&(s, p, o)) {
+                            existing
+                        } else {
+                            if self.terms.len() == self.terms.capacity() {
+                                let next_terms =
+                                    next_cap(self.terms.len(), self.terms.capacity(), 1) as u64
+                                        * (size_of::<(u64, u64, u64)>() + size_of::<Id>() + 1)
+                                            as u64;
+                                self.charge
+                                    .resize(mode_and_cur_bytes.saturating_add(next_terms))?;
+                            }
+                            let computed = {
+                                let parts = (ctx.term(Id(s)), ctx.term(Id(p)), ctx.term(Id(o)));
+                                if let (Some(s), Some(Term::NamedNode(p)), Some(o)) = parts {
+                                    match s {
+                                        Term::NamedNode(n) => ctx.intern_term(&Term::Triple(
+                                            Box::new(oxrdf::Triple::new(
+                                                oxrdf::NamedOrBlankNode::NamedNode(n),
+                                                p,
+                                                o,
+                                            )),
+                                        )),
+                                        Term::BlankNode(b) => ctx.intern_term(&Term::Triple(
+                                            Box::new(oxrdf::Triple::new(
+                                                oxrdf::NamedOrBlankNode::BlankNode(b),
+                                                p,
+                                                o,
+                                            )),
+                                        )),
+                                        _ => Id::UNDEF,
+                                    }
+                                } else {
+                                    Id::UNDEF
+                                }
                             };
-                            let s = match s {
-                                Term::NamedNode(n) => oxrdf::NamedOrBlankNode::NamedNode(n),
-                                Term::BlankNode(b) => oxrdf::NamedOrBlankNode::BlankNode(b),
-                                _ => return Id::UNDEF,
-                            };
-                            ctx.intern_term(&Term::Triple(Box::new(oxrdf::Triple::new(s, p, o))))
-                        });
+                            self.terms.insert((s, p, o), computed);
+                            computed
+                        };
                         ctx.check()?;
                         set(self.cols.edge_c, tid, &mut r);
                     }
@@ -4626,8 +4929,8 @@ impl Reader {
             }
             if *edge_at >= n_rows {
                 self.current = None;
-                self.update_charge()?;
             }
+            self.update_charge()?;
         }
         Ok(false)
     }
