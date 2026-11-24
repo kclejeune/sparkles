@@ -1205,3 +1205,271 @@ fn rebuild_releases_planning_staging_before_streaming() {
     assert!(cursor.memory_meter().live_bytes() < 512 << 10);
     assert!(cursor.stats().mem_peak_bytes > 512 << 10);
 }
+
+#[test]
+fn rebuilt_exists_preserves_native_reduced_and_values_cdts() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    let cdt = r#"VALUES ?x { "[_:a]"^^<http://w3id.org/awslabs/neptune/SPARQL-CDTs/List> }"#;
+
+    // 1. Ordered window with REDUCED inside a native EXISTS (Sol r3 #1).
+    rt.put(
+        &s,
+        "exists_window_reduced",
+        ViewDef::table(
+            "SELECT ?outer WHERE {
+                VALUES ?outer { 1 }
+                FILTER EXISTS {
+                    { SELECT REDUCED ?x WHERE { VALUES ?x { 1 1 } }
+                      ORDER BY ?x LIMIT 1 OFFSET 1 }
+                }
+            }",
+        ),
+    )
+    .unwrap();
+
+    // 2. Subquery aggregate over REDUCED inside a native EXISTS (Neon r3 #1b).
+    rt.put(
+        &s,
+        "exists_agg_reduced",
+        ViewDef::table(
+            "SELECT ?x WHERE {
+                VALUES ?x { 1 }
+                FILTER EXISTS {
+                    SELECT (COUNT(*) AS ?n) WHERE {
+                        { SELECT REDUCED ?y WHERE { VALUES ?y { 1 1 } } }
+                    }
+                    HAVING (COUNT(*) = 1)
+                }
+            }",
+        ),
+    )
+    .unwrap();
+
+    // 3. Native VALUES CDT blank-node literal inside FILTER EXISTS and NOT EXISTS (Neon r3 #1a).
+    rt.put(
+        &s,
+        "exists_cdt",
+        ViewDef::table(format!(
+            "SELECT ?x WHERE {{
+                {cdt}
+                FILTER EXISTS {{ {cdt} }}
+            }}"
+        )),
+    )
+    .unwrap();
+    rt.put(
+        &s,
+        "not_exists_cdt",
+        ViewDef::table(format!(
+            "SELECT ?x WHERE {{
+                {cdt}
+                FILTER NOT EXISTS {{ {cdt} }}
+            }}"
+        )),
+    )
+    .unwrap();
+
+    // 4. Nested EXISTS inside EXISTS with CDT VALUES and REDUCED.
+    rt.put(
+        &s,
+        "nested_exists",
+        ViewDef::table(format!(
+            "SELECT ?x WHERE {{
+                {cdt}
+                FILTER EXISTS {{
+                    {cdt}
+                    FILTER EXISTS {{
+                        SELECT (COUNT(*) AS ?n) WHERE {{
+                            {{ SELECT REDUCED ?y WHERE {{ VALUES ?y {{ 1 1 }} }} }}
+                        }}
+                        HAVING (COUNT(*) = 1)
+                    }}
+                }}
+            }}"
+        )),
+    )
+    .unwrap();
+
+    // 5. Correlated / non-native EXISTS inside OR keeps ordinary non-native REDUCED.
+    rt.put(
+        &s,
+        "correlated_exists_or",
+        ViewDef::table(
+            "SELECT ?outer WHERE {
+                VALUES ?outer { 1 }
+                OPTIONAL { <http://example.org/none> <http://example.org/p> ?opt }
+                FILTER (BOUND(?opt) || EXISTS {
+                    { SELECT REDUCED ?x WHERE { VALUES ?x { 1 1 } }
+                      ORDER BY ?x LIMIT 1 OFFSET 1 }
+                })
+            }",
+        ),
+    )
+    .unwrap();
+
+    // 6. CONSTRUCT view with CDT blank-node VALUES in both WHERE and native EXISTS.
+    rt.put(
+        &s,
+        "construct_exists_cdt",
+        ViewDef::table(format!(
+            "{P}CONSTRUCT {{ _:b ex:q ?x }} WHERE {{
+                {cdt}
+                FILTER EXISTS {{ {cdt} }}
+            }}"
+        )),
+    )
+    .unwrap();
+
+    rt.round(&s);
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt),
+        ..Default::default()
+    };
+    let alternate = QueryOptions {
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..opts.clone()
+    };
+
+    for (name, col, expected_len) in [
+        ("exists_window_reduced", "?outer", 0usize),
+        ("exists_agg_reduced", "?x", 1),
+        ("exists_cdt", "?x", 1),
+        ("not_exists_cdt", "?x", 0),
+        ("nested_exists", "?x", 1),
+        ("correlated_exists_or", "?outer", 1),
+    ] {
+        let q = format!(
+            "{P}SELECT {col} {{ SERVICE view:read {{ [] view:name '{name}'; view:bind {col} }} }}"
+        );
+        let maintained = drain(&snap, &q, &opts, 1).unwrap().0;
+        assert_eq!(maintained.len(), expected_len, "maintained view {name}");
+        let rebuilt = drain(&snap, &q, &alternate, 1).unwrap().0;
+        assert_eq!(bag(rebuilt), bag(maintained), "rebuilt view {name}");
+    }
+
+    let cq = format!(
+        "{P}SELECT ?subject ?object {{ SERVICE view:read {{ [] view:name 'construct_exists_cdt'; view:bind ?subject, ?object }} }}"
+    );
+    let maintained = drain(&snap, &cq, &opts, 1).unwrap().0;
+    assert_eq!(maintained.len(), 1);
+    let rebuilt = drain(&snap, &cq, &alternate, 1).unwrap().0;
+    assert_eq!(bag(rebuilt), bag(maintained));
+}
+
+#[test]
+fn raw_cursor_wait_credit_applies_to_protected_view_rebuild() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { ex:h ex:hidden 1 . ex:a ex:visible 1 . ex:b ex:visible 2 }",
+    );
+    let rt = runtime(&s);
+    rt.set_host(Arc::new(ProtectedHost(Arc::new(
+        GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "private".into(),
+                        predicates: Some(vec!["http://example.org/hidden".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Default::default(),
+            },
+        ),
+    ))));
+    rt.put(
+        &s,
+        "protected_stream",
+        ViewDef {
+            principal: Some("reader".into()),
+            ..ViewDef::table(format!("{P}SELECT ?s ?o WHERE {{ ?s ex:visible ?o }}"))
+        },
+    )
+    .unwrap();
+    rt.round(&s);
+
+    let q = format!(
+        "{P}SELECT ?s ?o {{ SERVICE view:read {{ [] view:name 'protected_stream'; view:bind ?s, ?o }} }}"
+    );
+    let opts = QueryOptions {
+        views: Some(rt),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        timeout: Some(Duration::from_millis(120)),
+        ..Default::default()
+    };
+    let mut cursor = select_cursor(s.snapshot(), &q, &opts, &strict(1)).unwrap();
+    let first = cursor.next_batch().unwrap().unwrap();
+    assert_eq!(first.len(), 1);
+
+    // Pause longer than the initial 120 ms timeout while crediting consumer wait time.
+    let wait = Duration::from_millis(180);
+    std::thread::sleep(wait);
+    cursor.deadline_pause().fetch_add(
+        Duration::from_millis(400).as_nanos() as u64,
+        Ordering::Relaxed,
+    );
+
+    let second = cursor.next_batch().unwrap().unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(cursor.next_batch().unwrap().is_none());
+}
+
+#[test]
+fn rebuilt_construct_keeps_retained_template_charged_between_batches() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    // Three 300 KiB literals in unbound template triples total 900 KiB of retained
+    // template storage while staying under the 1 MiB view definition limit and keeping
+    // any single per-triple transient decode well below the retained total.
+    let part_len = 300 << 10;
+    let total_payload = part_len * 3;
+    let payload = "x".repeat(part_len);
+    rt.put(
+        &s,
+        "big_template",
+        ViewDef::table(format!(
+            "{P}CONSTRUCT {{ ex:s ex:p ?x . ?unbound ex:h1 \"{payload}\" . ?unbound ex:h2 \"{payload}\" . ?unbound ex:h3 \"{payload}\" }} WHERE {{ VALUES ?x {{ 1 2 }} }}"
+        )),
+    )
+    .unwrap();
+    rt.round(&s);
+
+    let q = format!(
+        "{P}SELECT ?subject ?predicate ?object {{ SERVICE view:read {{ [] view:name 'big_template'; view:bind ?subject, ?predicate, ?object }} }}"
+    );
+    let opts = QueryOptions {
+        views: Some(rt),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..Default::default()
+    };
+    let mut cursor = select_cursor(s.snapshot(), &q, &opts, &strict(1)).unwrap();
+    let first = cursor.next_batch().unwrap().unwrap();
+    assert_eq!(first.len(), 1);
+    let live_between = cursor.memory_meter().live_bytes();
+    assert!(
+        live_between >= total_payload as u64,
+        "expected retained CONSTRUCT template ({total_payload} bytes) to stay charged between batches, got {live_between}"
+    );
+    assert!(
+        live_between < 3 << 20,
+        "expected transient planning staging to be released before streaming, got {live_between}"
+    );
+    let second = cursor.next_batch().unwrap().unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(cursor.next_batch().unwrap().is_none());
+    cursor.close();
+    assert!(cursor.memory_meter().live_bytes() < total_payload as u64);
+}

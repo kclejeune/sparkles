@@ -43,13 +43,14 @@ pub struct ExistsSpec {
     memo_charge: Mutex<Option<super::ctx::RetainedCharge>>,
     /// the key set answering the EXISTS for every outer row (see [`super::exists`])
     pub decor: super::exists::Decor,
+    /// Native REDUCED / VALUES occurrences projected onto this spec's heap-pinned pattern.
+    view_patterns: Option<Arc<super::viewsvc::ViewPatterns>>,
     _held: Option<Reservation>,
 }
 
-// The ordinary owned pattern keeps its existing inline representation.
-#[allow(clippy::large_enum_variant)]
 enum ExistsPattern {
-    Ordinary(GraphPattern),
+    // Arc-pinned so moving or sharing ExistsSpec keeps the root GraphPattern address stable.
+    Ordinary(Arc<GraphPattern>),
     Checked(Arc<super::checked_syntax::Pattern>),
 }
 
@@ -62,11 +63,35 @@ impl ExistsSpec {
     ) -> ExistsSpec {
         let calls_service = super::cursor::calls_service(&pattern);
         Self::from_pattern(
-            ExistsPattern::Ordinary(pattern),
+            ExistsPattern::Ordinary(Arc::new(pattern)),
             calls_service,
             graph,
             vars,
             bound,
+            None,
+            None,
+        )
+    }
+
+    pub(super) fn new_with_view_patterns(
+        pattern: &GraphPattern,
+        view_patterns: Option<&super::viewsvc::ViewPatterns>,
+        graph: super::plan::ActiveGraph,
+        vars: Vec<VarId>,
+        bound: Vec<(VarId, Id)>,
+    ) -> ExistsSpec {
+        let owned = Arc::new(pattern.clone());
+        let projected = view_patterns
+            .and_then(|vp| vp.project(pattern, &owned))
+            .map(Arc::new);
+        let calls_service = super::cursor::calls_service(&owned);
+        Self::from_pattern(
+            ExistsPattern::Ordinary(owned),
+            calls_service,
+            graph,
+            vars,
+            bound,
+            projected,
             None,
         )
     }
@@ -77,6 +102,7 @@ impl ExistsSpec {
         graph: super::plan::ActiveGraph,
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
+        view_patterns: Option<Arc<super::viewsvc::ViewPatterns>>,
         held: Option<Reservation>,
     ) -> Self {
         Self {
@@ -89,6 +115,7 @@ impl ExistsSpec {
             unbound: Default::default(),
             memo_charge: Mutex::new(None),
             decor: Default::default(),
+            view_patterns,
             _held: held,
         }
     }
@@ -98,6 +125,7 @@ impl ExistsSpec {
         graph: super::plan::ActiveGraph,
         vars: Vec<VarId>,
         bound: Vec<(VarId, Id)>,
+        view_patterns: Option<Arc<super::viewsvc::ViewPatterns>>,
         held: Reservation,
     ) -> Self {
         let calls_service = pattern.calls_service;
@@ -107,6 +135,7 @@ impl ExistsSpec {
             graph,
             vars,
             bound,
+            view_patterns,
             Some(held),
         )
     }
@@ -130,6 +159,11 @@ impl ExistsSpec {
             ExistsPattern::Ordinary(pattern) => pattern,
             ExistsPattern::Checked(pattern) => &pattern.syntax,
         }
+    }
+
+    /// Native REDUCED and VALUES occurrences projected onto [`Self::pattern`].
+    pub(super) fn view_patterns(&self) -> Option<&super::viewsvc::ViewPatterns> {
+        self.view_patterns.as_deref()
     }
 
     /// Memoize the answer for `key`, charging the entry first, in both accounting modes.
@@ -180,11 +214,18 @@ impl ExistsSpec {
     pub fn with_bound(&self, v: VarId, c: Id) -> Self {
         let mut bound = self.bound.clone();
         bound.push((v, c));
-        Self::new(
-            self.pattern().clone(),
+        let pattern = match &self.pattern {
+            ExistsPattern::Ordinary(pattern) => ExistsPattern::Ordinary(pattern.clone()),
+            ExistsPattern::Checked(pattern) => ExistsPattern::Checked(pattern.clone()),
+        };
+        Self::from_pattern(
+            pattern,
+            self.calls_service,
             self.graph.clone(),
             self.vars.clone(),
             bound,
+            self.view_patterns.clone(),
+            None,
         )
     }
 
@@ -215,6 +256,7 @@ impl ExistsSpec {
             self.graph.clone(),
             vars,
             bound,
+            self.view_patterns.clone(),
             held,
         ))
     }

@@ -258,6 +258,331 @@ impl ViewPatterns {
         self.native
             .contains(&(std::ptr::from_ref(pattern) as usize))
     }
+
+    /// Remap recorded occurrences from `source` onto a structurally identical heap-pinned
+    /// clone `cloned` (such as an `ExistsSpec`'s owned pattern).
+    pub(crate) fn project(&self, source: &GraphPattern, cloned: &GraphPattern) -> Option<Self> {
+        if self.native.is_empty() {
+            return None;
+        }
+        let mut native = rustc_hash::FxHashSet::default();
+        let _ = walk_gp_pair(source, cloned, &mut |s, c| {
+            if self.contains(s) {
+                native.insert(std::ptr::from_ref(c) as usize);
+            }
+            Ok(())
+        });
+        (!native.is_empty()).then_some(Self { native })
+    }
+
+    /// Checked variant of [`Self::project`] that polls `preparation` and admits the
+    /// projected set's storage before allocating it.
+    pub(crate) fn project_checked(
+        &self,
+        source: &GraphPattern,
+        cloned: &GraphPattern,
+        preparation: &crate::access::Preparation,
+    ) -> Result<Option<(Self, crate::access::Reservation)>> {
+        if self.native.is_empty() {
+            return Ok(None);
+        }
+        let mut count = 0usize;
+        walk_gp_pair(source, cloned, &mut |s, _| {
+            preparation.check()?;
+            if self.contains(s) {
+                count = count.saturating_add(1);
+            }
+            Ok(())
+        })?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let cap = sparkles_budget::sizes::table_grown(0, 0, count);
+        let bytes = (sparkles_budget::sizes::table_bytes(cap, std::mem::size_of::<usize>()) as u64)
+            .saturating_add(std::mem::size_of::<Self>() as u64 + 64);
+        let held = preparation.reserve(bytes)?;
+        let mut native = rustc_hash::FxHashSet::default();
+        native
+            .try_reserve(count)
+            .map_err(|_| preparation.exhausted())?;
+        walk_gp_pair(source, cloned, &mut |s, c| {
+            preparation.check()?;
+            if self.contains(s) {
+                native.insert(std::ptr::from_ref(c) as usize);
+            }
+            Ok(())
+        })?;
+        Ok(Some((Self { native }, held)))
+    }
+}
+
+fn walk_gp_pair(
+    source: &GraphPattern,
+    cloned: &GraphPattern,
+    visit: &mut impl FnMut(&GraphPattern, &GraphPattern) -> Result<()>,
+) -> Result<()> {
+    use spargebra::algebra::{AggregateExpression as A, GraphPattern as G, OrderExpression as O};
+    visit(source, cloned)?;
+    match (source, cloned) {
+        (G::Bgp { .. }, G::Bgp { .. })
+        | (G::Path { .. }, G::Path { .. })
+        | (G::Values { .. }, G::Values { .. }) => Ok(()),
+        (
+            G::Join {
+                left: sl,
+                right: sr,
+            },
+            G::Join {
+                left: cl,
+                right: cr,
+            },
+        )
+        | (
+            G::Lateral {
+                left: sl,
+                right: sr,
+            },
+            G::Lateral {
+                left: cl,
+                right: cr,
+            },
+        )
+        | (
+            G::Union {
+                left: sl,
+                right: sr,
+            },
+            G::Union {
+                left: cl,
+                right: cr,
+            },
+        )
+        | (
+            G::Minus {
+                left: sl,
+                right: sr,
+            },
+            G::Minus {
+                left: cl,
+                right: cr,
+            },
+        )
+        | (
+            G::SemiJoin {
+                left: sl,
+                right: sr,
+            },
+            G::SemiJoin {
+                left: cl,
+                right: cr,
+            },
+        )
+        | (
+            G::AntiJoin {
+                left: sl,
+                right: sr,
+            },
+            G::AntiJoin {
+                left: cl,
+                right: cr,
+            },
+        ) => {
+            walk_gp_pair(sl, cl, visit)?;
+            walk_gp_pair(sr, cr, visit)
+        }
+        (
+            G::LeftJoin {
+                left: sl,
+                right: sr,
+                expression: se,
+            },
+            G::LeftJoin {
+                left: cl,
+                right: cr,
+                expression: ce,
+            },
+        ) => {
+            walk_gp_pair(sl, cl, visit)?;
+            walk_gp_pair(sr, cr, visit)?;
+            if let (Some(se), Some(ce)) = (se, ce) {
+                walk_expr_pair(se, ce, visit)?;
+            }
+            Ok(())
+        }
+        (
+            G::Filter {
+                expr: se,
+                inner: si,
+            },
+            G::Filter {
+                expr: ce,
+                inner: ci,
+            },
+        ) => {
+            walk_gp_pair(si, ci, visit)?;
+            walk_expr_pair(se, ce, visit)
+        }
+        (G::Graph { inner: si, .. }, G::Graph { inner: ci, .. })
+        | (G::Project { inner: si, .. }, G::Project { inner: ci, .. })
+        | (G::Distinct { inner: si }, G::Distinct { inner: ci })
+        | (G::Reduced { inner: si }, G::Reduced { inner: ci })
+        | (G::Slice { inner: si, .. }, G::Slice { inner: ci, .. })
+        | (G::Service { inner: si, .. }, G::Service { inner: ci, .. }) => {
+            walk_gp_pair(si, ci, visit)
+        }
+        (
+            G::Extend {
+                inner: si,
+                expression: se,
+                ..
+            },
+            G::Extend {
+                inner: ci,
+                expression: ce,
+                ..
+            },
+        )
+        | (
+            G::Assign {
+                inner: si,
+                expression: se,
+                ..
+            },
+            G::Assign {
+                inner: ci,
+                expression: ce,
+                ..
+            },
+        )
+        | (
+            G::Unfold {
+                inner: si,
+                expression: se,
+                ..
+            },
+            G::Unfold {
+                inner: ci,
+                expression: ce,
+                ..
+            },
+        ) => {
+            walk_gp_pair(si, ci, visit)?;
+            walk_expr_pair(se, ce, visit)
+        }
+        (
+            G::OrderBy {
+                inner: si,
+                expression: se,
+            },
+            G::OrderBy {
+                inner: ci,
+                expression: ce,
+            },
+        ) => {
+            walk_gp_pair(si, ci, visit)?;
+            for (so, co) in se.iter().zip(ce) {
+                let (O::Asc(se) | O::Desc(se), O::Asc(ce) | O::Desc(ce)) = (so, co);
+                walk_expr_pair(se, ce, visit)?;
+            }
+            Ok(())
+        }
+        (
+            G::Group {
+                inner: si,
+                aggregates: sa,
+                ..
+            },
+            G::Group {
+                inner: ci,
+                aggregates: ca,
+                ..
+            },
+        ) => {
+            walk_gp_pair(si, ci, visit)?;
+            for ((_, sa), (_, ca)) in sa.iter().zip(ca) {
+                match (sa, ca) {
+                    (A::CountSolutions { .. }, A::CountSolutions { .. }) => {}
+                    (A::FunctionCall { expr: se, .. }, A::FunctionCall { expr: ce, .. }) => {
+                        walk_expr_pair(se, ce, visit)?;
+                    }
+                    (
+                        A::Fold {
+                            expr: se,
+                            value: sv,
+                            order: so,
+                            ..
+                        },
+                        A::Fold {
+                            expr: ce,
+                            value: cv,
+                            order: co,
+                            ..
+                        },
+                    ) => {
+                        walk_expr_pair(se, ce, visit)?;
+                        if let (Some(sv), Some(cv)) = (sv, cv) {
+                            walk_expr_pair(sv, cv, visit)?;
+                        }
+                        for (so, co) in so.iter().zip(co) {
+                            let (O::Asc(se) | O::Desc(se), O::Asc(ce) | O::Desc(ce)) = (so, co);
+                            walk_expr_pair(se, ce, visit)?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn walk_expr_pair(
+    source: &spargebra::algebra::Expression,
+    cloned: &spargebra::algebra::Expression,
+    visit: &mut impl FnMut(&GraphPattern, &GraphPattern) -> Result<()>,
+) -> Result<()> {
+    use spargebra::algebra::Expression as E;
+    match (source, cloned) {
+        (E::Exists(sp), E::Exists(cp)) => walk_gp_pair(sp, cp, visit),
+        (E::Or(sa, sb), E::Or(ca, cb))
+        | (E::And(sa, sb), E::And(ca, cb))
+        | (E::Equal(sa, sb), E::Equal(ca, cb))
+        | (E::SameTerm(sa, sb), E::SameTerm(ca, cb))
+        | (E::Greater(sa, sb), E::Greater(ca, cb))
+        | (E::GreaterOrEqual(sa, sb), E::GreaterOrEqual(ca, cb))
+        | (E::Less(sa, sb), E::Less(ca, cb))
+        | (E::LessOrEqual(sa, sb), E::LessOrEqual(ca, cb))
+        | (E::Add(sa, sb), E::Add(ca, cb))
+        | (E::Subtract(sa, sb), E::Subtract(ca, cb))
+        | (E::Multiply(sa, sb), E::Multiply(ca, cb))
+        | (E::Divide(sa, sb), E::Divide(ca, cb)) => {
+            walk_expr_pair(sa, ca, visit)?;
+            walk_expr_pair(sb, cb, visit)
+        }
+        (E::UnaryPlus(sa), E::UnaryPlus(ca))
+        | (E::UnaryMinus(sa), E::UnaryMinus(ca))
+        | (E::Not(sa), E::Not(ca)) => walk_expr_pair(sa, ca, visit),
+        (E::In(sa, sl), E::In(ca, cl)) => {
+            walk_expr_pair(sa, ca, visit)?;
+            for (se, ce) in sl.iter().zip(cl) {
+                walk_expr_pair(se, ce, visit)?;
+            }
+            Ok(())
+        }
+        (E::If(sa, sb, sc), E::If(ca, cb, cc)) => {
+            walk_expr_pair(sa, ca, visit)?;
+            walk_expr_pair(sb, cb, visit)?;
+            walk_expr_pair(sc, cc, visit)
+        }
+        (E::Coalesce(sl), E::Coalesce(cl)) | (E::FunctionCall(_, sl), E::FunctionCall(_, cl)) => {
+            for (se, ce) in sl.iter().zip(cl) {
+                walk_expr_pair(se, ce, visit)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// A view that must be evaluated directly at the query's snapshot (expired

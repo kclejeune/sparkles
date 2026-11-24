@@ -59,6 +59,67 @@ impl Spec {
             Self::Describe { .. } => QueryKind::Describe,
         }
     }
+
+    fn retained_bytes(&self) -> u64 {
+        fn named_bytes(pattern: &spargebra::term::NamedNodePattern) -> u64 {
+            match pattern {
+                spargebra::term::NamedNodePattern::NamedNode(n) => n.as_str().len() as u64,
+                spargebra::term::NamedNodePattern::Variable(v) => v.as_str().len() as u64,
+            }
+        }
+        fn term_bytes(pattern: &spargebra::term::TermPattern) -> u64 {
+            use spargebra::term::TermPattern as T;
+            match pattern {
+                T::NamedNode(n) => n.as_str().len() as u64,
+                T::BlankNode(b) => b.as_str().len() as u64,
+                T::Variable(v) => v.as_str().len() as u64,
+                T::Literal(l) => (l.value().len() as u64)
+                    .saturating_add(l.datatype().as_str().len() as u64)
+                    .saturating_add(l.language().map_or(0, |s| s.len() as u64)),
+                T::Triple(tp) => {
+                    (std::mem::size_of::<TriplePattern>() as u64).saturating_add(triple_bytes(tp))
+                }
+            }
+        }
+        fn triple_bytes(tp: &TriplePattern) -> u64 {
+            term_bytes(&tp.subject)
+                .saturating_add(named_bytes(&tp.predicate))
+                .saturating_add(term_bytes(&tp.object))
+        }
+        match self {
+            Self::Construct { template, graphs } => {
+                let mut bytes = (template
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<TriplePattern>())
+                    as u64)
+                    .saturating_add(
+                        graphs
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<GraphTemplate>())
+                            as u64,
+                    );
+                for tp in template {
+                    bytes = bytes.saturating_add(triple_bytes(tp));
+                }
+                for graph in graphs {
+                    bytes = bytes
+                        .saturating_add(term_bytes(&graph.name))
+                        .saturating_add(
+                            graph
+                                .triples
+                                .capacity()
+                                .saturating_mul(std::mem::size_of::<TriplePattern>())
+                                as u64,
+                        );
+                    for tp in &graph.triples {
+                        bytes = bytes.saturating_add(triple_bytes(tp));
+                    }
+                }
+                bytes
+            }
+            Self::Describe { .. } => 0,
+        }
+    }
 }
 
 /// Immutable decoded graph terms. Retained batches remain on the query budget
@@ -212,6 +273,7 @@ pub(super) fn from_pattern(
             ._plan_charge
             .bytes()
             .saturating_mul(2)
+            .saturating_add(spec.retained_bytes())
             .saturating_add(where_cursor.ctx.nvars() as u64 * 16 + 4096);
         let seen_charge = OwnedCharge::new(&where_cursor.ctx, base_bytes)?;
         let map = where_cursor.variables.ids.iter().enumerate().fold(
@@ -275,6 +337,7 @@ impl GraphCursor {
                 !matches!(t.subject, TermPattern::Triple(_))
                     && !matches!(t.object, TermPattern::Triple(_))
             });
+            template.shrink_to_fit();
         }
         let mut graph = from_pattern(where_cursor, spec, 0)?;
         if let Some(template_columns) = template_columns {

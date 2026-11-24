@@ -68,13 +68,16 @@ struct Inner {
     context_bytes: u64,
     cancellation: Option<crate::task::Cancellation>,
     original_controls: Option<QueryControl>,
+    inherited_controls: Option<Box<Preparation>>,
     upstream: Option<Box<Upstream>>,
 }
 
 struct Upstream {
     parent: ParentHandle,
     held: Mutex<MemoryLease>,
-    controls: Option<Preparation>,
+    /// Consumer wait credit forwarded by a streaming view rebuild once synchronous mask
+    /// preparation has finished. Zero during mask preparation so the deadline stays fixed.
+    pause: Arc<AtomicU64>,
 }
 
 impl Drop for Inner {
@@ -180,6 +183,7 @@ impl Preparation {
                 context_bytes: CONTEXT_BYTES,
                 cancellation: None,
                 original_controls: None,
+                inherited_controls: None,
                 upstream: None,
             }),
             no_wait: false,
@@ -303,6 +307,7 @@ impl Preparation {
                     cancellation,
                     deadline,
                 }),
+                inherited_controls: None,
                 upstream: None,
             }),
             no_wait: false,
@@ -331,7 +336,15 @@ impl Preparation {
         if let Some(cancellation) = &opts.cancellation {
             cancellation.check()?;
         }
-        let bytes = (std::mem::size_of::<Inner>() + 16 + std::mem::size_of::<Upstream>()) as u64;
+        let bytes = (std::mem::size_of::<Inner>()
+            + 16
+            + std::mem::size_of::<Upstream>()
+            + 32
+            + if inherited.is_some() {
+                std::mem::size_of::<Preparation>()
+            } else {
+                0
+            }) as u64;
         let limit = opts.max_memory_bytes.expect("rebuild memory limit");
         if bytes > limit {
             return Err(memory(limit));
@@ -347,10 +360,11 @@ impl Preparation {
                 context_bytes: bytes,
                 cancellation: opts.cancellation.clone(),
                 original_controls: None,
+                inherited_controls: inherited.cloned().map(Box::new),
                 upstream: Some(Box::new(Upstream {
                     parent,
                     held: Mutex::new(held),
-                    controls: inherited.cloned(),
+                    pause: Arc::new(AtomicU64::new(0)),
                 })),
             }),
             no_wait: inherited.is_some_and(|original| original.no_wait),
@@ -358,6 +372,15 @@ impl Preparation {
         };
         preparation.check()?;
         Ok(preparation)
+    }
+
+    /// Shared wait-credit counter for a view rebuild's own ordinary execution deadline.
+    /// `None` for ordinary checked sources whose absolute deadlines never extend on pause.
+    pub(crate) fn view_rebuild_pause(&self) -> Option<Arc<AtomicU64>> {
+        self.inner
+            .upstream
+            .as_ref()
+            .map(|upstream| upstream.pause.clone())
     }
 
     pub(crate) fn with_query_controls(
@@ -416,6 +439,7 @@ impl Preparation {
                 context_bytes: CONTEXT_BYTES,
                 cancellation: self.inner.cancellation.clone(),
                 original_controls: self.inner.original_controls.clone(),
+                inherited_controls: self.inner.inherited_controls.clone(),
                 upstream: None,
             }),
             no_wait: self.no_wait,
@@ -586,12 +610,7 @@ impl Preparation {
     /// order. This is distinct from byte-only admission through an existing parent.
     pub fn check_work(&self) -> std::result::Result<(), sparkles_budget::WorkStopped> {
         use sparkles_budget::WorkStopped;
-        if let Some(original) = self
-            .inner
-            .upstream
-            .as_ref()
-            .and_then(|p| p.controls.as_ref())
-        {
+        if let Some(original) = &self.inner.inherited_controls {
             original.check_work()?;
         }
         self.inner
@@ -599,13 +618,20 @@ impl Preparation {
             .cancel
             .check()
             .map_err(|_| WorkStopped::Cancelled)?;
-        if self
-            .inner
-            .control
-            .deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return Err(WorkStopped::Timeout);
+        if let Some(deadline) = self.inner.control.deadline {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                let expired = match &self.inner.upstream {
+                    Some(upstream) => {
+                        let paused = Duration::from_nanos(upstream.pause.load(Ordering::Relaxed));
+                        deadline.checked_add(paused).is_some_and(|end| now >= end)
+                    }
+                    None => true,
+                };
+                if expired {
+                    return Err(WorkStopped::Timeout);
+                }
+            }
         }
         if let Some(cancellation) = &self.inner.cancellation {
             cancellation.check().map_err(|_| WorkStopped::Cancelled)?;

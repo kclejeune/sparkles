@@ -907,4 +907,54 @@ mod tests {
         std::thread::sleep(end.saturating_duration_since(Instant::now()));
         assert!(matches!(child.next_batch(), Err(Error::Timeout)));
     }
+
+    #[test]
+    fn consumer_pause_cannot_extend_an_absolute_source_deadline_in_a_protected_rebuild() {
+        use crate::access::{Caller, GraphAccess, Graphs, Protection, Rule, TripleRules};
+
+        let s = Store::in_memory(StoreOptions::default());
+        let mut ctx = Ctx::new(s.snapshot());
+        let end = Instant::now() + Duration::from_millis(120);
+        ctx.source_preparation = Some(
+            Preparation::new(
+                Control {
+                    deadline: Some(end),
+                    ..Control::none()
+                },
+                16 << 20,
+            )
+            .unwrap(),
+        );
+        let ctx = ctx.into_shared();
+        let mut select = rebuild(&s, "SELECT ?x { VALUES ?x { 1 2 } }");
+        select.deadline = Some(end);
+        select.access = Some(Arc::new(GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "private".into(),
+                        predicates: Some(vec!["http://example.org/hidden".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Default::default(),
+            },
+        )));
+        let (mut child, _) = View::open_rebuild(&ctx, &CursorOptions::default(), &select).unwrap();
+        child
+            .deadline_pause()
+            .store(10_000_000_000, Ordering::Relaxed);
+        std::thread::sleep(end.saturating_duration_since(Instant::now()));
+        assert!(matches!(child.next_batch(), Err(Error::Timeout)));
+    }
 }

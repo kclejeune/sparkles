@@ -924,10 +924,11 @@ fn make_source_ctx_policy(
 ) -> Result<(Ctx, Option<Arc<crate::access::GraphAccess>>)> {
     let deadline = opts.effective_deadline(Instant::now())?;
     let (snapshot, _, preparation) = source.query_input();
+    let view_pause = preparation.view_rebuild_pause();
     let preparation = preparation.with_query_controls(
         opts.cancel.clone(),
         opts.cancellation.clone(),
-        deadline,
+        if view_pause.is_some() { None } else { deadline },
     )?;
     let snapshot = snapshot.clone();
     // Covers the actual Ctx Arc, snapshot header, lazy ledger/owner bookkeeping,
@@ -944,6 +945,9 @@ fn make_source_ctx_policy(
     let setup = preparation.reserve(setup_bytes)?;
     let parent = preparation.memory_parent()?;
     let mut ctx = Ctx::new(snapshot);
+    if let Some(pause) = view_pause {
+        ctx.deadline_pause = pause;
+    }
     ctx.read_source = Some(source);
     ctx.source_setup = Some(setup);
     ctx.source_preparation = Some(preparation.clone());

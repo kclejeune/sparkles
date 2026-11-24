@@ -1066,6 +1066,12 @@ impl<'a> Planner<'a> {
         }
     }
 
+    pub(super) fn for_exists(ctx: &'a Ctx, spec: &'a ExistsSpec) -> Self {
+        let mut planner = Self::new(ctx);
+        planner.view_patterns = spec.view_patterns();
+        planner
+    }
+
     /// Whether the variable or blank node `t`, which a property function call binds,
     /// occurs in the query anywhere but that call. Every occurrence in the algebra's SSE
     /// form counts, so the answer errs towards "used" (a string that happens to contain
@@ -1107,7 +1113,13 @@ impl<'a> Planner<'a> {
                 .iter()
                 .filter_map(|v| subst.get(v).map(|id| (*v, *id)))
                 .collect();
-            Arc::new(ExistsSpec::new(p.clone(), graph.clone(), vars, bound))
+            Arc::new(ExistsSpec::new_with_view_patterns(
+                p,
+                self.view_patterns,
+                graph.clone(),
+                vars,
+                bound,
+            ))
         };
         Compiler {
             ctx,
@@ -1147,7 +1159,17 @@ impl<'a> Planner<'a> {
             sort_by_prepared(&mut ids, preparation, |a, b| Ok(a.cmp(b)))?;
             ids.dedup();
             let bound_len = ids.iter().filter(|id| subst.contains_key(id)).count();
-            let held = ExistsSpec::reserve_checked(preparation, ids.len(), bound_len)?;
+            let mut held = ExistsSpec::reserve_checked(preparation, ids.len(), bound_len)?;
+            let view_patterns = match self.view_patterns {
+                Some(vp) => match vp.project_checked(p, &pattern.syntax, preparation)? {
+                    Some((projected, charge)) => {
+                        held.merge(charge);
+                        Some(Arc::new(projected))
+                    }
+                    None => None,
+                },
+                None => None,
+            };
             let mut vars = Vec::with_capacity(ids.len());
             let mut bound = Vec::with_capacity(bound_len);
             for &id in &*ids {
@@ -1162,6 +1184,7 @@ impl<'a> Planner<'a> {
                 graph.clone(),
                 vars,
                 bound,
+                view_patterns,
                 held,
             )))
         };
@@ -8601,7 +8624,7 @@ pub fn short(t: &Term) -> String {
 
 /// Evaluate `EXISTS { pattern }` for one outer binding (substitution semantics).
 pub fn eval_exists(ctx: &Ctx, spec: &ExistsSpec, key: &[Id], schema: &[VarId]) -> Result<bool> {
-    let mut p = Planner::new(ctx);
+    let mut p = Planner::for_exists(ctx, spec);
     if ctx.calls_extensions {
         p.property_inputs.extend(schema.iter().copied());
     }

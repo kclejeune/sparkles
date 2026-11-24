@@ -886,13 +886,13 @@ fn has_exists(e: &Expression) -> bool {
     }
 }
 
-fn conjuncts(e: &Expression, out: &mut Vec<Expression>) {
+fn conjuncts<'a>(e: &'a Expression, out: &mut Vec<&'a Expression>) {
     match e {
         Expression::And(a, b) => {
             conjuncts(a, out);
             conjuncts(b, out);
         }
-        e => out.push(e.clone()),
+        e => out.push(e),
     }
 }
 
@@ -1749,18 +1749,18 @@ impl C {
         let mut cs = Vec::new();
         conjuncts(expr, &mut cs);
         let mut plain: Vec<Expression> = Vec::new();
-        let mut exists: Vec<(GP, MatchMode)> = Vec::new();
+        let mut exists: Vec<(&GP, MatchMode)> = Vec::new();
         // conjuncts evaluated by substitution: a correlated EXISTS, and an EXISTS inside
         // an expression
         let mut correlated: Vec<Expression> = Vec::new();
         for c in cs {
-            match &c {
-                Expression::Exists(p) => exists.push(((**p).clone(), MatchMode::Exists)),
+            match c {
+                Expression::Exists(p) => exists.push((p.as_ref(), MatchMode::Exists)),
                 Expression::Not(e) if matches!(**e, Expression::Exists(_)) => {
                     let Expression::Exists(p) = &**e else {
                         unreachable!()
                     };
-                    exists.push(((**p).clone(), MatchMode::NotExists));
+                    exists.push((p.as_ref(), MatchMode::NotExists));
                 }
                 e if has_exists(e) => {
                     if !matches!(scope, Scope::Default) {
@@ -1771,9 +1771,9 @@ impl C {
                             None,
                         );
                     }
-                    correlated.push(c);
+                    correlated.push(c.clone());
                 }
-                _ => plain.push(c),
+                _ => plain.push(c.clone()),
             }
         }
         let mut node = self.compile(inner, scope);
@@ -1804,16 +1804,13 @@ impl C {
             let mut own: Vec<String> = Vec::new();
             p.on_in_scope_variable(|v| own.push(v.as_str().to_string()));
             let mut all = Vec::new();
-            mentioned(&p, &mut all);
+            mentioned(p, &mut all);
             let free_outer = all.iter().any(|v| !own.contains(v) && outer.contains(v));
             let mut ends = Vec::new();
-            nullable_ends(&p, &mut ends);
+            nullable_ends(p, &mut ends);
             let nullable_outer = ends.iter().any(|v| outer.contains(v));
-            // The eager EXISTS planner uses its own copy of the expression's algebra.
-            // A temporary compiler copy does not identify any saved WHERE occurrence.
             let mark = self.native_patterns.len();
-            let right = self.compile(&p, scope);
-            self.native_patterns.truncate(mark);
+            let right = self.compile(p, scope);
             let shared_ok = right.schema.iter().all(|v| {
                 !node.schema.contains(v) || (node.certain.contains(v) && right.certain.contains(v))
             });
@@ -1822,11 +1819,12 @@ impl C {
                 || nullable_outer
                 || right.has_recompute() && matches!(scope, Scope::Var(_))
             {
+                self.native_patterns.truncate(mark);
                 // substitution semantics: the engine evaluates the pattern per row
                 if !matches!(scope, Scope::Default) {
                     return self.recompute(gp, scope, "a correlated EXISTS under GRAPH", None);
                 }
-                let e = Expression::Exists(Box::new(p));
+                let e = Expression::Exists(Box::new(p.clone()));
                 correlated.push(match mode {
                     MatchMode::Exists => e,
                     _ => Expression::Not(Box::new(e)),

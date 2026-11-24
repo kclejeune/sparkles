@@ -1699,7 +1699,7 @@ pub(super) fn streams_natively(ctx: &Ctx, node: &Node) -> bool {
                 && !spec.calls_service()
                 && keyed_exists(ctx, node, spec)
                     .or_else(|| {
-                        super::plan::Planner::new(ctx)
+                        super::plan::Planner::for_exists(ctx, spec)
                             .plan(spec.pattern(), &spec.graph, Vec::new())
                             .ok()
                     })
@@ -3206,7 +3206,11 @@ fn exists_streams(ctx: &Arc<Ctx>, kind: &Kind) -> Result<bool> {
         expr.exists_specs(&mut specs);
     }
     for spec in specs {
-        let planned = super::plan::Planner::new(ctx).plan(spec.pattern(), &spec.graph, Vec::new());
+        let planned = super::plan::Planner::for_exists(ctx, spec).plan(
+            spec.pattern(),
+            &spec.graph,
+            Vec::new(),
+        );
         if let Err(error) = &planned
             && super::extensions::is_unconfigured(error)
         {
