@@ -2178,7 +2178,21 @@ impl Ctx {
     #[inline]
     fn with_vocab_key<T>(&self, id: u64, mut f: impl FnMut(&[u8]) -> T) -> Option<T> {
         let strict = self.is_strict_decode();
-        if !self.envelope_refuses() && !strict {
+        if strict {
+            return match self.snap.generation.vocab.get_with_controlled(
+                id,
+                |need| self.reserve_decode_checked(need),
+                |_| self.check(),
+                |key| self.reserve_decode(key.len()).then(|| f(key)),
+            ) {
+                Ok(found) => found.flatten(),
+                Err(error) => {
+                    self.fail_memory(&error);
+                    None
+                }
+            };
+        }
+        if !self.envelope_refuses() {
             // An envelope that never refuses is charged after the key is rebuilt, on the
             // vocabulary's unchecked path. Checking it before each step of the rebuild
             // made an eager `term` about a quarter slower, which writing a large answer
@@ -2192,12 +2206,7 @@ impl Ctx {
         }
         match self.snap.generation.vocab.get_with_checked(
             id,
-            |need| {
-                if strict {
-                    self.check()?;
-                }
-                self.reserve_decode_checked(need)
-            },
+            |need| self.reserve_decode_checked(need),
             |key| self.reserve_decode(key.len()).then(|| f(key)),
         ) {
             Ok(found) => found.flatten(),
@@ -2733,16 +2742,24 @@ impl Ctx {
     pub fn term(&self, id: Id) -> Option<Term> {
         match id.tag() {
             Tag::Local => {
+                if self.is_strict_decode() && self.check().is_err() {
+                    return None;
+                }
                 let local = self.local.read();
                 let key = local.get(id.payload())?;
                 self.reserve_decode(key.len()).then(|| id::key_to_term(key))
             }
             Tag::Vocab => self.with_vocab_key(id.payload(), id::key_to_term),
-            Tag::Delta => self.snap.generation.dvocab.with(|vocab| {
-                vocab
-                    .get(id.payload())
-                    .and_then(|key| self.reserve_decode(key.len()).then(|| id::key_to_term(key)))
-            }),
+            Tag::Delta => {
+                if self.is_strict_decode() && self.check().is_err() {
+                    return None;
+                }
+                self.snap.generation.dvocab.with(|vocab| {
+                    vocab.get(id.payload()).and_then(|key| {
+                        self.reserve_decode(key.len()).then(|| id::key_to_term(key))
+                    })
+                })
+            }
             Tag::BNode => Some(Term::BlankNode(bnode_for(id))),
             _ => self.snap.term(id),
         }
@@ -3422,12 +3439,21 @@ impl Ctx {
                     |key: &[u8]| self.reserve_decode(key.len()).then(|| Value::from_key(key));
                 let v = match id.tag() {
                     Tag::Vocab => self.with_vocab_key(id.payload(), Value::from_key),
-                    Tag::Delta => self
-                        .snap
-                        .generation
-                        .dvocab
-                        .with(|v| v.get(id.payload()).and_then(decode)),
-                    Tag::Local => self.local.read().get(id.payload()).and_then(decode),
+                    Tag::Delta => {
+                        if self.is_strict_decode() && self.check().is_err() {
+                            return None;
+                        }
+                        self.snap
+                            .generation
+                            .dvocab
+                            .with(|v| v.get(id.payload()).and_then(decode))
+                    }
+                    Tag::Local => {
+                        if self.is_strict_decode() && self.check().is_err() {
+                            return None;
+                        }
+                        self.local.read().get(id.payload()).and_then(decode)
+                    }
                     _ => unreachable!("dictionary value tag"),
                 }?;
                 self.cache_value(id, &v);
@@ -3539,7 +3565,12 @@ impl Ctx {
                     TermKind::Literal
                 }
             }
-            Tag::Delta => self.snap.key(id).map_or(TermKind::None, |k| key_kind(&k)),
+            Tag::Delta if id.payload() < self.snap.dvocab_len => self
+                .snap
+                .generation
+                .dvocab
+                .with(|d| d.get(id.payload()).map_or(TermKind::None, key_kind)),
+            Tag::Delta => TermKind::None,
             Tag::Local => self
                 .local
                 .read()
@@ -3562,6 +3593,38 @@ impl Ctx {
         let lexical = |k: &[u8]| -> Option<std::ops::Range<usize>> {
             (k.len() >= 2 && k[0] == b'"' && k[k.len() - 1] == id::KEY_SEP).then(|| 1..k.len() - 1)
         };
+        if self.is_strict_decode() {
+            let mut order = None;
+            let outer = v.get_with_controlled(
+                x,
+                |need| self.reserve_decode_checked(need),
+                |_| self.check(),
+                |kx| {
+                    let Some(rx) = lexical(kx) else {
+                        return Ok(());
+                    };
+                    v.get_with_controlled(
+                        y,
+                        |need| self.reserve_decode_checked(need),
+                        |_| self.check(),
+                        |ky| {
+                            if let Some(ry) = lexical(ky) {
+                                order = Some(kx[rx.clone()].cmp(&ky[ry]));
+                            }
+                        },
+                    )
+                    .map(|_| ())
+                },
+            );
+            return match outer {
+                Ok(Some(Ok(()))) => order,
+                Ok(Some(Err(error))) | Err(error) => {
+                    self.fail_memory(&error);
+                    None
+                }
+                Ok(None) => None,
+            };
+        }
         // The reconstruction of both keys is reserved before it grows them, within the
         // high-water envelope of transient decoding ([`Ctx::reserve_decode`]). That
         // envelope covers a key of the largest size seen so far on every worker, both
@@ -3656,6 +3719,11 @@ impl Ctx {
             }
             f.take().map(|f| f(prev, key))
         };
+        if self.is_strict_decode() {
+            return self
+                .with_vocab_key(id, |key| f.take().map(|f| f(None, key)))
+                .flatten();
+        }
         if !self.envelope_refuses() {
             return self
                 .snap
@@ -3785,6 +3853,19 @@ impl Ctx {
     /// envelope. A refusal records a failure and gives `None`.
     fn vocab_lower_bound(&self, key: &[u8]) -> Option<u64> {
         let v = &self.snap.generation.vocab;
+        if self.is_strict_decode() {
+            return match v.find_with_controlled(
+                key,
+                |need| self.reserve_decode_checked(need),
+                |_| self.check(),
+            ) {
+                Ok(Ok(i) | Err(i)) => Some(i),
+                Err(error) => {
+                    self.fail_memory(&error);
+                    None
+                }
+            };
+        }
         if !self.envelope_refuses() {
             let (Ok(i) | Err(i)) = v.find(key);
             return Some(i);

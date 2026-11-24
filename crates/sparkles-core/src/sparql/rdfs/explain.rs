@@ -49,6 +49,12 @@ fn named_node_bytes(n: &NamedNode) -> usize {
         .saturating_add(std::mem::size_of::<NamedNode>())
 }
 
+fn triple_copy_bytes(s: &Term, p: &NamedNode, o: &Term) -> usize {
+    term_bytes(s)
+        .saturating_add(named_node_bytes(p))
+        .saturating_add(term_bytes(o))
+}
+
 struct Cx<'a> {
     schema: Option<&'a RdfsSchema>,
     snap: &'a Snapshot,
@@ -195,7 +201,7 @@ impl Cx<'_> {
         self.scan_rows(Perm::Gspo, &[g.0, subject.0, predicate.0], |key| {
             self.read()?;
             if let Some(object) = self.decode_term(Id(key[3]))? {
-                let _hold = self.workspace.hold(term_bytes(&object))?;
+                let _hold = self.workspace.hold(triple_copy_bytes(s, p, &object))?;
                 let triple = [s.clone(), Term::NamedNode(p.clone()), object];
                 if let Some(proof) = self.leaf(g, &triple)? {
                     found = Some(proof);
@@ -220,7 +226,7 @@ impl Cx<'_> {
             if q[3] == g
                 && let Some(subject) = self.decode_term(q[0])?
             {
-                let _hold = self.workspace.hold(term_bytes(&subject))?;
+                let _hold = self.workspace.hold(triple_copy_bytes(&subject, p, o))?;
                 let triple = [subject, Term::NamedNode(p.clone()), o.clone()];
                 if let Some(proof) = self.leaf(g, &triple)? {
                     found = Some(proof);
@@ -245,21 +251,33 @@ impl Cx<'_> {
                 return Ok(Some(d));
             }
         }
-        let subs: Vec<NamedNode> = RdfsSchema::get(&self.schema().sub_class, c.as_ref())
+        let rdf_type_bytes = rdf::TYPE
+            .as_str()
+            .len()
+            .saturating_add(std::mem::size_of::<Term>());
+        for d in self
+            .schema()
+            .sub_class
+            .get(c)
             .into_iter()
             .flatten()
             .filter(|d| *d != c)
-            .cloned()
-            .collect();
-        for d in &subs {
-            let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
-            let premise = if let Some(proof) = self.asserted(g, &typed)? {
-                Some(proof)
-            } else {
-                match self.by_domain_range(g, s, d, false)? {
+        {
+            let premise = {
+                let _typed_hold = self.workspace.hold(
+                    term_bytes(s)
+                        .saturating_add(rdf_type_bytes)
+                        .saturating_add(named_node_bytes(d)),
+                )?;
+                let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
+                self.asserted(g, &typed)?
+            };
+            let premise = match premise {
+                Some(proof) => Some(proof),
+                None => match self.by_domain_range(g, s, d, false)? {
                     Some(x) => Some(x),
                     None => self.by_domain_range(g, s, d, true)?,
-                }
+                },
             };
             let Some(premise) = premise else {
                 continue;
@@ -286,19 +304,33 @@ impl Cx<'_> {
         pred: NamedNodeRef<'_>,
         b: &NamedNode,
     ) -> Result<Option<Derivation>> {
-        let t = [
-            Term::NamedNode(a.clone()),
-            nn(pred),
-            Term::NamedNode(b.clone()),
-        ];
         Ok(match self.leaves {
             // a document's leaves are the triples of its closure, so a fact outside it is
             // no leaf
-            SchemaLeaves::Document => self
-                .schema()
-                .closes(a, pred, b)
-                .then(|| Derivation::asserted(t, None)),
-            SchemaLeaves::Graph(g) => self.asserted(g, &t)?,
+            SchemaLeaves::Document => self.schema().closes(a, pred, b).then(|| {
+                Derivation::asserted(
+                    [
+                        Term::NamedNode(a.clone()),
+                        nn(pred),
+                        Term::NamedNode(b.clone()),
+                    ],
+                    None,
+                )
+            }),
+            SchemaLeaves::Graph(g) => {
+                let _fact_hold = self.workspace.hold(
+                    named_node_bytes(a)
+                        .saturating_add(pred.as_str().len())
+                        .saturating_add(std::mem::size_of::<Term>())
+                        .saturating_add(named_node_bytes(b)),
+                )?;
+                let t = [
+                    Term::NamedNode(a.clone()),
+                    nn(pred),
+                    Term::NamedNode(b.clone()),
+                ];
+                self.asserted(g, &t)?
+            }
             SchemaLeaves::Hidden => None,
         })
     }
@@ -346,12 +378,20 @@ impl Cx<'_> {
                 {
                     let y_bytes = named_node_bytes(&y);
                     let y_hold = self.workspace.hold(y_bytes)?;
-                    let triple = [
-                        Term::NamedNode(x.clone()),
-                        Term::NamedNode(pred_owned.clone()),
-                        Term::NamedNode(y.clone()),
-                    ];
-                    if self.leaf(g, &triple)?.is_none() {
+                    let supported = {
+                        let _triple_hold = self.workspace.hold(
+                            x_bytes
+                                .saturating_add(named_node_bytes(&pred_owned))
+                                .saturating_add(y_bytes),
+                        )?;
+                        let triple = [
+                            Term::NamedNode(x.clone()),
+                            Term::NamedNode(pred_owned.clone()),
+                            Term::NamedNode(y.clone()),
+                        ];
+                        self.leaf(g, &triple)?.is_some()
+                    };
+                    if !supported {
                         return Ok(true);
                     }
                     search_hold.add(y_bytes.saturating_add(x_bytes))?;
@@ -382,6 +422,11 @@ impl Cx<'_> {
             "rdfs5"
         };
         let leaf = |x: &NamedNode, y: &NamedNode| -> Result<Derivation> {
+            let _triple_hold = self.workspace.hold(
+                named_node_bytes(x)
+                    .saturating_add(named_node_bytes(&pred_owned))
+                    .saturating_add(named_node_bytes(y)),
+            )?;
             let triple = [
                 Term::NamedNode(x.clone()),
                 Term::NamedNode(pred_owned.clone()),
@@ -564,27 +609,33 @@ fn explain_inner<'a>(
     if pr == rdf::TYPE
         && let Term::NamedNode(c) = o
     {
-        let subs: Vec<NamedNode> = RdfsSchema::get(&schema.sub_class, c.as_ref())
-            .into_iter()
-            .flatten()
-            .filter(|d| *d != c)
-            .cloned()
-            .collect();
+        let rdf_type_bytes = rdf::TYPE
+            .as_str()
+            .len()
+            .saturating_add(std::mem::size_of::<Term>());
+        let subs = schema.sub_class.get(c);
         for &g in graphs {
             for range in [false, true] {
                 if let Some(d) = cx.by_domain_range(g, s, c, range)? {
                     keep(d)?;
                 }
             }
-            for d in &subs {
-                let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
-                let premise = if let Some(proof) = cx.asserted(g, &typed)? {
-                    Some(proof)
-                } else {
-                    match cx.by_domain_range(g, s, d, false)? {
+            for d in subs.into_iter().flatten().filter(|d| *d != c) {
+                let premise = {
+                    let _typed_hold = cx.workspace.hold(
+                        term_bytes(s)
+                            .saturating_add(rdf_type_bytes)
+                            .saturating_add(named_node_bytes(d)),
+                    )?;
+                    let typed = [s.clone(), nn(rdf::TYPE), Term::NamedNode(d.clone())];
+                    cx.asserted(g, &typed)?
+                };
+                let premise = match premise {
+                    Some(proof) => Some(proof),
+                    None => match cx.by_domain_range(g, s, d, false)? {
                         Some(x) => Some(x),
                         None => cx.by_domain_range(g, s, d, true)?,
-                    }
+                    },
                 };
                 let Some(premise) = premise else {
                     continue;
@@ -603,16 +654,15 @@ fn explain_inner<'a>(
         }
     }
     if pr != rdfs::SUB_CLASS_OF && pr != rdfs::SUB_PROPERTY_OF {
-        let subs: Vec<NamedNode> = RdfsSchema::get(&schema.sub_prop, pr)
-            .into_iter()
-            .flatten()
-            .filter(|q| *q != p)
-            .cloned()
-            .collect();
+        let subs = schema.sub_prop.get(p);
         'graphs: for &g in graphs {
-            for q in &subs {
-                let stored = [s.clone(), Term::NamedNode(q.clone()), o.clone()];
-                let premise = if let Some(proof) = cx.asserted(g, &stored)? {
+            for q in subs.into_iter().flatten().filter(|q| *q != p) {
+                let asserted = {
+                    let _stored_hold = cx.workspace.hold(triple_copy_bytes(s, q, o))?;
+                    let stored = [s.clone(), Term::NamedNode(q.clone()), o.clone()];
+                    cx.asserted(g, &stored)?
+                };
+                let premise = if let Some(proof) = asserted {
                     proof
                 } else if q.as_ref() == rdf::TYPE
                     && let Term::NamedNode(c) = o

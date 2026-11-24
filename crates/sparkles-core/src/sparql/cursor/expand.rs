@@ -128,8 +128,8 @@ struct Remote {
     run: crate::sparql::enhancer::RemoteRun,
     /// The input rows whose inputs a request has still to answer.
     held: Option<Buffer>,
-    /// The charge of what the loop keeps for inputs that later rows repeat: their
-    /// answers, and the distinct keys and inputs that look them up.
+    /// The charge of the answers the loop keeps for inputs that later rows repeat;
+    /// distinct keys and inputs are charged continuously on `run`.
     answers: OwnedCharge,
 }
 
@@ -349,8 +349,9 @@ impl Expand {
             && let Some(batch) = child.next(ctx, options, options.batch_rows.max(1))?
         {
             remote.run.add(ctx, spec, rl, &batch.table)?;
-            // The keys and inputs the batch added are held before any request is sent.
-            remote.answers.resize(remote.run.held_bytes())?;
+            // Keys and inputs are already charged on `remote.run`; admit any cached answers
+            // read during `add` before any request is sent.
+            remote.answers.resize(remote.run.answer_bytes())?;
             match &mut remote.held {
                 Some(held) => {
                     super::merge::append(ctx, held, &batch.table, 0..batch.table.len)?;

@@ -1065,3 +1065,121 @@ fn rdfs_on_read_resolver_shares_workspace_with_proof_search() {
         "shared workspace across proof search and resolver must fail with reasoning-budget, got {err:?}"
     );
 }
+
+#[test]
+fn rdfs_on_read_explain_accounts_for_nested_triple_terms_and_borrowed_schema() {
+    // 1. Domain proof over an uncompacted delta object containing a 12 KiB nested triple
+    //    term in a 6 KiB delta graph with an 8 KiB answer limit (16,640-byte workspace):
+    //    workspace hold on the object + 6 KiB graph-name decode exceeds 16,640 bytes, and
+    //    the final answer also exceeds 8 KiB.
+    {
+        let (_dir, ds) = open();
+        ds.load_str(
+            "<http://ex.org/seed> <http://ex.org/seedp> <http://ex.org/seedo> .\n",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+        ds.store().compact().unwrap();
+        let g_6k = format!("http://ex.org/g6k/{}", "g".repeat(6144));
+        let lit_12k = "t".repeat(12_288);
+        let nq = format!(
+            "<http://ex.org/s> <http://ex.org/p> <<( <http://ex.org/a> <http://ex.org/b> \"{lit_12k}\" )>> <{g_6k}> .\n"
+        );
+        ds.load_str(&nq, RdfFormat::NQuads).unwrap();
+        let snap = ds.store().snapshot();
+        assert_eq!(
+            snap.lookup_iri(&g_6k).unwrap().tag(),
+            sparkles_core::id::Tag::Delta
+        );
+        let domain_schema = vec![oxrdf::Triple::new(
+            NamedNode::new_unchecked("http://ex.org/p"),
+            NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#domain"),
+            NamedNode::new_unchecked("http://ex.org/C"),
+        )];
+        ds.reasoning()
+            .rdfs()
+            .set(sparkles::reasoning::rdfs::NewSchema::Triples(domain_schema))
+            .unwrap();
+
+        let mut req = ExplainRequest::new([ex("s"), ty(), ex("C")]);
+        req.max_memory = Some(8192);
+        let err = ds.reasoning().explain(&req).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "12 KiB nested triple object + 6 KiB delta graph must fail with reasoning-budget, got {err:?}"
+        );
+    }
+
+    // 2. Same 12 KiB nested triple term in the default graph (short graph name): workspace
+    //    passes the decode, and the final Derivation::heap_bytes() check must still refuse
+    //    for an 8 KiB answer limit.
+    {
+        let (_dir, ds) = open();
+        ds.load_str(
+            "<http://ex.org/seed> <http://ex.org/seedp> <http://ex.org/seedo> .\n",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+        ds.store().compact().unwrap();
+        let lit_12k = "u".repeat(12_288);
+        let ttl = format!(
+            "<http://ex.org/s> <http://ex.org/p> <<( <http://ex.org/a> <http://ex.org/b> \"{lit_12k}\" )>> .\n"
+        );
+        ds.load_str(&ttl, RdfFormat::Turtle).unwrap();
+        let domain_schema = vec![oxrdf::Triple::new(
+            NamedNode::new_unchecked("http://ex.org/p"),
+            NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#domain"),
+            NamedNode::new_unchecked("http://ex.org/C"),
+        )];
+        ds.reasoning()
+            .rdfs()
+            .set(sparkles::reasoning::rdfs::NewSchema::Triples(domain_schema))
+            .unwrap();
+
+        let mut req = ExplainRequest::new([ex("s"), ty(), ex("C")]);
+        req.max_memory = Some(8192);
+        let err = ds.reasoning().explain(&req).map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "final Derivation::heap_bytes() must include nested triple literal payload, got {err:?}"
+        );
+    }
+
+    // 3. Warm graph-backed schema with 30 distinct 1 KiB subclasses of BigClass and 30
+    //    distinct 1 KiB subproperties of bigProp: explaining a missing subject under a 4 KiB
+    //    answer limit borrows the cached sets without cloning 30 KiB vectors.
+    {
+        let (_dir, ds) = open();
+        let mut nq = String::new();
+        for i in 0..30 {
+            let sub_c = format!("http://ex.org/SubC{i:02}/{}", "c".repeat(1024));
+            let sub_p = format!("http://ex.org/subP{i:02}/{}", "p".repeat(1024));
+            nq.push_str(&format!(
+                "<{sub_c}> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://ex.org/BigClass> <{ONTO}> .\n\
+                 <{sub_p}> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <http://ex.org/bigProp> <{ONTO}> .\n"
+            ));
+        }
+        ds.load_str(&nq, RdfFormat::NQuads).unwrap();
+        ds.store().compact().unwrap();
+        ds.reasoning()
+            .rdfs()
+            .set(sparkles::reasoning::rdfs::NewSchema::Graph(ONTO.into()))
+            .unwrap();
+
+        // Warm the schema cache.
+        let _ = ds
+            .reasoning()
+            .explain(&ExplainRequest::new([ex("missing"), ty(), ex("BigClass")]))
+            .unwrap();
+
+        let mut req_type = ExplainRequest::new([ex("missing"), ty(), ex("BigClass")]);
+        req_type.max_memory = Some(4096);
+        let ans_type = ds.reasoning().explain(&req_type).unwrap();
+        assert!(matches!(ans_type.explained, Explained::NotFound));
+
+        let mut req_prop = ExplainRequest::new([ex("missing"), ex("bigProp"), ex("o")]);
+        req_prop.max_memory = Some(4096);
+        let ans_prop = ds.reasoning().explain(&req_prop).unwrap();
+        assert!(matches!(ans_prop.explained, Explained::NotFound));
+    }
+}

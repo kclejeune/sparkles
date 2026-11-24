@@ -827,7 +827,11 @@ impl DeltaVocab {
         self.len() == 0
     }
     pub fn get(&self, id: u64) -> Option<Vec<u8>> {
-        self.inner.read().get(id).map(|k| k.to_vec())
+        self.inner.read().get(id).map(|k| {
+            #[cfg(test)]
+            DELTA_KEY_COPIES.with(|n| n.set(n.get() + 1));
+            k.to_vec()
+        })
     }
     pub fn find(&self, key: &[u8]) -> Option<u64> {
         self.inner.read().find(key)
@@ -1112,6 +1116,16 @@ fn extend_read_only_controlled(
     budget.drop_vec(parsed.keys);
     budget.drop_vec(bytes);
     budget.check()
+}
+
+#[cfg(test)]
+thread_local! {
+    static DELTA_KEY_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn delta_key_copies() -> usize {
+    DELTA_KEY_COPIES.with(|n| n.get())
 }
 
 #[cfg(test)]

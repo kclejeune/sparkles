@@ -1208,9 +1208,13 @@ pub(super) struct RemoteRun {
     /// the bytes of the keys and inputs the loop keeps, summed as they are added
     kept: u64,
     pub stats: LoopStats,
-    /// retained credit for decoded outer constants and input terms, dropped last after
-    /// `outer`, `pattern`, `inputs` and `by_values`
-    decode_lease: Option<QueryMemoryLease>,
+    /// retained credit for decoded outer constants and substituted pattern, dropped after
+    /// `outer` and `pattern`
+    _outer_lease: Option<QueryMemoryLease>,
+    /// retained credit for `self.kept` (distinct keys, inputs and cache keys), reconciled
+    /// continuously from each row's decode charge and dropped after `inputs`, `by_values`
+    /// and `by_key`
+    kept_lease: Option<QueryMemoryLease>,
 }
 
 /// The bytes one distinct key of `width` identifiers holds in `by_key`: the key, its
@@ -1253,7 +1257,7 @@ impl RemoteRun {
             }
         }
         let pattern = substitute(&spec.pattern, &outer);
-        let decode_lease = if decode.bytes() > 0 {
+        let _outer_lease = if decode.bytes() > 0 {
             Some(decode.output_lease(decode.bytes())?)
         } else {
             None
@@ -1278,7 +1282,8 @@ impl RemoteRun {
             held: 0,
             kept: 0,
             stats: LoopStats::default(),
-            decode_lease,
+            _outer_lease,
+            kept_lease: None,
         })
     }
 
@@ -1291,7 +1296,8 @@ impl RemoteRun {
     }
 
     /// Take the left rows `l`: their new distinct inputs, answered from the cache where
-    /// it has them.
+    /// it has them. Reconciles each row's transient decode charge continuously into
+    /// `kept_lease`, releasing credit for filtered or deduplicated terms immediately.
     pub(super) fn add(
         &mut self,
         ctx: &Ctx,
@@ -1299,40 +1305,43 @@ impl RemoteRun {
         rl: &RemoteLoop,
         l: &Table,
     ) -> Result<()> {
-        let first = self.inputs.len();
-        let decode = ctx.charge(0)?;
+        let cache = &ctx.snap.results.service;
         for i in 0..l.len() {
             let key = Self::key(spec, l, i);
             if self.by_key.contains_key(&key) {
                 continue;
             }
+            let row_decode = ctx.charge(0)?;
             let mut values = Vec::with_capacity(key.len());
             for id in &key {
                 let term = if id.is_undef() {
                     None
                 } else {
-                    ctx.term_checked_into(*id, &decode)?
+                    ctx.term_checked_into(*id, &row_decode)?
                         .filter(|t| matches!(t, Term::NamedNode(_) | Term::Literal(_)))
                 };
                 values.push(term);
             }
-            let n = self.inputs.len();
-            let input = *self.by_values.entry(values.clone()).or_insert_with(|| {
-                self.inputs.push(Input {
-                    values,
-                    key: None,
-                    rows: None,
-                });
-                n
-            });
-            self.kept = self.kept.saturating_add(key_bytes(key.len()));
-            self.by_key.insert(key, (input, false));
-        }
-        self.stats.inputs = self.inputs.len();
-        let cache = &ctx.snap.results.service;
-        for i in first..self.inputs.len() {
+            let key_cost = key_bytes(key.len());
+            if let Some(&existing) = self.by_values.get(&values) {
+                // Duplicate values (including filtered terms that collapsed to an existing
+                // entry): drop the decoded terms and settle credit down to the key alone.
+                drop(values);
+                let mut lease = Some(row_decode.output_lease(key_cost)?);
+                match &mut self.kept_lease {
+                    Some(held) => held.merge(&mut lease)?,
+                    None => self.kept_lease = lease,
+                }
+                self.kept = self.kept.saturating_add(key_cost);
+                self.by_key.insert(key, (existing, false));
+                continue;
+            }
+            let mut input = Input {
+                values,
+                key: None,
+                rows: None,
+            };
             if self.caching {
-                let input = &mut self.inputs[i];
                 let mut kv: Vec<(&str, &Term)> = self
                     .outer
                     .map
@@ -1344,37 +1353,53 @@ impl RemoteRun {
                         kv.push((n.as_str(), t));
                     }
                 }
-                let k = svccache::key(&ctx.service_scope, rl.endpoint.as_str(), &self.text, &kv);
+                input.key = Some(svccache::key(
+                    &ctx.service_scope,
+                    rl.endpoint.as_str(),
+                    &self.text,
+                    &kv,
+                ));
+            }
+            let kept_cost = key_cost.saturating_add(input_bytes(&input));
+            // Admit any growth above the transient decode charge before cloning `values`
+            // into `by_values` or mutating state, then settle continuously into `kept_lease`.
+            if kept_cost > row_decode.bytes() {
+                row_decode.add(kept_cost - row_decode.bytes())?;
+            }
+            if let Some(k) = &input.key {
                 if rl.cache.reads() {
-                    input.rows = cache.get(&k);
+                    input.rows = cache.get(k);
                     if let Some(rows) = &input.rows {
                         self.stats.cache_hits += 1;
                         self.held = self.held.saturating_add(rows.bytes());
                     }
                 } else {
-                    cache.remove(&k);
+                    cache.remove(k);
                 }
-                input.key = Some(k);
             }
-            if self.inputs[i].rows.is_none() {
-                self.missing.push(i);
+            let n = self.inputs.len();
+            self.by_values.insert(input.values.clone(), n);
+            if input.rows.is_none() {
+                self.missing.push(n);
             }
-            self.kept = self.kept.saturating_add(input_bytes(&self.inputs[i]));
-        }
-        if decode.bytes() > 0 {
-            let mut lease = Some(decode.output_lease(decode.bytes())?);
-            match &mut self.decode_lease {
+            self.inputs.push(input);
+            self.by_key.insert(key, (n, false));
+            let mut lease = Some(row_decode.output_lease(kept_cost)?);
+            match &mut self.kept_lease {
                 Some(held) => held.merge(&mut lease)?,
-                None => self.decode_lease = lease,
+                None => self.kept_lease = lease,
             }
+            self.kept = self.kept.saturating_add(kept_cost);
         }
+        self.stats.inputs = self.inputs.len();
         Ok(())
     }
 
     /// Send the requests for the unanswered inputs: the full bulk requests among them,
     /// and with `all` the last partial one too. After each request it passes `admit` the
-    /// bytes the loop then holds ([`RemoteRun::held_bytes`]), so a caller that charges
-    /// them refuses the loop before it sends the next request.
+    /// answer bytes the loop then holds ([`RemoteRun::answer_bytes`]), so a caller that
+    /// charges them refuses the loop before it sends the next request. Keys and inputs
+    /// are already covered by `self.kept_lease`.
     pub(super) fn send(
         &mut self,
         ctx: &Ctx,
@@ -1392,7 +1417,7 @@ impl RemoteRun {
             return Ok(());
         }
         let missing: Vec<usize> = self.missing.drain(..ready).collect();
-        let (mut held, kept) = (self.held, self.kept);
+        let mut held = self.held;
         let (names, outer, pattern) = (&self.names, &self.outer, &self.pattern);
         let (inputs, stats) = (&mut self.inputs, &mut self.stats);
         let unit = || {
@@ -1460,7 +1485,7 @@ impl RemoteRun {
                             let mut out = Vec::new();
                             let mut err = None;
                             // Each answer is held before the next request goes out.
-                            let mut retried = held.saturating_add(kept);
+                            let mut retried = held;
                             for i in chunk {
                                 match ctx
                                     .check()
@@ -1508,7 +1533,7 @@ impl RemoteRun {
                 .sum();
             held = held.saturating_add(answered);
             self.held = held;
-            admit(held.saturating_add(kept))?;
+            admit(held)?;
         }
         Ok(())
     }
@@ -1525,10 +1550,10 @@ impl RemoteRun {
             .unwrap_or(l.len())
     }
 
-    /// The bytes the loop holds: the answers of its inputs, and the distinct keys and
-    /// inputs it keeps to look them up.
-    pub(super) fn held_bytes(&self) -> u64 {
-        self.held.saturating_add(self.kept)
+    /// The bytes of the answers the loop holds (cached and fetched). Distinct keys and
+    /// inputs are charged separately on `self.kept_lease`.
+    pub(super) fn answer_bytes(&self) -> u64 {
+        self.held
     }
 
     /// Join the left rows `l`, whose inputs all have answers, with their solutions.

@@ -2153,3 +2153,404 @@ fn diagnostic_rendering_uses_plan_term_without_latching_refusal() {
     ctx.check()
         .expect("vector diagnostic must not latch a decode refusal");
 }
+
+#[cfg(feature = "geo")]
+#[test]
+fn geopf_fold_const_borrows_delta_kind_and_checkpoints_controlled_reconstruction() {
+    // 1. Delta IRI in IF(isIRI(Expr::Const(delta_id)), small_geom, ...) must check kind on
+    //    a borrowed delta key without copying the full delta key into a Vec.
+    {
+        let store = store_with_turtle(
+            "<http://example.org/seed> <http://example.org/seedp> <http://example.org/seedo> .\n",
+            true,
+        );
+        let long_delta_iri = format!("http://example.org/delta/{}", "d".repeat(2048));
+        let ttl = format!(
+            "<{long_delta_iri}> <http://example.org/p> \"POINT(1 2)\"^^<{}> .\n",
+            crate::geo::vocab::WKT_LITERAL,
+        );
+        store
+            .load(&[Source::from_bytes(
+                ttl.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        let snap = store.snapshot();
+        let delta_id = snap.lookup_iri(&long_delta_iri).unwrap();
+        let small_geom_id = snap
+            .lookup_term(&Term::Literal(Literal::new_typed_literal(
+                "POINT(1 2)",
+                NamedNode::new_unchecked(crate::geo::vocab::WKT_LITERAL),
+            )))
+            .unwrap();
+        let small_geom_val = super::value::Value::Other {
+            lex: "POINT(1 2)".into(),
+            dt: crate::geo::vocab::WKT_LITERAL.into(),
+        };
+        assert_eq!(delta_id.tag(), Tag::Delta);
+
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = MIB;
+        let _held = hold_all_but(&ctx, 100);
+
+        let if_is_iri = super::expr::Expr::If(
+            Box::new(super::expr::Expr::Call(
+                super::expr::Func::Builtin(spargebra::algebra::Function::IsIri),
+                vec![super::expr::Expr::Const(delta_id)],
+            )),
+            Box::new(super::expr::Expr::Lit(
+                small_geom_id,
+                small_geom_val.clone(),
+            )),
+            Box::new(super::expr::Expr::Const(delta_id)),
+        );
+        let copies_before = crate::vocab::delta::delta_key_copies();
+        let folded = super::geopf::fold_const_checked(&if_is_iri, &ctx)
+            .expect("borrowed delta kind check must not fail or copy full key");
+        let copies_after = crate::vocab::delta::delta_key_copies();
+        assert_eq!(
+            copies_after - copies_before,
+            0,
+            "Ctx::kind on a delta ID must borrow the delta key without copying it"
+        );
+        assert_eq!(folded.map(|v| v.to_term()), Some(small_geom_val.to_term()));
+
+        // Actual decoding of the 2 KiB delta IRI under strict_decode_guard still refuses.
+        let str_delta = super::expr::Expr::Call(
+            super::expr::Func::Builtin(spargebra::algebra::Function::Str),
+            vec![super::expr::Expr::Const(delta_id)],
+        );
+        assert_memory_budget_error(
+            super::geopf::fold_const_checked(&str_delta, &ctx),
+            "geopf::fold_const_checked STR over large delta IRI",
+        );
+    }
+
+    // 2. Controlled reconstruction checkpoints during fold_const_checked: front-code steps
+    //    without scratch growth, simple_literal_cmp, and FSST-coded vocabulary blocks.
+    {
+        let mut ttl = String::new();
+        // Enough repetitive literals so a compacted block has 32 front-coded short entries
+        // (all well below initial scratch capacity) and FSST compression is active.
+        for i in 0..256 {
+            ttl.push_str(&format!(
+                "<http://example.org/s> <http://example.org/p> \"prefix_common_segment_{i:03}_tail\" .\n"
+            ));
+        }
+        let store = store_with_turtle(&ttl, true);
+        let snap = store.snapshot();
+        let lit_20 = snap
+            .lookup_term(&Term::Literal(Literal::new_simple_literal(
+                "prefix_common_segment_020_tail",
+            )))
+            .unwrap();
+        let lit_31 = snap
+            .lookup_term(&Term::Literal(Literal::new_simple_literal(
+                "prefix_common_segment_031_tail",
+            )))
+            .unwrap();
+        assert_eq!(lit_20.tag(), Tag::Vocab);
+        assert_eq!(lit_31.tag(), Tag::Vocab);
+        let block_pos_31 = (lit_31.payload() as usize) % 16;
+        let block_pos_20 = (lit_20.payload() as usize) % 16;
+        assert!(
+            block_pos_31 >= 8 || block_pos_20 >= 8,
+            "expected at least one literal deep inside a front-coded block"
+        );
+        let deep_lit = if block_pos_31 >= block_pos_20 {
+            lit_31
+        } else {
+            lit_20
+        };
+        let deep_pos = (deep_lit.payload() as usize) % 16;
+
+        // 2a. STR(Expr::Const(deep_lit)): must run reconstruction checkpoints on every
+        //     front-code step even when scratch does not grow after the initial allocation.
+        let mut ctx = Ctx::new(snap.clone());
+        ctx.mem_limit = MIB;
+        let str_expr = super::expr::Expr::Call(
+            super::expr::Func::Builtin(spargebra::algebra::Function::Str),
+            vec![super::expr::Expr::Const(deep_lit)],
+        );
+        let before = super::ctx::CHECKS.with(|n| n.get());
+        let folded = super::geopf::fold_const_checked(&str_expr, &ctx).unwrap();
+        let checks = super::ctx::CHECKS.with(|n| n.get()) - before;
+        assert!(folded.is_some());
+        assert!(
+            checks > deep_pos + 2,
+            "expected controlled reconstruction checkpoints across front-code steps (pos={deep_pos}, checks={checks})"
+        );
+
+        // 2b. simple_literal_cmp inside fold_const_checked: must also use controlled
+        //     reconstruction with per-step checkpoints on both operands.
+        let mut ctx = Ctx::new(snap);
+        ctx.mem_limit = MIB;
+        let cmp_expr = super::expr::Expr::Cmp(
+            Box::new(super::expr::Expr::Const(lit_20)),
+            Box::new(super::expr::Expr::Const(lit_31)),
+            super::expr::CmpOp::Lt,
+        );
+        let before = super::ctx::CHECKS.with(|n| n.get());
+        let folded = super::geopf::fold_const_checked(&cmp_expr, &ctx).unwrap();
+        let checks = super::ctx::CHECKS.with(|n| n.get()) - before;
+        assert!(matches!(folded, Some(super::value::Value::Bool(true))));
+        assert!(
+            checks > block_pos_20 + block_pos_31 + 2,
+            "expected controlled reconstruction checkpoints in simple_literal_cmp (pos20={block_pos_20}, pos31={block_pos_31}, checks={checks})"
+        );
+    }
+}
+
+#[test]
+fn remote_service_cursor_admission_does_not_double_charge_or_retain_discarded_inputs() {
+    #[derive(Debug)]
+    struct ReachSendEndpoint;
+    impl LocalEndpoints for ReachSendEndpoint {
+        fn resolve(&self, iri: &str) -> Option<Result<LocalTarget>> {
+            (iri == "http://example.org/remote-sparql")
+                .then(|| Err(Error::Service("sentinel: reached send".into())))
+        }
+    }
+
+    let store = store_with_turtle(
+        "<http://example.org/seed> <http://example.org/seedp> <http://example.org/seedo> .\n",
+        true,
+    );
+    let long_iri = format!("http://example.org/delta-iri/{}", "x".repeat(2048));
+    let long_lit1 = "t".repeat(2048);
+    let long_lit2 = "u".repeat(2048);
+    let ttl = format!(
+        "<http://example.org/s> <http://example.org/p> <{long_iri}> .\n\
+         <http://example.org/s> <http://example.org/t> <<( <http://example.org/a> <http://example.org/b> \"{long_lit1}\" )>> .\n\
+         <http://example.org/s> <http://example.org/t> <<( <http://example.org/a> <http://example.org/b> \"{long_lit2}\" )>> .\n"
+    );
+    store
+        .load(&[Source::from_bytes(
+            ttl.into_bytes(),
+            RdfFormat::Turtle,
+            None,
+        )])
+        .unwrap();
+    let snap = store.snapshot();
+    let delta_iri_id = snap.lookup_iri(&long_iri).unwrap();
+    assert_eq!(delta_iri_id.tag(), Tag::Delta);
+    let iri_len = long_iri.len() as u64;
+
+    // 1. Cursor SERVICE with cache disabled, no outer terms, and one long delta IRI of
+    //    length L: headroom ~9*L above fixed cursor setup fits checked decode (~8*L) and
+    //    retained input (~2*L) separately, and must NOT double-charge and refuse before send.
+    {
+        let query = "SELECT ?x ?y WHERE { \
+            <http://example.org/s> <http://example.org/p> ?x . \
+            SERVICE <loop:http://example.org/remote-sparql> { ?x <http://example.org/q> ?y } \
+        }";
+        // Measure fixed cursor setup cost on an unbounded probe so the tight run gets
+        // ~9*L headroom above fixed costs: fits checked decode (~8*L) and retained input
+        // (~2*L) individually, and would fail if double-charged (~10*L).
+        let probe_opts = QueryOptions {
+            allow_service: true,
+            no_cache: true,
+            local_endpoints: Some(Arc::new(ReachSendEndpoint)),
+            max_memory_bytes: Some(MIB),
+            ..QueryOptions::default()
+        };
+        let cursor_opts = super::cursor::CursorOptions {
+            batch_rows: 16,
+            fallback: super::cursor::FallbackPolicy::RejectMaterialization,
+            ..super::cursor::CursorOptions::default()
+        };
+        let fixed_setup = {
+            let probe =
+                super::cursor::select_cursor(store.snapshot(), query, &probe_opts, &cursor_opts)
+                    .expect("open probe cursor for fixed setup cost");
+            probe.memory_meter().live_bytes()
+        };
+        let opts = QueryOptions {
+            allow_service: true,
+            no_cache: true,
+            local_endpoints: Some(Arc::new(ReachSendEndpoint)),
+            max_memory_bytes: Some(fixed_setup + 9 * iri_len),
+            ..QueryOptions::default()
+        };
+        let mut cursor = super::cursor::select_cursor(store.snapshot(), query, &opts, &cursor_opts)
+            .expect("open cursor for remote SERVICE");
+        let Err(err) = cursor.next_batch() else {
+            panic!("sentinel local endpoint should be reached and return Error::Service");
+        };
+        assert!(
+            matches!(&err, Error::Service(msg) if msg.contains("sentinel: reached send")),
+            "cursor SERVICE must admit input without double-charging and reach send, got {err:?}"
+        );
+    }
+
+    // 2. Discarded terms (filtered triple terms + deduplicated values) must NOT retain their
+    //    decode credit, and kept terms must reconcile to a single retained input charge in
+    //    both eager and cursor modes.
+    let t1_id = snap
+        .lookup_term(&Term::Triple(Box::new(oxrdf::Triple::new(
+            NamedNode::new_unchecked("http://example.org/a"),
+            NamedNode::new_unchecked("http://example.org/b"),
+            Term::Literal(Literal::new_simple_literal(&long_lit1)),
+        ))))
+        .unwrap();
+    let t2_id = snap
+        .lookup_term(&Term::Triple(Box::new(oxrdf::Triple::new(
+            NamedNode::new_unchecked("http://example.org/a"),
+            NamedNode::new_unchecked("http://example.org/b"),
+            Term::Literal(Literal::new_simple_literal(&long_lit2)),
+        ))))
+        .unwrap();
+    assert_eq!(t1_id.tag(), Tag::Delta);
+    assert_eq!(t2_id.tag(), Tag::Delta);
+
+    let pattern = GraphPattern::Bgp {
+        patterns: vec![TriplePattern {
+            subject: TermPattern::Variable(Variable::new_unchecked("x")),
+            predicate: NamedNodePattern::NamedNode(NamedNode::new_unchecked(
+                "http://example.org/q",
+            )),
+            object: TermPattern::Variable(Variable::new_unchecked("y")),
+        }],
+    };
+    let rl = super::enhancer::RemoteLoop {
+        endpoint: NamedNode::new_unchecked("http://example.org/remote-sparql"),
+        bulk: 10,
+        cache: super::enhancer::CacheMode::None,
+        silent: false,
+        values: true,
+        idx: "__idx".into(),
+    };
+
+    for cursor in [false, true] {
+        let mut ctx = Ctx::new(store.snapshot());
+        ctx.mem_limit = MIB;
+        ctx.allow_service = true;
+        if cursor {
+            ctx.enable_cursor_accounting().unwrap();
+        }
+        let v_x = ctx.var("x");
+        let spec = LateralSpec {
+            pattern: pattern.clone(),
+            keys: vec![v_x],
+            outer: Vec::new(),
+            outer_scoped: Vec::new(),
+            graph: ActiveGraph::Default,
+            optional: None,
+            unscoped: false,
+            service: Some(Box::new(rl.clone())),
+        };
+
+        // 2a. Two distinct 2 KiB triple terms are both filtered out to None (and the second
+        //     deduplicates in by_values): retained credit must cover only keys/empty slot,
+        //     not ~32 KiB of transient decode charges.
+        let baseline = ctx.live_bytes();
+        let mut run = super::enhancer::RemoteRun::new(&ctx, &spec, &rl).unwrap();
+        let mut discarded = Table::new(vec![v_x]);
+        discarded.push_row(&[t1_id]);
+        discarded.push_row(&[t2_id]);
+        run.add(&ctx, &spec, &rl, &discarded).unwrap();
+        let after_discarded = ctx.live_bytes() - baseline;
+        assert!(
+            after_discarded < 1024,
+            "filtered/deduplicated terms must not retain decode credit (cursor={cursor}, retained={after_discarded})"
+        );
+        drop(run);
+        assert_eq!(ctx.live_bytes(), baseline);
+
+        // 2b. A retained 2 KiB delta IRI reconciles to one retained input charge (~2*L + overhead),
+        //     not ~8*L, and stays held until RemoteRun drops.
+        let mut run = super::enhancer::RemoteRun::new(&ctx, &spec, &rl).unwrap();
+        let mut kept = Table::new(vec![v_x]);
+        kept.push_row(&[delta_iri_id]);
+        run.add(&ctx, &spec, &rl, &kept).unwrap();
+        let after_kept = ctx.live_bytes() - baseline;
+        assert!(
+            after_kept >= 2 * iri_len && after_kept < 4 * iri_len,
+            "retained input must reconcile to one retained charge ~2*L (cursor={cursor}, L={iri_len}, retained={after_kept})"
+        );
+        drop(run);
+        assert_eq!(ctx.live_bytes(), baseline);
+    }
+}
+
+#[test]
+fn rdfs_explain_holds_owned_copies_across_decodes_and_counts_nested_triples() {
+    // 1. term_bytes must count nested RDF-star triple payloads (including nested triples).
+    let lit_12k = Term::Literal(Literal::new_simple_literal("z".repeat(12_288)));
+    let inner = Term::Triple(Box::new(oxrdf::Triple::new(
+        NamedNode::new_unchecked("http://example.org/a"),
+        NamedNode::new_unchecked("http://example.org/b"),
+        lit_12k,
+    )));
+    let outer = Term::Triple(Box::new(oxrdf::Triple::new(
+        NamedNode::new_unchecked("http://example.org/outer_s"),
+        NamedNode::new_unchecked("http://example.org/outer_p"),
+        inner.clone(),
+    )));
+    assert!(
+        crate::explain::term_bytes(&inner) > 12_288,
+        "term_bytes must include nested triple literal payload, got {}",
+        crate::explain::term_bytes(&inner)
+    );
+    assert!(
+        crate::explain::term_bytes(&outer) > crate::explain::term_bytes(&inner),
+        "term_bytes must include outer and inner nested triple payloads"
+    );
+
+    // 2. Owned copies constructed during proof search (e.g. typed candidate triple) that
+    //    survive into a later graph-name decode must be held on the shared ExplainWorkspace.
+    let s_4k = format!("http://example.org/s/{}", "s".repeat(4096));
+    let d_5k = format!("http://example.org/D/{}", "d".repeat(5120));
+    let g_5k = format!("http://example.org/g/{}", "g".repeat(5120));
+    let nq = format!(
+        "<{s_4k}> <{}> <{d_5k}> <{g_5k}> .\n\
+         <{d_5k}> <{}> <http://example.org/C> <http://example.org/ont> .\n",
+        rdf::TYPE.as_str(),
+        rdfs::SUB_CLASS_OF.as_str(),
+    );
+    let store = store_with_turtle(
+        "<http://example.org/seed> <http://example.org/seedp> <http://example.org/seedo> .\n",
+        true,
+    );
+    store
+        .load(&[Source::from_bytes(nq.into_bytes(), RdfFormat::NQuads, None)])
+        .unwrap();
+    let snap = store.snapshot();
+    let schema = super::rdfs::schema_of_graph(&snap, Some("http://example.org/ont")).unwrap();
+    let g_id = snap.lookup_iri(&g_5k).unwrap();
+    assert_eq!(g_id.tag(), Tag::Delta);
+    let ont_id = snap.lookup_iri("http://example.org/ont").unwrap();
+
+    // Workspace limit for max_memory = 6144 is 12544 bytes.
+    // Owned typed triple (~9.2 KiB) + 5.1 KiB graph name decode = ~14.3 KiB > 12544.
+    let resolver = |g: Id,
+                    _triple: &[Term; 3],
+                    ws: &super::rdfs::ExplainWorkspace|
+     -> Result<Option<crate::explain::Derivation>> {
+        let _name = ws.graph_name(&snap, g, &mut || Ok(()))?;
+        Ok(None)
+    };
+    let res = super::rdfs::RdfsOnRead::fixed(schema).explain_resolving(
+        &snap,
+        super::rdfs::SchemaLeaves::Graph(ont_id),
+        &[g_id],
+        &[
+            Term::NamedNode(NamedNode::new_unchecked(&s_4k)),
+            Term::NamedNode(rdf::TYPE.into_owned()),
+            Term::NamedNode(NamedNode::new_unchecked("http://example.org/C")),
+        ],
+        crate::explain::ExplainLimits {
+            max_trees: 4,
+            max_depth: 8,
+            deadline: None,
+            cancel: None,
+            max_memory: Some(6144),
+        },
+        Some(&resolver),
+    );
+    assert!(
+        matches!(&res, Err(Error::Component(c)) if c.code == "reasoning-budget"),
+        "owned candidate copies surviving into graph-name decode must exceed shared workspace, got {res:?}"
+    );
+}
