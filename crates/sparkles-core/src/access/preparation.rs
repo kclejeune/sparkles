@@ -8,6 +8,7 @@ use crate::store::Snapshot;
 use crate::task::Control;
 use oxrdf::{NamedNode, Term};
 use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard};
+use sparkles_budget::{MemoryLease, ParentHandle};
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -67,11 +68,20 @@ struct Inner {
     context_bytes: u64,
     cancellation: Option<crate::task::Cancellation>,
     original_controls: Option<QueryControl>,
+    upstream: Option<Box<Upstream>>,
+}
+
+struct Upstream {
+    parent: ParentHandle,
+    held: Mutex<MemoryLease>,
+    controls: Option<Preparation>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        if let Some(grant) = &self.grant {
+        if self.upstream.is_none()
+            && let Some(grant) = &self.grant
+        {
             grant.release(self.context_bytes);
         }
     }
@@ -170,6 +180,7 @@ impl Preparation {
                 context_bytes: CONTEXT_BYTES,
                 cancellation: None,
                 original_controls: None,
+                upstream: None,
             }),
             no_wait: false,
             query: None,
@@ -292,6 +303,7 @@ impl Preparation {
                     cancellation,
                     deadline,
                 }),
+                upstream: None,
             }),
             no_wait: false,
             query: None,
@@ -299,6 +311,53 @@ impl Preparation {
         partial.bytes = 0;
         root.check()?;
         Ok(root)
+    }
+
+    /// Prepare a view principal's physical read under the executing query's allowance.
+    pub(crate) fn for_view_rebuild(
+        opts: &crate::sparql::QueryOptions,
+        parent: ParentHandle,
+        inherited: Option<&Self>,
+    ) -> Result<Self> {
+        if let Some(inherited) = inherited {
+            inherited.check()?;
+        }
+        let mut control = Control::with_cancel(opts.cancel.clone().expect("rebuild cancellation"));
+        control.deadline = opts.deadline;
+        if let Some(inherited) = inherited {
+            control.progress = inherited.inner.control.progress.clone();
+        }
+        control.check()?;
+        if let Some(cancellation) = &opts.cancellation {
+            cancellation.check()?;
+        }
+        let bytes = (std::mem::size_of::<Inner>() + 16 + std::mem::size_of::<Upstream>()) as u64;
+        let limit = opts.max_memory_bytes.expect("rebuild memory limit");
+        if bytes > limit {
+            return Err(memory(limit));
+        }
+        let held = parent.reserve(bytes).map_err(parent_error)?;
+        let preparation = Self {
+            inner: Shared::new(Inner {
+                control,
+                limit,
+                used: AtomicU64::new(bytes),
+                peak: AtomicU64::new(bytes),
+                grant: opts.grant.clone(),
+                context_bytes: bytes,
+                cancellation: opts.cancellation.clone(),
+                original_controls: None,
+                upstream: Some(Box::new(Upstream {
+                    parent,
+                    held: Mutex::new(held),
+                    controls: inherited.cloned(),
+                })),
+            }),
+            no_wait: inherited.is_some_and(|original| original.no_wait),
+            query: None,
+        };
+        preparation.check()?;
+        Ok(preparation)
     }
 
     pub(crate) fn with_query_controls(
@@ -357,6 +416,7 @@ impl Preparation {
                 context_bytes: CONTEXT_BYTES,
                 cancellation: self.inner.cancellation.clone(),
                 original_controls: self.inner.original_controls.clone(),
+                upstream: None,
             }),
             no_wait: self.no_wait,
             query: self.query.clone(),
@@ -429,18 +489,31 @@ impl Preparation {
                 Err(actual) => used = actual,
             }
         };
-        if let Some(grant) = &self.inner.grant
-            && let Err(error) = grant.charge(bytes)
-        {
+        let backing = if let Some(upstream) = &self.inner.upstream {
+            upstream.parent.reserve(bytes).map(|mut lease| {
+                upstream
+                    .held
+                    .lock()
+                    .try_merge(&mut lease)
+                    .expect("same admitted parent");
+            })
+        } else if let Some(grant) = &self.inner.grant {
+            grant.charge(bytes).map_err(|error| {
+                let Error::BudgetExceeded(budget) = error else {
+                    unreachable!("grant charge only refuses memory")
+                };
+                ParentRefused::Limit {
+                    limit: budget.limit,
+                    requested: budget.requested,
+                    scope: Scope::Work,
+                }
+            })
+        } else {
+            Ok(())
+        };
+        if let Err(error) = backing {
             self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
-            let Error::BudgetExceeded(budget) = error else {
-                unreachable!("grant charge only refuses memory")
-            };
-            return Err(ParentRefused::Limit {
-                limit: budget.limit,
-                requested: budget.requested,
-                scope: Scope::Work,
-            });
+            return Err(error);
         }
         self.inner.peak.fetch_max(next, Ordering::Relaxed);
         Ok(())
@@ -452,8 +525,11 @@ impl Preparation {
         self.inner.used.fetch_sub(bytes, Ordering::Relaxed);
         #[cfg(test)]
         crate::test_alloc::released(&self.inner.used, bytes);
-        if let Some(grant) = &self.inner.grant {
-            // No preparation lock is held when a grant invokes synchronous wakeups.
+        if let Some(upstream) = &self.inner.upstream {
+            let lease = upstream.held.lock().split(bytes).expect("admitted credit");
+            // Returning parent credit can wake memory waiters synchronously.
+            drop(lease);
+        } else if let Some(grant) = &self.inner.grant {
             grant.release(bytes);
         }
     }
@@ -510,6 +586,14 @@ impl Preparation {
     /// order. This is distinct from byte-only admission through an existing parent.
     pub fn check_work(&self) -> std::result::Result<(), sparkles_budget::WorkStopped> {
         use sparkles_budget::WorkStopped;
+        if let Some(original) = self
+            .inner
+            .upstream
+            .as_ref()
+            .and_then(|p| p.controls.as_ref())
+        {
+            original.check_work()?;
+        }
         self.inner
             .control
             .cancel
@@ -1044,8 +1128,8 @@ impl Preparation {
             sparkles_budget::ParentRefused::Limit {
                 scope: sparkles_budget::Scope::Local,
                 ..
-            }
-            | sparkles_budget::ParentRefused::Overflow => memory(self.inner.limit),
+            } if self.inner.upstream.is_none() => memory(self.inner.limit),
+            sparkles_budget::ParentRefused::Overflow => memory(self.inner.limit),
             error => parent_error(error),
         })?;
         let held = Reservation {

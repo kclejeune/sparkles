@@ -397,6 +397,9 @@ impl View {
                         paused,
                     }
                 };
+                let snapshot_bytes = rebuild.snapshot_bytes();
+                drop(rebuild);
+                charge.resize(scratch.saturating_add(snapshot_bytes))?;
                 self.rebuilt = true;
                 self.charge = Some(charge);
                 self.source = Some(source);
@@ -474,7 +477,7 @@ impl View {
                     .map(|source| source.query_input().2.clone())
             }),
             spill: ctx.spill.clone(),
-            reductions: rebuild.reductions.clone(),
+            patterns: rebuild.patterns.clone(),
         };
         super::call_parsed_cursor(
             rebuild.snap.clone(),
@@ -812,7 +815,7 @@ mod tests {
             inference: None,
             deadline: None,
             max_memory_bytes: None,
-            reductions: None,
+            patterns: None,
             union_default_graph: false,
             template_columns: None,
             aggregate_errors: AggregateErrors::Sparkles,

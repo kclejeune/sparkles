@@ -13,7 +13,7 @@ use super::zset::{Changes, Row, ZSet, consolidate};
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
 use crate::id::Id;
-use crate::sparql::viewsvc::{PublishedBytes, ViewReductions, ViewTable, ViewVersion};
+use crate::sparql::viewsvc::{PublishedBytes, ViewPatterns, ViewTable, ViewVersion};
 use crate::store::{ChangesOptions, Snapshot, Store};
 use crate::task::Control;
 use oxrdf::Term;
@@ -263,7 +263,7 @@ pub struct Circuit {
     pub kind: Kind,
     pub vars: Vec<String>,
     pub(crate) template_columns: Option<Arc<[String]>>,
-    pub(crate) reductions: Option<Arc<ViewReductions>>,
+    pub(crate) rebuild_patterns: Option<Arc<ViewPatterns>>,
     pub root: Node,
     pub footprint: Footprint,
     resolved: Option<Resolved>,
@@ -343,7 +343,8 @@ impl Circuit {
         Circuit {
             kind: c.kind,
             template_columns,
-            reductions: (!c.reductions.native.is_empty()).then(|| Arc::new(c.reductions)),
+            rebuild_patterns: (!c.rebuild_patterns.native.is_empty())
+                .then(|| Arc::new(c.rebuild_patterns)),
             vars: c.vars,
             root: c.root,
             footprint: c.footprint,
@@ -573,7 +574,10 @@ impl Circuit {
         self.root.bytes()
             + self.result.bytes(self.root.schema.len())
             + self.terms.bytes()
-            + self.version.as_ref().map_or(0, |v| v.retained_bytes())
+            + self.version.as_ref().map_or(0, |v| {
+                v.retained_bytes()
+                    .saturating_sub(v.terms.key_storage_bytes())
+            })
             + prov::map_bytes(&self.ann, self.root.schema.len())
             + self.facts.bytes()
     }
@@ -660,8 +664,8 @@ impl Circuit {
                 prev.terms.clone()
             }
             _ => {
-                let mut terms = self.terms.snapshot();
-                terms.published = pool.map(|p| PublishedBytes::new(p, terms.retained_bytes() + 16));
+                let mut terms = self.terms.snapshot_in(pool);
+                terms.published = pool.map(|p| PublishedBytes::new(p, terms.table_bytes() + 16));
                 Arc::new(terms)
             }
         };

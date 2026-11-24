@@ -1060,7 +1060,6 @@ pub struct Ctx {
     // their actual sources. A new mask can share its original source's backing.
     pub(super) source_view: Option<crate::access::PreparedView>,
     pub(super) read_source: Option<crate::store::BoundReadSource>,
-    pub(super) view_reductions: Option<Arc<super::viewsvc::ViewReductions>>,
     pub(super) view_source_controls: Option<crate::access::Preparation>,
     pub(super) source_preparation: Option<crate::access::Preparation>,
     pub(super) source_setup: Option<crate::access::Reservation>,
@@ -1511,7 +1510,6 @@ impl Ctx {
             snap,
             read_source: None,
             source_view: None,
-            view_reductions: None,
             view_source_controls: None,
             source_preparation: None,
             source_setup: None,

@@ -167,11 +167,7 @@ impl ViewVersion {
                 .published
                 .as_ref()
                 .map_or(0, PublishedBytes::bytes)
-            + self
-                .terms
-                .published
-                .as_ref()
-                .map_or(0, PublishedBytes::bytes)
+            + self.terms.published_bytes()
     }
 
     /// Decode all rows into owned RDF terms for callers of [`ViewSource::read_view`].
@@ -250,11 +246,18 @@ impl RewoundView {
     }
 }
 
-/// The compiler's treatment of REDUCED nodes in a view.
+/// Native REDUCED and VALUES occurrences in the saved view query. The keys
+/// identify nodes in that query's allocation and are never dereferenced.
 #[derive(Clone, Debug, Default)]
-pub struct ViewReductions {
-    pub(crate) native: rustc_hash::FxHashSet<GraphPattern>,
-    pub(crate) recomputed: rustc_hash::FxHashSet<GraphPattern>,
+pub struct ViewPatterns {
+    pub(crate) native: rustc_hash::FxHashSet<usize>,
+}
+
+impl ViewPatterns {
+    pub(crate) fn contains(&self, pattern: &GraphPattern) -> bool {
+        self.native
+            .contains(&(std::ptr::from_ref(pattern) as usize))
+    }
 }
 
 /// A view that must be evaluated directly at the query's snapshot (expired
@@ -268,13 +271,23 @@ pub struct ViewRebuild {
     pub deadline: Option<Instant>,
     pub max_memory_bytes: Option<u64>,
     pub union_default_graph: bool,
-    pub reductions: Option<Arc<ViewReductions>>,
+    pub patterns: Option<Arc<ViewPatterns>>,
     /// The solution column order used by the maintained CONSTRUCT template hash.
     pub template_columns: Option<Arc<[String]>>,
     pub inference: Option<Arc<Inference>>,
     pub aggregate_errors: super::AggregateErrors,
     pub commit: u64,
     pub evaluated_under: Option<super::AggregateErrors>,
+}
+
+impl ViewRebuild {
+    pub(crate) fn snapshot_bytes(&self) -> u64 {
+        if self.union_default_graph == self.snap.union_default_graph {
+            0
+        } else {
+            (std::mem::size_of::<crate::store::Snapshot>() + 16) as u64
+        }
+    }
 }
 
 /// The opened state of a streaming view read, held by the cursor with no view lock.

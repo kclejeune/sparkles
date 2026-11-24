@@ -22,6 +22,8 @@ impl Runtime {
         let mode = whole
             .clone()
             .or_else(|| inference.as_ref().map(|i| i.reason().to_string()));
+        // Compile the same allocation that a rebuild will plan from.
+        let q = Arc::new(q);
         let compiled = compile(&q, mode.as_deref())?;
         let mut circuit = Circuit::new(compiled, access);
         circuit.max_memory_bytes = max_memory_bytes;
@@ -46,7 +48,7 @@ impl Runtime {
             key,
             state: Mutex::new(Slot {
                 circuit,
-                query: Arc::new(q),
+                query: q,
                 query_text_bytes: text.len(),
                 whole,
                 vars,

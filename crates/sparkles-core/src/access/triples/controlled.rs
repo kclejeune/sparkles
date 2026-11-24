@@ -13,6 +13,14 @@ pub(crate) fn prepare(
     prepare_input(Input::Legacy { original, snap }, preparation)
 }
 
+pub(crate) fn prepare_rebuild(
+    original: &GraphAccess,
+    snap: &Arc<Snapshot>,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    prepare_input(Input::Rebuild { original, snap }, preparation)
+}
+
 pub(crate) fn prepare_selected(
     selected: crate::store::bound_read_source::PreparedRead,
     preparation: &Preparation,
@@ -25,27 +33,31 @@ enum Input<'a> {
         original: &'a GraphAccess,
         snap: &'a Arc<Snapshot>,
     },
+    Rebuild {
+        original: &'a GraphAccess,
+        snap: &'a Arc<Snapshot>,
+    },
     Selected(crate::store::bound_read_source::PreparedRead),
 }
 
 impl Input<'_> {
     fn original(&self) -> &GraphAccess {
         match self {
-            Self::Legacy { original, .. } => original,
+            Self::Legacy { original, .. } | Self::Rebuild { original, .. } => original,
             Self::Selected(selected) => selected.policy(),
         }
     }
 
     fn snapshot(&self) -> &Arc<Snapshot> {
         match self {
-            Self::Legacy { snap, .. } => snap,
+            Self::Legacy { snap, .. } | Self::Rebuild { snap, .. } => snap,
             Self::Selected(selected) => selected.snapshot(),
         }
     }
 
     fn selected(self) -> Option<crate::store::bound_read_source::PreparedRead> {
         match self {
-            Self::Legacy { .. } => None,
+            Self::Legacy { .. } | Self::Rebuild { .. } => None,
             Self::Selected(selected) => Some(selected),
         }
     }

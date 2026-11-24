@@ -2,16 +2,18 @@
 //! shared view versions (item 1121).
 
 use oxrdf::Term;
-use sparkles_core::access::{GraphAccess, Preparation};
+use sparkles_core::access::{
+    Caller, GraphAccess, Graphs, Preparation, Protection, Rule, TripleRules,
+};
 use sparkles_core::error::BudgetKind;
-use sparkles_core::incr::{OpenHost, Runtime, RuntimeOptions, ViewDef};
+use sparkles_core::incr::{Host, OpenHost, Runtime, RuntimeOptions, ViewDef};
 use sparkles_core::sparql::update::update;
 use sparkles_core::sparql::{
     AggregateErrors, CursorOptions, FallbackPolicy, QueryOptions, query, select_cursor,
     select_source_cursor,
 };
 use sparkles_core::store::{Store, StoreOptions};
-use sparkles_core::task::Control;
+use sparkles_core::task::{Control, Progress};
 use sparkles_core::{Error, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -962,4 +964,244 @@ fn rebuilt_views_share_a_work_budget_in_both_execution_modes() {
         query(snap, &both, &limited),
         Err(Error::BudgetExceeded(_))
     ));
+}
+
+#[test]
+fn rebuilt_reduced_is_specific_to_its_graph_occurrence() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        "INSERT DATA { GRAPH <urn:outer> { ex:a ex:p 1 } GRAPH <urn:inner> { ex:a ex:p 1 } }",
+    );
+    let rt = runtime(&s);
+    rt.set_options(RuntimeOptions {
+        history_commits: 1,
+        ..rt.options()
+    });
+    rt.put(
+        &s,
+        "nested",
+        ViewDef::table(
+            "SELECT ?x WHERE {
+            { SELECT REDUCED ?x WHERE { VALUES ?x { 1 1 } } }
+            UNION
+            { GRAPH <urn:outer> { GRAPH <urn:inner> {
+                { SELECT REDUCED ?x WHERE { VALUES ?x { 1 1 } } }
+            } } }
+            UNION { <http://example.org/delta> <http://example.org/p> ?x }
+        }",
+        ),
+    )
+    .unwrap();
+    rt.round(&s);
+    let snap = s.snapshot();
+    let opts = QueryOptions {
+        views: Some(rt.clone()),
+        ..Default::default()
+    };
+    let q = format!(
+        "{P}SELECT ?x ?c {{ SERVICE view:read {{ [] view:name 'nested'; view:bind ?x; view:commit ?c }} }}"
+    );
+    let maintained = drain(&snap, &q, &opts, 1).unwrap().0;
+    assert_eq!(maintained.len(), 3);
+    let alternate = QueryOptions {
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..opts.clone()
+    };
+    assert_eq!(drain(&snap, &q, &alternate, 1).unwrap().0, maintained);
+    for value in [2, 3] {
+        upd(&s, &format!("INSERT DATA {{ ex:delta ex:p {value} }}"));
+        rt.round(&s);
+    }
+    assert_eq!(drain(&snap, &q, &opts, 1).unwrap().0, maintained);
+}
+
+#[test]
+fn rebuilt_construct_hashes_the_native_values_terms() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    let values = r#"VALUES ?x { "[_:a]"^^<http://w3id.org/awslabs/neptune/SPARQL-CDTs/List> }"#;
+    rt.put(
+        &s,
+        "cdt",
+        ViewDef::table(format!(
+            "{P}CONSTRUCT {{ _:b ex:q ?x }} WHERE {{
+            {{ {values} }} UNION {{ SELECT ?x WHERE {{ {values} }} LIMIT 1 }}
+        }}",
+        )),
+    )
+    .unwrap();
+    rt.round(&s);
+    let q = format!(
+        "{P}SELECT ?subject ?object {{ SERVICE view:read {{ [] view:name 'cdt'; view:bind ?subject, ?object }} }}"
+    );
+    let opts = QueryOptions {
+        views: Some(rt),
+        ..Default::default()
+    };
+    let snap = s.snapshot();
+    let maintained = drain(&snap, &q, &opts, 1).unwrap().0;
+    assert_eq!(maintained.len(), 2);
+    assert_eq!(
+        maintained
+            .iter()
+            .filter(|row| { matches!(&row[1], Some(Term::Literal(l)) if l.value() == "[_:a]") })
+            .count(),
+        1
+    );
+    let alternate = QueryOptions {
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..opts
+    };
+    assert_eq!(
+        bag(drain(&snap, &q, &alternate, 1).unwrap().0),
+        bag(maintained)
+    );
+}
+
+struct ProtectedHost(Arc<GraphAccess>);
+
+impl Host for ProtectedHost {
+    fn access(&self, principal: Option<&str>) -> Result<Option<Arc<GraphAccess>>> {
+        Ok(principal.map(|_| self.0.clone()))
+    }
+
+    fn stored_query(&self, name: &str) -> Result<String> {
+        OpenHost.stored_query(name)
+    }
+}
+
+#[test]
+fn a_historical_construct_admits_the_principals_cold_mask() {
+    let s = Store::in_memory(StoreOptions::default());
+    for chunk in 0..4 {
+        let mut data = String::from("INSERT DATA { ");
+        for i in 0..1000 {
+            data.push_str(&format!("ex:s{chunk}-{i} ex:hidden 1 . "));
+        }
+        data.push('}');
+        upd(&s, &data);
+    }
+    upd(&s, "INSERT DATA { ex:public ex:visible 42 }");
+    let historical = s.snapshot();
+    upd(&s, "INSERT DATA { ex:next ex:visible 43 }");
+    let rt = runtime(&s);
+    rt.set_host(Arc::new(ProtectedHost(Arc::new(
+        GraphAccess::with_triples(
+            Graphs::All,
+            Graphs::none(),
+            TripleRules {
+                rules: vec![Rule {
+                    protection: Arc::new(Protection {
+                        name: "private".into(),
+                        predicates: Some(vec!["http://example.org/hidden".into()]),
+                        classes: None,
+                        subclasses: false,
+                        graphs: None,
+                        pattern: None,
+                        prefixes: Default::default(),
+                        hide_inferences: false,
+                    }),
+                    read: Graphs::none(),
+                    write: Graphs::none(),
+                }],
+                caller: Caller::default(),
+                limits: Default::default(),
+            },
+        ),
+    ))));
+    rt.put(
+        &s,
+        "protected",
+        ViewDef {
+            principal: Some("reader".into()),
+            ..ViewDef::table(format!("{P}CONSTRUCT {{ ?s ?p ?o }} WHERE {{ ?s ?p ?o }}"))
+        },
+    )
+    .unwrap();
+    rt.round(&s);
+    let q = format!(
+        "{P}SELECT ?subject ?object ?c {{ SERVICE view:read {{ [] view:name 'protected'; view:bind ?subject, ?object; view:commit ?c }} }} LIMIT 1"
+    );
+    let opts = QueryOptions {
+        views: Some(rt),
+        ..Default::default()
+    };
+    let tiny = QueryOptions {
+        max_memory_bytes: Some(64 << 10),
+        ..opts.clone()
+    };
+    let err = drain(&historical, &q, &tiny, 1).unwrap_err();
+    assert!(matches!(err, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory));
+    let rows = drain(&historical, &q, &opts, 1).unwrap().0;
+    assert_eq!(
+        rows,
+        vec![vec![
+            Some(Term::NamedNode(
+                oxrdf::NamedNode::new("http://example.org/public").unwrap()
+            )),
+            Some(Term::Literal(oxrdf::Literal::from(42))),
+            Some(Term::Literal(oxrdf::Literal::from(
+                historical.commit as i64
+            ))),
+        ]]
+    );
+
+    let flag = Arc::new(AtomicBool::new(false));
+    let cancel = flag.clone();
+    let prep = Preparation::new(
+        Control {
+            progress: Progress::new(move |_, phase| {
+                if phase == "applying permission mask" {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }),
+            ..Control::with_cancel(flag.clone())
+        },
+        32 << 20,
+    )
+    .unwrap();
+    let caller = Arc::new(GraphAccess::all());
+    let view = s.prepare_read(caller.clone(), &prep).unwrap();
+    let mut cursor = select_source_cursor(
+        view.read_source(),
+        &s,
+        &q,
+        &QueryOptions {
+            graphs: Some(caller),
+            aggregate_errors: Some(AggregateErrors::Sparkles),
+            ..opts
+        },
+        &strict(1),
+    )
+    .unwrap();
+    assert!(matches!(cursor.next_batch(), Err(Error::Cancelled)));
+    assert!(flag.load(Ordering::Relaxed));
+}
+
+#[test]
+fn rebuild_releases_planning_staging_before_streaming() {
+    let s = Store::in_memory(StoreOptions::default());
+    let rt = runtime(&s);
+    rt.put(
+        &s,
+        "v",
+        ViewDef::table(format!(
+            "SELECT ?x {{ VALUES ?x {{ 1 2 }} }} # {}",
+            "a".repeat(32 << 10)
+        )),
+    )
+    .unwrap();
+    rt.round(&s);
+    let q = format!("{P}SELECT ?x {{ SERVICE view:read {{ [] view:name 'v'; view:bind ?x }} }}");
+    let opts = QueryOptions {
+        views: Some(rt),
+        aggregate_errors: Some(AggregateErrors::Sparkles),
+        ..Default::default()
+    };
+    let mut cursor = select_cursor(s.snapshot(), &q, &opts, &strict(1)).unwrap();
+    let batch = cursor.next_batch().unwrap().unwrap();
+    assert_eq!(batch.len(), 1);
+    assert!(cursor.memory_meter().live_bytes() < 512 << 10);
+    assert!(cursor.stats().mem_peak_bytes > 512 << 10);
 }

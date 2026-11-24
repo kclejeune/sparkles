@@ -8,23 +8,69 @@
 //! rewrites its state.
 
 use crate::id::{self, Id, Tag};
+use crate::sparql::viewsvc::PublishedBytes;
 use crate::store::Snapshot;
 use oxrdf::Term;
+use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
-use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Weak};
+
+/// Both the mutable dictionary and its immutable versions share this backing.
+#[derive(Debug)]
+struct Key {
+    bytes: Arc<[u8]>,
+    published: Mutex<Weak<PublishedBytes>>,
+}
+
+impl Key {
+    fn retained_bytes(&self) -> u64 {
+        (self.bytes.len() + std::mem::size_of::<Self>() + 32) as u64
+    }
+
+    fn freeze(self: &Arc<Self>, pool: Option<&Arc<AtomicU64>>) -> FrozenKey {
+        let published = pool.map(|pool| {
+            let mut last = self.published.lock();
+            if let Some(held) = last.upgrade() {
+                return held;
+            }
+            let held = Arc::new(PublishedBytes::new(
+                pool,
+                self.retained_bytes() + (std::mem::size_of::<PublishedBytes>() + 16) as u64,
+            ));
+            *last = Arc::downgrade(&held);
+            held
+        });
+        FrozenKey {
+            key: self.clone(),
+            published,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FrozenKey {
+    key: Arc<Key>,
+    // A live-only circuit may retain the same bytes after the last view detaches.
+    // Only a published table owns a strong reference to the view-pool charge.
+    published: Option<Arc<PublishedBytes>>,
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Terms {
-    keys: Vec<Arc<[u8]>>,
+    // Drop the lookup table's aliases before releasing the keys' backing.
     index: FxHashMap<Arc<[u8]>, u64>,
+    keys: Vec<Arc<Key>>,
 }
 
 /// An immutable term table frozen with one view version so streaming cursors can decode
 /// `Tag::Local` ids without touching the circuit's lock.
 #[derive(Debug, Default)]
 pub struct ViewTerms {
-    keys: Arc<[Arc<[u8]>]>,
-    pub(crate) published: Option<crate::sparql::viewsvc::PublishedBytes>,
+    keys: Arc<[FrozenKey]>,
+    key_bytes: u64,
+    published_key_bytes: u64,
+    pub(crate) published: Option<PublishedBytes>,
 }
 
 impl ViewTerms {
@@ -37,26 +83,35 @@ impl ViewTerms {
     }
 
     pub fn key_bytes(&self, index: usize) -> Option<&[u8]> {
-        self.keys.get(index).map(|k| k.as_ref())
+        self.keys.get(index).map(|k| k.key.bytes.as_ref())
     }
 
     /// The term of an id of this version's space.
     pub fn term(&self, snap: &Snapshot, i: Id) -> Option<Term> {
         match i.tag() {
-            Tag::Local => self
-                .keys
-                .get(i.payload() as usize)
-                .map(|k| id::key_to_term(k)),
+            Tag::Local => self.key_bytes(i.payload() as usize).map(id::key_to_term),
             Tag::Undef => None,
             _ => snap.term(i),
         }
     }
 
+    /// The bytes owned by the table, excluding the shared key backings.
+    pub(crate) fn table_bytes(&self) -> u64 {
+        (std::mem::size_of::<Self>() + self.keys.len() * std::mem::size_of::<FrozenKey>() + 16)
+            as u64
+    }
+
+    pub(crate) fn key_storage_bytes(&self) -> u64 {
+        self.key_bytes
+    }
+
+    pub(crate) fn published_bytes(&self) -> u64 {
+        self.published.as_ref().map_or(0, PublishedBytes::bytes) + self.published_key_bytes
+    }
+
     /// The bytes an unshared term table keeps allocated on the heap.
     pub fn retained_bytes(&self) -> u64 {
-        let slice = self.keys.len() * std::mem::size_of::<Arc<[u8]>>() + 16;
-        let keys: usize = self.keys.iter().map(|k| k.len() + 16).sum();
-        (std::mem::size_of::<Self>() + slice + keys) as u64
+        self.table_bytes() + self.key_bytes
     }
 }
 
@@ -74,16 +129,34 @@ impl Terms {
     }
 
     pub fn bytes(&self) -> u64 {
-        self.keys.iter().map(|k| k.len() as u64 + 64).sum()
+        self.keys.iter().map(|k| k.retained_bytes() + 48).sum()
     }
 
     /// Freeze the current local term table into an immutable snapshot.
     pub fn snapshot(&self) -> ViewTerms {
+        self.snapshot_in(None)
+    }
+
+    pub(crate) fn snapshot_in(&self, pool: Option<&Arc<AtomicU64>>) -> ViewTerms {
         if self.keys.is_empty() {
             return ViewTerms::default();
         }
+        let mut key_bytes = 0;
+        let mut published_key_bytes = 0;
+        let keys = self
+            .keys
+            .iter()
+            .map(|key| {
+                let frozen = key.freeze(pool);
+                key_bytes += key.retained_bytes();
+                published_key_bytes += frozen.published.as_deref().map_or(0, PublishedBytes::bytes);
+                frozen
+            })
+            .collect();
         ViewTerms {
-            keys: self.keys.iter().cloned().collect(),
+            keys,
+            key_bytes,
+            published_key_bytes,
             published: None,
         }
     }
@@ -118,9 +191,12 @@ impl Terms {
             return Id::local(n);
         }
         let n = self.keys.len() as u64;
-        let key: Arc<[u8]> = key.into();
-        self.keys.push(key.clone());
-        self.index.insert(key, n);
+        let bytes: Arc<[u8]> = key.into();
+        self.keys.push(Arc::new(Key {
+            bytes: bytes.clone(),
+            published: Mutex::new(Weak::new()),
+        }));
+        self.index.insert(bytes, n);
         Id::local(n)
     }
 
@@ -130,7 +206,7 @@ impl Terms {
             Tag::Local => self
                 .keys
                 .get(i.payload() as usize)
-                .map(|k| id::key_to_term(k)),
+                .map(|k| id::key_to_term(&k.bytes)),
             Tag::Undef => None,
             _ => snap.term(i),
         }
@@ -139,7 +215,10 @@ impl Terms {
     /// The vocabulary key of an id, which means the same term in every generation.
     pub fn key(&self, snap: &Snapshot, i: Id) -> Option<Vec<u8>> {
         match i.tag() {
-            Tag::Local => self.keys.get(i.payload() as usize).map(|k| k.to_vec()),
+            Tag::Local => self
+                .keys
+                .get(i.payload() as usize)
+                .map(|k| k.bytes.to_vec()),
             Tag::Vocab | Tag::Delta => snap.key(i).map(|k| k.into_owned()),
             Tag::Undef => None,
             _ => snap.term(i).map(|t| id::term_key(&t)),

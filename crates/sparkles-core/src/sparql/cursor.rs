@@ -1018,6 +1018,19 @@ fn call_parsed_cursor(
     parent: sparkles_budget::ParentHandle,
     inherited: &super::ViewExecution,
 ) -> Result<(QueryCursor, Option<graph::Spec>)> {
+    let (snapshot, source, parent) = if let Some(access) = &options.graphs {
+        let preparation = crate::access::Preparation::for_view_rebuild(
+            options,
+            parent,
+            inherited.preparation.as_ref(),
+        )?;
+        let snapshot = super::with_union_default(snapshot, options);
+        let view = access.prepare_view_rebuild(&snapshot, &preparation)?;
+        let source = view.read_source();
+        (source.query_input().0.clone(), Some(source), None)
+    } else {
+        (snapshot, None, Some(parent))
+    };
     open_parsed_cursor_input(
         snapshot,
         parsed,
@@ -1025,8 +1038,8 @@ fn call_parsed_cursor(
         options,
         cursor,
         None,
-        None,
-        Some(parent),
+        source,
+        parent,
         Instant::now(),
         0.0,
         Some(inherited),

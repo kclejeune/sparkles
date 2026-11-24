@@ -1303,14 +1303,18 @@ walk is [item 1175](../../ROADMAP.md).
 A maintained view read streams from the immutable version published by its circuit.
 Current and stale readers release the circuit lock after taking a reference. A published
 row table and frozen term table count toward the view memory pool while readers still
-hold them. Readers of the same allocation share its charge. When the circuit has advanced
+hold them. A local term key has one charge across the circuit and all frozen tables that
+share its backing. When the circuit has advanced
 within the retained history, the reader admits and folds history slices and applies the
 net change while streaming the shared table.
 
 When history has expired or the reader asks for another aggregate-errors reading, a
 child query runs under the caller's memory, row-work, spill, cancellation and deadline
-controls. SELECT rebuilds stream rows. CONSTRUCT rebuilds instantiate the maintained
-template and charge distinct graph state as the graph streams. Strict policy also
+controls. Rebuilds admit the principal's permission mask before allocating it. The child
+retains the mask's charge and releases temporary planning credit before it streams.
+SELECT rebuilds preserve the maintained treatment of each REDUCED occurrence. CONSTRUCT
+rebuilds use the maintained VALUES terms for template blank-node identity and charge
+distinct graph state as the graph streams. Strict policy also
 applies inside the child. A custom source that only implements eager view reads requires
 the permissive policy. The cursor inventory and heap audit cover the maintained readers.
 Path searches that

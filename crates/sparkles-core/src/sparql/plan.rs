@@ -983,7 +983,7 @@ pub struct Planner<'a> {
     pub scoped: FxHashSet<VarId>,
     pub(super) property_inputs: FxHashSet<VarId>,
     bnode_scope: u32,
-    recomputing_view: bool,
+    pub(super) view_patterns: Option<&'a super::viewsvc::ViewPatterns>,
     /// RDF 1.2 triple-term patterns created while translating triple patterns
     unpacks: std::cell::RefCell<Vec<UnpackItem>>,
     /// the whole query being planned, if known: a search output it mentions nowhere else
@@ -1057,7 +1057,7 @@ impl<'a> Planner<'a> {
             scoped: FxHashSet::default(),
             property_inputs: FxHashSet::default(),
             bnode_scope: 0,
-            recomputing_view: false,
+            view_patterns: None,
             unpacks: Default::default(),
             source: None,
             source_sse: Default::default(),
@@ -1464,28 +1464,6 @@ impl<'a> Planner<'a> {
     // ------------------------------------------------------------------ plan ------
 
     pub fn plan(&mut self, gp: &GraphPattern, g: &ActiveGraph, filters: Vec<Expr>) -> Result<Node> {
-        if !self.recomputing_view
-            && self
-                .ctx
-                .view_reductions
-                .as_ref()
-                .is_some_and(|patterns| patterns.recomputed.contains(gp))
-        {
-            self.recomputing_view = true;
-            let plan = self.plan_pattern(gp, g, filters);
-            self.recomputing_view = false;
-            plan
-        } else {
-            self.plan_pattern(gp, g, filters)
-        }
-    }
-
-    fn plan_pattern(
-        &mut self,
-        gp: &GraphPattern,
-        g: &ActiveGraph,
-        filters: Vec<Expr>,
-    ) -> Result<Node> {
         self.ctx.check()?;
         use GraphPattern as GP;
         match gp {
@@ -1546,12 +1524,18 @@ impl<'a> Planner<'a> {
                             .count()
                     })
                 };
-                if let Some(pushed) =
-                    super::valuespush::rewrite(gp, &|patterns| calls(self.ctx, patterns), &graphs)
+                // These rewrites clone algebra. View rebuilds plan the saved occurrences
+                // whose semantics the incremental compiler recorded.
+                if self.view_patterns.is_none()
+                    && let Some(pushed) = super::valuespush::rewrite(
+                        gp,
+                        &|patterns| calls(self.ctx, patterns),
+                        &graphs,
+                    )
                 {
                     return self.plan(&pushed, g, filters);
                 }
-                let consider_union = !self.ctx.calls_extensions
+                let consider_union = self.view_patterns.is_none() && !self.ctx.calls_extensions
                     // Preserve outer filters' ordinary evaluation boundary, including
                     // extension aliases and dynamic calls that might be volatile.
                     && filters.is_empty();
@@ -1832,8 +1816,11 @@ impl<'a> Planner<'a> {
                 variables,
                 bindings,
             } => {
+                let native = self
+                    .view_patterns
+                    .is_some_and(|patterns| patterns.contains(gp));
                 if self.branch_payload.borrow().is_some() {
-                    let values = self.checked_values(variables, bindings)?;
+                    let values = self.checked_values(variables, bindings, native)?;
                     return self.apply_filters(values, filters);
                 }
                 let vars: Vec<VarId> = variables.iter().map(|v| self.ctx.var(v.as_str())).collect();
@@ -1849,8 +1836,10 @@ impl<'a> Planner<'a> {
                                 GroundTerm::NamedNode(n) => {
                                     self.ctx.intern_term(&Term::NamedNode(n.clone()))
                                 }
-                                GroundTerm::Literal(l) => self.ctx.intern_query_literal(l),
-                                GroundTerm::Triple(_) => self.ctx.intern_term(&ground_term(t)),
+                                GroundTerm::Literal(l) if !native => {
+                                    self.ctx.intern_query_literal(l)
+                                }
+                                _ => self.ctx.intern_term(&ground_term(t)),
                             }),
                         })
                         .collect();
@@ -1965,13 +1954,9 @@ impl<'a> Planner<'a> {
                 self.apply_filters(n, filters)
             }
             GP::Reduced { inner }
-                if self.recomputing_view
-                    || matches!(g, ActiveGraph::Var(_))
-                    || self
-                        .ctx
-                        .view_reductions
-                        .as_ref()
-                        .is_none_or(|patterns| !patterns.native.contains(gp)) =>
+                if self
+                    .view_patterns
+                    .is_none_or(|patterns| !patterns.contains(gp)) =>
             {
                 let child = self.plan(inner, g, Vec::new())?;
                 self.apply_filters(child, filters)
@@ -3613,6 +3598,7 @@ impl<'a> Planner<'a> {
         &self,
         variables: &[oxrdf::Variable],
         bindings: &[Vec<Option<GroundTerm>>],
+        native: bool,
     ) -> Result<Node> {
         let preparation = self.ctx.source_preparation.as_ref().expect("checked GRAPH");
         let mut layout = super::checked_layout::Layout::new(preparation);
@@ -3664,7 +3650,9 @@ impl<'a> Planner<'a> {
                         layout.ground(term)?;
                         let _term = preparation.reserve(layout.bytes())?;
                         let id = match term {
-                            GroundTerm::Literal(literal) => self.ctx.intern_query_literal(literal),
+                            GroundTerm::Literal(literal) if !native => {
+                                self.ctx.intern_query_literal(literal)
+                            }
                             _ => self.ctx.intern_term(&ground_term(term)),
                         };
                         self.ctx.check()?;

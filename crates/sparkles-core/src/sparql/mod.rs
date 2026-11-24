@@ -735,7 +735,6 @@ fn make_ctx_input_policy(
     ctx.geo.set_op_vertices(op_vertices);
     if let Some(inherited) = inherited {
         ctx.view_source_controls = inherited.preparation.clone();
-        ctx.view_reductions = inherited.reductions.clone();
         ctx.check()?;
     }
     if ctx.read_source.is_none() {
@@ -1659,7 +1658,7 @@ fn prepare_query_input(
 struct ViewExecution {
     preparation: Option<crate::access::Preparation>,
     spill: Option<Arc<crate::spill::QuerySpill>>,
-    reductions: Option<Arc<viewsvc::ViewReductions>>,
+    patterns: Option<Arc<viewsvc::ViewPatterns>>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1745,6 +1744,7 @@ fn prepare_query_input_policy(
         planner.subst.insert(v, id);
         bound.push((v, id));
     }
+    let saved_pattern = pattern;
     let (kind, pattern) = match parsed {
         Query::Select { .. } => (QueryKind::Select, pattern.clone()),
         Query::Ask { .. } => (
@@ -1758,7 +1758,14 @@ fn prepare_query_input_policy(
         Query::Construct { .. } => (QueryKind::Construct, pattern.clone()),
         Query::Describe { .. } => (QueryKind::Describe, pattern.clone()),
     };
-    let planned = rdfs::apply(&ctx, &pattern);
+    planner.view_patterns = inherited.and_then(|view| view.patterns.as_deref());
+    let input = if planner.view_patterns.is_some() {
+        debug_assert!(matches!(kind, QueryKind::Select | QueryKind::Construct));
+        saved_pattern
+    } else {
+        &pattern
+    };
+    let planned = rdfs::apply(&ctx, input);
     ioacct::mark("plan");
     let node = planner.plan(&planned, &ActiveGraph::Default, Vec::new())?;
     // the count of the parsed query bounds the plan, and this makes it true of the plan

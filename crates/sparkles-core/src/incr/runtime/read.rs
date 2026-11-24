@@ -446,16 +446,7 @@ impl Runtime {
             .snap
             .as_ref()
             .map_or(snap.union_default_graph, |s| s.union_default_graph);
-        let snapshot_bytes = if union_default_graph == snap.union_default_graph {
-            0
-        } else {
-            std::mem::size_of::<crate::store::Snapshot>() + 16
-        };
-        // The planner clones algebra and template terms from the stored query.
-        // Cover that staging before handing the parsed query to the child.
-        let planning_bytes = (st.query_text_bytes as u64).saturating_mul(16);
-        admit((std::mem::size_of::<ViewRebuild>() + snapshot_bytes) as u64 + planning_bytes)?;
-        Ok(OpenedView::Rebuild(Box::new(ViewRebuild {
+        let rebuild = ViewRebuild {
             columns: st.vars.clone(),
             query: st.query.clone(),
             snap: snap.clone(),
@@ -463,13 +454,22 @@ impl Runtime {
             deadline: open.read.deadline.or_else(|| self.control().deadline),
             max_memory_bytes: st.circuit.max_memory_bytes,
             union_default_graph,
-            reductions: st.circuit.reductions.clone(),
+            patterns: st.circuit.rebuild_patterns.clone(),
             template_columns: st.circuit.template_columns.clone(),
             inference: st.circuit.inference.clone(),
             aggregate_errors,
             commit: snap.commit,
             evaluated_under,
-        })))
+        };
+        // The planner clones algebra and template terms from the stored query.
+        // Cover that staging before handing the parsed query to the child.
+        let planning_bytes = (st.query_text_bytes as u64).saturating_mul(16);
+        admit(
+            (std::mem::size_of::<ViewRebuild>() as u64)
+                .saturating_add(rebuild.snapshot_bytes())
+                .saturating_add(planning_bytes),
+        )?;
+        Ok(OpenedView::Rebuild(Box::new(rebuild)))
     }
 }
 
@@ -633,6 +633,54 @@ mod tests {
         assert_eq!(rt.published_views.load(Ordering::Relaxed), before);
         drop(second_reader);
         assert_eq!(rt.published_views.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn overlapping_term_tables_share_the_large_key_charge() {
+        let (s, rt) = fixture();
+        let update =
+            |text: &str| crate::sparql::update::update(&s, text, &Default::default()).unwrap();
+        update(&format!(
+            "INSERT DATA {{ <urn:a> <urn:label> \"{}\" }}",
+            "x".repeat(256 << 10)
+        ));
+        rt.put(
+            &s,
+            "local",
+            ViewDef::table("SELECT (CONCAT(\"v-\", ?text) AS ?value) { ?s <urn:label> ?text }"),
+        )
+        .unwrap();
+        rt.round(&s);
+        let cell = rt.reg.lock().views["local"].cell.clone().unwrap();
+        let get_version = || cell.state.lock().circuit.version.clone().unwrap();
+        let old = get_version();
+        assert_eq!(old.terms.len(), 1);
+        let before = rt.published_views.load(Ordering::Relaxed);
+        let local_state = rt.get(&s, "local").unwrap().state_bytes;
+        let other_state = rt.get(&s, "v").unwrap().state_bytes;
+        rt.set_options(RuntimeOptions {
+            views_memory: Some(local_state + other_state + (64 << 10)),
+            ..rt.options()
+        });
+        update("INSERT DATA { <urn:b> <urn:label> \"y\" }");
+        rt.round(&s);
+        assert!(matches!(
+            rt.get(&s, "local").unwrap().state,
+            ViewState::Current
+        ));
+        let new = get_version();
+        assert_eq!(new.terms.len(), 2);
+        assert!(!Arc::ptr_eq(&old.terms, &new.terms));
+        assert!(rt.published_views.load(Ordering::Relaxed) - before < 64 << 10);
+        rt.delete("local").unwrap();
+        rt.delete("v").unwrap();
+        rt.round(&s);
+        drop(new);
+        assert!(rt.published_views.load(Ordering::Relaxed) >= 256 << 10);
+        drop(old);
+        assert_eq!(rt.published_views.load(Ordering::Relaxed), 0);
+        // A subscriber can keep the circuit's term backing alive after detachment.
+        assert_eq!(cell.state.lock().circuit.terms.key_count(), 2);
     }
 
     #[test]
