@@ -990,7 +990,7 @@ fn store_add_parts_and_rooted_next_refuse_copy_and_maxima_scratch() {
     assert_eq!(rooted_store.bytes(), rooted_store.scan_bytes());
     assert!(rooted_store.has_queued(), "live clause must remain queued");
     assert_eq!(
-        rooted_store.peek_live(),
+        rooted_store.peek_live(&run),
         Some(0),
         "dead shorter clause must have been discarded ahead of live clause 0"
     );
@@ -1773,7 +1773,8 @@ fn rooted_maxima_scratch_bound_covers_empty_realloc_overlap_and_warm_comparator(
     };
     let mut store = Store::default();
     assert!(store.add(Clause::new(Vec::new(), named)).is_some());
-    let id = store.peek_live().expect("queued wide clause");
+    let idle_run = DlRun::default();
+    let id = store.peek_live(&idle_run).expect("queued wide clause");
 
     // 1. Empty `max`: all 256 incomparable named classes are pushed; final 128 -> 256 growth
     // overlaps old and new buffers under the counting-allocator model.

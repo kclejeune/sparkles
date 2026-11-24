@@ -2067,7 +2067,7 @@ impl Sink for Out<'_, '_> {
 
     #[inline]
     fn worked(&mut self, n: usize) {
-        self.work += n;
+        self.work = self.work.saturating_add(n);
         self.dl().count(n);
     }
 

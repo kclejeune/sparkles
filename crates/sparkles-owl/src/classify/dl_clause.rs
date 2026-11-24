@@ -1295,6 +1295,9 @@ pub struct Stored {
     pub gbody: bool,
 }
 
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<Stored>() == 64);
+
 /// A context's clause store, with the indexes the rules read.
 #[derive(Default)]
 pub struct Store {
@@ -1427,6 +1430,13 @@ impl Store {
 
     pub fn is_idle(&self) -> bool {
         self.queue.is_empty() && !self.interrupted
+    }
+
+    /// Number of entries currently resident in the clause processing heap (including
+    /// any dead entries not yet popped by [`Store::peek_live`]).
+    #[inline]
+    pub(super) fn queue_len(&self) -> usize {
+        self.queue.len()
     }
 
     /// Whether a clause of the store that is not dead subsumes `(body, head)`, whose
@@ -1608,6 +1618,7 @@ impl Store {
         }
         let delta = self.add_unchecked(c, sig);
         out.commit_dl(bound, delta);
+        out.dl().on_queue_push();
         true
     }
 
@@ -1664,6 +1675,7 @@ impl Store {
         let committed_bound = covered_payload + extra_need;
         debug_assert!(committed_bound >= total_need);
         out.commit_dl(committed_bound, delta);
+        out.dl().on_queue_push();
         (true, true)
     }
 
@@ -1907,18 +1919,27 @@ impl Store {
     }
 
     /// Peeks the next live queued clause id without popping it. Discards already-subsumed
-    /// dead queue entries in place; dead-entry cleanup allocates nothing and leaves
+    /// dead queue entries in place; dead-entry cleanup allocates nothing, updates `dl`'s
+    /// resident queue occupancy counter (without crediting retained heap capacity), and leaves
     /// `owned_bytes`, every live clause, and every index unchanged, including if a following
     /// admission refuses.
-    pub fn peek_live(&mut self) -> Option<u32> {
-        while let Some(&std::cmp::Reverse((_, id))) = self.queue.peek() {
+    pub fn peek_live(&mut self, dl: &super::dl_rules::DlRun) -> Option<u32> {
+        let mut dead_popped = 0usize;
+        let live = loop {
+            let Some(&std::cmp::Reverse((_, id))) = self.queue.peek() else {
+                break None;
+            };
             if self.clauses[id as usize].dead {
                 self.queue.pop();
+                dead_popped += 1;
                 continue;
             }
-            return Some(id);
+            break Some(id);
+        };
+        if dead_popped > 0 {
+            dl.on_queue_pop(dead_popped);
         }
-        None
+        live
     }
 
     /// Upper bound on additional temporary scratch `(views_bytes, max_peak_add)` needed above
@@ -1988,9 +2009,13 @@ impl Store {
         rooted: Option<&Rooted>,
         id: u32,
         max: &[Lit],
+        dl: &super::dl_rules::DlRun,
     ) -> usize {
         let popped = self.queue.pop();
         debug_assert_eq!(popped.map(|r| r.0.1), Some(id));
+        if popped.is_some() {
+            dl.on_queue_pop(1);
+        }
         self.index_processed(ix, rooted, id, max)
     }
 
@@ -2012,7 +2037,7 @@ impl Store {
         max: &mut Vec<Lit>,
         out: &mut S,
     ) -> Option<u32> {
-        let id = self.peek_live()?;
+        let id = self.peek_live(out.dl())?;
         let max_cap_before = max.capacity();
         let Some((views_bytes, max_peak_add)) =
             self.next_scratch_bound(id, rooted.is_some(), max, max_cap_before)
@@ -2043,7 +2068,7 @@ impl Store {
             self.interrupted = true;
             return None;
         }
-        let delta = self.next_commit(ix, rooted, id, max);
+        let delta = self.next_commit(ix, rooted, id, max, scratch_guard.dl());
         scratch_guard.commit_dl(bound, delta);
         Some(id)
     }

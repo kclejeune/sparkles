@@ -94,6 +94,8 @@ mod numeric;
 mod query;
 #[cfg(test)]
 mod retained_accounting_tests;
+#[cfg(test)]
+mod rooted_adaptive_tests;
 mod saturate;
 #[cfg(test)]
 mod scratch_admission_tests;
@@ -186,6 +188,155 @@ fn drawing_on(
 /// Of the 50 `shoi` fixtures, 45 finish within 190,000 conclusions on one and on four
 /// threads, and the other five derive millions, as F24's measured effect records.
 const ROOTED_WORK_BOUND: usize = 1 << 19;
+
+/// Policy selected for a rooted, non-counting Tier D attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootedBoundPolicy {
+    /// Explicit caller `Limits::dl_work = Some(n)` (wins over all switches).
+    ExplicitFixed(usize),
+    /// Qualified deterministic Option 2 (`rawQ`) adaptive policy (fixed ceiling `2^25`).
+    Adaptive(dl_rules::AdaptivePolicy),
+    /// Fallback fixed rooted bound (`ROOTED_WORK_BOUND`, or per-class selector if present).
+    DefaultFixed(usize),
+}
+
+impl RootedBoundPolicy {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ExplicitFixed(_) => "explicit_fixed",
+            Self::Adaptive(_) => "adaptive",
+            Self::DefaultFixed(_) => "default_fixed",
+        }
+    }
+
+    fn work_limit(self) -> usize {
+        match self {
+            Self::ExplicitFixed(n) | Self::DefaultFixed(n) => n,
+            Self::Adaptive(p) => p.ceiling,
+        }
+    }
+}
+
+/// Precedence selector for rooted non-counting Tier D attempts:
+/// 1. Explicit `Some(n)` always wins with `n.max(1)`.
+/// 2. Qualified deterministic adaptive (`dl_steps && adaptive_enabled`) uses `policy`
+///    with its fixed ceiling (`2^25`), independent of any per-class fallback bound.
+/// 3. Otherwise falls through to `fallback_fixed.max(1)`.
+pub(crate) fn select_rooted_bound(
+    explicit_work: Option<usize>,
+    dl_steps: bool,
+    adaptive_enabled: bool,
+    policy: dl_rules::AdaptivePolicy,
+    fallback_fixed: usize,
+) -> RootedBoundPolicy {
+    if let Some(n) = explicit_work {
+        RootedBoundPolicy::ExplicitFixed(n.max(1))
+    } else if dl_steps && adaptive_enabled {
+        RootedBoundPolicy::Adaptive(policy)
+    } else {
+        RootedBoundPolicy::DefaultFixed(fallback_fixed.max(1))
+    }
+}
+
+/// Winning outcome of a joined `saturate_counted` call, captured immediately on return
+/// before error translation, `partial=true` routing, marker decline, or store teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WinningStop {
+    SaturationFinished,
+    Work,
+    Memory,
+    Timeout,
+    Cancelled,
+}
+
+impl WinningStop {
+    fn from_stop(stop: Option<Stop>) -> Self {
+        match stop {
+            None => Self::SaturationFinished,
+            Some(Stop::Work { .. }) => Self::Work,
+            Some(Stop::Memory { .. }) => Self::Memory,
+            Some(Stop::Timeout) => Self::Timeout,
+            Some(Stop::Cancelled) => Self::Cancelled,
+        }
+    }
+
+    fn event_name(self) -> &'static str {
+        match self {
+            Self::SaturationFinished => "saturation_finished",
+            _ => "saturation_stopped",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SaturationFinished => "none",
+            Self::Work => "work",
+            Self::Memory => "memory",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Snapshot captured immediately after `saturate_counted` for a tracked rooted attempt.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdaptiveSnapshot {
+    pub attempt: u32,
+    pub after_counting: bool,
+    pub enforce: bool,
+    pub policy_name: &'static str,
+    pub effective_cap: usize,
+    pub winning_stop: WinningStop,
+    pub stop_guard: dl_rules::WorkStopGuard,
+    pub stop_requested_at: usize,
+    pub hypothetical_guard: dl_rules::WorkStopGuard,
+    pub hypothetical_at: usize,
+    pub final_work: usize,
+    pub root_work: usize,
+    pub raw_queue: usize,
+    pub raw_pushed: usize,
+    pub mrepair_work: usize,
+    pub samples: usize,
+    pub oracle_queue: usize,
+}
+
+#[cfg(test)]
+impl AdaptiveSnapshot {
+    pub(crate) fn overshoot(&self) -> usize {
+        if self.stop_guard != dl_rules::WorkStopGuard::None {
+            self.final_work.saturating_sub(self.stop_requested_at)
+        } else {
+            0
+        }
+    }
+}
+
+fn next_adaptive_run_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Sums resident clause-heap lengths across all already-initialized base and dynamic
+/// contexts without materializing any context or allocating a snapshot.
+fn count_actual_queue_len(ctx: &Contexts, dynamic: Option<&saturate::Dynamic>) -> usize {
+    let mut total = 0usize;
+    for slot in ctx {
+        if let Some(c) = slot.get()
+            && let Some(dl) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref())
+        {
+            total += dl.store.queue_len();
+        }
+    }
+    if let Some(dy) = dynamic {
+        dy.each(|c| {
+            if let Some(dl) = c.st.lock().extra.as_ref().and_then(|x| x.dl.as_ref()) {
+                total += dl.store.queue_len();
+            }
+        });
+    }
+    total
+}
 
 /// The most conclusions a run of Tier D with counting derives, kept or redundant, before
 /// it passes its bound and the run starts again without counting.
@@ -1138,6 +1289,10 @@ pub struct Saturation {
     /// the clause table of the last run of Tier D whose contexts the next run may keep,
     /// which name its clauses by id
     dl_run: Option<dl_rules::DlRun>,
+    /// diagnostic run id for top-level `run_with_all` (non-zero only when adaptive diag is on)
+    adaptive_run_id: u64,
+    /// number of tracked rooted attempts executed in the current top-level `run_with_all`
+    adaptive_attempts: u32,
 }
 
 /// The rules of a run whose contexts the next run may keep.
@@ -1804,6 +1959,8 @@ impl Saturation {
             kept: None,
             reused: false,
             dl_run: None,
+            adaptive_run_id: 0,
+            adaptive_attempts: 0,
         }
     }
 
@@ -1944,6 +2101,15 @@ impl Saturation {
         };
         self.dl_worked.store(false, Ordering::Relaxed);
         self.rooted_declined = false;
+        self.adaptive_attempts = 0;
+        let adaptive_diag = dl_rules::rooted_adaptive_diag();
+        self.adaptive_run_id = if adaptive_diag {
+            next_adaptive_run_id()
+        } else {
+            0
+        };
+        #[cfg(test)]
+        LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow_mut().clear());
         let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
         if let Err(Error::Memory { .. }) = r
             && self.reused
@@ -2235,7 +2401,140 @@ impl Saturation {
             stats.dl_rooted_declined = true;
             stats.dl_over_budget = true;
         }
+        if adaptive_diag && self.adaptive_attempts > 0 {
+            match &r {
+                Ok((consistent, _, stats)) => {
+                    let partial_incomplete = self.partial.as_ref().map_or(0, |(inc, _)| inc.len());
+                    eprintln!(
+                        "ADAPTIVE-OUTCOME run={} attempts={} status=ok consistent={} dl_rooted_over={} dl_rooted_declined={} dl_counting_over={} dl_over_budget={} horn_over_budget={} outside_horn={} outside_disj={} excluded={} partial_incomplete={}",
+                        self.adaptive_run_id,
+                        self.adaptive_attempts,
+                        consistent,
+                        stats.dl_rooted_over,
+                        stats.dl_rooted_declined,
+                        stats.dl_counting_over,
+                        stats.dl_over_budget,
+                        stats.horn_over_budget,
+                        stats.outside_el.horn,
+                        stats.outside_el.disjunctive,
+                        self.excluded.len(),
+                        partial_incomplete,
+                    );
+                }
+                Err(e) => {
+                    let kind = match e {
+                        Error::Memory { .. } => "memory",
+                        Error::Timeout => "timeout",
+                        Error::Cancelled => "cancelled",
+                        Error::Incomplete(_) => "incomplete",
+                    };
+                    eprintln!(
+                        "ADAPTIVE-OUTCOME run={} attempts={} status=err err={kind}",
+                        self.adaptive_run_id, self.adaptive_attempts,
+                    );
+                }
+            }
+        }
         r
+    }
+
+    /// Captures the joined saturation's counters, resident clause-heap oracle, and winning
+    /// stop reason immediately after `saturate_counted`.
+    fn record_adaptive_saturation(
+        &self,
+        d: &dl_rules::DlRun,
+        dynamic: Option<&saturate::Dynamic>,
+        stop: Option<Stop>,
+    ) {
+        let winning = WinningStop::from_stop(stop);
+        let final_work = d.work();
+        let root_work = d.root_work();
+        let raw_queue = d.raw_queue();
+        let raw_pushed = d.raw_pushed();
+        let mrepair_work = d.mrepair_work();
+        let stop_guard = d.stop_guard();
+        let stop_requested_at = d.stop_requested_at();
+        let hyp_guard = d.hypothetical_guard();
+        let hyp_at = d.hypothetical_at();
+        let check_oracle = cfg!(any(debug_assertions, test)) || d.is_adaptive_diag();
+        let oracle_queue = if check_oracle {
+            let actual = count_actual_queue_len(&self.ctx, dynamic);
+            assert_eq!(
+                raw_queue, actual,
+                "raw_queue ({raw_queue}) != sum(store.queue_len()) ({actual})"
+            );
+            assert!(
+                raw_queue <= raw_pushed,
+                "raw_queue ({raw_queue}) exceeded raw_pushed ({raw_pushed})"
+            );
+            actual
+        } else {
+            raw_queue
+        };
+        if d.is_adaptive_diag()
+            && let Some(meta) = d.adaptive_meta()
+        {
+            let overshoot = if stop_guard != dl_rules::WorkStopGuard::None {
+                final_work.saturating_sub(stop_requested_at)
+            } else {
+                0
+            };
+            eprintln!(
+                "ADAPTIVE-SAT run={} attempt={} mode={} policy={} cap={} after_counting={} mrepair={} threads={} event={} stop={} guard={} req_at={} overshoot={} hyp_guard={} hyp_at={} work={} root_work={} raw_q={} raw_p={} oracle_q={} mrepair_work={} samples={}",
+                meta.run_id,
+                meta.attempt,
+                if d.is_adaptive_enforced() {
+                    "enforce"
+                } else {
+                    "observe"
+                },
+                meta.policy_name,
+                meta.effective_cap,
+                usize::from(meta.after_counting),
+                meta.mrepair,
+                meta.threads,
+                winning.event_name(),
+                winning.as_str(),
+                stop_guard.as_str(),
+                stop_requested_at,
+                overshoot,
+                hyp_guard.as_str(),
+                hyp_at,
+                final_work,
+                root_work,
+                raw_queue,
+                raw_pushed,
+                oracle_queue,
+                mrepair_work,
+                d.adaptive_samples(),
+            );
+        }
+        #[cfg(test)]
+        if let Some(meta) = d.adaptive_meta() {
+            LAST_ADAPTIVE_ATTEMPTS.with(|c| {
+                c.borrow_mut().push(AdaptiveSnapshot {
+                    attempt: meta.attempt,
+                    after_counting: meta.after_counting,
+                    enforce: d.is_adaptive_enforced(),
+                    policy_name: meta.policy_name,
+                    effective_cap: meta.effective_cap,
+                    winning_stop: winning,
+                    stop_guard,
+                    stop_requested_at,
+                    hypothetical_guard: hyp_guard,
+                    hypothetical_at: hyp_at,
+                    final_work,
+                    root_work,
+                    raw_queue,
+                    raw_pushed,
+                    mrepair_work,
+                    samples: d.adaptive_samples(),
+                    oracle_queue,
+                });
+            });
+        }
+        #[cfg(not(test))]
+        let _ = oracle_queue;
     }
 
     /// After a rooted run that withdrew its answer (item 1231), which `rooted_declined`
@@ -3125,7 +3424,7 @@ impl Saturation {
             }
             _ => dl_rules::DlRun::new(limits.expansion == Expansion::Eager, self.dl_worked.clone()),
         });
-        let dl_run = dl_run.map(|mut d| {
+        let mut dl_run = dl_run.map(|mut d| {
             d.mrepair = dl_root::marker_repair(limits.rooted_marker_repair);
             d
         });
@@ -3243,7 +3542,7 @@ impl Saturation {
         self.dl_counted = ax.dl.as_ref().is_some_and(|d| d.counting);
         self.dl_attempt =
             dl_run.is_some() && !self.dl_rooted && !self.dl_counted && !self.no_counting;
-        if let Some(d) = &dl_run {
+        if let Some(d) = &mut dl_run {
             // a run that counts has the bound of the limits, and the run that starts again
             // without counting after it passed that bound has the larger one of a run that
             // cannot expect to finish soon, before the Horn rules take over; a rooted run
@@ -3252,7 +3551,34 @@ impl Saturation {
             // only an attempt has a limit on the choices of a product
             d.set_width_limit(0);
             if self.dl_rooted && !self.dl_counted {
-                d.set_work_limit(limits.dl_work.unwrap_or(ROOTED_WORK_BOUND).max(1));
+                let adaptive_on = dl_rules::rooted_adaptive_bound();
+                let diag_on = dl_rules::rooted_adaptive_diag();
+                let policy = dl_rules::active_adaptive_policy();
+                let selected = select_rooted_bound(
+                    limits.dl_work,
+                    limits.dl_steps,
+                    adaptive_on,
+                    policy,
+                    ROOTED_WORK_BOUND,
+                );
+                let effective_cap = selected.work_limit();
+                d.set_work_limit(effective_cap);
+                if limits.dl_steps
+                    && (matches!(selected, RootedBoundPolicy::Adaptive(_)) || diag_on)
+                {
+                    self.adaptive_attempts += 1;
+                    let enforce = matches!(selected, RootedBoundPolicy::Adaptive(_));
+                    let meta = dl_rules::AdaptiveMeta {
+                        run_id: self.adaptive_run_id,
+                        attempt: self.adaptive_attempts,
+                        after_counting: self.no_counting,
+                        policy_name: selected.name(),
+                        effective_cap,
+                        mrepair: d.mrepair,
+                        threads: limits.threads,
+                    };
+                    d.enable_adaptive(policy, enforce, diag_on, meta);
+                }
             } else if self.no_counting {
                 d.set_work_limit(DL_RETRY_WORK);
             } else if self.dl_counted {
@@ -3354,8 +3680,15 @@ impl Saturation {
         // the stop to the caller's deadline, cancellation or memory refusal does not count
         let mut over_work = false;
         let partial = bounds.partial;
-        let mut totals = match saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds)
-        {
+        let (sat_totals, sat_stop) =
+            saturate::saturate_counted(&ix, &self.ctx, &roots, &[], &[], &bounds);
+        // Capture saturation counters, heap occupancy oracle, and winning stop reason
+        // immediately after `saturate_counted`, before error translation, `partial=true`
+        // routing, marker decline, or partial store teardown.
+        if let Some(d) = dl_run.as_ref().filter(|d| d.tracks_adaptive()) {
+            self.record_adaptive_saturation(d, dynamic.as_ref(), sat_stop);
+        }
+        let mut totals = match (sat_totals, sat_stop) {
             (t, None) => t,
             (t, Some(s)) if partial => {
                 over_work = matches!(s, Stop::Work { .. });
@@ -5135,6 +5468,15 @@ thread_local! {
     /// `(base, allowance_base, own)` observed by the last Horn/Tier D run on this thread.
     pub(super) static LAST_ALLOWANCE: std::cell::Cell<(usize, usize, usize)> =
         const { std::cell::Cell::new((0, 0, 0)) };
+    /// Snapshots captured immediately after `saturate_counted` for each tracked rooted
+    /// attempt in the last top-level classification on this thread.
+    pub(super) static LAST_ADAPTIVE_ATTEMPTS: std::cell::RefCell<Vec<AdaptiveSnapshot>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(super) fn last_adaptive_attempts() -> Vec<AdaptiveSnapshot> {
+    LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow().clone())
 }
 
 fn poll(limits: &Limits) -> Result<(), Error> {
