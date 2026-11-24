@@ -608,6 +608,61 @@ fn complemented_disjoint_classes_stays_horn_in_strict_and_rooted_runs() {
 }
 
 #[test]
+fn single_surviving_disjoint_class_with_non_horn_neg_stays_horn() {
+    let single = "Declaration(Class(:A))\n\
+        Declaration(Class(:B))\n\
+        Declaration(Class(:C))\n\
+        DisjointClasses(:A :A ObjectIntersectionOf(ObjectComplementOf(:B) ObjectComplementOf(:C)))";
+    let (_, out) = classify_ofn(single, &Limits::default());
+    assert!(out.complete);
+    assert_eq!(out.stats.tier, Tier::Horn);
+    assert_eq!(out.stats.outside_el.horn, 1);
+    assert_eq!(out.stats.outside_el.disjunctive, 0);
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("B")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+
+    let mixed_horn = "Declaration(Class(:A))\n\
+        Declaration(Class(:B))\n\
+        Declaration(Class(:C))\n\
+        Declaration(Class(:D))\n\
+        DisjointClasses(:A :A ObjectIntersectionOf(ObjectComplementOf(:B) ObjectComplementOf(:C)))\n\
+        DisjointObjectProperties(:p :q)\n\
+        SubObjectPropertyOf(:q :p)\n\
+        SubClassOf(:D ObjectSomeValuesFrom(:q owl:Thing))";
+    for (label, base) in limits_pair() {
+        let strict = Limits {
+            strict: true,
+            ..base
+        };
+        let (_, out) = classify_ofn(mixed_horn, &strict);
+        assert!(out.complete, "mixed {label}");
+        assert_eq!(out.stats.tier, Tier::Horn, "mixed {label}");
+        assert_eq!(out.stats.outside_el.disjunctive, 0, "mixed {label}");
+        assert_eq!(out.consistency, Consistency::Consistent, "mixed {label}");
+        assert!(out.taxonomy.is_unsatisfiable(&c("A")), "mixed {label}");
+        assert!(out.taxonomy.is_unsatisfiable(&c("D")), "mixed {label}");
+    }
+
+    let irrefl_horn = "DisjointClasses(:A :A ObjectIntersectionOf(ObjectComplementOf(:B) ObjectComplementOf(:C)))\n\
+        IrreflexiveObjectProperty(:r)\n\
+        ObjectPropertyAssertion(:r :a :a)";
+    for (label, base) in limits_pair() {
+        let strict = Limits {
+            strict: true,
+            ..base
+        };
+        let (_, out) = classify_ofn(irrefl_horn, &strict);
+        assert!(out.complete, "irrefl {label}");
+        assert_eq!(out.stats.tier, Tier::Horn, "irrefl {label}");
+        assert_eq!(out.stats.outside_el.disjunctive, 0, "irrefl {label}");
+        assert_eq!(out.consistency, Consistency::Inconsistent, "irrefl {label}");
+    }
+}
+
+#[test]
 fn mixed_repeated_disjoint_union_with_individual_is_horn_and_inconsistent() {
     // Sol #1 second case: DisjointUnion(:C :A :A :B) with ClassAssertion(:A :a) must
     // normalize in Horn under rooted=false and rooted=true (reducing to :A ⊑ ⊥, :C ≡ :B).

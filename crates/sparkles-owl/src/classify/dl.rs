@@ -336,10 +336,13 @@ pub(super) fn split_multiset<T: Eq>(ms: &Multiset<T>) -> (Vec<&T>, Vec<&T>) {
 }
 
 /// The most that two of the counts add up to, from the two largest, which is the largest
-/// clause of a set of pairwise disjointness conditions.
+/// clause of a set of pairwise disjointness conditions. Returns `0` when fewer than two
+/// items are present because there are no pairwise clauses.
 fn pairs(ns: impl Iterator<Item = u8>) -> u8 {
     let (mut a, mut b) = (0, 0);
+    let mut count = 0usize;
     for n in ns {
+        count += 1;
         if n > a {
             b = a;
             a = n;
@@ -347,7 +350,7 @@ fn pairs(ns: impl Iterator<Item = u8>) -> u8 {
             b = n;
         }
     }
-    add(a, b)
+    if count < 2 { 0 } else { add(a, b) }
 }
 
 /// The largest clause of an equivalence: the negative count of one operand and the
@@ -687,6 +690,24 @@ mod tests {
             Shape {
                 horn: false,
                 global: true
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(:A :A ObjectIntersectionOf(ObjectComplementOf(:B) ObjectComplementOf(:C)))"
+            ),
+            Shape {
+                horn: true,
+                global: false
+            }
+        );
+        assert_eq!(
+            of(
+                "DisjointClasses(ObjectComplementOf(:A) ObjectComplementOf(:A) ObjectComplementOf(ObjectUnionOf(:B :C)))"
+            ),
+            Shape {
+                horn: true,
+                global: false
             }
         );
     }
