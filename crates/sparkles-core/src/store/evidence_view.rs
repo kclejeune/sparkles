@@ -364,17 +364,7 @@ impl Store {
             .as_ref()
             .ok_or_else(inactive)?
             .identity(self.owner_dataset_id());
-        let (allowance, mut held) = {
-            let allowance = preparation.selection_room();
-            match preparation.reserve(allowance) {
-                Ok(held) => (allowance, held),
-                Err(Error::BudgetExceeded(_)) => {
-                    let covered = preparation.covered_room();
-                    (covered, preparation.reserve(covered)?)
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let (allowance, mut held) = preparation.reserve_available()?;
         let options = HistoryOptions {
             cancel: Some(preparation.control().cancel.flag()),
             deadline: preparation.control().deadline,
@@ -504,8 +494,7 @@ impl Store {
                 source = Source::Borrowed(self);
                 continue;
             }
-            let allowance = preparation.room();
-            let temporary = preparation.reserve(allowance)?;
+            let (allowance, temporary) = preparation.reserve_available()?;
             let options = HistoryOptions {
                 cancel: Some(preparation.control().cancel.flag()),
                 deadline: preparation.control().deadline,

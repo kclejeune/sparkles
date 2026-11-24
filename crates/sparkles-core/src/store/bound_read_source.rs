@@ -361,17 +361,7 @@ impl super::Store {
         // succeed before any cold metadata/decoder/source allocation. Another
         // grant can take the free granules first, so a refused estimate retries
         // once with the room the grant already covers.
-        let (allowance, mut held) = {
-            let allowance = selection.selection_room();
-            match selection.reserve(allowance) {
-                Ok(held) => (allowance, held),
-                Err(Error::BudgetExceeded(_)) => {
-                    let covered = selection.covered_room();
-                    (covered, selection.reserve(covered)?)
-                }
-                Err(error) => return Err(error),
-            }
-        };
+        let (allowance, mut held) = selection.reserve_available()?;
         let snapshot = if inherited {
             let (snapshot, resolved, _) =
                 self.snapshot_at_prepared(logical, at, &selection, allowance)?;

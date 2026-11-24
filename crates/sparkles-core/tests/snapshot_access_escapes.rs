@@ -1079,3 +1079,194 @@ fn evidence_selection_ceiling_is_distinct_from_execution_allowance() {
     drop(grant);
     assert_eq!(big_pool.granted(), 0);
 }
+
+#[test]
+fn persistent_evidence_view_succeeds_under_pool_smaller_than_selection_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dataset");
+    drop(Store::open(&path, StoreOptions::default()).unwrap());
+    let init_prep = Preparation::new(Control::none(), 64 << 20).unwrap();
+    sparkles_core::migrate::activate_configuration_history(&path, false, &init_prep).unwrap();
+
+    let (seq_main, seq_p1) = {
+        let store = Store::open(&path, StoreOptions::default()).unwrap();
+        sparkles_core::sparql::update::update(
+            &store,
+            "INSERT DATA { <urn:main:s1> <urn:p> \"v1\" }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let seq_main = store.head_commit().seq;
+
+        // Publish a second configuration generation so history resolution walks
+        // committed persistent configuration history as well as WAL bindings.
+        let settings = sparkles_core::evidence::Settings {
+            enabled: true,
+            source_records: vec!["urn:evidence:sub-ceiling".into()],
+            proposals: vec!["urn:evidence:sub-ceiling:proposals".into()],
+            ..Default::default()
+        };
+        let canonical = settings.canonical(&Control::none()).unwrap();
+        let bytes = canonical.bytes().to_vec();
+        store
+            .enable_managed(
+                sparkles_core::managed::OwnerKind::Evidence,
+                sparkles_core::managed::OwnerEntry::for_settings(
+                    1,
+                    settings.managed_graphs(),
+                    &bytes,
+                ),
+                &bytes,
+            )
+            .unwrap();
+
+        // Build a parent -> child persistent branch chain so reopening only `child`
+        // leaves `parent` cold on disk when reading `seq_p1` through `child`.
+        store
+            .create_branch("parent", &sparkles_core::branch::BranchOptions::default())
+            .unwrap();
+        let parent = store.branch("parent").unwrap();
+        sparkles_core::sparql::update::update(
+            &parent,
+            "INSERT DATA { <urn:parent:s1> <urn:p> \"p1\" }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        let seq_p1 = parent.head_commit().seq;
+        sparkles_core::sparql::update::update(
+            &parent,
+            "INSERT DATA { <urn:parent:s2> <urn:p> \"p2\" }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        store
+            .create_branch(
+                "child",
+                &sparkles_core::branch::BranchOptions {
+                    from: "parent".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let child = store.branch("child").unwrap();
+        sparkles_core::sparql::update::update(
+            &child,
+            "INSERT DATA { <urn:child:s1> <urn:p> \"c1\" }",
+            &QueryOptions::default(),
+        )
+        .unwrap();
+        (seq_main, seq_p1)
+    };
+
+    let reopened = Store::open(&path, StoreOptions::default()).unwrap();
+    let child = reopened.branch("child").unwrap();
+
+    // 1. 32 MiB pool with 64 MiB selection ceiling (production server ceiling):
+    //    resident persistent `At::Head` and `At::Commit` must succeed, support
+    //    live query execution on `BoundEvidenceView::read_source()`, and release
+    //    the grant cleanly on drop.
+    let pool = QueryPool::new(32 << 20);
+    {
+        let grant = Arc::new(pool.empty_grant());
+        {
+            let prep = Preparation::with_grant(Control::none(), 16 << 20, grant.clone())
+                .unwrap()
+                .with_selection_limit(64 << 20)
+                .unwrap();
+            let baseline = grant.used();
+
+            let head_view = reopened.evidence_view(&At::Head, &prep).unwrap();
+            let commit_view = reopened
+                .evidence_view(&At::Commit(seq_main), &prep)
+                .unwrap();
+            assert_eq!(head_view.commit().seq, seq_main);
+            assert_eq!(commit_view.commit().seq, seq_main);
+            assert_ne!(head_view.configuration(), commit_view.configuration());
+
+            let rows = query_source(
+                head_view.read_source(),
+                &reopened,
+                "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+                &QueryOptions {
+                    graphs: Some(Arc::new(GraphAccess::all())),
+                    grant: Some(grant.clone()),
+                    max_memory_bytes: Some(16 << 20),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 1);
+            drop(rows);
+            drop(commit_view);
+            drop(head_view);
+            assert_eq!(grant.used(), baseline);
+        }
+        assert_eq!(grant.used(), 0);
+    }
+    assert_eq!(pool.granted(), 0);
+
+    // 2. Cold inherited persistent branch under the same 32 MiB pool / 64 MiB
+    //    selection ceiling: reading `seq_p1` through `child` exercises the cold
+    //    inherited decoder (`readonly_branch_read_limited`).
+    {
+        let grant = Arc::new(pool.empty_grant());
+        {
+            let prep = Preparation::with_grant(Control::none(), 16 << 20, grant.clone())
+                .unwrap()
+                .with_selection_limit(64 << 20)
+                .unwrap();
+            let baseline = grant.used();
+
+            let cold_view = reopened
+                .evidence_view_with_branch(&child, &At::Commit(seq_p1), &prep)
+                .unwrap();
+            assert_eq!(cold_view.commit().seq, seq_p1);
+
+            let rows = query_source(
+                cold_view.read_source(),
+                &child,
+                "SELECT ?s ?o WHERE { ?s <urn:p> ?o }",
+                &QueryOptions {
+                    graphs: Some(Arc::new(GraphAccess::all())),
+                    grant: Some(grant.clone()),
+                    max_memory_bytes: Some(16 << 20),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(rows.len(), 2);
+            drop(rows);
+            drop(cold_view);
+            assert_eq!(grant.used(), baseline);
+        }
+        assert_eq!(grant.used(), 0);
+    }
+    assert_eq!(pool.granted(), 0);
+
+    // 3. Competing grant leaving sub-granule free slack: both resident and cold
+    //    inherited persistent evidence views stay within the covered grant.
+    let tight_pool = QueryPool::new(10 << 20);
+    {
+        let grant = Arc::new(tight_pool.try_grant(4 << 20).unwrap());
+        let competitor = tight_pool.try_grant(4 << 20).unwrap();
+        {
+            let prep = Preparation::with_grant(Control::none(), 16 << 20, grant.clone())
+                .unwrap()
+                .with_selection_limit(64 << 20)
+                .unwrap();
+            let baseline = grant.used();
+
+            let head_view = reopened.evidence_view(&At::Head, &prep).unwrap();
+            let cold_view = reopened
+                .evidence_view_with_branch(&child, &At::Commit(seq_p1), &prep)
+                .unwrap();
+            assert_eq!(grant.granted(), 4 << 20);
+            drop(cold_view);
+            drop(head_view);
+            assert_eq!(grant.used(), baseline);
+        }
+        assert_eq!(grant.used(), 0);
+        drop(competitor);
+    }
+    assert_eq!(tight_pool.granted(), 0);
+}

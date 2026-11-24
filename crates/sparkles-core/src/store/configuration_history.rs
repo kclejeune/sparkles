@@ -233,10 +233,9 @@ impl Store {
                 .copied()
                 .unwrap_or_default()
         } else {
-            // Hold the whole temporary decoder allowance before using the existing
+            // Hold the available temporary decoder allowance before using the existing
             // cold reader. Its buffers are gone before this reservation returns.
-            let allowance = preparation.room();
-            let _held = preparation.reserve(allowance)?;
+            let (allowance, _held) = preparation.reserve_available()?;
             let options = HistoryOptions {
                 cancel: Some(preparation.control().cancel.flag()),
                 deadline: preparation.control().deadline,

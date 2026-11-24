@@ -573,20 +573,27 @@ impl Preparation {
             .map_or(local, |grant| local.min(grant.growth_room()))
     }
 
-    /// The part of [`Preparation::selection_room`] the grant already covers, which
-    /// needs no pool growth. A selection that loses a race for free granules
-    /// retries with this smaller allowance before any read.
-    pub(crate) fn covered_room(&self) -> u64 {
-        let local = if let Some(selection) = &self.inner.selection {
-            selection
-                .limit
-                .saturating_sub(selection.used.load(Ordering::Relaxed))
-        } else {
-            self.room()
-        };
-        self.inner.grant.as_ref().map_or(local, |grant| {
-            local.min(grant.granted().saturating_sub(grant.used()))
-        })
+    /// Reserve the active budget's pool-aware remaining room, retrying once with
+    /// the room the grant already covers when another grant takes free pool
+    /// granules first. Returns the actual reserved allowance and its guard.
+    pub(crate) fn reserve_available(&self) -> Result<(u64, Reservation)> {
+        let local = self.room();
+        let allowance = self
+            .inner
+            .grant
+            .as_ref()
+            .map_or(local, |grant| local.min(grant.growth_room()));
+        match self.reserve(allowance) {
+            Ok(held) => Ok((allowance, held)),
+            Err(Error::BudgetExceeded(_)) => {
+                let local = self.room();
+                let covered = self.inner.grant.as_ref().map_or(local, |grant| {
+                    local.min(grant.granted().saturating_sub(grant.used()))
+                });
+                Ok((covered, self.reserve(covered)?))
+            }
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) fn refuses_wait(&self) -> bool {

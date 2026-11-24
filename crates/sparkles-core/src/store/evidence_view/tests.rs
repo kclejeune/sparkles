@@ -386,3 +386,74 @@ fn bound_read_source_keeps_genuine_history_view_and_configuration_credit() {
     assert!(backing.upgrade().is_none());
     assert_eq!(preparation.inner_used(), before);
 }
+
+#[test]
+fn persistent_and_cold_inherited_evidence_selection_respects_sub_ceiling_pool() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("dataset");
+    drop(Store::open(&path, Default::default()).unwrap());
+    let init = preparation();
+    crate::migrate::activate_configuration_history(&path, false, &init).unwrap();
+
+    let (parent_id, seq_p1) = {
+        let store = Store::open(&path, Default::default()).unwrap();
+        update(&store, "main-data");
+        configure(&store, "second");
+        let parent_info = store.create_branch("parent", &Default::default()).unwrap();
+        let parent = store.branch("parent").unwrap();
+        update(&parent, "parent-first");
+        let seq_p1 = parent.head_commit().seq;
+        update(&parent, "parent-second");
+        store
+            .create_branch(
+                "child",
+                &crate::branch::BranchOptions {
+                    from: "parent".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        (parent_info.id, seq_p1)
+    };
+
+    let reopened = Store::open(&path, Default::default()).unwrap();
+    let child = reopened.branch("child").unwrap();
+    assert!(
+        reopened
+            .try_resident_branch(parent_id, &Default::default())
+            .unwrap()
+            .is_none(),
+        "parent branch must remain cold before inherited selection"
+    );
+
+    let pool = crate::sparql::pool::QueryPool::new(32 << 20);
+    {
+        let grant = Arc::new(pool.empty_grant());
+        {
+            let prep = Preparation::with_grant(Control::none(), 16 << 20, grant.clone())
+                .unwrap()
+                .with_selection_limit(64 << 20)
+                .unwrap();
+            let baseline = grant.used();
+
+            let head = reopened.evidence_view(&At::Head, &prep).unwrap();
+            let cold = reopened
+                .evidence_view_with_branch(&child, &At::Commit(seq_p1), &prep)
+                .unwrap();
+            assert_eq!(cold.commit().seq, seq_p1);
+            assert!(
+                reopened
+                    .try_resident_branch(parent_id, &Default::default())
+                    .unwrap()
+                    .is_none(),
+                "cold inherited selection must not make parent branch resident"
+            );
+
+            drop(cold);
+            drop(head);
+            assert_eq!(grant.used(), baseline);
+        }
+        assert_eq!(grant.used(), 0);
+    }
+    assert_eq!(pool.granted(), 0);
+}
