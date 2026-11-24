@@ -7859,8 +7859,12 @@ mod tests {
                 } else if on.0.complete && on.1 == 0 {
                     repair_off_checked += 1;
                     assert!(
+                        off.0.taxonomy.is_subclass(&z, &ans),
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=false): OFF misses Z ⊑ Ans"
+                    );
+                    assert!(
                         on.0.taxonomy.is_subclass(&z, &ans),
-                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=false): misses Z ⊑ Ans"
+                        "{name} ({threads}t {expansion:?} steps={dl_steps} repair=false): ON misses Z ⊑ Ans"
                     );
                 }
             }

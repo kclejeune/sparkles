@@ -2412,3 +2412,478 @@ fn hyper_at_conj_admits_peak_and_refuses_without_uncharged_scratch() {
         }
     }
 }
+
+/// Sol r2 P1: after `push_partners_admitted` fills `Found::one` with 513 conjunction
+/// conclusions (exact initial capacity 513), a subsequent producer on the same `Found` —
+/// `hyper_roles` via a universal `D ⊑ ∀r.Q` over a stored role clause `r(u0, u1)` — must
+/// pre-admit both the `Found::one` reallocation overlap and the new `Side` BEFORE allocating.
+/// Under a tight cap that grants the 513-partner conjunction batch (~68 KiB) and refuses
+/// `hyper_roles`'s next growth (513 -> 1026 realloc overlap ~65 KiB), refusal must occur
+/// without exceeding the cap in both `shared_facts = false` and `true`, root and non-root.
+#[test]
+fn hyper_at_conj_then_hyper_roles_admits_peak_and_refuses_tight_cap() {
+    struct BudgetSink<'a> {
+        run: &'a DlRun,
+        cap: usize,
+        live: usize,
+        peak: usize,
+        stopped: bool,
+    }
+    impl Sink for BudgetSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            if self.stopped || self.live.saturating_add(bytes) > self.cap {
+                self.stopped = true;
+                return false;
+            }
+            self.live += bytes;
+            self.peak = self.peak.max(self.live);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.live = self.live.saturating_sub(bytes);
+        }
+        fn admit_dl(&mut self, bytes: usize) -> bool {
+            self.reserve_data(bytes)
+        }
+        fn commit_dl(&mut self, admitted: usize, kept: usize) {
+            self.live = self.live.saturating_sub(admitted.saturating_sub(kept));
+        }
+        fn go_on(&self) -> bool {
+            !self.stopped
+        }
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    // Declare :H0..:H519 BEFORE :D, :P, :K, :Q so P(u0) is maximal in all 513 partner clauses.
+    // Give :D BOTH a conjunction rule `D ⊓ P ⊑ K` AND a universal `D ⊑ ∀r.Q` (which normalizes
+    // so `ix.head(D)` or a told subsumer? Direct `ObjectAllValuesFrom(:r :Q)` is a Forall node,
+    // so use `D = ObjectAllValuesFrom(:r :Q)` via `EquivalentClasses` or `SubClassOf(D ⊓ P, K)`
+    // where `D` itself is `ObjectAllValuesFrom(:r :Q)`, OR `SubClassOf(ObjectSomeValuesFrom(:r_inv :D) :Q)`
+    // so `alls(ix, D)` directly yields `(r, Q)` on `D` itself!).
+    let mut body = String::new();
+    for i in 0..520 {
+        body.push_str(&format!("Declaration(Class(:H{i}))\n"));
+    }
+    body.push_str(
+        "Declaration(ObjectProperty(:r))\n\
+         Declaration(Class(:P))\n\
+         Declaration(Class(:Q))\n\
+         Declaration(Class(:K))\n\
+         SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n\
+         ClassAssertion(:Seed :u0)\n\
+         ClassAssertion(:Seed :u1)\n",
+    );
+    let input = axioms(&body);
+    let mut it = Interner::new();
+    let mut ax = Axioms::default();
+    let mut outside = Vec::new();
+    for a in &input {
+        if super::index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+            outside.push(&a.kind);
+        }
+    }
+    let allowed = super::dl_norm::Allowed {
+        rooted: true,
+        ..Default::default()
+    };
+    let mut dl_ax = super::dl_norm::normalize(&outside, &mut it, &mut ax, None, &|| false, allowed)
+        .expect("dl_norm")
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let root = dl_ax.root.unwrap_or_else(|| {
+        let r = it.fresh_class();
+        dl_ax.root = Some(r);
+        r
+    });
+    for set in &mut ax.disjoint {
+        set.sort_unstable();
+    }
+    ax.dl = Some(Box::new(dl_ax));
+    let p_cls = it.class(&Class::new("urn:tierd1291:P"));
+    let q_cls = it.class(&Class::new("urn:tierd1291:Q"));
+    let k_cls = it.class(&Class::new("urn:tierd1291:K"));
+    let r_role = it.role(super::index::RoleName::Object(
+        crate::model::ObjectProperty::new("urn:tierd1291:r"),
+    ));
+    let d_cls = it.node(super::index::Node::Forall(r_role, q_cls));
+    let dp_conj = it.node(super::index::Node::Conj(d_cls, p_cls));
+    ax.subs.push((dp_conj, k_cls));
+    let h_cls: Vec<Ex> = (0..520)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+    let dx = ix.dl.as_deref().expect("rooted dl index");
+    let u0 = dx.consts[0].0;
+    let u1 = dx.consts[1].0;
+    let conj_cls = ix
+        .conj_of(ix.head(d_cls))
+        .iter()
+        .find(|&&(p, _)| p == p_cls)
+        .map(|&(_, k)| k)
+        .expect("conj_of(D) contains P");
+    let mut d_alls = Vec::new();
+    super::dl_rules::alls(&ix, d_cls, &mut d_alls);
+    assert!(
+        d_alls.iter().any(|&(_, c)| c == q_cls),
+        "D must carry universal restriction yielding Q for hyper_roles"
+    );
+    let inv = |r: super::index::Role| dx.inv(&ix, r);
+    let mk_atom =
+        |run: &DlRun, cls: Ex, u: u32| match run.lits.lit(XLit::Atom(cls, RTerm::C(u)), inv) {
+            Made::Lit(l) => l,
+            _ => unreachable!(),
+        };
+    let mk_role = |run: &DlRun| match run
+        .lits
+        .lit(XLit::Role(r_role, RTerm::C(u0), RTerm::C(u1)), inv)
+    {
+        Made::Lit(l) => l,
+        _ => unreachable!(),
+    };
+
+    for share in [false, true] {
+        let run = DlRun::new(false, Default::default()).with_shared_facts(share);
+        let lp = mk_atom(&run, p_cls, u0);
+        let ld = mk_atom(&run, d_cls, u0);
+        let lrole = mk_role(&run);
+        let lh: Vec<Lit> = h_cls.iter().map(|&c| mk_atom(&run, c, u0)).collect();
+        let lconj = mk_atom(&run, conj_cls, u0);
+        let lq = mk_atom(&run, q_cls, u1);
+        let _ = run.table.push(Clause::new(Vec::new(), vec![ld]));
+
+        let build_state = |subsume_outputs: bool| {
+            let mut st = State::default();
+            let mut setup_sink = BudgetSink {
+                run: &run,
+                cap: usize::MAX,
+                live: 0,
+                peak: 0,
+                stopped: false,
+            };
+            let x = super::dl_rules::ds(&mut st);
+            let ground_total = super::dl_clause::ground_total();
+            let o = Rooted {
+                ix: &ix,
+                lits: &run.lits,
+                inv: &inv,
+                ground_total,
+            };
+            let mut max = Vec::new();
+            // 1. Insert 513 live unselected partner clauses for P(u0).
+            for i in 0..513usize {
+                let mut head = vec![lp];
+                for j in 0..7usize {
+                    head.push(lh[(i + j * 73) % 520]);
+                }
+                let c = Clause::new(vec![Lit::x(h_cls[i])], head);
+                let _ = x.store.add(c);
+                let id = x.store.peek_live().expect("partner queued");
+                let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+                let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+                assert!(max.contains(&lp));
+            }
+            // 2. Insert a live unselected role clause `H0(x) -> r(u0, u1)` indexed in `roles_of[u0]`
+            //    so `hyper_roles` fires right AFTER the 513-partner `conj_of` batch on the same `Found`.
+            let role_clause = Clause::new(vec![Lit::x(h_cls[0])], vec![lrole]);
+            let _ = x.store.add(role_clause);
+            let rid = x.store.peek_live().expect("role clause queued");
+            let _ = x.store.next_prepare_id(&ix, Some(&o), rid, &mut max);
+            let _ = x.store.next_commit(&ix, Some(&o), rid, &max);
+            assert!(max.contains(&lrole), "role literal must be maximal");
+            super::dl_root::index_consts(&ix, x, &max, rid, &mut setup_sink);
+            if subsume_outputs {
+                for unit_lit in [lconj, lq] {
+                    let _ = x.store.add(Clause::new(Vec::new(), vec![unit_lit]));
+                    let id = x.store.peek_live().expect("subsumer queued");
+                    let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+                    let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+                }
+            }
+            // 3. Queue trigger clause `-> D(u0)`.
+            let _ = x.store.add(Clause::new(Vec::new(), vec![ld]));
+            if let Some(last) = x.store.clauses.last_mut() {
+                last.sent = Some(0);
+            }
+            super::dl_root::register_max(&ix, root, &mut st, &[], &mut setup_sink);
+            st
+        };
+
+        // 1. Unbounded counting-allocator peak coverage: `sink.peak` must cover BOTH the
+        //    513-partner conjunction batch AND `hyper_roles`'s 513 -> 1026 vector growth.
+        for is_root in [true, false] {
+            let mut st = build_state(true);
+            let mut sink = BudgetSink {
+                run: &run,
+                cap: usize::MAX,
+                live: 0,
+                peak: 0,
+                stopped: false,
+            };
+            let (processed, sample) = measure(|| {
+                if is_root {
+                    super::dl_root::flush(&ix, &mut st, &mut sink, 1)
+                } else {
+                    super::dl_rules::flush(&ix, d_cls, &mut st, &mut sink, 1)
+                }
+            });
+            assert_eq!(processed, 1);
+            assert!(
+                sink.peak >= sample.peak,
+                "share={share}, is_root={is_root}: mixed conj+hyper_roles peak charge ({}) < measured peak ({})",
+                sink.peak,
+                sample.peak
+            );
+            assert!(
+                sink.live <= 4096,
+                "share={share}, is_root={is_root}: leaked reservation ({} B)",
+                sink.live
+            );
+        }
+
+        // 2. Tight cap that GRANTS the 513-partner conjunction batch (~70 KiB) but REFUSES
+        //    `hyper_roles`'s subsequent 513 -> 1026 reallocation (~65 KiB overlap -> ~135 KiB):
+        //    must stop cleanly BEFORE reallocating `Found::one` or constructing the new `Side`!
+        let conj_batch_bytes = 513
+            * (std::mem::size_of::<(super::dl_rules::Side, &'static str)>()
+                + 9 * std::mem::size_of::<Lit>());
+        let mid_cap = conj_batch_bytes + (16 << 10);
+        for is_root in [true, false] {
+            let mut st_mid = build_state(false);
+            let mut tight = BudgetSink {
+                run: &run,
+                cap: mid_cap,
+                live: 0,
+                peak: 0,
+                stopped: false,
+            };
+            let (_, sample) = measure(|| {
+                if is_root {
+                    super::dl_root::flush(&ix, &mut st_mid, &mut tight, 1)
+                } else {
+                    super::dl_rules::flush(&ix, d_cls, &mut st_mid, &mut tight, 1)
+                }
+            });
+            assert!(
+                tight.stopped,
+                "share={share}, is_root={is_root}: mid cap ({mid_cap}) must refuse hyper_roles growth after 513-partner conj batch"
+            );
+            assert!(
+                super::dl_rules::dl(&st_mid).is_some_and(|x| x.store.interrupted),
+                "share={share}, is_root={is_root}: hyper_roles refusal must mark store interrupted"
+            );
+            assert!(
+                sample.peak <= mid_cap + 4096,
+                "share={share}, is_root={is_root}: hyper_roles growth overshot mid cap ({mid_cap}): measured peak = {}",
+                sample.peak
+            );
+            assert!(
+                tight.peak >= sample.peak,
+                "share={share}, is_root={is_root}: admitted peak ({}) < measured peak ({}) under mid cap",
+                tight.peak,
+                sample.peak
+            );
+        }
+    }
+}
+
+/// Sol r2 Other checks #2: many small conjunction batches (256 distinct conjunction rules
+/// with 1 partner each) must grow `Found::one` geometrically with O(1) `held_bytes()` sizing,
+/// covering peak heap and refusing cleanly under a tight cap.
+#[test]
+fn hyper_at_many_small_conj_batches_admits_peak_and_refuses_tight_cap() {
+    struct BudgetSink<'a> {
+        run: &'a DlRun,
+        cap: usize,
+        live: usize,
+        peak: usize,
+        stopped: bool,
+    }
+    impl Sink for BudgetSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            if self.stopped || self.live.saturating_add(bytes) > self.cap {
+                self.stopped = true;
+                return false;
+            }
+            self.live += bytes;
+            self.peak = self.peak.max(self.live);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.live = self.live.saturating_sub(bytes);
+        }
+        fn admit_dl(&mut self, bytes: usize) -> bool {
+            self.reserve_data(bytes)
+        }
+        fn commit_dl(&mut self, admitted: usize, kept: usize) {
+            self.live = self.live.saturating_sub(admitted.saturating_sub(kept));
+        }
+        fn go_on(&self) -> bool {
+            !self.stopped
+        }
+        fn stopped(&self) -> bool {
+            self.stopped
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    const N: usize = 256;
+    let mut body = String::new();
+    for i in 0..N {
+        body.push_str(&format!("Declaration(Class(:H{i}))\n"));
+    }
+    for i in 0..N {
+        body.push_str(&format!(
+            "SubClassOf(ObjectIntersectionOf(:D :P{i}) :K{i})\n"
+        ));
+    }
+    body.push_str(
+        "SubClassOf(:Seed ObjectUnionOf(:U0 :U1))\n\
+         ClassAssertion(:Seed :u0)\n",
+    );
+    let input = axioms(&body);
+    let mut it = Interner::new();
+    let mut ax = Axioms::default();
+    let mut outside = Vec::new();
+    for a in &input {
+        if super::index::normalize(&a.kind, &mut it, &mut ax).is_some() {
+            outside.push(&a.kind);
+        }
+    }
+    let allowed = super::dl_norm::Allowed {
+        rooted: true,
+        ..Default::default()
+    };
+    let mut dl_ax = super::dl_norm::normalize(&outside, &mut it, &mut ax, None, &|| false, allowed)
+        .expect("dl_norm")
+        .map(|(_, d)| d)
+        .unwrap_or_default();
+    let root = dl_ax.root.unwrap_or_else(|| {
+        let r = it.fresh_class();
+        dl_ax.root = Some(r);
+        r
+    });
+    for set in &mut ax.disjoint {
+        set.sort_unstable();
+    }
+    ax.dl = Some(Box::new(dl_ax));
+    let d_cls = it.class(&Class::new("urn:tierd1291:D"));
+    let p_cls: Vec<Ex> = (0..N)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:P{i}"))))
+        .collect();
+    let h_cls: Vec<Ex> = (0..N)
+        .map(|i| it.class(&Class::new(format!("urn:tierd1291:H{i}"))))
+        .collect();
+    let ix = Index::build(&ax, &mut it, None, &|| false).unwrap();
+    let dx = ix.dl.as_deref().expect("rooted dl index");
+    let u0 = dx.consts[0].0;
+    let inv = |r: super::index::Role| dx.inv(&ix, r);
+    let mk_atom = |run: &DlRun, cls: Ex| match run.lits.lit(XLit::Atom(cls, RTerm::C(u0)), inv) {
+        Made::Lit(l) => l,
+        _ => unreachable!(),
+    };
+    let conj_classes: Vec<Ex> = ix.conj_of(ix.head(d_cls)).iter().map(|&(_, k)| k).collect();
+    assert_eq!(conj_classes.len(), N);
+
+    let run = DlRun::new(false, Default::default()).with_shared_facts(true);
+    let ld = mk_atom(&run, d_cls);
+    let lp: Vec<Lit> = p_cls.iter().map(|&c| mk_atom(&run, c)).collect();
+    let lh: Vec<Lit> = h_cls.iter().map(|&c| mk_atom(&run, c)).collect();
+    let lconjs: Vec<Lit> = conj_classes.iter().map(|&c| mk_atom(&run, c)).collect();
+    let _ = run.table.push(Clause::new(Vec::new(), vec![ld]));
+
+    let build_state = |subsume: bool| {
+        let mut st = State::default();
+        let mut setup_sink = BudgetSink {
+            run: &run,
+            cap: usize::MAX,
+            live: 0,
+            peak: 0,
+            stopped: false,
+        };
+        let x = super::dl_rules::ds(&mut st);
+        let ground_total = super::dl_clause::ground_total();
+        let o = Rooted {
+            ix: &ix,
+            lits: &run.lits,
+            inv: &inv,
+            ground_total,
+        };
+        let mut max = Vec::new();
+        for i in 0..N {
+            let c = Clause::new(vec![Lit::x(h_cls[i])], vec![lp[i], lh[i]]);
+            let _ = x.store.add(c);
+            let id = x.store.peek_live().expect("partner queued");
+            let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+            let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+            assert!(max.contains(&lp[i]));
+        }
+        if subsume {
+            for &lc in &lconjs {
+                let _ = x.store.add(Clause::new(Vec::new(), vec![lc]));
+                let id = x.store.peek_live().expect("subsumer queued");
+                let _ = x.store.next_prepare_id(&ix, Some(&o), id, &mut max);
+                let _ = x.store.next_commit(&ix, Some(&o), id, &max);
+            }
+        }
+        let _ = x.store.add(Clause::new(Vec::new(), vec![ld]));
+        if let Some(last) = x.store.clauses.last_mut() {
+            last.sent = Some(0);
+        }
+        super::dl_root::register_max(&ix, root, &mut st, &[], &mut setup_sink);
+        st
+    };
+
+    // Unbounded peak check
+    let mut st = build_state(true);
+    let mut sink = BudgetSink {
+        run: &run,
+        cap: usize::MAX,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (processed, sample) = measure(|| super::dl_root::flush(&ix, &mut st, &mut sink, 1));
+    assert_eq!(processed, 1);
+    assert!(
+        sink.peak >= sample.peak,
+        "many small conj batches: peak charge ({}) < measured peak ({})",
+        sink.peak,
+        sample.peak
+    );
+    assert!(sink.live <= 4096);
+
+    // Tight cap check (refuses mid-way through geometric growth without overshooting cap)
+    let mut st_tight = build_state(false);
+    let cap = 8 << 10;
+    let mut tight = BudgetSink {
+        run: &run,
+        cap,
+        live: 0,
+        peak: 0,
+        stopped: false,
+    };
+    let (_, tight_sample) = measure(|| super::dl_root::flush(&ix, &mut st_tight, &mut tight, 1));
+    assert!(
+        tight.stopped,
+        "tight cap must refuse 256 small conj batches"
+    );
+    assert!(super::dl_rules::dl(&st_tight).is_some_and(|x| x.store.interrupted));
+    assert!(
+        tight_sample.peak <= cap + 4096,
+        "many small conj batches tight cap overshot ({cap}): measured peak = {}",
+        tight_sample.peak
+    );
+}
