@@ -7,6 +7,14 @@ use super::index::{BOTTOM, Ex, Node, TOP};
 use crate::model::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 
+/// Cached top and inferred-bottom closures for [`Saturation::describe`], matching the
+/// taxonomy's equivalence-inferred bottom propagation and upward top lifting.
+#[derive(Debug)]
+pub(super) struct QueryClosure {
+    top: FxHashSet<Ex>,
+    bottom: FxHashSet<Ex>,
+}
+
 /// What a run says about one class. Classes are sorted by IRI, and the class itself is
 /// left out of every list. The superclasses include `owl:Thing`, and the subclasses
 /// leave out `owl:Nothing` and the unsatisfiable classes, as the taxonomy's bottom node
@@ -100,7 +108,6 @@ impl Saturation {
                 .filter(|(e, _)| self.named_subsumers(*e).is_some())
                 .collect()
         };
-        let unsatisfiable = |e: Ex| self.is_bottom(e);
         if !self.consistent {
             let mut eq: Vec<Class> = named.iter().map(|(_, k)| k.clone()).collect();
             eq.push(Class::thing());
@@ -115,10 +122,14 @@ impl Saturation {
                 ..Default::default()
             });
         }
-        let (bottom, mut subsumers) = self
+        let closure = self.query_closure();
+        let bottom = &closure.bottom;
+        let top = &closure.top;
+        let unsatisfiable = |e: Ex| e == BOTTOM || bottom.contains(&e) || self.is_bottom(e);
+        let (raw_bottom, mut subsumers) = self
             .named_subsumers(q)
             .unwrap_or((q == BOTTOM, vec![q, TOP]));
-        if bottom {
+        if raw_bottom || unsatisfiable(q) {
             let mut eq: Vec<Class> = named
                 .iter()
                 .filter(|(e, _)| unsatisfiable(*e))
@@ -132,9 +143,8 @@ impl Saturation {
                 ..Default::default()
             });
         }
-        // Every class reachable upward from owl:Thing is equivalent to owl:Thing,
-        // including through hidden internal classes (item 1086).
-        let top = self.top_closure();
+        // Every satisfiable class reachable upward from owl:Thing is equivalent to
+        // owl:Thing, including through hidden internal classes (item 1086).
         for &e in top {
             let visible = match self.interner.nodes[e as usize] {
                 Node::Top => true,
@@ -159,7 +169,7 @@ impl Saturation {
         // `a ⊑ b` among saturated contexts, where a class classified in a world of its
         // own reads its subsumers from that world
         let below = |a: Ex, b: Ex| -> bool {
-            if b == TOP || a == b || top.contains(&b) {
+            if b == TOP || a == b || top.contains(&b) || unsatisfiable(a) {
                 return true;
             }
             if let Some((bottom, subs)) = self.worlds.get(&a) {
@@ -199,7 +209,7 @@ impl Saturation {
         let mut subs: FxHashMap<Ex, Vec<Ex>> = FxHashMap::default();
         let eq_set: FxHashSet<Ex> = equivalents.iter().copied().collect();
         for (e, _) in &named {
-            if *e == q || eq_set.contains(e) {
+            if *e == q || eq_set.contains(e) || unsatisfiable(*e) {
                 continue;
             }
             if let Some((false, ss)) = self.named_subsumers(*e)
@@ -235,24 +245,62 @@ impl Saturation {
         })
     }
 
-    /// `TOP` and every satisfiable `Node::Class` reachable upward from `TOP` through
-    /// named subsumers, including through hidden internal classes (item 1086), cached
-    /// across descriptions of the same saturated state.
-    fn top_closure(&self) -> &FxHashSet<Ex> {
-        self.top_cache.get_or_init(|| self.compute_top_closure())
+    /// Cached top and inferred-bottom closures across descriptions of the same saturated
+    /// state.
+    fn query_closure(&self) -> &QueryClosure {
+        self.query_cache
+            .get_or_init(|| self.compute_query_closure())
     }
 
-    fn compute_top_closure(&self) -> FxHashSet<Ex> {
+    fn compute_query_closure(&self) -> QueryClosure {
+        let bottom = self.compute_bottom_closure();
+        let top = self.compute_top_closure(&bottom);
+        QueryClosure { top, bottom }
+    }
+
+    /// Visible classes marked unsatisfiable or mutually subsuming with one, matching
+    /// [`super::taxonomy::build`]'s inferred-bottom rule.
+    fn compute_bottom_closure(&self) -> FxHashSet<Ex> {
+        let mut bottom = FxHashSet::default();
+        let mut stack: Vec<Ex> = Vec::new();
+        for e in self.interner.met_classes() {
+            if self.is_bottom(e) && bottom.insert(e) {
+                stack.push(e);
+            }
+        }
+        while let Some(u) = stack.pop() {
+            let Some((_, subs)) = self.named_subsumers(u) else {
+                continue;
+            };
+            for b in subs {
+                if self.is_visible_class(b)
+                    && !bottom.contains(&b)
+                    && self.raw_has_subsumer(b, u)
+                    && bottom.insert(b)
+                {
+                    stack.push(b);
+                }
+            }
+        }
+        bottom
+    }
+
+    /// `TOP` and every satisfiable `Node::Class` reachable upward from `TOP` through
+    /// named subsumers, including through hidden internal classes (item 1086), stopping
+    /// before both raw and equivalence-inferred unsatisfiable classes.
+    fn compute_top_closure(&self, bottom: &FxHashSet<Ex>) -> FxHashSet<Ex> {
         let mut top = FxHashSet::default();
         top.insert(TOP);
         if self.top_row_closed() {
             #[cfg(test)]
             top_closure_count_visit();
             let _ = self.visit_satisfiable_named_subsumers(TOP, |e| {
-                top.insert(e);
+                if e == TOP || !bottom.contains(&e) {
+                    top.insert(e);
+                }
                 Ok::<(), std::convert::Infallible>(())
             });
-            top.retain(|&e| e == TOP || !self.is_bottom(e));
+            top.retain(|&e| e == TOP || (!bottom.contains(&e) && !self.is_bottom(e)));
             return top;
         }
         let mut seen = FxHashSet::default();
@@ -261,7 +309,7 @@ impl Saturation {
         #[cfg(test)]
         top_closure_count_visit();
         let seed_ok = self.visit_satisfiable_named_subsumers(TOP, |e| {
-            if seen.insert(e) {
+            if !bottom.contains(&e) && seen.insert(e) {
                 stack.push(e);
             }
             Ok::<(), std::convert::Infallible>(())
@@ -273,7 +321,7 @@ impl Saturation {
             #[cfg(test)]
             top_closure_count_visit();
             let visited = self.visit_satisfiable_named_subsumers(e, |x| {
-                if seen.insert(x) {
+                if !bottom.contains(&x) && seen.insert(x) {
                     stack.push(x);
                 }
                 Ok::<(), std::convert::Infallible>(())

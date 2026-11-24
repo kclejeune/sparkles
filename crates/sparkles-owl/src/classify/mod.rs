@@ -1075,9 +1075,9 @@ pub struct Saturation {
     /// the subsumers of the classes that the last run classified in worlds of their own,
     /// with whether each is unsatisfiable
     worlds: FxHashMap<Ex, (bool, Vec<Ex>)>,
-    /// cached upward closure of `owl:Thing`'s satisfiable named subsumers for
+    /// cached upward top closure and equivalence-inferred bottom closure for
     /// [`Saturation::describe`], cleared whenever a new run starts or finishes
-    top_cache: std::sync::OnceLock<FxHashSet<Ex>>,
+    query_cache: std::sync::OnceLock<query::QueryClosure>,
     /// whether the last run's contexts depend on one another through individuals in ways
     /// the invalidation does not follow: a context merged with an individual, a world, a
     /// key or a fact of a universal role
@@ -1807,7 +1807,7 @@ impl Saturation {
             excluded: Vec::new(),
             dirty: true,
             worlds: FxHashMap::default(),
-            top_cache: std::sync::OnceLock::new(),
+            query_cache: std::sync::OnceLock::new(),
             entangled: false,
             stale_tier: false,
             consistent: true,
@@ -2989,7 +2989,7 @@ impl Saturation {
         let again = self.dirty || self.index.is_none();
         // until the saturation ends, a stop leaves the state for a run that starts again
         self.dirty = true;
-        self.top_cache = std::sync::OnceLock::new();
+        self.query_cache = std::sync::OnceLock::new();
         self.horn_tried = false;
         self.dl_tried = false;
         self.partial_over = false;
@@ -3067,7 +3067,7 @@ impl Saturation {
         self.stale_tier = stale && !full;
         let kept = kept.filter(|_| !full);
         self.worlds.clear();
-        self.top_cache = std::sync::OnceLock::new();
+        self.query_cache = std::sync::OnceLock::new();
         if full {
             self.interner = Interner::new();
             self.ctx = Vec::new();
@@ -4301,7 +4301,7 @@ impl Saturation {
         // the saturated state is complete: a stop from here on keeps it for the next run. A
         // partial answer's is not, and the next run starts again.
         self.dirty = open.is_some();
-        self.top_cache = std::sync::OnceLock::new();
+        self.query_cache = std::sync::OnceLock::new();
         self.kept = kept_now;
         let ix_nominals = ix.nominals.clone();
         self.index = Some(ix);
@@ -4823,6 +4823,30 @@ impl Saturation {
             .get(e as usize)
             .and_then(|c| c.get())
             .is_some_and(|c| c.st.lock().bottom)
+    }
+
+    /// Whether `b` is explicitly recorded in `a`'s saturated subsumer row, without
+    /// treating `bottom` as implying every class.
+    fn raw_has_subsumer(&self, a: Ex, b: Ex) -> bool {
+        if a == b {
+            return true;
+        }
+        if let Some((_, subs)) = self.worlds.get(&a) {
+            return subs.contains(&b);
+        }
+        self.ctx
+            .get(a as usize)
+            .and_then(|c| c.get())
+            .is_some_and(|c| c.st.lock().subs.contains(&b))
+    }
+
+    /// Whether `e` is a visible class of the run's signature (`met` is set).
+    fn is_visible_class(&self, e: Ex) -> bool {
+        matches!(
+            self.interner.nodes.get(e as usize),
+            Some(Node::Class(id))
+                if self.interner.met.get(*id as usize).copied().unwrap_or(false)
+        )
     }
 
     /// Streams the named subsumers (`Node::Class` or `Node::Top`) of a saturated context

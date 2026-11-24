@@ -306,19 +306,56 @@ pub(super) fn build(
         }
     })?;
     if close {
-        top = close_rows(&mut subs, &top, budget)?;
+        let seed_bytes = top.capacity() * std::mem::size_of::<u32>()
+            + top_hidden.capacity() * std::mem::size_of::<Ex>();
+        top = close_rows(&mut subs, &top, seed_bytes, budget)?;
     }
     let bytes = bytes_of(&classes, &subs, pos.len());
-    let mut lift_live =
-        bytes + (top.capacity() + top_hidden.capacity()) * std::mem::size_of::<u32>();
+    let mut lift_live = bytes
+        + top.capacity() * std::mem::size_of::<u32>()
+        + top_hidden.capacity() * std::mem::size_of::<Ex>();
     if !budget(lift_live) {
         return Err(Halt::Memory(lift_live));
     }
     let has = |a: u32, b: u32| a == b || subs[a as usize].1.binary_search(&b).is_ok();
-    // each class not already flagged unsatisfiable picks its equivalence class's first
-    // class in IRI order; unsatisfiable classes get NONE. Running representative
-    // selection and bottom propagation before top-lifting preserves inferred bottom
-    // membership in incomplete rows so bottom-equivalent classes are never lifted.
+    // A class equivalent to an unsatisfiable class is unsatisfiable too, regardless of
+    // IRI order. Propagate bottom membership across mutual-subsumption edges before
+    // representative selection and top-lifting so incomplete rows never lift
+    // bottom-equivalent classes and taxonomy agrees with `Saturation::describe`.
+    let mut at_bottom: Vec<bool> = subs.iter().map(|s| s.0).collect();
+    let lift_base = lift_live;
+    let mut bottom_stack: Vec<u32> = Vec::new();
+    let mut bottom_steps = 0usize;
+    for (i, &unsat) in at_bottom.iter().enumerate() {
+        if unsat {
+            if bottom_steps.is_multiple_of(POLL_EVERY) && stop() {
+                return Err(Halt::Stopped);
+            }
+            bottom_steps += 1;
+            push_budgeted(&mut bottom_stack, i as u32, &mut lift_live, budget)?;
+        }
+    }
+    while let Some(u) = bottom_stack.pop() {
+        if bottom_steps.is_multiple_of(POLL_EVERY) && stop() {
+            return Err(Halt::Stopped);
+        }
+        bottom_steps += 1;
+        for &b in &subs[u as usize].1 {
+            if bottom_steps.is_multiple_of(POLL_EVERY) && stop() {
+                return Err(Halt::Stopped);
+            }
+            bottom_steps += 1;
+            let bu = b as usize;
+            if !at_bottom[bu] && has(b, u) {
+                at_bottom[bu] = true;
+                push_budgeted(&mut bottom_stack, b, &mut lift_live, budget)?;
+            }
+        }
+    }
+    drop(bottom_stack);
+    lift_live = lift_base;
+    // each satisfiable class picks its equivalence class's first class in IRI order;
+    // unsatisfiable classes get NONE.
     let mut key: Vec<u32> = vec![NONE; n];
     let mut work: Vec<(usize, &mut u32)> = key.iter_mut().enumerate().collect();
     super::par_chunks(&mut work, threads, super::MIN_CLASSES, |chunk| {
@@ -327,10 +364,10 @@ pub(super) fn build(
                 return;
             }
             let i32 = *i as u32;
-            let (unsat, s) = &subs[*i];
-            if *unsat {
+            if at_bottom[*i] {
                 continue;
             }
+            let s = &subs[*i].1;
             // the subsumers are sorted, so the first one equivalent to the class is its
             // equivalence class's first class
             **slot = s
@@ -344,22 +381,6 @@ pub(super) fn build(
     drop(work);
     if stopped.load(Ordering::Relaxed) {
         return Err(Halt::Stopped);
-    }
-    // a class equivalent to a class that is unsatisfiable is so too, as the equivalence
-    // entails. A run that is not complete can derive the equivalence and not the
-    // subsumption by owl:Nothing, so the class goes where its equivalence class's first
-    // class goes, which has no node of its own. The first class comes earlier, so one
-    // pass in order settles every class.
-    let mut at_bottom: Vec<bool> = subs.iter().map(|s| s.0).collect();
-    for i in 0..n {
-        let r = key[i] as usize;
-        if key[i] == NONE || r == i {
-            continue;
-        }
-        if at_bottom[r] {
-            at_bottom[i] = true;
-            key[i] = NONE;
-        }
     }
     // Every satisfiable class above a class equivalent to owl:Thing is equivalent to
     // owl:Thing too, transitively through visible classes, equivalence classes and
@@ -792,10 +813,12 @@ fn merge_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
 /// row. A row that reaches an unsatisfiable class is unsatisfiable. The closed row of
 /// owl:Thing, `top`, joins every row, and the answer is that closed row. The rows grow
 /// only by entailed subsumers, and a row that was saturated is closed already. The bytes
-/// of the closed rows are asked of `budget` as they grow.
+/// of the closed rows, added to `live` bytes already retained by the caller (such as the
+/// top seed buffers), are asked of `budget` as they grow.
 fn close_rows(
     subs: &mut [(bool, Vec<u32>)],
     top: &[u32],
+    live: usize,
     budget: &dyn Fn(usize) -> bool,
 ) -> Result<Vec<u32>, Halt> {
     let n = subs.len();
@@ -860,10 +883,10 @@ fn close_rows(
     // scratch row included, are asked of `budget` before each merge that passes the last
     // grant by a mebibyte.
     let mut rows: Vec<(bool, Vec<u32>)> = Vec::with_capacity(comps.len());
-    let mut held = 0usize;
-    let mut asked = 0usize;
+    let mut held = live;
+    let mut asked = live;
     let ask = |bytes: usize, asked: &mut usize| -> Result<(), Halt> {
-        if bytes > *asked + (1 << 20) {
+        if bytes > asked.saturating_add(1 << 20) {
             if !budget(bytes) {
                 return Err(Halt::Memory(bytes));
             }
@@ -888,13 +911,16 @@ fn close_rows(
                 seen[c as usize] = id;
                 let (u, other) = &rows[c as usize];
                 unsat |= *u;
-                ask(held + (row.len() + other.len()) * 4 * 2, &mut asked)?;
+                ask(
+                    held.saturating_add((row.len() + other.len()).saturating_mul(8)),
+                    &mut asked,
+                )?;
                 merge_into(&row, other, &mut scratch);
                 std::mem::swap(&mut row, &mut scratch);
             }
         }
         row.shrink_to_fit();
-        held += row.len() * 4 + 32;
+        held = held.saturating_add(row.len().saturating_mul(4).saturating_add(32));
         ask(held, &mut asked)?;
         rows.push((unsat, row));
     }
@@ -908,7 +934,10 @@ fn close_rows(
     for &p in top {
         let (u, r) = &rows[comp[p as usize] as usize];
         t_unsat |= *u;
-        ask(held + (t.len() + r.len()) * 4 * 2, &mut asked)?;
+        ask(
+            held.saturating_add((t.len() + r.len()).saturating_mul(8)),
+            &mut asked,
+        )?;
         merge_into(&t, r, &mut scratch);
         std::mem::swap(&mut t, &mut scratch);
     }
@@ -920,7 +949,7 @@ fn close_rows(
         let mut row = Vec::new();
         merge_into(r, &t, &mut row);
         row.shrink_to_fit();
-        held += row.len() * 4;
+        held = held.saturating_add(row.len().saturating_mul(4));
         ask(held, &mut asked)?;
         *slot = (*u || t_unsat, row);
     }
@@ -1377,30 +1406,96 @@ mod tests {
         // Incomplete rows with consistent=true, close=false: TOP -> D -> B -> C, and
         // A ≡ B with A earlier in IRI order and only A flagged unsatisfiable. B inherits
         // bottom membership from A, so B goes to BOTTOM_NODE and lifting stops before C.
-        let mut k = saturated(&[
-            Axiom::equivalent_classes([c("A").into(), c("B").into()]),
-            Axiom::sub_class_of(c("B"), c("C")),
-            Axiom::sub_class_of(c("D"), c("B")),
-        ]);
-        let ex = |s: &str| k.interner.class_ex(&c(s)).unwrap();
-        let (a, b, cc, d) = (ex("A"), ex("B"), ex("C"), ex("D"));
-        k.worlds.insert(TOP, (false, vec![TOP, d]));
-        k.worlds.insert(d, (false, vec![d, b]));
-        k.worlds.insert(a, (true, vec![a, b, cc]));
-        k.worlds.insert(b, (false, vec![b, a, cc]));
-        k.worlds.insert(cc, (false, vec![cc]));
-        for threads in [1, 4] {
-            let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
-            assert_eq!(t.node_of(&c("D")), Some(TOP_NODE));
-            assert_eq!(t.node_of(&c("A")), Some(BOTTOM_NODE));
-            assert_eq!(t.node_of(&c("B")), Some(BOTTOM_NODE));
-            let cn = t.node_of(&c("C")).unwrap();
-            assert_ne!(cn, TOP_NODE);
-            assert_ne!(cn, BOTTOM_NODE);
-            assert_eq!(t.parents(&c("C")), &[TOP_NODE]);
+        // Both Taxonomy and Saturation::describe must agree on every class.
+        let setup = |top_target: &str, unsat_earlier: bool| {
+            let mut k = saturated(&[
+                Axiom::equivalent_classes([c("A").into(), c("B").into()]),
+                Axiom::sub_class_of(c("B"), c("C")),
+                Axiom::sub_class_of(c("D"), c("B")),
+            ]);
+            let ex = |s: &str| k.interner.class_ex(&c(s)).unwrap();
+            let (a, b, cc, d) = (ex("A"), ex("B"), ex("C"), ex("D"));
+            k.worlds.insert(TOP, (false, vec![TOP, ex(top_target)]));
+            k.worlds
+                .insert(d, (false, vec![d, if unsat_earlier { b } else { a }]));
+            k.worlds.insert(a, (unsat_earlier, vec![a, b, cc]));
+            k.worlds.insert(b, (!unsat_earlier, vec![b, a, cc]));
+            k.worlds.insert(cc, (false, vec![cc]));
+            k
+        };
+
+        // Indirect path TOP -> D -> B -> C (A raw-bottom, B inferred-bottom)
+        // and reverse IRI order TOP -> D -> A -> C (B raw-bottom, A inferred-bottom).
+        for unsat_earlier in [true, false] {
+            let k = setup("D", unsat_earlier);
+            for threads in [1, 4] {
+                let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
+                assert_eq!(
+                    t.node_of(&c("D")),
+                    Some(TOP_NODE),
+                    "unsat_earlier={unsat_earlier}"
+                );
+                assert_eq!(
+                    t.node_of(&c("A")),
+                    Some(BOTTOM_NODE),
+                    "unsat_earlier={unsat_earlier}"
+                );
+                assert_eq!(
+                    t.node_of(&c("B")),
+                    Some(BOTTOM_NODE),
+                    "unsat_earlier={unsat_earlier}"
+                );
+                let cn = t.node_of(&c("C")).unwrap();
+                assert_ne!(cn, TOP_NODE, "unsat_earlier={unsat_earlier}");
+                assert_ne!(cn, BOTTOM_NODE, "unsat_earlier={unsat_earlier}");
+                assert_eq!(
+                    t.parents(&c("C")),
+                    &[TOP_NODE],
+                    "unsat_earlier={unsat_earlier}"
+                );
+            }
+            let top_desc = k.describe(&Class::thing()).unwrap();
+            assert!(top_desc.satisfiable, "unsat_earlier={unsat_earlier}");
+            assert_eq!(
+                top_desc.equivalents,
+                vec![c("D")],
+                "describe(owl:Thing) must not lift inferred-bottom classes or C (unsat_earlier={unsat_earlier}): {top_desc:?}"
+            );
+            assert_eq!(
+                top_desc.subclasses,
+                vec![c("C")],
+                "describe(owl:Thing) subclasses must exclude inferred-bottom classes (unsat_earlier={unsat_earlier}): {top_desc:?}"
+            );
+            let a_desc = k.describe(&c("A")).unwrap();
+            assert!(
+                !a_desc.satisfiable,
+                "describe(A) must be unsatisfiable (unsat_earlier={unsat_earlier}): {a_desc:?}"
+            );
+            assert_eq!(a_desc.equivalents, vec![c("B"), Class::nothing()]);
+            let b_desc = k.describe(&c("B")).unwrap();
+            assert!(
+                !b_desc.satisfiable,
+                "describe(B) must be unsatisfiable (unsat_earlier={unsat_earlier}): {b_desc:?}"
+            );
+            assert_eq!(b_desc.equivalents, vec![c("A"), Class::nothing()]);
+            let d_desc = k.describe(&c("D")).unwrap();
+            assert!(d_desc.satisfiable);
+            assert_eq!(d_desc.equivalents, vec![Class::thing()]);
+            assert!(d_desc.superclasses.is_empty(), "{d_desc:?}");
+            assert_eq!(d_desc.subclasses, vec![c("C")], "{d_desc:?}");
+            let c_desc = k.describe(&c("C")).unwrap();
+            assert!(c_desc.satisfiable);
+            assert!(c_desc.equivalents.is_empty(), "{c_desc:?}");
+            assert_eq!(
+                c_desc.direct_superclasses,
+                vec![c("D"), Class::thing()],
+                "{c_desc:?}"
+            );
+            assert!(c_desc.subclasses.is_empty(), "{c_desc:?}");
         }
+
         // Direct top seed variant: TOP -> B directly with A ≡ B (only A flagged unsat).
-        k.worlds.insert(TOP, (false, vec![TOP, b]));
+        let k = setup("B", true);
         for threads in [1, 4] {
             let (t, _) = build(&k, true, threads, false, &|| false, &|_| true).unwrap();
             assert_eq!(t.node_of(&c("A")), Some(BOTTOM_NODE));
@@ -1408,6 +1503,116 @@ mod tests {
             let cn = t.node_of(&c("C")).unwrap();
             assert_ne!(cn, TOP_NODE);
             assert_ne!(cn, BOTTOM_NODE);
+        }
+        let top_desc = k.describe(&Class::thing()).unwrap();
+        assert!(top_desc.satisfiable);
+        assert!(
+            top_desc.equivalents.is_empty(),
+            "direct-seed describe(owl:Thing) must not report B or C as equivalents: {top_desc:?}"
+        );
+        assert_eq!(top_desc.subclasses, vec![c("C"), c("D")], "{top_desc:?}");
+        let b_desc = k.describe(&c("B")).unwrap();
+        assert!(
+            !b_desc.satisfiable,
+            "direct-seed describe(B) must be unsatisfiable: {b_desc:?}"
+        );
+        assert_eq!(b_desc.equivalents, vec![c("A"), Class::nothing()]);
+    }
+
+    #[test]
+    fn partial_close_rows_budget_includes_live_top_seed_buffers() {
+        // When close=true and row closure dominates the build, top and top_hidden stay
+        // live throughout close_rows. A cap that covers seed collection, row closure, and
+        // post-closure lifting individually — but not row closure plus the live hidden
+        // seed buffer together — must refuse the build.
+        let m = 1024usize;
+        let h_count = 8192usize;
+        let vis: Vec<Class> = (0..m).map(|i| c(&format!("V{i:04}"))).collect();
+        let lifted = c("Lifted");
+        let hidden: Vec<Class> = (0..h_count)
+            .map(|i| Class::new(format!("{}pc{i}", super::super::dl_reduce::PREFIX)))
+            .collect();
+        let mut axioms: Vec<Axiom> = vis
+            .iter()
+            .map(|cl| Axiom::sub_class_of(cl.clone(), cl.clone()))
+            .collect();
+        axioms.push(Axiom::sub_class_of(lifted.clone(), lifted.clone()));
+        for h in &hidden {
+            axioms.push(Axiom::sub_class_of(h.clone(), h.clone()));
+        }
+        let mut k = saturated(&axioms);
+        let v_ex: Vec<Ex> = vis
+            .iter()
+            .map(|cl| k.interner.class_ex(cl).unwrap())
+            .collect();
+        let l_ex = k.interner.class_ex(&lifted).unwrap();
+        let h_ex: Vec<Ex> = hidden
+            .iter()
+            .map(|h| k.interner.class_ex(h).unwrap())
+            .collect();
+        k.interner.hide_prefix(super::super::dl_reduce::PREFIX);
+        for i in 0..m {
+            let row = if i + 1 < m {
+                vec![v_ex[i], v_ex[i + 1]]
+            } else {
+                vec![v_ex[i]]
+            };
+            k.worlds.insert(v_ex[i], (false, row));
+        }
+        k.worlds.insert(l_ex, (false, vec![l_ex]));
+        for &h in &h_ex[..h_count - 1] {
+            k.worlds.insert(h, (false, vec![h]));
+        }
+        k.worlds
+            .insert(h_ex[h_count - 1], (false, vec![h_ex[h_count - 1], l_ex]));
+
+        // Baseline: close=true with empty TOP seeds so close_rows alone sets the peak.
+        k.worlds.insert(TOP, (false, vec![TOP]));
+        let base_peak = std::cell::Cell::new(0usize);
+        let (_, base_final) = build(&k, true, 1, true, &|| false, &|asked| {
+            base_peak.set(base_peak.get().max(asked));
+            true
+        })
+        .unwrap();
+        let base_peak = base_peak.get();
+        assert!(
+            base_peak > base_final + h_count * 16,
+            "expected close_rows peak ({base_peak}) to dominate post-closure bytes ({base_final})"
+        );
+
+        // Now seed TOP with the wide hidden frontier while keeping visible rows identical.
+        let mut top_row = Vec::with_capacity(h_count + 1);
+        top_row.push(TOP);
+        top_row.extend_from_slice(&h_ex);
+        k.worlds.insert(TOP, (false, top_row));
+
+        let with_seeds_peak = std::cell::Cell::new(0usize);
+        let (t, _) = build(&k, true, 1, true, &|| false, &|asked| {
+            with_seeds_peak.set(with_seeds_peak.get().max(asked));
+            true
+        })
+        .unwrap();
+        assert_eq!(t.node_of(&lifted), Some(TOP_NODE));
+        let with_seeds_peak = with_seeds_peak.get();
+        let min_seed_bytes = h_count * std::mem::size_of::<Ex>();
+        assert!(
+            with_seeds_peak >= base_peak + min_seed_bytes,
+            "expected close_rows peak with live hidden seeds ({with_seeds_peak}) >= base_peak ({base_peak}) + {min_seed_bytes}"
+        );
+
+        // A cap that admits seed collection, close_rows alone, and post-closure lifting
+        // individually, but not close_rows + live top_hidden together, must refuse.
+        let cap = base_peak + min_seed_bytes / 2;
+        match build(&k, true, 1, true, &|| false, &|asked| asked <= cap) {
+            Err(Halt::Memory(used)) => {
+                assert!(
+                    used > cap,
+                    "refused Halt::Memory({used}) must report > cap ({cap})"
+                );
+            }
+            other => panic!(
+                "expected Halt::Memory under cap {cap} (base_peak={base_peak}, with_seeds_peak={with_seeds_peak}), got {other:?}"
+            ),
         }
     }
 
@@ -1542,7 +1747,7 @@ mod tests {
         let out_bytes = (n as usize * (n as usize + 1) / 2) * 4;
         let most = std::cell::Cell::new(0usize);
         let mut subs = rows();
-        let top = close_rows(&mut subs, &[], &|b| {
+        let top = close_rows(&mut subs, &[], 0, &|b| {
             most.set(most.get().max(b));
             true
         })
@@ -1565,7 +1770,7 @@ mod tests {
         // a budget below the closed rows stops the closure
         let mut subs = rows();
         assert!(matches!(
-            close_rows(&mut subs, &[], &|b| b <= out_bytes / 4),
+            close_rows(&mut subs, &[], 0, &|b| b <= out_bytes / 4),
             Err(Halt::Memory(_))
         ));
     }
@@ -1576,7 +1781,7 @@ mod tests {
         let n = 350_000u32;
         let mut subs: Vec<(bool, Vec<u32>)> = (0..n).map(|i| (false, vec![i])).collect();
         let first = std::cell::Cell::new(0usize);
-        let r = close_rows(&mut subs, &[], &|b| {
+        let r = close_rows(&mut subs, &[], 0, &|b| {
             if first.get() == 0 {
                 first.set(b);
             }
