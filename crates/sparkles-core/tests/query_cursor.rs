@@ -1243,28 +1243,35 @@ fn standard_writers_match_eager_and_stop_at_send_without_draining() {
 #[test]
 fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
     use sparkles_core::sparql::results::{
-        LimitedWriter, SolutionsFormat, write_cursor_native_json_counted,
-        write_cursor_solutions_counted, write_solutions_counted,
+        Format, LimitedWriter, RowCount, SolutionsFormat, Source, WriteOptions, write,
     };
-    use std::cell::Cell;
     let s = store(3000);
     let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
     let eager = query(s.snapshot(), q, &Default::default()).unwrap();
     for fmt in [SolutionsFormat::Tsv, SolutionsFormat::Csv] {
         for limit in [1u64, 20_000, 40_000] {
             let mut cut = LimitedWriter::new(Vec::new(), Some(limit), None);
-            let sent = Cell::new(0);
+            let sent = RowCount::new();
             let mut c = open(&s, q, 1024);
-            let result = write_cursor_solutions_counted(&mut c, fmt, &mut cut, None, &sent);
+            let result = write(
+                Source::Select(&mut c),
+                WriteOptions::new(Format::Solutions(fmt), &sent),
+                &mut cut,
+            );
             assert!(result.is_err(), "{fmt:?} {limit}");
             let out = cut.get_ref();
             let lines = out.iter().filter(|&&b| b == b'\n').count() as u64;
             assert_eq!(sent.get(), lines.saturating_sub(1), "{fmt:?} {limit}");
             assert!(c.stats().emitted_rows >= sent.get());
             let mut eager_cut = LimitedWriter::new(Vec::new(), Some(limit), None);
-            let eager_sent = Cell::new(0);
+            let eager_sent = RowCount::new();
             assert!(
-                write_solutions_counted(&eager, fmt, &mut eager_cut, None, &eager_sent).is_err()
+                write(
+                    Source::Result(&eager),
+                    WriteOptions::new(Format::Solutions(fmt), &eager_sent),
+                    &mut eager_cut,
+                )
+                .is_err()
             );
             // the cursor's flush after its first batch moves where the buffer's pieces
             // end, so the bytes may differ, but the rule that counts them is the same
@@ -1275,16 +1282,28 @@ fn counted_cursor_writers_report_the_rows_a_byte_budget_let_through() {
                 "{fmt:?} {limit}"
             );
         }
-        let sent = Cell::new(0);
+        let sent = RowCount::new();
         let mut whole = Vec::new();
         let mut c = open(&s, q, 1024);
-        write_cursor_solutions_counted(&mut c, fmt, &mut whole, None, &sent).unwrap();
+        write(
+            Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(fmt), &sent),
+            &mut whole,
+        )
+        .unwrap();
         assert_eq!(sent.get(), 3000);
     }
     let mut cut = LimitedWriter::new(Vec::new(), Some(40_000), None);
-    let sent = Cell::new(0);
+    let sent = RowCount::new();
     let mut c = open(&s, q, 1024);
-    assert!(write_cursor_native_json_counted(&mut c, &mut cut, None, None, &sent).is_err());
+    assert!(
+        write(
+            Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(SolutionsFormat::Sparkles), &sent),
+            &mut cut,
+        )
+        .is_err()
+    );
     // every cell is bound and an object, so each whole row ends with `}]`
     let rows = cut.get_ref().windows(2).filter(|w| w == b"}]").count() as u64;
     assert_eq!(sent.get(), rows);
@@ -2232,6 +2251,131 @@ fn native_graph_document_and_jena_writers_stream_and_fuse_failures() {
         query_cursor(s.snapshot(), "ASK {}", &Default::default(), &options(1)).unwrap(),
         QueryExecution::Ask(_)
     ));
+}
+
+#[test]
+fn completion_runs_once_after_ask_empty_select_and_graph_output() {
+    use sparkles_core::sparql::graph_cursor;
+    use sparkles_core::sparql::results::{
+        Format, RowCount, SolutionsFormat, Source, WriteOptions, write, write_with_completion,
+    };
+
+    let s = store(1);
+    let construct = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }";
+    let tsv = Format::Solutions(SolutionsFormat::Tsv);
+    let ntriples = Format::Rdf(RdfFormat::NTriples);
+    for (text, format) in [
+        ("ASK {}", tsv),
+        ("SELECT ?s WHERE { ?s <urn:missing> ?o }", tsv),
+        (construct, ntriples),
+    ] {
+        let result = query(s.snapshot(), text, &Default::default()).unwrap();
+        let expected_rows = RowCount::new();
+        let mut expected = Vec::new();
+        write(
+            Source::Result(&result),
+            WriteOptions::new(format, &expected_rows),
+            &mut expected,
+        )
+        .unwrap();
+        let mut calls = 0;
+        let mut out = Vec::new();
+        let sent = RowCount::new();
+        let stats = write_with_completion(
+            Source::Result(&result),
+            WriteOptions {
+                format,
+                send: None,
+                prefixes: &[],
+                metadata: None,
+                rows: &sent,
+            },
+            &mut out,
+            |out| {
+                calls += 1;
+                assert_eq!(*out, expected);
+                assert_eq!(sent.get(), expected_rows.get());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(stats.is_none());
+        assert_eq!(calls, 1);
+    }
+
+    let mut graph =
+        graph_cursor(s.snapshot(), construct, &Default::default(), &options(1)).unwrap();
+    let sent = RowCount::new();
+    let error = write_with_completion(
+        Source::Graph(&mut graph),
+        WriteOptions::new(ntriples, &sent),
+        &mut Vec::new(),
+        |out| {
+            assert!(out.ends_with(b" .\n"));
+            assert_eq!(sent.get(), 1);
+            Err(Error::Cancelled)
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Cancelled));
+    let stats = graph.stats();
+    assert_eq!(stats.status, CursorStatus::Failed);
+    assert_eq!(stats.error, Some(error.to_string()));
+}
+
+#[test]
+fn completion_is_skipped_on_dispatch_drain_and_flush_failures() {
+    use sparkles_core::sparql::results::{
+        Format, LimitedWriter, RowCount, SolutionsFormat, Source, WriteOptions,
+        write_with_completion,
+    };
+    use std::io::{self, Write};
+
+    let s = store(1);
+    let ask = query(s.snapshot(), "ASK {}", &Default::default()).unwrap();
+    let sent = RowCount::new();
+    let error = write_with_completion(
+        Source::Result(&ask),
+        WriteOptions::new(Format::ResultsThrift, &sent),
+        &mut Vec::new(),
+        |_| panic!("invalid format must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(error, Error::Invalid(_)));
+
+    let mut limited = LimitedWriter::new(Vec::new(), Some(0), None);
+    let error = write_with_completion(
+        Source::Result(&ask),
+        WriteOptions::new(Format::Solutions(SolutionsFormat::Csv), &sent),
+        &mut limited,
+        |_| panic!("failed drain must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        limited.classify(error),
+        Error::BudgetExceeded(b) if b.kind == BudgetKind::ResultBytes
+    ));
+
+    struct BrokenFlush;
+    impl Write for BrokenFlush {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::ErrorKind::BrokenPipe.into())
+        }
+    }
+    let mut cursor = open(&s, "SELECT ?o WHERE { ?s <urn:p> ?o }", 1);
+    let error = write_with_completion(
+        Source::Select(&mut cursor),
+        WriteOptions::new(Format::Solutions(SolutionsFormat::Tsv), &sent),
+        &mut BrokenFlush,
+        |_| panic!("failed first-batch flush must skip completion"),
+    )
+    .unwrap_err();
+    assert!(matches!(&error, Error::Io(e) if e.kind() == io::ErrorKind::BrokenPipe));
+    assert_eq!(sent.get(), 1);
+    assert_eq!(cursor.stats().error, Some(error.to_string()));
 }
 
 #[test]
@@ -5530,52 +5674,123 @@ fn arq_uuid_aliases_and_dynamic_calls_stay_volatile_across_cursor_morsels() {
     }
 }
 
-/// The graph writers flush once after their first batch, with that batch's statements
-/// written and later batches not yet, so a writer that commits on a flush starts the
-/// response then. RDF/JSON groups by subject and writes everything at the end.
+/// The graph writers flush once after their first batch, before they pull the second, so
+/// a writer that commits on a flush starts the response then. The probe cancels the query
+/// at its first flush, so the next pull fails, and the output holds exactly the first
+/// batch's statements, written and counted.
 #[test]
 fn graph_writers_flush_after_their_first_batch() {
     use sparkles_core::jena_formats::JenaFormat;
-    use sparkles_core::sparql::{cursor::graph::write_cursor_graph, graph_cursor, results};
-    #[derive(Default)]
+    use sparkles_core::sparql::graph_cursor;
+    use sparkles_core::sparql::results::{
+        self, Format, RowCount, SolutionsFormat, Source, WriteOptions,
+    };
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     struct Probe {
-        written: usize,
-        first_flush: Option<usize>,
+        out: Vec<u8>,
+        flushes: usize,
+        cancel: Arc<AtomicBool>,
     }
     impl std::io::Write for Probe {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.written += b.len();
+            self.out.extend_from_slice(b);
             Ok(b.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
-            self.first_flush.get_or_insert(self.written);
+            self.flushes += 1;
+            self.cancel.store(true, Ordering::Relaxed);
             Ok(())
         }
     }
     let s = store(1000);
     let q = "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }";
-    let check = |name: &str, probe: Probe| {
-        let at = probe
-            .first_flush
-            .unwrap_or_else(|| panic!("{name}: no flush"));
+    let formats = [
+        Format::Rdf(RdfFormat::NTriples),
+        Format::Rdf(RdfFormat::NQuads),
+        Format::Rdf(RdfFormat::Turtle),
+        Format::Jena(JenaFormat::Thrift),
+        Format::Jena(JenaFormat::Protobuf),
+        Format::Jena(JenaFormat::TriX),
+        Format::Solutions(SolutionsFormat::Sparkles),
+    ];
+    for format in formats {
+        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
+        let mut probe = Probe {
+            out: Vec::new(),
+            flushes: 0,
+            cancel: c.cancellation_token(),
+        };
+        let rows = RowCount::new();
+        let options = WriteOptions::new(format, &rows);
+        let r = results::write(Source::Graph(&mut c), options, &mut probe);
         assert!(
-            at > 0 && at * 10 < probe.written,
-            "{name}: flushed at {at} of {}",
-            probe.written
+            matches!(r, Err(sparkles_core::Error::Cancelled)),
+            "{format:?}: {r:?}"
         );
+        assert_eq!(probe.flushes, 1, "{format:?}");
+        assert_eq!(rows.get(), 10, "{format:?}");
+        if matches!(format, Format::Rdf(RdfFormat::NTriples | RdfFormat::NQuads)) {
+            let lines = probe.out.iter().filter(|&&b| b == b'\n').count();
+            assert_eq!(lines, 10, "{format:?}");
+        }
+    }
+}
+
+/// The cursor's SPARQL Results Thrift writer flushes once after its first batch, before it
+/// pulls the second, so a writer that commits on a flush starts the response then. The
+/// probe cancels the query at its first flush, and the output holds exactly the first
+/// batch's rows, written and counted.
+#[test]
+fn the_cursor_thrift_writer_flushes_after_its_first_batch() {
+    use sparkles_core::jena_formats::ThriftResults;
+    use sparkles_core::sparql::results::{self, Format, RowCount, Source, WriteOptions};
+    struct Probe {
+        out: Vec<u8>,
+        flushes: usize,
+        cancel: Arc<AtomicBool>,
+    }
+    impl std::io::Write for Probe {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.out.extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            self.cancel.store(true, Ordering::Relaxed);
+            Ok(())
+        }
+    }
+    let s = store(1000);
+    let q = "SELECT ?s ?o WHERE { ?s <urn:p> ?o }";
+    let eager = query(s.snapshot(), q, &Default::default())
+        .unwrap()
+        .application_rows();
+    let vars = ["s".to_string(), "o".to_string()];
+    let mut expected = ThriftResults::new(Vec::new(), &vars).unwrap();
+    for row in &eager[..10] {
+        expected.row(row).unwrap();
+    }
+    let mut c = open(&s, q, 10);
+    let mut probe = Probe {
+        out: Vec::new(),
+        flushes: 0,
+        cancel: c.cancellation_token(),
     };
-    for format in [RdfFormat::NTriples, RdfFormat::NQuads] {
-        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
-        let mut probe = Probe::default();
-        write_cursor_graph(&mut c, format, &mut probe, None, &[]).unwrap();
-        check(&format!("{format:?}"), probe);
-    }
-    for format in [JenaFormat::Thrift, JenaFormat::Protobuf, JenaFormat::TriX] {
-        let mut c = graph_cursor(s.snapshot(), q, &Default::default(), &options(10)).unwrap();
-        let mut probe = Probe::default();
-        results::write_cursor_jena_graph(&mut c, format, &mut probe, None).unwrap();
-        check(&format!("{format:?}"), probe);
-    }
+    let rows = RowCount::new();
+    let r = results::write(
+        Source::Select(&mut c),
+        WriteOptions::new(Format::ResultsThrift, &rows),
+        &mut probe,
+    );
+    assert!(matches!(r, Err(Error::Cancelled)), "{r:?}");
+    assert_eq!(probe.flushes, 1);
+    assert_eq!(rows.get(), 10);
+    assert_eq!(
+        &probe.out,
+        expected.get_mut(),
+        "the first batch's rows, whole"
+    );
 }
 
 /// An OPTIONAL over two inputs sorted on their shared variable merges when the
@@ -6519,4 +6734,132 @@ fn reference_evaluator_notes_open_choices_and_keeps_scopes() {
     }
     // NaN is unordered against a number
     assert_eq!(spec_order(terms[3].as_ref(), terms[0].as_ref()), None);
+}
+
+/// A term that the memory budget refuses to decode in the middle of an answer fails the
+/// output with the budget's error, in every SELECT format of both executors, after the
+/// rows before it, which are written whole and counted. The long literal sorts in the
+/// middle of the objects, and the query reads them in object order.
+///
+/// The cursor runs with batches of 1 and 64 rows, whose term caches fit the budget, so the
+/// batches before the long literal are written from the cache and the batch holding it
+/// falls back to decoding row by row. With 4,096 rows the one batch's cache needs 128 bytes
+/// a cell before any term, 256 KiB, which the 128 KiB budget refuses, so every row is
+/// decoded row by row. The unit test
+/// `the_refused_decode_cases_cover_cached_and_declined_batches` checks these cases, and a
+/// control without the long literal is written whole under the same budget.
+#[test]
+fn a_refused_decode_mid_answer_keeps_the_budget_error_in_every_writer() {
+    use sparkles_core::sparql::results::{
+        self, Format, RowCount, SolutionsFormat, WriteOptions, write,
+    };
+    let load = |long: bool| {
+        let s = Store::in_memory(StoreOptions::default());
+        let data = (0..1000)
+            .map(|i| {
+                if i == 600 && long {
+                    format!(
+                        "<urn:s:{i}> <urn:p> \"v{i:04}{}\" .\n",
+                        "x".repeat(256 << 10)
+                    )
+                } else {
+                    format!("<urn:s:{i}> <urn:p> \"v{i:04}\" .\n")
+                }
+            })
+            .collect::<String>();
+        s.load(&[Source::from_bytes(
+            data.into_bytes(),
+            RdfFormat::NTriples,
+            None,
+        )])
+        .unwrap();
+        s
+    };
+    let s = load(true);
+    let control = load(false);
+    let q = "SELECT ?o ?s WHERE { ?s <urn:p> ?o }";
+    let opts = QueryOptions {
+        max_memory_bytes: Some(128 << 10),
+        ..Default::default()
+    };
+    // the rows whose object, the last thing a row holds of its own, was written
+    let complete = |out: &[u8]| -> u64 {
+        out.windows(6)
+            .filter(|w| w[0] == b'v' && w[1..5].iter().all(u8::is_ascii_digit) && w[5] != b'x')
+            .count() as u64
+    };
+    let refused = |name: &str, error: &Error| {
+        assert!(
+            matches!(error, Error::BudgetExceeded(b) if b.kind == BudgetKind::Memory),
+            "{name}: {error:?}"
+        );
+    };
+    for batch in [1, 64, 4096] {
+        let mut c = select_cursor(control.snapshot(), q, &opts, &options(batch)).unwrap();
+        let rows = RowCount::new();
+        write(
+            results::Source::Select(&mut c),
+            WriteOptions::new(Format::Solutions(SolutionsFormat::Tsv), &rows),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(rows.get(), 1000, "control batch {batch}");
+    }
+    for fmt in [
+        SolutionsFormat::Json,
+        SolutionsFormat::Xml,
+        SolutionsFormat::Csv,
+        SolutionsFormat::Tsv,
+        SolutionsFormat::Sparkles,
+    ] {
+        let r = query(s.snapshot(), q, &opts).unwrap();
+        let rows = RowCount::new();
+        let mut out = Vec::new();
+        let error = write(
+            results::Source::Result(&r),
+            WriteOptions::new(Format::Solutions(fmt), &rows),
+            &mut out,
+        )
+        .unwrap_err();
+        let name = format!("eager {fmt:?}");
+        refused(&name, &error);
+        assert!(
+            rows.get() > 0 && rows.get() < 1000,
+            "{name}: {}",
+            rows.get()
+        );
+        assert_eq!(rows.get(), complete(&out), "{name}");
+        for batch in [1, 64, 4096] {
+            let mut c = select_cursor(s.snapshot(), q, &opts, &options(batch)).unwrap();
+            let rows = RowCount::new();
+            let mut out = Vec::new();
+            let error = write(
+                results::Source::Select(&mut c),
+                WriteOptions::new(Format::Solutions(fmt), &rows),
+                &mut out,
+            )
+            .unwrap_err();
+            let name = format!("cursor {fmt:?} batch {batch}");
+            refused(&name, &error);
+            assert!(
+                rows.get() > 0 && rows.get() < 1000,
+                "{name}: {}",
+                rows.get()
+            );
+            assert_eq!(rows.get(), complete(&out), "{name}");
+            // a cursor still open fails with the output; the one batch of 4,096 rows
+            // completed the plan before the writer failed, and keeps the output's error
+            let status = if batch == 4096 {
+                CursorStatus::Complete
+            } else {
+                CursorStatus::Failed
+            };
+            assert_eq!(c.status(), status, "{name}");
+            assert!(c.stats().error.is_some(), "{name}");
+            assert!(
+                c.next_batch().unwrap().is_none(),
+                "{name}: the cursor is fused"
+            );
+        }
+    }
 }

@@ -1751,16 +1751,31 @@ impl<W: Write> ThriftResults<W> {
     }
 
     pub fn row(&mut self, row: &[Option<Term>]) -> io::Result<()> {
+        self.row_cells(row.len(), row.iter().map(Option::as_ref))
+    }
+
+    /// A row of `width` cells, each a term or unbound. `cells` yields exactly `width`
+    /// items.
+    pub fn row_cells<'t>(
+        &mut self,
+        width: usize,
+        cells: impl IntoIterator<Item = Option<&'t Term>>,
+    ) -> io::Result<()> {
         self.out.begin();
         self.out.field(1, ttype::LIST)?;
-        list_header(&mut self.out, row.len(), ttype::STRUCT)?;
-        for t in row {
+        list_header(&mut self.out, width, ttype::STRUCT)?;
+        for t in cells {
             match t {
                 Some(t) => self.out.term(t)?,
                 None => self.out.undef()?,
             }
         }
         self.out.end()
+    }
+
+    /// The writer the rows go to, for a flush between rows.
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.out.w
     }
 
     pub fn finish(mut self) -> io::Result<W> {

@@ -1,0 +1,2 @@
+200 application/x-sparkles+json
+{"queryType":"SELECT","vars":["s","p","o"],"rows":[[{"type":"bnode","value":"b0"},{"type":"uri","value":"urn:ex:q"},{"type":"uri","value":"urn:ex:s1"}],[{"type":"uri","value":"urn:ex:s1"},{"type":"uri","value":"urn:ex:p"},{"type":"bnode","value":"b0"}]],"meta":{"commit":1,"datasetId":"<n>","memory":"<n>","plan":"<n>","rowsProduced":"<n>","sentRows":2,"status":"stopped","timing":"<n>","totalRows":null}}

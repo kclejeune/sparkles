@@ -177,6 +177,48 @@ instruction sequence in both binaries after addresses are normalized. Checks of 
 intermediate builds did not isolate a single responsible change. Item 306 remains open
 for a measurement confined to execution and its plan bookkeeping.
 
+### Unified result writers and exact row accounting
+
+Unifying result serialization into one columnar writer per format with engine-owned SPARQL
+JSON, XML, CSV and TSV encoders, streamed SPARQL Results Thrift, `RowLedger` row-end
+accounting, a 16-entry bounded stream channel and reduced stream idle-timer wakeups
+([X14](../../specs/X14-unified-executor/SPEC.md#one-writer-per-format-and-exact-row-accounting-items-828-and-243))
+was measured on quiet `atlas` with matched release binaries built on `wally` (`rustc
+1.99.1`, `LLD 23.1.1`, `GCC 15.3.0`). Every timed comparison ran order-corrected A,B,B,A
+rounds in both arm orders with identical answer fingerprints across A and B.
+
+The 12-thread native streaming confirmation compared `fd47b7ae` with `a6814599` at 10.5M
+triples (`people1m`, 12 Rayon threads on CPUs 0 to 11, client on CPU 12, 8 rounds of 10
+requests in each order). All four queries improved with 0 of 16 rounds slower. The
+row-storage charge hoist included in `a6814599` was later reverted so row-storage credit
+releases between batches, keeping the idle-timer wakeup reduction and the 16-entry stream
+channel.
+
+| Query | Base (`fd47b7ae`) | Tip (`a6814599`) | Tip against base | 95% interval | Added time |
+|---|--:|--:|--:|---|--:|
+| `export-500k` | 676.68 ms | 250.94 ms | 0.3710 | 0.3703 to 0.3716 | −425.13 ms |
+| `optional-chain` | 224.86 ms | 211.72 ms | 0.9420 | 0.9327 to 0.9481 | −13.06 ms |
+| `order-by-full` | 1,018.84 ms | 794.14 ms | 0.7782 | 0.7759 to 0.7817 | −226.45 ms |
+| `star-join` | 63.35 ms | 53.87 ms | 0.8508 | 0.8348 to 0.8580 | −9.52 ms |
+
+*Wall times were measured on quiet `atlas` (`Intel Core i5-13500`, kernel 7.3.3) for
+release builds of `fd47b7ae` and `a6814599` made on `wally`. They are not comparable with
+`forge`'s figures.*
+
+The full 34-pair `atlas` matrix comparing `fd47b7ae` with `726563ad` under the same
+`wally` toolchain measured the engine-owned format encoders across 1-thread workload
+(`people1m`, 8 rounds of 10 requests in each order) and literal (`literals`, 8 rounds in
+each order) cells with identical answer fingerprints. On 1-thread `optional-chain`, SPARQL
+JSON ran at 0.4381× streamed and 0.5658× eager, XML at 0.5691× streamed and 0.7154× eager,
+TSV at 0.9078× streamed and CSV at 0.8979× streamed. On `literals`, `long-literal` ran at
+0.4234× streamed and 0.4447× eager in SPARQL JSON, 0.7580× eager and 0.8632× streamed in
+CSV and 0.8381× streamed in TSV. The streamed Thrift probe produced matching HTTP chunked
+framing and identical body SHA-256 digests across base eager, tip eager and tip streaming.
+Three small costs confirmed in that matrix that passed the gate are tracked in roadmap
+item 1195: 1-thread native eager `order-by-full` at 1.0029× (+2.43 ms, 13/16), 1-thread
+TSV eager `escape-straddle` at 1.0017× (+3.76 µs, 14/16) and 1-thread native streaming
+`predicate-counts` at 1.0010× (+2.00 µs, 23/24).
+
 ### The cost of the query memory pool
 
 The query memory pool of [X08](../../specs/X08-disk-spill-and-server-memory.md#gates) is on by

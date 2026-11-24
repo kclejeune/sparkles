@@ -1,0 +1,2 @@
+200 application/x-sparkles+json
+{"queryType":"CONSTRUCT","triples":[],"quads":[[{"type":"uri","value":"urn:ex:s1"},{"type":"uri","value":"urn:ex:p"},{"type":"literal","value":"42","datatype":"http://www.w3.org/2001/XMLSchema#integer"},null],[{"type":"uri","value":"urn:ex:s1"},{"type":"uri","value":"urn:ex:p"},{"type":"bnode","value":"b0"},null]],"meta":{"commit":1,"datasetId":"<n>","describeTruncated":false,"memory":"<n>","plan":"<n>","rowsProduced":"<n>","sentRows":2,"status":"stopped","timing":"<n>","totalRows":null}}

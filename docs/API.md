@@ -2732,8 +2732,7 @@ Query parameters beyond the standard protocol:
   LIMIT, a grouping, a DISTINCT and a join write what does not fit to disk and finish
   within the budget (see [Disk spill](#disk-spill)). A query that exceeds the budget
   otherwise fails, so streaming does not keep every query in constant memory. SELECT in SPARQL
-  Results Thrift is not supported in streaming mode and returns `501`. An invalid mode
-  returns `400`.
+  Results Thrift streams in the same bytes as the eager answer. An invalid mode returns `400`.
 
   `auto` streams a plain SELECT of scans and projections when it expects at least a
   thousand rows and the data comes from immutable blocks with no pending changes. Any graph
@@ -2753,8 +2752,7 @@ Query parameters beyond the standard protocol:
   budget fails it with a status before any output. Every other plan runs eagerly, with the
   same response as `execution=eager`. A query that ran in under 10 ms the last time also
   runs eagerly without being planned for the decision, also when its last run streamed and
-  its answer fit in one 1 MiB body. A request for SPARQL
-  Results Thrift runs eagerly because that encoding has no streaming writer. A stored-query run with
+  its answer fit in one 1 MiB body. A stored-query run with
   parameter values also runs eagerly, because initial bindings rule out every automatic
   plan. A streamed answer that passes a lowered `max-result-mb` within its first
   1 MiB is refused with a status before any output, as an eager one is. The policy is
@@ -2775,8 +2773,12 @@ Query parameters beyond the standard protocol:
   response starts gets the normal status and JSON error. An error after it has started,
   such as a timeout or an exhausted budget, aborts the body transfer. The client then sees a truncated
   response with a `200` status, and in TSV, CSV or N-Triples the rows before
-  the cut are well formed, so only a transfer that completes is a complete answer. Treat
-  a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
+  the cut are well formed, so only a transfer that completes is a complete answer. The
+  result-size budget follows the same rule. An answer that passes `max-result-mb` before
+  its response starts gets `507`, and one that passes it later is cut. The exact byte at
+  which a response starts depends on how the format's writer hands its bytes on and is
+  not part of the interface, so an answer that passes the budget near that point can get
+  either outcome. Treat a failed or truncated transfer as an error. The clients Sparkles ships do. With `send`,
   the native metadata reports `stopped` and an unknown total instead of the full count.
   Rows come in the same order as eagerly. Streamed answers skip the full-result cache,
   and the access log entry and the metrics are recorded once both the query and the

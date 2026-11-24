@@ -1295,6 +1295,13 @@ enum OutFormat {
 }
 
 impl OutFormat {
+    fn format(self) -> results::Format {
+        match self {
+            OutFormat::Rdf(f) => results::Format::Rdf(f),
+            OutFormat::Jena(j) => results::Format::Jena(j),
+        }
+    }
+
     fn file_extension(self) -> &'static str {
         match self {
             OutFormat::Rdf(f) => f.file_extension(),
@@ -1888,13 +1895,11 @@ pub(crate) async fn run_query(
     // otherwise name for nobody (item 180).
     opts.no_plan_patterns = sfmt != SolutionsFormat::Sparkles && !params_wants_sparkles(&headers);
     // Automatic execution decides once the query is planned, and a plan it keeps eager
-    // continues below exactly as an eager request does. The policy runs some requests
-    // eagerly without asking, since SPARQL Results Thrift has no cursor writer and
-    // initial bindings rule out every automatic plan.
+    // continues below exactly as an eager request does. The policy runs a request with
+    // initial bindings eagerly without asking, since they rule out every automatic plan.
     let execution = sparkles::sparql::choose_execution(&sparkles::sparql::Consumer {
         requested,
         default: st.default_execution,
-        cursor_format: !thrift,
         initial_bindings: !bindings.is_empty(),
         ..Default::default()
     })
@@ -2130,6 +2135,11 @@ pub(crate) async fn run_query(
     }
     // SPARQL Results Thrift is written for SELECT; ASK falls back to the negotiated format
     let thrift = thrift && r.kind == QueryKind::Select && !sparkles_doc;
+    let solutions_format = if thrift {
+        results::Format::ResultsThrift
+    } else {
+        results::Format::Solutions(sfmt)
+    };
     let ct: String = if sparkles_doc {
         SolutionsFormat::Sparkles.media_type().into()
     } else if is_graph {
@@ -2167,25 +2177,21 @@ pub(crate) async fn run_query(
     let cancel_guard = _cancel_on_drop;
     let write = move |w: &mut LimitedWriter<stream::SwitchWriter>| -> sparkles::Result<()> {
         let ts = std::time::Instant::now();
-        let sent = std::cell::Cell::new(0);
-        let written = if thrift {
-            write_thrift_results(&r, w, send, &sent)
-        } else {
-            serialize_result(
-                &r,
-                w,
-                sparkles_doc,
-                is_graph,
-                sfmt,
-                rfmt,
-                send,
-                &prefixes,
-                seq,
-                &dataset_id,
-                io.as_deref(),
-                &sent,
-            )
-        };
+        let sent = results::RowCount::with_ledger(w.get_ref().ledger());
+        let written = serialize_result(
+            &r,
+            w,
+            sparkles_doc,
+            is_graph,
+            solutions_format,
+            rfmt,
+            send,
+            &prefixes,
+            seq,
+            &dataset_id,
+            io.as_deref(),
+            &sent,
+        );
         rows_written.store(sent.get(), std::sync::atomic::Ordering::Relaxed);
         // phase spans once serialization has ended (the request span is current here)
         attempted_ms.set(attempted_ms.get() + ts.elapsed().as_secs_f64() * 1000.0);
@@ -2203,11 +2209,12 @@ pub(crate) async fn run_query(
     let on_stream_end = move |end: stream::StreamEnd| {
         stream_end_log("query", &end);
         let (outcome, budget) = end.outcome();
-        let rows = if end.error.is_some() {
-            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed))
-        } else {
-            streamed_base.rows
-        };
+        // the same rule as the cursor route's, which a pre-commit failure never reaches
+        // here today, since its error response is logged from its own report
+        let rows = end.reported_rows(
+            Some(sent_rows.load(std::sync::atomic::Ordering::Relaxed)),
+            streamed_base.rows,
+        );
         stream_report.producer_done(RequestReport {
             outcome,
             budget,
@@ -2318,61 +2325,53 @@ pub(crate) fn io_profile(
 static QUICK: std::sync::LazyLock<inline::QuickQueries> =
     std::sync::LazyLock::new(Default::default);
 
-/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions.
+/// Serialize a query result: the Sparkles JSON document, an RDF graph or solutions in
+/// `solutions`, a SPARQL result format or SPARQL Results Thrift.
 #[allow(clippy::too_many_arguments)]
 fn serialize_result(
     r: &sparkles::sparql::QueryResult,
     w: &mut LimitedWriter<stream::SwitchWriter>,
     sparkles_doc: bool,
     is_graph: bool,
-    sfmt: SolutionsFormat,
+    solutions: results::Format,
     rfmt: OutFormat,
     send: Option<usize>,
     prefixes: &std::collections::BTreeMap<String, String>,
     seq: u64,
     dataset_id: &str,
     io: Option<&sparkles::ioacct::Profile>,
-    sent: &std::cell::Cell<u64>,
+    sent: &results::RowCount,
 ) -> sparkles::Result<()> {
-    if sparkles_doc {
-        results::write_native_json_counted(
-            r,
-            w,
+    let prefix_list: Vec<(String, String)>;
+    let options = if sparkles_doc {
+        results::WriteOptions {
             send,
-            Some(results::NativeJsonMetadata {
+            metadata: Some(results::NativeJsonMetadata {
                 commit: seq,
                 dataset_id,
                 io,
             }),
-            sent,
-        )
+            ..results::WriteOptions::new(
+                results::Format::Solutions(SolutionsFormat::Sparkles),
+                sent,
+            )
+        }
     } else if is_graph {
-        match rfmt {
-            OutFormat::Rdf(f) => results::write_graph_counted(r, f, prefixes, w, sent),
-            OutFormat::Jena(j) => results::write_jena_graph_counted(r, j, w, sent),
+        prefix_list = prefixes
+            .iter()
+            .map(|(p, ns)| (p.clone(), ns.clone()))
+            .collect();
+        results::WriteOptions {
+            prefixes: &prefix_list,
+            ..results::WriteOptions::new(rfmt.format(), sent)
         }
     } else {
-        results::write_solutions_counted(r, sfmt, w, send, sent)
-    }
-}
-
-/// SELECT results in SPARQL Results Thrift, `send` rows at most, counting in `sent` the
-/// rows written whole.
-fn write_thrift_results(
-    r: &sparkles::sparql::QueryResult,
-    w: &mut LimitedWriter<stream::SwitchWriter>,
-    send: Option<usize>,
-    sent: &std::cell::Cell<u64>,
-) -> sparkles::Result<()> {
-    let mut out = jena_formats::ThriftResults::new(w, r.variables())?;
-    let n = send.map_or(r.len(), |s| s.min(r.len()));
-    for i in 0..n {
-        let row = r.row(i)?;
-        out.row(row.values())?;
-        sent.set(sent.get() + 1);
-    }
-    out.finish()?;
-    Ok(())
+        results::WriteOptions {
+            send,
+            ..results::WriteOptions::new(solutions, sent)
+        }
+    };
+    results::write(results::Source::Result(r), options, w).map(drop)
 }
 
 /// Log how a streamed response ended (its bytes are counted in the metrics).
@@ -6429,6 +6428,8 @@ mod stream_idle_tests;
 mod text_tests;
 #[cfg(all(test, feature = "shacl"))]
 mod validation_tests;
+#[cfg(test)]
+mod writer_goldens_tests;
 
 #[cfg(test)]
 mod spool_tests {

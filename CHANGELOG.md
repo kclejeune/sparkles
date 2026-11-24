@@ -2,6 +2,61 @@
 
 ## Unreleased
 
+### One result writer per format, with the engine's own SPARQL encoders
+
+Roadmap items 828 and 243 write every SELECT, ASK and graph answer through one writer per
+format, which takes an eager result and a cursor alike. Every writer keeps the bytes it
+wrote before, so the responses that already differed between the executors, such as the
+native document's graph layout, still differ, and item 1111 holds that change. The engine
+now writes SPARQL TSV, CSV, JSON and XML SELECT results with its own encoders in place of
+the sparesults writers, with the same bytes. SPARQL Results Thrift moved from the server
+into the library and streams from a cursor in the same bytes as the eager answer. A
+streamed Thrift request no longer answers `501`, and `auto` no longer runs every Thrift
+request eagerly.
+
+The result buffer records where each row ends instead of checking the row count at every
+write, and a streamed body counts a row once the transport has handed over the bytes up to
+its end. A body whose last send fails therefore no longer reports the rows of that unsent
+chunk. In per-request instruction counts on `wally` at 1.05M triples, native JSON
+`optional-chain` runs 0.894 of the base's instructions eagerly and 0.888 streamed, and
+`export-500k` 0.888 and 0.870. In the counts of their commits, the SPARQL encoders run
+`export-500k` in 0.93 and 0.89 of the sparesults writers' instructions in TSV, 0.93 and
+0.90 in CSV, 0.37 and 0.30 in JSON and 0.51 and 0.44 in XML, eager and streamed. Item 1195
+holds the per-row cost of the whole-row output that the next paragraph describes.
+
+Each row now reaches the response whole. A row that passes the result-size budget before
+the response starts answers `507` in every SELECT format and both executors, where SPARQL
+JSON and native JSON in streaming answered `200` with a cut body. A `507` before the
+response starts logs no rows. A row longer than the 8 KiB buffer in TSV, CSV, native JSON
+or Thrift is assembled in a scratch buffer that is charged to the query's memory, so a
+tight memory budget can answer `507` where it answered `200` before. The buffer, its
+scratch and its record of row ends grow under the same charge, which admits each growth
+with the old allocation that a moving reallocation holds beside the new one. Whole-row
+admission can also move a refusal earlier, so a two-cell XML row with a 70 KiB and a 20 KiB
+literal can answer `507` where sparesults committed the response and cut the body.
+
+In the Rust library, `sparql::results::write` takes a `Source`, `WriteOptions` and a writer
+and replaces the public `_counted` writer functions, such as `write_solutions_counted` and
+`write_cursor_graph_counted`, which are removed. The uncounted functions such as
+`write_solutions` and `write_cursor_graph` keep their signatures, so the bindings and the
+CLI do not change. `write_with_completion` runs a callback once after a successful write
+and its final drain, so a caller can check a `LimitedWriter` with `check_completion` for a
+cancellation that is due. `RowCount` and `RowLedger` carry the row counts.
+
+The HTTP streaming path also removes per-chunk idle timer wakeups, waking the stream timer
+only when the idle deadline starts, moves earlier or enters a terminal or aborted state,
+and raises `SwitchWriter`'s bounded stream channel from 4 to 16 entries (`CHANNEL_CAP =
+16`). Post-switch chunks are at most 64 KiB, while a threshold-driven switch queues its
+initial buffer as one entry (up to `STREAM_AFTER` + 1 byte before the remaining 15
+chunks). That trades up to 768 KiB more queued payload per active streamed response,
+released when the stream ends or aborts, so decoded cursor batches can enqueue without
+stalling the producer when queue space allows. On quiet `atlas` at 10.5M triples with 12
+threads, native streaming runs `export-500k` at 0.3710×, `optional-chain` at 0.9420×,
+`order-by-full` at 0.7782× and `star-join` at 0.8508×, and with one thread
+`optional-chain` runs at 0.4381× in streamed SPARQL JSON and 0.5691× in streamed XML while
+`long-literal` runs at 0.4234× in streamed SPARQL JSON. All 1,274 W3C streaming
+conformance tests pass.
+
 ### Streamed SERVICE, text and history readers with non-materializing timestamp lookup
 
 Explicit streaming execution now serves SERVICE without SILENT, unbounded constant-query

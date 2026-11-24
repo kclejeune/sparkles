@@ -1,0 +1,4 @@
+200 text/turtle; charset=utf-8
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+@prefix ex: <urn:ex:> .
+ex:s1 ex:p 42 , _:b0 .

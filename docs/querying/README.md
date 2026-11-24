@@ -73,9 +73,9 @@ check them against the W3C suites and Jena's own answers.
   `VARIANCE`, `VAR_SAMP` and `VAR_POP` work with `DISTINCT`, as keywords, by their `agg:`
   and `afn:` IRIs and through `AGG <iri>(…)`. Their results, types, empty groups and errors
   match ARQ's.
-* Results come as JSON, XML, CSV, TSV and `x-sparkles+json`, which includes the executed
-  plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and RDF/XML, and as
-  Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
+* Results come as JSON, XML, CSV, TSV, SPARQL Results Thrift and `x-sparkles+json`, which
+  includes the executed plan. Graphs come as Turtle, N-Triples, N-Quads, TriG, JSON-LD and
+  RDF/XML, and as Jena's TriX, RDF Thrift, RDF Protobuf and RDF/JSON.
 
 ### Aggregate errors
 
@@ -315,8 +315,29 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   FOLD, registered aggregates, `MEDIAN`, `MODE` and the other custom aggregates read the
   whole rows of each group.
 * Rust, Python and Node have snapshot-owning SELECT and graph cursors, and the JVM
-  library pulls SELECT results. Result writers use bounded buffers with backpressure and
-  stop when the client disconnects.
+  library pulls SELECT results. Result writers share one columnar implementation per
+  format across eager and cursor sources, including streamed SPARQL Results Thrift, and
+  stop when the client disconnects. Each active streamed HTTP response uses a bounded
+  channel of 16 entries, released when the stream ends or aborts. Post-switch chunks are
+  at most 64 KiB, and a threshold-driven switch queues its initial buffer (up to
+  `STREAM_AFTER` + 1 byte) as the first entry before the remaining 15 chunks. Sizing the
+  queue to 16 entries instead of 4 trades up to 768 KiB more queued payload per active
+  stream so decoded cursor batches can enqueue without stalling the producer when their
+  encoded bytes fit in the available queue space. The stream idle timer wakes only when
+  the idle deadline starts, moves earlier or enters a terminal or aborted state rather
+  than on every chunk.
+* Rust callers can use `sparql::results::write_with_completion` to check a writer
+  after serialization finishes and the writer has accepted the final rows. With a
+  `LimitedWriter`, the callback can call `check_completion` to observe a pending
+  byte-based cancellation check. If the caller supplies a buffered wrapper, the
+  callback can reach the adapter through the wrapper. Row counts describe what
+  the supplied writer accepted, including rows it still holds in its buffer.
+  The completion check itself performs no I/O. An error during serialization
+  or writing skips the callback. Some writers flush the supplied writer as part of
+  serialization. SPARQL Results Thrift, RDF/JSON, TriX and the other Jena graph formats
+  flush it at their end, and every format flushes after the first batch of a cursor, so
+  an adapter's check can fail inside serialization and skip the callback, and a buffered
+  wrapper may have passed its bytes on by the time the callback runs.
 * Native SELECT output and standard JSON, XML, CSV and TSV solution responses of at
   most 65,536 rows check a complete decoded row before writing its cells. Row storage
   and decoded terms retain query memory credit while they are written. A required
@@ -439,10 +460,10 @@ MIN and MAX become unbound where an argument was unbound or an error, and can se
   also cover finite Graph Store, diff and changes bodies. See [server settings](../USAGE.md).
 * A response that the result-size budget stops after its first bytes, eager or streamed,
   first sends what its writer had buffered and then aborts the transfer. The access log
-  and the metrics count the rows whose bytes the response writer accepted, which are the
+  and the metrics count the rows whose bytes the transport handed over, which are the
   rows a client that keeps reading receives. When the client has stopped reading, that
   last send waits only as long as the idle limit, and if it fails the report leaves out
-  its bytes but still counts the rows of that last chunk.
+  its bytes and the rows that end in them.
 * A query that a budget or its timeout stopped keeps its plan in the error body of the
   `application/x-sparkles+json` format.
 * `POST /{ds}/sparql/explain` explains an estimated plan, a read-only run or a plan the

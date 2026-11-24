@@ -1,0 +1,2 @@
+200 application/sparql-results+xml
+<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#"><head><variable name="s"/><variable name="p"/><variable name="o"/></head><results><result><binding name="s"><bnode>b0</bnode></binding><binding name="p"><uri>urn:ex:q</uri></binding><binding name="o"><uri>urn:ex:s1</uri></binding></result><result><binding name="s"><uri>urn:ex:s1</uri></binding><binding name="p"><uri>urn:ex:p</uri></binding><binding name="o"><bnode>b0</bnode></binding></result></results></sparql>

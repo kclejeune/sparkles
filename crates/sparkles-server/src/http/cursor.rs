@@ -143,23 +143,23 @@ pub(super) async fn serve(
     let send = params.get("send").and_then(|s| s.parse::<usize>().ok());
     // what query-time reasoning derived, for the response header
     let derived = cursor.reasoning();
-    if thrift && cursor.kind() == QueryKind::Select && !matches!(cursor, QueryExecution::Eager(_)) {
-        return Err(Error::Unsupported(
-            "streaming SELECT does not support Thrift; choose JSON, XML, CSV, TSV or native JSON"
-                .into(),
-        )
-        .into());
-    }
     let graph = matches!(cursor.kind(), QueryKind::Construct | QueryKind::Describe);
     let kind = cursor.kind();
-    let content_type =
-        if thrift && cursor.kind() == QueryKind::Select && format != SolutionsFormat::Sparkles {
-            jena_formats::RESULTS_THRIFT
-        } else if graph && !native_graph {
-            rdf_format.media_type()
-        } else {
-            format.media_type()
-        };
+    // SPARQL Results Thrift holds SELECT results; ASK and the Sparkles document keep the
+    // negotiated format
+    let thrift = thrift && kind == QueryKind::Select && format != SolutionsFormat::Sparkles;
+    let solutions_format = if thrift {
+        results::Format::ResultsThrift
+    } else {
+        results::Format::Solutions(format)
+    };
+    let content_type = if thrift {
+        jena_formats::RESULTS_THRIFT
+    } else if graph && !native_graph {
+        rdf_format.media_type()
+    } else {
+        format.media_type()
+    };
     let prefixes = prefix_map
         .iter()
         .map(|(a, b)| (a.clone(), b.clone()))
@@ -201,24 +201,14 @@ pub(super) async fn serve(
                 io: io.as_deref(),
             });
             let result = match &mut cursor {
-                QueryExecution::Eager(result)
-                    if thrift
-                        && result.result().kind == QueryKind::Select
-                        && format != SolutionsFormat::Sparkles =>
-                {
-                    let sent = std::cell::Cell::new(0);
-                    let written = write_thrift_results(result.result(), writer, send, &sent);
-                    *sent_slot.lock() = Some(sent.get());
-                    written
-                }
                 QueryExecution::Eager(result) => {
-                    let sent = std::cell::Cell::new(0);
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
                     let written = serialize_result(
                         result.result(),
                         writer,
                         (!graph && format == SolutionsFormat::Sparkles) || native_graph,
                         graph,
-                        format,
+                        solutions_format,
                         rdf_format,
                         send,
                         &prefix_map,
@@ -230,63 +220,33 @@ pub(super) async fn serve(
                     *sent_slot.lock() = Some(sent.get());
                     written
                 }
-                QueryExecution::Select(cursor) if format == SolutionsFormat::Sparkles => {
-                    let sent = std::cell::Cell::new(0);
-                    let written = results::write_cursor_native_json_counted(
-                        cursor,
-                        &mut *writer,
-                        send,
-                        metadata,
-                        &sent,
-                    );
-                    *sent_slot.lock() = Some(sent.get());
-                    written.map(|_| ())
-                }
                 QueryExecution::Select(cursor) => {
-                    let sent = std::cell::Cell::new(0);
-                    let written = results::write_cursor_solutions_counted(
-                        cursor,
-                        format,
-                        &mut *writer,
-                        send,
-                        &sent,
-                    );
-                    *sent_slot.lock() = Some(sent.get());
-                    written.map(|_| ())
-                }
-                QueryExecution::Graph(cursor) if native_graph => {
-                    let sent = std::cell::Cell::new(0);
-                    let written = results::write_cursor_graph_native_json_counted(
-                        cursor,
-                        &mut *writer,
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
+                    let options = results::WriteOptions {
                         send,
                         metadata,
-                        &sent,
-                    );
+                        ..results::WriteOptions::new(solutions_format, &sent)
+                    };
+                    let written =
+                        results::write(results::Source::Select(cursor), options, &mut *writer);
                     *sent_slot.lock() = Some(sent.get());
                     written.map(|_| ())
                 }
                 QueryExecution::Graph(cursor) => {
-                    let sent = std::cell::Cell::new(0);
-                    let written = match rdf_format {
-                        OutFormat::Rdf(format) => {
-                            sparkles::sparql::cursor::graph::write_cursor_graph_counted(
-                                cursor,
-                                format,
-                                &mut *writer,
-                                send,
-                                &prefixes,
-                                &sent,
-                            )
-                        }
-                        OutFormat::Jena(format) => results::write_cursor_jena_graph_counted(
-                            cursor,
-                            format,
-                            &mut *writer,
-                            send,
-                            &sent,
-                        ),
+                    let sent = results::RowCount::with_ledger(writer.get_ref().ledger());
+                    let format = if native_graph {
+                        results::Format::Solutions(SolutionsFormat::Sparkles)
+                    } else {
+                        rdf_format.format()
                     };
+                    let options = results::WriteOptions {
+                        send,
+                        prefixes: &prefixes,
+                        metadata,
+                        ..results::WriteOptions::new(format, &sent)
+                    };
+                    let written =
+                        results::write(results::Source::Graph(cursor), options, &mut *writer);
                     *sent_slot.lock() = Some(sent.get());
                     written.map(|_| ())
                 }
@@ -320,10 +280,8 @@ pub(super) async fn serve(
             let (outcome, budget) = end.outcome();
             // The statistics count all the rows an answer produced, so a body that stopped
             // partway reports the rows that reached the response writer whole.
-            let rows = match *sent_rows.lock() {
-                Some(sent) if end.error.is_some() => Some(sent),
-                _ => stats.as_ref().map(|s| s.emitted_rows),
-            };
+            // `StreamEnd::reported_rows` says which rows a streamed body reports.
+            let rows = end.reported_rows(*sent_rows.lock(), stats.as_ref().map(|s| s.emitted_rows));
             if let Some(stats) = &stats {
                 crate::otel::cursor_done(t0, kind, stats, serialize_ms);
             }

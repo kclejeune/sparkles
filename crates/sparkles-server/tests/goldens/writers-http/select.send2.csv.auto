@@ -1,0 +1,4 @@
+200 text/csv; charset=utf-8
+s,p,o
+_:b0,urn:ex:q,urn:ex:s1
+urn:ex:s1,urn:ex:p,_:b0

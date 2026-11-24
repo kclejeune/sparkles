@@ -14,7 +14,7 @@ use super::{ApiError, ApiResult, err};
 use axum::body::Bytes;
 use axum::http::StatusCode;
 use sparkles::Error;
-use sparkles::sparql::results::LimitedWriter;
+use sparkles::sparql::results::{LimitedWriter, RowLedger};
 use std::io::{self, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -31,6 +31,13 @@ pub const STREAM_AFTER: usize = 1 << 20;
 pub const FIRST_BYTES_AFTER: usize = 64 << 10;
 /// Size of the chunks of a streamed body.
 pub const CHUNK: usize = 64 << 10;
+/// Bounded in-flight channel entries per streamed response (16 entries). Post-switch
+/// chunks are at most [`CHUNK`] (64 KiB), while a threshold-driven switch queues its
+/// initial buffer as one entry (up to [`STREAM_AFTER`] + 1 byte before the remaining 15
+/// chunks). Raising the queue from 4 to 16 entries adds at most 768 KiB of queued payload
+/// per active streamed response so decoded cursor batches can enqueue without stalling the
+/// blocking producer when queue space allows.
+pub const CHANNEL_CAP: usize = 16;
 /// A controlled writer checks its deadline whenever its buffer crosses a multiple of
 /// 2^CONTROL_SHIFT bytes.
 const CONTROL_SHIFT: u32 = 14;
@@ -66,6 +73,14 @@ pub struct StreamEnd {
     pub error: Option<Error>,
     /// the client went away before the end
     pub disconnected: bool,
+    /// The rows whose bytes the transport accepted, from the writer's row ledger, or
+    /// `None` when the writer recorded no rows there or the body failed before it was
+    /// committed. A row counts once the send that holds its end has enqueued.
+    pub rows: Option<u64>,
+    /// The response was committed: it switched to streaming, or its whole body went
+    /// out. A body that failed before then is answered with an error status, and no
+    /// row of it reached the client.
+    pub committed: bool,
 }
 
 impl StreamEnd {
@@ -80,6 +95,21 @@ impl StreamEnd {
             Some(_) if self.disconnected => (Some(O::Cancelled), None),
             Some(_) => (Some(O::Error), None),
             None => (None, None),
+        }
+    }
+
+    /// The rows that the access log and the metrics report for a body that ended this way.
+    /// A body that failed before it was committed is an error response, which sent none of
+    /// its rows. One that failed after reports the rows whose ends the transport handed
+    /// over, or for a writer that records none there the rows it `written` whole, and
+    /// otherwise the `complete` count. A complete body reports `complete`.
+    pub(crate) fn reported_rows(&self, written: Option<u64>, complete: Option<u64>) -> Option<u64> {
+        if !self.committed {
+            None
+        } else if self.error.is_some() {
+            self.rows.or(written).or(complete)
+        } else {
+            complete
         }
     }
 }
@@ -105,6 +135,14 @@ pub struct SwitchWriter {
     timeouts: Option<Timeouts>,
     timed: Option<lifetime::Producer>,
     held: Option<crate::ratelimit::Held>,
+    /// where the writer's rows end, credited at each send that enqueued
+    ledger: RowLedger,
+    /// the bytes copied into `buf` since the start
+    copied: u64,
+    /// An error of a send that had already enqueued its chunk, such as the body timer
+    /// aborting the transfer just after. The chunk's rows count, and the error is
+    /// returned from the next write, flush or send.
+    after_send: Option<io::Error>,
     #[cfg(test)]
     producer_gate: Option<Arc<super::algo::probe::Gate>>,
     #[cfg(test)]
@@ -198,7 +236,7 @@ impl SwitchWriter {
     /// Switch to streaming: hand the receiver to the handler, then send what is
     /// buffered.
     fn switch(&mut self) -> io::Result<()> {
-        let (tx, rx) = mpsc::channel(4);
+        let (tx, rx) = mpsc::channel(CHANNEL_CAP);
         let signal = self.signal.take().expect("signal before the switch");
         if let Some(timeouts) = self.timeouts {
             let cancel = self
@@ -232,7 +270,58 @@ impl SwitchWriter {
         self.deferred
     }
 
+    /// The ledger in which a result writer records where its rows end.
+    pub(crate) fn ledger(&self) -> RowLedger {
+        self.ledger.clone()
+    }
+
+    #[cfg(test)]
+    fn new(threshold: usize, signal: Option<oneshot::Sender<Outcome>>) -> Self {
+        SwitchWriter {
+            buf: Vec::new(),
+            threshold,
+            signal,
+            tx: None,
+            deferred: false,
+            control: None,
+            commit_on_flush: false,
+            timeouts: None,
+            timed: None,
+            held: None,
+            ledger: RowLedger::new(),
+            copied: 0,
+            after_send: None,
+            #[cfg(test)]
+            producer_gate: None,
+            #[cfg(test)]
+            queued_producer_gate: None,
+        }
+    }
+
+    /// The error of an earlier send that enqueued and then failed.
+    #[inline]
+    fn failed_send(&mut self) -> io::Result<()> {
+        match self.after_send.take() {
+            None => Ok(()),
+            Some(e) => {
+                let copy = io::Error::new(e.kind(), e.to_string());
+                self.after_send = Some(e);
+                Err(copy)
+            }
+        }
+    }
+
+    /// The chunk enqueued: its rows count. A check that then fails is kept for the next
+    /// call, so that the write that sent the chunk still counts its bytes.
+    fn enqueued(&mut self, after: io::Result<()>) {
+        self.ledger.handed_over(self.copied);
+        if let Err(e) = after {
+            self.after_send = Some(e);
+        }
+    }
+
     fn send_chunk(&mut self) -> io::Result<()> {
+        self.failed_send()?;
         let Some(tx) = &self.tx else {
             return Ok(());
         };
@@ -241,11 +330,14 @@ impl SwitchWriter {
         }
         let chunk = std::mem::replace(&mut self.buf, Vec::with_capacity(CHUNK));
         if self.control.is_none() && self.timed.is_none() {
-            return tx.blocking_send(Ok(Bytes::from(chunk))).map_err(|_| gone());
+            tx.blocking_send(Ok(Bytes::from(chunk)))
+                .map_err(|_| gone())?;
+            self.enqueued(Ok(()));
+            return Ok(());
         }
         let mut item = Ok(Bytes::from(chunk));
         let stalled = Instant::now();
-        loop {
+        let after = loop {
             if let Some(control) = &self.control {
                 control.check()?;
             }
@@ -257,7 +349,7 @@ impl SwitchWriter {
                 None => tx.try_send(item),
             };
             match sent {
-                Ok(()) => return Ok(()),
+                Ok(()) => break self.timed.as_ref().map_or(Ok(()), |p| p.check()),
                 Err(mpsc::error::TrySendError::Closed(_)) => return Err(gone()),
                 Err(mpsc::error::TrySendError::Full(returned)) => {
                     item = returned;
@@ -281,10 +373,10 @@ impl SwitchWriter {
                             }
                             if let Some(producer) = &self.timed {
                                 producer.permit_send(permit, item)?;
-                            } else {
-                                permit.send(item);
+                                break producer.check();
                             }
-                            return Ok(());
+                            permit.send(item);
+                            break Ok(());
                         }
                         Ok(Err(_)) => return Err(gone()),
                         Err(_) => {
@@ -306,12 +398,15 @@ impl SwitchWriter {
                     }
                 }
             }
-        }
+        };
+        self.enqueued(after);
+        Ok(())
     }
 }
 
 impl Write for SwitchWriter {
     fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.failed_send()?;
         if let Some(control) = &self.control {
             // Serializers write a few bytes at a time, and reading the clock on each
             // write took a third of a streamed response's time. The deadline is
@@ -339,6 +434,8 @@ impl Write for SwitchWriter {
                 ));
             }
             self.buf.extend_from_slice(b);
+            self.copied += b.len() as u64;
+            self.ledger.copied(self.copied);
             return Ok(b.len());
         }
         // A serializer may hand us one enormous literal/body. Consume only the
@@ -354,6 +451,8 @@ impl Write for SwitchWriter {
         };
         let n = b.len().min(room);
         self.buf.extend_from_slice(&b[..n]);
+        self.copied += n as u64;
+        self.ledger.copied(self.copied);
         if self.tx.is_none() && self.buf.len() > self.threshold {
             self.switch()?;
         } else if self.tx.is_some() && self.buf.len() >= CHUNK {
@@ -365,6 +464,7 @@ impl Write for SwitchWriter {
     /// A flush commits an explicitly streamed response that has not switched yet. Every
     /// other flush leaves the buffer to fill its chunk.
     fn flush(&mut self) -> io::Result<()> {
+        self.failed_send()?;
         if self.commit_on_flush
             && self.tx.is_none()
             && self.signal.is_some()
@@ -539,6 +639,9 @@ where
             timeouts,
             timed: None,
             held: Some(held),
+            ledger: RowLedger::new(),
+            copied: 0,
+            after_send: None,
             #[cfg(test)]
             producer_gate: probe.producer,
             #[cfg(test)]
@@ -597,6 +700,8 @@ where
         });
         let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
         if let Some(mut producer) = sw.timed.take() {
+            // the producer is installed before the handoff, which can fail
+            let committed = sw.tx.is_some();
             drop(sw.tx.take());
             let result = producer.finish(result);
             let serialize_ms = t0.elapsed().as_secs_f64() * 1000.0;
@@ -607,6 +712,9 @@ where
                 serialize_ms,
                 error: result.err(),
                 disconnected,
+                // a handoff that failed committed nothing, so no row reached a client
+                rows: committed.then(|| sw.ledger.delivered()).flatten(),
+                committed,
             });
             drop(span);
             producer.publish();
@@ -616,11 +724,15 @@ where
             (None, Ok(())) => {
                 let body = std::mem::take(&mut sw.buf);
                 if control.is_some() {
+                    // a whole body delivers every row it holds
+                    sw.ledger.handed_over(sw.copied);
                     on_stream_end(StreamEnd {
                         bytes,
                         serialize_ms,
                         error: None,
                         disconnected: false,
+                        rows: sw.ledger.delivered(),
+                        committed: true,
                     });
                 }
                 drop(span);
@@ -638,6 +750,9 @@ where
                         serialize_ms,
                         error: Some(copy_error(&e)),
                         disconnected: false,
+                        // the response is an error status, and none of its rows was sent
+                        rows: None,
+                        committed: false,
                     });
                     drop(span);
                     drop(sw.held.take());
@@ -665,6 +780,8 @@ where
                     serialize_ms,
                     error,
                     disconnected,
+                    rows: sw.ledger.delivered(),
+                    committed: true,
                 });
                 drop(span);
                 if let Some(msg) = abort {
@@ -798,6 +915,9 @@ where
         timeouts: None,
         timed: None,
         held: None,
+        ledger: RowLedger::new(),
+        copied: 0,
+        after_send: None,
         #[cfg(test)]
         producer_gate: None,
         #[cfg(test)]
@@ -850,6 +970,72 @@ impl futures_util::Stream for ChunkStream {
 mod tests {
     use super::*;
     use std::sync::Mutex;
+
+    /// Both query routes report a body's rows by one rule: none for a body that failed
+    /// before it was committed, whatever its writer counted, then the delivered rows, the
+    /// rows written whole and the complete count, in that order (items 828 and 243).
+    #[test]
+    fn the_reported_rows_follow_the_commit_and_the_error() {
+        let end = |committed, error: bool, rows| StreamEnd {
+            bytes: 0,
+            serialize_ms: 0.0,
+            error: error.then_some(Error::Cancelled),
+            disconnected: false,
+            rows,
+            committed,
+        };
+        // an error response sent no rows, also when the buffer had whole rows in it
+        assert_eq!(
+            end(false, true, Some(3)).reported_rows(Some(5), Some(9)),
+            None
+        );
+        assert_eq!(end(false, true, None).reported_rows(Some(5), Some(9)), None);
+        assert_eq!(
+            end(true, true, Some(3)).reported_rows(Some(5), Some(9)),
+            Some(3)
+        );
+        assert_eq!(
+            end(true, true, None).reported_rows(Some(5), Some(9)),
+            Some(5)
+        );
+        assert_eq!(end(true, true, None).reported_rows(None, Some(9)), Some(9));
+        assert_eq!(
+            end(true, false, Some(3)).reported_rows(Some(5), Some(9)),
+            Some(9)
+        );
+    }
+
+    /// A send that enqueued and then failed its check counts the rows that end in its
+    /// chunk, and its error comes back from the next write, flush or send, also when the
+    /// serializer writes nothing more (item 243).
+    #[test]
+    fn a_send_that_enqueued_and_then_failed_counts_its_rows() {
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let r = sparkles::sparql::query(
+            store.snapshot(),
+            "SELECT ?x WHERE { VALUES ?x { 1 2 3 } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let mut sw = SwitchWriter::new(1 << 20, None);
+        let rows = sparkles::sparql::results::RowCount::with_ledger(sw.ledger());
+        use sparkles::sparql::results as res;
+        res::write(
+            res::Source::Result(&r),
+            res::WriteOptions::new(res::Format::Solutions(res::SolutionsFormat::Tsv), &rows),
+            &mut sw,
+        )
+        .unwrap();
+        assert_eq!(rows.get(), 3);
+        assert_eq!(sw.ledger().delivered(), Some(0), "nothing was sent");
+        sw.enqueued(Err(io::Error::new(io::ErrorKind::TimedOut, "aborted")));
+        assert_eq!(sw.ledger().delivered(), Some(3));
+        for _ in 0..2 {
+            assert_eq!(sw.send_chunk().unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(sw.write(b"x").unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(sw.flush().unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+    }
 
     fn ends() -> (
         Arc<Mutex<Vec<StreamEnd>>>,
@@ -965,23 +1151,9 @@ mod tests {
         usize,
     ) {
         let (signal, outcome) = oneshot::channel();
-        let size = CHUNK * 8 + 17;
+        let size = CHUNK * (CHANNEL_CAP + 4) + 17;
         let producer = tokio::task::spawn_blocking(move || {
-            let mut w = SwitchWriter {
-                buf: Vec::new(),
-                threshold: 100,
-                signal: Some(signal),
-                tx: None,
-                deferred: false,
-                control: None,
-                commit_on_flush: false,
-                timeouts: None,
-                timed: None,
-                held: None,
-                producer_gate: None,
-                #[cfg(test)]
-                queued_producer_gate: None,
-            };
+            let mut w = SwitchWriter::new(100, Some(signal));
             w.write_all(&vec![b'x'; size])?;
             w.send_chunk()
         });
@@ -989,7 +1161,7 @@ mod tests {
             panic!("expected a stream");
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while rx.len() < 4 && !producer.is_finished() {
+            while rx.len() < CHANNEL_CAP && !producer.is_finished() {
                 tokio::task::yield_now().await;
             }
         })
@@ -1001,7 +1173,7 @@ mod tests {
     #[tokio::test]
     async fn a_single_large_write_has_bounded_chunks_and_backpressure() {
         let (mut rx, producer, size) = single_large_write().await;
-        assert_eq!(rx.len(), 4);
+        assert_eq!(rx.len(), CHANNEL_CAP);
         assert!(
             !producer.is_finished(),
             "the full channel must block writes"
@@ -1021,7 +1193,7 @@ mod tests {
     #[tokio::test]
     async fn disconnect_interrupts_a_single_large_write() {
         let (rx, producer, _) = single_large_write().await;
-        assert_eq!(rx.len(), 4);
+        assert_eq!(rx.len(), CHANNEL_CAP);
         assert!(!producer.is_finished());
         drop(rx);
         let error = tokio::time::timeout(std::time::Duration::from_secs(5), producer)
@@ -1092,9 +1264,9 @@ mod tests {
             Default::default(),
             Some(Duration::from_millis(150)),
         );
-        // The switch sends the first 101 bytes and three full chunks fill the channel of
-        // four, so the budget cuts the next chunk halfway while the channel is full.
-        let sent = 101 + (CHUNK * 3) as u64;
+        // The switch sends the first 101 bytes and `CHANNEL_CAP - 1` full chunks fill the
+        // channel, so the budget cuts the next chunk halfway while the channel is full.
+        let sent = 101 + (CHUNK * (CHANNEL_CAP - 1)) as u64;
         let limit = sent + (CHUNK / 2) as u64;
         let started = Instant::now();
         let Ok(Serialized::Streamed(body)) = serialize_inner(
@@ -1240,6 +1412,127 @@ mod tests {
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1);
         assert!(matches!(seen[0].error, Some(Error::Cancelled)));
+    }
+
+    /// A cursor graph written in Turtle or N-Triples keeps the kind of the I/O error that
+    /// stops it, so a deadline that passes mid-stream is reported as a timeout and a
+    /// cancellation as a cancellation, as in the other graph writers. The failure comes
+    /// after the first batch's flush, at the first write after it, which the serializer
+    /// makes while it writes a later statement.
+    #[tokio::test]
+    async fn a_cursor_graph_stream_is_classified_by_the_error_that_stops_it() {
+        use sparkles::sparql::results as res;
+        /// Trips the failure at its first write after a flush.
+        struct Trip<'w> {
+            inner: &'w mut LimitedWriter<SwitchWriter>,
+            flushed: bool,
+            trip: Option<Box<dyn FnOnce() + 'w>>,
+        }
+        impl Write for Trip<'_> {
+            fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+                if self.flushed
+                    && let Some(trip) = self.trip.take()
+                {
+                    trip();
+                }
+                self.inner.write(b)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                self.flushed = true;
+                self.inner.flush()
+            }
+        }
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let data = (0..5000)
+            .map(|i| format!("<urn:s:{i}> <urn:p> \"value {i}\" .\n"))
+            .collect::<String>();
+        store
+            .load(&[sparkles::io::Source::from_bytes(
+                data.into_bytes(),
+                oxrdfio::RdfFormat::NTriples,
+                None,
+            )])
+            .unwrap();
+        for format in [oxrdfio::RdfFormat::Turtle, oxrdfio::RdfFormat::NTriples] {
+            for timeout in [true, false] {
+                let (seen, on_end) = ends();
+                let cancel = Arc::new(AtomicBool::new(false));
+                // the deadline has passed, and a pause too long to represent holds it off
+                // until the trip clears the pause
+                let pause = Arc::new(AtomicU64::new(u64::MAX));
+                let control = StreamControl::new(
+                    cancel.clone(),
+                    timeout.then(Instant::now),
+                    pause.clone(),
+                    None,
+                );
+                let mut cursor = sparkles::sparql::graph_cursor(
+                    store.snapshot(),
+                    "CONSTRUCT { ?s <urn:q> ?o } WHERE { ?s <urn:p> ?o }",
+                    &Default::default(),
+                    &sparkles::sparql::CursorOptions {
+                        batch_rows: 100,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+                let taken = Arc::new(AtomicU64::new(0));
+                let tripped = Arc::new(AtomicBool::new(false));
+                let (taken_in, tripped_in) = (taken.clone(), tripped.clone());
+                let write = move |w: &mut LimitedWriter<SwitchWriter>| {
+                    // the response switches to streaming before the graph is written
+                    w.write_all(&[b'#'; 200])?;
+                    w.write_all(b"\n")?;
+                    let rows = res::RowCount::with_ledger(w.get_ref().ledger());
+                    let mut trip = Trip {
+                        inner: w,
+                        flushed: false,
+                        trip: Some(Box::new(move || {
+                            tripped_in.store(true, Ordering::Relaxed);
+                            if timeout {
+                                pause.store(0, Ordering::Relaxed);
+                            } else {
+                                cancel.store(true, Ordering::Relaxed);
+                            }
+                        })),
+                    };
+                    let written = res::write(
+                        res::Source::Graph(&mut cursor),
+                        res::WriteOptions::new(res::Format::Rdf(format), &rows),
+                        &mut trip,
+                    );
+                    taken_in.store(rows.get(), Ordering::Relaxed);
+                    written.map(|_| ())
+                };
+                let Ok(Serialized::Streamed(body)) =
+                    serialize_inner(100, false, None, Some(control), write, on_end).await
+                else {
+                    panic!("expected a stream");
+                };
+                assert!(axum::body::to_bytes(body, usize::MAX).await.is_err());
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 1);
+                let error = &seen[0].error;
+                if timeout {
+                    assert!(
+                        matches!(error, Some(Error::Timeout)),
+                        "{format:?}: {error:?}"
+                    );
+                } else {
+                    assert!(
+                        matches!(error, Some(Error::Cancelled)),
+                        "{format:?}: {error:?}"
+                    );
+                }
+                // the first batch was written and flushed, and the failure came later
+                assert!(tripped.load(Ordering::Relaxed), "{format:?} {timeout}");
+                let taken = taken.load(Ordering::Relaxed);
+                assert!(
+                    (100..5000).contains(&taken),
+                    "{format:?} {timeout}: {taken}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1464,7 +1757,7 @@ mod timed_tests {
         let (send, end) = oneshot::channel();
         let control = StreamControl::new(Default::default(), None, Default::default(), None);
         // as in the untimed test, the budget cuts a chunk while the channel is full
-        let sent = 101 + (CHUNK * 3) as u64;
+        let sent = 101 + (CHUNK * (CHANNEL_CAP - 1)) as u64;
         let limit = sent + (CHUNK / 2) as u64;
         let result = serialize_inner_timed(
             100,
@@ -1517,10 +1810,58 @@ mod timed_tests {
                 .contains("producer stopped unexpectedly")
         );
     }
+    /// A handler that went away before the switch to streaming leaves the timed handoff
+    /// failed and the body uncommitted, so its report gives no rows, though the writer
+    /// recorded its rows in the ledger.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_handoff_reports_no_rows() {
+        use sparkles::sparql::results as res;
+        let store = sparkles::store::Store::in_memory(Default::default());
+        let r = sparkles::sparql::query(
+            store.snapshot(),
+            "SELECT ?x WHERE { VALUES ?x { 1 2 3 } }",
+            &Default::default(),
+        )
+        .unwrap();
+        let (gate_tx, gate) = std::sync::mpsc::channel::<()>();
+        let release = Release(Some(gate_tx));
+        let (send, end) = oneshot::channel();
+        let mut serialized = Box::pin(serialize_inner_timed(
+            1,
+            false,
+            None,
+            None,
+            Some(timeouts()),
+            move |w: &mut LimitedWriter<SwitchWriter>| {
+                let _ = gate.recv();
+                let rows = res::RowCount::with_ledger(w.get_ref().ledger());
+                res::write(
+                    res::Source::Result(&r),
+                    res::WriteOptions::new(
+                        res::Format::Solutions(res::SolutionsFormat::Tsv),
+                        &rows,
+                    ),
+                    w,
+                )
+                .map(|_| ())
+            },
+            move |e| {
+                let _ = send.send(e);
+            },
+        ));
+        // the producer starts and waits at the gate, and the handler goes away
+        assert!(futures_util::poll!(serialized.as_mut()).is_pending());
+        drop(serialized);
+        drop(release);
+        let report = ended(end).await;
+        assert!(report.error.is_some());
+        assert!(!report.committed);
+        assert_eq!(report.rows, None);
+    }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn dropped_body_cancels_and_joins_producer_timer() {
         let (body, _, end) = timed(timeouts(), None, |w| {
-            w.write_all(&[b'x'; 1 << 20])?;
+            w.write_all(&vec![b'x'; CHUNK * (CHANNEL_CAP + 4)])?;
             Ok(())
         })
         .await;

@@ -1,0 +1,63 @@
+<trix xmlns="http://www.w3.org/2004/03/trix/trix-1/">
+  <graph>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <typedLiteral datatype="http://www.w3.org/2001/XMLSchema#boolean">true</typedLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <typedLiteral datatype="http://www.w3.org/2001/XMLSchema#integer">42</typedLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <id>b0</id>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <plainLiteral>   </plainLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <plainLiteral>  lead and trail  </plainLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <typedLiteral datatype="http://www.w3.org/2001/XMLSchema#integer">+7</typedLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <typedLiteral datatype="http://www.w3.org/2001/XMLSchema#decimal">-0.50</typedLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <typedLiteral datatype="http://www.w3.org/2001/XMLSchema#double">1.0E3</typedLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <plainLiteral>]]&gt; &lt;&amp;&gt; ' "x"</plainLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <typedLiteral datatype="http://www.w3.org/2001/XMLSchema#integer">abc</typedLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:o</uri>
+      <uri>urn:ex:q</uri>
+      <plainLiteral>after
+o</plainLiteral>
+    </triple>
+    <triple>
+      <uri>urn:ex:s1</uri>
+      <uri>urn:ex:p</uri>
+      <plainLiteral>
+!ERROR: I/O error: TriX (XML 1.0) cannot hold the character U+0001

@@ -1,0 +1,2 @@
+@prefix ex: <urn:ex:> .
+ex:o ex:q "after\no" .

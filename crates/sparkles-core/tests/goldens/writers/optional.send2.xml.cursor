@@ -1,0 +1,2 @@
+<?xml version="1.0"?><sparql xmlns="http://www.w3.org/2005/sparql-results#"><head><variable name="s"/><variable name="élan"/><variable name="y"/></head><results><result><binding name="s"><uri>urn:ex:s1</uri></binding><binding name="élan"><bnode>b0</bnode></binding><binding name="y"><uri>urn:ex:s1</uri></binding></result><result><binding name="s"><uri>urn:ex:s1</uri></binding><binding name="élan"><uri>urn:ex:o</uri></binding><binding name="y"><literal>after
+o</literal></binding></result></results></sparql>

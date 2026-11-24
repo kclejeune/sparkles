@@ -29,9 +29,6 @@ pub struct Consumer {
     /// reads. A query that asked for no mode runs eagerly, and one that asked for a
     /// cursor or for automatic execution is refused.
     pub in_transaction: bool,
-    /// The answer's format has a cursor writer. SPARQL Results Thrift does not, so
-    /// automatic execution runs eagerly for it.
-    pub cursor_format: bool,
     /// The query has initial bindings, which rule out every automatic plan, so automatic
     /// execution runs eagerly.
     pub initial_bindings: bool,
@@ -46,7 +43,6 @@ impl Default for Consumer {
             plan: false,
             whole_result: false,
             in_transaction: false,
-            cursor_format: true,
             initial_bindings: false,
         }
     }
@@ -143,7 +139,7 @@ pub fn choose_execution(consumer: &Consumer) -> Result<ExecutionMode, PolicyErro
         }
         None => consumer.default,
     };
-    if mode == ExecutionMode::Auto && (!consumer.cursor_format || consumer.initial_bindings) {
+    if mode == ExecutionMode::Auto && consumer.initial_bindings {
         return Ok(ExecutionMode::Eager);
     }
     Ok(mode)
@@ -156,41 +152,38 @@ mod tests {
 
     const MODES: [Option<ExecutionMode>; 4] = [None, Some(Eager), Some(Streaming), Some(Auto)];
 
-    /// The HTTP rules before the policy moved into core: the parameter, or the server's
-    /// default, and automatic execution kept eager for Thrift and for initial bindings.
-    fn http_before(
+    /// The HTTP rules: the parameter, or the server's default, and automatic execution
+    /// kept eager for initial bindings. SPARQL Results Thrift has a cursor writer, so the
+    /// answer's format plays no part.
+    fn http_rule(
         requested: Option<ExecutionMode>,
         default: ExecutionMode,
-        thrift: bool,
         bindings: bool,
     ) -> ExecutionMode {
         let execution = requested.unwrap_or(default);
         if execution == Streaming {
             return Streaming;
         }
-        let auto = execution == Auto && !thrift && !bindings;
+        let auto = execution == Auto && !bindings;
         if auto { Auto } else { Eager }
     }
 
     #[test]
-    fn http_chooses_as_before() {
+    fn http_chooses_by_mode_and_bindings() {
         for requested in MODES {
             for default in [Eager, Auto] {
-                for thrift in [false, true] {
-                    for bindings in [false, true] {
-                        let consumer = Consumer {
-                            requested,
-                            default,
-                            cursor_format: !thrift,
-                            initial_bindings: bindings,
-                            ..Consumer::default()
-                        };
-                        assert_eq!(
-                            choose_execution(&consumer),
-                            Ok(http_before(requested, default, thrift, bindings)),
-                            "{consumer:?}"
-                        );
-                    }
+                for bindings in [false, true] {
+                    let consumer = Consumer {
+                        requested,
+                        default,
+                        initial_bindings: bindings,
+                        ..Consumer::default()
+                    };
+                    assert_eq!(
+                        choose_execution(&consumer),
+                        Ok(http_rule(requested, default, bindings)),
+                        "{consumer:?}"
+                    );
                 }
             }
         }

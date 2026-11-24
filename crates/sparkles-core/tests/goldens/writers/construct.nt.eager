@@ -1,0 +1,23 @@
+<urn:ex:s1> <urn:ex:p> "true"^^<http://www.w3.org/2001/XMLSchema#boolean> .
+<urn:ex:s1> <urn:ex:p> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:ex:s1> <urn:ex:p> _:b0 .
+<urn:ex:s1> <urn:ex:p> "   " .
+<urn:ex:s1> <urn:ex:p> "  lead and trail  " .
+<urn:ex:s1> <urn:ex:p> "+7"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:ex:s1> <urn:ex:p> "-0.50"^^<http://www.w3.org/2001/XMLSchema#decimal> .
+<urn:ex:s1> <urn:ex:p> "1.0E3"^^<http://www.w3.org/2001/XMLSchema#double> .
+<urn:ex:s1> <urn:ex:p> "]]> <&> ' \"x\"" .
+<urn:ex:s1> <urn:ex:p> "abc"^^<http://www.w3.org/2001/XMLSchema#integer> .
+<urn:ex:o> <urn:ex:q> "after\no" .
+<urn:ex:s1> <urn:ex:p> "ctl\u0001\u001F\u007F" .
+<urn:ex:s1> <urn:ex:p> "en"@en .
+<urn:ex:s1> <urn:ex:p> "plain" .
+<urn:ex:s1> <urn:ex:p> "quote\" back\\ nl\n tab\t cr\r end" .
+<urn:ex:s1> <urn:ex:p> "rtl"@ar--rtl .
+<urn:ex:s1> <urn:ex:p> "x"^^<urn:ex:dt> .
+<urn:ex:s1> <urn:ex:p> "😀 é ü" .
+<urn:ex:s1> <urn:ex:p> "" .
+<urn:ex:s1> <urn:ex:p> <<( <urn:ex:a> <urn:ex:b> "t,\"q\"" )>> .
+<urn:ex:s1> <urn:ex:p> <urn:ex:o> .
+_:b0 <urn:ex:q> <urn:ex:s1> .
+<urn:ex:s1> <urn:ex:p> "2024-01-01"^^<http://www.w3.org/2001/XMLSchema#date> .

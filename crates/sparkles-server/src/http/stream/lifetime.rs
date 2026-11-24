@@ -184,25 +184,31 @@ impl Shared {
             None
         }
     }
-    fn arm(&self, state: &mut State, now: Instant) -> Option<AbortAction> {
+    fn arm(&self, state: &mut State, now: Instant) -> (Option<AbortAction>, bool) {
         let ready =
             state.producer_finished || state.receiver.as_ref().is_some_and(|r| !r.is_empty());
         if ready && state.idle_at.is_none() {
             match now.checked_add(self.timeouts.idle) {
-                Some(at) => state.idle_at = Some(at),
+                Some(at) => {
+                    state.idle_at = Some(at);
+                    return (None, true);
+                }
                 None => {
-                    return Self::abort_locked(
-                        state,
-                        &sparkles::Error::Io(io::Error::other(
-                            "response idle deadline is not representable",
-                        )),
+                    return (
+                        Self::abort_locked(
+                            state,
+                            &sparkles::Error::Io(io::Error::other(
+                                "response idle deadline is not representable",
+                            )),
+                        ),
+                        false,
                     );
                 }
             }
         } else if !ready {
             state.idle_at = None;
         }
-        None
+        (None, false)
     }
     fn failure_io(state: &State) -> io::Error {
         let kind = match state.failure.as_ref() {
@@ -353,17 +359,17 @@ impl Producer {
             return Err(error);
         }
         let result = tx.try_send(item);
-        let action = if result.is_ok() {
+        let (action, wake_timer) = if result.is_ok() {
             self.shared.arm(&mut state, Instant::now())
         } else {
-            None
+            (None, false)
         };
         drop(state);
         self.shared.complete_abort(action);
-        self.shared.changed.notify_one();
-        if result.is_ok() {
-            self.check()?;
+        if wake_timer {
+            self.shared.changed.notify_one();
         }
+        // the caller checks after it has counted the enqueued chunk
         Ok(result)
     }
     pub(super) fn permit_send(
@@ -380,11 +386,14 @@ impl Producer {
             return Err(error);
         }
         permit.send(item);
-        let action = self.shared.arm(&mut state, Instant::now());
+        let (action, wake_timer) = self.shared.arm(&mut state, Instant::now());
         drop(state);
         self.shared.complete_abort(action);
-        self.shared.changed.notify_one();
-        self.check()
+        if wake_timer {
+            self.shared.changed.notify_one();
+        }
+        // the caller checks after it has counted the enqueued chunk
+        Ok(())
     }
     pub(super) fn record_error(&self, error: &sparkles::Error) {
         Shared::remember(&mut self.shared.state.lock(), error);
@@ -397,7 +406,7 @@ impl Producer {
             }
             state.producer_finished = true;
             let waker = state.waker.take();
-            let action = self.shared.arm(&mut state, Instant::now());
+            let (action, _) = self.shared.arm(&mut state, Instant::now());
             drop(state);
             self.shared.complete_abort(action);
             if let Some(waker) = waker {
@@ -514,13 +523,25 @@ impl Stream for Receiver {
                 .poll_recv(cx)
             {
                 Poll::Ready(Some(item)) => {
+                    let prev_idle = state.idle_at;
                     if item.as_ref().is_ok_and(|bytes| !bytes.is_empty()) {
                         state.idle_at = None;
                     }
-                    let action = this.shared.arm(&mut state, Instant::now());
+                    let (action, _) = this.shared.arm(&mut state, Instant::now());
+                    // Only wake the timer when an idle deadline becomes armed or moves
+                    // earlier. Extending an already-armed deadline needs no wakeup
+                    // because `Shared::timer` re-reads `state.idle_at` on expiry and
+                    // sleeps until the updated deadline.
+                    let wake_timer = match (prev_idle, state.idle_at) {
+                        (None, Some(_)) => true,
+                        (Some(prev), Some(next)) => next < prev,
+                        _ => false,
+                    };
                     drop(state);
                     this.shared.complete_abort(action);
-                    this.shared.changed.notify_one();
+                    if wake_timer {
+                        this.shared.changed.notify_one();
+                    }
                     return Poll::Ready(Some(item));
                 }
                 Poll::Ready(None) if state.producer_finished => {
@@ -543,9 +564,12 @@ impl Stream for Receiver {
         if matches!(result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
             this.done = true;
         }
+        let wake_timer = state.terminal_requested || state.aborted;
         drop(state);
         this.shared.complete_abort(action);
-        this.shared.changed.notify_one();
+        if wake_timer {
+            this.shared.changed.notify_one();
+        }
         result
     }
 }
@@ -602,7 +626,7 @@ mod tests {
             let (shared, tx) = shared(timeouts());
             tx.try_send(Ok(axum::body::Bytes::from_static(b"queued")))
                 .unwrap();
-            let action = shared.arm(&mut shared.state.lock(), Instant::now());
+            let (action, _) = shared.arm(&mut shared.state.lock(), Instant::now());
             shared.complete_abort(action);
             let timer = tokio::spawn(shared.clone().timer());
             tokio::time::advance(Duration::from_secs(10)).await;
@@ -725,6 +749,8 @@ mod tests {
                             serialize_ms: 0.0,
                             error: Some(error),
                             disconnected: false,
+                            rows: None,
+                            committed: true,
                         },
                     )
                 }),
@@ -1032,7 +1058,7 @@ mod tests {
         });
         tx.try_send(Ok(axum::body::Bytes::from_static(b"ready")))
             .unwrap();
-        let action = shared.arm(&mut shared.state.lock(), Instant::now());
+        let (action, _) = shared.arm(&mut shared.state.lock(), Instant::now());
         shared.complete_abort(action);
         assert!(shared.state.lock().aborted);
         assert!(matches!(
@@ -1084,7 +1110,7 @@ mod tests {
         let (shared, tx) = shared(timeouts());
         tx.try_send(Ok(axum::body::Bytes::from_static(b"ready")))
             .unwrap();
-        let action = shared.arm(&mut shared.state.lock(), Instant::now());
+        let (action, _) = shared.arm(&mut shared.state.lock(), Instant::now());
         shared.complete_abort(action);
         let timer = tokio::spawn(shared.clone().timer());
         tokio::time::advance(Duration::from_secs(10)).await;
@@ -1119,7 +1145,7 @@ mod tests {
         let (shared, tx) = shared(timeouts());
         drop(tx);
         shared.state.lock().producer_finished = true;
-        let action = shared.arm(&mut shared.state.lock(), Instant::now());
+        let (action, _) = shared.arm(&mut shared.state.lock(), Instant::now());
         shared.complete_abort(action);
         let timer = tokio::spawn(shared.clone().timer());
         tokio::time::advance(Duration::from_secs(10)).await;
@@ -1158,7 +1184,7 @@ mod tests {
         tx.try_send(Ok(axum::body::Bytes::from_static(b"ready")))
             .unwrap();
         let start = Instant::now();
-        assert!(shared.arm(&mut shared.state.lock(), start).is_none());
+        assert!(shared.arm(&mut shared.state.lock(), start).0.is_none());
         let mut receiver = Receiver {
             shared: shared.clone(),
             done: false,
@@ -1194,6 +1220,7 @@ mod tests {
             assert!(
                 shared
                     .arm(&mut shared.state.lock(), Instant::now())
+                    .0
                     .is_none()
             );
             tokio::time::advance(Duration::from_secs(8)).await;
@@ -1202,6 +1229,140 @@ mod tests {
         }
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(receiver.next().await.unwrap().is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn steady_chunks_and_full_channel_do_not_wake_timer() {
+        use futures_util::StreamExt;
+        let (shared, tx) = shared(timeouts());
+        let producer = Producer {
+            shared: shared.clone(),
+            task: None,
+            runtime: tokio::runtime::Handle::current(),
+            held: None,
+            wait_ns: None,
+            published: true,
+        };
+        let mut receiver = Receiver {
+            shared: shared.clone(),
+            done: false,
+        };
+        async fn take_notify(shared: &Shared) -> bool {
+            let notified = shared.changed.notified();
+            tokio::pin!(notified);
+            futures_util::poll!(notified).is_ready()
+        }
+
+        assert!(
+            producer
+                .try_send(&tx, Ok(axum::body::Bytes::from_static(b"c1")))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            take_notify(&shared).await,
+            "initial arm must wake the timer"
+        );
+
+        for chunk in [b"c2", b"c3", b"c4"] {
+            assert!(
+                producer
+                    .try_send(&tx, Ok(axum::body::Bytes::from_static(chunk)))
+                    .unwrap()
+                    .is_ok()
+            );
+            assert!(
+                !take_notify(&shared).await,
+                "already-armed try_send must not wake the timer"
+            );
+        }
+        assert!(matches!(
+            producer
+                .try_send(&tx, Ok(axum::body::Bytes::from_static(b"full")))
+                .unwrap(),
+            Err(mpsc::error::TrySendError::Full(_))
+        ));
+        assert!(
+            !take_notify(&shared).await,
+            "Err(Full) must not wake the timer"
+        );
+
+        tokio::time::advance(Duration::from_secs(3)).await;
+        let before = shared.state.lock().idle_at;
+        assert_eq!(receiver.next().await.unwrap().unwrap(), b"c1"[..]);
+        assert!(shared.state.lock().idle_at > before);
+        assert!(
+            !take_notify(&shared).await,
+            "extending an already-armed idle deadline must not wake the timer"
+        );
+
+        let permit = tx.reserve().await.unwrap();
+        producer
+            .permit_send(permit, Ok(axum::body::Bytes::from_static(b"c5")))
+            .unwrap();
+        assert!(
+            !take_notify(&shared).await,
+            "already-armed permit_send must not wake the timer"
+        );
+
+        for expected in [&b"c2"[..], &b"c3"[..], &b"c4"[..], &b"c5"[..]] {
+            assert_eq!(receiver.next().await.unwrap().unwrap(), expected);
+            assert!(!take_notify(&shared).await);
+        }
+        assert!(shared.state.lock().idle_at.is_none());
+
+        assert!(
+            producer
+                .try_send(&tx, Ok(axum::body::Bytes::from_static(b"c6")))
+                .unwrap()
+                .is_ok()
+        );
+        assert!(
+            take_notify(&shared).await,
+            "re-arming after an empty queue must wake the timer"
+        );
+        receiver.done = true;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_idle_extension_resleeps_and_expires_at_new_deadline() {
+        use futures_util::StreamExt;
+        let (shared, tx) = shared(timeouts());
+        tx.try_send(Ok(axum::body::Bytes::from_static(b"c1")))
+            .unwrap();
+        tx.try_send(Ok(axum::body::Bytes::from_static(b"c2")))
+            .unwrap();
+        let (action, wake) = shared.arm(&mut shared.state.lock(), Instant::now());
+        assert!(action.is_none() && wake);
+        let timer = tokio::spawn(shared.clone().timer());
+        let mut receiver = Receiver {
+            shared: shared.clone(),
+            done: false,
+        };
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        assert_eq!(receiver.next().await.unwrap().unwrap(), b"c1"[..]);
+
+        // Past the original 10s deadline: the timer wakes, observes the extended 15s
+        // deadline, and goes back to sleep without aborting.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(!shared.state.lock().aborted);
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        tokio::task::yield_now().await;
+        assert!(!shared.state.lock().aborted);
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        timer.await.unwrap();
+        assert!(shared.state.lock().aborted);
+        assert!(matches!(
+            shared.state.lock().failure,
+            Some(sparkles::Error::Timeout)
+        ));
+        assert!(tx.is_closed());
+        receiver.done = true;
     }
 
     #[tokio::test(start_paused = true)]
