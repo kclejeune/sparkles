@@ -1271,8 +1271,8 @@ fn tier_neutral(ax: &AxiomKind) -> bool {
             Entity::ObjectProperty(p) if *p == ObjectProperty::top() || *p == ObjectProperty::bottom()
         ),
         AxiomKind::SubClassOf(a, b) => plain(a) && plain(b),
-        AxiomKind::EquivalentClasses(cs) | AxiomKind::DisjointClasses(cs) => cs.iter().all(plain),
-        AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
+        AxiomKind::EquivalentClasses(cs) => cs.iter().all(plain),
+        AxiomKind::DisjointClasses(cs) | AxiomKind::DisjointUnion(_, cs) => cs.iter().all(plain),
         AxiomKind::ObjectPropertyDomain(p, c) => named(p) && plain(c),
         _ => false,
     }

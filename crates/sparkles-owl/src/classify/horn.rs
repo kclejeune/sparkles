@@ -1708,7 +1708,9 @@ impl Norm<'_> {
                 }
                 Ok(())
             }
-            K::DisjointUnion(c, ds) if ds.len() <= 1 => {
+            K::DisjointUnion(c, ds)
+                if ds.is_empty() || ds.iter().all(|d| d == &ds.as_slice()[0]) =>
+            {
                 let d = ds
                     .iter()
                     .next()
@@ -1716,7 +1718,11 @@ impl Norm<'_> {
                     .unwrap_or(C::Class(Class::nothing()));
                 let c = C::Class(c.clone());
                 self.sub(vec![c.clone()], vec![d.clone()])?;
-                self.sub(vec![d], vec![c])
+                self.sub(vec![d], vec![c])?;
+                if ds.len() >= 2 {
+                    self.axiom(&K::DisjointClasses(ds.clone()))?;
+                }
+                Ok(())
             }
             K::ObjectPropertyDomain(p, c) => self.sub(
                 vec![C::ObjectSomeValuesFrom(
@@ -1773,10 +1779,11 @@ impl Norm<'_> {
                     .iter()
                     .map(|p| self.simple_role(p))
                     .collect::<Result<Vec<_>, _>>()?;
-                for &a in &rs {
-                    for &b in &rs {
+                for (i, &a) in rs.iter().enumerate() {
+                    for &b in &rs[i + 1..] {
+                        self.out.clash.push((a, b));
                         if a != b {
-                            self.out.clash.push((a, b));
+                            self.out.clash.push((b, a));
                         }
                     }
                 }

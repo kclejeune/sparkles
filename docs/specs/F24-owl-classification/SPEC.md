@@ -205,6 +205,19 @@ axiom can equal an axiom that the ontology states unchanged or the rewriting of 
 axiom, so the report of the axioms left out now names every original axiom that a left-out
 rewritten axiom stands for, and names each original once for each kind of gap.
 
+Item 1314 preserves repeated operands in disjointness and inequality axioms at parsing and
+model construction. `DisjointClasses`, `DisjointUnion`, `DisjointObjectProperties`,
+`DisjointDataProperties` and `DifferentIndividuals` now store their operands in a sorted
+`Multiset<T>` instead of a `BTreeSet<T>`, so structural equality, ordering, hashing and
+serialized output remain order-independent while duplicate occurrences are kept across the
+functional-style, RDF, Manchester and JSON readers, writers and public constructors.
+Equivalences, unions, intersections and `SameIndividual` keep `BTreeSet` deduplication.
+Classification forces repeated class operands empty in `DisjointClasses` and
+`DisjointUnion`, marks repeated properties empty in `DisjointObjectProperties` and
+`DisjointDataProperties`, and derives inconsistency for repeated individuals in
+`DifferentIndividuals` with rooted rules off and on, while preserving round-tripping,
+annotations and original-axiom diagnostics.
+
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
 1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`

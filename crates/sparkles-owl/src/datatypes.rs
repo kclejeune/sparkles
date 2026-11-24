@@ -1115,7 +1115,8 @@ impl<'a> Literals<'a> {
                 self.class(a);
                 self.class(b);
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
+            K::EquivalentClasses(cs) => cs.iter().for_each(|c| self.class(c)),
+            K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
                 cs.iter().for_each(|c| self.class(c))
             }
             K::ObjectPropertyDomain(_, c)

@@ -712,9 +712,12 @@ impl Opened {
         use AxiomKind as K;
         let opts = &*crate::overview::one_deadline(opts)?;
         for (ax, origins) in &self.ontology.axioms {
-            if let K::SameIndividual(set) | K::DifferentIndividuals(set) = &ax.kind
-                && set.contains(i)
-            {
+            let matches_i = match &ax.kind {
+                K::SameIndividual(set) => set.contains(i),
+                K::DifferentIndividuals(bag) => bag.contains(i),
+                _ => false,
+            };
+            if matches_i {
                 for g in origin_graphs(origins) {
                     if !f(ax.clone(), g)? {
                         return Ok(());

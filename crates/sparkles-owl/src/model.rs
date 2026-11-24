@@ -1,14 +1,126 @@
 //! The OWL 2 structural specification as Rust values: entities, property and class
 //! expressions, data ranges, axioms, annotations and the ontology header.
 //!
-//! Abstract classes of the specification are enums and n-ary operands are sets, so two
-//! values are equal exactly when the specification calls them structurally equivalent.
-//! Sets are `BTreeSet`s, which also gives every value a stable order for output.
+//! Abstract classes of the specification are enums and n-ary operands are sets (or sorted
+//! [`Multiset`]s for disjointness and inequality axioms, where repeated operands constrain
+//! the repeated member rather than collapsing), so two values are equal exactly when the
+//! specification calls them structurally equivalent and every value has a stable order for
+//! output.
 
 use crate::vocab;
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
+
+/// A canonical, order-independent multiset of operands.
+///
+/// Elements are kept in sorted order so structural equality, ordering, hashing and
+/// serialized output do not depend on input order, while repeated occurrences are
+/// preserved. Disjointness and inequality axioms use this instead of `BTreeSet` because
+/// repeating an operand (such as `DisjointClasses(:A :A)` or `DisjointUnion(:C :A :A)`)
+/// carries logical meaning that deduplication would lose.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Multiset<T>(Vec<T>);
+
+impl<T> Multiset<T> {
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.0.iter()
+    }
+
+    pub fn as_slice(&self) -> &[T] {
+        &self.0
+    }
+
+    pub fn into_vec(self) -> Vec<T> {
+        self.0
+    }
+}
+
+impl<T: Ord> Multiset<T> {
+    pub fn insert(&mut self, value: T) {
+        let pos = match self.0.binary_search(&value) {
+            Ok(i) | Err(i) => i,
+        };
+        self.0.insert(pos, value);
+    }
+
+    pub fn contains(&self, value: &T) -> bool {
+        self.0.binary_search(value).is_ok()
+    }
+
+    pub fn count(&self, value: &T) -> usize {
+        let start = self.0.partition_point(|x| x < value);
+        let end = self.0.partition_point(|x| x <= value);
+        end - start
+    }
+}
+
+impl<T: Eq> Multiset<T> {
+    pub fn has_duplicates(&self) -> bool {
+        self.0.windows(2).any(|w| w[0] == w[1])
+    }
+}
+
+impl<T: Ord> From<Vec<T>> for Multiset<T> {
+    fn from(mut values: Vec<T>) -> Self {
+        values.sort();
+        Self(values)
+    }
+}
+
+impl<T: Ord, const N: usize> From<[T; N]> for Multiset<T> {
+    fn from(values: [T; N]) -> Self {
+        Self::from(Vec::from(values))
+    }
+}
+
+impl<T> From<BTreeSet<T>> for Multiset<T> {
+    fn from(values: BTreeSet<T>) -> Self {
+        Self(values.into_iter().collect())
+    }
+}
+
+impl<T: Ord> FromIterator<T> for Multiset<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<Vec<_>>())
+    }
+}
+
+impl<T> IntoIterator for Multiset<T> {
+    type Item = T;
+    type IntoIter = std::vec::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Multiset<T> {
+    type Item = &'a T;
+    type IntoIter = std::slice::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T> AsRef<[T]> for Multiset<T> {
+    fn as_ref(&self) -> &[T] {
+        &self.0
+    }
+}
 
 /// An IRI.
 pub type Iri = oxrdf::NamedNode;
@@ -560,12 +672,12 @@ pub enum AxiomKind {
 
     SubClassOf(ClassExpression, ClassExpression),
     EquivalentClasses(BTreeSet<ClassExpression>),
-    DisjointClasses(BTreeSet<ClassExpression>),
-    DisjointUnion(Class, BTreeSet<ClassExpression>),
+    DisjointClasses(Multiset<ClassExpression>),
+    DisjointUnion(Class, Multiset<ClassExpression>),
 
     SubObjectPropertyOf(SubObjectPropertyExpression, ObjectPropertyExpression),
     EquivalentObjectProperties(BTreeSet<ObjectPropertyExpression>),
-    DisjointObjectProperties(BTreeSet<ObjectPropertyExpression>),
+    DisjointObjectProperties(Multiset<ObjectPropertyExpression>),
     InverseObjectProperties(ObjectPropertyExpression, ObjectPropertyExpression),
     ObjectPropertyDomain(ObjectPropertyExpression, ClassExpression),
     ObjectPropertyRange(ObjectPropertyExpression, ClassExpression),
@@ -579,7 +691,7 @@ pub enum AxiomKind {
 
     SubDataPropertyOf(DataProperty, DataProperty),
     EquivalentDataProperties(BTreeSet<DataProperty>),
-    DisjointDataProperties(BTreeSet<DataProperty>),
+    DisjointDataProperties(Multiset<DataProperty>),
     DataPropertyDomain(DataProperty, ClassExpression),
     DataPropertyRange(DataProperty, DataRange),
     FunctionalDataProperty(DataProperty),
@@ -592,7 +704,7 @@ pub enum AxiomKind {
     ),
 
     SameIndividual(BTreeSet<Individual>),
-    DifferentIndividuals(BTreeSet<Individual>),
+    DifferentIndividuals(Multiset<Individual>),
     ClassAssertion(ClassExpression, Individual),
     ObjectPropertyAssertion(ObjectPropertyExpression, Individual, Individual),
     NegativeObjectPropertyAssertion(ObjectPropertyExpression, Individual, Individual),
@@ -846,6 +958,24 @@ impl Axiom {
 
     pub fn disjoint_classes(cs: impl IntoIterator<Item = ClassExpression>) -> Axiom {
         AxiomKind::DisjointClasses(cs.into_iter().collect()).into()
+    }
+
+    pub fn disjoint_union(c: Class, cs: impl IntoIterator<Item = ClassExpression>) -> Axiom {
+        AxiomKind::DisjointUnion(c, cs.into_iter().collect()).into()
+    }
+
+    pub fn disjoint_object_properties(
+        ps: impl IntoIterator<Item = ObjectPropertyExpression>,
+    ) -> Axiom {
+        AxiomKind::DisjointObjectProperties(ps.into_iter().collect()).into()
+    }
+
+    pub fn disjoint_data_properties(ps: impl IntoIterator<Item = DataProperty>) -> Axiom {
+        AxiomKind::DisjointDataProperties(ps.into_iter().collect()).into()
+    }
+
+    pub fn different_individuals(is: impl IntoIterator<Item = Individual>) -> Axiom {
+        AxiomKind::DifferentIndividuals(is.into_iter().collect()).into()
     }
 
     pub fn class_assertion(c: impl Into<ClassExpression>, i: Individual) -> Axiom {
@@ -1109,7 +1239,8 @@ impl Signature {
                 self.ce(a);
                 self.ce(b);
             }
-            K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().for_each(|c| self.ce(c)),
+            K::EquivalentClasses(cs) => cs.iter().for_each(|c| self.ce(c)),
+            K::DisjointClasses(cs) => cs.iter().for_each(|c| self.ce(c)),
             K::DisjointUnion(c, cs) => {
                 self.class(c);
                 cs.iter().for_each(|c| self.ce(c));
@@ -1121,9 +1252,8 @@ impl Signature {
                 }
                 self.ope(sup);
             }
-            K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-                ps.iter().for_each(|p| self.ope(p))
-            }
+            K::EquivalentObjectProperties(ps) => ps.iter().for_each(|p| self.ope(p)),
+            K::DisjointObjectProperties(ps) => ps.iter().for_each(|p| self.ope(p)),
             K::InverseObjectProperties(a, b) => {
                 self.ope(a);
                 self.ope(b);
@@ -1143,9 +1273,8 @@ impl Signature {
                 self.dp(a);
                 self.dp(b);
             }
-            K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
-                ps.iter().for_each(|p| self.dp(p))
-            }
+            K::EquivalentDataProperties(ps) => ps.iter().for_each(|p| self.dp(p)),
+            K::DisjointDataProperties(ps) => ps.iter().for_each(|p| self.dp(p)),
             K::DataPropertyDomain(p, c) => {
                 self.dp(p);
                 self.ce(c);
@@ -1164,9 +1293,8 @@ impl Signature {
                 ops.iter().for_each(|p| self.ope(p));
                 dps.iter().for_each(|p| self.dp(p));
             }
-            K::SameIndividual(is) | K::DifferentIndividuals(is) => {
-                is.iter().for_each(|i| self.ind(i))
-            }
+            K::SameIndividual(is) => is.iter().for_each(|i| self.ind(i)),
+            K::DifferentIndividuals(is) => is.iter().for_each(|i| self.ind(i)),
             K::ClassAssertion(c, i) => {
                 self.ce(c);
                 self.ind(i);

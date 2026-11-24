@@ -189,9 +189,8 @@ fn ax_has_top(k: &AxiomKind) -> bool {
     use AxiomKind as K;
     match k {
         K::SubClassOf(a, b) => ce_has_top(a) || ce_has_top(b),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-            cs.iter().any(ce_has_top)
-        }
+        K::EquivalentClasses(cs) => cs.iter().any(ce_has_top),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().any(ce_has_top),
         K::ClassAssertion(c, _) => ce_has_top(c),
         K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) => is_top(p) || ce_has_top(c),
         K::SubObjectPropertyOf(s, p) => {
@@ -201,9 +200,8 @@ fn ax_has_top(k: &AxiomKind) -> bool {
                     SubObjectPropertyExpression::Chain(qs) => qs.iter().any(is_top),
                 }
         }
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-            ps.iter().any(is_top)
-        }
+        K::EquivalentObjectProperties(ps) => ps.iter().any(is_top),
+        K::DisjointObjectProperties(ps) => ps.iter().any(is_top),
         K::InverseObjectProperties(p, q) => is_top(p) || is_top(q),
         K::FunctionalObjectProperty(p)
         | K::InverseFunctionalObjectProperty(p)
@@ -251,7 +249,7 @@ impl Cx {
     /// disjointness makes the image empty, which the set of images alone would lose.
     fn disjoint(
         &mut self,
-        cs: &BTreeSet<ClassExpression>,
+        cs: &Multiset<ClassExpression>,
     ) -> Result<(BTreeSet<ClassExpression>, Vec<AxiomKind>), ()> {
         let mut images = BTreeSet::new();
         let mut empty = BTreeSet::new();
@@ -325,7 +323,7 @@ impl Cx {
             K::DisjointClasses(cs) => {
                 let (images, mut out) = self.disjoint(cs)?;
                 if images.len() >= 2 {
-                    out.push(K::DisjointClasses(images));
+                    out.push(K::DisjointClasses(images.into()));
                 }
                 return Ok(Rt::New(out));
             }
@@ -334,7 +332,7 @@ impl Cx {
             K::DisjointUnion(c, cs) => {
                 let (images, mut out) = self.disjoint(cs)?;
                 if images.len() >= 2 {
-                    out.push(K::DisjointUnion(c.clone(), images));
+                    out.push(K::DisjointUnion(c.clone(), images.into()));
                 } else if let Some(d) = images.into_iter().next() {
                     let c = ClassExpression::Class(c.clone());
                     if c != d {

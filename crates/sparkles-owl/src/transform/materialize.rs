@@ -127,7 +127,14 @@ pub(crate) fn materialize_with<E>(
             | AxiomKind::DisjointUnion(c, _) => {
                 described.insert(c);
             }
-            AxiomKind::EquivalentClasses(cs) | AxiomKind::DisjointClasses(cs) => {
+            AxiomKind::EquivalentClasses(cs) => {
+                for x in cs {
+                    if let ClassExpression::Class(c) = x {
+                        described.insert(c);
+                    }
+                }
+            }
+            AxiomKind::DisjointClasses(cs) => {
                 for x in cs {
                     if let ClassExpression::Class(c) = x {
                         described.insert(c);

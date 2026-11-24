@@ -943,7 +943,8 @@ fn round_trips(doc: &sparkles_owl::ofn_read::Document) -> bool {
                 ps.len() == 2 || ps.len() > 2 && ps.iter().all(|p| matches!(p, Ope::Property(_)))
             }
             AxiomKind::EquivalentDataProperties(ps) => ps.len() >= 2,
-            AxiomKind::SameIndividual(is) | AxiomKind::DifferentIndividuals(is) => is.len() >= 2,
+            AxiomKind::SameIndividual(is) => is.len() >= 2,
+            AxiomKind::DifferentIndividuals(is) => is.len() >= 2,
             AxiomKind::DisjointClasses(cs) => cs.len() >= 2,
             AxiomKind::DisjointUnion(_, cs) => cs.len() >= 2,
             AxiomKind::DisjointObjectProperties(ps) => ps.len() >= 2,

@@ -93,9 +93,8 @@ pub(super) fn axiom(ax: &Axiom) -> Vec<Broken> {
             sub(a, &mut out);
             sup(b, &mut out);
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
-            cs.iter().for_each(|c| sub(c, &mut out))
-        }
+        K::EquivalentClasses(cs) => cs.iter().for_each(|c| sub(c, &mut out)),
+        K::DisjointClasses(cs) => cs.iter().for_each(|c| sub(c, &mut out)),
         K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(_), _) => out.push(broken(
             AXIOMS,
             "SubObjectPropertyOf with a property chain is not allowed",

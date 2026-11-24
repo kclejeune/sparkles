@@ -1624,18 +1624,12 @@ fn normalize_axiom(
                 .map(|c| ce(c, it, &mut partial))
                 .collect::<Result<_, _>>()?;
             es.sort_unstable();
-            let before = es.len();
-            es.dedup();
-            if es.len() < before {
-                // two operands that normalize to one expression make it unsatisfiable
-                let mut seen = FxHashSet::default();
-                for c in cs {
-                    let e = ce(c, it, &mut partial)?;
-                    if !seen.insert(e) {
-                        out.subs.push((e, BOTTOM));
-                    }
+            for w in es.windows(2) {
+                if w[0] == w[1] {
+                    out.subs.push((w[0], BOTTOM));
                 }
             }
+            es.dedup();
             if es.len() >= 2 {
                 out.disjoint.push(es);
             }
@@ -1921,6 +1915,11 @@ fn normalize_axiom(
             let mut es: Vec<Ex> = is.iter().map(|i| it.individual(i)).collect();
             out.individuals.extend(es.iter().copied());
             es.sort_unstable();
+            for w in es.windows(2) {
+                if w[0] == w[1] {
+                    out.subs.push((w[0], BOTTOM));
+                }
+            }
             es.dedup();
             if es.len() >= 2 {
                 out.disjoint.push(es);

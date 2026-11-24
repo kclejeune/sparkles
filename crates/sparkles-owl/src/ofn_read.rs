@@ -788,6 +788,14 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn individual_multiset(&mut self) -> Result<Multiset<Individual>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.individual()?);
+        }
+        Ok(out.into())
+    }
+
     fn ope(&mut self) -> Result<ObjectPropertyExpression, ParseError> {
         if self.at_keyword("ObjectInverseOf")? {
             self.take()?;
@@ -809,6 +817,14 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn ope_multiset(&mut self) -> Result<Multiset<ObjectPropertyExpression>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.ope()?);
+        }
+        Ok(out.into())
+    }
+
     fn data_property(&mut self) -> Result<DataProperty, ParseError> {
         Ok(DataProperty(self.iri()?))
     }
@@ -819,6 +835,14 @@ impl<'a> Reader<'a> {
             out.insert(self.data_property()?);
         }
         Ok(out)
+    }
+
+    fn data_property_multiset(&mut self) -> Result<Multiset<DataProperty>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.data_property()?);
+        }
+        Ok(out.into())
     }
 
     fn annotation_property(&mut self) -> Result<AnnotationProperty, ParseError> {
@@ -991,6 +1015,14 @@ impl<'a> Reader<'a> {
         Ok(out)
     }
 
+    fn class_expression_multiset(&mut self) -> Result<Multiset<ClassExpression>, ParseError> {
+        let mut out = Vec::new();
+        while !self.at_close()? {
+            out.push(self.class_expression()?);
+        }
+        Ok(out.into())
+    }
+
     // ---- annotations and axioms
 
     fn annotation(&mut self) -> Result<Annotation, ParseError> {
@@ -1063,10 +1095,10 @@ impl<'a> Reader<'a> {
                 K::SubClassOf(a, self.class_expression()?)
             }
             "EquivalentClasses" => K::EquivalentClasses(self.class_expressions()?),
-            "DisjointClasses" => K::DisjointClasses(self.class_expressions()?),
+            "DisjointClasses" => K::DisjointClasses(self.class_expression_multiset()?),
             "DisjointUnion" => {
                 let c = Class(self.iri()?);
-                K::DisjointUnion(c, self.class_expressions()?)
+                K::DisjointUnion(c, self.class_expression_multiset()?)
             }
             "SubObjectPropertyOf" => {
                 let sub = if self.at_keyword("ObjectPropertyChain")? {
@@ -1084,7 +1116,7 @@ impl<'a> Reader<'a> {
                 K::SubObjectPropertyOf(sub, self.ope()?)
             }
             "EquivalentObjectProperties" => K::EquivalentObjectProperties(self.opes()?),
-            "DisjointObjectProperties" => K::DisjointObjectProperties(self.opes()?),
+            "DisjointObjectProperties" => K::DisjointObjectProperties(self.ope_multiset()?),
             "InverseObjectProperties" => {
                 let a = self.ope()?;
                 K::InverseObjectProperties(a, self.ope()?)
@@ -1109,7 +1141,7 @@ impl<'a> Reader<'a> {
                 K::SubDataPropertyOf(a, self.data_property()?)
             }
             "EquivalentDataProperties" => K::EquivalentDataProperties(self.data_properties()?),
-            "DisjointDataProperties" => K::DisjointDataProperties(self.data_properties()?),
+            "DisjointDataProperties" => K::DisjointDataProperties(self.data_property_multiset()?),
             "DataPropertyDomain" => {
                 let p = self.data_property()?;
                 K::DataPropertyDomain(p, self.class_expression()?)
@@ -1134,7 +1166,7 @@ impl<'a> Reader<'a> {
                 K::HasKey(c, ops, dps)
             }
             "SameIndividual" => K::SameIndividual(self.individuals()?),
-            "DifferentIndividuals" => K::DifferentIndividuals(self.individuals()?),
+            "DifferentIndividuals" => K::DifferentIndividuals(self.individual_multiset()?),
             "ClassAssertion" => {
                 let c = self.class_expression()?;
                 K::ClassAssertion(c, self.individual()?)

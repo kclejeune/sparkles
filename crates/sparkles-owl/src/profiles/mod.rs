@@ -408,9 +408,8 @@ pub(crate) fn individuals(ax: &AxiomKind) -> Vec<&Individual> {
             ce(a, &mut out);
             ce(b, &mut out);
         }
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-            cs.iter().for_each(|c| ce(c, &mut out))
-        }
+        K::EquivalentClasses(cs) => cs.iter().for_each(|c| ce(c, &mut out)),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().for_each(|c| ce(c, &mut out)),
         K::ObjectPropertyDomain(_, c)
         | K::ObjectPropertyRange(_, c)
         | K::DataPropertyDomain(_, c)
@@ -419,7 +418,8 @@ pub(crate) fn individuals(ax: &AxiomKind) -> Vec<&Individual> {
             ce(c, &mut out);
             out.push(i);
         }
-        K::SameIndividual(is) | K::DifferentIndividuals(is) => out.extend(is.iter()),
+        K::SameIndividual(is) => out.extend(is.iter()),
+        K::DifferentIndividuals(is) => out.extend(is.iter()),
         K::ObjectPropertyAssertion(_, a, b) | K::NegativeObjectPropertyAssertion(_, a, b) => {
             out.push(a);
             out.push(b);
@@ -538,7 +538,8 @@ mod el_first_tests {
         prop_oneof![
             4 => (class_expression(), class_expression()).prop_map(|(a, b)| K::SubClassOf(a, b)),
             2 => ces().prop_map(K::EquivalentClasses),
-            1 => ces().prop_map(K::DisjointClasses),
+            1 => prop::collection::vec(class_expression(), 1..3)
+                .prop_map(|v| K::DisjointClasses(v.into())),
             2 => (class_expression(), ind()).prop_map(|(c, i)| K::ClassAssertion(c, i)),
             1 => (ope(), ind(), ind()).prop_map(|(p, a, b)| K::ObjectPropertyAssertion(p, a, b)),
             1 => (ope(), ind(), ind()).prop_map(|(p, a, b)| K::NegativeObjectPropertyAssertion(p, a, b)),
@@ -546,7 +547,8 @@ mod el_first_tests {
             1 => (prop::collection::vec(ope(), 1..3), ope())
                 .prop_map(|(ps, b)| K::SubObjectPropertyOf(SubObjectPropertyExpression::Chain(ps), b)),
             1 => prop::collection::btree_set(ope(), 1..3).prop_map(K::EquivalentObjectProperties),
-            1 => prop::collection::btree_set(ope(), 1..3).prop_map(K::DisjointObjectProperties),
+            1 => prop::collection::vec(ope(), 1..3)
+                .prop_map(|v| K::DisjointObjectProperties(v.into())),
             1 => (ope(), class_expression()).prop_map(|(p, c)| K::ObjectPropertyDomain(p, c)),
             1 => (ope(), class_expression()).prop_map(|(p, c)| K::ObjectPropertyRange(p, c)),
             1 => ope().prop_map(K::TransitiveObjectProperty),
@@ -554,7 +556,7 @@ mod el_first_tests {
             1 => ope().prop_map(K::FunctionalObjectProperty),
             1 => ope().prop_map(K::SymmetricObjectProperty),
             1 => inds().prop_map(K::SameIndividual),
-            1 => inds().prop_map(K::DifferentIndividuals),
+            1 => prop::collection::vec(ind(), 1..3).prop_map(|v| K::DifferentIndividuals(v.into())),
             1 => datatype().prop_map(|d| K::Declaration(Entity::Datatype(d))),
             1 => (0..2u8).prop_map(|c| K::Declaration(Entity::Class(Class::new(format!("urn:c{c}"))))),
             1 => (dp(), data_range()).prop_map(|(p, r)| K::DataPropertyRange(p, r)),

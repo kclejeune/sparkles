@@ -234,8 +234,8 @@ fn axiom_counts(ax: &AxiomKind, rooted: bool) -> bool {
         |c: &ClassExpression| needs_counting(c, false, rooted) || needs_counting(c, true, rooted);
     match ax {
         K::SubClassOf(c, d) => needs_counting(c, false, rooted) || needs_counting(d, true, rooted),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().any(either),
-        K::DisjointUnion(_, cs) => cs.iter().any(either),
+        K::EquivalentClasses(cs) => cs.iter().any(either),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().any(either),
         K::ObjectPropertyDomain(_, c) | K::ObjectPropertyRange(_, c) => {
             needs_counting(c, true, rooted)
         }

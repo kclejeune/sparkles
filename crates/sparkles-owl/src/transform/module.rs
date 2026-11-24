@@ -506,9 +506,8 @@ fn names_nominal(k: &AxiomKind) -> bool {
     use AxiomKind as K;
     match k {
         K::SubClassOf(a, b) => nominal(a) || nominal(b),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => {
-            cs.iter().any(nominal)
-        }
+        K::EquivalentClasses(cs) => cs.iter().any(nominal),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().any(nominal),
         K::ObjectPropertyDomain(_, c)
         | K::ObjectPropertyRange(_, c)
         | K::DataPropertyDomain(_, c)
@@ -900,9 +899,8 @@ fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut Vec<&'k str>) {
             SubObjectPropertyExpression::Expression(p) => ope(p, out),
             SubObjectPropertyExpression::Chain(ps) => ps.iter().for_each(|p| ope(p, out)),
         },
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-            ps.iter().for_each(|p| ope(p, out))
-        }
+        K::EquivalentObjectProperties(ps) => ps.iter().for_each(|p| ope(p, out)),
+        K::DisjointObjectProperties(ps) => ps.iter().for_each(|p| ope(p, out)),
         K::InverseObjectProperties(p, q) => {
             ope(p, out);
             ope(q, out);
@@ -922,9 +920,8 @@ fn bottom_deps<'k>(k: &'k AxiomKind, out: &mut Vec<&'k str>) {
         | K::DataPropertyRange(p, _)
         | K::FunctionalDataProperty(p)
         | K::NegativeDataPropertyAssertion(p, _, _) => out.push(p.as_str()),
-        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
-            out.extend(ps.iter().map(|p| p.as_str()))
-        }
+        K::EquivalentDataProperties(ps) => out.extend(ps.iter().map(|p| p.as_str())),
+        K::DisjointDataProperties(ps) => out.extend(ps.iter().map(|p| p.as_str())),
         K::DataPropertyDomain(p, c) => {
             out.push(p.as_str());
             ce_top_deps(c, out);
@@ -958,9 +955,8 @@ fn bottom_needs(k: &AxiomKind) -> Option<Vec<Vec<&str>>> {
     }
     Some(match k {
         K::SubClassOf(a, _) => each(vec![nonempty_needs(a)]),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => {
-            each(cs.iter().map(nonempty_needs).collect())
-        }
+        K::EquivalentClasses(cs) => each(cs.iter().map(nonempty_needs).collect()),
+        K::DisjointClasses(cs) => each(cs.iter().map(nonempty_needs).collect()),
         K::DisjointUnion(c, cs) => {
             let mut sets = vec![class_needs(c)];
             sets.extend(cs.iter().map(nonempty_needs));
@@ -970,9 +966,8 @@ fn bottom_needs(k: &AxiomKind) -> Option<Vec<Vec<&str>>> {
             SubObjectPropertyExpression::Expression(p) => ope(p),
             SubObjectPropertyExpression::Chain(ps) => ps.iter().flat_map(ope).collect(),
         }],
-        K::EquivalentObjectProperties(ps) | K::DisjointObjectProperties(ps) => {
-            ps.iter().map(ope).collect()
-        }
+        K::EquivalentObjectProperties(ps) => ps.iter().map(ope).collect(),
+        K::DisjointObjectProperties(ps) => ps.iter().map(ope).collect(),
         K::InverseObjectProperties(p, q) => vec![ope(p), ope(q)],
         K::ObjectPropertyDomain(p, _)
         | K::ObjectPropertyRange(p, _)
@@ -988,9 +983,8 @@ fn bottom_needs(k: &AxiomKind) -> Option<Vec<Vec<&str>>> {
         | K::DataPropertyRange(p, _)
         | K::FunctionalDataProperty(p)
         | K::NegativeDataPropertyAssertion(p, _, _) => vec![dp(p)],
-        K::EquivalentDataProperties(ps) | K::DisjointDataProperties(ps) => {
-            ps.iter().map(dp).collect()
-        }
+        K::EquivalentDataProperties(ps) => ps.iter().map(dp).collect(),
+        K::DisjointDataProperties(ps) => ps.iter().map(dp).collect(),
         K::HasKey(c, ps, ds) => each(vec![nonempty_needs(c).map(|mut set| {
             set.extend(ps.iter().flat_map(ope));
             set.extend(ds.iter().flat_map(dp));
@@ -1160,8 +1154,8 @@ fn ill_literal(k: &AxiomKind) -> bool {
     use AxiomKind as K;
     match k {
         K::SubClassOf(a, b) => ill_class(a) || ill_class(b),
-        K::EquivalentClasses(cs) | K::DisjointClasses(cs) => cs.iter().any(ill_class),
-        K::DisjointUnion(_, cs) => cs.iter().any(ill_class),
+        K::EquivalentClasses(cs) => cs.iter().any(ill_class),
+        K::DisjointClasses(cs) | K::DisjointUnion(_, cs) => cs.iter().any(ill_class),
         K::ObjectPropertyDomain(_, c)
         | K::ObjectPropertyRange(_, c)
         | K::DataPropertyDomain(_, c)
