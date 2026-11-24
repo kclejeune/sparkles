@@ -1214,6 +1214,24 @@ impl<'a> Reads<'a> {
         }
     }
 
+    /// Borrow a prepared view's masked snapshot under `preparation` without letting
+    /// the snapshot escape its owning [`crate::access::PreparedView`].
+    pub fn from_prepared(
+        preparation: &'a Preparation,
+        view: &'a crate::access::PreparedView,
+    ) -> Self {
+        Self::new(preparation, view.snapshot())
+    }
+
+    /// Borrow an evidence view's physical snapshot under `preparation` without letting
+    /// the snapshot escape its owning [`crate::store::BoundEvidenceView`].
+    pub fn from_evidence(
+        preparation: &'a Preparation,
+        view: &'a crate::store::BoundEvidenceView,
+    ) -> Self {
+        Self::new(preparation, view.snapshot())
+    }
+
     fn id(&mut self, iri: &str) -> Result<Option<Id>> {
         if let Some(id) = self.ids.get(iri) {
             return Ok(*id);

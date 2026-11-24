@@ -9,7 +9,7 @@
 //! withdrawal that ends it. Otherwise it answers as missing, so a reader learns nothing
 //! about hidden records, and an older decision never stands in for a hidden current one.
 
-use super::{G, PolicyGraphs, State, caller_view};
+use super::{G, PolicyGraphs, State, caller_view_evidence};
 use crate::access::GraphAccess;
 use crate::evidence::propose::READS_BYTES;
 use crate::managed::{ManagedErrorKind, OwnerKind};
@@ -230,12 +230,10 @@ pub fn with_policy_claims<R>(
     let all = access
         .clone()
         .or_else(|| Some(Arc::new(GraphAccess::all())));
-    let seen = caller_view(all.as_ref(), view.shared_snapshot(), &preparation)?;
+    let seen = caller_view_evidence(all.as_ref(), view, &preparation)?;
     let state = State {
-        reads: Reads::new(&preparation, view.snapshot()),
-        seen: seen
-            .as_ref()
-            .map(|v| Reads::new(&preparation, v.snapshot())),
+        reads: Reads::from_evidence(&preparation, view),
+        seen: seen.as_ref().map(|v| Reads::from_prepared(&preparation, v)),
         claim_graphs,
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),

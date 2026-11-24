@@ -616,12 +616,7 @@ impl Tools<'_> {
         let mut ropts = opts.clone();
         ropts.union_default_graph = Some(false);
         ropts.default_graph_extra.clear();
-        let r = Reader {
-            snap: ds.store.snapshot(),
-            opts: ropts,
-            deadline,
-            reasoning: false,
-        };
+        let r = Reader::from_snapshot(ds.store.snapshot(), ropts, deadline, false);
         // the IRIs of the call
         let now = now_ms();
         let dataset_id = ds
@@ -674,13 +669,13 @@ impl Tools<'_> {
             minted.push((e.key.clone(), minter.mint("entity", &e.key[2..])));
         }
         // a retry of a call that committed writes nothing
-        if a.idempotency_key.is_some() && applied(&r.snap, &activity, &graph) {
+        if a.idempotency_key.is_some() && applied(r.snap(), &activity, &graph) {
             return Ok(Outcome::Structured(already_applied(
                 &ds.name,
                 &graph,
                 &activity,
                 &minted,
-                r.snap.commit,
+                r.commit(),
                 &prefixes,
             )));
         }
@@ -1520,7 +1515,7 @@ impl Tools<'_> {
                 if !seen.insert(n.as_str().to_string()) {
                     continue;
                 }
-                let known = match r.snap.lookup_term(&Term::NamedNode(n.clone())) {
+                let known = match r.snap().lookup_term(&Term::NamedNode(n.clone())) {
                     // never stored: absent everywhere
                     None => false,
                     Some(_) if lookups < MAX_LOOKUPS => {
@@ -1671,11 +1666,11 @@ impl Tools<'_> {
             };
             // a report from the index statistics samples the objects: a literal that is
             // already an object of the predicate meets it
-            if !rep.basis.is_exact() && super::check::is_object(&r.snap, &f.p, l) {
+            if !rep.basis.is_exact() && super::check::is_object(r.snap(), &f.p, l) {
                 continue;
             }
             let (objects, sampled) =
-                self.entry_objects(ds, &r.snap, &rep, entry, r.deadline, ctx)?;
+                self.entry_objects(ds, r.snap(), &rep, entry, r.deadline, ctx)?;
             if let Some(issue) = literal_issue(&f.p, l, Meet::Pattern, &objects.literals, terms) {
                 let mut message = issue.message;
                 if let Some(n) = sampled {

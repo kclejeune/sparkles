@@ -586,7 +586,7 @@ struct CacheKey {
 
 impl CacheKey {
     fn of(snap: &Snapshot) -> Option<CacheKey> {
-        (snap.cacheable && snap.mask.is_none()).then(|| CacheKey {
+        (snap.cacheable && !snap.has_mask()).then(|| CacheKey {
             store: snap.results.clone(),
             generation: snap.generation.uid,
             commit: snap.commit,

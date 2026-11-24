@@ -174,18 +174,45 @@ fn options_of(st: &AppState, ds: &Dataset, p: &Principal, cancel: Arc<AtomicBool
     crate::http::caller::CallerContext::for_caller(st, ds, p).task_options(cancel)
 }
 
-/// The rows of a query.
+/// The consistent view a build reads from: either a bound evidence source or an ordinary snapshot.
+enum BuildView {
+    Snapshot(Arc<Snapshot>),
+    Source {
+        source: sparkles::store::BoundReadSource,
+        commit: u64,
+    },
+}
+
+impl BuildView {
+    fn commit(&self) -> u64 {
+        match self {
+            Self::Snapshot(snap) => snap.commit,
+            Self::Source { commit, .. } => *commit,
+        }
+    }
+}
+
+/// The rows of a query over a build view.
 fn rows(
-    snap: &Arc<Snapshot>,
+    view: &BuildView,
+    store: &sparkles::store::Store,
     q: &str,
     opts: &QueryOptions,
 ) -> Result<sparql::output::OwnedRows, RunError> {
-    sparql::query(snap.clone(), q, opts)
-        .and_then(|r| r.rows())
-        .map_err(|e| match e {
-            sparkles::Error::Cancelled => RunError::Cancelled,
-            e => failed(e),
-        })
+    let result = match view {
+        BuildView::Snapshot(snap) => sparql::query(snap.clone(), q, opts),
+        BuildView::Source { source, .. } => {
+            let mut source_opts = opts.clone();
+            if source_opts.graphs.is_none() {
+                source_opts.graphs = Some(Arc::new(sparkles::access::GraphAccess::all()));
+            }
+            sparql::query_source(source.clone(), store, q, &source_opts)
+        }
+    };
+    result.and_then(|r| r.rows()).map_err(|e| match e {
+        sparkles::Error::Cancelled => RunError::Cancelled,
+        e => failed(e),
+    })
 }
 
 fn nt(t: &Option<Term>) -> Option<String> {
@@ -330,7 +357,7 @@ fn input_change(prep: &Prepared, b: &BuildRecord, why: &[Why]) -> Option<String>
 
 /// The inputs a run reads before it calls a model.
 struct Prepared {
-    snap: Arc<Snapshot>,
+    source_commit: u64,
     nodes: Vec<Node>,
     info: HashMap<String, EntityInfo>,
     existing: HashMap<String, Existing>,
@@ -568,9 +595,12 @@ impl Run<'_> {
             self.cancel.clone(),
             self.limits,
         )?;
-        let snap = match &ev {
-            Some(e) => e.snapshot(),
-            None => self.ds.store.snapshot(),
+        let view = match &ev {
+            Some(e) => BuildView::Source {
+                source: e.read_source(),
+                commit: e.commit(),
+            },
+            None => BuildView::Snapshot(self.ds.store.snapshot()),
         };
         let output: Option<String> = ev.as_ref().map(|e| e.policy.output.clone());
         let ctl = sparkles::algo::Control::new(self.cancel.clone(), None, u64::MAX);
@@ -579,9 +609,20 @@ impl Run<'_> {
             output: output.as_deref(),
             excluded: ev.as_ref().map(|e| &e.excluded),
         };
-        let proj: Projection =
-            projection::read_with(snap.clone(), &opts, &self.settings, &extra, &ctl)
-                .map_err(failed)?;
+        let proj: Projection = match &view {
+            BuildView::Snapshot(snap) => {
+                projection::read_with(snap.clone(), &opts, &self.settings, &extra, &ctl)
+            }
+            BuildView::Source { source, .. } => projection::read_with_source(
+                source.clone(),
+                &self.ds.store,
+                &opts,
+                &self.settings,
+                &extra,
+                &ctl,
+            ),
+        }
+        .map_err(failed)?;
         // the footprint lists the evidence graphs whose records the citations name (§6.2)
         let mut footprint_graphs = proj.graphs.clone();
         if let Some(e) = &ev {
@@ -589,7 +630,7 @@ impl Run<'_> {
             footprint_graphs.sort();
             footprint_graphs.dedup();
         }
-        let footprint = self.footprint(p, snap.commit, &footprint_graphs)?;
+        let footprint = self.footprint(p, view.commit(), &footprint_graphs)?;
         self.progress(0.03, "finding communities");
         let h = hierarchy::compute(
             &proj.graph,
@@ -681,7 +722,7 @@ impl Run<'_> {
                 );
             }
             let read =
-                self.facts_of(&snap, &opts, &graphs, &nodes[i].members, output.as_deref())?;
+                self.facts_of(&view, &opts, &graphs, &nodes[i].members, output.as_deref())?;
             let facts: Vec<Fact> = match ev.as_mut() {
                 None => read.into_iter().map(|(f, _)| f).collect(),
                 Some(e) => {
@@ -795,7 +836,7 @@ impl Run<'_> {
             );
             // each label or type triple, with whether only the output graph holds it
             let mut lines: BTreeMap<(String, String), (Term, bool, bool)> = BTreeMap::new();
-            for r in rows(&snap, &q, &opts)? {
+            for r in rows(&view, &self.ds.store, &q, &opts)? {
                 let r = r.values();
                 let Some(e) = nt(&r[0]) else { continue };
                 let value = match (&r[1], &r[2]) {
@@ -887,7 +928,7 @@ impl Run<'_> {
             }
         }
         // what the reports graph holds now, read without a view: the build writes it
-        let (existing, all) = self.existing(&snap)?;
+        let (existing, all) = self.existing(&view)?;
         let keep: HashSet<&str> = nodes.iter().map(|n| n.iri.as_str()).collect();
         // the reports of gone communities go with them, once nothing cites them
         let mut gone: Vec<String> = all
@@ -901,7 +942,7 @@ impl Run<'_> {
         let mut ended: HashSet<u32> = HashSet::new();
         // read for every run, so that a run without a policy finds reports that record
         // one even when the state does not say so, as after an interrupted run
-        let revisions = self.revisions(&snap)?;
+        let revisions = self.revisions(&view)?;
         if let Some(e) = ev.as_mut()
             && let Some(b) = &previous.last_build
             && same_policy(b.policy.as_ref(), &e.policy)
@@ -913,7 +954,7 @@ impl Run<'_> {
                 .map(|[c, d]| (c.clone(), d.clone()))
                 .collect();
             let out = e.policy.output.clone();
-            let present = |ts: &[oxrdf::Triple]| self.present(&snap, &opts, &out, ts);
+            let present = |ts: &[oxrdf::Triple]| self.present(&view, &opts, &out, ts);
             for (i, gone) in e.ended(&old, &present)?.into_iter().enumerate() {
                 if gone {
                     ended.insert(i as u32);
@@ -921,7 +962,7 @@ impl Run<'_> {
             }
         }
         Ok(Prepared {
-            snap,
+            source_commit: view.commit(),
             nodes,
             info,
             existing,
@@ -938,7 +979,7 @@ impl Run<'_> {
     /// Which of `triples` the principal's view of the output graph `graph` holds.
     fn present(
         &self,
-        snap: &Arc<Snapshot>,
+        view: &BuildView,
         opts: &QueryOptions,
         graph: &str,
         triples: &[oxrdf::Triple],
@@ -954,7 +995,7 @@ impl Run<'_> {
                 "SELECT ?s ?p ?o WHERE {{ VALUES (?s ?p ?o) {{ {} }} GRAPH <{graph}> {{ ?s ?p ?o }} }}",
                 values.join(" ")
             );
-            for r in rows(snap, &q, opts)? {
+            for r in rows(view, &self.ds.store, &q, opts)? {
                 let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     found.insert((s, p, o));
@@ -975,7 +1016,7 @@ impl Run<'_> {
 
     /// Each report of the reports graph with the report it revises and whether a run
     /// generated it, which tells a person's edit from a run's replacement.
-    fn revisions(&self, snap: &Arc<Snapshot>) -> Result<HashMap<String, Revision>, RunError> {
+    fn revisions(&self, view: &BuildView) -> Result<HashMap<String, Revision>, RunError> {
         let g = self.graph();
         let q = format!(
             "SELECT ?r ?prev ?a ?pol ?ver WHERE {{ GRAPH <{g}> {{ ?r a <{}> OPTIONAL {{ ?r <{p}wasRevisionOf> ?prev }} OPTIONAL {{ ?r <{p}wasGeneratedBy> ?a }} OPTIONAL {{ ?r <{}> ?pol OPTIONAL {{ ?r <{}> ?ver }} }} }} }}",
@@ -985,7 +1026,7 @@ impl Run<'_> {
             p = store::PROV,
         );
         let mut out: HashMap<String, Revision> = HashMap::new();
-        for r in rows(snap, &q, &QueryOptions::default())? {
+        for r in rows(view, &self.ds.store, &q, &QueryOptions::default())? {
             let r = r.values();
             let Some(Term::NamedNode(rep)) = &r[0] else {
                 continue;
@@ -1013,7 +1054,7 @@ impl Run<'_> {
     /// policy's output graph `output` holds it and whether only that graph does.
     fn facts_of(
         &self,
-        snap: &Arc<Snapshot>,
+        view: &BuildView,
         opts: &QueryOptions,
         graphs: &[String],
         members: &[String],
@@ -1062,7 +1103,7 @@ impl Run<'_> {
                 REIFIES,
                 store::RDF_TYPE
             );
-            for r in rows(snap, &q, opts)? {
+            for r in rows(view, &self.ds.store, &q, opts)? {
                 let r = r.values();
                 if let (Some(s), Some(p), Some(o)) = (nt(&r[0]), nt(&r[1]), nt(&r[2])) {
                     let flag = |i: usize| matches!(r.get(i), Some(Some(Term::Literal(l))) if l.value() == "1");
@@ -1091,7 +1132,7 @@ impl Run<'_> {
     #[allow(clippy::type_complexity)]
     fn existing(
         &self,
-        snap: &Arc<Snapshot>,
+        view: &BuildView,
     ) -> Result<(HashMap<String, Existing>, BTreeMap<String, Existing>), RunError> {
         let g = self.graph();
         let q = format!(
@@ -1101,7 +1142,7 @@ impl Run<'_> {
             super::guard::gr("status"),
         );
         let mut all: BTreeMap<String, Existing> = BTreeMap::new();
-        for r in rows(snap, &q, &QueryOptions::default())? {
+        for r in rows(view, &self.ds.store, &q, &QueryOptions::default())? {
             let r = r.values();
             let Some(Term::NamedNode(c)) = &r[0] else {
                 continue;
@@ -1132,7 +1173,12 @@ impl Run<'_> {
         let mut title = String::new();
         let mut summary = String::new();
         let mut findings: BTreeMap<u64, ChildFinding> = BTreeMap::new();
-        for r in rows(snap, &q, &QueryOptions::default())? {
+        for r in rows(
+            &BuildView::Snapshot(snap.clone()),
+            &self.ds.store,
+            &q,
+            &QueryOptions::default(),
+        )? {
             let r = r.values();
             if let Some(Term::Literal(l)) = &r[0] {
                 title = l.value().to_string();
@@ -1781,7 +1827,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
     let ev_check: Option<EvidenceCheck> = ev.as_ref().map(Evidence::check);
     let mut outcome = Outcome {
         mode: r.mode.as_str(),
-        source_commit: prep.snap.commit,
+        source_commit: prep.source_commit,
         communities: prep.nodes.len(),
         ..Default::default()
     };
@@ -2140,7 +2186,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
                     iri: iri.clone(),
                     community: n.iri.clone(),
                     status,
-                    source_commit: prep.snap.commit,
+                    source_commit: prep.source_commit,
                     footprint: fp_iri.clone(),
                     language: r.settings.language.clone(),
                     activity,
@@ -2174,7 +2220,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         )?;
         // a review or another writer changed a report link since the run read it: the
         // run's plan no longer describes the graph, and committing would undo that change
-        let (now, _) = r.existing(&r.ds.store.snapshot())?;
+        let (now, _) = r.existing(&BuildView::Snapshot(r.ds.store.snapshot()))?;
         let now: BTreeMap<String, Option<String>> =
             now.into_iter().map(|(c, e)| (c, e.report)).collect();
         if now != expected {
@@ -2272,7 +2318,7 @@ pub fn run(r: &Run<'_>) -> Result<Outcome, RunError> {
         .collect();
     r.save_state(BuildState {
         last_build: Some(BuildRecord {
-            source_commit: prep.snap.commit,
+            source_commit: prep.source_commit,
             branch: branch_name(&r.ds),
             finished_at: now_rfc3339(),
             communities,

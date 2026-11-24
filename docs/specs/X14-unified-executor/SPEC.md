@@ -524,12 +524,51 @@ budget. These remain estimated heap charges rather than process RSS limits.
 The remaining stage 4 ownership seams are tracked by their own items. Retaining every
 result table under its own lease belongs to the merge phase of item 453, linking the
 reasoner's budgets and incremental views into the query pool belongs to item 675, binding
-result buffers belong to item 1306, snapshot and access escapes belong to item 1307 and
-strict decoding across all callers belongs to item 1308. MCP native frame ownership
-belongs to item 1305: MCP tool results are still application copies of their rendered
-text, and a retained renderer would keep each response frame under its query's credit
-until the transport writes it, which needs an rmcp transport qualified for retained
-results, including session replay and tasks.
+result buffers belong to item 1306, strict decoding across all callers belongs to item
+1308 and MCP native frame ownership belongs to item 1305. MCP tool results are still
+application copies of their rendered text, and a retained renderer would keep each
+response frame under its query's credit until the transport writes it, which needs an
+rmcp transport qualified for retained results, including session replay and tasks.
+
+### Snapshot, mask and graph-access escapes
+
+Item 1307 audited 46 snapshot, mask and graph-access surfaces across the core, facade,
+server and binding crates, closed the actionable escapes behind owned handles or
+non-owning caches and documented the intentional caller-owned views.
+
+`PreparedView::snapshot`, `PreparedView::access`, `BoundEvidenceView::snapshot` and
+`BoundEvidenceView::shared_snapshot` are now crate-private so external callers cannot
+clone an uncredited masked snapshot or bound access policy past its preparation
+reservation. External callers consume prepared and evidence views through
+`BoundReadSource`, `BoundEvidenceView::prepare_view`, `Reads::from_prepared`,
+`Reads::from_evidence` and non-escaping policy and metadata accessors on `PreparedView`.
+`BoundEvidenceView::prepare_view` retains the evidence view and its reservation inside
+the returned `PreparedView`. In the server, GraphRAG's `Evidence` replaces `snapshot`
+with `read_source` and `commit`, and MCP memory recall runs evidence-backed reads
+through `BoundReadSource` under the call's grant instead of cloning the raw snapshot.
+
+`Snapshot::mask`, `Snapshot::counts` and `access::triples::apply` are now crate-private,
+with read-only non-escaping accessors (`has_mask`, `mask_id`, `mask_key` and
+`hidden_quad_count`) on `Snapshot`. `CountCache::masks` and `CountCache::views` hold
+non-owning weak references with drop-time slot eviction on `Mask` and dead-entry pruning
+on lookup and insertion, so masked snapshots, copied delta nodes and visible-graph lists
+deduplicate concurrent live holders without surviving past the last owning `PreparedView`
+or query. `GraphAccess::bound` stamps each decided guard with the snapshot identity it
+was bound against, and checked read paths refuse applying that bound policy to a
+different commit, store or uncommitted view. `WriteTxn::graphs` is removed and
+`WriteTxn::prepare_read_view` prepares a transaction's read view under a `Preparation`.
+`QueryBatch::transient_term`, used only by the FFI cursor encoder, remains deferred to
+coordinate with items 1306 and 1308.
+
+The remaining audited getters are intentional caller-owned unbudgeted views or unbound
+policy builders documented as limitations in the server and storage guides. These cover
+`Store::snapshot`, `Dataset::snapshot`, `QuadIter::snapshot`, `Embedder::snapshot`,
+`WriteTxn::view`, `WriteTxn::base`, `WriteTxn::read_view`, `Snapshot::without_cache_fill`,
+`Snapshot::with_overlay`, `Snapshot::generation`, `Snapshot::delta`,
+`sparql::with_union_default`, `Opened::snapshot`, `ReportOutcome::snapshot`,
+`Store::managed_snapshot`, `Access::view`, `Grants::graphs`, `guard::apply`, incremental
+view snapshot accessors covered by item 675 and internal context structs that carry a
+caller's snapshot.
 
 ### Dead compaction arm and one generation switch
 

@@ -299,11 +299,13 @@ mod tests {
                     pattern: strings[2].clone(),
                     exempt: strings.clone(),
                     decide: None,
+                    bound_to: None,
                 },
                 GraphGuard {
                     pattern: "other".into(),
                     exempt: Vec::new(),
                     decide: Some(Decider(Arc::new(Uncalled))),
+                    bound_to: None,
                 },
             ],
         });

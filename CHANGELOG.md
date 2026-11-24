@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+### Prepared and evidence views no longer leak raw snapshots, masks or bound policies
+
+`PreparedView::{snapshot, access}`, `BoundEvidenceView::{snapshot, shared_snapshot}`,
+`Snapshot::{mask, counts}` and `access::triples::apply` are now crate-private so callers
+cannot retain uncredited masked snapshots, access masks or bound `GraphAccess` policies
+past their owning `Preparation` or `BoundEvidenceView` reservation (roadmap item 1307).
+Checked callers now use `BoundReadSource`, `BoundEvidenceView::prepare_view`,
+`Reads::{from_prepared, from_evidence}`, `WriteTxn::prepare_read_view` and non-escaping
+read-only accessors on `PreparedView` and `Snapshot`. `CountCache::masks` and
+`CountCache::views` now store non-owning weak references with drop-time slot eviction and
+dead-entry pruning, so masked snapshots and visible-graph lists do not outlive their
+active holders. `GraphAccess::bound` records the snapshot identity it resolved guards
+against and checked read paths refuse applying that bound policy to another commit, store
+or uncommitted view. GraphRAG evidence runs and MCP memory recall now read evidence views
+through `BoundReadSource` instead of cloning the raw snapshot.
+
 ### A classification is complete only for the whole ontology
 
 `complete` in a classification answer now means complete for the whole input ontology, as

@@ -270,11 +270,22 @@ with the view belong to the caller and are not charged again. Cached results mus
 the cap too. `with_no_wait(true)` refuses a preparation lock that is held.
 A refused call returns no partial view.
 
-The returned `PreparedView` owns its retained-state reservations and borrows its access
-policy and snapshot to callers. Apply both together, since the physical triple mask
-does not enforce graph restrictions by itself. Keep that owner alive while using the
-prepared view. A snapshot that another policy already masked is refused unless the
-requested policy hides no triples.
+The returned `PreparedView` owns its retained-state reservations and exposes non-escaping
+policy predicates, metadata accessors and `PreparedView::read_source` rather than a
+cloneable raw snapshot or `GraphAccess` reference. `BoundEvidenceView` follows the same
+boundary through `BoundEvidenceView::read_source` and `BoundEvidenceView::prepare_view`,
+which retains the evidence view's reservation for as long as the prepared view lives.
+A snapshot that another policy already masked is refused unless the requested policy
+hides no triples. Masked-snapshot and visible-graph deduplication slots on a base
+snapshot hold only non-owning weak references and evict themselves when their last live
+owner drops, so neither masked delta nodes nor visible-graph lists survive past their
+creating view or query without credit. A `GraphAccess` whose undecided guards were bound
+against one snapshot with `GraphAccess::bound` carries that snapshot's identity and is
+refused by checked read paths if applied to another commit, store or uncommitted view.
+Unbound request policy builders such as `Access::view`, `Grants::graphs` and
+`guard::apply` intentionally construct reusable policy definitions outside a query
+budget before binding, and legacy unbudgeted helpers such as `GraphAccess::masked` and
+`WriteTxn::read_view` hand out caller-owned snapshots outside a `Preparation`.
 Independent copies need their own accounting. This cap does not cover subsequent
 query execution or replace the store's accounting for immutable mappings and shared
 caches. Existing query, hidden-quad and pattern-row limits retain their scope.

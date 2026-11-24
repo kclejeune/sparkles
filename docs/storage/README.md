@@ -395,6 +395,17 @@ dependencies are recorded in the [central roadmap](../ROADMAP.md).
 * The prewarm restores the block cache and the pages of the generation's files. It does
   not restore the result cache, and it reads data that the next queries may never touch.
   Its list holds at most 4 GiB of pages.
+* Caller-owned snapshot getters (`Store::snapshot`, `Dataset::snapshot`,
+  `QuadIter::snapshot`, `Embedder::snapshot`, `WriteTxn::view`, `WriteTxn::base`,
+  `WriteTxn::read_view`, `Snapshot::without_cache_fill`, `Snapshot::with_overlay`,
+  `sparql::with_union_default`, `Opened::snapshot`, `ReportOutcome::snapshot`, context
+  structs carrying an `Arc<Snapshot>` and clones of `Snapshot::generation` or
+  `Snapshot::delta`) intentionally hand out unbudgeted views that pin their referenced
+  generation and delta storage until dropped. An uncommitted `WriteTxn::view` or
+  `WriteTxn::read_view` must not be retained past `WriteTxn::discard_terms`, and checked
+  transaction reads should use `WriteTxn::prepare_read_view`. Incremental view snapshot
+  retention is accounted under item 675, and `Store::managed_snapshot` returns registry
+  metadata rather than an RDF snapshot.
 * Group commit on datasets with a full-text, spatial or embedding index meets its gates
   ([X09](../specs/X09-group-commit-by-default.md#phase-4)). A serial commit pays 0.1% to
   0.3% more instructions for the group's admission checks, and spatial readers at 1.05M

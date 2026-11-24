@@ -118,9 +118,7 @@ pub fn dependents(
     // triple of is left out, since authentication reads only its receipt and protection.
     let mut state = State {
         reads: Reads::new(&preparation, &head),
-        seen: view
-            .as_ref()
-            .map(|v| Reads::new(&preparation, v.snapshot())),
+        seen: view.as_ref().map(|v| Reads::from_prepared(&preparation, v)),
         claim_graphs: Vec::new(),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),

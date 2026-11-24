@@ -323,7 +323,7 @@ impl Tools<'_> {
         }
         let mut value = json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "search": { "text": text_used, "vector": vector_used },
             "prefixes": terms.used(),
         });
@@ -366,8 +366,14 @@ impl Tools<'_> {
                     else {
                         continue;
                     };
-                    let (objects, sampled) =
-                        self.entry_objects(ds, &r.snap, &rep, &rep.predicates[i], r.deadline, ctx)?;
+                    let (objects, sampled) = self.entry_objects(
+                        ds,
+                        r.snap(),
+                        &rep,
+                        &rep.predicates[i],
+                        r.deadline,
+                        ctx,
+                    )?;
                     languages_complete &= sampled.is_none()
                         && objects.literals.iter().all(|group| {
                             group.datatype
@@ -562,7 +568,7 @@ impl Tools<'_> {
             };
             match crate::ask::profile::nested(
                 crate::ask::profile::Stage::LinkerVectorSearch,
-                r.snap.commit,
+                r.commit(),
                 1,
                 || self.vector_hits(r, pred, &input, &setup.graphs),
             ) {

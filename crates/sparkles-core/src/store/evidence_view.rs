@@ -13,6 +13,21 @@ use crate::managed::{ManagedState, OwnerEntry, OwnerKind};
 /// use sparkles_core::store::BoundEvidenceView;
 /// fn forge() -> BoundEvidenceView { BoundEvidenceView { inner: todo!() } }
 /// ```
+///
+/// ```compile_fail
+/// use sparkles_core::store::{BoundEvidenceView, Snapshot};
+/// fn escape(view: &BoundEvidenceView) -> Snapshot {
+///     view.snapshot().clone()
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::store::{BoundEvidenceView, Snapshot};
+/// use std::sync::Arc;
+/// fn escape(view: &BoundEvidenceView) -> Arc<Snapshot> {
+///     view.shared_snapshot().clone()
+/// }
+/// ```
 #[derive(Clone)]
 pub struct BoundEvidenceView {
     inner: Arc<BoundInner>,
@@ -86,19 +101,28 @@ impl BoundEvidenceView {
         self.inner.original_data_binding
     }
 
-    /// Physical RDF only. Apply the caller's current mask as well. As with a
-    /// PreparedView, independently cloning raw data requires caller accounting;
-    /// a raw clone carries no authority to construct another BoundEvidenceView.
-    pub fn snapshot(&self) -> &Snapshot {
+    /// Physical RDF only, restricted to crate internals so callers cannot clone
+    /// an uncredited snapshot past this view's reservation.
+    pub(crate) fn snapshot(&self) -> &Snapshot {
         &self.inner.snapshot
     }
 
-    /// The shared physical snapshot, for preparing the caller's mask and running
-    /// reads while this view is alive. Cloning it gives no authority to construct
-    /// another view, and a reader that keeps it past this view needs its own
-    /// accounting, as [`Self::snapshot`] says.
-    pub fn shared_snapshot(&self) -> &Arc<Snapshot> {
+    /// Shared physical snapshot, restricted to crate internals. External callers
+    /// consume this view through [`Self::read_source`], [`Self::prepare_view`], or
+    /// [`crate::evidence::write::Reads::from_evidence`].
+    pub(crate) fn shared_snapshot(&self) -> &Arc<Snapshot> {
         &self.inner.snapshot
+    }
+
+    /// Prepare a controlled access view over this evidence view under `preparation`.
+    /// The returned [`crate::access::PreparedView`] retains this evidence view and its
+    /// original reservation alongside the mask's own credit.
+    pub fn prepare_view(
+        &self,
+        access: &crate::access::GraphAccess,
+        preparation: &Preparation,
+    ) -> Result<crate::access::PreparedView> {
+        crate::access::triples::controlled::prepare_evidence(self.clone(), access, preparation)
     }
 
     /// Exact original owner bytes. These describe history and grant no access.

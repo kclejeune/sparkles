@@ -29,9 +29,9 @@
 
 use super::{
     Changed, Decided, Evidence, G, MapChange, Options, ProjectionChange, Reviewed, State,
-    branch_name, caller_view, capability, check_identities, check_store, claim_graphs, hidden,
-    incomplete, operation, projection_unavailable, publish, readable, record_graph_nonces,
-    replayed, writable,
+    branch_name, caller_view, caller_view_evidence, capability, check_identities, check_store,
+    claim_graphs, hidden, incomplete, operation, projection_unavailable, publish, readable,
+    record_graph_nonces, replayed, writable,
 };
 use crate::access::GraphAccess;
 use crate::evidence::propose::{READS_BYTES, managed, settings_of};
@@ -769,7 +769,7 @@ pub(super) fn review(
     let masked = caller_view(access.as_ref(), &head, &mask_preparation)?;
     state.seen = masked
         .as_ref()
-        .map(|v| Reads::new(&mask_preparation, v.snapshot()));
+        .map(|v| Reads::from_prepared(&mask_preparation, v));
     let previous = latest(&mut state, main.dataset_id(), &m, control)?;
     let mut resolution = Resolution::new(control.clone())?;
     let mut evidence = Evidence {
@@ -1168,7 +1168,7 @@ fn resolve_bounded(
         &settings,
         &nonce,
         main.dataset_id(),
-        &head,
+        ResolveHead::Snapshot(&head),
         policy,
         entities,
         access,
@@ -1200,13 +1200,46 @@ pub fn resolve_at(
         &settings,
         &nonce,
         view.dataset_id(),
-        view.shared_snapshot(),
+        ResolveHead::Evidence(view),
         policy,
         entities,
         access,
         control,
         MAX_EVIDENCE,
     )
+}
+
+#[derive(Clone, Copy)]
+enum ResolveHead<'a> {
+    Snapshot(&'a Arc<crate::store::Snapshot>),
+    Evidence(&'a sparkles_core::store::BoundEvidenceView),
+}
+
+impl<'a> ResolveHead<'a> {
+    fn caller_view(
+        self,
+        access: Option<&Arc<GraphAccess>>,
+        preparation: &crate::access::Preparation,
+    ) -> Result<Option<crate::access::PreparedView>> {
+        match self {
+            Self::Snapshot(head) => caller_view(access, head, preparation),
+            Self::Evidence(view) => caller_view_evidence(access, view, preparation),
+        }
+    }
+
+    fn reads(self, preparation: &'a crate::access::Preparation) -> Reads<'a> {
+        match self {
+            Self::Snapshot(head) => Reads::new(preparation, head),
+            Self::Evidence(view) => Reads::from_evidence(preparation, view),
+        }
+    }
+
+    fn commit(self) -> u64 {
+        match self {
+            Self::Snapshot(head) => head.commit,
+            Self::Evidence(view) => view.commit().seq,
+        }
+    }
 }
 
 /// The graphs a caller must be able to read to resolve entities under `policy`: its
@@ -1232,7 +1265,7 @@ fn resolve_in(
     settings: &Settings,
     nonce: &dyn Fn(&str) -> Option<Uuid>,
     dataset_id: Uuid,
-    head: &Arc<crate::store::Snapshot>,
+    head: ResolveHead<'_>,
     policy: &str,
     entities: &[NamedNode],
     access: Option<Arc<GraphAccess>>,
@@ -1259,17 +1292,15 @@ fn resolve_in(
         readable(access.as_ref(), g)?;
     }
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
-    let view = caller_view(access.as_ref(), head, &preparation)?;
+    let view = head.caller_view(access.as_ref(), &preparation)?;
     // Records are read at the unmasked head with the caller's view beside it. The map's
     // consistency is checked there, so that a mask cannot hide the metadata that would
     // refuse it, and a revision the caller's view masks is refused rather than read. A
     // proposal or decision the view hides any triple of takes no part in a cluster, and
     // the output graph is read in the caller's view.
     let mut state = State {
-        reads: Reads::new(&preparation, head),
-        seen: view
-            .as_ref()
-            .map(|v| Reads::new(&preparation, v.snapshot())),
+        reads: head.reads(&preparation),
+        seen: view.as_ref().map(|v| Reads::from_prepared(&preparation, v)),
         claim_graphs: Vec::new(),
         superseded: BTreeSet::new(),
         withdrawn: BTreeSet::new(),
@@ -1345,7 +1376,7 @@ fn resolve_in(
         policy: m.policy_iri.clone(),
         revision: latest.as_ref().map(|l| l.iri.clone()),
         number: latest.as_ref().map_or(0, |l| l.number),
-        commit: head.commit,
+        commit: head.commit(),
         entities: out,
     })
 }

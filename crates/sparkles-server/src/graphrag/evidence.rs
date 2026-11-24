@@ -15,7 +15,7 @@
 use super::build::RunError;
 use sparkles::access::GraphAccess;
 use sparkles::evidence::{self, ClaimState, Settings};
-use sparkles::store::{BoundEvidenceView, Snapshot};
+use sparkles::store::{BoundEvidenceView, BoundReadSource};
 use sparkles::task::Control;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -252,9 +252,14 @@ impl Evidence {
         }))
     }
 
-    /// The snapshot the run reads throughout.
-    pub fn snapshot(&self) -> Arc<Snapshot> {
-        self.view.shared_snapshot().clone()
+    /// Opaque bound read source retaining the evidence view and its reservation.
+    pub fn read_source(&self) -> BoundReadSource {
+        self.view.read_source()
+    }
+
+    /// Commit sequence of the evidence view this run reads throughout.
+    pub fn commit(&self) -> u64 {
+        self.view.commit().seq
     }
 
     /// The check a recheck repeats.

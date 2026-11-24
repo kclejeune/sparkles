@@ -599,6 +599,25 @@ impl Delta {
 }
 
 /// A consistent, immutable view of the store.
+///
+/// Retaining a `Snapshot` (or cloning its `generation` or `delta` fields) pins the
+/// generation and delta storage it references until dropped. Internal count caches and
+/// triple-level access masks are crate-private so callers cannot retain them apart from
+/// the snapshot or forge an uncredited mask:
+///
+/// ```compile_fail
+/// use sparkles_core::store::Snapshot;
+/// fn escape_mask(snap: &Snapshot) {
+///     let _ = snap.mask.clone();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// use sparkles_core::store::Snapshot;
+/// fn escape_counts(snap: &Snapshot) {
+///     let _ = snap.counts.clone();
+/// }
+/// ```
 #[derive(Clone)]
 pub struct Snapshot {
     /// Dataset family identity (shared by its branches and derived views).
@@ -632,10 +651,10 @@ pub struct Snapshot {
     pub historical: bool,
     /// exact counts from the statistics corrected for this snapshot's delta, worked out
     /// once per snapshot
-    pub counts: Arc<crate::sparql::stats::CountCache>,
+    pub(crate) counts: Arc<crate::sparql::stats::CountCache>,
     /// the quads a triple-level access view hides, when this snapshot is such a view's
     /// (they are in the delta as deletions; see [`crate::access::triples`])
-    pub mask: Option<Arc<crate::access::Mask>>,
+    pub(crate) mask: Option<Arc<crate::access::Mask>>,
     /// the store's change log, which history queries read (see [`ChangeLog`])
     pub change_log: Option<Arc<ChangeLog>>,
 }
@@ -694,6 +713,26 @@ pub enum Chunk<'a> {
 }
 
 impl Snapshot {
+    /// Whether this snapshot carries a triple-level access mask.
+    pub fn has_mask(&self) -> bool {
+        self.mask.is_some()
+    }
+
+    /// Process-unique identifier of this snapshot's triple-level access mask, if masked.
+    pub fn mask_id(&self) -> Option<u64> {
+        self.mask.as_ref().map(|m| m.id)
+    }
+
+    /// View key of this snapshot's triple-level access mask, if masked.
+    pub fn mask_key(&self) -> Option<&str> {
+        self.mask.as_ref().map(|m| m.key.as_str())
+    }
+
+    /// Number of quads hidden by this snapshot's triple-level access mask.
+    pub fn hidden_quad_count(&self) -> usize {
+        self.mask.as_ref().map_or(0, |m| m.hidden.len())
+    }
+
     /// The same snapshot, reading through the block cache without filling it: for full
     /// scans such as exports, which would evict the blocks queries use.
     pub fn without_cache_fill(&self) -> Snapshot {
@@ -6689,14 +6728,25 @@ impl WriteTxn<'_> {
         self.store.aggregate_errors()
     }
 
-    /// The graph view of this transaction's writes, if it does not cover every graph.
-    pub fn graphs(&self) -> Option<&Arc<crate::access::GraphAccess>> {
-        self.opts.graphs.as_ref()
+    /// Prepare the transaction's read view under `preparation`, applying this
+    /// transaction's graph access and triple protections without exposing a raw
+    /// uncredited snapshot or populating the base snapshot's caches.
+    pub fn prepare_read_view(
+        &self,
+        preparation: &crate::access::Preparation,
+    ) -> Result<crate::access::PreparedView> {
+        preparation.check()?;
+        let snap = Arc::new(self.view());
+        let all = crate::access::GraphAccess::all();
+        let access = self.opts.graphs.as_deref().unwrap_or(&all);
+        access.masked_controlled(&snap, preparation)
     }
 
-    /// The state the transaction's reads see: [`view`](Self::view), without the triples
-    /// the graph view's protections hide. Before the first change it is the committed
-    /// snapshot's masked view, built once per commit.
+    /// Legacy unbudgeted helper returning the state the transaction's reads see:
+    /// [`view`](Self::view), without the triples the graph view's protections hide.
+    /// The returned snapshot is not bound to a [`crate::access::Preparation`] and must
+    /// not be retained past [`Self::discard_terms`]; prefer [`Self::prepare_read_view`]
+    /// for budgeted read paths.
     pub fn read_view(&self) -> Result<Arc<Snapshot>> {
         match self.opts.graphs.as_ref().filter(|a| a.hides_triples()) {
             Some(a) if !self.is_dirty() => a.masked(&self.base),

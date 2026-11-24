@@ -835,7 +835,7 @@ impl Tools<'_> {
             + branches.len();
         let mut out = json!({
             "dataset": ds.name,
-            "commit": r.snap.commit,
+            "commit": r.commit(),
             "agentGraphs": memory.agent_graphs,
             "sessions": sessions,
             "branches": branches,
@@ -1185,8 +1185,8 @@ impl Tools<'_> {
             "dataset": ds.name,
             "branch": b,
             "kind": review_kind(b),
-            "base": main.snap.commit,
-            "head": br.snap.commit,
+            "base": main.commit(),
+            "head": br.commit(),
             "facts": facts,
             "retracts": retracts,
             "rejected": rejected,

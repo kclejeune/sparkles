@@ -1531,12 +1531,12 @@ impl Tools<'_> {
                 let mut opts = opts.clone();
                 opts.union_default_graph = Some(false);
                 opts.default_graph_extra.clear();
-                super::memory::Reader {
-                    snap: snap.clone(),
+                super::memory::Reader::from_snapshot(
+                    snap.clone(),
                     opts,
-                    deadline: self.call.arrived + timeout,
+                    self.call.arrived + timeout,
                     reasoning,
-                }
+                )
             });
         // the planner's own notes first (spatial filters not pushed down, …)
         let mut warnings: Vec<Value> = plan

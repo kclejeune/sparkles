@@ -444,13 +444,7 @@ impl Tools<'_> {
             None
         };
         let r = match &view {
-            Some(v) => self.reader_on(
-                &ds,
-                v.shared_snapshot().clone(),
-                a.reasoning,
-                deadline,
-                &ctx,
-            )?,
+            Some(v) => self.reader_on_evidence(&ds, v.clone(), a.reasoning, deadline, &ctx)?,
             None => self.reader(&ds, a.at_commit, a.at.as_ref(), a.reasoning, deadline, &ctx)?,
         };
         let eng = |e| ctx.engine(e);
@@ -696,7 +690,7 @@ impl Tools<'_> {
         };
         let doc = Doc {
             dataset: &ds.name,
-            commit: r.snap.commit,
+            commit: r.commit(),
             seeds: seeds.len(),
             entities: &entities,
             facts: &facts,
@@ -970,7 +964,7 @@ impl Tools<'_> {
         }
         let graph = settings.reports_graph;
         let opts = r.timed()?;
-        if !read::readable(&r.snap, &opts, &graph) {
+        if !r.readable_graph(&opts, &graph)? {
             return Ok(Communities {
                 unavailable: Some("access"),
                 ..Default::default()
@@ -985,14 +979,8 @@ impl Tools<'_> {
             .collect();
         seeds.sort();
         let members: Vec<String> = seeds.iter().map(|(_, s)| s.clone()).collect();
-        let found = read::reports_of_members(
-            &r.snap,
-            &opts,
-            &graph,
-            &members,
-            level,
-            read::Filter::default(),
-        )?;
+        let found =
+            r.reports_of_members(&opts, &graph, &members, level, read::Filter::default())?;
         let mut reports: Vec<(read::ReportRef, Vec<usize>)> = Vec::new();
         for (m, rep) in found {
             let n = seeds.iter().find(|(_, s)| *s == m).map_or(0, |(n, _)| *n);
@@ -1268,7 +1256,7 @@ impl Tools<'_> {
     fn conflicts(
         &self,
         ds: &crate::state::Dataset,
-        r: &Reader,
+        _r: &Reader,
         entities: &[Entity],
         facts: &[Fact],
         ctx: &ErrorContext,
@@ -1280,13 +1268,14 @@ impl Tools<'_> {
             .call
             .principal
             .view(&ds.name, crate::auth::Endpoint::Info);
-        let layer = match ds.dataset.schema().constraints_at(
-            &r.snap,
-            &sparkles::handles::ShapesRequest::default(),
-            view.as_deref(),
-        ) {
-            Ok(Some(l)) => l,
-            Ok(None) => return Ok(Vec::new()),
+        let layer = match ds
+            .dataset
+            .schema()
+            .constraints(&sparkles::handles::ConstraintsRequest {
+                graphs: view,
+                ..Default::default()
+            }) {
+            Ok(l) => l,
             Err(Error::Unsupported(_)) | Err(Error::NotFound(_)) | Err(Error::Invalid(_)) => {
                 return Ok(Vec::new());
             }
@@ -2260,8 +2249,16 @@ impl Tools<'_> {
             deadline: Some(deadline),
             ..sparkles::task::Control::with_cancel(self.call.cancel.clone())
         };
-        let preparation =
-            sparkles::access::Preparation::new(control, VIEW_BYTES).map_err(|e| ctx.engine(e))?;
+        let limit = self
+            .cfg()
+            .query_memory_bytes
+            .unwrap_or(VIEW_BYTES)
+            .max(VIEW_BYTES);
+        let preparation = match &self.call.grant {
+            Some(grant) => sparkles::access::Preparation::with_grant(control, limit, grant.clone()),
+            None => sparkles::access::Preparation::new(control, limit),
+        }
+        .map_err(|e| ctx.engine(e))?;
         main.dataset
             .store()
             .evidence_view_with_branch(ds.dataset.store(), &sel, &preparation)
