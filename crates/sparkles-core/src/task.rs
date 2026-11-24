@@ -21,6 +21,13 @@ pub(crate) fn read_lock<'a, T>(
     lock: &'a parking_lot::RwLock<T>,
     check: impl Fn() -> Result<()>,
 ) -> Result<parking_lot::RwLockReadGuard<'a, T>> {
+    read_lock_with(lock, check)
+}
+
+pub(crate) fn read_lock_with<'a, T, E>(
+    lock: &'a parking_lot::RwLock<T>,
+    check: impl Fn() -> std::result::Result<(), E>,
+) -> std::result::Result<parking_lot::RwLockReadGuard<'a, T>, E> {
     loop {
         check()?;
         if let Some(guard) = lock.try_read_for(std::time::Duration::from_millis(10)) {

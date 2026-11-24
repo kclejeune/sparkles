@@ -922,6 +922,82 @@ fn materialized_fast_miss_admits_fsst_lookup_scratch() {
 
 #[cfg(feature = "reasoning")]
 #[test]
+fn demand_and_why_not_admit_fsst_root_lookup_scratch() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        explain::ExplainMode,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+    use sparkles_core::{
+        builder::{BuildOptions, VocabCodec},
+        store::StoreOptions,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let ds = Dataset::open_with(
+        dir.path().join("db"),
+        StoreOptions {
+            build: BuildOptions {
+                vocab_codec: Some(VocabCodec::Fsst),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let long = "z".repeat(65_536);
+    let mut data = format!(r#"@prefix ex: <http://ex.org/> . ex:hr {{ ex:s ex:p "a", "{long}""#);
+    for i in 2..sparkles_core::vocab::FC_BLOCK {
+        data.push_str(&format!(r#", "~filler{i}""#));
+    }
+    data.push_str(" . }");
+    ds.load_str(&data, RdfFormat::TriG).unwrap();
+    ds.store().compact().unwrap();
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+            ),
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named(HR.into())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+    // 48 KiB admits the demand session's term table (~35 KiB) with ~13 KiB left,
+    // well under the 64 KiB FSST suffix that precedes "b" and "~filler2".
+    for (mode, object) in [
+        (ExplainMode::Why, "b"),
+        (ExplainMode::Why, "~filler2"),
+        (ExplainMode::WhyNot, "b"),
+    ] {
+        let mut req = ExplainRequest::new([
+            ex("s"),
+            ex("q"),
+            oxrdf::Literal::new_simple_literal(object).into(),
+        ]);
+        req.source = Some(ExplainSource::Demand);
+        req.mode = mode;
+        req.max_memory = Some(48 * 1024);
+        let (result, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req));
+        assert!(
+            alloc.largest < 65_536,
+            "{mode:?} on {object:?} allocated an oversized FSST suffix (peak={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+        let error = result.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&error, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "{mode:?} on {object:?}: {error:?}"
+        );
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
 fn demand_session_refuses_before_allocating_terms_table() {
     use sparkles::reasoning::{
         ReasonRequest,

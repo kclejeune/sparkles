@@ -1674,9 +1674,19 @@ impl Vocab {
     pub(crate) fn find_with_controlled_growth(
         &self,
         key: &[u8],
-        mut grow: impl FnMut(usize, usize) -> crate::error::Result<()>,
-        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+        grow: impl FnMut(usize, usize) -> crate::error::Result<()>,
+        checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
     ) -> crate::error::Result<std::result::Result<u64, u64>> {
+        self.find_with_controlled_capacity(key, grow, |_| Ok(()), checkpoint)
+    }
+
+    pub(crate) fn find_with_controlled_capacity<E: From<crate::error::Error>>(
+        &self,
+        key: &[u8],
+        mut grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        mut settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<std::result::Result<u64, u64>, E> {
         let (mut lo, mut hi) = (0usize, self.num_blocks());
         while lo < hi {
             let mid = (lo + hi) / 2;
@@ -1699,7 +1709,7 @@ impl Vocab {
             b,
             ALL_KEYS,
             &mut grow,
-            &mut |_| Ok(()),
+            &mut settled,
             &mut |phase| check.borrow_mut()(phase),
             |at, actual| {
                 Ok(
@@ -2841,11 +2851,11 @@ pub struct AppendVocab {
 /// The longest key a controlled delta-vocabulary lookup hashes in one probe.
 pub(crate) const PREPARED_PROBE_BYTES: usize = 1 << 20;
 
-fn compare_prepared_bytes(
+fn compare_prepared_bytes<E>(
     left: &[u8],
     right: &[u8],
-    checkpoint: &mut impl FnMut(&'static str) -> crate::error::Result<()>,
-) -> crate::error::Result<std::cmp::Ordering> {
+    checkpoint: &mut impl FnMut(&'static str) -> std::result::Result<(), E>,
+) -> std::result::Result<std::cmp::Ordering, E> {
     let common = left.len().min(right.len());
     for (left, right) in left[..common]
         .chunks(1024)
@@ -2885,8 +2895,17 @@ impl AppendVocab {
         &self,
         key: &[u8],
         limit: u64,
-        mut checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
+        checkpoint: impl FnMut(&'static str) -> crate::error::Result<()>,
     ) -> crate::error::Result<Option<u64>> {
+        self.find_prepared_with(key, limit, checkpoint)
+    }
+
+    pub(crate) fn find_prepared_with<E>(
+        &self,
+        key: &[u8],
+        limit: u64,
+        mut checkpoint: impl FnMut(&'static str) -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<u64>, E> {
         checkpoint("searching delta vocabulary")?;
         if key.len() <= PREPARED_PROBE_BYTES {
             let found = self.find(key).filter(|&id| id < limit);

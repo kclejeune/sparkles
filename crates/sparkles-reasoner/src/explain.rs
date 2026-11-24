@@ -1089,7 +1089,7 @@ fn materialized(
     };
     let mut root = [0u64; 3];
     for (k, t) in triple.iter().enumerate() {
-        let id = terms.try_id_for(t)?;
+        let id = terms.try_id_for_controlled(t, || check_controls(opts))?;
         if Id(id).tag() == Tag::Local {
             return Ok(Explained::NotFound);
         }
@@ -1257,7 +1257,7 @@ fn program_search(
     let mut held = Held::new(&budget);
     {
         held.try_grow(generalized.len() * size_of::<Triple>())?;
-        let id = |k: &[u8]| terms.try_id_for_key(k);
+        let id = |k: &[u8]| terms.try_id_for_key_controlled(k, || check_controls(opts));
         let mut facts: Vec<Triple> = Vec::with_capacity(generalized.len());
         for k in generalized {
             facts.push([id(&k[0])?, id(&k[1])?, id(&k[2])?]);
@@ -1318,7 +1318,7 @@ fn program_search(
     };
     let mut root = [0u64; 3];
     for (k, t) in triple.iter().enumerate() {
-        let id = terms.try_id_for(t)?;
+        let id = terms.try_id_for_controlled(t, || check_controls(opts))?;
         if Id(id).tag() == Tag::Local {
             return Ok(Explained::NotFound);
         }
@@ -1539,6 +1539,21 @@ fn search(
     Ok(Explained::Found { trees, more })
 }
 
+/// Fail when an explanation's cancellation flag or deadline has tripped.
+pub(crate) fn check_controls(opts: &ExplainOptions) -> anyhow::Result<()> {
+    if opts
+        .cancel
+        .as_ref()
+        .is_some_and(|c| c.load(Ordering::Relaxed))
+    {
+        return Err(anyhow::Error::new(sparkles_core::Error::Cancelled));
+    }
+    if opts.deadline.is_some_and(|d| Instant::now() >= d) {
+        return Err(ExplainBudgetExceeded("the explanation passed its timeout".to_string()).into());
+    }
+    Ok(())
+}
+
 /// The stop function of a session from an explanation's controls.
 pub(crate) fn session_stop(
     opts: &ExplainOptions,
@@ -1664,9 +1679,9 @@ pub fn explain_demand(
         let root = {
             let terms = session.terms();
             [
-                terms.try_id_for(&triple[0])?,
-                terms.try_id_for(&triple[1])?,
-                terms.try_id_for(&triple[2])?,
+                terms.try_id_for_controlled(&triple[0], || check_controls(opts))?,
+                terms.try_id_for_controlled(&triple[1], || check_controls(opts))?,
+                terms.try_id_for_controlled(&triple[2], || check_controls(opts))?,
             ]
         };
         session
@@ -1849,6 +1864,349 @@ mod partial_tests {
             "builtin allocated both the 64 KiB term and call before refusing (peak={peak})"
         );
         assert!(BudgetFailure::from_anyhow(&result.unwrap_err()).is_some());
+    }
+
+    #[test]
+    fn proof_leaf_classification_keeps_large_delta_object_within_budget() {
+        let store = sparkles_core::store::Store::in_memory(Default::default());
+        let mut tx = store.write();
+        let subject = tx
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:s").into())
+            .unwrap();
+        let predicate = tx
+            .intern(&oxrdf::NamedNode::new_unchecked("urn:p").into())
+            .unwrap();
+        let value = "z".repeat(65_536);
+        let literal = tx
+            .intern(&oxrdf::Literal::new_simple_literal(value.clone()).into())
+            .unwrap();
+        tx.insert([subject, predicate, literal, Id::DEFAULT_GRAPH])
+            .unwrap();
+        tx.commit().unwrap();
+        assert_eq!(literal.tag(), Tag::Delta);
+        let snap = store.snapshot();
+        let terms = Terms::new(snap.clone());
+        let rs = RuleSet {
+            rules: &[],
+            infos: &[],
+            sources: &[],
+            geo: None,
+            relations: None,
+        };
+        let mut graph = Graph::with_capacity(0);
+        let plans = Plans::new(&mut graph, &[]).unwrap();
+        const LIMIT: usize = 96 * 1024;
+        let budget = Budget::new(Some(LIMIT));
+        let search = Search {
+            snap: &snap,
+            g: &graph,
+            terms: &terms,
+            rs: &rs,
+            plans: &plans,
+            inputs: &[Id::DEFAULT_GRAPH],
+            extra: &FxHashSet::default(),
+            budget: &budget,
+            opts: &ExplainOptions::default(),
+            rounds: &[],
+            abort: AtomicBool::new(false),
+            facts: vec![[subject.0, predicate.0, literal.0]],
+            index: FxHashMap::default(),
+            leaf: vec![Some(Leaf::Graph(Id::DEFAULT_GRAPH))],
+            by_head: vec![Vec::new()],
+            insts: Vec::new(),
+            premises: Vec::new(),
+            binds: Vec::new(),
+            visited: 0,
+            depth: vec![0],
+            via: vec![NONE],
+            kept: 0,
+            full_schedule: None,
+            _full_schedule_allocation: None,
+        };
+        let mut builder = Builder {
+            s: &search,
+            memory: Held::new(&budget),
+            max_depth: 1,
+            ids: FxHashMap::default(),
+            next: 0,
+        };
+        let (result, peak) = crate::alloc_probe::peak_of(|| builder.node(0, 0, None));
+        let proof = result.expect("valid leaf with one 64 KiB delta literal fits in 96 KiB");
+        assert!(
+            peak <= LIMIT,
+            "leaf classification copied the 64 KiB delta key while its literal was live (peak={peak})"
+        );
+        assert!(!proof.generalized);
+        assert_eq!(proof.kind, DerivationKind::Asserted);
+        assert_eq!(
+            proof.triple[2],
+            Term::Literal(oxrdf::Literal::new_simple_literal(value))
+        );
+        drop(proof);
+        drop(builder);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn explanation_root_lookup_admits_fsst_scratch_and_polls_controls() {
+        use sparkles_core::{
+            builder::{BuildOptions, VocabCodec},
+            io::{RdfFormat, Source},
+            store::{Store, StoreOptions},
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(
+            &dir.path().join("db"),
+            StoreOptions {
+                build: BuildOptions {
+                    vocab_codec: Some(VocabCodec::Fsst),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let long = "z".repeat(65_536);
+        let mut data = format!(r#"@prefix ex: <http://ex.org/> . ex:s ex:p "a", "{long}""#);
+        for i in 2..sparkles_core::vocab::FC_BLOCK {
+            data.push_str(&format!(r#", "~filler{i}""#));
+        }
+        data.push_str(" .");
+        store
+            .load(&[Source::from_bytes(
+                data.into_bytes(),
+                RdfFormat::Turtle,
+                None,
+            )])
+            .unwrap();
+        store.compact().unwrap();
+        let snap = store.snapshot();
+        assert!(snap.generation.vocab.is_fsst());
+        assert_eq!(
+            snap.generation.vocab.find(&sparkles_core::id::term_key(
+                &oxrdf::Literal::new_simple_literal(long).into()
+            )),
+            Ok(1)
+        );
+
+        let ex = |local: &str| {
+            Term::NamedNode(oxrdf::NamedNode::new(format!("http://ex.org/{local}")).unwrap())
+        };
+        let lit = |s: &str| Term::Literal(oxrdf::Literal::new_simple_literal(s));
+        let profile = Profile::Rules(
+            "@prefix ex: <http://ex.org/> . \
+             [derive: (?x ex:p ?y) -> (?x ex:q ?y)] \
+             [fresh: (?x ex:p \"a\") -> (?x ex:derived \"fresh\")]"
+                .into(),
+        );
+        let extras = Extras::default();
+
+        // Measure the budget used by materialized setup before root lookup, then leave 8 KiB.
+        let setup_budget = Budget::unlimited();
+        let base = Arc::new(Base::new(snap.clone(), &[Id::DEFAULT_GRAPH]).unwrap());
+        let mut g = Graph::with_base(base);
+        g.set_budget(&setup_budget).unwrap();
+        let setup_terms = Terms::new_in(snap.clone(), &setup_budget).unwrap();
+        let mut warnings = WorkingWarnings::new(&setup_budget);
+        let parsed = crate::profile_rules(&profile, &extras).unwrap();
+        let _compiled = engine::compile_info(&parsed, &setup_terms, &mut warnings, false).unwrap();
+        let mat_limit = setup_budget.used() + 8192;
+
+        let mat_input = ExplainInput {
+            snap: snap.clone(),
+            profile: &profile,
+            extras: &extras,
+            inputs: &[Id::DEFAULT_GRAPH],
+            inferred: None,
+        };
+        // Entry 0 ("a") is uncompressed; measure baseline peak without scanning entry 1.
+        let (_, mat_baseline) = crate::alloc_probe::peak_of(|| {
+            explain(
+                &mat_input,
+                &[ex("s"), ex("p"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let mat_opts = ExplainOptions {
+            max_memory: Some(mat_limit),
+            ..Default::default()
+        };
+        // 1. Materialized strict reasoner route on absent short literal "b".
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain(&mat_input, &[ex("s"), ex("p"), lit("b")], &mat_opts)
+        });
+        assert!(
+            peak < mat_baseline + 16_384,
+            "materialized root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+        // 2. Materialized strict reasoner route on present short filler sorting after 64 KiB literal.
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain(&mat_input, &[ex("s"), ex("p"), lit("~filler2")], &mat_opts)
+        });
+        assert!(
+            peak < mat_baseline + 16_384,
+            "materialized root hit allocated 64 KiB FSST suffix (peak={peak}, baseline={mat_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // 3. Demand and why-not routes with 8 KiB left after demand session setup.
+        let reasoner =
+            QueryReasoner::new(profile.clone(), &extras, crate::Inputs::default()).unwrap();
+        let demand_input = DemandInput {
+            reasoner: &reasoner,
+            snap: snap.clone(),
+            readable: None,
+        };
+        let probe_session =
+            demand_session(&demand_input, &ExplainOptions::default(), true).unwrap();
+        let demand_limit = probe_session.budget().used() + 8192;
+        drop(probe_session);
+        let (_, demand_baseline) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_input,
+                &[ex("s"), ex("absent"), lit("a")],
+                &ExplainOptions::default(),
+            )
+            .unwrap()
+        });
+        let demand_opts = ExplainOptions {
+            max_memory: Some(demand_limit),
+            ..Default::default()
+        };
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain_demand(&demand_input, &[ex("s"), ex("q"), lit("b")], &demand_opts)
+        });
+        assert!(
+            peak < demand_baseline + 16_384,
+            "demand root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            explain_demand(
+                &demand_input,
+                &[ex("s"), ex("q"), lit("~filler2")],
+                &demand_opts,
+            )
+        });
+        assert!(
+            peak < demand_baseline + 16_384,
+            "demand root hit allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        let whynot_opts = crate::whynot::WhyNotOptions {
+            explain: demand_opts,
+            ..Default::default()
+        };
+        let (res, peak) = crate::alloc_probe::peak_of(|| {
+            crate::whynot::why_not(&demand_input, &[ex("s"), ex("q"), lit("b")], &whynot_opts)
+        });
+        assert!(
+            peak < demand_baseline + 16_384,
+            "why-not root miss allocated 64 KiB FSST suffix (peak={peak}, baseline={demand_baseline})"
+        );
+        assert!(
+            res.unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+
+        // Local-interning behavior on misses is preserved when budget allows.
+        let found = explain_demand(
+            &demand_input,
+            &[ex("s"), ex("derived"), lit("fresh")],
+            &ExplainOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(found, Explained::Found { .. }));
+        let wn = crate::whynot::why_not(
+            &demand_input,
+            &[ex("s"), ex("q"), lit("b")],
+            &crate::whynot::WhyNotOptions::default(),
+        )
+        .unwrap();
+        assert!(!matches!(wn, crate::whynot::WhyNot::Entailed));
+
+        // Direct strict term lookup with 8 KiB left after Terms::new_in refuses before
+        // allocating the 64 KiB FSST suffix, and polls live cancellation/deadline controls.
+        let direct_probe = Budget::unlimited();
+        let _direct_setup = Terms::new_in(snap.clone(), &direct_probe).unwrap();
+        let direct_limit = direct_probe.used() + 8192;
+        let direct_budget = Budget::new(Some(direct_limit));
+        let direct_terms = Terms::new_in(snap.clone(), &direct_budget).unwrap();
+        for term in [lit("b"), lit("~filler2")] {
+            let (res, peak) = crate::alloc_probe::peak_of(|| {
+                direct_terms.try_id_for_controlled(&term, || Ok(()))
+            });
+            assert!(
+                peak <= 8192,
+                "direct strict lookup for {term} allocated oversized FSST scratch (peak={peak})"
+            );
+            assert!(BudgetFailure::from_anyhow(&res.unwrap_err()).is_some());
+        }
+        let mid_budget = Budget::unlimited();
+        let mid_terms = Terms::new_in(snap.clone(), &mid_budget).unwrap();
+        let polls = Cell::new(0usize);
+        let (stopped, peak) = crate::alloc_probe::peak_of(|| {
+            mid_terms.try_id_for_controlled(&lit("b"), || {
+                let n = polls.get() + 1;
+                polls.set(n);
+                if n >= 8 {
+                    Err(anyhow::Error::new(sparkles_core::Error::Cancelled))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+        assert!(
+            peak <= 8192,
+            "mid-scan cancellation should stop before 64 KiB allocation (peak={peak})"
+        );
+        assert!(
+            stopped
+                .unwrap_err()
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
+        let expired_opts = ExplainOptions {
+            deadline: Some(Instant::now() - std::time::Duration::from_secs(1)),
+            ..Default::default()
+        };
+        assert!(
+            explain(&mat_input, &[ex("s"), ex("p"), lit("b")], &expired_opts)
+                .unwrap_err()
+                .downcast_ref::<ExplainBudgetExceeded>()
+                .is_some()
+        );
+        let cancel_opts = ExplainOptions {
+            cancel: Some(Arc::new(AtomicBool::new(true))),
+            ..Default::default()
+        };
+        assert!(
+            explain(&mat_input, &[ex("s"), ex("p"), lit("b")], &cancel_opts)
+                .unwrap_err()
+                .downcast_ref::<sparkles_core::Error>()
+                .is_some_and(|e| matches!(e, sparkles_core::Error::Cancelled))
+        );
     }
 
     #[test]

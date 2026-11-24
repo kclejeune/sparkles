@@ -24,8 +24,8 @@ use crate::builtins::BuiltinKind;
 use crate::demand::{head_slots, intensional};
 use crate::engine::{CHead, CRule, Eval, Mode, Slot};
 use crate::explain::{
-    CallBytes, DemandInput, ExplainOptions, demand_session, search_session, session_error,
-    write_call,
+    CallBytes, DemandInput, ExplainOptions, check_controls, demand_session, search_session,
+    session_error, write_call,
 };
 use crate::facts::Memo;
 use crate::graph::{Graph, Triple};
@@ -1073,9 +1073,9 @@ fn why_not_inner(
     let root = {
         let terms = session.terms();
         [
-            terms.try_id_for(&triple[0])?,
-            terms.try_id_for(&triple[1])?,
-            terms.try_id_for(&triple[2])?,
+            terms.try_id_for_controlled(&triple[0], || check_controls(&opts.explain))?,
+            terms.try_id_for_controlled(&triple[1], || check_controls(&opts.explain))?,
+            terms.try_id_for_controlled(&triple[2], || check_controls(&opts.explain))?,
         ]
     };
     session
@@ -1397,7 +1397,9 @@ fn verify(
                 let term = from
                     .term(f[i])
                     .ok_or_else(|| anyhow::anyhow!("term {} is unknown", f[i]))?;
-                t[i] = s.terms().try_id_for(&term)?;
+                t[i] = s
+                    .terms()
+                    .try_id_for_controlled(&term, || check_controls(&verification_opts))?;
                 shown.push(term);
             }
         }
@@ -1409,9 +1411,9 @@ fn verify(
     let root = {
         let terms = s.terms();
         [
-            terms.try_id_for(&triple[0])?,
-            terms.try_id_for(&triple[1])?,
-            terms.try_id_for(&triple[2])?,
+            terms.try_id_for_controlled(&triple[0], || check_controls(&verification_opts))?,
+            terms.try_id_for_controlled(&triple[1], || check_controls(&verification_opts))?,
+            terms.try_id_for_controlled(&triple[2], || check_controls(&verification_opts))?,
         ]
     };
     match s.derive_ids(&[[Some(root[0]), Some(root[1]), Some(root[2])]]) {

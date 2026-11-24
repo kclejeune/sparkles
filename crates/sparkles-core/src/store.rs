@@ -779,26 +779,45 @@ impl Snapshot {
                 }
                 id::write_term_ref_key(t.as_ref(), &mut key);
                 debug_assert_eq!(key.len(), len);
-                check()?;
-                let found = match self.generation.vocab.find_with_controlled_growth(
+                self.lookup_key_controlled(
                     &key,
                     |old, new| {
                         let bytes = key.capacity().saturating_add(old).saturating_add(new);
                         admit(bytes)
                     },
-                    |_| check(),
-                )? {
-                    Ok(i) => Some(Id::vocab(i)),
-                    Err(_) => self
-                        .generation
-                        .dvocab
-                        .find_prepared(&key, self.dvocab_len, &mut *check)?
-                        .map(Id::delta),
-                };
-                check()?;
-                Ok(found)
+                    |_| Ok(()),
+                    check,
+                )
             }
         }
+    }
+
+    /// Id of a vocabulary key if it exists in this snapshot, checking live controls and
+    /// admitting coexisting vocabulary reconstruction buffers during growth, then only the
+    /// settled scratch allocation.
+    pub fn lookup_key_controlled<E: From<Error>>(
+        &self,
+        key: &[u8],
+        grow: impl FnMut(usize, usize) -> std::result::Result<(), E>,
+        settled: impl FnMut(usize) -> std::result::Result<(), E>,
+        mut check: impl FnMut() -> std::result::Result<(), E>,
+    ) -> std::result::Result<Option<Id>, E> {
+        check()?;
+        let found =
+            match self
+                .generation
+                .vocab
+                .find_with_controlled_capacity(key, grow, settled, |_| check())?
+            {
+                Ok(i) => Some(Id::vocab(i)),
+                Err(_) => self
+                    .generation
+                    .dvocab
+                    .find_prepared(key, self.dvocab_len, &mut check)?
+                    .map(Id::delta),
+            };
+        check()?;
+        Ok(found)
     }
 
     pub fn lookup_iri(&self, iri: &str) -> Option<Id> {

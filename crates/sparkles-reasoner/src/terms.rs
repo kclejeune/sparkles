@@ -378,6 +378,108 @@ impl Terms {
         self.id_charged(t, true)
     }
 
+    /// Strict [`try_id_for`](Self::try_id_for) that admits vocabulary reconstruction
+    /// scratch against the term table's budget and polls live controls.
+    pub(crate) fn try_id_for_controlled(
+        &self,
+        t: &Term,
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        check()?;
+        if let Some(id) = id::inline_id(t) {
+            return Ok(id.0);
+        }
+        if matches!(t, Term::BlankNode(_)) {
+            return match self.id_charged(t, true) {
+                Ok(id) => Ok(id),
+                Err(err) => {
+                    check()?;
+                    Err(err.into())
+                }
+            };
+        }
+        let budget = self.budget();
+        let key = match key::WorkingKey::new(t, &budget, true) {
+            Ok(key) => key,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        if let Some(id) = self.lookup_key_controlled(key.as_slice(), &budget, &mut check)? {
+            return Ok(id.0);
+        }
+        check()?;
+        match key.intern(self, true) {
+            Ok(id) => Ok(id),
+            Err(err) => {
+                check()?;
+                Err(err.into())
+            }
+        }
+    }
+
+    /// Strict [`try_id_for_key`](Self::try_id_for_key) that admits vocabulary
+    /// reconstruction scratch against the term table's budget and polls live controls.
+    pub(crate) fn try_id_for_key_controlled(
+        &self,
+        key: &[u8],
+        mut check: impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<u64> {
+        let budget = self.budget();
+        if let Some(id) = self.lookup_key_controlled(key, &budget, &mut check)? {
+            return Ok(id.0);
+        }
+        check()?;
+        let temporary = match Held::try_new_exact(&budget, key.len()) {
+            Ok(held) => held,
+            Err(err) => {
+                check()?;
+                return Err(err.into());
+            }
+        };
+        match self.local_keyed(
+            Some(temporary),
+            key.to_vec(),
+            LocalTerm::Key(Vec::new()),
+            true,
+        ) {
+            Ok(id) => Ok(id),
+            Err(err) => {
+                check()?;
+                Err(err.into())
+            }
+        }
+    }
+
+    fn lookup_key_controlled(
+        &self,
+        key: &[u8],
+        budget: &Arc<Budget>,
+        check: &mut impl FnMut() -> anyhow::Result<()>,
+    ) -> anyhow::Result<Option<Id>> {
+        let check = std::cell::RefCell::new(check);
+        let scratch = std::cell::RefCell::new(Held::new(budget));
+        self.snap.lookup_key_controlled(
+            key,
+            |old, new| -> anyhow::Result<()> {
+                if let Err(err) = scratch.borrow_mut().try_set(old.saturating_add(new)) {
+                    (check.borrow_mut())()?;
+                    return Err(err.into());
+                }
+                Ok(())
+            },
+            |capacity| -> anyhow::Result<()> {
+                if let Err(err) = scratch.borrow_mut().try_set(capacity) {
+                    (check.borrow_mut())()?;
+                    return Err(err.into());
+                }
+                Ok(())
+            },
+            || (check.borrow_mut())(),
+        )
+    }
+
     /// The id of the IRI or literal with vocabulary key `key`: in the store, else a
     /// (new) local id, failing without a new term when it does not fit the budget.
     pub fn try_id_for_key(&self, key: &[u8]) -> Result<u64, BudgetFailure> {
@@ -710,7 +812,11 @@ impl Terms {
                     Kind::Other
                 }
             }
-            Tag::Delta => self.snap.key(i).map_or(Kind::Other, |k| key_kind(&k)),
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|v| v.get(i.payload()).map_or(Kind::Other, key_kind)),
             Tag::Local => self.local_kind(id),
             _ => Kind::Other,
         }
