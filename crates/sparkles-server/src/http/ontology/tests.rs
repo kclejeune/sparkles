@@ -2979,3 +2979,133 @@ async fn classify_reports_what_a_left_out_axiom_reaches_and_strict_refuses_it() 
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert_eq!(r.json()["complete"], true);
 }
+
+const DL663_TRAILING_SUPERROLES: &str = include_str!(
+    "../../../../sparkles-owl/tests/fixtures/dl663_top_chain_default/03-trailing-superroles.ofn"
+);
+const DL663_CLASSIFY: &str = "/$/ontology/t/classify?graph=urn%3Adl663%3Ainput";
+const DL663_GAP: &str = "property chains through the top object property";
+
+async fn dl663_classification_server() -> Server {
+    let s = server();
+    // Supply declarations for the reverse RDF mapping of the retained OFN fixture.
+    let body = DL663_TRAILING_SUPERROLES.replacen(
+        "Ontology(",
+        "Ontology(<urn:dl663:input>
+         Declaration(Class(:A)) Declaration(Class(:B)) Declaration(Class(:D))
+         Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:s))
+         Declaration(ObjectProperty(:t)) Declaration(ObjectProperty(:g))
+         ",
+        1,
+    );
+    let r = send(
+        &s.app,
+        "PUT",
+        "/t/data?graph=urn%3Adl663%3Ainput",
+        &[(header::CONTENT_TYPE.as_str(), sparkles::io::OFN_MEDIA_TYPE)],
+        &body,
+    )
+    .await;
+    assert!(r.status.is_success(), "{} {}", r.status, r.text());
+    s
+}
+
+#[tokio::test]
+async fn dl663_http_default_classification_includes_the_projected_parent() {
+    let s = dl663_classification_server().await;
+    let about = "urn:top-domain:A";
+    let r = post(&s.app, DL663_CLASSIFY, json!({"about": about})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let plain = r.json();
+    assert_eq!(plain["reused"], false, "{plain}");
+    assert_eq!(plain["complete"], false, "{plain}");
+    assert_eq!(plain["completeForTaken"], true, "{plain}");
+    assert_eq!(plain["excludedCount"], 1, "{plain}");
+    assert_eq!(plain["excluded"][0]["partial"], DL663_GAP, "{plain}");
+
+    let r = post(
+        &s.app,
+        DL663_CLASSIFY,
+        json!({"projection": "frame", "about": about}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let projected = r.json();
+    let frame = &projected["frame"];
+    assert_eq!(
+        projected["classificationSource"],
+        plain["classificationSource"]
+    );
+    assert_eq!(
+        projected["classificationSource"]["producer"]["elOnly"],
+        false
+    );
+    assert_eq!(frame["result"]["resultId"], plain["resultId"]);
+    assert_eq!(frame["retention"]["kept"], true);
+    assert_eq!(frame["retention"]["resultId"], plain["resultId"]);
+    assert_eq!(frame["result"]["elOnly"], false);
+    assert_eq!(frame["outcome"]["complete"], false);
+    assert_eq!(frame["outcome"]["partial"], false);
+    assert_eq!(frame["outcome"]["unmappedCount"], 0);
+    assert_eq!(frame["excluded"]["total"], 1);
+    let e = &frame["excluded"]["items"][0];
+    assert_eq!(
+        e["gap"],
+        json!({"kind": "partiallyUsed", "reason": DL663_GAP})
+    );
+    let original = sparkles::owl::ofn_read::parse_axiom(
+        "SubObjectPropertyOf(ObjectPropertyChain(<urn:top-domain:r> owl:topObjectProperty) <urn:top-domain:t>)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(e["axiom"], sparkles::owl::json::axiom(&original));
+
+    let r = post(&s.app, DL663_CLASSIFY, json!({"about": "urn:top-domain:C"})).await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert!(
+        !r.json()["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("urn:top-domain:D"))
+    );
+    assert!(
+        frame["parents"]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["iri"] == "urn:top-domain:D")
+            && plain["class"]["superClasses"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("urn:top-domain:D")),
+        "dl663 missing: HTTP default projected domain",
+    );
+    println!("dl663 ok: HTTP default projected domain");
+}
+
+#[tokio::test]
+async fn dl663_http_strict_refusal_leaves_the_target_unpublished() {
+    let s = dl663_classification_server().await;
+    let ds = s._state.get("t").unwrap();
+    let head = ds.store.head_commit().seq;
+    let r = post(
+        &s.app,
+        DL663_CLASSIFY,
+        json!({"strict": true, "target": "urn:dl663:target"}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    let message = j["error"].as_str().unwrap();
+    assert!(
+        message.contains("ObjectPropertyChain") && message.contains(DL663_GAP),
+        "{j}"
+    );
+    assert_eq!(ds.store.head_commit().seq, head);
+
+    let r = get(&s.app, "/$/ontology/t/axioms?graph=urn%3Adl663%3Atarget").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["total"], 0);
+    println!("dl663 ok: HTTP strict leaves target unpublished");
+}

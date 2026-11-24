@@ -90,6 +90,10 @@ struct Held {
     peak: usize,
 }
 impl Budget {
+    pub(super) fn memory_limit(&self) -> usize {
+        self.limits.max_memory.unwrap_or(usize::MAX)
+    }
+
     #[cfg(test)]
     pub fn set_hook(&self, hook: Arc<TestHook>) {
         *self.hook.lock() = Some(hook);

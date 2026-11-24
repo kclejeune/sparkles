@@ -681,3 +681,170 @@ SubClassOf(:A ObjectMaxCardinality(2 :r :B))
     let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert_eq!(j["complete"], true, "{j}");
 }
+
+const DL663_TRAILING_SUPERROLES: &str = include_str!(
+    "../../sparkles-owl/tests/fixtures/dl663_top_chain_default/03-trailing-superroles.ofn"
+);
+
+fn dl663_write_input(dir: &Path) {
+    // A ⊑ E is direct in ELK and redundant through D in the default reasoner.
+    let input = DL663_TRAILING_SUPERROLES.replacen(
+        "Ontology(",
+        "Ontology(
+         Declaration(Class(:A)) Declaration(Class(:B)) Declaration(Class(:D))
+         Declaration(Class(:E))
+         Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:s))
+         Declaration(ObjectProperty(:t)) Declaration(ObjectProperty(:g))
+         SubClassOf(:A :E) SubClassOf(:D :E)
+         ",
+        1,
+    );
+    std::fs::write(dir.join("chain.ofn"), input).unwrap();
+}
+
+fn dl663_transform(
+    dir: &Path,
+    command: &str,
+    output: &str,
+    extra: &[&str],
+) -> Vec<sparkles::owl::Axiom> {
+    let mut args = vec![
+        "ontology",
+        command,
+        "--input",
+        "chain.ofn",
+        "--output",
+        output,
+    ];
+    args.extend_from_slice(extra);
+    let o = sparkles(dir, &args);
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let doc = std::fs::read_to_string(dir.join(output)).unwrap();
+    sparkles::owl::ofn_read::parse(&doc).unwrap().axioms
+}
+
+fn dl663_subclass(sub: &str, sup: &str) -> sparkles::owl::Axiom {
+    sparkles::owl::Axiom::sub_class_of(
+        sparkles::owl::Class::new(format!("urn:top-domain:{sub}")),
+        sparkles::owl::Class::new(format!("urn:top-domain:{sup}")),
+    )
+}
+
+#[test]
+fn dl663_cli_file_classify_uses_the_default_reasoner() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    dl663_write_input(dir);
+    let o = sparkles(
+        dir,
+        &[
+            "ontology",
+            "classify",
+            "chain.ofn",
+            "--about",
+            "urn:top-domain:A",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(o.status.code(), Some(0), "{}", err(&o));
+    let j: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(j["complete"], false, "{j}");
+    assert_eq!(j["completeForTaken"], true, "{j}");
+    assert_eq!(j["excludedCount"], 1, "{j}");
+    assert_eq!(
+        j["excluded"][0]["partial"], "property chains through the top object property",
+        "{j}",
+    );
+    assert!(
+        j["class"]["superClasses"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("urn:top-domain:D")),
+        "dl663 missing: CLI file classification domain",
+    );
+    println!("dl663 ok: CLI file classification domain");
+}
+
+#[test]
+fn dl663_cli_default_reason_writes_the_named_consequence() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    dl663_write_input(dir);
+    let axioms = dl663_transform(dir, "reason", "reasoned.ofn", &[]);
+    assert!(axioms.contains(&dl663_subclass("D", "E")));
+    assert!(!axioms.contains(&dl663_subclass("C", "D")));
+    assert!(
+        axioms.contains(&dl663_subclass("A", "D")),
+        "dl663 missing: CLI default reason domain",
+    );
+    println!("dl663 ok: CLI default reason domain");
+}
+
+#[test]
+fn dl663_cli_default_reduce_removes_the_now_redundant_axiom() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    dl663_write_input(dir);
+    let axioms = dl663_transform(
+        dir,
+        "reduce",
+        "reduced.ofn",
+        &["--named-classes-only", "true"],
+    );
+    assert!(axioms.contains(&dl663_subclass("D", "E")));
+    assert!(
+        !axioms.contains(&dl663_subclass("A", "E")),
+        "dl663 missing: CLI default reduce redundancy",
+    );
+    println!("dl663 ok: CLI default reduce redundancy");
+}
+
+#[test]
+fn dl663_cli_explicit_elk_and_emr_keep_legacy_answers() {
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    dl663_write_input(dir);
+    for reasoner in ["ELK", "emr"] {
+        let axioms = dl663_transform(dir, "reason", "legacy.ofn", &["--reasoner", reasoner]);
+        assert!(axioms.contains(&dl663_subclass("A", "E")), "{reasoner}");
+        assert!(!axioms.contains(&dl663_subclass("A", "D")), "{reasoner}");
+    }
+    let axioms = dl663_transform(
+        dir,
+        "reduce",
+        "reduced.ofn",
+        &["--named-classes-only", "true", "--reasoner", "ELK"],
+    );
+    assert!(axioms.contains(&dl663_subclass("A", "E")));
+    assert!(axioms.contains(&dl663_subclass("D", "E")));
+    println!("dl663 ok: CLI explicit ELK and emr parity");
+}
+
+#[test]
+fn dl663_cli_materialize_defaults_to_elk() {
+    use sparkles::owl::{Axiom, Class, ClassExpression, ObjectProperty};
+
+    let d = tempfile::tempdir().unwrap();
+    let dir = d.path();
+    dl663_write_input(dir);
+    let args = ["--term", "urn:top-domain:r"];
+    let default = dl663_transform(dir, "materialize", "default.ofn", &args);
+    let explicit = dl663_transform(
+        dir,
+        "materialize",
+        "elk.ofn",
+        &[&args[..], &["--reasoner", "ELK"]].concat(),
+    );
+    let ordinary = Axiom::sub_class_of(
+        Class::new("urn:top-domain:A"),
+        ClassExpression::some(
+            ObjectProperty::new("urn:top-domain:r"),
+            Class::new("urn:top-domain:B"),
+        ),
+    );
+    assert!(default.contains(&ordinary));
+    assert!(!default.contains(&dl663_subclass("A", "D")));
+    assert_eq!(default, explicit);
+    println!("dl663 ok: CLI omitted materialize reasoner is ELK");
+}

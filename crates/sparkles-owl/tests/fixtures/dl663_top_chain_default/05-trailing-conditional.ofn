@@ -1,0 +1,7 @@
+Prefix(:=<urn:top-domain:>) Ontology(SubObjectPropertyOf(ObjectPropertyChain(:r owl:topObjectProperty) :t)
+     ObjectPropertyDomain(:t :D) SubClassOf(:A ObjectOneOf(:a))
+     SubClassOf(:A ObjectSomeValuesFrom(:q :B))
+     SubClassOf(:B ObjectOneOf(:b)) SubClassOf(:B :P)
+     ObjectPropertyAssertion(:s :a :b)
+     SubClassOf(ObjectSomeValuesFrom(:s :P) :Q)
+     SubClassOf(:Q ObjectSomeValuesFrom(:r :Tail)) Declaration(Class(:C)))

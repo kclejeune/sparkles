@@ -853,16 +853,19 @@ impl Interner {
         id
     }
 
+    pub(super) fn object_role_id(&self, p: &ObjectProperty) -> Option<Role> {
+        self.role_ids
+            .find(
+                object_hash(p.as_str()),
+                |&id| matches!(&self.roles[id as usize], RoleName::Object(q) if q == p),
+            )
+            .copied()
+    }
+
     /// The role of an object property, which copies its IRI only when it is new.
     pub fn object_role(&mut self, p: &ObjectProperty) -> Role {
-        let found = self.role_ids.find(
-            object_hash(p.as_str()),
-            |&id| matches!(&self.roles[id as usize], RoleName::Object(q) if q == p),
-        );
-        match found {
-            Some(&id) => id,
-            None => self.role(RoleName::Object(p.clone())),
-        }
+        self.object_role_id(p)
+            .unwrap_or_else(|| self.role(RoleName::Object(p.clone())))
     }
 
     pub fn fresh_role(&mut self) -> Role {
@@ -1939,7 +1942,7 @@ fn normalize_axiom(
 
 /// Why an axiom with a chain through the top object property is used in part: the
 /// classifier composes links, and the top property links every pair.
-const TOP_CHAIN: &str = "property chains through the top object property";
+pub(super) const TOP_CHAIN: &str = "property chains through the top object property";
 /// Why an axiom with a literal or a datatype that the classifier cannot compare is used
 /// in part: it is an atom that only equals itself.
 pub const OPAQUE: &str = "literals and datatypes without values the classifier compares";
@@ -2111,6 +2114,7 @@ pub struct Head {
 /// The rules each expression triggers.
 #[derive(Default)]
 pub struct Index {
+    pub(super) top_chain: Option<super::top_chain::Rules>,
     /// Keeps the numeric accounting root alive without billing each alias.
     pub(super) numeric_ledger: Option<std::sync::Arc<super::numeric::NumericLedger>>,
     /// by expression
@@ -2190,6 +2194,7 @@ impl Index {
             horn: a_horn,
             dl: a_dl,
             dt: a_dt,
+            top_chain: a_top_chain,
         } = self;
         let Index {
             numeric_ledger: b_ledger,
@@ -2211,7 +2216,9 @@ impl Index {
             horn: b_horn,
             dl: b_dl,
             dt: b_dt,
+            top_chain: b_top_chain,
         } = expected;
+        assert!(a_top_chain.is_none() && b_top_chain.is_none());
         assert_eq!(a_dt.is_some(), b_dt.is_some());
         match (a_ledger, b_ledger) {
             (None, None) => {}
@@ -2626,7 +2633,9 @@ impl Index {
 
     /// The bytes the index takes, roughly, the role table included.
     pub fn bytes(&self) -> usize {
-        self.heads.capacity() * std::mem::size_of::<Head>()
+        let top_chain = self.top_chain.as_ref().map_or(0, |rules| rules.bytes());
+        top_chain
+            + self.heads.capacity() * std::mem::size_of::<Head>()
             + self.told.capacity() * 4
             + self.conj.capacity() * 8
             + self.exist.capacity() * 8

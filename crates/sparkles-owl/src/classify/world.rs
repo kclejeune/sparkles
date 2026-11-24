@@ -107,6 +107,47 @@ pub fn universal_facts(ix: &Index, view: &dyn View, known: &[Ex]) -> Vec<Ex> {
     out
 }
 
+/// Reports live changes. An installed named-domain table gives its worlds direct
+/// access to the ledger so unwinding can retire ownership without polling.
+#[derive(Clone, Copy)]
+enum Reporter<'a> {
+    Callback(&'a (dyn Fn(isize) -> bool + Sync)),
+    NamedDomain(&'a super::WorldBudget<'a>),
+}
+
+impl Reporter<'_> {
+    fn tell(self, delta: isize) -> bool {
+        self.tell_owned(delta, || {})
+    }
+
+    /// `own` records the posted delta using only infallible assignments.
+    fn tell_owned(self, delta: isize, own: impl FnOnce()) -> bool {
+        match self {
+            Self::Callback(bound) => {
+                own();
+                bound(delta)
+            }
+            Self::NamedDomain(budget) => {
+                let previous = budget.post(delta);
+                own();
+                #[cfg(test)]
+                super::world_retirement_mixed_tests::world_posted(budget, delta, previous);
+                budget.check_post(delta, previous)
+                    && budget.halt.load(std::sync::atomic::Ordering::Relaxed) == 0
+            }
+        }
+    }
+
+    fn retire(self, delta: isize) {
+        match self {
+            Self::Callback(bound) => {
+                bound(-delta);
+            }
+            Self::NamedDomain(budget) => budget.retire(delta),
+        }
+    }
+}
+
 /// The pairs of named individuals made equal by keys. All vector capacities remain
 /// admitted until their owners die; only the returned pair owner outlives this call.
 pub struct KeyMerges<'a> {
@@ -119,13 +160,13 @@ impl std::ops::Deref for KeyMerges<'_> {
     }
 }
 struct Scratch<'a> {
-    bound: &'a (dyn Fn(isize) -> bool + Sync),
+    reporter: Reporter<'a>,
     bytes: usize,
 }
 impl Drop for Scratch<'_> {
     fn drop(&mut self) {
         if self.bytes > 0 {
-            (self.bound)(-(self.bytes as isize));
+            self.reporter.retire(self.bytes as isize);
         }
     }
 }
@@ -140,21 +181,17 @@ struct KeyStorage<'a, T> {
     _scratch: Scratch<'a>,
 }
 impl<'a, T> KeyStorage<'a, T> {
-    fn new(count: usize, bound: &'a (dyn Fn(isize) -> bool + Sync)) -> Result<Self, Halt> {
-        Self::with_payload(count, 0, bound)
+    fn new(count: usize, reporter: Reporter<'a>) -> Result<Self, Halt> {
+        Self::with_payload(count, 0, reporter)
     }
-    fn with_payload(
-        count: usize,
-        payload: usize,
-        bound: &'a (dyn Fn(isize) -> bool + Sync),
-    ) -> Result<Self, Halt> {
-        Self::with_live(count, payload, 0, bound)
+    fn with_payload(count: usize, payload: usize, reporter: Reporter<'a>) -> Result<Self, Halt> {
+        Self::with_live(count, payload, 0, reporter)
     }
     fn with_live(
         count: usize,
         payload: usize,
         live: usize,
-        bound: &'a (dyn Fn(isize) -> bool + Sync),
+        reporter: Reporter<'a>,
     ) -> Result<Self, Halt> {
         let bytes = count
             .checked_mul(std::mem::size_of::<T>())
@@ -164,11 +201,11 @@ impl<'a, T> KeyStorage<'a, T> {
         live.checked_add(bytes)
             .filter(|&total| total <= isize::MAX as usize)
             .ok_or(Halt::Memory(usize::MAX))?;
-        let scratch = Scratch { bound, bytes };
+        let mut scratch = Scratch { reporter, bytes: 0 };
         if bytes > 0 {
             #[cfg(test)]
             KEY_ADMITTING.with(|p| p.set(true));
-            let accepted = bound(bytes as isize);
+            let accepted = reporter.tell_owned(bytes as isize, || scratch.bytes = bytes);
             #[cfg(test)]
             KEY_ADMITTING.with(|p| p.set(false));
             if !accepted {
@@ -372,6 +409,14 @@ pub fn key_merges<'a>(
     view: &dyn View,
     bound: &'a (dyn Fn(isize) -> bool + Sync),
 ) -> Result<KeyMerges<'a>, Halt> {
+    key_merges_reported(ix, view, Reporter::Callback(bound))
+}
+
+fn key_merges_reported<'a>(
+    ix: &Index,
+    view: &dyn View,
+    reporter: Reporter<'a>,
+) -> Result<KeyMerges<'a>, Halt> {
     // The global fixpoint and each conditional world are stable while this routine
     // reads them. The first pass counts the pairs each key actually merges, so that the
     // returned storage is admitted for those pairs only, and not for every pair of key
@@ -379,12 +424,12 @@ pub fn key_merges<'a>(
     // the key work in exchange for storage that grows with the merges found.
     let mut found = 0;
     for key in &ix.keys {
-        key_matches(ix, view, key, 0, bound, |_| key_add(&mut found, 1))?;
+        key_matches(ix, view, key, 0, reporter, |_| key_add(&mut found, 1))?;
     }
-    let mut pairs = KeyStorage::new(found, bound)?;
+    let mut pairs = KeyStorage::new(found, reporter)?;
     let live = pairs._scratch.bytes;
     for key in &ix.keys {
-        key_matches(ix, view, key, live, bound, |pair| pairs.push(pair))?;
+        key_matches(ix, view, key, live, reporter, |pair| pairs.push(pair))?;
     }
     pairs.rows.sort_unstable();
     pairs.rows.dedup();
@@ -405,14 +450,19 @@ fn key_matches(
     view: &dyn View,
     key: &super::index::Key,
     live: usize,
-    bound: &(dyn Fn(isize) -> bool + Sync),
+    reporter: Reporter<'_>,
     mut emit: impl FnMut((Ex, Ex)) -> Result<(), Halt>,
 ) -> Result<(), Halt> {
+    let report = |delta| reporter.tell(delta);
+    let bound: &(dyn Fn(isize) -> bool + Sync) = match reporter {
+        Reporter::Callback(bound) => bound,
+        Reporter::NamedDomain(_) => &report,
+    };
     let count = key_member_count(ix, view, key.class, bound)?;
     if count < 2 {
         return Ok(());
     }
-    let mut members = KeyStorage::with_live(count, 0, live, bound)?;
+    let mut members = KeyStorage::with_live(count, 0, live, reporter)?;
     for &individual in &ix.nominals {
         key_poll(bound)?;
         if key_member(ix, view, individual, key.class) {
@@ -421,8 +471,12 @@ fn key_matches(
     }
     let mut count = 0;
     key_sources(ix, view, &members.rows, bound, |_| key_add(&mut count, 1))?;
-    let mut sources =
-        KeyStorage::with_live(count, 0, key_live(&[live, members._scratch.bytes])?, bound)?;
+    let mut sources = KeyStorage::with_live(
+        count,
+        0,
+        key_live(&[live, members._scratch.bytes])?,
+        reporter,
+    )?;
     key_sources(ix, view, &members.rows, bound, |row| sources.push(row))?;
     sources.rows.sort_unstable();
     let (mut object_count, mut data_count, mut data_payload) = (0, 0, 0);
@@ -439,12 +493,12 @@ fn key_matches(
         },
     )?;
     let held = key_live(&[live, members._scratch.bytes, sources._scratch.bytes])?;
-    let mut objects = KeyStorage::with_live(object_count, 0, held, bound)?;
+    let mut objects = KeyStorage::with_live(object_count, 0, held, reporter)?;
     let mut data = KeyStorage::with_live(
         data_count,
         data_payload,
         key_live(&[held, objects._scratch.bytes])?,
-        bound,
+        reporter,
     )?;
     key_records(
         ix,
@@ -676,6 +730,21 @@ struct Slot {
     queued: bool,
 }
 
+/// Owns the estimate reported for a world's private state.
+struct WorldDebit<'a> {
+    reporter: Reporter<'a>,
+    reported: usize,
+}
+
+impl Drop for WorldDebit<'_> {
+    fn drop(&mut self) {
+        match self.reporter {
+            Reporter::Callback(_) => {}
+            Reporter::NamedDomain(budget) => budget.retire(self.reported as isize),
+        }
+    }
+}
+
 /// A world over the global contexts, in which one class has an instance.
 pub struct World<'a> {
     ix: &'a Index,
@@ -694,17 +763,17 @@ pub struct World<'a> {
     pending: Vec<(Ex, Concl)>,
     /// the facts of universal roles that hold in this world alone
     universal: Vec<Ex>,
-    /// told each change of the bytes the world holds: false stops it
-    bound: &'a (dyn Fn(isize) -> bool + Sync),
     /// the bytes of the copies, the slots and the stored conclusions
     held: usize,
     /// the messages waiting in the slots' to-do lists
     waiting: usize,
-    /// the bytes last told to `bound`
-    reported: usize,
     applied: usize,
     halted: bool,
     halt_reason: Option<Halt>,
+    #[cfg(test)]
+    retirement_witness: Option<retirement_tests::Witness<'a>>,
+    // Every field that owns private allocations must precede the estimate's owner.
+    debit: WorldDebit<'a>,
 }
 
 /// The conclusions a world applies between checks of its bound.
@@ -716,7 +785,7 @@ struct WorldSink<'b> {
     me: Ex,
     local: &'b mut Vec<Concl>,
     out: &'b mut Vec<(Ex, Concl)>,
-    bound: &'b (dyn Fn(isize) -> bool + Sync),
+    reporter: Reporter<'b>,
     data_growth: &'b Cell<isize>,
     halted: &'b Cell<bool>,
     overflow: &'b Cell<bool>,
@@ -728,6 +797,20 @@ struct WorldSink<'b> {
     /// activation's end releases
     grown: &'b Cell<usize>,
     charged: &'b Cell<isize>,
+}
+
+/// The activation owns all posted bytes that have yet to move into the world's debit.
+struct ActivationDebit<'a> {
+    budget: &'a super::WorldBudget<'a>,
+    data_growth: &'a Cell<isize>,
+    charged: &'a Cell<isize>,
+}
+
+impl Drop for ActivationDebit<'_> {
+    fn drop(&mut self) {
+        let delta = self.data_growth.get().wrapping_add(self.charged.get());
+        self.budget.retire(delta);
+    }
 }
 
 /// The messages a world's sink buffers between two charges of their bytes.
@@ -744,8 +827,11 @@ impl WorldSink<'_> {
         if live >= base + CHARGE_EVERY {
             let bytes = ((live - base) * std::mem::size_of::<(Ex, Concl)>()) as isize;
             self.grown.set(live);
-            self.charged.set(self.charged.get() + bytes);
-            if !(self.bound)(bytes) {
+            let charged = self.charged.get() + bytes;
+            if !self
+                .reporter
+                .tell_owned(bytes, || self.charged.set(charged))
+            {
                 self.halted.set(true);
             }
         }
@@ -765,15 +851,14 @@ impl Sink for WorldSink<'_> {
             self.data_overflow();
             return false;
         };
-        self.data_growth.set(next);
         #[cfg(test)]
         if add > 0 {
             super::admission_test::hit(super::admission_test::Point::WorldDataReserve);
         }
-        let ok = (self.bound)(add);
+        let ok = self.reporter.tell_owned(add, || self.data_growth.set(next));
         if !ok {
             self.data_growth.set(next - add);
-            (self.bound)(-add);
+            self.reporter.retire(add);
             self.halted.set(true);
         }
         ok
@@ -787,11 +872,11 @@ impl Sink for WorldSink<'_> {
     fn keep_shared(&mut self, bytes: usize) {
         if bytes > isize::MAX as usize {
             self.data_overflow();
-        } else if !(self.bound)(bytes as isize) {
+        } else if !self.reporter.tell(bytes as isize) {
             self.halted.set(true);
         }
     }
-    // `reserve_data` already charged `self.bound` and added `bytes` to `data_growth`;
+    // `reserve_data` already charged `self.reporter` and added `bytes` to `data_growth`;
     // taking `bytes` out of `data_growth` keeps the bound charged after the world drops.
     fn retain_shared(&mut self, bytes: usize) {
         self.data_growth
@@ -800,13 +885,45 @@ impl Sink for WorldSink<'_> {
     fn release_data(&mut self, bytes: usize) {
         self.data_growth
             .set(self.data_growth.get() - bytes as isize);
-        (self.bound)(-(bytes as isize));
+        self.reporter.tell(-(bytes as isize));
     }
     fn go_on(&self) -> bool {
-        !self.halted.get() && (self.bound)(0)
+        !self.halted.get() && self.reporter.tell(0)
     }
     fn stopped(&self) -> bool {
         self.halted.get()
+    }
+
+    fn top_chain_sub(
+        &mut self,
+        to: Ex,
+        domain: Ex,
+        #[cfg(test)] probe: Option<&super::top_chain_diagnostic::Probe>,
+    ) -> bool {
+        let bytes = size_of::<(Ex, Concl)>() as isize;
+        let (Some(charged), Some(grown)) = (
+            self.charged.get().checked_add(bytes),
+            self.grown.get().checked_add(1),
+        ) else {
+            self.data_overflow();
+            return false;
+        };
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::TopChainWorldMessage);
+        if !self.reserve_data(bytes as usize) {
+            return false;
+        }
+        self.data_growth.set(self.data_growth.get() - bytes);
+        self.charged.set(charged);
+        self.grown.set(grown);
+        self.out.push((to, Concl::Sub(domain)));
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe
+                .world_messages
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        true
     }
 
     fn send(&mut self, to: Ex, c: Concl) {
@@ -904,6 +1021,7 @@ pub struct Found {
 }
 
 impl<'a> World<'a> {
+    #[cfg(test)]
     pub fn new(
         ix: &'a Index,
         ctx: &'a Contexts,
@@ -912,6 +1030,45 @@ impl<'a> World<'a> {
         global_real: &'a [Ex],
         bound: &'a (dyn Fn(isize) -> bool + Sync),
     ) -> World<'a> {
+        assert!(
+            ix.top_chain.is_none(),
+            "an active world requires its budget"
+        );
+        Self::new_reported(
+            ix,
+            ctx,
+            dynamic,
+            global_universal,
+            global_real,
+            Reporter::Callback(bound),
+        )
+    }
+
+    pub(super) fn new_with_budget(
+        ix: &'a Index,
+        ctx: &'a Contexts,
+        dynamic: Option<&'a Dynamic>,
+        global_universal: &'a [Ex],
+        global_real: &'a [Ex],
+        bound: &'a (dyn Fn(isize) -> bool + Sync),
+        budget: &'a super::WorldBudget<'a>,
+    ) -> Self {
+        let reporter = if ix.top_chain.is_some() {
+            Reporter::NamedDomain(budget)
+        } else {
+            Reporter::Callback(bound)
+        };
+        Self::new_reported(ix, ctx, dynamic, global_universal, global_real, reporter)
+    }
+
+    fn new_reported(
+        ix: &'a Index,
+        ctx: &'a Contexts,
+        dynamic: Option<&'a Dynamic>,
+        global_universal: &'a [Ex],
+        global_real: &'a [Ex],
+        reporter: Reporter<'a>,
+    ) -> Self {
         let base = ctx.len() + dynamic.map_or(0, |d| d.len());
         World {
             ix,
@@ -924,13 +1081,17 @@ impl<'a> World<'a> {
             queue: Vec::new(),
             pending: Vec::new(),
             universal: Vec::new(),
-            bound,
             held: 0,
             waiting: 0,
-            reported: 0,
             applied: 0,
             halted: false,
             halt_reason: None,
+            #[cfg(test)]
+            retirement_witness: None,
+            debit: WorldDebit {
+                reporter,
+                reported: 0,
+            },
         }
     }
 
@@ -941,9 +1102,16 @@ impl<'a> World<'a> {
         let used = self.held
             + self.local.bytes()
             + (self.waiting + self.pending.len() + busy) * std::mem::size_of::<(Ex, Concl)>();
-        let delta = used as isize - self.reported as isize;
-        self.reported = used;
-        if !(self.bound)(delta) {
+        let delta = used as isize - self.debit.reported as isize;
+        #[cfg(test)]
+        if self.ix.top_chain.is_some() {
+            super::admission_test::hit(super::admission_test::Point::TopChainWorldCheckpoint);
+        }
+        if !self
+            .debit
+            .reporter
+            .tell_owned(delta, || self.debit.reported = used)
+        {
             self.halted = true;
         }
     }
@@ -958,20 +1126,66 @@ impl<'a> World<'a> {
     fn deliver(&mut self) {
         while let Some((to, c)) = self.pending.pop() {
             self.deliver_one(to, c);
+            if self.ix.top_chain.is_some() && self.halted {
+                break;
+            }
         }
+    }
+
+    fn admit_slot(&mut self, to: Ex) {
+        let (Some(held), Some(reported)) = (
+            self.held.checked_add(SLOT_BYTES),
+            self.debit
+                .reported
+                .checked_add(SLOT_BYTES)
+                .filter(|&total| isize::try_from(total).is_ok()),
+        ) else {
+            self.halt_reason = Some(Halt::Memory(usize::MAX));
+            self.halted = true;
+            return;
+        };
+        let reporter = self.debit.reporter;
+        let mut debit = Scratch { reporter, bytes: 0 };
+        #[cfg(test)]
+        super::admission_test::hit(super::admission_test::Point::TopChainWorldDestination);
+        #[cfg(test)]
+        if let Reporter::NamedDomain(budget) = reporter {
+            super::world_retirement_mixed_tests::before_slot_post(budget, to, SLOT_BYTES as isize);
+        }
+        if !reporter.tell_owned(SLOT_BYTES as isize, || debit.bytes = SLOT_BYTES) {
+            self.halted = true;
+            return;
+        }
+        let real = self.global_real(to);
+        self.insert_slot(to, real);
+        self.held = held;
+        self.debit.reported = reported;
+        debit.bytes = 0;
+    }
+
+    fn insert_slot(&mut self, to: Ex, real: bool) {
+        self.slots.insert(
+            to,
+            Slot {
+                real,
+                ..Slot::default()
+            },
+        );
     }
 
     fn deliver_one(&mut self, to: Ex, c: Concl) {
         if !self.slots.contains_key(&to) {
-            let real = self.global_real(to);
-            self.held += SLOT_BYTES;
-            self.slots.insert(
-                to,
-                Slot {
-                    real,
-                    ..Slot::default()
-                },
-            );
+            let top_chain = self.ix.top_chain.is_some();
+            if top_chain {
+                self.admit_slot(to);
+                if self.halted {
+                    return;
+                }
+            } else {
+                let real = self.global_real(to);
+                self.held += SLOT_BYTES;
+                self.insert_slot(to, real);
+            }
         }
         if c == Concl::Real {
             self.make_real(to);
@@ -1078,6 +1292,16 @@ impl<'a> World<'a> {
                 return;
             }
             let ix = self.ix;
+            let data_growth = Cell::new(0isize);
+            let charged = Cell::new(0isize);
+            let _debit = match self.debit.reporter {
+                Reporter::NamedDomain(budget) => Some(ActivationDebit {
+                    budget,
+                    data_growth: &data_growth,
+                    charged: &charged,
+                }),
+                Reporter::Callback(_) => None,
+            };
             let slot = self.slots.get_mut(&e).expect("slot");
             slot.queued = false;
             let mut todo = std::mem::take(&mut slot.todo);
@@ -1101,8 +1325,12 @@ impl<'a> World<'a> {
                             return;
                         };
                         // A clone shares numeric payload, but owns every state container.
-                        self.reported += bytes;
-                        if !(self.bound)(bytes as isize) {
+                        let reported = self.debit.reported + bytes;
+                        if !self
+                            .debit
+                            .reporter
+                            .tell_owned(bytes as isize, || self.debit.reported = reported)
+                        {
                             self.halted = true;
                             return;
                         }
@@ -1125,21 +1353,19 @@ impl<'a> World<'a> {
             };
             let mut local: Vec<Concl> = Vec::new();
             let mut out: Vec<(Ex, Concl)> = Vec::new();
-            let data_growth = Cell::new(0isize);
             let data_halted = Cell::new(false);
             let data_overflow = Cell::new(false);
             // the initialization's output is metered from zero, and the incoming
             // messages, which were reported as waiting, raise the mark when they join
             // the buffers below
             let grown = Cell::new(0usize);
-            let charged = Cell::new(0isize);
             {
                 let core = self.conjunction_core(e).map(|c| c.to_vec());
                 let mut sink = WorldSink {
                     me: e,
                     local: &mut local,
                     out: &mut out,
-                    bound: self.bound,
+                    reporter: self.debit.reporter,
                     data_growth: &data_growth,
                     halted: &data_halted,
                     overflow: &data_overflow,
@@ -1177,8 +1403,10 @@ impl<'a> World<'a> {
                         if self.applied.is_multiple_of(CHECK_EVERY) {
                             // the sink's charge for the buffers counts as reported, so
                             // that the checkpoint charges the buffers once
-                            self.reported = self.reported.saturating_add_signed(charged.get());
-                            charged.set(0);
+                            self.debit.reported = self
+                                .debit
+                                .reported
+                                .saturating_add_signed(charged.replace(0));
                             grown.set(sink.local.len() + sink.out.len());
                             self.checkpoint(sink.local.len() + sink.out.len());
                             if self.halted {
@@ -1199,11 +1427,21 @@ impl<'a> World<'a> {
             }
             // the messages charged as they were pushed are released here, and the
             // checkpoint below counts those still waiting
-            if charged.get() != 0 {
-                (self.bound)(-charged.get());
+            let top_chain = self.ix.top_chain.is_some();
+            if top_chain {
+                // The local work is finished or discarded. The outgoing buffer stays
+                // owned through the checkpoint and moves to pending only on success.
+                drop(local);
+                self.debit.reported = self
+                    .debit
+                    .reported
+                    .saturating_add_signed(charged.replace(0));
+            } else if charged.get() != 0 {
+                self.debit.reporter.tell(-charged.get());
             }
-            self.held = self.held.saturating_add_signed(data_growth.get());
-            self.reported = self.reported.saturating_add_signed(data_growth.get());
+            let data = data_growth.replace(0);
+            self.held = self.held.saturating_add_signed(data);
+            self.debit.reported = self.debit.reported.saturating_add_signed(data);
             self.halted |= data_halted.get();
             if data_overflow.get() {
                 self.halt_reason = Some(Halt::Memory(usize::MAX));
@@ -1213,7 +1451,15 @@ impl<'a> World<'a> {
             // the messages the context sent count until they are delivered, and once
             // they wait in their contexts' to-do lists
             self.checkpoint(out.len());
-            self.pending.extend(out);
+            if top_chain {
+                if self.halted {
+                    return;
+                }
+                debug_assert!(self.pending.is_empty());
+                self.pending = out;
+            } else {
+                self.pending.extend(out);
+            }
             self.deliver();
         }
     }
@@ -1236,7 +1482,7 @@ impl<'a> World<'a> {
                 .copied()
                 .collect();
             let facts = universal_facts(self.ix, &self, &known);
-            let merges = key_merges(self.ix, &self, self.bound)?;
+            let merges = key_merges_reported(self.ix, &self, self.debit.reporter)?;
             if facts.is_empty() && merges.is_empty() {
                 break;
             }
@@ -1275,6 +1521,19 @@ impl<'a> World<'a> {
         if !found.bottom {
             super::dt_sat::world(self.ix, self.slots.values().filter_map(|s| s.st.as_ref()));
         }
+        #[cfg(test)]
+        if let Some(rules) = &self.ix.top_chain {
+            rules.world_ready(class, self.debit.reported);
+        }
+        #[cfg(test)]
+        if let Reporter::NamedDomain(budget) = self.debit.reporter {
+            super::world_retirement_mixed_tests::world_ready(budget, class, self.debit.reported);
+        }
+        #[cfg(test)]
+        if let Some(witness) = &self.retirement_witness {
+            let state = self.slots[&class].st.as_ref().expect("resident COW slot");
+            witness.ready(class, state, &found, self.debit.reported);
+        }
         // the world's copies go when it does
         Ok(found)
     }
@@ -1282,9 +1541,19 @@ impl<'a> World<'a> {
 
 impl Drop for World<'_> {
     fn drop(&mut self) {
-        (self.bound)(-(self.reported as isize));
+        match self.debit.reporter {
+            Reporter::Callback(bound) => {
+                // Keep the ordinary callback ahead of field destruction, even at zero.
+                bound(-(self.debit.reported as isize));
+            }
+            Reporter::NamedDomain(_) => {}
+        }
     }
 }
+
+#[cfg(test)]
+#[path = "world_retirement_tests.rs"]
+mod retirement_tests;
 
 #[cfg(test)]
 mod numeric_resource_tests {
@@ -1296,6 +1565,340 @@ mod numeric_resource_tests {
         Arc, Mutex as StdMutex,
         atomic::{AtomicIsize, AtomicUsize, Ordering},
     };
+
+    use crate::classify::{
+        Error, WorldBudget,
+        admission_test::{ChargePanic, Point, with_hook},
+        saturate::Totals,
+        top_chain_cases::accounting::{Grant, id, prefix, trailing_index},
+    };
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Fault {
+        Accept,
+        Refuse,
+        Panic,
+        BeforePost,
+        AfterPost,
+        AfterGrant,
+    }
+
+    impl Fault {
+        fn unwinds(self) -> bool {
+            !matches!(self, Self::Accept | Self::Refuse)
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum WorldBoundary {
+        TwoRows,
+        AfterCheckpoint,
+        Destination,
+        DestinationWithPending,
+    }
+
+    fn check_world_admission(boundary: WorldBoundary, fault: Fault) {
+        use std::{
+            panic::{AssertUnwindSafe, catch_unwind, panic_any},
+            sync::atomic::AtomicBool,
+        };
+
+        const BASE: usize = 4096;
+        const SIBLING: isize = 128;
+        const MESSAGE: usize = size_of::<(Ex, Concl)>();
+        assert_eq!(MESSAGE, CONCLUSION_BYTES);
+
+        let (sat, probe) = trailing_index(boundary == WorldBoundary::TwoRows);
+        let (tail, source, fence, domain) = (
+            id(&sat, "Tail"),
+            id(&sat, "Source"),
+            id(&sat, "Fence"),
+            id(&sat, "D"),
+        );
+        let r = prefix(&sat);
+        let destination = matches!(
+            boundary,
+            WorldBoundary::Destination | WorldBoundary::DestinationWithPending
+        );
+        let two_inputs = matches!(
+            boundary,
+            WorldBoundary::AfterCheckpoint | WorldBoundary::DestinationWithPending
+        );
+        let grant = Arc::new(Grant::default());
+        let armed = Arc::new(AtomicBool::new(false));
+        let cancellation_polls = Arc::new(AtomicUsize::new(0));
+        let limits = Limits {
+            threads: 1,
+            cancelled: (fault == Fault::AfterGrant).then(|| {
+                let (armed, polls) = (armed.clone(), cancellation_polls.clone());
+                let cancelled: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
+                    if armed.load(Ordering::Relaxed) && polls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        panic_any(ChargePanic);
+                    }
+                    false
+                });
+                cancelled
+            }),
+            charge: Some(Arc::new({
+                let (grant, armed) = (grant.clone(), armed.clone());
+                move |bytes| {
+                    let fault = if armed.load(Ordering::Relaxed) {
+                        fault
+                    } else {
+                        Fault::Accept
+                    };
+                    let ok = grant.request(
+                        bytes,
+                        if matches!(fault, Fault::Accept | Fault::AfterGrant) {
+                            usize::MAX
+                        } else {
+                            0
+                        },
+                    );
+                    if fault == Fault::Panic {
+                        panic_any(ChargePanic);
+                    }
+                    ok
+                }
+            })),
+            ..Limits::default()
+        };
+        let charge = limits.charge.as_deref().unwrap() as &(dyn Fn(usize) -> bool + Sync);
+        let mut totals = Totals::default();
+        let budget = WorldBudget::start(&limits, Some(charge), BASE, &mut totals).unwrap();
+        let bound = |delta| budget.tell(delta);
+        assert!(budget.tell(SIBLING));
+
+        let frozen: Contexts = (0..sat.ctx.len())
+            .map(|_| std::sync::OnceLock::new())
+            .collect();
+        let mut world = World::new_with_budget(
+            sat.index.as_ref().unwrap(),
+            &frozen,
+            None,
+            &[],
+            &[],
+            &bound,
+            &budget,
+        );
+        let mut todo = vec![Concl::Back(source, r)];
+        if two_inputs {
+            todo.push(Concl::Back(fence, r));
+        }
+        let st = State {
+            init: true,
+            real: true,
+            ..State::default()
+        };
+        world.held = SLOT_BYTES + CONTEXT_BYTES + st.bytes();
+        world.waiting = todo.len();
+        world.debit.reported = world.held + world.waiting * MESSAGE;
+        let setup = world.debit.reported;
+        assert!(bound(setup as isize));
+        world.slots.insert(
+            tail,
+            Slot {
+                real: true,
+                st: Some(st),
+                todo,
+                queued: true,
+            },
+        );
+        world.queue.push(tail);
+        if boundary == WorldBoundary::AfterCheckpoint {
+            world.applied = CHECK_EVERY - 1;
+        }
+        let baseline = BASE + SIBLING as usize + setup;
+        assert_eq!(budget.paid.load(Ordering::Relaxed), baseline);
+        assert_eq!(
+            budget.held.load(Ordering::Relaxed),
+            SIBLING + setup as isize
+        );
+        assert!(!world.slots.contains_key(&source));
+        assert!(!world.slots.contains_key(&fence));
+
+        let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let result = with_hook(
+            {
+                let (events, armed) = (events.clone(), armed.clone());
+                let mut messages = 0;
+                move |point| match point {
+                    Point::TopChainWorldMessage => {
+                        messages += 1;
+                        events.lock().push(point);
+                        if !destination && messages == 2 {
+                            armed.store(true, Ordering::Relaxed);
+                            if fault == Fault::BeforePost {
+                                panic_any(ChargePanic);
+                            }
+                        }
+                    }
+                    Point::Observed
+                        if fault == Fault::AfterPost && armed.load(Ordering::Relaxed) =>
+                    {
+                        panic_any(ChargePanic);
+                    }
+                    Point::TopChainWorldDestination => {
+                        events.lock().push(point);
+                        armed.store(true, Ordering::Relaxed);
+                    }
+                    Point::TopChainWorldCheckpoint => events.lock().push(point),
+                    _ => {}
+                }
+            },
+            || {
+                catch_unwind(AssertUnwindSafe(move || {
+                    world.drain();
+                    world
+                }))
+            },
+        );
+
+        let expected_events = match boundary {
+            WorldBoundary::TwoRows if fault.unwinds() => {
+                vec![Point::TopChainWorldMessage, Point::TopChainWorldMessage]
+            }
+            WorldBoundary::TwoRows => vec![
+                Point::TopChainWorldMessage,
+                Point::TopChainWorldMessage,
+                Point::TopChainWorldCheckpoint,
+            ],
+            WorldBoundary::AfterCheckpoint => vec![
+                Point::TopChainWorldMessage,
+                Point::TopChainWorldCheckpoint,
+                Point::TopChainWorldMessage,
+            ],
+            WorldBoundary::Destination => vec![
+                Point::TopChainWorldMessage,
+                Point::TopChainWorldCheckpoint,
+                Point::TopChainWorldDestination,
+            ],
+            WorldBoundary::DestinationWithPending => vec![
+                Point::TopChainWorldMessage,
+                Point::TopChainWorldMessage,
+                Point::TopChainWorldCheckpoint,
+                Point::TopChainWorldDestination,
+            ],
+        };
+        assert_eq!(*events.lock(), expected_events);
+        assert!(armed.load(Ordering::Relaxed));
+        let sent = if boundary == WorldBoundary::DestinationWithPending {
+            2
+        } else {
+            1
+        };
+        assert_eq!(probe.world_messages.load(Ordering::Relaxed), sent);
+        let fault_bytes = if destination { SLOT_BYTES } else { MESSAGE };
+        let mut requests = vec![(BASE, true), (SIBLING as usize, true), (setup, true)];
+        requests.extend(std::iter::repeat_n((MESSAGE, true), sent));
+        if !matches!(fault, Fault::BeforePost | Fault::AfterPost) {
+            requests.push((
+                fault_bytes,
+                matches!(fault, Fault::Accept | Fault::AfterGrant),
+            ));
+        }
+        assert_eq!(grant.calls(), requests);
+        let first_peak = baseline + sent * MESSAGE;
+        let full_peak = first_peak + fault_bytes;
+        let peak = budget.peak.load(Ordering::Relaxed);
+        if fault == Fault::AfterPost {
+            assert!((first_peak..=full_peak).contains(&peak));
+        } else {
+            assert_eq!(
+                peak,
+                if fault == Fault::BeforePost {
+                    first_peak
+                } else {
+                    full_peak
+                }
+            );
+        }
+        let paid = if matches!(fault, Fault::Accept | Fault::AfterGrant) {
+            full_peak
+        } else {
+            first_peak
+        };
+        assert_eq!(budget.paid.load(Ordering::Relaxed), paid);
+        assert_eq!(grant.accepted(), paid);
+
+        match result {
+            Ok(world) => {
+                assert!(!fault.unwinds());
+                let tail_state = world.slots[&tail].st.as_ref().unwrap();
+                assert!(tail_state.holds(&Concl::Back(source, r)));
+                if fault == Fault::Accept {
+                    assert!(budget.stopped().is_ok());
+                    assert!(!world.halted);
+                    assert_eq!(world.slots[&source].todo, [Concl::Sub(domain)]);
+                } else {
+                    assert!(
+                        matches!(budget.stopped(), Err(Error::Memory { limit: usize::MAX, used }) if used == peak)
+                    );
+                    assert!(world.halted);
+                    assert!(!world.slots.contains_key(&source));
+                    assert!(!world.slots.contains_key(&fence));
+                    if boundary == WorldBoundary::DestinationWithPending {
+                        assert_eq!(world.pending, [(source, Concl::Sub(domain))]);
+                    }
+                }
+                drop(world);
+            }
+            Err(payload) => {
+                assert!(fault.unwinds());
+                assert_eq!(payload.downcast_ref::<ChargePanic>(), Some(&ChargePanic));
+                if fault == Fault::Panic {
+                    assert!(matches!(budget.stopped(), Err(Error::Cancelled)));
+                }
+            }
+        }
+        let live = budget.held.load(Ordering::Relaxed);
+        let polls = cancellation_polls.load(Ordering::Relaxed);
+        eprintln!(
+            "world {boundary:?} {fault:?}: live={live} sibling={SIBLING} paid={paid} peak={peak} polls={polls} requests={requests:?}"
+        );
+        let _ = budget.tell(-SIBLING);
+        let after_sibling = budget.held.load(Ordering::Relaxed);
+        assert_eq!(
+            (live, polls),
+            (SIBLING, usize::from(fault == Fault::AfterGrant)),
+            "world debit survived {boundary:?} {fault:?} or teardown repolled"
+        );
+        assert_eq!(after_sibling, 0);
+    }
+
+    #[test]
+    fn named_domain_activation_debits_retire_on_unwind() {
+        check_world_admission(WorldBoundary::TwoRows, Fault::Refuse);
+        check_world_admission(WorldBoundary::TwoRows, Fault::Panic);
+    }
+
+    #[test]
+    fn named_domain_activation_retires_only_untransferred_debits_after_checkpoint() {
+        check_world_admission(WorldBoundary::AfterCheckpoint, Fault::Panic);
+    }
+
+    #[test]
+    fn named_domain_destination_slot_admission_owns_its_debit() {
+        check_world_admission(WorldBoundary::Destination, Fault::Accept);
+        check_world_admission(WorldBoundary::Destination, Fault::Refuse);
+        check_world_admission(WorldBoundary::DestinationWithPending, Fault::Refuse);
+        check_world_admission(WorldBoundary::Destination, Fault::Panic);
+    }
+
+    #[test]
+    fn named_domain_world_prepost_panic_retires_only_the_buffered_debit() {
+        check_world_admission(WorldBoundary::TwoRows, Fault::BeforePost);
+    }
+
+    #[test]
+    fn named_domain_world_posted_debit_is_owned_before_the_caller_grant() {
+        check_world_admission(WorldBoundary::TwoRows, Fault::AfterPost);
+    }
+
+    #[test]
+    fn named_domain_world_cancel_panic_keeps_payment_and_never_repolls_on_drop() {
+        check_world_admission(WorldBoundary::TwoRows, Fault::AfterGrant);
+    }
 
     fn key_workspace_fixture(
         individuals: usize,
@@ -1361,7 +1964,7 @@ mod numeric_resource_tests {
             me: 0,
             local: &mut Vec::new(),
             out: &mut Vec::new(),
-            bound: &bound,
+            reporter: Reporter::Callback(&bound),
             data_growth: &growth,
             halted: &halted,
             overflow: &Cell::new(false),
@@ -1382,7 +1985,7 @@ mod numeric_resource_tests {
         sink.release_data(16);
         assert_eq!(growth.get(), 16);
         // The activation transfers only its remaining local debit to the world.
-        world.reported += growth.get() as usize;
+        world.debit.reported += growth.get() as usize;
         drop(world);
         assert_eq!(budget.held.load(Ordering::Relaxed), 32);
         assert_eq!(*reports.lock(), [64, 128, -128, -16, -16]);
@@ -2067,11 +2670,18 @@ mod numeric_resource_tests {
     #[test]
     fn key_workspace_overflow_is_an_allocation_free_refusal() {
         let overflow_bound = |_| panic!("overflow must precede admission");
-        let (result, allocated) = measure(|| KeyStorage::<Ex>::new(usize::MAX, &overflow_bound));
+        let (result, allocated) =
+            measure(|| KeyStorage::<Ex>::new(usize::MAX, Reporter::Callback(&overflow_bound)));
         assert!(matches!(result, Err(Halt::Memory(usize::MAX))));
         assert_eq!(allocated.events, 0);
-        let (aggregate, allocated) =
-            measure(|| KeyStorage::<Ex>::with_live(1, 0, isize::MAX as usize, &overflow_bound));
+        let (aggregate, allocated) = measure(|| {
+            KeyStorage::<Ex>::with_live(
+                1,
+                0,
+                isize::MAX as usize,
+                Reporter::Callback(&overflow_bound),
+            )
+        });
         assert!(matches!(aggregate, Err(Halt::Memory(usize::MAX))));
         assert_eq!(allocated.events, 0);
         assert!(key_live(&[isize::MAX as usize, 1]).is_err());

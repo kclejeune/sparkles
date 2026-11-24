@@ -635,6 +635,10 @@ fn world_cover() -> String {
     )
 }
 
+pub(super) fn world_cover_axioms() -> Vec<AxiomKind> {
+    axioms(&world_cover())
+}
+
 #[test]
 fn a_cover_found_only_in_a_world_is_used_in_part() {
     let (sat, ax) = run(&world_cover());

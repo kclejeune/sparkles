@@ -11,6 +11,33 @@ pub(super) enum Point {
     #[allow(dead_code)] // The test-only parent snapshot has no admission lock.
     Contended,
     WorldDataReserve,
+    TopChainScratch,
+    TopChainRetained,
+    TopChainKeptPlan,
+    TopChainWorldCheckpoint,
+    TopChainWorldDestination,
+    TopChainGlobalQueued {
+        batched: bool,
+    },
+    TopChainGlobalTaken {
+        tagged: usize,
+        ordinary: usize,
+    },
+    TopChainGlobalOutbox {
+        tagged: usize,
+        ordinary: usize,
+        ordinary_payloads: usize,
+    },
+    TopChainGlobalFiltered {
+        tagged: usize,
+    },
+    TopChainGlobalJoin {
+        tagged: usize,
+        queued: isize,
+    },
+    TopChainScan,
+    TopChainGlobalMessage,
+    TopChainWorldMessage,
     BeforePanicWake,
     Idle,
 }
@@ -23,6 +50,22 @@ thread_local! {
 
 pub(super) fn set_hook(hook: impl FnMut(Point) + 'static) {
     HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+}
+
+pub(super) fn with_hook<T>(hook: impl FnMut(Point) + 'static, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Hook>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let previous = HOOK.with(|slot| slot.borrow_mut().replace(Box::new(hook)));
+    let _restore = Restore(previous);
+    run()
+}
+
+pub(super) fn has_hook() -> bool {
+    HOOK.with(|slot| slot.borrow().is_some())
 }
 
 pub(super) fn hit(point: Point) {
