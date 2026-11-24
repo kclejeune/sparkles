@@ -4,9 +4,10 @@ Sparkles provides an RDF store, query engine, server and embedded libraries. The
 category guides below describe current capabilities, configuration, usage and limits.
 The standard server includes local embeddings, OCR support and encrypted repositories.
 Models, OCR libraries and encrypted repository keys require runtime configuration.
-The [capability matrix](#capability-status) distinguishes complete, partially complete
-and planned work. The [roadmap](ROADMAP.md) gives the path to completing the remaining
-phases, and the [design specs](specs/README.md) explain their contracts and decisions.
+The [capability matrix](#capability-status) grades each area on a five-tier maturity
+scale from planned through complete. The [roadmap](ROADMAP.md) gives the path to
+completing the remaining phases, and the [design specs](specs/README.md) explain their
+contracts and decisions.
 
 * [Querying](#querying)
 * [Storage and history](#storage-and-history)
@@ -128,93 +129,98 @@ open.
 
 ## Capability status
 
-Status describes the scope named in each row. **Complete** means that documented scope
-is available. **Partially complete** means usable functionality is available while the
-listed phases or extensions remain. **In progress** identifies active implementation
-that has not shipped. **Planned** means the design exists without an implementation.
-Writing a spec or running validation does not make a planned capability available.
-The [spec index](specs/README.md) records the phase boundaries, and the
-[roadmap](ROADMAP.md) describes the remaining work. Benchmark coverage is separate from
-implementation status.
+Status grades each capability's named scope on a five-tier maturity scale. Writing a spec
+or running validation does not make a planned capability available, and benchmark coverage
+is tracked separately from implementation status.
 
-Benchmark results qualify the recorded host and executable. A pinned
+* **Complete.** The documented scope is shipped.
+* **Core complete.** Primary workflows and capabilities are shipped, while secondary
+  extensions or edge cases remain.
+* **Partial.** A usable core is shipped while major planned phases remain.
+* **Early.** Foundational primitives or an initial phase are shipped, while primary
+  end-to-end workflows remain ahead.
+* **Planned.** The design is specified without an implementation.
+
+The [spec index](specs/README.md) records the phase boundaries, and the
+[roadmap](ROADMAP.md) describes the remaining work. Benchmark results qualify the recorded
+host and executable. A pinned
 [instruction-count diagnostic](benchmarks/synthetic/RESULTS.md#query-layout-after-the-classification-batch)
-records query timing differences between executables with unchanged plans,
-answers and instruction counts, and the limits of attributing them to layout.
+records query timing differences between executables with unchanged plans, answers and
+instruction counts, and the limits of attributing them to layout.
 
 ### Querying and storage
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [SPARQL Query, Update and Graph Store protocols](querying/README.md#standards-conformance) | Complete within the documented conformance scope. | The listed SPARQL suites pass, and a test-only reference evaluator that follows the SPARQL algebra literally checks the optimizer and cursor tests. This does not promise every Jena extension or plugin interface. |
-| [Durable commits and dataset identity](storage/README.md#storage-and-indexes) | Complete within the documented commit contract. | Transactions have receipts and synchronized acknowledgements. |
-| [Storage, loading and compaction](storage/README.md#storage-and-indexes) | Partially complete. | Compressed indexes, bulk imports, online compaction, optional FSST, a warm-up of the query path before a server reports ready and an optional prewarm after a restart are available. Finer compaction controls and larger-scale measurements remain. |
-| [History, snapshots and branches](storage/README.md#versioning-and-history) | Partially complete. | Retained commits, diffs, branches and merge review are available. Capped Store snapshots and trusted Dataset history handles preserve retained origins. Historical full-text search and further branch administration remain. |
-| [Join estimation](internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations) | Partially complete. | Stars, object joins, chains and joins on several keys are estimated from characteristic sets with a remainder and from key probes. Characteristic pairs, sampling of large inputs and the other X15 phases remain under item 454. |
-| [Streaming execution and disk spill](querying/README.md#sparql-queries-and-updates) | Partially complete. | Eligible plans stream automatically while explicit cursors and disk spill are on by default. Both modes share one plan, join kernels, grouping operator and columnar result writers (including engine-owned SPARQL encoders, streamed SPARQL Results Thrift and a 16-entry per-stream HTTP channel), with conditional OPTIONAL pair filtering and resumable SERVICE, text and history readers. Remaining work covers eager fallbacks (SILENT SERVICE, view reads, unlimited path searches, vector ORDER BY, nearest-neighbour and some spatial forms), ordered spill costs, in-place cursor hand-off and automatic streaming of OPTIONAL conditions containing EXISTS. |
-| [Incremental views and live queries](querying/README.md#sparql-queries-and-updates) | Partially complete. | Table views and live query updates are available, including maintained property paths, the aggregates `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`, `HAVING`, correlated `EXISTS` and ordered windows with row positions. Graph views, commit-time maintenance, branch views and provenance on views remain planned. |
+| [SPARQL Query, Update and Graph Store protocols](querying/README.md#standards-conformance) | Complete | W3C SPARQL 1.0, 1.1 Query, 1.1 Update and 1.2 conformance suites pass, checked against a reference algebra evaluator. Unsupported Jena extensions and Java plugins remain outside scope. |
+| [Durable commits and dataset identity](storage/README.md#storage-and-indexes) | Complete | Transactions produce durable receipts, gap-free commit sequences, change digests, ETags and synchronized acknowledgements. |
+| [Storage, loading and compaction](storage/README.md#storage-and-indexes) | Core complete | Compressed permutations, bulk loading, group commit, online compaction, optional FSST and startup prewarm are available. Adaptive compaction, per-dataset codecs, remaining X16 consolidation and larger-scale measurements remain. |
+| [History, snapshots and branches](storage/README.md#versioning-and-history) | Core complete | Retained commits, time travel, snapshots, diffs, change feeds, branches and conflict-checked merges are available. Historical full-text search, pin rebasing and remote or archive cloning remain. |
+| [Join estimation](internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations) | Partial (Phase 1) | Characteristic sets and key probes estimate star, object, chain and multi-key joins. Characteristic pairs, large-input sampling and the remaining X15 join-algorithm phases stay under item 454. |
+| [Streaming execution and disk spill](querying/README.md#sparql-queries-and-updates) | Partial | Eligible plans stream automatically with default disk spill, shared join and grouping kernels, and resumable readers. Remaining eager fallbacks, ordered spill costs and executor unification remain under item 453. |
+| [Incremental views and live queries](querying/README.md#sparql-queries-and-updates) | Partial (Phase 1) | Maintained table views with paths, aggregates, `HAVING`, correlated `EXISTS` and windows pair with SSE live queries. Graph views, commit-time maintenance, branch views and per-fact provenance remain planned. |
 
 ### Search and graph analysis
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Full-text and vector search](search/README.md#search) | Partially complete. | BM25, HNSW, hybrid ranking and embeddings on write are available. Historical search, multi-field documents and quantization remain planned. |
-| [Paths and graph algorithms](search/README.md#search) | Partially complete. | Shortest paths, communities, centrality and graph embeddings are available. Further kernels, API surfaces and reference comparisons remain under items 8, 275 and 276. |
-| [GeoSPARQL](search/README.md#geosparql) | Partially complete. | Spatial filters, joins and constant-geometry nearest-neighbour ordering are available. Further spatial queries and coordinate reference systems remain under item 24. |
+| [Full-text and vector search](search/README.md#search) | Core complete | BM25 full-text search, HNSW vector indexes, hybrid ranking and local or remote embeddings on write are available. Historical search, multi-field documents, more analyzers and vector quantization remain planned. |
+| [Paths and graph algorithms](search/README.md#search) | Core complete | Shortest, k-shortest and bounded path search run beside community detection, centrality, similarity and graph embeddings. Weighted length bounds, background progress and Graphalytics acceptance remain under items 8, 275 and 276. |
+| [GeoSPARQL](search/README.md#geosparql) | Core complete | OGC GeoSPARQL 1.1 functions, spatial indexes, joins, constant-geometry nearest-neighbour ordering, custom CRSs and map views are available. Per-row nearest-neighbour joins, polygon approximations, datum shifts and extra syntax remain under item 24. |
 
 ### Reasoning and validation
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Reasoning](reasoning/README.md#reasoning) | Partially complete. | RDFS, OWL 2 RL, Jena rules (including `@hybrid jena` backward rules) and Datalog clauses with relations and negation run through incremental materialization over a columnar derived tier (about 52 bytes per fact), closure operators, sampled-binding body planning, demand derivation with a budgeted table cache, `reasoning=auto` and OWL 2 QL query rewriting. Deletions that exceed an allowance fall back to a full run, and demand tables carry over across unaffected commits. A separate derived layer, canonical equality and per-pattern cost selection for `auto` remain planned. |
-| [SHACL rules](reasoning/README.md#shacl-rules) | Partially complete. | SHACL-AF triple and SPARQL rules with conditions, orders and fixed points, and SPIN rules with their query text, materialize through the `shacl-af` profile. Updates run in full until item 958, and SPIN's RDF syntax is item 959. |
-| [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available, with optional bounded witnesses per derived fact. Inferred visibility and review protections that read witnesses remain planned. |
-| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, and forms edit nested children, lists and value alternatives in one commit while refusing incomplete discovery. Node-level alternatives, complex nested paths and some target producers remain. |
-| [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
-| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF and functional-style mappings, profile checks, entity accessors, typed axiom constructors that preserve repeated disjointness and inequality operands, and axiom diffs are available in Rust, Python, Node.js, the JVM (with `jena-ontapi` bridging), HTTP, MCP and the CLI, with inferred reads and the Manchester reader everywhere except MCP and the CLI. Literal checks cover XML namespace conformance, with full XML canonical lexical and value semantics remaining in item 663. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
-| [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent classifier computes the class hierarchy and unsatisfiable classes of OWL 2 EL, Horn and ALCHI ontologies in Rust, Python, Node.js, the JVM, HTTP and the CLI, activating two-link top-object-property chain inference by default, bounding Tier D with pre-admitted growth and a thread-independent logical allowance, and calling an answer complete only when it holds for the whole ontology. On one and eight threads it classifies GO, ChEBI lite and the largest ORE 2015 EL ontologies 3.1 to 20 times as fast as ELK and faster than Konclude ([results](benchmarks/el-classification/RESULTS.md)). The Horn tier checks OWL 2 DL datatypes and data cardinalities, while data case analysis, keys over checked properties, data properties in disjunctive rules, and default activation of counting and rooted runs remain open. |
-| [Ontology editor](visualization/README.md#ontology-editor) | Partially complete. | Ontology editing, paged class, property and individual trees, DL Query, entity history with revert, discussions, watches, bulk edits, import resolution (with import maps, XML catalogs and fetched imports), session branches, undo and on-demand metrics are available. Remaining diagram, tree, IRI policy, grant and read-cost work is listed in the visualization guide. |
-| [Thesaurus editor](visualization/README.md#thesaurus-editor) | Complete. | The Workbench's Thesaurus editor edits SKOS concept schemes, concepts, collections, multilingual and SKOS-XL labels, hierarchy and mapping links as previewed commits, with drag to re-parent and built-in SKOS integrity checks. Larger trees and search, foreign mapping labels, label relations, combined guards and graph-scoped forms remain in items 638 to 642. |
-| [Visual SHACL shape editor](visualization/README.md#visual-shacl-shape-editor) | Complete. | Trees and forms author node and property shapes, Core targets and constraints, nested paths and severities as previewed graph commits up to 5,000 triples per shapes graph. Sample validation retains source identity, and unrecognized RDF is preserved beside the Turtle and SHACLC text validator. |
-| [Kept classification reads](reasoning/README.md#owl-2-ontologies) | Partially complete. | Rust, Python, Node.js, the JVM and HTTP expose bounded named-class hierarchy, equivalence, unsatisfiability and source pages pinned to exact kept results, while fresh RDFS or OWL RL materializations separately supply pinned property hierarchies, individual named types and derived frames. General classifier-backed entity and axiom reads, complete property and individual entailments and classification justifications remain in items 588, 622, 609 and F24. |
-| [Ontology browser](visualization/README.md#ontology-browser) | Partially complete. | Browse gives entities and ontologies dedicated pages with linked Manchester axioms, definition disclosures, metadata cards, tree and graph hierarchies, vector-based related terms, previewed inline editing and typo-tolerant [entity search](search/README.md#entity-search) (under 8.3 ms at p99 on ChEBI lite). Named-class views read bounded kept classifications at the displayed commit, while property and individual views read fresh RDFS or OWL RL materializations with exact revision pins. General classifier-backed entailments and explanation links remain in items 588, 622, 609 and F24. |
+| [Reasoning](reasoning/README.md#reasoning) | Partial | RDFS, OWL 2 RL, Jena rules, Datalog, demand derivation, `reasoning=auto` and OWL 2 QL rewriting run with incremental materialization. A separate derived layer, canonical equality, restricted chase and per-pattern `auto` selection remain planned. |
+| [SHACL rules](reasoning/README.md#shacl-rules) | Core complete | SHACL-AF triple and SPARQL rules plus `sp:text` SPIN rules materialize under the `shacl-af` profile. Incremental updates remain in item 958, and RDF-only SPIN syntax and templates remain in item 959. |
+| [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partial (Phases 1–2) | Derivation trees, bounded why-not hypotheses, entailment diffs, minimal supports and optional bounded witnesses are available. Provenance-based inferred visibility, witness-aware review guards and unbound why-not abduction remain planned. |
+| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Core complete | SHACL, SHACLC and ShEx validation, write guards and nested shape-driven forms commit edits in one previewed transaction. Node-level alternatives, complex nested paths, combined guards and some target producers remain. |
+| [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete | Class and predicate profiles, VoID exports, schema diffs and constrained SHACL and ShEx shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
+| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Core complete | Axioms, syntax mappings, profile checks and diffs span libraries, HTTP, MCP and CLI. Fetched imports, read budgets, XML literal semantics and MCP or CLI inferred reads remain in items 539, 559, 565, 578 and 663. |
+| [OWL 2 classification](reasoning/README.md#owl-2-ontologies) | Core complete (EL complete) | OWL 2 EL classification is complete with ROBOT export and published [results](benchmarks/el-classification/RESULTS.md), alongside incremental Horn and ALCHI classification. Remaining DL rules, default counting and rooted runs, external reasoner bridging and justifications remain open. |
+| [Ontology editor](visualization/README.md#ontology-editor) | Core complete | Ontology editing includes paged entity trees, DL Query, history revert, discussions, watches, bulk edits, import resolution and session branches. Editable schema diagrams, classifier-backed inferred frames and pattern generation remain in the visualization guide. |
+| [Thesaurus editor](visualization/README.md#thesaurus-editor) | Complete | The Thesaurus editor manages SKOS schemes, concepts, collections, SKOS-XL labels, hierarchies and mappings as previewed commits with integrity checks. Larger trees, foreign mapping labels, label relations and graph-scoped forms remain in items 638 to 642. |
+| [Visual SHACL shape editor](visualization/README.md#visual-shacl-shape-editor) | Complete | Trees and forms author SHACL Core shapes, nested paths and severities as previewed graph commits with sample validation. Unrecognized RDF is preserved beside the Turtle and SHACLC text validator. |
+| [Kept classification reads](reasoning/README.md#owl-2-ontologies) | Partial | Libraries and HTTP expose revision-pinned named-class classification pages, while RDFS or OWL RL materializations back property and individual reads. General classifier-backed reads, full entailments and justifications remain in items 588, 622, 609 and F24. |
+| [Ontology browser](visualization/README.md#ontology-browser) | Core complete | Dedicated entity and ontology pages provide linked Manchester axioms, hierarchies, related terms, inline editing and typo-tolerant [entity search](search/README.md#entity-search). General classifier-backed entailments and explanation links remain in items 588, 622, 609 and F24. |
 
 ### Server and security
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Server and Fuseki integration](server/README.md#server-and-protocols) | Partially complete. | Supported Fuseki protocols, configuration conversion and administration are available. On Linux, request work keeps to the performance cores of Intel hybrid processors while they can hold it. Further integration and ARQ extensions remain. |
-| [Access control and authentication](server/README.md#access-control-and-security) | Partially complete. | Dataset, graph and triple protections, OIDC and API tokens are available. Derived visibility, guarded caller adoption and authentication extensions remain planned. |
-| [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete within the documented settings scope. | Layered settings, operator locks, runtime administration and prefix completion are available. |
-| [Resource catalog](server/README.md#resource-catalog) | Partially complete. | Versioned resources, SPDX licence classes with propagated obligations and a NOTICE, and vocabulary namespaces are available in DCAT 3. The licence gate reports a verdict that warns by default. Fetching, loading, mirrors and gates on export routes remain under items 458, 525 and 526. |
+| [Server and Fuseki integration](server/README.md#server-and-protocols) | Core complete | Fuseki protocols, config conversion, write previews, stored queries, read-only GraphQL and OpenAPI 3.1 are available. GraphQL Phase 2, OTLP metrics and Fuseki or ARQ extensions remain under items 37, 38, 39, 51, 76 and 342. |
+| [Access control and authentication](server/README.md#access-control-and-security) | Core complete | Dataset, graph, branch, endpoint and triple guards pair with Basic, OIDC, API-token, trusted-proxy and TLS authentication. Provenance-based derived visibility, guarded view preparation and triple-restricted change feeds or validation remain planned. |
+| [Settings and declared prefixes](server/README.md#server-and-protocols) | Complete | Layered server and dataset settings, operator locks, runtime administration and declared prefix completion span HTTP, the CLI, LSP and the web UI. |
+| [Resource catalog](server/README.md#resource-catalog) | Early (Phase 1) | DCAT 3 resource records, SPDX licence tracking, NOTICE generation, warning licence gates and vocabulary namespaces are available for administrators. Remote fetching, content-addressed storage, recipes, mirrors and export enforcement remain under items 458, 525 and 526. |
 
 ### Agents and interfaces
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Ask, ingestion and agent memory](ai/README.md#ai-and-agents) | Partially complete. | Checked queries, ingestion review and cited memory shown as fact cards with their sources, confidence and a timeline of superseded facts are available. Accuracy, contextual linking and additional ingest formats remain open. |
-| [GraphRAG reports](ai/README.md#ai-and-agents) | Partially complete. | Community reports, which a dataset's page lists as a tree or a treemap, global Ask, memory retrieval and change-feed refresh are available. View-based refresh and reports for distinct audiences remain planned. |
-| [Web graph, map and editing tools](visualization/README.md#web-ui) | Partially complete. | Explore, paths, lenses, derivation trees, maps, linked selections and the visual query builder are available. Explore draws up to 5,000 of the 100,000 nodes it holds, in a WebGL view past 1,000 visible nodes, with group nodes for large fan-outs and filters that choose what is drawn. Live profiling, additional builder blocks and the rendering items 737 to 739 remain. |
-| [App shell and design system](visualization/README.md#app-shell) | Complete. | Every page shares a top bar whose command palette searches entities, datasets, saved queries and pages and runs each page's commands, and a rail that narrows to icons and becomes a drawer on a phone. Light and dark tokens and shared components set one layout at large, medium and phone widths, with toolbars that keep one row and dialogs that dock as sheets on a phone. |
-| [Rust, Python, JVM and Node.js APIs](integrations/README.md#libraries-and-bindings) | Partially complete. | All four embed the engine, and the JVM binding integrates with Jena. Administration, callback and platform coverage differ by binding. |
-| [Formatting, linting and command-line tools](querying/README.md#formatter-and-editor-support) | Complete within the documented scope. | Formatting, linting, completion and CLI tools are available. The [querying guide](querying/README.md#sparql-and-formats) lists embedded-query limits and remaining linter work. |
-| [Backups and operations](operations/README.md#operations) | Partially complete. | Dataset backups, integrity checks, format migration and degraded startup are available, and webhook, ntfy and email notifications report failed backups, verifications and GCs. The server page manages notification channels and routes. Whole-server recovery and published release artifacts remain open. |
+| [Ask, ingestion and agent memory](ai/README.md#ai-and-agents) | Partial | Scoped MCP profiles, checked Ask threads, document ingestion review and cited agent memory are available. Contextual entity linking, multimodal ingestion, approval queues, extra platform controls and broader evaluations remain open. |
+| [GraphRAG reports](ai/README.md#ai-and-agents) | Core complete | Hierarchical Leiden community reports, global Ask, memory retrieval and budgeted change-feed refresh are available. View-based refresh, broader corpus evaluation and per-audience report configurations remain planned. |
+| [Web graph, map and editing tools](visualization/README.md#web-ui) | Partial | Explore, WebGL graph rendering, the time slider, path finder, maps, derivation trees and visual query builder are available. Live profiling, data-quality timelines, server-cached layouts and rendering items 737 to 739 remain. |
+| [App shell and design system](visualization/README.md#app-shell) | Complete | Every page shares a top bar with a `Ctrl+K` / `Cmd+K` command palette, a responsive navigation rail and shared components. Light and dark WCAG AA tokens cover desktop through phone layouts. |
+| [Rust, Python, JVM and Node.js APIs](integrations/README.md#libraries-and-bindings) | Core complete | In-process Rust, Python, Node.js and Jena-compatible JVM bindings ship beside native Rust and TypeScript HTTP clients. Foreign query callbacks, reusable plans, admin parity, wider platforms and package publication remain. |
+| [Formatting, linting and command-line tools](querying/README.md#formatter-and-editor-support) | Complete | Formatting, linting, language-server completion, shell completions and Jena-compatible CLI utilities are available. The [querying guide](querying/README.md#sparql-and-formats) lists embedded-query limits and remaining linter follow-ups. |
+| [Backups and operations](operations/README.md#operations) | Partial | Incremental filesystem and S3 backups with optional encryption, integrity checks, migrations, degraded startup and notifications are available. Whole-server recovery, live encryption at rest, replication and published release artifacts remain open. |
 
 ### Evidence and planned extensions
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reversible identity resolution maps, assessment inputs and dependent lookups are available through Rust, HTTP and caller-scoped MCP tools. `recall`, Ask, document ingestion (`mode: "claims"`) and community reports integrate with named review policies and claim citations. Maintained analyses remain planned under item 340. |
-| [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
-| [Durable jobs and delivery](ai/README.md#durable-jobs) | Partially complete. | Idempotent submission, fenced worker leases, atomic publication of the `quads` kind, restart fencing and restored-work recovery are available through Rust and HTTP in the store's control keyspace (invisible to queries, listings, indexes and history). The transactional outbox and recurring definitions remain under item 339. |
-| [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |
-| [Valid-time queries and event history](ai/README.md#valid-time-profile) | Partially complete. | Versioned RDF resources, SHACL shapes, temporal stored-query templates, validity records on authenticated claims and server-owned availability that refuses backdating are available. The projection helper, event-time UI and expiry integration remain planned. |
-| [Reports for distinct audiences](specs/C22b-report-configurations.md) | Planned. | Item 100 specifies multiple guarded GraphRAG configurations and shared budget enforcement. |
-| [ChatGPT-plan model access](specs/C28-chatgpt-model-access.md) | Planned. | Item 344 specifies personal sign-in, protected connections and Responses streaming. Existing OpenAI-compatible providers use API keys. |
-| [Batched updates and triggers](specs/C23-batched-updates-and-triggers.md) | Planned. | Item 36 specifies batched work, commit-trigger authoring and the writer that graph algorithms use. |
-| [Additional query languages](specs/C24-json-query-languages.md) | Planned. | JSON node-pattern and Datalog query surfaces remain item 72. openCypher remains item 20, which also supplies graph algorithm procedures. |
-| [Query by example and notebooks](#known-gaps) | Planned. | Items 28 and 30 describe these interfaces. The existing visual query builder is available. |
-| [Local-first engine](#known-gaps) | Planned. | Item 44 describes this extension. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partial | Evidence proposals, reviews, withdrawals, identity maps and dependent lookups span Rust, HTTP and MCP, integrated with Ask, ingestion and reports. Binding handles, proposition indexing, support-aware visibility and maintained analyses remain under items 81 and 340. |
+| [Shared entity representation](ai/README.md#shared-entity-representation) | Early | Versioned profile resources, acceptance fixtures and a bounded offline resolver are available. Managed integration with the evidence, temporal and analysis runtimes remains under item 396. |
+| [Durable jobs and delivery](ai/README.md#durable-jobs) | Early (Phase 1) | Idempotent submission, fenced leases, atomic `quads` publication and crash recovery are available over Rust and HTTP. The transactional outbox, recurring jobs, maintenance jobs, bindings and UI controls remain under item 339. |
+| [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |
+| [Valid-time queries and event history](ai/README.md#valid-time-profile) | Early (Phase 1) | Versioned RDF resources, SHACL shapes, temporal query templates and non-backdated claim validity records are available. The temporal projection helper, event-time UI and expiry integration remain under item 341. |
+| [Reports for distinct audiences](specs/C22b-report-configurations.md) | Planned | Item 100 specifies multiple guarded GraphRAG configurations and shared budget enforcement. |
+| [ChatGPT-plan model access](specs/C28-chatgpt-model-access.md) | Planned | Item 344 specifies personal sign-in, protected connections and Responses streaming. Existing OpenAI-compatible providers use API keys. |
+| [Batched updates and triggers](specs/C23-batched-updates-and-triggers.md) | Planned | Item 36 specifies batched work, commit-trigger authoring and the writer that graph algorithms use. |
+| [Additional query languages](specs/C24-json-query-languages.md) | Planned | JSON node-pattern and Datalog query surfaces remain item 72, and openCypher with graph algorithm procedures remains item 20. |
+| [Query by example and notebooks](#known-gaps) | Planned | Items 28 and 30 specify these interfaces beside the existing visual query builder. |
+| [Local-first engine](#known-gaps) | Planned | Item 44 specifies the WebAssembly engine over browser OPFS and edge runtimes. |
 
 ## Compatibility boundaries
 
