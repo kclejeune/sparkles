@@ -693,3 +693,29 @@ fn the_kept_taxonomy_counts_beside_a_query_saturation() {
     query(&ds, "teaches some Course");
     assert_eq!(kept(), Some(before));
 }
+
+#[test]
+fn dl663_dataset_dl_query_returns_the_named_source() {
+    let ds = dataset(
+        "Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:t))
+         Declaration(Class(:C)) Declaration(Class(:D))
+         Declaration(NamedIndividual(:a)) Declaration(NamedIndividual(:b))
+         Declaration(NamedIndividual(:c))
+         SubObjectPropertyOf(ObjectPropertyChain(:r owl:topObjectProperty) :t)
+         ObjectPropertyDomain(:t :D)
+         ObjectPropertyAssertion(:r :a :b)
+         ClassAssertion(:C :c)",
+    );
+    let answer = query(&ds, "D");
+    assert_eq!(answer.reasoning.engine, DlEngine::El);
+    assert!(!answer.reasoning.complete);
+    assert_eq!(answer.reasoning.instances_complete, Some(false));
+    assert!(matches!(&answer.reasoning.gaps[..], [gap] if gap.partial
+        && gap.message == "used in part: property chains through the top object property"));
+    assert_eq!(
+        answer.instances,
+        Some(vec![Individual::named(ex("a"))]),
+        "dl663 missing: Dataset DL query source instance",
+    );
+    println!("dl663 ok: Dataset DL query source instance");
+}

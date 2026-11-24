@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Default OWL classification derives named domains of top-object-property chains
+
+The default OWL classification path now derives named-domain consequences of two-link
+OWL 2 EL property chains ending in `owl:topObjectProperty` when the ontology stays within
+OWL 2 EL without datatype-checker components. When both links are `owl:topObjectProperty`,
+every live context derives the named domains of the chain's head property and its
+superproperties. When the first link is an ordinary non-empty, non-universal object
+property, every source context with an edge under that property derives those named
+domains. The rule table is bounded at 4,096 domain and rule rows under the classifier's
+memory budget, polls cancellation and deadlines, and preserves shared `Found`-row
+ownership and private-world teardown refund ordering under pooled paid admission. Explicit
+EL-only mode (`Limits::el_only`, `ClassifyRequest::el_only` and `--reasoner ELK`) and
+rooted runs are unchanged. The chain axioms remain reported as used in part while general
+composition through `owl:topObjectProperty` remains open under roadmap item 663.
+
 ### Streamed conditional merge OPTIONAL tests eligible pairs before copying output
 
 The cursor's conditional merge OPTIONAL now enables `merge_pair_conditions` by default

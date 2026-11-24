@@ -601,6 +601,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   or datatype that the classifier cannot compare, such as an XML literal, an ill-typed
   literal or a datatype outside the OWL 2 datatype map, or with a property chain through
   the top object property, is used as far as the calculus goes and reported as partial.
+  On the default classification path, two-link OWL 2 EL property chains ending in
+  `owl:topObjectProperty` derive the named domains of the chain's head property and its
+  superproperties under a 4,096-row bound and the classifier's memory budget, while
+  explicit EL-only mode (`Limits::el_only`, `ClassifyRequest::el_only` and `--reasoner
+  ELK`) and rooted runs leave those chains unchanged.
   Every answer is entailed, and outside a rooted run or a run that counts it is complete
   for named classes when nothing is reported. A rooted run can miss entailments even when
   it reports nothing left out and calls its answer complete, which is roadmap item 1231,

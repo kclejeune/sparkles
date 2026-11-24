@@ -1,0 +1,5 @@
+Prefix(:=<urn:top-domain:>) Ontology(Declaration(ObjectProperty(:r)) Declaration(ObjectProperty(:t))
+     Declaration(Class(:D)) Declaration(Class(:C))
+     ReflexiveObjectProperty(:r)
+     SubObjectPropertyOf(ObjectPropertyChain(:r owl:topObjectProperty) :t)
+     ObjectPropertyDomain(:t :D))

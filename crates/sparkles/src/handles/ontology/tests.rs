@@ -1671,7 +1671,7 @@ fn entity_operations_answer_in_the_route_forms() {
 
 mod classification {
     use super::*;
-    use crate::handles::ontology::classify::ClassifyRequest;
+    use crate::handles::ontology::classify::{Classified, ClassifyRequest};
     use crate::handles::ontology::wire;
     use serde_json::json;
     use std::collections::BTreeSet;
@@ -1690,6 +1690,142 @@ mod classification {
 
     fn named(g: &str) -> GraphRef {
         GraphRef::Named(g.to_string())
+    }
+
+    const DL663_CHAIN: &str = "
+        :o a owl:Ontology .
+        :A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+        :r a owl:ObjectProperty . :t a owl:ObjectProperty .
+        :t owl:propertyChainAxiom ( :r owl:topObjectProperty ) .
+        :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] .
+    ";
+    const DL663_DOMAIN: &str = ":t rdfs:domain :D .";
+
+    fn dl663_has_domain(answer: &Classified) -> bool {
+        answer.classification.taxonomy.is_subclass(&c("A"), &c("D"))
+    }
+
+    fn dl663_partial_chain(answer: &Classified) {
+        use sparkles_owl::classify::{Excluded, Gap};
+
+        let chain = sparkles_owl::ofn_read::parse_axiom(
+            "SubObjectPropertyOf(ObjectPropertyChain(<http://ex.org/r> owl:topObjectProperty) <http://ex.org/t>)",
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            answer.excluded.as_slice(),
+            [Excluded {
+                axiom: chain.kind,
+                gap: Gap::Partial("property chains through the top object property"),
+            }],
+        );
+        assert!(answer.classification.complete_for_taken);
+        assert!(!answer.classification.complete);
+        assert_eq!(answer.classification.stats.unmapped, 0);
+        assert!(!answer.classification.taxonomy.is_subclass(&c("C"), &c("D")));
+    }
+
+    #[test]
+    fn dl663_dataset_default_answer_is_cached() {
+        let ds = dataset(&format!("{DL663_CHAIN} {DL663_DOMAIN}"));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let cr = ClassifyRequest::default();
+        let first = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(!first.reused);
+        dl663_partial_chain(&first);
+        let cached = h.classify(&req, &cr, &opts()).unwrap();
+        assert!(cached.reused);
+        assert!(Arc::ptr_eq(&first.classification, &cached.classification));
+        assert_eq!(first.publication.id, cached.publication.id);
+        assert!(
+            dl663_has_domain(&first) && dl663_has_domain(&cached),
+            "dl663 missing: Dataset default cached domain",
+        );
+        println!("dl663 ok: Dataset default cached domain");
+    }
+
+    #[test]
+    fn dl663_dataset_el_only_keeps_its_partition() {
+        let ds = dataset(&format!("{DL663_CHAIN} {DL663_DOMAIN}"));
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let default = ClassifyRequest::default();
+        let el_only = ClassifyRequest {
+            el_only: true,
+            ..Default::default()
+        };
+        let first = h.classify(&req, &default, &opts()).unwrap();
+        let elk = h.classify(&req, &el_only, &opts()).unwrap();
+        dl663_partial_chain(&elk);
+        assert!(!dl663_has_domain(&elk));
+        assert!(!elk.reused && !elk.retained);
+        let again = h.classify(&req, &el_only, &opts()).unwrap();
+        assert!(!again.reused && !again.retained);
+        assert_eq!(again.classification.taxonomy, elk.classification.taxonomy);
+        let cached = h.classify(&req, &default, &opts()).unwrap();
+        assert!(cached.reused && cached.retained);
+        assert!(Arc::ptr_eq(&first.classification, &cached.classification));
+        assert_eq!(cached.publication.id, first.publication.id);
+
+        let default_source = cached.publication.identity();
+        let elk_source = elk.publication.identity();
+        assert_eq!(default_source["commit"], elk_source["commit"]);
+        assert_eq!(default_source["producer"]["elOnly"], false);
+        assert_eq!(elk_source["producer"]["elOnly"], true);
+        assert_ne!(
+            default_source["inputFingerprint"],
+            elk_source["inputFingerprint"]
+        );
+        println!("dl663 ok: Dataset EL-only cache partition");
+    }
+
+    #[test]
+    fn dl663_dataset_domain_edit_refreshes_the_answer() {
+        let ds = dataset(DL663_CHAIN);
+        let h = ds.ontology();
+        let req = OntologyRequest::default();
+        let cr = ClassifyRequest::default();
+        let classify = || h.classify(&req, &cr, &opts()).unwrap();
+
+        let before = classify();
+        dl663_partial_chain(&before);
+        assert!(!dl663_has_domain(&before));
+        assert!(classify().reused);
+
+        ds.update(&format!("{PREFIXES} INSERT DATA {{ {DL663_DOMAIN} }}"))
+            .unwrap();
+        let added = classify();
+        assert!(!added.reused);
+        dl663_partial_chain(&added);
+        assert_ne!(added.publication.id, before.publication.id);
+        assert!(added.opened.snapshot.commit > before.opened.snapshot.commit);
+        let fresh = dataset(&format!("{DL663_CHAIN} {DL663_DOMAIN}"))
+            .ontology()
+            .classify(&req, &cr, &opts())
+            .unwrap();
+        assert_eq!(added.classification.taxonomy, fresh.classification.taxonomy);
+        assert_eq!(added.excluded, fresh.excluded);
+        let cached = classify();
+        assert!(cached.reused);
+        assert!(Arc::ptr_eq(&added.classification, &cached.classification));
+
+        ds.update(&format!("{PREFIXES} DELETE DATA {{ {DL663_DOMAIN} }}"))
+            .unwrap();
+        let removed = classify();
+        assert!(!removed.reused && !dl663_has_domain(&removed));
+        dl663_partial_chain(&removed);
+        assert_ne!(removed.publication.id, added.publication.id);
+        assert_eq!(
+            removed.classification.taxonomy,
+            before.classification.taxonomy
+        );
+        assert!(
+            dl663_has_domain(&added) && dl663_has_domain(&cached),
+            "dl663 missing: Dataset post-edit domain",
+        );
+        println!("dl663 ok: Dataset post-edit domain");
     }
 
     #[test]

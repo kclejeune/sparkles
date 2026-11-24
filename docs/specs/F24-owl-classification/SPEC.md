@@ -90,8 +90,15 @@ Integer, decimal and rational literals use exact arbitrary-precision canonical v
 including values beyond 128 bits. Construction and copied storage obey the classifier's
 resource controls, and large values share immutable storage until their last owner
 releases it. XML namespace conformance is checked without canonicalizing XML values.
-Canonical XML values, ill-typed literal semantics, datatypes outside the supported map
-and chains through the top object property remain in item 663. Item 692 runs the Horn
+On the default classification path, two-link OWL 2 EL property chains ending in
+`owl:topObjectProperty` now derive their named-domain consequences when the ontology
+stays within OWL 2 EL without datatype-checker components, under a 4,096-row bound, the
+classifier's memory budget and shared-world teardown refund ordering under pooled paid
+admission. Explicit EL-only mode (`Limits::el_only`, `ClassifyRequest::el_only` and
+`--reasoner ELK`) and rooted runs are unchanged, and the chain axioms remain reported as
+used in part. General composition through the top object property, canonical XML values,
+ill-typed literal semantics and datatypes outside the supported map remain in item 663.
+Item 692 runs the Horn
 rules on ontologies with individuals, functional data properties and top properties, as
 [The Horn rules with individuals](#the-horn-rules-with-individuals) describes, and the
 shared hierarchical budget remains in item 675.

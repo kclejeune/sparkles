@@ -1,0 +1,4 @@
+Prefix(:=<urn:top-domain:>) Ontology(SubObjectPropertyOf(ObjectPropertyChain(:r :s) :t)
+    ObjectPropertyDomain(:t :D)
+    SubClassOf(:A ObjectSomeValuesFrom(:r ObjectSomeValuesFrom(:s :B)))
+    Declaration(Class(:C)))

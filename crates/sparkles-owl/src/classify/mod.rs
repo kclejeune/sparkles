@@ -97,8 +97,17 @@ mod retained_accounting_tests;
 mod saturate;
 #[cfg(test)]
 mod scratch_admission_tests;
+#[cfg(test)]
+mod shared_world_found_row_tests;
 mod taxonomy;
+mod top_chain;
+#[cfg(test)]
+mod top_chain_cases;
+#[cfg(test)]
+mod top_chain_diagnostic;
 mod world;
+#[cfg(test)]
+mod world_retirement_mixed_tests;
 
 pub use dl::{OutsideEl, Tier};
 #[doc(hidden)]
@@ -113,6 +122,7 @@ use index::{Axioms, Ex, Index, Interner, Node, TOP};
 use rustc_hash::{FxHashMap, FxHashSet};
 use saturate::{Bounds, Contexts, Stop};
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicIsize, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -1050,6 +1060,8 @@ impl Default for Classifier {
 /// knows which axioms changed since the last run gives them too, and the run saturates
 /// again only what they can reach.
 pub struct Saturation {
+    #[cfg(test)]
+    top_chain_probe: Option<std::sync::Arc<top_chain_diagnostic::Probe>>,
     interner: Interner,
     index: Option<Index>,
     ctx: Contexts,
@@ -1765,9 +1777,26 @@ impl Classifier {
     }
 }
 
+type RunOutcome = ControlFlow<LateRestart, (bool, Option<Taxonomy>, Stats)>;
+
+/// Distinguishes the caller's original default attempt from rewrites and fallbacks.
+#[derive(Clone, Copy)]
+enum AttemptProvenance {
+    OriginalDefault,
+    Ineligible,
+}
+
+/// Why an incremental attempt must start over after building its index.
+enum LateRestart {
+    Incompatible,
+    NamedDomain { normalized_peak: usize },
+}
+
 impl Saturation {
     pub fn new() -> Saturation {
         Saturation {
+            #[cfg(test)]
+            top_chain_probe: None,
             interner: Interner::new(),
             index: None,
             ctx: Vec::new(),
@@ -1939,7 +1968,12 @@ impl Saturation {
         };
         self.dl_worked.store(false, Ordering::Relaxed);
         self.rooted_declined = false;
-        let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy);
+        let attempt = if limits.el_only || limits.rooted {
+            AttemptProvenance::Ineligible
+        } else {
+            AttemptProvenance::OriginalDefault
+        };
+        let mut r = self.run(axioms, changes, held_bytes, first, with_taxonomy, attempt);
         if let Err(Error::Memory { .. }) = r
             && self.reused
         {
@@ -1975,7 +2009,7 @@ impl Saturation {
                 charge: counting,
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &again, with_taxonomy);
+            r = self.run(axioms, None, held_bytes, &again, with_taxonomy, attempt);
         }
         // a rooted run that withdrew its answer starts again without the rooted rules, here
         // and after each retry below that can run the rooted rules again
@@ -2025,7 +2059,14 @@ impl Saturation {
                 charge: counting,
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &one, with_taxonomy);
+            r = self.run(
+                axioms,
+                None,
+                held_bytes,
+                &one,
+                with_taxonomy,
+                AttemptProvenance::Ineligible,
+            );
             self.restart_declined(
                 &mut r,
                 &mut declined,
@@ -2068,7 +2109,14 @@ impl Saturation {
                 charge: counting,
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &without, with_taxonomy);
+            r = self.run(
+                axioms,
+                None,
+                held_bytes,
+                &without,
+                with_taxonomy,
+                AttemptProvenance::Ineligible,
+            );
             // the run without counting can be rooted and withdraw its answer, and its
             // restart counts no more than it did
             self.restart_declined(
@@ -2117,7 +2165,14 @@ impl Saturation {
                 charge: counting,
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &unrooted, with_taxonomy);
+            r = self.run(
+                axioms,
+                None,
+                held_bytes,
+                &unrooted,
+                with_taxonomy,
+                AttemptProvenance::Ineligible,
+            );
             self.no_rooted = false;
             rooted_over = Some(used);
         }
@@ -2156,7 +2211,14 @@ impl Saturation {
                 charge: counting,
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &horn, with_taxonomy);
+            r = self.run(
+                axioms,
+                None,
+                held_bytes,
+                &horn,
+                with_taxonomy,
+                AttemptProvenance::Ineligible,
+            );
             self.skip_dl = false;
             dl_over = Some(used);
             r = r.map(|(consistent, taxonomy, mut stats)| {
@@ -2186,8 +2248,16 @@ impl Saturation {
                     .map(|f| drawing_on(admitted.load(Ordering::Relaxed), f)),
                 ..limits.clone()
             };
-            r = self.run(axioms, None, held_bytes, &el, with_taxonomy).map(
-                |(consistent, taxonomy, mut stats)| {
+            r = self
+                .run(
+                    axioms,
+                    None,
+                    held_bytes,
+                    &el,
+                    with_taxonomy,
+                    AttemptProvenance::Ineligible,
+                )
+                .map(|(consistent, taxonomy, mut stats)| {
                     stats.horn_over_budget = true;
                     if let Some(d) = dl_over {
                         stats.dl_over_budget = true;
@@ -2197,8 +2267,7 @@ impl Saturation {
                     // the Horn run's high-water mark, which the run reached first
                     stats.peak_memory = stats.peak_memory.max(used);
                     (consistent, taxonomy, stats)
-                },
-            );
+                });
         }
         if r.is_err() && self.dirty {
             self.reset();
@@ -2278,7 +2347,14 @@ impl Saturation {
             charge: counting,
             ..limits.clone()
         };
-        *r = self.run(axioms, None, held_bytes, &unrooted, with_taxonomy);
+        *r = self.run(
+            axioms,
+            None,
+            held_bytes,
+            &unrooted,
+            with_taxonomy,
+            AttemptProvenance::Ineligible,
+        );
         declined.get_or_insert(used);
     }
 
@@ -2298,6 +2374,7 @@ impl Saturation {
     /// The answer's last part is the estimated peak of a parallel normalization, with
     /// `held_bytes`, which the pool has been charged for, or 0. `kept_bytes` are those of
     /// the contexts the run keeps, [`Saturation::context_bytes`].
+    #[allow(clippy::too_many_arguments)]
     fn build(
         &mut self,
         axioms: &[&AxiomKind],
@@ -2306,6 +2383,7 @@ impl Saturation {
         held_bytes: usize,
         kept_bytes: usize,
         limits: &Limits,
+        attempt: AttemptProvenance,
     ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
         let budget = numeric::Budget::new(
             limits,
@@ -2314,7 +2392,7 @@ impl Saturation {
         );
         budget.baseline(self.interner.bytes())?;
         self.interner.ranges.begin(budget.clone());
-        let result = self.build_inner(axioms, outside, threads, held_bytes, limits);
+        let result = self.build_inner(axioms, outside, threads, held_bytes, limits, attempt);
         // the run's components and definitions end with its normalization, on every exit
         self.interner.dt_run = None;
         self.numeric_halt |= self.interner.ranges.check().is_err();
@@ -2329,6 +2407,7 @@ impl Saturation {
         threads: usize,
         held_bytes: usize,
         limits: &Limits,
+        attempt: AttemptProvenance,
     ) -> Result<(Axioms, Index, usize, OutsideEl), Error> {
         let mut ax = Axioms::default();
         let mut partial: BTreeMap<&AxiomKind, &'static str> = BTreeMap::new();
@@ -2502,6 +2581,7 @@ impl Saturation {
         poll(limits)?;
         // the range restriction of OWL 2 EL (Profiles §2.2.6): a chain's superproperty
         // has no range that its last property lacks
+        let mut named_domain_candidate = false;
         if !chains.is_empty() {
             let ranges = range_table(axioms, &is_outside);
             for k in chains {
@@ -2527,6 +2607,11 @@ impl Saturation {
                     }
                 }
                 if let Some(why) = index::normalize(k, &mut self.interner, &mut ax) {
+                    if matches!(attempt, AttemptProvenance::OriginalDefault)
+                        && !named_domain_candidate
+                    {
+                        named_domain_candidate = top_chain::shape(k, why).is_some();
+                    }
                     partial.insert(k, why);
                 }
                 self.interner.ranges.check()?;
@@ -2536,6 +2621,10 @@ impl Saturation {
         // chain whose superproperty has a range its last property lacks is Horn
         let mut candidates: Vec<&AxiomKind> = outside.iter().map(|(i, _)| axioms[*i]).collect();
         candidates.extend(chain_ranges.iter().map(|(k, _)| *k));
+        // Capture the checker decision before Tier D can clear dt_run. The candidate
+        // list includes chains rejected by the central last-role range check.
+        let plan_named_domains =
+            named_domain_candidate && candidates.is_empty() && self.interner.dt_run.is_none();
         if self.hide_internal {
             self.chain_ranged = chain_ranges.iter().map(|(k, _)| (*k).clone()).collect();
         }
@@ -2669,7 +2758,30 @@ impl Saturation {
                 debug_assert!(!checker(r), "a lattice data range over a checker property");
             }
         }
-        let ix = Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
+        let mut ix =
+            Index::build(&ax, &mut self.interner, limits.max_memory, &stop).map_err(halt)?;
+        if plan_named_domains && ax.horn.is_none() && ax.dl.is_none() {
+            let budget = self.interner.ranges.budget.as_ref().expect("build budget");
+            let base = self
+                .interner
+                .bytes()
+                .checked_add(ax.bytes())
+                .and_then(|n| n.checked_add(ix.bytes()))
+                .ok_or(Error::Memory {
+                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                    used: usize::MAX,
+                })?;
+            ix.top_chain = top_chain::plan(
+                axioms,
+                &partial,
+                &self.interner,
+                &ix,
+                budget,
+                base,
+                #[cfg(test)]
+                self.top_chain_probe.as_ref(),
+            )?;
+        }
         self.interner.dt_run = None;
         self.interner.end_run();
         let mut excluded: Vec<Excluded> = Vec::new();
@@ -2753,6 +2865,7 @@ impl Saturation {
         held_bytes: usize,
         limits: &Limits,
         with_taxonomy: bool,
+        attempt: AttemptProvenance,
     ) -> Result<(bool, Option<Taxonomy>, Stats), Error> {
         if limits.rooted
             && !self.no_rooted
@@ -2770,10 +2883,17 @@ impl Saturation {
             // the rewritten axioms are held beside the caller's for the run
             let red_bytes: usize = red.axioms.iter().map(held_bytes_of).sum();
             self.hide_internal = true;
-            let r = self.run_once(&all, None, held_bytes + red_bytes, limits, with_taxonomy);
+            let r = self.run_once(
+                &all,
+                None,
+                held_bytes + red_bytes,
+                limits,
+                with_taxonomy,
+                AttemptProvenance::Ineligible,
+            );
             self.hide_internal = false;
             match r {
-                Ok(Some(mut r)) if self.dl_tried => {
+                Ok(ControlFlow::Continue(mut r)) if self.dl_tried => {
                     red.restore(axioms, &mut self.excluded);
                     r.2.added = self.source_len.unwrap_or(axioms.len());
                     let tier = r.2.tier;
@@ -2810,15 +2930,38 @@ impl Saturation {
             self.reset();
         }
         let changes = changes.filter(|_| !was);
-        if let Some(r) = self.run_once(axioms, changes, held_bytes, limits, with_taxonomy)? {
-            return Ok(r);
-        }
+        let restart =
+            match self.run_once(axioms, changes, held_bytes, limits, with_taxonomy, attempt)? {
+                ControlFlow::Continue(r) => return Ok(r),
+                ControlFlow::Break(restart) => restart,
+            };
         self.reset();
-        let r = self.run_once(axioms, None, held_bytes, limits, with_taxonomy)?;
-        Ok(r.expect("a run without changes starts again"))
+        let credited;
+        let (limits, discarded_peak) = match restart {
+            LateRestart::Incompatible => (limits, 0),
+            LateRestart::NamedDomain { normalized_peak } => match &limits.charge {
+                Some(charge) => {
+                    // The successful build's one numeric budget approved exactly this
+                    // much growth at the incoming callback, including inherited credit.
+                    credited = Limits {
+                        charge: Some(drawing_on(normalized_peak, charge.clone())),
+                        ..limits.clone()
+                    };
+                    (&credited, normalized_peak)
+                }
+                None => (limits, 0),
+            },
+        };
+        let ControlFlow::Continue(mut r) =
+            self.run_once(axioms, None, held_bytes, limits, with_taxonomy, attempt)?
+        else {
+            unreachable!("a run without changes starts fresh");
+        };
+        r.2.peak_memory = r.2.peak_memory.max(discarded_peak);
+        Ok(r)
     }
 
-    /// [`Saturation::run`], or `None` when a run with changes must start again.
+    /// [`Saturation::run`], with a reason when a run with changes must start again.
     fn run_once(
         &mut self,
         axioms: &[&AxiomKind],
@@ -2826,7 +2969,8 @@ impl Saturation {
         held_bytes: usize,
         limits: &Limits,
         with_taxonomy: bool,
-    ) -> Result<Option<(bool, Option<Taxonomy>, Stats)>, Error> {
+        attempt: AttemptProvenance,
+    ) -> Result<RunOutcome, Error> {
         let mut stats = Stats::default();
         let start = Instant::now();
         let threads = threads_of(limits);
@@ -2895,7 +3039,9 @@ impl Saturation {
         // data property or datatype already satisfies `needs_full_run` inside
         // `must_restart`, so `!full` guarantees no changed axiom can trigger a checker
         // component.
+        let had_top_chain = self.index.as_ref().is_some_and(|ix| ix.top_chain.is_some());
         let full = self.entangled
+            || had_top_chain
             || self.index.as_ref().is_some_and(|ix| ix.dt.is_some())
             || match (&kept, changes) {
                 (Some(k), Some(c)) => {
@@ -2978,7 +3124,15 @@ impl Saturation {
             held_bytes + old_bytes + sets_bytes + premises_bytes,
             kept_bytes,
             limits,
+            attempt,
         )?;
+        if kept.is_some() && ix.top_chain.is_some() {
+            #[cfg(test)]
+            admission_test::hit(admission_test::Point::TopChainKeptPlan);
+            return Ok(ControlFlow::Break(LateRestart::NamedDomain {
+                normalized_peak,
+            }));
+        }
         drop(outside);
         // the disjointness sets by their numbers in this index, beside those of the
         // last run's, by which the contexts it leaves number the sets they meet; the run
@@ -3030,12 +3184,12 @@ impl Saturation {
         {
             // the edit changed the rules the ontology needs, which the run decided over
             // an interner that still holds the expressions of removed axioms
-            return Ok(None);
+            return Ok(ControlFlow::Break(LateRestart::Incompatible));
         }
         let reuse = match &old_ix {
             Some(old) => {
                 if !ix.same_tables(old) {
-                    return Ok(None);
+                    return Ok(ControlFlow::Break(LateRestart::Incompatible));
                 }
                 true
             }
@@ -3685,29 +3839,113 @@ impl Saturation {
                     world_base(totals.memory, pending)?,
                     &mut totals,
                 )?;
+                #[cfg(test)]
+                let row_test = shared_world_found_row_tests::active();
+                #[cfg(test)]
+                let _row_phase = row_test
+                    .as_deref()
+                    .map(|test| test.phase(&budget, &self.interner, &classes, ix.dt.as_deref()));
+                #[cfg(test)]
+                let mixed_test = world_retirement_mixed_tests::active();
+                #[cfg(test)]
+                let _mixed_phase = mixed_test.as_deref().map(|test| {
+                    assert!(ix.dt.is_none(), "mixed fixture excludes checker ownership");
+                    test.phase(&budget, &classes, ix.top_chain.is_some(), self.worlds.len())
+                });
                 let bound = |delta: isize| budget.tell(delta);
-                let found = par_map(&classes, threads, MIN_CLASSES, |_, chunk| {
-                    let mut out = Vec::with_capacity(chunk.len());
+                let found = par_map(&classes, threads, MIN_CLASSES, |_offset, chunk| {
+                    #[cfg(test)]
+                    let mixed_worker = mixed_test
+                        .as_ref()
+                        .map(|test| test.worker(_offset, chunk, &budget));
+                    #[cfg(test)]
+                    let _row_worker = row_test.as_deref().map(|test| test.worker(_offset, chunk));
+                    let mut out = FoundWorldChunk {
+                        rows: Vec::with_capacity(chunk.len()),
+                        debit: FoundWorldDebit {
+                            budget: &budget,
+                            outstanding: 0,
+                        },
+                    };
                     for &d in chunk {
-                        let w = world::World::new(
+                        #[cfg(test)]
+                        if let Some(test) = row_test.as_deref() {
+                            test.before_world(_offset, out.rows.len())?;
+                        }
+                        #[cfg(test)]
+                        if let Some(worker) = &mixed_worker {
+                            worker.before_world(out.rows.len())?;
+                        }
+                        let w = world::World::new_with_budget(
                             &ix,
                             &self.ctx,
                             dynamic.as_ref(),
                             &universal,
                             &real,
                             &bound,
+                            &budget,
                         );
                         let f = w.classify(d)?;
-                        let kept = 48 + f.subs.len() * 4;
-                        if !bound(kept as isize) {
+                        #[cfg(test)]
+                        if let Some(worker) = &mixed_worker {
+                            worker.after_world(d)?;
+                        }
+                        let kept = f
+                            .subs
+                            .len()
+                            .checked_mul(4)
+                            .and_then(|bytes| bytes.checked_add(48))
+                            .and_then(|bytes| isize::try_from(bytes).ok())
+                            .ok_or(index::Halt::Memory(usize::MAX))?;
+                        let outstanding = out
+                            .debit
+                            .outstanding
+                            .checked_add(kept)
+                            .ok_or(index::Halt::Memory(usize::MAX))?;
+                        #[cfg(test)]
+                        if let Some(test) = row_test.as_deref() {
+                            test.before_report(&budget, _offset, d, &f, kept as usize);
+                        }
+                        out.rows.push((d, f, kept));
+                        #[cfg(test)]
+                        if let Some(test) = row_test.as_deref() {
+                            test.before_post(out.rows.len());
+                        }
+                        #[cfg(test)]
+                        if let Some(worker) = &mixed_worker {
+                            worker.before_row_post(out.rows.len(), d, kept);
+                        }
+                        if !out.debit.post(kept, outstanding) {
                             return Err(index::Halt::Stopped);
                         }
-                        out.push((d, f, kept));
+                        #[cfg(test)]
+                        if let Some(test) = row_test.as_deref() {
+                            test.admitted(_offset, d);
+                        }
+                        #[cfg(test)]
+                        if let Some(worker) = &mixed_worker {
+                            worker.admitted(d, kept);
+                        }
                     }
                     Ok(out)
                 })
                 .into_iter()
                 .collect::<Result<Vec<_>, index::Halt>>();
+                #[cfg(test)]
+                if let Some(test) = row_test.as_deref() {
+                    test.collected(
+                        &budget,
+                        found
+                            .as_ref()
+                            .map(|chunks| chunks.iter().map(|chunk| chunk.rows.len()).sum())
+                            .map_err(|&halt| halt),
+                        ix.dt.as_deref(),
+                    );
+                }
+                #[cfg(test)]
+                if let Some(test) = mixed_test.as_deref() {
+                    test.collected(&budget, found.as_ref().err().copied());
+                }
                 budget.stopped()?;
                 let found = found.map_err(|h| match h {
                     index::Halt::Memory(used) => Error::Memory {
@@ -3719,10 +3957,34 @@ impl Saturation {
                 budget.finish(&mut totals);
                 if charge_fn.is_some() {
                     world_live = budget.held.load(Ordering::Relaxed).max(0) as usize;
+                    #[cfg(test)]
+                    if let Some(test) = row_test.as_deref() {
+                        test.pooled_live(world_live);
+                    }
                 }
-                for (d, f, kept) in found.into_iter().flatten() {
-                    world_bytes += kept;
-                    self.worlds.insert(d, (f.bottom, f.subs));
+                for FoundWorldChunk { rows, mut debit } in found {
+                    // The iterator and each yielded row drop before the debit.
+                    for (d, f, kept) in rows {
+                        let next_bytes =
+                            world_bytes
+                                .checked_add(kept as usize)
+                                .ok_or(Error::Memory {
+                                    limit: limits.max_memory.unwrap_or(usize::MAX),
+                                    used: usize::MAX,
+                                })?;
+                        let remaining = debit.outstanding - kept;
+                        #[cfg(test)]
+                        if let Some(test) = row_test.as_deref() {
+                            test.before_insert(self.worlds.len());
+                        }
+                        self.worlds.insert(d, (f.bottom, f.subs));
+                        world_bytes = next_bytes;
+                        debit.outstanding = remaining;
+                        #[cfg(test)]
+                        if let Some(test) = row_test.as_deref() {
+                            test.after_insert(self.worlds.len());
+                        }
+                    }
                 }
                 #[cfg(test)]
                 if admission_test::observing() {
@@ -4072,7 +4334,7 @@ impl Saturation {
             stats.peak_memory = totals.peak.max(held);
             stats.contexts = self.context_count();
             poll(limits)?;
-            return Ok(Some((consistent, None, stats)));
+            return Ok(ControlFlow::Continue((consistent, None, stats)));
         }
         // a partial answer builds its taxonomy past the deadline that stopped it
         let stop = || open.is_none() && poll(limits).is_err();
@@ -4111,10 +4373,10 @@ impl Saturation {
                 .collect();
             classes.sort();
             self.partial = Some((classes, consistency));
-            return Ok(Some((consistent, Some(taxonomy), stats)));
+            return Ok(ControlFlow::Continue((consistent, Some(taxonomy), stats)));
         }
         poll(limits)?;
-        Ok(Some((consistent, Some(taxonomy), stats)))
+        Ok(ControlFlow::Continue((consistent, Some(taxonomy), stats)))
     }
 
     /// The contexts saturated, those of the Horn rules' conjunctions included.
@@ -4959,8 +5221,35 @@ struct WorldBudget<'a> {
     halted_at: AtomicUsize,
 }
 
+struct FoundWorldChunk<'r, 'a> {
+    // Drop the rows and the vector allocation before returning their live bytes.
+    rows: Vec<(Ex, world::Found, isize)>,
+    debit: FoundWorldDebit<'r, 'a>,
+}
+
+struct FoundWorldDebit<'r, 'a> {
+    budget: &'r WorldBudget<'a>,
+    outstanding: isize,
+}
+
+impl FoundWorldDebit<'_, '_> {
+    fn post(&mut self, bytes: isize, outstanding: isize) -> bool {
+        let before = self.budget.post(bytes);
+        self.outstanding = outstanding;
+        #[cfg(test)]
+        world_retirement_mixed_tests::row_posted(self.budget, bytes, before, outstanding);
+        self.budget.check_post(bytes, before)
+    }
+}
+
+impl Drop for FoundWorldDebit<'_, '_> {
+    fn drop(&mut self) {
+        self.budget.retire(self.outstanding);
+    }
+}
+
 /// Declared after the growth guard so the stop is visible before a waiter enters.
-/// The reporters still own their deltas and retire them through `tell`.
+/// The reporters still own their deltas and retire them during teardown.
 struct WorldChargePanic<'r, 'a>(&'r WorldBudget<'a>, bool);
 
 impl Drop for WorldChargePanic<'_, '_> {
@@ -5003,7 +5292,23 @@ impl<'a> WorldBudget<'a> {
 
     /// Takes a change of what a world holds, and answers whether the worlds go on.
     fn tell(&self, delta: isize) -> bool {
-        let now = self.held.fetch_add(delta, Ordering::Relaxed) + delta;
+        self.check_post(delta, self.post(delta))
+    }
+
+    /// Posts a signed change and returns the previous ledger value. A scoped owner can
+    /// arm its inverse here, before any hook, admission or poll.
+    fn post(&self, delta: isize) -> isize {
+        self.held.fetch_add(delta, Ordering::Relaxed)
+    }
+
+    fn retire(&self, delta: isize) {
+        if delta != 0 {
+            self.held.fetch_sub(delta, Ordering::Relaxed);
+        }
+    }
+
+    fn check_post(&self, delta: isize, previous: isize) -> bool {
+        let now = previous + delta;
         #[cfg(test)]
         if delta > 0 {
             admission_test::hit(admission_test::Point::Observed);
@@ -5264,7 +5569,18 @@ mod admission_handoff_tests {
             probe,
             individuals,
             move |e| observer.lock().observe(e, refuse),
-            || classifier.run_once(axioms, None, 0, &limits, true),
+            || {
+                classifier
+                    .run_once(
+                        axioms,
+                        None,
+                        0,
+                        &limits,
+                        true,
+                        AttemptProvenance::Ineligible,
+                    )
+                    .map(ControlFlow::continue_value)
+            },
         );
         let trace = recorded.lock().clone();
         (result, trace)
@@ -6507,7 +6823,15 @@ mod tests {
             .collect();
         let mut s = Saturation::default();
         let (_, ix, _, _) = s
-            .build(&axioms, &outside, 1, 0, 0, &Limits::default())
+            .build(
+                &axioms,
+                &outside,
+                1,
+                0,
+                0,
+                &Limits::default(),
+                AttemptProvenance::Ineligible,
+            )
             .unwrap();
         assert!(ix.horn.is_some());
         ix

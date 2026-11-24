@@ -41,6 +41,8 @@ use std::time::{Duration, Instant};
 pub enum Concl {
     /// the context's root is subsumed by the expression
     Sub(Ex),
+    /// Named subsumption carrying one already reserved conclusion.
+    TopChainSub(Ex),
     /// an instance of the source context has an instance of this context as an
     /// `r`-successor
     Back(Ex, Role),
@@ -429,6 +431,8 @@ impl State {
     pub fn holds(&self, c: &Concl) -> bool {
         match *c {
             Concl::Sub(d) => self.bottom || self.subs.contains(&d),
+            // Leave prepaid messages for the recipient to retire or retain.
+            Concl::TopChainSub(_) => false,
             Concl::Back(e, r) => self.back.iter().any(|(s, v)| *s == r && v.contains(&e)),
             Concl::Fwd(r, f) => self.fwd.contains(&(r, f)),
             Concl::Loop(r) => self.loops.contains(&r),
@@ -953,6 +957,80 @@ impl Drop for ReservationDebit<'_, '_> {
     }
 }
 
+/// A named-domain round can discard work, but each prepaid tag still has one owner.
+struct PendingTagRetirement<'r, 'a> {
+    run: &'r Run<'a>,
+    already_panicking: bool,
+}
+
+impl Drop for PendingTagRetirement<'_, '_> {
+    fn drop(&mut self) {
+        if self.run.stopped() || unwinds(self.already_panicking) {
+            // The worker scope has joined. Never instantiate a context to sweep it.
+            for cell in self.run.ctx {
+                if let Some(ctx) = cell.get() {
+                    let mut todo = ctx.todo.lock();
+                    let before = todo.len();
+                    todo.retain(|c| !matches!(c, Concl::TopChainSub(_)));
+                    self.run.credit((before - todo.len()) * CONCLUSION_BYTES);
+                }
+            }
+        }
+    }
+}
+
+/// What has left a context's to-do list but has not been applied yet.
+struct Taken<'r, 'a> {
+    batch: Vec<Concl>,
+    at: usize,
+    // In ordinary rounds taking the list accounts for the whole batch at once.
+    active_run: Option<&'r Run<'a>>,
+}
+
+impl Drop for Taken<'_, '_> {
+    fn drop(&mut self) {
+        if let Some(run) = self.active_run {
+            let suffix = &self.batch[self.at..];
+            let tags = tag_count(suffix);
+            run.credit(tags * CONCLUSION_BYTES);
+            if tags != suffix.len() {
+                run.queued
+                    .fetch_sub((suffix.len() - tags) as isize, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// A worker owns the logical destination uses its outbox has yet to deliver.
+struct OutboxRetirement<'r, 'a> {
+    run: &'r Run<'a>,
+    outbox: &'r mut Outbox,
+    tally: &'r mut Tally,
+}
+
+impl Drop for OutboxRetirement<'_, '_> {
+    fn drop(&mut self) {
+        if self.run.ix.top_chain.is_none() {
+            return;
+        }
+        let mut tags = 0;
+        let mut uses = 0;
+        for d in &self.outbox.runs[self.outbox.delivered..] {
+            let rows = &self.outbox.msgs[d.start as usize..d.end as usize];
+            uses += rows.len();
+            tags += tag_count(rows);
+        }
+        self.outbox.clear();
+        self.run.credit(tags * CONCLUSION_BYTES);
+        // A panic can bypass a regular flush. Publish only the unpublished ordinary
+        // balance and subtract one ordinary row for each abandoned destination use.
+        let queued = self.tally.queued - (uses - tags) as isize;
+        if queued != 0 {
+            self.run.queued.fetch_add(queued, Ordering::Relaxed);
+        }
+    }
+}
+
 /// A helper's part in a phase of a run in steps, which it leaves when it is dropped,
 /// at the end of its work and when it unwinds.
 struct InPhase<'r, 'a>(&'r Run<'a>, &'r Steps);
@@ -1063,6 +1141,9 @@ pub fn saturate_counted(
     universal: &[Ex],
     bounds: &Bounds<'_>,
 ) -> (Totals, Option<Stop>) {
+    let initial_batch = bounds.threads > 1;
+    #[cfg(test)]
+    let initial_batch = initial_batch || horn_accounting_tests::MIXED_OUTBOX.get();
     let run = Run {
         ix,
         ctx,
@@ -1081,7 +1162,7 @@ pub fn saturate_counted(
         paid: Mutex::new(bounds.paid_memory),
         applied: AtomicUsize::new(0),
         merged: AtomicBool::new(false),
-        batch: AtomicBool::new(bounds.threads > 1),
+        batch: AtomicBool::new(initial_batch),
         plain: plain(ix),
         horn: ix.horn.is_some() && bounds.dynamic.is_some(),
         disj: ix.dl.is_some() && bounds.dl.is_some(),
@@ -1095,6 +1176,20 @@ pub fn saturate_counted(
         #[cfg(test)]
         always_congested: ALWAYS_CONGESTED.get(),
     };
+    let pending_tags = ix.top_chain.as_ref().map(|_| {
+        assert!(
+            !bounds.partial
+                && !bounds.steps
+                && bounds.dynamic.is_none()
+                && bounds.dl.is_none()
+                && ix.horn.is_none()
+                && ix.dl.is_none()
+        );
+        PendingTagRetirement {
+            run: &run,
+            already_panicking: std::thread::panicking(),
+        }
+    });
     // An empty pooled round still holds its inherited tables and queued messages.
     if bounds.charge.is_none()
         || run
@@ -1131,6 +1226,20 @@ pub fn saturate_counted(
         } else {
             run.workers::<Full>(threads);
         }
+    }
+    drop(pending_tags);
+    #[cfg(test)]
+    if ix.top_chain.is_some() && run.stopped() && super::admission_test::has_hook() {
+        use super::admission_test::{Point, hit};
+        let tagged = ctx
+            .iter()
+            .filter_map(|slot| slot.get())
+            .map(|ctx| tag_count(&ctx.todo.lock()))
+            .sum();
+        hit(Point::TopChainGlobalJoin {
+            tagged,
+            queued: run.queued.load(Ordering::Relaxed),
+        });
     }
     let memory = run.memory.load(Ordering::Relaxed);
     let peak = run.peak.load(Ordering::Relaxed).max(memory);
@@ -1181,6 +1290,28 @@ const KEEP_BATCH: usize = 16 << 10;
 impl Drop for Out<'_, '_> {
     /// An activation charges what it kept and has not charged yet as it ends.
     fn drop(&mut self) {
+        if self.run.ix.top_chain.is_some() {
+            // The normal activation epilogue takes `sent`. On unwind the queued rows
+            // already visible to their owners still need their signed publication.
+            if self.sent != 0 {
+                self.run
+                    .queued
+                    .fetch_add(self.sent as isize, Ordering::Relaxed);
+            }
+            if std::thread::panicking() {
+                // Retained rule data already belongs to the context. Publishing it
+                // during unwind must avoid refreshing bounds or calling the pool.
+                if self.kept != 0 {
+                    let _ = self
+                        .run
+                        .memory
+                        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                            Some(n.saturating_add(self.kept))
+                        });
+                }
+                return;
+            }
+        }
         if self.kept > 0 {
             let kept = std::mem::take(&mut self.kept);
             self.charge_kept(kept);
@@ -1244,6 +1375,8 @@ struct Outbox {
     runs: Vec<Dest>,
     /// the messages the runs stand for, those they share counted for each
     total: usize,
+    /// the runs already transferred to destinations in a named-domain round
+    delivered: usize,
     tmp: Vec<Dest>,
     counts: Vec<u32>,
     /// the messages of a run in steps with their destinations, in the order sent, which
@@ -1256,6 +1389,12 @@ struct Outbox {
 const RADIX_BITS: u32 = 11;
 /// The runs below which an outbox sorts by comparison instead.
 const RADIX_MIN: usize = 512;
+
+fn tag_count(msgs: &[Concl]) -> usize {
+    msgs.iter()
+        .filter(|c| matches!(c, Concl::TopChainSub(_)))
+        .count()
+}
 
 impl Outbox {
     fn is_empty(&self) -> bool {
@@ -1299,6 +1438,7 @@ impl Outbox {
         self.msgs.clear();
         self.runs.clear();
         self.total = 0;
+        self.delivered = 0;
     }
 
     /// Orders the runs by destination, keeping the order of each destination's.
@@ -1379,6 +1519,16 @@ pub trait Sink {
     /// memory count.
     fn data_overflow(&mut self) {}
 
+    /// Sends a named subsumption after admitting its waiting message.
+    fn top_chain_sub(
+        &mut self,
+        _to: Ex,
+        _domain: Ex,
+        #[cfg(test)] _probe: Option<&super::top_chain_diagnostic::Probe>,
+    ) -> bool {
+        unreachable!("named-domain rules require an admitted saturation sink")
+    }
+
     /// sends a conclusion to a context, which may be the one the rules run in
     fn send(&mut self, to: Ex, c: Concl);
     /// a conclusion for the context the rules run in
@@ -1453,7 +1603,7 @@ fn before_debit() {
     }
 }
 
-impl Out<'_, '_> {
+impl<'r, 'a> Out<'r, 'a> {
     /// Charges retained bytes from [`Sink::keep_data`] into the run's memory count without
     /// rolling them back on a bound refusal, since the caller keeps the data.
     fn charge_kept(&mut self, bytes: usize) {
@@ -1466,15 +1616,26 @@ impl Out<'_, '_> {
 
     #[inline]
     fn reserve(&mut self, bytes: usize, memory_only: bool) -> bool {
-        if bytes > isize::MAX as usize {
-            self.data_overflow();
-            return false;
-        }
-        let waiting = (!memory_only).then(|| self.run.queued.load(Ordering::Relaxed));
-        let Some(held) = self.run.debit_or_stop(bytes) else {
+        let Some(mut debit) = self.reserve_debit(bytes, memory_only) else {
             return false;
         };
-        let mut debit = ReservationDebit {
+        debit.bytes = 0;
+        true
+    }
+
+    #[inline]
+    fn reserve_debit(
+        &mut self,
+        bytes: usize,
+        memory_only: bool,
+    ) -> Option<ReservationDebit<'r, 'a>> {
+        if bytes > isize::MAX as usize {
+            self.data_overflow();
+            return None;
+        }
+        let waiting = (!memory_only).then(|| self.run.queued.load(Ordering::Relaxed));
+        let held = self.run.debit_or_stop(bytes)?;
+        let debit = ReservationDebit {
             run: self.run,
             bytes,
         };
@@ -1487,10 +1648,9 @@ impl Out<'_, '_> {
         // The step-local work check is part of the reservation. Keep the debit
         // guarded until both checks pass, including if a caller's poll unwinds.
         if !ok || self.run.steps && self.dl().past(self.work) {
-            return false;
+            return None;
         }
-        debit.bytes = 0;
-        true
+        Some(debit)
     }
 }
 
@@ -1528,6 +1688,48 @@ impl Sink for Out<'_, '_> {
         self.kept -= waiting;
         let bytes = bytes - waiting;
         self.run.credit(bytes);
+    }
+
+    fn top_chain_sub(
+        &mut self,
+        to: Ex,
+        domain: Ex,
+        #[cfg(test)] probe: Option<&super::top_chain_diagnostic::Probe>,
+    ) -> bool {
+        #[cfg(test)]
+        use super::admission_test::{Point, hit};
+
+        #[cfg(test)]
+        hit(Point::TopChainGlobalMessage);
+        let Some(mut debit) = self.reserve_debit(CONCLUSION_BYTES, false) else {
+            return false;
+        };
+        // The signed queue balance counts ordinary sends only. Transfer to the queue
+        // that receives the tag before any wake-up or batch delivery.
+        let c = Concl::TopChainSub(domain);
+        let batched = to != self.me && self.run.batch.load(Ordering::Relaxed);
+        if !batched {
+            let ctx = self.run.get(to);
+            ctx.todo.lock().push(c);
+            debit.bytes = 0;
+            if to != self.me && self.run.mark(ctx) {
+                self.woke.push_back(to);
+            }
+        } else {
+            self.outbox.push(to, c);
+            debit.bytes = 0;
+            if self.outbox.full() {
+                self.run.deliver(self.outbox, self.woke);
+            }
+        }
+        #[cfg(test)]
+        {
+            if let Some(probe) = probe {
+                probe.global_messages.fetch_add(1, Ordering::Relaxed);
+            }
+            hit(Point::TopChainGlobalQueued { batched });
+        }
+        true
     }
 
     #[inline]
@@ -1899,10 +2101,26 @@ impl<'a> Run<'a> {
             let to = runs[at].to;
             let end = at + runs[at..].iter().take_while(|d| d.to == to).count();
             let ctx = self.get(to);
-            if !(filter && self.deliver_new(ctx, &runs[at..end], msgs)) {
+            let filtered = filter && self.deliver_new(ctx, &runs[at..end], msgs);
+            if !filtered {
                 let mut t = ctx.todo.lock();
                 for d in &runs[at..end] {
                     t.extend_from_slice(&msgs[d.start as usize..d.end as usize]);
+                }
+            }
+            if self.ix.top_chain.is_some() {
+                // The recipient owns every copied tag. Congested filtering preserves
+                // tags and has already retired any ordinary rows it rejected.
+                outbox.delivered = end;
+                #[cfg(test)]
+                if filtered && super::admission_test::has_hook() {
+                    let tagged = runs[at..end]
+                        .iter()
+                        .map(|d| tag_count(&msgs[d.start as usize..d.end as usize]))
+                        .sum();
+                    super::admission_test::hit(
+                        super::admission_test::Point::TopChainGlobalFiltered { tagged },
+                    );
                 }
             }
             if self.mark(ctx) {
@@ -2236,6 +2454,12 @@ impl<'a> Run<'a> {
         let mut local: Vec<Concl> = Vec::new();
         let mut outbox = Outbox::default();
         let mut marks = Marks::default();
+        let retirement = OutboxRetirement {
+            run: self,
+            outbox: &mut outbox,
+            tally: &mut tally,
+        };
+        let (tally, outbox) = (&mut *retirement.tally, &mut *retirement.outbox);
         loop {
             if round >= ROOTS_PER_ROUND && mine.is_empty() {
                 round = 0;
@@ -2252,14 +2476,14 @@ impl<'a> Run<'a> {
                 e
             } else if !outbox.is_empty() {
                 // the messages the worker holds go out before it looks for more work
-                self.deliver(&mut outbox, &mut mine);
+                self.deliver(outbox, &mut mine);
                 continue;
             } else {
                 // no roots are left: what the worker counted goes to the totals before
                 // it waits for the others
                 round = 0;
                 if tally.applied > 0 || tally.stored > 0 || tally.queued != 0 {
-                    self.flush(&mut tally);
+                    self.flush(tally);
                 }
                 // the worker goes idle; the last to do so with the queue empty ends the
                 // saturation
@@ -2289,22 +2513,26 @@ impl<'a> Run<'a> {
                 }
             };
             if self.stopped() {
-                self.flush(&mut tally);
+                #[cfg(test)]
+                if self.ix.top_chain.is_some() && !self.bounds.partial && !outbox.is_empty() {
+                    let tagged = tag_count(&outbox.msgs);
+                    super::admission_test::hit(
+                        super::admission_test::Point::TopChainGlobalOutbox {
+                            tagged,
+                            ordinary: outbox.total - tagged,
+                            ordinary_payloads: outbox.msgs.len() - tagged,
+                        },
+                    );
+                }
+                self.flush(tally);
                 // the messages the worker holds reach their contexts' to-do lists, which
                 // then show the work left for a partial answer
                 if self.bounds.partial {
-                    self.deliver(&mut outbox, &mut mine);
+                    self.deliver(outbox, &mut mine);
                 }
                 return;
             }
-            self.process::<R>(
-                next,
-                &mut mine,
-                &mut tally,
-                &mut local,
-                &mut outbox,
-                &mut marks,
-            );
+            self.process::<R>(next, &mut mine, tally, &mut local, outbox, &mut marks);
             #[cfg(test)]
             if self.bounds.partial
                 && !self.stopped()
@@ -2322,7 +2550,7 @@ impl<'a> Run<'a> {
                 start();
             }
             if !outbox.is_empty() && self.idle.load(Ordering::Relaxed) > 0 {
-                self.deliver(&mut outbox, &mut mine);
+                self.deliver(outbox, &mut mine);
             }
             self.share(&mut mine);
         }
@@ -2773,19 +3001,26 @@ impl<'a> Run<'a> {
 
     /// Adds a worker's counts to the totals and checks the bounds.
     fn flush(&self, t: &mut Tally) -> bool {
+        // check_debit adds the queue delta before its first possible hook or poll.
+        // The worker's retirement must never publish that delta a second time.
+        let queued = if self.ix.top_chain.is_some() {
+            std::mem::take(&mut t.queued)
+        } else {
+            t.queued
+        };
         let Some(bytes) = t.stored.checked_mul(CONCLUSION_BYTES) else {
             if t.applied != 0 {
                 self.applied.fetch_add(t.applied, Ordering::Relaxed);
             }
-            if t.queued != 0 {
-                self.queued.fetch_add(t.queued, Ordering::Relaxed);
+            if queued != 0 {
+                self.queued.fetch_add(queued, Ordering::Relaxed);
             }
             self.peak.fetch_max(usize::MAX, Ordering::Relaxed);
             self.halt(STOP_MEMORY);
             *t = Tally::default();
             return false;
         };
-        let ok = self.check(t.applied, bytes, t.queued);
+        let ok = self.check(t.applied, bytes, queued);
         *t = Tally::default();
         ok
     }
@@ -2854,22 +3089,45 @@ impl<'a> Run<'a> {
         // own buffer, and the place of its next conclusion. The conclusions the rules
         // give the context itself come first, as they did when the batch went onto
         // `local` reversed (roadmap item 889).
-        let mut taken: Vec<Concl> = Vec::new();
-        let mut at = 0;
+        let top_chain = self.ix.top_chain.is_some();
+        let mut taken = Taken {
+            batch: Vec::new(),
+            at: 0,
+            active_run: top_chain.then_some(self),
+        };
         'outer: loop {
             loop {
                 let c = match out.local.pop() {
                     Some(c) => c,
-                    None if at < taken.len() => {
-                        at += 1;
-                        taken[at - 1]
+                    None if taken.at < taken.batch.len() => {
+                        let c = taken.batch[taken.at];
+                        taken.at += 1;
+                        if taken.active_run.is_some() && !matches!(c, Concl::TopChainSub(_)) {
+                            tally.queued -= 1;
+                        }
+                        c
                     }
                     None => break,
                 };
-                if apply_rules::<_, R>(self.ix, me, &mut st, c, &mut out) {
+                let (c, debit) = match c {
+                    Concl::TopChainSub(d) => (
+                        Concl::Sub(d),
+                        Some(ReservationDebit {
+                            run: self,
+                            bytes: CONCLUSION_BYTES,
+                        }),
+                    ),
+                    _ => (c, None),
+                };
+                let prepaid = debit.is_some();
+                let stored = apply_rules_owned::<_, R>(self.ix, me, &mut st, c, &mut out, debit);
+                if stored && !prepaid {
                     tally.stored += 1;
                 }
                 tally.applied += 1;
+                if top_chain && self.stopped() {
+                    break 'outer;
+                }
                 if tally.applied >= CHECK_EVERY || out.sent >= SEND_EVERY {
                     if !self.flush_sends(&mut out, tally) {
                         break 'outer;
@@ -2982,22 +3240,33 @@ impl<'a> Run<'a> {
                 }
                 break;
             };
-            tally.queued -= batch.len() as isize;
-            taken = batch;
-            at = 0;
+            if taken.active_run.is_none() {
+                tally.queued -= batch.len() as isize;
+            }
+            taken.batch = batch;
+            taken.at = 0;
         }
         // A run that answers in part when it stops gives back the conclusions it did not
         // apply, so that the context shows as not closed, and sends the products of the
         // links it did apply, so that its state and its messages agree (roadmap item 603).
+        #[cfg(test)]
+        if top_chain && self.stopped() && !self.bounds.partial && taken.at < taken.batch.len() {
+            let suffix = &taken.batch[taken.at..];
+            let tagged = tag_count(suffix);
+            super::admission_test::hit(super::admission_test::Point::TopChainGlobalTaken {
+                tagged,
+                ordinary: suffix.len() - tagged,
+            });
+        }
         if self.bounds.partial {
             self.flush_links(&st, &mut out, tally);
         }
-        tally.queued += out.sent as isize;
-        if self.bounds.partial && (at < taken.len() || !out.local.is_empty()) {
+        tally.queued += std::mem::take(&mut out.sent) as isize;
+        if self.bounds.partial && (taken.at < taken.batch.len() || !out.local.is_empty()) {
             // the rest of the batch in the order the reversed batch left it on `local`,
             // below what the rules gave the context
             let mut t = ctx.todo.lock();
-            t.extend(taken[at..].iter().rev());
+            t.extend(taken.batch[taken.at..].iter().rev());
             t.append(out.local);
         }
         // the activation charges what it kept as it ends
@@ -3152,11 +3421,35 @@ fn apply_rules<S: Sink, R: Rules>(
     c: Concl,
     out: &mut S,
 ) -> bool {
+    apply_rules_owned::<S, R>(ix, me, st, c, out, None)
+}
+
+#[inline(always)]
+fn apply_rules_owned<S: Sink, R: Rules>(
+    ix: &Index,
+    me: Ex,
+    st: &mut State,
+    c: Concl,
+    out: &mut S,
+    mut debit: Option<ReservationDebit<'_, '_>>,
+) -> bool {
     let roles = &ix.roles;
     match c {
+        Concl::TopChainSub(_) => unreachable!("the receiver unwraps prepaid named subsumptions"),
         Concl::Sub(d) => {
             if st.bottom || !st.subs.insert(d) {
                 return false;
+            }
+            if let Some(debit) = &mut debit {
+                debit.bytes = 0;
+            }
+            if d == TOP
+                && let Some(rules) = &ix.top_chain
+            {
+                rules.apply(ix, None, me, out);
+                if out.stopped() {
+                    return true;
+                }
             }
             let h = ix.head(d);
             match h.node {
@@ -3284,6 +3577,12 @@ fn apply_rules<S: Sink, R: Rules>(
             if st.bottom {
                 out.send(e, Concl::Sub(BOTTOM));
                 return true;
+            }
+            if let Some(rules) = &ix.top_chain {
+                rules.apply(ix, Some(r), e, out);
+                if out.stopped() {
+                    return true;
+                }
             }
             if !out.defer() {
                 for &(s, x) in &st.props {
@@ -3678,6 +3977,453 @@ mod horn_accounting_tests {
     use crate::classify::horn::HornAx;
     use crate::classify::index::{Axioms, Interner, RoleName};
     use crate::model::{Class, ObjectProperty};
+
+    use crate::classify::{
+        admission_test::{Point, with_hook},
+        top_chain_cases::accounting::{Grant, id, prefix, trailing_index},
+    };
+    use std::sync::Arc;
+
+    const BASE: usize = 8192;
+    const QUEUE_BYTES: usize = size_of::<Concl>();
+    const MESSAGE: usize = CONCLUSION_BYTES;
+
+    thread_local! {
+        // The mixed ordinary producer sends before the first bounds check.
+        pub(super) static MIXED_OUTBOX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    fn with_congestion<T>(congested: bool, mixed: bool, f: impl FnOnce() -> T) -> T {
+        struct Restore {
+            congested: bool,
+            mixed: bool,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ALWAYS_CONGESTED.set(self.congested);
+                MIXED_OUTBOX.set(self.mixed);
+            }
+        }
+        let _restore = Restore {
+            congested: ALWAYS_CONGESTED.replace(congested),
+            mixed: MIXED_OUTBOX.replace(mixed),
+        };
+        f()
+    }
+
+    fn paid_bounds<'a>(queued: usize, charge: &'a (dyn Fn(usize) -> bool + Sync)) -> Bounds<'a> {
+        let paid = BASE + queued * QUEUE_BYTES;
+        assert!(charge(paid));
+        Bounds {
+            threads: 1,
+            charge: Some(charge),
+            base_memory: BASE,
+            base_queued: queued,
+            peak_memory: paid,
+            paid_memory: paid,
+            ..bounds(false)
+        }
+    }
+
+    fn initialized(ctx: &Contexts, at: Ex) -> &Ctx {
+        let c = ctx[at as usize].get_or_init(Box::default);
+        c.st.lock().init = true;
+        c
+    }
+
+    #[test]
+    fn named_domain_stop_discards_prepaid_taken_suffix() {
+        let (sat, probe) = trailing_index(false);
+        let ix = sat.index.as_ref().unwrap();
+        let (tail, source, domain) = (id(&sat, "Tail"), id(&sat, "Source"), id(&sat, "D"));
+        let back = Concl::Back(source, prefix(&sat));
+        let ctx = (0..sat.ctx.len()).map(|_| OnceLock::new()).collect();
+        let receiver = initialized(&ctx, tail);
+        receiver.todo.lock().push(back);
+        let grant = Grant::default();
+        let baseline = BASE + 2 * QUEUE_BYTES;
+        let charge = |bytes| grant.request(bytes, baseline + MESSAGE);
+        let bounds = paid_bounds(2, &charge);
+        let mut run = run(ix, &ctx, &bounds);
+        run.queued.store(2, Ordering::Relaxed);
+        run.always_congested = true;
+        let mut mine = VecDeque::new();
+        let mut outbox = Outbox::default();
+        let mut marks = Marks::default();
+        let mut local = Vec::new();
+        {
+            let mut out = Out {
+                run: &run,
+                me: tail,
+                local: &mut local,
+                woke: &mut mine,
+                outbox: &mut outbox,
+                marks: &mut marks,
+                pending: false,
+                sent: 0,
+                work: 0,
+                kept: 0,
+            };
+            assert!(out.top_chain_sub(tail, domain, Some(&probe)));
+            assert_eq!(out.sent, 0);
+        }
+        receiver.todo.lock().push(Concl::Sub(TOP));
+        assert_eq!(
+            *receiver.todo.lock(),
+            [back, Concl::TopChainSub(domain), Concl::Sub(TOP)]
+        );
+        assert!(run.batch.load(Ordering::Relaxed));
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut tally = Tally::default();
+        with_hook(
+            {
+                let events = events.clone();
+                move |point| {
+                    if matches!(
+                        point,
+                        Point::TopChainGlobalTaken { .. } | Point::TopChainGlobalMessage
+                    ) {
+                        events.lock().push(point);
+                    }
+                }
+            },
+            || {
+                run.process::<Plain>(
+                    tail,
+                    &mut mine,
+                    &mut tally,
+                    &mut local,
+                    &mut outbox,
+                    &mut marks,
+                )
+            },
+        );
+        assert_eq!(
+            *events.lock(),
+            [
+                Point::TopChainGlobalMessage,
+                Point::TopChainGlobalTaken {
+                    tagged: 1,
+                    ordinary: 1
+                }
+            ]
+        );
+        assert_eq!(tally.applied, 1);
+        assert_eq!(tally.stored, 1);
+        assert!(!run.flush(&mut tally));
+        assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
+        assert!(receiver.todo.lock().is_empty());
+        assert!(outbox.is_empty());
+        {
+            let st = receiver.st.lock();
+            assert!(st.holds(&back));
+            assert!(!st.holds(&Concl::Sub(domain)));
+            assert!(!st.holds(&Concl::Sub(TOP)));
+        }
+        assert_eq!(probe.global_messages.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            grant.calls(),
+            [(baseline, true), (MESSAGE, true), (MESSAGE, false)]
+        );
+        let paid = *run.paid.lock();
+        let peak = run.peak.load(Ordering::Relaxed);
+        assert_eq!(paid, grant.accepted());
+        assert_eq!(paid, baseline + MESSAGE);
+        assert_eq!(peak, baseline + 2 * MESSAGE);
+        let live = run.memory.load(Ordering::Relaxed);
+        let queued = run.queued.load(Ordering::Relaxed);
+        eprintln!(
+            "global taken: live={live} queued={queued} paid={paid} peak={peak} calls={:?}",
+            grant.calls()
+        );
+        assert_eq!(
+            (live, queued),
+            (BASE + MESSAGE, 0),
+            "discarded taken suffix still counted"
+        );
+    }
+
+    #[test]
+    fn named_domain_ordinary_queue_retires_at_activation_checkpoint() {
+        let (sat, _) = trailing_index(false);
+        let ix = sat.index.as_ref().unwrap();
+        let tail = id(&sat, "Tail");
+        let ctx = (0..sat.ctx.len()).map(|_| OnceLock::new()).collect();
+        let receiver = initialized(&ctx, tail);
+        receiver.st.lock().subs.insert(TOP);
+        receiver.todo.lock().push(Concl::Sub(TOP));
+        let grant = Grant::default();
+        let charge = |bytes| grant.request(bytes, usize::MAX);
+        let bounds = paid_bounds(1, &charge);
+        let run = run(ix, &ctx, &bounds);
+        let mut tally = Tally {
+            applied: CHECK_EVERY - 1,
+            ..Tally::default()
+        };
+        run.process::<Plain>(
+            tail,
+            &mut VecDeque::new(),
+            &mut tally,
+            &mut Vec::new(),
+            &mut Outbox::default(),
+            &mut Marks::default(),
+        );
+        assert!(!run.stopped());
+        assert_eq!(tally.applied, 0);
+        assert_eq!(run.applied.load(Ordering::Relaxed), CHECK_EVERY);
+        assert_eq!(run.queued.load(Ordering::Relaxed), 0);
+        assert_eq!(run.memory.load(Ordering::Relaxed), BASE);
+        assert_eq!(grant.calls(), [(BASE + QUEUE_BYTES, true)]);
+    }
+
+    fn check_global_stopped_worker(congested: bool, fence_root: bool, mixed: bool) {
+        let (sat, probe) = trailing_index(true);
+        let ix = sat.index.as_ref().unwrap();
+        assert!(ix.dl.is_none());
+        let (tail, source, fence) = (id(&sat, "Tail"), id(&sat, "Source"), id(&sat, "Fence"));
+        let back = Concl::Back(source, prefix(&sat));
+        let ctx = (0..sat.ctx.len()).map(|_| OnceLock::new()).collect();
+        let tail_ctx = initialized(&ctx, tail);
+        let source_ctx = initialized(&ctx, source);
+        let fence_ctx = initialized(&ctx, fence);
+        tail_ctx.todo.lock().push(back);
+
+        let producer = id(&sat, "Producer");
+        let parked = id(&sat, "Parked");
+        let parked_ctx = initialized(&ctx, parked);
+        let roots = if mixed {
+            assert!(congested && fence_root);
+            // One ordinary propagation is shared by two destinations through
+            // process -> flush_links -> send_all, before the Tail activation.
+            let q = sat
+                .interner
+                .object_role_id(&ObjectProperty::new("urn:top-domain:q"))
+                .unwrap();
+            let c = initialized(&ctx, producer);
+            c.st.lock().back_by(q).insert(source);
+            c.st.lock().back_by(q).insert(fence);
+            c.todo.lock().push(Concl::Sub(id(&sat, "P")));
+            parked_ctx.todo.lock().push(Concl::Sub(TOP));
+            vec![producer, tail, fence]
+        } else if fence_root {
+            vec![tail, fence]
+        } else {
+            vec![tail]
+        };
+        let initial_queued = if mixed { 3 } else { 1 };
+        let kept_ordinary = usize::from(mixed);
+        let grant = Grant::default();
+        let baseline = BASE + initial_queued * QUEUE_BYTES;
+        let charge = |bytes| grant.request(bytes, baseline + MESSAGE);
+        let bounds = paid_bounds(initial_queued, &charge);
+        assert!(!bounds.partial && !bounds.steps);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (totals, stop) = with_hook(
+            {
+                let events = events.clone();
+                move |point| {
+                    if matches!(
+                        point,
+                        Point::TopChainGlobalMessage
+                            | Point::TopChainGlobalQueued { .. }
+                            | Point::TopChainGlobalOutbox { .. }
+                            | Point::TopChainGlobalFiltered { .. }
+                            | Point::TopChainGlobalJoin { .. }
+                    ) {
+                        events.lock().push(point);
+                    }
+                }
+            },
+            || {
+                with_congestion(congested, mixed, || {
+                    saturate_counted(ix, &ctx, &roots, &[], &[], &bounds)
+                })
+            },
+        );
+
+        let events = events.lock();
+        assert!(events.starts_with(&[
+            Point::TopChainGlobalMessage,
+            Point::TopChainGlobalQueued { batched: congested },
+            Point::TopChainGlobalMessage,
+        ]));
+        let discarded = events.contains(&Point::TopChainGlobalOutbox {
+            tagged: 1,
+            ordinary: 2 * kept_ordinary,
+            ordinary_payloads: kept_ordinary,
+        });
+        let delivered = events.contains(&Point::TopChainGlobalFiltered { tagged: 1 });
+        if congested && fence_root {
+            assert!(discarded, "expected discarded outbox, observed {events:?}");
+            assert!(!delivered);
+        } else if congested {
+            // Stopped work can either be discarded in the worker or reach the
+            // receiving queue before its final retirement.
+            assert!(discarded || delivered);
+        } else {
+            assert!(!discarded && !delivered);
+        }
+        let Some(&Point::TopChainGlobalJoin { tagged, queued }) = events.last() else {
+            panic!("stopped worker never reached the join: {events:?}");
+        };
+        assert!(tail_ctx.st.lock().holds(&back));
+        assert!(tail_ctx.todo.lock().is_empty());
+        assert!(fence_ctx.todo.lock().is_empty());
+        assert!(!source_ctx.st.lock().holds(&Concl::Sub(id(&sat, "D"))));
+        assert!(!source_ctx.st.lock().holds(&Concl::Sub(id(&sat, "E"))));
+        assert_eq!(probe.global_messages.load(Ordering::Relaxed), 1);
+        assert_eq!(totals.conclusions, 1 + kept_ordinary);
+        assert_eq!(source_ctx.todo.lock().len(), tagged);
+        assert_eq!(parked_ctx.todo.lock().len(), kept_ordinary);
+        if mixed {
+            assert_eq!(*parked_ctx.todo.lock(), [Concl::Sub(TOP)]);
+            assert!(
+                initialized(&ctx, producer)
+                    .st
+                    .lock()
+                    .holds(&Concl::Sub(id(&sat, "P")))
+            );
+        }
+        assert_eq!(
+            grant.calls(),
+            [(baseline, true), (MESSAGE, true), (MESSAGE, false)]
+        );
+        assert_eq!(totals.paid, grant.accepted());
+        assert_eq!(totals.paid, baseline + MESSAGE);
+        assert!(totals.peak >= baseline + 2 * MESSAGE);
+        if !mixed {
+            assert_eq!(totals.peak, baseline + 2 * MESSAGE);
+        }
+        assert_eq!(stop, Some(Stop::Memory { used: totals.peak }));
+        eprintln!(
+            "global stop congested={congested} fence={fence_root} mixed={mixed}: live={} queued={queued} paid={} peak={} events={events:?} calls={:?}",
+            totals.memory,
+            totals.paid,
+            totals.peak,
+            grant.calls(),
+        );
+        assert_eq!(
+            (totals.memory, tagged, queued),
+            (
+                BASE + (1 + kept_ordinary) * MESSAGE,
+                0,
+                kept_ordinary as isize
+            ),
+            "discarded worker or destination tag still counted"
+        );
+    }
+
+    #[test]
+    fn named_domain_stop_discards_prepaid_outbox() {
+        check_global_stopped_worker(true, true, false);
+    }
+
+    #[test]
+    fn named_domain_stop_discards_prepaid_outbox_without_fence() {
+        check_global_stopped_worker(true, false, false);
+    }
+
+    #[test]
+    fn named_domain_stop_discards_prepaid_todo() {
+        check_global_stopped_worker(false, true, false);
+    }
+
+    #[test]
+    fn named_domain_stop_discards_shared_ordinary_outbox_uses() {
+        check_global_stopped_worker(true, true, true);
+    }
+
+    #[test]
+    fn named_domain_congested_duplicate_retires_once() {
+        for duplicate in [true, false] {
+            let (sat, probe) = trailing_index(false);
+            let ix = sat.index.as_ref().unwrap();
+            let (tail, source, domain) = (id(&sat, "Tail"), id(&sat, "Source"), id(&sat, "D"));
+            let ctx = (0..sat.ctx.len()).map(|_| OnceLock::new()).collect();
+            let receiver = initialized(&ctx, source);
+            receiver.st.lock().subs.insert(TOP);
+            if duplicate {
+                receiver.st.lock().subs.insert(domain);
+            }
+            let grant = Grant::default();
+            let charge = |bytes| grant.request(bytes, usize::MAX);
+            let bounds = paid_bounds(0, &charge);
+            let mut run = run(ix, &ctx, &bounds);
+            run.queued.store(0, Ordering::Relaxed);
+            run.always_congested = true;
+            let mut tally = Tally::default();
+            let mut mine = VecDeque::new();
+            let mut outbox = Outbox::default();
+            let mut marks = Marks::default();
+            let mut local = Vec::new();
+            {
+                let mut out = Out {
+                    run: &run,
+                    me: tail,
+                    local: &mut local,
+                    woke: &mut mine,
+                    outbox: &mut outbox,
+                    marks: &mut marks,
+                    pending: false,
+                    sent: 0,
+                    work: 0,
+                    kept: 0,
+                };
+                assert!(out.top_chain_sub(source, domain, Some(&probe)));
+                assert_eq!(out.sent, 0);
+                out.send(source, Concl::Sub(TOP));
+                assert!(run.flush_sends(&mut out, &mut tally));
+            }
+            assert_eq!(run.queued.load(Ordering::Relaxed), 1);
+            assert_eq!(outbox.msgs, [Concl::TopChainSub(domain), Concl::Sub(TOP)]);
+            let filtered = Arc::new(AtomicUsize::new(0));
+            with_hook(
+                {
+                    let filtered = filtered.clone();
+                    move |point| {
+                        if point == (Point::TopChainGlobalFiltered { tagged: 1 }) {
+                            filtered.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                },
+                || run.deliver(&mut outbox, &mut mine),
+            );
+            assert_eq!(filtered.load(Ordering::Relaxed), 1);
+            assert!(outbox.is_empty());
+            assert_eq!(*receiver.todo.lock(), [Concl::TopChainSub(domain)]);
+            assert_eq!(run.queued.load(Ordering::Relaxed), 0);
+            assert_eq!(run.memory.load(Ordering::Relaxed), BASE + MESSAGE);
+            assert_eq!(mine.pop_front(), Some(source));
+            assert!(mine.is_empty());
+            run.process::<Plain>(
+                source,
+                &mut mine,
+                &mut tally,
+                &mut local,
+                &mut outbox,
+                &mut marks,
+            );
+            assert!(run.flush(&mut tally));
+            assert!(receiver.st.lock().holds(&Concl::Sub(domain)));
+            assert!(receiver.todo.lock().is_empty());
+            assert_eq!(run.applied.load(Ordering::Relaxed), 1);
+            assert_eq!(run.queued.load(Ordering::Relaxed), 0);
+            assert_eq!(
+                run.memory.load(Ordering::Relaxed),
+                BASE + usize::from(!duplicate) * MESSAGE
+            );
+            let paid = BASE + MESSAGE + QUEUE_BYTES;
+            assert_eq!(*run.paid.lock(), paid);
+            assert_eq!(run.peak.load(Ordering::Relaxed), paid);
+            assert_eq!(
+                grant.calls(),
+                [(BASE, true), (MESSAGE, true), (QUEUE_BYTES, true)]
+            );
+            assert_eq!(grant.accepted(), paid);
+        }
+    }
 
     struct Fixture {
         ix: Index,

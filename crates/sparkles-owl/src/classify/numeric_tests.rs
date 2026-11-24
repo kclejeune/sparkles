@@ -26,6 +26,48 @@ thread_local! {
         requested_alloc_bytes: 0, requested_realloc_bytes: 0, replaced_realloc_bytes: 0,
     }) };
 }
+#[derive(Clone, Copy)]
+struct DeallocationWatch {
+    address: usize,
+    layout: Layout,
+    count: usize,
+}
+
+thread_local! {
+    static DEALLOCATION_WATCH: Cell<Option<DeallocationWatch>> = const { Cell::new(None) };
+}
+
+pub(in crate::classify) fn watch_deallocation(address: usize, layout: Layout) {
+    DEALLOCATION_WATCH.with(|watch| {
+        assert!(watch.get().is_none());
+        watch.set(Some(DeallocationWatch {
+            address,
+            layout,
+            count: 0,
+        }));
+    });
+}
+
+pub(in crate::classify) fn watched_deallocations() -> Option<usize> {
+    DEALLOCATION_WATCH.with(|watch| watch.get().map(|watch| watch.count))
+}
+
+pub(in crate::classify) fn take_watched_deallocations() -> Option<usize> {
+    DEALLOCATION_WATCH.with(|watch| watch.take().map(|watch| watch.count))
+}
+
+fn completed_deallocation(address: usize, layout: Layout) {
+    let _ = DEALLOCATION_WATCH.try_with(|slot| {
+        if let Some(mut watch) = slot.get()
+            && watch.address == address
+            && watch.layout == layout
+        {
+            watch.count = watch.count.saturating_add(1);
+            slot.set(Some(watch));
+        }
+    });
+}
+
 struct Counting;
 #[global_allocator]
 static ALLOCATOR: Counting = Counting;
@@ -86,7 +128,9 @@ unsafe impl GlobalAlloc for Counting {
     }
     unsafe fn dealloc(&self, p: *mut u8, layout: Layout) {
         freed(layout.size());
-        unsafe { System.dealloc(p, layout) }
+        let address = p.addr();
+        unsafe { System.dealloc(p, layout) };
+        completed_deallocation(address, layout);
     }
     unsafe fn realloc(&self, p: *mut u8, layout: Layout, size: usize) -> *mut u8 {
         let out = unsafe { System.realloc(p, layout, size) };
