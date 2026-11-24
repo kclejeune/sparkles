@@ -649,6 +649,211 @@ fn rdfs_on_read_materialized_resolver_does_not_clone_held_premise_over_workspace
             alloc.largest
         );
     }
+
+    // 4. Generalized mixed fixture with positive remaining headroom large enough for the
+    //    materialized pass to return NotFound and enter demand_with_for -> explain_demand:
+    //    the demand fallback must not duplicate the workspace-held premise unbudgeted.
+    {
+        let (_dir, ds) = open();
+        ds.load_str(
+            "@prefix ex: <http://ex.org/> .\n\
+             @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+             ex:init rdf:first rdf:nil ; rdf:rest rdf:nil ; ex:of ex:init .\n",
+            RdfFormat::Turtle,
+        )
+        .unwrap();
+        ds.store().compact().unwrap();
+        let lit_64k = "d".repeat(65_536);
+        ds.load_str(
+            &format!(
+                "@prefix ex: <http://ex.org/> .\n\
+                 ex:hr {{ ex:s ex:seed \"{lit_64k}\" . }}\n"
+            ),
+            RdfFormat::TriG,
+        )
+        .unwrap();
+        ds.reasoning()
+            .run(&ReasonRequest {
+                profile: Profile::Rules(
+                    "@prefix ex: <http://ex.org/> . \
+                     [reverse: (?x ex:seed ?v) -> (?v ex:of ?x)] \
+                     [derive: (?v ex:of ?x) -> (?x ex:p ?v)]"
+                        .into(),
+                ),
+                inputs: Inputs {
+                    data_graphs: vec![GraphRef::Named(HR.into())],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        ds.reasoning()
+            .rdfs()
+            .set(NewSchema::Triples(vec![oxrdf::Triple::new(
+                NamedNode::new("http://ex.org/p").unwrap(),
+                oxrdf::vocab::rdfs::DOMAIN.into_owned(),
+                NamedNode::new("http://ex.org/C").unwrap(),
+            )]))
+            .unwrap();
+
+        let unbounded = ds
+            .reasoning()
+            .explain(&ExplainRequest::new([ex("s"), ty(), ex("C")]))
+            .unwrap();
+        assert_eq!(unbounded.source, Some(ExplainSource::RdfsOnRead));
+        let trees = found(unbounded.explained);
+        assert_eq!(rule(&trees[0]), "rdfs2");
+        assert_eq!(rule(&trees[0].premises[0]), "derive");
+
+        let mut req = ExplainRequest::new([ex("s"), ty(), ex("C")]);
+        req.max_memory = Some(200_000);
+        let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req));
+        let err = res.map(|_| ()).unwrap_err();
+        assert!(
+            matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+            "expected reasoning-budget in demand fallback, got {err:?}"
+        );
+        assert!(
+            alloc.peak <= 200_000 && alloc.largest <= 65_600,
+            "demand fallback must not clone held 64 KiB premise over budget (peak_live={}, largest={})",
+            alloc.peak,
+            alloc.largest
+        );
+    }
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn materialized_fast_miss_refuses_oversized_key_before_allocating() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+
+    let (_dir, ds) = open();
+    ds.load_str(
+        "@prefix ex: <http://ex.org/> .\n\
+         ex:hr { ex:s ex:p ex:o . }\n",
+        RdfFormat::TriG,
+    )
+    .unwrap();
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+            ),
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named(HR.into())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+    // 1. Oversized absent simple literal must refuse before allocating a 64 KiB vocabulary key.
+    let mut req_lit = ExplainRequest::new([
+        ex("s"),
+        ex("q"),
+        Term::Literal(oxrdf::Literal::new_simple_literal("k".repeat(65_536))),
+    ]);
+    req_lit.max_memory = Some(8192);
+    let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req_lit));
+    let err = res.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "expected reasoning-budget on oversized literal fast miss, got {err:?}"
+    );
+    assert!(
+        alloc.peak <= 8192,
+        "fast miss must refuse before allocating 64 KiB literal key (peak_live={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+
+    // 2. Oversized RDF 1.2 triple term must refuse before allocating recursive key buffers.
+    let mut req_triple = ExplainRequest::new([
+        ex("s"),
+        ex("q"),
+        Term::Triple(Box::new(oxrdf::Triple::new(
+            NamedNode::new("http://ex.org/a").unwrap(),
+            NamedNode::new("http://ex.org/b").unwrap(),
+            oxrdf::Literal::new_simple_literal("t".repeat(65_536)),
+        ))),
+    ]);
+    req_triple.max_memory = Some(8192);
+    let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req_triple));
+    let err = res.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "expected reasoning-budget on oversized triple-term fast miss, got {err:?}"
+    );
+    assert!(
+        alloc.peak <= 8192,
+        "fast miss must refuse before allocating 64 KiB triple-term key (peak_live={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+
+    // 3. Tiny headroom smaller than even a short IRI key must refuse before allocating the key.
+    let mut req_tiny = ExplainRequest::new([ex("absent"), ex("q"), ex("o")]);
+    req_tiny.max_memory = Some(8);
+    let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req_tiny));
+    let err = res.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "expected reasoning-budget on tiny-headroom fast miss, got {err:?}"
+    );
+    assert!(
+        alloc.peak <= 4096,
+        "fast miss with tiny headroom must not spike allocations (peak_live={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
+}
+
+#[cfg(feature = "reasoning")]
+#[test]
+fn demand_session_refuses_before_allocating_terms_table() {
+    use sparkles::reasoning::{
+        ReasonRequest,
+        reasoner::{GraphRef, Inputs, Profile},
+    };
+
+    let (_dir, ds) = open();
+    ds.load_str(
+        "@prefix ex: <http://ex.org/> .\n\
+         ex:hr { ex:s ex:p ex:o . }\n",
+        RdfFormat::TriG,
+    )
+    .unwrap();
+    ds.reasoning()
+        .run(&ReasonRequest {
+            profile: Profile::Rules(
+                "@prefix ex: <http://ex.org/> . [derive: (?x ex:p ?y) -> (?x ex:q ?y)]".into(),
+            ),
+            inputs: Inputs {
+                data_graphs: vec![GraphRef::Named(HR.into())],
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .unwrap();
+
+    let mut req = ExplainRequest::new([ex("s"), ex("q"), ex("o")]);
+    req.source = Some(ExplainSource::Demand);
+    req.max_memory = Some(2048);
+    let (res, alloc) = caller_allocations::measure(|| ds.reasoning().explain(&req));
+    let err = res.map(|_| ()).unwrap_err();
+    assert!(
+        matches!(&err, sparkles::Error::Component(c) if c.code == sparkles::reasoning::explain::REASONING_BUDGET),
+        "expected reasoning-budget on tiny demand session, got {err:?}"
+    );
+    assert!(
+        alloc.peak < 16_384,
+        "demand Session::new must use Terms::new_in and refuse before allocating LocalTable segment (peak_live={}, largest={})",
+        alloc.peak,
+        alloc.largest
+    );
 }
 
 #[cfg(feature = "reasoning")]

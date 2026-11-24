@@ -394,12 +394,8 @@ fn materialized_for(
             _ => (head.clone(), false),
         };
         let view = view_of(access, &snap)?;
-        let names = rec
-            .input_graphs
-            .clone()
-            .unwrap_or_else(|| vec!["default".to_string()]);
         let mut inputs: Vec<Id> = Vec::new();
-        for n in &names {
+        let mut push_input = |n: &str| {
             let id = if n == "default" {
                 Some(Id::DEFAULT_GRAPH)
             } else {
@@ -411,33 +407,60 @@ fn materialized_for(
             {
                 inputs.push(id);
             }
+        };
+        match &rec.input_graphs {
+            Some(names) => {
+                for n in names {
+                    push_input(n);
+                }
+            }
+            None => push_input("default"),
         }
         let inferred = snap
             .lookup_iri(super::INFERRED_GRAPH)
             .filter(|&g| readable(access, &snap, g));
         let generalized =
             matches!(triple[0], Term::Literal(_)) || matches!(triple[1], Term::BlankNode(_));
+        let lookup_triple = |snap: &Snapshot| -> Result<Option<[Id; 3]>> {
+            let mut admit = |bytes: usize| -> Result<()> {
+                if let Some(limit) = query.max_memory
+                    && bytes > limit
+                {
+                    check_controls(req, deadline)?;
+                    return Err(budget_error(format!(
+                        "looking up an explanation term needs {bytes} bytes, over its memory limit of {limit}"
+                    )));
+                }
+                Ok(())
+            };
+            let mut check = || check_controls(req, deadline);
+            let mut ids = [Id::UNDEF; 3];
+            for (k, term) in triple.iter().enumerate() {
+                let Some(id) = snap.lookup_term_controlled(term, &mut admit, &mut check)? else {
+                    return Ok(None);
+                };
+                ids[k] = id;
+            }
+            Ok(Some(ids))
+        };
         let mut stored_inference = if query.known_inferred && snap.commit == head.commit {
             Some(inferred.is_some())
         } else {
             None
         };
         if !query.known_inferred && !generalized {
-            let triple_ids = (
-                snap.lookup_term(&triple[0]),
-                snap.lookup_term(&triple[1]),
-                snap.lookup_term(&triple[2]),
-            );
-            let inferred_hit =
-                if let (Some(graph), (Some(s), Some(p), Some(o))) = (inferred, triple_ids) {
-                    snap.contains(&[s, p, o, graph])?
-                } else {
-                    false
-                };
+            let triple_ids = lookup_triple(&snap)?;
+            let inferred_hit = if let (Some(graph), Some([s, p, o])) = (inferred, triple_ids) {
+                check_controls(req, deadline)?;
+                snap.contains(&[s, p, o, graph])?
+            } else {
+                false
+            };
             stored_inference = Some(inferred_hit);
-            let in_inputs = if let (Some(s), Some(p), Some(o)) = triple_ids {
+            let in_inputs = if let Some([s, p, o]) = triple_ids {
                 let mut held = false;
                 for &g in &inputs {
+                    check_controls(req, deadline)?;
                     if view.contains(&[s, p, o, g])? {
                         held = true;
                         break;
@@ -483,12 +506,9 @@ fn materialized_for(
                 Some(hit) => hit,
                 None => {
                     if let Some(graph) = inferred
-                        && let (Some(s), Some(p), Some(o)) = (
-                            snap.lookup_term(&triple[0]),
-                            snap.lookup_term(&triple[1]),
-                            snap.lookup_term(&triple[2]),
-                        )
+                        && let Some([s, p, o]) = lookup_triple(&snap)?
                     {
+                        check_controls(req, deadline)?;
                         snap.contains(&[s, p, o, graph])?
                     } else {
                         false

@@ -435,6 +435,10 @@ pub fn parse_bnode_payload(label: &str) -> Option<u64> {
 /// labels from [`bnode_label`] map back to their id, other labels hash into the space
 /// of minted blank nodes, which the store never holds.
 pub fn default_bnode_id(b: &BlankNode) -> u64 {
+    default_bnode_ref_id(b.as_ref())
+}
+
+fn default_bnode_ref_id(b: oxrdf::BlankNodeRef<'_>) -> u64 {
     if let Some(id) = parse_bnode_payload(b.as_str()) {
         return id;
     }
@@ -442,6 +446,76 @@ pub fn default_bnode_id(b: &BlankNode) -> u64 {
         (h ^ c as u64).wrapping_mul(0x100_0000_01b3)
     });
     (h & (PAYLOAD_MASK >> 1)) | Id::LOCAL_BNODE_BIT
+}
+
+fn varint_len(mut n: usize) -> usize {
+    let mut len = 1;
+    while n >= 128 {
+        len += 1;
+        n >>= 7;
+    }
+    len
+}
+
+/// Exact encoded byte length of [`write_term_ref_key`] for `term`, computed without
+/// allocating so callers can admit the vocabulary-key buffer before building it.
+pub fn term_key_len(term: oxrdf::TermRef<'_>) -> Option<usize> {
+    match term {
+        oxrdf::TermRef::NamedNode(n) => n.as_str().len().checked_add(1),
+        oxrdf::TermRef::BlankNode(_) => Some(9),
+        oxrdf::TermRef::Literal(l) => {
+            let mut n = l.value().len().checked_add(2)?;
+            if let Some(lang) = l.language() {
+                n = n.checked_add(lang.len())?.checked_add(1)?;
+                if l.direction().is_some() {
+                    n = n.checked_add(5)?;
+                }
+            } else if l.datatype() != xsd::STRING {
+                n = n.checked_add(l.datatype().as_str().len())?.checked_add(1)?;
+            }
+            Some(n)
+        }
+        oxrdf::TermRef::Triple(t) => {
+            let mut n = 1usize;
+            for child in [
+                t.subject.as_ref().into(),
+                t.predicate.as_ref().into(),
+                t.object.as_ref(),
+            ] {
+                let part = term_key_len(child)?;
+                n = n.checked_add(varint_len(part))?.checked_add(part)?;
+            }
+            Some(n)
+        }
+    }
+}
+
+/// Write the vocabulary key of a borrowed term directly into `out`, matching
+/// [`write_term_key`] without temporary child buffers or subject/predicate clones.
+pub fn write_term_ref_key(term: oxrdf::TermRef<'_>, out: &mut Vec<u8>) {
+    match term {
+        oxrdf::TermRef::NamedNode(n) => {
+            out.push(b'<');
+            out.extend_from_slice(n.as_str().as_bytes());
+        }
+        oxrdf::TermRef::Literal(l) => write_literal_ref_key(l, out),
+        oxrdf::TermRef::BlankNode(b) => {
+            out.push(b'_');
+            out.extend_from_slice(&default_bnode_ref_id(b).to_be_bytes());
+        }
+        oxrdf::TermRef::Triple(t) => {
+            out.push(b'(');
+            for child in [
+                t.subject.as_ref().into(),
+                t.predicate.as_ref().into(),
+                t.object.as_ref(),
+            ] {
+                let len = term_key_len(child).expect("term key length overflow");
+                crate::vocab::write_varint(out, len as u64);
+                write_term_ref_key(child, out);
+            }
+        }
+    }
 }
 
 pub fn write_term_key(term: &Term, out: &mut Vec<u8>) {
@@ -744,6 +818,43 @@ mod tests {
         ];
         for t in terms {
             assert_eq!(key_to_term(&term_key(&t)), t);
+        }
+    }
+
+    #[test]
+    fn borrowed_term_key_matches_owned_and_reserves_exact_fresh_capacity() {
+        let terms = [
+            Term::NamedNode(NamedNode::new_unchecked("http://ex.org/a")),
+            Term::BlankNode(BlankNode::new_unchecked("b2a")),
+            Term::BlankNode(BlankNode::new_unchecked("custom-label")),
+            Term::Literal(Literal::new_simple_literal("x".repeat(20_000))),
+            Term::Literal(Literal::new_language_tagged_literal_unchecked("chat", "fr")),
+            Term::Literal(Literal::new_directional_language_tagged_literal_unchecked(
+                "hi",
+                "en",
+                oxrdf::BaseDirection::Rtl,
+            )),
+            Term::Literal(Literal::new_typed_literal("2020-01-01", xsd::DATE)),
+            Term::Triple(Box::new(oxrdf::Triple::new(
+                BlankNode::new_unchecked("b2a"),
+                NamedNode::new_unchecked("http://ex.org/p"),
+                Term::Literal(Literal::new_simple_literal("y".repeat(256))),
+            ))),
+        ];
+        for t in &terms {
+            let expected = term_key(t);
+            let len = term_key_len(t.as_ref()).unwrap();
+            assert_eq!(len, expected.len());
+            let mut out = Vec::with_capacity(len);
+            write_term_ref_key(t.as_ref(), &mut out);
+            assert_eq!(out, expected);
+            assert_eq!(out.capacity(), len);
+            if let Term::Literal(l) = t {
+                let mut lit_buf = Vec::new();
+                write_literal_ref_key(l.as_ref(), &mut lit_buf);
+                assert_eq!(lit_buf, expected);
+                assert_eq!(lit_buf.capacity(), lit_buf.len());
+            }
         }
     }
 }

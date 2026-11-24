@@ -752,6 +752,38 @@ impl Snapshot {
         }
     }
 
+    /// Id of a term if it exists in this snapshot, checking live controls and admitting
+    /// the exact encoded vocabulary-key length before allocating its lookup buffer.
+    pub fn lookup_term_controlled(
+        &self,
+        t: &Term,
+        admit: &mut dyn FnMut(usize) -> Result<()>,
+        check: &mut dyn FnMut() -> Result<()>,
+    ) -> Result<Option<Id>> {
+        check()?;
+        match t {
+            Term::BlankNode(b) => Ok(parse_bnode_label(b.as_str())),
+            _ => {
+                if let Some(id) = id::inline_id(t) {
+                    return Ok(Some(id));
+                }
+                let Some(len) = id::term_key_len(t.as_ref()) else {
+                    admit(usize::MAX)?;
+                    return Err(Error::invalid("term key length overflow"));
+                };
+                admit(len)?;
+                check()?;
+                let mut key = Vec::with_capacity(len);
+                if key.capacity() > len {
+                    admit(key.capacity())?;
+                }
+                id::write_term_ref_key(t.as_ref(), &mut key);
+                debug_assert_eq!(key.len(), len);
+                Ok(self.lookup_key(&key))
+            }
+        }
+    }
+
     pub fn lookup_iri(&self, iri: &str) -> Option<Id> {
         self.lookup_key(&id::iri_key(iri))
     }

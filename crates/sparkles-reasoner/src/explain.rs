@@ -47,7 +47,9 @@ pub use sparkles_core::explain::{
 };
 use sparkles_core::id::{Id, Tag};
 use sparkles_core::index::Perm;
-use sparkles_core::sparql::reasoning::{Demand, DemandTerm, SessionRequest};
+use sparkles_core::sparql::reasoning::SessionRequest;
+#[cfg(test)]
+use sparkles_core::sparql::reasoning::{Demand, DemandTerm};
 use sparkles_core::store::Snapshot;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -632,7 +634,13 @@ impl Builder<'_, '_> {
     fn term(&self, id: u64) -> anyhow::Result<Term> {
         self.s
             .terms
-            .term(id)
+            .term_admitted(id, self.budget)
+            .map_err(|e| match e {
+                crate::budget::BudgetFailure::Local(m) => anyhow::Error::from(
+                    m.with_context(" while building an explanation".to_string()),
+                ),
+                e => anyhow::Error::from(e),
+            })?
             .ok_or_else(|| anyhow::anyhow!("term {id} of a derivation is unknown"))
     }
 
@@ -1534,6 +1542,7 @@ pub(crate) fn session_error(e: sparkles_core::Error) -> anyhow::Error {
 }
 
 /// A demand for `t` with its three positions constant.
+#[cfg(test)]
 pub(crate) fn demand_of(t: &[Term; 3]) -> Demand {
     Demand {
         s: DemandTerm::Const(t[0].clone()),
@@ -1622,15 +1631,17 @@ pub fn explain_demand(
 ) -> anyhow::Result<Explained> {
     budget_errors((|| {
         let mut session = demand_session(input, opts, true)?;
+        let root = {
+            let terms = session.terms();
+            [
+                terms.try_id_for(&triple[0])?,
+                terms.try_id_for(&triple[1])?,
+                terms.try_id_for(&triple[2])?,
+            ]
+        };
         session
-            .derive_all(&[demand_of(triple)])
+            .derive_ids(&[[Some(root[0]), Some(root[1]), Some(root[2])]])
             .map_err(session_error)?;
-        let terms = session.terms();
-        let root = [
-            terms.try_id_for(&triple[0])?,
-            terms.try_id_for(&triple[1])?,
-            terms.try_id_for(&triple[2])?,
-        ];
         let holds = session.graph().is_some_and(|g| g.contains(&root));
         if !holds {
             return Ok(Explained::NotFound);

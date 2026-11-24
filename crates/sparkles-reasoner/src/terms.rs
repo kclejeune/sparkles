@@ -725,6 +725,51 @@ impl Terms {
         self.snap.term(i)
     }
 
+    /// Decode `raw` only after admitting its reconstruction scratch and encoded key length
+    /// against `budget` (transient admission; callers that retain the decoded [`Term`]
+    /// charge its retained heap separately).
+    pub(crate) fn term_admitted(
+        &self,
+        raw: u64,
+        budget: &Arc<Budget>,
+    ) -> Result<Option<Term>, BudgetFailure> {
+        let id = Id(raw);
+        let decode = |key: &[u8]| -> Result<Term, BudgetFailure> {
+            let _temporary = Held::try_new_exact(budget, key.len())?;
+            Ok(id::key_to_term(key))
+        };
+        match id.tag() {
+            Tag::Local => match self.table.get(id.payload()) {
+                Some(LocalTerm::Key(key)) => decode(key).map(Some),
+                Some(LocalTerm::RuleBNode(key)) => {
+                    let bytes =
+                        8usize.saturating_add(key.len().saturating_sub(3).saturating_mul(2));
+                    let _temporary = Held::try_new_exact(budget, bytes)?;
+                    Ok(self.term(raw))
+                }
+                _ => Ok(self.term(raw)),
+            },
+            Tag::Vocab => {
+                let mut reconstruction = Held::new(budget);
+                self.snap
+                    .generation
+                    .vocab
+                    .get_with_checked(
+                        id.payload(),
+                        |capacity| reconstruction.try_set(capacity),
+                        decode,
+                    )?
+                    .transpose()
+            }
+            Tag::Delta => self
+                .snap
+                .generation
+                .dvocab
+                .with(|vocab| vocab.get(id.payload()).map(decode).transpose()),
+            _ => Ok(self.term(raw)),
+        }
+    }
+
     /// Decode a summary term only after reserving reconstruction and RDF heap space.
     /// The returned holder covers the decoded term until the caller drops it.
     pub fn term_controlled(

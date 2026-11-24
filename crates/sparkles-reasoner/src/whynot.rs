@@ -23,9 +23,7 @@
 use crate::builtins::BuiltinKind;
 use crate::demand::{head_slots, intensional};
 use crate::engine::{CHead, CRule, Eval, Mode, Slot};
-use crate::explain::{
-    DemandInput, ExplainOptions, demand_of, demand_session, search_session, session_error,
-};
+use crate::explain::{DemandInput, ExplainOptions, demand_session, search_session, session_error};
 use crate::facts::Memo;
 use crate::graph::{Graph, Triple};
 use crate::query::Session;
@@ -1096,15 +1094,18 @@ fn why_not_inner(
     opts: &WhyNotOptions,
 ) -> anyhow::Result<WhyNot> {
     let mut session = demand_session(input, &opts.explain, true)?;
+    let root = {
+        let terms = session.terms();
+        [
+            terms.try_id_for(&triple[0])?,
+            terms.try_id_for(&triple[1])?,
+            terms.try_id_for(&triple[2])?,
+        ]
+    };
     session
-        .derive_all(&[demand_of(triple)])
+        .derive_ids(&[[Some(root[0]), Some(root[1]), Some(root[2])]])
         .map_err(session_error)?;
     let terms = session.terms();
-    let root = [
-        terms.try_id_for(&triple[0])?,
-        terms.try_id_for(&triple[1])?,
-        terms.try_id_for(&triple[2])?,
-    ];
     if session.graph().is_some_and(|g| g.contains(&root)) {
         return Ok(WhyNot::Entailed);
     }
@@ -1429,7 +1430,15 @@ fn verify(
         missing.push([a, b, c]);
     }
     add_hypothesis(&mut s, &facts, &verification_opts)?;
-    match s.derive_all(&[demand_of(triple)]) {
+    let root = {
+        let terms = s.terms();
+        [
+            terms.try_id_for(&triple[0])?,
+            terms.try_id_for(&triple[1])?,
+            terms.try_id_for(&triple[2])?,
+        ]
+    };
+    match s.derive_ids(&[[Some(root[0]), Some(root[1]), Some(root[2])]]) {
         Ok(()) => {}
         // a hypothesis whose program passes its size, such as one that adds equality
         // to rules with variable predicates, is not verified
@@ -1441,12 +1450,6 @@ fn verify(
         }
         Err(e) => return Err(session_error(e)),
     }
-    let terms = s.terms();
-    let root = [
-        terms.try_id_for(&triple[0])?,
-        terms.try_id_for(&triple[1])?,
-        terms.try_id_for(&triple[2])?,
-    ];
     if !s.graph().is_some_and(|g| g.contains(&root)) {
         return Ok(None);
     }
