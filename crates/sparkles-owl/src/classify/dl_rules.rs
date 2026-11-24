@@ -541,7 +541,45 @@ pub struct DlRun {
     /// the most choices of one product that the run makes before it passes its bound on
     /// derived conclusions, zero for no limit (roadmap item 1011)
     width_limit: AtomicUsize,
+    /// row 1231's marker repair (PLAN v3.1's rule M), which is off unless
+    /// [`Limits::rooted_marker_repair`](super::Limits) turns it on: [`MREPAIR_ON`], with
+    /// [`MREPAIR_HOLDER`], [`MREPAIR_UNITS`] and [`MREPAIR_WIDE`] for measurements, and
+    /// [`MREPAIR_NO_RETURN`] and [`MREPAIR_NO_REPLAY`] for the diagnostic's tests, and
+    /// [`MREPAIR_CF`] for M-return's restriction to premises without ground body literals
+    pub mrepair: u8,
+    /// the repair's counts, for measurements: the notices of held triggers the root took,
+    /// the markers it sent and the clauses it returned
+    pub mcount: [AtomicUsize; 3],
 }
+
+/// [`DlRun::mrepair`]: M-send and M-return are on.
+pub const MREPAIR_ON: u8 = 1;
+/// [`DlRun::mrepair`]: M-send also sends the marker to the holder itself, which holds it
+/// already, so the marker is a tautology there.
+pub const MREPAIR_HOLDER: u8 = 2;
+/// [`DlRun::mrepair`]: M-send sends the marker of a trigger that is a live unit of the root
+/// too, which the registered contexts take as the root's fact already.
+pub const MREPAIR_UNITS: u8 = 4;
+/// [`DlRun::mrepair`]: M-send sends the marker to every registered context, the wide arm,
+/// and not only to those that the root reaches by successors, the pair set P_R of PLAN v3.1.
+pub const MREPAIR_WIDE: u8 = 8;
+/// [`DlRun::mrepair`], for the deficits' tests only: the root returns no clause (M-return),
+/// so that a missing product shows in the diagnostic's second deficit.
+pub const MREPAIR_NO_RETURN: u8 = 32;
+/// [`DlRun::mrepair`], for the deficits' tests only: a context that the root registers or
+/// reaches late takes no marker sent before, so that a missing marker shows in the first.
+pub const MREPAIR_NO_REPLAY: u8 = 64;
+/// [`DlRun::mrepair`]: M-return-cf. M-return resolves a returned clause only with premises
+/// of the holder whose body has no ground literal, a literal over constants and function
+/// terms of constants alone, at the return and at the late premise. A product with a ground
+/// body then never arises, which would go back to the root and out again through each
+/// alternative condition of its body atoms. A measurement bit, off by default: with the
+/// selection of ground body literals off it loses no answer against [`MREPAIR_ON`] alone,
+/// finishes ten more runs within the bound and takes a purpose-built ontology's cost from 24% to 10.5%,
+/// but g1-051_p0012 still passes the bound (roadmap item 1250) and g1-051_p0121 derives
+/// 1.42 million conclusions against 1.17 million. Which of the two the default takes is
+/// for item 1231 to decide on evidence.
+pub const MREPAIR_CF: u8 = 128;
 
 impl DlRun {
     pub fn new(eager: bool, worked: std::sync::Arc<std::sync::atomic::AtomicBool>) -> DlRun {
@@ -657,7 +695,7 @@ pub struct DlSt {
     /// in a rooted run, whether the context is taking a fact of the root, which it keeps
     pub taking_fact: bool,
     /// in a rooted run, the heads of the facts a hypothetical successor sent the root
-    promoted: FxHashSet<Box<[Lit]>>,
+    pub(super) promoted: FxHashSet<Box<[Lit]>>,
     /// the clauses over the predecessor that successors sent, by successor
     pub pred_in: FxHashMap<Ex, Vec<u32>>,
     pub(super) pred_seen: FxHashSet<(Ex, u32)>,
@@ -1411,9 +1449,51 @@ impl Found {
     pub(super) fn products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, false);
     }
+    /// A bound on the bytes that [`fold`] holds without a charge while it derives the
+    /// products that are not ground, for a caller that reserves them before it drains:
+    /// the largest over the products, since fold drops a product's tables before the next.
+    /// fold charges each union it keeps, but not the slots of its `seen` table beyond the
+    /// union itself, nor its step list's spare capacity, each with the buffer it grew from.
+    /// The bound takes each step to make one union per choice, the product of the lengths
+    /// of the lists so far, which can far exceed the unions a step keeps. Any overflow of
+    /// a nonempty product's choice count or table model saturates cleanly to `usize::MAX`.
+    pub(super) fn fold_slack(&self) -> usize {
+        const SIDE: u128 = std::mem::size_of::<Side>() as u128;
+        const MAX: u128 = usize::MAX as u128;
+        self.prods
+            .iter()
+            .filter(|p| !p.2)
+            .map(|p| fold_slack_lens(p.0.iter().map(Vec::len), SIDE, MAX) as usize)
+            .max()
+            .unwrap_or(0)
+    }
     /// [`Found::products`] for a ground inference, whose choices the restriction filters.
     pub(super) fn ground_products(&mut self, lists: Vec<Vec<Side>>, base: Side) {
         self.products_of(lists, base, true);
+    }
+    /// The bytes that the conclusions and products waiting here hold, their vectors'
+    /// capacities included, for a rule that admits a batch before it drains it.
+    pub(super) fn held_bytes(&self) -> usize {
+        use std::mem::size_of;
+        let lits = |s: &Side| (s.0.capacity() + s.1.capacity()) * size_of::<Lit>();
+        let one = self.one.capacity() * size_of::<(Side, &str)>()
+            + self.one.iter().map(|(s, _)| lits(s)).sum::<usize>();
+        let prods = self.prods.capacity() * size_of::<(Vec<Vec<Side>>, Side, bool, &str)>()
+            + self
+                .prods
+                .iter()
+                .map(|(lists, base, ..)| {
+                    lits(base)
+                        + lists.capacity() * size_of::<Vec<Side>>()
+                        + lists
+                            .iter()
+                            .map(|l| {
+                                l.capacity() * size_of::<Side>() + l.iter().map(lits).sum::<usize>()
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        one + prods
     }
     fn products_of(&mut self, mut lists: Vec<Vec<Side>>, base: Side, ground: bool) {
         if lists.iter().any(|l| l.is_empty()) {
@@ -1487,12 +1567,88 @@ const PRODUCT_POLL: usize = 256;
 
 /// The most bytes of a product's record of its conclusions that may go uncharged when the
 /// product ends between two checks of the bounds; a larger tail is charged at the end.
-const RECORD_SLACK: usize = 64 * 1024;
+pub(super) const RECORD_SLACK: usize = 64 * 1024;
 
 /// The most sides of one step of a product that [`fold`] keeps only where no other side
 /// of the step has a subset of their literals, which costs a comparison of each side with
 /// the sides kept before it.
 const FOLD_PRUNE: usize = 4096;
+
+/// The [`step_slack`] model in `u128` for a `Side` of `side` bytes, clamped once at the
+/// end to `max`. Computing in `u128` avoids subtracting saturated `usize` values when
+/// `unions * side` and the table size both exceed `max`.
+fn step_slack_model(unions: u128, listed: u128, side: u128, max: u128) -> u128 {
+    debug_assert!(unions <= u64::MAX as u128 && listed <= u64::MAX as u128);
+    let table = |n: u128| -> u128 {
+        let buckets = match n {
+            0 => 0,
+            1..4 => 4,
+            4..8 => 8,
+            _ => (n * 8 / 7).next_power_of_two(),
+        };
+        buckets * (side + 1) + 16
+    };
+    let grown = table(unions)
+        + if unions >= 4 {
+            table(unions / 2 + 1)
+        } else {
+            0
+        };
+    let cap = if listed == 0 {
+        0
+    } else {
+        listed.next_power_of_two()
+    };
+    let list = (cap + cap / 2) * side;
+    let slack = (grown - unions * side) + (list - listed * side);
+    slack.min(max)
+}
+
+/// The [`Found::fold_slack`] bound for one product's list lengths, returning `max` when
+/// a nonempty product's choice count overflows `max`.
+fn fold_slack_lens(
+    lens: impl ExactSizeIterator<Item = usize> + Clone,
+    side: u128,
+    max: u128,
+) -> u128 {
+    if lens.clone().any(|n| n == 0) {
+        return 0;
+    }
+    let last = lens.len().saturating_sub(1);
+    let mut choices = 1u128;
+    let mut most = 0u128;
+    for (i, len) in lens.enumerate() {
+        let Some(next) = choices.checked_mul(len as u128).filter(|&c| c <= max) else {
+            return max;
+        };
+        choices = next;
+        // a last step past FOLD_PRUNE unions derives them as it makes them
+        let listed = if i < last {
+            choices
+        } else {
+            choices.min((FOLD_PRUNE + 1) as u128)
+        };
+        most = most.max(step_slack_model(choices, listed, side, max));
+    }
+    most
+}
+
+/// The bytes of one step of [`fold`] that its charge leaves out, for `unions` unions of
+/// which `listed` stay in the step's list: the `seen` table's slots and control bytes
+/// beyond the size of a union, which fold charges for each, together with the table of
+/// half the buckets it grew from, and the list's capacity beyond its length, together with
+/// the buffer of half that capacity it grew from. The buckets follow the hash table's
+/// growth, a power of two at least 8/7 of the entries. All arithmetic runs in `u128` and
+/// clamps once to `usize::MAX` at the end.
+#[cfg(test)]
+fn step_slack(unions: usize, listed: usize) -> usize {
+    step_slack_model(
+        unions as u128,
+        listed as u128,
+        std::mem::size_of::<Side>() as u128,
+        usize::MAX as u128,
+    ) as usize
+}
 
 /// Derives the conclusions of a product that is not ground (item 969): the union of one
 /// premise from every list with `base`, list after list. Each step keeps the unions it
@@ -1589,8 +1745,13 @@ fn fold<S: Sink>(
                 if x.choices as usize >= PRODUCT_POLL {
                     x.choices = 0;
                     let go = if pending > 0 {
-                        charged += pending;
-                        out.reserve_data(std::mem::take(&mut pending))
+                        let add = std::mem::take(&mut pending);
+                        if out.reserve_data(add) {
+                            charged += add;
+                            true
+                        } else {
+                            false
+                        }
                     } else {
                         out.go_on()
                     };
@@ -1616,8 +1777,10 @@ fn fold<S: Sink>(
         charged -= back;
         out.release_data(back);
         if pending >= RECORD_SLACK {
-            charged += pending;
-            if !out.reserve_data(std::mem::take(&mut pending)) {
+            let add = std::mem::take(&mut pending);
+            if out.reserve_data(add) {
+                charged += add;
+            } else {
                 return stop(st, out, charged);
             }
         }
@@ -1781,8 +1944,13 @@ pub(super) fn drain_with<S: Sink>(
             if x.choices as usize >= PRODUCT_POLL {
                 x.choices = 0;
                 let go = if pending > 0 {
-                    charged += pending;
-                    out.reserve_data(std::mem::take(&mut pending))
+                    let add = std::mem::take(&mut pending);
+                    if out.reserve_data(add) {
+                        charged += add;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     out.go_on()
                 };
@@ -1812,8 +1980,10 @@ pub(super) fn drain_with<S: Sink>(
         // and a small tail is left uncharged rather than add a check of the bounds to
         // every product, which bounds what one product holds unseen by RECORD_SLACK
         if pending >= RECORD_SLACK {
-            charged += pending;
-            if !out.reserve_data(std::mem::take(&mut pending)) {
+            let add = std::mem::take(&mut pending);
+            if out.reserve_data(add) {
+                charged += add;
+            } else {
                 ds(st).store.interrupted = true;
                 out.release_data(charged);
                 return;
@@ -1889,7 +2059,7 @@ fn equality_tautology(head: &[Lit]) -> bool {
 /// Adds a clause the rules derived in this context: a unit over x goes to the EL rules, an
 /// empty clause makes the context unsatisfiable, and any other clause goes to the store
 /// unless it is redundant.
-fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: &mut S) {
+pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: &mut S) {
     if st.bottom {
         return;
     }
@@ -2151,7 +2321,7 @@ fn again(ix: &Index, st: &State, id: u32, c: &Clause, found: &mut Found) {
 }
 
 /// The clauses read that count as one derived conclusion for the work bound.
-const WORK_READS: usize = 16;
+pub(super) const WORK_READS: usize = 16;
 
 /// A class of `a` and one of `b` in a disjointness set, with the clauses that give them.
 fn disjoint(ix: &Index, a: &[(Ex, u32)], b: &[(Ex, u32)]) -> Option<(u32, u32)> {
@@ -3722,11 +3892,14 @@ mod tests {
         fn me(&mut self, _: Concl) {}
         // a reservation checks the bounds too, as the saturation's does
         fn reserve_data(&mut self, bytes: usize) -> bool {
-            self.reserved += bytes;
-            self.go_on()
+            let ok = self.go_on()
                 && self
                     .budget
-                    .is_none_or(|b| self.reserved - self.released <= b)
+                    .is_none_or(|b| self.reserved - self.released + bytes <= b);
+            if ok {
+                self.reserved += bytes;
+            }
+            ok
         }
         fn release_data(&mut self, bytes: usize) {
             self.released += bytes;
@@ -4037,5 +4210,110 @@ mod tests {
         let mut run = run;
         run.begin_run();
         assert!(!run.too_wide(&lists));
+    }
+
+    #[test]
+    fn step_slack_saturates_cleanly_and_matches_the_u128_model() {
+        let side_bytes = std::mem::size_of::<Side>() as u128;
+        let expected = |unions: usize, listed: usize| -> usize {
+            let u = unions as u128;
+            let l = listed as u128;
+            let table = |n: u128| -> u128 {
+                let buckets = match n {
+                    0 => 0,
+                    1..4 => 4,
+                    4..8 => 8,
+                    _ => (n * 8 / 7).next_power_of_two(),
+                };
+                buckets * (side_bytes + 1) + 16
+            };
+            let grown = table(u) + if u >= 4 { table(u / 2 + 1) } else { 0 };
+            let cap = if l == 0 { 0 } else { l.next_power_of_two() };
+            let list = (cap + cap / 2) * side_bytes;
+            ((grown - u * side_bytes) + (list - l * side_bytes)).min(usize::MAX as u128) as usize
+        };
+        for (u, l) in [
+            (0, 0),
+            (1, 1),
+            (3, 3),
+            (4, 4),
+            (7, 7),
+            (8, 8),
+            (16, 16),
+            (100, 100),
+            (FOLD_PRUNE, FOLD_PRUNE),
+            (FOLD_PRUNE + 1, FOLD_PRUNE + 1),
+            (50_000, 50_000),
+            (200_000_000, FOLD_PRUNE + 1),
+            (usize::MAX / std::mem::size_of::<Side>() + 1, FOLD_PRUNE + 1),
+            (usize::MAX, FOLD_PRUNE + 1),
+            (usize::MAX, usize::MAX),
+        ] {
+            assert_eq!(step_slack(u, l), expected(u, l), "u={u}, l={l}");
+        }
+        assert_eq!(step_slack(usize::MAX, usize::MAX), usize::MAX);
+        assert_eq!(step_slack(usize::MAX, FOLD_PRUNE + 1), usize::MAX);
+    }
+
+    #[test]
+    fn fold_slack_saturates_on_choice_overflow_and_handles_empty_and_ground() {
+        assert_eq!(Found::default().fold_slack(), 0);
+        // Ground products are ignored by fold_slack.
+        let mut ground = Found::default();
+        ground.ground_products(
+            vec![vec![side(&[1]), side(&[2])], vec![side(&[3]), side(&[4])]],
+            side(&[]),
+        );
+        assert_eq!(ground.fold_slack(), 0);
+        // Empty-list products produce no choices.
+        let mut empty = Found::default();
+        empty.products(vec![vec![side(&[1])], Vec::new()], side(&[]));
+        assert_eq!(empty.fold_slack(), 0);
+        // Choice multiplication overflowing usize must return usize::MAX.
+        let mut overflow = Found::default();
+        let lists: Vec<Vec<Side>> = (0..usize::BITS)
+            .map(|i| vec![side(&[2 * i + 2]), side(&[2 * i + 3])])
+            .collect();
+        overflow.products(lists, side(&[]));
+        assert_eq!(overflow.fold_slack(), usize::MAX);
+        // Multiple sequential products take the maximum, not the sum.
+        let mut multi = Found::default();
+        multi.products(
+            vec![
+                vec![side(&[1]), side(&[2]), side(&[3]), side(&[4])],
+                vec![side(&[5]), side(&[6]), side(&[7]), side(&[8])],
+            ],
+            side(&[]),
+        );
+        let one = multi.fold_slack();
+        assert_eq!(one, step_slack(4, 4).max(step_slack(16, 16)));
+        multi.products(
+            vec![
+                vec![side(&[11]), side(&[12]), side(&[13]), side(&[14])],
+                vec![side(&[15]), side(&[16]), side(&[17]), side(&[18])],
+            ],
+            side(&[]),
+        );
+        assert_eq!(multi.fold_slack(), one);
+        // 32-bit 50,000 x 4,000 example (Side = 24 B, max = u32::MAX): step 0 is 2,416,928 B
+        // and step 1 (200,000,000 choices, FOLD_PRUNE + 1 listed) must saturate to u32::MAX
+        // instead of collapsing to 196,584 B and letting fold_slack return 2,416,928 B.
+        assert_eq!(
+            step_slack_model(50_000, 50_000, 24, u32::MAX as u128),
+            2_416_928
+        );
+        assert_eq!(
+            step_slack_model(200_000_000, (FOLD_PRUNE + 1) as u128, 24, u32::MAX as u128),
+            u32::MAX as u128
+        );
+        assert_eq!(
+            fold_slack_lens([50_000, 4_000].into_iter(), 24, u32::MAX as u128),
+            u32::MAX as u128
+        );
+        // Empty list after an overflowing prefix still represents an empty product (0).
+        assert_eq!(
+            fold_slack_lens([usize::MAX, 2, 0].into_iter(), 48, usize::MAX as u128),
+            0
+        );
     }
 }

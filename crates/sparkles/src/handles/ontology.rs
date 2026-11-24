@@ -217,6 +217,9 @@ struct Inner {
     /// the main triples of reified axioms whose predicate is not terminological, read
     /// eagerly with their `owl:Axiom` node and left out of the assertion stream
     mains: FxHashSet<[Id; 4]>,
+    /// the blank nodes whose class assertions `x rdf:type _:c` were read eagerly, as
+    /// the class expressions of the terminology
+    class_nodes: FxHashSet<Id>,
 }
 
 /// One kept ontology.
@@ -802,15 +805,23 @@ struct Stream<'a> {
 impl Stream<'_> {
     /// The triple of a stored quad when it is an assertion the read left in the store:
     /// not terminological, not the main triple of an annotated axiom the read holds, and
-    /// not a class assertion of a structural type or a class expression.
+    /// not a class assertion of a structural type or of a class expression the read
+    /// collected. A class assertion whose blank-node class the read did not collect
+    /// stays in the stream, where it maps to no axiom.
     fn assertion(o: &Opened, rdf_type: Option<Id>, q: &[Id; 4]) -> Option<Triple> {
         let inner = &o.inner;
         if inner.terminological.contains(&q[1]) || inner.mains.contains(q) {
             return None;
         }
         let t = triple_of(&o.snapshot, q)?;
-        // class assertions with a structural type or a class expression were read
-        if Some(q[1]) == rdf_type && read::is_terminological(&t, &|_| false) {
+        // class assertions with a structural type or a collected class expression were
+        // read
+        if Some(q[1]) == rdf_type
+            && match &t.object {
+                Term::BlankNode(_) => inner.class_nodes.contains(&q[2]),
+                _ => read::is_terminological(&t, &|_| false),
+            }
+        {
             return None;
         }
         Some(t)
@@ -1326,11 +1337,23 @@ impl Ontologies {
         o: &Opened,
         record: Option<&crate::reasoning::ReasoningRecord>,
     ) -> Option<Inferences> {
+        self.inferences_of(&o.graphs, &o.inner.graph_ids, o.snapshot.commit, record)
+    }
+
+    /// [`inferences`](Self::inferences) of a read of `graphs`, with their store ids, at
+    /// `commit`.
+    fn inferences_of(
+        &self,
+        graphs: &[GraphRef],
+        graph_ids: &[Option<Id>],
+        commit: u64,
+        record: Option<&crate::reasoning::ReasoningRecord>,
+    ) -> Option<Inferences> {
         let record = record?;
         let inferred = GraphRef::Named(INFERRED_GRAPH.to_string());
-        let n = o.graphs.iter().position(|g| *g == inferred)?;
-        o.inner.graph_ids.get(n).copied().flatten()?;
-        let f = crate::reasoning::freshness(record, self.ds.store(), o.snapshot.commit);
+        let n = graphs.iter().position(|g| *g == inferred)?;
+        graph_ids.get(n).copied().flatten()?;
+        let f = crate::reasoning::freshness(record, self.ds.store(), commit);
         Some(Inferences {
             profile: record.profile.clone(),
             graph: n as u32,
@@ -1910,6 +1933,7 @@ fn read_store(
         opts,
     };
     let mut terminological: FxHashSet<Id> = FxHashSet::default();
+    let mut class_nodes: FxHashSet<Id> = FxHashSet::default();
     let predicates = vocab::STRUCTURAL_PREDICATES
         .iter()
         .chain(vocab::FACETS.iter())
@@ -1954,6 +1978,7 @@ fn read_store(
         for b in bnodes {
             check(opts)?;
             c.prefix(&[rdf_type.0, b.0])?;
+            class_nodes.insert(b);
         }
     }
     // the main triples of reified axioms whose predicate was not read: an annotated
@@ -2001,7 +2026,7 @@ fn read_store(
         graph_ids.len(),
         requested,
         mode,
-        (terminological, mains),
+        (terminological, mains, class_nodes),
     )
 }
 
@@ -2049,7 +2074,7 @@ fn finish(
     graphs: usize,
     requested: usize,
     mode: Mode,
-    (terminological, mains): (FxHashSet<Id>, FxHashSet<[Id; 4]>),
+    (terminological, mains, class_nodes): (FxHashSet<Id>, FxHashSet<[Id; 4]>, FxHashSet<Id>),
 ) -> Result<(read::Ontology, Inner)> {
     let mut triples = Vec::with_capacity(quads.len());
     let mut graph_of = Vec::with_capacity(quads.len());
@@ -2086,6 +2111,7 @@ fn finish(
             graph_ids,
             terminological,
             mains,
+            class_nodes,
         },
     ))
 }
@@ -2539,6 +2565,7 @@ pub mod browse;
 pub mod classify;
 pub mod dl_query;
 pub mod file;
+pub mod head;
 pub mod kept;
 pub mod metrics;
 pub mod search;
@@ -2550,3 +2577,9 @@ mod tests;
 
 #[cfg(test)]
 mod individual_lookup_tests;
+
+#[cfg(test)]
+mod head_tests;
+
+#[cfg(test)]
+mod head_gen_tests;

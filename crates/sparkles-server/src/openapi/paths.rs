@@ -713,6 +713,7 @@ fn ontology(p: &mut Paths) {
             .param("at")
             .query("inferences", boolean(), "Also read the materialized inferences while the dataset has them, so that the axioms include the materialized closure. The answer's `inferences` says whether they were read and whether they are stale.")
             .param("ifNoneMatch")
+            .query("view", json!({ "type": "string", "enum": ["full", "head"] }), "`full` (the default) or `head`. The head answers the header, the counts of declared entities, the graphs read, the imports and the imports closure from bounded index reads, without mapping the whole graph into axioms, and leaves out `axioms`, `axiomCount`, `triples`, `unmapped`, `diagnostics` and `cached`. Its entity tag also names the commit for an edit's `If-Match`. It refuses `metrics`.")
             .query("metrics", boolean(), "Also stream assertions and return scoped axiom counts, distinct signature entities, a conservative containing DL and bounded EL, QL, RL and DL reports in metrics. Refuses scopes over 1000000 mapped axioms and assertion triples or signature entities. Ordinary summaries omit this work.")
             .resp("200", "The summary.", Some(object.clone()))
             .resp("304", "The summary is still at the tagged commit.", None)
@@ -832,6 +833,7 @@ fn ontology(p: &mut Paths) {
                         "offset": { "type": "integer", "minimum": 0, "description": "The first node listed." },
                         "threads": { "type": "integer", "minimum": 0, "maximum": 1024, "description": "The worker threads, within the algorithm pool's grant (0 for the grant)." },
                         "partial": { "type": "boolean", "description": "Answer what a run with the disjunctive rules proved when its deadline, cancellation or memory budget stops it, instead of failing. Runs of the other rules fail as before." },
+                        "strict": { "type": "boolean", "description": "Refuse with `422` and code `classification-incomplete` when the classifier would leave an axiom out or use one only in part, or the run stopped, so that an answer is always complete for the whole ontology, as HermiT refuses what it does not support. The message names the axioms and the rules they break." },
                         "expansion": { "type": "string", "enum": ["cautious", "eager"], "description": "The expansion strategy of the disjunctive rules, `cautious` by default. Both give the same answer." }
                     }
                 } } }),
@@ -840,11 +842,11 @@ fn ontology(p: &mut Paths) {
                 "200",
                 "The classification, with the receipt when a write asked for one.",
                 Some(json!({
-                    "application/json": { "schema": { "oneOf": [{ "type": "object", "required": ["consistent","complete","classes"], "properties": {"consistent":{"type":"boolean"},"complete":{"type":"boolean"},"classes":{"type":"integer"}} }, sref("OntologyFrameClassification")] } },
+                    "application/json": { "schema": { "oneOf": [{ "type": "object", "required": ["consistent","complete","completeForTaken","classes"], "properties": {"consistent":{"type":"boolean"},"complete":{"type":"boolean","description":"Whether the answer is complete for the whole ontology: false when an axiom is left out or used only in part, or the run stopped. The classes outside `incomplete` have their complete answer either way."},"completeForTaken":{"type":"boolean","description":"Whether the answer is complete for the axioms the run took, as a profile reasoner such as ELK reports it. False only for a partial answer."},"classes":{"type":"integer"},"unmappedTriples":{"type":"array","description":"The first 100 triples of the input that map to no axiom, in the order the input gave them, as N-Triples terms. Each leaves the answer incomplete, and `stats.unmapped` counts them all. The OWL API calls such triples unparsed.","items":{"type":"object","required":["subject","predicate","object"],"properties":{"subject":{"type":"string"},"predicate":{"type":"string"},"object":{"type":"string"}}}},"unmappedTruncated":{"type":"boolean","description":"Whether `stats.unmapped` counts more triples than `unmappedTriples` lists."}} }, sref("OntologyFrameClassification")] } },
                     "text/owl-functional": { "schema": { "type": "string" } }
                 })),
             )
-            .errors(&[400, 403, 404, 408, 409, 507]),
+            .errors(&[400, 403, 404, 408, 409, 422, 507]),
     );
     p.add(
         op(POST, "/$/ontology/{ds}/parse", "parseManchester", "Ontology", "Read Manchester syntax")

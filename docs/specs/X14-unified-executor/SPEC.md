@@ -521,12 +521,15 @@ stops before successful completion metadata. Native output holds a whole decoded
 rather than one cell at a time, and its additional live storage counts against the
 budget. These remain estimated heap charges rather than process RSS limits.
 
-Hierarchical ownership of public results, native buffers, reasoner work and views, and
-strict decoding throughout their callers remain part of item 675.
-One follow-up of item 675 is MCP native frame ownership. MCP tool results are still
-application copies of their rendered text. A retained renderer would keep each response
-frame under its query's credit until the transport writes it. That needs an rmcp
-transport qualified for retained results, including session replay and tasks.
+The remaining stage 4 ownership seams are tracked by their own items. Retaining every
+result table under its own lease belongs to the merge phase of item 453, linking the
+reasoner's budgets and incremental views into the query pool belongs to item 675, binding
+result buffers belong to item 1306, snapshot and access escapes belong to item 1307 and
+strict decoding across all callers belongs to item 1308. MCP native frame ownership
+belongs to item 1305: MCP tool results are still application copies of their rendered
+text, and a retained renderer would keep each response frame under its query's credit
+until the transport writes it, which needs an rmcp transport qualified for retained
+results, including session replay and tasks.
 
 ### Dead compaction arm and one generation switch
 

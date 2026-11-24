@@ -10,6 +10,9 @@
 //!
 //! A row is `{"values": [term, …]}` in the order of `vars`, with SPARQL JSON terms and
 //! `null` for unbound, plus `"count"` when the row was added or removed more than once.
+//! A query with `ORDER BY` and `LIMIT` gives each row its `"position"` in the result, 0
+//! for the first: a snapshot lists the rows in order, and a diff gives a removed row its
+//! position before the change and an added row its position after it (spec F13 §4.4).
 //! ASK streams `{commit, value}`. The stream ends when the client closes it, when the
 //! server drains, and with an `error` event when the subscription fails or the access
 //! policy changes.
@@ -34,11 +37,14 @@ fn row_json(r: &LiveRow) -> J {
         .iter()
         .map(|t| t.as_ref().map_or(J::Null, results::term_json))
         .collect();
-    if r.count == 1 {
-        json!({ "values": values })
-    } else {
-        json!({ "values": values, "count": r.count })
+    let mut row = json!({ "values": values });
+    if r.count != 1 {
+        row["count"] = r.count.into();
     }
+    if let Some(p) = r.position {
+        row["position"] = p.into();
+    }
+    row
 }
 
 /// The SSE events of a live event.
@@ -186,7 +192,9 @@ impl Stream {
                 Some(e) => e,
                 None => self.recv().await?,
             };
+            // positioned diffs do not merge, so waiting for the next would only delay them
             if !self.coalesce.is_zero()
+                && !e.positioned()
                 && matches!(e, LiveEvent::Diff { .. } | LiveEvent::Value { .. })
             {
                 #[cfg(all(test, feature = "auth"))]

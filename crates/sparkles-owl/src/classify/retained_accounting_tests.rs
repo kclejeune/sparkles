@@ -164,16 +164,25 @@ fn retained_reconciliation_keeps_peak_credit_and_enforces_both_bounds() {
         })),
         ..Limits::default()
     };
-    assert_eq!(Saturation::admit_retained(80, 100, &limits).unwrap(), 100);
+    let baseline = saturate::Totals {
+        peak: 100,
+        paid: 100,
+        ..Default::default()
+    };
+    let mut totals = baseline;
+    Saturation::admit_retained(80, &mut totals, &limits).unwrap();
+    assert_eq!((totals.peak, totals.paid), (100, 100));
     assert!(grants.lock().unwrap().is_empty());
-    assert_eq!(Saturation::admit_retained(120, 100, &limits).unwrap(), 120);
+    Saturation::admit_retained(120, &mut totals, &limits).unwrap();
+    assert_eq!((totals.peak, totals.paid), (120, 120));
     assert_eq!(*grants.lock().unwrap(), [20]);
     let hard = Limits {
         max_memory: Some(119),
         ..limits.clone()
     };
+    let mut totals = baseline;
     assert!(matches!(
-        Saturation::admit_retained(120, 100, &hard),
+        Saturation::admit_retained(120, &mut totals, &hard),
         Err(Error::Memory {
             limit: 119,
             used: 120
@@ -184,15 +193,18 @@ fn retained_reconciliation_keeps_peak_credit_and_enforces_both_bounds() {
         [20],
         "hard refusal must not charge the pool"
     );
+    assert_eq!((totals.peak, totals.paid), (120, 100));
     let pool = Limits {
         charge: Some(Arc::new(|_| false)),
         ..Limits::default()
     };
+    let mut totals = baseline;
     assert!(matches!(
-        Saturation::admit_retained(120, 100, &pool),
+        Saturation::admit_retained(120, &mut totals, &pool),
         Err(Error::Memory {
             limit: usize::MAX,
             used: 120
         })
     ));
+    assert_eq!((totals.peak, totals.paid), (120, 100));
 }

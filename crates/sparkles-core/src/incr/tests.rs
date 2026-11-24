@@ -272,10 +272,8 @@ fn plans_mark_their_modes() {
         .filter(|q| compile(&parse(q), None).unwrap().root.has_recompute())
         .copied()
         .collect();
-    assert_eq!(
-        recomputed,
-        vec!["SELECT ?t ?n WHERE { ?p :memberOf ?t } ORDER BY ?t LIMIT 1"]
-    );
+    // ORDER BY with LIMIT is an ordered window (item 419)
+    assert_eq!(recomputed, Vec::<&str>::new());
 }
 
 #[test]
@@ -1070,6 +1068,30 @@ fn edge_cases_follow_the_oracle() {
     let c = circuit(&s, q);
     check(&s, &c, q, "after the build");
     assert_eq!(result(&c).len(), 2);
+}
+
+/// The inner node of a path takes a hidden name that no query variable can take, so a
+/// query variable named like the compiler's old prefix keeps its own binding.
+#[test]
+fn a_path_node_never_meets_a_query_variable() {
+    let s = Store::in_memory(StoreOptions::default());
+    upd(
+        &s,
+        &format!("{PREFIX}INSERT DATA {{ :a :p :m . :m :q :o . :a :r :z }}"),
+    )
+    .expect("update");
+    // the parser turns a plain sequence into triples, so an alternative keeps it a path
+    let q = "SELECT ?s ?__incr1 WHERE { ?s (:p/:q)|:none ?o . ?s :r ?__incr1 }";
+    let mut c = circuit(&s, q);
+    check(&s, &c, q, "build");
+    assert_eq!(result(&c), ["<http://ex/a> <http://ex/z>"]);
+    upd(
+        &s,
+        &format!("{PREFIX}INSERT DATA {{ :b :p :n . :n :q :o . :b :r :y }}"),
+    )
+    .expect("update");
+    step(&s, &mut c);
+    check(&s, &c, q, "after an insert");
 }
 
 /// A zero-length path from a term an outer pattern binds matches that term, even when

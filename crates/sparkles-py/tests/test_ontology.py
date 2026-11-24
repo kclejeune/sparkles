@@ -93,6 +93,12 @@ def test_summary_and_axioms(ds: sparkles.Dataset) -> None:
     s = ds.ontology.summary()
     assert s["header"]["iri"] == EX + "o"
     assert s["axioms"]["SubClassOf"] == 1
+    head = ds.ontology.summary(view="head")
+    assert head["view"] == "head"
+    assert head["header"] == s["header"] and head["entities"] == s["entities"]
+    assert head["commit"] == s["commit"] and "axioms" not in head
+    with pytest.raises(ValueError):
+        ds.ontology.summary(view="light")
     page = ds.ontology.axioms(type="SubClassOf")
     assert page["total"] == 1
     entry = page["axioms"][0]
@@ -398,7 +404,11 @@ def test_classify(ds: sparkles.Dataset) -> None:
         "owl:onProperty :teaches ; owl:someValuesFrom :Course ] . }"
     )
     r = ds.ontology.classify(about=EX + "FullProfessor")
-    assert r["consistent"] and r["complete"]
+    # the terminology alone leaves out the class assertion of :ann, which a run with
+    # the assertions reads
+    assert r["consistent"] and not r["complete"] and r["completeForTaken"]
+    assert r["consistency"] == "unknown"
+    assert ds.ontology.classify(assertions=True)["complete"]
     assert not r["reused"]
     assert EX + "Teacher" in r["class"]["superClasses"]
     again = ds.ontology.classify()
@@ -414,6 +424,38 @@ def test_classify(ds: sparkles.Dataset) -> None:
         e["axiom"] for e in ds.ontology.axioms(EX + "taxonomy")["axioms"]
     ]
 
+
+def test_classify_strict_refuses_what_it_leaves_out(ds: sparkles.Dataset) -> None:
+    # a maximum of two needs counting, which the classifier leaves out
+    ds.update(
+        f"{PREFIXES} INSERT DATA {{ :X rdfs:subClassOf [ a owl:Restriction ; "
+        "owl:onProperty :teaches ; owl:maxCardinality 2 ] . }"
+    )
+    r = ds.ontology.classify()
+    assert not r["complete"] and r["completeForTaken"] and not r["partial"]
+    assert r["excludedCount"] >= 1
+    with pytest.raises(sparkles.UnsupportedError) as e:
+        ds.ontology.classify(strict=True)
+    assert "maxCardinality" in str(e.value) or "ObjectMaxCardinality" in str(e.value)
+
+
+
+def test_classify_lists_the_triples_that_map_to_no_axiom(ds: sparkles.Dataset) -> None:
+    # the domain of a property that nothing declares maps to no axiom
+    ds.update(f"{PREFIXES} INSERT DATA {{ :undeclared rdfs:domain :Teacher . }}")
+    r = ds.ontology.classify()
+    assert not r["complete"] and r["stats"]["unmapped"] == 1
+    assert r["unmappedTriples"] == [
+        {
+            "subject": f"<{EX}undeclared>",
+            "predicate": "<http://www.w3.org/2000/01/rdf-schema#domain>",
+            "object": f"<{EX}Teacher>",
+        }
+    ]
+    assert r["unmappedTruncated"] is False
+    with pytest.raises(sparkles.UnsupportedError) as e:
+        ds.ontology.classify(strict=True)
+    assert "map to no axiom" in str(e.value) and f"<{EX}undeclared>" in str(e.value)
 
 def cases(n: int, inconsistent: bool) -> str:
     """Item 603's cases, as the Rust tests write them: a classification that the
@@ -511,7 +553,7 @@ def partial_answers(inconsistent: bool) -> list[str]:
 
 def test_classify_answers_in_part_under_a_deadline(ds: sparkles.Dataset) -> None:
     assert partial_answers(False), "no deadline gave a partial answer"
-    r = ds.ontology.classify(partial=True, expansion="eager")
+    r = ds.ontology.classify(partial=True, expansion="eager", assertions=True)
     assert r["complete"] and not r["partial"] and r["consistency"] == "consistent"
     assert r["tier"] == "el" and r["incomplete"] == []
     with pytest.raises(ValueError):

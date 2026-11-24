@@ -341,7 +341,7 @@ fn check_partial(part: &Classification, full: &Classification, cs: &[Class]) {
         .filter(|(x, _)| !want.contains(&(x.clone(), "⊥".to_string())))
         .collect();
     assert!(extra.is_empty(), "a partial answer has {extra:?}");
-    if part.complete {
+    if part.complete_for_taken {
         assert_eq!(got, want);
         return;
     }
@@ -444,7 +444,7 @@ fn partial_answers(inconsistent: bool) {
                 .classify(&cancelled_at(k, threads, expansion))
                 .unwrap();
             check_partial(&out, &full, &cs);
-            if !out.complete {
+            if !out.complete_for_taken {
                 partial += 1;
                 early_unknown += (out.consistency == Consistency::Unknown) as usize;
             }
@@ -470,7 +470,7 @@ fn partial_answers(inconsistent: bool) {
                 continue;
             };
             check_partial(&out, &full, &cs);
-            if !out.complete {
+            if !out.complete_for_taken {
                 partial += 1;
                 in_tests += (out.stats.dl_tests > 0) as usize;
                 if out.incomplete.len() + 2 < cs.len() {
@@ -572,7 +572,7 @@ fn a_deadline_before_a_class_has_a_context_leaves_it_open() {
         };
         if let Ok(out) = Classifier::of(&ax).classify(&limits) {
             check_partial(&out, &full, &cs);
-            partial += (!out.complete) as usize;
+            partial += (!out.complete_for_taken) as usize;
         }
         d = d.mul_f64(1.1);
     }
@@ -804,7 +804,7 @@ fn partial_answers_of_random_ontologies_are_sound_and_complete_where_they_say() 
                     r.is_ok(),
                     "seed {seed}, stop {stop}, {threads} threads\n{body}"
                 );
-                partial += !out.complete as usize;
+                partial += !out.complete_for_taken as usize;
             }
         }
     }
@@ -835,7 +835,7 @@ fn a_memory_stop_answers_in_part() {
                 );
                 assert_eq!(out.stats.tier, Tier::Disjunctive);
                 check_partial(&out, &full, &cs);
-                if !out.complete {
+                if !out.complete_for_taken {
                     answered += 1;
                     assert!(
                         out.stats.conclusions > 0,
@@ -918,7 +918,7 @@ fn partial_memory_completion_preserves_tier_and_reuse() {
                     assert_eq!(out.stats.tier, Tier::Disjunctive);
                     assert!(k.excluded().is_empty());
                     check_partial(&out, &full, &cs);
-                    if !out.complete {
+                    if !out.complete_for_taken {
                         partials += 1;
                         assert!(out.stats.conclusions > 0);
                         assert!(out.stats.peak_memory > cap);
@@ -987,6 +987,12 @@ fn partial_memory_pool_and_taxonomy_refusals_preserve_tier_and_reuse() {
                 assert_eq!(out.stats.tier, Tier::Disjunctive);
                 assert!(!out.stats.dl_over_budget);
                 assert!(k.excluded().is_empty());
+                let covered = accepted.load(Ordering::SeqCst);
+                assert!(
+                    out.stats.memory <= covered,
+                    "threads {threads}: {} output bytes against {covered} paid",
+                    out.stats.memory,
+                );
                 check_partial(&out, &full, &cs);
             }
         }
@@ -1423,7 +1429,7 @@ fn a_wide_maximum_passes_the_bound_instead_of_enumerating_its_subsets() {
     let out = k.classify(&counting()).unwrap();
     // the answer is sound: A is satisfiable
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
-    assert!(out.stats.dl_over_budget || out.complete);
+    assert!(out.stats.dl_over_budget || out.complete_for_taken);
 }
 
 #[test]
@@ -1438,7 +1444,7 @@ fn a_maximum_of_many_passes_the_bound_instead_of_making_its_equalities() {
     let mut k = Classifier::of(&ax);
     let out = k.classify(&counting()).unwrap();
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
-    assert!(out.stats.dl_over_budget || out.complete);
+    assert!(out.stats.dl_over_budget || out.complete_for_taken);
 }
 
 #[test]
@@ -1453,7 +1459,7 @@ fn a_maximum_of_a_hundred_passes_the_bound_instead_of_factoring_its_equalities()
     let mut k = Classifier::of(&ax);
     let out = k.classify(&counting()).unwrap();
     assert!(!out.taxonomy.is_subclass(&c("A"), &Class::nothing()));
-    assert!(out.stats.dl_over_budget || out.complete);
+    assert!(out.stats.dl_over_budget || out.complete_for_taken);
 }
 
 /// A counting ontology: A has at least three B-successors by r and at most two r-successors,
@@ -1701,7 +1707,7 @@ fn a_wide_redundant_product_is_charged_to_the_memory_budget() {
     match out {
         Err(e) => eprintln!("stopped: {e}"),
         Ok(out) => assert!(
-            !out.complete || out.stats.peak_memory >= 1_000_000,
+            !out.complete_for_taken || out.stats.peak_memory >= 1_000_000,
             "the run finished under the budget with a peak of {} bytes",
             out.stats.peak_memory
         ),
@@ -1743,7 +1749,7 @@ fn a_short_product_with_wide_conclusions_is_charged_before_its_record_is_dropped
     match out {
         Err(e) => eprintln!("stopped: {e}"),
         Ok(out) => assert!(
-            !out.complete || out.stats.peak_memory >= 1_000_000,
+            !out.complete_for_taken || out.stats.peak_memory >= 1_000_000,
             "the run finished under the budget with a peak of {} bytes",
             out.stats.peak_memory
         ),

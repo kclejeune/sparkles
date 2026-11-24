@@ -138,6 +138,82 @@ async fn the_summary_counts_the_terminology() {
     assert_eq!(r.status, StatusCode::NOT_FOUND);
 }
 
+/// Roadmap item 735: `view=head` answers the summary's header, entity counts, graphs
+/// and imports without the axiom counts, under its own tag, which an edit can name.
+#[tokio::test]
+async fn the_summary_head_answers_the_header_and_counts() {
+    let s = server();
+    let full = get(&s.app, "/$/ontology/t").await.json();
+    let r = get(&s.app, "/$/ontology/t?view=head").await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["view"], "head");
+    for k in [
+        "dataset", "commit", "mode", "graphs", "imports", "warnings", "header", "entities",
+        "closure",
+    ] {
+        assert_eq!(j[k], full[k], "{k}");
+    }
+    for k in [
+        "axioms",
+        "axiomCount",
+        "triples",
+        "unmapped",
+        "diagnostics",
+        "cached",
+    ] {
+        assert!(j.get(k).is_none(), "{k}");
+    }
+    let tag = r.headers[header::ETAG].to_str().unwrap().to_string();
+    assert!(tag.ends_with(":owl-head\""), "{tag}");
+    assert_eq!(
+        r.headers["sparkles-commit"],
+        full["commit"].to_string().as_str()
+    );
+    let r = send(
+        &s.app,
+        "GET",
+        "/$/ontology/t?view=head",
+        &[("if-none-match", &tag)],
+        "",
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::NOT_MODIFIED);
+    let r = get(&s.app, "/$/ontology/t?view=full").await;
+    assert_eq!(r.json()["axioms"], full["axioms"]);
+    for bad in [
+        "/$/ontology/t?view=light",
+        "/$/ontology/t?view=head&metrics=true",
+    ] {
+        assert_eq!(
+            get(&s.app, bad).await.status,
+            StatusCode::BAD_REQUEST,
+            "{bad}"
+        );
+    }
+    // an edit's If-Match can name the head's tag
+    let body = json!({"add": [sub("http://ex.org/A", json!("http://ex.org/B"))]}).to_string();
+    let ct = (header::CONTENT_TYPE.as_str(), "application/json");
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let r = send(
+        &s.app,
+        "POST",
+        "/$/ontology/t/axioms",
+        &[ct, ("if-match", &tag)],
+        &body,
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::PRECONDITION_FAILED, "{}", r.text());
+}
+
 #[tokio::test]
 async fn axioms_page_and_filter() {
     let s = server();
@@ -628,10 +704,33 @@ async fn classify_answers_the_taxonomy_and_writes_it() {
     assert_eq!(r.status, StatusCode::OK, "{}", r.text());
     assert!(r.headers.contains_key("sparkles-commit"), "{:?}", r.headers);
     let j = r.json();
+    // the terminology alone leaves out the assertions about :ada, which a run with the
+    // assertions reads
     assert_eq!(
-        (j["consistent"].as_bool(), j["complete"].as_bool()),
-        (Some(true), Some(true)),
+        (
+            j["consistent"].as_bool(),
+            j["complete"].as_bool(),
+            j["completeForTaken"].as_bool(),
+            j["consistency"].as_str(),
+        ),
+        (Some(true), Some(false), Some(true), Some("unknown")),
         "{j}"
+    );
+    assert_eq!(j["excluded"][0]["rule"], "assertion-not-read", "{j}");
+    let with_assertions = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true}),
+    )
+    .await
+    .json();
+    assert_eq!(
+        (
+            with_assertions["complete"].as_bool(),
+            with_assertions["consistency"].as_str(),
+        ),
+        (Some(true), Some("consistent")),
+        "{with_assertions}"
     );
     assert_eq!(j["nodes"].as_array().unwrap().len(), 2, "{j}");
     assert_eq!(j["next"], 2, "{j}");
@@ -738,7 +837,10 @@ async fn kept_classification_get_is_fresh_read_only_and_pins_pages() {
     assert_eq!(read.headers[header::CACHE_CONTROL], "no-store");
     let j = read.json();
     assert_eq!(j["status"], "available");
-    assert_eq!(j["outcome"]["consistency"], "consistent");
+    // the fixture holds assertions that a terminology-only run does not read
+    assert_eq!(j["outcome"]["consistency"], "unknown");
+    assert_eq!(j["outcome"]["complete"], false);
+    assert_eq!(j["outcome"]["excludedCount"], 1);
     let pin = format!(
         "at=commit:{}&resultId={}",
         j["commit"],
@@ -1236,7 +1338,7 @@ async fn classify_answers_in_part_under_a_deadline() {
         let j = post(
             &s.app,
             "/$/ontology/t/classify",
-            json!({"partial": true, "expansion": e}),
+            json!({"partial": true, "expansion": e, "assertions": true}),
         )
         .await
         .json();
@@ -2805,4 +2907,75 @@ async fn the_outbound_policy_refuses_a_fetch_and_nothing_changes() {
         json!([])
     );
     assert_eq!(get(&s.app, "/$/ontology/t").await.json()["commit"], commit);
+}
+
+/// A classification that leaves an axiom out is not complete, names the classes it may
+/// miss, and is refused when strict (roadmap item 1271).
+#[tokio::test]
+async fn classify_reports_what_a_left_out_axiom_reaches_and_strict_refuses_it() {
+    let s = server_of(
+        r#"@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :X a owl:Class . :Y a owl:Class .
+:A rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :B :C ) ] .
+:X rdfs:subClassOf :Y .
+:k a owl:NamedIndividual , :A .
+"#,
+    );
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["complete"], false, "{j}");
+    assert_eq!(j["completeForTaken"], true, "{j}");
+    assert_eq!(j["partial"], false, "{j}");
+    assert_eq!(j["incomplete"], json!(["http://ex.org/A"]), "{j}");
+    assert_eq!(j["consistency"], "consistent", "{j}");
+    let r = post(
+        &s.app,
+        "/$/ontology/t/classify",
+        json!({"assertions": true, "strict": true}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    assert!(
+        j["error"].as_str().unwrap().contains("ObjectUnionOf"),
+        "{j}"
+    );
+    // strict as a query parameter refuses a terminology-only run that leaves assertions unread
+    let r = post(&s.app, "/$/ontology/t/classify?strict=true", json!({})).await;
+    assert_eq!(r.status, StatusCode::UNPROCESSABLE_ENTITY, "{}", r.text());
+    let j = r.json();
+    assert_eq!(j["code"], "classification-incomplete", "{j}");
+    assert!(
+        j["error"].as_str().unwrap().contains("assertion-not-read"),
+        "{j}"
+    );
+    // strict as a query parameter, on an answer that is complete
+    let complete = server_of(
+        r#"@prefix : <http://ex.org/> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:o a owl:Ontology .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :X a owl:Class . :Y a owl:Class .
+:A rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :B :C ) ] .
+:X rdfs:subClassOf :Y .
+"#,
+    );
+    let r = post(
+        &complete.app,
+        "/$/ontology/t/classify?strict=true",
+        json!({}),
+    )
+    .await;
+    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
+    assert_eq!(r.json()["complete"], true);
 }

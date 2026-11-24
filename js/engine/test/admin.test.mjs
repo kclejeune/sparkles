@@ -1158,19 +1158,38 @@ async function wholeRun(t, inconsistent) {
   assert.equal(full.consistency, want);
   assert.equal(full.tier, 'disjunctive');
   assert.deepEqual(full.incomplete, []);
-  return { body, full, took, want };
+  const classIris = [...new Set(body.match(/:[BCEFGKN]\d+\b/g))]
+    .map((name) => `http://ex.org/${name.slice(1)}`)
+    .sort();
+  assert.equal(classIris.length, full.classes);
+  return { body, full, took, want, classIris };
 }
 
 /** Check an answer to a stopped classification against the full one, and return its consistency when it is partial. */
-function checkAnswer(r, { full, want }) {
+function checkAnswer(r, { full, want, classIris }) {
   assert.equal(r.classes, full.classes);
+  assert.equal(r.tier, 'disjunctive');
+  assert.equal(typeof r.partial, 'boolean');
+  assert.equal(r.completeForTaken, !r.partial);
+  assert.equal(r.excludedCount, 0);
+  assert.deepEqual(r.excluded, []);
+  assert.equal(r.stats.unmapped, 0);
+  assert.equal(typeof r.stats.coverageStopped, 'boolean');
+  assert.equal(r.incompleteCount, r.incomplete.length);
+  // The deadline can stop the check for unread assertions whether saturation finished or not.
+  if (r.stats.coverageStopped) {
+    assert.equal(r.complete, false);
+    assert.equal(r.consistency, 'unknown');
+    assert.deepEqual(r.incomplete, classIris);
+    return r.partial ? r.consistency : undefined;
+  }
   if (!r.partial) {
     assert.equal(r.complete, true);
     assert.equal(r.consistency, want);
+    assert.deepEqual(r.incomplete, []);
     return undefined;
   }
   assert.equal(r.complete, false, 'a partial answer is presented as complete');
-  assert.equal(r.incompleteCount, r.incomplete.length);
   assert.ok([want, 'unknown'].includes(r.consistency), r.consistency);
   if (r.consistency === 'unknown') assert.ok(r.incomplete.length + 2 >= r.classes);
   return r.consistency;
@@ -1313,15 +1332,14 @@ test('a classification answers in part when its signal aborts it', async (t) => 
     await ds.update(whole.body);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), ms);
+    let r;
     try {
-      const r = await ds.ontology.classify({
+      r = await ds.ontology.classify({
         partial: true,
         threads: 1,
         limit: 10000,
         signal: controller.signal,
       });
-      if (checkAnswer(r, whole)) partial++;
-      return true;
     } catch (e) {
       if (!controller.signal.aborted) throw e;
       return false;
@@ -1329,6 +1347,8 @@ test('a classification answers in part when its signal aborts it', async (t) => 
       clearTimeout(timer);
       await ds.close();
     }
+    if (checkAnswer(r, whole)) partial++;
+    return true;
   });
   assert.ok(partial > 0, 'no abort gave a partial answer');
 });

@@ -132,6 +132,11 @@ pub enum OntologyCmd {
         /// with status 2. Not with --target, --format ofn or a chain
         #[arg(long)]
         partial: bool,
+        /// Refuse with an error, as HermiT does, when the classifier would leave an
+        /// axiom out or use one only in part, so that the answer is complete for the
+        /// whole ontology or there is none. The error names the axioms and the rules
+        #[arg(long)]
+        strict: bool,
         /// The expansion strategy of the disjunctive rules: cautious or eager
         #[arg(long, default_value = "cautious")]
         expansion: String,
@@ -433,6 +438,7 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
             allow_unsatisfiable,
             timeout,
             partial,
+            strict,
             expansion,
             format,
             rest,
@@ -485,6 +491,8 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                 about: about.clone(),
                 el_only: false,
                 partial,
+                strict,
+                skip_coverage: false,
                 expansion,
             };
             let q = ClassifyQuery {
@@ -552,6 +560,9 @@ pub fn run(cmd: OntologyCmd, opts: StoreOptions) -> Result<()> {
                     body["limit"] = json!(MAX_LIMIT);
                     if partial {
                         body["partial"] = json!(true);
+                    }
+                    if strict {
+                        body["strict"] = json!(true);
                     }
                     if c.expansion == sparkles::owl::classify::Expansion::Eager {
                         body["expansion"] = json!("eager");
@@ -764,6 +775,20 @@ pub(crate) fn finish_classify(
     if j["partial"].as_bool() == Some(true) {
         eprintln!(
             "partial answer: the run stopped before it finished, {} classes may miss superclasses, consistency {}",
+            j["incompleteCount"].as_u64().unwrap_or(0),
+            j["consistency"].as_str().unwrap_or("unknown"),
+        );
+    } else if j["stats"]["coverageStopped"].as_bool() == Some(true) {
+        eprintln!(
+            "incomplete answer: a deadline or cancellation stopped the check of which classes keep their answer, so all {} classes may miss entailments, consistency unknown",
+            j["incompleteCount"].as_u64().unwrap_or(0),
+        );
+    } else if j["complete"].as_bool() == Some(false) {
+        // as ELK warns of the axioms outside its fragment
+        eprintln!(
+            "incomplete answer: {} axioms left out or used in part, {} triples that map to no axiom, {} classes may miss entailments, consistency {}; --strict refuses instead",
+            j["excludedCount"].as_u64().unwrap_or(0),
+            j["stats"]["unmapped"].as_u64().unwrap_or(0),
             j["incompleteCount"].as_u64().unwrap_or(0),
             j["consistency"].as_str().unwrap_or("unknown"),
         );
@@ -1062,6 +1087,39 @@ fn print_classify(j: &J) {
                     )
                 });
             println!("  {why}\n    {}", e["ofn"].as_str().unwrap_or(""));
+        }
+    }
+    let unmapped = j["stats"]["unmapped"].as_u64().unwrap_or(0);
+    if j["complete"].as_bool() != Some(true) && unmapped > 0 {
+        println!("incomplete: {unmapped} triples of the input map to no axiom");
+        let listed = j["unmappedTriples"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        for t in listed.iter().take(10) {
+            let term = |k: &str| t[k].as_str().unwrap_or("").to_string();
+            println!(
+                "  {} {} {} .",
+                term("subject"),
+                term("predicate"),
+                term("object")
+            );
+        }
+        if unmapped as usize > listed.len().min(10) {
+            println!("  and {} more", unmapped as usize - listed.len().min(10));
+        }
+    }
+    if j["complete"].as_bool() != Some(true)
+        && j["partial"].as_bool() != Some(true)
+        && (n("excludedCount") > 0 || n("incompleteCount") > 0)
+    {
+        println!(
+            "  {} classes may miss entailments, consistency {}",
+            n("incompleteCount"),
+            j["consistency"].as_str().unwrap_or("unknown")
+        );
+        for c in j["incomplete"].as_array().into_iter().flatten() {
+            println!("  incomplete {}", c.as_str().unwrap_or(""));
         }
     }
     let s = &j["stats"];

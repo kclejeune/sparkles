@@ -54,7 +54,7 @@ pub mod reasoning;
 mod registeredagg;
 pub mod results;
 mod sample;
-mod sortkey;
+pub(crate) mod sortkey;
 pub mod stats;
 pub mod svccache;
 pub mod table;

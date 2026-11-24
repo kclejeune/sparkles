@@ -754,15 +754,21 @@ impl WorldSink<'_> {
 
 impl Sink for WorldSink<'_> {
     fn reserve_data(&mut self, bytes: usize) -> bool {
-        if bytes > isize::MAX as usize {
-            self.halted.set(true);
-            self.overflow.set(true);
+        let Ok(add) = isize::try_from(bytes) else {
+            self.data_overflow();
             return false;
+        };
+        let Some(next) = self.data_growth.get().checked_add(add) else {
+            self.data_overflow();
+            return false;
+        };
+        self.data_growth.set(next);
+        let ok = (self.bound)(add);
+        if !ok {
+            self.data_growth.set(next - add);
+            (self.bound)(-add);
+            self.halted.set(true);
         }
-        self.data_growth
-            .set(self.data_growth.get() + bytes as isize);
-        let ok = (self.bound)(bytes as isize);
-        self.halted.set(self.halted.get() || !ok);
         ok
     }
     fn data_overflow(&mut self) {
@@ -1287,6 +1293,75 @@ mod numeric_resource_tests {
         }
         text.push(')');
         crate::ofn_read::parse(&text).unwrap().axioms
+    }
+
+    #[test]
+    fn a_world_sink_rolls_back_a_refused_reservation_and_releases_its_own_data() {
+        use crate::classify::{Error, WorldBudget, saturate::Totals};
+
+        let ax = owner_axioms("SubClassOf(:A :B)");
+        let kinds: Vec<_> = ax.iter().map(|a| &a.kind).collect();
+        let mut sat = Saturation::new();
+        sat.saturate(&kinds, None, &Limits::default()).unwrap();
+        let limits = Limits {
+            charge: Some(std::sync::Arc::new(|_| false)),
+            ..Limits::default()
+        };
+        let charge = limits
+            .charge
+            .as_deref()
+            .map(|f| f as &(dyn Fn(usize) -> bool + Sync));
+        let mut totals = Totals {
+            peak: 4160,
+            paid: 4160,
+            ..Totals::default()
+        };
+        let budget = WorldBudget::start(&limits, charge, 4096, &mut totals).unwrap();
+        let bound = |delta| budget.tell(delta);
+        let mut world = World::new(
+            sat.index.as_ref().unwrap(),
+            &sat.ctx,
+            None,
+            &[],
+            &[],
+            &bound,
+        );
+        let growth = Cell::new(0);
+        let halted = Cell::new(false);
+        let mut sink = WorldSink {
+            me: 0,
+            local: &mut Vec::new(),
+            out: &mut Vec::new(),
+            bound: &bound,
+            data_growth: &growth,
+            halted: &halted,
+            overflow: &Cell::new(false),
+            ctx_len: sat.ctx.len(),
+            dynamic: None,
+            table: world.local.clone(),
+            grown: &Cell::new(0),
+            charged: &Cell::new(0),
+        };
+        assert!(sink.reserve_data(64));
+        assert!(!sink.reserve_data(128));
+        assert!(halted.get());
+        assert_eq!(growth.get(), 64);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 64);
+        sink.release_data(16);
+        assert_eq!(growth.get(), 48);
+        // The activation transfers only its remaining local debit to the world.
+        world.reported += growth.get() as usize;
+        drop(world);
+        assert_eq!(budget.held.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            budget.stopped(),
+            Err(Error::Memory {
+                limit: usize::MAX,
+                used: 4288,
+            })
+        );
+        budget.finish(&mut totals);
+        assert_eq!((totals.peak, totals.paid), (4288, 4160));
     }
 
     #[test]

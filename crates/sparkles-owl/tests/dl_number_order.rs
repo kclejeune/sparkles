@@ -597,7 +597,7 @@ fn a_stopped_run_leaves_the_class_of_a_waiting_minimum_open() {
         else {
             continue;
         };
-        if out.complete {
+        if out.complete_for_taken {
             continue;
         }
         stopped += 1;
@@ -736,7 +736,7 @@ fn the_fixtures_with_minimums_keep_their_answers_with_the_order() {
                     }
                 }
             }
-            let fell = out.stats.dl_over_budget || !out.complete;
+            let fell = out.stats.dl_over_budget || !out.complete_for_taken;
             (got, k.excluded().is_empty(), fell)
         };
         let (_, _, fell_off) = answer(false, 1, Expansion::Cautious);

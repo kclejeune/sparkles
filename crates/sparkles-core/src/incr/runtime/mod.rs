@@ -47,6 +47,8 @@ mod key;
 mod read;
 mod registry;
 mod round;
+#[cfg(test)]
+pub(crate) use round::PASS_CANCEL;
 mod stats;
 mod subscribe;
 mod worker;

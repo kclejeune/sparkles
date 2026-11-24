@@ -2662,10 +2662,11 @@ fn a_range_on_links_that_are_not_loops() {
                 };
                 let o = Classifier::of(&ofn(body)).classify(&limits).unwrap();
                 // a datatype restriction with a facet is outside OWL 2 EL, and no tier
-                // takes it: the run leaves it out and reports it
+                // takes it: the run leaves it out and reports it, complete for what it
+                // took and not for the whole ontology
                 if name == "data told" || name == "data range exist" {
                     let out = &o.stats.outside_el;
-                    if !(o.complete && out.horn == 1 && out.taken == 0) {
+                    if !(o.complete_for_taken && !o.complete && out.horn == 1 && out.taken == 0) {
                         bad.push(format!("{name} el_only={el_only}: not left out"));
                     }
                 }

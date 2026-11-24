@@ -9,6 +9,7 @@
 use sparkles_owl::classify::{Classification, Classifier, Consistency, Expansion, Limits, Tier};
 use sparkles_owl::model::*;
 use sparkles_owl::ofn_read;
+use sparkles_owl::vocab;
 
 const EX: &str = "http://ex.org/";
 
@@ -424,7 +425,7 @@ fn a_rooted_run_past_its_bound_answers_without_the_rooted_rules() {
         );
         assert!(out.stats.dl_over_budget);
         assert!(!out.stats.dl_counting_over);
-        assert!(out.complete);
+        assert!(out.complete_for_taken);
         assert_eq!(out.consistency, Consistency::Consistent);
         assert_eq!(k.excluded().len(), left, "{:#?}", k.excluded());
         assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
@@ -460,10 +461,20 @@ fn a_rooted_run_past_its_bound_falls_back_though_it_may_answer_in_part() {
         assert!(out.stats.dl_rooted_over, "{threads} threads");
         assert!(out.stats.dl_over_budget);
         assert!(
-            out.complete,
+            out.complete_for_taken,
             "{threads} threads: a partial answer instead of the fallback"
         );
-        assert!(out.incomplete.is_empty());
+        // the answer is not complete for the whole ontology: the left-out assertion is
+        // in the module of the empty signature, and the nominal keeps the terminology's
+        // modules from deciding, so every class is incomplete, but the consistency holds
+        assert!(!out.complete);
+        let named = out
+            .taxonomy
+            .classes()
+            .filter(|k| !matches!(k.as_str(), vocab::OWL_THING | vocab::OWL_NOTHING))
+            .count();
+        assert_eq!(out.incomplete.len(), named);
+        assert!(out.incomplete.contains(&c("A")));
         assert_eq!(out.consistency, Consistency::Consistent);
         assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
         assert!(!k.excluded().is_empty());
@@ -499,7 +510,7 @@ fn a_rooted_run_that_counts_falls_back_twice_past_a_tiny_bound() {
             assert!(out.stats.dl_counting_over, "{run}");
             assert!(out.stats.dl_rooted_over, "{run}");
             assert!(out.stats.dl_over_budget, "{run}");
-            assert!(out.complete, "{run}");
+            assert!(out.complete_for_taken, "{run}");
             assert_eq!(out.consistency, Consistency::Consistent);
             assert!(!out.taxonomy.is_subclass(&c("A"), &c("D")));
             assert!(!k.excluded().is_empty());
@@ -631,6 +642,205 @@ fn an_existential_over_the_universal_property_reaches_a_nominal() {
         &[("A", "C")],
         &[("C", "A")],
     );
+}
+
+/// `∃top.A` and `≥1 top.A` are the same class, and the rewriting gives both `∃U.A`. Their
+/// disjointness makes that class empty, and with an element in the domain A is empty,
+/// as HermiT answers for this ontology (row 1304). The set of images alone held one
+/// member, which the normaliser drops, and the run answered A satisfiable.
+#[test]
+fn a_disjointness_of_two_members_with_one_image_makes_the_image_empty() {
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A))
+         SubClassOf(:K :A)
+         ClassAssertion(:B :b)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")), "A is empty");
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")), "K is empty");
+    assert!(!out.taxonomy.is_unsatisfiable(&c("B")));
+}
+
+/// The control of the case above, with members whose images differ (row 1304). HermiT
+/// answers A and K empty.
+#[test]
+fn a_disjointness_of_two_members_with_distinct_images_keeps_both() {
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :B))
+         EquivalentClasses(:A :B)
+         SubClassOf(:K :A)
+         ClassAssertion(:C :b)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+}
+
+/// `≥0 top.X` holds of every element, so it is `owl:Thing`, and the disjointness says the
+/// domain is empty, which no interpretation allows. The ontology is inconsistent by this
+/// derivation, since HermiT fails on it and Konclude is not at hand (row 1304). HermiT
+/// does answer the variants below with a third member or two such members inconsistent.
+#[test]
+fn a_disjointness_of_owl_thing_and_at_least_none_is_inconsistent() {
+    inconsistent(
+        "DisjointClasses(owl:Thing ObjectMinCardinality(0 owl:topObjectProperty :X))
+         SubClassOf(:A :X)",
+    );
+}
+
+/// The control of the case above without a merge: `⊤ ⊑ ¬(≥0 top.X)` is `⊤ ⊑ ⊥`.
+#[test]
+fn owl_thing_below_the_complement_of_at_least_none_is_inconsistent() {
+    inconsistent(
+        "SubClassOf(owl:Thing ObjectComplementOf(ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         SubClassOf(:A :X)",
+    );
+}
+
+/// Three members with one image and a fourth with another: the shared image is empty and
+/// the other stays satisfiable. `≥0 top.X` and `≥0 top.Y` are both `owl:Thing`, so the
+/// third case is inconsistent too. HermiT gives the same answers.
+#[test]
+fn a_disjointness_of_three_members_with_one_image_makes_it_empty() {
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty owl:Thing)
+             ObjectMinCardinality(1 owl:topObjectProperty)
+             ObjectMinCardinality(1 owl:topObjectProperty owl:Thing)
+             :D)
+         SubClassOf(:A :D)",
+        false,
+        &[],
+    );
+    // ∃top.⊤ holds of every element, so the domain is empty
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+    let out = rooted(
+        "DisjointClasses(ObjectSomeValuesFrom(owl:topObjectProperty :E)
+             ObjectMinCardinality(1 owl:topObjectProperty :E)
+             ObjectSomeValuesFrom(:r ObjectMinCardinality(1 owl:topObjectProperty :E))
+             :D)
+         SubClassOf(:A :D)
+         SubClassOf(:K :E)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+    inconsistent(
+        "DisjointClasses(ObjectMinCardinality(0 owl:topObjectProperty :X)
+             ObjectMinCardinality(0 owl:topObjectProperty :Y))
+         SubClassOf(:A :X)",
+    );
+}
+
+/// The disjointness part of a disjoint union follows the rule of `DisjointClasses`, and
+/// the union part keeps the set of images: C is the union of two equal classes that are
+/// disjoint, so C and its members are empty. HermiT gives the same answers.
+#[test]
+fn a_disjoint_union_of_two_members_with_one_image_is_empty() {
+    let out = rooted(
+        "DisjointUnion(:C ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A))
+         SubClassOf(:K :A)
+         SubClassOf(:L :C)
+         ClassAssertion(:B :b)",
+        false,
+        &[],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    for name in ["A", "K", "C", "L"] {
+        assert!(out.taxonomy.is_unsatisfiable(&c(name)), "{name} is empty");
+    }
+    assert!(!out.taxonomy.is_unsatisfiable(&c("B")));
+    // with a third member of another image, C is that member and stays satisfiable
+    let out = rooted(
+        "DisjointUnion(:C ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A) :D)
+         SubClassOf(:K :A)",
+        false,
+        &[("C", "D"), ("D", "C")],
+    );
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_unsatisfiable(&c("K")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("C")));
+    assert!(out.taxonomy.is_subclass(&c("C"), &c("D")));
+    assert!(out.taxonomy.is_subclass(&c("D"), &c("C")));
+}
+
+/// A rewritten axiom can equal an axiom the ontology states as it is. Here both members of
+/// the disjointness rewrite to `≥2 r.⊤`, so the rewriting adds `≥2 r.⊤ ⊑ ⊥`, which the
+/// first axiom states too. Without counting the run leaves that axiom out, and the report
+/// names both original axioms (row 1304).
+#[test]
+fn the_report_names_every_original_axiom_of_a_rewritten_one_left_out() {
+    let ax = axioms(
+        "SubClassOf(ObjectMinCardinality(2 :r owl:Thing) owl:Nothing)
+         DisjointClasses(ObjectMinCardinality(2 :r owl:Thing)
+             ObjectMinCardinality(2 :r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         ClassAssertion(:B :b)",
+    );
+    let find = |f: fn(&AxiomKind) -> bool| ax.iter().map(|a| a.kind.clone()).find(f).unwrap();
+    let stated = find(|k| matches!(k, AxiomKind::SubClassOf(_, ClassExpression::Class(_))));
+    let disjoint = find(|k| matches!(k, AxiomKind::DisjointClasses(_)));
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
+    assert!(left.contains(&stated), "{left:#?}");
+    assert!(left.contains(&disjoint), "{left:#?}");
+    assert_eq!(left.len(), 2, "{left:#?}");
+    // the disjunction is the only axiom outside OWL 2 EL that the run takes
+    assert_eq!(out.stats.outside_el.taken, 1);
+}
+
+/// Two replaced axioms can rewrite to one axiom, here `≥2 r.∃U.A ⊑ ⊥`, and the report
+/// names both when the run leaves it out (row 1304).
+#[test]
+fn the_report_names_both_replaced_axioms_of_one_rewritten_axiom() {
+    let ax = axioms(
+        "DisjointClasses(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A)))
+         SubClassOf(
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             owl:Nothing)
+         ClassAssertion(:B :b)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    let left: Vec<_> = k.excluded().into_iter().map(|e| e.axiom).collect();
+    assert_eq!(left.len(), 2, "{left:#?}");
+    assert!(
+        left.iter()
+            .any(|k| matches!(k, AxiomKind::DisjointClasses(_)))
+    );
+    assert!(left.iter().any(|k| matches!(k, AxiomKind::SubClassOf(..))));
+    assert_eq!(out.stats.outside_el.taken, 1);
+}
+
+/// A disjoint union whose rewritten axioms are left out for two rules is reported once.
+#[test]
+fn a_disjoint_union_left_out_for_two_rules_is_reported_once() {
+    let ax = axioms(
+        "DisjointUnion(:C
+             ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A))
+             :D)
+         ClassAssertion(:B :b)",
+    );
+    let mut k = Classifier::of(&ax);
+    k.classify(&rooted_limits()).unwrap();
+    let left = k.excluded();
+    assert_eq!(left.len(), 1, "{left:#?}");
+    assert!(matches!(left[0].axiom, AxiomKind::DisjointUnion(..)));
 }
 
 const INTERNAL: &str = "urn:sparkles:internal:";
@@ -1728,6 +1938,235 @@ fn without_the_decline_a_rooted_run_claims_an_answer_that_misses_an_entailment()
     }
 }
 
+/// Row 1231's marker repair fixtures (PLAN v3.1's rule M): each holds a ground fact about
+/// a constant that holds only under the query class K, whose consequence passes through an
+/// element outside K's successors, so that a rooted run without the repair misses it.
+const REPAIRS: [(&str, &str); 13] = [
+    // the regression itself
+    ("av2", AV2),
+    // a return whose body has two ground atoms, both held by the query context
+    ("multi", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectSomeValuesFrom(:t3 ObjectIntersectionOf(ObjectOneOf(:w2) :H)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(:E ObjectHasValue(:r3 :w2))
+     SubClassOf(ObjectIntersectionOf(ObjectSomeValuesFrom(:r2 :G) ObjectSomeValuesFrom(:r3 :H)) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // a holder clause whose residual head is an atom over x, a disjunction
+    ("resid", "SubClassOf(:K ObjectUnionOf(:B ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G))))
+     SubClassOf(:B :Ans)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // a holder clause whose residual head is a ground role atom, a disjunction
+    ("resid2", "SubClassOf(:K ObjectUnionOf(ObjectHasValue(:t4 :v2) ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G))))
+     SubClassOf(ObjectHasValue(:t4 :v2) :Ans)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the linked element links to a constant equal to the one the condition is about
+    ("cong", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SameIndividual(:w :w2)
+     SubClassOf(:E ObjectHasValue(:r2 :w2))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the link to the constant comes from a deeper derivation of the linked context
+    ("late", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E :E1)
+     SubClassOf(:E1 ObjectSomeValuesFrom(:r5 :E2))
+     SubClassOf(:E2 ObjectHasValue(:r6 :u))
+     SubClassOf(ObjectSomeValuesFrom(:r6 ObjectOneOf(:u)) :E3)
+     SubClassOf(ObjectSomeValuesFrom(:r5 :E3) :E4)
+     SubClassOf(:E4 ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // a returned consequence is itself a condition that a second linked element needs
+    ("chain", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C3)
+     SubClassOf(:C3 ObjectHasValue(:s3 :w3))
+     SubClassOf(:C3 ObjectAllValuesFrom(:s3 :G3))
+     ClassAssertion(ObjectSomeValuesFrom(:p2 :D2) :u2)
+     SubClassOf(:D2 ObjectSomeValuesFrom(:r :E5))
+     SubClassOf(:E5 ObjectHasValue(:r7 :w3))
+     SubClassOf(ObjectSomeValuesFrom(:r7 :G3) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is a ground role atom rather than a class atom
+    ("role", "SubClassOf(:K ObjectHasValue(:t :w))
+     SubClassOf(:K ObjectSomeValuesFrom(:t9 ObjectIntersectionOf(ObjectOneOf(:w) ObjectHasValue(:m :w5))))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 ObjectHasValue(:m :w5)) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is also a fact of the root, which the registered contexts take as one
+    ("pos", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))
+     ClassAssertion(:G :w)"),
+    // the linked element denies the condition, and the denial returns as a contradiction
+    ("denial2", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) owl:Nothing)"),
+    // the linked element needs a consequence at the constant that the holder derives and sends in turn
+    ("sel", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) :G)))
+     SubClassOf(:G :C5)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :C5) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is an equality of two constants, and the root fact about one reaches the other
+    ("eq", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) ObjectOneOf(:w2))))
+     ClassAssertion(:G :w)
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w2))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+    // the condition is an equality and a fact under it, about two names of one constant
+    ("eq2", "SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w) ObjectOneOf(:w2))))
+     SubClassOf(:K ObjectSomeValuesFrom(:t ObjectIntersectionOf(ObjectOneOf(:w2) :G)))
+     SubClassOf(:K ObjectHasValue(:q :v))
+     SubClassOf(ObjectSomeValuesFrom(:q :Y) :Ans)
+     ClassAssertion(ObjectSomeValuesFrom(:p :D) :u)
+     SubClassOf(:D ObjectSomeValuesFrom(:r :E))
+     SubClassOf(:E ObjectHasValue(:r2 :w))
+     SubClassOf(ObjectSomeValuesFrom(:r2 :G) :C2)
+     SubClassOf(:C2 ObjectHasValue(:s :v))
+     SubClassOf(:C2 ObjectAllValuesFrom(:s :Y))"),
+];
+
+/// What a rooted run of a repair fixture must find: `K ⊑ Ans`, or for a denial `K ⊑ ⊥`.
+fn repaired(name: &str, out: &Classification) -> bool {
+    if name.starts_with("denial") {
+        out.taxonomy.is_subclass(&c("K"), &c("Nothing"))
+    } else {
+        out.taxonomy.is_subclass(&c("K"), &c("Ans"))
+    }
+}
+
+/// Row 1231's marker repair finds every fixture's entailment with a complete rooted answer,
+/// on every configuration, with the decline off so that the answer is the rooted run's.
+#[test]
+fn the_marker_repair_delivers_conditional_facts_outside_the_query_successors() {
+    for (name, body) in REPAIRS {
+        let ax = axioms(body);
+        // dl_steps off lets a bounded run saturate on several threads
+        for ((threads, expansion), dl_steps) in
+            CONFIGS.into_iter().flat_map(|c| [(c, true), (c, false)])
+        {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    rooted_decline: false,
+                    rooted_marker_repair: true,
+                    dl_steps,
+                    ..Limits::default()
+                })
+                .unwrap();
+            let at = format!("{name}, {threads} threads {expansion:?}, steps {dl_steps}");
+            assert!(rooted_claim(&k, &out), "{at}: no claim");
+            assert!(
+                repaired(name, &out),
+                "{at}: the repair misses the entailment"
+            );
+            // nothing else changes: the linked element's class keeps out of the answer
+            assert!(
+                !out.taxonomy.is_subclass(&c("E"), &c("Ans")),
+                "{at}: E ⊑ Ans"
+            );
+            assert_eq!(
+                out.taxonomy.is_subclass(&c("K"), &c("Nothing")),
+                name.starts_with("denial"),
+                "{at}: K's satisfiability"
+            );
+        }
+    }
+}
+
+/// The control of the repair fixtures: without the repair and the decline, the rooted run
+/// claims an answer that misses each fixture's entailment, but for `pos`, whose condition
+/// is a fact of the root.
+#[test]
+fn without_the_marker_repair_a_rooted_run_misses_each_fixture() {
+    for (name, body) in REPAIRS {
+        let ax = axioms(body);
+        for (threads, expansion) in CONFIGS {
+            let mut k = Classifier::of(&ax);
+            let out = k
+                .classify(&Limits {
+                    threads,
+                    expansion,
+                    rooted: true,
+                    rooted_decline: false,
+                    ..Limits::default()
+                })
+                .unwrap();
+            assert!(
+                rooted_claim(&k, &out),
+                "{name}, {threads} threads {expansion:?}: no claim"
+            );
+            assert_eq!(
+                repaired(name, &out),
+                name == "pos",
+                "{name}, {threads} threads {expansion:?}: the control changed"
+            );
+        }
+    }
+}
+
 /// Row 1231's decline withdraws the rooted answer on every path a rooted run takes: a
 /// classification, its repetition on the same classifier, a run that counts, a saturation
 /// and a run of axioms that item 805 rewrites. Each reports the decline and its fallback,
@@ -1773,6 +2212,99 @@ fn the_decline_withdraws_the_rooted_answer_on_every_path() {
             );
             assert!(sat.stats.dl_over_budget, "{at}: saturate");
         }
+    }
+}
+
+/// Row 1231's marker repair finds `K ⊑ Ans` on every path a rooted run takes: a
+/// classification and its repetition on the same classifier, a run that counts, a run of
+/// axioms that item 805 rewrites, a run after an edit, and runs on one classifier whose
+/// repair setting differs from that of the run before. No rooted run keeps its contexts
+/// for the next, so a run never meets contexts whose holders sent no notice; the test pins
+/// that. A saturation and a classification of `denial2` with an element of `K` that the
+/// ABox asserts find no model, as they do without the repair, since the facts of a context
+/// that the root reaches hold without a condition.
+#[test]
+fn the_marker_repair_delivers_on_every_path() {
+    let keyed = format!("{AV2}\n     HasKey(:K (:q) ())");
+    let counted = format!("{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))");
+    let edit = axioms("SubClassOf(:F ObjectSomeValuesFrom(:t :G))");
+    let limits = |threads, expansion, counting, repair| Limits {
+        threads,
+        expansion,
+        counting,
+        rooted: true,
+        rooted_decline: false,
+        rooted_marker_repair: repair,
+        ..Limits::default()
+    };
+    for (name, body, counting) in [
+        ("plain", AV2.to_string(), false),
+        ("counting", counted, true),
+        ("keys", keyed, false),
+    ] {
+        let ax = axioms(&body);
+        for (threads, expansion) in CONFIGS {
+            let on = limits(threads, expansion, counting, true);
+            let off = limits(threads, expansion, counting, false);
+            let at = format!("{name}, {threads} threads {expansion:?}");
+            let found = |k: &Classifier, out: &Classification, what: &str| {
+                assert!(rooted_claim(k, out), "{at}, {what}: no claim");
+                out.taxonomy.is_subclass(&c("K"), &c("Ans"))
+            };
+            let mut k = Classifier::of(&ax);
+            for round in 0..2 {
+                let out = k.classify(&on).unwrap();
+                assert!(
+                    found(&k, &out, &format!("round {round}")),
+                    "{at}, round {round}"
+                );
+            }
+            // an edit that leaves the answer as it is
+            k.add(&edit);
+            let out = k.classify(&on).unwrap();
+            assert!(found(&k, &out, "after an edit"), "{at}, after an edit");
+            assert!(
+                !out.stats.incremental,
+                "{at}: a rooted run kept its contexts"
+            );
+            k.remove(&edit);
+            // the repair setting changes between the runs of one classifier, both ways
+            let mut k = Classifier::of(&ax);
+            let out = k.classify(&off).unwrap();
+            assert!(!found(&k, &out, "off first"), "{at}: the control changed");
+            let out = k.classify(&on).unwrap();
+            assert!(found(&k, &out, "on after off"), "{at}, on after off");
+            let out = k.classify(&off).unwrap();
+            assert!(!found(&k, &out, "off after on"), "{at}, off after on");
+            k.add(&edit);
+            let out = k.classify(&on).unwrap();
+            assert!(
+                found(&k, &out, "on after off and an edit"),
+                "{at}, on after an edit"
+            );
+            assert!(
+                !out.stats.incremental,
+                "{at}: a rooted run kept its contexts"
+            );
+        }
+    }
+    // the denial of the condition of an element of K leaves the ontology without a model
+    let denied = axioms(&format!(
+        "{}\n     ClassAssertion(ObjectSomeValuesFrom(:p0 :K) :a)",
+        REPAIRS.iter().find(|(n, _)| *n == "denial2").unwrap().1
+    ));
+    for (threads, expansion) in CONFIGS {
+        let at = format!("{threads} threads {expansion:?}");
+        let mut k = Classifier::of(&denied);
+        let sat = k
+            .saturate(&limits(threads, expansion, false, true))
+            .unwrap();
+        assert!(!sat.consistent, "{at}: the saturation finds a model");
+        let mut k = Classifier::of(&denied);
+        let out = k
+            .classify(&limits(threads, expansion, false, true))
+            .unwrap();
+        assert!(!out.consistent, "{at}: the classification finds a model");
     }
 }
 
@@ -2089,4 +2621,129 @@ fn a_rewritten_key_does_not_bind_an_anonymous_individual_in_a_rooted_run() {
     };
     assert!(run("_:x"));
     assert!(!run(":x"));
+}
+
+/// M-send skips the marker of a trigger that is a live unit of the root, since the contexts
+/// registered for its constants take the unit as a fact. A unit `→ l` of the root dies only
+/// when a clause that subsumes it arrives, and only the empty clause does: the store takes
+/// no second copy of the unit, and an equality adds clauses beside the unit rather than
+/// rewriting it. So a unit live at the skip dies only when the root becomes unsatisfiable,
+/// which sends the empty clause to every registered context. The cases: `pos` with an
+/// equality of the constant that the root derives later, along a chain or through a
+/// successor and back, with the linked element on either name, and `pos` whose root derives
+/// a contradiction with the unit after the skip.
+#[test]
+fn a_root_unit_live_at_the_skip_stays_live_or_ends_the_root() {
+    let pos = REPAIRS.iter().find(|(n, _)| *n == "pos").unwrap().1;
+    let chain = "ClassAssertion(:H0 :w)
+     SubClassOf(:H0 :H1)
+     SubClassOf(:H1 :H2)
+     SubClassOf(:H2 ObjectOneOf(:w2))";
+    let back = "ClassAssertion(ObjectSomeValuesFrom(:p9 :H0) :w)
+     SubClassOf(:H0 ObjectSomeValuesFrom(:p8 :H1))
+     SubClassOf(:H1 ObjectHasValue(:p7 :w2))
+     SubClassOf(ObjectSomeValuesFrom(:p7 ObjectOneOf(:w2)) :H4)
+     SubClassOf(ObjectSomeValuesFrom(:p8 :H4) :H5)
+     SubClassOf(ObjectSomeValuesFrom(:p9 :H5) ObjectOneOf(:w2))";
+    let to_w2 = "SubClassOf(:E ObjectHasValue(:r2 :w2))";
+    let cases = [
+        format!("{pos}\n     {chain}"),
+        format!("{pos}\n     {chain}\n     {to_w2}"),
+        format!("{pos}\n     {back}"),
+        format!("{pos}\n     {back}\n     {to_w2}"),
+    ];
+    let ended = format!(
+        "{pos}\n     ClassAssertion(:H0 :w)
+     SubClassOf(:H0 :H1)
+     SubClassOf(:H1 :H2)
+     DisjointClasses(:H2 :G)"
+    );
+    for (threads, expansion) in CONFIGS {
+        let limits = Limits {
+            threads,
+            expansion,
+            rooted: true,
+            rooted_decline: false,
+            rooted_marker_repair: true,
+            ..Limits::default()
+        };
+        let at = format!("{threads} threads {expansion:?}");
+        for (i, body) in cases.iter().enumerate() {
+            let mut k = Classifier::of(&axioms(body));
+            let out = k.classify(&limits).unwrap();
+            assert!(rooted_claim(&k, &out), "{at}, case {i}: no claim");
+            assert!(
+                out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+                "{at}, case {i}: K ⊑ Ans missed"
+            );
+        }
+        let mut k = Classifier::of(&axioms(&ended));
+        let out = k.classify(&limits).unwrap();
+        assert!(rooted_claim(&k, &out), "{at}, ended: no claim");
+        assert!(!out.consistent, "{at}: the contradiction is missed");
+    }
+}
+
+/// The repair in the run without counting after a rooted run with counting passes its bound:
+/// that run answers rooted and finds `K ⊑ Ans`. The bound lies between the work of the two
+/// runs with the repair, 303 without counting and 453 to 464 with it.
+#[test]
+fn the_marker_repair_delivers_in_the_run_without_counting_after_the_bound() {
+    let ax = axioms(&format!(
+        "{AV2}\n     SubClassOf(:K ObjectMaxCardinality(1 :q))"
+    ));
+    for (threads, expansion) in CONFIGS {
+        let at = format!("{threads} threads {expansion:?}");
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                rooted_decline: false,
+                rooted_marker_repair: true,
+                dl_work: Some(380),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            out.stats.dl_counting_over,
+            "{at}: the run with counting finished"
+        );
+        // The fallback finishes for the axioms it takes and leaves the maximum out.
+        assert_eq!(out.stats.tier, Tier::Disjunctive, "{at}: unexpected tier");
+        assert!(out.complete_for_taken, "{at}: the fallback did not finish");
+        assert!(!out.complete, "{at}: the fallback left the maximum out");
+        assert!(
+            !out.stats.dl_rooted_over && !out.stats.dl_rooted_declined,
+            "{at}: the run started again without the rooted rules"
+        );
+        assert!(
+            out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{at}: K ⊑ Ans missed"
+        );
+        // the control: without the repair, the same path under the bound of 180, between
+        // 145 and 216, misses K ⊑ Ans
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                expansion,
+                counting: true,
+                rooted: true,
+                rooted_decline: false,
+                dl_work: Some(180),
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(
+            out.stats.dl_counting_over && !out.stats.dl_rooted_over,
+            "{at}: control"
+        );
+        assert!(
+            !out.taxonomy.is_subclass(&c("K"), &c("Ans")),
+            "{at}: the control finds K ⊑ Ans"
+        );
+    }
 }

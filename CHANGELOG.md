@@ -2,6 +2,71 @@
 
 ## Unreleased
 
+### A classification is complete only for the whole ontology
+
+`complete` in a classification answer now means complete for the whole input ontology, as
+HermiT and the OWL API read an answer. It was true before when the run left axioms out
+that `excluded` listed, which is ELK's convention, and that meaning moves to
+`completeForTaken` in the wire answers and `Classification::complete_for_taken` in Rust.
+`partial` and the dataset's retention now follow `completeForTaken`. `incomplete` and a
+`consistency` of `unknown` no longer imply a stopped run. A run that left axioms out lists
+the classes whose bottom-locality module holds one of them in `incomplete`, keeps every
+other class's exact superclasses, and makes the consistency `unknown` with every class
+incomplete when a left-out axiom could make the ontology inconsistent. A classification
+without `assertions` counts any assertion with logical content that it did not read as
+left out under the rule `assertion-not-read`, so an ontology with individuals answers
+incomplete, with every class incomplete and the consistency `unknown`, until it is
+classified with them. A class that only such an assertion names shows only through
+`complete` and that entry. A triple that maps to no axiom, such as the domain of an
+undeclared property or a class assertion of a blank node that no triple describes, is
+counted in the new `unmapped` statistic and leaves the answer incomplete in the same way,
+also in a classification later in a ROBOT chain (roadmap item 1276). The
+new `strict` option, `--strict` on `sparkles ontology classify` and `--strict true` on
+ROBOT's `reason`, `reduce` and `materialize` refuse an incomplete run with the error
+`classification-incomplete`, HTTP 422. ROBOT's commands are strict by default with
+`--reasoner hermit` or `jfact`, and `--strict false` turns that off. The answers' stats gain `coverageMs`,
+`coverageOver`, `coverageStopped` and `unmapped`, the answer lists the first 100 such
+triples in `unmappedTriples` with `unmappedTruncated`, the kept classification's outcome gains
+`unmappedCount`, a classification does not count a typing as `rdf:Property` alone, which has no logical content, and the content fingerprint of a retained
+classification is version 2, as roadmap item 1271.
+
+### Rooted runs keep the disjointness of members that the rewriting merges
+
+The rewriting of item 805 gives `∃top.A` and `≥1 top.A` the same image, and `≥0 top.X`
+the image `owl:Thing`, so two members of a `DisjointClasses` or `DisjointUnion` axiom
+could become one and the axiom was dropped. A rooted run of `DisjointClasses(∃top.A,
+≥1 top.A)` with `K ⊑ A` answered A and K satisfiable where HermiT finds them empty, and
+`DisjointClasses(owl:Thing, ≥0 top.X)` came out consistent, with each run reporting itself
+complete. The rewriting now makes an image of more than one member empty and keeps the
+disjointness of the distinct images, as roadmap item 1304. The report of the axioms
+left out names every original axiom that a left-out rewritten axiom stands for, where it
+named only the first, and no longer drops an axiom that the ontology states unchanged.
+Runs without `Limits::rooted` were not affected.
+
+### Views keep ORDER BY with LIMIT as an ordered window
+
+A view or live query whose SELECT has `ORDER BY` with `LIMIT` and `OFFSET` no longer
+evaluates its whole query again at every commit that touches it. It keeps the best
+`k + m + max(k, 100)` rows in order, promotes the next row when one leaves the window and
+refills the reserve from its input when it runs out, as roadmap item 419. A live query's
+rows now carry a `position`, its diffs list the rows that leave with their old positions
+and the rows that enter with their new ones, and `view:read` returns the window in order.
+Ordered live queries no longer merge diffs under `coalesceMs` and resume with a `reset`.
+The view compiler's version changed, so every existing view is built again once after the
+upgrade. The inner nodes of a view's property paths now take hidden names that no query
+variable can spell, so a query variable named `?__incr1` keeps its own binding (item 549).
+
+### The ontology editor's head no longer waits for the whole mapping
+
+`GET /$/ontology/{ds}?view=head` answers the summary's header, entity counts, graphs,
+imports and closure from index reads, without mapping the ontology into axioms, and the Rust
+JSON `summary` operation and Python's `summary()` take the same `view`. The ontology editor
+reads the head when it opens, and its Header tab and **Count the axioms** read the full
+summary. The head answers only when an allow-list shows that no other triple can change its
+answer, and otherwise opens the ontology, so its values always equal the full summary's. On
+`wally` its first call takes 9.6 ms on ChEBI lite and 25.1 ms on a taxonomy of 1 million
+classes, where the full summary takes 2.77 and 5.63 s, as roadmap item 735.
+
 ### The matrix flags of batches 49 and 50 did not reproduce in a same-day run
 
 The forge matrices of b47b582b and 0779d666 ran `order-by-full` and `optional-chain` 1.3 to

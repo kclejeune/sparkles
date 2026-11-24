@@ -84,6 +84,72 @@ test('the trees, the frame, the usage and the header', async ({ page }) => {
   );
 });
 
+test('the editor opens on the head and maps the ontology only for the axiom counts', async ({
+  page,
+}) => {
+  // ROADMAP item 735: the page head, the tree and the counts of declared entities come from
+  // the summary's head, and the full summary, which maps the whole ontology, waits for the
+  // Header tab or the button that asks for it
+  const summaries: string[] = [];
+  page.on('request', (r) => {
+    const u = new URL(r.url());
+    if (u.pathname === '/$/ontology/uni') summaries.push(u.searchParams.get('view') ?? 'full');
+  });
+  await page.goto('/ui/workbench/ontology?ds=uni');
+  const classes = page.getByRole('tree', { name: 'Classes (asserted)' });
+  await expect(classes.getByRole('button', { name: 'Agent', exact: true })).toBeVisible({
+    timeout: 30_000,
+  });
+  const contents = page.getByRole('region', { name: 'Contents' });
+  await expect(contents).toContainText('Class');
+  const count = contents.getByRole('button', { name: 'Count the axioms' });
+  await expect(count).toBeVisible();
+  expect(summaries).toEqual(['head']);
+  await count.click();
+  await expect(contents).toContainText('SubClassOf');
+  await expect(contents).toContainText('triples read');
+  expect(summaries).toEqual(['head', 'full']);
+  // the Header tab reads the full summary by itself
+  await page.reload();
+  summaries.length = 0;
+  await page.getByRole('tab', { name: 'Header' }).click();
+  await expect(page.getByRole('region', { name: 'Contents' })).toContainText('SubClassOf');
+  expect(summaries).toContain('full');
+  await expect(
+    page
+      .getByRole('region', { name: 'Contents' })
+      .getByRole('button', { name: 'Count the axioms' }),
+  ).toBeHidden();
+});
+
+test('the axiom counts never pair with the head of another import scope', async ({ page }) => {
+  // the head of the scope without imports is held back, and Count the axioms waits for it
+  let release: () => void = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  const fulls: string[] = [];
+  await page.route('**/$/ontology/uni?*', async (route) => {
+    const u = new URL(route.request().url());
+    if (u.searchParams.get('view') !== 'head') fulls.push(u.searchParams.get('imports') ?? 'true');
+    if (u.searchParams.get('view') === 'head' && u.searchParams.get('imports') === 'false')
+      await held;
+    await route.continue();
+  });
+  await page.goto('/ui/workbench/ontology?ds=uni');
+  const contents = page.getByRole('region', { name: 'Contents' });
+  const count = contents.getByRole('button', { name: 'Count the axioms' });
+  await expect(count).toBeVisible({ timeout: 30_000 });
+  await page.getByRole('checkbox', { name: 'Imported axioms' }).uncheck();
+  await expect(page).toHaveURL(/imports=0/);
+  await count.click();
+  await expect(contents).not.toContainText('triples read');
+  expect(fulls).toEqual([]);
+  release();
+  await expect(count).toBeVisible();
+  await count.click();
+  await expect(contents).toContainText('triples read');
+  expect(fulls).toEqual(['false']);
+});
+
 test('the inferred class tree sits beside the asserted one', async ({ page }) => {
   await page.goto('/ui/workbench/ontology?ds=uni&inferred=1');
   await page.getByRole('button', { name: 'Classify tree', exact: true }).click();

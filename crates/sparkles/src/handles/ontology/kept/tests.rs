@@ -563,7 +563,7 @@ fn stopped_frame_control(partial: bool, composite: bool) {
             &options,
         )
         .unwrap();
-    assert_eq!(classified.classification.complete, !partial);
+    assert_eq!(classified.classification.complete_for_taken, !partial);
     stopped.store(true, Ordering::Relaxed);
     let response = super::super::wire::classify_body(
         "fixture",
@@ -654,6 +654,25 @@ fn raw_ontology_selectors_do_not_treat_a_null_body_as_an_empty_object() {
             "{op}"
         );
     }
+}
+
+/// A run whose only gap is a triple that maps to no axiom, here the domain of a property
+/// that is not declared, names the count in its outcome, since no `excluded` entry
+/// names such a triple.
+#[test]
+fn the_outcome_counts_the_triples_that_map_to_no_axiom() {
+    let ds = ds(":A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A . :p rdfs:domain :A .");
+    let frame = super::super::wire::call(
+        &ds,
+        "classify",
+        &json!({"projection":"frame","about":"http://ex.org/B","limit":10}),
+        &opts(),
+    )
+    .unwrap();
+    let outcome = &frame["frame"]["outcome"];
+    assert_eq!(outcome["complete"], false, "{outcome}");
+    assert_eq!(outcome["excludedCount"], 0, "{outcome}");
+    assert!(outcome["unmappedCount"].as_u64().unwrap() > 0, "{outcome}");
 }
 
 #[test]
@@ -858,7 +877,7 @@ fn stopped_partial_and_oversized_outcomes_drop_both_retained_owners() {
         let restore = CapRestore(cap);
         super::super::classify::FORCE_PARTIAL.with(|f| f.set(partial));
         let terminal = classify(&ds);
-        assert_eq!(!terminal.classification.complete, partial);
+        assert_eq!(!terminal.classification.complete_for_taken, partial);
         empty_slot(&ds);
         assert_eq!(
             read(&ds, &req(), &KeptQuery::default()).status,
@@ -1033,6 +1052,16 @@ fn fingerprints_compare_actual_content_and_policies_without_run_ids_or_timing() 
     assert_ne!(
         content_fingerprint(&timing, &a.excluded, &opts()).unwrap(),
         a.publication.content_fingerprint
+    );
+    // the count of unmapped triples is part of the outcome, so two answers that differ
+    // only in it differ
+    let mut unmapped = timing.clone();
+    unmapped.stats.unmapped = 1;
+    let one = content_fingerprint(&unmapped, &a.excluded, &opts()).unwrap();
+    unmapped.stats.unmapped = 2;
+    assert_ne!(
+        content_fingerprint(&unmapped, &a.excluded, &opts()).unwrap(),
+        one
     );
     let other = self::ds(":A a owl:Class . :B a owl:Class . :B rdfs:subClassOf :A .");
     let mut taxonomy = a.classification.as_ref().clone();
@@ -1215,6 +1244,7 @@ fn isolated_names_never_redecide_graph_guards_after_triple_masking() {
     c.read_options = super::super::classify::result_options(&stopped_options, false);
     let mut partial = (*c.classification).clone();
     partial.complete = false;
+    partial.complete_for_taken = false;
     partial.consistency = sparkles_owl::classify::Consistency::Unknown;
     c.classification = Arc::new(partial);
     c.publication = KeptClassification::capture(
@@ -1390,4 +1420,43 @@ fn raw_and_structured_kept_selectors_reject_duplicates_overflow_and_inferences()
     }
     empty_slot(&ds);
     assert!(ds.state().ontology_cache.lock().is_empty());
+}
+
+/// A kept classification whose modules' pass the deadline stopped answers with every
+/// class incomplete but publishes nothing, and keeps its saturation, so the next request
+/// takes the pass again without saturating from the start.
+#[test]
+fn a_stopped_coverage_pass_keeps_the_saturation_and_publishes_nothing() {
+    let ds = ds(":A a owl:Class ; rdfs:subClassOf :B . :B a owl:Class .");
+    super::super::classify::FORCE_COVERAGE_STOP.with(|f| f.set(true));
+    // the hook sets this cancellation, which the stopped pass acknowledged, so the
+    // metadata and the answer finish without it
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopping = QueryOptions {
+        cancel: Some(stop.clone()),
+        ..opts()
+    };
+    let first = ds
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &stopping)
+        .unwrap();
+    assert!(stop.load(std::sync::atomic::Ordering::Relaxed));
+    assert!(first.classification.stats.coverage_stopped);
+    assert!(!first.classification.complete && first.classification.complete_for_taken);
+    assert!(!first.retained && !first.reused);
+    let second = ds
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    assert!(!second.reused, "a stopped pass is never published");
+    assert!(
+        second.classification.stats.incremental,
+        "the saturation was kept"
+    );
+    assert!(second.classification.complete && second.retained);
+    let third = ds
+        .ontology()
+        .classify(&req(), &ClassifyRequest::default(), &opts())
+        .unwrap();
+    assert!(third.reused);
 }

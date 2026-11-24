@@ -618,6 +618,7 @@ export interface ClassificationOutcome {
   consistency: 'consistent' | 'inconsistent' | 'unknown';
   excludedCount: number;
   incompleteCount: number;
+  unmappedCount: number;
 }
 export type ClassificationSourceRow =
   | { kind: 'requestedGraph'; ordinal: number; graph: string }
@@ -693,18 +694,30 @@ export interface OntologyClassification extends OntologyState {
   resultId: string;
   /** false only when the ontology is proved inconsistent; see `consistency` */
   consistent: boolean;
-  /** whether the ontology has a model as far as the run knows: only a partial answer is `unknown` */
+  /**
+   * whether the ontology has a model as far as the run knows: `unknown` for a partial
+   * answer that did not decide it, or when a left-out axiom could make it inconsistent
+   */
   consistency: 'consistent' | 'inconsistent' | 'unknown';
   /**
-   * false when an axiom is left out or used in part, or the answer is partial, so that
-   * entailments may be missing
+   * whether the answer is complete for the whole ontology: false when an axiom is left
+   * out or used in part, or the answer is partial, so that entailments may be missing
    */
   complete: boolean;
+  /**
+   * whether the answer is complete for the axioms the run took, as a profile reasoner
+   * such as ELK reports it: false only for a partial answer
+   */
+  completeForTaken: boolean;
   /** true for the partial answer of a run that its deadline, cancellation or memory budget stopped */
   partial: boolean;
   /** the rules the ontology's axioms need */
   tier: 'el' | 'horn' | 'disjunctive';
-  /** the classes whose superclasses a partial answer may miss */
+  /**
+   * the classes whose superclasses, equivalent classes or satisfiability the answer may
+   * miss: those a partial answer left open and those whose bottom-locality module holds
+   * a left-out axiom
+   */
   incompleteCount: number;
   /** those classes, the first `limit`, in IRI order */
   incomplete: string[];
@@ -716,6 +729,14 @@ export interface OntologyClassification extends OntologyState {
   unsatisfiable: string[];
   excludedCount: number;
   excluded: OntologyExcluded[];
+  /**
+   * the first 100 triples of the input that map to no axiom, as N-Triples terms, which
+   * leave the answer incomplete; `stats.unmapped` counts them all (the OWL API calls
+   * such triples unparsed)
+   */
+  unmappedTriples: { subject: string; predicate: string; object: string }[];
+  /** whether `stats.unmapped` counts more triples than `unmappedTriples` lists */
+  unmappedTruncated: boolean;
   stats: Configuration;
   nodes?: OntologyTaxonomyNode[];
   next?: number;
@@ -1271,6 +1292,11 @@ export class Administration {
             message?: string;
             /** answer what a run with the disjunctive rules proved when `timeout` or `signal` stops it */
             partial?: boolean;
+            /**
+             * refuse with `UnsupportedError`, whose `details.code` is
+             * `classification-incomplete`, when the classifier would leave an axiom out
+             */
+            strict?: boolean;
             /** the expansion strategy of the disjunctive rules */
             expansion?: 'cautious' | 'eager';
             projection?: P;
@@ -1293,6 +1319,7 @@ export class Administration {
             target: o.target,
             message: o.message,
             partial: o.partial,
+            strict: o.strict,
             expansion: o.expansion,
             projection: o.projection,
             lang: o.lang,

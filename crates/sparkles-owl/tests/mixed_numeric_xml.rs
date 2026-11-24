@@ -67,7 +67,7 @@ fn mixed_valid_xml_is_partial_while_huge_numeric_equality_entails_named_class() 
         })
         .expect("small mixed EL classification must finish within its real limits");
     // complete describes termination here; the exact XML gap below remains present.
-    assert!(result.complete);
+    assert!(result.complete_for_taken);
     assert!(result.consistent);
     assert!(result.taxonomy.is_subclass(&class("A"), &class("B")));
     assert!(

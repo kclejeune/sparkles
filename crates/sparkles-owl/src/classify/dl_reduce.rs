@@ -37,7 +37,7 @@ use super::dl;
 use super::index::Gap;
 use crate::model::*;
 use crate::vocab;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeSet;
 
 /// The IRI prefix of the names that the reductions make up.
@@ -73,31 +73,57 @@ impl Reduction {
     }
 
     /// Puts the original axioms in place of the rewritten ones that the run's report
-    /// holds. The lookup holds only the report's axioms, so it costs memory in proportion
-    /// to the report and not to the rewriting.
+    /// holds. A rewritten axiom stands for every original axiom that made it, and for
+    /// itself as well when the ontology states it unchanged, so one entry of the report
+    /// can become several. The lookup holds only the report's axioms, so it costs memory
+    /// in proportion to the report and not to the rewriting.
     pub fn restore(&self, axioms: &[&AxiomKind], excluded: &mut Vec<Excluded>) {
         if excluded.is_empty() {
             return;
         }
-        let mut origin: FxHashMap<AxiomKind, Option<usize>> =
-            excluded.iter().map(|e| (e.axiom.clone(), None)).collect();
-        let mut open = origin.len();
+        // the origins of each axiom of the report, and whether the ontology states it as
+        // it is
+        let mut origin: FxHashMap<AxiomKind, (Vec<usize>, bool)> = excluded
+            .iter()
+            .map(|e| (e.axiom.clone(), (Vec::new(), false)))
+            .collect();
         for (k, &i) in self.axioms.iter().zip(&self.origin) {
-            if open == 0 {
-                break;
-            }
-            if let Some(slot @ None) = origin.get_mut(k) {
-                *slot = Some(i);
-                open -= 1;
+            if let Some((from, _)) = origin.get_mut(k)
+                && from.last() != Some(&i)
+            {
+                from.push(i);
             }
         }
-        for e in excluded.iter_mut() {
-            if let Some(Some(i)) = origin.get(&e.axiom) {
-                e.axiom = axioms[*i].clone();
+        for (k, r) in axioms.iter().zip(&self.replaced) {
+            if !*r && let Some((_, stated)) = origin.get_mut(*k) {
+                *stated = true;
             }
         }
+        let mut out = Vec::with_capacity(excluded.len());
+        // an original axiom whose rewritten axioms are left out for several reasons of
+        // one kind is reported once for that kind, by the first of them
+        let mut told: FxHashSet<(usize, std::mem::Discriminant<Gap>)> = FxHashSet::default();
         excluded.sort();
-        excluded.dedup();
+        for e in excluded.drain(..) {
+            match origin.get(&e.axiom) {
+                Some((from, stated)) if !from.is_empty() => {
+                    let kind = std::mem::discriminant(&e.gap);
+                    out.extend(from.iter().filter(|&&i| told.insert((i, kind))).map(|&i| {
+                        Excluded {
+                            axiom: axioms[i].clone(),
+                            gap: e.gap.clone(),
+                        }
+                    }));
+                    if *stated {
+                        out.push(e);
+                    }
+                }
+                _ => out.push(e),
+            }
+        }
+        out.sort();
+        out.dedup();
+        *excluded = out;
     }
 
     /// What the original axioms outside OWL 2 EL need, for the run's statistics, with the
@@ -220,6 +246,30 @@ impl Cx {
         cs.iter().map(|c| self.ce(c)).collect()
     }
 
+    /// The images of the members of a disjointness, and an axiom `D ⊑ ⊥` for each image
+    /// `D` of more than one member. Two members with one image are equivalent, so their
+    /// disjointness makes the image empty, which the set of images alone would lose.
+    fn disjoint(
+        &mut self,
+        cs: &BTreeSet<ClassExpression>,
+    ) -> Result<(BTreeSet<ClassExpression>, Vec<AxiomKind>), ()> {
+        let mut images = BTreeSet::new();
+        let mut empty = BTreeSet::new();
+        for c in cs {
+            let d = self.ce(c)?;
+            if images.contains(&d) {
+                empty.insert(d);
+            } else {
+                images.insert(d);
+            }
+        }
+        let empty = empty
+            .into_iter()
+            .map(|d| AxiomKind::SubClassOf(d, ClassExpression::Class(Class::nothing())))
+            .collect();
+        Ok((images, empty))
+    }
+
     fn ce(&mut self, c: &ClassExpression) -> Result<ClassExpression, ()> {
         use ClassExpression as C;
         let filler = |s: &mut Cx, f: &Option<Box<ClassExpression>>| match f {
@@ -272,8 +322,27 @@ impl Cx {
         Ok(Rt::New(vec![match k {
             K::SubClassOf(a, b) => K::SubClassOf(self.ce(a)?, self.ce(b)?),
             K::EquivalentClasses(cs) => K::EquivalentClasses(self.ces(cs)?),
-            K::DisjointClasses(cs) => K::DisjointClasses(self.ces(cs)?),
-            K::DisjointUnion(c, cs) => K::DisjointUnion(c.clone(), self.ces(cs)?),
+            K::DisjointClasses(cs) => {
+                let (images, mut out) = self.disjoint(cs)?;
+                if images.len() >= 2 {
+                    out.push(K::DisjointClasses(images));
+                }
+                return Ok(Rt::New(out));
+            }
+            // the union keeps the set of images, and the disjointness of its members
+            // follows the rule of `DisjointClasses`
+            K::DisjointUnion(c, cs) => {
+                let (images, mut out) = self.disjoint(cs)?;
+                if images.len() >= 2 {
+                    out.push(K::DisjointUnion(c.clone(), images));
+                } else if let Some(d) = images.into_iter().next() {
+                    let c = ClassExpression::Class(c.clone());
+                    if c != d {
+                        out.push(K::EquivalentClasses([c, d].into()));
+                    }
+                }
+                return Ok(Rt::New(out));
+            }
             K::ClassAssertion(c, i) => K::ClassAssertion(self.ce(c)?, i.clone()),
             // every element is in the domain and in the range of the universal property
             K::ObjectPropertyDomain(p, c) | K::ObjectPropertyRange(p, c) if is_top(p) => {

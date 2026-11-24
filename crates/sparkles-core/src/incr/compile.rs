@@ -17,6 +17,7 @@ use super::ops::linear::{Extend, Filter, Project, Union, Values};
 use super::ops::matching::{MatchMode, MatchOp};
 use super::ops::recompute::Recompute;
 use super::ops::template::{TSlot, Template};
+use super::ops::window::Window;
 use super::ops::{Node, Op};
 use super::zset::ZSet;
 use crate::error::{ComponentError, Error, Result};
@@ -29,8 +30,9 @@ use spargebra::algebra::{
 };
 use spargebra::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-/// The prefix of the variables the compiler adds for the inner nodes of paths.
-const HIDDEN: &str = "__incr";
+/// The prefix of the variables the compiler adds for the inner nodes of paths. A SPARQL
+/// variable name cannot hold `#`, so no query variable takes one of these names.
+const HIDDEN: &str = "#incr";
 /// The most alternatives a path expands to before it is recomputed instead.
 const MAX_PATH_ALTERNATIVES: usize = 16;
 
@@ -1529,7 +1531,14 @@ impl C {
                     certain,
                 }
             }
-            GP::Slice { .. } => self.recompute(gp, scope, "LIMIT and OFFSET (Phase 2)", None),
+            GP::Slice {
+                inner,
+                start,
+                length: Some(limit),
+            } => self.window(gp, inner, *start, *limit, scope),
+            GP::Slice { length: None, .. } => {
+                self.recompute(gp, scope, "OFFSET without LIMIT", None)
+            }
             GP::Group {
                 inner,
                 variables,
@@ -1543,6 +1552,137 @@ impl C {
                 self.recompute(gp, scope, "an ARQ extension", None)
             }
             GP::Service { .. } => self.recompute(gp, scope, "SERVICE", None),
+        }
+    }
+
+    /// `ORDER BY` with `LIMIT` and `OFFSET` as an ordered window (spec F13 §4.4). The
+    /// order's expressions become hidden variables bound below the projection, so the
+    /// window compares columns, and a projection above it drops them again.
+    fn window(&mut self, gp: &GP, inner: &GP, offset: usize, limit: usize, scope: &Scope) -> Node {
+        if matches!(scope, Scope::Var(_)) {
+            return self.recompute(gp, scope, "an ordered window under GRAPH ?g", None);
+        }
+        let (distinct, rest) = match inner {
+            GP::Distinct { inner } | GP::Reduced { inner } => (true, &**inner),
+            other => (false, other),
+        };
+        let (projected, rest) = match rest {
+            GP::Project { inner, variables } => (Some(variables.clone()), &**inner),
+            other => (None, other),
+        };
+        let GP::OrderBy {
+            inner: base,
+            expression,
+        } = rest
+        else {
+            return self.recompute(gp, scope, "LIMIT without ORDER BY", None);
+        };
+        let projected = projected.unwrap_or_else(|| {
+            scope_vars(base)
+                .into_iter()
+                .map(Variable::new_unchecked)
+                .collect()
+        });
+        let mut keyed = (**base).clone();
+        let mut keys: Vec<(Variable, bool)> = Vec::new();
+        for o in expression {
+            let (e, asc) = match o {
+                OrderExpression::Asc(e) => (e, true),
+                OrderExpression::Desc(e) => (e, false),
+            };
+            if has_exists(e) {
+                return self.recompute(gp, scope, "EXISTS in an ORDER BY key", None);
+            }
+            if distinct {
+                let mut used = Vec::new();
+                mentioned(
+                    &GP::Filter {
+                        expr: e.clone(),
+                        inner: Box::new(GP::Bgp { patterns: vec![] }),
+                    },
+                    &mut used,
+                );
+                if used
+                    .iter()
+                    .any(|u| !projected.iter().any(|v| v.as_str() == u))
+                {
+                    return self.recompute(
+                        gp,
+                        scope,
+                        "DISTINCT with an ORDER BY key outside the projection",
+                        None,
+                    );
+                }
+            }
+            let var = match e {
+                Expression::Variable(v) => v.clone(),
+                _ => {
+                    // a name no query can write, so it never meets a query's variable
+                    self.hidden += 1;
+                    let v = Variable::new_unchecked(format!("#ord{}", self.hidden));
+                    keyed = GP::Extend {
+                        inner: Box::new(keyed),
+                        variable: v.clone(),
+                        expression: e.clone(),
+                    };
+                    v
+                }
+            };
+            keys.push((var, asc));
+        }
+        let mut cols = projected.clone();
+        for (v, _) in &keys {
+            if !cols.contains(v) {
+                cols.push(v.clone());
+            }
+        }
+        let mut below = GP::Project {
+            inner: Box::new(keyed),
+            variables: cols.clone(),
+        };
+        if distinct {
+            below = GP::Distinct {
+                inner: Box::new(below),
+            };
+        }
+        let i = self.compile(&below, scope);
+        let key_cols = keys
+            .iter()
+            .map(|(v, asc)| {
+                let x = self.var(v.as_str());
+                (
+                    i.schema.iter().position(|s| *s == x).expect("a key column"),
+                    *asc,
+                )
+            })
+            .collect();
+        let (schema, certain) = (i.schema.clone(), i.certain.clone());
+        let node = Node {
+            op: Op::Window(Box::new(Window::new(i, key_cols, limit, offset))),
+            schema: schema.clone(),
+            certain: certain.clone(),
+        };
+        if cols.len() == projected.len() {
+            return node;
+        }
+        let names: Vec<String> = projected.iter().map(|v| v.as_str().to_string()).collect();
+        let out = self.vars_of(&names);
+        let pcols = out
+            .iter()
+            .map(|v| schema.iter().position(|x| x == v))
+            .collect();
+        let certain = out
+            .iter()
+            .filter(|v| certain.contains(v))
+            .copied()
+            .collect();
+        Node {
+            op: Op::Project(Box::new(Project {
+                inner: node,
+                cols: pcols,
+            })),
+            schema: out,
+            certain,
         }
     }
 
@@ -1896,6 +2036,14 @@ pub fn compile(q: &Query, whole: Option<&str>) -> Result<Compiled> {
         | Query::Construct { base_iri, .. }
         | Query::Describe { base_iri, .. } => base_iri.clone(),
     };
+    // the window of a SELECT's own ORDER BY and LIMIT orders its result and reports
+    // positions (a window in a subquery does not)
+    if kind == Kind::Select
+        && matches!(pattern, GP::Slice { .. })
+        && let Some(w) = root.result_window_mut()
+    {
+        w.positions = true;
+    }
     Ok(Compiled {
         kind,
         vars: c.vars,

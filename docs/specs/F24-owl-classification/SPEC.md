@@ -155,6 +155,19 @@ gave a rooted run with an empty root, which left out a minimum cardinality. The 
 longer rooted, takes the cardinality and derives the subsumption that the run without the
 option derives, which a regression test checks.
 
+Item 1304 keeps the disjointness of members that the rewriting merges. Two members such
+as `∃top.A` and `≥1 top.A`, or `owl:Thing` and `≥0 top.X`, have one image, and the set of
+images held one member, which the normaliser drops, so a rooted run lost the disjointness
+and could answer a class satisfiable or an inconsistent ontology consistent while it
+reported itself complete. The members are equivalent, so their disjointness makes the
+image empty. The rewriting now adds `D ⊑ ⊥` for each image `D` of more than one member,
+keeps the disjointness of the distinct images when two or more remain, and keeps the union
+of a `DisjointUnion` over the set of images. Intersections, unions and equivalences keep
+the set of images, since a repeated member does not change their meaning. A rewritten
+axiom can equal an axiom that the ontology states unchanged or the rewriting of another
+axiom, so the report of the axioms left out now names every original axiom that a left-out
+rewritten axiom stands for, and names each original once for each kind of gap.
+
 Item 822 adds a fifth departure, [the constant of a restriction into a
 singleton](#item-822s-departure-the-constant-of-a-restriction-into-a-singleton), and item
 1070 makes the context of `owl:Thing` a query context. With both, 48 of the 50 `shoi`
@@ -233,6 +246,120 @@ without counting or without the rooted rules, with the same taxonomy as before a
 bound, which item 1232 follows. `SPARKLES_COUNTING_LATE_UNIT=1` gives the earlier containment, in
 which a rooted run classifies again without counting or without the rooted rules when such
 a restriction or edge arrives, and `=0` turns both off, for measurement.
+
+Item 1231 records a loss of rooted runs. A fact that holds in a context only under the
+queried class and concerns an individual reached from another individual must reach the
+contexts registered for that individual, and its consequences there must come back to the
+context, and the departures above keep a context's conditional ground literals in that
+context.
+A rooted run therefore looks after its saturation for such a fact that cannot reach a
+registered context, and when it finds one it classifies again without the rooted rules and
+sets `Stats::dl_rooted_declined`. The check exempts four kinds of context without a proof,
+and it withdraws between 2 and 38 complete answers per generated corpus, so it is partial
+containment, and `Limits::rooted_decline` turns it off for measurement.
+
+`Limits::rooted_marker_repair`, off by default, repairs the delivery. A context that holds
+a ground literal as a condition tells the root, which sends the literal as a marker to the
+contexts registered for its individuals that the root reaches, also to a context that
+registers or becomes reachable later. The root returns its clauses whose bodies hold such
+literals to the contexts that hold them, and each holder resolves a returned clause with
+its own premises for the body, again when a premise comes later. The sends and the returns
+count against the work bound. With the repair on and the check off, the two generated
+corpora built around the loss give 1,168 and 262 runs that differ from HermiT without the
+repair and none with it. Twelve fixtures built for particular orders of arrival fail
+without it and pass with it, although no fixture isolates a returned clause that the root
+subsumes later or a return followed by a late premise that it misses. No run that finishes
+on the other generated corpora, with or without counting and on one and four threads,
+differs from HermiT apart from g2-150. With the repair off, every corpus gives the same
+answers and the same counts of derived conclusions as before. With the diagnostic
+`SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in `Stats::dl_marker_deficits` the markers
+and returned products that its quiescent contexts still owe, and every finished run on the
+corpora owes none with the repair. The repair derives 1.02 to 1.13 times the conclusions
+on the larger generated corpora, up to 1.41 times on corpora of small files, up to 1.28
+times with counting and 1.4 to 1.65 times on the two built around the loss, which now
+derive the missing entailments, so a few runs near the bound pass it and give their
+default answer.
+
+With the selection of ground body literals off, the setting of item 1220's measurements,
+the repair's returns derive more. On one purpose-built ontology they add 24% to the
+derived conclusions, and on the generated ontology g1-051_p0012 the run passes the work
+bound at 4 million conclusions and the memory budget of 1 GiB at 400 million, against
+455,967 conclusions without the repair. `SPARKLES_ROOTED_MARKER_REPAIR=129` resolves a
+returned clause only with premises whose body has no ground literal. It loses no answer on
+the corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten
+runs that the repair alone takes past the bound, but g1-051_p0012 still passes the bound of 4
+million and finishes only at 63.2 million conclusions under a bound of 400 million. Its
+growth is in Pred over successor terms of constants and in Join, which item 1250
+follows, and g1-051_p0121 derives 1.42 million conclusions against 1.17 million with the
+repair alone. The repair's state costs 8 bytes per context with the repair off, which item
+1247 removes, and a synthetic family whose conditions nest two or more deep grows with the
+repair's sends, which is item 1251. The repair's completeness is not proved, and the check
+stays on by default.
+
+The repair keeps the resource contract of the rest of Tier D, and the contract is
+cooperative. A run charges each conclusion that it derives to the work bound, and several
+of the repair's scans also charge one conclusion for every 16 entries that they read,
+while others do not. The preparation of an inference, such as the premise lists of a rule
+and their pruning, takes time and memory in proportion to the clauses that the context
+already holds and is not charged while it runs. The redundancy test of each derived
+conclusion against the stored clauses is not counted either, here as in the rest of Tier
+D. Growth of the retained indexes is added to the memory estimate after the allocation.
+The run checks the work bound, the memory budget, the deadline and a cancellation at
+cooperative checkpoints, which come after every 256 choices of a product, after every 64
+sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
+totals. The contract therefore bounds neither the time between two checks by a fixed
+number of reads nor the allocated bytes by the memory budget, which is an estimate. A counting allocator
+measures the heap 6 to 31% above the charged estimate on the three files named below, with the
+repair on or off, and item 1291 follows that difference.
+
+A returned clause reserves memory before its products run, both on initial arrival and when a
+late premise replays saved returns. The product of a clause that
+is not ground charges each union that it keeps, as every rule does, but not the table that
+records its unions nor the spare capacity of each step's list. These grow with the number of
+unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
+million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
+and 51 MB, and the heap reached 286 MB. Initial arrivals therefore reserve a bound on those
+tables before draining their products and release it after them, and each late-replay batch
+reserves the checked sum of its held products and the largest product's table bound before
+draining. The table model runs in 128-bit arithmetic and saturates once at the end, and an
+unrepresentable bound or estimate overflow stops the run cleanly with a memory stop before
+enumeration rather than clamping the reservation or promising a hard allocation ceiling. A
+refused reservation rolls back any debit it added and stops the run as a refused charge does.
+The bound takes one union per choice of the product,
+which can exceed the unions a step keeps by more than a thousand times. That overcount is
+what makes it a bound. Its model of a step's tables, taken at the unions that the step
+actually keeps, is smaller than the growth of the heap past the estimate in the heaviest
+returns without the reservation, 18.7 MB against 23.3 MB under the budget of 256 MiB and
+24.6 MB against 173.6 MB under the default budget. In the initial-arrival measurements on
+those files, the return reservation stopped g1-051_p0012 earlier at a heap of 179 MB under
+256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
+conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
+stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
+reservation, so that run does not finish under its own budget either way and item 1291
+follows it. The rules of the default
+path leave the same tables uncharged. With the repair off these tables stay at or below
+6.3 KB on these files and at 50 KB on ore_ont_14817 until its Tier D attempt passes its
+bound, and item 1291 covers them.
+
+Some steps of the repair and of the rooted rules read between two checks without counting
+what they read. The steps named here are the ones that were measured or reproduced, and
+other preparation falls under the rule above. The premise lists of a returned clause are
+prepared for one return, and for up to 64 returns when a late premise replays them,
+before the next check. On the three files where the returns derive most, part022 p01,
+g1-051_p0121 and g1-051_p0012 under the containment arm with the repair at 1 and at 129,
+a list read at most 548 premises and kept at most 378, one pruning of a list made at most
+38,226 comparisons, and the preparation of a batch of returns allocated at most 143 KB,
+at most 6.4% of the holder's store at the time. The index of a clause that the root
+offers to its holders is built for the whole body before the first check, so that step is
+bounded by one clause's body. With `SPARKLES_ROOTED_MARKER_DIAG=1`, the redundancy test
+of each of the diagnostic's products scans the context's stored clauses without a count.
+The marker pass that the diagnostic and the decline check run after a rooted run
+saturates checks no bound. The decline check runs it on every rooted run with the check
+on, with the repair on or off. When the last step of a wide product passes 4,096 unions,
+the product derives the 4,097 unions that it holds before its next check, also with the
+repair off. Item 1260 follows the stop latency of the marker pass and of the wide
+product, and item 1280 gives the repair and the store's premise lists one meter that
+counts these reads.
 
 Item 728 delivers the clauses of [counting over definitions](#item-728s-clauses-for-counting-over-definitions)
 and their record. With counting, an exact or minimum cardinality in a negative position
@@ -838,7 +965,9 @@ waiting messages while they run, and the subsumers they keep once they end. The 
 of a parallel normalization count their interners and axioms with room for what their
 merge adds, the merge counts what it adds past that room, and a run whose chunks pass
 the budget or a refused grant normalizes on one thread instead. The memory pool is
-charged for the growth of the peak, once, from the normalization on.
+charged for the growth of the peak, once, from the normalization on. A refused
+estimate can raise the reported peak. Only successful grants count toward the
+coverage that later phases reuse.
 Numeric parsing and reduction poll cancellation and deadlines and admit construction
 scratch before allocation. Large canonical values share immutable limbs whose live
 storage remains counted until the last alias drops. Index copies, functional-data
@@ -5197,6 +5326,127 @@ that it derived from the survey's file came from the translation's extra sub-pro
 statements. Sparkles' rule parser refuses the adapter's file at its first line, and with
 the brackets added it derives exactly Jena's 321 facts. Item 1020 takes the bare
 namespace IRIs.
+
+### Completeness for the whole ontology
+
+Item 1271 aligns `complete` with complete OWL reasoners. HermiT, Pellet, FaCT++ and
+Konclude either answer for the whole ontology or refuse it, and the OWL API's reasoner
+interface has no completeness flag, so its callers read every answer as complete. A
+profile reasoner such as ELK ignores the axioms outside its fragment and warns. Before
+this item `complete` was ELK's weaker statement, true while `outside` listed axioms the run
+left out. It now means that every subsumption between named classes and every
+unsatisfiable class that the whole input ontology entails is in the taxonomy. It is false
+when the run left out or used only in part an axiom, which `excluded` lists, and for the
+partial answer of a stopped run. `completeForTaken` in the wire answers and
+`Classification::complete_for_taken` in Rust keep the old meaning, false only for a
+partial answer. `partial` is its negation, and the dataset retains a run by it.
+
+A class outside `incomplete` keeps its exact answer when axioms are left out. The
+classifier extracts the syntactic bottom-locality module of the class, after Cuenca Grau,
+Horrocks, Kazakov and Sattler, and the class is complete when the module holds no axiom
+the run left out. Let `O` be the ontology, `L` the axioms left out and `T = O \ L`. A model
+of the module `M_C` of `{C}` in `O` extends to a model of `O` that agrees with it on the
+module's signature and makes every other class empty, so the named superclasses of `C`
+that `O` entails are those that `M_C` entails. When `L` misses `M_C`, `M_C` is inside `T`,
+and the run, which is complete for `T`, finds them all. Equivalent classes and
+unsatisfiability follow. A satisfiable class equivalent to such a class is in its module's
+signature, so its own module is inside `M_C`. Every unsatisfiable class shares the node of
+`owl:Nothing`, which a missed unsatisfiable class leaves short, so when any class is
+incomplete every unsatisfiable class is listed too. The answer is exact for the superclasses,
+equivalents and satisfiability of a class outside `incomplete`, and not for its
+subclasses. A class can be complete while a subclass of it is missed, since the subclass's
+module can hold a left-out axiom. On item 1271's `irl1`, which a plain run classifies
+without `K ⊑ Ans`, `Ans` is complete and its children are not.
+
+The consistency verdict needs its own condition, since an inconsistent ontology makes
+every class unsatisfiable. A verdict of inconsistent is sound for `O`. When the run finds
+`T` consistent, `O` is consistent if `L` misses the bottom module of the empty signature in
+`O` or its top module, whose models extend to models of `O` with every class outside the
+signature empty or the whole domain. Otherwise `consistency` is `unknown` and every class is
+incomplete. A third layer decides more classes. Without nominals or `ObjectHasValue`
+outside the assertions and keys, and without the universal object property, a model of
+the terminology's module joins a model of `O` in a disjoint union, so the module of a class
+in `O` without its assertions and keys is enough. The module documentation of
+`transform/module.rs` gives the three arguments in full, and a rule unsure of an axiom's
+locality calls it non-local, which only makes a module larger. The test is syntactic and
+over-approximates, so it can list a class whose answer is exact, such as `S` in `irl1`, and
+never omits a class whose answer can be missed. `dl_fixtures` checks every complete class
+against HermiT on the 640 cases of item 603 with and without the EL-only rules. In 1009
+runs that left axioms out, the consistency stayed known in 379 and 1486 of 5914 classes
+were complete, with no mismatch.
+
+A classification of the terminology alone, which is the default of `ontology classify`,
+HTTP and the bindings without `assertions`, does not read the file's assertions, which are
+part of its ontology. Any assertion with logical content among them counts as left out,
+whether or not it could change an answer. The run reads the assertions up to the first
+such one and reports it in `excluded` under the rule `assertion-not-read`, with one entry
+for all of them. The answer is then not complete, every class of the taxonomy is
+incomplete, and a consistency the run found becomes `unknown`, while an inconsistency
+stays, since it holds for the whole ontology too. A class that only an unread assertion
+names is in no taxonomy, so `incomplete` cannot list it, and it shows through `complete`
+and the `assertion-not-read` entry, and as a class that is not found. An earlier design
+let assertions that the module layers proved harmless leave the run complete. Three
+review rounds each found a case it missed, all of the kind of a class that only an
+assertion names, so it was removed, and roadmap item 1301 records a sound replacement.
+`assertions` true gives the complete answer, and roadmap item 1279 makes it the default.
+
+A triple that maps to no axiom, such as an assertion that a strict read cannot map or
+the domain of a property that is not declared, may carry any logical
+content. Every classification counts such triples, of the terminology and of the
+assertions, in `Stats::unmapped`, and with any of them the answer is not complete, every
+class is incomplete and a consistency found is `unknown`. No `excluded` entry names them,
+since an entry names an axiom, so the wire answers report the count as `stats.unmapped`
+and list the first 100 triples in `unmappedTriples`, in the order the input gave them, as
+N-Triples terms, with `unmappedTruncated` when there are more. The CLI lists the first
+ten, ROBOT's warning the first five and a strict run's refusal the first three. The OWL
+API calls such triples unparsed and reports them through its RDF parser's metadata.
+Sparkles calls them unmapped, since a read of the store maps stored triples and parses
+nothing. A run of the terminology alone reads the assertions only up to the first that
+has logical content or maps to no axiom, so it counts and lists at most one unmapped
+assertion triple. A file in functional-style syntax
+whose entities are all declared reads without the store and has no unmapped triples. One
+with an undeclared entity takes the store's reading, in which a domain or range of an
+undeclared property is such a triple. A class assertion whose class is a blank node that
+no triple of the terminology describes, such as `:x a _:c` alone, is one too. A
+classification later in a ROBOT chain, such as `relax` followed by `classify`, counts the
+unmapped triples of the input that the chain read, while a `check` there checks the
+mapped document, which has lost them, as roadmap item 1311 records. A classification with
+unmapped triples still runs the modules' pass for its left-out axioms, whose answer the
+unmapped triples then override, and roadmap item 1309 records skipping it. A typing as `rdf:Property` alone, as RDFS
+vocabularies type their properties, carries no logical content, so a classification does
+not count it, while the read and the profile checks still report it as unmapped. The GO and ChEBI lite releases in RDF/XML, and stores of
+OWL2Bench and of LUBM with their assertions, count no unmapped triple. The triples of a SWRL rule are not unmapped, since
+the RDF reader maps a rule and its atoms to assertions about anonymous individuals, so a
+classification with `assertions` reads them as assertions and can answer complete while
+it ignores the rule. Roadmap item 1302 records this.
+
+The pass costs nothing when nothing is left out and nothing is dropped. A classification of
+the terminology alone reads the assertions only up to the first with logical content, and
+takes no extraction for them. The pass's extractions share one bound on the
+axioms they examine, 1024 for each axiom of the input and at least about a million, past
+which the classes not yet decided are incomplete, so an answer depends on the input
+alone. `Limits::coverage_work` sets the bound and `Stats::coverage_over` reports it. A
+deadline or cancellation during the pass leaves every class incomplete and the
+consistency unknown with `coverageStopped` set, rather than discard the saturation, and the
+dataset retains the saturation but publishes no such answer. On a loaded laptop with four
+threads the pass took about 0.4 s on GO and 0.8 s and 107 MiB on ChEBI lite with the
+EL-only rules, which leave axioms of both out. These are single approximate runs. `Limits::coverage` false skips it, which the ROBOT-compatible commands
+do since they read only the taxonomy.
+
+`strict` on the request, `--strict` on `ontology classify` and `--strict true` on ROBOT's
+`reason`, `reduce` and `materialize` refuse a run that is not complete for the whole
+ontology. The refusal is the component error `classification-incomplete`, HTTP 422, which
+names the axioms and the rule each breaks, `UnsupportedError` in Python and Node.js, an
+unsupported error in the JVM and the FFI, and ROBOT's `INCOMPLETE REASONING ERROR`. The
+default stays non-strict, except that ROBOT's commands are strict when they name HermiT
+or JFact as the reasoner, since a caller who asks for those expects a complete answer or
+an error. `--strict false` turns that off, and ELK and the other names keep the warning.
+`reduce` classifies ROBOT's subset of the subclass axioms and the property
+characteristics, so its refusal concerns the axioms of that subset. The JVM binding has
+no OWL API reasoner adapter and its `ClassifyQuery` names no reasoner, so its `strict`
+stays off by default as the opt-in. The content fingerprint of a retained classification is
+version 2, since it now covers both flags. The server computes it in memory and stores it
+nowhere, so only a client that kept an older fingerprint sees a new value.
 
 ### Roadmap follow-ups
 

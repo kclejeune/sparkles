@@ -970,6 +970,8 @@ impl From<Error> for ApiError {
             {
                 StatusCode::UNPROCESSABLE_ENTITY
             }
+            // a strict classification whose answer would not be complete
+            Error::Component(c) if c.component == "classifier" => StatusCode::UNPROCESSABLE_ENTITY,
             // a write handler answers a dry run with its preview before errors are mapped
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
@@ -996,6 +998,9 @@ impl From<Error> for ApiError {
                 "requested": b.requested,
             }),
             Error::Component(c) if c.component == "reasoner" => {
+                json!({ "error": msg, "code": c.code })
+            }
+            Error::Component(c) if c.component == "classifier" => {
                 json!({ "error": msg, "code": c.code })
             }
             #[cfg(feature = "ontology")]
