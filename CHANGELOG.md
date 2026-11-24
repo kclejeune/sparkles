@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+### Rooted rewriting kept when an ontology becomes Horn or EL
+
+When item 805's rooted rewriting turns every non-Horn axiom into Horn or OWL 2 EL axioms,
+such as a one-image `DisjointUnion` or two complemented disjointness members that merge to
+one image, `Saturation::run` now keeps the lower-tier classification whenever every rewritten
+axiom is taken (roadmap item 1313). Previously it discarded the result whenever Tier D did
+not run and reported the original axiom outside the supported fragment. Kept lower-tier
+results preserve original-axiom counts, outside-EL statistics and tier, restore unchanged
+exclusions and hide all internal fresh classes and the hub individual. Rewritten runs that
+stay disjunctive without taking Tier D or that leave out any rewritten axiom still fall back
+to the original axioms.
+
 ### One result writer per format, with the engine's own SPARQL encoders
 
 Roadmap items 828 and 243 write every SELECT, ASK and graph answer through one writer per

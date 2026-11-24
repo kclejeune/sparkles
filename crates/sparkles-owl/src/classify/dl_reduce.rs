@@ -126,6 +126,17 @@ impl Reduction {
         *excluded = out;
     }
 
+    /// Whether the run left out or used only in part any axiom that the rewriting made.
+    /// The lookup holds only the report's axioms, so it costs memory in proportion to
+    /// the report and not to the rewriting.
+    pub fn excludes_rewritten(&self, excluded: &[Excluded]) -> bool {
+        if excluded.is_empty() {
+            return false;
+        }
+        let left: FxHashSet<&AxiomKind> = excluded.iter().map(|e| &e.axiom).collect();
+        self.axioms.iter().any(|k| left.contains(k))
+    }
+
     /// What the original axioms outside OWL 2 EL need, for the run's statistics, with the
     /// report of the axioms the run left out.
     /// `chains` are the original chains outside OWL 2 EL for their ranges alone, which are

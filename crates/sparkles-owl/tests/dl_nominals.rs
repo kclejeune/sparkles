@@ -2747,3 +2747,530 @@ fn the_marker_repair_delivers_in_the_run_without_counting_after_the_bound() {
         );
     }
 }
+
+/// Parses an ontology directly with `ofn_read::parse`, without injecting `UNION` (row 1313).
+fn direct_axioms(body: &str) -> Vec<Axiom> {
+    ofn_read::parse(&format!(
+        "Prefix(:=<{EX}>)\nPrefix(owl:=<http://www.w3.org/2002/07/owl#>)\nOntology(\n{body}\n)"
+    ))
+    .unwrap()
+    .axioms
+}
+
+/// Asserts that a direct-parsed ontology whose item-805 rewriting turns a one-image
+/// `DisjointUnion` into Horn axioms keeps the rewritten result without an injected
+/// disjunction (row 1313).
+#[test]
+fn one_image_disjoint_union_becomes_horn_without_injected_disjunction() {
+    let ax = direct_axioms(
+        "DisjointUnion(:C
+             ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A))
+         SubClassOf(:K :A)
+         SubClassOf(:L :C)
+         ClassAssertion(:B :b)",
+    );
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                strict: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{threads}: {:#?}", k.excluded());
+        assert!(out.complete && out.complete_for_taken);
+        assert!(out.incomplete.is_empty());
+        assert_eq!(out.consistency, Consistency::Consistent);
+        for name in ["A", "K", "C", "L"] {
+            assert!(
+                out.taxonomy.is_unsatisfiable(&c(name)),
+                "{threads}: {name} is empty"
+            );
+        }
+        assert!(!out.taxonomy.is_unsatisfiable(&c("B")));
+        assert_eq!(out.stats.added, ax.len());
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert_eq!(out.stats.outside_el.horn, 0);
+        assert_eq!(out.stats.outside_el.disjunctive, 1);
+        assert_eq!(out.stats.outside_el.global, 0);
+        assert_eq!(out.stats.outside_el.taken, 1);
+        assert_eq!(out.stats.clauses, 0, "Horn rules ran instead of Tier D");
+        let instances: Vec<String> = k
+            .describe(&Class::thing())
+            .unwrap()
+            .instances
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        assert_eq!(instances, [format!("{EX}b")]);
+        assert!(k.describe(&Class::new(format!("{INTERNAL}u"))).is_none());
+        no_internal_names(
+            &k,
+            &out,
+            &[
+                Class::thing(),
+                Class::nothing(),
+                c("A"),
+                c("B"),
+                c("C"),
+                c("K"),
+                c("L"),
+            ],
+        );
+    }
+
+    // Re-running after removing the DisjointUnion resets the reduced state and matches a
+    // fresh classifier without leaking internal names.
+    let mut k = Classifier::of(&ax);
+    k.classify(&rooted_limits()).unwrap();
+    let du: Vec<Axiom> = ax
+        .iter()
+        .filter(|a| matches!(a.kind, AxiomKind::DisjointUnion(..)))
+        .cloned()
+        .collect();
+    k.remove(&du);
+    let after = k.classify(&rooted_limits()).unwrap();
+    let rest: Vec<Axiom> = ax
+        .iter()
+        .filter(|a| !matches!(a.kind, AxiomKind::DisjointUnion(..)))
+        .cloned()
+        .collect();
+    let mut fresh = Classifier::of(&rest);
+    let want = fresh.classify(&rooted_limits()).unwrap();
+    assert_eq!(after.taxonomy, want.taxonomy);
+    assert_eq!(after.consistency, want.consistency);
+    assert_eq!(k.excluded(), fresh.excluded());
+    assert!(!after.taxonomy.is_unsatisfiable(&c("A")));
+    no_internal_names(&k, &after, &[Class::thing(), c("A"), c("B"), c("K")]);
+}
+
+/// A one-image `DisjointUnion` whose rewriting drops `owl:topObjectProperty` via
+/// `ObjectMinCardinality(0 owl:topObjectProperty :X)` becomes pure OWL 2 EL (row 1313).
+#[test]
+fn one_image_disjoint_union_becomes_el_without_universal_property() {
+    let ax = direct_axioms(
+        "DisjointUnion(:C
+             ObjectSomeValuesFrom(:r owl:Thing)
+             ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))
+         SubClassOf(:D ObjectSomeValuesFrom(:r :Y))
+         SubClassOf(:L :C)
+         ClassAssertion(:Y :y)",
+    );
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                strict: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{threads}: {:#?}", k.excluded());
+        assert!(out.complete && out.complete_for_taken);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        for name in ["C", "L", "D"] {
+            assert!(
+                out.taxonomy.is_unsatisfiable(&c(name)),
+                "{threads}: {name} is empty"
+            );
+        }
+        for name in ["X", "Y"] {
+            assert!(
+                out.taxonomy.node_of(&c(name)).is_some(),
+                "{threads}: {name} stays in signature"
+            );
+            assert!(
+                !out.taxonomy.is_unsatisfiable(&c(name)),
+                "{threads}: {name} stays satisfiable"
+            );
+        }
+        assert_eq!(out.stats.added, ax.len());
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert_eq!(out.stats.outside_el.horn, 0);
+        assert_eq!(out.stats.outside_el.disjunctive, 1);
+        assert_eq!(out.stats.outside_el.global, 0);
+        assert_eq!(out.stats.outside_el.taken, 1);
+        assert_eq!(out.stats.clauses, 0);
+        assert_eq!(out.stats.conjunctions, 0);
+        let instances: Vec<String> = k
+            .describe(&Class::thing())
+            .unwrap()
+            .instances
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        assert_eq!(instances, [format!("{EX}y")]);
+        no_internal_names(
+            &k,
+            &out,
+            &[Class::thing(), c("C"), c("D"), c("L"), c("X"), c("Y")],
+        );
+    }
+}
+
+/// Two complemented disjointness members that merge to one image become `¬D ⊑ ⊥`, which is
+/// Horn (`⊤ ⊑ D`), and must be kept without an injected disjunction (row 1313).
+#[test]
+fn two_complemented_disjointness_members_become_horn_without_injected_disjunction() {
+    // Nested complement case: `¬(P ⊓ ¬∃top.A)` and `¬(P ⊓ ¬≥1 top.A)` merge to
+    // `¬(P ⊓ ¬∃U.A) ⊑ ⊥`, giving `⊤ ⊑ P` and `A ⊑ ⊥`. Without item 1313, the original
+    // disjointness fails Horn normalization because each positive complement allocates its
+    // own fresh class.
+    let ax_nested = direct_axioms(
+        "DisjointClasses(
+             ObjectComplementOf(ObjectIntersectionOf(:P ObjectComplementOf(ObjectSomeValuesFrom(owl:topObjectProperty :A))))
+             ObjectComplementOf(ObjectIntersectionOf(:P ObjectComplementOf(ObjectMinCardinality(1 owl:topObjectProperty :A)))))
+         ClassAssertion(:D :d)",
+    );
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax_nested);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                strict: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{threads}: {:#?}", k.excluded());
+        assert!(out.complete && out.complete_for_taken);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(out.taxonomy.is_subclass(&Class::thing(), &c("P")));
+        assert!(out.taxonomy.is_subclass(&c("D"), &c("P")));
+        assert!(!out.taxonomy.is_subclass(&c("P"), &c("D")));
+        assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("D")));
+        assert_eq!(out.stats.added, ax_nested.len());
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert_eq!(out.stats.outside_el.horn, 0);
+        assert_eq!(out.stats.outside_el.disjunctive, 1);
+        assert_eq!(out.stats.outside_el.global, 1);
+        assert_eq!(out.stats.outside_el.taken, 1);
+        assert_eq!(out.stats.clauses, 0);
+        let instances: Vec<String> = k
+            .describe(&Class::thing())
+            .unwrap()
+            .instances
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        assert_eq!(instances, [format!("{EX}d")]);
+        no_internal_names(&k, &out, &[Class::thing(), c("A"), c("D"), c("P")]);
+    }
+
+    // Consistent case with `U` and `hub`: `¬∃top.A` and `¬≥1 top.A` merge to `¬∃U.A ⊑ ⊥`,
+    // giving `⊤ ⊑ ∃U.A` and thus `owl:Thing ⊑ :B`.
+    let ax = direct_axioms(
+        "DisjointClasses(
+             ObjectComplementOf(ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectComplementOf(ObjectMinCardinality(1 owl:topObjectProperty :A)))
+         SubClassOf(ObjectSomeValuesFrom(owl:topObjectProperty :A) :B)
+         ClassAssertion(:D :d)",
+    );
+    for threads in [1, 4] {
+        let mut k = Classifier::of(&ax);
+        let out = k
+            .classify(&Limits {
+                threads,
+                rooted: true,
+                strict: true,
+                ..Limits::default()
+            })
+            .unwrap();
+        assert!(k.excluded().is_empty(), "{threads}: {:#?}", k.excluded());
+        assert!(out.complete && out.complete_for_taken);
+        assert_eq!(out.consistency, Consistency::Consistent);
+        assert!(out.taxonomy.is_subclass(&Class::thing(), &c("B")));
+        assert!(out.taxonomy.is_subclass(&c("D"), &c("B")));
+        assert!(!out.taxonomy.is_subclass(&c("B"), &c("D")));
+        assert!(!out.taxonomy.is_unsatisfiable(&c("A")));
+        assert_eq!(out.stats.added, ax.len());
+        assert_eq!(out.stats.tier, Tier::Disjunctive);
+        assert_eq!(out.stats.outside_el.horn, 0);
+        assert_eq!(out.stats.outside_el.disjunctive, 1);
+        assert_eq!(out.stats.outside_el.global, 1);
+        assert_eq!(out.stats.outside_el.taken, 1);
+        assert_eq!(out.stats.clauses, 0);
+        let instances: Vec<String> = k
+            .describe(&Class::thing())
+            .unwrap()
+            .instances
+            .iter()
+            .map(|i| i.as_str().to_string())
+            .collect();
+        assert_eq!(instances, [format!("{EX}d")]);
+        no_internal_names(&k, &out, &[Class::thing(), c("A"), c("B"), c("D")]);
+    }
+
+    // Inconsistent case: `⊤ ⊑ ∃top.A` with `A ⊑ ⊥` has no model.
+    let ax_unsat = direct_axioms(
+        "DisjointClasses(
+             ObjectComplementOf(ObjectSomeValuesFrom(owl:topObjectProperty :A))
+             ObjectComplementOf(ObjectMinCardinality(1 owl:topObjectProperty :A)))
+         SubClassOf(:A owl:Nothing)
+         ClassAssertion(:D :d)",
+    );
+    let mut k = Classifier::of(&ax_unsat);
+    let out = k
+        .classify(&Limits {
+            rooted: true,
+            strict: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.complete);
+    assert!(!out.consistent);
+    assert_eq!(out.consistency, Consistency::Inconsistent);
+    assert_eq!(out.stats.added, ax_unsat.len());
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert_eq!(out.stats.outside_el.horn, 0);
+    assert_eq!(out.stats.outside_el.disjunctive, 1);
+    assert_eq!(out.stats.outside_el.global, 1);
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.clauses, 0);
+    let instances: Vec<String> = k
+        .describe(&Class::thing())
+        .unwrap()
+        .instances
+        .iter()
+        .map(|i| i.as_str().to_string())
+        .collect();
+    assert_eq!(instances, [format!("{EX}d")]);
+    no_internal_names(&k, &out, &[Class::thing(), c("A"), c("D")]);
+
+    // Case without `U`/`hub`: `¬∃r.⊤` and `¬∃r.(≥0 top.X)` merge to `¬∃r.⊤ ⊑ ⊥`, giving
+    // `⊤ ⊑ ∃r.⊤` and thus `owl:Thing ⊑ :Dom`.
+    let ax_no_u = direct_axioms(
+        "DisjointClasses(
+             ObjectComplementOf(ObjectSomeValuesFrom(:r owl:Thing))
+             ObjectComplementOf(ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X))))
+         ObjectPropertyDomain(:r :Dom)",
+    );
+    let mut k = Classifier::of(&ax_no_u);
+    let out = k
+        .classify(&Limits {
+            rooted: true,
+            strict: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.complete);
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_subclass(&Class::thing(), &c("Dom")));
+    assert!(out.taxonomy.node_of(&c("X")).is_some());
+    assert!(!out.taxonomy.is_unsatisfiable(&c("X")));
+    assert_eq!(out.stats.added, ax_no_u.len());
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert_eq!(out.stats.outside_el.horn, 0);
+    assert_eq!(out.stats.outside_el.disjunctive, 1);
+    assert_eq!(out.stats.outside_el.global, 1);
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.clauses, 0);
+    no_internal_names(&k, &out, &[Class::thing(), c("Dom"), c("X")]);
+}
+
+/// When item-805 rewriting turns the ontology Horn beside a `HasKey`, the Horn rules
+/// classify both the key axioms and the rewritten disjoint union while hiding every fresh
+/// key class and the hub individual (row 1313).
+#[test]
+fn one_image_disjoint_union_with_key_keeps_rewritten_horn_and_hides_key_names() {
+    let ax = direct_axioms(
+        "HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)
+         ClassAssertion(:G :a)
+         EquivalentClasses(:D ObjectOneOf(:b))
+         DisjointUnion(:C
+             ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k
+        .classify(&Limits {
+            rooted: true,
+            strict: true,
+            ..Limits::default()
+        })
+        .unwrap();
+    assert!(k.excluded().is_empty(), "{:#?}", k.excluded());
+    assert!(out.complete);
+    assert_eq!(out.consistency, Consistency::Consistent);
+    assert!(out.taxonomy.is_subclass(&c("D"), &c("G")));
+    assert!(out.taxonomy.is_subclass(&c("D"), &c("K")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("D")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+    assert_eq!(out.stats.added, ax.len());
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert_eq!(out.stats.outside_el.horn, 0);
+    assert_eq!(out.stats.outside_el.disjunctive, 1);
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.clauses, 0);
+    let instances: Vec<String> = k
+        .describe(&Class::thing())
+        .unwrap()
+        .instances
+        .iter()
+        .map(|i| i.as_str().to_string())
+        .collect();
+    assert_eq!(
+        instances,
+        [format!("{EX}a"), format!("{EX}b"), format!("{EX}c")]
+    );
+    no_internal_names(
+        &k,
+        &out,
+        &[Class::thing(), c("A"), c("C"), c("D"), c("G"), c("K")],
+    );
+}
+
+/// When the rewritten ontology becomes Horn and every rewritten axiom is taken, an
+/// unchanged axiom outside OWL 2 DL (such as functionality on a superproperty of
+/// `owl:topObjectProperty`) stays excluded while the rewritten result is kept (row 1313).
+#[test]
+fn rewritten_horn_keeps_result_when_only_an_unchanged_axiom_is_excluded() {
+    let ax = direct_axioms(
+        "EquivalentObjectProperties(owl:topObjectProperty :p)
+         FunctionalObjectProperty(:p)
+         DisjointUnion(:C
+             ObjectSomeValuesFrom(owl:topObjectProperty :A)
+             ObjectMinCardinality(1 owl:topObjectProperty :A))
+         ClassAssertion(:B :b)",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    assert!(!out.complete && out.complete_for_taken);
+    assert!(out.consistent);
+    assert_eq!(out.consistency, Consistency::Unknown);
+    assert!(out.taxonomy.is_unsatisfiable(&c("A")));
+    assert!(out.taxonomy.is_unsatisfiable(&c("C")));
+    assert!(!out.taxonomy.is_unsatisfiable(&c("B")));
+    let left = k.excluded();
+    assert_eq!(left.len(), 1, "{left:#?}");
+    assert!(matches!(
+        left[0].axiom,
+        AxiomKind::FunctionalObjectProperty(_)
+    ));
+    assert_eq!(out.stats.added, ax.len());
+    assert_eq!(out.stats.tier, Tier::Disjunctive);
+    assert_eq!(out.stats.outside_el.horn, 1);
+    assert_eq!(out.stats.outside_el.disjunctive, 1);
+    assert_eq!(out.stats.outside_el.taken, 1);
+    assert_eq!(out.stats.clauses, 0);
+    no_internal_names(&k, &out, &[Class::thing(), c("A"), c("B"), c("C")]);
+}
+
+/// Ineligible lower-tier rewrites must still be discarded and reported on the original
+/// axioms when the lower-tier reduction contract does not hold (row 1313).
+#[test]
+fn ineligible_lower_tier_rewrites_still_fall_back_to_original_axioms() {
+    let cases: &[(&str, &str)] = &[
+        // Non-regular role hierarchy causes Horn to reject Symmetric(U) and Transitive(U).
+        (
+            "non-regular top chain",
+            "SubObjectPropertyOf(ObjectPropertyChain(:r owl:topObjectProperty :r) :r)
+             DisjointUnion(:C
+                 ObjectSomeValuesFrom(owl:topObjectProperty :A)
+                 ObjectMinCardinality(1 owl:topObjectProperty :A))
+             ClassAssertion(:B :b)",
+        ),
+        // Rewritten 2-member DisjointUnion(:C, {owl:Thing, ∃U.A}) has Horn shape but Horn
+        // rejects multi-member DisjointUnion axioms.
+        (
+            "horn-shaped two-member disjoint union",
+            "DisjointUnion(:C
+                 owl:Thing
+                 ObjectSomeValuesFrom(owl:topObjectProperty :A)
+                 ObjectMinCardinality(1 owl:topObjectProperty :A))
+             ClassAssertion(:B :b)",
+        ),
+        // Rewritten ¬(≥2 r.∃U.A) ⊑ ⊥ is Horn-shaped (⊤ ⊑ ≥2 r.∃U.A), but Horn rejects
+        // at-least cardinalities above one beside individuals.
+        (
+            "complemented at-least-2 beside individuals",
+            "DisjointClasses(
+                 ObjectComplementOf(ObjectMinCardinality(2 :r ObjectSomeValuesFrom(owl:topObjectProperty :A)))
+                 ObjectComplementOf(ObjectMinCardinality(2 :r ObjectMinCardinality(1 owl:topObjectProperty :A))))
+             ClassAssertion(:B :b)",
+        ),
+        // Rewritten ≥3 r.∃U.A ⊑ ⊥ remains non-Horn (Tier::Disjunctive) and Tier D declines
+        // it with counting off.
+        (
+            "at-least-3 stays disjunctive",
+            "DisjointClasses(
+                 ObjectMinCardinality(3 :r ObjectSomeValuesFrom(owl:topObjectProperty :A))
+                 ObjectMinCardinality(3 :r ObjectMinCardinality(1 owl:topObjectProperty :A)))
+             ClassAssertion(:B :b)",
+        ),
+    ];
+
+    for &(label, body) in cases {
+        let ax = direct_axioms(body);
+        let mut k = Classifier::of(&ax);
+        let out = k.classify(&rooted_limits()).unwrap();
+        let mut plain = Classifier::of(&ax);
+        let default = plain.classify(&Limits::default()).unwrap();
+        assert!(!out.complete, "{label}: must stay incomplete");
+        assert_eq!(out.taxonomy, default.taxonomy, "{label}: taxonomy");
+        assert_eq!(out.consistency, default.consistency, "{label}: consistency");
+        assert_eq!(k.excluded(), plain.excluded(), "{label}: excluded");
+        assert!(
+            k.excluded().iter().any(|e| matches!(
+                e.axiom,
+                AxiomKind::DisjointUnion(..) | AxiomKind::DisjointClasses(..)
+            )),
+            "{label}: original non-Horn axiom must be reported: {:#?}",
+            k.excluded()
+        );
+        no_internal_names(&k, &out, &[Class::thing(), c("A"), c("B")]);
+    }
+
+    // Non-regular chain beside a HasKey and a one-image DisjointUnion: Horn rejects the
+    // rewritten key's universal axiom, so the rewritten run must be discarded and the
+    // original EL HasKey must still merge :a and :b.
+    let ax = direct_axioms(
+        "SubObjectPropertyOf(ObjectPropertyChain(:p :q) :s)
+         SubObjectPropertyOf(ObjectPropertyChain(:s :p) :q)
+         HasKey(:K (:p) ())
+         ClassAssertion(:K :a)
+         ClassAssertion(:K :b)
+         ObjectPropertyAssertion(:p :a :c)
+         ObjectPropertyAssertion(:p :b :c)
+         ClassAssertion(:G :a)
+         EquivalentClasses(:D ObjectOneOf(:b))
+         DisjointUnion(:C
+             ObjectSomeValuesFrom(:r owl:Thing)
+             ObjectSomeValuesFrom(:r ObjectMinCardinality(0 owl:topObjectProperty :X)))",
+    );
+    let mut k = Classifier::of(&ax);
+    let out = k.classify(&rooted_limits()).unwrap();
+    let mut plain = Classifier::of(&ax);
+    let default = plain.classify(&Limits::default()).unwrap();
+    assert_eq!(out.taxonomy, default.taxonomy);
+    assert_eq!(out.consistency, default.consistency);
+    assert_eq!(k.excluded(), plain.excluded());
+    assert!(out.taxonomy.is_subclass(&c("D"), &c("G")));
+    assert!(
+        k.excluded()
+            .iter()
+            .any(|e| matches!(e.axiom, AxiomKind::DisjointUnion(..))),
+        "{:#?}",
+        k.excluded()
+    );
+    assert!(
+        !k.excluded()
+            .iter()
+            .any(|e| matches!(e.axiom, AxiomKind::HasKey(..))),
+        "{:#?}",
+        k.excluded()
+    );
+    no_internal_names(&k, &out, &[Class::thing(), c("C"), c("D"), c("G"), c("K")]);
+}

@@ -2874,8 +2874,9 @@ impl Saturation {
             && let Some(red) = dl_reduce::plan(axioms, limits.max_memory)
         {
             // item 805: keys over object properties and the universal property go through
-            // class axioms over fresh names, which a run that does not take Tier D leaves
-            // to the run without them
+            // class axioms over fresh names; keep the run when Tier D took it, or when
+            // the rewriting turned the ontology Horn or EL and every rewritten axiom was
+            // taken (item 1313)
             let all = red.all(axioms);
             // the interner of an earlier run holds names and individuals that decide the
             // tiers, so the rewritten axioms start from nothing
@@ -2893,10 +2894,13 @@ impl Saturation {
             );
             self.hide_internal = false;
             match r {
-                Ok(ControlFlow::Continue(mut r)) if self.dl_tried => {
+                Ok(ControlFlow::Continue(mut r))
+                    if self.dl_tried
+                        || (r.2.tier != Tier::Disjunctive
+                            && !red.excludes_rewritten(&self.excluded)) =>
+                {
                     red.restore(axioms, &mut self.excluded);
                     r.2.added = self.source_len.unwrap_or(axioms.len());
-                    let tier = r.2.tier;
                     let mut chains: Vec<Excluded> = std::mem::take(&mut self.chain_ranged)
                         .into_iter()
                         .map(|axiom| Excluded {
@@ -2907,18 +2911,20 @@ impl Saturation {
                     red.restore(axioms, &mut chains);
                     let chains: Vec<&AxiomKind> = chains.iter().map(|e| &e.axiom).collect();
                     r.2.outside_el = red.outside_el(axioms, &chains, &self.excluded);
-                    r.2.tier = tier;
+                    r.2.tier = r.2.outside_el.tier();
                     self.reduced = true;
                     return Ok(r);
                 }
                 Err(e) => {
                     // the report of a run that stopped still names the original axioms
                     red.restore(axioms, &mut self.excluded);
+                    self.chain_ranged.clear();
                     self.reduced = true;
                     return Err(e);
                 }
                 _ => {
                     red.restore(axioms, &mut self.excluded);
+                    self.chain_ranged.clear();
                     self.reset();
                 }
             }
