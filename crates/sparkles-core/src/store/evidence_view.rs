@@ -66,6 +66,11 @@ impl BoundEvidenceView {
         self.inner._held.bytes()
     }
 
+    /// The configured memory limit of the [`Preparation`] backing this evidence view.
+    pub fn preparation_limit(&self) -> u64 {
+        self.inner._held.preparation().limit()
+    }
+
     /// Retain the genuine RDF/configuration source and its original admission.
     /// This owner grants no current authorization or independent output credit.
     pub fn read_source(&self) -> super::BoundReadSource {
@@ -114,15 +119,22 @@ impl BoundEvidenceView {
         &self.inner.snapshot
     }
 
+    /// Refuse applying an access policy whose top-level or nested guards were bound
+    /// against a different snapshot than this evidence view.
+    pub fn validate_access(&self, access: &crate::access::GraphAccess) -> Result<()> {
+        access.check_bound_snapshot(&self.inner.snapshot)
+    }
+
     /// Prepare a controlled access view over this evidence view under `preparation`.
     /// The returned [`crate::access::PreparedView`] retains this evidence view and its
-    /// original reservation alongside the mask's own credit.
+    /// original reservation alongside the mask's own credit, and records a weak identity
+    /// of `policy` for strict cursor execution (`sparql::select_source_cursor`).
     pub fn prepare_view(
         &self,
-        access: &crate::access::GraphAccess,
+        policy: Arc<crate::access::GraphAccess>,
         preparation: &Preparation,
     ) -> Result<crate::access::PreparedView> {
-        crate::access::triples::controlled::prepare_evidence(self.clone(), access, preparation)
+        crate::access::triples::controlled::prepare_evidence(self.clone(), policy, preparation)
     }
 
     /// Exact original owner bytes. These describe history and grant no access.
@@ -336,8 +348,17 @@ impl Store {
             .as_ref()
             .ok_or_else(inactive)?
             .identity(self.owner_dataset_id());
-        let allowance = preparation.room();
-        let mut held = preparation.reserve(allowance)?;
+        let (allowance, mut held) = {
+            let allowance = preparation.selection_room();
+            match preparation.reserve(allowance) {
+                Ok(held) => (allowance, held),
+                Err(Error::BudgetExceeded(_)) => {
+                    let covered = preparation.covered_room();
+                    (covered, preparation.reserve(covered)?)
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let options = HistoryOptions {
             cancel: Some(preparation.control().cancel.flag()),
             deadline: preparation.control().deadline,

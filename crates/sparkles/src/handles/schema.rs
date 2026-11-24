@@ -446,6 +446,37 @@ impl Schema {
             .unwrap_or_default())
     }
 
+    /// The constraints layer of `shapes` over an authenticated [`crate::store::BoundEvidenceView`],
+    /// without opening live `HEAD` when only the installed write guard is needed and without
+    /// exposing the evidence view's raw snapshot.
+    pub fn constraints_for_evidence(
+        &self,
+        evidence: &crate::store::BoundEvidenceView,
+        shapes: &ShapesRequest,
+        view: Option<&GraphAccess>,
+    ) -> Result<Option<ConstraintsLayer>> {
+        evidence.validate_instance(self.ds.store())?;
+        if let Some(v) = view {
+            evidence.validate_access(v)?;
+        }
+        #[cfg(feature = "shacl")]
+        {
+            if shapes.graphs.is_empty() {
+                return guard_constraints_layer(&self.ds, shapes, view);
+            }
+            let snap = self.state(Some(&At::Commit(evidence.commit().seq)), None)?;
+            constraints_layer(&self.ds, &snap, shapes, view)
+        }
+        #[cfg(not(feature = "shacl"))]
+        {
+            let _ = view;
+            if shapes.guard == Some(true) || !shapes.graphs.is_empty() {
+                return Err(Error::unsupported("built without the `shacl` feature"));
+            }
+            Ok(None)
+        }
+    }
+
     /// The constraints layer of `shapes` over a state the caller has opened, or `None`
     /// when it has no source (see [`constraints`](Self::constraints)).
     pub fn constraints_at(
@@ -637,11 +668,11 @@ impl Schema {
     }
 }
 
-/// The constraints layer of `req` over `snap`, or `None` when it has no source.
+/// The constraints layer of the dataset's installed write guard alone, requiring no
+/// RDF snapshot read.
 #[cfg(feature = "shacl")]
-fn constraints_layer(
+fn guard_constraints_layer(
     ds: &Dataset,
-    snap: &Snapshot,
     req: &ShapesRequest,
     view: Option<&GraphAccess>,
 ) -> Result<Option<ConstraintsLayer>> {
@@ -688,6 +719,28 @@ fn constraints_layer(
             None => {}
         }
     }
+    Ok((!layer.is_empty()).then_some(layer))
+}
+
+/// The constraints layer of `req` over `snap`, or `None` when it has no source.
+#[cfg(feature = "shacl")]
+fn constraints_layer(
+    ds: &Dataset,
+    snap: &Snapshot,
+    req: &ShapesRequest,
+    view: Option<&GraphAccess>,
+) -> Result<Option<ConstraintsLayer>> {
+    let mut layer = guard_constraints_layer(ds, req, view)?.unwrap_or_default();
+    let view = view.filter(|v| !v.reads_all());
+    let readable = |g: &str| {
+        view.is_none_or(|v| {
+            if g == "default" {
+                v.read.default_graph()
+            } else {
+                v.read.allows_iri(g)
+            }
+        })
+    };
     if !req.graphs.is_empty() {
         for g in &req.graphs {
             let exists = g == "default" || graph_exists(snap, g);

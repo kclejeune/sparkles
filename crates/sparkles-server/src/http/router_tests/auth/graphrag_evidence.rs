@@ -1029,6 +1029,7 @@ async fn a_changed_evidence_configuration_stops_the_run() {
             None,
             Default::default(),
             Limits::default(),
+            &e2.ds().dataset.query_options(),
         )
         .unwrap()
         .unwrap();
@@ -1318,4 +1319,119 @@ async fn failed_refreshes_after_checks_back_off() {
     })
     .await
     .unwrap();
+}
+
+/// A pooled server running a GraphRAG build under a review policy must share the
+/// catalog's memory pool instead of failing with query-memory: foreign-domain.
+#[tokio::test(flavor = "multi_thread")]
+async fn pooled_server_evidence_build_succeeds_and_returns_pool_credit() {
+    let dir = tempfile::tempdir().unwrap();
+    let st = Arc::new(
+        crate::state::AppState::with_memory(
+            dir.path(),
+            sparkles::store::StoreOptions::default(),
+            std::time::Duration::from_secs(30),
+            Some(128 << 20),
+        )
+        .unwrap(),
+    );
+    let ds = st.attach("ev", DbType::Memory, None).unwrap();
+    let p = sparkles::access::Preparation::new(Control::none(), 64 << 20).unwrap();
+    ds.dataset
+        .store()
+        .activate_memory_configuration_history(&p)
+        .unwrap();
+    drop(p);
+    evidence::configure(&ds.dataset, &evidence_settings(1), &Control::none()).unwrap();
+    let mut org = crate::graphrag::build::tests::data(4);
+    org.push_str(&format!(
+        "<{ORG}> {{ <http://ex/y0> <http://ex/owns> <http://ex/y1> . }}\n"
+    ));
+    ds.store
+        .load(&[Source::from_bytes(
+            org.into_bytes(),
+            oxrdfio::RdfFormat::TriG,
+            None,
+        )])
+        .unwrap();
+    let a = propose(&ds.dataset, "advisory", leads());
+    decide(&ds.dataset, &a, Disposition::Accepted, 1);
+    let mock = MockModel::start(|r, _| (200, mock::openai(&answer_all(r))));
+    st.models
+        .store(Some(Arc::new(crate::graphrag::build::tests::models_for(
+            &mock.url(),
+            &serde_json::json!({ "provider": "p", "model": "m" }),
+        ))));
+    crate::settings::store_runtime(
+        &st,
+        &ds,
+        &crate::settings::ASSISTANT,
+        &serde_json::json!({ "send": "rows" }),
+    )
+    .unwrap();
+    let s = settings(serde_json::json!({}));
+    crate::settings::store_runtime(
+        &st,
+        &ds,
+        &crate::settings::GRAPHRAG,
+        &serde_json::to_value(&s).unwrap(),
+    )
+    .unwrap();
+    let st_bg = st.clone();
+    let ds_bg = ds.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        build::run(&Run {
+            st: &st_bg,
+            ds: ds_bg,
+            settings: s,
+            mode: Mode::Build,
+            confirmed: true,
+            task: None,
+            task_id: "pooled-1".into(),
+            cancel: Default::default(),
+            limits: Limits::default(),
+        })
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(outcome.communities > 0);
+    assert_eq!(st.catalog.pool().unwrap().granted(), 0);
+
+    // Verify Evidence::admit preserves configured query_memory_bytes (> 64 MiB and
+    // unbounded None) rather than capping query execution at the 64 MiB selection floor.
+    let mut big_opts = ds.dataset.query_options();
+    big_opts.max_memory_bytes = Some(256 << 20);
+    let ev_big = Evidence::admit(
+        &ds,
+        Some("main"),
+        None,
+        Default::default(),
+        Limits::default(),
+        &big_opts,
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        ev_big.preparation_limit() >= 256 << 20,
+        "expected >= 256 MiB, got {}",
+        ev_big.preparation_limit()
+    );
+    drop(ev_big);
+
+    let mut unbounded_opts = ds.dataset.query_options();
+    unbounded_opts.max_memory_bytes = None;
+    let ev_unbounded = Evidence::admit(
+        &ds,
+        Some("main"),
+        None,
+        Default::default(),
+        Limits::default(),
+        &unbounded_opts,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(ev_unbounded.preparation_limit(), u64::MAX);
+    drop(ev_unbounded);
+    assert_eq!(st.catalog.pool().unwrap().granted(), 0);
 }

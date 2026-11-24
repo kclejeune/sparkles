@@ -101,6 +101,10 @@ pub fn dependents(
         })
     };
     let access = access.or_else(|| Some(Arc::new(GraphAccess::all())));
+    let head = logical.store().snapshot();
+    if let Some(a) = access.as_deref() {
+        a.validate_bound_snapshot(&head)?;
+    }
     let graphs: Vec<(NamedNode, Option<uuid::Uuid>)> = settings
         .proposals
         .iter()
@@ -111,7 +115,6 @@ pub fn dependents(
             (g, n)
         })
         .collect();
-    let head = logical.store().snapshot();
     let preparation = crate::access::Preparation::new(control.clone(), READS_BYTES)?;
     let view = caller_view(access.as_ref(), &head, &preparation)?;
     // Records authenticate at the unmasked head, and a record the caller's view hides any

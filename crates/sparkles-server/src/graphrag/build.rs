@@ -594,6 +594,7 @@ impl Run<'_> {
             opts.graphs.clone(),
             self.cancel.clone(),
             self.limits,
+            &opts,
         )?;
         let view = match &ev {
             Some(e) => BuildView::Source {

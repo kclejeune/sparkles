@@ -1256,7 +1256,7 @@ impl Tools<'_> {
     fn conflicts(
         &self,
         ds: &crate::state::Dataset,
-        _r: &Reader,
+        r: &Reader,
         entities: &[Entity],
         facts: &[Fact],
         ctx: &ErrorContext,
@@ -1268,15 +1268,12 @@ impl Tools<'_> {
             .call
             .principal
             .view(&ds.name, crate::auth::Endpoint::Info);
-        let layer = match ds
-            .dataset
-            .schema()
-            .constraints(&sparkles::handles::ConstraintsRequest {
-                graphs: view,
-                ..Default::default()
-            }) {
-            Ok(l) => l,
-            Err(Error::Unsupported(_)) | Err(Error::NotFound(_)) | Err(Error::Invalid(_)) => {
+        let layer = match r.constraints(ds, view.as_deref()) {
+            Ok(Some(l)) => l,
+            Ok(None)
+            | Err(Error::Unsupported(_))
+            | Err(Error::NotFound(_))
+            | Err(Error::Invalid(_)) => {
                 return Ok(Vec::new());
             }
             Err(e) => return Err(ctx.engine(e)),
@@ -2252,10 +2249,15 @@ impl Tools<'_> {
         let limit = self
             .cfg()
             .query_memory_bytes
-            .unwrap_or(VIEW_BYTES)
-            .max(VIEW_BYTES);
-        let preparation = match &self.call.grant {
-            Some(grant) => sparkles::access::Preparation::with_grant(control, limit, grant.clone()),
+            .map_or(u64::MAX, |bytes| bytes.saturating_add(VIEW_BYTES));
+        let grant = self.call.grant.clone().or_else(|| {
+            ds.dataset
+                .query_options()
+                .pool
+                .map(|pool| std::sync::Arc::new(pool.empty_grant()))
+        });
+        let preparation = match grant {
+            Some(grant) => sparkles::access::Preparation::with_grant(control, limit, grant),
             None => sparkles::access::Preparation::new(control, limit),
         }
         .map_err(|e| ctx.engine(e))?;

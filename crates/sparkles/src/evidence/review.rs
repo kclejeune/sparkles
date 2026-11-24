@@ -1636,7 +1636,7 @@ fn caller_view_evidence(
     match access.filter(|a| a.hides_triples()) {
         None => Ok(None),
         Some(a) => view
-            .prepare_view(a, preparation)
+            .prepare_view(a.clone(), preparation)
             .map(Some)
             .map_err(|e| match e {
                 Error::Unsupported(m) => managed(ManagedErrorKind::IncompleteEvidence, m),

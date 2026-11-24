@@ -379,11 +379,12 @@ fn controlled_exemptions(
     v: &GraphAccess,
     p: &sparkles::access::Preparation,
 ) -> sparkles::Result<Vec<String>> {
+    let guard_snap = sparkles::access::GuardSnapshot::new(snap);
     let output = Decide {
         guard: g.clone(),
         view: v.clone(),
     }
-    .exempt_controlled(snap, p)?;
+    .exempt_controlled(&guard_snap, p)?;
     let mut values: Vec<_> = output.iter().map(str::to_string).collect();
     values.sort();
     Ok(values)

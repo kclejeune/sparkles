@@ -8,15 +8,21 @@
 `Snapshot::{mask, counts}` and `access::triples::apply` are now crate-private so callers
 cannot retain uncredited masked snapshots, access masks or bound `GraphAccess` policies
 past their owning `Preparation` or `BoundEvidenceView` reservation (roadmap item 1307).
-Checked callers now use `BoundReadSource`, `BoundEvidenceView::prepare_view`,
-`Reads::{from_prepared, from_evidence}`, `WriteTxn::prepare_read_view` and non-escaping
-read-only accessors on `PreparedView` and `Snapshot`. `CountCache::masks` and
-`CountCache::views` now store non-owning weak references with drop-time slot eviction and
-dead-entry pruning, so masked snapshots and visible-graph lists do not outlive their
-active holders. `GraphAccess::bound` records the snapshot identity it resolved guards
-against and checked read paths refuse applying that bound policy to another commit, store
-or uncommitted view. GraphRAG evidence runs and MCP memory recall now read evidence views
-through `BoundReadSource` instead of cloning the raw snapshot.
+`GuardDecision::exempt_controlled` now receives a scoped non-escaping `GuardSnapshot`
+instead of `&Arc<Snapshot>`. Checked callers now use `BoundReadSource`,
+`BoundEvidenceView::prepare_view`, `Reads::{from_prepared, from_evidence}`,
+`WriteTxn::prepare_read_view` (returning a writer-scoped `PreparedTxnView` and
+`ScopedQueryResult`), and non-escaping read-only accessors on `PreparedView` and
+`Snapshot`. `CountCache` stores non-owning weak references in separate controlled and
+legacy mask tables alongside weak visible-graph entries, with best-effort drop-time slot
+eviction and dead-entry pruning so legacy callers cannot acquire paid controlled masks
+and masks do not outlive their active holders. `GraphAccess::bound` records the view
+identity it resolved guards against, and checked read paths and facade evidence readers
+validate top-level and nested rules, accepting the matching view and refusing another
+commit, store, uncommitted view or masked derivative. GraphRAG evidence runs and MCP
+memory recall now read evidence views through `BoundReadSource` under the call's grant or
+dataset query pool while preserving the configured query memory budget and evaluating
+recall conflicts against the reader's state rather than live `HEAD`.
 
 ### A classification is complete only for the whole ontology
 
@@ -1152,6 +1158,23 @@ item 318). `scripts/eval-ask --profile-stages` records the Ask stage diagnostics
 each evaluation child.
 
 ### Compatibility
+
+The unreleased Rust snapshot, mask and access-control surface changed under roadmap item
+1307; HTTP and CLI wire contracts are unchanged:
+
+- `PreparedView::{snapshot, access}`, `BoundEvidenceView::{snapshot, shared_snapshot}`,
+  `Snapshot::{mask, counts}` and `access::triples::apply` are now crate-private. Migrate
+  to `BoundReadSource`, `BoundEvidenceView::prepare_view`,
+  `Reads::{from_prepared, from_evidence}`, and the non-escaping accessors on
+  `PreparedView` and `Snapshot` (`has_mask`, `mask_id`, `mask_key`, `hidden_quad_count`).
+- `GuardDecision::exempt_controlled` now takes `&GuardSnapshot<'_>` instead of
+  `&Arc<Snapshot>`. Migrate providers to `GuardSnapshot::{commit, content_key,
+  lookup_iri, scan, with_term}`.
+- `GraphGuard` now carries a crate-private `bound_to` stamp, breaking downstream struct
+  literals (including `..Default::default()`). Construct guards with `GraphGuard::new`,
+  `GraphGuard::with_decider`, `Graphs::guarded` or `Graphs::guarded_by`.
+- `WriteTxn::graphs` is removed. Use `WriteTxn::prepare_read_view`, which returns a
+  writer-scoped `PreparedTxnView` and `ScopedQueryResult`.
 
 The experimental Rust memory-admission API uses an opaque `ParentHandle` in place
 of `Arc<dyn MemoryParent>`. Parent leases, live credit, query contexts and reasoner

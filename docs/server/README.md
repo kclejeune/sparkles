@@ -274,14 +274,19 @@ The returned `PreparedView` owns its retained-state reservations and exposes non
 policy predicates, metadata accessors and `PreparedView::read_source` rather than a
 cloneable raw snapshot or `GraphAccess` reference. `BoundEvidenceView` follows the same
 boundary through `BoundEvidenceView::read_source` and `BoundEvidenceView::prepare_view`,
-which retains the evidence view's reservation for as long as the prepared view lives.
+which retains the evidence view, its reservation and its Store-instance and weak policy
+identity for as long as the prepared view lives.
 A snapshot that another policy already masked is refused unless the requested policy
-hides no triples. Masked-snapshot and visible-graph deduplication slots on a base
-snapshot hold only non-owning weak references and evict themselves when their last live
-owner drops, so neither masked delta nodes nor visible-graph lists survive past their
-creating view or query without credit. A `GraphAccess` whose undecided guards were bound
-against one snapshot with `GraphAccess::bound` carries that snapshot's identity and is
-refused by checked read paths if applied to another commit, store or uncommitted view.
+hides no triples. Masked-snapshot and visible-graph deduplication tables on a base
+snapshot hold only non-owning weak references, keep controlled `masked_controlled` masks
+separate from legacy `GraphAccess::masked` slots so legacy callers cannot acquire paid
+controlled masks, and evict dead slots on drop on a best-effort basis with dead-entry
+pruning on subsequent lookups and insertions. Neither masked delta nodes nor
+visible-graph lists survive past their last owning view or query without credit. A
+`GraphAccess` whose undecided guards were bound against one snapshot with
+`GraphAccess::bound` carries that view's identity across both top-level and nested rules;
+checked read paths accept the exact matching view and refuse applying it to another
+commit, store, uncommitted view or masked derivative.
 Unbound request policy builders such as `Access::view`, `Grants::graphs` and
 `guard::apply` intentionally construct reusable policy definitions outside a query
 budget before binding, and legacy unbudgeted helpers such as `GraphAccess::masked` and
@@ -290,8 +295,10 @@ Independent copies need their own accounting. This cap does not cover subsequent
 query execution or replace the store's accounting for immutable mappings and shared
 caches. Existing query, hidden-quad and pattern-row limits retain their scope.
 
-Providers implement `GuardDecision::exempt_controlled` to share these controls and
-reservations. The default returns `Unsupported` without running the legacy callback.
+Providers implement `GuardDecision::exempt_controlled`, which receives a scoped
+`GuardSnapshot` rather than a cloneable `Arc<Snapshot>`, to share these controls and
+reservations without retaining a physical snapshot past preparation. The default returns
+`Unsupported` without running the legacy callback.
 The built-in GraphRAG disclosure guard supports controlled preparation, including cold
 index reads, footprint digest checking and exact coverage. It builds a temporary local
 index on a cold call and reads an existing compatible index in place, charging only the

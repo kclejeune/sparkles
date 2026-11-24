@@ -293,7 +293,11 @@ fn static_public_rule_order_and_already_masked_scope_remain_unchanged() {
             &Preparation::new(Control::none(), 16 << 20).unwrap(),
         )
         .unwrap();
-    assert!(actual.same_snapshot_as(&again));
+    // Controlled and legacy masks do not share cache slots, while preparing a policy
+    // that hides no triples over an already-masked snapshot preserves that snapshot.
+    assert!(!actual.same_snapshot(&legacy));
+    assert!(again.same_snapshot(&legacy));
+    assert_eq!(again.len(), actual.len());
 }
 
 #[test]
@@ -392,7 +396,7 @@ fn supported_providers_use_the_same_preparation_and_keep_legacy_exemptions() {
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<Snapshot>,
+            _: &sparkles_core::access::GuardSnapshot<'_>,
             preparation: &Preparation,
         ) -> sparkles_core::Result<Exemptions> {
             let mut output = Exemptions::new(preparation)?;
@@ -588,7 +592,7 @@ fn mixed_static_and_undecided_rules_normalize_both_graph_sets_like_legacy_bindin
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<Snapshot>,
+            _: &sparkles_core::access::GuardSnapshot<'_>,
             p: &Preparation,
         ) -> sparkles_core::Result<Exemptions> {
             let mut values = Exemptions::new(p)?;
@@ -719,7 +723,7 @@ fn retained_nested_provider_state_refuses_without_callbacks_or_a_returned_owner(
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<Snapshot>,
+            _: &sparkles_core::access::GuardSnapshot<'_>,
             p: &Preparation,
         ) -> sparkles_core::Result<Exemptions> {
             self.calls.fetch_add(1, Ordering::SeqCst);

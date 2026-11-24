@@ -174,6 +174,7 @@ impl Evidence {
         access: Option<Arc<GraphAccess>>,
         cancel: Arc<AtomicBool>,
         limits: Limits,
+        query_opts: &sparkles::sparql::QueryOptions,
     ) -> Result<Option<Evidence>, RunError> {
         let Some(name) = name else {
             return Ok(None);
@@ -181,8 +182,33 @@ impl Evidence {
         let control = Control::with_cancel(cancel);
         let main = ds.main();
         let main: &crate::state::Dataset = main.as_deref().unwrap_or(ds);
-        let preparation =
-            sparkles::access::Preparation::new(control.clone(), VIEW_BYTES).map_err(engine)?;
+        let grant = query_opts
+            .grant
+            .clone()
+            .or_else(|| {
+                query_opts
+                    .pool
+                    .as_ref()
+                    .map(|pool| Arc::new(pool.empty_grant()))
+            })
+            .or_else(|| {
+                ds.dataset
+                    .query_options()
+                    .pool
+                    .map(|pool| Arc::new(pool.empty_grant()))
+            });
+        // Preserve the configured query execution budget (including unbounded None)
+        // while keeping room for the retained evidence view's selection reservation.
+        let prep_bytes = query_opts
+            .max_memory_bytes
+            .map_or(u64::MAX, |bytes| bytes.saturating_add(VIEW_BYTES));
+        let preparation = match grant {
+            Some(grant) => {
+                sparkles::access::Preparation::with_grant(control.clone(), prep_bytes, grant)
+            }
+            None => sparkles::access::Preparation::new(control.clone(), prep_bytes),
+        }
+        .map_err(engine)?;
         let view = main
             .dataset
             .store()
@@ -260,6 +286,11 @@ impl Evidence {
     /// Commit sequence of the evidence view this run reads throughout.
     pub fn commit(&self) -> u64 {
         self.view.commit().seq
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preparation_limit(&self) -> u64 {
+        self.view.preparation_limit()
     }
 
     /// The check a recheck repeats.

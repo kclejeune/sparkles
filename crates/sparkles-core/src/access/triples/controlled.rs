@@ -22,10 +22,26 @@ pub(crate) fn prepare_selected(
 
 pub(crate) fn prepare_evidence(
     evidence: crate::store::BoundEvidenceView,
+    policy: Arc<GraphAccess>,
+    preparation: &Preparation,
+) -> Result<PreparedView> {
+    let identity = Arc::downgrade(&policy);
+    prepare_input(
+        Input::Evidence {
+            evidence,
+            policy,
+            identity,
+        },
+        preparation,
+    )
+}
+
+pub(crate) fn prepare_txn(
+    txn: crate::store::bound_read_source::PreparedTxn,
     original: &GraphAccess,
     preparation: &Preparation,
 ) -> Result<PreparedView> {
-    prepare_input(Input::Evidence { evidence, original }, preparation)
+    prepare_input(Input::Transaction { txn, original }, preparation)
 }
 
 enum Input<'a> {
@@ -36,6 +52,11 @@ enum Input<'a> {
     Selected(crate::store::bound_read_source::PreparedRead),
     Evidence {
         evidence: crate::store::BoundEvidenceView,
+        policy: Arc<GraphAccess>,
+        identity: std::sync::Weak<GraphAccess>,
+    },
+    Transaction {
+        txn: crate::store::bound_read_source::PreparedTxn,
         original: &'a GraphAccess,
     },
 }
@@ -43,8 +64,9 @@ enum Input<'a> {
 impl Input<'_> {
     fn original(&self) -> &GraphAccess {
         match self {
-            Self::Legacy { original, .. } | Self::Evidence { original, .. } => original,
+            Self::Legacy { original, .. } | Self::Transaction { original, .. } => original,
             Self::Selected(selected) => selected.policy(),
+            Self::Evidence { policy, .. } => policy,
         }
     }
 
@@ -53,6 +75,7 @@ impl Input<'_> {
             Self::Legacy { snap, .. } => snap,
             Self::Selected(selected) => selected.snapshot(),
             Self::Evidence { evidence, .. } => evidence.shared_snapshot(),
+            Self::Transaction { txn, .. } => txn.snapshot(),
         }
     }
 
@@ -61,11 +84,16 @@ impl Input<'_> {
     ) -> (
         Option<crate::store::bound_read_source::PreparedRead>,
         Option<crate::store::BoundEvidenceView>,
+        Option<std::sync::Weak<GraphAccess>>,
+        Option<crate::store::bound_read_source::PreparedTxn>,
     ) {
         match self {
-            Self::Legacy { .. } => (None, None),
-            Self::Selected(selected) => (Some(selected.into_identity()), None),
-            Self::Evidence { evidence, .. } => (None, Some(evidence)),
+            Self::Legacy { .. } => (None, None, None, None),
+            Self::Selected(selected) => (Some(selected.into_identity()), None, None, None),
+            Self::Evidence {
+                evidence, identity, ..
+            } => (None, Some(evidence), Some(identity), None),
+            Self::Transaction { txn, .. } => (None, None, None, Some(txn)),
         }
     }
 }
@@ -77,30 +105,39 @@ fn finish(
     preparation: &Preparation,
     input: Input<'_>,
 ) -> Result<PreparedView> {
-    // Binding is complete, so the strict view drops its strong reference to the
-    // original policy and keeps only the admitted weak identity. Evidence views
-    // retain the BoundEvidenceView owner alongside this mask's reservation.
-    let (selected, evidence) = input.into_owners();
-    PreparedView::new_owned(access, snapshot, held, preparation, selected, evidence)
+    // Binding is complete, so strict and evidence views drop their strong reference
+    // to the original policy and keep only the admitted weak identity alongside any
+    // source owner and reservation.
+    let (selected, evidence, evidence_policy, txn) = input.into_owners();
+    PreparedView::new_owned(
+        access,
+        snapshot,
+        held,
+        preparation,
+        selected,
+        evidence,
+        evidence_policy,
+        txn,
+    )
 }
 
 fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<PreparedView> {
-    // Strict Store-minted and BoundEvidenceView preparations never publish into
-    // the base snapshot's mask deduplication table. Legacy preparations use only
-    // non-owning weak slots that evict themselves on drop.
-    let use_legacy_cache = matches!(&input, Input::Legacy { .. });
+    // Strict Store-minted, BoundEvidenceView and WriteTxn preparations never publish
+    // into any base snapshot deduplication table. Controlled raw-snapshot preparations
+    // use only the dedicated non-owning controlled weak table, separate from legacy
+    // GraphAccess::masked slots.
+    let use_controlled_cache = matches!(&input, Input::Legacy { .. });
     let original = input.original();
     let snap = input.snapshot();
     preparation.stage("preparing permission view")?;
     original.check_bound_snapshot(snap)?;
-    // The input snapshot and its persistent delta belong to the caller. The returned
-    // view is charged only for storage this preparation creates or keeps alive alone.
+    // For Legacy inputs, the caller owns and pays for the input snapshot. Selected,
+    // Evidence and Transaction inputs already carry their own admitted reservations.
     let mut held = preparation.reserve(PreparedView::header_bytes()?)?;
-    if matches!(&input, Input::Selected(_)) {
-        // The strict view keeps only a weak identity of the invocation's original
-        // policy, so a replacement policy can be refused without extending the
-        // lifetime of its contents or opaque guard providers. The weak reference
-        // keeps the policy's Arc allocation, whose layout is admitted here.
+    if matches!(&input, Input::Selected(_) | Input::Evidence { .. }) {
+        // Strict and evidence views keep only a weak identity of the invocation's
+        // original policy, so a replacement policy can be refused without extending
+        // the lifetime of its contents or opaque guard providers.
         held.merge(preparation.reserve(weak_policy_bytes()?)?);
     }
     // Shared policy definitions are retained too. Inspect their sizes with controls
@@ -160,19 +197,24 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
         preparation.check()?;
         return finish(access, snap.clone(), held, preparation, input);
     }
-    let existing = if use_legacy_cache {
+    let existing = if use_controlled_cache {
         snap.counts.prepared_mask_slot(&key, preparation)?
     } else {
         None
     };
-    if let Some(slot) = &existing {
-        let slot = preparation.lock(slot)?;
-        if let Some(cached) = slot.upgrade() {
-            // The view may outlive any other live holder, so it owns the mask's own storage.
-            held.merge(preparation.reserve(mask_storage(&cached))?);
-            preparation.check()?;
-            return finish(access, cached, held, preparation, input);
-        }
+    let cached = if let Some(slot) = &existing {
+        let guard = preparation.lock(slot)?;
+        guard.upgrade()
+    } else {
+        None
+    };
+    if let Some(cached) = cached {
+        // The slot lock is already released, so an error during reservation or finish
+        // can drop `cached` and evict a dead slot immediately without contention.
+        // The view may outlive any other live holder, so it owns the mask's own storage.
+        held.merge(preparation.reserve(mask_storage(&cached))?);
+        preparation.check()?;
+        return finish(access, cached, held, preparation, input);
     }
     // Build outside the slot lock. User progress and controlled provider helpers
     // never execute while this cache lock is owned. A cold race may build twice.
@@ -180,22 +222,17 @@ fn prepare_input(input: Input<'_>, preparation: &Preparation) -> Result<Prepared
     let (snapshot, derived) = apply_controlled(snap, hidden, &key, preparation)?;
     held.merge(derived);
     preparation.check()?;
-    if use_legacy_cache {
-        if let Some(slot) = existing {
-            let mut guard = preparation.lock(&slot)?;
-            if guard.strong_count() == 0 {
-                *guard = Arc::downgrade(&snapshot);
-                if let Some(mask) = &snapshot.mask {
-                    mask.attach_cache(&snap.counts, slot.clone());
-                }
-            }
-        } else if let Some(slot) = snap
+    if use_controlled_cache
+        && let Some(slot) = snap
             .counts
             .cache_prepared_mask(key, &snapshot, preparation)?
-            && let Some(mask) = &snapshot.mask
-        {
-            mask.attach_cache(&snap.counts, slot);
-        }
+        && let Some(mask) = &snapshot.mask
+    {
+        mask.attach_cache(
+            &snap.counts,
+            crate::sparql::stats::MaskCacheKind::Controlled,
+            slot,
+        );
     }
     drop(key_held);
     preparation.check()?;
@@ -374,10 +411,11 @@ fn bind_graphs(
         pattern.push_str(&guard.pattern)?;
         let (pattern, charge) = pattern.finish()?;
         held.merge(charge);
+        let guard_snap = crate::access::GuardSnapshot::new(snap);
         let (mut exempt, charge) = match &guard.decide {
             Some(provider) => provider
                 .0
-                .exempt_controlled(snap, preparation)?
+                .exempt_controlled(&guard_snap, preparation)?
                 .into_parts(preparation)?,
             None => copy_strings(&guard.exempt, preparation)?,
         };
@@ -1102,7 +1140,12 @@ mod tests {
             let view = view();
             let prep = Preparation::new(Control::none(), 8 << 20).unwrap();
             let (key, _key_held) = cache_key(&view, view.triples.as_ref().unwrap(), &prep).unwrap();
-            let slot = snap.counts.mask_slot(&key);
+            let _live_holder = view.masked_controlled(&snap, &prep).unwrap();
+            let slot = snap
+                .counts
+                .prepared_mask_slot(&key, &prep)
+                .unwrap()
+                .unwrap();
             let held = slot.lock();
             let (entered_tx, entered_rx) = mpsc::sync_channel(1);
             let control = Control {
@@ -1589,6 +1632,45 @@ mod tests {
         assert!(legacy_mask.upgrade().is_none());
         assert_eq!(snap.counts.live_mask_count(), 0);
         assert_eq!(snap.counts.mask_entry_count(), 0);
+
+        // Mixed-ownership: legacy GraphAccess::masked cannot acquire a mask paid for by
+        // masked_controlled, and dropping the controlled view drops its physical mask
+        // immediately even while a legacy caller still holds its own mask.
+        let mix_prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+        let mix_before = mix_prep.inner_used();
+        let ctrl_view = policy.masked_controlled(&snap, &mix_prep).unwrap();
+        let ctrl_weak = Arc::downgrade(ctrl_view.snapshot().mask.as_ref().unwrap());
+        let leg_snap = policy.masked(&snap).unwrap();
+        assert!(!ctrl_view.same_snapshot(&leg_snap));
+        assert_ne!(ctrl_view.mask_id(), leg_snap.mask_id());
+        assert_eq!(snap.counts.controlled_mask_entry_count(), 1);
+        assert_eq!(snap.counts.legacy_mask_entry_count(), 1);
+        drop(ctrl_view);
+        assert_eq!(mix_prep.inner_used(), mix_before);
+        assert!(
+            ctrl_weak.upgrade().is_none(),
+            "controlled mask must drop when PreparedView drops even if legacy mask is live"
+        );
+        assert_eq!(snap.counts.controlled_mask_entry_count(), 0);
+        assert_eq!(snap.counts.legacy_mask_entry_count(), 1);
+        drop(leg_snap);
+        assert_eq!(snap.counts.legacy_mask_entry_count(), 0);
+
+        // Warm hit failure (tight cap) releases the slot lock before failing so the
+        // dead slot evicts cleanly when the last holder drops, and a subsequent cold
+        // refill succeeds cleanly.
+        let holder_prep = Preparation::new(Control::none(), 8 << 20).unwrap();
+        let holder = policy.masked_controlled(&snap, &holder_prep).unwrap();
+        let holder_weak = Arc::downgrade(holder.snapshot().mask.as_ref().unwrap());
+        let tiny_prep = Preparation::new(Control::none(), 4096).unwrap();
+        assert!(policy.masked_controlled(&snap, &tiny_prep).is_err());
+        drop(holder);
+        assert!(holder_weak.upgrade().is_none());
+        assert_eq!(snap.counts.controlled_mask_entry_count(), 0);
+        let refilled = policy.masked_controlled(&snap, &holder_prep).unwrap();
+        assert_eq!(snap.counts.controlled_mask_entry_count(), 1);
+        drop(refilled);
+        assert_eq!(snap.counts.controlled_mask_entry_count(), 0);
     }
 
     #[test]

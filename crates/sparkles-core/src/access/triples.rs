@@ -177,9 +177,10 @@ impl TripleRules {
 }
 
 /// Link back to the base snapshot's non-owning mask deduplication slot so dropping
-/// the last masked snapshot removes its dead entry immediately.
+/// the last masked snapshot evicts its dead entry on a best-effort basis.
 pub(crate) struct MaskCacheLink {
     cache: std::sync::Weak<crate::sparql::stats::CountCache>,
+    kind: crate::sparql::stats::MaskCacheKind,
     slot: crate::sparql::stats::MaskSlot,
 }
 
@@ -224,7 +225,7 @@ impl Drop for Mask {
         if let Some(link) = self.cache_link.get()
             && let Some(cache) = link.cache.upgrade()
         {
-            cache.evict_mask_slot(&self.key, &link.slot);
+            cache.evict_mask_slot(link.kind, &self.key, &link.slot);
         }
     }
 }
@@ -238,10 +239,12 @@ impl Mask {
     pub(crate) fn attach_cache(
         &self,
         cache: &Arc<crate::sparql::stats::CountCache>,
+        kind: crate::sparql::stats::MaskCacheKind,
         slot: crate::sparql::stats::MaskSlot,
     ) {
         let _ = self.cache_link.set(MaskCacheLink {
             cache: Arc::downgrade(cache),
+            kind,
             slot,
         });
     }
@@ -266,14 +269,19 @@ pub(super) fn masked(
         Ok(hidden) => hidden,
         Err(err) => {
             drop(held);
-            snap.counts.evict_mask_slot(&key, &slot);
+            snap.counts
+                .evict_mask_slot(crate::sparql::stats::MaskCacheKind::Legacy, &key, &slot);
             return Err(err);
         }
     };
     let m = Arc::new(apply(snap, hidden, key));
     *held = Arc::downgrade(&m);
     if let Some(mask) = &m.mask {
-        mask.attach_cache(&snap.counts, slot.clone());
+        mask.attach_cache(
+            &snap.counts,
+            crate::sparql::stats::MaskCacheKind::Legacy,
+            slot.clone(),
+        );
     }
     Ok(m)
 }

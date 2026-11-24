@@ -32,7 +32,7 @@ pub use control_store::{ControlOwner, ControlStamp, ControlWrite};
 #[cfg(test)]
 mod compaction_tests;
 pub(crate) mod configuration_history;
-pub use bound_read_source::BoundReadSource;
+pub use bound_read_source::{BoundReadSource, PreparedTxnView, ScopedQueryResult};
 mod evidence_view;
 pub use evidence_view::BoundEvidenceView;
 mod aggregates;
@@ -6728,18 +6728,42 @@ impl WriteTxn<'_> {
         self.store.aggregate_errors()
     }
 
-    /// Prepare the transaction's read view under `preparation`, applying this
-    /// transaction's graph access and triple protections without exposing a raw
-    /// uncredited snapshot or populating the base snapshot's caches.
-    pub fn prepare_read_view(
-        &self,
+    /// Prepare a scoped, budgeted read view of this transaction under `preparation`,
+    /// reserving the transaction snapshot's delta and generation storage before
+    /// constructing the view.
+    ///
+    /// The returned [`PreparedTxnView`] borrows this [`WriteTxn`], preventing mutations,
+    /// commits, [`Self::discard_terms`], or dry-run vocabulary rollback while the view or
+    /// any [`ScopedQueryResult`] derived from it is alive. When the transaction has no
+    /// uncommitted changes yet, the prepared view reads `self.base` so a policy bound
+    /// against `self.base` remains valid; once dirty, policies bound to an earlier state
+    /// are refused.
+    pub fn prepare_read_view<'a>(
+        &'a self,
         preparation: &crate::access::Preparation,
-    ) -> Result<crate::access::PreparedView> {
+    ) -> Result<PreparedTxnView<'a>> {
         preparation.check()?;
-        let snap = Arc::new(self.view());
+        let limit = crate::history::ReadLimit {
+            options: preparation,
+            memory: Some(preparation.selection_room()),
+            held: 0,
+        };
+        let delta_bytes = crate::store::history_limited::preparation_delta_bytes(&self.delta);
+        let retained = delta_bytes
+            .checked_add(self.base.generation.retained_bytes_limited(&limit)?)
+            .and_then(|bytes| bytes.checked_add(crate::history::READ_METADATA_BYTES))
+            .ok_or_else(|| preparation.exhausted())?;
+        let held = preparation.reserve(retained)?;
+        let snap = if self.is_dirty() {
+            Arc::new(self.view())
+        } else {
+            self.base.clone()
+        };
+        let txn = bound_read_source::PreparedTxn::new(snap, self.store, held);
         let all = crate::access::GraphAccess::all();
         let access = self.opts.graphs.as_deref().unwrap_or(&all);
-        access.masked_controlled(&snap, preparation)
+        let view = crate::access::triples::controlled::prepare_txn(txn, access, preparation)?;
+        Ok(PreparedTxnView::new(self.store, view))
     }
 
     /// Legacy unbudgeted helper returning the state the transaction's reads see:

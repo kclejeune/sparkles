@@ -455,14 +455,14 @@ fn data_dependent_guard_binds_once_on_the_original_before_hiding_its_evidence() 
         }
         fn exempt_controlled(
             &self,
-            snap: &Arc<super::super::Snapshot>,
+            snap: &crate::access::GuardSnapshot<'_>,
             prep: &Preparation,
         ) -> Result<crate::access::Exemptions> {
             self.0.fetch_add(1, Ordering::SeqCst);
             let mut allowed = crate::access::Exemptions::new(prep)?;
-            if let Some(predicate) = prep.lookup_iri(snap, "urn:secret")? {
+            if let Some(predicate) = snap.lookup_iri(prep, "urn:secret")? {
                 let mut found = false;
-                prep.scan(snap, crate::index::Perm::Pso, &[predicate.0], |_| {
+                snap.scan(prep, crate::index::Perm::Pso, &[predicate.0], |_| {
                     found = true;
                     Ok(false)
                 })?;
@@ -517,7 +517,7 @@ fn strict_provider_wait_observes_the_original_composed_cancellation() {
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<super::super::Snapshot>,
+            _: &crate::access::GuardSnapshot<'_>,
             prep: &Preparation,
         ) -> Result<crate::access::Exemptions> {
             self.entered.send(()).unwrap();
@@ -636,7 +636,7 @@ fn strict_view_keeps_only_a_weak_identity_of_its_original_guarded_policy() {
         }
         fn exempt_controlled(
             &self,
-            _: &Arc<super::super::Snapshot>,
+            _: &crate::access::GuardSnapshot<'_>,
             prep: &Preparation,
         ) -> Result<crate::access::Exemptions> {
             crate::access::Exemptions::new(prep)

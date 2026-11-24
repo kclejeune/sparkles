@@ -338,6 +338,11 @@ impl Preparation {
         Ok(view)
     }
 
+    /// Configured memory limit of this preparation.
+    pub fn limit(&self) -> u64 {
+        self.inner.limit
+    }
+
     /// A separate synchronous preparation with this one's request controls,
     /// descendant query controls and wait policy but its own allowance. Charges
     /// against it never reach this preparation's counter.
@@ -1725,8 +1730,12 @@ struct PreparedInner {
     // physical selected source/original policy precede its selection credit.
     selected: Option<crate::store::bound_read_source::PreparedRead>,
     // When prepared from a BoundEvidenceView, retain that owner and its
-    // selection credit for as long as this prepared view lives.
+    // selection credit alongside the weak identity of the original policy Arc.
     evidence: Option<crate::store::BoundEvidenceView>,
+    evidence_policy: Option<std::sync::Weak<GraphAccess>>,
+    // When prepared from a WriteTxn, retain the admitted transaction snapshot
+    // reservation and Store origin.
+    txn: Option<crate::store::bound_read_source::PreparedTxn>,
     _held: Reservation,
 }
 
@@ -1755,9 +1764,10 @@ impl PreparedView {
         held: Reservation,
         preparation: &Preparation,
     ) -> Result<Self> {
-        Self::new_owned(access, snapshot, held, preparation, None, None)
+        Self::new_owned(access, snapshot, held, preparation, None, None, None, None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_owned(
         access: Arc<GraphAccess>,
         snapshot: Arc<Snapshot>,
@@ -1765,6 +1775,8 @@ impl PreparedView {
         preparation: &Preparation,
         selected: Option<crate::store::bound_read_source::PreparedRead>,
         evidence: Option<crate::store::BoundEvidenceView>,
+        evidence_policy: Option<std::sync::Weak<GraphAccess>>,
+        txn: Option<crate::store::bound_read_source::PreparedTxn>,
     ) -> Result<Self> {
         // Couple all incoming payloads and their credits on the stack before
         // any fallible validation, so early exits obey the same drop order.
@@ -1773,6 +1785,8 @@ impl PreparedView {
             snapshot,
             selected,
             evidence,
+            evidence_policy,
+            txn,
             _held: held,
         };
         preparation.check()?;
@@ -1805,12 +1819,29 @@ impl PreparedView {
         )
     }
 
+    pub(crate) fn validate_query_instance(&self, store: &crate::store::Store) -> Result<()> {
+        if let Some(selected) = self.inner.selected.as_ref() {
+            return selected.validate_instance(store);
+        }
+        if let Some(evidence) = self.inner.evidence.as_ref() {
+            return evidence.validate_instance(store);
+        }
+        if let Some(txn) = self.inner.txn.as_ref() {
+            return txn.validate_instance(store);
+        }
+        // Raw-input legacy masked_controlled views carry no Store-minted origin.
+        Ok(())
+    }
+
     pub(crate) fn validate_instance(&self, store: &crate::store::Store) -> Result<()> {
         if let Some(selected) = self.inner.selected.as_ref() {
             return selected.validate_instance(store);
         }
         if let Some(evidence) = self.inner.evidence.as_ref() {
             return evidence.validate_instance(store);
+        }
+        if let Some(txn) = self.inner.txn.as_ref() {
+            return txn.validate_instance(store);
         }
         Err(Error::invalid(
             "strict source requires a Store-minted physical origin",
@@ -1822,6 +1853,11 @@ impl PreparedView {
             .selected
             .as_ref()
             .is_some_and(|selected| selected.is_original_policy(policy))
+            || self
+                .inner
+                .evidence_policy
+                .as_ref()
+                .is_some_and(|identity| std::ptr::eq(identity.as_ptr(), Arc::as_ptr(policy)))
     }
 
     /// Bound policy to apply while consuming the physical snapshot.

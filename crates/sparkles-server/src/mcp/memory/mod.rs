@@ -151,10 +151,31 @@ impl Reader {
             ReaderSource::Evidence { view, .. } => match &opts.graphs {
                 None => Ok(true),
                 Some(access) => {
+                    let graph_only = Arc::new(sparkles::access::GraphAccess::graphs(
+                        access.read.clone(),
+                        sparkles::access::Graphs::none(),
+                    ));
                     let prep = sparkles::access::Preparation::for_request(opts)?;
-                    Ok(view.prepare_view(access, &prep)?.allows_read_iri(graph))
+                    Ok(view.prepare_view(graph_only, &prep)?.allows_read_iri(graph))
                 }
             },
+        }
+    }
+
+    /// Read the SHACL constraints layer at this reader's snapshot or evidence view
+    /// without opening live `HEAD`.
+    pub(crate) fn constraints(
+        &self,
+        ds: &Dataset,
+        view: Option<&sparkles::access::GraphAccess>,
+    ) -> Result<Option<sparkles::schema::ConstraintsLayer>, Error> {
+        let shapes = sparkles::handles::ShapesRequest::default();
+        match &self.source {
+            ReaderSource::Snapshot(snap) => ds.dataset.schema().constraints_at(snap, &shapes, view),
+            ReaderSource::Evidence { view: ev, .. } => ds
+                .dataset
+                .schema()
+                .constraints_for_evidence(ev, &shapes, view),
         }
     }
 

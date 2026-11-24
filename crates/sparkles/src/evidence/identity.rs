@@ -1216,6 +1216,13 @@ enum ResolveHead<'a> {
 }
 
 impl<'a> ResolveHead<'a> {
+    fn validate_access(self, access: &GraphAccess) -> Result<()> {
+        match self {
+            Self::Snapshot(head) => access.validate_bound_snapshot(head),
+            Self::Evidence(view) => view.validate_access(access),
+        }
+    }
+
     fn caller_view(
         self,
         access: Option<&Arc<GraphAccess>>,
@@ -1285,6 +1292,9 @@ fn resolve_in(
     let m = MapGraphs::new(policy, p, settings, nonce)?;
     let all = Some(Arc::new(GraphAccess::all()));
     let access = access.or(all);
+    if let Some(a) = access.as_deref() {
+        head.validate_access(a)?;
+    }
     for (g, _) in [&m.decisions, &m.maps, &m.output]
         .into_iter()
         .chain(m.proposals.iter())

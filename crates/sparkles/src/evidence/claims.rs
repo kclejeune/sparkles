@@ -155,6 +155,9 @@ pub fn check_matching_policy(
     name: &str,
     access: Option<&Arc<GraphAccess>>,
 ) -> Result<u32> {
+    if let Some(a) = access {
+        view.validate_access(a)?;
+    }
     let settings = view_settings(view)?;
     let Some(p) = settings
         .matching_policies
@@ -205,6 +208,9 @@ pub fn with_policy_claims<R>(
     f: impl FnOnce(&mut PolicyClaims<'_>) -> Result<R>,
 ) -> Result<R> {
     control.check()?;
+    if let Some(a) = access.as_deref() {
+        view.validate_access(a)?;
+    }
     let settings = view_settings(view)?;
     let Some(p) = settings.policies.get(policy).filter(|_| settings.enabled) else {
         return Err(unknown_policy(policy));
@@ -605,5 +611,110 @@ mod tests {
             ManagedErrorKind::ProjectionUnavailable,
             "x"
         )));
+    }
+
+    #[test]
+    fn graph_only_stale_bound_policy_is_refused_by_evidence_reads() {
+        use crate::access::{
+            Decider, Exemptions, GraphAccess, Graphs, GuardDecision, GuardSnapshot, Preparation,
+        };
+        use crate::evidence::{MatchingPolicy, configure, resolve_entities_at};
+        use crate::store::Snapshot;
+        struct CommitGuard;
+        impl GuardDecision for CommitGuard {
+            fn exempt(&self, snap: &Arc<Snapshot>) -> Vec<String> {
+                if snap.commit <= 2 {
+                    vec!["urn:ev:decisions".into()]
+                } else {
+                    Vec::new()
+                }
+            }
+            fn exempt_controlled(
+                &self,
+                snap: &GuardSnapshot<'_>,
+                preparation: &Preparation,
+            ) -> Result<Exemptions> {
+                let mut out = Exemptions::new(preparation)?;
+                if snap.commit() <= 2 {
+                    out.push("urn:ev:decisions")?;
+                }
+                Ok(out)
+            }
+        }
+        let ds = crate::Dataset::memory();
+        let prep = Preparation::new(Control::none(), 16 << 20).unwrap();
+        ds.store()
+            .activate_memory_configuration_history(&prep)
+            .unwrap();
+        let settings = Settings {
+            enabled: true,
+            source_records: vec!["urn:ev:sources".into()],
+            proposals: vec!["urn:ev:claims".into()],
+            decisions: vec!["urn:ev:decisions".into()],
+            supports: vec!["urn:ev:supports".into()],
+            identity: vec!["urn:ev:id".into(), "urn:ev:maps".into()],
+            projections: vec!["urn:ev:accepted".into(), "urn:ev:map".into()],
+            policies: [(
+                "main".into(),
+                super::super::Policy {
+                    version: 1,
+                    admitted_kinds: vec![ClaimKind::Reported],
+                    required_scope: vec![],
+                    conflicts: super::super::ConflictMode::AdmitLabelled,
+                    boundary: vec!["urn:ev:sources".into(), "urn:ev:claims".into()],
+                    decisions: "urn:ev:decisions".into(),
+                    supports: "urn:ev:supports".into(),
+                    output: "urn:ev:accepted".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            matching_policies: [(
+                "people".into(),
+                MatchingPolicy {
+                    version: 1,
+                    boundary: vec!["urn:ev:id".into()],
+                    decisions: "urn:ev:decisions".into(),
+                    maps: "urn:ev:maps".into(),
+                    output: "urn:ev:map".into(),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        configure(&ds, &settings, &Control::none()).unwrap();
+        let snap_before = ds.store().snapshot();
+        let unbound = Arc::new(GraphAccess::graphs(
+            Graphs::All.guarded_by("urn:ev:decisions", Decider(Arc::new(CommitGuard))),
+            Graphs::none(),
+        ));
+        let bound_before = unbound.bound(&snap_before);
+        assert!(bound_before.read.allows_iri("urn:ev:decisions"));
+
+        // Advance commit so CommitGuard would no longer exempt urn:ev:decisions.
+        ds.update("INSERT DATA { <urn:s> <urn:p> 1 }").unwrap();
+        let view = ds
+            .store()
+            .evidence_view(&crate::history::At::Head, &prep)
+            .unwrap();
+        assert!(matches!(
+            with_policy_claims(
+                &view,
+                "main",
+                Some(bound_before.clone()),
+                &Control::none(),
+                |_| Ok(()),
+            ),
+            Err(Error::Invalid(ref m)) if m.contains("different snapshot")
+        ));
+        assert!(matches!(
+            check_matching_policy(&view, "people", Some(&bound_before)),
+            Err(Error::Invalid(ref m)) if m.contains("different snapshot")
+        ));
+        assert!(matches!(
+            resolve_entities_at(&view, "people", &[], Some(bound_before), &Control::none()),
+            Err(Error::Invalid(ref m)) if m.contains("different snapshot")
+        ));
     }
 }

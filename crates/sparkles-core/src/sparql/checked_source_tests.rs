@@ -957,7 +957,7 @@ impl crate::access::GuardDecision for WaitingPolicy {
     }
     fn exempt_controlled(
         &self,
-        _: &Arc<Snapshot>,
+        _: &crate::access::GuardSnapshot<'_>,
         preparation: &Preparation,
     ) -> Result<crate::access::Exemptions> {
         self.started.send(()).unwrap();

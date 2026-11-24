@@ -121,11 +121,24 @@ pub(crate) type VisibleGraphs = (Arc<Vec<crate::id::Id>>, bool);
 /// the query or caller that holds them without credit.
 type CachedVisibleGraphs = (Weak<Vec<crate::id::Id>>, bool);
 
+static COUNT_CACHE_UIDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Which non-owning mask deduplication table a [`MaskSlot`] belongs to.
+/// Legacy unbudgeted callers (`GraphAccess::masked`) and controlled callers
+/// (`GraphAccess::masked_controlled`) never share physical mask slots so a legacy
+/// caller cannot acquire a mask paid for by a controlled preparation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MaskCacheKind {
+    Legacy,
+    Controlled,
+}
+
 /// Counts already worked out, kept with a generation (the part that depends only on the
 /// base) or with a snapshot (the final answers), and the FILTER selectivities and key
 /// probes measured on a snapshot (see [`super::sample`] and [`super::keyprobe`]).
-#[derive(Default)]
 pub struct CountCache {
+    /// process-unique identity of the snapshot view that owns this cache
+    uid: u64,
     counts: Mutex<FxHashMap<CountKey, Arc<Counts>>>,
     sampled: Mutex<FxHashMap<String, super::sample::Sampled>>,
     probed: Mutex<FxHashMap<String, Option<super::keyprobe::Measure>>>,
@@ -133,13 +146,29 @@ pub struct CountCache {
     /// [`crate::access::GraphAccess::visible_named`]); entries live only while a caller
     /// holds the `Arc<Vec<Id>>`
     views: Mutex<FxHashMap<String, CachedVisibleGraphs>>,
-    /// non-owning slots for masked snapshots of triple-level views, by view key (see
-    /// [`crate::access::GraphAccess::masked`]); entries hold only a `Weak<Snapshot>` and
-    /// are evicted when the last owning view or caller drops
+    /// non-owning slots for legacy masked snapshots (`GraphAccess::masked`)
     masks: Mutex<FxHashMap<String, MaskSlot>>,
+    /// non-owning slots for controlled masked snapshots (`GraphAccess::masked_controlled`),
+    /// kept separate from legacy `masks` so legacy callers cannot upgrade paid masks
+    controlled_masks: Mutex<FxHashMap<String, MaskSlot>>,
     /// the correction of each predicate pattern table for the snapshot's delta (see
     /// [`super::patternplan`]), `None` when the delta touches too many subjects
     patterns: Mutex<FxHashMap<PatternKey, Option<Arc<crate::patterns::Correction>>>>,
+}
+
+impl Default for CountCache {
+    fn default() -> Self {
+        Self {
+            uid: COUNT_CACHE_UIDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            counts: Default::default(),
+            sampled: Default::default(),
+            probed: Default::default(),
+            views: Default::default(),
+            masks: Default::default(),
+            controlled_masks: Default::default(),
+            patterns: Default::default(),
+        }
+    }
 }
 
 /// A pattern table and the size of the delta its correction was worked out for.
@@ -210,8 +239,15 @@ impl CountCache {
         None
     }
 
-    /// The slot of a view's masked snapshot, by the view's key.
+    pub(crate) fn uid(&self) -> u64 {
+        self.uid
+    }
+
+    /// The slot of a legacy view's masked snapshot, by the view's key.
     pub(crate) fn mask_slot(&self, k: &str) -> MaskSlot {
+        if k.len() > Self::MAX_CACHE_KEY_BYTES {
+            return MaskSlot::default();
+        }
         let mut m = self.masks.lock();
         if let Some(s) = m.get(k) {
             return s.clone();
@@ -231,7 +267,7 @@ impl CountCache {
         key: &str,
         preparation: &crate::access::Preparation,
     ) -> Result<Option<MaskSlot>> {
-        let slots = preparation.lock(&self.masks)?;
+        let slots = preparation.lock(&self.controlled_masks)?;
         for (stored, slot) in slots.iter() {
             if preparation.compare(stored, key)?.is_eq() {
                 return Ok(Some(slot.clone()));
@@ -241,9 +277,10 @@ impl CountCache {
         Ok(None)
     }
 
-    /// Only complete successful masks enter the non-owning deduplication table.
-    /// Controlled cold builders may race, never install an empty slot or evict live
-    /// views on refusal, and never keep a masked snapshot alive past its last owner.
+    /// Only complete successful controlled masks enter the non-owning controlled
+    /// deduplication table. Controlled cold builders may race, never install an empty
+    /// slot or evict live views on refusal, never share slots with legacy callers, and
+    /// never keep a masked snapshot alive past its last owner.
     pub(crate) fn cache_prepared_mask(
         &self,
         key: String,
@@ -258,20 +295,26 @@ impl CountCache {
             return Ok(None);
         }
         let _workspace = preparation.reserve(32 << 10)?;
-        let mut slots = preparation.lock(&self.masks)?;
+        let mut slots = preparation.lock(&self.controlled_masks)?;
         slots.retain(|_, slot| slot.try_lock().is_none_or(|guard| guard.strong_count() > 0));
-        if slots.len() >= Self::VIEW_ENTRIES {
+        for (stored, existing) in slots.iter() {
             preparation.check()?;
-            return Ok(None);
-        }
-        for stored in slots.keys() {
-            preparation.check()?;
-            if stored.len() > Self::MAX_CACHE_KEY_BYTES
-                || preparation.compare(stored, &key)?.is_eq()
-            {
+            if stored.len() > Self::MAX_CACHE_KEY_BYTES {
                 preparation.check()?;
                 return Ok(None);
             }
+            if preparation.compare(stored, &key)?.is_eq() {
+                // Another live controlled builder already holds this key.
+                if existing.try_lock().is_none_or(|g| g.strong_count() > 0) {
+                    preparation.check()?;
+                    return Ok(None);
+                }
+                break;
+            }
+        }
+        if slots.len() >= Self::VIEW_ENTRIES && !slots.contains_key(&key) {
+            preparation.check()?;
+            return Ok(None);
         }
         slots.try_reserve(1).map_err(|_| preparation.exhausted())?;
         preparation.check()?;
@@ -280,10 +323,13 @@ impl CountCache {
         Ok(Some(slot))
     }
 
-    /// Remove a mask slot whose owning masked snapshot has just been dropped, if no
-    /// concurrent builder has replaced it with a live snapshot.
-    pub(crate) fn evict_mask_slot(&self, key: &str, slot: &MaskSlot) {
-        let mut m = self.masks.lock();
+    /// Best-effort removal of a mask slot whose owning masked snapshot has just been
+    /// dropped, if no concurrent builder has replaced it with a live snapshot.
+    pub(crate) fn evict_mask_slot(&self, kind: MaskCacheKind, key: &str, slot: &MaskSlot) {
+        let mut m = match kind {
+            MaskCacheKind::Legacy => self.masks.lock(),
+            MaskCacheKind::Controlled => self.controlled_masks.lock(),
+        };
         let should_remove = m
             .get(key)
             .filter(|current| Arc::ptr_eq(current, slot))
@@ -329,16 +375,28 @@ impl CountCache {
 
     #[cfg(test)]
     pub(crate) fn mask_entry_count(&self) -> usize {
-        self.masks.lock().len()
+        self.masks.lock().len() + self.controlled_masks.lock().len()
     }
 
     #[cfg(test)]
     pub(crate) fn live_mask_count(&self) -> usize {
-        self.masks
-            .lock()
-            .values()
-            .filter(|slot| slot.try_lock().is_some_and(|g| g.strong_count() > 0))
-            .count()
+        let count = |map: &Mutex<FxHashMap<String, MaskSlot>>| {
+            map.lock()
+                .values()
+                .filter(|slot| slot.try_lock().is_some_and(|g| g.strong_count() > 0))
+                .count()
+        };
+        count(&self.masks) + count(&self.controlled_masks)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn legacy_mask_entry_count(&self) -> usize {
+        self.masks.lock().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controlled_mask_entry_count(&self) -> usize {
+        self.controlled_masks.lock().len()
     }
 
     #[cfg(test)]

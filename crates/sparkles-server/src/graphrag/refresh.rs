@@ -468,6 +468,7 @@ pub(crate) fn due_reason(
                 None,
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 Default::default(),
+                &ds.dataset.query_options(),
             )
             .map_err(|e| e.to_string())?
             .expect("a named policy"),

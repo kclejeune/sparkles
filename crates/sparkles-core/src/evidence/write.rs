@@ -1216,6 +1216,10 @@ impl<'a> Reads<'a> {
 
     /// Borrow a prepared view's masked snapshot under `preparation` without letting
     /// the snapshot escape its owning [`crate::access::PreparedView`].
+    ///
+    /// This is a physical triple-level reader: it sees the prepared triple mask and
+    /// does not enforce graph-level access rules, which remain the caller's
+    /// responsibility.
     pub fn from_prepared(
         preparation: &'a Preparation,
         view: &'a crate::access::PreparedView,
@@ -1225,6 +1229,9 @@ impl<'a> Reads<'a> {
 
     /// Borrow an evidence view's physical snapshot under `preparation` without letting
     /// the snapshot escape its owning [`crate::store::BoundEvidenceView`].
+    ///
+    /// This is an unmasked physical reader: callers must enforce current graph-level
+    /// and triple-level access policies separately.
     pub fn from_evidence(
         preparation: &'a Preparation,
         view: &'a crate::store::BoundEvidenceView,
