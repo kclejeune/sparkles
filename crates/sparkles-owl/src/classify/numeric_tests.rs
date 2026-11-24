@@ -96,7 +96,7 @@ unsafe impl GlobalAlloc for Counting {
         out
     }
 }
-pub(super) fn sample() -> Sample {
+pub(in crate::classify) fn sample() -> Sample {
     SAMPLE.with(Cell::get)
 }
 pub(in crate::classify) fn measure<T>(f: impl FnOnce() -> T) -> (T, Sample) {

@@ -116,16 +116,17 @@ pub(super) fn hash_table_grow_bound(
 /// Next capacity of a `Vec<T>` when `len == cap` (matching `alloc::raw_vec` growth).
 #[inline]
 pub(super) fn next_vec_cap(cap: usize, elem_size: usize) -> Option<usize> {
-    if cap == 0 {
-        Some(if elem_size == 1 {
-            8
-        } else if elem_size <= 1024 {
-            4
-        } else {
-            1
-        })
+    let min_cap = if elem_size == 1 {
+        8
+    } else if elem_size <= 1024 {
+        4
     } else {
-        cap.checked_mul(2)
+        1
+    };
+    if cap == 0 {
+        Some(min_cap)
+    } else {
+        cap.checked_mul(2).map(|doubled| doubled.max(min_cap))
     }
 }
 
@@ -1127,19 +1128,25 @@ impl Rooted<'_> {
                 (false, false) => {}
             }
         }
-        let (ma, na) = Rooted::terms(a);
+        let (mut ra, mut ra_len) = Rooted::terms(a);
         let (mb, nb) = Rooted::terms(b);
-        // the multiset differences
-        let mut ra: Vec<OTerm> = ma[..na].to_vec();
-        let mut rb: Vec<OTerm> = Vec::with_capacity(nb);
+        // the multiset differences, kept on the stack so `maximal_rooted` never allocates
+        // inside comparisons while its views buffer is live
+        let mut rb = [OTerm::True; 4];
+        let mut rb_len = 0usize;
         for &t in &mb[..nb] {
-            if let Some(k) = ra.iter().position(|&s| s == t) {
-                ra.swap_remove(k);
+            if let Some(k) = ra[..ra_len].iter().position(|&s| s == t) {
+                ra_len -= 1;
+                ra[k] = ra[ra_len];
             } else {
-                rb.push(t);
+                rb[rb_len] = t;
+                rb_len += 1;
             }
         }
-        !ra.is_empty() && rb.iter().all(|&t| ra.iter().any(|&s| self.t_gt(s, t)))
+        ra_len > 0
+            && rb[..rb_len]
+                .iter()
+                .all(|&t| ra[..ra_len].iter().any(|&s| self.t_gt(s, t)))
     }
 
     /// Whether a literal is an atom over y alone, which only Pred reads: no rule selects
@@ -1907,9 +1914,11 @@ impl Store {
         None
     }
 
-    /// Upper bound on temporary scratch `(views_bytes, max_realloc_bytes)` needed to compute
-    /// the maximal literals of clause `id` into `max` (in a rooted run `maximal_rooted`
-    /// allocates a `Vec<XLit>` of views and can grow `max` up to `head.len()`).
+    /// Upper bound on additional temporary scratch `(views_bytes, max_peak_add)` needed above
+    /// `max`'s current capacity to compute the maximal literals of clause `id` into `max`
+    /// (in a rooted run `maximal_rooted` allocates a `Vec<XLit>` of views and can grow `max`
+    /// up to `head.len()`, whose final reallocation holds consecutive capacities simultaneously
+    /// under the old/new overlap model).
     pub fn next_scratch_bound(
         &self,
         id: u32,
@@ -1929,16 +1938,23 @@ impl Store {
         } else {
             usize::from(head_len > 0)
         };
-        let max_realloc = if target_len <= max_cap {
+        let max_peak_add = if target_len <= max_cap {
             0
         } else {
+            let mut prev = max_cap;
             let mut cap = max_cap;
             while cap < target_len {
+                prev = cap;
                 cap = next_vec_cap(cap, std::mem::size_of::<Lit>())?;
             }
-            cap.checked_mul(std::mem::size_of::<Lit>())?
+            // Peak `max` storage during the final growth is `(prev + cap)` entries; callers
+            // already hold `max_cap` entries, so the additional peak above `max_cap` is
+            // `(prev - max_cap) + cap`.
+            prev.checked_sub(max_cap)?
+                .checked_add(cap)?
+                .checked_mul(std::mem::size_of::<Lit>())?
         };
-        Some((views, max_realloc))
+        Some((views, max_peak_add))
     }
 
     /// Computes the maximal literals of live queued clause `id` into `max` and returns the
@@ -1990,14 +2006,15 @@ impl Store {
         out: &mut S,
     ) -> Option<u32> {
         let id = self.peek_live()?;
-        let Some((views_bytes, max_realloc)) =
-            self.next_scratch_bound(id, rooted.is_some(), max, max.capacity())
+        let max_cap_before = max.capacity();
+        let Some((views_bytes, max_peak_add)) =
+            self.next_scratch_bound(id, rooted.is_some(), max, max_cap_before)
         else {
             out.data_overflow();
             self.interrupted = true;
             return None;
         };
-        let Some(scratch) = views_bytes.checked_add(max_realloc) else {
+        let Some(scratch) = views_bytes.checked_add(max_peak_add) else {
             out.data_overflow();
             self.interrupted = true;
             return None;
@@ -2012,8 +2029,9 @@ impl Store {
             self.interrupted = true;
             return None;
         };
-        // `views` dropped inside `maximal_rooted`; keep only `max` growth while admitting.
-        scratch_guard.release_to(max_realloc);
+        // `views` dropped inside `maximal_rooted`; keep only net `max` growth while admitting.
+        let max_growth = max.capacity().saturating_sub(max_cap_before) * std::mem::size_of::<Lit>();
+        scratch_guard.release_to(max_growth);
         if !scratch_guard.admit_dl(bound) {
             self.interrupted = true;
             return None;

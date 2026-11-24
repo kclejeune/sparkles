@@ -58,7 +58,7 @@ use super::dl_rules::{
     dl, drain, drain_with, ds, ds_admit, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
-use super::saturate::{Concl, DlGuard, Guard, Sink, State};
+use super::saturate::{Concl, CreditGuard, DlGuard, Guard, Sink, State};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// What a context of a rooted run keeps for the rules at the constants and over `f_e(u)`.
@@ -2068,19 +2068,17 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
         // the registrations that waited for the reach are replayed once, and the ones
         // that come later go to the context as they come ([`register`]). Empty the slot in
         // place instead of removing the key so `regs` stays append-only with no hashbrown
-        // tombstones, and credit the freed vector's capacity after replay.
+        // tombstones. Declare `credit` before `us` so LIFO drop always frees `us` before
+        // crediting its retained capacity back on both normal return and callback unwind.
+        let mut credit = CreditGuard::new(out, 0);
         let us = r
             .mw()
             .regs
             .get_mut(&e)
             .map(std::mem::take)
             .unwrap_or_default();
-        let freed = us.capacity() * std::mem::size_of::<u32>();
-        m_registered(x, e, &us, out);
-        drop(us);
-        if freed > 0 {
-            out.credit_dl(freed);
-        }
+        credit.arm(us.capacity() * std::mem::size_of::<u32>());
+        m_registered(x, e, &us, &mut credit);
         return true;
     }
     let Some(x) = ds_admit(st, out) else {

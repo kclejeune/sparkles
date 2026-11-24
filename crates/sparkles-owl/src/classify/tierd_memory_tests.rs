@@ -6,7 +6,7 @@ use super::dl_clause::{
 };
 use super::dl_rules::{Deriver, DlRun, Found, MREPAIR_ON, NoopDerive};
 use super::index::{Axioms, Ex, Index, Interner};
-use super::numeric::tests::measure;
+use super::numeric::tests::{measure, sample};
 use super::saturate::{Concl, Sink, State};
 use super::*;
 use rustc_hash::FxHashMap;
@@ -934,7 +934,8 @@ fn store_add_parts_and_rooted_next_refuse_copy_and_maxima_scratch() {
     assert!(store.clauses.is_empty());
     assert_eq!(store.bytes(), store.scan_bytes());
 
-    // 2. Rooted `next_admitted` with a dead queue entry ahead of a wide 256-literal clause:
+    // 2. Rooted `next_admitted` with a dead shorter queue entry ahead of a live wide 256-literal
+    // clause: dead-entry cleanup discards the shorter dead entry without allocating, then the
     // cap refuses `maximal_rooted`'s `views` (`256 * size_of::<XLit>()`) before allocation.
     let inv = |_: u32| None;
     let lits = Lits::default();
@@ -947,23 +948,31 @@ fn store_add_parts_and_rooted_next_refuse_copy_and_maxima_scratch() {
         wide_head.push(l);
     }
     assert!(rooted_store.add_parts_admitted(vec![wide_head[0]], wide_head.clone(), &mut unlimited));
-    // Add a weaker clause that gets backward-subsumed so a dead entry sits in `queue`.
-    let mut weaker = wide_head.clone();
+    // Add a dead 2-literal clause ahead of the 257-literal live clause: add `[extra, extra2]`,
+    // backward-subsume it with unit `[extra]`, then process `[extra]` so the dead 2-literal
+    // entry sits at the very front of `queue`.
     let Made::Lit(extra) = lits.lit(XLit::Atom(999, RTerm::C(1)), inv) else {
         panic!()
     };
-    weaker.push(extra);
-    assert!(rooted_store.add_parts_admitted(vec![], weaker, &mut unlimited));
+    let Made::Lit(extra2) = lits.lit(XLit::Atom(1000, RTerm::C(1)), inv) else {
+        panic!()
+    };
+    assert!(rooted_store.add_parts_admitted(vec![], vec![extra, extra2], &mut unlimited));
     assert!(rooted_store.add_parts_admitted(vec![], vec![extra], &mut unlimited));
     assert!(rooted_store.clauses.iter().any(|s| s.dead));
-    let bytes_before = rooted_store.bytes();
-
     let ord = Rooted {
         ix: &ix,
         lits: &lits,
         inv: &inv,
         ground_total: true,
     };
+    let mut drain_unit = Vec::new();
+    let unit_id = rooted_store
+        .next_admitted(&ix, Some(&ord), &mut drain_unit, &mut unlimited)
+        .expect("pop live unit [extra] first");
+    assert_eq!(rooted_store.clauses[unit_id as usize].c.head(), &[extra]);
+    let bytes_before = rooted_store.bytes();
+
     let mut tiny_sink = BudgetSink {
         run: &run,
         cap: 16, // far below `views` (`256 * size_of::<XLit>()`)
@@ -980,6 +989,11 @@ fn store_add_parts_and_rooted_next_refuse_copy_and_maxima_scratch() {
     assert_eq!(rooted_store.bytes(), bytes_before);
     assert_eq!(rooted_store.bytes(), rooted_store.scan_bytes());
     assert!(rooted_store.has_queued(), "live clause must remain queued");
+    assert_eq!(
+        rooted_store.peek_live(),
+        Some(0),
+        "dead shorter clause must have been discarded ahead of live clause 0"
+    );
     assert_eq!(
         max.capacity(),
         0,
@@ -1729,4 +1743,384 @@ fn store_clone_preserves_owned_bytes_and_independent_byterm_scan() {
             + super::dl_clause::map_vec_bytes(&cloned.terms.as_deref().unwrap().eqs),
         "ByTerm::clone() must recompute its owned_bytes"
     );
+}
+
+/// Round-2 blocker 1: `Store::next_scratch_bound` must cover the actual counting-allocator peak
+/// of `next_prepare_id` (`maximal_rooted` + `Rooted::gt`) for 256 incomparable named class atoms
+/// over `x`, both when `max` starts empty (consecutive reallocation overlap) and when `max` is
+/// already warm and never grows (comparator must not allocate unreserved heap).
+#[test]
+fn rooted_maxima_scratch_bound_covers_empty_realloc_overlap_and_warm_comparator() {
+    let mut body = String::from("SubClassOf(:A ObjectUnionOf(:B :C))\nClassAssertion(:A :u0)\n");
+    for i in 0..256 {
+        body.push_str(&format!("SubClassOf(:C{i} :B)\n"));
+    }
+    let (ix, _, n_nodes) = rooted_index(&body);
+    let named: Vec<Lit> = (0..n_nodes as Ex)
+        .filter(|&e| super::dl_clause::rank(&ix, e).0 == 2)
+        .take(256)
+        .map(Lit::x)
+        .collect();
+    assert_eq!(named.len(), 256, "expected 256 named classes");
+
+    let lits = Lits::default();
+    let inv = |_: u32| None;
+    let ord = Rooted {
+        ix: &ix,
+        lits: &lits,
+        inv: &inv,
+        ground_total: true,
+    };
+    let mut store = Store::default();
+    assert!(store.add(Clause::new(Vec::new(), named)).is_some());
+    let id = store.peek_live().expect("queued wide clause");
+
+    // 1. Empty `max`: all 256 incomparable named classes are pushed; final 128 -> 256 growth
+    // overlaps old and new buffers under the counting-allocator model.
+    let mut empty_max = Vec::new();
+    let (views_empty, max_add_empty) = store
+        .next_scratch_bound(id, true, &empty_max, empty_max.capacity())
+        .expect("scratch bound");
+    let scratch_empty = views_empty + max_add_empty;
+    let (bound_empty, sample_empty) =
+        measure(|| store.next_prepare_id(&ix, Some(&ord), id, &mut empty_max));
+    assert!(bound_empty.is_some());
+    assert_eq!(
+        empty_max.len(),
+        256,
+        "all 256 named class atoms over x must be mutually incomparable"
+    );
+    assert!(
+        scratch_empty >= sample_empty.peak,
+        "empty-max scratch bound ({scratch_empty}) undercounted maximal_rooted peak ({})",
+        sample_empty.peak
+    );
+
+    // 2. Warm `max` (capacity 256, no growth): views fill their exact allocation and
+    // `Rooted::gt` must not allocate heap beyond `views_warm`.
+    let mut warm_max = Vec::with_capacity(256);
+    let (views_warm, max_add_warm) = store
+        .next_scratch_bound(id, true, &warm_max, warm_max.capacity())
+        .expect("scratch bound");
+    assert_eq!(max_add_warm, 0);
+    let scratch_warm = views_warm + max_add_warm;
+    let (bound_warm, sample_warm) =
+        measure(|| store.next_prepare_id(&ix, Some(&ord), id, &mut warm_max));
+    assert!(bound_warm.is_some());
+    assert_eq!(warm_max.len(), 256);
+    assert!(
+        scratch_warm >= sample_warm.peak,
+        "warm-max scratch bound ({scratch_warm}) undercounted maximal_rooted peak ({})",
+        sample_warm.peak
+    );
+}
+
+/// Round-2 blocker 2: the `FOLD_PRUNE` (4,096) streaming transition must poll `go_on()`
+/// periodically while emitting buffered unions so a stop observable only through `go_on()`
+/// (cancellation, deadline, or step-mode work limit while `stopped()` remains `false`) halts
+/// promptly instead of emitting all 4,096 buffered unions.
+#[test]
+fn fold_prune_streaming_transition_polls_go_on_when_stopped_flag_stays_clear() {
+    struct TriggerCancelDerive {
+        count: Arc<AtomicUsize>,
+        min_live: Arc<AtomicUsize>,
+        live_ref: Arc<AtomicUsize>,
+        cancel_at: usize,
+        cancel_flag: Arc<AtomicBool>,
+    }
+    impl Deriver for TriggerCancelDerive {
+        fn derive<S: Sink>(&self, _: &Index, _: &mut State, _: super::dl_rules::Side, _: &mut S) {
+            let n = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+            let cur = self.live_ref.load(Ordering::Relaxed);
+            self.min_live.fetch_min(cur, Ordering::Relaxed);
+            if n == self.cancel_at {
+                self.cancel_flag.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+    struct GoOnOnlySink<'a> {
+        run: &'a DlRun,
+        live: Arc<AtomicUsize>,
+        cancelled: Arc<AtomicBool>,
+    }
+    impl Sink for GoOnOnlySink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            self.live.fetch_add(bytes, Ordering::Relaxed);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.live.fetch_sub(bytes, Ordering::Relaxed);
+        }
+        fn stopped(&self) -> bool {
+            // Intentionally stays false (models unobserved cancellation/deadline or step work).
+            false
+        }
+        fn go_on(&self) -> bool {
+            !self.cancelled.load(Ordering::Relaxed)
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    let (ix, _, _) = rooted_index(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    let run = DlRun::new(false, Default::default());
+
+    let side = |a: Ex| (Vec::new(), vec![Lit::x(a)]);
+    let list_a: Vec<_> = (10..75).map(side).collect(); // 65
+    let list_b: Vec<_> = (200..265).map(side).collect(); // 65 -> 4,225 > FOLD_PRUNE (4,096)
+    let mut found = Found::default();
+    found.products(vec![list_a, list_b], (Vec::new(), Vec::new()));
+
+    let count = Arc::new(AtomicUsize::new(0));
+    let min_live = Arc::new(AtomicUsize::new(usize::MAX));
+    let live_ref = Arc::new(AtomicUsize::new(0));
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let deriver = TriggerCancelDerive {
+        count: count.clone(),
+        min_live: min_live.clone(),
+        live_ref: live_ref.clone(),
+        cancel_at: 5,
+        cancel_flag: cancel_flag.clone(),
+    };
+    let mut sink = GoOnOnlySink {
+        run: &run,
+        live: live_ref.clone(),
+        cancelled: cancel_flag.clone(),
+    };
+    let mut st = State::default();
+    super::dl_rules::drain_with(&ix, &mut st, found, &mut sink, &deriver);
+
+    let emitted = count.load(Ordering::Relaxed);
+    assert!(
+        emitted <= 256,
+        "FOLD_PRUNE transition must poll go_on() within one PRODUCT_POLL window (emitted={emitted})"
+    );
+    assert!(
+        min_live.load(Ordering::Relaxed) >= 4096 * std::mem::size_of::<super::dl_rules::Side>(),
+        "drained buffer must stay charged during emission (min_live={})",
+        min_live.load(Ordering::Relaxed)
+    );
+    assert_eq!(live_ref.load(Ordering::Relaxed), 0);
+    assert!(st.interrupted);
+}
+
+/// Round-2 blocker 3: a callback panic inside `rreach` -> `m_registered`'s first sizing scan
+/// (`M_SCAN = 1,024` pending registrations) must drop the detached registration vector before
+/// crediting its retained capacity back to the ledger on unwind.
+#[test]
+fn rreach_replay_callback_panic_drops_vec_before_crediting_retained_memory() {
+    struct ReplayPanicSink<'a> {
+        run: &'a DlRun,
+        live: Arc<AtomicUsize>,
+        credited: Arc<AtomicUsize>,
+        deallocs_at_credit: Arc<AtomicUsize>,
+        panic_on_go_on: bool,
+    }
+    impl Sink for ReplayPanicSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn admit_dl(&mut self, bytes: usize) -> bool {
+            self.live.fetch_add(bytes, Ordering::Relaxed);
+            true
+        }
+        fn commit_dl(&mut self, admitted: usize, kept: usize) {
+            self.live
+                .fetch_sub(admitted.saturating_sub(kept), Ordering::Relaxed);
+        }
+        fn credit_dl(&mut self, bytes: usize) {
+            self.deallocs_at_credit
+                .store(sample().dealloc_events, Ordering::Relaxed);
+            self.live.fetch_sub(bytes, Ordering::Relaxed);
+            self.credited.fetch_add(bytes, Ordering::Relaxed);
+        }
+        fn go_on(&self) -> bool {
+            if self.panic_on_go_on {
+                panic!("simulated callback panic during m_registered sizing scan");
+            }
+            true
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    let (ix, root, _) = rooted_index(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    let mut run = DlRun::new(false, Default::default());
+    run.mrepair = MREPAIR_ON;
+    let live = Arc::new(AtomicUsize::new(0));
+    let credited = Arc::new(AtomicUsize::new(0));
+    let deallocs_at_credit = Arc::new(AtomicUsize::new(0));
+    let mut st = State::default();
+
+    // Seed 1,024 pending registrations so `m_registered`'s sizing scan hits `Scan::read`'s
+    // `go_on()` callback on the 1,024th constant even with no held marker pairs.
+    let ctx = 100u32;
+    let mut seed_sink = ReplayPanicSink {
+        run: &run,
+        live: live.clone(),
+        credited: credited.clone(),
+        deallocs_at_credit: deallocs_at_credit.clone(),
+        panic_on_go_on: false,
+    };
+    for c in 0..1024u32 {
+        assert!(super::dl_root::redge(&mut st, ctx, c, &mut seed_sink));
+    }
+
+    let mut panic_sink = ReplayPanicSink {
+        run: &run,
+        live: live.clone(),
+        credited: credited.clone(),
+        deallocs_at_credit: deallocs_at_credit.clone(),
+        panic_on_go_on: true,
+    };
+    let (res, _) = measure(|| {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = super::dl_root::rreach(&ix, root, &mut st, ctx, &mut panic_sink);
+        }))
+    });
+    assert!(
+        res.is_err(),
+        "expected simulated go_on panic in m_registered"
+    );
+    assert!(
+        credited.load(Ordering::Relaxed) >= 1024 * std::mem::size_of::<u32>(),
+        "rreach unwind must credit freed registration vector (credited={})",
+        credited.load(Ordering::Relaxed)
+    );
+    assert!(
+        deallocs_at_credit.load(Ordering::Relaxed) >= 1,
+        "detached registration vector must be deallocated before credit_dl runs"
+    );
+    let expected_live = std::mem::size_of::<super::saturate::Extra>()
+        + super::dl_rules::dl(&st).expect("dl state").bytes();
+    assert_eq!(
+        live.load(Ordering::Relaxed),
+        expected_live,
+        "retained ledger must equal Extra + DlSt bytes after rreach unwind"
+    );
+}
+
+/// Round-2 blocker 4: an early stop or callback panic during single-conclusion delivery in
+/// `drain_with_covered` must drop pending product buffers before `held_guard` calls
+/// `release_data`.
+#[test]
+fn drain_single_conclusion_early_stop_and_panic_drop_products_before_release() {
+    struct StopOrPanicOnFirst {
+        stop_flag: Arc<AtomicBool>,
+        should_panic: bool,
+    }
+    impl Deriver for StopOrPanicOnFirst {
+        fn derive<S: Sink>(&self, _: &Index, _: &mut State, _: super::dl_rules::Side, _: &mut S) {
+            if self.should_panic {
+                panic!("simulated panic on first single conclusion");
+            }
+            self.stop_flag.store(true, Ordering::Relaxed);
+        }
+    }
+    struct ReleaseInspectSink<'a> {
+        run: &'a DlRun,
+        live_charge: Arc<AtomicUsize>,
+        heap_at_release: Arc<AtomicUsize>,
+        released: Arc<AtomicUsize>,
+        stop_flag: Arc<AtomicBool>,
+    }
+    impl Sink for ReleaseInspectSink<'_> {
+        fn send(&mut self, _: Ex, _: Concl) {}
+        fn me(&mut self, _: Concl) {}
+        fn dl(&self) -> &DlRun {
+            self.run
+        }
+        fn reserve_data(&mut self, bytes: usize) -> bool {
+            self.live_charge.fetch_add(bytes, Ordering::Relaxed);
+            true
+        }
+        fn release_data(&mut self, bytes: usize) {
+            self.heap_at_release.store(sample().live, Ordering::Relaxed);
+            self.live_charge.fetch_sub(bytes, Ordering::Relaxed);
+            self.released.fetch_add(bytes, Ordering::Relaxed);
+        }
+        fn stopped(&self) -> bool {
+            self.stop_flag.load(Ordering::Relaxed)
+        }
+        fn worked(&mut self, _: usize) {}
+    }
+
+    let (ix, _, _) = rooted_index(
+        "SubClassOf(:A ObjectUnionOf(:B :C))\n\
+         ClassAssertion(:A :u0)\n",
+    );
+    let run = DlRun::new(false, Default::default());
+
+    for should_panic in [false, true] {
+        let mut st = State::default();
+        let _ = super::dl_rules::ds(&mut st);
+        let live_charge = Arc::new(AtomicUsize::new(0));
+        let heap_at_release = Arc::new(AtomicUsize::new(usize::MAX));
+        let released = Arc::new(AtomicUsize::new(0));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let deriver = StopOrPanicOnFirst {
+            stop_flag: stop_flag.clone(),
+            should_panic,
+        };
+        let mut sink = ReleaseInspectSink {
+            run: &run,
+            live_charge: live_charge.clone(),
+            heap_at_release: heap_at_release.clone(),
+            released: released.clone(),
+            stop_flag: stop_flag.clone(),
+        };
+
+        let mut prods_bytes = 0usize;
+        let (_, _) = measure(|| {
+            let wide = |base: Ex| (Vec::new(), (base..base + 256).map(Lit::x).collect());
+            let list_a: Vec<_> = (0..16u32).map(|i| wide(100 + i * 300)).collect();
+            let list_b: Vec<_> = (0..4u32).map(|i| wide(10_000 + i * 300)).collect();
+            let mut found = Found::default();
+            found.push((Vec::new(), vec![Lit::x(1)]));
+            found.push((Vec::new(), vec![Lit::x(2)]));
+            let one_bytes = found.held_bytes();
+            found.products(vec![list_a, list_b], (Vec::new(), Vec::new()));
+            prods_bytes = found.held_bytes() - one_bytes;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::dl_rules::drain_with(&ix, &mut st, found, &mut sink, &deriver);
+            }));
+            assert_eq!(res.is_err(), should_panic);
+        });
+
+        assert!(
+            prods_bytes > 32 << 10,
+            "expected wide pending product buffers (prods_bytes={prods_bytes})"
+        );
+        assert!(
+            released.load(Ordering::Relaxed) > 32 << 10,
+            "should_panic={should_panic}: expected wide held reservation release"
+        );
+        let live_at_release = heap_at_release.load(Ordering::Relaxed);
+        if should_panic {
+            // Unwinding itself holds a small libstd panic payload/unwind frame (~300 B),
+            // which is far below the 40+ KiB of pending product buffers that must already
+            // have been freed before `held_guard` released credit.
+            assert!(
+                live_at_release < 4096 && live_at_release < prods_bytes,
+                "should_panic=true: pending product buffers ({prods_bytes} B) were still live ({live_at_release} B) when held_guard released credit"
+            );
+        } else {
+            assert_eq!(
+                live_at_release, 0,
+                "should_panic=false: pending product buffers were still live ({live_at_release} B) when held_guard released credit"
+            );
+        }
+        assert_eq!(live_charge.load(Ordering::Relaxed), 0);
+    }
 }

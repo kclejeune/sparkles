@@ -1259,6 +1259,106 @@ impl<S: Sink> Sink for DlGuard<'_, S> {
     }
 }
 
+/// RAII scope guard for retained Tier D memory credit returned through [`Sink::credit_dl`]
+/// once a detached buffer has been dropped, on both normal exit and callback panic unwind.
+pub(super) struct CreditGuard<'a, S: Sink> {
+    out: &'a mut S,
+    bytes: usize,
+}
+
+impl<'a, S: Sink> CreditGuard<'a, S> {
+    #[inline]
+    pub(super) fn new(out: &'a mut S, bytes: usize) -> Self {
+        Self { out, bytes }
+    }
+
+    #[inline]
+    pub(super) fn arm(&mut self, bytes: usize) {
+        self.bytes = bytes;
+    }
+}
+
+impl<S: Sink> Drop for CreditGuard<'_, S> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let bytes = std::mem::take(&mut self.bytes);
+            self.out.credit_dl(bytes);
+        }
+    }
+}
+
+impl<S: Sink> Sink for CreditGuard<'_, S> {
+    fn reserve_data(&mut self, bytes: usize) -> bool {
+        self.out.reserve_data(bytes)
+    }
+    fn admit_data(&mut self, bytes: usize) -> bool {
+        self.out.admit_data(bytes)
+    }
+    fn keep_data(&mut self, bytes: usize) {
+        self.out.keep_data(bytes);
+    }
+    fn keep_shared(&mut self, bytes: usize) {
+        self.out.keep_shared(bytes);
+    }
+    fn retain_shared(&mut self, bytes: usize) {
+        self.out.retain_shared(bytes);
+    }
+    fn release_data(&mut self, bytes: usize) {
+        self.out.release_data(bytes);
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        self.out.admit_dl(bytes)
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        self.out.commit_dl(admitted, kept);
+    }
+    fn credit_dl(&mut self, bytes: usize) {
+        self.out.credit_dl(bytes);
+    }
+    fn data_overflow(&mut self) {
+        self.out.data_overflow();
+    }
+    fn send(&mut self, to: Ex, c: Concl) {
+        self.out.send(to, c);
+    }
+    fn me(&mut self, c: Concl) {
+        self.out.me(c);
+    }
+    fn merged(&mut self) {
+        self.out.merged();
+    }
+    fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+        self.out.core(ix, e, out);
+    }
+    fn intern(&mut self, core: &[Ex]) -> Ex {
+        self.out.intern(core)
+    }
+    fn dl(&self) -> &super::dl_rules::DlRun {
+        self.out.dl()
+    }
+    fn busy(&self) -> bool {
+        self.out.busy()
+    }
+    fn defer(&mut self) -> bool {
+        self.out.defer()
+    }
+    fn go_on(&self) -> bool {
+        self.out.go_on()
+    }
+    fn sent_go_on(&mut self) -> bool {
+        self.out.sent_go_on()
+    }
+    fn worked(&mut self, n: usize) {
+        self.out.worked(n);
+    }
+    fn pause(&self) -> bool {
+        self.out.pause()
+    }
+    fn stopped(&self) -> bool {
+        self.out.stopped()
+    }
+}
+
 /// A helper's part in a phase of a run in steps, which it leaves when it is dropped,
 /// at the end of its work and when it unwinds.
 struct InPhase<'r, 'a>(&'r Run<'a>, &'r Steps);

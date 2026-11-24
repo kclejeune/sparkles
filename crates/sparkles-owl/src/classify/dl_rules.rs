@@ -2018,7 +2018,8 @@ fn fold<S: Sink, D: Deriver>(
                     } else if next.len() >= FOLD_PRUNE {
                         // Switch to streaming before doubling `next` past FOLD_PRUNE: keep
                         // `drained` charged until every buffered union and `s` have been
-                        // emitted and dropped, halting immediately if the run stops.
+                        // emitted and dropped, polling bounds periodically as the final
+                        // emission loop does.
                         streaming = true;
                         let drained = std::mem::take(&mut next);
                         next_lits = 0;
@@ -2027,6 +2028,14 @@ fn fold<S: Sink, D: Deriver>(
                             if guard.stopped() {
                                 mark_interrupted(st);
                                 return false;
+                            }
+                            st.dl_choices += 1;
+                            if st.dl_choices as usize >= PRODUCT_POLL {
+                                st.dl_choices = 0;
+                                if !guard.go_on() {
+                                    mark_interrupted(st);
+                                    return false;
+                                }
                             }
                         }
                         emit(ix, st, s, rule, root, trace, &mut guard, deriver);
@@ -2217,21 +2226,25 @@ fn drain_with_covered<S: Sink, D: Deriver>(
         mark_interrupted(st);
         return;
     }
+    let h = if held_covered { 0 } else { found.held_bytes() };
+    // Declare `held_guard` before moving `found`'s collections into locals so LIFO drop
+    // always frees both `one` and `prods` before releasing their reservation, including on
+    // early stop or callback panic unwind during single-conclusion delivery.
     let mut held_guard = Guard::new(out);
-    if !held_covered {
-        let h = found.held_bytes();
-        if h > 0 && !held_guard.admit_add(h) {
-            mark_interrupted(st);
-            return;
-        }
+    let Found {
+        one, prods, root, ..
+    } = found;
+    if h > 0 && !held_guard.admit_add(h) {
+        mark_interrupted(st);
+        return;
     }
     let trace = tracing();
-    for (c, rule) in found.one {
+    for (c, rule) in one {
         if trace {
             let lits = &held_guard.dl().lits;
             eprintln!(
                 "TR {} {rule} {} -> {}",
-                tr_ctx(st, found.root),
+                tr_ctx(st, root),
                 tr(ix, lits, &c.0),
                 tr(ix, lits, &c.1)
             );
@@ -2252,7 +2265,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
     }
     let dx = ix.dl.as_deref();
     let inv = |r: Role| dx.and_then(|d| d.inv(ix, r));
-    for (lists, base, ground, rule) in found.prods {
+    for (lists, base, ground, rule) in prods {
         // a product past the run's limit on choices ends the run as its bound does, before
         // the product spends its work (roadmap item 1011)
         if held_guard.dl().too_wide(&lists) {
@@ -2267,7 +2280,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
                 &lists,
                 base,
                 rule,
-                found.root,
+                root,
                 trace,
                 slack_covered,
                 &mut held_guard,
@@ -2393,7 +2406,7 @@ fn drain_with_covered<S: Sink, D: Deriver>(
                     let lits = &guard.dl().lits;
                     eprintln!(
                         "TR {} {rule} {} -> {}",
-                        tr_ctx(st, found.root),
+                        tr_ctx(st, root),
                         tr(ix, lits, &s.0),
                         tr(ix, lits, &s.1)
                     );
