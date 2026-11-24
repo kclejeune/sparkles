@@ -1305,6 +1305,42 @@ its ledger in `cursor_text_heap.rs`, `cursor_history_heap.rs` and
 `cursor_memory_audit.rs`, and cover retention and disabling between pulls, a branch
 deleted under a read, endpoint failures, timeouts, cancellation and the cache.
 
+Checked history cursors honor source and query cancellation and absolute deadlines during
+read-only timestamp lookup as well as during page reads. To avoid allocating term tables
+while resolving time bounds on a read-only log, `ReadOnlyLog::commit_at_time` validates
+each frame's CRC, metadata, term framing and quad term references in place without
+materializing `Arc<[u8]>` term payloads, while preserving consecutive-prefix semantics,
+full-walk head-before-clamp selection and cooperative stop precedence. On `forge`, an
+Intel i5-13500 pinned to CPU 2 with one Rayon thread, matched release builds of
+`2233637a` and `01b46ba1` ran all 26 cells of the history timing matrix with 12 ABBA,
+12 BAAB and 12 same-binary rounds of 200 samples per process and 100% row-count
+agreement. Checked first pulls on archived ancestor logs became 9.9% faster on
+`ancestor-one`, at 0.901 of the base and 16.95 ms against 18.80 ms, and 15.1% faster on
+`ancestor-two`, at 0.849 and 20.90 ms against 24.61 ms. No cell failed the 2% bound.
+The 16 primary cells on writable history logs that showed a real slowdown between 0.46%
+and 1.13% are recorded below for [item 1074](../../ROADMAP.md) on host `forge` comparing
+`2233637a..01b46ba1`, to be recovered by profiling the checked cursor's per-entry control
+polls and timestamp-index lookup path within two batches or by 2026-12-08.
+
+| Query and route | Phase | Host | Commits | Baseline | Ratio and 95% interval | Added | Recovery and deadline |
+|---|---|---|---|---:|---|---:|---|
+| `commit-warm` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.26 ms | 1.0053, 1.0036 to 1.0063 | +43.9 µs | Item 1074, within two batches or by 2026-12-08 |
+| `commit-warm` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.50 ms | 1.0046, 1.0029 to 1.0059 | +34.5 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-first-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 123.1 µs | 1.0103, 1.0080 to 1.0113 | +1.26 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-first-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 123.6 µs | 1.0112, 1.0099 to 1.0121 | +1.38 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.12 ms | 1.0075, 1.0060 to 1.0089 | +60.8 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.37 ms | 1.0056, 1.0027 to 1.0090 | +41.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-one` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.48 ms | 1.0113, 1.0094 to 1.0126 | +354.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.23 ms | 1.0057, 1.0048 to 1.0069 | +46.8 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.49 ms | 1.0046, 1.0030 to 1.0061 | +34.4 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-warm-cross-two` eager | `eager` | `forge` | `2233637a..01b46ba1` | 30.99 ms | 1.0103, 1.0083 to 1.0141 | +320.7 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.21 ms | 1.0083, 1.0050 to 1.0117 | +68.0 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.43 ms | 1.0089, 1.0064 to 1.0108 | +66.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-one` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.56 ms | 1.0107, 1.0090 to 1.0120 | +337.0 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` checked | `first` | `forge` | `2233637a..01b46ba1` | 8.45 ms | 1.0060, 1.0042 to 1.0089 | +50.4 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` ordinary | `first` | `forge` | `2233637a..01b46ba1` | 7.71 ms | 1.0104, 1.0061 to 1.0126 | +80.3 µs | Item 1074, within two batches or by 2026-12-08 |
+| `time-uncached-two` eager | `eager` | `forge` | `2233637a..01b46ba1` | 31.17 ms | 1.0104, 1.0084 to 1.0119 | +325.0 µs | Item 1074, within two batches or by 2026-12-08 |
+
 All three streamed readers report `growingState` from construction onward because the
 batch cap does not bound their retained state. An in-process SERVICE call clears the
 target's pool alongside inheriting the caller's grant so an unpooled caller keeps its
