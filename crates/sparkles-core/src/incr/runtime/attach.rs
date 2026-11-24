@@ -124,7 +124,7 @@ impl Runtime {
             }
             match st.circuit.decode(body, &snap) {
                 Ok(()) => {
-                    st.circuit.applied = h.commit;
+                    st.circuit.set_applied(h.commit);
                     self.seen.fetch_max(h.commit, Ordering::AcqRel);
                     self.counters.loaded.fetch_add(1, Ordering::Relaxed);
                     let mut info = cell.info.lock();
@@ -230,6 +230,7 @@ impl Runtime {
             c.terms = std::mem::take(&mut old.terms);
             c.snap = old.snap.take();
             c.applied = old.applied;
+            c.version = old.version.take();
             st.circuit = c;
             // diffs of the old mode do not lead to rows of the new one
             st.clear_history();

@@ -37,6 +37,7 @@ mod ripple;
 mod service;
 mod text;
 mod topk;
+mod view;
 mod walk;
 mod whole;
 
@@ -961,6 +962,36 @@ pub(super) fn call_cursor(
     .map(|(cursor, _, _)| cursor)
 }
 
+/// A SELECT cursor for an already-parsed query (such as a rebuilt `table` view),
+/// charged against its caller's query from its first allocation.
+pub(super) fn call_parsed_cursor(
+    snapshot: Arc<Snapshot>,
+    parsed: spargebra::Query,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    parent: sparkles_budget::ParentHandle,
+) -> Result<QueryCursor> {
+    if cursor.batch_rows == 0 || cursor.batch_bytes == 0 {
+        return Err(Error::invalid(
+            "cursor batch rows and bytes must be positive",
+        ));
+    }
+    let started = Instant::now();
+    open_parsed_cursor_input(
+        snapshot,
+        parsed,
+        "",
+        options,
+        cursor,
+        Some(QueryKind::Select),
+        None,
+        Some(parent),
+        started,
+        0.0,
+    )
+    .map(|(cursor, _, _)| cursor)
+}
+
 fn open_pattern_cursor_input(
     snapshot: Arc<Snapshot>,
     query: &str,
@@ -984,50 +1015,68 @@ fn open_pattern_cursor_input(
         .min(depth::MAX_ALGEBRA_DEPTH);
     depth::with_stack(parser_depth, || {
         let parsed = super::parse_query(query, options.base_iri.as_deref(), &options.prefixes)?;
-        let kind = match &parsed {
-            spargebra::Query::Select { .. } => QueryKind::Select,
-            spargebra::Query::Ask { .. } => QueryKind::Ask,
-            spargebra::Query::Construct { .. } => QueryKind::Construct,
-            spargebra::Query::Describe { .. } => QueryKind::Describe,
-        };
-        if expected.is_some_and(|expected| {
-            kind != expected && !(expected == QueryKind::Construct && kind == QueryKind::Describe)
-        }) {
-            return Err(Error::Unsupported(format!(
-                "a {expected:?} cursor requires a {expected:?} query"
-            )));
-        }
         let parse_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let levels = depth::check_query(&parsed)?;
-        depth::with_stack(levels, || {
-            let planning = Instant::now();
-            // The public strict boundary validated the original invocation Arc.
-            // Pass only its retained already-bound policy internally; guards
-            // must not be rebound against the masked physical snapshot.
-            // This owner is declared before the policy alias, so on a setup
-            // refusal the alias drops before the last source returns its credit.
-            let _retained = source.clone();
-            let bound_policy = source
-                .as_ref()
-                .and_then(|source| source.query_input().1)
-                .cloned();
-            let prepared = super::prepare_query_input_policy(
-                snapshot,
-                &parsed,
-                options,
-                Some(started),
-                None,
-                source,
-                bound_policy.as_ref(),
-                parent,
-                None,
-            )?;
-            let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
-            let levels = levels.max(prepared.plan_depth);
-            from_prepared(
-                prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
-            )
-        })
+        open_parsed_cursor_input(
+            snapshot, parsed, query, options, cursor, expected, source, parent, started, parse_ms,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_parsed_cursor_input(
+    snapshot: Arc<Snapshot>,
+    parsed: spargebra::Query,
+    query: &str,
+    options: &QueryOptions,
+    cursor: &CursorOptions,
+    expected: Option<QueryKind>,
+    source: Option<crate::store::BoundReadSource>,
+    parent: Option<sparkles_budget::ParentHandle>,
+    started: Instant,
+    parse_ms: f64,
+) -> Result<(QueryCursor, Option<graph::Spec>, QueryKind)> {
+    let kind = match &parsed {
+        spargebra::Query::Select { .. } => QueryKind::Select,
+        spargebra::Query::Ask { .. } => QueryKind::Ask,
+        spargebra::Query::Construct { .. } => QueryKind::Construct,
+        spargebra::Query::Describe { .. } => QueryKind::Describe,
+    };
+    if expected.is_some_and(|expected| {
+        kind != expected && !(expected == QueryKind::Construct && kind == QueryKind::Describe)
+    }) {
+        return Err(Error::Unsupported(format!(
+            "a {expected:?} cursor requires a {expected:?} query"
+        )));
+    }
+    let levels = depth::check_query(&parsed)?;
+    depth::with_stack(levels, || {
+        let planning = Instant::now();
+        // The public strict boundary validated the original invocation Arc.
+        // Pass only its retained already-bound policy internally; guards
+        // must not be rebound against the masked physical snapshot.
+        // This owner is declared before the policy alias, so on a setup
+        // refusal the alias drops before the last source returns its credit.
+        let _retained = source.clone();
+        let bound_policy = source
+            .as_ref()
+            .and_then(|source| source.query_input().1)
+            .cloned();
+        let prepared = super::prepare_query_input_policy(
+            snapshot,
+            &parsed,
+            options,
+            Some(started),
+            None,
+            source,
+            bound_policy.as_ref(),
+            parent,
+            None,
+        )?;
+        let plan_ms = planning.elapsed().as_secs_f64() * 1000.0;
+        let levels = levels.max(prepared.plan_depth);
+        from_prepared(
+            prepared, &parsed, query, options, cursor, started, parse_ms, plan_ms, levels, kind,
+        )
     })
 }
 
@@ -2755,6 +2804,8 @@ enum State {
     Text(Box<text::Text>),
     /// A history query without a limit or input, read a page of whole commits at a time.
     History(Box<history::History>),
+    /// A `SERVICE view:read` leaf, streamed from an immutable shared view version.
+    View(Box<view::View>),
 }
 
 /// An eager kernel's node, its answer once it has run, and how far its consumer has
@@ -3154,6 +3205,7 @@ fn ranked(kind: &Kind) -> bool {
             | Kind::HybridSearch(_)
             | Kind::SpatialKnn(_)
             | Kind::Service { .. }
+            | Kind::ViewRead(_)
             | Kind::PathSearch(_)
             | Kind::AlgoCall(_)
     )
@@ -3342,6 +3394,8 @@ impl Operator {
         let text_reader = text::eligible(&node);
         // A history query without a limit holds a page of its changes at a time.
         let history_reader = history::eligible(&node);
+        // A view read streams from an immutable shared view version without copying.
+        let view_reader = view::eligible(&node);
         // A native sort consumes cursor batches into charged state. It blocks before
         // its first output but is not an eager fallback, so strict policy admits it.
         let materializes = !(exists_streams && supported(&node.kind))
@@ -3355,6 +3409,7 @@ impl Operator {
             && !service_reader
             && !text_reader
             && !history_reader
+            && !view_reader
             && !pattern_counts
             && (!native_blocking || !exists_streams);
         // A kernel that answers whole tables runs as a native operator when its form is
@@ -3538,7 +3593,8 @@ impl Operator {
             || exists
             || service_reader
             || text_reader
-            || history_reader;
+            || history_reader
+            || view_reader;
         let mut order = output_order(
             &node,
             &children,
@@ -3598,8 +3654,13 @@ impl Operator {
             }
         }
         let heap = native_blocking && !materializes && topk::eligible(ctx, &node);
-        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input || text_reader || history_reader).then(|| {
-            if history_reader {
+        let reason = (materializes || native_blocking || exists || index_topk || run_group || whole_input || text_reader || history_reader || view_reader).then(|| {
+            if view_reader {
+                format!(
+                    "{} reads the view's immutable shared version a batch at a time under the memory budget",
+                    node.operator()
+                )
+            } else if history_reader {
                 format!(
                     "{} reads the change log a page of whole commits at a time under the memory budget, pinning the commits it has still to read",
                     node.operator()
@@ -3679,6 +3740,8 @@ impl Operator {
             State::Text(Box::new(text::Text::new(node)))
         } else if history_reader {
             State::History(Box::new(history::History::new(node)))
+        } else if view_reader {
+            State::View(Box::new(view::View::new(node)))
         } else if index_topk {
             State::IndexTopK(Box::new(topk::IndexTopK::new(node, fallback)))
         } else if heap {
@@ -3879,6 +3942,7 @@ impl Operator {
             State::Service(service) => service.release(),
             State::Text(text) => text.release(),
             State::History(history) => history.release(),
+            State::View(view) => view.release(),
             _ => {}
         }
         if let Some(ahead) = &mut self.ahead {
@@ -4571,6 +4635,11 @@ impl Operator {
                 State::History(history) => {
                     let b = history.next(ctx, cap)?;
                     self.done = history.done();
+                    b
+                }
+                State::View(view) => {
+                    let b = view.next(ctx, options, cap)?;
+                    self.done = view.done();
                     b
                 }
                 State::TopK(topk) => {

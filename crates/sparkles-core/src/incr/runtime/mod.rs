@@ -22,7 +22,10 @@ use super::views::{self, ViewDef, ViewInfo, ViewState};
 use super::zset::Changes;
 use crate::access::GraphAccess;
 use crate::error::{Error, Result};
-use crate::sparql::viewsvc::{ViewRead, ViewRows, ViewSource};
+use crate::sparql::viewsvc::{
+    OpenedView, RewoundView, ViewOpen, ViewRead, ViewRebuild, ViewRows, ViewSource, ViewVersion,
+    row_retained_bytes,
+};
 use crate::store::definitions::{self, DefinitionFile, DefinitionSource};
 use crate::store::{DeltaSubscription, Store};
 use crate::task::Control;

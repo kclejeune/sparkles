@@ -11,11 +11,55 @@ use crate::id::{self, Id, Tag};
 use crate::store::Snapshot;
 use oxrdf::Term;
 use rustc_hash::FxHashMap;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct Terms {
-    keys: Vec<Box<[u8]>>,
-    index: FxHashMap<Box<[u8]>, u64>,
+    keys: Vec<Arc<[u8]>>,
+    index: FxHashMap<Arc<[u8]>, u64>,
+}
+
+/// An immutable term table frozen with one view version so streaming cursors can decode
+/// `Tag::Local` ids without touching the circuit's lock.
+#[derive(Clone, Debug, Default)]
+pub struct ViewTerms {
+    keys: Arc<[Arc<[u8]>]>,
+}
+
+impl ViewTerms {
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    pub fn key_bytes(&self, index: usize) -> Option<&[u8]> {
+        self.keys.get(index).map(|k| k.as_ref())
+    }
+
+    /// The term of an id of this version's space.
+    pub fn term(&self, snap: &Snapshot, i: Id) -> Option<Term> {
+        match i.tag() {
+            Tag::Local => self
+                .keys
+                .get(i.payload() as usize)
+                .map(|k| id::key_to_term(k)),
+            Tag::Undef => None,
+            _ => snap.term(i),
+        }
+    }
+
+    /// The bytes an unshared term table keeps allocated on the heap.
+    pub fn retained_bytes(&self) -> u64 {
+        if self.keys.is_empty() {
+            return 0;
+        }
+        let slice = self.keys.len() * std::mem::size_of::<Arc<[u8]>>() + 16;
+        let keys: usize = self.keys.iter().map(|k| k.len() + 16).sum();
+        (slice + keys) as u64
+    }
 }
 
 impl Terms {
@@ -27,8 +71,22 @@ impl Terms {
         self.index.is_empty()
     }
 
+    pub fn key_count(&self) -> usize {
+        self.keys.len()
+    }
+
     pub fn bytes(&self) -> u64 {
-        self.keys.iter().map(|k| k.len() as u64 * 2 + 48).sum()
+        self.keys.iter().map(|k| k.len() as u64 + 64).sum()
+    }
+
+    /// Freeze the current local term table into an immutable snapshot.
+    pub fn snapshot(&self) -> ViewTerms {
+        if self.keys.is_empty() {
+            return ViewTerms::default();
+        }
+        ViewTerms {
+            keys: self.keys.iter().cloned().collect(),
+        }
     }
 
     /// The id of the term with vocabulary key `key`.
@@ -61,7 +119,7 @@ impl Terms {
             return Id::local(n);
         }
         let n = self.keys.len() as u64;
-        let key: Box<[u8]> = key.into();
+        let key: Arc<[u8]> = key.into();
         self.keys.push(key.clone());
         self.index.insert(key, n);
         Id::local(n)

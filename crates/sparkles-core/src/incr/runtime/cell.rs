@@ -31,10 +31,12 @@ pub(super) struct Info {
     pub(super) whole: Option<String>,
 }
 
+pub(super) type HistRows = Arc<[(Vec<Option<Term>>, i64)]>;
+
 pub(super) struct Hist {
     from: u64,
     to: u64,
-    rows: Arc<[(Vec<Option<Term>>, i64)]>,
+    rows: HistRows,
 }
 
 pub(super) struct Sub {
@@ -229,8 +231,10 @@ impl Slot {
         }
     }
 
-    /// The net change from commit `after` to the circuit's commit from the history.
-    pub(super) fn history_since(&self, after: u64) -> Option<Vec<(Vec<Option<Term>>, i64)>> {
+    /// The history slices from commit `after` to the circuit's commit, without merging
+    /// them under the circuit lock. An empty vector means every commit since `after`
+    /// left the result unchanged.
+    pub(super) fn history_parts_since(&self, after: u64) -> Option<Vec<HistRows>> {
         let start = self.history.iter().position(|h| {
             h.from == after || (h.rows.is_empty() && h.from <= after && after < h.to)
         })?;
@@ -240,12 +244,20 @@ impl Slot {
             if h.from > at {
                 return None;
             }
-            parts.push(&h.rows);
+            if !h.rows.is_empty() {
+                parts.push(h.rows.clone());
+            }
             at = h.to;
         }
         if at != self.circuit.applied {
             return None;
         }
+        Some(parts)
+    }
+
+    /// The net change from commit `after` to the circuit's commit from the history.
+    pub(super) fn history_since(&self, after: u64) -> Option<Vec<(Vec<Option<Term>>, i64)>> {
+        let parts = self.history_parts_since(after)?;
         Some(net(parts.iter().flat_map(|r| r.iter().cloned())))
     }
 }

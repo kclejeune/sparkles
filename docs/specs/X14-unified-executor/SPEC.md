@@ -1300,12 +1300,24 @@ Deleting the branch or dataset still removes the segments under a read, which
 decodes them, which [item 1124](../../ROADMAP.md) holds, and a read-only log's newest-first
 walk is [item 1175](../../ROADMAP.md).
 
-View reads stay refused under the strict policy, since a view's result is decoded under
-its lock against the circuit's latest pass, and [item 1121](../../ROADMAP.md) keeps a
-versioned result that a cursor can page through. Path searches that keep a set per pair
-of endpoints and path searches over their input without a limit stay refused under items
-[1122](../../ROADMAP.md) and [1123](../../ROADMAP.md). The inventory test
-`cursor_inventory.rs` lists every form as native or refused with its decision or row.
+A view read, in `cursor/view.rs`, streams natively under the strict policy from an
+immutable shared `ViewVersion` that each circuit publishes with its frozen `ViewTerms`
+table, snapshot and flat row table whenever a pass applies. Current and `view:allowStale`
+reads take only a reference to the shared version and release the circuit lock at once,
+so updates arriving between pulls never alter an open cursor or block maintenance passes,
+and rows translate ids directly against the query snapshot without a whole-result copy.
+When a view has moved ahead of the query commit within its retained history, the reader
+folds the history slices outside the circuit lock under an admitted charge and streams
+the shared version while subtracting added rows and emitting removed rows after it. When
+history has expired or the reader asks for another `aggregate_errors` reading, a `SELECT`
+view streams through a child cursor charged to the caller's memory budget, and a
+`CONSTRUCT` view builds under the caller's deadline, cancellation and memory limit and
+admits its owned version. Multiplicities expand across batch boundaries with cooperative
+cancellation checks, and all three `ViewRead` forms are native in `cursor_inventory.rs`
+and audited in `cursor_memory_audit.rs` alongside `cursor_view.rs`. Path searches that
+keep a set per pair of endpoints and path searches over their input without a limit stay
+refused under items [1122](../../ROADMAP.md) and [1123](../../ROADMAP.md). The inventory
+test `cursor_inventory.rs` lists every form as native or refused with its decision or row.
 
 Tests compare each reader with eager answers at batch sizes down to one row, refuse the
 budget and row limits where eager execution refuses, measure each reader's heap against
