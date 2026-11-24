@@ -292,6 +292,10 @@ impl DataVal {
         self.opaque.capacity() * std::mem::size_of::<u32>()
     }
 
+    pub(super) fn logical_owned_bytes(&self) -> usize {
+        self.opaque.len() * std::mem::size_of::<u32>()
+    }
+
     pub const TOP: DataVal = DataVal {
         known: Known::Top,
         opaque: Vec::new(),

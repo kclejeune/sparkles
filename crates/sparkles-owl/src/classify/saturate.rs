@@ -337,6 +337,11 @@ pub struct State {
     pub bottom: bool,
     /// whether the context has an instance in every model
     pub real: bool,
+    /// whether a Tier D stop or memory refusal cut work short before a store was created
+    pub interrupted: bool,
+    /// choices derived by Tier D since the last bounds poll (kept inline to avoid boxing
+    /// `DlSt` solely to count choices)
+    pub dl_choices: u16,
     /// the negative existential restrictions whose filler is a subsumer, which a new
     /// backward link propagates to its source
     pub props: Vec<(Role, Ex)>,
@@ -652,6 +657,11 @@ impl Ctx {
         *self.st.lock() = State::default();
         self.todo.lock().clear();
         self.started.store(false, Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
     }
 }
 
@@ -1031,6 +1041,440 @@ impl Drop for OutboxRetirement<'_, '_> {
     }
 }
 
+/// RAII scope guard for temporary memory reservations granted through [`Sink::reserve_data`]
+/// or [`Sink::admit_data`]. Releases any remaining bytes on normal exit and on unwind so a
+/// panicking caller callback never leaks a granted debit.
+pub(super) struct Guard<'a, S: Sink> {
+    out: &'a mut S,
+    bytes: usize,
+}
+
+impl<'a, S: Sink> Guard<'a, S> {
+    #[inline]
+    pub(super) fn new(out: &'a mut S) -> Self {
+        Self { out, bytes: 0 }
+    }
+
+    #[inline]
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    #[inline]
+    pub(super) fn reserve_add(&mut self, add: usize) -> bool {
+        if add == 0 {
+            return true;
+        }
+        let Some(next) = self.bytes.checked_add(add) else {
+            self.out.data_overflow();
+            return false;
+        };
+        if self.out.reserve_data(add) {
+            self.bytes = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(super) fn admit_add(&mut self, add: usize) -> bool {
+        if add == 0 {
+            return !self.out.stopped();
+        }
+        let Some(next) = self.bytes.checked_add(add) else {
+            self.out.data_overflow();
+            return false;
+        };
+        if self.out.admit_data(add) {
+            self.bytes = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(super) fn ensure_admitted(&mut self, need: usize) -> bool {
+        if need <= self.bytes {
+            return true;
+        }
+        self.admit_add(need - self.bytes)
+    }
+
+    #[inline]
+    pub(super) fn ensure_reserved(&mut self, need: usize) -> bool {
+        if need <= self.bytes {
+            return true;
+        }
+        self.reserve_add(need - self.bytes)
+    }
+
+    #[inline]
+    pub(super) fn release_to(&mut self, want: usize) {
+        if self.bytes > want {
+            let back = self.bytes - want;
+            self.bytes -= back;
+            self.out.release_data(back);
+        }
+    }
+}
+
+impl<S: Sink> Drop for Guard<'_, S> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let bytes = std::mem::take(&mut self.bytes);
+            self.out.release_data(bytes);
+        }
+    }
+}
+
+impl<S: Sink> Sink for Guard<'_, S> {
+    fn reserve_data(&mut self, bytes: usize) -> bool {
+        self.out.reserve_data(bytes)
+    }
+    fn admit_data(&mut self, bytes: usize) -> bool {
+        self.out.admit_data(bytes)
+    }
+    fn keep_data(&mut self, bytes: usize) {
+        self.out.keep_data(bytes);
+    }
+    fn keep_shared(&mut self, bytes: usize) {
+        self.out.keep_shared(bytes);
+    }
+    fn retain_shared(&mut self, bytes: usize) {
+        self.out.retain_shared(bytes);
+    }
+    fn release_data(&mut self, bytes: usize) {
+        self.out.release_data(bytes);
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        self.out.admit_dl(bytes)
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        self.out.commit_dl(admitted, kept);
+    }
+    fn credit_dl(&mut self, bytes: usize) {
+        self.out.credit_dl(bytes);
+    }
+    fn data_overflow(&mut self) {
+        self.out.data_overflow();
+    }
+    fn top_chain_sub(
+        &mut self,
+        to: Ex,
+        domain: Ex,
+        #[cfg(test)] probe: Option<&super::top_chain_diagnostic::Probe>,
+    ) -> bool {
+        self.out.top_chain_sub(
+            to,
+            domain,
+            #[cfg(test)]
+            probe,
+        )
+    }
+    fn send(&mut self, to: Ex, c: Concl) {
+        self.out.send(to, c);
+    }
+    fn me(&mut self, c: Concl) {
+        self.out.me(c);
+    }
+    fn merged(&mut self) {
+        self.out.merged();
+    }
+    fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+        self.out.core(ix, e, out);
+    }
+    fn intern(&mut self, core: &[Ex]) -> Ex {
+        self.out.intern(core)
+    }
+    fn dl(&self) -> &super::dl_rules::DlRun {
+        self.out.dl()
+    }
+    fn busy(&self) -> bool {
+        self.out.busy()
+    }
+    fn defer(&mut self) -> bool {
+        self.out.defer()
+    }
+    fn go_on(&self) -> bool {
+        self.out.go_on()
+    }
+    fn sent_go_on(&mut self) -> bool {
+        self.out.sent_go_on()
+    }
+    fn worked(&mut self, n: usize) {
+        self.out.worked(n);
+    }
+    fn pause(&self) -> bool {
+        self.out.pause()
+    }
+    fn stopped(&self) -> bool {
+        self.out.stopped()
+    }
+}
+
+/// RAII scope guard for Tier D reservations granted through [`Sink::admit_dl`]. Commits
+/// `0` retained bytes on drop unless [`DlGuard::commit`] or [`DlGuard::take`] transfers
+/// ownership first.
+pub(super) struct DlGuard<'a, S: Sink> {
+    out: &'a mut S,
+    bytes: usize,
+}
+
+impl<'a, S: Sink> DlGuard<'a, S> {
+    #[inline]
+    pub(super) fn new(out: &'a mut S) -> Self {
+        Self { out, bytes: 0 }
+    }
+
+    #[inline]
+    pub(super) fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    #[inline]
+    pub(super) fn sink(&self) -> &S {
+        self.out
+    }
+
+    #[inline]
+    pub(super) fn admit_add(&mut self, add: usize) -> bool {
+        if add == 0 {
+            return !self.out.stopped();
+        }
+        let Some(next) = self.bytes.checked_add(add) else {
+            self.out.data_overflow();
+            return false;
+        };
+        if self.out.admit_dl(add) {
+            self.bytes = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(super) fn commit(mut self, kept: usize) {
+        let admitted = std::mem::take(&mut self.bytes);
+        if admitted > 0 || kept > 0 {
+            self.out.commit_dl(admitted, kept);
+        }
+    }
+
+    #[inline]
+    pub(super) fn take(&mut self) -> usize {
+        std::mem::take(&mut self.bytes)
+    }
+}
+
+impl<S: Sink> Drop for DlGuard<'_, S> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let bytes = std::mem::take(&mut self.bytes);
+            self.out.commit_dl(bytes, 0);
+        }
+    }
+}
+
+impl<S: Sink> Sink for DlGuard<'_, S> {
+    fn reserve_data(&mut self, bytes: usize) -> bool {
+        self.out.reserve_data(bytes)
+    }
+    fn admit_data(&mut self, bytes: usize) -> bool {
+        self.out.admit_data(bytes)
+    }
+    fn keep_data(&mut self, bytes: usize) {
+        self.out.keep_data(bytes);
+    }
+    fn keep_shared(&mut self, bytes: usize) {
+        self.out.keep_shared(bytes);
+    }
+    fn retain_shared(&mut self, bytes: usize) {
+        self.out.retain_shared(bytes);
+    }
+    fn release_data(&mut self, bytes: usize) {
+        self.out.release_data(bytes);
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        self.out.admit_dl(bytes)
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        self.out.commit_dl(admitted, kept);
+    }
+    fn credit_dl(&mut self, bytes: usize) {
+        self.out.credit_dl(bytes);
+    }
+    fn data_overflow(&mut self) {
+        self.out.data_overflow();
+    }
+    fn top_chain_sub(
+        &mut self,
+        to: Ex,
+        domain: Ex,
+        #[cfg(test)] probe: Option<&super::top_chain_diagnostic::Probe>,
+    ) -> bool {
+        self.out.top_chain_sub(
+            to,
+            domain,
+            #[cfg(test)]
+            probe,
+        )
+    }
+    fn send(&mut self, to: Ex, c: Concl) {
+        self.out.send(to, c);
+    }
+    fn me(&mut self, c: Concl) {
+        self.out.me(c);
+    }
+    fn merged(&mut self) {
+        self.out.merged();
+    }
+    fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+        self.out.core(ix, e, out);
+    }
+    fn intern(&mut self, core: &[Ex]) -> Ex {
+        self.out.intern(core)
+    }
+    fn dl(&self) -> &super::dl_rules::DlRun {
+        self.out.dl()
+    }
+    fn busy(&self) -> bool {
+        self.out.busy()
+    }
+    fn defer(&mut self) -> bool {
+        self.out.defer()
+    }
+    fn go_on(&self) -> bool {
+        self.out.go_on()
+    }
+    fn sent_go_on(&mut self) -> bool {
+        self.out.sent_go_on()
+    }
+    fn worked(&mut self, n: usize) {
+        self.out.worked(n);
+    }
+    fn pause(&self) -> bool {
+        self.out.pause()
+    }
+    fn stopped(&self) -> bool {
+        self.out.stopped()
+    }
+}
+
+/// RAII scope guard for retained Tier D memory credit returned through [`Sink::credit_dl`]
+/// once a detached buffer has been dropped, on both normal exit and callback panic unwind.
+pub(super) struct CreditGuard<'a, S: Sink> {
+    out: &'a mut S,
+    bytes: usize,
+}
+
+impl<'a, S: Sink> CreditGuard<'a, S> {
+    #[inline]
+    pub(super) fn new(out: &'a mut S, bytes: usize) -> Self {
+        Self { out, bytes }
+    }
+
+    #[inline]
+    pub(super) fn arm(&mut self, bytes: usize) {
+        self.bytes = bytes;
+    }
+}
+
+impl<S: Sink> Drop for CreditGuard<'_, S> {
+    fn drop(&mut self) {
+        if self.bytes > 0 {
+            let bytes = std::mem::take(&mut self.bytes);
+            self.out.credit_dl(bytes);
+        }
+    }
+}
+
+impl<S: Sink> Sink for CreditGuard<'_, S> {
+    fn reserve_data(&mut self, bytes: usize) -> bool {
+        self.out.reserve_data(bytes)
+    }
+    fn admit_data(&mut self, bytes: usize) -> bool {
+        self.out.admit_data(bytes)
+    }
+    fn keep_data(&mut self, bytes: usize) {
+        self.out.keep_data(bytes);
+    }
+    fn keep_shared(&mut self, bytes: usize) {
+        self.out.keep_shared(bytes);
+    }
+    fn retain_shared(&mut self, bytes: usize) {
+        self.out.retain_shared(bytes);
+    }
+    fn release_data(&mut self, bytes: usize) {
+        self.out.release_data(bytes);
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        self.out.admit_dl(bytes)
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        self.out.commit_dl(admitted, kept);
+    }
+    fn credit_dl(&mut self, bytes: usize) {
+        self.out.credit_dl(bytes);
+    }
+    fn data_overflow(&mut self) {
+        self.out.data_overflow();
+    }
+    fn top_chain_sub(
+        &mut self,
+        to: Ex,
+        domain: Ex,
+        #[cfg(test)] probe: Option<&super::top_chain_diagnostic::Probe>,
+    ) -> bool {
+        self.out.top_chain_sub(
+            to,
+            domain,
+            #[cfg(test)]
+            probe,
+        )
+    }
+    fn send(&mut self, to: Ex, c: Concl) {
+        self.out.send(to, c);
+    }
+    fn me(&mut self, c: Concl) {
+        self.out.me(c);
+    }
+    fn merged(&mut self) {
+        self.out.merged();
+    }
+    fn core(&self, ix: &Index, e: Ex, out: &mut Vec<Ex>) {
+        self.out.core(ix, e, out);
+    }
+    fn intern(&mut self, core: &[Ex]) -> Ex {
+        self.out.intern(core)
+    }
+    fn dl(&self) -> &super::dl_rules::DlRun {
+        self.out.dl()
+    }
+    fn busy(&self) -> bool {
+        self.out.busy()
+    }
+    fn defer(&mut self) -> bool {
+        self.out.defer()
+    }
+    fn go_on(&self) -> bool {
+        self.out.go_on()
+    }
+    fn sent_go_on(&mut self) -> bool {
+        self.out.sent_go_on()
+    }
+    fn worked(&mut self, n: usize) {
+        self.out.worked(n);
+    }
+    fn pause(&self) -> bool {
+        self.out.pause()
+    }
+    fn stopped(&self) -> bool {
+        self.out.stopped()
+    }
+}
 /// A helper's part in a phase of a run in steps, which it leaves when it is dropped,
 /// at the end of its work and when it unwinds.
 struct InPhase<'r, 'a>(&'r Run<'a>, &'r Steps);
@@ -1514,6 +1958,25 @@ pub trait Sink {
     /// Releases bytes previously granted by [`Sink::reserve_data`] or [`Sink::admit_data`]
     /// or charged by [`Sink::keep_data`]. Refused reservations need no release.
     fn release_data(&mut self, _bytes: usize) {}
+    /// Pre-admits `bytes` of peak allocation (including reallocation overlap) before Tier D
+    /// grows a retained structure. Returns `false` and leaves no debit active on refusal.
+    fn admit_dl(&mut self, _bytes: usize) -> bool {
+        !self.stopped()
+    }
+    /// Commits `kept` retained bytes (`<= admitted`) from a granted [`Sink::admit_dl`]
+    /// reservation and releases the unused overlap atomically.
+    fn commit_dl(&mut self, _admitted: usize, kept: usize) {
+        if kept > 0 {
+            self.dl().grow(kept);
+        }
+    }
+    /// Credits `bytes` of retained Tier D storage freed back to the run (for example a
+    /// registration buffer released after replay).
+    fn credit_dl(&mut self, bytes: usize) {
+        if bytes > 0 {
+            self.dl().shrink(bytes);
+        }
+    }
     /// Records an unrepresentable memory reservation or total, raising peak memory to
     /// `usize::MAX` and stopping the run with a memory stop without changing the shared
     /// memory count.
@@ -1687,6 +2150,27 @@ impl Sink for Out<'_, '_> {
         let waiting = bytes.min(self.kept);
         self.kept -= waiting;
         let bytes = bytes - waiting;
+        self.run.credit(bytes);
+    }
+    fn admit_dl(&mut self, bytes: usize) -> bool {
+        if bytes == 0 {
+            return !self.stopped();
+        }
+        self.admit_data(bytes)
+    }
+    fn commit_dl(&mut self, admitted: usize, kept: usize) {
+        debug_assert!(
+            kept <= admitted,
+            "Tier D growth {kept} exceeded admitted bound {admitted}"
+        );
+        // Keep `kept` in `self.run.memory` and credit only the unused overlap so live
+        // memory moves monotonically in one atomic update with no two-ledger double count.
+        let release = admitted.saturating_sub(kept);
+        if release > 0 {
+            self.run.credit(release);
+        }
+    }
+    fn credit_dl(&mut self, bytes: usize) {
         self.run.credit(bytes);
     }
 
@@ -3054,6 +3538,7 @@ impl<'a> Run<'a> {
             work: 0,
             kept: 0,
         };
+        let mut skip = false;
         if !st.init {
             tally.stored += CONTEXT_BYTES / CONCLUSION_BYTES;
             if R::DISJ && me as usize >= self.ctx.len() {
@@ -3064,7 +3549,12 @@ impl<'a> Run<'a> {
                 let core = self.dynamic.expect("a run with the Horn rules").core(me);
                 init_conjunction(self.ix, core, &mut st, self.universal, &mut out);
             } else if R::DISJ && self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
-                dl_root::init(self.ix, &mut st, &mut out);
+                if !self.flush_sends(&mut out, tally) {
+                    st.interrupted = true;
+                    skip = true;
+                } else {
+                    dl_root::init(self.ix, &mut st, &mut out);
+                }
             } else {
                 init(self.ix, me, &mut st, self.universal, &mut out);
                 // owl:Thing and the individuals have an instance in every model, which
@@ -3079,7 +3569,9 @@ impl<'a> Run<'a> {
                     out.me(Concl::Real);
                 }
             }
-            ctx.started.store(true, Ordering::Release);
+            if !skip {
+                ctx.started.store(true, Ordering::Release);
+            }
         }
         // the clauses Tier D processed in this activation, with the minimums whose
         // witnesses it released, and whether it gave way
@@ -3095,156 +3587,159 @@ impl<'a> Run<'a> {
             at: 0,
             active_run: top_chain.then_some(self),
         };
-        'outer: loop {
-            loop {
-                let c = match out.local.pop() {
-                    Some(c) => c,
-                    None if taken.at < taken.batch.len() => {
-                        let c = taken.batch[taken.at];
-                        taken.at += 1;
-                        if taken.active_run.is_some() && !matches!(c, Concl::TopChainSub(_)) {
-                            tally.queued -= 1;
+        if !skip {
+            'outer: loop {
+                loop {
+                    let c = match out.local.pop() {
+                        Some(c) => c,
+                        None if taken.at < taken.batch.len() => {
+                            let c = taken.batch[taken.at];
+                            taken.at += 1;
+                            if taken.active_run.is_some() && !matches!(c, Concl::TopChainSub(_)) {
+                                tally.queued -= 1;
+                            }
+                            c
                         }
-                        c
+                        None => break,
+                    };
+                    let (c, debit) = match c {
+                        Concl::TopChainSub(d) => (
+                            Concl::Sub(d),
+                            Some(ReservationDebit {
+                                run: self,
+                                bytes: CONCLUSION_BYTES,
+                            }),
+                        ),
+                        _ => (c, None),
+                    };
+                    let prepaid = debit.is_some();
+                    let stored =
+                        apply_rules_owned::<_, R>(self.ix, me, &mut st, c, &mut out, debit);
+                    if stored && !prepaid {
+                        tally.stored += 1;
                     }
-                    None => break,
-                };
-                let (c, debit) = match c {
-                    Concl::TopChainSub(d) => (
-                        Concl::Sub(d),
-                        Some(ReservationDebit {
-                            run: self,
-                            bytes: CONCLUSION_BYTES,
-                        }),
-                    ),
-                    _ => (c, None),
-                };
-                let prepaid = debit.is_some();
-                let stored = apply_rules_owned::<_, R>(self.ix, me, &mut st, c, &mut out, debit);
-                if stored && !prepaid {
-                    tally.stored += 1;
-                }
-                tally.applied += 1;
-                if top_chain && self.stopped() {
-                    break 'outer;
-                }
-                if tally.applied >= CHECK_EVERY || out.sent >= SEND_EVERY {
-                    if !self.flush_sends(&mut out, tally) {
+                    tally.applied += 1;
+                    if top_chain && self.stopped() {
                         break 'outer;
                     }
-                    // a long activation gives idle workers what it woke as it goes, the
-                    // products of its links so far included, and one of a run in steps
-                    // delivers nothing before its step ends and sends those products
-                    // where no schedule decides it
-                    if !self.steps && self.idle.load(Ordering::Relaxed) > 0 {
-                        if !self.flush_links(&st, &mut out, tally) {
-                            break 'outer;
-                        }
-                        self.deliver(out.outbox, out.woke);
-                        self.share(out.woke);
-                    }
-                }
-            }
-            // An activation of a run in steps that derived its share of conclusions gives
-            // way too, so that the bound is compared before one context derives far more.
-            // It sends the products of its links first, as the context below does that
-            // processed its share of clauses.
-            if self.steps && out.pause() && !st.bottom {
-                if !self.flush_links(&st, &mut out, tally) {
-                    break 'outer;
-                }
-                if !out.local.is_empty() {
-                    continue;
-                }
-                gave_way = true;
-                break;
-            }
-            // A context of Tier D that processed its share of clauses, which counts the
-            // minimums it released as [`dl_rules::flush`] does, gives way to the
-            // contexts this worker woke and goes behind them, with its other clauses left
-            // in its store. What they conclude can close it before it derives the rest, as
-            // a successor without a model does for a context that is equating its
-            // successors, and one worker otherwise finishes that derivation first.
-            // The messages in the outbox show first whom they wake. The products of the
-            // links and propagations this activation stored go out before that, since the
-            // marks of the context's next activation start at the lists' ends and that
-            // activation would leave them out. Those for the context itself come back as
-            // its own conclusions, which it applies before it gives way. In a run in
-            // steps the context gives way whoever waits, so that its activation does not
-            // depend on the others'.
-            if R::DISJ && clauses >= DL_CLAUSES {
-                if !self.flush_links(&st, &mut out, tally) {
-                    break 'outer;
-                }
-                if !out.local.is_empty() {
-                    continue;
-                }
-                if self.steps {
-                    gave_way = true;
-                    break;
-                }
-                if out.woke.is_empty() {
-                    self.deliver(out.outbox, out.woke);
-                }
-                if !out.woke.is_empty() {
-                    gave_way = true;
-                    break;
-                }
-                clauses = 0;
-            }
-            // the to-do list leaves the context with its buffer, so that a context keeps
-            // no room for the messages it took
-            let batch = {
-                let mut t = ctx.todo.lock();
-                if t.is_empty() {
-                    None
-                } else {
-                    Some(std::mem::take(&mut *t))
-                }
-            };
-            let Some(batch) = batch else {
-                // the products of the links and propagations this activation found go out
-                // once its own conclusions are applied, and those for the context itself
-                // come back as conclusions of its own
-                if !self.flush_links(&st, &mut out, tally) {
-                    break 'outer;
-                }
-                if !out.local.is_empty() {
-                    continue;
-                }
-                // R3 of the Horn rules waits for the activation's universals
-                if R::HORN && horn_rules::flush(self.ix, me, &mut st, &mut out) {
-                    continue;
-                }
-                // Tier D's clauses wait for the units, which the EL rules take first
-                if R::DISJ {
-                    // an activation of a run in steps has one share of clauses in all
-                    let share = if self.steps {
-                        DL_CLAUSES - clauses
-                    } else {
-                        DL_CLAUSES
-                    };
-                    let n = if self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
-                        dl_root::flush(self.ix, &mut st, &mut out, share)
-                    } else {
-                        dl_rules::flush(self.ix, me, &mut st, &mut out, share)
-                    };
-                    if n > 0 {
-                        clauses += n;
-                        tally.applied += n;
+                    if tally.applied >= CHECK_EVERY || out.sent >= SEND_EVERY {
                         if !self.flush_sends(&mut out, tally) {
                             break 'outer;
                         }
-                        continue;
+                        // a long activation gives idle workers what it woke as it goes, the
+                        // products of its links so far included, and one of a run in steps
+                        // delivers nothing before its step ends and sends those products
+                        // where no schedule decides it
+                        if !self.steps && self.idle.load(Ordering::Relaxed) > 0 {
+                            if !self.flush_links(&st, &mut out, tally) {
+                                break 'outer;
+                            }
+                            self.deliver(out.outbox, out.woke);
+                            self.share(out.woke);
+                        }
                     }
                 }
-                break;
-            };
-            if taken.active_run.is_none() {
-                tally.queued -= batch.len() as isize;
+                // An activation of a run in steps that derived its share of conclusions gives
+                // way too, so that the bound is compared before one context derives far more.
+                // It sends the products of its links first, as the context below does that
+                // processed its share of clauses.
+                if self.steps && out.pause() && !st.bottom {
+                    if !self.flush_links(&st, &mut out, tally) {
+                        break 'outer;
+                    }
+                    if !out.local.is_empty() {
+                        continue;
+                    }
+                    gave_way = true;
+                    break;
+                }
+                // A context of Tier D that processed its share of clauses, which counts the
+                // minimums it released as [`dl_rules::flush`] does, gives way to the
+                // contexts this worker woke and goes behind them, with its other clauses left
+                // in its store. What they conclude can close it before it derives the rest, as
+                // a successor without a model does for a context that is equating its
+                // successors, and one worker otherwise finishes that derivation first.
+                // The messages in the outbox show first whom they wake. The products of the
+                // links and propagations this activation stored go out before that, since the
+                // marks of the context's next activation start at the lists' ends and that
+                // activation would leave them out. Those for the context itself come back as
+                // its own conclusions, which it applies before it gives way. In a run in
+                // steps the context gives way whoever waits, so that its activation does not
+                // depend on the others'.
+                if R::DISJ && clauses >= DL_CLAUSES {
+                    if !self.flush_links(&st, &mut out, tally) {
+                        break 'outer;
+                    }
+                    if !out.local.is_empty() {
+                        continue;
+                    }
+                    if self.steps {
+                        gave_way = true;
+                        break;
+                    }
+                    if out.woke.is_empty() {
+                        self.deliver(out.outbox, out.woke);
+                    }
+                    if !out.woke.is_empty() {
+                        gave_way = true;
+                        break;
+                    }
+                    clauses = 0;
+                }
+                // the to-do list leaves the context with its buffer, so that a context keeps
+                // no room for the messages it took
+                let batch = {
+                    let mut t = ctx.todo.lock();
+                    if t.is_empty() {
+                        None
+                    } else {
+                        Some(std::mem::take(&mut *t))
+                    }
+                };
+                let Some(batch) = batch else {
+                    // the products of the links and propagations this activation found go out
+                    // once its own conclusions are applied, and those for the context itself
+                    // come back as conclusions of its own
+                    if !self.flush_links(&st, &mut out, tally) {
+                        break 'outer;
+                    }
+                    if !out.local.is_empty() {
+                        continue;
+                    }
+                    // R3 of the Horn rules waits for the activation's universals
+                    if R::HORN && horn_rules::flush(self.ix, me, &mut st, &mut out) {
+                        continue;
+                    }
+                    // Tier D's clauses wait for the units, which the EL rules take first
+                    if R::DISJ {
+                        // an activation of a run in steps has one share of clauses in all
+                        let share = if self.steps {
+                            DL_CLAUSES - clauses
+                        } else {
+                            DL_CLAUSES
+                        };
+                        let n = if self.ix.dl.as_deref().is_some_and(|d| d.is_root(me)) {
+                            dl_root::flush(self.ix, &mut st, &mut out, share)
+                        } else {
+                            dl_rules::flush(self.ix, me, &mut st, &mut out, share)
+                        };
+                        if n > 0 {
+                            clauses += n;
+                            tally.applied += n;
+                            if !self.flush_sends(&mut out, tally) {
+                                break 'outer;
+                            }
+                            continue;
+                        }
+                    }
+                    break;
+                };
+                if taken.active_run.is_none() {
+                    tally.queued -= batch.len() as isize;
+                }
+                taken.batch = batch;
+                taken.at = 0;
             }
-            taken.batch = batch;
-            taken.at = 0;
         }
         // A run that answers in part when it stops gives back the conclusions it did not
         // apply, so that the context shows as not closed, and sends the products of the
@@ -3518,7 +4013,7 @@ fn apply_rules_owned<S: Sink, R: Rules>(
                 _ => {}
             }
             let wait = if R::DISJ && matches!(h.node, Node::Fresh(_)) {
-                dl_rules::defer(ix, st, d)
+                dl_rules::defer(ix, st, d, out)
             } else {
                 None
             };
@@ -3942,6 +4437,138 @@ fn functional<S: Sink>(ix: &Index, st: &mut State, r: Role, w: Ex, out: &mut S) 
     let after = st.bytes();
     debug_assert!(after.saturating_sub(before) <= reserve);
     out.release_data(reserve.saturating_add(before).saturating_sub(after));
+}
+
+/// Helper for `tierd_memory_tests`: runs concurrent `Out::commit_dl` and `admit_lit`
+/// publications against a tight cap (with pooled `charge`) while a second thread
+/// continuously checks memory.
+#[cfg(test)]
+pub(super) fn test_concurrent_commit_dl_no_double_count() -> (bool, usize, usize) {
+    use super::dl_clause::{RTerm, XLit, admit_lit};
+    use super::dl_rules::DlRun;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+    let mut it = super::index::Interner::new();
+    let ix = Index::build(&super::index::Axioms::default(), &mut it, None, &|| false).unwrap();
+    let ctx: Contexts = Vec::new();
+    let dl = DlRun::new(false, Default::default());
+    let base = 4096usize;
+    let step_admit = 16 * 1024;
+    let step_kept = 8 * 1024;
+    let rounds = 64usize;
+    // Measure exact Lits bytes for 64 interned literals on a throwaway Lits so the cap fits
+    // the real live overlap with zero double-count margin for `step_kept` or `lits` growth.
+    let probe = super::dl_clause::Lits::default();
+    for r in 0..rounds {
+        probe.lit(XLit::Atom(10 + r as u32, RTerm::C(r as u32)), |_| None);
+    }
+    // Real peak occurs on the final round: `base + (rounds - 1) * step_kept + probe.bytes() + step_admit`
+    // (or during the last table rehash inside `admit_lit`, which is bounded by `+ 4096`).
+    let cap = base + (rounds - 1) * step_kept + probe.bytes() + step_admit + 4096;
+    let paid_total = Arc::new(AtomicUsize::new(base));
+    let pt = paid_total.clone();
+    let charge = move |bytes: usize| {
+        let prev = pt.fetch_add(bytes, AOrd::Relaxed);
+        if prev.saturating_add(bytes) > cap {
+            pt.fetch_sub(bytes, AOrd::Relaxed);
+            false
+        } else {
+            true
+        }
+    };
+    let bounds = Bounds {
+        threads: 2,
+        deadline: None,
+        max_memory: Some(cap),
+        cancelled: None,
+        charge: Some(&charge),
+        base_memory: base,
+        base_queued: 0,
+        peak_memory: base,
+        paid_memory: base,
+        dynamic: None,
+        dl: Some(&dl),
+        partial: false,
+        steps: false,
+    };
+    let run = Run {
+        ix: &ix,
+        ctx: &ctx,
+        universal: &[],
+        roots: &[],
+        next_root: AtomicUsize::new(0),
+        queue: Mutex::new(Vec::new()),
+        ready: Condvar::new(),
+        pending: AtomicUsize::new(0),
+        idle: AtomicUsize::new(0),
+        stop: AtomicU8::new(STOP_NONE),
+        memory: AtomicUsize::new(base),
+        queued: AtomicIsize::new(0),
+        peak: AtomicUsize::new(base),
+        paid: Mutex::new(base),
+        applied: AtomicUsize::new(0),
+        merged: AtomicBool::new(false),
+        batch: AtomicBool::new(false),
+        plain: false,
+        horn: false,
+        disj: true,
+        steps: false,
+        dynamic: None,
+        bounds: &bounds,
+        started: &STARTED_NS,
+        always_congested: false,
+    };
+    let done = Arc::new(AtomicBool::new(false));
+    let done_obs = done.clone();
+    let mut ok_pub = true;
+    std::thread::scope(|s| {
+        let obs = s.spawn(|| {
+            while !done_obs.load(AOrd::Relaxed) {
+                let _ = run.check(0, 0, 0);
+            }
+        });
+        let mut local = Vec::new();
+        let mut woke = VecDeque::new();
+        let mut outbox = Outbox::default();
+        let mut marks = Marks::default();
+        let mut out = Out {
+            run: &run,
+            me: 0,
+            local: &mut local,
+            woke: &mut woke,
+            outbox: &mut outbox,
+            marks: &mut marks,
+            pending: false,
+            sent: 0,
+            work: 0,
+            kept: 0,
+        };
+        for r in 0..rounds {
+            if !out.admit_dl(step_admit) {
+                ok_pub = false;
+                break;
+            }
+            out.commit_dl(step_admit, step_kept);
+            if admit_lit(
+                XLit::Atom(10 + r as u32, RTerm::C(r as u32)),
+                |_| None,
+                &mut out,
+            )
+            .is_none()
+            {
+                ok_pub = false;
+                break;
+            }
+        }
+        done.store(true, AOrd::Relaxed);
+        obs.join().unwrap();
+    });
+    (
+        ok_pub && !run.stopped(),
+        run.peak.load(Ordering::Relaxed),
+        cap,
+    )
 }
 
 #[cfg(test)]
@@ -5694,6 +6321,8 @@ mod horn_accounting_tests {
         assert!(out1.reserve_data(first));
         assert_eq!(run.memory.load(Ordering::Relaxed), base + first);
 
+        let before_st = st.bytes();
+        let retained;
         {
             let mut m2 = Marks::default();
             let (mut l2, mut w2, mut o2) = (Vec::new(), VecDeque::new(), Outbox::default());
@@ -5711,15 +6340,23 @@ mod horn_accounting_tests {
             };
             out2.keep_data(500);
             assert_eq!(out2.kept, 500);
-            // rret requests a representable fold_slack larger than the remaining headroom
-            // (`room`), so `base + first + fold_slack` overflows `run.memory` before debit;
-            // its cleanup must leave out1's debit and out2's kept untouched.
+            // rret commits its small retained seen/MRep/rets growth into `run.memory`
+            // (single ledger) and then requests a representable fold_slack larger than the
+            // remaining headroom (`room`), so `base + first + retained + fold_slack`
+            // overflows `run.memory` before debit; its cleanup must leave out1's debit,
+            // the committed retained growth, and out2's kept untouched.
             assert!(super::dl_root::rret(&ix, &mut st, cid, &mut out2));
+            retained = st.bytes() - before_st;
             assert_eq!(run.stop.load(Ordering::Relaxed), STOP_MEMORY);
             assert_eq!(run.peak.load(Ordering::Relaxed), usize::MAX);
             assert_eq!(
+                dl.bytes(),
+                dl_bytes,
+                "single-ledger commit_dl must keep retained growth in run.memory, not dl.stores"
+            );
+            assert_eq!(
                 run.memory.load(Ordering::Relaxed),
-                base + first,
+                base + first + retained,
                 "overflow refusal in rret must not subtract from worker 1's debit"
             );
             assert_eq!(
@@ -5728,13 +6365,16 @@ mod horn_accounting_tests {
             );
             // Also verify direct unrepresentable request leaves both untouched.
             assert!(!out2.reserve_data(isize::MAX as usize + 1));
-            assert_eq!(run.memory.load(Ordering::Relaxed), base + first);
+            assert_eq!(run.memory.load(Ordering::Relaxed), base + first + retained);
             assert_eq!(out2.kept, 500);
         }
-        // Dropping out2 flushes its 500 kept bytes cleanly onto base + first.
-        assert_eq!(run.memory.load(Ordering::Relaxed), base + first + 500);
+        // Dropping out2 flushes its 500 kept bytes cleanly onto base + first + retained.
+        assert_eq!(
+            run.memory.load(Ordering::Relaxed),
+            base + first + retained + 500
+        );
         out1.release_data(first);
-        assert_eq!(run.memory.load(Ordering::Relaxed), base + 500);
+        assert_eq!(run.memory.load(Ordering::Relaxed), base + retained + 500);
     }
 
     #[test]

@@ -190,24 +190,26 @@ impl Eqs<'_> {
         }
     }
 
-    /// The premises whose maximal literals mention `t`, each with its literal and whether
-    /// its clause is selected: the stored clauses, and the units in place of a context
-    /// other than the root.
-    fn targets(&self, st: &State, t: RTerm, out: &mut Vec<(Side, XLit, bool)>) {
-        out.clear();
+    /// Visits each premise whose maximal literal mentions `t`, with its literal and its
+    /// `(sel, gbody)` flags: the stored clauses, and the units in place of a context other
+    /// than the root (with neither flag set), without cloning the whole target list upfront.
+    fn for_each_target(&self, st: &State, t: RTerm, mut f: impl FnMut(&Side, XLit, bool, bool)) {
         if !self.root {
+            let u = unit();
             match t {
                 RTerm::X => {
                     for &a in &st.subs {
                         if a != TOP {
-                            out.push((unit(), XLit::Atom(a, RTerm::X), false));
+                            f(&u, XLit::Atom(a, RTerm::X), false, false);
                         }
                     }
                 }
                 RTerm::Fx(e) => {
                     let mut us = Vec::new();
                     unit_lits(self, st, e, &mut us);
-                    out.extend(us.into_iter().map(|l| (unit(), l, false)));
+                    for l in us {
+                        f(&u, l, false, false);
+                    }
                 }
                 _ => {}
             }
@@ -222,61 +224,72 @@ impl Eqs<'_> {
                 continue;
             }
             for &l in d.store.maxima(i) {
-                out.push((side(&s.c, l), self.view(l), s.sel));
+                let c2 = side(&s.c, l);
+                f(&c2, self.view(l), s.sel, s.gbody);
             }
         }
     }
 
     /// The rules on a new premise `prem` whose maximal literal is `l`: as an equality it
     /// rewrites the premises that mention its side and factors with its own head, and as
-    /// any literal it is rewritten by the stored equalities of its terms. A selected
-    /// premise, `sel`, takes only the inferences local to its context, those on a literal
-    /// that [`super::dl_rules::local`] admits, and so does a selected stored premise.
-    pub fn on_max(&self, st: &State, l: Lit, prem: &Side, found: &mut Found, sel: bool) {
+    /// any literal it is rewritten by the stored equalities of its terms. A fully selected
+    /// premise (`sel`) takes only local inferences ([`super::dl_rules::local`]); a premise
+    /// cut only by `gbody` (item 1250) is blocked from purely `no_xy` Eq and Factor pairs
+    /// while remaining eligible for mixed non-local pairs.
+    pub fn on_max(
+        &self,
+        st: &State,
+        l: Lit,
+        prem: &Side,
+        found: &mut Found,
+        sel: bool,
+        gbody: bool,
+    ) {
         found.rule = "eqmax";
         let v = self.view(l);
         let mut made = Vec::new();
-        let mut ts = Vec::new();
         if let XLit::Eq(a, b) = v {
             for (s1, t1) in [(a, b), (b, a)] {
                 if Rooted::a_gt(t1, s1) {
                     continue;
                 }
-                // Factor has no exclusions of x ≈ y and y ≈ u, which only Eq has
+                // Factor has no exclusions of x ≈ y and y ≈ u, which only Eq has.
+                // Preserve full selection's asymmetry (testing locality on the maximal
+                // equality `v` alone) while checking `gbody` per pair inside `factor`.
                 if !sel || local(v) {
-                    self.factor(prem, l, s1, t1, found);
+                    self.factor(prem, l, s1, t1, found, gbody);
                 }
                 found.rule = "eq";
                 if !Eqs::orients(s1, t1) {
                     continue;
                 }
-                self.targets(st, s1, &mut ts);
-                for (c2, v2, sel2) in &ts {
-                    if *v2 == v && c2 == prem || !self.admits(s1, t1, *v2, c2) {
-                        continue;
+                self.for_each_target(st, s1, |c2, v2, sel2, gbody2| {
+                    if v2 == v && c2 == prem || !self.admits(s1, t1, v2, c2) {
+                        return;
                     }
-                    if (sel || *sel2) && !(local(v) || local(*v2)) {
-                        continue;
+                    let pure = no_xy(v) && no_xy(v2);
+                    if (sel || sel2 || (pure && (gbody || gbody2))) && !(local(v) || local(v2)) {
+                        return;
                     }
                     made.clear();
-                    self.rewrites(*v2, s1, t1, &mut made);
+                    self.rewrites(v2, s1, t1, &mut made);
                     found.rule = shape("eq", s1, t1);
-                    self.push(found, prem, c2, &made, no_xy(v) && no_xy(*v2));
-                }
+                    self.push(found, prem, c2, &made, pure);
+                });
             }
         }
-        self.into(st, v, prem, found, sel);
+        self.into(st, v, prem, found, sel, gbody);
     }
 
     /// A new premise in place `prem` of `v`, a unit of a context other than the root: the
     /// stored equalities of its terms rewrite it.
     pub fn on_unit(&self, st: &State, v: XLit, found: &mut Found) {
         found.rule = "equnit";
-        self.into(st, v, &unit(), found, false);
+        self.into(st, v, &unit(), found, false, false);
     }
 
     /// The stored equalities whose side is a term of `v` rewrite `prem`'s `v`.
-    fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found, sel: bool) {
+    fn into(&self, st: &State, v: XLit, prem: &Side, found: &mut Found, sel: bool, gbody: bool) {
         found.rule = "eqinto";
         let Some(d) = dl(st) else { return };
         let Some(by) = d.store.terms.as_deref() else {
@@ -301,7 +314,8 @@ impl Eqs<'_> {
                         continue;
                     }
                     for &e in d.store.maxima(i) {
-                        let XLit::Eq(a, b) = self.view(e) else {
+                        let ve = self.view(e);
+                        let XLit::Eq(a, b) = ve else {
                             continue;
                         };
                         let t1 = if a == s1 { b } else { a };
@@ -311,17 +325,20 @@ impl Eqs<'_> {
                         if !self.admits(s1, t1, v, prem) {
                             continue;
                         }
-                        if (sel || s.sel) && !(local(v) || local(self.view(e))) {
+                        let pure = no_xy(ve) && no_xy(v);
+                        if (sel || s.sel || (pure && (gbody || s.gbody)))
+                            && !(local(v) || local(ve))
+                        {
                             continue;
                         }
                         let c1 = side(&s.c, e);
-                        if self.view(e) == v && &c1 == prem {
+                        if ve == v && &c1 == prem {
                             continue;
                         }
                         made.clear();
                         self.rewrites(v, s1, t1, &mut made);
                         found.rule = shape("eqinto", s1, t1);
-                        self.push(found, &c1, prem, &made, no_xy(self.view(e)) && no_xy(v));
+                        self.push(found, &c1, prem, &made, pure);
                     }
                 }
             }
@@ -330,7 +347,7 @@ impl Eqs<'_> {
 
     /// Factor: `Γ → Δ ∨ s ≈ t₀ ∨ s ≈ t₁`, with `s ≈ t₁` maximal and read as `s ↦ t₁`,
     /// gives `Γ → Δ ∨ t₀ ≉ t₁ ∨ s ≈ t₁`.
-    fn factor(&self, prem: &Side, l: Lit, s: RTerm, t1: RTerm, found: &mut Found) {
+    fn factor(&self, prem: &Side, l: Lit, s: RTerm, t1: RTerm, found: &mut Found, gbody: bool) {
         found.rule = "factor";
         for &o in &prem.1 {
             let XLit::Eq(a, b) = self.view(o) else {
@@ -343,6 +360,10 @@ impl Eqs<'_> {
             } else {
                 continue;
             };
+            let pure = no_xy(XLit::Eq(s, t1)) && no_xy(XLit::Eq(s, t0));
+            if pure && gbody {
+                continue;
+            }
             let mut c: Side = (
                 prem.0.clone(),
                 prem.1.iter().copied().filter(|&m| m != o).collect(),
@@ -353,9 +374,7 @@ impl Eqs<'_> {
                 Made::False => {}
                 Made::True => continue,
             }
-            if !(no_xy(XLit::Eq(s, t1)) && no_xy(XLit::Eq(s, t0)))
-                || !restricted(self.lits, self.inv(), &c)
-            {
+            if !pure || !restricted(self.lits, self.inv(), &c) {
                 found.push(c);
             }
         }

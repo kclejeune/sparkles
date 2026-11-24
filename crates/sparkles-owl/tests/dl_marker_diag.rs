@@ -62,9 +62,10 @@ const FIXTURES: [(&str, &str); 3] = [
     ),
 ];
 
-/// The modes: the repair on (1), on with M-return-cf (1 + 128), on without returns (1 + 32),
-/// on without the replay of markers to contexts registered or reached late (1 + 64), and
-/// off.
+/// The modes: the default opt-in repair (0 with `rooted_marker_repair: true`, which selects
+/// M-return-cf `1 | 128`), unfiltered on (1), explicit M-return-cf (1 + 128), on without
+/// returns (1 + 32), on without the replay of markers to contexts registered or reached
+/// late (1 + 64), and off.
 const ON: u8 = 1;
 const CF: u8 = 1 | 128;
 const NO_RETURN: u8 = 1 | 32;
@@ -87,7 +88,16 @@ fn deficits(body: &str, mode: u8, cfg: Cfg) -> [usize; 3] {
 
 /// The deficits of a run of `body` with the mode `mode`, and whether its complete answer
 /// holds the fixture's entailment: K is unsatisfiable for a denial and K ⊑ Ans otherwise.
-fn classified(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> ([usize; 3], bool) {
+fn classified(body: &str, mode: u8, cfg: Cfg) -> ([usize; 3], bool) {
+    classified_with(body, mode, mode != OFF, cfg)
+}
+
+fn classified_with(
+    body: &str,
+    mode: u8,
+    repair: bool,
+    (threads, expansion, dl_steps): Cfg,
+) -> ([usize; 3], bool) {
     marker_test_mode(mode, true);
     let mut k = Classifier::of(&axioms(body));
     let out = k
@@ -96,7 +106,7 @@ fn classified(body: &str, mode: u8, (threads, expansion, dl_steps): Cfg) -> ([us
             expansion,
             rooted: true,
             rooted_decline: false,
-            rooted_marker_repair: mode != OFF,
+            rooted_marker_repair: repair,
             dl_steps,
             ..Limits::default()
         })
@@ -148,6 +158,11 @@ fn the_deficits_find_a_missing_marker_and_a_missing_return_product() {
             for _ in 0..4 {
                 assert_eq!(deficits(body, ON, cfg), [0, 0, 0], "{at}: on");
                 assert_eq!(classified(body, CF, cfg), ([0, 0, 0], true), "{at}: cf");
+                assert_eq!(
+                    classified_with(body, OFF, true, cfg),
+                    ([0, 0, 0], true),
+                    "{at}: default repair (M-return-cf)"
+                );
             }
             let d = deficits(body, NO_RETURN, cfg);
             assert!(d[0] == 0 && d[1] > 0, "{at}: without returns {d:?}");

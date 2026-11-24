@@ -177,6 +177,11 @@ impl<T: Named> Names<T> {
             + self.table.capacity() * 5
     }
 
+    /// Logical input-size measure of the table, independent of allocator capacities.
+    pub fn logical_bytes(&self) -> usize {
+        self.items.len() * (std::mem::size_of::<T>() + 8 + 5)
+    }
+
     /// Takes the entities and their hashes out, leaving the table empty.
     pub fn take(&mut self) -> (Vec<T>, Vec<u64>) {
         self.table.clear();
@@ -380,6 +385,23 @@ impl Interner {
     /// Retained inline data containers and their independently owned opaque arrays.
     pub fn data_bytes(&self) -> usize {
         self.checked_data_bytes().unwrap_or(usize::MAX)
+    }
+
+    /// Logical data-value storage estimate, independent of allocator capacities.
+    pub fn logical_data_bytes(&self) -> usize {
+        let vector = self
+            .vals
+            .len()
+            .saturating_mul(std::mem::size_of::<DataVal>());
+        let table =
+            super::saturate::table_bytes(self.val_ids.len(), std::mem::size_of::<(DataVal, u32)>());
+        let opaque: usize = self
+            .vals
+            .iter()
+            .map(DataVal::logical_owned_bytes)
+            .sum::<usize>()
+            .saturating_mul(2);
+        vector.saturating_add(table).saturating_add(opaque)
     }
 
     fn checked_data_bytes(&self) -> Option<usize> {
@@ -929,6 +951,10 @@ impl Interner {
         self.scope_bytes + self.made_universals.capacity() * 5
     }
 
+    pub fn logical_scope_bytes(&self) -> usize {
+        self.scope_bytes + self.made_universals.len() * 5
+    }
+
     /// Starts a run's normalization: the scopes it opens are those the run keeps.
     pub fn begin_run(&mut self) {
         self.run += 1;
@@ -1158,6 +1184,28 @@ impl Roles {
                 .comp_fwd
                 .values()
                 .map(|v| 40 + v.capacity() * 4)
+                .sum::<usize>()
+    }
+
+    pub fn logical_bytes(&self) -> usize {
+        self.sup.iter().map(|v| 24 + v.len() * 4).sum::<usize>()
+            + self.comp.values().map(|v| 40 + v.len() * 4).sum::<usize>()
+            + self.right.len()
+            + self.left.len()
+            + self.reflexive.len() * 4
+            + self.range.len() * 8
+            + self.data_range.len() * 8
+            + self
+                .functional
+                .iter()
+                .map(|v| 24 + v.len() * 4)
+                .sum::<usize>()
+            + self.empty.len()
+            + self.linear.len()
+            + self
+                .comp_fwd
+                .values()
+                .map(|v| 40 + v.len() * 4)
                 .sum::<usize>()
     }
 
@@ -1516,6 +1564,39 @@ impl Axioms {
             + self.classes.capacity() * 4
             + self.horn.as_ref().map_or(0, |h| h.bytes())
             + self.dl.as_ref().map_or(0, |d| d.bytes())
+    }
+
+    /// Logical input-size measure of the normalized axioms, independent of vector
+    /// capacities.
+    pub fn logical_bytes(&self) -> usize {
+        self.subs.len() * 8
+            + self
+                .disjoint
+                .iter()
+                .map(|d| 24 + d.len() * 4)
+                .sum::<usize>()
+            + self.disjoint.len() * 24
+            + self.role_subs.len() * 8
+            + self
+                .chains
+                .iter()
+                .map(|(c, _)| 32 + c.len() * 4)
+                .sum::<usize>()
+            + self.reflexive.len() * 4
+            + self.ranges.len() * 8
+            + self.data_ranges.len() * 8
+            + self.dt_ranges.len() * 8
+            + self.dt_disjoint.len() * 8
+            + self.functional.len() * 4
+            + self
+                .keys
+                .iter()
+                .map(|k| 56 + (k.objects.len() + k.data.len()) * 4)
+                .sum::<usize>()
+            + self.individuals.len() * 4
+            + self.classes.len() * 4
+            + self.horn.as_ref().map_or(0, |h| h.logical_bytes())
+            + self.dl.as_ref().map_or(0, |d| d.logical_bytes())
     }
 }
 
@@ -2668,6 +2749,34 @@ impl Index {
             + self.horn.as_ref().map_or(0, |h| h.bytes())
             + self.dl.as_ref().map_or(0, |d| d.bytes())
             + self.dt.as_ref().map_or(0, |d| d.bytes())
+    }
+
+    /// Logical input-size measure of the index, independent of allocator capacities.
+    pub fn logical_bytes(&self) -> usize {
+        self.heads.len() * std::mem::size_of::<Head>()
+            + self.told.len() * 4
+            + self.conj.len() * 8
+            + self.exist.len() * 8
+            + self.disjoint.len() * 4
+            + self.selfs.len() * 8
+            + self.vals.len() * std::mem::size_of::<DataVal>()
+            + self
+                .vals
+                .iter()
+                .map(DataVal::logical_owned_bytes)
+                .sum::<usize>()
+            + self
+                .neg_data
+                .values()
+                .map(|v| 48 + v.len() * 8)
+                .sum::<usize>()
+            + self.universal.len() * 8
+            + self.nominals.len() * 4
+            + self.anonymous.len() * 4
+            + self.roles.logical_bytes()
+            + self.horn.as_ref().map_or(0, |h| h.logical_bytes())
+            + self.dl.as_ref().map_or(0, |d| d.logical_bytes())
+            + self.dt.as_ref().map_or(0, |d| d.logical_bytes())
     }
 
     /// Builds the index of normalized axioms. It may intern new expressions: the

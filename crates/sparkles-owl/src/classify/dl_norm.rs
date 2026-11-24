@@ -105,6 +105,24 @@ impl DlAx {
                 .map(|v| v.capacity() * 4)
                 .sum::<usize>()
     }
+
+    pub fn logical_bytes(&self) -> usize {
+        self.clauses
+            .iter()
+            .map(|(b, h)| 48 + (b.len() + h.len()) * 4)
+            .sum::<usize>()
+            + super::saturate::table_bytes(self.hyp.len(), 8)
+            + self.atmost.len() * 16
+            + self.rdis.len() * 8
+            + self.ne.len() * std::mem::size_of::<(Ex, Vec<Ex>)>()
+            + self.ne.iter().map(|(_, es)| es.len() * 4).sum::<usize>()
+            + self.least.len() * std::mem::size_of::<(Ex, Option<Ex>)>()
+            + super::saturate::table_bytes(
+                self.blockers.len(),
+                std::mem::size_of::<(Ex, Vec<Ex>)>(),
+            )
+            + self.blockers.values().map(|v| v.len() * 4).sum::<usize>()
+    }
 }
 
 /// Why an axiom stays left out.

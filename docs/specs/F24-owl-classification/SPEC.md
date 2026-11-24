@@ -279,7 +279,8 @@ fixtures are exact again, and two runs pass the bound that finished before, s2-g
 one thread and on four and a version of shoi-022 with its individuals merged on four
 threads, which are items 1227 and 1228. `SPARKLES_ROOTED_SELECT_GROUND=0`,
 `SPARKLES_ROOTED_SEL_PARTNERS_X=0` and `SPARKLES_ROOTED_JOIN_EXEMPT=0` turn each part off
-for measurement.
+for measurement, and reproducing the original uncut selection-off control after item 1250
+also sets `SPARKLES_ROOTED_GROUND_BODY_CUT=0`.
 
 Item 1229 records a loss of runs that count and of rooted runs. Pred takes each clause
 that a successor sends with the restrictions that reach the successor when it arrives, and
@@ -327,39 +328,75 @@ containment, and `Limits::rooted_decline` turns it off for measurement.
 a ground literal as a condition tells the root, which sends the literal as a marker to the
 contexts registered for its individuals that the root reaches, also to a context that
 registers or becomes reachable later. The root returns its clauses whose bodies hold such
-literals to the contexts that hold them, and each holder resolves a returned clause with
-its own premises for the body, again when a premise comes later. The sends and the returns
-count against the work bound. With the repair on and the check off, the two generated
-corpora built around the loss give 1,168 and 262 runs that differ from HermiT without the
-repair and none with it. Twelve fixtures built for particular orders of arrival fail
-without it and pass with it, although no fixture isolates a returned clause that the root
-subsumes later or a return followed by a late premise that it misses. No run that finishes
-on the other generated corpora, with or without counting and on one and four threads,
-differs from HermiT apart from g2-150. With the repair off, every corpus gives the same
-answers and the same counts of derived conclusions as before. With the diagnostic
-`SPARKLES_ROOTED_MARKER_DIAG=1`, a run reports in `Stats::dl_marker_deficits` the markers
-and returned products that its quiescent contexts still owe, and every finished run on the
-corpora owes none with the repair. The repair derives 1.02 to 1.13 times the conclusions
-on the larger generated corpora, up to 1.41 times on corpora of small files, up to 1.28
-times with counting and 1.4 to 1.65 times on the two built around the loss, which now
-derive the missing entailments, so a few runs near the bound pass it and give their
-default answer.
+literals to the contexts that hold them. Enabling `Limits::rooted_marker_repair` defaults
+to mode `129` (`MREPAIR_ON | MREPAIR_CF`), in which both return arrival paths exclude any
+holder premise whose body holds a literal mentioning neither `x` nor `y`, namely a constant
+literal or a constant-successor `f_e(u)` literal. On initial return arrival the holder
+records the returned clause under every literal of its body before filtering its candidate
+premises, and on late premise arrival the holder registers itself with the root before
+excluding an ineligible premise from replay. The sends and the returns count against the
+work bound. `SPARKLES_ROOTED_MARKER_REPAIR=1` selects the unfiltered return rule that
+resolves against all live non-marker holder premises on both arrival paths, `=0` turns the
+repair off, and an explicit environment value takes precedence over test overrides and
+`Limits::rooted_marker_repair`. With the diagnostic `SPARKLES_ROOTED_MARKER_DIAG=1`, a run
+reports in `Stats::dl_marker_deficits` the markers and returned products that its quiescent
+contexts still owe; when mode `129` is active, the second deficit measures only the
+eligible filtered return products, while mode `1` measures unfiltered products. In the
+initial unfiltered measurements (`SPARKLES_ROOTED_MARKER_REPAIR=1`) with the check off, the
+two generated corpora built around the loss give 1,168 and 262 runs that differ from HermiT
+without the repair and none with it. Twelve fixtures built for particular orders of arrival
+fail without it and pass with it, although no fixture isolates a returned clause that the
+root subsumes later or a return followed by a late premise that it misses. No run that
+finishes on the other generated corpora, with or without counting and on one and four
+threads, differs from HermiT apart from g2-150. With the repair off, every corpus gives the
+same answers and the same counts of derived conclusions as before, and every finished run
+on the corpora owes no deficit with the repair. Unfiltered repair derives 1.02 to 1.13
+times the conclusions on the larger generated corpora, up to 1.41 times on corpora of small
+files, up to 1.28 times with counting and 1.4 to 1.65 times on the two built around the
+loss, which now derive the missing entailments, so a few runs near the bound pass it and
+give their default answer.
 
-With the selection of ground body literals off, the setting of item 1220's measurements,
-the repair's returns derive more. On one purpose-built ontology they add 24% to the
-derived conclusions, and on the generated ontology g1-051_p0012 the run passes the work
-bound at 4 million conclusions and the memory budget of 1 GiB at 400 million, against
-455,967 conclusions without the repair. `SPARKLES_ROOTED_MARKER_REPAIR=129` resolves a
-returned clause only with premises whose body has no ground literal. It loses no answer on
-the corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten
-runs that the repair alone takes past the bound, but g1-051_p0012 still passes the bound of 4
+In the original uncut selection-off control (`SPARKLES_ROOTED_SELECT_GROUND=0` and
+`SPARKLES_ROOTED_GROUND_BODY_CUT=0`, the setting of item 1220's earlier measurements),
+unfiltered returns (`SPARKLES_ROOTED_MARKER_REPAIR=1`) derive more. On one purpose-built
+ontology they add 24% to the derived conclusions, and on the generated ontology
+g1-051_p0012 the run passes the work bound at 4 million conclusions and the memory budget
+of 1 GiB at 400 million, against 455,967 conclusions without the repair. Filtering returns
+alone with `SPARKLES_ROOTED_MARKER_REPAIR=129` on that uncut control loses no answer on the
+corpora, takes the purpose-built ontology's cost from 24% to 10.5% and finishes ten runs
+that unfiltered repair takes past the bound, but g1-051_p0012 still passes the bound of 4
 million and finishes only at 63.2 million conclusions under a bound of 400 million. Its
-growth is in Pred over successor terms of constants and in Join, which item 1250
-follows, and g1-051_p0121 derives 1.42 million conclusions against 1.17 million with the
-repair alone. The repair's state costs 8 bytes per context with the repair off, which item
-1247 removes, and a synthetic family whose conditions nest two or more deep grows with the
-repair's sends, which is item 1251. The repair's completeness is not proved, and the check
-stays on by default.
+growth is in Pred over successor terms of constants and in Join, and g1-051_p0121 derives
+1.42 million conclusions against 1.17 million with unfiltered repair alone.
+
+Item 1250 decouples the non-root ground-body cut from full ground-body selection and makes
+mode `129` the default when `Limits::rooted_marker_repair` is enabled. Each stored clause
+in a non-root context carries `Stored::gbody` alongside `Stored::sel`, while root clauses
+keep both flags false. A non-root clause whose body holds a literal mentioning neither `x`
+nor `y` sets `Stored::gbody` whenever either full selection or the decoupled cut is active
+and sets `Stored::sel` only when full selection is active. `Stored::gbody` cuts non-local
+ground Hyper, role-universal inferences with constant or `f_e(u)` fillers, head-side Join,
+and purely constant or `f_e(u)` binary Eq and Factor even when
+`SPARKLES_ROOTED_SELECT_GROUND=0`. Mixed non-local Eq and Factor, including query-form
+`x ≈ u` equalities, remain gated by `Stored::sel`, and Hyper over `x` and `f_e(u)` Pred
+partners remain gated by `Stored::sel` and `SPARKLES_ROOTED_SEL_PARTNERS_X`.
+`SPARKLES_ROOTED_GROUND_BODY_CUT` is on by default and `=0` disables the decoupled cut;
+reproducing the original uncut selection-off control therefore sets
+`SPARKLES_ROOTED_SELECT_GROUND=0`, `SPARKLES_ROOTED_GROUND_BODY_CUT=0` and
+`SPARKLES_ROOTED_SEL_PARTNERS_X=0`, together with `SPARKLES_ROOTED_MARKER_REPAIR=1` for
+unfiltered returns. With the decoupled cut active under `SPARKLES_ROOTED_SELECT_GROUND=0`
+and `SPARKLES_ROOTED_SEL_PARTNERS_X=0`, the full 19-axiom `g1-051_p0012` finishes complete
+within the default 524,288 rooted work bound with zero marker deficits and matches HermiT
+1.4.5's taxonomy (`C1` unsatisfiable and `C0` equivalent to `owl:Thing`) across repair off,
+default filtered mode `129` and unfiltered mode `1`: on one thread cautious with default
+mode `129` it takes 251,217 derived conclusions, 32,307 stored clauses and 10.9 MB peak
+estimated memory, and on four threads eager it takes 336,298 derived conclusions, 41,450
+stored clauses and 12.6 MB peak estimated memory, against 232,622 conclusions (10.2 MB)
+with repair off and 262,033 conclusions (10.9 MB) with mode `1` on one thread cautious. The
+repair's state costs 8 bytes per context with the repair off, which item 1247 removes, and
+a synthetic family whose conditions nest two or more deep grows with the repair's sends,
+which is item 1251. The repair's completeness is not proved, and the check stays on by
+default.
 
 The repair keeps the resource contract of the rest of Tier D, and the contract is
 cooperative. A run charges each conclusion that it derives to the work bound, and several
@@ -368,18 +405,44 @@ while others do not. The preparation of an inference, such as the premise lists 
 and their pruning, takes time and memory in proportion to the clauses that the context
 already holds and is not charged while it runs. The redundancy test of each derived
 conclusion against the stored clauses is not counted either, here as in the rest of Tier
-D. Growth of the retained indexes is added to the memory estimate after the allocation.
-The run checks the work bound, the memory budget, the deadline and a cancellation at
+D. The run checks the work bound, the memory budget, the deadline and a cancellation at
 cooperative checkpoints, which come after every 256 choices of a product, after every 64
 sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
-totals. The contract therefore bounds neither the time between two checks by a fixed
-number of reads nor the allocated bytes by the memory budget, which is an estimate. A counting allocator
-measures the heap 6 to 31% above the charged estimate on the three files named below, with the
-repair on or off, and item 1291 follows that difference.
+totals. Earlier builds added retained index growth to the memory estimate only after
+allocation, buffered rooted initialization into one uncharged `Found` collection per
+constant, and left non-ground product tables uncharged on the default path, so a counting
+allocator measured the heap 6 to 31% above the charged estimate on the three files named
+below and 1.04 GB above the 1 GiB budget on `ore_ont_8480`.
+
+Item 1291 closes those gaps across Tier D. Root initialization streams directly through
+`derive` with pre-admitted literal interning and store growth instead of buffering
+constants times `owl:Thing` in `Found`. `Store` tracks exact incremental owned bytes across
+its clause vector, literal slices, queue, predecessor list and index maps, pre-admitting
+clause construction copies, `maximal_rooted` scratch and reallocation or rehash overlap
+before mutating its containers. `DlSt`, `RootSt`, `MRep` and their index maps and vectors
+are pre-admitted before allocation, `MRep::regs` empties replayed slots in place to stay
+append-only and credits freed vectors after replay, and `Lits::lit_admitted` revalidates
+growth bounds under the interner mutex while keeping caller callbacks outside the lock.
+Committed Tier D growth stays inside the saturation's single memory counter so concurrent
+checks never double-count a transfer, and temporary reservations in root initialization,
+product enumeration and marker-repair handlers are guarded against callback unwinds.
+Non-ground `fold` and ground products pre-admit candidate buffers, retained union payloads,
+table rehashes, step-list growth and `prune` scratch, keep drained buffers charged until
+emitted when switching to streaming at 4,096 unions, and account for live union payloads
+when `slack_covered` pre-reserves table slack on M-return. The discretionary Horn and Tier
+D memory allowance now uses a deterministic `.len()`-based logical input size independent
+of thread count while `Limits::max_memory` and `Limits::charge` continue to observe full
+container capacities, and `Saturation::retained_bytes` includes `DlRun::lits`. Counting-allocator
+regression tests cover store mutations, backward subsumption, refusal without growth,
+concurrent literal and ledger boundaries, non-ground and ground products, marker replay,
+unwind cleanup and multi-chunk thread invariance. Remaining estimation boundaries outside
+item 1291 are the upfront 32-slot `Segs` directory, `Table::push` segment allocations,
+un-admitted `Lits::lit` calls outside root initialization, which remain post-counted in
+`DlRun::bytes`, and premise-list preparation and read metering, which remain in item 1280.
 
 A returned clause reserves memory before its products run, both on initial arrival and when a
-late premise replays saved returns. The product of a clause that
-is not ground charges each union that it keeps, as every rule does, but not the table that
+late premise replays saved returns. Before item 1291, the product of a clause that
+is not ground charged each union that it kept, as every rule did, but not the table that
 records its unions nor the spare capacity of each step's list. These grow with the number of
 unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
 million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
@@ -400,11 +463,9 @@ those files, the return reservation stopped g1-051_p0012 earlier at a heap of 17
 256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
 conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
 stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
-reservation, so that run does not finish under its own budget either way and item 1291
-follows it. The rules of the default
-path leave the same tables uncharged. With the repair off these tables stay at or below
-6.3 KB on these files and at 50 KB on ore_ont_14817 until its Tier D attempt passes its
-bound, and item 1291 covers them.
+reservation, so that run did not finish under its own budget either way. Item 1291 now
+charges those product tables and step lists directly on both default and repair paths, while
+item 1280 replaces the loose upfront bound with a shared meter.
 
 Some steps of the repair and of the rooted rules read between two checks without counting
 what they read. The steps named here are the ones that were measured or reproduced, and

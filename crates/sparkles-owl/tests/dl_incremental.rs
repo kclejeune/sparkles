@@ -1197,13 +1197,16 @@ const BOUNDED: [&str; 2] = [UNIVERSALS, UNIONS];
 
 #[test]
 fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
-    // whether a base's kept run peaks above the least budget of a fresh run depends on
-    // a few bytes of accounting, so the test asks that one base's kept run at least
-    // passes it, and that every kept run answers as the fresh one does
-    let mut restarted = 0;
+    // Pad each base with unrelated classes so holding the last index beside the new
+    // one cleanly exceeds the least budget of a fresh run on both the Horn and Tier D
+    // bases, rather than depending on a few bytes of transient scratch accounting.
+    let pad: String = (0..64)
+        .map(|i| format!("SubClassOf(:Pad{i} :L)\n"))
+        .collect();
     for base in BOUNDED {
+        let padded = format!("{base}\n{pad}");
         let held = {
-            let mut held = axioms(base);
+            let mut held = axioms(&padded);
             held.extend(axioms("SubClassOf(:M :K)"));
             held
         };
@@ -1233,8 +1236,9 @@ fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
         let want = fresh(high).unwrap();
         // a kept run holds more than that, the last index among it, and answers as the
         // classifier that starts again does
+        let mut restarted = 0;
         for more in [0usize, 64, 256, 1024, 4096] {
-            let (mut k, _) = started(base, 1);
+            let (mut k, _) = started(&padded, 1);
             k.add(&axioms("SubClassOf(:M :K)"));
             let out = k
                 .classify(&Limits {
@@ -1252,11 +1256,11 @@ fn a_kept_run_that_passes_its_memory_budget_starts_again_in_full() {
             let out = k.classify(&limits(1)).unwrap();
             assert!(out.stats.incremental);
         }
+        assert!(
+            restarted > 0,
+            "no kept run passed the budget of a fresh one"
+        );
     }
-    assert!(
-        restarted > 0,
-        "no kept run passed the budget of a fresh one"
-    );
 }
 
 #[test]
