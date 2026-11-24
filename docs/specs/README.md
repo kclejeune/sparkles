@@ -98,9 +98,11 @@ A spec's status describes delivery within its named scope. *Implemented* means t
 phase contract shipped. *Implemented in part* means usable functionality shipped with
 listed phases or follow-up items still open. *In progress* is reserved for active
 unshipped implementation rather than a design or unfinished validation run. *Specified*
-means the design is written and unimplemented. These correspond to Complete, Partially
-complete and Planned in the [capability overview](../FEATURES.md#capability-status). A
-completed phase does not imply every later extension or compatibility goal is built.
+means the design is written and unimplemented. *Implemented* maps to Complete,
+*implemented in part* maps to Core complete, Partial or Early depending on remaining
+phases, and *specified* maps to Planned in the
+[capability overview](../FEATURES.md#capability-status). A completed phase does not imply
+every later extension or compatibility goal is built.
 
 | Spec | Summary | Status |
 |---|---|---|
