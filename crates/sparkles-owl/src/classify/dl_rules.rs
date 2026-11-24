@@ -668,9 +668,13 @@ pub(super) struct AdaptiveState {
     hypothetical_at: AtomicUsize,
     /// Number of `2^sample_shift` sample crossings observed.
     samples: AtomicUsize,
-    /// Set once a non-work stop has already won on a `partial = true` run so subsequent
-    /// individual-marking rounds cannot trip on a stale guard or emit post-saturation samples.
-    disarmed: std::sync::atomic::AtomicBool,
+    /// Set at the joined saturation boundary so post-saturation rounds (e.g. entangled
+    /// individual marking) emit no late `ADAPTIVE-SAMPLE` rows and latch no policy guards.
+    sampling_stopped: std::sync::atomic::AtomicBool,
+    /// Set ONLY when `enforce` is active and a non-work stop has already won on a
+    /// `partial = true` run, disarming adaptive work-bound enforcement for the subsequent
+    /// individual-marking round without modifying fixed-limit or non-adaptive paths.
+    enforce_disarmed: std::sync::atomic::AtomicBool,
 }
 
 impl AdaptiveState {
@@ -691,7 +695,8 @@ impl AdaptiveState {
             hypothetical_guard: AtomicU8::new(WorkStopGuard::None as u8),
             hypothetical_at: AtomicUsize::new(0),
             samples: AtomicUsize::new(0),
-            disarmed: std::sync::atomic::AtomicBool::new(false),
+            sampling_stopped: std::sync::atomic::AtomicBool::new(false),
+            enforce_disarmed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -1012,15 +1017,27 @@ impl DlRun {
             self.set_work_limit(policy.ceiling);
         }
     }
-    /// Disarms work-bound enforcement once a non-work stop has already won on a
+    /// Stops adaptive sampling at the joined saturation boundary so post-saturation
+    /// rounds (such as entangled individual marking) emit no late `ADAPTIVE-SAMPLE` rows
+    /// and latch no post-saturation policy guards, without affecting fixed-limit or
+    /// forced-exhaustion work enforcement.
+    pub(super) fn stop_adaptive_sampling(&self) {
+        if let Some(a) = self.adaptive.as_deref() {
+            a.sampling_stopped.store(true, Ordering::Relaxed);
+        }
+    }
+    /// Disarms adaptive work-bound enforcement once a non-work stop has already won on a
     /// `partial = true` run, keeping `AdaptiveState` allocated so `bytes()` accounting
     /// remains accurate through individual marking and partial result construction.
-    pub(super) fn disarm_work_bound(&self) {
-        self.work_limit.store(0, Ordering::Relaxed);
-        self.width_limit.store(0, Ordering::Relaxed);
-        self.exhausted.store(false, Ordering::Relaxed);
-        if let Some(a) = self.adaptive.as_deref() {
-            a.disarmed.store(true, Ordering::Relaxed);
+    /// Non-adaptive (`adaptive.is_none()`) and observe-only (`!a.enforce`) runs are
+    /// completely unaffected and keep their verbatim fixed-limit, width-limit, and
+    /// forced-exhaustion enforcement.
+    pub(super) fn disarm_adaptive_work_bound(&self) {
+        if let Some(a) = self.adaptive.as_deref()
+            && a.enforce
+        {
+            a.sampling_stopped.store(true, Ordering::Relaxed);
+            a.enforce_disarmed.store(true, Ordering::Relaxed);
         }
     }
     #[inline]
@@ -1171,7 +1188,7 @@ impl DlRun {
         if n == 0 {
             return;
         }
-        if a.disarmed.load(Ordering::Relaxed) {
+        if a.sampling_stopped.load(Ordering::Relaxed) {
             self.work.fetch_add(n, Ordering::Relaxed);
             return;
         }
@@ -1265,6 +1282,13 @@ impl DlRun {
     /// keeps, are more than the run's bound, and marks the run past its bound when they
     /// are.
     pub(super) fn past(&self, n: usize) -> bool {
+        if self
+            .adaptive
+            .as_deref()
+            .is_some_and(|a| a.enforce && a.enforce_disarmed.load(Ordering::Relaxed))
+        {
+            return false;
+        }
         let l = self.work_limit.load(Ordering::Relaxed);
         let past = l != 0 && self.carried.saturating_add(n) > l;
         if past {
@@ -1279,16 +1303,16 @@ impl DlRun {
     /// Passes the bound on derived conclusions at once, recording `guard` when adaptive
     /// enforcement is active.
     fn exhaust_with(&self, guard: WorkStopGuard) {
-        if let Some(a) = self.adaptive.as_deref() {
-            if a.disarmed.load(Ordering::Relaxed) {
+        if let Some(a) = self.adaptive.as_deref()
+            && a.enforce
+        {
+            if a.enforce_disarmed.load(Ordering::Relaxed) {
                 return;
             }
-            if a.enforce {
-                let w = self
-                    .carried
-                    .saturating_add(self.work.load(Ordering::Relaxed));
-                a.latch_stop(guard, w);
-            }
+            let w = self
+                .carried
+                .saturating_add(self.work.load(Ordering::Relaxed));
+            a.latch_stop(guard, w);
         }
         self.exhausted.store(true, Ordering::Relaxed);
     }
@@ -1297,7 +1321,7 @@ impl DlRun {
     /// the range each before a check read it, and the run would then end as complete
     /// without them.
     #[cfg(test)]
-    fn exhaust(&self) {
+    pub(super) fn exhaust(&self) {
         self.exhaust_with(WorkStopGuard::ForcedExhaust);
     }
     #[inline]
@@ -1332,7 +1356,7 @@ impl DlRun {
         if let Some(a) = self.adaptive.as_deref()
             && a.enforce
         {
-            if a.disarmed.load(Ordering::Relaxed) {
+            if a.enforce_disarmed.load(Ordering::Relaxed) {
                 return false;
             }
             return self.over_work_adaptive(a);

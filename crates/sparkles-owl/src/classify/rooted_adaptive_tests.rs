@@ -953,11 +953,13 @@ fn partial_true_stop_capture_and_publication_order() {
     assert!(!out_mem.complete && !out_mem.complete_for_taken);
     assert_eq!(out_mem.consistency, Consistency::Unknown);
 
-    // (b2) Neon Blocker #1 regression: `partial = true` + `entangled == true` + `Stop::Memory`
-    //      winning AFTER `stop_guard` latched. `:Witness ⊑ {:w}` is processed before `dl.root`
-    //      so `totals.merged == true` (making `entangled == true`); the individual-marking
-    //      loop must NOT abort the partial answer on the stale adaptive `stop_guard` or fall
-    //      back to Horn!
+    // (b2) Neon Blocker #1 / Sol r2 #2 regression: `partial = true` + `entangled == true`
+    //      + `Stop::Memory` winning AFTER `stop_guard` latched. Run under
+    //      `admission_test::with_attempt(None, true, ...)` (enabling `DisjWithIndividuals`
+    //      just like `partial_pending_messages_count_individual_marking_seeds_once`) so
+    //      `:Witness ⊑ {:w}` sets `totals.merged == true`, and observe `Attempt::Marking`
+    //      with `seeds > 0` to PROVE the individual-marking loop actually ran where the
+    //      stale adaptive `stop_guard` used to abort the partial answer into Horn fallback.
     let mut ent_body = String::from(
         "SubClassOf(:Witness ObjectOneOf(:w))\n\
          SubClassOf(:Witness :Tag)\n\
@@ -979,6 +981,8 @@ fn partial_true_stop_capture_and_publication_order() {
     let ent_latched_hook = ent_latched.clone();
     let ent_latched_charge = ent_latched.clone();
     let ent_refused_charge = ent_refused.clone();
+    let marking_seeds: Arc<parking_lot::Mutex<Vec<usize>>> = Arc::default();
+    let marking_seeds_obs = marking_seeds.clone();
     let limits_ent_mem = Limits {
         threads: 1,
         rooted: true,
@@ -1004,16 +1008,29 @@ fn partial_true_stop_capture_and_publication_order() {
                     }
                 },
                 || {
-                    let r = ent_sat.classify(&ent_kinds, None, &limits_ent_mem);
-                    (r, last_adaptive_attempts())
+                    admission_test::with_attempt(
+                        None,
+                        true,
+                        move |event| {
+                            if let admission_test::Attempt::Marking { seeds, .. } = event {
+                                marking_seeds_obs.lock().push(seeds);
+                            }
+                        },
+                        || {
+                            let r = ent_sat.classify(&ent_kinds, None, &limits_ent_mem);
+                            (r, last_adaptive_attempts())
+                        },
+                    )
                 },
             )
         })
     });
     assert!(ent_latched.load(Ordering::SeqCst) && ent_refused.load(Ordering::SeqCst));
+    assert!(ent_sat.dl_rooted, "must stay on the rooted partial run");
+    let observed_marking = marking_seeds.lock().clone();
     assert!(
-        ent_sat.entangled && ent_sat.dl_rooted,
-        "must exercise entangled rooted marking path"
+        observed_marking.iter().any(|&seeds| seeds > 0),
+        "partial entangled rooted run must actually enter the individual-marking round with nonempty seeds: {observed_marking:?}"
     );
     assert_eq!(snaps_ent.len(), 1);
     assert_eq!(snaps_ent[0].stop_guard, WorkStopGuard::RootWork);
@@ -1396,9 +1413,23 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
         sample.peak
     );
 
-    // (b) Sol Blocker #1: pre-box `AdaptiveState` refusal at exact pre-box `base` boundary
-    //     (both without a pool and with a pool refusing the `size_of::<AdaptiveState>()`
-    //     increment), plus single-charge and mid-saturation counting-allocator coverage.
+    // (b) Sol Blocker #1 / Sol r2 #3: pre-box `AdaptiveState` refusal at exact pre-box
+    //     boundary (both without a pool and with a pool refusing the `pre_more` increment),
+    //     explicitly witnessing that the attempt reached the adaptive pre-admission check,
+    //     plus proving that saturation entry (`Point::Observed`) emits ZERO charge calls
+    //     and that the first subsequent saturation charge occurs only after worker growth
+    //     (`Point::BeforeDebit`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum MemEvent {
+        Charge {
+            bytes: usize,
+            accepted: bool,
+            paid_after: usize,
+        },
+        Observed,
+        BeforeDebit,
+    }
+    let kinds: Vec<&AxiomKind> = input.iter().map(|a| &a.kind).collect();
     let baseline_limits = Limits {
         threads: 1,
         rooted: true,
@@ -1407,116 +1438,429 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
     };
     let pre_box_base = with_rooted_adaptive_bound(false, || {
         with_rooted_adaptive_diag(false, || {
-            let mut k = Classifier::of(&input);
-            let _ = k.classify(&baseline_limits).expect("baseline");
+            let mut s = Saturation::new();
+            let _ = s
+                .run_once(&kinds, None, 0, &baseline_limits, true)
+                .expect("baseline");
             LAST_ALLOWANCE.get().0
         })
     });
     assert!(pre_box_base > 0);
     let state_bytes = std::mem::size_of::<super::dl_rules::AdaptiveState>();
 
-    // (b1) Without a pool: `max_memory == Some(pre_box_base)` must refuse BEFORE allocating
+    // Calibrate exact `(norm_peak, pre_sat_exact, pre_more)` on a single rooted attempt.
+    reset_adaptive_preadmit();
+    LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow_mut().clear());
+    let (norm_peak, pre_sat_exact, pre_more) = with_rooted_adaptive_bound(true, || {
+        let mut s = Saturation::new();
+        let _ = s
+            .run_once(&kinds, None, 0, &baseline_limits, true)
+            .expect("calibrate adaptive preadmit");
+        last_adaptive_preadmit().expect("must record pre-box adaptive admission")
+    });
+    assert_eq!(pre_sat_exact, pre_box_base + state_bytes);
+    assert!(
+        norm_peak < pre_sat_exact && pre_more == pre_sat_exact - norm_peak && pre_more > 0,
+        "pre-box adaptive admission must require a positive increment above normalization peak: norm_peak={norm_peak}, pre_sat_exact={pre_sat_exact}, pre_more={pre_more}"
+    );
+    let refuse_cap = pre_box_base.max(norm_peak);
+    assert!(refuse_cap < pre_sat_exact);
+
+    // (b1) Without a pool: `max_memory == Some(refuse_cap)` passes normalization, reaches
+    //      the adaptive pre-admission check, and refuses BEFORE allocating
     //      `Box<AdaptiveState>` and BEFORE starting saturation workers.
     let cap_at_base = Limits {
         threads: 1,
         rooted: true,
         dl_steps: true,
-        max_memory: Some(pre_box_base),
+        max_memory: Some(refuse_cap),
         ..Limits::default()
     };
     reset_adaptive_alloc_count();
-    let (res_base_cap, snaps_base_cap, allocs_base_cap) = with_rooted_adaptive_bound(true, || {
-        let mut k = Classifier::of(&input);
-        let r = k.classify(&cap_at_base);
-        (r, last_adaptive_attempts(), adaptive_alloc_count())
-    });
-    let _ = res_base_cap;
+    reset_adaptive_preadmit();
+    LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow_mut().clear());
+    let (res_base_cap, preadmit_b1, snaps_base_cap, allocs_base_cap) =
+        with_rooted_adaptive_bound(true, || {
+            let mut s = Saturation::new();
+            let r = s.run_once(&kinds, None, 0, &cap_at_base, true);
+            (
+                r,
+                last_adaptive_preadmit(),
+                last_adaptive_attempts(),
+                adaptive_alloc_count(),
+            )
+        });
+    assert_eq!(
+        preadmit_b1,
+        Some((norm_peak, pre_sat_exact, pre_more)),
+        "b1 must pass normalization and witness the pre-box adaptive admission check"
+    );
+    assert!(
+        matches!(
+            res_base_cap,
+            Err(Error::Memory { limit, used }) if limit == refuse_cap && used == pre_sat_exact
+        ),
+        "b1 must return exact pre-box Error::Memory: {res_base_cap:?}"
+    );
     assert_eq!(
         allocs_base_cap, 0,
-        "max_memory == pre_box_base must refuse before allocating Box<AdaptiveState>"
+        "max_memory == refuse_cap must refuse before allocating Box<AdaptiveState>"
     );
     assert!(snaps_base_cap.is_empty());
 
-    // (b2) With a pool refusing any increment above `pre_box_base`: the `AdaptiveState`
-    //      overlap debit is cleanly rejected BEFORE `enable_adaptive` allocates.
+    // (b2) With a pool refusing any increment above `refuse_cap`: normalization succeeds
+    //      up to `norm_peak`, the adaptive admission check requests exact `pre_more`, and
+    //      the pool refuses it BEFORE `enable_adaptive` allocates.
+    let events_b2: Arc<parking_lot::Mutex<Vec<MemEvent>>> = Arc::default();
     let paid_b2 = Arc::new(AtomicUsize::new(0));
-    let rejected_b2 = Arc::new(AtomicBool::new(false));
+    let events_b2_charge = events_b2.clone();
     let paid_b2_ref = paid_b2.clone();
-    let rejected_b2_ref = rejected_b2.clone();
     let pool_at_base = Limits {
         threads: 1,
         rooted: true,
         dl_steps: true,
         charge: Some(Arc::new(move |bytes: usize| {
             let cur = paid_b2_ref.load(Ordering::Relaxed);
-            if cur.saturating_add(bytes) > pre_box_base {
-                rejected_b2_ref.store(true, Ordering::SeqCst);
+            if cur.saturating_add(bytes) > refuse_cap {
+                events_b2_charge.lock().push(MemEvent::Charge {
+                    bytes,
+                    accepted: false,
+                    paid_after: cur,
+                });
                 return false;
             }
-            paid_b2_ref.fetch_add(bytes, Ordering::Relaxed);
+            let next = cur + bytes;
+            paid_b2_ref.store(next, Ordering::Relaxed);
+            events_b2_charge.lock().push(MemEvent::Charge {
+                bytes,
+                accepted: true,
+                paid_after: next,
+            });
             true
         })),
         ..Limits::default()
     };
     reset_adaptive_alloc_count();
-    let (_res_pool_refuse, snaps_pool_refuse, allocs_pool_refuse) =
+    reset_adaptive_preadmit();
+    LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow_mut().clear());
+    let (res_pool_refuse, preadmit_b2, snaps_pool_refuse, allocs_pool_refuse) =
         with_rooted_adaptive_bound(true, || {
-            let mut k = Classifier::of(&input);
-            let r = k.classify(&pool_at_base);
-            (r, last_adaptive_attempts(), adaptive_alloc_count())
+            let mut s = Saturation::new();
+            let r = s.run_once(&kinds, None, 0, &pool_at_base, true);
+            (
+                r,
+                last_adaptive_preadmit(),
+                last_adaptive_attempts(),
+                adaptive_alloc_count(),
+            )
         });
+    assert_eq!(
+        preadmit_b2,
+        Some((norm_peak, pre_sat_exact, pre_more)),
+        "b2 must pass normalization and witness the pre-box adaptive admission check"
+    );
     assert!(
-        rejected_b2.load(Ordering::SeqCst),
-        "pool capped at pre_box_base must reject the AdaptiveState increment"
+        matches!(
+            res_pool_refuse,
+            Err(Error::Memory { used, .. }) if used == pre_sat_exact
+        ),
+        "b2 must fail at pre_sat_exact: {res_pool_refuse:?}"
+    );
+    let log_b2 = events_b2.lock().clone();
+    assert_eq!(
+        log_b2.last().copied(),
+        Some(MemEvent::Charge {
+            bytes: pre_more,
+            accepted: false,
+            paid_after: norm_peak,
+        }),
+        "b2 must refuse the exact pre-box adaptive delta after normalization paid norm_peak: {log_b2:?}"
     );
     assert_eq!(
         allocs_pool_refuse, 0,
-        "pool refusal at pre_box_base must happen before allocating Box<AdaptiveState>"
+        "pool refusal at refuse_cap must happen before allocating Box<AdaptiveState>"
     );
     assert!(snaps_pool_refuse.is_empty());
 
-    // (b3) When the pool allows `pre_box_base + state_bytes` (`pre_sat_exact`), `AdaptiveState`
-    //      is admitted once (`allocs == 1`), NOT double-charged on entry to `saturate_counted`,
-    //      and refusing the first mid-saturation growth debit stops cleanly with
-    //      `WinningStop::Memory` and full counting-allocator peak coverage!
-    let pre_sat_exact = pre_box_base + state_bytes;
+    // (b3) Exact single-charge boundary check: a pool capped at EXACTLY `pre_sat_exact`
+    //      (`pre_box_base + state_bytes`, zero extra headroom) must:
+    //      1. grant `pre_more` up to `pre_sat_exact` BEFORE `Point::Observed`,
+    //      2. allocate `Box<AdaptiveState>` once (`allocs == 1`),
+    //      3. pass `saturate_counted`'s entry check (`Point::Observed`) with ZERO charge
+    //         calls (proving `AdaptiveState` is NOT double-charged at entry),
+    //      4. start workers (`Point::BeforeDebit`), and
+    //      5. reject the first worker-growth debit (NOT an entry debit) cleanly with
+    //         `WinningStop::Memory`.
+    let events_b3: Arc<parking_lot::Mutex<Vec<MemEvent>>> = Arc::default();
     let paid_b3 = Arc::new(AtomicUsize::new(0));
-    let rejected_b3 = Arc::new(AtomicBool::new(false));
+    let events_b3_charge = events_b3.clone();
+    let events_b3_hook = events_b3.clone();
     let paid_b3_ref = paid_b3.clone();
-    let rejected_b3_ref = rejected_b3.clone();
-    let pool_tight_sat = Limits {
+    let pool_exact_presat = Limits {
         threads: 1,
         rooted: true,
         dl_steps: true,
         partial: true,
         charge: Some(Arc::new(move |bytes: usize| {
             let cur = paid_b3_ref.load(Ordering::Relaxed);
-            // Allow exact `pre_sat_exact` (plus a bounded saturation prefix) to verify
-            // single-charge admission, refuse ONCE on mid-saturation growth to trigger
-            // `WinningStop::Memory`, then allow partial taxonomy construction to finish.
-            if cur.saturating_add(bytes) > pre_sat_exact + (64 << 10)
-                && !rejected_b3_ref.swap(true, Ordering::SeqCst)
-            {
+            if cur.saturating_add(bytes) > pre_sat_exact {
+                events_b3_charge.lock().push(MemEvent::Charge {
+                    bytes,
+                    accepted: false,
+                    paid_after: cur,
+                });
                 return false;
             }
-            paid_b3_ref.fetch_add(bytes, Ordering::Relaxed);
+            let next = cur + bytes;
+            paid_b3_ref.store(next, Ordering::Relaxed);
+            events_b3_charge.lock().push(MemEvent::Charge {
+                bytes,
+                accepted: true,
+                paid_after: next,
+            });
             true
         })),
         ..Limits::default()
     };
     reset_adaptive_alloc_count();
-    let ((res_tight, snaps_tight, allocs_tight), sample_tight) =
+    reset_adaptive_preadmit();
+    LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow_mut().clear());
+    let (res_exact, preadmit_b3, snaps_exact, allocs_exact) =
         with_rooted_adaptive_bound(true, || {
-            let mut k = Classifier::of(&input);
-            let (r, sample) = measure(|| k.classify(&pool_tight_sat));
-            (
-                (r, last_adaptive_attempts(), adaptive_alloc_count()),
-                sample,
+            admission_test::with_point_hook(
+                move |point| match point {
+                    admission_test::Point::Observed => {
+                        events_b3_hook.lock().push(MemEvent::Observed);
+                    }
+                    admission_test::Point::BeforeDebit => {
+                        events_b3_hook.lock().push(MemEvent::BeforeDebit);
+                    }
+                    _ => {}
+                },
+                || {
+                    let mut s = Saturation::new();
+                    let r = s.run_once(&kinds, None, 0, &pool_exact_presat, true);
+                    (
+                        r,
+                        last_adaptive_preadmit(),
+                        last_adaptive_attempts(),
+                        adaptive_alloc_count(),
+                    )
+                },
             )
         });
+    assert_eq!(preadmit_b3, Some((norm_peak, pre_sat_exact, pre_more)));
+    let log_b3 = events_b3.lock().clone();
+    let b3_first_obs = log_b3
+        .iter()
+        .position(|e| matches!(e, MemEvent::Observed))
+        .expect("b3 must enter saturate_counted entry check");
+    let b3_first_debit = log_b3
+        .iter()
+        .position(|e| matches!(e, MemEvent::BeforeDebit))
+        .expect(
+            "b3 must pass saturation entry without double-charging and reach worker BeforeDebit",
+        );
+    assert!(
+        b3_first_debit > b3_first_obs,
+        "b3 saturation entry must precede first worker debit"
+    );
+    assert_eq!(
+        log_b3[..b3_first_obs]
+            .iter()
+            .rev()
+            .find(|e| matches!(e, MemEvent::Charge { .. }))
+            .copied(),
+        Some(MemEvent::Charge {
+            bytes: pre_more,
+            accepted: true,
+            paid_after: pre_sat_exact,
+        }),
+        "b3 must grant exact pre-box adaptive delta up to pre_sat_exact before saturation entry"
+    );
+    assert!(
+        !log_b3[b3_first_obs..b3_first_debit]
+            .iter()
+            .any(|e| matches!(e, MemEvent::Charge { .. })),
+        "b3 must NOT charge at saturation entry (would indicate double-charging AdaptiveState): {:?}",
+        &log_b3[b3_first_obs..=b3_first_debit]
+    );
+    let b3_first_sat_charge = log_b3[b3_first_debit..]
+        .iter()
+        .find(|e| matches!(e, MemEvent::Charge { .. }))
+        .copied();
+    assert!(
+        matches!(
+            b3_first_sat_charge,
+            Some(MemEvent::Charge {
+                bytes,
+                accepted: false,
+                paid_after,
+            }) if bytes > 0 && paid_after == pre_sat_exact
+        ),
+        "b3 first charge after entry must be a refused worker-growth debit after BeforeDebit: {b3_first_sat_charge:?}"
+    );
+    assert_eq!(
+        allocs_exact, 1,
+        "pool capped at exact pre_box_base + state_bytes must admit AdaptiveState once"
+    );
+    assert_eq!(snaps_exact.len(), 1);
+    assert_eq!(snaps_exact[0].winning_stop, WinningStop::Memory);
+    assert_eq!(snaps_exact[0].raw_queue, snaps_exact[0].oracle_queue);
+    assert!(matches!(res_exact, Err(Error::Memory { .. })));
+
+    // (b4) Wider-cap arm through full `Classifier::classify` with counting-allocator peak
+    //      coverage: calibrate the `Classifier` attempt's pre-box admission, verify the
+    //      pre-box grant, verify ZERO saturation-entry charges before `BeforeDebit`,
+    //      identify the first accepted worker-growth debit, and refuse a later
+    //      mid-saturation growth debit once to produce a partial `WinningStop::Memory`
+    //      answer whose `peak_memory` covers `sample.peak`.
+    let (clf_norm_peak, clf_pre_sat, clf_pre_more) = with_rooted_adaptive_bound(true, || {
+        let mut k = Classifier::of(&input);
+        let _ = k.classify(&baseline_limits).expect("calibrate classifier");
+        last_adaptive_preadmit().expect("classifier must record pre-box adaptive admission")
+    });
+    assert!(clf_pre_sat > state_bytes);
+    // Pre-allocate the trace buffer so the test harness itself performs zero heap
+    // allocations inside `measure(|| ...)` when recording `Charge`/`Observed`/`BeforeDebit`.
+    let events_b4: Arc<parking_lot::Mutex<Vec<MemEvent>>> =
+        Arc::new(parking_lot::Mutex::new(Vec::with_capacity(4096)));
+    let paid_b4 = Arc::new(AtomicUsize::new(0));
+    let rejected_b4 = Arc::new(AtomicBool::new(false));
+    let events_b4_charge = events_b4.clone();
+    let events_b4_hook = events_b4.clone();
+    let paid_b4_ref = paid_b4.clone();
+    let rejected_b4_ref = rejected_b4.clone();
+    let push_capped = |buf: &parking_lot::Mutex<Vec<MemEvent>>, ev: MemEvent| {
+        let mut g = buf.lock();
+        if g.len() < g.capacity() {
+            g.push(ev);
+        }
+    };
+    let pool_tight_sat = Limits {
+        threads: 1,
+        rooted: true,
+        dl_steps: true,
+        partial: true,
+        charge: Some(Arc::new(move |bytes: usize| {
+            let cur = paid_b4_ref.load(Ordering::Relaxed);
+            if cur.saturating_add(bytes) > clf_pre_sat + (64 << 10)
+                && !rejected_b4_ref.swap(true, Ordering::SeqCst)
+            {
+                push_capped(
+                    &events_b4_charge,
+                    MemEvent::Charge {
+                        bytes,
+                        accepted: false,
+                        paid_after: cur,
+                    },
+                );
+                return false;
+            }
+            let next = cur + bytes;
+            paid_b4_ref.store(next, Ordering::Relaxed);
+            push_capped(
+                &events_b4_charge,
+                MemEvent::Charge {
+                    bytes,
+                    accepted: true,
+                    paid_after: next,
+                },
+            );
+            true
+        })),
+        ..Limits::default()
+    };
+    reset_adaptive_alloc_count();
+    let ((res_tight, preadmit_b4, snaps_tight, allocs_tight), sample_tight) =
+        with_rooted_adaptive_bound(true, || {
+            admission_test::with_point_hook(
+                move |point| match point {
+                    admission_test::Point::Observed => {
+                        push_capped(&events_b4_hook, MemEvent::Observed);
+                    }
+                    admission_test::Point::BeforeDebit => {
+                        push_capped(&events_b4_hook, MemEvent::BeforeDebit);
+                    }
+                    _ => {}
+                },
+                || {
+                    let mut k = Classifier::of(&input);
+                    let (r, sample) = measure(|| k.classify(&pool_tight_sat));
+                    (
+                        (
+                            r,
+                            last_adaptive_preadmit(),
+                            last_adaptive_attempts(),
+                            adaptive_alloc_count(),
+                        ),
+                        sample,
+                    )
+                },
+            )
+        });
+    assert_eq!(
+        preadmit_b4,
+        Some((clf_norm_peak, clf_pre_sat, clf_pre_more))
+    );
+    let log_b4 = events_b4.lock().clone();
+    let b4_first_obs = log_b4
+        .iter()
+        .position(|e| matches!(e, MemEvent::Observed))
+        .expect("b4 must hit saturation entry Observed");
+    let b4_first_debit = log_b4
+        .iter()
+        .position(|e| matches!(e, MemEvent::BeforeDebit))
+        .expect("b4 must start workers and hit BeforeDebit");
+    assert!(
+        b4_first_debit > b4_first_obs,
+        "b4 saturation entry must precede first worker debit"
+    );
+    let b4_last_pre_charge = log_b4[..b4_first_obs]
+        .iter()
+        .rev()
+        .find(|e| matches!(e, MemEvent::Charge { .. }))
+        .copied();
+    assert!(
+        matches!(
+            b4_last_pre_charge,
+            Some(MemEvent::Charge {
+                accepted: true,
+                paid_after,
+                ..
+            }) if paid_after >= clf_pre_sat
+        ),
+        "b4 must grant pre-box admission covering clf_pre_sat ({clf_pre_sat}) before saturation entry: {b4_last_pre_charge:?}"
+    );
+    let b4_paid_before_obs = match b4_last_pre_charge.unwrap() {
+        MemEvent::Charge { paid_after, .. } => paid_after,
+        _ => unreachable!(),
+    };
+    assert!(
+        !log_b4[b4_first_obs..b4_first_debit]
+            .iter()
+            .any(|e| matches!(e, MemEvent::Charge { .. })),
+        "b4 must NOT charge again at saturation entry before first worker debit: {:?}",
+        &log_b4[b4_first_obs..=b4_first_debit]
+    );
+    let b4_first_sat_charge = log_b4[b4_first_debit..]
+        .iter()
+        .find(|e| matches!(e, MemEvent::Charge { .. }))
+        .copied();
+    assert!(
+        matches!(
+            b4_first_sat_charge,
+            Some(MemEvent::Charge {
+                bytes,
+                accepted: true,
+                paid_after,
+            }) if bytes > 0 && paid_after == b4_paid_before_obs + bytes
+        ),
+        "b4 first saturation charge must occur after worker BeforeDebit and grow above pre-entry paid ({b4_paid_before_obs}): {b4_first_sat_charge:?}"
+    );
     assert_eq!(allocs_tight, 1, "AdaptiveState must be allocated once");
     assert!(
-        rejected_b3.load(Ordering::SeqCst),
+        rejected_b4.load(Ordering::SeqCst),
         "tight saturation pool must cleanly reject a mid-saturation debit"
     );
     assert_eq!(snaps_tight.len(), 1);
@@ -1532,47 +1876,6 @@ fn counting_allocator_rooted_adaptive_init_and_fallback() {
         out_tight.stats.peak_memory,
         sample_tight.peak
     );
-
-    // (b4) Exact single-charge boundary check: a pool capped at EXACTLY `pre_sat_exact`
-    //      (`pre_box_base + state_bytes`, zero extra headroom) must admit `AdaptiveState`
-    //      without double-charging on `saturate_counted` entry, enter saturation, and then
-    //      reject the first saturation allocation debit cleanly (`allocs == 1`, `snaps == 1`,
-    //      `WinningStop::Memory`).
-    let paid_b4 = Arc::new(AtomicUsize::new(0));
-    let rejected_b4 = Arc::new(AtomicBool::new(false));
-    let paid_b4_ref = paid_b4.clone();
-    let rejected_b4_ref = rejected_b4.clone();
-    let pool_exact_presat = Limits {
-        threads: 1,
-        rooted: true,
-        dl_steps: true,
-        partial: true,
-        charge: Some(Arc::new(move |bytes: usize| {
-            let cur = paid_b4_ref.load(Ordering::Relaxed);
-            if cur.saturating_add(bytes) > pre_sat_exact {
-                rejected_b4_ref.store(true, Ordering::SeqCst);
-                return false;
-            }
-            paid_b4_ref.fetch_add(bytes, Ordering::Relaxed);
-            true
-        })),
-        ..Limits::default()
-    };
-    reset_adaptive_alloc_count();
-    let (res_exact, snaps_exact, allocs_exact) = with_rooted_adaptive_bound(true, || {
-        let mut k = Classifier::of(&input);
-        let r = k.classify(&pool_exact_presat);
-        (r, last_adaptive_attempts(), adaptive_alloc_count())
-    });
-    assert_eq!(
-        allocs_exact, 1,
-        "pool capped at exact pre_box_base + state_bytes must admit AdaptiveState once"
-    );
-    assert!(rejected_b4.load(Ordering::SeqCst));
-    assert_eq!(snaps_exact.len(), 1);
-    assert_eq!(snaps_exact[0].winning_stop, WinningStop::Memory);
-    assert_eq!(snaps_exact[0].raw_queue, snaps_exact[0].oracle_queue);
-    assert!(matches!(res_exact, Err(Error::Memory { .. })));
 }
 
 /// 11. Sol Blocker #2 & Neon Note #3: `ADAPTIVE-OUTCOME` reports the EXACT final public
@@ -1750,5 +2053,129 @@ fn adaptive_outcome_matches_public_result_and_clears_on_early_error() {
     assert!(
         last_adaptive_outcome().is_none(),
         "early interchangeable() cancellation must clear prior adaptive outcome"
+    );
+}
+
+/// 12. Sol r2 #1 regression: marking-round disarm is strictly scoped to adaptive
+///     enforcement; non-adaptive and observe-only runs preserve verbatim fixed-limit,
+///     width-limit, and forced-exhaustion (`Found::over`) enforcement while stopping
+///     post-saturation adaptive sampling independently.
+#[test]
+fn marking_disarm_preserves_fixed_and_observe_only_enforcement() {
+    let policy = AdaptivePolicy {
+        sample_shift: 4, // sample every 16 work
+        ratio_num: 3,
+        ratio_den: 10,
+        root_limit: 8,
+        warmup_work: 1 << 20,
+        queue_max: 1 << 20,
+        ceiling: 64,
+    };
+
+    // (a) Non-adaptive `DlRun` (switch OFF / explicit fixed / counted / unrooted):
+    //     `disarm_adaptive_work_bound()` must leave `work_limit`, `width_limit`, and
+    //     `exhausted` untouched.
+    let fixed_run = DlRun::new(false, Arc::new(AtomicBool::new(false)));
+    fixed_run.set_work_limit(10);
+    fixed_run.set_width_limit(2);
+    fixed_run.count(11);
+    assert!(fixed_run.over_work());
+    fixed_run.disarm_adaptive_work_bound();
+    assert!(fixed_run.bounded(), "fixed work_limit must remain intact");
+    assert!(
+        fixed_run.over_work(),
+        "fixed run with work > work_limit must still report over_work after disarm"
+    );
+    let wide = vec![vec![(vec![], vec![]); 3]];
+    assert!(
+        fixed_run.too_wide(&wide),
+        "fixed width_limit must remain intact"
+    );
+
+    let fixed_exhaust = DlRun::new(false, Arc::new(AtomicBool::new(false)));
+    fixed_exhaust.set_work_limit(100);
+    fixed_exhaust.exhaust();
+    fixed_exhaust.disarm_adaptive_work_bound();
+    assert!(
+        fixed_exhaust.over_work(),
+        "fixed run with exhausted=true must still report over_work after disarm"
+    );
+
+    // (b) Observe-only mode (`enforce = false`, `diag = true`):
+    //     `stop_adaptive_sampling()` + `disarm_adaptive_work_bound()` must stop further
+    //     adaptive sampling (`samples` and `hypothetical_guard` frozen) while still
+    //     counting work, enforcing fixed `work_limit`, and letting a fresh `exhaust()`
+    //     (`Found::over`) set `exhausted` and trigger `over_work()`.
+    let mut obs_run = DlRun::new(false, Arc::new(AtomicBool::new(false)));
+    obs_run.set_work_limit(20);
+    obs_run.enable_adaptive(policy, false, false, make_meta("default_fixed", 20));
+    obs_run.count(16);
+    assert_eq!(obs_run.adaptive_samples(), 1);
+    assert!(!obs_run.over_work());
+    obs_run.stop_adaptive_sampling();
+    obs_run.disarm_adaptive_work_bound();
+    // Cross another sample boundary and exceed `root_limit` + `work_limit`: sampling
+    // stays stopped, but fixed `work_limit` enforcement MUST still fire!
+    obs_run.count_root(100);
+    obs_run.count(16);
+    assert_eq!(
+        obs_run.adaptive_samples(),
+        1,
+        "observe-only sampling must stay stopped after joined boundary"
+    );
+    assert_eq!(
+        obs_run.hypothetical_guard(),
+        WorkStopGuard::None,
+        "observe-only must not latch post-saturation hypothetical guards"
+    );
+    assert_eq!(obs_run.work(), 32);
+    assert!(
+        obs_run.over_work(),
+        "observe-only must preserve fixed work_limit enforcement during marking"
+    );
+
+    // Fresh `Found::over` (`exhaust()`) in observe-only mode after sampling stopped:
+    let mut obs_exhaust = DlRun::new(false, Arc::new(AtomicBool::new(false)));
+    obs_exhaust.set_work_limit(10_000);
+    obs_exhaust.enable_adaptive(policy, false, false, make_meta("default_fixed", 10_000));
+    obs_exhaust.stop_adaptive_sampling();
+    obs_exhaust.disarm_adaptive_work_bound();
+    assert!(!obs_exhaust.over_work());
+    obs_exhaust.exhaust();
+    assert!(
+        obs_exhaust.over_work(),
+        "observe-only must still honor fresh Found::over during marking, matching diag-off"
+    );
+
+    // (c) Enforced adaptive mode (`enforce = true`):
+    //     `disarm_adaptive_work_bound()` suppresses late `Stop::Work` on a latched guard,
+    //     ceiling excess, or `exhaust()`, while keeping `AdaptiveState` in `bytes()`.
+    let mut enf_run = DlRun::new(false, Arc::new(AtomicBool::new(false)));
+    enf_run.enable_adaptive(policy, true, false, make_meta("rawq_v1", policy.ceiling));
+    let bytes_before = enf_run.bytes();
+    assert!(bytes_before >= std::mem::size_of::<super::dl_rules::AdaptiveState>());
+    enf_run.count_root(10);
+    enf_run.count(16);
+    assert_eq!(enf_run.stop_guard(), WorkStopGuard::RootWork);
+    assert!(enf_run.over_work());
+    enf_run.stop_adaptive_sampling();
+    enf_run.disarm_adaptive_work_bound();
+    assert!(
+        !enf_run.over_work(),
+        "disarmed enforced adaptive run must not re-fire stale stop_guard in marking"
+    );
+    enf_run.count(policy.ceiling + 16);
+    assert!(!enf_run.past(policy.ceiling + 16));
+    enf_run.exhaust();
+    assert!(!enf_run.over_work());
+    assert_eq!(
+        enf_run.adaptive_samples(),
+        1,
+        "enforced sampling must stay stopped"
+    );
+    assert_eq!(
+        enf_run.bytes(),
+        bytes_before,
+        "AdaptiveState must remain accounted in DlRun::bytes()"
     );
 }

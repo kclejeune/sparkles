@@ -2088,6 +2088,8 @@ impl Saturation {
         LAST_ADAPTIVE_ATTEMPTS.with(|c| c.borrow_mut().clear());
         #[cfg(test)]
         LAST_ADAPTIVE_OUTCOME.with(|c| *c.borrow_mut() = None);
+        #[cfg(test)]
+        LAST_ADAPTIVE_PREADMIT.with(|c| c.set(None));
         // the class assertions that another one stands for add nothing (roadmap item
         // 1281), and the run reads the other axioms, whose list it holds beside the
         // caller's
@@ -3828,6 +3830,10 @@ impl Saturation {
         };
         // the pool has been charged for the peak of a parallel normalization
         let more = pre_sat.saturating_sub(normalized_peak);
+        #[cfg(test)]
+        if adaptive_bytes > 0 {
+            LAST_ADAPTIVE_PREADMIT.with(|c| c.set(Some((normalized_peak, pre_sat, more))));
+        }
         if pre_cap.is_some_and(|m| pre_sat > m) || charge_fn.is_some_and(|f| more > 0 && !f(more)) {
             return Err(Error::Memory {
                 limit: pre_cap.unwrap_or(pre_sat),
@@ -3900,6 +3906,7 @@ impl Saturation {
         // routing, marker decline, or partial store teardown.
         if let Some(d) = dl_run.as_ref().filter(|d| d.tracks_adaptive()) {
             self.record_adaptive_saturation(d, dynamic.as_ref(), sat_stop);
+            d.stop_adaptive_sampling();
         }
         let mut totals = match (sat_totals, sat_stop) {
             (t, None) => t,
@@ -4089,13 +4096,14 @@ impl Saturation {
             (incomplete, consistency)
         });
         // A non-work stop already won and a partial answer is being constructed: disarm
-        // work-bound enforcement on `dl_run` before the individual-marking round so a
-        // previously latched adaptive guard or marking-round clause flush cannot abort the
-        // partial answer with a late `Stop::Work`, while keeping `dl_run.bytes()` intact.
+        // adaptive work-bound enforcement on `dl_run` before the individual-marking round
+        // so a previously latched adaptive guard cannot abort the partial answer with a
+        // late `Stop::Work`, while keeping `dl_run.bytes()` intact and preserving fixed /
+        // non-adaptive work enforcement verbatim.
         if open.is_some()
             && let Some(d) = dl_run.as_ref()
         {
-            d.disarm_work_bound();
+            d.disarm_adaptive_work_bound();
         }
         // Dependency recording has seen the stopped to-do lists. The messages still
         // occupy memory while marking and retained output run.
@@ -5697,6 +5705,10 @@ thread_local! {
     /// Final public outcome recorded by `emit_adaptive_*_outcome` when diagnostics ran.
     pub(super) static LAST_ADAPTIVE_OUTCOME: std::cell::RefCell<Option<AdaptiveOutcome>> =
         const { std::cell::RefCell::new(None) };
+    /// `(normalized_peak, pre_sat, more)` witnessed at the pre-box adaptive admission
+    /// check in `Saturation::run`.
+    pub(super) static LAST_ADAPTIVE_PREADMIT: std::cell::Cell<Option<(usize, usize, usize)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
@@ -5707,6 +5719,16 @@ pub(super) fn last_adaptive_attempts() -> Vec<AdaptiveSnapshot> {
 #[cfg(test)]
 pub(super) fn last_adaptive_outcome() -> Option<AdaptiveOutcome> {
     LAST_ADAPTIVE_OUTCOME.with(|c| *c.borrow())
+}
+
+#[cfg(test)]
+pub(super) fn reset_adaptive_preadmit() {
+    LAST_ADAPTIVE_PREADMIT.with(|c| c.set(None));
+}
+
+#[cfg(test)]
+pub(super) fn last_adaptive_preadmit() -> Option<(usize, usize, usize)> {
+    LAST_ADAPTIVE_PREADMIT.with(|c| c.get())
 }
 
 fn poll(limits: &Limits) -> Result<(), Error> {

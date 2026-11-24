@@ -25,6 +25,18 @@ pub(super) fn set_hook(hook: impl FnMut(Point) + 'static) {
     HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
 }
 
+pub(super) fn with_point_hook<T>(hook: impl FnMut(Point) + 'static, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<Hook>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HOOK.with(|h| *h.borrow_mut() = self.0.take());
+        }
+    }
+    let prev = HOOK.with(|h| h.borrow_mut().replace(Box::new(hook)));
+    let _reset = Reset(prev);
+    run()
+}
+
 pub(super) fn hit(point: Point) {
     HOOK.with(|h| {
         if let Some(hook) = h.borrow_mut().as_mut() {
