@@ -41,16 +41,33 @@ fn hash_buckets(capacity: usize) -> Option<usize> {
     }
 }
 
+/// Control-byte SIMD group width of hashbrown on the current target: 16 bytes with SSE2 or
+/// AArch64 NEON, 8 bytes on other 64-bit targets, and 4 bytes on other 32-bit targets.
+const HASH_GROUP_WIDTH: usize = if cfg!(any(
+    target_feature = "sse2",
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+)) {
+    16
+} else if cfg!(target_pointer_width = "64") {
+    8
+} else {
+    4
+};
+
 /// Allocation size of a hashbrown table with `buckets` slots of `entry_size` bytes plus
-/// its control bytes and 16-byte SIMD clone trailer.
+/// its control bytes and group clone trailer.
 #[inline]
 fn table_layout_bytes(buckets: usize, entry_size: usize) -> Option<usize> {
     if buckets == 0 {
         return Some(0);
     }
     let data = buckets.checked_mul(entry_size)?;
-    let ctrl_offset = data.checked_add(15)? & !15;
-    ctrl_offset.checked_add(buckets)?.checked_add(16)
+    let align_mask = HASH_GROUP_WIDTH - 1;
+    let ctrl_offset = data.checked_add(align_mask)? & !align_mask;
+    ctrl_offset
+        .checked_add(buckets)?
+        .checked_add(HASH_GROUP_WIDTH)
 }
 
 /// Exact heap allocation size of a `FxHashMap`/`FxHashSet` with `capacity` slots of
@@ -440,7 +457,102 @@ pub struct Lits {
     ids: parking_lot::Mutex<FxHashMap<XLit, u32>>,
     recs: Segs<XLit>,
     next: AtomicU32,
+    /// Exact total bytes of the map and segments (updated by every insertion).
     bytes: AtomicUsize,
+    /// Bytes added by un-admitted [`Lits::lit`] insertions (or carried from an earlier run),
+    /// counted by [`super::dl_rules::DlRun::bytes`]. Admitted insertions via
+    /// [`Lits::lit_admitted`] / [`admit_lit`] keep their bytes inside `Run::memory` so live
+    /// memory checks never observe a two-counter transfer double count.
+    unadmitted_bytes: AtomicUsize,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static BEFORE_LIT_REVALIDATE: std::cell::RefCell<Option<std::sync::Arc<std::sync::Barrier>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn before_lit_revalidate() {
+    let barrier = BEFORE_LIT_REVALIDATE.with(|slot| slot.borrow().clone());
+    if let Some(b) = barrier {
+        b.wait();
+    }
+}
+
+/// Checks whether `l` can be packed or simplified without touching the interner.
+#[inline]
+fn packed_xlit(l: XLit, inv: impl Fn(Role) -> Option<Role> + Copy) -> Option<Made> {
+    use RTerm::*;
+    match l {
+        XLit::Atom(a, X) => Some(Made::Lit(Lit::x(a))),
+        XLit::Atom(a, Y) => Some(Made::Lit(Lit::y(a))),
+        XLit::Atom(a, Fx(e)) => Some(Made::Lit(Lit::f(e, a))),
+        XLit::Role(s, Y, X) => Some(Made::Lit(Lit::ry(s))),
+        XLit::Role(s, X, Y) => inv(s).map(|i| Made::Lit(Lit::ry(i))),
+        XLit::Role(s, X, Fx(f)) => Some(Made::Lit(Lit::rl(f, s))),
+        XLit::Role(s, Fx(f), X) => inv(s).map(|i| Made::Lit(Lit::rl(f, i))),
+        XLit::Eq(a, b) if a == b => Some(Made::True),
+        XLit::Ne(a, b) if a == b => Some(Made::False),
+        XLit::Eq(a, b) => packed_pair(EQ, a, b).map(Made::Lit),
+        XLit::Ne(a, b) => packed_pair(NE, a, b).map(Made::Lit),
+        _ => None,
+    }
+}
+
+/// Shared admission-and-revalidate loop for [`Lits::lit_admitted`] and [`admit_lit`]. Caller
+/// callbacks (`out.admit_dl`, `out.stopped`, `out.commit_dl`) always run outside `ids.lock()`.
+fn lit_admitted_loop<S: Sink>(
+    try_insert: impl Fn(&S, usize) -> Result<(Made, usize), Option<usize>>,
+    out: &mut S,
+) -> Option<Made> {
+    let mut guard = super::saturate::DlGuard::new(out);
+    loop {
+        if guard.stopped() {
+            return None;
+        }
+        match try_insert(guard.sink(), guard.bytes()) {
+            Ok((made, grown)) => {
+                guard.commit(grown);
+                return Some(made);
+            }
+            Err(None) => {
+                guard.data_overflow();
+                return None;
+            }
+            Err(Some(need)) => {
+                debug_assert!(need > guard.bytes());
+                let add = need - guard.bytes();
+                if !guard.admit_add(add) {
+                    return None;
+                }
+                #[cfg(test)]
+                before_lit_revalidate();
+            }
+        }
+    }
+}
+
+/// Interns `l` in `out.dl().lits`, pre-admitting and revalidating any hash-table rehash or
+/// segment allocation against `out` before growing `Lits`. Returns `None` when the run stops
+/// or refuses the growth, publishing neither a literal nor a retained allocation.
+#[inline]
+pub fn admit_lit<S: Sink>(
+    l: XLit,
+    inv: impl Fn(Role) -> Option<Role> + Copy,
+    out: &mut S,
+) -> Option<Made> {
+    if out.stopped() {
+        return None;
+    }
+    if let Some(m) = packed_xlit(l, inv) {
+        return Some(m);
+    }
+    let canon = l.canon(inv);
+    lit_admitted_loop(
+        |sink, budget| sink.dl().lits.lit_try_insert_canon(canon, budget),
+        out,
+    )
 }
 
 #[cfg_attr(
@@ -452,110 +564,101 @@ impl Lits {
     /// otherwise, or true or false for an equality or inequality of a term with itself.
     /// `inv` gives a role's inverse.
     pub fn lit(&self, l: XLit, inv: impl Fn(Role) -> Option<Role> + Copy) -> Made {
-        use RTerm::*;
-        let packed = match l {
-            XLit::Atom(a, X) => Some(Lit::x(a)),
-            XLit::Atom(a, Y) => Some(Lit::y(a)),
-            XLit::Atom(a, Fx(e)) => Some(Lit::f(e, a)),
-            XLit::Role(s, Y, X) => Some(Lit::ry(s)),
-            XLit::Role(s, X, Y) => inv(s).map(Lit::ry),
-            XLit::Role(s, X, Fx(f)) => Some(Lit::rl(f, s)),
-            XLit::Role(s, Fx(f), X) => inv(s).map(|i| Lit::rl(f, i)),
-            XLit::Eq(a, b) | XLit::Ne(a, b) if a == b => {
-                return if matches!(l, XLit::Eq(..)) {
-                    Made::True
-                } else {
-                    Made::False
-                };
-            }
-            XLit::Eq(a, b) => packed_pair(EQ, a, b),
-            XLit::Ne(a, b) => packed_pair(NE, a, b),
-            _ => None,
-        };
-        if let Some(p) = packed {
-            return Made::Lit(p);
+        if let Some(m) = packed_xlit(l, inv) {
+            return m;
         }
         let l = l.canon(inv);
         let mut ids = self.ids.lock();
         let cap = ids.capacity();
+        let mut seg_grown = 0usize;
         let id = *ids.entry(l).or_insert_with(|| {
             let id = self.next.fetch_add(1, Ordering::Relaxed);
-            let _ = self.recs.slot(id, &self.bytes).set(l);
+            let (slot, g) = self.recs.slot_with_delta(id);
+            seg_grown = g;
+            let _ = slot.set(l);
             id
         });
         let entry = std::mem::size_of::<(XLit, u32)>();
-        let grown =
+        let map_grown =
             hash_table_bytes(ids.capacity(), entry).saturating_sub(hash_table_bytes(cap, entry));
-        self.bytes.fetch_add(grown, Ordering::Relaxed);
+        let grown = seg_grown + map_grown;
+        if grown > 0 {
+            self.bytes.fetch_add(grown, Ordering::Relaxed);
+            self.unadmitted_bytes.fetch_add(grown, Ordering::Relaxed);
+        }
         Made::Lit(Lit::xl(id))
     }
 
-    /// [`Lits::lit`], pre-admitting any hash-table rehash or new segment allocation against
-    /// Checks whether `l` is already packed or interned without allocating. Returns
-    /// `Ok(made)` if no interning allocation is needed, or `Err(bound)` with the peak
-    /// growth bound (`None` on overflow) required before calling [`Lits::lit`].
-    pub fn lit_prepare(
-        &self,
-        l: XLit,
-        inv: impl Fn(Role) -> Option<Role> + Copy,
-    ) -> Result<Made, Option<usize>> {
-        use RTerm::*;
-        let packed = match l {
-            XLit::Atom(a, X) => Some(Lit::x(a)),
-            XLit::Atom(a, Y) => Some(Lit::y(a)),
-            XLit::Atom(a, Fx(e)) => Some(Lit::f(e, a)),
-            XLit::Role(s, Y, X) => Some(Lit::ry(s)),
-            XLit::Role(s, X, Y) => inv(s).map(Lit::ry),
-            XLit::Role(s, X, Fx(f)) => Some(Lit::rl(f, s)),
-            XLit::Role(s, Fx(f), X) => inv(s).map(|i| Lit::rl(f, i)),
-            XLit::Eq(a, b) if a == b => return Ok(Made::True),
-            XLit::Ne(a, b) if a == b => return Ok(Made::False),
-            XLit::Eq(a, b) => packed_pair(EQ, a, b),
-            XLit::Ne(a, b) => packed_pair(NE, a, b),
-            _ => None,
-        };
-        if let Some(p) = packed {
-            return Ok(Made::Lit(p));
-        }
-        let l = l.canon(inv);
+    /// Attempts to look up or insert canonical `l` under `self.ids.lock()` without exceeding
+    /// `budget` bytes of peak growth. Returns `Ok((made, grown))` when found or inserted, or
+    /// `Err(Some(need))` (`Err(None)` on overflow) without inserting or allocating when
+    /// `need > budget`.
+    fn lit_try_insert_canon(&self, l: XLit, budget: usize) -> Result<(Made, usize), Option<usize>> {
         let entry = std::mem::size_of::<(XLit, u32)>();
-        let ids = self.ids.lock();
+        let mut ids = self.ids.lock();
         if let Some(&id) = ids.get(&l) {
-            return Ok(Made::Lit(Lit::xl(id)));
+            return Ok((Made::Lit(Lit::xl(id)), 0));
         }
         let map_grow = if ids.len() >= ids.capacity() {
             next_hash_table_bytes(ids.capacity(), entry)
         } else {
             Some(0)
         };
-        let seg_grow = self.recs.next_seg_bytes(self.next.load(Ordering::Relaxed));
-        Err(map_grow.and_then(|m| m.checked_add(seg_grow)))
+        let next_id = self.next.load(Ordering::Relaxed);
+        let seg_grow = self.recs.next_seg_bytes(next_id);
+        let Some(need) = map_grow.and_then(|m| m.checked_add(seg_grow)) else {
+            return Err(None);
+        };
+        if need > budget {
+            return Err(Some(need));
+        }
+        let cap = ids.capacity();
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        debug_assert_eq!(id, next_id);
+        let (slot, seg_grown) = self.recs.slot_with_delta(id);
+        let _ = slot.set(l);
+        ids.insert(l, id);
+        let map_grown =
+            hash_table_bytes(ids.capacity(), entry).saturating_sub(hash_table_bytes(cap, entry));
+        let grown = seg_grown + map_grown;
+        debug_assert!(
+            grown <= budget,
+            "Lits growth {grown} exceeded revalidated budget {budget}"
+        );
+        if grown > 0 {
+            self.bytes.fetch_add(grown, Ordering::Relaxed);
+        }
+        Ok((Made::Lit(Lit::xl(id)), grown))
     }
 
-    /// `out` before growing `self`. Returns `None` when the run refuses the growth.
+    /// [`Lits::lit`], pre-admitting and revalidating any hash-table rehash or new segment
+    /// allocation against `out` before growing `self`. Returns `None` when the run stops or
+    /// refuses the growth, publishing neither a literal nor a retained allocation.
     pub fn lit_admitted<S: Sink>(
         &self,
         l: XLit,
         inv: impl Fn(Role) -> Option<Role> + Copy,
         out: &mut S,
     ) -> Option<Made> {
-        match self.lit_prepare(l, inv) {
-            Ok(m) => Some(m),
-            Err(None) => {
-                out.data_overflow();
-                None
-            }
-            Err(Some(need)) => {
-                if need > 0 && !out.admit_dl(need) {
-                    return None;
-                }
-                let made = self.lit(l, inv);
-                if need > 0 {
-                    out.commit_dl(need, 0);
-                }
-                Some(made)
-            }
+        if out.stopped() {
+            return None;
         }
+        if let Some(m) = packed_xlit(l, inv) {
+            return Some(m);
+        }
+        let canon = l.canon(inv);
+        lit_admitted_loop(|_, budget| self.lit_try_insert_canon(canon, budget), out)
+    }
+
+    /// Bytes of `self` not accounted for in `Run::memory`, for [`super::dl_rules::DlRun::bytes`].
+    pub(super) fn unadmitted_bytes(&self) -> usize {
+        self.unadmitted_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Re-bases `unadmitted_bytes` to total `bytes` when starting a new saturation round that
+    /// carries `self` forward from a previous run.
+    pub(super) fn sync_unadmitted_on_begin_run(&mut self) {
+        *self.unadmitted_bytes.get_mut() = *self.bytes.get_mut();
     }
 
     /// Whether a head holds an equality and the inequality of the same terms, in any
@@ -656,11 +759,65 @@ impl Clause {
         body.dedup();
         head.sort_unstable();
         head.dedup();
+        Clause::from_sorted(body, head)
+    }
+
+    /// Builds a clause from already-sorted, deduplicated `body` and `head`. Reuses `head`
+    /// without a copy when `body` is empty (and `body` when `head` is empty), and uses an
+    /// exact-capacity combined buffer otherwise.
+    fn from_sorted(mut body: Vec<Lit>, head: Vec<Lit>) -> Clause {
+        if body.is_empty() {
+            return Clause {
+                lits: head.into_boxed_slice(),
+                body: 0,
+            };
+        }
         let b = body.len() as u32;
-        body.extend(head);
+        if head.is_empty() {
+            return Clause {
+                lits: body.into_boxed_slice(),
+                body: b,
+            };
+        }
+        let total = body.len() + head.len();
+        if body.capacity() == total {
+            body.extend(head);
+            return Clause {
+                lits: body.into_boxed_slice(),
+                body: b,
+            };
+        }
+        let mut lits = Vec::with_capacity(total);
+        lits.extend_from_slice(&body);
+        lits.extend_from_slice(&head);
+        drop(body);
+        drop(head);
         Clause {
-            lits: body.into_boxed_slice(),
+            lits: lits.into_boxed_slice(),
             body: b,
+        }
+    }
+
+    /// Upper bound on temporary copy/shrink allocation in [`Clause::from_sorted`].
+    fn build_alloc_bound(body: &Vec<Lit>, head: &Vec<Lit>) -> Option<usize> {
+        let total = body.len().checked_add(head.len())?;
+        let bytes = total.checked_mul(std::mem::size_of::<Lit>())?;
+        if body.is_empty() {
+            Some(if head.len() == head.capacity() {
+                0
+            } else {
+                bytes
+            })
+        } else if head.is_empty() {
+            Some(if body.len() == body.capacity() {
+                0
+            } else {
+                bytes
+            })
+        } else if body.capacity() == total {
+            Some(0)
+        } else {
+            Some(bytes)
         }
     }
     #[inline]
@@ -1045,20 +1202,28 @@ impl<T> Segs<T> {
         }
     }
 
-    /// The slot of entry `id`, whose segment is made on first use and its bytes added to
-    /// `bytes`.
-    fn slot(&self, id: u32, bytes: &AtomicUsize) -> &OnceLock<T> {
+    /// The slot of entry `id`, initializing its segment on first use and returning the
+    /// newly allocated segment bytes (`0` when already initialized).
+    fn slot_with_delta(&self, id: u32) -> (&OnceLock<T>, usize) {
         let off = id as usize;
         let k = (off / SEG0 + 1).ilog2() as usize;
         let at = off - SEG0 * ((1 << k) - 1);
+        let mut grown = 0usize;
         let seg = self.segs[k].get_or_init(|| {
-            bytes.fetch_add(
-                (SEG0 << k) * std::mem::size_of::<OnceLock<T>>(),
-                Ordering::Relaxed,
-            );
+            grown = (SEG0 << k) * std::mem::size_of::<OnceLock<T>>();
             (0..SEG0 << k).map(|_| OnceLock::new()).collect()
         });
-        &seg[at]
+        (&seg[at], grown)
+    }
+
+    /// The slot of entry `id`, whose segment is made on first use and its bytes added to
+    /// `bytes`.
+    fn slot(&self, id: u32, bytes: &AtomicUsize) -> &OnceLock<T> {
+        let (slot, grown) = self.slot_with_delta(id);
+        if grown > 0 {
+            bytes.fetch_add(grown, Ordering::Relaxed);
+        }
+        slot
     }
 }
 
@@ -1118,7 +1283,7 @@ pub struct Stored {
 }
 
 /// A context's clause store, with the indexes the rules read.
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct Store {
     pub clauses: Vec<Stored>,
     /// the clauses waiting for the rules, by length, shortest first
@@ -1172,15 +1337,43 @@ pub struct Store {
     pub interrupted: bool,
 }
 
+impl Clone for Store {
+    fn clone(&self) -> Store {
+        let mut copy = Store {
+            clauses: self.clauses.clone(),
+            queue: self.queue.clone(),
+            by_x: self.by_x.clone(),
+            by_f: self.by_f.clone(),
+            by_succ: self.by_succ.clone(),
+            #[cfg(test)]
+            grown: self.grown,
+            by_rl: self.by_rl.clone(),
+            by_cert: self.by_cert.clone(),
+            by_eq: self.by_eq.clone(),
+            preds: self.preds.clone(),
+            multi: self.multi.clone(),
+            by_xl: self.by_xl.clone(),
+            terms: self.terms.clone(),
+            by_ground: self.by_ground.clone(),
+            by_lit: self.by_lit.clone(),
+            by_last: self.by_last.clone(),
+            empty: self.empty.clone(),
+            owned_bytes: 0,
+            interrupted: self.interrupted,
+        };
+        copy.owned_bytes = copy.compute_bytes();
+        copy
+    }
+}
+
 impl Store {
     pub fn bytes(&self) -> usize {
         self.owned_bytes
     }
 
-    /// Full independent scan of every heap allocation owned by this store, for invariant
-    /// assertions and tests.
-    #[cfg(test)]
-    pub(super) fn scan_bytes(&self) -> usize {
+    /// Full independent scan of every heap allocation owned by this store (including
+    /// scanning `ByTerm`'s inner maps independently of its cached counter).
+    fn compute_bytes(&self) -> usize {
         self.clauses.capacity() * std::mem::size_of::<Stored>()
             + self
                 .clauses
@@ -1208,36 +1401,47 @@ impl Store {
                 .map(|m| m.len() * std::mem::size_of::<Lit>())
                 .sum::<usize>()
             + map_vec_bytes(&self.by_xl)
-            + self.terms.as_ref().map_or(0, |t| t.bytes())
+            + self.terms.as_deref().map_or(0, ByTerm::scan_bytes)
             + map_vec_bytes(&self.by_ground)
+    }
+
+    /// Full independent scan of every heap allocation owned by this store, for invariant
+    /// assertions and tests.
+    #[cfg(test)]
+    pub(super) fn scan_bytes(&self) -> usize {
+        self.compute_bytes()
     }
 
     pub fn is_idle(&self) -> bool {
         self.queue.is_empty() && !self.interrupted
     }
 
-    /// Whether a clause of the store that is not dead subsumes `c`, whose signature is
-    /// `sig`: a clause that does has its last head literal in `c`'s head.
-    pub(super) fn subsumed(&self, c: &Clause, sig: u64) -> bool {
+    /// Whether a clause of the store that is not dead subsumes `(body, head)`, whose
+    /// signature is `sig`: a clause that does has its last head literal in `head`.
+    fn subsumed_parts(&self, body: &[Lit], head: &[Lit], sig: u64) -> bool {
         let check = |ids: &[u32]| {
             ids.iter().any(|&i| {
                 let s = &self.clauses[i as usize];
-                s.sig & !sig == 0 && !s.dead && s.c.subsumes(c)
+                s.sig & !sig == 0 && !s.dead && subset(s.c.body(), body) && subset(s.c.head(), head)
             })
         };
         if check(&self.empty) {
             return true;
         }
-        c.head()
-            .iter()
+        head.iter()
             .any(|l| self.by_last.get(l).is_some_and(|ids| check(ids)))
     }
 
-    /// Upper bound on peak allocation (including reallocation overlap) needed by
-    /// [`Store::add_unchecked`] for `c`.
-    fn add_growth_bound(&self, c: &Clause) -> Option<usize> {
-        let mut bound = c.lits.len().checked_mul(std::mem::size_of::<Lit>())?;
-        bound = bound.checked_add(vec_grow_bound(&self.clauses)?)?;
+    /// Whether a clause of the store that is not dead subsumes `c`, whose signature is
+    /// `sig`: a clause that does has its last head literal in `c`'s head.
+    pub(super) fn subsumed(&self, c: &Clause, sig: u64) -> bool {
+        self.subsumed_parts(c.body(), c.head(), sig)
+    }
+
+    /// Upper bound on peak index/container allocation (excluding the clause's own literal
+    /// slice) needed by [`Store::add_unchecked`] for a clause with head `head`.
+    fn add_index_growth_bound(&self, head: &[Lit]) -> Option<usize> {
+        let mut bound = vec_grow_bound(&self.clauses)?;
         if self.queue.len() >= self.queue.capacity() {
             let q = next_vec_cap(
                 self.queue.capacity(),
@@ -1246,7 +1450,7 @@ impl Store {
             .checked_mul(std::mem::size_of::<std::cmp::Reverse<(u32, u32)>>())?;
             bound = bound.checked_add(q)?;
         }
-        match c.head().last() {
+        match head.last() {
             None => bound = bound.checked_add(vec_grow_bound(&self.empty)?)?,
             Some(l) => bound = bound.checked_add(map_vec_push_bound(&self.by_last, l)?)?,
         }
@@ -1254,7 +1458,7 @@ impl Store {
             next_vec_cap(0, std::mem::size_of::<u32>())?.checked_mul(std::mem::size_of::<u32>())?;
         let mut new_lit_keys = 0usize;
         let mut new_eq_keys = 0usize;
-        for &l in c.head() {
+        for &l in head {
             if let Some(v) = self.by_lit.get(&l) {
                 bound = bound.checked_add(vec_grow_bound(v)?)?;
             } else {
@@ -1287,6 +1491,13 @@ impl Store {
             std::mem::size_of::<(Ex, Vec<u32>)>(),
         )?)?;
         Some(bound)
+    }
+
+    /// Upper bound on peak allocation (including reallocation overlap) needed by
+    /// [`Store::add_unchecked`] for `c`.
+    fn add_growth_bound(&self, c: &Clause) -> Option<usize> {
+        let payload = c.lits.len().checked_mul(std::mem::size_of::<Lit>())?;
+        payload.checked_add(self.add_index_growth_bound(c.head())?)
     }
 
     /// Inserts an unsubsumed clause `c` with signature `sig`, marking backward-subsumed
@@ -1384,6 +1595,74 @@ impl Store {
         let delta = self.add_unchecked(c, sig);
         out.commit_dl(bound, delta);
         true
+    }
+
+    /// Pre-admits clause construction copy/shrink scratch and store index growth before
+    /// building `Clause` from `(body, head)`. When `covered_payload > 0`, the caller already
+    /// holds a `Sink::admit_dl` reservation of `covered_payload` covering the source buffer;
+    /// returns `(ok, consumed_covered)` where `consumed_covered` is `true` iff `commit_dl`
+    /// settled `covered_payload` (so the caller should disarm its guard).
+    pub fn add_parts_admitted_covered<S: Sink>(
+        &mut self,
+        mut body: Vec<Lit>,
+        mut head: Vec<Lit>,
+        covered_payload: usize,
+        out: &mut S,
+    ) -> (bool, bool) {
+        body.sort_unstable();
+        body.dedup();
+        head.sort_unstable();
+        head.dedup();
+        let sig = body
+            .iter()
+            .chain(head.iter())
+            .fold(0u64, |s, l| s | l.sig_bit());
+        if self.subsumed_parts(&body, &head, sig) {
+            return (true, false);
+        }
+        let Some((total_need, extra_need)) = (|| {
+            let payload = body
+                .len()
+                .checked_add(head.len())?
+                .checked_mul(std::mem::size_of::<Lit>())?;
+            let build_alloc = Clause::build_alloc_bound(&body, &head)?;
+            let index_bound = self.add_index_growth_bound(&head)?;
+            let during_build = covered_payload.checked_add(build_alloc)?;
+            let during_index = payload.checked_add(index_bound)?;
+            let total = during_build.max(during_index);
+            let extra = total.saturating_sub(covered_payload);
+            Some((total, extra))
+        })() else {
+            out.data_overflow();
+            self.interrupted = true;
+            return (false, false);
+        };
+        if extra_need > 0 && !out.admit_dl(extra_need) {
+            self.interrupted = true;
+            return (false, false);
+        }
+        if extra_need == 0 && out.stopped() {
+            self.interrupted = true;
+            return (false, false);
+        }
+        let c = Clause::from_sorted(body, head);
+        let delta = self.add_unchecked(c, sig);
+        let committed_bound = covered_payload + extra_need;
+        debug_assert!(committed_bound >= total_need);
+        out.commit_dl(committed_bound, delta);
+        (true, true)
+    }
+
+    /// Pre-admits clause construction and store index growth before building `Clause` from
+    /// `(body, head)`. Returns `false` and marks `interrupted` without copying or mutating
+    /// `self` when `out` refuses the growth.
+    pub fn add_parts_admitted<S: Sink>(
+        &mut self,
+        body: Vec<Lit>,
+        head: Vec<Lit>,
+        out: &mut S,
+    ) -> bool {
+        self.add_parts_admitted_covered(body, head, 0, out).0
     }
 
     /// Upper bound on peak allocation needed to index processed clause `id` with maximal
@@ -1613,30 +1892,72 @@ impl Store {
         None
     }
 
-    /// Peeks the next live queued clause, computes its maximal literals into `max`, and
-    /// returns `(id, growth_bound)` without popping or mutating processing indexes.
-    pub fn next_prepare(
-        &mut self,
-        ix: &Index,
-        rooted: Option<&Rooted>,
-        max: &mut Vec<Lit>,
-    ) -> Option<(u32, Option<usize>)> {
+    /// Peeks the next live queued clause id without popping it. Discards already-subsumed
+    /// dead queue entries in place; dead-entry cleanup allocates nothing and leaves
+    /// `owned_bytes`, every live clause, and every index unchanged, including if a following
+    /// admission refuses.
+    pub fn peek_live(&mut self) -> Option<u32> {
         while let Some(&std::cmp::Reverse((_, id))) = self.queue.peek() {
             if self.clauses[id as usize].dead {
                 self.queue.pop();
                 continue;
             }
-            match rooted {
-                None => self.clauses[id as usize].c.maximal(ix, max),
-                Some(o) => self.clauses[id as usize].c.maximal_rooted(o, max),
-            }
-            let bound = self.next_growth_bound(ix, rooted, id, max);
-            return Some((id, bound));
+            return Some(id);
         }
         None
     }
 
-    /// Pops and indexes the clause prepared by [`Store::next_prepare`], returning the
+    /// Upper bound on temporary scratch `(views_bytes, max_realloc_bytes)` needed to compute
+    /// the maximal literals of clause `id` into `max` (in a rooted run `maximal_rooted`
+    /// allocates a `Vec<XLit>` of views and can grow `max` up to `head.len()`).
+    pub fn next_scratch_bound(
+        &self,
+        id: u32,
+        rooted: bool,
+        max: &[Lit],
+        max_cap: usize,
+    ) -> Option<(usize, usize)> {
+        let _ = max;
+        let head_len = self.clauses[id as usize].c.head().len();
+        let views = if rooted {
+            head_len.checked_mul(std::mem::size_of::<XLit>())?
+        } else {
+            0
+        };
+        let target_len = if rooted {
+            head_len
+        } else {
+            usize::from(head_len > 0)
+        };
+        let max_realloc = if target_len <= max_cap {
+            0
+        } else {
+            let mut cap = max_cap;
+            while cap < target_len {
+                cap = next_vec_cap(cap, std::mem::size_of::<Lit>())?;
+            }
+            cap.checked_mul(std::mem::size_of::<Lit>())?
+        };
+        Some((views, max_realloc))
+    }
+
+    /// Computes the maximal literals of live queued clause `id` into `max` and returns the
+    /// index-growth bound (`None` on overflow) without popping or mutating processing indexes.
+    pub fn next_prepare_id(
+        &self,
+        ix: &Index,
+        rooted: Option<&Rooted>,
+        id: u32,
+        max: &mut Vec<Lit>,
+    ) -> Option<usize> {
+        match rooted {
+            None => self.clauses[id as usize].c.maximal(ix, max),
+            Some(o) => self.clauses[id as usize].c.maximal_rooted(o, max),
+        }
+        self.next_growth_bound(ix, rooted, id, max)
+    }
+
+    /// Pops and indexes the clause prepared by [`Store::next_prepare_id`], returning the
     /// exact retained byte delta.
     pub fn next_commit(
         &mut self,
@@ -1656,9 +1977,11 @@ impl Store {
         !self.queue.is_empty()
     }
 
-    /// [`Store::next`], pre-admitting peak index growth against `out` before popping or
-    /// mutating any processing index. Leaves the clause queued and marks `interrupted` on
-    /// refusal.
+    /// [`Store::next`], pre-admitting maximal-literal scratch and peak index growth against
+    /// `out` before computing maxima or popping/mutating any processing index. Leaves the
+    /// live clause queued and marks `interrupted` on refusal (already-subsumed dead queue
+    /// entries ahead of it may be discarded without allocating).
+    #[cfg(test)]
     pub fn next_admitted<S: Sink>(
         &mut self,
         ix: &Index,
@@ -1666,18 +1989,37 @@ impl Store {
         max: &mut Vec<Lit>,
         out: &mut S,
     ) -> Option<u32> {
-        let (id, bound) = self.next_prepare(ix, rooted, max)?;
-        let Some(bound) = bound else {
+        let id = self.peek_live()?;
+        let Some((views_bytes, max_realloc)) =
+            self.next_scratch_bound(id, rooted.is_some(), max, max.capacity())
+        else {
             out.data_overflow();
             self.interrupted = true;
             return None;
         };
-        if !out.admit_dl(bound) {
+        let Some(scratch) = views_bytes.checked_add(max_realloc) else {
+            out.data_overflow();
+            self.interrupted = true;
+            return None;
+        };
+        let mut scratch_guard = super::saturate::Guard::new(out);
+        if scratch > 0 && !scratch_guard.admit_add(scratch) {
+            self.interrupted = true;
+            return None;
+        }
+        let Some(bound) = self.next_prepare_id(ix, rooted, id, max) else {
+            scratch_guard.data_overflow();
+            self.interrupted = true;
+            return None;
+        };
+        // `views` dropped inside `maximal_rooted`; keep only `max` growth while admitting.
+        scratch_guard.release_to(max_realloc);
+        if !scratch_guard.admit_dl(bound) {
             self.interrupted = true;
             return None;
         }
         let delta = self.next_commit(ix, rooted, id, max);
-        out.commit_dl(bound, delta);
+        scratch_guard.commit_dl(bound, delta);
         Some(id)
     }
 
@@ -1805,11 +2147,23 @@ impl Store {
 /// The processed clauses of a rooted run's store by the terms of their maximal literals,
 /// which the Eq rule reads: every clause by each term of a maximal literal, a constant
 /// inside `f(u)` included, and the clauses with a maximal equality by each of its terms.
-#[derive(Clone)]
 pub struct ByTerm {
     pub any: FxHashMap<RTerm, Vec<u32>>,
     pub eqs: FxHashMap<RTerm, Vec<u32>>,
     owned_bytes: usize,
+}
+
+impl Clone for ByTerm {
+    fn clone(&self) -> ByTerm {
+        let any = self.any.clone();
+        let eqs = self.eqs.clone();
+        let owned_bytes = std::mem::size_of::<ByTerm>() + map_vec_bytes(&any) + map_vec_bytes(&eqs);
+        ByTerm {
+            any,
+            eqs,
+            owned_bytes,
+        }
+    }
 }
 
 impl Default for ByTerm {
@@ -1823,6 +2177,10 @@ impl Default for ByTerm {
 }
 
 impl ByTerm {
+    fn scan_bytes(&self) -> usize {
+        std::mem::size_of::<ByTerm>() + map_vec_bytes(&self.any) + map_vec_bytes(&self.eqs)
+    }
+
     #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.owned_bytes

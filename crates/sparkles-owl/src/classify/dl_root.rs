@@ -48,17 +48,17 @@
 //! The at-most restrictions and the qualified roles of counting are not read in the root.
 
 use super::dl_clause::{
-    Clause, Lit, Made, RTerm, Rooted, XL, XLit, hash_table_bytes, map_vec_bytes,
-    map_vec_push_bound, map_vec_push_dedup, set_insert_bound, set_insert_delta, terms_of,
-    vec_grow_bound, vec_push_delta,
+    Clause, Lit, Made, RTerm, Rooted, XL, XLit, admit_lit, hash_table_bytes, hash_table_grow_bound,
+    map_vec_bytes, map_vec_push_bound, map_vec_push_dedup, next_vec_cap, set_insert_bound,
+    set_insert_delta, terms_of, vec_grow_bound, vec_push_delta,
 };
 use super::dl_rules::{
     DlIx, DlSt, Found, MREPAIR_CF, MREPAIR_HOLDER, MREPAIR_NO_REPLAY, MREPAIR_NO_RETURN,
-    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, RECORD_SLACK, Side, WORK_READS, alls, dix, dl, drain,
-    drain_with, ds, ds_admit, merge, pred_id, restricted, side, unit, with,
+    MREPAIR_ON, MREPAIR_UNITS, MREPAIR_WIDE, RECORD_SLACK, RootDerive, Side, WORK_READS, alls, dix,
+    dl, drain, drain_with, ds, ds_admit, merge, pred_id, restricted, side, unit, with,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
-use super::saturate::{Concl, Sink, State};
+use super::saturate::{Concl, DlGuard, Guard, Sink, State};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// What a context of a rooted run keeps for the rules at the constants and over `f_e(u)`.
@@ -253,27 +253,35 @@ fn atom<S: Sink>(ix: &Index, out: &S, a: Ex, u: u32) -> Lit {
     }
 }
 
-/// The literal of `l`, pre-admitting any `Lits` growth against `out`.
-#[inline]
-fn lit_admitted<S: Sink>(ix: &Index, out: &mut S, l: XLit) -> Option<Made> {
-    let inv = inv_of(ix, dix(ix));
-    match out.dl().lits.lit_prepare(l, inv) {
-        Ok(m) => Some(m),
-        Err(None) => {
-            out.data_overflow();
-            None
-        }
-        Err(Some(need)) => {
-            if need > 0 && !out.admit_dl(need) {
-                return None;
-            }
-            let made = out.dl().lits.lit(l, inv);
-            if need > 0 {
-                out.commit_dl(need, 0);
-            }
-            Some(made)
+/// Upper bound on peak growth when pushing one `u32` under each distinct key in `keys`.
+fn map_vec_push_keys_bound<K: Eq + std::hash::Hash>(
+    m: &FxHashMap<K, Vec<u32>>,
+    keys: &[K],
+) -> Option<usize> {
+    let new_vec =
+        next_vec_cap(0, std::mem::size_of::<u32>())?.checked_mul(std::mem::size_of::<u32>())?;
+    let mut bound = 0usize;
+    let mut new_keys = 0usize;
+    for k in keys {
+        if let Some(v) = m.get(k) {
+            bound = bound.checked_add(vec_grow_bound(v)?)?;
+        } else {
+            new_keys += 1;
+            bound = bound.checked_add(new_vec)?;
         }
     }
+    bound.checked_add(hash_table_grow_bound(
+        m.len(),
+        m.capacity(),
+        new_keys,
+        std::mem::size_of::<(K, Vec<u32>)>(),
+    )?)
+}
+
+/// The literal of `l`, pre-admitting and revalidating any `Lits` growth against `out`.
+#[inline]
+fn lit_admitted<S: Sink>(ix: &Index, out: &mut S, l: XLit) -> Option<Made> {
+    admit_lit(l, inv_of(ix, dix(ix)), out)
 }
 
 /// The literal of a ground atom `a(u)`, pre-admitting any `Lits` growth against `out`.
@@ -309,6 +317,17 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
     let dx = dix(ix);
     let top_h = ix.head(TOP);
     let trace = super::dl_rules::tracing();
+    let poll_init = |st: &mut State, out: &mut S| -> bool {
+        st.dl_choices += 1;
+        if st.dl_choices as usize >= INIT_POLL {
+            st.dl_choices = 0;
+            if !out.go_on() {
+                ds(st).store.interrupted = true;
+                return false;
+            }
+        }
+        true
+    };
     let emit = |st: &mut State, head: Vec<Lit>, rule: &'static str, out: &mut S| -> bool {
         if st.bottom {
             return false;
@@ -329,15 +348,7 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
             ds(st).store.interrupted = true;
             return false;
         }
-        st.dl_choices += 1;
-        if st.dl_choices as usize >= INIT_POLL {
-            st.dl_choices = 0;
-            if !out.go_on() {
-                ds(st).store.interrupted = true;
-                return false;
-            }
-        }
-        true
+        poll_init(st, out)
     };
     for &(u, n) in &dx.consts {
         if st.bottom {
@@ -388,6 +399,8 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
                 if !emit(st, vec![l], "hyperc", out) {
                     return;
                 }
+            } else if !poll_init(st, out) {
+                return;
             }
         }
         if let Some(ids) = dx.by_body.get(&TOP) {
@@ -395,6 +408,9 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
                 let (body, head) = &dx.clauses[cl as usize];
                 // During init no clause has been processed yet, so only `TOP` has a partner.
                 if !body.iter().all(|&a| a == TOP) {
+                    if !poll_init(st, out) {
+                        return;
+                    }
                     continue;
                 }
                 let Some(head_bytes) = head.len().checked_mul(std::mem::size_of::<Lit>()) else {
@@ -402,26 +418,60 @@ pub fn init<S: Sink>(ix: &Index, st: &mut State, out: &mut S) {
                     ds(st).store.interrupted = true;
                     return;
                 };
-                if head_bytes > 0 && !out.admit_data(head_bytes) {
+                let mut head_guard = DlGuard::new(out);
+                if head_bytes > 0 && !head_guard.admit_add(head_bytes) {
                     ds(st).store.interrupted = true;
                     return;
                 }
                 let mut lits = Vec::with_capacity(head.len());
                 for &a in head.iter() {
-                    let Some(l) = atom_admitted(ix, out, a, u) else {
-                        if head_bytes > 0 {
-                            out.release_data(head_bytes);
-                        }
+                    let Some(l) = atom_admitted(ix, &mut head_guard, a, u) else {
                         ds(st).store.interrupted = true;
                         return;
                     };
                     lits.push(l);
+                    st.dl_choices += 1;
+                    if st.dl_choices as usize >= INIT_POLL {
+                        st.dl_choices = 0;
+                        if !head_guard.go_on() {
+                            ds(st).store.interrupted = true;
+                            return;
+                        }
+                    }
                 }
-                let ok = emit(st, lits, "hyperc", out);
-                if head_bytes > 0 {
-                    out.release_data(head_bytes);
+                if st.bottom {
+                    return;
                 }
-                if !ok {
+                if head_guard.stopped() {
+                    ds(st).store.interrupted = true;
+                    return;
+                }
+                if trace {
+                    let dl_lits = &head_guard.dl().lits;
+                    eprintln!(
+                        "TR R hyperc [] -> {}",
+                        super::dl_rules::tr(ix, dl_lits, &lits)
+                    );
+                }
+                let consumed = derive_covered(
+                    ix,
+                    st,
+                    (Vec::new(), lits),
+                    head_guard.bytes(),
+                    &mut head_guard,
+                );
+                if consumed {
+                    let _ = head_guard.take();
+                }
+                drop(head_guard);
+                if st.bottom {
+                    return;
+                }
+                if out.stopped() {
+                    ds(st).store.interrupted = true;
+                    return;
+                }
+                if !poll_init(st, out) {
                     return;
                 }
             }
@@ -435,6 +485,7 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
     let dx = dix(ix);
     let inv = inv_of(ix, dx);
     let mut n = 0;
+    let mut max_guard = Guard::new(out);
     let mut max: Vec<Lit> = Vec::new();
     while n < budget {
         if st.bottom {
@@ -443,48 +494,70 @@ pub fn flush<S: Sink>(ix: &Index, st: &mut State, out: &mut S, budget: usize) ->
         let Some(x) = st.extra.as_mut().and_then(|x| x.dl.as_deref_mut()) else {
             break;
         };
-        let ground_total = super::dl_clause::ground_total();
-        let prep = {
-            let o = Rooted {
-                ix,
-                lits: &out.dl().lits,
-                inv: &inv,
-                ground_total,
-            };
-            x.store.next_prepare(ix, Some(&o), &mut max)
-        };
-        let Some((id, bound)) = prep else {
+        let Some(id) = x.store.peek_live() else {
             break;
         };
-        let Some(bound) = bound else {
-            out.data_overflow();
+        let Some((views_bytes, max_realloc)) =
+            x.store.next_scratch_bound(id, true, &max, max.capacity())
+        else {
+            max_guard.data_overflow();
             x.store.interrupted = true;
             break;
         };
-        if !out.admit_dl(bound) {
+        let max_live = max.capacity() * std::mem::size_of::<Lit>();
+        let Some(scratch_peak) = max_live
+            .checked_add(max_realloc)
+            .and_then(|b| b.checked_add(views_bytes))
+        else {
+            max_guard.data_overflow();
+            x.store.interrupted = true;
+            break;
+        };
+        if !max_guard.ensure_admitted(scratch_peak) {
+            x.store.interrupted = true;
+            break;
+        }
+        let ground_total = super::dl_clause::ground_total();
+        let bound = {
+            let o = Rooted {
+                ix,
+                lits: &max_guard.dl().lits,
+                inv: &inv,
+                ground_total,
+            };
+            x.store.next_prepare_id(ix, Some(&o), id, &mut max)
+        };
+        max_guard.release_to(max.capacity() * std::mem::size_of::<Lit>());
+        let Some(bound) = bound else {
+            max_guard.data_overflow();
+            x.store.interrupted = true;
+            break;
+        };
+        if !max_guard.admit_dl(bound) {
             x.store.interrupted = true;
             break;
         }
         let delta = {
             let o = Rooted {
                 ix,
-                lits: &out.dl().lits,
+                lits: &max_guard.dl().lits,
                 inv: &inv,
                 ground_total,
             };
             x.store.next_commit(ix, Some(&o), id, &max)
         };
-        out.commit_dl(bound, delta);
-        index_consts(ix, x, &max, id, out);
-        if out.stopped() {
+        max_guard.commit_dl(bound, delta);
+        index_consts(ix, x, &max, id, &mut max_guard);
+        if max_guard.stopped() {
+            x.store.interrupted = true;
             break;
         }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
-        process(ix, st, &c, &max, out);
-        offer(ix, st, id, &c, out);
-        m_offer(ix, st, id, &c, out);
-        if out.stopped() {
+        process(ix, st, &c, &max, &mut max_guard);
+        offer(ix, st, id, &c, &mut max_guard);
+        m_offer(ix, st, id, &c, &mut max_guard);
+        if max_guard.stopped() {
             break;
         }
     }
@@ -561,7 +634,7 @@ fn process<S: Sink>(ix: &Index, st: &mut State, c: &Clause, max: &[Lit], out: &m
         }
         at_consts(ix, me, st, l, v, &prem, &mut found, out, false);
     }
-    drain_with(ix, st, found, out, derive);
+    drain_with(ix, st, found, out, &RootDerive);
 }
 
 /// The rules at the constants on a new premise `prem` of the context `me` whose maximal
@@ -994,9 +1067,22 @@ fn on_role<S: Sink>(
 /// Adds a clause the root's rules derived: the empty clause makes the root unsatisfiable,
 /// and any other clause goes to the store unless it is redundant. The root has no units
 /// over x, so even a unit is stored.
-pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): Side, out: &mut S) {
+pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, side: Side, out: &mut S) {
+    let _ = derive_covered(ix, st, side, 0, out);
+}
+
+/// [`derive`], carrying `covered_payload` bytes of an active [`Sink::admit_dl`] reservation
+/// for the source literal buffer into the store. Returns `true` when `covered_payload` was
+/// settled by `commit_dl`.
+fn derive_covered<S: Sink>(
+    ix: &Index,
+    st: &mut State,
+    (mut body, mut head): Side,
+    covered_payload: usize,
+    out: &mut S,
+) -> bool {
     if st.bottom {
-        return;
+        return false;
     }
     out.worked(1);
     let inv = inv_of(ix, dix(ix));
@@ -1012,7 +1098,7 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
         _ => true,
     });
     if holds {
-        return;
+        return false;
     }
     body.sort_unstable();
     body.dedup();
@@ -1020,14 +1106,18 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
     head.dedup();
     // Γ ∧ A → Δ ∨ A and Γ → Δ ∨ s ≈ t ∨ s ≉ t
     if head.iter().any(|l| body.binary_search(l).is_ok()) || lits.complementary(&head, inv) {
-        return;
+        return false;
     }
     if body.is_empty() && head.is_empty() {
         out.me(Concl::Sub(BOTTOM));
-        return;
+        return false;
     }
     if let Some(x) = ds_admit(st, out) {
-        let _ = x.store.add_admitted(Clause::new(body, head), out);
+        x.store
+            .add_parts_admitted_covered(body, head, covered_payload, out)
+            .1
+    } else {
+        false
     }
 }
 
@@ -1207,7 +1297,7 @@ pub fn rfact<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool
     found.root = true;
     found.rule = "rfact";
     found.push((Vec::new(), c.head().to_vec()));
-    drain_with(ix, st, found, out, derive);
+    drain_with(ix, st, found, out, &RootDerive);
     true
 }
 
@@ -1233,34 +1323,39 @@ fn register<S: Sink>(st: &mut State, v: Ex, mut us: Vec<u32>, out: &mut S) -> bo
     let mut new = Vec::new();
     let pairs = out.dl().mrepair & (MREPAIR_ON | MREPAIR_WIDE) == MREPAIR_ON;
     for &u in &us {
-        match RootSt::ins_admit(&mut r.edge_set, (v, u), out) {
-            Some(true) => {
-                if !RootSt::push_admit(&mut r.edges, u, v, out) {
-                    x.store.interrupted = true;
-                    return false;
-                }
-                // a context the root reaches already takes its markers below, so only one
-                // that it does not reach yet waits for its reach
-                if pairs {
-                    if !mrep_admit(r, out) {
-                        x.store.interrupted = true;
-                        return false;
-                    }
-                    if !r.mr().reach_set.contains(&v)
-                        && !RootSt::push_admit(&mut r.mw().regs, v, u, out)
-                    {
-                        x.store.interrupted = true;
-                        return false;
-                    }
-                }
-                new.push(u);
-            }
-            Some(false) => {}
-            None => {
-                x.store.interrupted = true;
-                return false;
-            }
+        if r.edge_set.contains(&(v, u)) {
+            continue;
         }
+        if pairs && !mrep_admit(r, out) {
+            x.store.interrupted = true;
+            return false;
+        }
+        let need_reg = pairs && !r.mr().reach_set.contains(&v);
+        let Some(bound) = (|| {
+            let mut b = set_insert_bound(&r.edge_set, &(v, u))?;
+            b = b.checked_add(map_vec_push_bound(&r.edges, &u)?)?;
+            if need_reg {
+                b = b.checked_add(map_vec_push_bound(&r.mr().regs, &v)?)?;
+            }
+            Some(b)
+        })() else {
+            out.data_overflow();
+            x.store.interrupted = true;
+            return false;
+        };
+        if bound > 0 && !out.admit_dl(bound) {
+            x.store.interrupted = true;
+            return false;
+        }
+        let mut delta = set_insert_delta(&mut r.edge_set, (v, u)).unwrap_or(0)
+            + map_vec_push_dedup(&mut r.edges, u, v);
+        if need_reg {
+            delta += map_vec_push_dedup(&mut r.mw().regs, v, u);
+        }
+        if bound > 0 {
+            out.commit_dl(bound, delta);
+        }
+        new.push(u);
     }
     if new.is_empty() {
         return false;
@@ -1920,20 +2015,18 @@ fn m_flush<S: Sink>(ix: &Index, st: &mut State, batch: &mut Found, out: &mut S) 
         ds(st).store.interrupted = true;
         return false;
     };
+    let mut guard = Guard::new(out);
     let go = if need > 0 {
-        out.reserve_data(need)
+        guard.reserve_add(need)
     } else {
-        out.go_on()
+        guard.go_on()
     };
     if !go {
         ds(st).store.interrupted = true;
         return false;
     }
     let was = ds(st).store.interrupted;
-    super::dl_rules::drain_covered(ix, st, b, out, true, slack);
-    if need > 0 {
-        out.release_data(need);
-    }
+    super::dl_rules::drain_covered(ix, st, b, &mut guard, true, slack);
     was || !ds(st).store.interrupted
 }
 
@@ -1973,9 +2066,21 @@ pub fn rreach<S: Sink>(ix: &Index, me: Ex, st: &mut State, e: Ex, out: &mut S) -
             return true;
         }
         // the registrations that waited for the reach are replayed once, and the ones
-        // that come later go to the context as they come ([`register`])
-        let us = r.mw().regs.remove(&e).unwrap_or_default();
+        // that come later go to the context as they come ([`register`]). Empty the slot in
+        // place instead of removing the key so `regs` stays append-only with no hashbrown
+        // tombstones, and credit the freed vector's capacity after replay.
+        let us = r
+            .mw()
+            .regs
+            .get_mut(&e)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let freed = us.capacity() * std::mem::size_of::<u32>();
         m_registered(x, e, &us, out);
+        drop(us);
+        if freed > 0 {
+            out.credit_dl(freed);
+        }
         return true;
     }
     let Some(x) = ds_admit(st, out) else {
@@ -2062,17 +2167,6 @@ impl Scan {
     fn end<S: Sink>(self, out: &mut S) {
         out.worked(self.0 % M_SCAN / WORK_READS);
     }
-}
-
-/// Admits `bytes` of a handler's scratch before the handler builds it, false when the run
-/// refused them, which marks the store `x` interrupted. The caller releases `bytes` only
-/// when `m_admit` returns `true` ([`Sink::reserve_data`]).
-fn m_admit<S: Sink>(x: &mut DlSt, bytes: usize, out: &mut S) -> bool {
-    if out.reserve_data(bytes) {
-        return true;
-    }
-    x.store.interrupted = true;
-    false
 }
 
 /// The repair's sends poll the run's bounds after every [`M_POLL`] of them, as a rule whose
@@ -2175,73 +2269,85 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         x.store.interrupted = true;
         return false;
     }
-    match RootSt::ins_admit(&mut r.mw().hold_set, (h, l), out) {
-        Some(true) => {}
-        Some(false) => return false,
-        None => {
-            x.store.interrupted = true;
-            return false;
-        }
+    if r.mr().hold_set.contains(&(h, l)) {
+        return false;
     }
-    out.dl().mcount[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let first = !r.mr().holders.contains_key(&l);
-    if !RootSt::push_admit(&mut r.mw().holders, l, h, out) {
+    let Some(bound) = (|| {
+        let mut b = set_insert_bound(&r.mr().hold_set, &(h, l))?;
+        b = b.checked_add(map_vec_push_bound(&r.mr().holders, &l)?)?;
+        if first {
+            b = b.checked_add(map_vec_push_keys_bound(&r.mr().held_at, &us)?)?;
+        }
+        Some(b)
+    })() else {
+        out.data_overflow();
         x.store.interrupted = true;
-        return true;
+        return false;
+    };
+    if bound > 0 && !out.admit_dl(bound) {
+        x.store.interrupted = true;
+        return false;
     }
+    let mut delta = set_insert_delta(&mut r.mw().hold_set, (h, l)).unwrap_or(0)
+        + map_vec_push_dedup(&mut r.mw().holders, l, h);
     if first {
         for &u in &us {
-            if !RootSt::push_admit(&mut r.mw().held_at, u, xid, out) {
-                x.store.interrupted = true;
-                return true;
-            }
+            delta += map_vec_push_dedup(&mut r.mw().held_at, u, xid);
         }
     }
+    if bound > 0 {
+        out.commit_dl(bound, delta);
+    }
+    out.dl().mcount[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let unit = mode & MREPAIR_UNITS == 0 && root_unit(x, l);
     if !unit {
         // the destinations, admitted before they are listed
         let r = x.root.as_deref().expect("made above");
         let n: usize = us.iter().map(|u| r.edges.get(u).map_or(0, Vec::len)).sum();
         let bytes = n * std::mem::size_of::<Ex>();
-        if !m_admit(x, bytes, out) {
-            return true;
-        }
-        // the registrations are read as a scan, charged and polled, and the destinations
-        // are built in the capacity admitted for them
-        let r = x.root.as_deref_mut().expect("made above");
-        let mut scan = Scan(0);
-        let mut to: Vec<Ex> = Vec::with_capacity(n);
         let mut cut = false;
-        'scan: for u in &us {
-            for &d in r.edges.get(u).into_iter().flatten() {
-                if !scan.read(1, out) {
-                    cut = true;
-                    break 'scan;
+        {
+            let mut guard = Guard::new(out);
+            if !guard.reserve_add(bytes) {
+                x.store.interrupted = true;
+                return true;
+            }
+            // the registrations are read as a scan, charged and polled, and the destinations
+            // are built in the capacity admitted for them
+            let r = x.root.as_deref_mut().expect("made above");
+            let mut scan = Scan(0);
+            let mut to: Vec<Ex> = Vec::with_capacity(n);
+            'scan: for u in &us {
+                for &d in r.edges.get(u).into_iter().flatten() {
+                    if !scan.read(1, &mut guard) {
+                        cut = true;
+                        break 'scan;
+                    }
+                    if d != root
+                        && (d != h || mode & MREPAIR_HOLDER != 0)
+                        && (mode & MREPAIR_WIDE != 0 || r.mr().reach_set.contains(&d))
+                    {
+                        to.push(d);
+                    }
                 }
-                if d != root
-                    && (d != h || mode & MREPAIR_HOLDER != 0)
-                    && (mode & MREPAIR_WIDE != 0 || r.mr().reach_set.contains(&d))
-                {
-                    to.push(d);
+            }
+            scan.end(&mut guard);
+            if !cut {
+                to.sort_unstable();
+                to.dedup();
+                for (k, d) in to.into_iter().enumerate() {
+                    if k > 0 && k.is_multiple_of(M_POLL) && !guard.sent_go_on() {
+                        cut = true;
+                        break;
+                    }
+                    if !m_fwd(r, d, l, &mut guard) {
+                        cut = true;
+                        break;
+                    }
                 }
             }
         }
-        scan.end(out);
-        if !cut {
-            to.sort_unstable();
-            to.dedup();
-            for (k, d) in to.into_iter().enumerate() {
-                if k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on() {
-                    cut = true;
-                    break;
-                }
-                if !m_fwd(r, d, l, out) {
-                    cut = true;
-                    break;
-                }
-            }
-        }
-        out.release_data(bytes);
         if cut {
             x.store.interrupted = true;
             return true;
@@ -2258,7 +2364,9 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         .and_then(|r| r.mr().gbody.get(&l))
         .map_or(0, Vec::len);
     let bytes = g * 4;
-    if !m_admit(x, bytes, out) {
+    let mut guard = Guard::new(out);
+    if !guard.reserve_add(bytes) {
+        x.store.interrupted = true;
         return true;
     }
     let r = x.root.as_deref().expect("made above");
@@ -2269,7 +2377,7 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
         let mut all = true;
         for &m in x.store.clauses[i as usize].c.body() {
             // each body literal checked is a read
-            if !scan.read(1, out) {
+            if !scan.read(1, &mut guard) {
                 cut = true;
                 break 'scan;
             }
@@ -2282,21 +2390,20 @@ pub fn rmark<S: Sink>(ix: &Index, st: &mut State, h: Ex, xid: u32, out: &mut S) 
             ids.push(i);
         }
     }
-    scan.end(out);
+    scan.end(&mut guard);
     if cut {
         x.store.interrupted = true;
         ids.clear();
     }
     for (k, i) in ids.into_iter().enumerate() {
-        if !m_poll(k, st, out) {
+        if !m_poll(k, st, &mut guard) {
             break;
         }
-        let cid = ret_id(ds(st), i, out);
-        out.send(h, Concl::RRet(cid));
-        out.worked(1);
-        out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let cid = ret_id(ds(st), i, &mut guard);
+        guard.send(h, Concl::RRet(cid));
+        guard.worked(1);
+        guard.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
-    out.release_data(bytes);
     true
 }
 
@@ -2332,19 +2439,21 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
         return;
     }
     let bytes = n * std::mem::size_of::<(u32, u32)>();
-    if !m_admit(x, bytes, out) {
-        scan.end(out);
+    let mut guard = Guard::new(out);
+    if !guard.reserve_add(bytes) {
+        scan.end(&mut guard);
+        x.store.interrupted = true;
         return;
     }
     let r = x.root.as_deref().expect("read above");
     let mut ls: Vec<(u32, u32)> = Vec::with_capacity(n);
     'list: for &u in new {
-        if !scan.read(1, out) {
+        if !scan.read(1, &mut guard) {
             cut = true;
             break;
         }
         for &i in r.mr().held_at.get(&u).into_iter().flatten() {
-            if !scan.read(1, out) {
+            if !scan.read(1, &mut guard) {
                 cut = true;
                 break 'list;
             }
@@ -2357,7 +2466,7 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
     ls.sort_unstable();
     ls.dedup_by_key(|p| p.0);
     for (k, (i, _)) in ls.into_iter().enumerate() {
-        if (k > 0 && k.is_multiple_of(M_POLL) && !out.sent_go_on()) || !scan.read(1, out) {
+        if (k > 0 && k.is_multiple_of(M_POLL) && !guard.sent_go_on()) || !scan.read(1, &mut guard) {
             cut = true;
             break;
         }
@@ -2369,13 +2478,12 @@ fn m_registered<S: Sink>(x: &mut DlSt, v: Ex, new: &[u32], out: &mut S) {
         if !held || (mode & MREPAIR_UNITS == 0 && root_unit(x, l)) {
             continue;
         }
-        if !m_fwd(x.root.as_deref_mut().expect("read above"), v, l, out) {
+        if !m_fwd(x.root.as_deref_mut().expect("read above"), v, l, &mut guard) {
             cut = true;
             break;
         }
     }
-    scan.end(out);
-    out.release_data(bytes);
+    scan.end(&mut guard);
     if cut {
         x.store.interrupted = true;
     }
@@ -2425,11 +2533,21 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
         x.store.interrupted = true;
         return;
     }
+    let Some(gbody_bound) = map_vec_push_keys_bound(&r.mr().gbody, c.body()) else {
+        out.data_overflow();
+        x.store.interrupted = true;
+        return;
+    };
+    if gbody_bound > 0 && !out.admit_dl(gbody_bound) {
+        x.store.interrupted = true;
+        return;
+    }
+    let mut gbody_delta = 0usize;
     for &l in c.body() {
-        if !RootSt::push_admit(&mut r.mw().gbody, l, id, out) {
-            x.store.interrupted = true;
-            return;
-        }
+        gbody_delta += map_vec_push_dedup(&mut r.mw().gbody, l, id);
+    }
+    if gbody_bound > 0 {
+        out.commit_dl(gbody_bound, gbody_delta);
     }
     // the holders of the body literal with the fewest, admitted before they are listed,
     // and the scan of the others' charged and polled
@@ -2437,7 +2555,9 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
     let first = *c.body().iter().min_by_key(|l| len(l)).expect("a body");
     let cap = len(&first);
     let bytes = cap * std::mem::size_of::<Ex>();
-    if !m_admit(x, bytes, out) {
+    let mut guard = Guard::new(out);
+    if !guard.reserve_add(bytes) {
+        x.store.interrupted = true;
         return;
     }
     let r = x.root.as_deref().expect("made above");
@@ -2448,7 +2568,7 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
         let mut all = true;
         for &m in c.body() {
             // each body literal checked is a read
-            if !scan.read(1, out) {
+            if !scan.read(1, &mut guard) {
                 cut = true;
                 break 'scan;
             }
@@ -2461,23 +2581,22 @@ fn m_offer<S: Sink>(ix: &Index, st: &mut State, id: u32, c: &Clause, out: &mut S
             hs.push(h);
         }
     }
-    scan.end(out);
+    scan.end(&mut guard);
     if cut {
         x.store.interrupted = true;
         hs.clear();
     }
     if !hs.is_empty() {
-        let cid = ret_id(x, id, out);
+        let cid = ret_id(x, id, &mut guard);
         for (k, h) in hs.into_iter().enumerate() {
-            if !m_poll(k, st, out) {
+            if !m_poll(k, st, &mut guard) {
                 break;
             }
-            out.send(h, Concl::RRet(cid));
-            out.worked(1);
-            out.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            guard.send(h, Concl::RRet(cid));
+            guard.worked(1);
+            guard.dl().mcount[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    out.release_data(bytes);
 }
 
 /// A context other than the root takes a clause the root returned (M-return), once: each
@@ -2498,24 +2617,39 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
         x.store.interrupted = true;
         return false;
     };
-    match RootSt::ins_admit(&mut r.seen, cid, out) {
-        Some(true) => {}
-        Some(false) => return false,
-        None => {
-            x.store.interrupted = true;
-            return false;
-        }
-    }
-    if !mrep_admit(r, out) {
-        x.store.interrupted = true;
-        return true;
+    if r.seen.contains(&cid) {
+        return false;
     }
     let c = out.dl().table.get(cid).clone();
-    for &l in c.body() {
-        if !RootSt::push_admit(&mut r.mw().rets, l, cid, out) {
-            x.store.interrupted = true;
-            return true;
+    let Some(bound) = (|| {
+        let mut b = set_insert_bound(&r.seen, &cid)?;
+        if let Some(m) = r.m.as_deref() {
+            b = b.checked_add(map_vec_push_keys_bound(&m.rets, c.body())?)?;
+        } else {
+            let empty: FxHashMap<Lit, Vec<u32>> = FxHashMap::default();
+            b = b.checked_add(std::mem::size_of::<MRep>())?;
+            b = b.checked_add(map_vec_push_keys_bound(&empty, c.body())?)?;
         }
+        Some(b)
+    })() else {
+        out.data_overflow();
+        x.store.interrupted = true;
+        return false;
+    };
+    if bound > 0 && !out.admit_dl(bound) {
+        x.store.interrupted = true;
+        return false;
+    }
+    let mut delta = set_insert_delta(&mut r.seen, cid).unwrap_or(0);
+    if r.m.is_none() {
+        r.m = Some(Box::default());
+        delta += std::mem::size_of::<MRep>();
+    }
+    for &l in c.body() {
+        delta += map_vec_push_dedup(&mut r.mw().rets, l, cid);
+    }
+    if bound > 0 {
+        out.commit_dl(bound, delta);
     }
     let mut found = Found::default();
     ret_products(st, &c, None, cf_of(ix, out), &mut found);
@@ -2529,14 +2663,12 @@ pub fn rret<S: Sink>(ix: &Index, st: &mut State, cid: u32, out: &mut S) -> bool 
         ds(st).store.interrupted = true;
         return true;
     }
-    if slack > 0 && !out.reserve_data(slack) {
+    let mut guard = Guard::new(out);
+    if slack > 0 && !guard.reserve_add(slack) {
         ds(st).store.interrupted = true;
         return true;
     }
-    super::dl_rules::drain_covered(ix, st, found, out, false, slack);
-    if slack > 0 {
-        out.release_data(slack);
-    }
+    super::dl_rules::drain_covered(ix, st, found, &mut guard, false, slack);
     true
 }
 
@@ -3499,7 +3631,7 @@ pub(super) mod tests {
             let partners = 100;
             let one = late_replay(mode, 1, partners, true).peak;
             assert!(
-                one > 0 && one < RECORD_SLACK / 4,
+                one > 0 && one < RECORD_SLACK / 2,
                 "mode {mode}: one return {one}"
             );
             let rets = M_POLL - 1;
@@ -3891,10 +4023,15 @@ pub(super) mod tests {
             );
             assert!(!dl(&st).unwrap().store.interrupted, "mode {mode}");
             assert_eq!(out.held, 0, "mode {mode}");
-            assert_eq!(
-                out.peak,
-                held_one + slack_one,
-                "mode {mode}: late replay must reserve held ({held_one}) + slack ({slack_one})"
+            assert!(
+                out.peak >= held_one + slack_one,
+                "mode {mode}: late replay must reserve at least held ({held_one}) + slack ({slack_one}), got {}",
+                out.peak
+            );
+            let fold_unions = out.peak - (held_one + slack_one);
+            assert!(
+                fold_unions > 0,
+                "mode {mode}: fold must also reserve live union payloads beyond slack_covered"
             );
 
             // 2. Budget admitting held_bytes alone but rejecting held_bytes + fold_slack
@@ -3912,7 +4049,8 @@ pub(super) mod tests {
             assert!(dl(&st).unwrap().store.interrupted, "mode {mode}");
             assert_eq!(out.held, 0, "mode {mode}");
 
-            // 3. Multiple products in one batch reserve held_both + max(slack), not sum of slacks.
+            // 3. Multiple products in one batch reserve held_both + max(slack) + single-product
+            // fold union peak (released between products), not sum of slacks.
             let (ix, run, mut st, la, prem) = setup(&[0, 4, 4], true);
             let mut probe2 = Found::default();
             for &cid in &rst(&mut st, &Stops::new(&run)).mr().rets[&la].clone() {
@@ -3929,7 +4067,7 @@ pub(super) mod tests {
             assert_eq!(probe2.fold_slack(), slack_one, "mode {mode}");
             let mut out = Stops::new(&run);
             assert!(m_late(&ix, &mut st, la, &prem, &mut out), "mode {mode}");
-            assert_eq!(out.peak, held_two + slack_one, "mode {mode}");
+            assert_eq!(out.peak, held_two + slack_one + fold_unions, "mode {mode}");
             assert_eq!(out.held, 0, "mode {mode}");
 
             // 4. Empty replay (missing partner list): polls go_on without calling reserve_data.

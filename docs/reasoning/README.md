@@ -644,7 +644,11 @@ about forty times as long under OWL 2 RL, and the witnesses held 574 MiB and 1.7
   and 675.
   `Stats::memory` recounts retained index
   and context storage when saturation ends, using the same estimates for fresh and
-  unchanged reused state. This adds a traversal of the retained tables. The final
+  unchanged reused state. This adds a traversal of the retained tables. Tier D pre-admits
+  clause-store, literal-interner, context-state and product-table growth before allocating
+  and streams rooted initialization through the same bounds, while sizing the discretionary
+  Horn and Tier D memory allowance from logical input size independently of thread count.
+  The final
   estimate can differ from the allowances charged as conclusions arrive, while the
   saturation peak remains in `Stats::peak_memory`. Any final growth past that peak
   must fit the hard budget and the pool before the run returns. These are heap

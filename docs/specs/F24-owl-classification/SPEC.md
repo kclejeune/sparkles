@@ -340,18 +340,44 @@ while others do not. The preparation of an inference, such as the premise lists 
 and their pruning, takes time and memory in proportion to the clauses that the context
 already holds and is not charged while it runs. The redundancy test of each derived
 conclusion against the stored clauses is not counted either, here as in the rest of Tier
-D. Growth of the retained indexes is added to the memory estimate after the allocation.
-The run checks the work bound, the memory budget, the deadline and a cancellation at
+D. The run checks the work bound, the memory budget, the deadline and a cancellation at
 cooperative checkpoints, which come after every 256 choices of a product, after every 64
 sends of a loop and whenever a worker adds its counts of applied conclusions to the run's
-totals. The contract therefore bounds neither the time between two checks by a fixed
-number of reads nor the allocated bytes by the memory budget, which is an estimate. A counting allocator
-measures the heap 6 to 31% above the charged estimate on the three files named below, with the
-repair on or off, and item 1291 follows that difference.
+totals. Earlier builds added retained index growth to the memory estimate only after
+allocation, buffered rooted initialization into one uncharged `Found` collection per
+constant, and left non-ground product tables uncharged on the default path, so a counting
+allocator measured the heap 6 to 31% above the charged estimate on the three files named
+below and 1.04 GB above the 1 GiB budget on `ore_ont_8480`.
+
+Item 1291 closes those gaps across Tier D. Root initialization streams directly through
+`derive` with pre-admitted literal interning and store growth instead of buffering
+constants times `owl:Thing` in `Found`. `Store` tracks exact incremental owned bytes across
+its clause vector, literal slices, queue, predecessor list and index maps, pre-admitting
+clause construction copies, `maximal_rooted` scratch and reallocation or rehash overlap
+before mutating its containers. `DlSt`, `RootSt`, `MRep` and their index maps and vectors
+are pre-admitted before allocation, `MRep::regs` empties replayed slots in place to stay
+append-only and credits freed vectors after replay, and `Lits::lit_admitted` revalidates
+growth bounds under the interner mutex while keeping caller callbacks outside the lock.
+Committed Tier D growth stays inside the saturation's single memory counter so concurrent
+checks never double-count a transfer, and temporary reservations in root initialization,
+product enumeration and marker-repair handlers are guarded against callback unwinds.
+Non-ground `fold` and ground products pre-admit candidate buffers, retained union payloads,
+table rehashes, step-list growth and `prune` scratch, keep drained buffers charged until
+emitted when switching to streaming at 4,096 unions, and account for live union payloads
+when `slack_covered` pre-reserves table slack on M-return. The discretionary Horn and Tier
+D memory allowance now uses a deterministic `.len()`-based logical input size independent
+of thread count while `Limits::max_memory` and `Limits::charge` continue to observe full
+container capacities, and `Saturation::retained_bytes` includes `DlRun::lits`. Counting-allocator
+regression tests cover store mutations, backward subsumption, refusal without growth,
+concurrent literal and ledger boundaries, non-ground and ground products, marker replay,
+unwind cleanup and multi-chunk thread invariance. Remaining estimation boundaries outside
+item 1291 are the upfront 32-slot `Segs` directory, `Table::push` segment allocations,
+un-admitted `Lits::lit` calls outside root initialization, which remain post-counted in
+`DlRun::bytes`, and premise-list preparation and read metering, which remain in item 1280.
 
 A returned clause reserves memory before its products run, both on initial arrival and when a
-late premise replays saved returns. The product of a clause that
-is not ground charges each union that it keeps, as every rule does, but not the table that
+late premise replays saved returns. Before item 1291, the product of a clause that
+is not ground charged each union that it kept, as every rule did, but not the table that
 records its unions nor the spare capacity of each step's list. These grow with the number of
 unions a step makes. With the repair's wide products on g1-051_p0012, at a bound of 400
 million conclusions under a budget of 256 MiB, one product's table reached 504,475 unions
@@ -372,11 +398,9 @@ those files, the return reservation stopped g1-051_p0012 earlier at a heap of 17
 256 MiB, caused no refusal on part022 p01, g1-051_p0121 and g1-051_p0012 at 4 million
 conclusions or on g1-051_p0012 with `SPARKLES_ROOTED_MARKER_REPAIR=129` at 400 million, and
 stopped the default-budget run of 1 GiB at a heap of 256 MB against 1.29 GB without the
-reservation, so that run does not finish under its own budget either way and item 1291
-follows it. The rules of the default
-path leave the same tables uncharged. With the repair off these tables stay at or below
-6.3 KB on these files and at 50 KB on ore_ont_14817 until its Tier D attempt passes its
-bound, and item 1291 covers them.
+reservation, so that run did not finish under its own budget either way. Item 1291 now
+charges those product tables and step lists directly on both default and repair paths, while
+item 1280 replaces the loose upfront bound with a shared meter.
 
 Some steps of the repair and of the rooted rules read between two checks without counting
 what they read. The steps named here are the ones that were measured or reproduced, and

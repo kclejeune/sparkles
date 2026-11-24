@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Tier D pre-admits memory growth and uses a deterministic input allowance
+
+Tier D classification now pre-admits clause-store, literal-interner, context-state and
+product-table growth against the memory budget and reservation callback before allocating,
+streams rooted initialization directly through clause derivation instead of buffering one
+collection across constants and `owl:Thing`, and includes the rooted literal interner in
+retained classification memory (roadmap item 1291). The discretionary memory allowance for
+Horn and Tier D runs now depends on logical input size rather than container capacities, so
+it stays identical across single-threaded and multi-threaded normalization while the hard
+memory budget and caller charge callback continue to observe actual retained capacities.
+
 ### A classification is complete only for the whole ontology
 
 `complete` in a classification answer now means complete for the whole input ontology, as

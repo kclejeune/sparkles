@@ -2935,7 +2935,10 @@ impl Saturation {
         };
         let old_bytes = old_ix.as_ref().map_or(0, |ix| ix.bytes())
             + self.dynamic.as_ref().map_or(0, |d| d.retained_bytes())
-            + self.dl_run.as_ref().map_or(0, |d| d.bytes());
+            + self
+                .dl_run
+                .as_ref()
+                .map_or(0, |d| d.table.bytes() + d.lits.bytes());
         // from here on a stop on the memory budget may be the kept state's, which a run
         // that starts again does not hold, whatever the tier of the kept contexts
         self.reused = kept.is_some();
@@ -3222,15 +3225,6 @@ impl Saturation {
             + dynamic
                 .as_ref()
                 .map_or(0, |d| d.retained_bytes() - d.bytes());
-        // A deterministic logical input-size measure determines the classifier's
-        // discretionary Horn/Tier D memory allowance, independent of thread-count or
-        // allocator container capacities, while `base` continues to charge actual
-        // retained capacities against the caller's memory cap and reservation callback.
-        let allowance_base = self.logical_index_bytes(&ix)
-            + held_bytes
-            + ax.logical_bytes()
-            + roots.len() * 4
-            + self.ctx.len() * std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
         let cancelled = limits.cancelled.clone();
         let cancel_fn = cancelled
             .as_deref()
@@ -3277,6 +3271,15 @@ impl Saturation {
             }
         }
         let max_memory = if horn || disj {
+            // A deterministic logical input-size measure determines the classifier's
+            // discretionary Horn/Tier D memory allowance, independent of thread-count or
+            // allocator container capacities, while `base` continues to charge actual
+            // retained capacities against the caller's memory cap and reservation callback.
+            let allowance_base = self.logical_index_bytes(&ix)
+                + held_bytes
+                + ax.logical_bytes()
+                + roots.len() * 4
+                + self.ctx.len() * std::mem::size_of::<OnceLock<Box<saturate::Ctx>>>();
             let own = HORN_MEMORY_FLOOR.max(allowance_base.saturating_mul(HORN_MEMORY_FACTOR));
             #[cfg(test)]
             LAST_ALLOWANCE.with(|c| c.set((base, allowance_base, own)));

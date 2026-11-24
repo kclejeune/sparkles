@@ -42,7 +42,7 @@ use super::dl_clause::{
     next_vec_cap, set_insert_bound, set_insert_delta, vec_grow_bound, vec_push_delta,
 };
 use super::index::{BOTTOM, Ex, Index, Node, Role, TOP};
-use super::saturate::{Concl, Sink, State, flatten, table_bytes};
+use super::saturate::{Concl, Guard, Sink, State, flatten, table_bytes};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -627,7 +627,7 @@ impl DlRun {
         }
     }
     pub fn bytes(&self) -> usize {
-        self.table.bytes() + self.lits.bytes() + self.stores.load(Ordering::Relaxed)
+        self.table.bytes() + self.lits.unadmitted_bytes() + self.stores.load(Ordering::Relaxed)
     }
     /// Starts another run over the table of the last one, whose kept contexts name its
     /// clauses by id (roadmap item 753). The bytes of the kept contexts' stores count
@@ -641,6 +641,7 @@ impl DlRun {
     /// run can answer in full where a run that starts again falls back.
     pub fn begin_run(&mut self) {
         *self.stores.get_mut() = 0;
+        self.lits.sync_unadmitted_on_begin_run();
         self.carried = self.carried.saturating_add(*self.work.get_mut());
         *self.work.get_mut() = 0;
         *self.work_limit.get_mut() = 0;
@@ -649,6 +650,16 @@ impl DlRun {
     }
     pub(super) fn grow(&self, bytes: usize) {
         self.stores.fetch_add(bytes, Ordering::Relaxed);
+    }
+    pub(super) fn shrink(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self
+            .stores
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |m| {
+                Some(m.saturating_sub(bytes))
+            });
     }
     /// Bounds the conclusions the run derives, which bounds its time where redundant
     /// conclusions keep its memory flat.
@@ -881,8 +892,12 @@ pub fn init_test<S: Sink>(st: &mut State, core: &[Ex], out: &mut S) {
     out.me(Concl::Sub(TOP));
     for &m in core {
         if m & NEG != 0 {
-            if let Some(x) = ds_admit(st, out) {
-                let _ = vec_push_admit(&mut x.neg, m & !NEG, out);
+            let Some(x) = ds_admit(st, out) else {
+                return;
+            };
+            if !vec_push_admit(&mut x.neg, m & !NEG, out) {
+                mark_interrupted(st);
+                return;
             }
         } else {
             out.me(Concl::Sub(m));
@@ -1777,8 +1792,38 @@ fn step_slack(unions: usize, listed: usize) -> usize {
 /// bounded run does not build a wide product's steps unbounded. Each step's sets are charged to
 /// the memory budget as they grow, and what a step drops is released when it ends. The
 /// answer is whether the run goes on.
+/// Target callback for [`drain`] / [`fold`], polymorphic over any [`Sink`] so internal RAII
+/// reservation [`Guard`] wrappers pass through without locking the closure to one sink type.
+pub(super) trait Deriver {
+    fn derive<S: Sink>(&self, ix: &Index, st: &mut State, s: Side, out: &mut S);
+}
+
+struct ContextDerive;
+impl Deriver for ContextDerive {
+    #[inline]
+    fn derive<S: Sink>(&self, ix: &Index, st: &mut State, s: Side, out: &mut S) {
+        derive(ix, st, s, out);
+    }
+}
+
+pub(super) struct RootDerive;
+impl Deriver for RootDerive {
+    #[inline]
+    fn derive<S: Sink>(&self, ix: &Index, st: &mut State, s: Side, out: &mut S) {
+        super::dl_root::derive(ix, st, s, out);
+    }
+}
+
+#[cfg(test)]
+pub(super) struct NoopDerive;
+#[cfg(test)]
+impl Deriver for NoopDerive {
+    #[inline]
+    fn derive<S: Sink>(&self, _ix: &Index, _st: &mut State, _s: Side, _out: &mut S) {}
+}
+
 #[allow(clippy::too_many_arguments)]
-fn fold<S: Sink>(
+fn fold<S: Sink, D: Deriver>(
     ix: &Index,
     st: &mut State,
     lists: &[Vec<Side>],
@@ -1788,7 +1833,7 @@ fn fold<S: Sink>(
     trace: bool,
     slack_covered: usize,
     out: &mut S,
-    derive: &impl Fn(&Index, &mut State, Side, &mut S),
+    deriver: &D,
 ) -> bool {
     const SIDE: usize = std::mem::size_of::<Side>();
     const PRUNE_ELEM: usize = std::mem::size_of::<(Side, u64, u64, bool)>();
@@ -1800,35 +1845,17 @@ fn fold<S: Sink>(
     };
     let lits_bytes = |s: &Side| (s.0.capacity() + s.1.capacity()) * std::mem::size_of::<Lit>();
     norm(&mut base);
-    let mut charged = 0usize;
+    // Guard is declared before `acc` (and before every step's `seen`/`next`/`drained`) so
+    // LIFO drop always frees the buffers before releasing their reservation, including on
+    // panic unwind from a caller callback.
+    let mut guard = Guard::new(out);
     let mut acc_lits = lits_bytes(&base);
-    let mut acc: Vec<Side> = vec![base];
-    let stop = |st: &mut State, out: &mut S, charged: usize| {
+    let init_need = SIDE.saturating_add(acc_lits);
+    if !guard.ensure_admitted(init_need) {
         mark_interrupted(st);
-        if charged > 0 {
-            out.release_data(charged);
-        }
-        false
-    };
-    let ensure_reserved = |need: usize, charged: &mut usize, out: &mut S| -> bool {
-        if need <= *charged {
-            return true;
-        }
-        let add = need - *charged;
-        if out.admit_data(add) {
-            *charged += add;
-            true
-        } else {
-            false
-        }
-    };
-    let release_to = |want: usize, charged: &mut usize, out: &mut S| {
-        if *charged > want {
-            let back = *charged - want;
-            *charged -= back;
-            out.release_data(back);
-        }
-    };
+        return false;
+    }
+    let mut acc: Vec<Side> = vec![base];
     let last = lists.len().saturating_sub(1);
     let mut built = 0usize;
     let mut streaming = false;
@@ -1839,22 +1866,66 @@ fn fold<S: Sink>(
         let mut next_lits = 0usize;
         for a in &acc {
             for t in l {
-                if out.stopped() {
-                    return stop(st, out, charged);
+                if guard.stopped() {
+                    mark_interrupted(st);
+                    return false;
                 }
-                let mut s = a.clone();
-                s.0.extend_from_slice(&t.0);
-                s.1.extend_from_slice(&t.1);
+                let Some((cand_b, cand_h, cand_bytes)) = (|| {
+                    let cb = a.0.len().checked_add(t.0.len())?;
+                    let ch = a.1.len().checked_add(t.1.len())?;
+                    let bytes = cb
+                        .checked_add(ch)?
+                        .checked_mul(std::mem::size_of::<Lit>())?;
+                    Some((cb, ch, bytes))
+                })() else {
+                    guard.data_overflow();
+                    mark_interrupted(st);
+                    return false;
+                };
+                let acc_live = acc.capacity() * SIDE + acc_lits;
+                let seen_table = hash_table_bytes(seen.capacity(), SIDE);
+                let next_live = next.capacity() * SIDE + next_lits;
+                let Some(cand_peak) = acc_live
+                    .checked_add(seen_table)
+                    .and_then(|n| n.checked_add(seen_lits))
+                    .and_then(|n| n.checked_add(next_live))
+                    .and_then(|n| n.checked_add(cand_bytes))
+                else {
+                    guard.data_overflow();
+                    mark_interrupted(st);
+                    return false;
+                };
+                let cand_need = if slack_covered == 0 {
+                    cand_peak
+                } else {
+                    let union_cand = (acc.len() + seen.len() + next.len()) * SIDE
+                        + acc_lits
+                        + seen_lits
+                        + next_lits
+                        + cand_bytes;
+                    let slack_cand = cand_peak.saturating_sub(union_cand);
+                    union_cand.saturating_add(slack_cand.saturating_sub(slack_covered))
+                };
+                if !guard.ensure_admitted(cand_need) {
+                    mark_interrupted(st);
+                    return false;
+                }
+                let mut body = Vec::with_capacity(cand_b);
+                body.extend_from_slice(&a.0);
+                body.extend_from_slice(&t.0);
+                let mut head = Vec::with_capacity(cand_h);
+                head.extend_from_slice(&a.1);
+                head.extend_from_slice(&t.1);
+                let mut s = (body, head);
                 norm(&mut s);
                 if !seen.contains(&s) {
                     let s_lits = lits_bytes(&s);
-                    let seen_table = hash_table_bytes(seen.capacity(), SIDE);
-                    let acc_live = acc.capacity() * SIDE + acc_lits;
-                    let next_live = next.capacity() * SIDE + next_lits;
+                    let cloned_lits = (s.0.len() + s.1.len()) * std::mem::size_of::<Lit>();
                     let seen_rehash = if seen.len() >= seen.capacity() {
                         let Some(b) = next_hash_table_bytes(seen.capacity(), SIDE) else {
-                            out.data_overflow();
-                            return stop(st, out, charged);
+                            guard.data_overflow();
+                            mark_interrupted(st);
+                            return false;
                         };
                         b
                     } else {
@@ -1865,82 +1936,115 @@ fn fold<S: Sink>(
                         let Some(b) =
                             next_vec_cap(next.capacity(), SIDE).and_then(|c| c.checked_mul(SIDE))
                         else {
-                            out.data_overflow();
-                            return stop(st, out, charged);
+                            guard.data_overflow();
+                            mark_interrupted(st);
+                            return false;
                         };
                         b
                     } else {
                         0
                     };
-                    // Pre-admit any container growth (including rehash/doubling overlap)
-                    // before allocating. `seen` rehashes before `next` grows, so their
-                    // temporary allocations do not overlap each other. When the caller
-                    // already pre-reserved `fold_slack` (M-return), only charge what
-                    // exceeds `slack_covered`.
-                    if seen_rehash > 0 || next_grow > 0 {
-                        let seen_after = if seen_rehash > 0 {
-                            seen_rehash
-                        } else {
-                            seen_table
-                        };
-                        let during_seen = acc_live
-                            .saturating_add(seen_table)
-                            .saturating_add(seen_rehash)
-                            .saturating_add(seen_lits)
-                            .saturating_add(next_live)
-                            .saturating_add(2 * s_lits);
-                        let during_next = acc_live
-                            .saturating_add(seen_after)
-                            .saturating_add(seen_lits)
-                            .saturating_add(next_live)
-                            .saturating_add(next_grow)
-                            .saturating_add(2 * s_lits);
-                        let peak_total = during_seen.max(during_next);
-                        let peak_need = if slack_covered == 0 {
-                            peak_total
-                        } else {
-                            let union_now = (acc.len() + seen.len() + next.len()) * SIDE
-                                + acc_lits
-                                + seen_lits
-                                + next_lits;
-                            let peak_slack = peak_total.saturating_sub(union_now);
-                            peak_slack.saturating_sub(slack_covered)
-                        };
-                        if peak_need > 0 && !ensure_reserved(peak_need, &mut charged, out) {
-                            return stop(st, out, charged);
-                        }
+                    // Pre-admit both the cloned union payload and any container growth
+                    // (including rehash/doubling overlap) before cloning or inserting, even
+                    // when `seen` and `next` have spare capacity. `seen` rehashes before
+                    // `next` grows, so their temporary table/list buffers do not overlap.
+                    // When the caller already pre-reserved `fold_slack` (M-return), `slack_covered`
+                    // covers table/list spare-capacity slack only, never live union bytes.
+                    let seen_after = if seen_rehash > 0 {
+                        seen_rehash
+                    } else {
+                        seen_table
+                    };
+                    let Some(pair_lits) = s_lits.checked_add(cloned_lits) else {
+                        guard.data_overflow();
+                        mark_interrupted(st);
+                        return false;
+                    };
+                    let Some(during_seen) = acc_live
+                        .checked_add(seen_table)
+                        .and_then(|n| n.checked_add(seen_rehash))
+                        .and_then(|n| n.checked_add(seen_lits))
+                        .and_then(|n| n.checked_add(next_live))
+                        .and_then(|n| n.checked_add(pair_lits))
+                    else {
+                        guard.data_overflow();
+                        mark_interrupted(st);
+                        return false;
+                    };
+                    let Some(during_next) = acc_live
+                        .checked_add(seen_after)
+                        .and_then(|n| n.checked_add(seen_lits))
+                        .and_then(|n| n.checked_add(next_live))
+                        .and_then(|n| n.checked_add(next_grow))
+                        .and_then(|n| n.checked_add(pair_lits))
+                    else {
+                        guard.data_overflow();
+                        mark_interrupted(st);
+                        return false;
+                    };
+                    let peak_total = during_seen.max(during_next);
+                    let peak_need = if slack_covered == 0 {
+                        peak_total
+                    } else {
+                        let union_total = (acc.len() + seen.len() + next.len()) * SIDE
+                            + acc_lits
+                            + seen_lits
+                            + next_lits
+                            + pair_lits;
+                        let peak_slack = peak_total.saturating_sub(union_total);
+                        union_total.saturating_add(peak_slack.saturating_sub(slack_covered))
+                    };
+                    if !guard.ensure_admitted(peak_need) {
+                        mark_interrupted(st);
+                        return false;
                     }
                     let cloned = s.clone();
-                    let cloned_lits = lits_bytes(&cloned);
+                    let actual_cloned_lits = lits_bytes(&cloned);
                     seen.insert(cloned);
-                    seen_lits += cloned_lits;
+                    seen_lits += actual_cloned_lits;
                     if i < last {
                         next.push(s);
                         next_lits += s_lits;
                         built += 1;
                         if built > FOLD_PRUNE {
-                            out.worked(1);
+                            guard.worked(1);
                         }
                     } else if streaming {
-                        emit(ix, st, s, rule, root, trace, out, derive);
+                        emit(ix, st, s, rule, root, trace, &mut guard, deriver);
+                        if guard.stopped() {
+                            mark_interrupted(st);
+                            return false;
+                        }
                     } else if next.len() >= FOLD_PRUNE {
-                        // Switch to streaming before doubling `next` past FOLD_PRUNE:
-                        // emit the buffered unions and `s`, releasing `next`'s charge.
+                        // Switch to streaming before doubling `next` past FOLD_PRUNE: keep
+                        // `drained` charged until every buffered union and `s` have been
+                        // emitted and dropped, halting immediately if the run stops.
                         streaming = true;
                         let drained = std::mem::take(&mut next);
                         next_lits = 0;
+                        for u in drained {
+                            emit(ix, st, u, rule, root, trace, &mut guard, deriver);
+                            if guard.stopped() {
+                                mark_interrupted(st);
+                                return false;
+                            }
+                        }
+                        emit(ix, st, s, rule, root, trace, &mut guard, deriver);
+                        if guard.stopped() {
+                            mark_interrupted(st);
+                            return false;
+                        }
                         let live_after = (acc.capacity() * SIDE + acc_lits)
                             + (hash_table_bytes(seen.capacity(), SIDE) + seen_lits);
                         let want = if slack_covered == 0 {
                             live_after
                         } else {
-                            (acc.len() + seen.len()) * SIDE + acc_lits + seen_lits
+                            let union_after =
+                                (acc.len() + seen.len()) * SIDE + acc_lits + seen_lits;
+                            let slack_after = live_after.saturating_sub(union_after);
+                            union_after.saturating_add(slack_after.saturating_sub(slack_covered))
                         };
-                        release_to(want, &mut charged, out);
-                        for u in drained {
-                            emit(ix, st, u, rule, root, trace, out, derive);
-                        }
-                        emit(ix, st, s, rule, root, trace, out, derive);
+                        guard.release_to(want);
                     } else {
                         next.push(s);
                         next_lits += s_lits;
@@ -1960,40 +2064,38 @@ fn fold<S: Sink>(
                             + seen_lits
                             + next_lits;
                         let slack_now = live_now.saturating_sub(union_now);
-                        union_now + slack_now.saturating_sub(slack_covered)
+                        union_now.saturating_add(slack_now.saturating_sub(slack_covered))
                     };
-                    let go = if want > charged {
-                        ensure_reserved(want, &mut charged, out) && out.go_on()
-                    } else {
-                        out.go_on()
-                    };
+                    let go = guard.ensure_admitted(want) && guard.go_on();
                     if !go {
-                        return stop(st, out, charged);
+                        mark_interrupted(st);
+                        return false;
                     }
                 }
             }
         }
         drop(seen);
-        // Reserve `prune`'s temporary `keep` buffer before running `prune(&mut next)`.
+        // Reserve `prune`'s temporary scratch before running `prune(&mut next)`: stable
+        // `sort_by_key` uses up to `next.len() * SIDE` bytes and frees it before `keep`
+        // allocates `next.len() * PRUNE_ELEM` bytes.
         if next.len() >= 2 && next.len() <= FOLD_PRUNE {
+            let sort_bytes = next.len().saturating_mul(SIDE);
             let keep_bytes = next.len().saturating_mul(PRUNE_ELEM);
+            let prune_scratch = sort_bytes.max(keep_bytes);
             let live_before_prune =
                 (acc.capacity() * SIDE + acc_lits) + (next.capacity() * SIDE + next_lits);
             let need_prune = if slack_covered == 0 {
-                live_before_prune.saturating_add(keep_bytes)
+                live_before_prune.saturating_add(prune_scratch)
             } else {
                 let union_now = (acc.len() + next.len()) * SIDE + acc_lits + next_lits;
                 let extra = live_before_prune
                     .saturating_sub(union_now)
-                    .saturating_add(keep_bytes);
-                if extra > slack_covered {
-                    union_now.saturating_add(extra - slack_covered)
-                } else {
-                    0
-                }
+                    .saturating_add(prune_scratch);
+                union_now.saturating_add(extra.saturating_sub(slack_covered))
             };
-            if need_prune > 0 && !ensure_reserved(need_prune, &mut charged, out) {
-                return stop(st, out, charged);
+            if !guard.ensure_admitted(need_prune) {
+                mark_interrupted(st);
+                return false;
             }
             prune(&mut next);
         }
@@ -2005,33 +2107,36 @@ fn fold<S: Sink>(
         } else {
             let union_now = acc.len() * SIDE + acc_lits;
             let slack_now = live.saturating_sub(union_now);
-            union_now + slack_now.saturating_sub(slack_covered)
+            union_now.saturating_add(slack_now.saturating_sub(slack_covered))
         };
-        release_to(want, &mut charged, out);
-        if want.saturating_sub(charged) >= RECORD_SLACK && !ensure_reserved(want, &mut charged, out)
-        {
-            return stop(st, out, charged);
+        guard.release_to(want);
+        if want.saturating_sub(guard.bytes()) >= RECORD_SLACK && !guard.ensure_admitted(want) {
+            mark_interrupted(st);
+            return false;
         }
     }
     for s in acc {
-        emit(ix, st, s, rule, root, trace, out, derive);
+        emit(ix, st, s, rule, root, trace, &mut guard, deriver);
+        if guard.stopped() {
+            mark_interrupted(st);
+            return false;
+        }
         st.dl_choices += 1;
         if st.dl_choices as usize >= PRODUCT_POLL {
             st.dl_choices = 0;
-            if !out.go_on() {
-                return stop(st, out, charged);
+            if !guard.go_on() {
+                mark_interrupted(st);
+                return false;
             }
         }
     }
-    if charged > 0 {
-        out.release_data(charged);
-    }
+    // `acc` has been consumed and dropped; `guard` drops here and releases its reservation.
     true
 }
 
 /// Derives one conclusion of [`fold`], with its line of the derivation trace.
 #[allow(clippy::too_many_arguments)]
-fn emit<S: Sink>(
+fn emit<S: Sink, D: Deriver>(
     ix: &Index,
     st: &mut State,
     s: Side,
@@ -2039,7 +2144,7 @@ fn emit<S: Sink>(
     root: bool,
     trace: bool,
     out: &mut S,
-    derive: &impl Fn(&Index, &mut State, Side, &mut S),
+    deriver: &D,
 ) {
     if trace {
         let lits = &out.dl().lits;
@@ -2050,7 +2155,7 @@ fn emit<S: Sink>(
             tr(ix, lits, &s.1)
         );
     }
-    derive(ix, st, s, out);
+    deriver.derive(ix, st, s, out);
 }
 
 /// Derives what the rules found: the single conclusions, then each product's choices in
@@ -2060,7 +2165,7 @@ fn emit<S: Sink>(
 /// and marks the context's store interrupted, a store made for the mark if the context has
 /// none, so that the dependency record of a partial answer counts the context as open.
 pub(super) fn drain<S: Sink>(ix: &Index, st: &mut State, found: Found, out: &mut S) {
-    drain_with_covered(ix, st, found, out, derive, false, 0);
+    drain_with_covered(ix, st, found, out, &ContextDerive, false, 0);
 }
 
 /// [`drain`], when the caller has already reserved `held` and/or `slack_covered` bytes
@@ -2073,29 +2178,37 @@ pub(super) fn drain_covered<S: Sink>(
     held_covered: bool,
     slack_covered: usize,
 ) {
-    drain_with_covered(ix, st, found, out, derive, held_covered, slack_covered);
+    drain_with_covered(
+        ix,
+        st,
+        found,
+        out,
+        &ContextDerive,
+        held_covered,
+        slack_covered,
+    );
 }
 
-/// [`drain`], with `derive` adding each conclusion, which the root of a rooted run gives
+/// [`drain`], with `deriver` adding each conclusion, which the root of a rooted run gives
 /// its own.
 #[inline(always)]
-pub(super) fn drain_with<S: Sink>(
+pub(super) fn drain_with<S: Sink, D: Deriver>(
     ix: &Index,
     st: &mut State,
     found: Found,
     out: &mut S,
-    derive: impl Fn(&Index, &mut State, Side, &mut S),
+    deriver: &D,
 ) {
-    drain_with_covered(ix, st, found, out, derive, false, 0);
+    drain_with_covered(ix, st, found, out, deriver, false, 0);
 }
 
 #[inline(always)]
-fn drain_with_covered<S: Sink>(
+fn drain_with_covered<S: Sink, D: Deriver>(
     ix: &Index,
     st: &mut State,
     found: Found,
     out: &mut S,
-    derive: impl Fn(&Index, &mut State, Side, &mut S),
+    deriver: &D,
     held_covered: bool,
     slack_covered: usize,
 ) {
@@ -2104,29 +2217,18 @@ fn drain_with_covered<S: Sink>(
         mark_interrupted(st);
         return;
     }
-    let held_guard = if !held_covered {
+    let mut held_guard = Guard::new(out);
+    if !held_covered {
         let h = found.held_bytes();
-        if h > 0 {
-            if !out.admit_data(h) {
-                mark_interrupted(st);
-                return;
-            }
-            h
-        } else {
-            0
+        if h > 0 && !held_guard.admit_add(h) {
+            mark_interrupted(st);
+            return;
         }
-    } else {
-        0
-    };
-    let finish = |out: &mut S, held_guard: usize| {
-        if held_guard > 0 {
-            out.release_data(held_guard);
-        }
-    };
+    }
     let trace = tracing();
     for (c, rule) in found.one {
         if trace {
-            let lits = &out.dl().lits;
+            let lits = &held_guard.dl().lits;
             eprintln!(
                 "TR {} {rule} {} -> {}",
                 tr_ctx(st, found.root),
@@ -2134,18 +2236,16 @@ fn drain_with_covered<S: Sink>(
                 tr(ix, lits, &c.1)
             );
         }
-        derive(ix, st, c, out);
-        if out.stopped() {
+        deriver.derive(ix, st, c, &mut held_guard);
+        if held_guard.stopped() {
             mark_interrupted(st);
-            finish(out, held_guard);
             return;
         }
         st.dl_choices += 1;
         if st.dl_choices as usize >= PRODUCT_POLL {
             st.dl_choices = 0;
-            if !out.go_on() {
+            if !held_guard.go_on() {
                 mark_interrupted(st);
-                finish(out, held_guard);
                 return;
             }
         }
@@ -2155,10 +2255,9 @@ fn drain_with_covered<S: Sink>(
     for (lists, base, ground, rule) in found.prods {
         // a product past the run's limit on choices ends the run as its bound does, before
         // the product spends its work (roadmap item 1011)
-        if out.dl().too_wide(&lists) {
-            out.dl().exhaust();
+        if held_guard.dl().too_wide(&lists) {
+            held_guard.dl().exhaust();
             mark_interrupted(st);
-            finish(out, held_guard);
             return;
         }
         if !ground {
@@ -2171,83 +2270,127 @@ fn drain_with_covered<S: Sink>(
                 found.root,
                 trace,
                 slack_covered,
-                out,
-                &derive,
+                &mut held_guard,
+                deriver,
             ) {
-                finish(out, held_guard);
                 return;
             }
             continue;
+        }
+        // Declare `guard` before `at` and `seen` so LIFO drop always frees the hash table
+        // and index vector before releasing their reservation, including on panic unwind.
+        let mut guard = Guard::new(&mut held_guard);
+        let Some(at_bytes) = lists.len().checked_mul(std::mem::size_of::<usize>()) else {
+            guard.data_overflow();
+            mark_interrupted(st);
+            return;
+        };
+        if at_bytes > 0 && !guard.ensure_admitted(at_bytes) {
+            mark_interrupted(st);
+            return;
         }
         let mut at = vec![0usize; lists.len()];
         // two choices whose premises share their literals merge to one conclusion, as
         // when one role premise fits two places of a Pred body or two needs share their
         // premise lists, and the product derives each conclusion once. Its record of the
         // conclusions, kept or redundant, lives until the product ends, so it is charged
-        // to the memory budget as it grows and released at the end, and a conclusion the
-        // ground restriction rejects is not recorded
+        // to the memory budget as it grows and released after `seen` drops, and a
+        // conclusion the ground restriction rejects is not recorded.
         let mut seen: FxHashSet<(Vec<Lit>, Vec<Lit>)> = FxHashSet::default();
         let key_size = std::mem::size_of::<(Vec<Lit>, Vec<Lit>)>();
         let mut seen_lits = 0usize;
-        let mut charged = 0usize;
         'choices: loop {
-            if out.stopped() {
+            if guard.stopped() {
                 mark_interrupted(st);
-                if charged > 0 {
-                    out.release_data(charged);
-                }
-                finish(out, held_guard);
                 return;
             }
-            let mut s = base.clone();
-            for (l, &i) in lists.iter().zip(&at) {
-                s.0.extend_from_slice(&l[i].0);
-                s.1.extend_from_slice(&l[i].1);
+            let Some((cand_b, cand_h, cand_bytes)) = (|| {
+                let mut cb = base.0.len();
+                let mut ch = base.1.len();
+                for (l, &i) in lists.iter().zip(&at) {
+                    cb = cb.checked_add(l[i].0.len())?;
+                    ch = ch.checked_add(l[i].1.len())?;
+                }
+                let bytes = cb
+                    .checked_add(ch)?
+                    .checked_mul(std::mem::size_of::<Lit>())?;
+                Some((cb, ch, bytes))
+            })() else {
+                guard.data_overflow();
+                mark_interrupted(st);
+                return;
+            };
+            let seen_table = hash_table_bytes(seen.capacity(), key_size);
+            let Some(cand_need) = at_bytes
+                .checked_add(seen_table)
+                .and_then(|n| n.checked_add(seen_lits))
+                .and_then(|n| n.checked_add(cand_bytes))
+            else {
+                guard.data_overflow();
+                mark_interrupted(st);
+                return;
+            };
+            if !guard.ensure_admitted(cand_need) {
+                mark_interrupted(st);
+                return;
             }
-            let mut fresh = !ground || !restricted(&out.dl().lits, inv, &s);
+            let mut body = Vec::with_capacity(cand_b);
+            body.extend_from_slice(&base.0);
+            let mut head = Vec::with_capacity(cand_h);
+            head.extend_from_slice(&base.1);
+            for (l, &i) in lists.iter().zip(&at) {
+                body.extend_from_slice(&l[i].0);
+                head.extend_from_slice(&l[i].1);
+            }
+            let mut s = (body, head);
+            let mut fresh = !ground || !restricted(&guard.dl().lits, inv, &s);
             if fresh {
-                let mut key = (s.0.clone(), s.1.clone());
-                key.0.sort_unstable();
-                key.0.dedup();
-                key.1.sort_unstable();
-                key.1.dedup();
-                if !seen.contains(&key) {
-                    let bytes = (key.0.capacity() + key.1.capacity()) * std::mem::size_of::<Lit>();
-                    if seen.len() >= seen.capacity() {
-                        let Some(next_table) = next_hash_table_bytes(seen.capacity(), key_size)
-                        else {
-                            out.data_overflow();
+                s.0.sort_unstable();
+                s.0.dedup();
+                s.1.sort_unstable();
+                s.1.dedup();
+                if !seen.contains(&s) {
+                    let s_lits = (s.0.capacity() + s.1.capacity()) * std::mem::size_of::<Lit>();
+                    let key_lits = (s.0.len() + s.1.len()) * std::mem::size_of::<Lit>();
+                    let next_table = if seen.len() >= seen.capacity() {
+                        let Some(b) = next_hash_table_bytes(seen.capacity(), key_size) else {
+                            guard.data_overflow();
                             mark_interrupted(st);
-                            if charged > 0 {
-                                out.release_data(charged);
-                            }
-                            finish(out, held_guard);
                             return;
                         };
-                        let live = hash_table_bytes(seen.capacity(), key_size) + seen_lits;
-                        let need = live.saturating_add(next_table).saturating_add(bytes);
-                        if need > charged {
-                            let add = need - charged;
-                            if !out.admit_data(add) {
-                                mark_interrupted(st);
-                                if charged > 0 {
-                                    out.release_data(charged);
-                                }
-                                finish(out, held_guard);
-                                return;
-                            }
-                            charged += add;
-                        }
+                        b
+                    } else {
+                        0
+                    };
+                    // Pre-admit both the retained key payload and any rehash table overlap
+                    // unconditionally, even when `seen` has spare capacity.
+                    let Some(need) = at_bytes
+                        .checked_add(seen_table)
+                        .and_then(|n| n.checked_add(next_table))
+                        .and_then(|n| n.checked_add(seen_lits))
+                        .and_then(|n| n.checked_add(s_lits))
+                        .and_then(|n| n.checked_add(key_lits))
+                    else {
+                        guard.data_overflow();
+                        mark_interrupted(st);
+                        return;
+                    };
+                    if !guard.ensure_admitted(need) {
+                        mark_interrupted(st);
+                        return;
                     }
+                    let key = s.clone();
+                    let actual_key_lits =
+                        (key.0.capacity() + key.1.capacity()) * std::mem::size_of::<Lit>();
                     seen.insert(key);
-                    seen_lits += bytes;
+                    seen_lits += actual_key_lits;
                 } else {
                     fresh = false;
                 }
             }
             if fresh {
                 if trace {
-                    let lits = &out.dl().lits;
+                    let lits = &guard.dl().lits;
                     eprintln!(
                         "TR {} {rule} {} -> {}",
                         tr_ctx(st, found.root),
@@ -2255,31 +2398,25 @@ fn drain_with_covered<S: Sink>(
                         tr(ix, lits, &s.1)
                     );
                 }
-                derive(ix, st, s, out);
+                deriver.derive(ix, st, s, &mut guard);
+                if guard.stopped() {
+                    mark_interrupted(st);
+                    return;
+                }
             }
             st.dl_choices += 1;
             if st.dl_choices as usize >= PRODUCT_POLL {
                 st.dl_choices = 0;
-                let live = hash_table_bytes(seen.capacity(), key_size) + seen_lits;
-                let go = if live > charged {
-                    let add = live - charged;
-                    if out.reserve_data(add) {
-                        charged += add;
-                        true
-                    } else {
-                        false
-                    }
+                let live = at_bytes + hash_table_bytes(seen.capacity(), key_size) + seen_lits;
+                let go = if live > guard.bytes() {
+                    guard.ensure_reserved(live)
                 } else {
-                    out.go_on()
+                    guard.go_on()
                 };
                 if !go {
                     // the stop can come after the last choice, and the mark then only
                     // keeps the context open
                     mark_interrupted(st);
-                    if charged > 0 {
-                        out.release_data(charged);
-                    }
-                    finish(out, held_guard);
                     return;
                 }
             }
@@ -2296,25 +2433,13 @@ fn drain_with_covered<S: Sink>(
                 at[k] = 0;
             }
         }
-        let live = hash_table_bytes(seen.capacity(), key_size) + seen_lits;
-        if live.saturating_sub(charged) >= RECORD_SLACK {
-            let add = live - charged;
-            if out.reserve_data(add) {
-                charged += add;
-            } else {
-                mark_interrupted(st);
-                if charged > 0 {
-                    out.release_data(charged);
-                }
-                finish(out, held_guard);
-                return;
-            }
+        let live = at_bytes + hash_table_bytes(seen.capacity(), key_size) + seen_lits;
+        if live.saturating_sub(guard.bytes()) >= RECORD_SLACK && !guard.ensure_reserved(live) {
+            mark_interrupted(st);
+            return;
         }
-        if charged > 0 {
-            out.release_data(charged);
-        }
+        // `seen` and `at` drop here, before `guard` drops and releases its reservation.
     }
-    finish(out, held_guard);
 }
 
 /// The literals `ls` for the derivation trace, with each atom's node in place of its id.
@@ -2567,9 +2692,8 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
             head.remove(k);
         }
         if let Some(h) = differ {
-            let c = Clause::new(body, h);
             if let Some(x) = ds_admit(st, out) {
-                let _ = x.store.add_admitted(c, out);
+                let _ = x.store.add_parts_admitted(body, h, out);
             }
             return;
         }
@@ -2588,7 +2712,7 @@ pub(super) fn derive<S: Sink>(ix: &Index, st: &mut State, (mut body, mut head): 
         }
     }
     if let Some(x) = ds_admit(st, out) {
-        let _ = x.store.add_admitted(Clause::new(body, head), out);
+        let _ = x.store.add_parts_admitted(body, head, out);
     }
 }
 
@@ -3602,7 +3726,7 @@ pub fn pred_c<S: Sink>(ix: &Index, me: Ex, st: &mut State, v: Ex, cid: u32, out:
         super::dl_root::root_pred(ix, st, e, u, &c, None, &mut found, &out.dl().lits);
     }
     if root {
-        drain_with(ix, st, found, out, super::dl_root::derive);
+        drain_with(ix, st, found, out, &RootDerive);
     } else {
         drain(ix, st, found, out);
     }
@@ -3782,6 +3906,7 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
     if n > 0 {
         return n;
     }
+    let mut max_guard = Guard::new(out);
     let mut max: Vec<Lit> = Vec::new();
     while n < budget {
         if st.bottom {
@@ -3791,63 +3916,94 @@ pub fn flush<S: Sink>(ix: &Index, me: Ex, st: &mut State, out: &mut S, budget: u
             break;
         };
         let dx = dix(ix);
-        let id = if dx.root.is_some() {
+        let rooted = dx.root.is_some();
+        let Some(id) = x.store.peek_live() else {
+            break;
+        };
+        let Some((views_bytes, max_realloc)) =
+            x.store.next_scratch_bound(id, rooted, &max, max.capacity())
+        else {
+            max_guard.data_overflow();
+            x.store.interrupted = true;
+            break;
+        };
+        let max_live = max.capacity() * std::mem::size_of::<Lit>();
+        let Some(scratch_peak) = max_live
+            .checked_add(max_realloc)
+            .and_then(|b| b.checked_add(views_bytes))
+        else {
+            max_guard.data_overflow();
+            x.store.interrupted = true;
+            break;
+        };
+        if !max_guard.ensure_admitted(scratch_peak) {
+            x.store.interrupted = true;
+            break;
+        }
+        if rooted {
             let inv = |r: Role| dx.inv(ix, r);
             let ground_total = super::dl_clause::ground_total();
-            let prep = {
+            let bound = {
                 let o = super::dl_clause::Rooted {
                     ix,
-                    lits: &out.dl().lits,
+                    lits: &max_guard.dl().lits,
                     inv: &inv,
                     ground_total,
                 };
-                x.store.next_prepare(ix, Some(&o), &mut max)
+                x.store.next_prepare_id(ix, Some(&o), id, &mut max)
             };
-            let Some((id, bound)) = prep else {
-                break;
-            };
+            max_guard.release_to(max.capacity() * std::mem::size_of::<Lit>());
             let Some(bound) = bound else {
-                out.data_overflow();
+                max_guard.data_overflow();
                 x.store.interrupted = true;
                 break;
             };
-            if !out.admit_dl(bound) {
+            if !max_guard.admit_dl(bound) {
                 x.store.interrupted = true;
                 break;
             }
             let delta = {
                 let o = super::dl_clause::Rooted {
                     ix,
-                    lits: &out.dl().lits,
+                    lits: &max_guard.dl().lits,
                     inv: &inv,
                     ground_total,
                 };
                 x.store.next_commit(ix, Some(&o), id, &max)
             };
-            out.commit_dl(bound, delta);
-            Some(id)
+            max_guard.commit_dl(bound, delta);
         } else {
-            x.store.next_admitted(ix, None, &mut max, out)
-        };
-        let Some(id) = id else {
-            break;
-        };
-        if dx.root.is_some() {
-            super::dl_root::index_consts(ix, x, &max, id, out);
-            if out.stopped() {
+            let bound = x.store.next_prepare_id(ix, None, id, &mut max);
+            max_guard.release_to(max.capacity() * std::mem::size_of::<Lit>());
+            let Some(bound) = bound else {
+                max_guard.data_overflow();
+                x.store.interrupted = true;
+                break;
+            };
+            if !max_guard.admit_dl(bound) {
+                x.store.interrupted = true;
+                break;
+            }
+            let delta = x.store.next_commit(ix, None, id, &max);
+            max_guard.commit_dl(bound, delta);
+        }
+        if rooted {
+            super::dl_root::index_consts(ix, x, &max, id, &mut max_guard);
+            if max_guard.stopped() {
+                x.store.interrupted = true;
                 break;
             }
             let inv = |r: Role| dx.inv(ix, r);
             x.empty_core = dx.of_hyp.contains_key(&me);
             let s = &mut x.store.clauses[id as usize];
-            s.sel = selected(&out.dl().lits, inv, &s.c);
+            s.sel = selected(&max_guard.dl().lits, inv, &s.c);
         }
         n += 1;
         let c = x.store.clauses[id as usize].c.clone();
-        process(ix, me, st, id, &c, &max, out);
+        process(ix, me, st, id, &c, &max, &mut max_guard);
         // the units go to the EL rules first, and a stopped run leaves the rest queued,
         // as an activation of a run in steps does once it derived its share
-        if out.busy() || out.stopped() || out.pause() {
+        if max_guard.busy() || max_guard.stopped() || max_guard.pause() {
             break;
         }
     }
@@ -4362,11 +4518,15 @@ mod tests {
 
     /// Runs [`fold`] over the lists and gives the heads it derived, sorted.
     fn folded(lists: &[Vec<Side>], out: &mut Charges) -> Vec<Vec<Lit>> {
+        struct CollectHeads(std::cell::RefCell<Vec<Vec<Lit>>>);
+        impl Deriver for CollectHeads {
+            fn derive<S: Sink>(&self, _: &Index, _: &mut State, s: Side, _: &mut S) {
+                self.0.borrow_mut().push(s.1);
+            }
+        }
         let ix = index();
         let mut st = State::default();
-        let got = std::cell::RefCell::new(Vec::new());
-        let derive =
-            |_: &Index, _: &mut State, s: Side, _: &mut Charges| got.borrow_mut().push(s.1);
+        let derive = CollectHeads(std::cell::RefCell::new(Vec::new()));
         assert!(fold(
             &ix,
             &mut st,
@@ -4379,7 +4539,7 @@ mod tests {
             out,
             &derive
         ));
-        let mut got = got.into_inner();
+        let mut got = derive.0.into_inner();
         got.sort();
         got
     }
@@ -4427,11 +4587,14 @@ mod tests {
             limit: Some(20_000),
             ..Charges::default()
         };
-        let made = std::cell::Cell::new(0usize);
-        let derive = |_: &Index, _: &mut State, _: Side, out: &mut Charges| {
-            made.set(made.get() + 1);
-            out.worked(1);
-        };
+        struct CountWorked(std::cell::Cell<usize>);
+        impl Deriver for CountWorked {
+            fn derive<S: Sink>(&self, _: &Index, _: &mut State, _: Side, out: &mut S) {
+                self.0.set(self.0.get() + 1);
+                out.worked(1);
+            }
+        }
+        let derive = CountWorked(std::cell::Cell::new(0));
         assert!(!fold(
             &ix,
             &mut st,
@@ -4444,6 +4607,7 @@ mod tests {
             &mut out,
             &derive
         ));
+        let made = derive.0;
         assert!(
             made.get() <= 20_000 + PRODUCT_POLL + FOLD_PRUNE,
             "{}",
@@ -4462,7 +4626,6 @@ mod tests {
         let wide = |n: Ex| vec![(1..=n).map(|a| side(&[a])).collect::<Vec<_>>()];
         let run = |lists: &[Vec<Side>], out: &mut Charges| {
             let mut st = State::default();
-            let derive = |_: &Index, _: &mut State, _: Side, _: &mut Charges| {};
             fold(
                 &ix,
                 &mut st,
@@ -4473,7 +4636,7 @@ mod tests {
                 false,
                 0,
                 out,
-                &derive,
+                &NoopDerive,
             )
         };
         // a step of 2,048 unions, which ends at a check of the bounds, charges each
@@ -4506,7 +4669,6 @@ mod tests {
             .map(|k| side(&[4 * k + 1, 4 * k + 2, 4 * k + 3, 4 * k + 4]))
             .collect();
         let lists = vec![four, vec![side(&[])]];
-        let derive = |_: &Index, _: &mut State, _: Side, _: &mut Charges| {};
         // the first step's 128 sides of four literals hold 10,240 bytes once its record
         // goes, and the second step's record (hash table + copies), list and prune buffer
         // fit well below the cumulative sum of both steps' records
@@ -4524,7 +4686,7 @@ mod tests {
             false,
             0,
             &mut out,
-            &derive
+            &NoopDerive
         ));
         assert_eq!(out.reserved, out.released);
     }
