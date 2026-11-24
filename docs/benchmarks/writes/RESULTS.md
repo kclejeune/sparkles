@@ -6,11 +6,11 @@ This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 ## Comparison summary
 
 The suite's churn of 5,000 single-triple commits runs at 778 and 935 Sparkles commits/s
-  against 809 and 744 for unsynced Oxigraph at 1.05M, and at 681 and 684 against 715 at
-  10.5M. Sparkles synchronizes before acknowledgement. With sixteen unpaced readers,
-  Oxigraph completes about five times as many writes at 1.05M but 12 to 16 reads/s, against
-  Sparkles' 2,101 to 2,198. The [focused write assessment](#serial-writes-with-reader-work)
-  of 2026-10-25 predates the write-through fences of items 501 and 502.
+against 809 and 744 for unsynced Oxigraph at 1.05M, and at 681 and 684 against 715 at
+10.5M. Sparkles synchronizes before acknowledgement. With sixteen unpaced readers,
+Oxigraph completes about five times as many writes at 1.05M but 12 to 16 reads/s, against
+Sparkles' 2,101 to 2,198. The [focused write assessment](#serial-writes-with-reader-work)
+of 2026-10-25 predates the write-through fences of items 501 and 502.
 
 ## Writes and updates
 
@@ -250,7 +250,7 @@ certificate subtracts the lower sampled bound of the ordinary process, so it err
 #### Rerun on forge
 
 These campaigns ran on `forge` with a release build of commit `a202e8f2`, five blocks each
-in the order ordinary, grouped, grouped, ordinary, while another lane shared the host under
+in the order ordinary, grouped, grouped, ordinary, while another job shared the host under
 its heavy-job lock. The [run record](runs/2026-10-31-indexed-group-commit-forge/README.md)
 holds the results, the gate summaries and the process list at the start of each campaign.
 
@@ -963,9 +963,9 @@ median does not.
 
 The run below used a release build of commit 1f051759 on stanley, an Intel Core Ultra X7
 358H laptop with 16 threads, with `RAYON_NUM_THREADS=12`, under the host's heavy lock
-with other lanes' builds waiting, and 200,000 people. Every view's maintained rows matched
+with other builds waiting, and 200,000 people. Every view's maintained rows matched
 its query evaluated again at the end, and no view had a `recompute` node. The raw output
-is the lane's `aggregate_pass_against_recompute-stanley-1f051759.log`. The numbers are a
+is `aggregate_pass_against_recompute-stanley-1f051759.log`. The numbers are a
 laptop measurement for the design, not a published result.
 
 | View | Build ms | Query ms | Pass median ms | Pass p95 ms | Query / pass | State MiB |

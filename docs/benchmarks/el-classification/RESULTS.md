@@ -660,12 +660,12 @@ thread, and the hooks of the disjunctive rules made GO 0.9% and ChEBI lite 1.4% 
 with the same work. One worker held the activations of all four rule sets, and whether
 the compiler inlined each into it changed with their size.
 
-An A/B on forge ran the base, commit aa1b4502 with four units, and the lane, commit
+An A/B on forge ran the base, commit aa1b4502 with four units, and the candidate, commit
 f93ad3cb, five rounds each, with three rounds of two reference builds and of the base with
 one unit beside them in a screen of the same files. Times are the median over the rounds
 of each process's median classification in ms.
 
-| Ontology | Threads | Base | Lane | Lane / base | Before chain selection | Before the disjunctive rules |
+| Ontology | Threads | Base | Candidate | Candidate / base | Before chain selection | Before the disjunctive rules |
 |---|---:|---:|---:|---:|---:|---:|
 | GO | 1 | 303.5 | 301.5 | 0.99 | 359.5 | 303.3 |
 | | 8 | 89.5 | 85.9 | 0.96 | 96.9 | 95.7 |
@@ -680,18 +680,18 @@ The reference columns come from the screen. Before chain selection is commit 3ac
 whose Horn rules derive more on GO, and before the disjunctive rules is commit 3bc10115.
 At the base the slowdowns of items 711 and 715 no longer show against either reference
 on one thread, since the merge of the disjunctive rules moved the layout again, and the
-lane is faster than all three builds on one thread on every file, by under 1% on GO. The
+candidate is faster than all three builds on one thread on every file, by under 1% on GO. The
 index stage gives most of the gain, 378 against 397 ms on `ore_ont_3836`
-and 299 against 317 ms on `ore_ont_13482`, and on `atlas` the lane runs 3.8% fewer
+and 299 against 317 ms on `ore_ont_13482`, and on `atlas` the candidate runs 3.8% fewer
 user-space instructions than the base on `ore_ont_3836` and 2.0% fewer on GO, so one unit
 lets the compiler inline across the crate as well as place its code.
 
 ChEBI lite's eight-thread rounds spread by 15% on both sides of the gate. Six more rounds
 with each process pinned to the performance cores 0 to 11 took ChEBI lite in 393 ms on
-the lane against 418 ms on the base, with an 11 to 14% spread, and GO in 79.3 against
+the candidate against 418 ms on the base, with an 11 to 14% spread, and GO in 79.3 against
 79.1 ms, so the eight-thread difference is within the noise that roadmap item 683 follows.
 The 12 small ORE 2015 DL files of roadmap item 709 take 0.2 to 25 ms on both builds. The
-lane is within 0.3 ms of the base on each on one thread, and from 1.5 ms faster to 0.2 ms
+candidate is within 0.3 ms of the base on each on one thread, and from 1.5 ms faster to 0.2 ms
 slower on eight. Every build gives
 the same taxonomy of each file on one and eight threads.
 
@@ -728,14 +728,14 @@ at least 1,024 classes, since a class costs more than an axiom. Before these
 changes a cold run of `ore_ont_6855` on four threads spent 1.2 of its 1.4 ms in a
 saturation that takes 0.1 ms on one thread.
 
-An A/B on forge ran the base, commit ddfd453a, and the lane, commit 6b4c8e87, whose
+An A/B on forge ran the base, commit ddfd453a, and the candidate, commit 6b4c8e87, whose
 taxonomy also took chunks of 4,096, on the 12
 small ORE 2015 DL files of roadmap item 709 in seven rounds of rotating order, one thread
 pinned to CPU 4 and four and eight threads pinned to the performance cores 0 to 11. Each
 round ran one process with one classification, whose time is the cold one, and one with
 ten, whose last nine give the warm time. The table gives the median over the rounds in ms.
 
-| File | Rules | 1 thread, base and lane | 4 threads, base | 4 threads, lane | 8 threads, base | 8 threads, lane | Warm, 8 threads, base | Warm, 8 threads, lane |
+| File | Rules | 1 thread, base and candidate | 4 threads, base | 4 threads, candidate | 8 threads, base | 8 threads, candidate | Warm, 8 threads, base | Warm, 8 threads, candidate |
 |---|---|---:|---:|---:|---:|---:|---:|---:|
 | `ore_ont_1445` | disjunctive | 2.7 and 2.7 | 3.2 | 3.0 | 3.5 | 3.7 | 2.0 | 2.5 |
 | `ore_ont_2775` | Horn | 0.6 and 0.6 | 1.1 | 0.6 | 1.5 | 0.6 | 0.3 | 0.2 |
@@ -761,7 +761,7 @@ base's time. Seven more rounds of the base, commit 6b4c8e87 and the final commit
 47c13a51 gave the cold runs of 47c13a51 0.74 of the base's time on four threads and 0.67
 on eight, against 0.75 and 0.67 for 6b4c8e87 in the same rounds.
 
-A whole cold process of the lane on four threads takes less time on forge than Konclude
+A whole cold process of the candidate on four threads takes less time on forge than Konclude
 0.7.0 took on the same file on the laptop in the comparison of item 709, from 1.9 ms for
 `ore_ont_6855` to 21.8 ms for `ore_ont_8273` against Konclude's 11 and 82 ms, and so does
 the base's. The hosts differ, so this is not a published comparison. The item's estimates
@@ -771,7 +771,7 @@ times the base's whole processes on forge.
 On GO, ChEBI lite, `ore_ont_3836` and `ore_ont_13482`, five rounds of the same sides gave
 the following times, in ms, with the same taxonomies.
 
-| Ontology | Threads | Base | Lane | Lane / base |
+| Ontology | Threads | Base | Candidate | Candidate / base |
 |---|---:|---:|---:|---:|
 | GO | 1 | 303.3 | 302.1 | 1.00 |
 | | 8 | 79.6 | 79.6 | 1.00 |
@@ -820,9 +820,9 @@ rules took from the to-do lists, repeats included.
 | Side | Threads | Time, s | Peak resident set, GiB | Peak estimate, GiB | Conclusions taken, billions |
 |---|---:|---:|---:|---:|---:|
 | Base | 4 | 32.3 | 10.5 | 5.7 | 3.00 |
-| Lane | 4 | 29.0 | 7.5 | 3.8 | 2.10 |
+| Candidate | 4 | 29.0 | 7.5 | 3.8 | 2.10 |
 | Base | 1 | 90.5 | 9.4 | 5.8 | 3.00 |
-| Lane | 1 | 90.2 | 9.4 | 5.8 | 3.00 |
+| Candidate | 1 | 90.2 | 9.4 | 5.8 | 3.00 |
 
 On four threads the peak resident set falls by 29%, and the run fits the 10 GiB cap of
 the development set comparison, which it passed before. A run on one thread delivers no
@@ -850,11 +850,11 @@ threads do.
 These measurements ran on `atlas`, which has the benchmark host's hardware, with no other
 benchmark or gate on the host and no swap in use. The base is commit dbac7667, before is
 the base without the lazy start of item 709 and the delivery filter of item 695, and the
-lane is commit 5dca16bd. The table gives the median over nine rounds of rotating order,
+candidate is commit 5dca16bd. The table gives the median over nine rounds of rotating order,
 in ms, with four and eight threads pinned to the performance cores 0 to 11, as in the
 section above.
 
-| File | Cold, 8 threads, before | Cold, 8 threads, base | Cold, 8 threads, lane | Warm, 8 threads, before | Warm, 8 threads, base | Warm, 8 threads, lane | Warm, 4 threads, before | Warm, 4 threads, base | Warm, 4 threads, lane |
+| File | Cold, 8 threads, before | Cold, 8 threads, base | Cold, 8 threads, candidate | Warm, 8 threads, before | Warm, 8 threads, base | Warm, 8 threads, candidate | Warm, 4 threads, before | Warm, 4 threads, base | Warm, 4 threads, candidate |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
 | `ore_ont_1445` | 3.47 | 3.78 | 3.73 | 2.04 | 2.60 | 2.25 | 2.50 | 2.46 | 2.01 |
 | `ore_ont_2775` | 1.55 | 0.69 | 0.64 | 0.29 | 0.20 | 0.21 | 0.23 | 0.19 | 0.20 |
@@ -880,7 +880,7 @@ item 819 follows them with the rest of the five files.
 On one thread six rounds of the same sides gave the following times in ms, with one
 thread pinned to CPU 4.
 
-| Ontology | Before | Base | Lane | Lane / base |
+| Ontology | Before | Base | Candidate | Candidate / base |
 |---|---:|---:|---:|---:|
 | GO | 304.0 | 309.0 | 311.8 | 1.009 |
 | ChEBI lite | 1,068 | 1,058 | 1,058 | 1.000 |
@@ -891,31 +891,31 @@ thread pinned to CPU 4.
 The rounds spread by 0.5 to 2%. A run on one thread that is not congested reads the batching
 flag at each message it sends to another context, as it did before, and adds a comparison
 of the waiting messages with the stored conclusions to each check of the bounds. The times
-also move with the code's layout. Commit 70a5234c, whose run on one thread is the lane's
+also move with the code's layout. Commit 70a5234c, whose run on one thread is the candidate's
 and which differs from it only in code that runs on several threads, gave in ten rounds of an earlier run 0.998 of the time before
 on GO, 0.998 on ChEBI lite, 1.000 on `ore_ont_3836`, 1.005 on `ore_ont_13482` and 1.003 on
 `ore_ont_7914`, with the same user-space cycle counts as before within 0.3%. The base
 spent 1.3% more cycles than before on GO and 2.2% more on `ore_ont_3836`. Roadmap item
-722 follows the layout. On four and eight threads the lane is within the spread of the
+722 follows the layout. On four and eight threads the candidate is within the spread of the
 base's rounds on all five files, and ChEBI lite's eight-thread rounds spread by 9 to 13%.
 
 One run of `ore_ont_8737` of each side in a scope with a 13 GiB cap gave the following
-times and memory. The lane's runs are those of commit 70a5234c, whose saturation on one
-thread and congested runs are the lane's.
+times and memory. The candidate's runs are those of commit 70a5234c, whose saturation on one
+thread and congested runs are the candidate's.
 
 | Side | Threads | Time, s | Peak resident set, GiB | Peak estimate, GiB | Conclusions taken, billions |
 |---|---:|---:|---:|---:|---:|
 | Base | 1 | 95.8 | 9.34 | 5.84 | 3.00 |
-| Lane | 1 | 90.7 | 5.88 | 3.21 | 2.24 |
+| Candidate | 1 | 90.7 | 5.88 | 3.21 | 2.24 |
 | Base | 4 | 28.5 | 6.77 | 3.51 | 2.13 |
-| Lane | 4 | 28.2 | 7.92 | 4.07 | 2.10 |
+| Candidate | 4 | 28.2 | 7.92 | 4.07 | 2.10 |
 
 On one thread the peak resident set falls by 37% and the conclusions the rules take by
 25%. A run on four threads does the same work on both builds, and its peak varies from
 6.8 to 7.9 GiB between runs of the same code, as the threads' timing decides which
 contexts are free when their messages arrive. Konclude 0.7.0 took 11 s with 7 GB on the
 laptop, and roadmap item 818 follows the time on several threads. The base's one-thread
-run comes from the reproduction before the lane's changes, in the same session on the
+run comes from the reproduction before the candidate's changes, in the same session on the
 same host. Every side gave the same taxonomies in every round. On the laptop the 298 ORE
 2015 EL files, GO and ChEBI lite gave the base's taxonomies on one and eight threads, and
 `ore_ont_8737` gave the base's taxonomy on one and four threads.
@@ -1029,7 +1029,7 @@ its to-do list from the list's buffer instead of copying it reversed onto its ow
 conclusions. Each destination receives the same messages in the same order as before.
 
 These measurements ran on `atlas` with no other benchmark or gate on the host and no swap
-in use. The base is commit 3a1b9b04, the lane is commit 1da472f2, and the lane with the
+in use. The base is commit 3a1b9b04, the candidate is commit 1da472f2, and the candidate with the
 table adds an open-addressing table for the sets of more than 16 members, commit 79b0c707,
 which was reverted. Three rounds of rotating order classified `ore_ont_8737` once per side
 and thread count in a scope with a 13 GiB cap. On every side the file's Horn attempt passes
@@ -1041,19 +1041,19 @@ rounds, and the largest peak.
 | Side | Threads | Saturation, s | Classification, s | CPU time, s | Peak resident set, GiB | Conclusions taken, billions |
 |---|---:|---:|---:|---:|---:|---:|
 | Base | 1 | 45.0 | 67.6 | 71 | 8.50 | 1.62 |
-| Lane | 1 | 24.6 | 40.2 | 43 | 8.52 | 1.62 |
-| Lane with the table | 1 | 24.5 | 40.9 | 44 | 8.49 | 1.62 |
+| Candidate | 1 | 24.6 | 40.2 | 43 | 8.52 | 1.62 |
+| Candidate with the table | 1 | 24.5 | 40.9 | 44 | 8.49 | 1.62 |
 | Base | 4 | 13.7 | 22.2 | 88 | 10.29 | 1.28 |
-| Lane | 4 | 8.9 | 15.6 | 60 | 10.11 | 1.28 |
-| Lane with the table | 4 | 8.7 | 15.9 | 62 | 10.83 | 1.31 |
+| Candidate | 4 | 8.9 | 15.6 | 60 | 10.11 | 1.28 |
+| Candidate with the table | 4 | 8.7 | 15.9 | 62 | 10.83 | 1.31 |
 | Base | 12 | 9.3 | 15.5 | 157 | 12.20 | 1.33 |
-| Lane | 12 | 7.4 | 13.4 | 127 | 12.19 | 1.33 |
-| Lane with the table | 12 | 7.6 | 13.4 | 123 | 12.29 | 1.31 |
+| Candidate | 12 | 7.4 | 13.4 | 127 | 12.19 | 1.33 |
+| Candidate with the table | 12 | 7.6 | 13.4 | 123 | 12.29 | 1.31 |
 
 Every run gave the taxonomy of the base. The saturation takes 45% less time on one thread,
 35% less on four and 20% less on twelve, and on four and twelve threads it takes less time
 than Konclude 0.7.0's classification of the file on the same host, 9.5 to 9.7 s. In the
-profile of the lane on four threads on the laptop the sends take under 1% of the cycles,
+profile of the candidate on four threads on the laptop the sends take under 1% of the cycles,
 the filter 45%, the rules' inserts into the hash sets 13% and the copies 8%. The filter's
 cost is the three billion messages the saturation sends for 32 million conclusions, which
 roadmap item 956 follows.
@@ -1063,7 +1063,7 @@ The same slot ran six interleaved rounds of GO, ChEBI lite, `ore_ont_3836` and
 one-thread runs pinned to one CPU and the others to twelve. The table gives the median of
 the rounds in milliseconds and the ratios to the base.
 
-| File | Threads | Base, ms | Lane, ms | Lane / base | Lane with the table / base |
+| File | Threads | Base, ms | Candidate, ms | Candidate / base | Candidate with the table / base |
 |---|---:|---:|---:|---:|---:|
 | GO | 1 | 312.2 | 303.9 | 0.973 | 0.970 |
 | GO | 4 | 107.3 | 105.7 | 0.985 | 0.989 |

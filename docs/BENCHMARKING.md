@@ -1,24 +1,11 @@
 # Running benchmarks
 
-The [benchmark index](benchmarks/README.md) organizes published workloads into methodology
-and result pages. Imported reports remain manually maintained. The synthetic suite also
-has [generated record tables and charts](benchmarks/synthetic/RECORDS.md) with an explicit
-source selection and validation rules.
-
-`python3 scripts/bench-docs.py --check` verifies the retained source hashes and checks that
-generated output matches its selected records. Without `--check`, it rewrites only the
-generated report and charts. A changed raw record is refused in both modes. To publish a
-new run, retain its original JSON and manifest under the workload's `runs/<run-id>/`
-directory, add its content hash and context to RUNS.json, and select it in report.json.
-Run IDs use the SHA-256 of the raw bytes. Review the host, source revisions, timing,
-durability and answer contract before selecting another run. The renderer supports only
-single-client warm query records and does not convert other assessment formats.
-
-This guide describes how to measure Sparkles: which host to use, how the comparison
-engines are pinned, how release builds are configured, and what each benchmark harness
-does and writes. [BENCHMARKS.md](BENCHMARKS.md) holds the published results and their
-methodology, [PERFORMANCE-EXPERIMENTS.md](PERFORMANCE-EXPERIMENTS.md) lists optimizations
-that were measured and not kept, and [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
+This guide explains how to measure Sparkles: which host to use, how comparison engines are
+pinned, how release builds are configured, and what each benchmark harness runs and
+writes. [BENCHMARKS.md](BENCHMARKS.md) summarizes the published results, the
+[benchmark index](benchmarks/README.md) organizes every workload's methodology and result
+pages, [PERFORMANCE-EXPERIMENTS.md](PERFORMANCE-EXPERIMENTS.md) records optimizations that
+were measured and not kept, and [DEVELOPMENT.md](DEVELOPMENT.md) covers building and
 testing.
 
 * [Choosing a host](#choosing-a-host)
@@ -26,6 +13,23 @@ testing.
 * [Pinned comparison engines](#pinned-comparison-engines)
 * [Release build settings](#release-build-settings)
 * [Benchmark scripts](#benchmark-scripts)
+* [Publishing and verifying records](#publishing-and-verifying-records)
+
+## Publishing and verifying records
+
+Imported result reports remain manually maintained, while the synthetic suite also keeps
+[generated record tables and charts](benchmarks/synthetic/RECORDS.md) rendered from
+explicit source selections. Run `python3 scripts/bench-docs.py --check` to verify every
+retained source hash and confirm that generated output matches its selected records. Run
+it without `--check` to rewrite only the generated report and charts; both modes refuse a
+modified raw record.
+
+To publish a new run, store its original JSON and manifest under the workload's
+`runs/<run-id>/` directory (using the SHA-256 of the raw bytes as the run ID), register
+its content hash and context in `RUNS.json`, and select it in `report.json`. Review the
+host, source revisions, timing, durability and answer contract before selecting another
+run. The renderer supports only single-client warm query records and does not convert
+other assessment formats.
 
 ## Choosing a host
 

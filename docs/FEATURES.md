@@ -59,13 +59,13 @@ default, described under [aggregate errors](querying/README.md#aggregate-errors)
 
 ### Storage and history
 
-Load RDF into [compressed indexes](storage/README.md#storage-and-indexes) with
-durable transactions, compaction, clones and integrity checks.
+Load RDF into [compressed indexes](storage/README.md#storage-and-indexes) with durable
+transactions, compaction, clones and integrity checks.
 [History and branches](storage/README.md#versioning-and-history) provide retained
-commits, time travel, diffs, change feeds, RDF Patch and merge review. HTTP history
-and diff filters accept nested triple terms with numeric objects. Rust branch deletion,
-renames and note changes refuse with a conflict when the calling thread holds a write
-transaction that the operation needs, leaving the transaction usable.
+commits, time travel, diffs, change feeds, RDF Patch and merge review, including nested
+triple terms in HTTP history and diff filters. Rust branch administration refuses with a
+conflict when the calling thread already holds a needed write transaction, leaving that
+transaction usable.
 
 <a id="search"></a>
 <a id="full-text-search"></a>
@@ -91,16 +91,15 @@ the documented geometry and query limits.
 
 ### Reasoning, validation and schema
 
-Derive facts with [RDFS, OWL 2 RL and Jena rules](reasoning/README.md#reasoning) and
-[SHACL and SPIN rules](reasoning/README.md#shacl-rules),
-and inspect explanations. Validate data with [SHACL](reasoning/README.md#shacl),
+Derive facts with [RDFS, OWL 2 RL, OWL 2 QL, Jena rules and Datalog clauses](reasoning/README.md#reasoning)
+or [SHACL and SPIN rules](reasoning/README.md#shacl-rules), inspect explanations, and
+read, check, edit and classify [OWL 2 ontologies](reasoning/README.md#owl-2-ontologies)
+(including the OWL form of [OML models](reasoning/README.md#oml-and-opencaesar-models)).
+Validate data with [SHACL](reasoning/README.md#shacl),
 [ShEx](reasoning/README.md#shex) and write guards, or
 [discover schema and draft shapes](reasoning/README.md#schema-discovery-and-drafted-shapes)
-from existing data. ShEx write guards verify copied schemas before installation or
-reuse. Legacy configurations without a copy digest validate the head in full at install.
-The OWL form of [OML models](reasoning/README.md#oml-and-opencaesar-models) classifies,
-and a Fuseki configuration of openCAESAR's serves its loads and queries, with the gaps
-that guide lists.
+from existing data. ShEx write guards verify copied schemas before installation or reuse,
+and legacy configurations without a copy digest validate the head in full at install.
 
 <a id="server-and-protocols"></a>
 <a id="sparql-protocol-and-fuseki-compatibility"></a>
@@ -123,36 +122,21 @@ graphs and triples, with OIDC and API-token authentication.
 
 ### AI and agents
 
-Connect agents through [MCP](ai/README.md#mcp-server), turn
-[questions into checked queries](ai/README.md#questions-in-plain-language), and keep
-[cited memory](ai/README.md#agent-memory). Review
-[document ingestion](ai/README.md#document-ingestion) and build
+Connect agents through [MCP](ai/README.md#mcp-server) with scoped tool profiles
+(`explore`, `memory`, `admin`), semantic search (`search_semantic`) and bounded entity
+linking. Turn [plain-language questions into checked queries](ai/README.md#questions-in-plain-language)
+grounded in entity predicate usage, keep [cited agent memory](ai/README.md#agent-memory),
+ingest Markdown, HTML, PDF and Office documents through
+[document ingestion](ai/README.md#document-ingestion), and build
 [GraphRAG community reports](ai/README.md#community-reports-graphrag).
-MCP [tool profiles](ai/README.md#mcp-server) load only the explore, memory or admin
-tools a session needs, and `search_semantic` embeds a question with the dataset's
-embedding provider and fuses the nearest entities with full-text search.
-MCP entity linking exposes bounded, versioned candidate evidence and can order label
-matches by use. Ask uses it for full choice identities and conservative ordering while
-retaining required clarification. Ask also grounds each question with the predicates
-that its entities and best-matching classes use in the data. GPT-6 Luna, the `openai`
-preset's model, answers 101 of 150 held-out QALD-9-plus questions at $0.0019 each,
-within the noise of GPT-6.1 Sol, while Opus 5.5 answers 114.
 
-[Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) separate grounding, tool
-and execution timings. An ambiguous mention is asked about before the rest of the
-grounding is read, so a clarification arrives in about half the time.
-Anthropic providers use [prompt caching](ai/README.md#questions-in-plain-language) for
-the stable start of each prompt, and budgets price cache writes and reads apart.
-
-The web UI asks through an [Ask thread](ai/README.md#the-ask-thread), shown as a page at
-`/ui/ask` and as a drawer beside any page. `Shift+A` or the palette's Ask row opens the
-drawer with the page's resource or query as context. Each answer folds its query, rows,
-sources and steps, follow-ups continue the thread, and the history reopens a thread from
-the answers the server keeps.
-
-![The Ask page with a thread's answer, its checked query, its rows and its sources, with the first cited row marked and the memory facts about it quoted](images/ask-answer.png)
-
-![The Ask drawer beside a Browse page of the class Professor, carrying the class as context and offering questions about it](images/ask-drawer.png)
+Anthropic providers cache stable prompt prefixes by default with separate cache pricing,
+and [Ask stage diagnostics](ai/README.md#ask-stage-diagnostics) break down grounding,
+tool and execution timings while surfacing ambiguous mentions early. The web UI runs
+questions in an [Ask thread](ai/README.md#the-ask-thread) at `/ui/ask`
+([screenshot](images/ask-answer.png)) or as a `Shift+A` drawer beside any page
+([screenshot](images/ask-drawer.png)), with folded queries, rows, sources, follow-ups
+and saved thread history.
 
 <a id="web-ui"></a>
 <a id="query-page"></a>
@@ -163,79 +147,27 @@ the answers the server keeps.
 
 ### Visualization and editing
 
-Use the [web UI](visualization/README.md#web-ui) to edit queries and inspect result
-tables, graphs and plans. [Explore](visualization/README.md#explore),
-[maps](visualization/README.md#maps), history views and validation tools support
-connected graph inspection and editing. The
-[ontology editor](visualization/README.md#ontology-editor) edits OWL classes, properties,
-individuals and annotations as previewed commits beside asserted trees, kept inferred
-class groups and strict materialization-backed property and individual views, and its DL Query tab answers Manchester class expressions with the reasoning used.
-Its entity frame lists the commits that changed an entity and holds
-[discussion threads](visualization/README.md#ontology-editor) on the entity and its
-axioms, with mentions, replies, resolve and reopen, which the editor's Discussions tab
-lists for the ontology. Threads are Web Annotation RDF in a named graph on the branch,
-so each comment is a commit. A user can
-[watch](visualization/README.md#ontology-editor) an entity or its asserted subtree from
-the frame. The Watches page lists the commits that changed it, and an email channel that
-a server administrator marks for watchers mails them to the user's verified address.
-Its [Bulk edits tab](visualization/README.md#ontology-editor) finds and replaces text
-across labels and annotations, sets or removes an annotation on many entities and moves
-many classes under a new parent, each as one previewed commit of at most 1,000 changes.
-Its [Imports tab](visualization/README.md#ontology-editor) shows the imports closure with
-its cycles and unresolved imports. An import resolves through the dataset's import map, the
-graph its IRI names or a resource catalog vocabulary, and the tab loads an OASIS XML catalog
-with its files or fetches an import into a graph. A switch includes or excludes imported
-axioms in every view.
-The [thesaurus editor](visualization/README.md#thesaurus-editor) edits SKOS concept
-schemes, concepts, collections and SKOS-XL labels in a concept tree, and checks them
-against the integrity conditions of the SKOS Reference. The
-[ontology browser](visualization/README.md#ontology-browser) gives every entity of an
-ontology or thesaurus a page with its definitions and notes, synonyms, axioms as linked
-Manchester prose, hierarchy and what links here, and the top bar's search opens it. A caller who can write
-switches a page into edit mode and changes its definition, synonyms, annotations,
-parents and axioms in place as previewed commits.
+Use the [web UI](visualization/README.md#web-ui) to write queries, inspect result tables,
+graphs and plans, and explore connected data with [Explore](visualization/README.md#explore),
+[maps](visualization/README.md#maps), history views and validation overlays. Every page
+shares one [app shell](visualization/README.md#app-shell) with WCAG AA light and dark
+tokens, a responsive navigation rail and a `Ctrl+K` / `Cmd+K` command palette
+(`>`, `@`, `#`, `?` filter commands, entities, datasets and saved queries).
 
-Every page shares one [app shell](visualization/README.md#app-shell), with a top bar
-whose search is a command palette, a rail of pages that narrows to icons at medium width
-and becomes a drawer on a phone, and one set of light and dark design tokens that meet
-WCAG AA contrast. `Ctrl+K` or `Cmd+K` opens the palette from anywhere. It lists recent
-picks and the open page's commands, searches the open dataset's entities, the datasets,
-saved queries, branches and pages, and runs commands such as running or formatting a
-query, starting a session, creating an entity, switching the dataset or branch and
-setting the theme. The prefixes `>`, `@`, `#` and `?` show commands, entities,
-datasets and saved queries alone.
-
-![The command palette on the Query page with nothing typed, listing the page's commands with their shortcuts and the pages of the shell](images/palette.png)
-
-![The top bar's search listing the demo dataset's classes and properties that match org, with the matched text highlighted](images/shell-search.png)
-
-![The ontology browser's page of mitochondrion, with a line of counts under its title, one text that leads with its property as a chip, disclosures for its other texts, sections with headings of one size, and a rail of cards with its metadata and hierarchy](images/browse-term.png)
-
-![The ontology browser's page of mitochondrion in edit mode, with the edit bar, the definition as a text field with its sources, and edit and remove buttons on the synonyms and annotations](images/browse-edit.png)
-
-![The ontology editor with the class tree and the frame of Professor](images/ontology-editor.png)
-
-![The DL Query tab with the answers of a class expression and the frame of a subclass](images/ontology-dl-query.png)
-
-![The thesaurus editor with the concept tree of an animals scheme and the labels of Whales](images/thesaurus-editor.png)
-
-![The SHACL shape editor with the shape tree and the form of a property shape with a sequence path](images/shape-editor.png)
-
-![The ontology editor's History view of Professor on a branch, with three commits and the opened one showing the annotation it added, its full diff link and its revert](images/entity-history.png)
-
-![The ontology editor's Discussion view of Professor with an open thread that mentions a colleague and has a reply, a thread on one of its axioms, and the composer](images/ontology-discussions.png)
-
-![The Watches page with a subtree watch on Professor opened, listing the commits that put a class below it and labelled it](images/watches.png)
-
-![The ontology editor's Bulk edits tab with a find and replace of student by learner in the English labels and the two changes it lists](images/ontology-bulk.png)
-
-![The ontology editor's Imports tab with the imports closure of an ontology, a cycle between two library graphs, an unresolved import and the import map](images/ontology-imports.png)
-
-[Editing forms](visualization/README.md#nested-form-read-models) generated from SHACL
-shapes edit a resource with its nested blank-node children, ordered lists and value
-alternatives, and save each form as one previewed commit.
-
-![A SKOS concept's form with its stored SKOS-XL label edited and a new label added as nested forms](images/forms-nested.png)
+For schema and vocabulary authoring, the [ontology editor](visualization/README.md#ontology-editor)
+edits OWL classes, properties, individuals and annotations as previewed commits beside
+asserted and inferred views, with DL Query, per-entity commit history, Web Annotation
+discussion threads, entity and subtree watches (with optional email notifications), bulk
+edits up to 1,000 changes per commit and an Imports closure manager with OASIS XML
+catalog support. The [ontology browser](visualization/README.md#ontology-browser) gives
+each entity a dedicated page with linked Manchester prose and inline edit mode, the
+[thesaurus editor](visualization/README.md#thesaurus-editor) manages SKOS and SKOS-XL
+hierarchies against SKOS integrity rules, the
+[visual SHACL shape editor](visualization/README.md#visual-shacl-shape-editor) authors
+shapes in trees and forms, and [SHACL-driven forms](visualization/README.md#nested-form-read-models)
+edit nested blank nodes, ordered lists and value alternatives in one previewed commit.
+See the [visualization guide](visualization/README.md#web-ui) for screenshots and
+walkthroughs of each view.
 
 <a id="libraries-and-bindings"></a>
 
@@ -287,7 +219,7 @@ answers and instruction counts, and the limits of attributing them to layout.
 | [Storage, loading and compaction](storage/README.md#storage-and-indexes) | Partially complete. | Compressed indexes, bulk imports, online compaction, optional FSST, a warm-up of the query path before a server reports ready and an optional prewarm after a restart are available. Finer compaction controls and larger-scale measurements remain. |
 | [History, snapshots and branches](storage/README.md#versioning-and-history) | Partially complete. | Retained commits, diffs, branches and merge review are available. Capped Store snapshots and trusted Dataset history handles preserve retained origins. Historical full-text search and further branch administration remain. |
 | [Join estimation](internals/OPTIMIZATIONS.md#further-scan-and-filter-optimizations) | Partially complete. | Stars, object joins, chains and joins on several keys are estimated from characteristic sets with a remainder and from key probes. Characteristic pairs, sampling of large inputs and the other X15 phases remain under item 454. |
-| [Streaming execution and disk spill](querying/README.md#sparql-queries-and-updates) | Partially complete. | Eligible plans stream automatically, including in the UI, while explicit cursors and disk spill are enabled by default. Both modes share one plan, join kernels, grouping operator and columnar result writers with engine-owned SPARQL encoders, streamed SPARQL Results Thrift and a bounded 16-entry per-stream HTTP channel, while the querying guide describes conditional OPTIONAL merges with single-key pair-condition filtering, resumable readers for non-SILENT SERVICE, unbounded constant-query text searches and history queries, string comparison caching and HTTP transfer deadlines. Remaining work covers eager fallbacks for SILENT SERVICE, view reads, unlimited path searches, vector ORDER BY, nearest-neighbour searches and some spatial forms, plus ordered spill costs, the in-place cursor hand-off and automatic streaming of an OPTIONAL whose condition holds EXISTS. |
+| [Streaming execution and disk spill](querying/README.md#sparql-queries-and-updates) | Partially complete. | Eligible plans stream automatically while explicit cursors and disk spill are on by default. Both modes share one plan, join kernels, grouping operator and columnar result writers (including engine-owned SPARQL encoders, streamed SPARQL Results Thrift and a 16-entry per-stream HTTP channel), with conditional OPTIONAL pair filtering and resumable SERVICE, text and history readers. Remaining work covers eager fallbacks (SILENT SERVICE, view reads, unlimited path searches, vector ORDER BY, nearest-neighbour and some spatial forms), ordered spill costs, in-place cursor hand-off and automatic streaming of OPTIONAL conditions containing EXISTS. |
 | [Incremental views and live queries](querying/README.md#sparql-queries-and-updates) | Partially complete. | Table views and live query updates are available, including maintained property paths, the aggregates `MIN`, `MAX`, `GROUP_CONCAT` and `SAMPLE`, `HAVING`, correlated `EXISTS` and ordered windows with row positions. Graph views, commit-time maintenance, branch views and provenance on views remain planned. |
 
 ### Search and graph analysis
@@ -302,18 +234,18 @@ answers and instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Reasoning](reasoning/README.md#reasoning) | Partially complete. | RDFS, a documented OWL 2 RL subset and Jena rules are available with demand derivation, rule bodies ordered from sampled bindings and incremental materialization, which reads its changes as ids from the store's log when the log holds them. Closure operators serve materialization and query-time reasoning, and derived facts live in a columnar tier of about 52 bytes per fact. A deletion whose maintenance passes an allowance set by the closure's size runs in full. Demand tables have a configurable process-wide cache budget and operator statistics. `reasoning=auto` reads a fresh materialization and derives over a stale or absent one and for backward rules, and a dataset setting makes it the default. Demand tables carry over to commits that change nothing the rules read or give. OWL 2 QL queries are rewritten against the ontology, and Jena's hybrid rules run their nested backward rules at query time. Rule texts can declare relations, negate atoms and write Datalog clauses, which every reasoning path reads. A separate derived layer and canonical equality remain planned. |
+| [Reasoning](reasoning/README.md#reasoning) | Partially complete. | RDFS, OWL 2 RL, Jena rules (including `@hybrid jena` backward rules) and Datalog clauses with relations and negation run through incremental materialization over a columnar derived tier (about 52 bytes per fact), closure operators, sampled-binding body planning, demand derivation with a budgeted table cache, `reasoning=auto` and OWL 2 QL query rewriting. Deletions that exceed an allowance fall back to a full run, and demand tables carry over across unaffected commits. A separate derived layer, canonical equality and per-pattern cost selection for `auto` remain planned. |
 | [SHACL rules](reasoning/README.md#shacl-rules) | Partially complete. | SHACL-AF triple and SPARQL rules with conditions, orders and fixed points, and SPIN rules with their query text, materialize through the `shacl-af` profile. Updates run in full until item 958, and SPIN's RDF syntax is item 959. |
-| [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available. The reasoner can keep bounded witnesses per fact. Inferred visibility and review protections that read them remain planned. |
-| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, and forms edit nested children, lists and value alternatives in one commit. Form checks refuse incomplete discovery. Node-level alternatives, complex nested paths and some target producers remain. |
+| [Explanations](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | Why, bounded why-not, entailment diffs and minimal supports are available, with optional bounded witnesses per derived fact. Inferred visibility and review protections that read witnesses remain planned. |
+| [Validation and forms](reasoning/README.md#reasoning-validation-and-schema) | Partially complete. | SHACL, ShEx, write guards and generated forms are available, and forms edit nested children, lists and value alternatives in one commit while refusing incomplete discovery. Node-level alternatives, complex nested paths and some target producers remain. |
 | [Schema discovery](reasoning/README.md#reasoning-validation-and-schema) | Complete within the documented discovery scope. | Class and predicate profiles, schema diffs and constrained shape drafts are available. Drafts retain the limits in the compatibility boundaries. |
-| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF mappings, profile checks and axiom diffs are available in Rust, Python, Node.js, the JVM through `jena-ontapi`, HTTP, MCP and the CLI. Reads with inferences and the Manchester reader are available in all of them except MCP and the CLI. Entity accessors, typed axiom constructors and literal checks include XML namespace conformance, with full XML canonical lexical and value semantics remaining in item 663. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
-| [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent classifier computes the class hierarchy and unsatisfiable classes of OWL 2 EL, Horn and ALCHI ontologies in Rust, Python, Node.js, the JVM, HTTP and the CLI, and calls an answer complete only when it holds for the whole ontology. The Horn tier checks OWL 2 DL datatypes and data cardinalities, with data case analysis, keys over checked properties and data properties in the disjunctive rules still open. Counting and the rooted run for individuals and nominals are off by default, and their completeness is not proved. On one and eight threads it classifies GO, ChEBI lite and the largest ORE 2015 EL ontologies 3.1 to 20 times as fast as ELK and faster than Konclude ([results](benchmarks/el-classification/RESULTS.md)). |
-| [Ontology editor](visualization/README.md#ontology-editor) | Partially complete. | Ontology editing, paged class and property trees, individuals paged by asserted type, DL Query, branch and entity history with revert, bulk edits, import resolution with an import map, XML catalogs and fetched imports, session branches and undo are available alongside shared rendering preferences. On-demand metrics show scoped axiom and signature counts, a conservative DL bound and OWL 2 profile reports including assertions. The feature guide describes the remaining diagram, tree, IRI policy, grant and read-cost work. |
-| [Thesaurus editor](visualization/README.md#thesaurus-editor) | Complete. | The Workbench's Thesaurus editor edits SKOS concept schemes, concepts, collections, multilingual and SKOS-XL labels, hierarchy and mapping links as previewed commits, with drag to re-parent. Built-in SKOS shapes check the SKOS Reference's integrity conditions and can guard writes. Larger trees and search, foreign mapping labels, label relations, combined guards and graph-scoped forms are items 638 to 642. |
-| [Visual SHACL shape editor](visualization/README.md#visual-shacl-shape-editor) | Complete. | Trees and forms author node and property shapes, Core targets and constraints, nested paths and severities as previewed graph commits. Sample validation retains source identity, and unrecognized RDF is preserved beside the existing Turtle and SHACLC text validator. A shapes graph opens for editing up to 5,000 triples. |
-| [Kept classification reads](reasoning/README.md#owl-2-ontologies) | Partially complete. | Rust, Python, Node.js, the JVM and HTTP expose bounded named-class hierarchy, equivalence, unsatisfiability and source pages pinned to exact kept results, with explicit scoped projection for restricted views. Fresh RDFS or OWL RL materializations separately supply pinned property hierarchies, individual named types and derived frames. General classifier-backed entity/axiom reads, complete property/individual entailments and classification justifications remain in items 588, 622, 609 and F24. |
-| [Ontology browser](visualization/README.md#ontology-browser) | Partially complete. | Browse gives entities and ontologies pages with linked Manchester axioms, definition disclosures, metadata and identifier/download cards, tree/graph hierarchies, related terms from the vector index and previewed editing, and its typo-tolerant [entity search](search/README.md#entity-search) answers typeahead on ChEBI lite within 8.3 ms at the 99th percentile. Named-class views read bounded kept clauses at the displayed commit with explicit scoped classification and visible outcomes, and property and individual views read fresh RDFS or OWL RL materializations with exact source/revision pins and inferred-graph provenance. General classifier-backed entailments and explanation links remain in items 588, 622, 609 and F24. |
+| [OWL 2 ontology API](reasoning/README.md#owl-2-ontologies) | Partially complete. | The axiom model, RDF and functional-style mappings, profile checks, entity accessors and axiom diffs are available in Rust, Python, Node.js, the JVM (with `jena-ontapi` bridging), HTTP, MCP and the CLI, with inferred reads and the Manchester reader everywhere except MCP and the CLI. Literal checks cover XML namespace conformance, with full XML canonical lexical and value semantics remaining in item 663. A read budget, fetched imports, and inferred reads and entity reports over MCP and the CLI remain in items 539, 559, 565 and 578. |
+| [OWL 2 EL classification](reasoning/README.md#owl-2-ontologies) | Partially complete. | An incremental, concurrent classifier computes the class hierarchy and unsatisfiable classes of OWL 2 EL, Horn and ALCHI ontologies in Rust, Python, Node.js, the JVM, HTTP and the CLI, activating two-link top-object-property chain inference by default and calling an answer complete only when it holds for the whole ontology. On one and eight threads it classifies GO, ChEBI lite and the largest ORE 2015 EL ontologies 3.1 to 20 times as fast as ELK and faster than Konclude ([results](benchmarks/el-classification/RESULTS.md)). The Horn tier checks OWL 2 DL datatypes and data cardinalities, while data case analysis, keys over checked properties, data properties in disjunctive rules, and default activation of counting and rooted runs remain open. |
+| [Ontology editor](visualization/README.md#ontology-editor) | Partially complete. | Ontology editing, paged class, property and individual trees, DL Query, entity history with revert, discussions, watches, bulk edits, import resolution (with import maps, XML catalogs and fetched imports), session branches, undo and on-demand metrics are available. Remaining diagram, tree, IRI policy, grant and read-cost work is listed in the visualization guide. |
+| [Thesaurus editor](visualization/README.md#thesaurus-editor) | Complete. | The Workbench's Thesaurus editor edits SKOS concept schemes, concepts, collections, multilingual and SKOS-XL labels, hierarchy and mapping links as previewed commits, with drag to re-parent and built-in SKOS integrity checks. Larger trees and search, foreign mapping labels, label relations, combined guards and graph-scoped forms remain in items 638 to 642. |
+| [Visual SHACL shape editor](visualization/README.md#visual-shacl-shape-editor) | Complete. | Trees and forms author node and property shapes, Core targets and constraints, nested paths and severities as previewed graph commits up to 5,000 triples per shapes graph. Sample validation retains source identity, and unrecognized RDF is preserved beside the Turtle and SHACLC text validator. |
+| [Kept classification reads](reasoning/README.md#owl-2-ontologies) | Partially complete. | Rust, Python, Node.js, the JVM and HTTP expose bounded named-class hierarchy, equivalence, unsatisfiability and source pages pinned to exact kept results, while fresh RDFS or OWL RL materializations separately supply pinned property hierarchies, individual named types and derived frames. General classifier-backed entity and axiom reads, complete property and individual entailments and classification justifications remain in items 588, 622, 609 and F24. |
+| [Ontology browser](visualization/README.md#ontology-browser) | Partially complete. | Browse gives entities and ontologies dedicated pages with linked Manchester axioms, definition disclosures, metadata cards, tree and graph hierarchies, vector-based related terms, previewed inline editing and typo-tolerant [entity search](search/README.md#entity-search) (under 8.3 ms at p99 on ChEBI lite). Named-class views read bounded kept classifications at the displayed commit, while property and individual views read fresh RDFS or OWL RL materializations with exact revision pins. General classifier-backed entailments and explanation links remain in items 588, 622, 609 and F24. |
 
 ### Server and security
 
@@ -340,9 +272,9 @@ answers and instruction counts, and the limits of attributing them to layout.
 
 | Capability | Status | Current scope and remaining work |
 |---|---|---|
-| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reviewed, reversible identity resolution maps, assessment inputs and the dependents of changed records are available through Rust, HTTP and caller-scoped MCP tools with protected records and retained source holds. `recall` and Ask cite claim occurrences with their review state under a named policy. Document ingestion can write extracted facts as claim proposals with their source registration in one commit. Community reports can read a review policy's accepted projection, cite the claims and decisions behind their facts, and refresh automatically when a reviewed input changes. Maintained analyses are planned under item 340. |
+| [Shared evidence and review records](ai/README.md#evidence-profile) | Partially complete. | Authenticated evidence proposals, reference resolution, review decisions with accepted projections, withdrawals, reversible identity resolution maps, assessment inputs and dependent lookups are available through Rust, HTTP and caller-scoped MCP tools. `recall`, Ask, document ingestion (`mode: "claims"`) and community reports integrate with named review policies and claim citations. Maintained analyses remain planned under item 340. |
 | [Shared entity representation](ai/README.md#shared-entity-representation) | Partially complete. | Versioned resources, fixed fixtures and a bounded private offline resolver are available. Authenticated managed integration remains under item 396. |
-| [Durable jobs and delivery](ai/README.md#durable-jobs) | Partially complete. | Idempotent submission, fenced worker leases, atomic publication of quads with a source checkpoint, restart fencing and the recovery of restored work are available through Rust and HTTP for the `quads` kind. The ledger lives in the store's control keyspace, which no query, listing, index or history reads. The outbox and recurring definitions remain under item 339. |
+| [Durable jobs and delivery](ai/README.md#durable-jobs) | Partially complete. | Idempotent submission, fenced worker leases, atomic publication of the `quads` kind, restart fencing and restored-work recovery are available through Rust and HTTP in the store's control keyspace (invisible to queries, listings, indexes and history). The transactional outbox and recurring definitions remain under item 339. |
 | [Maintained analysis results](specs/F22-analysis-lifecycle.md) | Planned. | Item 340 specifies reproducible runs, dependency checks, freshness and guarded publication. |
 | [Valid-time queries and event history](ai/README.md#valid-time-profile) | Partially complete. | Versioned RDF resources, SHACL shapes, temporal stored-query templates, validity records on authenticated claims and server-owned availability that refuses backdating are available. The projection helper, event-time UI and expiry integration remain planned. |
 | [Reports for distinct audiences](specs/C22b-report-configurations.md) | Planned. | Item 100 specifies multiple guarded GraphRAG configurations and shared budget enforcement. |
@@ -393,7 +325,7 @@ and links each item to its design spec.
 | <a id="sparql-and-formats"></a>[SPARQL and formats](querying/README.md#sparql-and-formats) | Additional query surfaces, execution coverage, formats and editor support remain. |
 | <a id="search-and-graph-algorithms"></a>[Search and graph algorithms](search/README.md#search-and-graph-algorithms) | Multi-field search, quantization and further algorithm surfaces remain. |
 | <a id="geosparql-1"></a>[GeoSPARQL](search/README.md#geosparql-1) | Item 24 adds per-row nearest-neighbour joins, spatial syntax, polygon approximations and further CRS support. |
-| <a id="reasoning-and-validation"></a>[Reasoning and validation](reasoning/README.md#reasoning-and-validation) | Automatic reasoning selection, a separate derived layer, the remaining ontology accessors and remaining validation and form work remain. |
+| <a id="reasoning-and-validation"></a>[Reasoning and validation](reasoning/README.md#reasoning-and-validation) | A separate derived layer, canonical equality, per-pattern `auto` selection, complete OWL 2 DL classification, MCP and CLI ontology entity and inferred reads, and remaining validation and form work remain. |
 | <a id="server-access-control-and-operations"></a>[Server, access control and operations](server/README.md#server-access-control-and-operations) | Further Fuseki integration, derived visibility and operational controls remain. |
 | <a id="ai-and-agents-1"></a>[AI and agents](ai/README.md#ai-and-agents-1) | Ask accuracy, contextual linking, ingestion formats and configurable reports remain. |
 | <a id="web-ui-1"></a>[Web UI](visualization/README.md#web-ui-1) | Live profiling, additional query-builder blocks and larger graph rendering remain. |

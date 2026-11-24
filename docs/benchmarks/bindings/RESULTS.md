@@ -5,10 +5,9 @@ This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 
 ## Comparison summary
 
-Through Jena's own API, Sparkles answers 24 of 28 suite queries faster
-  than TDB2 and than Jena's in-memory store. The Python package is faster than pyoxigraph
-  on 25 of 28, and the Node.js package is faster than Oxigraph's JavaScript package on 24
-  of 28.
+Through Jena's own API, Sparkles answers 24 of 28 suite queries faster than TDB2 and
+faster than Jena's in-memory store. The Python package is faster than pyoxigraph on 25 of
+28, and the Node.js package is faster than Oxigraph's JavaScript package on 24 of 28.
 
 ## Bindings
 

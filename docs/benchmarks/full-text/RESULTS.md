@@ -5,8 +5,8 @@ This is a [manual report](../README.md#evidence-and-generated-reports). Read the
 
 ## Comparison summary
 
-Sparkles is fastest on all seven queries at 1.05M and on six of
-  seven at 10.5M, against Fuseki with jena-text and QLever.
+Sparkles is fastest on all seven queries at 1.05M and on six of seven at 10.5M, against
+Fuseki with jena-text and QLever.
 
 ## Full-text search
 

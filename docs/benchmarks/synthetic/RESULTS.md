@@ -1266,7 +1266,7 @@ samples, the answers, the scripts and the screen.
 
 All runs used one Rayon thread with the server on CPU 2, the client on CPU 4 and spinners
 on both, at 1.05M triples. The atlas runs went through `scripts/nsc-bench-remote.sh` on
-atlas, while an unpinned single-threaded job of another lane ran there. The wally builds
+atlas, while an unpinned single-threaded job ran there. The wally builds
 used `scripts/nsc-build.sh`, and the server of cf033f12 is that of bf740bed, the merge of
 item 454, since cf033f12 changed only a Kotlin test.
 
