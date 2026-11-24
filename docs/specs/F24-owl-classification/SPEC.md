@@ -1921,28 +1921,36 @@ For OWL 2 EL data properties, resolve all EL `DatatypeDefinition` axioms first s
 every EL data range reduces to empty, a singleton `{v}`, a proper EL datatype `T`, or
 `rdfs:Literal`. The OWL 2 EL datatypes form disjoint chains of finite height beneath
 `rdfs:Literal`, and every proper EL datatype `T` has an infinite top atomic cell
-`T^∘ = T \ ⋃_{T' ⊊ T} T'`. Under the OWL 2 datatype map, `rdfs:Literal` likewise contains
-values outside every proper EL chain, such as `xsd:boolean` values that do not occur in
-EL data axioms, so `Δ_D` stays fixed; over the strict EL datatype map alone, extending
-`Δ_D` with one fresh element `u_⊤` in `rdfs:Literal` and adding `u_⊤` to every
-constant-tuple fiber equal to `Δ_D` preserves universal data roles, ranges, ground
-assertions and keys because any two named individuals already share all values of `Δ_D`
-on such a role. Pick one fresh representative `u_T ∈ T^∘` avoiding all finitely many
-literal values in the ontology for each EL datatype `T`, including `rdfs:Literal`, and
-define `φ : (Δ_D)^κ → Δ_D` by `φ(v⃗) = v` when `v⃗ = (v)_{α < κ}` is constant and
-`φ(v⃗) = u_{T(v⃗)}` otherwise, where `T(v⃗)` is the unique smallest EL datatype or
+`T^∘ = T \ ⋃_{T' ⊊ T} T'`. Distinguish the source data domain `Δ_D` from the target data
+domain `Δ_D'` of `I^κ`. Under the full OWL 2 datatype map, `rdfs:Literal` already
+contains values outside every proper EL chain, such as `xsd:boolean` values that do not
+occur in EL data axioms, so `Δ_D' = Δ_D`. Over the strict EL datatype map alone, where
+`Δ_D` has no value outside the proper EL chains, set `Δ_D' = Δ_D ∪ {u_⊤}` by adding one
+fresh value `u_⊤` to `rdfs:Literal` outside every proper EL datatype. Pick one fresh
+representative `u_T ∈ T^∘ ⊆ Δ_D'` avoiding all finitely many literal values in the
+ontology for each EL datatype `T`, using `u_⊤` for `rdfs:Literal` when `Δ_D'` is
+extended. Define `φ : (Δ_D)^κ → Δ_D'` by `φ(v⃗) = v` when `v⃗ = (v)_{α < κ}` is constant
+and `φ(v⃗) = u_{T(v⃗)}` otherwise, where `T(v⃗)` is the unique smallest EL datatype or
 `rdfs:Literal` containing `{v_α : α < κ}`. For every EL data property `d`, including
-`owl:topDataProperty` and any role forced universal by inclusions, copy `d^I(c)` on each
-constant tuple `x = (c)_{α < κ}` (with `u_⊤` when `Δ_D` is extended and `d^I(c) = Δ_D`)
-and set `d^{I^κ}(x) = {φ(v⃗) : v⃗ ∈ ∏_{α < κ} d^I(x_α)}` on each non-constant tuple `x`.
-Applying the same map `φ` to every data property preserves `SubDataPropertyOf`,
-`owl:topDataProperty` and universal superroles via constant vectors, and
-`FunctionalDataProperty` because `|∏ d^I(x_α)| ≤ 1`. It preserves `DataPropertyRange`,
-`DataHasValue` in both polarities because no `u_T` equals an ontology literal, and
-`DataSomeValuesFrom` in both polarities because `u_{T(v⃗)} ∈ T^∘ ∩ T` forces `T(v⃗) ⊆ T`
-on the tree of disjoint EL chains. Copying constant-tuple fibers verbatim preserves
-`DataPropertyAssertion`, `NegativeDataPropertyAssertion` and `HasKey` on named
-individuals without spurious key collisions from dummy values.
+`owl:topDataProperty` and any role forced universal by inclusions, set
+`d^{I^κ}(x) = Δ_D'` when `d^I(c) = Δ_D` and `d^{I^κ}(x) = d^I(c)` otherwise on each
+constant tuple `x = (c)_{α < κ}`, and set
+`d^{I^κ}(x) = {φ(v⃗) : v⃗ ∈ ∏_{α < κ} d^I(x_α)}` on each non-constant tuple `x`. On
+`owl:topDataProperty` and any universal superrole, every constant tuple receives `Δ_D'`,
+and every non-constant tuple's full product `(Δ_D)^κ` produces all values of `Δ_D` via
+constant vectors `(v)_{α < κ}` together with `u_⊤`, when `Δ_D'` is extended, via any
+non-constant vector combining values from two disjoint proper EL chains such as an
+`xsd:integer` and an `xsd:string`. Applying the same map `φ` to every data property
+preserves `SubDataPropertyOf` and preserves `FunctionalDataProperty` because
+`|d^I(x_α)| ≤ 1 < |Δ_D|` gives `|∏ d^I(x_α)| ≤ 1` and never makes a fiber equal to
+`Δ_D`. It preserves `DataPropertyRange`, `DataHasValue` in both polarities because no
+`u_T` equals an ontology literal, and `DataSomeValuesFrom` in both polarities because
+`u_{T(v⃗)} ∈ T^∘ ∩ T` forces `T(v⃗) ⊆ T` on the tree of disjoint EL chains. On constant
+tuples, `DataPropertyAssertion` and `NegativeDataPropertyAssertion` hold because `u_⊤` is
+distinct from every literal in `Δ_D`, and `HasKey` on named individuals holds without
+spurious collisions because dummy values never enter non-full diagonal fibers and any two
+diagonal fibers that share `u_⊤` were both equal to `Δ_D` in `I`, so those named
+individuals already shared an existing value of `Δ_D` in `I`.
 
 For each occurrence of `≥n r.C` processed bottom-up with already-unfolded filler `C'`,
 every tuple `x` in `((≥n r.C)^I)^κ` has at least `n^κ ≥ 2^κ` distinct `r`-successors in
